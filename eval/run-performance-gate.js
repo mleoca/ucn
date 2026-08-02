@@ -124,6 +124,7 @@ async function evaluateRepo(repo) {
     let firstQueryMs;
     let queryErrors = 0;
     let queryTimes = [];
+    const querySamples = [];
     const cacheLoadSamplesMs = [];
     const firstQuerySamplesMs = [];
     try {
@@ -166,7 +167,14 @@ async function evaluateRepo(repo) {
                 name: `${def.relativePath}:${def.startLine}:${def.name}`,
                 compact: true,
             });
-            queryTimes.push(elapsed(started));
+            const durationMs = elapsed(started);
+            queryTimes.push(durationMs);
+            querySamples.push({
+                name: def.name,
+                file: def.relativePath,
+                line: def.startLine,
+                durationMs,
+            });
             if (!result.ok) queryErrors++;
         }
     } finally {
@@ -185,6 +193,9 @@ async function evaluateRepo(repo) {
     };
     const { failures, warnings } = evaluatePerformanceBudgets(metrics, budgets);
     const firstSummary = summarizeSamples(firstQuerySamplesMs);
+    const slowestQueries = [...querySamples]
+        .sort((a, b) => b.durationMs - a.durationMs)
+        .slice(0, 5);
 
     process.stdout.write(`  ${fileCount} files, ${lines} LOC | cold ${coldMs}ms (${coldLocPerSec} LOC/s) | ` +
         `cache load median ${cacheLoadMs}ms + first query median ${firstQueryMs}ms ` +
@@ -193,6 +204,12 @@ async function evaluateRepo(repo) {
         `RSS ${rssMb}MB, peak ${peakRssMb}MB | errors ${queryErrors}` +
         `${failures.length ? ` | FAIL: ${failures.join('; ')}` : ''}` +
         `${warnings.length ? ` | NOTE: ${warnings.join('; ')}` : ''}\n`);
+    if (queryP95Ms > budgets.maxQueryP95Ms ||
+        slowestQueries[0]?.durationMs > budgets.maxQueryP95Ms) {
+        process.stdout.write(`  slowest: ${slowestQueries.map(query =>
+            `${query.file}:${query.line}:${query.name} ${query.durationMs}ms`)
+            .join(' | ')}\n`);
+    }
 
     return {
         repo: repo.name,
@@ -214,6 +231,7 @@ async function evaluateRepo(repo) {
         queryP50Ms,
         queryP95Ms,
         queryMaxMs: Number(Math.max(...queryTimes).toFixed(3)),
+        slowestQueries,
         queryErrors,
         rssMb,
         peakRssMb,

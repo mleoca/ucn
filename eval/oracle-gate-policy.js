@@ -53,6 +53,8 @@ function summarizeReviewBurden({
     symbols = [],
     oracleCallEdges = 0,
     placement = {},
+    exactOracleCallEdges = oracleCallEdges,
+    exactPlacement = placement,
     unverifiedEdges = 0,
     unverifiedHits = 0,
     unverifiedUnscored = 0,
@@ -67,6 +69,10 @@ function summarizeReviewBurden({
         sum + (Number(symbol?.runtimeDispatchSites) || 0), 0);
     const runtimeDispatchGroups = validSymbols.reduce((sum, symbol) =>
         sum + (Number(symbol?.runtimeDispatchGroups) || 0), 0);
+    const compileTimeDispatchSites = validSymbols.reduce((sum, symbol) =>
+        sum + (Number(symbol?.compileTimeDispatchSites) || 0), 0);
+    const compileTimeDispatchGroups = validSymbols.reduce((sum, symbol) =>
+        sum + (Number(symbol?.compileTimeDispatchGroups) || 0), 0);
     const actionableUnverifiedCandidates = counts.reduce(
         (sum, count) => sum + count, 0);
     const actionableUnverifiedHits = validSymbols.reduce((sum, symbol) =>
@@ -79,7 +85,15 @@ function summarizeReviewBurden({
         actionableUnverifiedScored - actionableUnverifiedHits);
     const semanticEligibleEdges = Math.max(0,
         oracleCallEdges - (placement.missingExplained || 0));
-    const trueEdgesUnverified = placement.unverified || 0;
+    // clangd can identify a conservative template-overload family while the
+    // exact specialization remains dependent on substitution/constraints.
+    // Keep those edges in semantic recall, but do not mislabel them as exact
+    // target edges. The strict placement gate is over statically exact oracle
+    // edges; compiler-dependent edges have their own visible counts/families.
+    const exactSemanticEligibleEdges = Math.max(0,
+        exactOracleCallEdges - (exactPlacement.missingExplained || 0));
+    const trueEdgesUnverified = exactPlacement.unverified || 0;
+    const allOracleEdgesUnverified = placement.unverified || 0;
     const unverifiedScoredEdges = Math.max(0, unverifiedEdges - unverifiedUnscored);
     const rawFalseUnverifiedCandidates = Math.max(0,
         unverifiedScoredEdges - unverifiedHits);
@@ -87,8 +101,8 @@ function summarizeReviewBurden({
     // one boundary explanation, not every raw implementation candidate.
     // Charge every family once (conservative even when it contains a true
     // edge), while actionable ambiguities remain candidate-by-candidate.
-    const unverifiedReviewItems =
-        actionableFalseUnverifiedCandidates + runtimeDispatchGroups;
+    const unverifiedReviewItems = actionableFalseUnverifiedCandidates +
+        runtimeDispatchGroups + compileTimeDispatchGroups;
 
     return {
         reviewedSymbols,
@@ -107,9 +121,19 @@ function summarizeReviewBurden({
         runtimeDispatchSites,
         runtimeDispatchGroups,
         runtimeDispatchReviewItems: runtimeDispatchGroups,
+        compileTimeDispatchSites,
+        compileTimeDispatchGroups,
+        compileTimeDispatchReviewItems: compileTimeDispatchGroups,
         semanticEligibleEdges,
+        exactSemanticEligibleEdges,
+        compilerDependentOracleEdges: Math.max(0,
+            semanticEligibleEdges - exactSemanticEligibleEdges),
         trueEdgesUnverified,
-        trueEdgeUnverifiedRate: roundedRate(trueEdgesUnverified, semanticEligibleEdges),
+        trueEdgeUnverifiedRate: roundedRate(
+            trueEdgesUnverified, exactSemanticEligibleEdges),
+        allOracleEdgesUnverified,
+        allOracleEdgeUnverifiedRate: roundedRate(
+            allOracleEdgesUnverified, semanticEligibleEdges),
         unverifiedCandidates: unverifiedEdges,
         unverifiedScoredEdges,
         unverifiedUnscored,

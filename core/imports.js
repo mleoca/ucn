@@ -191,7 +191,22 @@ function resolveImport(importPath, fromFile, config = {}) {
     if (config.language === 'c' || config.language === 'cpp') {
         const { includeDirectoriesForFile } = require('./compilation-database');
         const includeName = normalizedPath.replace(/^\.\//, '');
-        for (const includeDir of includeDirectoriesForFile(fromFile, config.root)) {
+        const includeDirs = includeDirectoriesForFile(fromFile, config.root);
+        for (const configured of config.includePaths || []) {
+            if (typeof configured !== 'string' || !configured.trim()) continue;
+            includeDirs.push(path.isAbsolute(configured)
+                ? configured
+                : path.resolve(config.root || fromDir, configured));
+        }
+        // Header-only/source-distribution projects commonly omit a generated
+        // compile_commands.json but still use the conventional public
+        // `include/` root (`#include "fmt/format.h"`). These are project-owned
+        // files, not external packages. Try explicit compiler metadata first,
+        // then deterministic project roots; never search arbitrary parents.
+        if (config.root) {
+            includeDirs.push(config.root, path.join(config.root, 'include'));
+        }
+        for (const includeDir of [...new Set(includeDirs)]) {
             const candidate = resolveFilePath(path.resolve(includeDir, includeName), extensions);
             if (candidate) return candidate;
         }

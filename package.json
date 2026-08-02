@@ -20,7 +20,7 @@
     "eval:performance": "node --expose-gc eval/run-performance-gate.js",
     "eval:consistency": "node eval/run-consistency-eval.js --project .",
     "profile:callers": "node eval/profile-callers.js",
-    "lint": "eslint core/ cli/ mcp/ languages/ eval/run-*.js eval/*-gate-policy.js eval/profile-callers.js",
+    "lint": "eslint core/ cli/ mcp/ languages/ eval/run-*.js eval/*-gate-policy.js eval/profile-callers.js eval/oracles/*.js",
     "verify": "npm run lint && npm test",
     "trust:gate:semantic": "node eval/run-oracle-eval.js --release --min-precision 0.98 --max-unscored-ratio 0.10",
     "trust:gate:deadcode": "node eval/run-deadcode-eval.js --release --sample 100 --arm default",

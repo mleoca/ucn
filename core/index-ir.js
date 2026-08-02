@@ -69,9 +69,11 @@ const OPTIONAL_SYMBOL_FIELDS = Object.freeze([
     'annotationsWithArgs', 'attributesWithArgs', 'nameLine', 'traitImpl',
     'traitName', 'isSignature', 'memberAssigned', 'bodyScopedName',
     'registryMember', 'registryContainer', 'namespace',
+    'isExtensionMethod', 'extensionReceiver', 'explicitInterface',
     'lexicalScopeStartLine', 'lexicalScopeEndLine',
     'returnTypeQualifier', 'macroNeverReturns', 'callbackParamTypes', 'iteratorItemType',
-    'returnedConcreteType', 'returnedConstructors',
+    'returnedConcreteType', 'returnedConstructors', 'templateDependent',
+    'linkage',
 ]);
 
 function materializeSymbol(fileEntry, item) {

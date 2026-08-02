@@ -1160,6 +1160,43 @@ describe('New Formatter Coverage', () => {
             assert.strictEqual(all.expandable.length, 4);
         });
 
+        it('groups compiler-dependent template overloads without hiding JSON sites', () => {
+            const ctx = {
+                function: 'copy', file: 'base.h', startLine: 10, endLine: 15,
+                callers: [], callees: [],
+                unverifiedCallers: Array.from({ length: 4 }, (_, i) => ({
+                    relativePath: 'format.h',
+                    line: i + 20,
+                    content: 'copy<T>(begin, end, out)',
+                    reason: 'overload-ambiguous',
+                    uncertaintyClass: 'compile-time-dispatch',
+                    dispatchFamily: 'copy template overload set',
+                    dispatchCandidates: 3,
+                })),
+                meta: { complete: true, skipped: 0, dynamicImports: 0, uncertain: 4 }
+            };
+            const { text, expandable } = output.formatContext(ctx);
+            assert.ok(text.includes(
+                'CALLERS — COMPILE-TIME DISPATCH (4 sites, 1 family)'));
+            assert.ok(text.includes(
+                'copy template overload set: 4 sites; 3 candidate overloads'));
+            assert.ok(text.includes(
+                '(+2 more compile-time-dispatch sites — use --all)'));
+            assert.ok(!text.includes('CALLERS — UNVERIFIED'),
+                'compiler handoffs are not presented as human-resolvable ambiguity');
+            assert.equal(expandable.length, 2);
+
+            const json = JSON.parse(output.formatContextJson(ctx));
+            assert.equal(json.data.unverifiedCallers.length, 4,
+                'the raw audit surface retains every source site');
+            assert.equal(
+                json.data.unverifiedCallers[0].uncertaintyClass,
+                'compile-time-dispatch');
+            assert.equal(
+                json.data.unverifiedCallers[0].dispatchFamily,
+                'copy template overload set');
+        });
+
         it('renders ACCOUNT line and unparsed WARNING from meta.account', () => {
             const ctx = {
                 function: 'fn', file: 'a.js', startLine: 1, endLine: 3,

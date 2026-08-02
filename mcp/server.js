@@ -41,7 +41,6 @@ const {
     generateMcpParamSection,
     resolveCommand,
     suggestCommand,
-    v4MigrationHint,
     formatSurfaceMessage,
 } = require('../core/registry');
 const { execute } = require('../core/execute');
@@ -243,7 +242,7 @@ Use UCN for semantic questions: exact definitions, symbol-aware callers/callees,
 - check: symbol signature check when name is set; precommit check when omitted. plan previews the selected declaration plus indexed call/import/export edits.
 - deadcode/audit_async/stacktrace: focused audits and runtime evidence. Computed dispatch is reported as a health/deletion blind spot.
 
-CONFIRMED carries target-identity evidence. UNVERIFIED is possible and requires review. ACCOUNT conserves observed literal-name lines; an observed-text zero never claims semantic completeness or safe deletion. Evidence weights are ordinal, not probabilities. Warnings, excluded reasons, and contract metadata remain visible when caller evidence is returned. Release evaluation cross-checks overlapping stable-handle claims across find, show, source, impact, tests, check, and caller trace.` + generateMcpParamSection();
+CONFIRMED carries target-identity evidence. UNVERIFIED is possible and requires review. ACCOUNT conserves observed literal-name lines; an observed-text zero never claims semantic completeness or safe deletion. Evidence weights are ordinal, not probabilities. Warnings, excluded reasons, and contract metadata remain visible when caller evidence is returned. Release evaluation cross-checks overlapping stable-handle claims across find, show, source, impact, tests, check, and caller trace, and compares pinned real-repository samples with ts-morph, Pyright, gopls, rust-analyzer, JDT LS, clangd, and Roslyn.` + generateMcpParamSection();
 
 // The default description is the only public contract. The former verbose
 // description is intentionally not selectable: it documented retired commands
@@ -263,12 +262,10 @@ server.registerTool(
     {
         description: TOOL_DESCRIPTION,
         inputSchema: z.object(Object.assign(INPUT_SHAPE, {
-            // Deliberately a string, not z.enum: a strict enum makes every
-            // unknown command (v4 names included) die in SDK validation
-            // before the handler can answer with replacement guidance. The
-            // handler validates against the same registry list and returns
-            // a directive error for v4 names (about → show, toc → repo ...).
-            command: z.string().describe(`Command to run. One of: ${getMcpCommandEnum().join(', ')}.`),
+            // Keep command discovery machine-readable. Retired names are not
+            // accepted: one strict v5 enum is easier for agents and clients
+            // to validate than a compatibility layer hidden in prose.
+            command: z.enum(getMcpCommandEnum()).describe('UCN task command.'),
             project_dir: z.string().describe('Absolute or relative path to the project root directory'),
             name: z.string().optional().describe('Symbol name or stable path:line:name handle. Used by show/find/usages/source/trace/impact/tests/check/plan.'),
             file: z.string().optional().describe('File target for source/deps/api or a symbol-disambiguation filter.'),
@@ -345,14 +342,9 @@ server.registerTool(
     async (args) => {
         const { command, project_dir, ...rawParams } = args;
 
-        // Command validation with directive guidance (the schema is a plain
-        // string so this handler, not SDK zod validation, answers). v4 names
-        // map to their v5 replacement; near-misses get a suggestion.
+        // Defensive validation for direct/internal handler calls. MCP clients
+        // normally fail at the strict command enum before reaching this path.
         if (!resolveCommand(command, 'mcp')) {
-            const migration = v4MigrationHint(command, 'mcp');
-            if (migration) {
-                return toolError(`Unknown command: ${command}. ${migration}`);
-            }
             const suggestion = suggestCommand(command, 'mcp');
             return toolError(`Unknown command: ${command}.` +
                 (suggestion ? ` Did you mean "${suggestion}"?` : '') +

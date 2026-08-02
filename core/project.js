@@ -33,6 +33,15 @@ const reportingModule = require('./reporting');
 // Lazy-initialized per-language keyword sets (populated on first isKeyword call)
 let LANGUAGE_KEYWORDS = null;
 
+// Query-time ASTs are immutable for the lifetime of an indexed file. Keep a
+// small cross-operation LRU so a sequence of agent queries does not reparse the
+// same large headers/modules for every conservation-account classification.
+// The source-byte budget is deliberately conservative because tree-sitter's
+// native tree is larger than its source. Evictions explicitly release native
+// memory instead of waiting for N-API finalizers.
+const PARSED_TREE_CACHE_MAX_ENTRIES = 128;
+const PARSED_TREE_CACHE_MAX_SOURCE_BYTES = 32 * 1024 * 1024;
+
 /**
  * ProjectIndex - Manages symbol table for a project
  */
@@ -58,9 +67,12 @@ class ProjectIndex {
         this._opContentCache = null;     // per-operation file content cache (Map<filePath, string>)
         this._opUsagesCache = null;      // per-operation findUsagesInCode cache (Map<"file:name", usages[]>)
         this._opTreeCache = null;        // per-operation parsed-tree cache (Map<filePath, tree|null>, bounded FIFO)
+        this._opTransientTrees = null;   // evicted/errored trees kept alive until the active operation ends
         this._opLinesCache = null;       // per-operation split-lines cache (Map<filePath, string[]>, bounded FIFO)
         this._opInnerSymbolRangesCache = null; // per-operation sorted class-method ranges by file
         this._opFlowTypeOriginCache = null; // per-operation annotation type identity results
+        this._parsedTreeCache = new Map(); // cross-operation LRU: filePath -> immutable tree entry
+        this._parsedTreeCacheSourceBytes = 0;
         this.calleeIndex = null;         // name -> Set<filePath> — inverted call index (built lazily)
     }
 
@@ -89,6 +101,7 @@ class ProjectIndex {
             this._opUsageTotalsCache = new Map();
             this._opEnclosingFnCache = new Map();
             this._opTreeCache = new Map();
+            this._opTransientTrees = new Set();
             this._opLinesCache = new Map();
             // Query-time semantic derivations that depend only on one file's
             // immutable call records. Reachability may ask findCallees() for
@@ -114,6 +127,10 @@ class ProjectIndex {
             this._opUsageTotalsCache = null;
             this._opEnclosingFnCache = null;
             this._opTreeCache = null;
+            if (this._opTransientTrees) {
+                for (const tree of this._opTransientTrees) tree?.delete?.();
+            }
+            this._opTransientTrees = null;
             this._opLinesCache = null;
             this._opReturnTypeFlowCache = null;
             this._opCallsByLineCache = null;
@@ -129,11 +146,46 @@ class ProjectIndex {
         }
     }
 
+    /** Remove one persistent parsed tree, deferring disposal if an operation still uses it. */
+    _evictParsedTree(filePath) {
+        const entry = this._parsedTreeCache.get(filePath);
+        if (!entry) return;
+        this._parsedTreeCache.delete(filePath);
+        this._parsedTreeCacheSourceBytes -= entry.sourceBytes;
+        if (this._opTreeCache?.get(filePath) === entry.tree) {
+            this._opTransientTrees?.add(entry.tree);
+        } else {
+            entry.tree?.delete?.();
+        }
+    }
+
+    /** Dispose every cross-operation tree. Used when an index is replaced from cache. */
+    _clearParsedTreeCache() {
+        for (const filePath of [...this._parsedTreeCache.keys()]) {
+            this._evictParsedTree(filePath);
+        }
+        this._parsedTreeCacheSourceBytes = 0;
+    }
+
+    _cacheParsedTree(filePath, language, tree, sourceBytes) {
+        const fileHash = this.files.get(filePath)?.hash || null;
+        this._evictParsedTree(filePath);
+        this._parsedTreeCache.set(filePath, {
+            tree, language, fileHash, sourceBytes,
+        });
+        this._parsedTreeCacheSourceBytes += sourceBytes;
+        while (this._parsedTreeCache.size > PARSED_TREE_CACHE_MAX_ENTRIES ||
+            this._parsedTreeCacheSourceBytes > PARSED_TREE_CACHE_MAX_SOURCE_BYTES) {
+            this._evictParsedTree(this._parsedTreeCache.keys().next().value);
+        }
+    }
+
     /**
-     * Parse a file once per operation and reuse the tree across symbol names.
+     * Parse a file once and reuse the immutable tree across operations.
      * Multi-symbol commands (diff-impact, check) classify ground lines for MANY
      * names against the SAME files; without this, each (file, name) pair costs a
-     * full tree-sitter parse. Bounded FIFO (trees hold native memory).
+     * full tree-sitter parse. Both operation and persistent caches are bounded
+     * because trees hold native memory.
      * Returns null when parsing fails or no operation cache is active — callers
      * fall back to parsing themselves.
      */
@@ -141,6 +193,19 @@ class ProjectIndex {
         if (!this._opTreeCache) return null;
         const cached = this._opTreeCache.get(filePath);
         if (cached !== undefined) return cached;
+
+        const persistent = this._parsedTreeCache.get(filePath);
+        const currentHash = this.files.get(filePath)?.hash || null;
+        if (persistent && persistent.language === language &&
+            persistent.fileHash === currentHash) {
+            // LRU touch.
+            this._parsedTreeCache.delete(filePath);
+            this._parsedTreeCache.set(filePath, persistent);
+            this._opTreeCache.set(filePath, persistent.tree);
+            return persistent.tree;
+        }
+        if (persistent) this._evictParsedTree(filePath);
+
         let tree;
         try {
             const parser = getParser(language);
@@ -152,6 +217,9 @@ class ProjectIndex {
             this._opTreeCache.delete(this._opTreeCache.keys().next().value);
         }
         this._opTreeCache.set(filePath, tree);
+        if (tree) {
+            this._cacheParsedTree(filePath, language, tree, Buffer.byteLength(content));
+        }
         return tree;
     }
 
@@ -534,6 +602,8 @@ class ProjectIndex {
         const existing = this.files.get(filePath);
         if (!existing) return;
 
+        this._evictParsedTree(filePath);
+
         for (const symbol of existing.symbols) {
             const entries = this.symbols.get(symbol.name);
             if (entries) {
@@ -656,6 +726,17 @@ class ProjectIndex {
                     }
                 }
             }
+            // A compiler-recognized type qualifier is also a semantic use of
+            // the receiver type: `JValue.Compare(...)` references both
+            // JValue and Compare. Index the receiver so class/type queries do
+            // not fall back to a full project scan or leave the occurrence as
+            // an unexplained call-not-resolved line.
+            if (call.receiverIsTypeQualified && call.receiver) {
+                if (!this.calleeIndex.has(call.receiver)) {
+                    this.calleeIndex.set(call.receiver, new Set());
+                }
+                this.calleeIndex.get(call.receiver).add(filePath);
+            }
         }
     }
 
@@ -679,6 +760,9 @@ class ProjectIndex {
                 for (const rn of call.resolvedNames) {
                     if (rn !== call.name) removeName(rn);
                 }
+            }
+            if (call.receiverIsTypeQualified && call.receiver) {
+                removeName(call.receiver);
             }
         }
     }
@@ -965,7 +1049,8 @@ class ProjectIndex {
             if (Number.isFinite(exactLine)) {
                 // A line is an exact identity pin, never a ranking hint.
                 // An unsatisfied pin must not fall back to another definition.
-                definitions = definitions.filter(d => d.startLine === exactLine);
+                definitions = definitions.filter(d =>
+                    d.startLine === exactLine || d.nameLine === exactLine);
             }
         }
         if (definitions.length === 0) {
@@ -973,7 +1058,9 @@ class ProjectIndex {
         }
 
         // Score each definition for selection
-        const typeOrder = new Set(['class', 'struct', 'interface', 'type', 'impl']);
+        const typeOrder = new Set([
+            'class', 'struct', 'interface', 'type', 'impl', 'enum', 'record',
+        ]);
         const { isTestPath } = require('./shared');
         const scored = definitions.map(d => {
             let score = 0;

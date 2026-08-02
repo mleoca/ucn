@@ -9,9 +9,6 @@ const { detectDoubleEscaping, advisoryLine } = require('./shared');
  */
 function formatSearch(results, term) {
     const meta = results.meta;
-    const fallbackNote = meta && meta.regexFallback
-        ? `\nNote: Invalid regex (${meta.regexFallback}). Fell back to plain text search.`
-        : '';
 
     const totalMatches = results.reduce((sum, r) => sum + r.matches.length, 0);
     if (totalMatches === 0) {
@@ -20,15 +17,14 @@ function formatSearch(results, term) {
                 ? `Searched ${meta.filesScanned} of ${meta.totalFiles} file${meta.totalFiles === 1 ? '' : 's'} (${meta.filesSkipped} excluded by filters).`
                 : `Searched ${meta.filesScanned} file${meta.filesScanned === 1 ? '' : 's'}.`;
             const escapingHint = detectDoubleEscaping(term);
-            return `No matches found for "${term}". ${scope}${fallbackNote}${escapingHint}`;
+            return `No matches found for "${term}". ${scope}${escapingHint}`;
         }
-        return `No matches found for "${term}"${fallbackNote}`;
+        return `No matches found for "${term}"`;
     }
 
     const lines = [];
     const fileWord = results.length === 1 ? 'file' : 'files';
     lines.push(`Found ${totalMatches} match${totalMatches === 1 ? '' : 'es'} for "${term}" in ${results.length} ${fileWord}:`);
-    if (fallbackNote) lines.push(fallbackNote.trim());
     lines.push('═'.repeat(60));
 
     for (const result of results) {
@@ -80,7 +76,6 @@ function formatSearchJson(results, term) {
         obj.filesScanned = meta.filesScanned;
         obj.filesSkipped = meta.filesSkipped;
         obj.totalFiles = meta.totalFiles;
-        if (meta.regexFallback) obj.regexFallback = meta.regexFallback;
         if (meta.truncatedMatches > 0) obj.truncatedMatches = meta.truncatedMatches;
     }
     return JSON.stringify(obj, null, 2);

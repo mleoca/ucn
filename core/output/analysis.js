@@ -230,6 +230,7 @@ function formatContextJson(context) {
                 usages: callers.map(c => ({
                     file: c.relativePath || c.file,
                     line: c.line,
+                    ...(Number.isInteger(c.column) && { column: c.column }),
                     expression: c.content,
                     callerName: c.callerName,
                     ...(c.calledAs && { calledAs: c.calledAs }),
@@ -245,6 +246,7 @@ function formatContextJson(context) {
                 unverifiedCallers: (context.unverifiedCallers || []).map(c => ({
                     file: c.relativePath || c.file,
                     line: c.line,
+                    ...(Number.isInteger(c.column) && { column: c.column }),
                     expression: c.content,
                     callerName: c.callerName ?? null,
                     ...(c.calledAs && { calledAs: c.calledAs }),
@@ -258,8 +260,10 @@ function formatContextJson(context) {
                     ...(c.dispatchVia && { dispatchVia: c.dispatchVia }),
                     ...(c.dispatchCandidates != null && { dispatchCandidates: c.dispatchCandidates }),
                     ...(c.externalContract && { externalContract: true }),
-                    uncertaintyClass: c.reason === 'possible-dispatch' && c.dispatchVia
-                        ? 'runtime-dispatch' : 'actionable-ambiguity',
+                    uncertaintyClass: c.uncertaintyClass ||
+                        (c.reason === 'possible-dispatch' && c.dispatchVia
+                            ? 'runtime-dispatch' : 'actionable-ambiguity'),
+                    ...(c.dispatchFamily && { dispatchFamily: c.dispatchFamily }),
                 })),
                 ...(context.warnings && { warnings: context.warnings })
             }
@@ -283,6 +287,7 @@ function formatContextJson(context) {
             callers: callers.map(c => ({
                 file: c.relativePath || c.file,
                 line: c.line,
+                ...(Number.isInteger(c.column) && { column: c.column }),
                 expression: c.content,  // FULL expression
                 callerName: c.callerName,
                 ...(c.calledAs && { calledAs: c.calledAs }),
@@ -296,6 +301,7 @@ function formatContextJson(context) {
             unverifiedCallers: unverifiedCallers.map(c => ({
                 file: c.relativePath || c.file,
                 line: c.line,
+                ...(Number.isInteger(c.column) && { column: c.column }),
                 expression: c.content,  // FULL expression
                 callerName: c.callerName ?? null,
                 ...(c.calledAs && { calledAs: c.calledAs }),
@@ -308,8 +314,10 @@ function formatContextJson(context) {
                 ...(c.dispatchVia && { dispatchVia: c.dispatchVia }),
                 ...(c.dispatchCandidates != null && { dispatchCandidates: c.dispatchCandidates }),
                 ...(c.externalContract && { externalContract: true }),
-                uncertaintyClass: c.reason === 'possible-dispatch' && c.dispatchVia
-                    ? 'runtime-dispatch' : 'actionable-ambiguity',
+                uncertaintyClass: c.uncertaintyClass ||
+                    (c.reason === 'possible-dispatch' && c.dispatchVia
+                        ? 'runtime-dispatch' : 'actionable-ambiguity'),
+                ...(c.dispatchFamily && { dispatchFamily: c.dispatchFamily }),
             })),
             callees: callees.map(c => ({
                 name: c.name,
@@ -516,9 +524,14 @@ function formatContext(ctx, options = {}) {
     // can investigate.
     const unverified = ctx.unverifiedCallers || [];
     const runtimeDispatch = unverified.filter(u =>
-        u.reason === 'possible-dispatch' && u.dispatchVia);
+        u.uncertaintyClass === 'runtime-dispatch' ||
+        (u.reason === 'possible-dispatch' && u.dispatchVia));
+    const compileTimeDispatch = unverified.filter(u =>
+        u.uncertaintyClass === 'compile-time-dispatch');
     const actionableUnverified = unverified.filter(u =>
-        u.reason !== 'possible-dispatch' || !u.dispatchVia);
+        u.uncertaintyClass !== 'compile-time-dispatch' &&
+        !(u.uncertaintyClass === 'runtime-dispatch' ||
+          (u.reason === 'possible-dispatch' && u.dispatchVia)));
     if (runtimeDispatch.length > 0) {
         const groups = new Map();
         for (const site of runtimeDispatch) {
@@ -561,6 +574,55 @@ function formatContext(ctx, options = {}) {
         }
         if (summarized > 0) {
             lines.push(`  (+${summarized} more runtime-dispatch sites — ${allHint})`);
+        }
+    }
+
+    // Template substitution, constraints, and dependent calls are selected by
+    // the C++ compiler. Repeating every source site as generic actionable
+    // ambiguity makes an agent inspect code it cannot settle statically. Keep
+    // every raw site in JSON/accounting and group the text view by the exact
+    // overload family that needs a compiler handoff.
+    if (compileTimeDispatch.length > 0) {
+        const groups = new Map();
+        for (const site of compileTimeDispatch) {
+            const key = `${site.dispatchFamily || 'template overload set'}\0` +
+                `${site.dispatchCandidates ?? ''}`;
+            if (!groups.has(key)) groups.set(key, []);
+            groups.get(key).push(site);
+        }
+        lines.push(`${compact ? '' : '\n'}CALLERS — COMPILE-TIME DISPATCH ` +
+            `(${compileTimeDispatch.length} site${compileTimeDispatch.length === 1 ? '' : 's'}, ` +
+            `${groups.size} ${groups.size === 1 ? 'family' : 'families'}) — ` +
+            'exact overload depends on template substitution or constraints:');
+        const showAll = !!ctx.meta?.all;
+        let summarized = 0;
+        for (const sites of groups.values()) {
+            const first = sites[0];
+            const candidates = first.dispatchCandidates > 1
+                ? `; ${first.dispatchCandidates} candidate overloads` : '';
+            lines.push(`  ${first.dispatchFamily || 'template overload set'}: ` +
+                `${sites.length} site${sites.length === 1 ? '' : 's'}${candidates}`);
+            const samples = showAll ? sites : sites.slice(0, 2);
+            for (const u of samples) {
+                const callerName = u.callerName ? ` [${u.callerName}]` : '';
+                const expr = u.content
+                    ? `: ${u.content.trim().replace(/\s+/g, ' ').slice(0, 100)}` : '';
+                lines.push(`    [${itemNum}] ${u.relativePath}:${u.line}${callerName}${expr}`);
+                expandable.push({
+                    num: itemNum++,
+                    type: 'caller',
+                    name: u.callerName || '(module level)',
+                    file: u.callerFile || u.file,
+                    relativePath: u.relativePath,
+                    line: u.line,
+                    startLine: u.callerStartLine || u.line,
+                    endLine: u.callerEndLine || u.line
+                });
+            }
+            summarized += sites.length - samples.length;
+        }
+        if (summarized > 0) {
+            lines.push(`  (+${summarized} more compile-time-dispatch sites — ${allHint})`);
         }
     }
 

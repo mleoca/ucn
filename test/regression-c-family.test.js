@@ -27,6 +27,35 @@ describe('C language support', () => {
         assert.ok(calls.some(call => call.name === 'helper' && call.argCount === 1));
     });
 
+    it('preserves anonymous C-style variadic tails for arity', () => {
+        const dir = tmp({
+            'variadic.cpp': [
+                'void safe_print(char* buffer, const char* format, ...);',
+                'void fallback(...);',
+                'void use(char* buffer) {',
+                '  safe_print(buffer, "%d", 42);',
+                '  fallback(1, 2);',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const definition = index.symbols.get('safe_print')[0];
+            assert.equal(definition.paramsStructured.at(-1).rest, true);
+            const result = index.context('safe_print');
+            assert.deepEqual(result.callers.map(call => call.line), [4]);
+            assert.equal(result.meta.account.conserved, true);
+            const fallback = index.symbols.get('fallback')[0];
+            assert.equal(fallback.paramsStructured[0].rest, true);
+            assert.deepEqual(
+                index.context('fallback').callers.map(call => call.line),
+                [5],
+            );
+        } finally {
+            rm(dir);
+        }
+    });
+
     it('indexes callers and conserves the caller account', () => {
         const dir = tmp({
             'lib.h': 'int helper(int value);',
@@ -38,6 +67,62 @@ describe('C language support', () => {
             const result = index.context('helper');
             assert.ok(result.callers.some(call => call.relativePath === 'main.c'));
             assert.equal(result.meta.account.conserved, true);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('treats an included prototype and implementation as one callable identity', () => {
+        const dir = tmp({
+            'lib.h': 'int helper(int value);',
+            'lib.c': '#include "lib.h"\nint helper(int value) { return value; }',
+            'main.c': '#include "lib.h"\nint main(void) { return helper(1); }',
+        });
+        try {
+            const index = idx(dir);
+            for (const target of [
+                { file: 'lib.h', line: 1 },
+                { file: 'lib.c', line: 2 },
+            ]) {
+                const result = index.context('helper', target);
+                assert.deepEqual(result.callers.map(call => [
+                    call.relativePath, call.line, call.tier,
+                ]), [['main.c', 2, 'confirmed']]);
+                assert.equal(result.unverifiedCallers.length, 0);
+                assert.equal(result.meta.account.conserved, true);
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('resolves identifier-line handles and follows transitive test includes', () => {
+        const dir = tmp({
+            'include/detail.h': [
+                'typedef enum',
+                '{',
+                '    FIRST = 0',
+                '} FLAGS_T;',
+            ].join('\n'),
+            'include/api.h': '#include "detail.h"',
+            'tests/check.c': [
+                '#include "../include/api.h"',
+                'int check(FLAGS_T flags) { return flags == FIRST; }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const context = execute(index, 'context', {
+                name: 'include/detail.h:4:FLAGS_T',
+            });
+            assert.equal(context.ok, true, context.error);
+            const foundTests = execute(index, 'tests', {
+                name: 'include/detail.h:1:FLAGS_T',
+            });
+            assert.equal(foundTests.ok, true, foundTests.error);
+            assert.ok(foundTests.result.some(file =>
+                file.file === 'tests/check.c' &&
+                file.matches.some(match => match.line === 2)));
         } finally {
             rm(dir);
         }
@@ -63,6 +148,81 @@ describe('C language support', () => {
         } finally {
             rm(dir);
         }
+    });
+
+    it('parses calls inside multiline replacement lists across public surfaces', () => {
+        const dir = tmp({
+            'tests/check.c': [
+                'static int target(int value) { return value; }',
+                '#define RUN_TARGET(value) \\',
+                '  do { \\',
+                '    target(value); \\',
+                '  } while (0)',
+                '#define APPLY(fn, value) fn(value)',
+                'void check(void) {',
+                '  RUN_TARGET(1);',
+                '  APPLY(target, 2);',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const target = index.symbols.get('target')
+                .find(symbol => symbol.relativePath === 'tests/check.c');
+            const context = index.context('target', {
+                file: 'tests/check.c', line: target.startLine,
+            });
+            assert.ok(context.callers.some(caller =>
+                caller.relativePath === 'tests/check.c' && caller.line === 4));
+            assert.ok(!context.callers.some(caller =>
+                caller.relativePath === 'tests/check.c' && caller.line === 6));
+            assert.equal(context.meta.account.conserved, true);
+
+            const macro = index.symbols.get('RUN_TARGET')[0];
+            const callees = index.findCallees(macro, { collectAccount: true });
+            assert.ok(callees.some(callee =>
+                callee.name === 'target' && callee.sites.includes(4)));
+            const apply = index.symbols.get('APPLY')[0];
+            const applyCallees = index.findCallees(apply, {
+                collectAccount: true,
+            });
+            assert.equal(
+                applyCallees.calleeAccount.excluded.byReason['macro-parameter'],
+                1,
+            );
+
+            const usages = execute(index, 'usages', {
+                name: 'target', includeTests: true,
+            });
+            assert.equal(usages.ok, true, usages.error);
+            assert.ok(usages.result.some(usage =>
+                usage.relativePath === 'tests/check.c' &&
+                usage.line === 4 && usage.usageType === 'call'));
+
+            const tests = execute(index, 'tests', {
+                name: 'target', file: 'tests/check.c', line: 1,
+            });
+            assert.equal(tests.ok, true, tests.error);
+            assert.ok(tests.result.some(file =>
+                file.file === 'tests/check.c' &&
+                file.matches.some(match => match.line === 4)));
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('recovers a calling-convention macro between return type and function name', () => {
+        const code = [
+            'int CDECL main(void)',
+            '{',
+            '    return 0;',
+            '}',
+        ].join('\n');
+        const result = parse(code, 'c');
+        const main = result.functions.find(fn => fn.name === 'main');
+        assert.equal(main?.startLine, 1);
+        assert.equal(main?.returnType, 'int');
+        assert.equal(result.parseRecovery, undefined);
     });
 });
 
@@ -109,6 +269,42 @@ describe('C++ language support', () => {
         }
     });
 
+    it('uses configured C/C++ include paths without a compilation database', () => {
+        const dir = tmp({
+            '.ucn.json': JSON.stringify({
+                includePaths: ['third_party/gtest'],
+                exclude: ['third_party/unused/**'],
+            }),
+            'third_party/gtest/gmock/gmock.h': 'struct MockApi {};',
+            'third_party/unused/ignored.cpp': 'void ignored() {}',
+            'test/helper.h': '#include "gmock/gmock.h"',
+        });
+        try {
+            const index = idx(dir);
+            assert.ok(index.importGraph.get(path.join(dir, 'test/helper.h'))
+                .has(path.join(dir, 'third_party/gtest/gmock/gmock.h')));
+            assert.equal(index.files.has(
+                path.join(dir, 'third_party/unused/ignored.cpp')), false);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('uses the repository translation-unit convention for distant headers', () => {
+        const dir = tmp({
+            '.git/HEAD': 'ref: refs/heads/main',
+            'include/api/detail.h': 'class Api { public: int run(); };',
+            'src/main.cpp': '#include "../include/api/detail.h"',
+        });
+        try {
+            assert.equal(
+                detectLanguage(path.join(dir, 'include/api/detail.h')),
+                'cpp');
+        } finally {
+            rm(dir);
+        }
+    });
+
     it('uses declared C++ field types to separate same-named methods', () => {
         const dir = tmp({
             'service.cpp': [
@@ -131,6 +327,964 @@ describe('C++ language support', () => {
             assert.deepEqual(result.callers.map(call => call.line), [6, 7]);
             assert.equal(result.unverifiedCallers.length, 0);
             assert.equal(result.meta.account.excluded.byReason['receiver-type-mismatch'].count, 1);
+            assert.equal(result.meta.account.conserved, true);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('indexes using aliases and closes template out-of-line method identity', () => {
+        const dir = tmp({
+            'api.h': [
+                'template <typename T> class Box {',
+                ' public:',
+                '  using value_type = T;',
+                '  void run(int value);',
+                '  void call() { run(1); }',
+                '};',
+                'template <typename T>',
+                'void Box<T>::run(int value) {}',
+                'using BoxInt = Box<int>;',
+                'void invoke(BoxInt box) { box.run(2); }',
+            ].join('\n'),
+            'main.cpp': '#include "api.h"\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.equal(index.symbols.get('value_type')?.[0]?.aliasOf, 'T');
+            const outOfLine = index.symbols.get('run')
+                .find(symbol => symbol.startLine === 8);
+            const result = index.context('run', {
+                file: 'api.h',
+                line: outOfLine.startLine,
+            });
+            assert.deepEqual(
+                result.callers.map(call => [
+                    call.relativePath,
+                    call.line,
+                    call.tier,
+                ]),
+                [
+                    ['api.h', 5, 'confirmed'],
+                    ['api.h', 10, 'confirmed'],
+                ],
+            );
+            assert.equal(result.unverifiedCallers.length, 0);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('retains lexical and qualified C++ member ownership in test references', () => {
+        const dir = tmp({
+            'test/native_test.cpp': [
+                'template <typename T> class NativeArray {',
+                ' public:',
+                '  NativeArray() { InitCopy(); }',
+                ' private:',
+                '  void InitCopy() {',
+                '    auto clone = &NativeArray::InitCopy;',
+                '  }',
+                '};',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = index.tests('InitCopy', {
+                file: 'test/native_test.cpp',
+                className: 'NativeArray',
+            });
+            assert.deepEqual(
+                result.flatMap(file => file.matches.map(match => match.line)),
+                [3, 6],
+            );
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('canonicalizes C++ operators and records multiline identifier lines', () => {
+        const code = [
+            'template <typename T>',
+            'inline auto',
+            'reserve(T value) -> T { return value; }',
+            'template <typename T> class Box {};',
+            'class Matcher {',
+            ' public:',
+            '  Matcher& operator <<(bool value);',
+            '  template <typename T>',
+            '  operator Box<T>() const { return {}; }',
+            '};',
+        ].join('\n');
+        const result = parse(code, 'cpp');
+        const reserve = result.functions.find(item => item.name === 'reserve');
+        assert.equal(reserve?.startLine, 2);
+        assert.equal(reserve?.nameLine, 3);
+        const matcher = result.classes.find(item => item.name === 'Matcher');
+        assert.ok(matcher.members.some(item => item.name === 'operator<<'));
+        const conversion = matcher.members.find(item =>
+            item.name === 'operator Box');
+        assert.equal(conversion?.returnType, 'Box');
+    });
+
+    it('extracts namespace-qualified template function calls by base name', () => {
+        const code = [
+            'namespace detail { template <typename T> int limit(); }',
+            'template <typename T> int use() {',
+            '  return detail::limit<T>();',
+            '}',
+        ].join('\n');
+        const calls = getLanguageAdapter('cpp')
+            .findCalls(code, getParser('cpp'));
+        assert.deepEqual(
+            calls.filter(call => call.name === 'limit').map(call => ({
+                line: call.line,
+                receiver: call.receiver,
+                isPathCall: call.isPathCall,
+            })),
+            [{ line: 3, receiver: 'detail', isPathCall: true }],
+        );
+    });
+
+    it('parses parenthesized template callables and keeps specialization identity', () => {
+        const code = [
+            'template <typename T> struct UniversalPrinter;',
+            'template <typename T> struct UniversalPrinter<T&> {',
+            '  static void Print(T& value) {}',
+            '};',
+            'template <typename T> void use(T& value) {',
+            '  (UniversalPrinter<T&>::Print)(value);',
+            '}',
+        ].join('\n');
+        const parsed = parse(code, 'cpp');
+        const specialization = parsed.classes.find(item =>
+            item.specialization === 'UniversalPrinter<T&>');
+        assert.equal(specialization?.name, 'UniversalPrinter');
+        assert.ok(specialization.members.some(member =>
+            member.name === 'Print' &&
+            member.className === 'UniversalPrinter<T&>'));
+        const calls = getLanguageAdapter('cpp')
+            .findCalls(code, getParser('cpp'));
+        assert.ok(calls.some(call =>
+            call.name === 'Print' &&
+            call.receiver === 'UniversalPrinter<T&>' &&
+            call.isPathCall));
+    });
+
+    it('resolves declared receiver types by lexical scope and source position', () => {
+        const code = [
+            'struct format_specs { void sign(); };',
+            'void first(format_specs specs) { specs.sign(); }',
+            'void second() { auto specs = make_specs(); }',
+        ].join('\n');
+        const calls = getLanguageAdapter('cpp')
+            .findCalls(code, getParser('cpp'));
+        const sign = calls.find(call => call.name === 'sign');
+        assert.equal(sign?.receiverType, 'format_specs');
+    });
+
+    it('keeps the outer type of nested generic receiver declarations', () => {
+        const code = [
+            'namespace fmt { template <typename T> struct context; }',
+            'template <typename T> struct dynamic_store { void clear(); };',
+            'void use(dynamic_store<fmt::context<char>> store) {',
+            '  store.clear();',
+            '}',
+        ].join('\n');
+        const calls = getLanguageAdapter('cpp')
+            .findCalls(code, getParser('cpp'));
+        assert.equal(
+            calls.find(call => call.name === 'clear')?.receiverType,
+            'dynamic_store',
+        );
+    });
+
+    it('resolves implicit-this C++ overloads by arity', () => {
+        const dir = tmp({
+            'clock.cpp': [
+                'struct Clock {',
+                '  void write2(int value) {}',
+                '  void write2(int value, int pad) {}',
+                '  void run() {',
+                '    write2(1);',
+                '    write2(1, 2);',
+                '  }',
+                '};',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const one = index.context('write2', {
+                file: 'clock.cpp',
+                line: 2,
+            });
+            assert.deepEqual(one.callers.map(caller => caller.line), [5]);
+            assert.equal(one.unverifiedCallers.length, 0);
+            assert.equal(one.meta.account.conserved, true);
+            const two = index.context('write2', {
+                file: 'clock.cpp',
+                line: 3,
+            });
+            assert.deepEqual(two.callers.map(caller => caller.line), [6]);
+            assert.equal(two.unverifiedCallers.length, 0);
+            assert.equal(two.meta.account.conserved, true);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('folds C++ out-of-line definitions into their overload slot', () => {
+        const dir = tmp({
+            'file.cpp': [
+                'struct File {',
+                '  void dup2(int fd);',
+                '  void dup2(int fd, int mode);',
+                '};',
+                'void File::dup2(int fd) {}',
+                'void File::dup2(int fd, int mode) {}',
+                'void use(File f) {',
+                '  f.dup2(1);',
+                '  f.dup2(1, 2);',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const one = index.context('dup2', {
+                file: 'file.cpp',
+                line: 2,
+            });
+            assert.deepEqual(one.callers.map(caller => caller.line), [8]);
+            assert.equal(one.unverifiedCallers.length, 0);
+            assert.equal(one.meta.account.conserved, true);
+            const two = index.context('dup2', {
+                file: 'file.cpp',
+                line: 3,
+            });
+            assert.deepEqual(two.callers.map(caller => caller.line), [9]);
+            assert.equal(two.unverifiedCallers.length, 0);
+            assert.equal(two.meta.account.conserved, true);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('types fields used by an out-of-line C++ member definition', () => {
+        const dir = tmp({
+            'redirect.h': [
+                'struct File { void dup2(int fd); };',
+                'struct Redirect {',
+                '  File original;',
+                '  void restore();',
+                '};',
+            ].join('\n'),
+            'redirect.cpp': [
+                '#include "redirect.h"',
+                'void Redirect::restore() {',
+                '  original.dup2(1);',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = index.context('dup2', {
+                file: 'redirect.h',
+                line: 1,
+            });
+            assert.deepEqual(result.callers.map(caller => [
+                caller.relativePath, caller.line,
+            ]), [['redirect.cpp', 3]]);
+            assert.equal(result.unverifiedCallers.length, 0);
+            assert.equal(result.meta.account.conserved, true);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('does not treat a wider global C++ call as recursive member dispatch', () => {
+        const dir = tmp({
+            'write.cpp': [
+                'void write(int fd, const void* data, int size) {}',
+                '#define SYS_CALL(call) ::call',
+                'struct File {',
+                '  void write(const void* data, int size) {',
+                '    SYS_CALL(write(1, data, size));',
+                '    ::write(1, data, size);',
+                '  }',
+                '};',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const member = index.context('write', {
+                className: 'File',
+                file: 'write.cpp',
+                line: 4,
+            });
+            assert.equal(member.callers.length, 0);
+            assert.equal(member.unverifiedCallers.length, 0);
+            assert.equal(
+                member.meta.account.excluded.byReason['arity-mismatch'].count,
+                1,
+            );
+            assert.equal(
+                member.meta.account.excluded.byReason['other-definition'].count,
+                1,
+            );
+            assert.equal(member.meta.account.conserved, true);
+            const global = index.context('write', {
+                file: 'write.cpp',
+                line: 1,
+            });
+            assert.deepEqual(global.callers.map(caller => caller.line), [6]);
+            assert.equal(global.meta.account.conserved, true);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('flows a qualified C++ constructor through a declared field path', () => {
+        const dir = tmp({
+            'include/fmt/os.h': [
+                'namespace fmt {',
+                'struct file { void fdopen(const char* mode); };',
+                'struct pipe { file write_end; };',
+                '}',
+            ].join('\n'),
+            'use.cpp': [
+                '#include "fmt/os.h"',
+                'void use() {',
+                '  auto p = fmt::pipe();',
+                '  p.write_end.fdopen("w");',
+                '}',
+                'void fdopen(int fd, const char* mode);',
+                'void system_call() { fdopen(1, "w"); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = index.context('fdopen', {
+                file: 'include/fmt/os.h',
+                line: 2,
+            });
+            assert.deepEqual(
+                result.callers.map(call => [
+                    call.relativePath,
+                    call.line,
+                    call.tier,
+                ]),
+                [['use.cpp', 4, 'confirmed']],
+            );
+            assert.equal(result.unverifiedCallers.length, 0);
+            assert.equal(
+                result.meta.account.excluded.byReason['method-kind-mismatch'].count,
+                1,
+            );
+            assert.equal(result.meta.account.conserved, true);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('uses C++ declaration order, include visibility, and arity for return flow', () => {
+        const dir = tmp({
+            'api.h': [
+                'struct buffered_file { int descriptor(); };',
+                'struct file { int descriptor(); };',
+                'buffered_file open_buffered_file(void** fp = nullptr);',
+            ].join('\n'),
+            'use.cpp': [
+                '#include "api.h"',
+                'void use() {',
+                '  auto f = open_buffered_file();',
+                '  f.descriptor();',
+                '}',
+                'file open_buffered_file(int& fd) { return {}; }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const buffered = index.context('descriptor', {
+                file: 'api.h',
+                line: 1,
+            });
+            assert.deepEqual(
+                buffered.callers.map(call => [
+                    call.relativePath,
+                    call.line,
+                    call.tier,
+                ]),
+                [['use.cpp', 4, 'confirmed']],
+            );
+            assert.equal(buffered.meta.account.conserved, true);
+
+            const plain = index.context('descriptor', {
+                file: 'api.h',
+                line: 2,
+            });
+            assert.equal(plain.callers.length, 0);
+            assert.equal(
+                plain.meta.account.excluded.byReason[
+                    'receiver-type-mismatch'
+                ].count,
+                1,
+            );
+            assert.equal(plain.meta.account.conserved, true);
+
+            const use = index.symbols.get('use')[0];
+            const callees = index.findCallees(use, {
+                includeMethods: true,
+                collectAccount: true,
+            });
+            const selected = callees.find(callee =>
+                callee.name === 'open_buffered_file');
+            assert.equal(selected?.relativePath, 'api.h');
+            assert.equal(selected?.startLine, 3);
+            assert.equal(callees.unverifiedCallees?.length || 0, 0);
+            assert.equal(callees.calleeAccount.conserved, true);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('preserves C++ namespace identity and qualified return flow', () => {
+        const dir = tmp({
+            'include/fmt/api.hpp': [
+                'namespace fmt {',
+                'struct buffered_file { int descriptor(); };',
+                '}',
+                'fmt::buffered_file open_buffered_file();',
+            ].join('\n'),
+            'use.cpp': [
+                '#include "fmt/api.hpp"',
+                'void use() {',
+                '  auto file = open_buffered_file();',
+                '  file.descriptor();',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const type = index.symbols.get('buffered_file')
+                .find(definition => definition.type === 'struct');
+            assert.equal(type.namespace, 'fmt');
+            const result = index.context('descriptor', {
+                file: 'include/fmt/api.hpp',
+                line: 2,
+            });
+            assert.deepEqual(result.callers.map(call => [
+                call.relativePath, call.line, call.tier,
+            ]), [['use.cpp', 4, 'confirmed']]);
+            assert.equal(result.unverifiedCallers.length, 0);
+            assert.equal(result.meta.account.conserved, true);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('connects namespace-qualified C++ template base classes', () => {
+        const dir = tmp({
+            'qualified.cpp': [
+                'namespace detail {',
+                'template <typename T> struct buffer {',
+                '  void try_reserve(int size);',
+                '};',
+                '}',
+                'template <typename T>',
+                'struct memory_buffer : public detail::buffer<T> {};',
+                'void use(memory_buffer<int> value) {',
+                '  value.try_reserve(20);',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.deepEqual(
+                index._getInheritanceParents(
+                    'memory_buffer', path.join(dir, 'qualified.cpp')),
+                ['buffer'],
+            );
+            const result = index.context('try_reserve', {
+                file: 'qualified.cpp',
+                line: 3,
+            });
+            assert.deepEqual(result.callers.map(call => [
+                call.relativePath, call.line, call.tier,
+            ]), [['qualified.cpp', 9, 'confirmed']]);
+            assert.equal(result.unverifiedCallers.length, 0);
+            assert.equal(result.meta.account.conserved, true);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('types use-proven C++ direct initializers without inventing free calls', () => {
+        const dir = tmp({
+            'direct.cpp': [
+                'struct file { int descriptor(); };',
+                'file make_file();',
+                'void use() {',
+                '  file value(make_file());',
+                '  value.descriptor();',
+                '}',
+                'void wrapped(std::unique_ptr<file> pointer, file value) {',
+                '  pointer->descriptor();',
+                '  (value.descriptor)();',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = index.context('descriptor', {
+                file: 'direct.cpp',
+                line: 1,
+            });
+            assert.deepEqual(result.callers.map(call => [
+                call.relativePath, call.line, call.tier,
+            ]), [
+                ['direct.cpp', 5, 'confirmed'],
+                ['direct.cpp', 8, 'confirmed'],
+                ['direct.cpp', 9, 'confirmed'],
+            ]);
+            assert.equal(result.unverifiedCallers.length, 0);
+            assert.equal(result.meta.account.conserved, true);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('folds C++ call receivers through declared producer return types', () => {
+        const dir = tmp({
+            'chain.cpp': [
+                'struct Allocator { int get(); };',
+                'struct Buffer { Allocator get_allocator(); };',
+                'struct buffered_file { void* get(); };',
+                'namespace fmt {',
+                'struct file { buffered_file fdopen(const char* mode); };',
+                'struct pipe { file read_end; };',
+                '}',
+                'void use(Buffer buffer, buffered_file file) {',
+                '  buffer.get_allocator().get();',
+                '  file.get();',
+                '}',
+                'void use_pipe() {',
+                '  auto value = fmt::pipe();',
+                '  value.read_end.fdopen("r").get();',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const adapter = getLanguageAdapter('cpp');
+            const calls = adapter.findCalls(
+                fs.readFileSync(path.join(dir, 'chain.cpp'), 'utf8'),
+                getParser('cpp'));
+            const chained = calls.find(call =>
+                call.name === 'get' && call.line === 9);
+            assert.equal(chained?.receiverCall, 'get_allocator');
+            assert.equal(chained?.receiverCallIsMethod, true);
+            assert.equal(chained?.receiverIsChainRoot, true);
+
+            const index = idx(dir);
+            const result = index.context('get', {
+                file: 'chain.cpp',
+                line: 3,
+            });
+            assert.deepEqual(result.callers.map(call => call.line), [10, 14]);
+            assert.equal(result.unverifiedCallers.length, 0);
+            assert.equal(
+                result.meta.account.excluded.byReason[
+                    'receiver-type-mismatch'
+                ].count,
+                1,
+            );
+            assert.equal(result.meta.account.conserved, true);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('types C++ functional construction and preserves std return ownership', () => {
+        const dir = tmp({
+            'flow.cpp': [
+                'namespace local {',
+                'struct utf8_to_utf16 {',
+                '  utf8_to_utf16();',
+                '  const char* c_str();',
+                '};',
+                '}',
+                'std::string make_external();',
+                'namespace factory { std::string make_external(); }',
+                'void use() {',
+                '  auto local_text = local::utf8_to_utf16();',
+                '  local_text.c_str();',
+                '  auto direct_std = std::string();',
+                '  direct_std.c_str();',
+                '  auto returned_std = make_external();',
+                '  returned_std.c_str();',
+                '  auto qualified_std = factory::make_external();',
+                '  qualified_std.c_str();',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = index.context('c_str', {
+                file: 'flow.cpp',
+                line: 4,
+            });
+            assert.deepEqual(result.callers.map(call => [
+                call.relativePath, call.line, call.tier,
+            ]), [['flow.cpp', 11, 'confirmed']]);
+            assert.equal(result.unverifiedCallers.length, 0);
+            assert.equal(
+                result.meta.account.excluded.total,
+                3,
+            );
+            assert.equal(
+                result.meta.account.excluded.byReason[
+                    'external-package'
+                ].count,
+                1,
+            );
+            assert.equal(
+                result.meta.account.excluded.byReason[
+                    'receiver-type-mismatch'
+                ].count,
+                2,
+            );
+            assert.equal(result.meta.account.conserved, true);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('classifies a C++ member receiver as a reference, not a call', () => {
+        const code = [
+            'void copy();',
+            'struct file { int descriptor(); };',
+            'void use(file copy) {',
+            '  copy.descriptor();',
+            '  copy();',
+            '}',
+        ].join('\n');
+        const usages = getLanguageAdapter('cpp')
+            .findUsages(code, 'copy', getParser('cpp'));
+        assert.deepEqual(usages.map(usage => [
+            usage.line, usage.usageType,
+        ]), [
+            [1, 'definition'],
+            [3, 'definition'],
+            [4, 'reference'],
+            [5, 'call'],
+        ]);
+    });
+
+    it('keeps same-arity C++ free-function overloads visibly ambiguous', () => {
+        const dir = tmp({
+            'api.h': [
+                'void pick(int value);',
+                'void pick(long value);',
+                'void use() { pick(1); }',
+                'struct Other {',
+                '  void pick(int value);',
+                '  void use() { pick(2); }',
+                '};',
+            ].join('\n'),
+            'main.cpp': '#include "api.h"\n',
+        });
+        try {
+            const index = idx(dir);
+            const result = index.context('pick', {
+                file: 'api.h',
+                line: 1,
+            });
+            assert.equal(result.callers.length, 0);
+            assert.deepEqual(
+                result.unverifiedCallers.map(call => [
+                    call.line,
+                    call.reason,
+                ]),
+                [[3, 'overload-ambiguous']],
+            );
+            assert.equal(
+                result.meta.account.excluded.byReason['other-definition'].count,
+                1,
+            );
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('groups untyped C++ member dispatch without hiding raw sites', () => {
+        const dir = tmp({
+            'methods.cpp': [
+                'struct Left { void begin(); };',
+                'struct Right { void begin(); };',
+                'void use() { value.begin(); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = index.context('begin', {
+                file: 'methods.cpp',
+                line: 1,
+            });
+            assert.equal(result.callers.length, 0);
+            assert.deepEqual(result.unverifiedCallers.map(call => [
+                call.line,
+                call.reason,
+                call.uncertaintyClass,
+                call.dispatchFamily,
+            ]), [[
+                3,
+                'method-ambiguous',
+                'compile-time-dispatch',
+                'begin C++ method dispatch set',
+            ]]);
+            assert.equal(result.meta.account.conserved, true);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('labels constrained C++ template overloads as compile-time dispatch', () => {
+        const dir = tmp({
+            'templates.cpp': [
+                'template <typename T, typename = decltype(T::first)>',
+                'void select(T value) {}',
+                'template <typename T, typename = decltype(T::second), int = 0>',
+                'void select(T value) {}',
+                'template <typename T>',
+                'void invoke(T value) { select(value); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const definitions = index.symbols.get('select');
+            assert.equal(definitions.length, 2);
+            assert.ok(definitions.every(definition =>
+                definition.templateDependent === true));
+
+            const result = index.context('select', {
+                file: 'templates.cpp',
+                line: 2,
+            });
+            assert.equal(result.callers.length, 0);
+            assert.equal(result.unverifiedCallers.length, 1);
+            assert.equal(
+                result.unverifiedCallers[0].uncertaintyClass,
+                'compile-time-dispatch',
+            );
+            assert.equal(
+                result.unverifiedCallers[0].dispatchFamily,
+                'select template overload set',
+            );
+            assert.equal(
+                result.unverifiedCallers[0].dispatchCandidates,
+                2,
+            );
+            assert.equal(result.meta.account.conserved, true);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('uses C++ literal kinds to select namespace-qualified free overloads', () => {
+        const dir = tmp({
+            'include/fmt/format.hpp': [
+                'namespace fmt {',
+                'template <typename... T> struct format_string {};',
+                'template <typename... T> struct wformat_string {};',
+                'struct locale_ref {};',
+                'struct text_style {};',
+                'template <typename... T>',
+                'void format(format_string<T...> value, T&&... args);',
+                'void format(locale_ref value);',
+                'void format(text_style value);',
+                'template <typename... T>',
+                'void format(wformat_string<T...> value, T&&... args);',
+                '}',
+            ].join('\n'),
+            'use.cpp': [
+                '#include "fmt/format.hpp"',
+                'void use() {',
+                '  fmt::format("answer {}");',
+                '  fmt::format(fmt::text_style{});',
+                '  fmt::format(L"wide {}");',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const calls = getLanguageAdapter('cpp').findCalls(
+                fs.readFileSync(path.join(dir, 'use.cpp'), 'utf8'),
+                getParser('cpp'),
+            ).filter(call => call.name === 'format');
+            assert.deepEqual(calls.map(call => call.argKinds[0]), [
+                'string:char',
+                'type:text_style',
+                'string:wchar_t',
+            ]);
+
+            const index = idx(dir);
+            const result = index.context('format', {
+                file: 'include/fmt/format.hpp',
+                line: 7,
+            });
+            assert.deepEqual(
+                result.callers.map(call => [
+                    call.relativePath,
+                    call.line,
+                    call.tier,
+                ]),
+                [['use.cpp', 3, 'confirmed']],
+            );
+            assert.equal(result.unverifiedCallers.length, 0);
+            assert.equal(
+                result.meta.account.excluded.byReason['overload-mismatch'].count,
+                2,
+            );
+            assert.equal(result.meta.account.conserved, true);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('does not attribute type-qualified methods to namespace free functions', () => {
+        const dir = tmp({
+            'include/fmt/api.hpp': [
+                'namespace fmt {',
+                'void format(const char* value);',
+                'template <typename T> struct formatter {',
+                '  void format(T value);',
+                '};',
+                '}',
+            ].join('\n'),
+            'use.cpp': [
+                '#include "fmt/api.hpp"',
+                'void use() {',
+                '  fmt::format("ok");',
+                '  fmt::formatter<int>::format(1);',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = index.context('format', {
+                file: 'include/fmt/api.hpp',
+                line: 2,
+            });
+            assert.deepEqual(result.callers.map(call => call.line), [3]);
+            assert.equal(result.unverifiedCallers.length, 0);
+            assert.equal(
+                result.meta.account.excluded.byReason['method-kind-mismatch'].count,
+                1,
+            );
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('does not attribute namespace or unrelated bare calls to a C++ member', () => {
+        const dir = tmp({
+            'scope.cpp': [
+                'struct File { void write(int value); };',
+                'void write(int value) {}',
+                'namespace detail { void write(int value) {} }',
+                'struct Other { void run() { write(1); } };',
+                'void free_run() { write(1); }',
+                'void use(File f) {',
+                '  detail::write(1);',
+                '  f.write(1);',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = index.context('write', {
+                className: 'File',
+                file: 'scope.cpp',
+                line: 1,
+            });
+            assert.deepEqual(result.callers.map(caller => caller.line), [8]);
+            assert.equal(result.unverifiedCallers.length, 0);
+            assert.equal(
+                result.meta.account.excluded.byReason[
+                    'method-kind-mismatch'].count,
+                3,
+            );
+            assert.equal(result.meta.account.conserved, true);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('uses a complete include closure to reject invisible C++ overloads', () => {
+        const dir = tmp({
+            'include/fmt/a.hpp': [
+                'namespace fmt { void choose(int value); }',
+            ].join('\n'),
+            'include/fmt/b.hpp': [
+                'namespace fmt { void choose(const char* value); }',
+            ].join('\n'),
+            'use.cpp': [
+                '#include "fmt/b.hpp"',
+                'void use() { fmt::choose("visible"); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = index.context('choose', {
+                file: 'include/fmt/a.hpp',
+                line: 1,
+            });
+            assert.equal(result.callers.length, 0);
+            assert.equal(result.unverifiedCallers.length, 0);
+            assert.equal(
+                result.meta.account.excluded.byReason['target-not-visible'].count,
+                1,
+            );
+            assert.equal(result.meta.account.conserved, true);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('keeps extern-C link variants visible as one dispatch family', () => {
+        const dir = tmp({
+            'driver.cpp': [
+                'extern "C" int fuzz(const unsigned char* data, int size);',
+                'int main() { return fuzz(nullptr, 0); }',
+            ].join('\n'),
+            'variant-a.cpp': [
+                'extern "C" int fuzz(const unsigned char*, int) { return 1; }',
+            ].join('\n'),
+            'variant-b.cpp': [
+                'extern "C" int fuzz(const unsigned char*, int) { return 2; }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const target = index.symbols.get('fuzz').find(definition =>
+                definition.file.endsWith('variant-a.cpp'));
+            assert.equal(target.linkage, 'c');
+            const result = index.context('fuzz', {
+                file: 'variant-a.cpp',
+                line: 1,
+            });
+            assert.equal(result.callers.length, 0);
+            assert.deepEqual(result.unverifiedCallers.map(call => [
+                call.relativePath,
+                call.line,
+                call.reason,
+                call.uncertaintyClass,
+                call.dispatchFamily,
+            ]), [[
+                'driver.cpp',
+                2,
+                'link-variant',
+                'compile-time-dispatch',
+                'fuzz external-linkage implementations',
+            ]]);
             assert.equal(result.meta.account.conserved, true);
         } finally {
             rm(dir);
@@ -162,7 +1316,103 @@ describe('C# language support', () => {
             member.name === 'service' && member.fieldType === 'IService'));
         const calls = getLanguageAdapter('csharp').findCalls(code, getParser('csharp'));
         assert.ok(calls.some(call => call.name === 'Load' &&
-            call.receiverType === 'IService'));
+            call.receiverField === 'service' &&
+            call.receiverRootType === 'Controller'));
+    });
+
+    it('preserves C# casts, null-forgiving fields, and nested receiver paths', () => {
+        const code = [
+            'using System.Collections;',
+            'class Holder {',
+            '  ICollection<int>? _items;',
+            '  Resolver _resolver;',
+            '  void Run(object value) {',
+            '    ((IList)value).CopyTo(null, 0);',
+            '    _items!.Add(1);',
+            '    _resolver.Loaded.Items.Add(value);',
+            '    _items?.Clear();',
+            '  }',
+            '}',
+        ].join('\n');
+        const calls = getLanguageAdapter('csharp').findCalls(
+            code, getParser('csharp'));
+        assert.deepEqual(calls.find(call => call.line === 6), {
+            name: 'CopyTo',
+            line: 6,
+            isMethod: true,
+            receiver: '((IList)value)',
+            receiverType: 'IList',
+            argCount: 2,
+            argKinds: ['null', 'int'],
+            enclosingFunction: { name: 'Run', startLine: 5, endLine: 10 },
+        });
+        assert.deepEqual(calls.find(call => call.line === 7).receiverFields,
+            ['_items']);
+        assert.deepEqual(calls.find(call => call.line === 8).receiverFields,
+            ['_resolver', 'Loaded', 'Items']);
+        assert.deepEqual(calls.find(call => call.line === 9).receiverFields,
+            ['_items']);
+    });
+
+    it('uses C# platform field ownership and enclosing-class lookup as exclusions', () => {
+        const dir = tmp({
+            'Fixture.cs': [
+                'using System.Collections.Generic;',
+                'class Target {',
+                '  public void CopyTo(int[] values, int offset) {}',
+                '  public static string GetType(object value) => "target";',
+                '}',
+                'class Holder {',
+                '  ICollection<int>? _items;',
+                '  void GetType() {}',
+                '  void Run(int[] values) {',
+                '    _items!.CopyTo(values, 0);',
+                '    GetType();',
+                '  }',
+                '}',
+            ].join('\n'),
+            'Fixture.csproj': '<Project Sdk="Microsoft.NET.Sdk"></Project>',
+        });
+        try {
+            const index = idx(dir);
+            for (const [name, line] of [['CopyTo', 3], ['GetType', 4]]) {
+                const result = index.context(name, { file: 'Fixture.cs', line });
+                assert.equal(result.callers.length, 0);
+                assert.equal(result.unverifiedCallers.length, 0);
+                assert.equal(result.meta.account.conserved, true);
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('distinguishes exact C# explicit-this casts from interface dispatch', () => {
+        const dir = tmp({
+            'Fixture.cs': [
+                'interface ISink { void Add(Token item); }',
+                'class Token {}',
+                'class Container : ISink {',
+                '  void ISink.Add(Token item) {}',
+                '  void Exact(Token item) { ((ISink)this).Add(item); }',
+                '  void Dynamic(ISink sink, Token item) { sink.Add(item); }',
+                '}',
+            ].join('\n'),
+            'Fixture.csproj': '<Project Sdk="Microsoft.NET.Sdk"></Project>',
+        });
+        try {
+            const index = idx(dir);
+            const result = index.context('Add', {
+                file: 'Fixture.cs',
+                line: 4,
+            });
+            assert.deepEqual(result.callers.map(call => call.line), [5]);
+            assert.deepEqual(result.unverifiedCallers.map(call => [
+                call.line, call.reason, call.dispatchVia,
+            ]), [[6, 'possible-dispatch', 'ISink']]);
+            assert.equal(result.meta.account.conserved, true);
+        } finally {
+            rm(dir);
+        }
     });
 
     it('recognizes Main and test attributes as runtime entry points', () => {
@@ -353,6 +1603,555 @@ describe('C# language support', () => {
             rm(dir);
         }
     });
+
+    it('resolves C# extension methods in caller and callee directions', () => {
+        const dir = tmp({
+            'Extensions.cs': [
+                'namespace Demo.Extensions;',
+                'public static class StringExtensions {',
+                '  public static string Wrap(this string value, int count) => value;',
+                '  public static string Wrap(this string value, int count, string suffix) => value;',
+                '}',
+            ].join('\n'),
+            'Use.cs': [
+                'using Demo.Extensions;',
+                'namespace Demo;',
+                'public class Use {',
+                '  public string Run() {',
+                '    return "x".Wrap(1);',
+                '  }',
+                '}',
+            ].join('\n'),
+            'Fixture.csproj': '<Project Sdk="Microsoft.NET.Sdk"></Project>',
+        });
+        try {
+            const index = idx(dir);
+            const result = index.context('Wrap', {
+                className: 'StringExtensions',
+                file: 'Extensions.cs',
+                line: 3,
+            });
+            assert.deepEqual(result.callers.map(call => call.line), [5]);
+            assert.equal(result.unverifiedCallers.length, 0);
+            assert.equal(result.meta.account.conserved, true);
+
+            const run = index.symbols.get('Run')[0];
+            const callees = index.findCallees(run, {
+                includeMethods: true,
+                collectAccount: true,
+            });
+            const wrap = callees.find(callee => callee.name === 'Wrap');
+            const oneArg = index.symbols.get('Wrap').find(symbol => symbol.startLine === 3);
+            assert.equal(wrap?.bindingId, oneArg.bindingId);
+            assert.equal(callees.unverifiedCallees?.length || 0, 0);
+            assert.equal(callees.calleeAccount.conserved, true);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('uses C# static argument types before falling back to inherited overloads', () => {
+        const dir = tmp({
+            'Overloads.cs': [
+                'namespace Demo;',
+                'public enum TokenKind { None }',
+                'public class Token {}',
+                'public class Reader {',
+                '  protected void SetToken(TokenKind token) {}',
+                '  protected virtual void SetToken(Token token) {}',
+                '}',
+                'public class TokenReader : Reader {',
+                '  protected override void SetToken(Token token) {}',
+                '  public void Run() {',
+                '    SetToken(TokenKind.None);',
+                '    SetToken(new Token());',
+                '  }',
+                '  public void ReadNullable(TokenKind? endToken) {',
+                '    SetToken(endToken.GetValueOrDefault());',
+                '  }',
+                '}',
+            ].join('\n'),
+            'Fixture.csproj': '<Project Sdk="Microsoft.NET.Sdk"></Project>',
+        });
+        try {
+            const index = idx(dir);
+            const inherited = index.context('SetToken', {
+                className: 'Reader',
+                file: 'Overloads.cs',
+                line: 5,
+            });
+            assert.deepEqual(inherited.callers.map(call => call.line), [11, 15]);
+            assert.equal(inherited.meta.account.conserved, true);
+
+            const local = index.context('SetToken', {
+                className: 'TokenReader',
+                file: 'Overloads.cs',
+                line: 9,
+            });
+            assert.deepEqual(local.callers.map(call => call.line), [12]);
+            assert.equal(local.meta.account.conserved, true);
+
+            const run = index.symbols.get('Run')[0];
+            const callees = index.findCallees(run, {
+                includeMethods: true,
+                collectAccount: true,
+            });
+            const selected = callees.filter(callee => callee.name === 'SetToken')
+                .map(callee => index.symbols.get('SetToken')
+                    .find(symbol => symbol.bindingId === callee.bindingId)?.startLine)
+                .sort((a, b) => a - b);
+            assert.deepEqual(selected, [5, 9]);
+            assert.equal(callees.calleeAccount.conserved, true);
+
+            const readNullable = index.symbols.get('ReadNullable')[0];
+            const nullableCallees = index.findCallees(readNullable, {
+                includeMethods: true,
+                collectAccount: true,
+            });
+            assert.equal(nullableCallees.find(callee =>
+                callee.name === 'SetToken')?.startLine, 5);
+            assert.equal(nullableCallees.calleeAccount.conserved, true);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('types C# literal receivers without inventing a field hop', () => {
+        const adapter = getLanguageAdapter('csharp');
+        const calls = adapter.findCalls(
+            'class Use { string Run() => "x".Trim(); }',
+            getParser('csharp'));
+        const trim = calls.find(call => call.name === 'Trim');
+        assert.equal(trim.receiverType, 'string');
+        assert.equal(trim.receiverField, undefined);
+        assert.equal(trim.argCount, 0);
+    });
+
+    it('keeps C# parameter receiver types scoped to their overload', () => {
+        const adapter = getLanguageAdapter('csharp');
+        const calls = adapter.findCalls([
+            'class Use {',
+            '  void Parse(StringReference value) { value.ToString(); }',
+            '  void Parse(string value, int mode) { value.ToString(); }',
+            '}',
+        ].join('\n'), getParser('csharp')).filter(call => call.name === 'ToString');
+        assert.deepEqual(calls.map(call => call.receiverType), [
+            'StringReference',
+            'string',
+        ]);
+    });
+
+    it('recovers C# declarations across preprocessor branches and explicit interfaces', () => {
+        const result = parse([
+            'namespace Demo {',
+            '  public class Service : System.IConvertible {',
+            '#if FEATURE',
+            '    public void Enabled() {}',
+            '#else',
+            '    public void Fallback() {}',
+            '#endif',
+            '    bool System.IConvertible.ToBoolean(System.IFormatProvider provider) => true;',
+            '    public void After() {}',
+            '  }',
+            '}',
+        ].join('\n'), 'csharp');
+        const service = result.classes.find(item => item.name === 'Service');
+        assert.deepEqual(service.members.map(member => member.name), [
+            'Enabled',
+            'Fallback',
+            'ToBoolean',
+            'After',
+        ]);
+        assert.equal(service.members.find(member =>
+            member.name === 'ToBoolean').explicitInterface,
+        'System.IConvertible');
+    });
+
+    it('rejects zero-width C# property fragments after conditional attributes', () => {
+        const result = parse([
+            'class Service {',
+            '  public static bool Enabled {',
+            '#if SAFE',
+            '    [System.Security.SecuritySafeCritical]',
+            '#endif',
+            '    get { return true; }',
+            '  }',
+            '}',
+        ].join('\n'), 'csharp');
+        const service = result.classes.find(item => item.name === 'Service');
+        assert.deepEqual(service.members.map(member => member.name), ['Enabled']);
+        assert.ok(service.members.every(member => member.name.length > 0));
+    });
+
+    it('recovers following C# methods after a conditional block distorts the AST', () => {
+        const result = parse([
+            'namespace Demo {',
+            '  class Reader {',
+            '    void Run() {',
+            '#if FEATURE',
+            '      if (true) {',
+            '#else',
+            '      if (false) {',
+            '#endif',
+            '      }',
+            '    }',
+            '    private void ShiftBufferIfNeeded() {}',
+            '  }',
+            '}',
+        ].join('\n'), 'csharp');
+        const reader = result.classes.find(item => item.name === 'Reader');
+        const shift = reader.members.find(member =>
+            member.name === 'ShiftBufferIfNeeded');
+        assert.equal(shift.startLine, 11);
+        assert.equal(shift.className, 'Reader');
+    });
+
+    it('recovers calls from preprocessor else-if parser artifacts', () => {
+        const code = [
+            'class Helper { public static bool Check(object value, System.Type type, out System.Type found) { found = type; return true; } }',
+            'class Reader {',
+            '  Reader(object value) {',
+            '    System.Type found;',
+            '    if (value == null) {}',
+            '#if FEATURE',
+            '    else if (Helper.Check(value, typeof(string), out found)) {}',
+            '#endif',
+            '  }',
+            '}',
+        ].join('\n');
+        const parsed = parse(code, 'csharp');
+        assert.equal(parsed.functions.some(func => func.name === 'if'), false);
+        const calls = getLanguageAdapter('csharp').findCalls(
+            code, getParser('csharp'));
+        const check = calls.find(call => call.name === 'Check');
+        assert.equal(check.line, 7);
+        assert.equal(check.argCount, 3);
+        assert.equal(check.receiver, 'Helper');
+        assert.equal(check.receiverIsTypeQualified, true);
+        assert.equal(check.enclosingFunction.name, 'Reader');
+    });
+
+    it('recovers C# pattern variable types from preprocessor else-if artifacts', () => {
+        const code = [
+            'using System.Numerics;',
+            'class Writer { public void WriteValue(object value) {} }',
+            'class Reader {',
+            '  void Run(object value, Writer writer) {',
+            '    if (value == null) {}',
+            '#if FEATURE',
+            '    else if (value is BigInteger integer) {',
+            '      writer.WriteValue(integer);',
+            '    }',
+            '#endif',
+            '  }',
+            '}',
+        ].join('\n');
+        const calls = getLanguageAdapter('csharp').findCalls(
+            code, getParser('csharp'));
+        const write = calls.find(call =>
+            call.name === 'WriteValue' && call.line === 8);
+        assert.deepEqual(write?.argKinds, ['type:BigInteger']);
+    });
+
+    it('resolves C# static type qualifiers and rejects external lookalikes', () => {
+        const dir = tmp({
+            'Qualified.cs': [
+                'using System.Diagnostics;',
+                'namespace Demo;',
+                'class Misc {',
+                '  static void Assert(bool value) {}',
+                '  public void Run() { Debug.Assert(true); }',
+                '}',
+                'class Helper { public static void Assert(bool value) {} }',
+                'class Use { public void Go() { Helper.Assert(true); } }',
+            ].join('\n'),
+            'Fixture.csproj': '<Project Sdk="Microsoft.NET.Sdk"></Project>',
+        });
+        try {
+            const index = idx(dir);
+            const misc = index.context('Assert', {
+                className: 'Misc',
+                file: 'Qualified.cs',
+                line: 4,
+            });
+            assert.equal(misc.callers.length, 0);
+            assert.equal(misc.unverifiedCallers.length, 0);
+            assert.equal(misc.meta.account.excluded.byReason['external-package'].count, 1);
+
+            const helper = index.context('Assert', {
+                className: 'Helper',
+                file: 'Qualified.cs',
+                line: 7,
+            });
+            assert.deepEqual(helper.callers.map(call => call.line), [8]);
+            const helperType = index.context('Helper', {
+                file: 'Qualified.cs',
+                line: 7,
+            });
+            const qualifierUse = helperType.callers.find(call =>
+                call.line === 8 && call.isTypeReference);
+            assert.equal(qualifierUse?.resolution, 'receiver-hint');
+            assert.equal(helperType.meta.account.conserved, true);
+
+            const runCallees = index.findCallees(index.symbols.get('Run')[0], {
+                includeMethods: true,
+                collectAccount: true,
+            });
+            assert.equal(runCallees.length, 0);
+            assert.equal(runCallees.calleeAccount.external.count, 1);
+            assert.equal(runCallees.calleeAccount.conserved, true);
+
+            const goCallees = index.findCallees(index.symbols.get('Go')[0], {
+                includeMethods: true,
+                collectAccount: true,
+            });
+            assert.equal(goCallees[0]?.className, 'Helper');
+            assert.equal(goCallees.calleeAccount.conserved, true);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('selects a C# params overload in normal array form', () => {
+        const dir = tmp({
+            'Extensions.cs': [
+                'namespace Demo;',
+                'public static class Ext {',
+                '  public static string FormatWith(this string format, object? arg0)',
+                '    => format.FormatWith(new object?[] { arg0 });',
+                '  private static string FormatWith(this string format, params object?[] args)',
+                '    => format;',
+                '}',
+                'public class Use {',
+                '  private string message = "x";',
+                '  public string Run(object value) => message.FormatWith(value);',
+                '}',
+            ].join('\n'),
+            'Fixture.csproj': '<Project Sdk="Microsoft.NET.Sdk"></Project>',
+        });
+        try {
+            const index = idx(dir);
+            const overloads = index.symbols.get('FormatWith');
+            const ordinary = overloads.find(symbol => symbol.startLine === 3);
+            const paramsArray = overloads.find(symbol => symbol.startLine === 5);
+            assert.equal(paramsArray.paramsStructured.at(-1).rest, true);
+            assert.equal(paramsArray.paramsStructured.at(-1).type, 'object?[]');
+
+            const ordinaryContext = index.context('FormatWith', {
+                className: 'Ext',
+                file: 'Extensions.cs',
+                line: 3,
+            });
+            assert.deepEqual(ordinaryContext.callers.map(call => call.line), [10]);
+            const paramsContext = index.context('FormatWith', {
+                className: 'Ext',
+                file: 'Extensions.cs',
+                line: 5,
+            });
+            assert.deepEqual(paramsContext.callers.map(call => call.line), [4]);
+
+            const wrapperCallees = index.findCallees(ordinary, {
+                includeMethods: true,
+                collectAccount: true,
+            });
+            assert.equal(wrapperCallees[0]?.bindingId, paramsArray.bindingId);
+            const runCallees = index.findCallees(index.symbols.get('Run')[0], {
+                includeMethods: true,
+                collectAccount: true,
+            });
+            assert.equal(runCallees[0]?.bindingId, ordinary.bindingId);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('keeps explicit C# interface implementations out of ordinary overload lookup', () => {
+        const dir = tmp({
+            'Container.cs': [
+                'namespace Demo;',
+                'interface ISink { void Add(Token item); }',
+                'class Token {}',
+                'class Container : ISink {',
+                '  public virtual void Add(object content) {}',
+                '  void ISink.Add(Token item) { Add(item); }',
+                '  public void Forward(object content) { Add(content); }',
+                '}',
+                'class Child : Container {',
+                '  public void Add(Token item) { Add((object)item); }',
+                '  public Child(object content) { Add(content); }',
+                '}',
+            ].join('\n'),
+            'Fixture.csproj': '<Project Sdk="Microsoft.NET.Sdk"></Project>',
+        });
+        try {
+            const index = idx(dir);
+            const overloads = index.symbols.get('Add');
+            const ordinary = overloads.find(symbol => symbol.startLine === 5);
+            const explicit = overloads.find(symbol => symbol.startLine === 6);
+            assert.equal(explicit.explicitInterface, 'ISink');
+
+            const context = index.context('Add', {
+                className: 'Container',
+                file: 'Container.cs',
+                line: 5,
+            });
+            assert.deepEqual(context.callers.map(call => call.line), [6, 7, 10, 11]);
+            assert.equal(context.meta.account.conserved, true);
+
+            for (const methodName of ['Forward', 'Child']) {
+                const owner = index.symbols.get(methodName).find(symbol =>
+                    symbol.startLine === (methodName === 'Forward' ? 7 : 11));
+                const callees = index.findCallees(owner, {
+                    includeMethods: true,
+                    collectAccount: true,
+                });
+                assert.equal(callees[0]?.bindingId, ordinary.bindingId,
+                    `${methodName} should select Add(object), not the interface-only Add(Token)`);
+                assert.equal(callees.calleeAccount.conserved, true);
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('uses nullable and cast argument kinds for C# overload selection', () => {
+        const dir = tmp({
+            'Writer.cs': [
+                'using System;',
+                'namespace Demo;',
+                'class Writer {',
+                '  void WriteValue(Guid? value) {}',
+                '  void WriteValue(string value) {}',
+                '  public void Run(Guid value, bool nullable) {',
+                '    WriteValue(nullable ? (Guid?)value : value);',
+                '    WriteValue((string)"x");',
+                '  }',
+                '}',
+            ].join('\n'),
+            'Fixture.csproj': '<Project Sdk="Microsoft.NET.Sdk"></Project>',
+        });
+        try {
+            const index = idx(dir);
+            const callees = index.findCallees(index.symbols.get('Run')[0], {
+                includeMethods: true,
+                collectAccount: true,
+            }).filter(callee => callee.name === 'WriteValue');
+            assert.deepEqual(callees.map(callee => callee.startLine), [4, 5]);
+            assert.deepEqual(callees.map(callee => callee.sites[0]), [7, 8]);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('keeps inherited C# overload slots distinct by parameter signature', () => {
+        const dir = tmp({
+            'Slots.cs': [
+                'using System;',
+                'namespace Demo;',
+                'class BaseWriter {',
+                '  public virtual void WriteValue(object? value) {}',
+                '  public virtual void WriteValue(Guid? value) {}',
+                '}',
+                'class DerivedWriter : BaseWriter {',
+                '  public override void WriteValue(object? value) {}',
+                '  public void CallBase(Guid? value) { base.WriteValue(value); }',
+                '}',
+                'class Use {',
+                '  void Run(DerivedWriter writer, Guid? value) {',
+                '    writer.WriteValue(value);',
+                '  }',
+                '}',
+            ].join('\n'),
+            'Fixture.csproj': '<Project Sdk="Microsoft.NET.Sdk"></Project>',
+        });
+        try {
+            const index = idx(dir);
+            const inherited = index.context('WriteValue', {
+                className: 'BaseWriter',
+                file: 'Slots.cs',
+                line: 5,
+            });
+            assert.deepEqual(inherited.callers.map(call => call.line), [9, 13]);
+            const callees = index.findCallees(index.symbols.get('Run')[0], {
+                includeMethods: true,
+                collectAccount: true,
+            });
+            assert.equal(callees[0]?.className, 'BaseWriter');
+            assert.equal(callees[0]?.startLine, 5);
+            const baseCallees = index.findCallees(index.symbols.get('CallBase')[0], {
+                includeMethods: true,
+                collectAccount: true,
+            });
+            assert.equal(baseCallees[0]?.className, 'BaseWriter');
+            assert.equal(baseCallees[0]?.startLine, 5);
+            assert.equal(baseCallees.unverifiedCallees?.length || 0, 0);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('treats same-namespace C# partial declarations as one class identity', () => {
+        const dir = tmp({
+            'JValue.cs': 'namespace Demo; public partial class JValue {}',
+            'JValue.Async.cs': [
+                'namespace Demo;',
+                'public partial class JValue { public int Value => 1; }',
+            ].join('\n'),
+            'Use.cs': [
+                'namespace Demo;',
+                'class Use { JValue Make() => new JValue(); }',
+            ].join('\n'),
+            'Fixture.csproj': '<Project Sdk="Microsoft.NET.Sdk"></Project>',
+        });
+        try {
+            const index = idx(dir);
+            for (const definition of index.symbols.get('JValue')) {
+                const result = index.context('JValue', {
+                    file: definition.relativePath,
+                    line: definition.startLine,
+                });
+                assert.deepEqual(result.callers.map(call => [
+                    call.relativePath,
+                    call.line,
+                ]), [['Use.cs', 2]]);
+                assert.equal(result.meta.account.conserved, true);
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('confirms C# constructor type identity from a nested namespace', () => {
+        const dir = tmp({
+            'Value.cs': [
+                'namespace Demo.Model;',
+                'public class Value { public Value(object value) {} }',
+            ].join('\n'),
+            'Parser.cs': [
+                'namespace Demo.Model.Parsing;',
+                'public class Parser {',
+                '  public Value Parse(object input) => new Value(input);',
+                '}',
+            ].join('\n'),
+            'Fixture.csproj': '<Project Sdk="Microsoft.NET.Sdk"></Project>',
+        });
+        try {
+            const index = idx(dir);
+            const result = index.context('Value', {
+                file: 'Value.cs',
+                line: 2,
+            });
+            assert.deepEqual(result.callers.map(call => [
+                call.relativePath,
+                call.line,
+                call.tier,
+            ]), [['Parser.cs', 3, 'confirmed']]);
+            assert.equal(result.unverifiedCallers.length, 0);
+            assert.equal(result.meta.account.conserved, true);
+        } finally {
+            rm(dir);
+        }
+    });
 });
 
 describe('fix: attribute-macro parse recovery (C/C++)', () => {
@@ -409,6 +2208,86 @@ describe('fix: attribute-macro parse recovery (C/C++)', () => {
         assert.equal(member?.returnType, 'int');
     });
 
+    it('C++: API macro between class keyword and name preserves member ownership', () => {
+        const code = [
+            '#define API __attribute__((visibility("default")))',
+            'class API Widget {',
+            ' public:',
+            '  static Widget* GetInstance();',
+            '};',
+            'struct API Pipe {',
+            '  int read_end;',
+            '  void open();',
+            '};',
+        ].join('\n');
+        const result = parse(code, 'cpp');
+        const widget = result.classes.find(item => item.name === 'Widget');
+        assert.ok(widget, 'Widget must be recovered as a class');
+        const member = widget.members.find(item => item.name === 'GetInstance');
+        assert.equal(member?.className, 'Widget');
+        assert.equal(member?.isSignature, true);
+        assert.ok(member?.modifiers.includes('static'));
+        assert.ok(!result.functions.some(item =>
+            item.name === 'GetInstance' && !item.className));
+        const pipe = result.classes.find(item => item.name === 'Pipe');
+        assert.equal(
+            pipe?.members.find(item => item.name === 'open')?.className,
+            'Pipe',
+        );
+    });
+
+    it('C++: declaration macros around templates and classes recover together', () => {
+        const code = [
+            'FMT_BEGIN_NAMESPACE',
+            'namespace detail {',
+            'template <typename T> class helper {',
+            ' public:',
+            '  FMT_CONSTEXPR helper(T value) {}',
+            '};',
+            '}',
+            'FMT_EXPORT template <typename Context> class dynamic_store {',
+            ' public:',
+            '  void clear() {}',
+            '};',
+            'FMT_PRAGMA_CLANG(diagnostic ignored "-Wweak-vtables")',
+            'class FMT_SO_VISIBILITY("default") format_error {',
+            ' public:',
+            '  void report() {}',
+            '};',
+            'FMT_END_NAMESPACE',
+        ].join('\n');
+        const result = parse(code, 'cpp');
+        const store = result.classes.find(item =>
+            item.name === 'dynamic_store');
+        assert.equal(
+            store?.members.find(member => member.name === 'clear')?.className,
+            'dynamic_store',
+        );
+        const error = result.classes.find(item =>
+            item.name === 'format_error');
+        assert.equal(
+            error?.members.find(member => member.name === 'report')?.className,
+            'format_error',
+        );
+        assert.ok(!result.functions.some(item =>
+            ['clear', 'report'].includes(item.name) && !item.className));
+    });
+
+    it('C++: declaration recovery preserves nested calls in statement macros', () => {
+        const code = [
+            'FMT_BEGIN_NAMESPACE',
+            'void target() {}',
+            'void use() {',
+            '  EXPECT_THROW_MSG(target(), error_type, "message");',
+            '}',
+            'FMT_END_NAMESPACE',
+        ].join('\n');
+        const calls = getLanguageAdapter('cpp')
+            .findCalls(code, getParser('cpp'));
+        assert.ok(calls.some(call =>
+            call.name === 'target' && call.line === 4));
+    });
+
     it('C: usages classification sees the recovered parse, not the broken one', () => {
         const dir = tmp({
             'lib.c': [
@@ -445,6 +2324,38 @@ describe('fix: C typedefs and unnamed parameters', () => {
         assert.equal(byName.get('Foo')?.aliasOf, 'Foo_s');
         // Anonymous struct named through the typedef fallback: exactly one entry.
         assert.equal(result.classes.filter(cls => cls.name === 'Point').length, 1);
+    });
+
+    it('records the identifier line for multiline anonymous typedefs', () => {
+        const code = [
+            'typedef enum',
+            '{',
+            '    FIRST = 0,',
+            '    SECOND',
+            '} FLAGS_T;',
+        ].join('\n');
+        const result = parse(code, 'c');
+        const flags = result.classes.find(cls => cls.name === 'FLAGS_T');
+        assert.equal(flags?.startLine, 1);
+        assert.equal(flags?.nameLine, 5);
+    });
+
+    it('classifies bodyless struct tags in value declarations as references', () => {
+        const code = [
+            'struct Item { int value; };',
+            'struct Item *current;',
+            'struct Forward;',
+        ].join('\n');
+        const itemUsages = getLanguageAdapter('c')
+            .findUsages(code, 'Item', getParser('c'));
+        assert.deepEqual(itemUsages.map(usage => [
+            usage.line, usage.usageType,
+        ]), [[1, 'definition'], [2, 'reference']]);
+        const forwardUsages = getLanguageAdapter('c')
+            .findUsages(code, 'Forward', getParser('c'));
+        assert.deepEqual(forwardUsages.map(usage => [
+            usage.line, usage.usageType,
+        ]), [[3, 'definition']]);
     });
 
     it('renders unnamed parameters as their type alone', () => {
@@ -583,5 +2494,61 @@ describe('fix: stacked attribute macros recover fully', () => {
         const result = parse(code, 'c');
         assert.ok(result.functions.some(fn => fn.name === 'good'), 'macro part still recovers');
         assert.equal(result.parseRecovery, true);
+    });
+});
+
+describe('v5 C++ compile-time call identity', () => {
+    it('recovers explicit call-operator template syntax from the AST', () => {
+        const code = [
+            'template <typename T> class Converter {',
+            '  void operator()(bool value) { operator()<bool>(value); }',
+            '  template <typename U> void operator()(U value) {}',
+            '};',
+        ].join('\n');
+        const calls = getLanguageAdapter('cpp').findCallsInCode(
+            code, getParser('cpp'));
+        const call = calls.find(candidate =>
+            candidate.name === 'operator()' && candidate.line === 2);
+        assert.ok(call, JSON.stringify(calls));
+        assert.equal(call.explicitTemplateCall, true);
+        assert.equal(call.argCount, 1);
+        assert.deepEqual(call.argKinds, ['type:bool']);
+        assert.ok(!calls.some(candidate => candidate.name === 'operator'),
+            'the parser-recovery fragment must not leak a phantom callee');
+    });
+
+    it('keeps decltype dependencies visible but outside runtime callers', () => {
+        const dir = tmp({
+            'sample.cpp': [
+                'template <typename T> T probe(T value);',
+                'template <typename T> struct Box {',
+                '  decltype(probe<T>(T{})) value;',
+                '};',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const target = index.symbols.get('probe')[0];
+            const result = index.findCallers('probe', {
+                targetDefinitions: [target],
+                collectAccount: true,
+                includeMethods: true,
+            });
+            assert.equal(result.length, 0);
+            assert.deepEqual(result.unverifiedEntries.map(entry => ({
+                line: entry.line,
+                reason: entry.reason,
+                uncertaintyClass: entry.uncertaintyClass,
+            })), [{
+                line: 3,
+                reason: 'compile-time-only',
+                uncertaintyClass: 'compile-time-dispatch',
+            }]);
+            const context = index.context('probe', {
+                file: target.file,
+                line: target.startLine,
+            });
+            assert.equal(context.meta.account.conserved, true);
+        } finally { rm(dir); }
     });
 });

@@ -13,9 +13,11 @@ const assert = require('node:assert');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const { spawnSync } = require('child_process');
 const { ProjectIndex } = require('../core/project');
 const { tsMorphOracle } = require('../eval/oracles/ts-morph-oracle');
 const { constructedReceiverAt } = require('../eval/oracles/jdtls-oracle');
+const { clangdOracle } = require('../eval/oracles/clangd-oracle');
 const { createOraclePathMapper } = require('../eval/oracles/oracle-interface');
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -39,6 +41,177 @@ function idx(d, g) {
 }
 
 describe('Oracle contract', () => {
+    it('clangd distinguishes passed function references from direct calls', async (t) => {
+        if (spawnSync('clangd', ['--version'], {
+            stdio: 'ignore',
+        }).status !== 0) {
+            t.skip('clangd is not installed');
+            return;
+        }
+        const d = tmp({
+            'sample.cpp': [
+                'void grow();',
+                'struct Base { explicit Base(void (*callback)()); };',
+                'struct Derived : Base { Derived() : Base(grow) {} };',
+                'void grow() {}',
+                'void invoke() { grow(); }',
+                '#define MAKE_TEST(group, name) void group##_##name()',
+                'MAKE_TEST(sample, generated) {}',
+                ...Array.from({ length: 120 }, (_, index) =>
+                    `void invoke_${index}() { grow(); }`),
+                '#define CHECK_CALL(value) do { (void)(value); } while (0)',
+                'void macro_invoke() { CHECK_CALL(grow()); }',
+                'struct Parent {};',
+                'struct Child : Parent {};',
+                'void choose(int) {}',
+                'void choose(int, int) {}',
+                'void choose_default(int, int = 0) {}',
+                'void invoke_one() { choose(1); }',
+                'void invoke_two() { choose(1, 2); }',
+                'void invoke_default() { choose_default(1); }',
+                'template <typename T> void make_type();',
+                'void use_parent_type() { make_type<Parent>(); }',
+                'Parent construct_parent() { return Parent(); }',
+                'template <typename T> void dependent_target(T);',
+                'template <typename T> void dependent_use(T value) { dependent_target(value); }',
+            ].join('\n'),
+            'third_party/bundled.cpp': 'void bundled_target() {}',
+        });
+        let handle;
+        let generatedDatabase;
+        try {
+            handle = await clangdOracle.prepare(d, {
+                repo: {
+                    language: 'cpp',
+                    oracleExclude: ['third_party'],
+                },
+            });
+            generatedDatabase = handle.database.generated
+                ? handle.database.directory : null;
+            const symbols = await clangdOracle.listSymbols(handle);
+            const target = symbols.find(symbol =>
+                symbol.name === 'grow' && symbol.line === 4);
+            assert.ok(target, 'clangd should enumerate the grow definition');
+            const prototype = symbols.find(symbol =>
+                symbol.name === 'grow' && symbol.line === 1);
+            assert.equal(
+                prototype?.compilerIdentity,
+                target.compilerIdentity,
+                'prototype and implementation share one compiler callable slot',
+            );
+            const parent = symbols.find(symbol =>
+                symbol.name === 'Parent' && symbol.line === 130);
+            assert.ok(parent, 'clangd should enumerate the parent class');
+            assert.ok(!symbols.some(symbol => symbol.line === 7),
+                'macro-generated declarations are not source symbols');
+            assert.ok(!symbols.some(symbol =>
+                symbol.name === 'bundled_target'),
+            'repository oracle exclusions keep vendored targets off the board');
+            const references = await clangdOracle.findReferences(
+                handle, { ...target, comprehensive: true });
+            assert.equal(
+                references.find(reference => reference.line === 3)?.kind,
+                'reference',
+                'passing grow into Base(...) is not a call to grow',
+            );
+            assert.equal(
+                references.find(reference => reference.line === 1)?.kind,
+                'definition',
+                'a prototype is a declaration, not a call',
+            );
+            assert.equal(
+                references.find(reference => reference.line === 4)?.kind,
+                'definition',
+                'a source definition is a declaration, not a call',
+            );
+            assert.equal(
+                references.find(reference => reference.line === 5)?.kind,
+                'call',
+            );
+            assert.ok(
+                references.filter(reference => reference.kind === 'call').length >= 122,
+                'clangd reference answers must not be truncated at the default result cap',
+            );
+            assert.equal(
+                references.find(reference => reference.line === 129)?.kind,
+                'call',
+                'compiler-backed macro argument fallback preserves direct calls',
+            );
+            const parentReferences = await clangdOracle.findReferences(
+                handle, { ...parent, comprehensive: true });
+            assert.equal(
+                parentReferences.find(reference => reference.line === 131)?.kind,
+                'reference',
+                'a base-class occurrence is a type reference, not a call',
+            );
+            assert.equal(
+                parentReferences.find(reference => reference.line === 139)?.kind,
+                'reference',
+                'a class used as another call template argument is a type reference',
+            );
+            assert.equal(
+                parentReferences.find(reference => reference.line === 140)?.kind,
+                'reference',
+                'class construction is scored through the class-usage contract',
+            );
+            const twoArgTarget = symbols.find(symbol =>
+                symbol.name === 'choose' && symbol.line === 133);
+            assert.ok(twoArgTarget,
+                'clangd should enumerate the two-argument overload');
+            const oneArgTarget = symbols.find(symbol =>
+                symbol.name === 'choose' && symbol.line === 132);
+            assert.notEqual(
+                oneArgTarget?.compilerIdentity,
+                twoArgTarget.compilerIdentity,
+                'same-name overloads remain distinct compiler callable slots',
+            );
+            const overloadReferences = await clangdOracle.findReferences(
+                handle, { ...twoArgTarget, comprehensive: true });
+            assert.equal(
+                overloadReferences.find(reference =>
+                    reference.line === 135)?.kind,
+                undefined,
+                'one-argument sibling calls are not credited to a two-argument overload',
+            );
+            assert.equal(
+                overloadReferences.find(reference =>
+                    reference.line === 136)?.kind,
+                'call',
+                'the matching two-argument overload call remains on the board',
+            );
+            const defaultTarget = symbols.find(symbol =>
+                symbol.name === 'choose_default' && symbol.line === 134);
+            const defaultReferences = await clangdOracle.findReferences(
+                handle, { ...defaultTarget, comprehensive: true });
+            assert.equal(
+                defaultReferences.find(reference =>
+                    reference.line === 137)?.kind,
+                'call',
+                'compiler-declared default arguments lower the accepted arity',
+            );
+            const dependentTarget = symbols.find(symbol =>
+                symbol.name === 'dependent_target' && symbol.line === 141);
+            assert.ok(dependentTarget,
+                'clangd should enumerate the dependent template target');
+            const dependentReferences = await clangdOracle.findReferences(
+                handle, { ...dependentTarget, comprehensive: true });
+            const dependentCall = dependentReferences.find(reference =>
+                reference.line === 142 && reference.kind === 'call');
+            assert.equal(
+                dependentCall?.uncertaintyClass,
+                'compile-time-dispatch',
+                'dependent overload identity remains visible but is not called exact',
+            );
+        } finally {
+            if (handle) await clangdOracle.dispose(handle);
+            if (generatedDatabase) {
+                assert.equal(fs.existsSync(generatedDatabase), false,
+                    'oracle cleanup waits for clangd before removing its database');
+            }
+            rm(d);
+        }
+    });
+
     it('normalizes canonical roots before comparing oracle and index paths', (t) => {
         const d = tmp({
             'project/src/com/example/Example.java': 'class Example {}',

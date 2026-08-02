@@ -12,6 +12,11 @@ const path = require('path');
 const CPP_EXTENSIONS = new Set(['.cc', '.cpp', '.cxx', '.c++', '.cp', '.mm']);
 const C_EXTENSIONS = new Set(['.c', '.m']);
 const cache = new Map();
+const conventionCache = new Map();
+const CONVENTION_IGNORES = new Set([
+    '.git', '.svn', 'node_modules', 'vendor', 'third_party',
+    'build', 'dist', 'out', 'target',
+]);
 
 function splitCommandLine(command) {
     const args = [];
@@ -154,6 +159,59 @@ function nearestEntries(database, filePath) {
     });
 }
 
+function projectBoundary(startDir) {
+    let directory = path.resolve(startDir);
+    let fallback = directory;
+    for (let depth = 0; depth < 8; depth++) {
+        fallback = directory;
+        if (fs.existsSync(path.join(directory, '.git')) ||
+            fs.existsSync(path.join(directory, 'CMakeLists.txt')) ||
+            fs.existsSync(path.join(directory, 'meson.build'))) {
+            return directory;
+        }
+        const parent = path.dirname(directory);
+        if (parent === directory) break;
+        directory = parent;
+    }
+    return fallback;
+}
+
+function projectTranslationUnitConvention(filePath) {
+    const root = projectBoundary(path.dirname(filePath));
+    if (conventionCache.has(root)) return conventionCache.get(root);
+    let cpp = 0;
+    let c = 0;
+    let visited = 0;
+    const queue = [root];
+    while (queue.length > 0 && visited < 5000) {
+        const directory = queue.shift();
+        let entries;
+        try {
+            entries = fs.readdirSync(directory, { withFileTypes: true });
+        } catch {
+            continue;
+        }
+        entries.sort((left, right) =>
+            left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
+        for (const entry of entries) {
+            if (visited++ >= 5000) break;
+            if (entry.isDirectory()) {
+                if (!CONVENTION_IGNORES.has(entry.name) &&
+                    !entry.name.startsWith('.')) {
+                    queue.push(path.join(directory, entry.name));
+                }
+                continue;
+            }
+            const extension = path.extname(entry.name).toLowerCase();
+            if (CPP_EXTENSIONS.has(extension)) cpp++;
+            else if (C_EXTENSIONS.has(extension)) c++;
+        }
+    }
+    const language = cpp === c ? null : cpp > c ? 'cpp' : 'c';
+    conventionCache.set(root, language);
+    return language;
+}
+
 function detectHeaderLanguage(filePath, projectRoot = null) {
     const originalExt = path.extname(filePath);
     if (originalExt === '.H' || originalExt === '.HPP') return 'cpp';
@@ -184,6 +242,8 @@ function detectHeaderLanguage(filePath, projectRoot = null) {
         const c = names.filter(name => C_EXTENSIONS.has(path.extname(name).toLowerCase())).length;
         if (cpp !== c) return cpp > c ? 'cpp' : 'c';
     } catch { /* default below */ }
+    const projectConvention = projectTranslationUnitConvention(filePath);
+    if (projectConvention) return projectConvention;
     return 'c';
 }
 
@@ -209,5 +269,6 @@ module.exports = {
     findCompilationDatabase,
     loadCompilationDatabase,
     detectHeaderLanguage,
+    projectTranslationUnitConvention,
     includeDirectoriesForFile,
 };

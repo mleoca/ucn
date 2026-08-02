@@ -341,7 +341,14 @@ function walkDir(dir, options, depth = 0, visited = new Set()) {
     for (const entry of entries) {
         const fullPath = path.join(dir, entry.name);
 
-        if (shouldIgnore(entry.name, options.ignores, dir, dir === options.anchorRoot)) continue;
+        if (shouldIgnore(
+            entry.name,
+            options.ignores,
+            dir,
+            dir === options.anchorRoot,
+            options.anchorRoot,
+            fullPath,
+        )) continue;
 
         let isDir = entry.isDirectory();
         let isFile = entry.isFile();
@@ -380,12 +387,40 @@ function walkDir(dir, options, depth = 0, visited = new Set()) {
  *   the .gitignore belongs to. Default false errs toward KEEPING files.
  * @param {string} [parentDir] - Parent directory path (for conditional checks)
  * @param {boolean} [atAnchorRoot] - Whether parentDir IS the anchor root
+ * @param {string} [anchorRoot] - Discovery root for path-aware config ignores
+ * @param {string} [fullPath] - Candidate path for root-relative matching
  */
 const _globRegexCache = new Map();
 
-function shouldIgnore(name, ignores, parentDir, atAnchorRoot = false) {
+function shouldIgnore(
+    name,
+    ignores,
+    parentDir,
+    atAnchorRoot = false,
+    anchorRoot,
+    fullPath,
+) {
     // Check unconditional ignores
     for (let pattern of ignores) {
+        if (pattern.includes('/') && anchorRoot && fullPath) {
+            const normalizedPattern = pattern.replace(/^\/+/, '')
+                .replaceAll('\\', '/');
+            const relative = path.relative(anchorRoot, fullPath)
+                .replaceAll(path.sep, '/');
+            let regex = _globRegexCache.get(`path:${normalizedPattern}`);
+            if (!regex) {
+                regex = globToRegex(normalizedPattern);
+                _globRegexCache.set(`path:${normalizedPattern}`, regex);
+            }
+            const directoryPrefix = normalizedPattern.endsWith('/**')
+                ? normalizedPattern.slice(0, -3).replace(/\/+$/, '')
+                : null;
+            if (regex.test(relative) ||
+                (directoryPrefix && relative === directoryPrefix)) {
+                return true;
+            }
+            continue;
+        }
         if (pattern.charCodeAt(0) === 47 /* '/' */) {
             if (!atAnchorRoot) continue;
             pattern = pattern.slice(1);

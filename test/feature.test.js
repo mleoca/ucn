@@ -22,17 +22,21 @@ const { createTempDir, cleanup, tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR } = req
 
 describe('Feature: file-exports command', () => {
     it('should return exports for a file (when implemented)', () => {
-        const index = new ProjectIndex('.');
-        index.build(null, { quiet: true });
-
-        // Check if fileExports method exists
-        if (typeof index.fileExports === 'function') {
+        const dir = tmp({
+            'package.json': '{}',
+            'core/parser.js': [
+                'function parse(code) { return code; }',
+                'function parseFile(file) { return parse(file); }',
+                'module.exports = { parse, parseFile };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
             const exports = index.fileExports('core/parser.js');
             assert.ok(Array.isArray(exports), 'Should return array of exports');
             assert.ok(exports.some(e => e.name === 'parse'), 'Should export parse function');
-        } else {
-            // Document that feature is missing
-            console.log('FEATURE MISSING: index.fileExports() not implemented');
+        } finally {
+            rm(dir);
         }
     });
 });
@@ -1060,16 +1064,27 @@ describe('Feature: search with exclude and in filters', () => {
 
 describe('Feature: bulk fn extraction (comma-separated)', () => {
     it('extracts multiple functions from project index', () => {
-        const index = new ProjectIndex('.');
-        index.build(null, { quiet: true });
-
-        // extractFunction is file-level; bulk is CLI/MCP level
-        // Test that find works for each name in a comma-split
-        const names = 'escapeRegExp,toolResult';
-        const fnNames = names.split(',').map(n => n.trim());
-        for (const fnName of fnNames) {
-            const matches = index.find(fnName).filter(m => m.type === 'function' || m.params !== undefined);
-            assert.ok(matches.length > 0, `Should find function "${fnName}"`);
+        const dir = tmp({
+            'package.json': '{}',
+            'lib.js': [
+                'function escapeRegExp(value) { return value; }',
+                'function toolResult(value) { return value; }',
+                'module.exports = { escapeRegExp, toolResult };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            // extractFunction is file-level; bulk is CLI/MCP level. Verify
+            // that each comma-split name resolves against the same index.
+            const names = 'escapeRegExp,toolResult';
+            const fnNames = names.split(',').map(n => n.trim());
+            for (const fnName of fnNames) {
+                const matches = index.find(fnName).filter(m =>
+                    m.type === 'function' || m.params !== undefined);
+                assert.ok(matches.length > 0, `Should find function "${fnName}"`);
+            }
+        } finally {
+            rm(dir);
         }
     });
 });
@@ -1077,14 +1092,28 @@ describe('Feature: bulk fn extraction (comma-separated)', () => {
 
 describe('Feature: find with glob patterns', () => {
     it('finds functions matching glob pattern with *', () => {
-        const index = new ProjectIndex('.');
-        index.build(null, { quiet: true });
-
-        const results = index.find('format*Json');
-        assert.ok(results.length > 5, `Should find multiple format*Json functions, got ${results.length}`);
-        for (const r of results) {
-            assert.ok(r.name.startsWith('format') && r.name.endsWith('Json'),
-                `${r.name} should match format*Json`);
+        const dir = tmp({
+            'package.json': '{}',
+            'formatters.js': [
+                'function formatOneJson() {}',
+                'function formatTwoJson() {}',
+                'function formatThreeJson() {}',
+                'function formatFourJson() {}',
+                'function formatFiveJson() {}',
+                'function formatSixJson() {}',
+                'function formatText() {}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const results = index.find('format*Json');
+            assert.strictEqual(results.length, 6);
+            for (const r of results) {
+                assert.ok(r.name.startsWith('format') && r.name.endsWith('Json'),
+                    `${r.name} should match format*Json`);
+            }
+        } finally {
+            rm(dir);
         }
     });
 
@@ -1210,12 +1239,12 @@ function handleResponse(res) {
         }
     });
 
-    it('invalid regex auto-falls back to plain text', () => {
+    it('invalid regex punctuation is safe in default literal mode', () => {
         const { dir, idx } = makeRegexTestIndex();
         try {
-            // process( is invalid regex — should not throw, falls back to plain text
             const results = idx.search('process(');
             assert.ok(Array.isArray(results), 'Should return results array, not throw');
+            assert.strictEqual(results.meta.mode, 'literal');
         } finally {
             fs.rmSync(dir, { recursive: true });
         }
@@ -1234,48 +1263,28 @@ function handleResponse(res) {
         }
     });
 
-    it('invalid regex falls back to plain text (does not throw)', () => {
+    it('invalid explicit regex fails instead of changing search semantics', () => {
         const { dir, idx } = makeRegexTestIndex();
         try {
             assert.doesNotThrow(() => idx.search('[invalid'));
-            const results = idx.search('[invalid', { regex: true });
-            assert.ok(Array.isArray(results), 'Should return array (fallback to plain text)');
+            assert.throws(
+                () => idx.search('[invalid', { regex: true }),
+                /Invalid regular expression "\[invalid"/,
+            );
         } finally {
             fs.rmSync(dir, { recursive: true });
         }
     });
 
-    it('invalid regex fallback sets regexFallback in meta', () => {
-        const { dir, idx } = makeRegexTestIndex();
-        try {
-            const results = idx.search('[invalid', { regex: true });
-            assert.ok(results.meta, 'Results should have meta');
-            assert.ok(results.meta.regexFallback, 'meta.regexFallback should be set');
-            assert.ok(results.meta.regexFallback.includes('Invalid regular expression'),
-                `regexFallback should contain error message: "${results.meta.regexFallback}"`);
-        } finally {
-            fs.rmSync(dir, { recursive: true });
-        }
-    });
-
-    it('valid regex does not set regexFallback in meta', () => {
+    it('valid regex reports regex mode', () => {
         const { dir, idx } = makeRegexTestIndex();
         try {
             const results = idx.search('\\d+', { regex: true });
             assert.ok(results.meta, 'Results should have meta');
-            assert.strictEqual(results.meta.regexFallback, false, 'regexFallback should be false for valid regex');
+            assert.strictEqual(results.meta.mode, 'regex');
         } finally {
             fs.rmSync(dir, { recursive: true });
         }
-    });
-
-    it('formatSearch shows fallback warning for invalid regex', () => {
-        const output = require('../core/output');
-        const results = [];
-        results.meta = { filesScanned: 5, filesSkipped: 0, totalFiles: 5, regexFallback: 'Invalid regular expression: Unterminated character class' };
-        const formatted = output.formatSearch(results, '[invalid');
-        assert.ok(formatted.includes('Invalid regex'), `Should mention invalid regex: "${formatted}"`);
-        assert.ok(formatted.includes('plain text'), `Should mention plain text fallback: "${formatted}"`);
     });
 
     it('regex mode works with case-sensitive flag', () => {

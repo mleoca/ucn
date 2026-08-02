@@ -295,9 +295,10 @@ function formatPublicJson(command, result, params = {}, execution = {}) {
     if (command === 'search' && result?.meta) {
         commandMeta.searchMode = result.meta.mode;
         commandMeta.totalMatches = result.meta.totalMatches;
-        if (result.meta.regexFallback) {
-            commandMeta.regexFallback = result.meta.regexFallback;
-        }
+        commandMeta.shownMatches = result.meta.shownMatches;
+        commandMeta.truncatedMatches = result.meta.truncatedMatches;
+        commandMeta.limit = result.meta.limit;
+        if (result.meta.truncatedMatches > 0) commandMeta.truncated = true;
     }
     // Handles are the documented spine (`Pass the resulting handle to show/
     // impact/source`) — the JSON records must carry them, not make agents

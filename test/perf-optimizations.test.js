@@ -217,6 +217,82 @@ describe('perf: incremental callee index', () => {
 
 // ── _endOp content clearing and mismatch guard ───────────────────────────────
 
+describe('perf: cross-operation parsed-tree cache', () => {
+    it('reuses immutable trees across commands and invalidates them on rebuild', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'export function helper(value) { return value + 1; }',
+        });
+        try {
+            const index = idx(dir);
+            const filePath = path.join(dir, 'lib.js');
+            const content = fs.readFileSync(filePath, 'utf8');
+            const language = index.files.get(filePath).language;
+            let first;
+            index._beginOp();
+            try {
+                first = index._getParsedTree(filePath, content, language);
+            } finally {
+                index._endOp();
+            }
+            assert.ok(first);
+            assert.strictEqual(index._parsedTreeCache.size, 1);
+
+            index._beginOp();
+            try {
+                const second = index._getParsedTree(filePath, content, language);
+                assert.strictEqual(second, first,
+                    'a later command should reuse the same immutable native tree');
+            } finally {
+                index._endOp();
+            }
+
+            fs.appendFileSync(filePath, '\nexport const changed = true;\n');
+            index.build(null, { forceRebuild: true, quiet: true, workers: 0 });
+            assert.strictEqual(index._parsedTreeCache.has(filePath), false,
+                'incremental rebuild must evict a changed file tree');
+
+            const changedContent = fs.readFileSync(filePath, 'utf8');
+            index._beginOp();
+            try {
+                const third = index._getParsedTree(filePath, changedContent, language);
+                assert.notStrictEqual(third, first);
+            } finally {
+                index._endOp();
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('drops parsed trees before replacing an index from persisted cache', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'export function helper() { return 1; }',
+        });
+        try {
+            const index = idx(dir);
+            const filePath = path.join(dir, 'lib.js');
+            index.saveCache();
+            index._beginOp();
+            try {
+                index._getParsedTree(
+                    filePath,
+                    fs.readFileSync(filePath, 'utf8'),
+                    index.files.get(filePath).language,
+                );
+            } finally {
+                index._endOp();
+            }
+            assert.strictEqual(index._parsedTreeCache.size, 1);
+            assert.strictEqual(index.loadCache(), true);
+            assert.strictEqual(index._parsedTreeCache.size, 0);
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
 describe('perf: _endOp behavior', () => {
     it('clears callsCache.content after operation', () => {
         const dir = tmp({

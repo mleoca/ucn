@@ -18,7 +18,6 @@ const {
     getCliCommandSet,
     resolveCommand,
     suggestCommand,
-    v4MigrationHint,
     FLAG_APPLICABILITY,
     toCliName,
     FILE_LOCAL_COMMANDS,
@@ -44,10 +43,6 @@ class FlagValidationError extends Error {
 }
 
 function unknownCommandMessage(command, { interactive = false } = {}) {
-    // v4 command names get directive replacement guidance before any
-    // edit-distance suggestion — `fn` must point at `source`, never "find".
-    const migration = v4MigrationHint(command, 'cli');
-    if (migration) return `Unknown command: ${command}. ${migration}`;
     const suggestion = suggestCommand(command, 'cli');
     const correction = suggestion ? ` Did you mean "${suggestion}"?` : '';
     const help = interactive && !suggestion ? ' Type "help" for available commands.' : '';
@@ -148,26 +143,28 @@ function validateNumericFlags(flags) {
     }
 }
 
-/**
- * Print an error message and abort. When `--json` is in effect, write a JSON
- * error envelope to stdout (so JSON-consuming pipelines see structured output)
- * and write the same plain message to stderr (for humans piping to a TTY).
- */
-function fail(msg) {
-    // This helper can run before parsed flags exist, so raw argv is the single
-    // reliable source for the output mode.
+/** Emit the one CLI error contract, including failures before main dispatch. */
+function emitCliError(msg, command = activeCanonicalCommand) {
     const wantsJson = process.argv.includes('--json');
+    const error = typeof msg === 'string' ? msg : String(msg);
     if (wantsJson) {
-        const error = typeof msg === 'string' ? msg : String(msg);
+        const canonical = command && isPublicCommand(command)
+            ? command
+            : resolveCommand(command, 'cli');
+        const surfaceCommand = canonical
+            ? toCliName(canonical)
+            : (command ? String(command) : null);
         const env = {
             meta: {
                 ok: false,
-                ...(activeCanonicalCommand && {
-                    command: toCliName(activeCanonicalCommand),
-                    ...(toCliName(activeCanonicalCommand) !== activeCanonicalCommand && {
-                        canonicalCommand: activeCanonicalCommand,
+                ...(surfaceCommand && {
+                    command: surfaceCommand,
+                    ...(canonical && surfaceCommand !== canonical && {
+                        canonicalCommand: canonical,
                     }),
-                    contract: output.contractMeta(activeCanonicalCommand),
+                    ...(canonical && {
+                        contract: output.contractMeta(canonical),
+                    }),
                 }),
             },
             data: null,
@@ -175,7 +172,15 @@ function fail(msg) {
         };
         try { process.stdout.write(JSON.stringify(env) + '\n'); } catch (_) { /* stdout may be closed */ }
     }
-    console.error(msg);
+    console.error(error);
+}
+
+/**
+ * Print an error message and abort command execution. Throw instead of calling
+ * process.exit so index/cache finally blocks still run.
+ */
+function fail(msg, command = activeCanonicalCommand) {
+    emitCliError(msg, command);
     throw new CommandError();
 }
 
@@ -353,8 +358,9 @@ const unknownFlags = args.filter(a => {
 });
 
 if (unknownFlags.length > 0) {
-    console.error(`Unknown flag(s): ${unknownFlags.join(', ')}`);
-    console.error('Use --help to see available flags');
+    emitCliError(
+        `Unknown flag(s): ${unknownFlags.join(', ')}. Use --help to see available flags.`,
+    );
     process.exit(1);
 }
 
@@ -365,11 +371,7 @@ try {
     validateNumericFlags(flags);
 } catch (e) {
     if (e instanceof FlagValidationError) {
-        if (flags.json) {
-            const env = { meta: { ok: false }, data: null, error: e.message };
-            try { process.stdout.write(JSON.stringify(env) + '\n'); } catch (_) { /* stdout may be closed */ }
-        }
-        console.error(e.message);
+        emitCliError(e.message);
         process.exit(1);
     }
     throw e;
@@ -495,17 +497,20 @@ function main() {
             // Single file mode
             runFileCommand(target, command, arg);
         } else {
-            // A migration-known v4 name (`ucn about x`) or a near-miss
-            // spelling is a command mistake, not a missing path.
-            const suggestion = suggestCommand(target, 'cli') || v4MigrationHint(target, 'cli');
-            console.error(suggestion
-                ? unknownCommandMessage(target)
-                : `Error: "${target}" not found`);
-            process.exit(1);
+            // `ucn missing-dir repo` is a target error. Any other two-token
+            // form whose first token is not a path is an unknown command.
+            const targetInvocation = positionalArgs.length > 1 &&
+                COMMANDS.has(positionalArgs[1]);
+            fail(
+                targetInvocation
+                    ? `Error: "${target}" not found`
+                    : unknownCommandMessage(target),
+                targetInvocation ? null : target,
+            );
         }
     } catch (e) {
         if (!(e instanceof CommandError)) {
-            console.error(`Error: ${e.message}`);
+            emitCliError(`Error: ${e.message}`);
         }
         process.exitCode = 1;
     }
@@ -555,8 +560,7 @@ function warnInapplicableFlags(canonical, parsedFlags, print) {
 function runFileCommand(filePath, command, arg) {
     const language = detectLanguage(filePath);
     if (!language) {
-        console.error(`Unsupported file type: ${filePath}`);
-        process.exit(1);
+        fail(`Unsupported file type: ${filePath}`, command);
     }
 
     const canonical = resolveCommand(command, 'cli') || command;
@@ -702,7 +706,7 @@ function runProjectCommand(rootDir, command, arg) {
     }
     } catch (e) {
         if (!(e instanceof CommandError)) {
-            console.error(`Error: ${e.message}`);
+            emitCliError(`Error: ${e.message}`);
         }
         process.exitCode = 1;
     } finally {
@@ -725,8 +729,7 @@ function runGlobCommand(pattern, command, arg) {
     const files = expandGlob(pattern);
 
     if (files.length === 0) {
-        console.error(`No files match pattern: ${pattern}`);
-        process.exit(1);
+        fail(`No files match pattern: ${pattern}`, command);
     }
 
     const canonical = resolveCommand(command, 'cli') || command;

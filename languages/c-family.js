@@ -17,6 +17,7 @@ const {
     sameNode,
     extractStringArg,
 } = require('./utils');
+const { createHash } = require('crypto');
 const { PARSE_OPTIONS, safeParse } = require('./index');
 
 const TYPE_NODES = new Set([
@@ -37,8 +38,10 @@ const IDENTIFIER_NODES = new Set([
 // declaration's TYPE, displacing the real return type into an ERROR node — and
 // for function-pointer declarators, displacing the real name into a parameter.
 // Blanking the macro token with spaces preserves every byte offset, so one
-// whole-file re-parse yields correct positions for all extractors. Only files
-// whose first parse already contains errors pay this cost.
+// whole-file re-parse yields correct positions for all extractors. Errored
+// files pay the full recovery scan; a clean file still needs one cached walk
+// because `class API Name` is a grammar-valid (but semantically wrong)
+// function-definition shape.
 const DECLARATION_NODES = new Set([
     'declaration', 'function_definition', 'field_declaration', 'type_definition',
 ]);
@@ -56,14 +59,185 @@ function hasMissingChild(node) {
     return false;
 }
 
-function macroTypeRanges(tree) {
+function classAttributeShape(node) {
+    if (node.type !== 'function_definition') return null;
+    const typeNode = node.childForFieldName('type');
+    const declaratorNode = node.childForFieldName('declarator');
+    if (!['class_specifier', 'struct_specifier', 'union_specifier']
+        .includes(typeNode?.type) ||
+        typeNode.childForFieldName('body') ||
+        declaratorNode?.type !== 'identifier' ||
+        node.childForFieldName('body')?.type !== 'compound_statement') {
+        return null;
+    }
+    return typeNode.childForFieldName('name') || null;
+}
+
+function isMacroToken(text) {
+    const value = String(text || '');
+    if (value.length < 2) return false;
+    let hasLetter = false;
+    for (const character of value) {
+        if (character >= 'A' && character <= 'Z') {
+            hasLetter = true;
+            continue;
+        }
+        if ((character >= '0' && character <= '9') ||
+            character === '_') {
+            continue;
+        }
+        return false;
+    }
+    return hasLetter;
+}
+
+function macroInvocationRange(code, identifier) {
+    if (!identifier || !isMacroToken(identifier.text)) return null;
+    let cursor = identifier.endIndex;
+    while (cursor < code.length &&
+        (code[cursor] === ' ' || code[cursor] === '\t')) {
+        cursor++;
+    }
+    if (code[cursor] !== '(') return null;
+    let depth = 0;
+    let quote = null;
+    let escaped = false;
+    for (let index = cursor; index < code.length; index++) {
+        const character = code[index];
+        if (quote) {
+            if (escaped) escaped = false;
+            else if (character === '\\') escaped = true;
+            else if (character === quote) quote = null;
+            continue;
+        }
+        if (character === '"' || character === "'") {
+            quote = character;
+            continue;
+        }
+        if (character === '(') depth++;
+        else if (character === ')' && --depth === 0) {
+            return [identifier.startIndex, index + 1];
+        }
+        if (character === '\n' && depth === 0) break;
+    }
+    return null;
+}
+
+function isStandaloneMacroLine(code, identifier) {
+    if (!identifier || !isMacroToken(identifier.text)) return false;
+    const lineStart = code.lastIndexOf('\n', identifier.startIndex - 1) + 1;
+    const lineEndAt = code.indexOf('\n', identifier.endIndex);
+    const lineEnd = lineEndAt < 0 ? code.length : lineEndAt;
+    return code.slice(lineStart, lineEnd).trim() === identifier.text;
+}
+
+function errorMacroRanges(node, code) {
     const ranges = [];
+    if (node.type === 'ERROR') {
+        const named = node.namedChildren || [];
+        for (const child of named) {
+            if (['class_specifier', 'struct_specifier',
+                'union_specifier'].includes(child.type)) {
+                const name = child.childForFieldName('name');
+                const invocation = macroInvocationRange(code, name);
+                if (invocation) ranges.push(invocation);
+                continue;
+            }
+            if (!IDENTIFIER_NODES.has(child.type)) continue;
+            const invocation = macroInvocationRange(code, child);
+            if (invocation) ranges.push(invocation);
+            else if (isStandaloneMacroLine(code, child)) {
+                ranges.push([child.startIndex, child.endIndex]);
+            } else if (child === named[0] &&
+                child.startPosition.row === node.startPosition.row &&
+                isMacroToken(child.text)) {
+                // Prefix before a declaration fragment inside one ERROR:
+                // `FMT_EXPORT template <...> class X`.
+                ranges.push([child.startIndex, child.endIndex]);
+            }
+        }
+    }
+    if (node.type === 'function_definition' && node.hasError) {
+        const type = node.childForFieldName('type');
+        const declarator = node.childForFieldName('declarator');
+        if (type && isStandaloneMacroLine(code, type) &&
+            declarator &&
+            declarator.startPosition.row > type.startPosition.row) {
+            // A standalone namespace/opening macro followed by a declaration
+            // can be swallowed as the return type of one enormous malformed
+            // function. It cannot be a real multi-line C++ return type.
+            ranges.push([type.startIndex, type.endIndex]);
+        }
+    }
+    // Prefix macro before a template declaration:
+    // `FMT_EXPORT template <typename T> class X`. The grammar represents the
+    // prefix plus template head as an erroneous template_function, followed
+    // by the class fragment and its body.
+    if (node.type === 'template_function' && node.hasError) {
+        const macro = node.childForFieldName('name') || node.namedChild(0);
+        if (macro && isMacroToken(macro.text) &&
+            (node.namedChildren || []).some(child =>
+                child.type === 'ERROR' &&
+                child.text.trim() === 'template')) {
+            ranges.push([macro.startIndex, macro.endIndex]);
+        }
+    }
+    return ranges;
+}
+
+function macroTypeRanges(tree, code) {
+    const ranges = [];
+    const treeHasError = tree.rootNode.hasError;
     traverseTree(tree.rootNode, node => {
-        if (!node.hasError) return false; // clean subtree — skip entirely
+        ranges.push(...errorMacroRanges(node, code));
+        const classAttribute = classAttributeShape(node);
+        if (!node.hasError && !classAttribute) {
+            // In an errored tree a clean subtree cannot hide a recovery
+            // candidate. A wholly clean tree still needs one traversal for
+            // grammar-valid `class API Name` misparses.
+            return treeHasError ? false : true;
+        }
         if (!DECLARATION_NODES.has(node.type)) return true;
         const typeNode = node.childForFieldName('type');
+        const declaratorNode = node.childForFieldName('declarator');
+        const directErrorNode = (node.namedChildren || [])
+            .find(child => child.type === 'ERROR');
+        if (node.type === 'function_definition' && typeNode &&
+            directErrorNode?.namedChildCount === 1 &&
+            directErrorNode.namedChild(0)?.type === 'identifier' &&
+            !RESERVED_TYPE_KEYWORDS.has(
+                directErrorNode.namedChild(0).text) &&
+            functionDeclarator(node)) {
+            ranges.push([
+                directErrorNode.namedChild(0).startIndex,
+                directErrorNode.namedChild(0).endIndex,
+            ]);
+            return true;
+        }
+        // `class API Widget { ... }` is parsed as a malformed function:
+        // type=`class API`, declarator=`Widget`, body=`{...}`. The bodyless
+        // class-specifier plus a bare declarator cannot be a valid function
+        // declaration, so the specifier's name is proven to be a class
+        // attribute/visibility macro. Blank only that token; the reparse
+        // recovers the real class and all member ownership.
+        if (classAttribute) {
+            ranges.push([classAttribute.startIndex, classAttribute.endIndex]);
+            return true;
+        }
+        // Calling-convention/export macro between a builtin return type and
+        // function name (`int CJSON_CDECL main(void)`) splits into a missing-;
+        // declaration plus a malformed function_definition on the SAME line.
+        // The declarator identifier is the macro token in that AST shape.
+        const next = node.nextNamedSibling;
+        if (typeNode && declaratorNode?.type === 'identifier' &&
+            hasMissingChild(node) &&
+            next?.type === 'function_definition' &&
+            next.startPosition.row === node.startPosition.row) {
+            ranges.push([declaratorNode.startIndex, declaratorNode.endIndex]);
+            return true;
+        }
         if (!typeNode || typeNode.type !== 'type_identifier') return true;
-        const directError = (node.namedChildren || []).some(child => child.type === 'ERROR');
+        const directError = !!directErrorNode;
         const identity = declaratorIdentity(functionDeclarator(node));
         // Stacked attribute macros (`A B extern void (*fp)(void *);`) split
         // into a fragment declaration [type_identifier, identifier,
@@ -71,7 +245,6 @@ function macroTypeRanges(tree) {
         // the missing semicolon on a bare two-identifier fragment. Blanking
         // the type re-joins the pair (the next round handles the inner
         // macro) and removes the phantom state var the fragment indexed.
-        const declaratorNode = node.childForFieldName('declarator');
         const bareFragment = declaratorNode && declaratorNode.type === 'identifier' &&
             node.namedChildCount === 2 && hasMissingChild(node);
         if (directError || bareFragment || RESERVED_TYPE_KEYWORDS.has(identity?.name)) {
@@ -79,7 +252,9 @@ function macroTypeRanges(tree) {
         }
         return true;
     });
-    return ranges;
+    return [...new Map(ranges.map(range => [
+        `${range[0]}:${range[1]}`, range,
+    ])).values()];
 }
 
 function countParseErrors(node) {
@@ -97,13 +272,94 @@ function countParseErrors(node) {
 // one-time cost per file content.
 const RECOVERY_MEMO_MAX = 8;
 const recoveryMemo = new Map();
+// C/C++ usage, test, and consistency queries revisit the same files across
+// separate operations. A recovered tree is immutable, so retain a bounded
+// content-addressed LRU per grammar instead of reparsing it for every symbol.
+// Hash keys avoid retaining a second copy of every source string. The byte
+// budget is based on source size (native tree size is not exposed); eviction
+// explicitly releases native trees rather than waiting for N-API finalizers.
+const TREE_CACHE_MAX_ENTRIES = 128;
+const TREE_CACHE_MAX_SOURCE_BYTES = 32 * 1024 * 1024;
+const treeCacheByParser = new WeakMap();
+// Replacement-list nodes are opaque leaves in the C grammars. Usage queries
+// used to traverse an entire (sometimes 100k-node) header for every requested
+// name merely to rediscover the same handful of macro definitions. Trees are
+// immutable, so retain the exact AST node set without retaining dead trees.
+const macroDefinitionsByTree = new WeakMap();
+
+function macroDefinitionNodes(tree) {
+    const cached = macroDefinitionsByTree.get(tree);
+    if (cached) return cached;
+    const definitions = [];
+    traverseTreeCached(tree.rootNode, node => {
+        if (node.type === 'preproc_function_def' || node.type === 'preproc_def') {
+            definitions.push(node);
+            return false;
+        }
+        return true;
+    });
+    macroDefinitionsByTree.set(tree, definitions);
+    return definitions;
+}
+
+function treeCacheKey(code) {
+    return `${code.length}:${createHash('sha256').update(code).digest('base64url')}`;
+}
+
+function cachedCFamilyTree(parser, key) {
+    const cache = treeCacheByParser.get(parser);
+    const entry = cache?.entries.get(key);
+    if (!entry) return null;
+    cache.entries.delete(key);
+    cache.entries.set(key, entry);
+    return entry.tree;
+}
+
+function cacheCFamilyTree(parser, key, tree, sourceBytes) {
+    let cache = treeCacheByParser.get(parser);
+    if (!cache) {
+        cache = { entries: new Map(), sourceBytes: 0 };
+        treeCacheByParser.set(parser, cache);
+    }
+    const previous = cache.entries.get(key);
+    if (previous) {
+        cache.sourceBytes -= previous.sourceBytes;
+        if (previous.tree !== tree) previous.tree.delete?.();
+        cache.entries.delete(key);
+    }
+    cache.entries.set(key, { tree, sourceBytes });
+    cache.sourceBytes += sourceBytes;
+    while (cache.entries.size > TREE_CACHE_MAX_ENTRIES ||
+        cache.sourceBytes > TREE_CACHE_MAX_SOURCE_BYTES) {
+        const oldestKey = cache.entries.keys().next().value;
+        const oldest = cache.entries.get(oldestKey);
+        cache.entries.delete(oldestKey);
+        cache.sourceBytes -= oldest.sourceBytes;
+        if (oldest.tree !== tree) oldest.tree.delete?.();
+    }
+}
 
 function parseTree(parser, code) {
+    const cacheKey = treeCacheKey(code);
+    const cached = cachedCFamilyTree(parser, cacheKey);
+    if (cached) return cached;
     const tree = safeParse(parser, code, undefined, PARSE_OPTIONS);
-    if (!tree.rootNode.hasError) return tree;
     if (recoveryMemo.has(code)) {
         const blanked = recoveryMemo.get(code);
-        return blanked === null ? tree : safeParse(parser, blanked, undefined, PARSE_OPTIONS);
+        const selected = blanked === null
+            ? tree : safeParse(parser, blanked, undefined, PARSE_OPTIONS);
+        if (selected !== tree) tree.delete?.();
+        cacheCFamilyTree(parser, cacheKey, selected, Buffer.byteLength(code));
+        return selected;
+    }
+    const initialRanges = macroTypeRanges(tree, code);
+    if (!tree.rootNode.hasError && initialRanges.length === 0) {
+        recoveryMemo.set(code, null);
+        if (recoveryMemo.size > RECOVERY_MEMO_MAX) {
+            recoveryMemo.delete(recoveryMemo.keys().next().value);
+        }
+        cacheCFamilyTree(parser, cacheKey, tree, Buffer.byteLength(code));
+        return tree;
     }
     // Non-worsening rounds may continue (blanking a stacked macro can turn a
     // MISSING token into an ERROR before the next round clears it), but a
@@ -113,19 +369,24 @@ function parseTree(parser, code) {
     let best = null;
     let bestCode = null;
     let bestErrors = countParseErrors(tree.rootNode);
-    for (let attempt = 0; attempt < 3; attempt++) {
-        const ranges = macroTypeRanges(workingTree);
+    const parsedTrees = [tree];
+    for (let attempt = 0; attempt < 8; attempt++) {
+        const ranges = attempt === 0
+            ? initialRanges : macroTypeRanges(workingTree, current);
         if (ranges.length === 0) break;
         let next = current;
         for (const [start, end] of ranges) {
             next = next.slice(0, start) + ' '.repeat(end - start) + next.slice(end);
         }
         const candidate = safeParse(parser, next, undefined, PARSE_OPTIONS);
+        parsedTrees.push(candidate);
         const errors = countParseErrors(candidate.rootNode);
         if (errors > bestErrors) break;
         current = next;
         workingTree = candidate;
-        if (errors < bestErrors) {
+        if (errors < bestErrors ||
+            (!tree.rootNode.hasError && attempt === 0 &&
+             errors === bestErrors)) {
             best = candidate;
             bestCode = next;
             bestErrors = errors;
@@ -136,7 +397,12 @@ function parseTree(parser, code) {
     if (recoveryMemo.size > RECOVERY_MEMO_MAX) {
         recoveryMemo.delete(recoveryMemo.keys().next().value);
     }
-    return best || tree;
+    const selected = best || tree;
+    for (const parsed of parsedTrees) {
+        if (parsed !== selected) parsed.delete?.();
+    }
+    cacheCFamilyTree(parser, cacheKey, selected, Buffer.byteLength(code));
+    return selected;
 }
 
 function unwrapDeclarator(node) {
@@ -165,19 +431,67 @@ function unwrapDeclarator(node) {
 
 function functionDeclarator(node) {
     if (!node) return null;
-    if (node.type === 'function_declarator') return node;
+    if (node.type === 'function_declarator' ||
+        node.type === 'operator_cast') return node;
+    if (node.type === 'template_declaration') {
+        const declaration = node.childForFieldName('declaration') ||
+            node.namedChildren.find(child =>
+                FUNCTION_CONTAINERS.has(child.type) ||
+                child.type === 'operator_cast');
+        return declaration ? functionDeclarator(declaration) : null;
+    }
     const direct = node.childForFieldName('declarator');
+    if (direct?.type === 'operator_cast') return direct;
     const unwrapped = unwrapDeclarator(direct);
     if (unwrapped) return unwrapped;
     for (const child of node.namedChildren || []) {
+        if (child.type === 'operator_cast') return child;
         const found = unwrapDeclarator(child);
         if (found) return found;
     }
     return null;
 }
 
+function canonicalCallableName(raw) {
+    const text = String(raw || '').trim();
+    if (!text.startsWith('operator')) return text;
+    const rest = text.slice('operator'.length).trim();
+    if (!rest) return 'operator';
+    if (/^(?:\(\)|\[\]|<=>|<<=?|>>=?|->\*?|[+\-*/%<>=!&|^~](?:=)?)$/
+        .test(rest)) {
+        return `operator${rest}`;
+    }
+    // Conversion operators are named by their destination type. Template
+    // arguments are instantiation detail, not source-level callable identity.
+    const destination = rest.replace(/\s*\(\).*/s, '')
+        .replace(/<.*>$/s, '').replace(/\s+/g, ' ').trim();
+    return destination ? `operator ${destination}` : 'operator';
+}
+
+function parameterListOf(node) {
+    if (!node) return null;
+    const direct = node.childForFieldName('parameters');
+    if (direct) return direct;
+    for (const child of node.namedChildren || []) {
+        if (child.type === 'parameter_list') return child;
+        const nested = parameterListOf(child);
+        if (nested) return nested;
+    }
+    return null;
+}
+
 function declaratorIdentity(declarator) {
     if (!declarator) return {};
+    if (declarator.type === 'operator_cast') {
+        const destination = declarator.childForFieldName('type') ||
+            declarator.namedChildren.find(child => TYPE_NODES.has(child.type));
+        if (!destination) return {};
+        return {
+            name: canonicalCallableName(`operator ${destination.text}`),
+            nameNode: declarator,
+            conversionType: typeName(destination),
+        };
+    }
     let node = declarator.childForFieldName('declarator') || declarator;
     while (node && (node.type.endsWith('_declarator') ||
         node.type === 'parenthesized_declarator')) {
@@ -191,13 +505,13 @@ function declaratorIdentity(declarator) {
             node.namedChildren[node.namedChildCount - 1];
         const scopeNode = node.childForFieldName('scope') || node.namedChild(0);
         return {
-            name: nameNode?.text,
+            name: canonicalCallableName(nameNode?.text),
             className: scopeNode?.text?.split('::').pop(),
             nameNode,
         };
     }
     if (IDENTIFIER_NODES.has(node.type)) {
-        return { name: node.text, nameNode: node };
+        return { name: canonicalCallableName(node.text), nameNode: node };
     }
     const named = node.namedChildren || [];
     for (let i = named.length - 1; i >= 0; i--) {
@@ -217,7 +531,33 @@ function enclosingClass(node) {
 }
 
 function enclosingClassName(node) {
-    return enclosingClass(node)?.name || null;
+    const identity = enclosingClass(node);
+    return identity?.ownerName || identity?.name || null;
+}
+
+function enclosingNamespace(node) {
+    const parts = [];
+    for (let parent = node?.parent; parent; parent = parent.parent) {
+        if (parent.type !== 'namespace_definition') continue;
+        const nameNode = parent.childForFieldName('name') ||
+            (parent.namedChildren || []).find(child =>
+                child.type === 'namespace_identifier' ||
+                child.type === 'identifier' ||
+                child.type === 'nested_namespace_specifier');
+        if (nameNode?.text) parts.unshift(nameNode.text.replace(/\s+/g, ''));
+    }
+    return parts.length > 0 ? parts.join('::') : null;
+}
+
+function cLanguageLinkage(node) {
+    for (let current = node; current; current = current.parent) {
+        if (current.type === 'linkage_specification' &&
+            /^extern\s+"C"/.test(current.text.trim())) {
+            return 'c';
+        }
+        if (current.type === 'translation_unit') break;
+    }
+    return null;
 }
 
 function classIdentity(node) {
@@ -225,7 +565,22 @@ function classIdentity(node) {
     if (!nameNode && node.parent?.type === 'type_definition') {
         nameNode = node.parent.childForFieldName('declarator');
     }
-    return nameNode ? { name: nameNode.text, node } : null;
+    if (!nameNode) return null;
+    if (nameNode.type === 'template_type') {
+        const baseNode = nameNode.childForFieldName('name') ||
+            (nameNode.namedChildren || []).find(child =>
+                child.type === 'type_identifier' ||
+                child.type === 'identifier');
+        if (baseNode?.text) {
+            return {
+                name: baseNode.text,
+                ownerName: nameNode.text,
+                node,
+                nameNode: baseNode,
+            };
+        }
+    }
+    return { name: nameNode.text, ownerName: nameNode.text, node, nameNode };
 }
 
 function modifiersOf(node, extra = []) {
@@ -239,6 +594,19 @@ function modifiersOf(node, extra = []) {
         }
     }
     return [...modifiers];
+}
+
+function isTemplateDependentCallable(node) {
+    // A callable can be dependent either because it has its own template
+    // declaration or because it is a member of a class template. Keep this as
+    // a boolean semantic fact; evaluating requires/enable_if expressions is a
+    // compiler job, but knowing that overload selection depends on template
+    // substitution lets the caller contract explain the uncertainty honestly.
+    for (let parent = node?.parent; parent; parent = parent.parent) {
+        if (parent.type === 'template_declaration') return true;
+        if (parent.type === 'translation_unit') break;
+    }
+    return false;
 }
 
 // Full type text for a NAMED parameter: the parameter's own text with the
@@ -267,7 +635,9 @@ function structuredParams(paramsNode) {
     const result = [];
     for (const param of paramsNode.namedChildren || []) {
         if (param.type !== 'parameter_declaration' &&
-            param.type !== 'optional_parameter_declaration') continue;
+            param.type !== 'optional_parameter_declaration' &&
+            param.type !== 'variadic_parameter_declaration' &&
+            param.type !== 'variadic_parameter') continue;
         const declarator = param.childForFieldName('declarator');
         const identity = declaratorIdentity(declarator);
         const typeNode = param.childForFieldName('type') ||
@@ -282,16 +652,55 @@ function structuredParams(paramsNode) {
             info.type = paramTypeText(param, identity) || typeNode.text;
         }
         if (param.type === 'optional_parameter_declaration') info.optional = true;
-        if (declarator?.type === 'variadic_declarator' || param.text.includes('...')) {
+        let declaratorCursor = declarator;
+        let variadicDeclarator = false;
+        const seenDeclarators = new Set();
+        while (declaratorCursor && !seenDeclarators.has(declaratorCursor.id)) {
+            seenDeclarators.add(declaratorCursor.id);
+            if (declaratorCursor.type === 'variadic_declarator') {
+                variadicDeclarator = true;
+                break;
+            }
+            declaratorCursor = declaratorCursor.childForFieldName('declarator') ||
+                (declaratorCursor.namedChildren || []).find(child =>
+                    child.type.endsWith('_declarator'));
+        }
+        if (param.type === 'variadic_parameter_declaration' ||
+            param.type === 'variadic_parameter' || variadicDeclarator) {
             info.rest = true;
         }
         result.push(info);
+    }
+    // tree-sitter-c/cpp represents a bare C-style `...` as anonymous
+    // punctuation rather than a named variadic parameter node. Preserve that
+    // tail explicitly so nominal arity pruning accepts calls beyond the fixed
+    // prefix (`void log(const char*, ...)`) instead of excluding every real
+    // variadic call.
+    if (!result.some(param => param.rest) &&
+        /(?:\(|,)\s*\.\.\.\s*\)$/.test(paramsNode.text)) {
+        result.push({ name: '...', rest: true });
     }
     if (result.length === 1 && result[0].name === 'void') return [];
     return result;
 }
 
 function returnTypeOf(node) {
+    const findTrailing = current => {
+        if (!current) return null;
+        if (current.type === 'trailing_return_type') {
+            const descriptor = (current.namedChildren || []).find(child =>
+                child.type === 'type_descriptor') || current.namedChild(0);
+            const type = descriptor?.childForFieldName('type') || descriptor;
+            return type?.text || null;
+        }
+        for (const child of current.namedChildren || []) {
+            const found = findTrailing(child);
+            if (found) return found;
+        }
+        return null;
+    };
+    const trailing = findTrailing(node.childForFieldName('declarator'));
+    if (trailing) return trailing;
     const typeNode = node.childForFieldName('type') ||
         node.namedChildren.find(child => TYPE_NODES.has(child.type));
     if (!typeNode) return null;
@@ -319,7 +728,7 @@ function memberFromNode(node, className, access, lines, mode) {
     if (!declarator) return null;
     const identity = declaratorIdentity(declarator);
     if (!identity.name) return null;
-    const paramsNode = declarator.childForFieldName('parameters');
+    const paramsNode = parameterListOf(declarator);
     const { startLine, endLine, indent } = nodeToLocation(node, lines);
     const isConstructor = mode === 'cpp' &&
         (identity.name === className || identity.name === `~${className}`);
@@ -329,15 +738,29 @@ function memberFromNode(node, className, access, lines, mode) {
         name: identity.name,
         params: paramsNode ? paramsNode.text.replace(/^\(|\)$/g, '').trim() : '...',
         paramsStructured: structuredParams(paramsNode),
-        returnType: isConstructor ? null : returnTypeOf(node),
+        returnType: isConstructor ? null :
+            (identity.conversionType || returnTypeOf(node)),
         startLine,
         endLine,
+        ...(identity.nameNode?.startPosition.row + 1 !== startLine && {
+            nameLine: identity.nameNode.startPosition.row + 1,
+        }),
         indent,
         modifiers,
         memberType: isConstructor ? 'constructor' : 'method',
         isMethod: true,
         isConstructor,
+        ...(enclosingNamespace(node) && {
+            namespace: enclosingNamespace(node),
+        }),
         className,
+        ...(mode === 'cpp' && isTemplateDependentCallable(node) && {
+            templateDependent: true,
+        }),
+        ...(mode === 'cpp' && cLanguageLinkage(node) && {
+            linkage: cLanguageLinkage(node),
+        }),
+        ...(node.type !== 'function_definition' && { isSignature: true }),
         docstring: extractJSDocstring(lines, startLine),
     };
 }
@@ -379,7 +802,8 @@ function classMembers(node, lines, mode) {
             continue;
         }
         if (CLASS_NODES.has(child.type)) continue;
-        const member = memberFromNode(child, identity.name, access, lines, mode);
+        const member = memberFromNode(
+            child, identity.ownerName || identity.name, access, lines, mode);
         if (member) members.push(member);
         else members.push(...fieldMembers(child, access, lines));
     }
@@ -412,9 +836,15 @@ function typedefEntries(node, lines) {
             type: 'type',
             startLine,
             endLine,
+            ...(identity.nameNode?.startPosition.row + 1 !== startLine && {
+                nameLine: identity.nameNode.startPosition.row + 1,
+            }),
             indent,
             modifiers: ['public'],
             members: [],
+            ...(enclosingNamespace(node) && {
+                namespace: enclosingNamespace(node),
+            }),
             ...(aliasOf && aliasOf !== identity.name && { aliasOf }),
             docstring: extractJSDocstring(lines, startLine),
         });
@@ -439,6 +869,35 @@ function findClasses(code, parser, mode) {
     });
     const forwardDeclared = new Set();
     traverseTreeCached(tree.rootNode, node => {
+        if (mode === 'cpp' && node.type === 'alias_declaration') {
+            const nameNode = node.childForFieldName('name') ||
+                node.namedChildren.find(child =>
+                    child.type === 'type_identifier' ||
+                    child.type === 'identifier');
+            const valueNode = node.childForFieldName('type') ||
+                node.namedChildren.find(child =>
+                    child !== nameNode &&
+                    (child.type === 'type_descriptor' ||
+                     TYPE_NODES.has(child.type)));
+            if (!nameNode?.text) return false;
+            const { startLine, endLine, indent } =
+                nodeToLocation(node, lines);
+            classes.push({
+                name: nameNode.text,
+                type: 'type',
+                startLine,
+                endLine,
+                indent,
+                modifiers: ['public'],
+                members: [],
+                ...(enclosingNamespace(node) && {
+                    namespace: enclosingNamespace(node),
+                }),
+                ...(valueNode?.text && { aliasOf: valueNode.text }),
+                docstring: extractJSDocstring(lines, startLine),
+            });
+            return false;
+        }
         if (node.type === 'type_definition') {
             classes.push(...typedefEntries(node, lines));
             return true; // descend — the inner specifier may be a named class
@@ -474,12 +933,21 @@ function findClasses(code, parser, mode) {
         }
         classes.push({
             name: identity.name,
+            ...(identity.ownerName !== identity.name && {
+                specialization: identity.ownerName,
+            }),
             type,
             startLine,
             endLine,
+            ...(identity.nameNode?.startPosition.row + 1 !== startLine && {
+                nameLine: identity.nameNode.startPosition.row + 1,
+            }),
             indent,
             modifiers: [...new Set(modifiers)],
             members: classMembers(node, lines, mode),
+            ...(enclosingNamespace(node) && {
+                namespace: enclosingNamespace(node),
+            }),
             ...(bases.length > 0 && { extends: bases.join(', ') }),
             docstring: extractJSDocstring(lines, startLine),
         });
@@ -504,7 +972,7 @@ function findFunctions(code, parser, mode) {
         const key = `${node.startIndex}:${identity.name}`;
         if (seen.has(key)) return false;
         seen.add(key);
-        const paramsNode = declarator.childForFieldName('parameters');
+        const paramsNode = parameterListOf(declarator);
         const { startLine, endLine, indent } = nodeToLocation(node, lines);
         const isConstructor = mode === 'cpp' && !!identity.className &&
             (identity.name === identity.className || identity.name === `~${identity.className}`);
@@ -514,15 +982,28 @@ function findFunctions(code, parser, mode) {
             name: identity.name,
             params: paramsNode ? paramsNode.text.replace(/^\(|\)$/g, '').trim() : '...',
             paramsStructured: structuredParams(paramsNode),
-            returnType: isConstructor ? null : returnTypeOf(node),
+            returnType: isConstructor ? null :
+                (identity.conversionType || returnTypeOf(node)),
             startLine,
             endLine,
+            ...(identity.nameNode?.startPosition.row + 1 !== startLine && {
+                nameLine: identity.nameNode.startPosition.row + 1,
+            }),
             indent,
             modifiers,
+            ...(enclosingNamespace(node) && {
+                namespace: enclosingNamespace(node),
+            }),
             ...(identity.className && {
                 className: identity.className,
                 receiver: identity.className,
                 isMethod: true,
+            }),
+            ...(mode === 'cpp' && isTemplateDependentCallable(node) && {
+                templateDependent: true,
+            }),
+            ...(mode === 'cpp' && cLanguageLinkage(node) && {
+                linkage: cLanguageLinkage(node),
             }),
             ...(isConstructor && { isConstructor: true }),
             ...(node.type !== 'function_definition' && { isSignature: true }),
@@ -601,6 +1082,9 @@ function enclosingFunctionOf(node) {
                 name: identity.name,
                 startLine: parent.startPosition.row + 1,
                 endLine: parent.endPosition.row + 1,
+                ...(identity.className && {
+                    className: identity.className,
+                }),
             } : null;
         }
     }
@@ -612,26 +1096,151 @@ function typeName(node) {
     let text = node.text;
     text = text.replace(/\b(const|volatile|struct|class|typename)\b/g, '').trim();
     text = text.replace(/[*&]+/g, '').trim();
+    // Strip template arguments before splitting namespace qualifiers.
+    // `dynamic_store<fmt::context<Char>>` contains `::` inside its template
+    // arguments; splitting first produced the bogus receiver type
+    // `context>` and discarded otherwise compiler-visible ownership.
+    const templateStart = text.indexOf('<');
+    if (templateStart >= 0) text = text.slice(0, templateStart).trim();
     const parts = text.split(/::/);
-    return parts[parts.length - 1].replace(/<.*>$/, '').trim() || null;
+    return parts[parts.length - 1].trim() || null;
 }
 
+function variableBindingScope(node) {
+    const parameter = node.type === 'parameter_declaration';
+    for (let parent = node.parent; parent; parent = parent.parent) {
+        if (parameter && parent.type === 'function_definition') return parent;
+        if (!parameter && (parent.type === 'compound_statement' ||
+            parent.type === 'translation_unit')) {
+            return parent;
+        }
+    }
+    return treeRoot(node);
+}
+
+function treeRoot(node) {
+    let current = node;
+    while (current?.parent) current = current.parent;
+    return current;
+}
+
+function variableDeclarators(node) {
+    if (node.type === 'parameter_declaration') {
+        const declarator = node.childForFieldName('declarator');
+        return declarator ? [declarator] : [];
+    }
+    // An initializer can contain a call expression whose nested syntax looks
+    // declarator-like to the generic recursive probe. The declaration itself
+    // is still unequivocally a value binding (`T value = factory()`), so keep
+    // its init_declarator before asking whether the outer node is callable.
+    const initialized = (node.namedChildren || []).filter(child =>
+        child.type === 'init_declarator');
+    if (initialized.length > 0) return initialized;
+    if (functionDeclarator(node)) return [];
+    return (node.namedChildren || []).filter(child =>
+        child.type !== 'attribute_specifier' &&
+        !TYPE_NODES.has(child.type));
+}
+
+/**
+ * Scope- and position-aware declared-type bindings.
+ *
+ * A file-global Map is unsound for C/C++: a later `auto specs` in an
+ * unrelated function used to overwrite an earlier `format_specs specs`
+ * parameter, changing every receiver in the file. Bindings are instead
+ * selected from scopes containing the use, with the nearest scope and latest
+ * preceding declaration winning. `auto` deliberately contributes no static
+ * type; assigned-call return flow handles it separately.
+ */
 function buildVariableTypes(tree) {
-    const map = new Map();
+    const bindings = [];
+    // tree-sitter must preserve C++'s most-vexing-parse ambiguity and can
+    // represent `T value(factory())` as a block-scope function declarator.
+    // A later `value.method()` use proves that spelling denotes an object in
+    // compiling code: a function declaration cannot be a member receiver.
+    // Record only those use-proven direct initializers, never every ambiguous
+    // block declaration.
+    const memberReceiverUses = [];
     traverseTree(tree.rootNode, node => {
-        if (node.type === 'parameter_declaration' || node.type === 'declaration') {
-            const typeNode = node.childForFieldName('type') ||
-                node.namedChildren.find(child => TYPE_NODES.has(child.type));
-            const declarator = node.childForFieldName('declarator') ||
-                node.namedChildren.find(child => child.type.endsWith('_declarator') ||
-                    child.type === 'identifier');
-            const identity = declaratorIdentity(declarator);
-            const type = typeName(typeNode);
-            if (identity.name && type) map.set(identity.name, type);
+        if (node.type !== 'field_expression') return true;
+        const argument = node.childForFieldName('argument') || node.namedChild(0);
+        if (argument?.type === 'identifier') {
+            memberReceiverUses.push({ name: argument.text, at: argument.startIndex });
         }
         return true;
     });
-    return map;
+    traverseTree(tree.rootNode, node => {
+        if (node.type !== 'parameter_declaration' && node.type !== 'declaration') {
+            return true;
+        }
+        const typeNode = node.childForFieldName('type') ||
+            (node.namedChildren || []).find(child => TYPE_NODES.has(child.type));
+        const type = typeName(typeNode);
+        if (!type || type === 'auto') return true;
+        const pointeeType = (() => {
+            const raw = String(typeNode?.text || '')
+                .replace(/\b(const|volatile|class|struct|typename)\b/g, '')
+                .trim();
+            const match = raw.match(
+                /^(?:std\s*::\s*)?(?:unique_ptr|shared_ptr|auto_ptr)\s*<\s*(.+)\s*>$/s);
+            if (!match) return undefined;
+            let depth = 0;
+            for (const character of match[1]) {
+                if (character === '<') depth++;
+                else if (character === '>') depth--;
+                else if (character === ',' && depth === 0) return undefined;
+            }
+            return typeName({ text: match[1] }) || undefined;
+        })();
+        const scope = variableBindingScope(node);
+        let declarators = variableDeclarators(node);
+        if (declarators.length === 0 && node.type === 'declaration' &&
+            node.parent?.type === 'compound_statement') {
+            const direct = node.childForFieldName('declarator');
+            const identity = direct?.type === 'function_declarator'
+                ? declaratorIdentity(direct) : null;
+            if (identity?.name && memberReceiverUses.some(use =>
+                use.name === identity.name &&
+                use.at > direct.endIndex &&
+                scope.startIndex <= use.at && use.at < scope.endIndex)) {
+                declarators = [direct];
+            }
+        }
+        for (const declarator of declarators) {
+            const identity = declaratorIdentity(declarator);
+            if (!identity.name) continue;
+            bindings.push({
+                name: identity.name,
+                type,
+                ...(pointeeType && { pointeeType }),
+                declaredAt: node.type === 'parameter_declaration'
+                    ? scope.startIndex : declarator.startIndex,
+                scopeStart: scope.startIndex,
+                scopeEnd: scope.endIndex,
+            });
+        }
+        return true;
+    });
+    const resolveBinding = (name, atNode) => {
+        if (!name || !atNode) return undefined;
+        const at = atNode.startIndex;
+        const candidates = bindings.filter(binding =>
+            binding.name === name &&
+            binding.scopeStart <= at && at < binding.scopeEnd &&
+            binding.declaredAt <= at);
+        candidates.sort((a, b) => {
+            const aSpan = a.scopeEnd - a.scopeStart;
+            const bSpan = b.scopeEnd - b.scopeStart;
+            return aSpan - bSpan || b.declaredAt - a.declaredAt;
+        });
+        return candidates[0];
+    };
+    return {
+        get: (name, atNode) => resolveBinding(name, atNode)?.type,
+        getPointee: (name, atNode) =>
+            resolveBinding(name, atNode)?.pointeeType,
+        has: (name, atNode) => resolveBinding(name, atNode) !== undefined,
+    };
 }
 
 function buildFieldTypes(tree) {
@@ -655,15 +1264,129 @@ function buildFieldTypes(tree) {
     return map;
 }
 
-function callArguments(node) {
+function stringLiteralKind(node) {
+    const text = node?.text || '';
+    if (text.startsWith('L"') || text.startsWith('LR"')) {
+        return 'string:wchar_t';
+    }
+    if (text.startsWith('u8"') || text.startsWith('u8R"')) {
+        return 'string:char8_t';
+    }
+    if (text.startsWith('u"') || text.startsWith('uR"')) {
+        return 'string:char16_t';
+    }
+    if (text.startsWith('U"') || text.startsWith('UR"')) {
+        return 'string:char32_t';
+    }
+    return 'string:char';
+}
+
+function literalPrefixKind(node, base) {
+    const text = node?.text || '';
+    if (text.startsWith('L')) return `${base}:wchar_t`;
+    if (text.startsWith('u8')) return `${base}:char8_t`;
+    if (text.startsWith('u')) return `${base}:char16_t`;
+    if (text.startsWith('U')) return `${base}:char32_t`;
+    return `${base}:char`;
+}
+
+/**
+ * Compiler-visible argument shape for conservative C++ overload pruning.
+ *
+ * Every branch starts from an AST-classified expression node. Text is used
+ * only to distinguish literal prefixes/suffixes or recover the type spelling
+ * carried by that node; unknown expressions deliberately stay `expr`.
+ */
+function staticArgumentKind(node, variableTypes) {
+    if (!node) return 'expr';
+    if (node.type === 'parenthesized_expression') {
+        return staticArgumentKind(node.namedChild(0), variableTypes);
+    }
+    if (node.type === 'string_literal' || node.type === 'raw_string_literal') {
+        return stringLiteralKind(node);
+    }
+    if (node.type === 'concatenated_string') {
+        const parts = (node.namedChildren || [])
+            .filter(child => child.type === 'string_literal' ||
+                child.type === 'raw_string_literal')
+            .map(stringLiteralKind);
+        return parts.length > 0 && parts.every(kind => kind === parts[0])
+            ? parts[0] : 'expr';
+    }
+    if (node.type === 'char_literal') {
+        return literalPrefixKind(node, 'char');
+    }
+    if (node.type === 'number_literal') {
+        const text = node.text || '';
+        const floating = text.includes('.') ||
+            /[pP][+-]?[0-9]/.test(text) ||
+            /[eE][+-]?[0-9]/.test(text) ||
+            /[fF]$/.test(text);
+        return floating ? 'number:floating' : 'number:integer';
+    }
+    if (node.type === 'true' || node.type === 'false') return 'bool';
+    if (node.type === 'null' || node.type === 'nullptr') return 'null';
+    if (node.type === 'identifier') {
+        const type = variableTypes?.get(node.text, node);
+        return type ? `type:${type}` : 'expr';
+    }
+    if (node.type === 'compound_literal_expression') {
+        const typeNode = node.childForFieldName('type') ||
+            (node.namedChildren || []).find(child =>
+                TYPE_NODES.has(child.type) || child.type === 'type_descriptor');
+        const type = typeName(typeNode);
+        return type ? `type:${type}` : 'expr';
+    }
+    if (node.type === 'new_expression') {
+        const typeNode = node.childForFieldName('type') ||
+            (node.namedChildren || []).find(child =>
+                TYPE_NODES.has(child.type) || child.type === 'type_descriptor');
+        const type = typeName(typeNode);
+        return type ? `type:${type}` : 'expr';
+    }
+    if (node.type === 'cast_expression') {
+        const typeNode = node.childForFieldName('type') ||
+            (node.namedChildren || []).find(child =>
+                TYPE_NODES.has(child.type) || child.type === 'type_descriptor');
+        const type = typeName(typeNode);
+        return type ? `type:${type}` : 'expr';
+    }
+    if (node.type === 'call_expression') {
+        const fnNode = node.childForFieldName('function');
+        const identity = callIdentity(fnNode);
+        if (identity.name === 'static_cast' || identity.name === 'dynamic_cast' ||
+            identity.name === 'const_cast' || identity.name === 'reinterpret_cast') {
+            const typeNode = fnNode?.childForFieldName('type') ||
+                (fnNode?.namedChildren || []).find(child =>
+                    child.type === 'type_descriptor' || TYPE_NODES.has(child.type));
+            const type = typeName(typeNode);
+            if (type) return `type:${type}`;
+        }
+        return identity.name ? `call:${identity.name}` : 'expr';
+    }
+    return 'expr';
+}
+
+function callArguments(node, variableTypes) {
     const args = node.childForFieldName('arguments');
-    if (!args) return { argCount: 0 };
+    if (!args) return { argCount: 0, argKinds: [] };
     const values = args.namedChildren.filter(child => !child.type.endsWith('comment'));
-    return { argCount: values.length, firstArg: values[0] };
+    return {
+        argCount: values.length,
+        argKinds: values.map(value => staticArgumentKind(value, variableTypes)),
+        firstArg: values[0],
+    };
 }
 
 function callIdentity(fnNode) {
     if (!fnNode) return {};
+    if (fnNode.type === 'type_descriptor') {
+        return callIdentity(fnNode.childForFieldName('type') ||
+            fnNode.namedChild(0));
+    }
+    if (fnNode.type === 'parenthesized_expression') {
+        return callIdentity(fnNode.namedChild(0));
+    }
     if (IDENTIFIER_NODES.has(fnNode.type)) {
         return { name: fnNode.text, nameNode: fnNode, isMethod: false };
     }
@@ -676,72 +1399,288 @@ function callIdentity(fnNode) {
             nameNode,
             isMethod: true,
             receiver: receiverNode?.text,
+            receiverNode,
+            pointerAccess: (fnNode.children || []).some(child =>
+                child.type === '->'),
         };
     }
     if (fnNode.type === 'qualified_identifier') {
-        const nameNode = fnNode.childForFieldName('name') ||
+        const rawNameNode = fnNode.childForFieldName('name') ||
             fnNode.namedChildren[fnNode.namedChildCount - 1];
         const scopeNode = fnNode.childForFieldName('scope') || fnNode.namedChild(0);
+        const globalQualified = fnNode.text.startsWith('::') &&
+            (!scopeNode || scopeNode === rawNameNode);
+        if (globalQualified) {
+            return {
+                name: rawNameNode?.text,
+                nameNode: rawNameNode,
+                isMethod: false,
+                isPathCall: true,
+                globalQualified: true,
+            };
+        }
+        const nested = rawNameNode?.type === 'template_function' ||
+            rawNameNode?.type === 'qualified_identifier'
+            ? callIdentity(rawNameNode) : null;
         return {
-            name: nameNode?.text,
-            nameNode,
+            name: nested?.name || rawNameNode?.text,
+            nameNode: nested?.nameNode || rawNameNode,
             isMethod: true,
-            receiver: scopeNode?.text,
+            receiver: nested?.receiver
+                ? `${scopeNode?.text}::${nested.receiver}`
+                : scopeNode?.text,
             isPathCall: true,
+            ...(nested?.explicitTemplateCall && { explicitTemplateCall: true }),
         };
     }
-    if (fnNode.type === 'template_function') {
-        return callIdentity(fnNode.childForFieldName('name') || fnNode.namedChild(0));
+    if (fnNode.type === 'template_function' || fnNode.type === 'template_type') {
+        const nested = callIdentity(
+            fnNode.childForFieldName('name') || fnNode.namedChild(0));
+        return {
+            ...nested,
+            explicitTemplateCall: true,
+        };
     }
     return {};
 }
 
-function findCallsInCode(code, parser) {
-    const tree = parseTree(parser, code);
+function compileTimeOnlyContext(node) {
+    for (let current = node?.parent; current; current = current.parent) {
+        // `decltype(f())` forms a compile-time dependency but never executes
+        // `f`. Keep it visible to impact analysis without presenting it as a
+        // runtime caller. Stop at the nearest callable so an outer declaration
+        // cannot accidentally classify calls inside a nested function body.
+        if (current.type === 'decltype') return 'decltype';
+        if (current.type === 'function_definition' ||
+            current.type === 'lambda_expression') return null;
+    }
+    return null;
+}
+
+function recoveredExplicitCallOperator(node, variableTypes) {
+    if (node?.type === 'ERROR') {
+        const operatorNode = (node.namedChildren || []).find(child =>
+            child.type === 'operator_name' && child.text === 'operator()');
+        const tokens = new Set((node.children || [])
+            .filter(child => !child.isNamed).map(child => child.type));
+        const named = node.namedChildren || [];
+        const operatorIndex = named.indexOf(operatorNode);
+        const templateType = named[operatorIndex + 1];
+        const hasTemplateType = TYPE_NODES.has(templateType?.type) ||
+            templateType?.type === 'type_descriptor';
+        if (!operatorNode || !hasTemplateType ||
+            !tokens.has('<') || !tokens.has('>') ||
+            !tokens.has('(') || !tokens.has(')')) return null;
+        const values = named.slice(operatorIndex + 2);
+        return {
+            name: 'operator()',
+            line: operatorNode.startPosition.row + 1,
+            column: operatorNode.startPosition.column,
+            isMethod: false,
+            explicitTemplateCall: true,
+            argCount: values.length,
+            argKinds: values.map(value =>
+                staticArgumentKind(value, variableTypes)),
+            enclosingFunction: enclosingFunctionOf(node),
+        };
+    }
+    if (node?.type !== 'binary_expression') return null;
+    const left = node.childForFieldName('left') || node.namedChild(0);
+    const right = node.childForFieldName('right') ||
+        node.namedChildren[node.namedChildCount - 1];
+    if (left?.type !== 'call_expression' || !right) return null;
+    const functionNode = left.childForFieldName('function');
+    const argumentNode = left.childForFieldName('arguments');
+    if (functionNode?.type !== 'identifier' ||
+        functionNode.text !== 'operator' ||
+        (argumentNode?.namedChildCount || 0) !== 0) return null;
+    const errorNode = (node.namedChildren || []).find(
+        child => child.type === 'ERROR');
+    const hasTemplateType = (errorNode?.namedChildren || []).some(child =>
+        TYPE_NODES.has(child.type) || child.type === 'type_descriptor');
+    const errorTokens = new Set((errorNode?.children || [])
+        .filter(child => !child.isNamed).map(child => child.type));
+    const binaryTokens = new Set((node.children || [])
+        .filter(child => !child.isNamed).map(child => child.type));
+    // tree-sitter-cpp 0.23 recovers `operator()<T>(value)` as
+    // `(operator()) < ERROR[T>( value`. This exact AST recovery shape is
+    // stronger than a text fallback and prevents the call from disappearing.
+    if (!hasTemplateType || !binaryTokens.has('<') ||
+        !errorTokens.has('>') || !errorTokens.has('(')) return null;
+    const values = commaExpressionValues(right);
+    return {
+        name: 'operator()',
+        line: functionNode.startPosition.row + 1,
+        column: functionNode.startPosition.column,
+        isMethod: false,
+        explicitTemplateCall: true,
+        argCount: values.length,
+        argKinds: values.map(value =>
+            staticArgumentKind(value, variableTypes)),
+        enclosingFunction: enclosingFunctionOf(node),
+    };
+}
+
+function commaExpressionValues(node) {
+    if (!node) return [];
+    if (node.type !== 'comma_expression') return [node];
+    const left = node.childForFieldName('left') || node.namedChild(0);
+    const right = node.childForFieldName('right') || node.namedChild(1);
+    return [...commaExpressionValues(left), ...commaExpressionValues(right)];
+}
+
+function assignmentTargetOf(callNode) {
+    let value = callNode;
+    let parent = value.parent;
+    while (parent?.type === 'parenthesized_expression') {
+        value = parent;
+        parent = parent.parent;
+    }
+    if (parent?.type === 'init_declarator' &&
+        sameNode(parent.childForFieldName('value'), value)) {
+        const identity = declaratorIdentity(parent.childForFieldName('declarator'));
+        return identity.name || null;
+    }
+    if (parent?.type === 'assignment_expression' &&
+        sameNode(parent.childForFieldName('right'), value)) {
+        const left = parent.childForFieldName('left');
+        return left?.type === 'identifier' ? left.text : null;
+    }
+    return null;
+}
+
+function fieldReceiverPath(node) {
+    if (!node) return null;
+    if (node.type === 'parenthesized_expression') {
+        return fieldReceiverPath(node.namedChild(0));
+    }
+    if (node.type === 'identifier' || node.type === 'this') {
+        return { root: node.text, fields: [] };
+    }
+    if (node.type !== 'field_expression') return null;
+    const argument = node.childForFieldName('argument') || node.namedChild(0);
+    const field = node.childForFieldName('field') ||
+        node.namedChildren[node.namedChildCount - 1];
+    const base = fieldReceiverPath(argument);
+    if (!base || !field?.text) return null;
+    return { root: base.root, fields: [...base.fields, field.text] };
+}
+
+function findCallsInCode(code, parser, _options = {}, existingTree = null,
+    includeMacroBodies = true) {
+    const tree = existingTree || parseTree(parser, code);
     const variableTypes = buildVariableTypes(tree);
     const fieldTypes = buildFieldTypes(tree);
     const calls = [];
     traverseTree(tree.rootNode, node => {
+        const recoveredOperator = recoveredExplicitCallOperator(
+            node, variableTypes);
+        if (recoveredOperator) {
+            calls.push(recoveredOperator);
+            return true;
+        }
         if (node.type === 'call_expression') {
+            if (recoveredExplicitCallOperator(node.parent, variableTypes)) {
+                return true;
+            }
             const functionNode = node.childForFieldName('function');
             const identity = callIdentity(functionNode);
             if (!identity.name) return true;
-            const args = callArguments(node);
+            const args = callArguments(node, variableTypes);
             const first = extractStringArg(args.firstArg);
-            const receiverBase = identity.receiver?.split(/[.>]/)[0];
-            const owner = enclosingClassName(node);
-            const receiverNode = functionNode?.type === 'field_expression'
-                ? functionNode.childForFieldName('argument') || functionNode.namedChild(0)
-                : null;
-            let receiverField = null;
-            if (owner && receiverNode?.type === 'field_expression') {
-                const root = receiverNode.childForFieldName('argument') || receiverNode.namedChild(0);
-                const field = receiverNode.childForFieldName('field') ||
-                    receiverNode.namedChildren[receiverNode.namedChildCount - 1];
-                if (root?.type === 'this' && field?.text &&
-                    fieldTypes.has(`${owner}.${field.text}`)) {
-                    receiverField = field.text;
+            const enclosingFunction = enclosingFunctionOf(node);
+            const owner = enclosingClassName(node) ||
+                enclosingFunction?.className;
+            const receiverNode = identity.receiverNode ||
+                (functionNode?.type === 'field_expression'
+                    ? functionNode.childForFieldName('argument') || functionNode.namedChild(0)
+                    : null);
+            let receiverCall;
+            let receiverCallIsMethod = false;
+            let receiverCallReceiver;
+            let receiverCallLine;
+            let receiverCallStart;
+            let receiverCallEnd;
+            if (receiverNode?.type === 'call_expression') {
+                const producerNode = receiverNode.childForFieldName('function');
+                const producer = callIdentity(producerNode);
+                if (producer.name) {
+                    receiverCall = producer.name;
+                    receiverCallIsMethod = producer.isMethod;
+                    receiverCallReceiver = producer.isPathCall
+                        ? producer.receiver : undefined;
+                    receiverCallLine = producer.nameNode?.startPosition.row + 1 ||
+                        receiverNode.startPosition.row + 1;
+                    receiverCallStart = receiverNode.startIndex;
+                    receiverCallEnd = receiverNode.endIndex;
                 }
-            } else if (owner && receiverNode?.type === 'identifier' &&
-                !variableTypes.has(receiverNode.text) &&
-                fieldTypes.has(`${owner}.${receiverNode.text}`)) {
-                receiverField = receiverNode.text;
             }
+            const receiverPath = fieldReceiverPath(receiverNode);
+            let receiverRoot = receiverPath?.root;
+            let receiverFields = receiverPath?.fields || [];
+            let receiverRootType = receiverRoot
+                ? ((identity.pointerAccess && receiverFields.length === 0
+                    ? variableTypes.getPointee(receiverRoot, node) : undefined) ||
+                   variableTypes.get(receiverRoot, node))
+                : undefined;
+            // A bare field inside a member function is implicitly rooted at
+            // `this`; keep that field path so declared-field resolution can
+            // type it without mistaking it for an unrelated local.
+            if (owner && receiverNode?.type === 'identifier' &&
+                !receiverRootType &&
+                (fieldTypes.has(`${owner}.${receiverNode.text}`) ||
+                 !variableTypes.get(receiverNode.text, node))) {
+                receiverRoot = 'this';
+                receiverFields = [receiverNode.text];
+                receiverRootType = owner;
+            }
+            if (receiverRoot === 'this' && !receiverRootType) {
+                receiverRootType = owner || undefined;
+            }
+            const directReceiverType = receiverPath &&
+                receiverFields.length === 0 && receiverRoot
+                ? ((identity.pointerAccess
+                    ? variableTypes.getPointee(receiverRoot, node) : undefined) ||
+                   variableTypes.get(receiverRoot, node))
+                : undefined;
+            const assignedTo = assignmentTargetOf(node);
+            const compileTimeOnly = compileTimeOnlyContext(node);
             calls.push({
                 name: identity.name,
                 line: identity.nameNode?.startPosition.row + 1 || node.startPosition.row + 1,
+                column: identity.nameNode?.startPosition.column,
+                callStart: node.startIndex,
+                callEnd: node.endIndex,
                 isMethod: identity.isMethod,
                 ...(identity.receiver && { receiver: identity.receiver }),
                 ...(identity.isPathCall && { isPathCall: true }),
-                ...(receiverBase && variableTypes.has(receiverBase) &&
-                    { receiverType: variableTypes.get(receiverBase) }),
-                ...(receiverField && {
-                    receiverRoot: 'this',
-                    receiverField,
-                    receiverRootType: owner,
+                ...(identity.globalQualified && { globalQualified: true }),
+                ...(identity.explicitTemplateCall && {
+                    explicitTemplateCall: true,
                 }),
+                ...(compileTimeOnly && { compileTimeOnly }),
+                ...(directReceiverType && { receiverType: directReceiverType }),
+                ...(receiverCall && {
+                    receiverCall,
+                    receiverIsChainRoot: true,
+                    receiverCallLine,
+                    receiverCallStart,
+                    receiverCallEnd,
+                    ...(receiverCallIsMethod && {
+                        receiverCallIsMethod: true,
+                    }),
+                    ...(receiverCallReceiver && { receiverCallReceiver }),
+                }),
+                ...(receiverFields.length > 0 && receiverRoot && {
+                    receiverRoot,
+                    receiverField: receiverFields[0],
+                    receiverFields,
+                    ...(receiverRootType && { receiverRootType }),
+                }),
+                ...(assignedTo && { assignedTo }),
                 argCount: args.argCount,
-                enclosingFunction: enclosingFunctionOf(node),
+                argKinds: args.argKinds,
+                enclosingFunction,
                 ...(first && {
                     firstStringArg: first.value,
                     firstStringArgInterp: first.interp,
@@ -749,26 +1688,141 @@ function findCallsInCode(code, parser) {
             });
             return true;
         }
+        if (node.type === 'cast_expression') {
+            // tree-sitter-cpp parses parenthesized function-template
+            // invocation (`(PrintSmartPointer<T>)(p, os, 0)`) as a cast whose
+            // "type" is the template callable. This is still an AST-proven
+            // callable expression: require the exact type-descriptor +
+            // parenthesized-value shape and recover its base/path identity.
+            const typeNode = node.childForFieldName('type');
+            const valueNode = node.childForFieldName('value');
+            if (typeNode?.type === 'type_descriptor' &&
+                valueNode?.type === 'parenthesized_expression') {
+                const identity = callIdentity(typeNode);
+                if (identity.name) {
+                    const expression = valueNode.namedChild(0);
+                    const values = commaExpressionValues(expression);
+                    calls.push({
+                        name: identity.name,
+                        line: identity.nameNode?.startPosition.row + 1 ||
+                            node.startPosition.row + 1,
+                        column: identity.nameNode?.startPosition.column,
+                        isMethod: identity.isMethod,
+                        ...(identity.receiver && { receiver: identity.receiver }),
+                        ...(identity.isPathCall && { isPathCall: true }),
+                        argCount: values.length,
+                        argKinds: values.map(value =>
+                            staticArgumentKind(value, variableTypes)),
+                        enclosingFunction: enclosingFunctionOf(node),
+                    });
+                    return false;
+                }
+            }
+        }
         if (node.type === 'new_expression') {
             const typeNode = node.childForFieldName('type') ||
                 node.namedChildren.find(child => child.type === 'type_identifier' ||
                     child.type === 'qualified_identifier');
             if (!typeNode) return true;
-            const args = callArguments(node);
+            const args = callArguments(node, variableTypes);
             const name = typeName(typeNode);
             if (name) {
                 calls.push({
                     name,
                     line: typeNode.startPosition.row + 1,
+                    column: typeNode.startPosition.column,
                     isMethod: false,
                     isConstructor: true,
                     argCount: args.argCount,
+                    argKinds: args.argKinds,
                     enclosingFunction: enclosingFunctionOf(node),
                 });
             }
         }
         return true;
     });
+    if (includeMacroBodies) calls.push(...findMacroBodyCalls(tree, code, parser));
+    return calls;
+}
+
+/**
+ * Parse C/C++ replacement lists as executable syntax without treating the
+ * preprocessor's opaque `preproc_arg` token as text evidence. Tree-sitter does
+ * not descend into replacement lists, so wrap each AST-identified value in a
+ * synthetic function body and parse it with the same grammar. The wrapper and
+ * line-splice blanking preserve a deterministic mapping back to source.
+ *
+ * Calls through macro parameters (`#define APPLY(fn, x) fn(x)`) are retained
+ * for conservation but marked as lexical parameter dispatch; they must never
+ * resolve to an unrelated project function that happens to share `fn`'s name.
+ */
+function findMacroBodyCalls(tree, code, parser, onlyName = null) {
+    const calls = [];
+    for (const node of macroDefinitionNodes(tree)) {
+        const nameNode = node.childForFieldName('name') ||
+            (node.namedChildren || []).find(child => child.type === 'identifier');
+        const valueNode = node.childForFieldName('value') ||
+            (node.namedChildren || []).find(child => child.type === 'preproc_arg');
+        if (!nameNode || !valueNode || !valueNode.text.trim()) continue;
+        // Usage queries ask about one identifier. Avoid reparsing every macro
+        // in every scanned file; the cheap prefilter only skips replacement
+        // lists that cannot possibly produce the requested AST name.
+        if (onlyName && !valueNode.text.includes(onlyName)) continue;
+        const paramsNode = node.childForFieldName('parameters') ||
+            (node.namedChildren || []).find(child => child.type === 'preproc_params');
+        const parameters = new Set((paramsNode?.namedChildren || [])
+            .filter(child => child.type === 'identifier')
+            .map(child => child.text));
+        // Replace only the continuation backslash. Keeping the newline and
+        // every other byte makes source-line/column and span remapping exact.
+        const body = valueNode.text.replace(/\\(?=\r?\n)/g, ' ');
+        const prefix = 'void __ucn_macro_body__(void) {\n';
+        const synthetic = `${prefix}${body}\n;}`;
+        // Synthetic replacement-list wrappers are one-shot parse inputs. Do
+        // not put hundreds of tiny trees in the full-source recovery LRU:
+        // that evicted large project headers and made every later agent query
+        // recover them again. Extract the immutable records, then explicitly
+        // release this native tree.
+        const nestedTree = safeParse(parser, synthetic, undefined, PARSE_OPTIONS);
+        let nested;
+        try {
+            nested = findCallsInCode(synthetic, parser, {}, nestedTree, false);
+        } finally {
+            nestedTree.delete?.();
+        }
+        for (const call of nested) {
+            if (call.line < 2) continue;
+            const line = valueNode.startPosition.row + call.line - 1;
+            const column = call.line === 2
+                ? valueNode.startPosition.column + (call.column || 0)
+                : call.column;
+            const callStart = call.callStart == null
+                ? undefined
+                : valueNode.startIndex + call.callStart - prefix.length;
+            const callEnd = call.callEnd == null
+                ? undefined
+                : valueNode.startIndex + call.callEnd - prefix.length;
+            calls.push({
+                ...call,
+                line,
+                column,
+                ...(callStart != null && callStart >= valueNode.startIndex && {
+                    callStart,
+                }),
+                ...(callEnd != null && callEnd >= valueNode.startIndex && {
+                    callEnd,
+                }),
+                inMacroBody: true,
+                ...(parameters.has(call.name) && { macroParameter: true }),
+                enclosingFunction: {
+                    name: nameNode.text,
+                    startLine: node.startPosition.row + 1,
+                    endLine: node.endPosition.row + 1,
+                    isMacro: true,
+                },
+            });
+        }
+    }
     return calls;
 }
 
@@ -803,32 +1857,86 @@ function findUsagesInCode(code, name, parser, existingTree) {
     visitNameNodes(tree, code, name, node => {
         if (!IDENTIFIER_NODES.has(node.type) || node.text !== name) return;
         let usageType = 'reference';
+        let receiver = null;
         const parent = node.parent;
         if (parent) {
             const call = parent.type === 'call_expression'
                 ? parent
                 : parent.parent?.type === 'call_expression' ? parent.parent : null;
-            if (call && (sameNode(call.childForFieldName('function'), node) ||
-                call.childForFieldName('function')?.descendantForIndex(node.startIndex)?.text === name)) {
+            // Only the callable's terminal name is a call usage. The previous
+            // descendant test also matched receiver identifiers, classifying
+            // `copy.descriptor()` as a call to a free function named `copy`.
+            // callIdentity already unwraps qualified/template/parenthesized
+            // callees while preserving the exact terminal name node.
+            const calledIdentity = call
+                ? callIdentity(call.childForFieldName('function')) : null;
+            if (calledIdentity?.nameNode &&
+                sameNode(calledIdentity.nameNode, node)) {
                 usageType = 'call';
             } else if ((parent.type === 'function_declarator' ||
-                parent.type === 'class_specifier' ||
-                parent.type === 'struct_specifier' ||
-                parent.type === 'enum_specifier' ||
                 parent.type === 'parameter_declaration') &&
                 (sameNode(parent.childForFieldName('declarator'), node) ||
                     sameNode(parent.childForFieldName('name'), node))) {
                 usageType = 'definition';
+            } else if (CLASS_NODES.has(parent.type) &&
+                sameNode(parent.childForFieldName('name'), node)) {
+                const body = parent.childForFieldName('body');
+                const declaration = parent.parent;
+                const opaqueForwardDeclaration =
+                    ['translation_unit', 'declaration_list']
+                        .includes(declaration?.type) ||
+                    (declaration?.type === 'declaration' &&
+                     (declaration.namedChildren || []).length === 1);
+                // `struct S *value` names an existing tag; only a bodied
+                // declaration or a standalone `struct S;` introduces it.
+                usageType = body || opaqueForwardDeclaration
+                    ? 'definition' : 'reference';
             } else if (parent.type === 'preproc_include') {
                 usageType = 'import';
             }
+            if (parent.type === 'qualified_identifier' &&
+                sameNode(parent.childForFieldName('name'), node)) {
+                receiver = typeName(parent.childForFieldName('scope') ||
+                    parent.namedChild(0));
+            } else if (parent.type === 'field_expression' &&
+                sameNode(parent.childForFieldName('field'), node)) {
+                const argument = parent.childForFieldName('argument') ||
+                    parent.namedChild(0);
+                receiver = argument?.text || null;
+            }
         }
+        // A bare name lexically inside a class method participates in C++
+        // member lookup on that class. This is ownership evidence for test
+        // discovery and usage presentation; receiver-qualified forms above
+        // retain their explicit receiver instead.
+        if (!receiver) receiver = enclosingClassName(node);
         usages.push({
             line: node.startPosition.row + 1,
             column: node.startPosition.column,
             usageType,
+            ...(receiver && { receiver }),
         });
     });
+    // Replacement lists are opaque preproc_arg nodes in the C grammars. The
+    // call extractor reparses those AST-proven regions; surface the resulting
+    // call usages here as well so callers/callees, usages, and tests share one
+    // semantic fact set.
+    const seenCalls = new Set(usages
+        .filter(usage => usage.usageType === 'call')
+        .map(usage => `${usage.line}:${usage.column ?? ''}`));
+    for (const call of findMacroBodyCalls(tree, code, parser, name)) {
+        if (call.name !== name) continue;
+        const key = `${call.line}:${call.column ?? ''}`;
+        if (seenCalls.has(key)) continue;
+        seenCalls.add(key);
+        usages.push({
+            line: call.line,
+            column: call.column,
+            usageType: 'call',
+            ...(call.receiver && { receiver: call.receiver }),
+            ...(call.macroParameter && { macroParameter: true }),
+        });
+    }
     return usages;
 }
 

@@ -456,7 +456,39 @@ function clearProjectCache(projectRoot) {
 // cannot silently lose the grep handoff discovered during a full scan.
 // v114: Rust impl owners normalize nested generics and reference impls to the
 // same concrete identity used by receiver-flow analysis.
-const CACHE_FORMAT_VERSION = 114;
+// v115: C# callable symbols persist extension-method identity and their
+// receiver parameter marker; string/char literal receiver typing changes the
+// call evidence consumed from cached indexes.
+// v116: C# call records persist overload argument kinds and callable-scoped
+// receiver types; enum members are indexed as typed fields for exact overload
+// selection.
+// v117: nullable GetValueOrDefault argument shapes retain their underlying
+// value type for C# inherited-overload selection.
+// v118: C# declarations nested under preprocessor nodes and recovered
+// namespace-level method siblings remain attached to their lexical class.
+// v125: C/C++ multiline typedef/class symbols persist the declaration
+// identifier's nameLine so compiler-selected handles survive caching.
+// v126: C/C++ parser recovery recognizes calling-convention/export macros
+// between a builtin return type and a function name.
+// v127: ambiguous .h files use the repository translation-unit convention
+// when no compilation database or same-directory source sibling is present.
+// v128: C++ using-alias symbols are indexed and template-qualified
+// out-of-line methods close with their in-class declarations.
+// v150: C/C++ call records persist source spans and chained-receiver producer
+// links so the nominal return-type fold can resolve call().member() identity.
+// v151: inheritance graphs normalize compiler-owned qualified nominal bases
+// (for example `detail::buffer<T>`) to their indexed type identity.
+// v152: C/C++ callable signatures persist anonymous C-style variadic tails.
+// v153: C++ callable symbols persist explicit C-language linkage identity.
+// v154: C/C++ calls parsed from preprocessor replacement lists persist their
+// macro-body and macro-parameter provenance.
+// v155: C# method symbols persist explicit-interface ownership so ordinary
+// member overload resolution cannot select an interface-only implementation.
+// v156: C# calls persist cast receiver types and multi-hop/null-forgiving
+// declared-field paths used for compiler-grade member ownership.
+// v157: C# cast receivers distinguish `((IFace)this).M()` from an arbitrary
+// interface-typed variable so explicit implementations are never overclaimed.
+const CACHE_FORMAT_VERSION = 157;
 
 /**
  * Save index to cache file
@@ -712,6 +744,10 @@ function loadCache(index, cachePath) {
         const toAbs = path.sep === '/'
             ? (relPath) => rootPrefix + relPath
             : (relPath) => rootPrefix + relPath.replace(/\//g, path.sep);
+
+        // Loading into a previously-used ProjectIndex replaces its indexed
+        // contents, so no parsed tree from the old state may survive.
+        index._clearParsedTreeCache?.();
 
         // Reconstruct files Map: relative key → absolute key, restore path and relativePath
         // Initialize symbols/bindings arrays (will be populated from top-level symbols)

@@ -36,8 +36,10 @@ const pyrightOracle = {
         let serverPath;
         try {
             serverPath = require.resolve('pyright/langserver.index.js');
-        } catch (e) {
-            throw new Error('pyright devDependency not installed — run npm install');
+        } catch (cause) {
+            throw new Error('pyright devDependency not installed — run npm install', {
+                cause,
+            });
         }
 
         // ast helper: any python3 works (no jedi needed for these ops)
@@ -176,7 +178,7 @@ const pyrightOracle = {
         const firstHop = [...defs.values()];
         for (const entry of firstHop) {
             const defAbs = path.join(handle.root, entry.file);
-            let defLine = '';
+            let defLine;
             try { defLine = fs.readFileSync(defAbs, 'utf-8').split('\n')[entry.line - 1] || ''; } catch { continue; }
             const rhs = simpleCallableAliasRhs(defLine, name);
             if (!rhs) continue;

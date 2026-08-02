@@ -162,6 +162,7 @@ function buildImportGraph(index) {
 
             let resolved = resolveImport(importModule, filePath, {
                 aliases: index.config.aliases,
+                includePaths: index.config.includePaths,
                 language: fileEntry.language,
                 root: index.root
             });
@@ -299,6 +300,38 @@ function buildInheritanceGraph(index) {
                     if (fileEntry.importAliases) {
                         const alias = fileEntry.importAliases.find(a => a.local === parent);
                         if (alias && classNames.has(alias.original)) return alias.original;
+                    }
+                    // Nominal languages commonly spell a project base with a
+                    // namespace/package qualifier (`detail::buffer<T>`,
+                    // `demo.Base`). The symbol table is keyed by the terminal
+                    // type name, so retaining the qualifier disconnects the
+                    // inheritance graph and can turn an inherited method call
+                    // into a false receiver mismatch. Strip it only when an
+                    // indexed type has the matching compiler owner; suffix
+                    // matching accommodates parsers which retain either the
+                    // full namespace or only its innermost component.
+                    if (langTraits(fileEntry.language)?.typeSystem === 'nominal' &&
+                        (parent.includes('::') || parent.includes('.'))) {
+                        const separator = parent.includes('::') ? '::' : '.';
+                        const pieces = parent.split(separator).filter(Boolean);
+                        const terminal = pieces.pop();
+                        const qualifier = pieces.join(separator);
+                        const typeKinds = new Set([
+                            'class', 'interface', 'struct', 'trait', 'record',
+                        ]);
+                        const matches = (index.symbols.get(terminal) || [])
+                            .filter(definition => {
+                                if (!typeKinds.has(definition.type)) return false;
+                                const owner = String(definition.namespace || '');
+                                return owner === qualifier ||
+                                    owner.endsWith(`${separator}${qualifier}`) ||
+                                    qualifier.endsWith(`${separator}${owner}`);
+                            });
+                        if (matches.length > 0 &&
+                            new Set(matches.map(definition =>
+                                definition.namespace || '')).size === 1) {
+                            return terminal;
+                        }
                     }
                     // Qualified structural parent: `class CustomCommand(
                     // click.Command)`. The symbol table owns bare class names,

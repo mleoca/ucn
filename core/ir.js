@@ -49,9 +49,11 @@ function normalizeSymbol(symbol, family, language, kind, owner = null) {
         'annotationsWithArgs', 'attributesWithArgs', 'nameLine', 'traitImpl',
         'traitName', 'isSignature', 'memberAssigned', 'bodyScopedName',
         'registryMember', 'registryContainer', 'isConstructor',
+        'isExtensionMethod', 'extensionReceiver', 'explicitInterface',
         'namespace', 'lexicalScopeStartLine', 'lexicalScopeEndLine',
         'returnTypeQualifier', 'macroNeverReturns', 'callbackParamTypes', 'iteratorItemType',
-        'returnedConcreteType', 'returnedConstructors',
+        'returnedConcreteType', 'returnedConstructors', 'templateDependent',
+        'linkage',
     ];
     for (const field of passthrough) {
         if (symbol[field] !== undefined && symbol[field] !== null) {

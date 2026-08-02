@@ -267,7 +267,9 @@ const LANGUAGES = {
             typeQualifiedCallStyle: 'path',
             hasArityOverloads: true,
             bareCallReachesMethods: true,
-            methodCallReachesFunctions: true,
+            // `obj.f()` performs member lookup and cannot bind a namespace
+            // free function. `ns::f()` remains supported through isPathCall.
+            methodCallReachesFunctions: false,
             testFileCandidates: (base, ext) => [
                 `${base}_test${ext}`, `test_${base}${ext}`, `${base}.test${ext}`,
             ],

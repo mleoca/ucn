@@ -29,6 +29,10 @@ test/bug-hunting/
 # Eval reports: JSON snapshots are large/regenerable; markdown roll-ups are committed
 eval/reports/*.json
 
+# Compiler-oracle helper build products
+eval/oracles/roslyn-helper/bin/
+eval/oracles/roslyn-helper/obj/
+
 /.claude-plugin/
 /.agents/
 /plugins/

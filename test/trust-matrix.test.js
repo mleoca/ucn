@@ -122,7 +122,7 @@ describe('command trust matrix: fail-closed proof coverage', () => {
     it('keeps one machine-readable release board across gates and documentation', () => {
         const pkg = require('../package.json');
         const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
-        assert.strictEqual(RELEASE_REPO_NAMES.length, 7);
+        assert.strictEqual(RELEASE_REPO_NAMES.length, 10);
         assert.strictEqual(new Set(RELEASE_REPO_NAMES).size, RELEASE_REPO_NAMES.length);
         assert.deepStrictEqual(RELEASE_REPOS.map(repo => repo.name), [...RELEASE_REPO_NAMES]);
         assert.ok(RELEASE_REPOS.every(repo => REPOS.includes(repo)));
@@ -135,8 +135,8 @@ describe('command trust matrix: fail-closed proof coverage', () => {
             assert.match(script, /--release/, `${script} must use the shared release board`);
             assert.doesNotMatch(script, /--repo/, `${script} must not duplicate the release list`);
         }
-        assert.match(readme, /seven-repository/i);
-        assert.match(readme, /nineteen pinned repositories/i);
+        assert.match(readme, /ten-repository/i);
+        assert.match(readme, /22 pinned repositories/i);
         for (const name of RELEASE_REPO_NAMES) {
             assert.ok(readme.includes(name), `README must name release repository ${name}`);
         }

@@ -82,6 +82,8 @@ const { jediOracle } = require('./oracles/jedi-oracle');
 const { goplsOracle } = require('./oracles/gopls-oracle');
 const { rustAnalyzerOracle } = require('./oracles/rust-analyzer-oracle');
 const { jdtlsOracle } = require('./oracles/jdtls-oracle');
+const { roslynOracle } = require('./oracles/roslyn-oracle');
+const { clangdOracle } = require('./oracles/clangd-oracle');
 
 const args = process.argv.slice(2);
 const releaseOnly = args.includes('--release');
@@ -123,7 +125,16 @@ const REPORTS_DIR = path.resolve(
 // Order matters: per repo the FIRST language match wins — pyright (stronger
 // inference) is the primary Python oracle, jedi stays as the second opinion
 // via --oracle jedi.
-const ORACLES = [tsMorphOracle, pyrightOracle, jediOracle, goplsOracle, rustAnalyzerOracle, jdtlsOracle]
+const ORACLES = [
+    tsMorphOracle,
+    pyrightOracle,
+    jediOracle,
+    goplsOracle,
+    rustAnalyzerOracle,
+    jdtlsOracle,
+    roslynOracle,
+    clangdOracle,
+]
     .map(validateOracle)
     .filter(o => !oracleFilter || o.name === oracleFilter);
 
@@ -179,7 +190,9 @@ function emptyKindTotals() {
         unverifiedEdges: 0, unverifiedHits: 0, unverifiedUnscored: 0,
         unverifiedReasons: {},
         oracleCallEdges: 0,
+        exactOracleCallEdges: 0,
         placement: emptyPlacement(),
+        exactPlacement: emptyPlacement(),
     };
 }
 
@@ -222,11 +235,34 @@ async function evaluateRepo(repo, oracle) {
     const target = resolveTarget(repoPath, repo);
 
     const index = new ProjectIndex(target);
+    // Feed the same explicit include roots to UCN that the compiler oracle
+    // receives. This keeps the comparison on one build configuration while
+    // exercising the public `.ucn.json` includePaths capability used by
+    // source distributions without compile_commands.json.
+    const configuredIncludePaths = [];
+    for (let i = 0; i < (repo.clangFlags || []).length; i++) {
+        const flag = String(repo.clangFlags[i]);
+        if (flag === '-I' && repo.clangFlags[i + 1]) {
+            configuredIncludePaths.push(String(repo.clangFlags[++i]));
+        } else if (flag.startsWith('-I') && flag.length > 2) {
+            configuredIncludePaths.push(flag.slice(2));
+        }
+    }
+    if (configuredIncludePaths.length > 0) {
+        index.config.includePaths = configuredIncludePaths;
+    }
+    if ((repo.oracleExclude || []).length > 0) {
+        index.config.exclude = [
+            ...(index.config.exclude || []),
+            ...repo.oracleExclude.map(relative =>
+                `${String(relative).replace(/\/+$/, '')}/**`),
+        ];
+    }
     index.build(null, { quiet: true });
     const indexedFiles = new Set([...index.files.values()].map(fe => fe.relativePath));
     process.stdout.write(`  UCN indexed ${indexedFiles.size} files\n`);
 
-    const handle = await oracle.prepare(target);
+    const handle = await oracle.prepare(target, { repo });
     // Path-base normalization: oracle paths are relative to the prepared
     // target dir; UCN paths are relative to its detected project root (which
     // may be a parent, e.g. packages/core vs packages/core/src). Convert all
@@ -269,6 +305,22 @@ async function evaluateRepo(repo, oracle) {
     }
     const sampled = [...buckets.values()].flat().slice(0, sampleSize);
     process.stdout.write(`  sampled ${sampled.length} symbols (buckets: ${[...buckets].map(([n, l]) => `${n}:${l.length}`).join(' ')})\n`);
+    if (oracle.comprehensiveReferences) {
+        process.stdout.write(
+            '  resolving comprehensive compiler call occurrences for sampled symbols...\n');
+        for (const sym of sampled) {
+            const refs = await oracle.findReferences(handle, {
+                name: sym.name,
+                file: sym.oracleFile,
+                line: sym.line,
+                comprehensive: true,
+            });
+            refCache.set(sym, refs.map(reference => ({
+                ...reference,
+                file: toUcnRel(reference.file),
+            })));
+        }
+    }
 
     // Score each symbol
     const perSymbol = [];
@@ -277,19 +329,29 @@ async function evaluateRepo(repo, oracle) {
         unverifiedEdges: 0, unverifiedHits: 0, unverifiedUnscored: 0,
         unverifiedReasons: {},
         oracleCallEdges: 0,
+        exactOracleCallEdges: 0,
         placement: emptyPlacement(),
+        exactPlacement: emptyPlacement(),
         zeroCases: 0, zeroAgreed: 0,
         conserved: 0, evaluated: 0,
     };
     const byKind = new Map(SYMBOL_KINDS.map(k => [k, emptyKindTotals()]));
     const confirmedFalsePositiveSamples = [];
+    const confirmedUnscoredSamples = [];
+    const unverifiedUnscoredSamples = [];
     const unexplainedSamples = [];
     const semanticMissingSamples = [];
+    const allOracleSemanticMissingSamples = [];
     const calleeAnswerCache = new Map();
     const calleeFalsePositiveSamples = [];
     const calleeUnexplainedSamples = [];
     const calleeSemanticMissingSamples = [];
-    const calleeTotals = { sites: 0, hits: 0, placement: emptyCalleePlacement() };
+    const calleeTotals = {
+        sites: 0,
+        hits: 0,
+        placement: emptyCalleePlacement(),
+        exactPlacement: emptyCalleePlacement(),
+    };
     const commandProof = createCommandProofSummary();
     const definitionCache = new Map();
     let definitionValidatedConfirmed = 0;
@@ -340,18 +402,24 @@ async function evaluateRepo(repo, oracle) {
         definitionCache.set(cacheKey, defs);
         return defs;
     };
+    const targetDefinitionList = targetDef =>
+        (Array.isArray(targetDef) ? targetDef : [targetDef]).filter(Boolean);
+    const definitionMatchesTarget = (definition, targetDef) =>
+        targetDefinitionList(targetDef).some(target =>
+            definition.file === target.relativePath &&
+            definition.line >= target.startLine &&
+            definition.line <= target.endLine);
     const resolvesTo = async (file, line, name, targetDef, column) => {
-        if (!targetDef) return false;
+        if (targetDefinitionList(targetDef).length === 0) return false;
         const defs = await resolvedDefinitions(file, line, name, column);
-        return defs.some(d => d.file === targetDef.relativePath &&
-            d.line >= targetDef.startLine && d.line <= targetDef.endLine);
+        return defs.some(d => definitionMatchesTarget(d, targetDef));
     };
     const definitionStatus = async (file, line, name, targetDef, column) => {
-        if (!targetDef || typeof oracle.resolveDefinition !== 'function') return 'unavailable';
+        if (targetDefinitionList(targetDef).length === 0 ||
+            typeof oracle.resolveDefinition !== 'function') return 'unavailable';
         const defs = await resolvedDefinitions(file, line, name, column);
         if (defs.length === 0) return 'unresolved';
-        return defs.some(d => d.file === targetDef.relativePath &&
-            d.line >= targetDef.startLine && d.line <= targetDef.endLine)
+        return defs.some(d => definitionMatchesTarget(d, targetDef))
             ? 'target' : 'other';
     };
 
@@ -371,11 +439,168 @@ async function evaluateRepo(repo, oracle) {
         const targetDef = sameNameDefs.find(d =>
             d.relativePath === sym.file &&
             (d.startLine === sym.line || d.nameLine === sym.line));
+        const targetLanguage = targetDef
+            ? index.files.get(targetDef.file)?.language : null;
+        // A C/C++ header prototype and its source definition are distinct
+        // source records but one compiler identity. Ask the independent
+        // oracle for the declaration's canonical definition, then map that
+        // location back to UCN records so precision and recall are judged
+        // against the whole redeclaration chain rather than whichever source
+        // location happened to be sampled.
+        let targetIdentityDefs = targetDef ? [targetDef] : [];
+        if (targetDef && typeof oracle.resolveDefinition === 'function') {
+            const canonicalTargets = await resolvedDefinitions(
+                sym.file, sym.line, sym.name);
+            for (const location of canonicalTargets) {
+                const equivalent = sameNameDefs.find(definition =>
+                    definition.relativePath === location.file &&
+                    location.line >= definition.startLine &&
+                    location.line <= definition.endLine);
+                const isCFamilyPrototype =
+                    ['c', 'cpp'].includes(targetLanguage) &&
+                    targetDef.isSignature;
+                const implementationIncludesTarget = equivalent &&
+                    (() => {
+                        if (equivalent.file === targetDef.file) return true;
+                        const queue = [equivalent.file];
+                        const seen = new Set(queue);
+                        for (let depth = 0;
+                            queue.length > 0 && depth < 16; depth++) {
+                            const file = queue.shift();
+                            for (const imported of
+                                index.importGraph?.get(file) || []) {
+                                if (imported === targetDef.file) return true;
+                                if (!seen.has(imported)) {
+                                    seen.add(imported);
+                                    queue.push(imported);
+                                }
+                            }
+                        }
+                        return false;
+                    })();
+                // A clangd workspace can contain several independently linked
+                // test binaries with the same external callback name. Its
+                // workspace-wide "definition" choice for a header prototype
+                // is then arbitrary. Accept only the same redeclaration file
+                // or a source file that actually includes the sampled header.
+                if (equivalent &&
+                    (!isCFamilyPrototype ||
+                     equivalent.relativePath === targetDef.relativePath ||
+                     implementationIncludesTarget) &&
+                    !targetIdentityDefs.includes(equivalent)) {
+                    targetIdentityDefs.push(equivalent);
+                }
+            }
+            if (['c', 'cpp'].includes(
+                index.files.get(targetDef.file)?.language) &&
+                targetDef.isSignature) {
+                for (const equivalent of sameNameDefs) {
+                    if (equivalent.relativePath === targetDef.relativePath &&
+                        !targetIdentityDefs.includes(equivalent)) {
+                        targetIdentityDefs.push(equivalent);
+                    }
+                }
+            }
+        }
+        if (targetDef && ['c', 'cpp'].includes(targetLanguage)) {
+            const typeSignature = definition => {
+                if (!Array.isArray(definition.paramsStructured)) return null;
+                const types = definition.paramsStructured.map(param =>
+                    String(param?.type ?? '').replace(/\s+/g, ''));
+                return types.some(type => !type) ? null : types.join(',');
+            };
+            const targetSignature = typeSignature(targetDef);
+            const sameSlotImplementations = sameNameDefs.filter(definition =>
+                !definition.isSignature &&
+                (definition.namespace || null) ===
+                    (targetDef.namespace || null) &&
+                (definition.className || definition.receiver || null) ===
+                    (targetDef.className || targetDef.receiver || null) &&
+                targetSignature !== null &&
+                typeSignature(definition) === targetSignature);
+            const targetExactOracleKeys = new Set(rawOracleCalls
+                .filter(reference =>
+                    reference.uncertaintyClass !== 'compile-time-dispatch')
+                .map(reference => key(reference.file, reference.line)));
+            const reachesFile = (from, destination) => {
+                if (from === destination) return true;
+                const queue = [from];
+                const seen = new Set(queue);
+                for (let depth = 0;
+                    queue.length > 0 && depth < 16; depth++) {
+                    const current = queue.shift();
+                    for (const imported of index.importGraph?.get(current) || []) {
+                        if (imported === destination) return true;
+                        if (!seen.has(imported)) {
+                            seen.add(imported);
+                            queue.push(imported);
+                        }
+                    }
+                }
+                return false;
+            };
+            for (const equivalent of sameNameDefs) {
+                if (targetIdentityDefs.includes(equivalent) ||
+                    (!targetDef.isSignature && !equivalent.isSignature) ||
+                    (targetDef.namespace || null) !==
+                        (equivalent.namespace || null) ||
+                    (targetDef.className || targetDef.receiver || null) !==
+                        (equivalent.className || equivalent.receiver || null) ||
+                    targetSignature === null ||
+                    typeSignature(equivalent) !== targetSignature) {
+                    continue;
+                }
+                // A prototype and definition are one callable identity only
+                // when one source surface reaches the other. This joins normal
+                // header/source redeclarations while keeping independently
+                // linked test callbacks such as multiple `setUp` definitions
+                // distinct.
+                const equivalentOracleSymbol = sampled.find(candidate =>
+                    candidate.name === sym.name &&
+                    candidate.file === equivalent.relativePath &&
+                    candidate.line === equivalent.startLine);
+                const equivalentExactOracleKeys = equivalentOracleSymbol
+                    ? new Set((refCache.get(equivalentOracleSymbol) || [])
+                        .filter(reference => reference.kind === 'call' &&
+                            reference.uncertaintyClass !==
+                                'compile-time-dispatch')
+                        .map(reference => key(reference.file, reference.line)))
+                    : null;
+                const sameCompilerReferenceFamily =
+                    targetExactOracleKeys.size > 0 &&
+                    equivalentExactOracleKeys?.size ===
+                        targetExactOracleKeys.size &&
+                    [...targetExactOracleKeys].every(referenceKey =>
+                        equivalentExactOracleKeys.has(referenceKey));
+                if (sameSlotImplementations.length === 1 ||
+                    sameCompilerReferenceFamily ||
+                    reachesFile(targetDef.file, equivalent.file) ||
+                    reachesFile(equivalent.file, targetDef.file)) {
+                    targetIdentityDefs.push(equivalent);
+                }
+            }
+        }
+        // UCN models `new Type(...)` as the exact constructor definition
+        // when one is indexed, while compiler reference search for a sampled
+        // class reports the construction as a use of the class symbol. Both
+        // are the same dependency for a class-target query: selecting that
+        // class's constructor is stronger evidence than merely selecting the
+        // class declaration.
+        const isExactCalleeTargetEdge = edge =>
+            edge.name === sym.name &&
+            (targetIdentityDefs.some(target =>
+                edge.relativePath === target.relativePath &&
+                edge.startLine === target.startLine) ||
+             (sym.kind === 'class' && edge.type === 'constructor' &&
+              edge.className === sym.name &&
+              (edge.namespace || null) === (targetDef?.namespace || null)));
         // Reference search in some LSPs expands virtual method families. For a
         // repeated project symbol name, exact definition lookup is therefore
         // the authority: an edge statically bound to another definition must
         // not inflate either this target's recall or its apparent precision.
-        const needsDefinitionAdjudication = sameNameDefs.length > 1 &&
+        const needsDefinitionAdjudication =
+            !oracle.exactReferenceIdentity &&
+            sameNameDefs.length > 1 &&
             typeof oracle.resolveDefinition === 'function';
         const adjudicatedOracleCalls = [];
         for (const oc of rawOracleCalls) {
@@ -395,7 +620,7 @@ async function evaluateRepo(repo, oracle) {
                 continue;
             }
             const status = await definitionStatus(
-                oc.file, oc.line, sym.name, targetDef, oc.column);
+                oc.file, oc.line, sym.name, targetIdentityDefs, oc.column);
             if (status === 'other') {
                 oracleBroadReferenceEdges++;
             } else if (status === 'target') {
@@ -430,7 +655,8 @@ async function evaluateRepo(repo, oracle) {
                 const relFile = path.isAbsolute(candidateFile)
                     ? path.relative(index.root, candidateFile) : candidateFile;
                 const status = await definitionStatus(
-                    relFile, best.line, best.calledAs || sym.name, targetDef);
+                    relFile, best.line, best.calledAs || sym.name,
+                    targetIdentityDefs);
                 if (status === 'target') return 'hit';
                 if (await isConfigurationGated(relFile, best.line)) return 'unscored';
                 // 'other' is a positive contradiction — the site provably
@@ -475,11 +701,13 @@ async function evaluateRepo(repo, oracle) {
         // decision 2026-06-12; the #218f class-kind precedent).
         const confirmed = dedupe((json.data.callers || json.data.usages || []).map(c => ({
             file: c.file, line: c.line,
+            ...(Number.isInteger(c.column) && { column: c.column }),
             ...(c.calledAs && c.calledAs !== 'bound' && { calledAs: c.calledAs }),
             usageStyle: c.calledAs === 'bound' || !!c.functionReference,
         })));
         const unverified = dedupe((json.data.unverifiedCallers || []).map(c => ({
             file: c.file, line: c.line,
+            ...(Number.isInteger(c.column) && { column: c.column }),
             ...(c.calledAs && c.calledAs !== 'bound' && { calledAs: c.calledAs }),
             usageStyle: c.calledAs === 'bound' || !!c.functionReference,
             reason: c.reason || c.resolution || 'unspecified',
@@ -489,6 +717,7 @@ async function evaluateRepo(repo, oracle) {
             }),
             ...(c.externalContract && { externalContract: true }),
             uncertaintyClass: c.uncertaintyClass || 'actionable-ambiguity',
+            ...(c.dispatchFamily && { dispatchFamily: c.dispatchFamily }),
         })));
         const account = json.meta.account;
 
@@ -531,30 +760,57 @@ async function evaluateRepo(repo, oracle) {
                     return { hit: true, scorable: true, definitionValidated: true };
                 }
                 const status = await definitionStatus(
-                    c.file, c.line, c.calledAs || sym.name, targetDef);
+                    c.file, c.line, c.calledAs || sym.name,
+                    targetIdentityDefs, c.column);
                 if (status === 'target') return { hit: true, scorable: true, definitionValidated: true };
                 const referenceHit = edgeHitWithoutDefinition(c);
                 if (status === 'other' && !referenceHit && await isConfigurationGated(c.file, c.line)) {
-                    return { hit: false, scorable: false, definitionValidated: true };
+                    return { hit: false, scorable: false, definitionValidated: true,
+                        abstention: 'configuration-gated' };
                 }
                 if (status === 'other') return { hit: false, scorable: true, definitionValidated: true };
                 if (status === 'unresolved' &&
                     lineContainsIdentifier(index, c.file, c.line,
                         c.calledAs || sym.name)) {
-                    return { hit: false, scorable: false, definitionValidated: false };
+                    return { hit: false, scorable: false, definitionValidated: false,
+                        abstention: 'definition-unresolved' };
                 }
                 if (referenceHit) return { hit: true, scorable: true, definitionValidated: false };
                 if (await isConfigurationGated(c.file, c.line)) {
-                    return { hit: false, scorable: false, definitionValidated: false };
+                    return { hit: false, scorable: false, definitionValidated: false,
+                        abstention: 'configuration-gated' };
                 }
                 return { hit: false, scorable: true, definitionValidated: false };
             }
             if (edgeHitWithoutDefinition(c)) return { hit: true, scorable: true, definitionValidated: false };
-            const definitionHit = await resolvesTo(
-                c.file, c.line, c.calledAs || sym.name, targetDef);
-            if (definitionHit) return { hit: true, scorable: true, definitionValidated: true };
+            if (typeof oracle.resolveDefinition === 'function') {
+                const status = await definitionStatus(
+                    c.file, c.line, c.calledAs || sym.name,
+                    targetIdentityDefs, c.column);
+                if (status === 'target') {
+                    return { hit: true, scorable: true, definitionValidated: true };
+                }
+                if (status === 'other') {
+                    if (await isConfigurationGated(c.file, c.line)) {
+                        return { hit: false, scorable: false, definitionValidated: true };
+                    }
+                    return { hit: false, scorable: true, definitionValidated: true };
+                }
+                // An oracle that cannot resolve an identifier occurrence is
+                // abstaining, not proving that UCN selected the wrong target.
+                // This discipline already applied to repeated names; apply it
+                // equally to globally unique names so compiler namespace/
+                // macro gaps cannot be scored as engine false positives.
+                if (status === 'unresolved' &&
+                    lineContainsIdentifier(index, c.file, c.line,
+                        c.calledAs || sym.name)) {
+                    return { hit: false, scorable: false, definitionValidated: false,
+                        abstention: 'definition-unresolved' };
+                }
+            }
             if (await isConfigurationGated(c.file, c.line)) {
-                return { hit: false, scorable: false, definitionValidated: false };
+                return { hit: false, scorable: false, definitionValidated: false,
+                    abstention: 'configuration-gated' };
             }
             return { hit: false, scorable: true, definitionValidated: false };
         };
@@ -563,28 +819,50 @@ async function evaluateRepo(repo, oracle) {
             const verdict = await edgeMatchesTarget(c);
             confirmedVerdicts.push(verdict);
             if (verdict.hit && verdict.definitionValidated) definitionValidatedConfirmed++;
-            if (!verdict.scorable) configurationGatedUnscored++;
+            if (!verdict.scorable) {
+                configurationGatedUnscored++;
+                pushSample(confirmedUnscoredSamples, {
+                    symbol: sym.name,
+                    target: `${sym.file}:${sym.line}`,
+                    edge: key(c.file, c.line),
+                    abstention: verdict.abstention || 'oracle-unscored',
+                    text: lineText(index.root, c.file, c.line),
+                }, 100);
+            }
         }
         const confirmedHits = confirmedVerdicts.filter(v => v.hit).length;
         const confirmedUnscored = confirmedVerdicts.filter(v => !v.scorable).length;
         let unverifiedHits = 0, unverifiedUnscored = 0;
         let actionableUnverifiedHits = 0, actionableUnverifiedUnscored = 0;
         let runtimeDispatchHits = 0, runtimeDispatchUnscored = 0;
+        let compileTimeDispatchHits = 0, compileTimeDispatchUnscored = 0;
         const unverifiedReasonStats = {};
         for (const c of unverified) {
             const verdict = await edgeMatchesTarget(c);
             const runtimeDispatch = c.uncertaintyClass === 'runtime-dispatch';
+            const compileTimeDispatch =
+                c.uncertaintyClass === 'compile-time-dispatch';
             addReasonStat(unverifiedReasonStats, c.reason, verdict);
             if (!verdict.scorable) {
                 unverifiedUnscored++;
                 if (runtimeDispatch) runtimeDispatchUnscored++;
+                else if (compileTimeDispatch) compileTimeDispatchUnscored++;
                 else actionableUnverifiedUnscored++;
                 configurationGatedUnscored++;
+                pushSample(unverifiedUnscoredSamples, {
+                    symbol: sym.name,
+                    target: `${sym.file}:${sym.line}`,
+                    edge: key(c.file, c.line),
+                    reason: c.reason,
+                    abstention: verdict.abstention || 'oracle-unscored',
+                    text: lineText(index.root, c.file, c.line),
+                }, 100);
                 continue;
             }
             if (verdict.hit) {
                 unverifiedHits++;
                 if (runtimeDispatch) runtimeDispatchHits++;
+                else if (compileTimeDispatch) compileTimeDispatchHits++;
                 else actionableUnverifiedHits++;
                 if (verdict.definitionValidated) definitionValidatedUnverified++;
             }
@@ -611,30 +889,51 @@ async function evaluateRepo(repo, oracle) {
         //   missingUnexplained   — in the ground set, indexed, yet unaccounted:
         //                          the silent lie the contract forbids. GATE: 0.
         const placement = emptyPlacement();
+        const exactPlacement = emptyPlacement();
         for (const oc of oracleCalls) {
             const k = key(oc.file, oc.line);
-            if (confirmedKeys.has(k)) placement.confirmed++;
-            else if (unverifiedKeys.has(k)) placement.unverified++;
-            else if (!indexedFiles.has(oc.file)) placement.missingExplained++; // outside UCN's file universe
+            const exact = oc.uncertaintyClass !== 'compile-time-dispatch';
+            const place = field => {
+                placement[field]++;
+                if (exact) exactPlacement[field]++;
+            };
+            if (confirmedKeys.has(k)) place('confirmed');
+            else if (unverifiedKeys.has(k)) place('unverified');
+            else if (!indexedFiles.has(oc.file)) place('missingExplained'); // outside UCN's file universe
+            else if (oc.oracleResolution === 'macro-expansion') {
+                // UCN models the source dependency once at the macro body and
+                // the macro invocation as a separate edge. Clang reports one
+                // expanded target call per invocation. Those are compiler-true
+                // runtime sites but not missing source dependencies: the
+                // literal target does not exist on the expansion line and the
+                // macro-body edge remains visible to trace.
+                place('missingExplained');
+            }
             else if (!lineMatchesSymbol(index.root, oc.file, oc.line, sym.name)) {
-                placement.missingBeyondText++;
-                pushSample(semanticMissingSamples, {
+                place('missingBeyondText');
+                const sample = {
                     category: 'missingBeyondText', symbol: sym.name, target: `${sym.file}:${sym.line}`,
                     edge: k, text: lineText(index.root, oc.file, oc.line),
-                });
+                };
+                pushSample(allOracleSemanticMissingSamples, sample);
+                if (exact) pushSample(semanticMissingSamples, sample);
             } else if (account && account.conserved) {
-                placement.accountedNotShown++;
-                pushSample(semanticMissingSamples, {
+                place('accountedNotShown');
+                const sample = {
                     category: 'accountedNotShown', symbol: sym.name, target: `${sym.file}:${sym.line}`,
                     edge: k, text: lineText(index.root, oc.file, oc.line),
-                });
+                };
+                pushSample(allOracleSemanticMissingSamples, sample);
+                if (exact) pushSample(semanticMissingSamples, sample);
             } else {
-                placement.missingUnexplained++;
-                pushSample(semanticMissingSamples, {
+                place('missingUnexplained');
+                const sample = {
                     category: 'missingUnexplained', symbol: sym.name, target: `${sym.file}:${sym.line}`,
                     edge: k, text: lineText(index.root, oc.file, oc.line),
-                });
-                if (unexplainedSamples.length < 10) {
+                };
+                pushSample(allOracleSemanticMissingSamples, sample);
+                if (exact) pushSample(semanticMissingSamples, sample);
+                if (exact && unexplainedSamples.length < 10) {
                     unexplainedSamples.push({ symbol: sym.name, edge: k });
                 }
             }
@@ -649,14 +948,25 @@ async function evaluateRepo(repo, oracle) {
         // sites verify against any-kind refs — the #221 usage-style rule;
         // class-kind constructor edges likewise per #218f).
         const calleePlacement = emptyCalleePlacement();
+        const exactCalleePlacement = emptyCalleePlacement();
         let calleeSites = 0, calleeHits = 0;
         {
             const seenPrecisionDefs = new Set();
             for (const oc of oracleCalls) {
-                if (!indexedFiles.has(oc.file)) { calleePlacement.missingExplained++; continue; }
+                const exactOracleEdge =
+                    oc.uncertaintyClass !== 'compile-time-dispatch';
+                const placeCallee = field => {
+                    calleePlacement[field]++;
+                    if (exactOracleEdge) exactCalleePlacement[field]++;
+                };
+                if (!indexedFiles.has(oc.file) ||
+                    oc.oracleResolution === 'macro-expansion') {
+                    placeCallee('missingExplained');
+                    continue;
+                }
                 const absFile = path.join(index.root, oc.file);
                 const encl = index.findEnclosingFunction(absFile, oc.line, true);
-                if (!encl) { calleePlacement.moduleLevel++; continue; }
+                if (!encl) { placeCallee('moduleLevel'); continue; }
                 const dKey = `${absFile}:${encl.startLine}`;
                 let ucnCallees = calleeAnswerCache.get(dKey);
                 if (!ucnCallees) {
@@ -670,7 +980,7 @@ async function evaluateRepo(repo, oracle) {
                 if (!seenPrecisionDefs.has(dKey)) {
                     seenPrecisionDefs.add(dKey);
                     for (const e of ucnCallees) {
-                        if (e.name !== sym.name || e.relativePath !== sym.file || e.startLine !== sym.line) continue;
+                        if (!isExactCalleeTargetEdge(e)) continue;
                         for (const siteLine of e.sites || []) {
                             const verdict = await edgeMatchesTarget({
                                 file: oc.file,
@@ -697,9 +1007,9 @@ async function evaluateRepo(repo, oracle) {
                 }
                 // Placement of this oracle edge in D's answer
                 const exactEdge = ucnCallees.find(e =>
-                    e.name === sym.name && e.sites && e.sites.includes(oc.line) &&
-                    e.relativePath === sym.file && e.startLine === sym.line);
-                if (exactEdge) { calleePlacement.confirmed++; continue; }
+                    e.sites && e.sites.includes(oc.line) &&
+                    isExactCalleeTargetEdge(e));
+                if (exactEdge) { placeCallee('confirmed'); continue; }
                 const unvEntry = (ucnCallees.unverifiedCallees || []).find(u =>
                     u.name === sym.name && u.sites && u.sites.includes(oc.line));
                 const otherDefEdge = ucnCallees.find(e =>
@@ -710,8 +1020,8 @@ async function evaluateRepo(repo, oracle) {
                 // over a different confirmed same-name occurrence. Preserve
                 // the collision as its own auditable bucket.
                 if (unvEntry) {
-                    if (otherDefEdge) calleePlacement.unverifiedWithOtherDef++;
-                    else calleePlacement.unverified++;
+                    if (otherDefEdge) placeCallee('unverifiedWithOtherDef');
+                    else placeCallee('unverified');
                     continue;
                 }
                 if (otherDefEdge) {
@@ -720,11 +1030,11 @@ async function evaluateRepo(repo, oracle) {
                     // the exact other edge UCN selected, the oracle target is
                     // a broad-family reference—not an exact-target miss.
                     if (await resolvesTo(oc.file, oc.line, sym.name, otherDefEdge)) {
-                        calleePlacement.oracleBroadReference++;
+                        placeCallee('oracleBroadReference');
                         continue;
                     }
-                    calleePlacement.confirmedOtherDef++;
-                    pushSample(calleeSemanticMissingSamples, {
+                    placeCallee('confirmedOtherDef');
+                    if (exactOracleEdge) pushSample(calleeSemanticMissingSamples, {
                         category: 'confirmedOtherDef', symbol: sym.name, target: `${sym.file}:${sym.line}`,
                         edge: key(oc.file, oc.line), enclosing: encl.name,
                         selected: `${otherDefEdge.relativePath}:${otherDefEdge.startLine}`,
@@ -733,8 +1043,8 @@ async function evaluateRepo(repo, oracle) {
                     continue;
                 }
                 if (!lineMatchesSymbol(index.root, oc.file, oc.line, sym.name)) {
-                    calleePlacement.missingBeyondText++;
-                    pushSample(calleeSemanticMissingSamples, {
+                    placeCallee('missingBeyondText');
+                    if (exactOracleEdge) pushSample(calleeSemanticMissingSamples, {
                         category: 'missingBeyondText', symbol: sym.name, target: `${sym.file}:${sym.line}`,
                         edge: key(oc.file, oc.line), enclosing: encl.name,
                         text: lineText(index.root, oc.file, oc.line),
@@ -749,20 +1059,20 @@ async function evaluateRepo(repo, oracle) {
                 const hasRecord = records.some(c => c.line === oc.line &&
                     c.line >= encl.startLine && c.line <= encl.endLine);
                 if (acct && acct.conserved && hasRecord) {
-                    calleePlacement.accounted++;
-                    pushSample(calleeSemanticMissingSamples, {
+                    placeCallee('accounted');
+                    if (exactOracleEdge) pushSample(calleeSemanticMissingSamples, {
                         category: 'accounted', symbol: sym.name, target: `${sym.file}:${sym.line}`,
                         edge: key(oc.file, oc.line), enclosing: encl.name,
                         text: lineText(index.root, oc.file, oc.line),
                     });
                 } else {
-                    calleePlacement.missingUnexplained++;
-                    pushSample(calleeSemanticMissingSamples, {
+                    placeCallee('missingUnexplained');
+                    if (exactOracleEdge) pushSample(calleeSemanticMissingSamples, {
                         category: 'missingUnexplained', symbol: sym.name, target: `${sym.file}:${sym.line}`,
                         edge: key(oc.file, oc.line), enclosing: encl.name,
                         text: lineText(index.root, oc.file, oc.line),
                     });
-                    if (calleeUnexplainedSamples.length < 10) {
+                    if (exactOracleEdge && calleeUnexplainedSamples.length < 10) {
                         calleeUnexplainedSamples.push({ symbol: sym.name, edge: key(oc.file, oc.line), enclosing: encl.name });
                     }
                 }
@@ -773,12 +1083,24 @@ async function evaluateRepo(repo, oracle) {
         const ucnZero = confirmed.length === 0 && unverified.length === 0;
         if (ucnZero) {
             totals.zeroCases++;
-            if (oracleCalls.length === 0) totals.zeroAgreed++;
+            // Oracle edges outside the indexed file universe or emitted only
+            // as compiler macro expansions are explicitly out of the direct
+            // source-site contract. A UCN zero agrees when no eligible source
+            // edge remains, not only when the compiler returned no runtime
+            // edge whatsoever.
+            const exactOracleCallsForSymbol = oracleCalls.filter(call =>
+                call.uncertaintyClass !== 'compile-time-dispatch').length;
+            if (exactOracleCallsForSymbol === exactPlacement.missingExplained) {
+                totals.zeroAgreed++;
+            }
         }
 
         calleeTotals.sites += calleeSites;
         calleeTotals.hits += calleeHits;
         for (const k of Object.keys(calleePlacement)) calleeTotals.placement[k] += calleePlacement[k];
+        for (const k of Object.keys(exactCalleePlacement)) {
+            calleeTotals.exactPlacement[k] += exactCalleePlacement[k];
+        }
 
         totals.confirmedEdges += confirmed.length;
         totals.confirmedHits += confirmedHits;
@@ -788,7 +1110,12 @@ async function evaluateRepo(repo, oracle) {
         totals.unverifiedUnscored += unverifiedUnscored;
         mergeReasonStats(totals.unverifiedReasons, unverifiedReasonStats);
         totals.oracleCallEdges += oracleCalls.length;
+        totals.exactOracleCallEdges += oracleCalls.filter(call =>
+            call.uncertaintyClass !== 'compile-time-dispatch').length;
         for (const k of Object.keys(placement)) totals.placement[camel(k)] += placement[k];
+        for (const k of Object.keys(exactPlacement)) {
+            totals.exactPlacement[camel(k)] += exactPlacement[k];
+        }
         totals.evaluated++;
         if (account && account.conserved) totals.conserved++;
 
@@ -803,15 +1130,27 @@ async function evaluateRepo(repo, oracle) {
         kt.unverifiedUnscored += unverifiedUnscored;
         mergeReasonStats(kt.unverifiedReasons, unverifiedReasonStats);
         kt.oracleCallEdges += oracleCalls.length;
+        kt.exactOracleCallEdges += oracleCalls.filter(call =>
+            call.uncertaintyClass !== 'compile-time-dispatch').length;
         for (const k of Object.keys(placement)) kt.placement[k] += placement[k];
+        for (const k of Object.keys(exactPlacement)) {
+            kt.exactPlacement[k] += exactPlacement[k];
+        }
 
         const actionableUnverified = unverified.filter(
-            site => site.uncertaintyClass !== 'runtime-dispatch');
+            site => site.uncertaintyClass !== 'runtime-dispatch' &&
+                site.uncertaintyClass !== 'compile-time-dispatch');
         const runtimeDispatch = unverified.filter(
             site => site.uncertaintyClass === 'runtime-dispatch');
+        const compileTimeDispatch = unverified.filter(
+            site => site.uncertaintyClass === 'compile-time-dispatch');
         const runtimeDispatchGroups = new Set(runtimeDispatch.map(site =>
             `${site.dispatchVia || ''}\0${site.dispatchCandidates ?? ''}\0` +
             `${site.externalContract ? 'external' : 'project'}`));
+        const compileTimeDispatchGroups = new Set(
+            compileTimeDispatch.map(site =>
+                `${site.dispatchFamily || ''}\0` +
+                `${site.dispatchCandidates ?? ''}`));
         perSymbol.push({
             name: sym.name, file: sym.file, line: sym.line, kind: sym.kind,
             oracleCalls: oracleCalls.length,
@@ -824,9 +1163,19 @@ async function evaluateRepo(repo, oracle) {
             runtimeDispatchGroups: runtimeDispatchGroups.size,
             runtimeDispatchHits,
             runtimeDispatchUnscored,
+            compileTimeDispatchSites: compileTimeDispatch.length,
+            compileTimeDispatchGroups: compileTimeDispatchGroups.size,
+            compileTimeDispatchHits,
+            compileTimeDispatchUnscored,
             unverifiedReasons: finalizeReasonStats(unverifiedReasonStats),
             placement,
+            exactOracleCalls: oracleCalls.filter(call =>
+                call.uncertaintyClass !== 'compile-time-dispatch').length,
+            compileTimeOracleCalls: oracleCalls.filter(call =>
+                call.uncertaintyClass === 'compile-time-dispatch').length,
+            exactPlacement,
             calleePlacement,
+            exactCalleePlacement,
             calleeSites, calleeHits,
             conserved: account ? account.conserved : null,
             commandProof: perCommandProof,
@@ -839,22 +1188,46 @@ async function evaluateRepo(repo, oracle) {
     const unverifiedScoredEdges = totals.unverifiedEdges - totals.unverifiedUnscored;
     const tier1Precision = rate(totals.confirmedHits, tier1ScoredEdges);
     const unverifiedPrecision = rate(totals.unverifiedHits, unverifiedScoredEdges);
-    const semanticMissing = totals.placement.accountedNotShown +
+    const allOracleSemanticMissing = totals.placement.accountedNotShown +
         totals.placement.missingBeyondText + totals.placement.missingUnexplained;
-    const semanticEligible = Math.max(0, totals.oracleCallEdges - totals.placement.missingExplained);
+    const allOracleSemanticEligible = Math.max(
+        0, totals.oracleCallEdges - totals.placement.missingExplained);
+    const allOracleSemanticRecall = allOracleSemanticEligible > 0
+        ? rate(allOracleSemanticEligible - allOracleSemanticMissing,
+            allOracleSemanticEligible)
+        : 1;
+    // Compiler-dependent overload families are conservative candidate sets,
+    // not exact target edges. Gate semantic recall on the compiler's exact
+    // identity set; retain the broad-family placement and recall alongside it
+    // so the report never hides how much compile-time ambiguity exists.
+    const semanticMissing = totals.exactPlacement.accountedNotShown +
+        totals.exactPlacement.missingBeyondText +
+        totals.exactPlacement.missingUnexplained;
+    const semanticEligible = Math.max(0,
+        totals.exactOracleCallEdges - totals.exactPlacement.missingExplained);
     const semanticRecall = semanticEligible > 0 ? rate(semanticEligible - semanticMissing, semanticEligible) : 1;
-    const calleeSemanticMissing = calleeTotals.placement.confirmedOtherDef +
-        calleeTotals.placement.accounted + calleeTotals.placement.missingBeyondText +
+    const allOracleCalleeSemanticMissing =
+        calleeTotals.placement.confirmedOtherDef +
+        calleeTotals.placement.accounted +
+        calleeTotals.placement.missingBeyondText +
         calleeTotals.placement.missingUnexplained;
-    const calleePlacementTotal = Object.values(calleeTotals.placement).reduce((a, b) => a + b, 0);
+    const calleeSemanticMissing = calleeTotals.exactPlacement.confirmedOtherDef +
+        calleeTotals.exactPlacement.accounted +
+        calleeTotals.exactPlacement.missingBeyondText +
+        calleeTotals.exactPlacement.missingUnexplained;
+    const calleePlacementTotal = Object.values(
+        calleeTotals.exactPlacement).reduce((a, b) => a + b, 0);
     const calleeSemanticEligible = Math.max(0, calleePlacementTotal -
-        calleeTotals.placement.moduleLevel - calleeTotals.placement.missingExplained);
+        calleeTotals.exactPlacement.moduleLevel -
+        calleeTotals.exactPlacement.missingExplained);
     const calleeSemanticRecall = calleeSemanticEligible > 0
         ? rate(calleeSemanticEligible - calleeSemanticMissing, calleeSemanticEligible) : 1;
     const reviewBurden = summarizeReviewBurden({
         symbols: perSymbol,
         oracleCallEdges: totals.oracleCallEdges,
         placement: totals.placement,
+        exactOracleCallEdges: totals.exactOracleCallEdges,
+        exactPlacement: totals.exactPlacement,
         unverifiedEdges: totals.unverifiedEdges,
         unverifiedHits: totals.unverifiedHits,
         unverifiedUnscored: totals.unverifiedUnscored,
@@ -870,6 +1243,8 @@ async function evaluateRepo(repo, oracle) {
             symbols: perSymbol.filter(symbol => symbol.kind === kind),
             oracleCallEdges: kt.oracleCallEdges,
             placement: kt.placement,
+            exactOracleCallEdges: kt.exactOracleCallEdges,
+            exactPlacement: kt.exactPlacement,
             unverifiedEdges: kt.unverifiedEdges,
             unverifiedHits: kt.unverifiedHits,
             unverifiedUnscored: kt.unverifiedUnscored,
@@ -877,6 +1252,9 @@ async function evaluateRepo(repo, oracle) {
         byKindSummary[kind] = {
             sampled: kt.sampled,
             oracleCallEdges: kt.oracleCallEdges,
+            exactOracleCallEdges: kt.exactOracleCallEdges,
+            compileTimeOracleCallEdges:
+                kt.oracleCallEdges - kt.exactOracleCallEdges,
             confirmedEdges: kt.confirmedEdges,
             confirmedHits: kt.confirmedHits,
             confirmedUnscored: kt.confirmedUnscored,
@@ -890,6 +1268,7 @@ async function evaluateRepo(repo, oracle) {
             tierSeparation: confirmedScored && unverifiedScored
                 ? Number((p1 - pu).toFixed(4)) : null,
             oraclePlacement: kt.placement,
+            exactOraclePlacement: kt.exactPlacement,
             reviewBurden: kindReviewBurden,
             unverifiedReasons: finalizeReasonStats(kt.unverifiedReasons),
         };
@@ -903,30 +1282,39 @@ async function evaluateRepo(repo, oracle) {
         evaluated: totals.evaluated,
         errors: perSymbol.filter(s => s.error).length,
         oracleCallEdges: totals.oracleCallEdges,
+        exactOracleCallEdges: totals.exactOracleCallEdges,
+        compileTimeOracleCallEdges:
+            totals.oracleCallEdges - totals.exactOracleCallEdges,
         confirmedEdges: totals.confirmedEdges,
         confirmedScoredEdges: tier1ScoredEdges,
         confirmedUnscored: totals.confirmedUnscored,
         confirmedHits: totals.confirmedHits,
         tier1Precision,
         confirmedFalsePositiveSamples,
+        confirmedUnscoredSamples,
         unverifiedPrecision,
         unverifiedEdges: totals.unverifiedEdges,
         unverifiedScoredEdges,
         unverifiedUnscored: totals.unverifiedUnscored,
+        unverifiedUnscoredSamples,
         unverifiedHits: totals.unverifiedHits,
         unverifiedReasons: finalizeReasonStats(totals.unverifiedReasons),
         reviewBurden,
         tierSeparation: tier1ScoredEdges && unverifiedScoredEdges
             ? Number((tier1Precision - unverifiedPrecision).toFixed(4)) : null,
         oraclePlacement: totals.placement,
+        exactOraclePlacement: totals.exactPlacement,
         byKind: byKindSummary,
         // Strict semantic-recall gate. Conservation alone is necessary but
-        // insufficient: a compiler-true edge must be shown to the agent.
+        // insufficient: every compiler-exact edge must be shown to the agent.
         semanticRecall,
         semanticMissing,
-        missingUnexplained: totals.placement.missingUnexplained,
+        missingUnexplained: totals.exactPlacement.missingUnexplained,
         unexplainedSamples,
         semanticMissingSamples,
+        allOracleSemanticRecall,
+        allOracleSemanticMissing,
+        allOracleSemanticMissingSamples,
         observedZeroAgreement: totals.zeroCases ? rate(totals.zeroAgreed, totals.zeroCases) : null,
         zeroCases: totals.zeroCases,
         conservedRate: rate(totals.conserved, totals.evaluated),
@@ -947,23 +1335,29 @@ async function evaluateRepo(repo, oracle) {
         calleeSites: calleeTotals.sites,
         calleeHits: calleeTotals.hits,
         calleePlacement: calleeTotals.placement,
+        exactCalleePlacement: calleeTotals.exactPlacement,
         calleeSemanticRecall,
         calleeSemanticMissing,
-        calleeMissingUnexplained: calleeTotals.placement.missingUnexplained,
+        allOracleCalleeSemanticMissing,
+        calleeMissingUnexplained:
+            calleeTotals.exactPlacement.missingUnexplained,
         calleeUnexplainedSamples,
         calleeSemanticMissingSamples,
         commandProof,
     };
 
     process.stdout.write(`  tier1Precision ${pct(summary.tier1Precision)} | unverifiedPrecision ${pct(summary.unverifiedPrecision)} | ` +
-        `tierSeparation ${summary.tierSeparation ?? 'n/a'} | placement ${JSON.stringify(summary.oraclePlacement)} | ` +
+        `tierSeparation ${summary.tierSeparation ?? 'n/a'} | exact placement ${JSON.stringify(summary.exactOraclePlacement)} | ` +
         `semanticRecall ${pct(summary.semanticRecall)} (${summary.semanticMissing} missing) | ` +
         `observedZeroAgreement ${summary.observedZeroAgreement != null ? pct(summary.observedZeroAgreement) : 'n/a'} (${summary.zeroCases} cases) | ` +
         `conserved ${pct(summary.conservedRate)}\n`);
-    process.stdout.write(`  review burden: true-edge unverified ${pct(reviewBurden.trueEdgeUnverifiedRate)} | ` +
+    process.stdout.write(`  review burden: exact true-edge unverified ${pct(reviewBurden.trueEdgeUnverifiedRate)} | ` +
+        `all oracle-edge unverified ${pct(reviewBurden.allOracleEdgeUnverifiedRate)} | ` +
         `zero-actionable-ambiguity targets ${pct(reviewBurden.zeroActionableUnverifiedTargetRate)} | ` +
         `actionable candidates p50/p95/max ${reviewBurden.actionableUnverifiedCandidatesP50}/${reviewBurden.actionableUnverifiedCandidatesP95}/${reviewBurden.actionableUnverifiedCandidatesMax} | ` +
         `runtime dispatch ${reviewBurden.runtimeDispatchSites} sites/${reviewBurden.runtimeDispatchGroups} families | ` +
+        `compile-time dispatch ${reviewBurden.compileTimeDispatchSites} sites/${reviewBurden.compileTimeDispatchGroups} families ` +
+        `(${reviewBurden.compilerDependentOracleEdges} oracle edges) | ` +
         `effective review items/oracle-edge ${reviewBurden.unverifiedReviewItemsPerOracleEdge} ` +
         `(${reviewBurden.unverifiedReviewItems}; raw false candidates ` +
         `${reviewBurden.rawFalseUnverifiedCandidates})\n`);
@@ -975,9 +1369,9 @@ async function evaluateRepo(repo, oracle) {
             `unverified ${k.unverifiedScored ? pct(k.unverifiedPrecision) : 'n/a'} (${k.unverifiedHits}/${k.unverifiedScored} scored; ${k.unverifiedUnscored} cfg-unscored) | ` +
             `placement ${JSON.stringify(k.oraclePlacement)}\n`);
     }
-    process.stdout.write(`  callee arm: precision ${pct(summary.calleePrecision)} (${summary.calleeHits}/${summary.calleeSites}) | ` +
-        `semanticRecall ${pct(summary.calleeSemanticRecall)} (${summary.calleeSemanticMissing} missing) | ` +
-        `placement ${JSON.stringify(summary.calleePlacement)}\n`);
+        process.stdout.write(`  callee arm: precision ${pct(summary.calleePrecision)} (${summary.calleeHits}/${summary.calleeSites}) | ` +
+            `semanticRecall ${pct(summary.calleeSemanticRecall)} (${summary.calleeSemanticMissing} missing) | ` +
+            `exact placement ${JSON.stringify(summary.exactCalleePlacement)}\n`);
     const commandCells = PROOF_COMMANDS.map(command =>
         `${command} ${pct(summary.commandProof[command].recall)}`);
     process.stdout.write(`  public command arm: ${commandCells.join(' | ')} | ` +
@@ -1100,7 +1494,7 @@ async function main() {
         const oracle = ORACLES.find(o => o.languages.includes(repo.language));
         try {
             const result = await evaluateRepo(repo, oracle);
-            result.schemaVersion = 3;
+            result.schemaVersion = 4;
             result.generatedAt = new Date().toISOString();
             result.reviewBudgets = reviewBudgets;
             results.push(result);
@@ -1193,7 +1587,7 @@ async function main() {
         a.summary.repo < b.summary.repo ? -1 : a.summary.repo > b.summary.repo ? 1 : 0);
     const generatedAt = new Date().toISOString();
     const rollupPayload = {
-        schemaVersion: 3,
+        schemaVersion: 4,
         generatedAt,
         board: {
             date,
@@ -1233,22 +1627,24 @@ async function main() {
     lines.push('This board measures how much candidate review remains, how often a pinned');
     lines.push('target has no actionable ambiguity, and how many effective review items');
     lines.push('the engine creates. Actionable false candidates count individually; named');
-    lines.push('runtime-dispatch families count once because that is how agents receive them.');
+    lines.push('runtime-dispatch and compiler-dependent template families count once because');
+    lines.push('that is how agents receive them. Exact and compiler-dependent oracle edges');
+    lines.push('remain separate so a dependent may-reach result is never called exact.');
     lines.push('Raw candidates and raw false counts remain visible. Configuration-unscored');
     lines.push('candidates stay visible but are not labeled false.');
     lines.push('');
-    lines.push('| repo | true-edge unverified | zero actionable ambiguity | actionable p50/p95/max | runtime dispatch sites/families | raw unverified | raw false | effective review items | items/oracle edge | top reasons |');
-    lines.push('|---|---:|---:|---:|---:|---:|---:|---:|---:|---|');
+    lines.push('| repo | exact true-edge unverified | all oracle-edge unverified | zero actionable ambiguity | actionable p50/p95/max | runtime sites/families | compile-time sites/families | compiler-dependent oracle edges | raw unverified | raw false | effective review items | items/oracle edge | top reasons |');
+    lines.push('|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|');
     for (const { summary: s } of rollupResults) {
         if (s.error) continue;
         const b = s.reviewBurden;
         if (!b) {
-            lines.push(`| ${s.repo} | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | report predates schema v3 |`);
+            lines.push(`| ${s.repo} | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | report predates schema v4 |`);
             continue;
         }
         const reasons = Object.entries(s.unverifiedReasons || {}).slice(0, 3)
             .map(([reason, row]) => `${reason} (${row.candidates})`).join(', ') || 'none';
-        lines.push(`| ${s.repo} | ${pct(b.trueEdgeUnverifiedRate)} (${b.trueEdgesUnverified}/${b.semanticEligibleEdges}) | ${pct(b.zeroActionableUnverifiedTargetRate)} (${b.zeroActionableUnverifiedTargets}/${b.reviewedSymbols}) | ${b.actionableUnverifiedCandidatesP50}/${b.actionableUnverifiedCandidatesP95}/${b.actionableUnverifiedCandidatesMax} | ${b.runtimeDispatchSites}/${b.runtimeDispatchGroups} | ${b.unverifiedCandidates} | ${b.rawFalseUnverifiedCandidates} | ${b.unverifiedReviewItems} | ${b.unverifiedReviewItemsPerOracleEdge} | ${reasons} |`);
+        lines.push(`| ${s.repo} | ${pct(b.trueEdgeUnverifiedRate)} (${b.trueEdgesUnverified}/${b.exactSemanticEligibleEdges}) | ${pct(b.allOracleEdgeUnverifiedRate)} (${b.allOracleEdgesUnverified}/${b.semanticEligibleEdges}) | ${pct(b.zeroActionableUnverifiedTargetRate)} (${b.zeroActionableUnverifiedTargets}/${b.reviewedSymbols}) | ${b.actionableUnverifiedCandidatesP50}/${b.actionableUnverifiedCandidatesP95}/${b.actionableUnverifiedCandidatesMax} | ${b.runtimeDispatchSites}/${b.runtimeDispatchGroups} | ${b.compileTimeDispatchSites}/${b.compileTimeDispatchGroups} | ${b.compilerDependentOracleEdges} | ${b.unverifiedCandidates} | ${b.rawFalseUnverifiedCandidates} | ${b.unverifiedReviewItems} | ${b.unverifiedReviewItemsPerOracleEdge} | ${reasons} |`);
     }
     lines.push('');
     lines.push('## Oracle-backed command surface');

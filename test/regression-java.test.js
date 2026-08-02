@@ -4226,3 +4226,44 @@ describe('v5 Java compiler-shaped call IR', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('v5 Java nested-type callee identity', () => {
+    it('keeps chained Builder.build calls on the defining outer type', () => {
+        const dir = tmp({
+            'AnnotationSpec.java': [
+                'class AnnotationSpec {',
+                '  static class Builder { AnnotationSpec build() { return null; } }',
+                '}',
+            ].join('\n'),
+            'CodeBlock.java': [
+                'class CodeBlock {',
+                '  static Builder builder() { return new Builder(); }',
+                '  static class Builder {',
+                '    Builder add() { return this; }',
+                '    CodeBlock build() { return new CodeBlock(); }',
+                '  }',
+                '}',
+            ].join('\n'),
+            'Use.java': [
+                'class Use {',
+                '  CodeBlock run() { return CodeBlock.builder().add().build(); }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const run = index.symbols.get('run')[0];
+            const callees = index.findCallees(run, {
+                collectAccount: true,
+                includeMethods: true,
+            });
+            const build = callees.find(edge =>
+                edge.name === 'build' && edge.sites?.includes(2));
+            assert.ok(build, JSON.stringify(callees));
+            assert.equal(build.relativePath, 'CodeBlock.java');
+            assert.equal(build.enclosingType, 'CodeBlock');
+            assert.ok(!(callees.unverifiedCallees || []).some(edge =>
+                edge.name === 'build' && edge.sites?.includes(2)));
+        } finally { rm(dir); }
+    });
+});

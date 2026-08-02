@@ -119,15 +119,19 @@ describe('Interactive Mode', () => {
 
     it('supports unified source, deps, and api commands', () => {
         const commands = [
-            'source formatToc',
-            'source ProjectIndex',
-            'source core/output.js:1-3',
-            'deps core/output.js',
-            'api core/output.js',
+            'source processData',
+            'source Service',
+            'source main.js:1-3',
+            'deps main.js',
+            'api main.js',
         ];
 
         const input = commands.join('\n') + '\nquit\n';
-        const result = execFileSync('node', [CLI_PATH, '--interactive', '.'], {
+        const result = execFileSync('node', [
+            CLI_PATH,
+            '--interactive',
+            path.join(FIXTURES_PATH, 'javascript'),
+        ], {
             input,
             encoding: 'utf-8',
             cwd: PROJECT_DIR,
@@ -138,18 +142,22 @@ describe('Interactive Mode', () => {
         assert.ok(!result.includes('Unknown command: source'), 'source should be recognized');
         assert.ok(!result.includes('Unknown command: deps'), 'deps should be recognized');
         assert.ok(!result.includes('Unknown command: api'), 'api should be recognized');
-        assert.ok(result.includes('formatToc'), 'source should output formatToc');
-        assert.ok(result.includes('ProjectIndex'), 'source should output ProjectIndex');
+        assert.ok(result.includes('processData'), 'source should output processData');
+        assert.ok(result.includes('Service'), 'source should output Service');
     });
 
     it('parses flags per-command (not frozen)', () => {
         const commands = [
-            'find formatToc --exact',
-            'find format',
+            'find processData --exact',
+            'find process',
         ];
 
         const input = commands.join('\n') + '\nquit\n';
-        const result = execFileSync('node', [CLI_PATH, '--interactive', '.'], {
+        const result = execFileSync('node', [
+            CLI_PATH,
+            '--interactive',
+            path.join(FIXTURES_PATH, 'javascript'),
+        ], {
             input,
             encoding: 'utf-8',
             cwd: PROJECT_DIR,
@@ -158,7 +166,7 @@ describe('Interactive Mode', () => {
         });
 
         assert.ok(!result.includes('Error'), 'Neither find should error');
-        assert.ok(result.includes('formatToc'), 'First find should include formatToc');
+        assert.ok(result.includes('processData'), 'First find should include processData');
     });
 
     // MED-2 (Round 5): the unified stats projection must not crash with
@@ -166,7 +174,11 @@ describe('Interactive Mode', () => {
     // parseFlags defaulted top to 0 and the dispatch handler passed that
     // straight through to the executor, which rejected it.
     it('MED-2: repo stats projection succeeds in interactive mode', () => {
-        const result = execFileSync('node', [CLI_PATH, '--interactive', '.'], {
+        const result = execFileSync('node', [
+            CLI_PATH,
+            '--interactive',
+            path.join(FIXTURES_PATH, 'javascript'),
+        ], {
             input: 'repo --sections=stats\nquit\n',
             encoding: 'utf-8',
             cwd: PROJECT_DIR,
@@ -182,8 +194,12 @@ describe('Interactive Mode', () => {
     // MED-3 (Round 5): bad --top value should be rejected in interactive mode
     // (matching CLI behaviour) instead of being silently coerced to falsy.
     it('MED-3: interactive rejects --top=abc with helpful error', () => {
-        const result = execFileSync('node', [CLI_PATH, '--interactive', '.'], {
-            input: 'show formatToc --top=abc\nquit\n',
+        const result = execFileSync('node', [
+            CLI_PATH,
+            '--interactive',
+            path.join(FIXTURES_PATH, 'javascript'),
+        ], {
+            input: 'show processData --top=abc\nquit\n',
             encoding: 'utf-8',
             cwd: PROJECT_DIR,
             timeout: 60000,
@@ -195,8 +211,12 @@ describe('Interactive Mode', () => {
 
     // MED-5 (Round 5): --limit=0 must be rejected, not treated as "no limit".
     it('MED-5: interactive rejects --limit=0', () => {
-        const result = execFileSync('node', [CLI_PATH, '--interactive', '.'], {
-            input: 'find formatToc --limit=0\nquit\n',
+        const result = execFileSync('node', [
+            CLI_PATH,
+            '--interactive',
+            path.join(FIXTURES_PATH, 'javascript'),
+        ], {
+            input: 'find processData --limit=0\nquit\n',
             encoding: 'utf-8',
             cwd: PROJECT_DIR,
             timeout: 60000,

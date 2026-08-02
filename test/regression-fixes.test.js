@@ -2183,13 +2183,6 @@ describe('Bug Hunt: formatSearchJson includes meta information', () => {
         assert.strictEqual(json.filesSkipped, 2, 'should include filesSkipped');
         assert.strictEqual(json.totalFiles, 12, 'should include totalFiles');
     });
-
-    it('should include regexFallback when present', () => {
-        const results = [];
-        results.meta = { filesScanned: 5, filesSkipped: 0, totalFiles: 5, regexFallback: true };
-        const json = JSON.parse(output.formatSearchJson(results, 'bad[regex'));
-        assert.strictEqual(json.regexFallback, true, 'should include regexFallback');
-    });
 });
 
 describe('Bug Hunt: formatTocJson includes hiddenFiles', () => {
@@ -2546,6 +2539,43 @@ describe('Bug Hunt: imports content.split performance', () => {
         assert.ok(Array.isArray(result), 'should return imports array');
         assert.ok(result.length >= 50, `should have at least 50 imports, got ${result.length}`);
         rm(dir);
+    });
+});
+
+describe('v5 composed answer identity', () => {
+    it('show pins every requested section to one ambiguous definition', () => {
+        const dir = tmp({
+            'a.js': 'export function duplicate() { return "a"; }',
+            'z.js': 'export function duplicate() { return "z"; }',
+            'use.js': [
+                'import { duplicate } from "./z.js";',
+                'export const value = duplicate();',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const execution = execute(index, 'show', {
+                name: 'duplicate',
+                sections: 'summary,callers,callees,source',
+            });
+            assert.equal(execution.ok, true, execution.error);
+            const selected = execution.result.summary.symbol;
+            assert.equal(execution.result.context.file, selected.file);
+            assert.equal(execution.result.context.startLine, selected.startLine);
+            assert.equal(
+                execution.result.source.entries[0].match.relativePath,
+                selected.file,
+            );
+            assert.equal(
+                execution.result.source.entries[0].match.startLine,
+                selected.startLine,
+            );
+            assert.equal(execution.result.warnings.length, 1);
+            assert.match(execution.note, new RegExp(
+                `Using ${selected.file}:${selected.startLine}`));
+        } finally {
+            rm(dir);
+        }
     });
 });
 

@@ -70,9 +70,16 @@ describe('oracle gate policy', () => {
             runtimeDispatchSites: 2,
             runtimeDispatchGroups: 1,
             runtimeDispatchReviewItems: 1,
+            compileTimeDispatchSites: 0,
+            compileTimeDispatchGroups: 0,
+            compileTimeDispatchReviewItems: 0,
             semanticEligibleEdges: 18,
+            exactSemanticEligibleEdges: 18,
+            compilerDependentOracleEdges: 0,
             trueEdgesUnverified: 4,
             trueEdgeUnverifiedRate: 0.2222,
+            allOracleEdgesUnverified: 4,
+            allOracleEdgeUnverifiedRate: 0.2222,
             unverifiedCandidates: 10,
             unverifiedScoredEdges: 9,
             unverifiedUnscored: 1,
@@ -137,6 +144,36 @@ describe('oracle gate policy', () => {
         assert.strictEqual(metrics.unverifiedReviewItems, 1);
         assert.strictEqual(metrics.unverifiedReviewItemsPerOracleEdge, 0.01,
             'one named runtime boundary is one agent-facing review item');
+    });
+
+    it('separates compiler-dependent template families from exact oracle edges', () => {
+        const metrics = summarizeReviewBurden({
+            symbols: [{
+                unverified: 43,
+                actionableUnverified: 0,
+                compileTimeDispatchSites: 43,
+                compileTimeDispatchGroups: 1,
+                compileTimeDispatchHits: 20,
+            }],
+            oracleCallEdges: 100,
+            placement: { unverified: 22 },
+            exactOracleCallEdges: 80,
+            exactPlacement: { unverified: 2 },
+            unverifiedEdges: 43,
+            unverifiedHits: 22,
+        });
+        assert.equal(metrics.compilerDependentOracleEdges, 20);
+        assert.equal(metrics.trueEdgeUnverifiedRate, 0.025,
+            'the strict rate contains only statically exact oracle identity');
+        assert.equal(metrics.allOracleEdgeUnverifiedRate, 0.22,
+            'the raw all-oracle abstention rate remains visible');
+        assert.equal(metrics.compileTimeDispatchSites, 43);
+        assert.equal(metrics.compileTimeDispatchGroups, 1);
+        assert.equal(metrics.actionableUnverifiedCandidatesP95, 0);
+        assert.equal(metrics.unverifiedReviewItems, 1,
+            'one named compiler handoff is one agent-facing review family');
+        assert.equal(metrics.rawFalseUnverifiedCandidates, 21,
+            'raw candidates are never removed from the audit');
     });
 
     it('accepts the measured Clap configuration coverage', () => {

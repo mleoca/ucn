@@ -222,16 +222,9 @@ describe('18-command CLI/MCP/interactive parity', () => {
         assert.strictEqual(listed.result.tools.length, 1);
         const tool = listed.result.tools[0];
         assert.strictEqual(tool.name, 'ucn');
-        // The command param is a described string, not a hard enum: an enum
-        // would make v4 names die in SDK validation with no replacement
-        // guidance. The handler validates against the same registry list.
         const commandSchema = tool.inputSchema.properties.command;
         assert.strictEqual(commandSchema.type, 'string');
-        assert.strictEqual(commandSchema.enum, undefined);
-        for (const name of getMcpCommandEnum()) {
-            assert.ok(commandSchema.description.includes(name),
-                `command description must list "${name}"`);
-        }
+        assert.deepStrictEqual(commandSchema.enum, getMcpCommandEnum());
         assert.match(tool.description, /18 task-oriented commands/);
         assert.doesNotMatch(tool.description, /- about\b|- context\b|- blast\b/);
     });

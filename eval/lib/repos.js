@@ -250,6 +250,49 @@ const REPOS = [
         language: 'javascript',
         targetCandidates: ['.'],
     },
+    {
+        // Mature, overload- and inheritance-heavy C# library. Roslyn builds
+        // one semantic compilation over the production source tree, so this
+        // board independently checks C# caller identity, overload selection,
+        // constructors/type usages, and cross-file resolution without
+        // relying on UCN's tree-sitter parser.
+        name: 'newtonsoft-json',
+        url: 'https://github.com/JamesNK/Newtonsoft.Json',
+        commit: '4f73e74372445108d2c1bda37b36e6f5e43402e0',
+        language: 'csharp',
+        targetCandidates: ['Src/Newtonsoft.Json'],
+    },
+    {
+        // Widely embedded ANSI C library with public-header declarations,
+        // macro configuration, recursive parsing, callbacks, and allocator
+        // indirection. clangd supplies the compiler-semantic release oracle.
+        name: 'cjson',
+        url: 'https://github.com/DaveGamble/cJSON',
+        commit: 'c859b25da02955fef659d658b8f324b5cde87be3',
+        language: 'c',
+        targetCandidates: ['.'],
+        clangFlags: ['-DCJSON_HIDE_SYMBOLS=0'],
+    },
+    {
+        // Template-heavy modern C++ library spanning headers and source
+        // implementations. This exercises overloads, constructors, methods,
+        // namespaces, macros, and header/source declaration identity.
+        name: 'fmt',
+        url: 'https://github.com/fmtlib/fmt',
+        commit: 'e424e3f2e607da02742f73db84873b8084fc714c',
+        language: 'cpp',
+        targetCandidates: ['.'],
+        // fmt vendors GoogleTest under test/gtest and its test translation
+        // units include "gmock/..." from that include root. Without this,
+        // clangd treats TEST(...) and other macros as undeclared functions,
+        // contaminating the oracle with synthetic source symbols.
+        clangFlags: ['-Itest/gtest'],
+        // The release board measures fmt itself, not the bundled GoogleTest
+        // implementation. Keep the directory available as an include root so
+        // clangd compiles fmt's tests faithfully, but never sample GTest's
+        // declarations as target symbols.
+        oracleExclude: ['test/gtest'],
+    },
 ];
 
 // Publish-blocking board. Keep this as a named subset of REPOS so every
@@ -264,6 +307,9 @@ const RELEASE_REPO_NAMES = Object.freeze([
     'ripgrep',
     'clap',
     'javapoet',
+    'newtonsoft-json',
+    'cjson',
+    'fmt',
 ]);
 const RELEASE_REPOS = Object.freeze(RELEASE_REPO_NAMES.map(name => {
     const repo = REPOS.find(candidate => candidate.name === name);

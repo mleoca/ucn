@@ -299,7 +299,8 @@ function context(index, name, options = {}) {
         !!(def.isMethod || def.type === 'method' || def.className);
 
     // Special handling for class/struct/interface types
-    if (['class', 'struct', 'interface', 'type'].includes(def.type)) {
+    if (['class', 'struct', 'interface', 'type', 'enum', 'record']
+        .includes(def.type)) {
         const methods = index.findMethodsForType(name);
 
         // Pin caller resolution to the resolved class definition — same as the

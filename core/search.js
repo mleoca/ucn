@@ -569,14 +569,14 @@ function search(index, term, options = {}) {
     const regexFlags = options.caseSensitive ? 'g' : 'gi';
     const useRegex = options.regex === true; // Safe default: literal text
     let regex;
-    let regexFallback = false;
     if (useRegex) {
         try {
             regex = new RegExp(term, regexFlags);
         } catch (e) {
-            // Invalid regex — fall back to plain text
-            regex = new RegExp(escapeRegExp(term), regexFlags);
-            regexFallback = e.message;
+            throw new Error(
+                `Invalid regular expression "${term}": ${e.message}`,
+                { cause: e },
+            );
         }
     } else {
         regex = new RegExp(escapeRegExp(term), regexFlags);
@@ -717,10 +717,11 @@ function search(index, term, options = {}) {
         filesSkipped,
         filesFilteredByFlag,
         totalFiles: index.files.size,
-        regexFallback,
-        mode: useRegex ? (regexFallback ? 'literal-fallback' : 'regex') : 'literal',
+        mode: useRegex ? 'regex' : 'literal',
         totalMatches,
+        shownMatches: totalMatches - truncatedMatches,
         truncatedMatches,
+        limit: options.top || null,
         projectLanguage: index._getPredominantLanguage(),
     };
     return results;
@@ -1788,7 +1789,16 @@ function _buildSourceFileImporters(index, defs) {
             // If so, add it to the queue so its importers are also discovered.
             if (!visited.has(imp)) {
                 const fe = index.files.get(imp);
-                if (fe && _fileReExportsSymbol(index, fe, symbolName, current)) {
+                const currentEntry = index.files.get(current);
+                // C/C++ #include is textual inclusion, not a module import.
+                // Names flow through every transitive include edge regardless
+                // of extension (`common.h` may intentionally include a .c
+                // implementation), so no re-export declaration is required.
+                const cFamilyIncludeChain =
+                    ['c', 'cpp'].includes(currentEntry?.language) &&
+                    ['c', 'cpp'].includes(fe?.language);
+                if (fe && (cFamilyIncludeChain ||
+                    _fileReExportsSymbol(index, fe, symbolName, current))) {
                     visited.add(imp);
                     queue.push(imp);
                 }

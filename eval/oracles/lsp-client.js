@@ -15,8 +15,13 @@ const { spawn } = require('child_process');
 const DEFAULT_TIMEOUT_MS = 300000;
 
 class LspClient {
-    constructor(command, args, { timeoutMs = DEFAULT_TIMEOUT_MS, settings = null, capabilities = null, onNotification = null, env = null } = {}) {
-        this.child = spawn(command, args, { stdio: ['pipe', 'pipe', 'inherit'], ...(env && { env }) });
+    constructor(command, args, { timeoutMs = DEFAULT_TIMEOUT_MS, settings = null,
+        capabilities = null, onNotification = null, env = null,
+        stderr = 'inherit' } = {}) {
+        this.child = spawn(command, args, {
+            stdio: ['pipe', 'pipe', stderr],
+            ...(env && { env }),
+        });
         this.timeoutMs = timeoutMs;
         this.settings = settings; // answers workspace/configuration by dotted section
         this.extraCapabilities = capabilities; // merged into initialize capabilities (e.g. rust-analyzer serverStatus)
@@ -146,8 +151,34 @@ class LspClient {
         });
     }
 
+    didChange(filePath, version, text) {
+        this.notify('textDocument/didChange', {
+            textDocument: { uri: pathToUri(filePath), version },
+            contentChanges: [{ text }],
+        });
+    }
+
     kill() {
         try { this.child.kill(); } catch (e) { /* already dead */ }
+    }
+
+    waitForExit(timeoutMs = 2000) {
+        if (this.child.exitCode !== null || this.child.signalCode !== null) {
+            return Promise.resolve(true);
+        }
+        return new Promise(resolve => {
+            let settled = false;
+            const finish = value => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                this.child.off('exit', onExit);
+                resolve(value);
+            };
+            const onExit = () => finish(true);
+            const timer = setTimeout(() => finish(false), timeoutMs);
+            this.child.once('exit', onExit);
+        });
     }
 }
 

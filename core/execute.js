@@ -299,7 +299,8 @@ function checkDefinitionPin(index, p) {
     }
     const line = Number(p.line);
     if (p.line && Number.isFinite(line)) {
-        const atLine = candidates.filter(d => d.startLine === line);
+        const atLine = candidates.filter(d =>
+            d.startLine === line || d.nameLine === line);
         if (atLine.length === 0) {
             return `No definition of "${p.name}" at line ${line}${p.file ? ` in files matching "${p.file}"` : ''}. Definitions:\n${describe(candidates)}`;
         }
@@ -435,6 +436,26 @@ const HANDLERS = {
     show: (index, p) => {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
+        const originalTarget = p.name;
+        const query = { ...p };
+        applyClassMethodSyntax(query);
+        const resolved = index.resolveSymbol(query.name, {
+            file: query.file,
+            className: query.className,
+            line: query.line,
+        });
+        // A composed answer must use one exact definition in every section.
+        // Let the child handler provide the normal not-found/filter error, but
+        // once resolution succeeds pin every composition to the selected file
+        // and line. Otherwise brief/context and source can apply different
+        // legitimate ranking policies and contradict each other.
+        const targetParams = resolved.def ? {
+            ...query,
+            name: resolved.def.name,
+            file: resolved.def.relativePath,
+            line: resolved.def.nameLine || resolved.def.startLine,
+            ...(resolved.def.className && { className: resolved.def.className }),
+        } : query;
         const parsed = parseSections(
             p.sections,
             ['summary', 'callers', 'callees'],
@@ -444,8 +465,9 @@ const HANDLERS = {
         if (parsed.error) return { ok: false, error: parsed.error };
 
         const selected = new Set(parsed.sections);
-        const result = { target: p.name, sections: parsed.sections };
-        const notes = [];
+        const result = { target: originalTarget, sections: parsed.sections };
+        const notes = (resolved.warnings || []).map(warning => warning.message);
+        if (resolved.warnings?.length) result.warnings = resolved.warnings;
         const run = (handler, params) => {
             const response = HANDLERS[handler](index, { ...params });
             if (!response.ok) return response;
@@ -454,12 +476,12 @@ const HANDLERS = {
         };
 
         if (selected.has('summary')) {
-            const response = run('brief', p);
+            const response = run('brief', targetParams);
             if (!response.ok) return response;
             result.summary = response.result;
         }
         if (selected.has('callers') || selected.has('callees')) {
-            const response = run('context', p);
+            const response = run('context', targetParams);
             if (!response.ok) return response;
             // Apply the projection in the engine result so text and JSON
             // expose the same sections. ACCOUNT/CONTRACT metadata stays
@@ -475,22 +497,24 @@ const HANDLERS = {
             }
         }
         if (selected.has('source')) {
-            const response = run('source', p);
+            const response = run('source', targetParams);
             if (!response.ok) return response;
             result.source = response.result;
         }
         if (selected.has('dependencies')) {
-            const response = run('smart', p);
+            const response = run('smart', targetParams);
             if (!response.ok) return response;
             result.dependencies = response.result;
         }
         if (selected.has('tests')) {
-            const response = run('tests', { ...p, depth: 0 });
+            const response = run('tests', { ...targetParams, depth: 0 });
             if (!response.ok) return response;
             result.tests = response.result;
         }
         if (selected.has('types')) {
-            const response = run('about', { ...p, withTypes: true, compact: true });
+            const response = run('about', {
+                ...targetParams, withTypes: true, compact: true,
+            });
             if (!response.ok) return response;
             result.types = {
                 types: response.result.types || [],
@@ -498,12 +522,12 @@ const HANDLERS = {
             };
         }
         if (selected.has('example')) {
-            const response = run('example', p);
+            const response = run('example', targetParams);
             if (!response.ok) return response;
             result.example = response.result;
         }
         if (selected.has('related')) {
-            const response = run('related', p);
+            const response = run('related', targetParams);
             if (!response.ok) return response;
             result.related = response.result;
         }
@@ -1197,8 +1221,12 @@ const HANDLERS = {
         if (err) return { ok: false, error: err };
         const testsExcluded = !p.includeTests;
         const exclude = applyTestExclusions(p.exclude, p.includeTests);
-        // Use limit as top if top not set
+        // JSON is intentionally structured rather than byte-truncated, so
+        // text search needs a row bound of its own. Keep the documented
+        // default at 500 and retain total/truncated metadata for controlled
+        // expansion with an explicit top/limit.
         const topVal = num(p.top, undefined) || num(p.limit, undefined);
+        const effectiveLimit = topVal || 500;
         const result = index.search(p.term, {
             codeOnly: p.codeOnly || false,
             context: num(p.context, 0),
@@ -1206,7 +1234,7 @@ const HANDLERS = {
             exclude,
             in: p.in,
             regex: p.regex,
-            top: topVal,
+            top: effectiveLimit,
             file: p.file,
         });
         if (result.meta) result.meta.testsExcluded = testsExcluded;

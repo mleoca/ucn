@@ -27,6 +27,8 @@ CLI, MCP, and interactive mode resolve the same 18 public commands through one r
 
 The release board independently cross-checks overlapping stable-handle answers from `find`, `show`, `source`, `impact`, `tests`, `check`, and caller `trace`. Target identity, source and direct-test projections, caller tiers, evidence reasons, totals, and accounting must agree exactly; a mismatch is a failing witness rather than an interpretation left to an agent.
 
+Publish-blocking semantic gates also compare stratified samples from pinned real repositories with independent language-native oracles: ts-morph, Pyright, gopls, rust-analyzer, JDT LS, clangd, and Roslyn. This validates the measured static evidence classes; it does not turn dynamic dispatch, generated code, reflection, or external dependencies into complete runtime knowledge.
+
 MCP keeps its process and project index warm across calls. CLI and MCP share
 the same text budget: targeted commands default to 10K output characters,
 broad commands to 3K, with a 100K hard ceiling. Use CLI `--max-chars`, MCP

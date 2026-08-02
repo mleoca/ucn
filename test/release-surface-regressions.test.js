@@ -2,7 +2,7 @@
 
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
-const { execFileSync } = require('child_process');
+const { execFileSync, spawnSync } = require('child_process');
 const fs = require('fs');
 
 const { execute } = require('../core/execute');
@@ -247,6 +247,87 @@ describe('v5 release-surface adversarial regressions', () => {
 
             const dotted = index.search('config.get');
             assert.deepEqual(dotted[0].matches.map(match => match.line), [4]);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('invalid explicit regex fails through the stable CLI JSON envelope', () => {
+        const dir = tmp({
+            'package.json': '{}',
+            'search.js': 'const value = "search me";',
+        });
+        try {
+            const run = spawnSync(process.execPath, [
+                CLI_PATH, dir, 'search', '[invalid',
+                '--regex', '--json', '--quiet', '--no-cache',
+            ], { encoding: 'utf8' });
+            assert.equal(run.status, 1);
+            const json = JSON.parse(run.stdout);
+            assert.equal(json.meta.ok, false);
+            assert.equal(json.meta.command, 'search');
+            assert.equal(json.data, null);
+            assert.match(json.error, /Invalid regular expression "\[invalid"/);
+            assert.match(run.stderr, /Invalid regular expression "\[invalid"/);
+            assert.doesNotMatch(run.stderr, /Fell back|plain text/i);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('unknown CLI flags remain machine-readable under --json', () => {
+        const run = spawnSync(process.execPath, [
+            CLI_PATH, '.', 'repo', '--json', '--definitely-not-a-flag',
+        ], {
+            encoding: 'utf8',
+            cwd: __dirname,
+        });
+        assert.equal(run.status, 1);
+        const json = JSON.parse(run.stdout);
+        assert.equal(json.meta.ok, false);
+        assert.equal(json.data, null);
+        assert.match(json.error, /Unknown flag/);
+        assert.match(run.stderr, /Unknown flag/);
+    });
+
+    it('text search has a truthful 500-row default and explicit expansion cap', () => {
+        const lines = Array.from(
+            { length: 620 },
+            (_, i) => `const match_${i} = "needle";`,
+        );
+        const dir = tmp({
+            'package.json': '{}',
+            'many.js': lines.join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const bounded = execute(index, 'search', { term: 'needle' });
+            assert.equal(bounded.ok, true);
+            assert.equal(bounded.result.meta.totalMatches, 620);
+            assert.equal(bounded.result.meta.shownMatches, 500);
+            assert.equal(bounded.result.meta.truncatedMatches, 120);
+            assert.equal(bounded.result.meta.limit, 500);
+            assert.equal(
+                bounded.result.reduce((sum, file) => sum + file.matches.length, 0),
+                500,
+            );
+
+            const json = JSON.parse(output.formatPublicJson(
+                'search', bounded.result, { term: 'needle' },
+                { ...bounded, surface: 'cli' }));
+            assert.equal(json.meta.totalMatches, 620);
+            assert.equal(json.meta.shownMatches, 500);
+            assert.equal(json.meta.truncated, true);
+            assert.equal(json.meta.limit, 500);
+            assert.equal(json.data[0].matches.length, 500);
+
+            const explicit = execute(index, 'search', {
+                term: 'needle',
+                limit: 17,
+            });
+            assert.equal(explicit.result.meta.totalMatches, 620);
+            assert.equal(explicit.result.meta.shownMatches, 17);
+            assert.equal(explicit.result.meta.limit, 17);
         } finally {
             rm(dir);
         }
