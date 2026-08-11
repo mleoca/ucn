@@ -16,6 +16,11 @@ const { makeHelperHandle } = require('./jsonl-helper');
 
 const HELPER_PROJECT = path.join(
     __dirname, 'roslyn-helper', 'RoslynHelper.csproj');
+// dotnet resolves global.json from the WORKING DIRECTORY, not the project
+// path — every dotnet invocation below runs from the helper directory so its
+// SDK pin (9.x band; see the csproj comment) governs even when a newer SDK is
+// installed alongside (CI runners preinstall the latest .NET).
+const HELPER_DIR = path.dirname(HELPER_PROJECT);
 
 const roslynOracle = {
     name: 'roslyn',
@@ -33,6 +38,7 @@ const roslynOracle = {
             '--nologo',
             '--verbosity', 'quiet',
         ], {
+            cwd: HELPER_DIR,
             encoding: 'utf8',
             stdio: ['ignore', 'pipe', 'pipe'],
         });
@@ -52,6 +58,7 @@ const roslynOracle = {
             repoDir,
             ...(projectConfig ? [projectConfig.path] : []),
         ], {
+            cwd: HELPER_DIR,
             stdio: ['pipe', 'pipe', 'inherit'],
         });
         const helper = makeHelperHandle(child, {
@@ -63,6 +70,7 @@ const roslynOracle = {
             throw new Error(`Roslyn helper failed to start: ${banner.error}`);
         }
         const version = spawnSync('dotnet', ['--version'], {
+            cwd: HELPER_DIR,
             stdio: 'pipe',
         }).stdout?.toString().trim() || 'unknown';
         process.stdout.write(

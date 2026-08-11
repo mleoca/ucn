@@ -1,4 +1,14 @@
 <Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    The Roslyn references below point at the SDK's OWN bundled compiler
+    assemblies, so the SDK that builds this project must match the
+    TargetFramework major: a newer installed SDK (CI runners preinstall the
+    latest .NET alongside the setup-dotnet version) would inject its Roslyn
+    built against a newer System.Runtime and fail with CS1705. global.json
+    next to this file pins SDK selection to the 9.x band; the oracle runs
+    dotnet from this directory so the pin always governs. Bump TargetFramework
+    and global.json TOGETHER when moving to a newer .NET.
+  -->
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net9.0</TargetFramework>
