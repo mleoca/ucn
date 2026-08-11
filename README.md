@@ -1,63 +1,149 @@
 # UCN — Universal Code Navigator
 
-**grep finds the line. UCN follows the code.**
+See what code does before you touch it.
 
-UCN is local, AST-based code intelligence for humans and AI agents. It answers
-the questions that usually come *after* a text search:
-
-- Which definition does this name refer to?
-- Who calls it, and what does it call?
-- What could change if I edit it?
-- Which tests are connected to it?
-- How do these files, entry points, and public APIs fit together?
-
-The answer is compact, source-linked, and honest about uncertainty. Use it from
-the terminal, interactive mode, or one MCP tool. The analysis needs no running
-language server, project build, background daemon, or per-project setup.
+Find symbols, follow execution, inspect impact, select tests, map dependencies,
+extract source, and audit cleanup candidates—from the terminal or an AI agent.
 
 [![npm](https://img.shields.io/npm/v/ucn)](https://www.npmjs.com/package/ucn)
 [![tests](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/mleoca/0e10a790e16ab61ddd233e05645e203e/raw/ucn-tests.json)](https://github.com/mleoca/ucn/actions/workflows/ci.yml)
 [![license](https://img.shields.io/npm/l/ucn)](LICENSE)
 
-JavaScript · TypeScript · Python · Go · Rust · Java · C · C++ · C# · HTML
+All commands, one engine, three ways to use it:
 
-## Start with one minute
+```text
+  Terminal              AI Agents           Agent Skills
+       │                    │                    │
+      CLI                  MCP                 Skill
+       └────────────────────┼────────────────────┘
+                            │
+                     ┌──────┴──────┐
+                     │ UCN Engine  │
+                     │  commands   │
+                     │ tree-sitter │
+                     └─────────────┘
+```
+
+Supports JavaScript, TypeScript, JSX/TSX, Python, Go, Rust, Java, C, C++, C#,
+and HTML inline scripts.
+
+If you work with AI, add UCN as a [Skill or MCP tool](#ai-setup). The agent gets
+compact, source-linked code intelligence through one tool instead of loading
+whole files to reconstruct every relationship.
+
+UCN is deliberately lightweight:
+
+- **No required background process** - the CLI parses on demand, answers, and
+  exits; MCP stays warm only when you choose to run it.
+- **No language servers** - tree-sitter performs the analysis without building
+  or compiling the project.
+- **MCP is optional** - it is only needed to connect UCN directly to an AI agent;
+  the CLI, interactive mode, and Agent Skill work without an MCP server.
+
+## Start here
 
 ```bash
 npm install -g ucn                    # Node.js 20+
 
 cd your-project
-ucn repo                              # understand the repository
-ucn find handleRequest                # find the exact definition
+ucn repo                              # repository map and health
+ucn find handleRequest                # exact definitions and stable handles
 ucn show src/server.ts:42:handleRequest
+ucn trace src/server.ts:42:handleRequest --direction=callers
 ucn impact src/server.ts:42:handleRequest
 ucn tests src/server.ts:42:handleRequest --depth=3
-ucn source src/server.ts:42:handleRequest
 ```
 
-`find` returns stable handles in `file:line:name` form. Reuse the handle to pin
-later questions to one definition, even when the repository contains several
-functions with the same name.
+The first command builds an incremental project index. Later commands reuse it.
+No configuration is required, and the cache stays outside the project directory.
 
-## Where UCN fits
+## Understand code you did not write
 
-UCN belongs beside grep, not in its place.
+`ucn show` gathers the useful context around one symbol: signature, source,
+callers, callees, tests, types, dependencies, examples, and related code. Ask for
+everything or project it down to the sections you need.
 
-| Question | Reach for |
-|---|---|
-| “Where does this text, error, key, or filename occur?” | `grep` / `rg` |
-| “Which symbol is this, who calls it, and what depends on it?” | UCN |
-| “Will this compile, pass at runtime, or behave the same in production?” | Compiler, type checker, tests, or profiler |
+```text
+$ ucn show detectLanguage --sections=summary,callers,callees,tests --compact
 
-Use grep for literals, logs, configuration, Markdown, and languages UCN does not
-parse. Use UCN when identity and relationships matter. It removes much of the
-repeated `grep → open file → infer binding → chase imports → repeat` loop without
-pretending to be a compiler.
+SUMMARY
+───────
+detectLanguage(filePath: string, projectRoot = null): string|null
+  languages/index.js:420-428  (9 lines)
+  handle: languages/index.js:420:detectLanguage
+  "Detect language from file path"
+  async: no  |  side_effects: [none]  |  complexity: branches=1, depth=1
 
-## Useful answers without invented certainty
+RELATIONSHIPS
+─────────────
+CALLERS — CONFIRMED (51, 30 prod + 21 test):
+  cli/index.js:604 [runFileCommand]: const language = detectLanguage(filePath);
+  core/build-worker.js:39 [processFile]: const language = detectLanguage(filePath, rootDir);
+  core/project.js:472 [build]: const language = detectLanguage(filePath, this.root);
+  test/parser-unit.test.js:19: assert.strictEqual(detectLanguage('file.js'), 'javascript');
+  test/parser-unit.test.js:46: assert.strictEqual(detectLanguage('file.c'), 'c');
+  test/parser-unit.test.js:50: assert.strictEqual(detectLanguage('file.cs'), 'csharp');
+  ... 45 more callers
 
-A code-navigation tool is only helpful if you know which parts of its answer to
-trust. UCN keeps proven and possible edges separate:
+CALLEES (1):
+  detectHeaderLanguage {fs} - core/compilation-database.js:217
+CALLEES — UNVERIFIED (1):
+  toLowerCase ×1 — possible-dispatch L422
+
+ACCOUNT: "detectLanguage" occurs on 79 lines in 20 files: 51 confirmed,
+  0 unverified, 28 non-call, 0 other-target, 0 unaccounted
+CONTRACT: literal-name text partition complete; semantic completeness is not claimed.
+
+TESTS: 27 matches in 6 test files
+```
+
+`find` returns stable handles in `file:line:name` form. Pass the handle to any
+symbol command to pin the answer to one definition, even when several files or
+classes use the same name.
+
+## Follow the execution path
+
+`trace` walks callees, callers, or callers toward runtime entry points. The tree
+keeps proven edges and unresolved dispatch visibly separate.
+
+```text
+$ ucn trace build --depth=2
+
+build
+├── detectProjectPattern (core/discovery.js:760) 1x
+├── parseGitignore (core/discovery.js:253) 1x
+│   ├── gitignoreFiles (core/discovery.js:234) 1x
+│   └── parseGitignoreFile (core/discovery.js:152) 1x
+├── expandGlob (core/discovery.js:314) 1x
+│   ├── parseGlobPattern (core/discovery.js:369) 1x
+│   ├── walkDir (core/discovery.js:426) 1x
+│   └── compareNames (core/discovery.js:293) 1x
+├── parallelBuild (core/parallel-build.js:48) 1x
+│   ├── partitionFiles (core/parallel-build.js:16) 1x
+│   ├── removeFileSymbols (core/project.js:675) 1x
+│   └── [unverified] set — method-ambiguous L171,L176,L180
+└── ... more callees
+
+CALLEE ACCOUNT: 11 nodes expanded · 210 call sites = 31 confirmed +
+  33 unverified + 86 external/builtin + 60 excluded
+```
+
+The account line makes the tree auditable: unresolved sites remain visible and
+quantified instead of disappearing from the result.
+
+## Answers you can trust
+
+UCN does not turn every matching name into a semantic claim. Caller-bearing
+answers separate evidence into clear tiers:
+
+- **CONFIRMED** - target identity is supported by a binding, import, receiver
+  type, qualified path, same-class resolution, or equivalent evidence.
+- **UNVERIFIED** - call syntax exists, but UCN cannot prove the target. The site
+  stays visible with a reason such as `method-ambiguous` or `possible-dispatch`.
+- **NON-CALL, OTHER-TARGET, and EXCLUDED** - observed lines classified away from
+  the selected target.
+- **ACCOUNT** - every observed literal-name line is reconciled across the tiers.
+- **CONTRACT** - states the boundary of the answer and what it does not prove.
 
 ```text
 CALLERS — CONFIRMED (2):
@@ -72,28 +158,18 @@ ACCOUNT: "parseRequest" occurs on 8 lines: 2 confirmed, 1 unverified,
 CONTRACT: literal-name text partition complete; semantic completeness is not claimed.
 ```
 
-- **CONFIRMED** means UCN has target-identity evidence: a binding, import,
-  receiver type, qualified path, or same-class resolution.
-- **UNVERIFIED** means a possible edge remains, but UCN cannot prove its target.
-  The site stays visible with a reason instead of being guessed or discarded.
-- **ACCOUNT** reconciles every observed literal-name line across confirmed,
-  unverified, non-call, other-target, and excluded buckets.
-- **CONTRACT** states the boundary of the answer. A clean text account is not a
-  claim that reflection, generated code, aliases, or runtime registration do not
-  exist.
+An observed-text zero is not a safe-deletion claim. Aliases, generated code,
+reflection, runtime registration, dynamic dispatch, and external consumers can
+exist beyond the indexed evidence. UCN reports those blind spots through
+`repo --sections=health --deep` and keeps risky decisions review-only.
 
-That distinction is especially useful to an agent: it can act on strong evidence,
-review a small uncertainty band, and know when to fall back to grep or a native
-toolchain.
+### Measured against ground truth
 
-## Measured, not merely claimed
+Release gates compare UCN with ts-morph, Pyright, gopls, rust-analyzer, JDT LS,
+Roslyn, and clangd on ten pinned production repositories. The latest full v5
+release-board run produced:
 
-UCN's release gates compare its answers with real compiler and language-server
-oracles on pinned repositories. The latest full v5 release-board run covered
-TypeScript, Python, Go, Rust, Java, C#, C, and C++ through ts-morph, Pyright,
-gopls, rust-analyzer, JDT LS, Roslyn, and clangd.
-
-| Latest release-board result | Measurement |
+| Release-board result | Measurement |
 |---|---:|
 | In-scope caller and callee semantic recall | **100%** on all 10 repositories |
 | Confirmed caller precision | **99.4–100%** per repository |
@@ -103,254 +179,185 @@ gopls, rust-analyzer, JDT LS, Roslyn, and clangd.
 | Automated suite | **3,383 tests** across 981 suites, 0 failures or skips |
 | Performance board | **10 / 10 repositories passed** |
 
-On that performance run, the slowest median cold build still indexed 15.4K
-lines/second by wall time, the worst repository query p95 was 73.8 ms, and the
-highest measured peak RSS was 771 MB. Each repository ran in an isolated process
-with three cold samples and a fixed four-worker ceiling.
+On that run, the slowest median cold build indexed 15.4K lines/second by wall
+time, the worst repository query p95 was 73.8 ms, and the highest measured peak
+RSS was 771 MB. Each repository ran in an isolated process with three cold
+samples and a fixed four-worker ceiling.
 
-These are measurements of a deterministic, stratified release board—not a promise
-of universal program understanding or identical speed on every machine. The gate
-requires 100% in-scope semantic recall, at least 98% confirmed precision, a fully
-conserved account, zero cross-command disagreements, bounded ambiguity, at least
-10K indexed lines/second by wall time, and bounded query latency and memory. Repos
-that expose gaps stay in the wider scheduled matrix instead of being removed to
-protect a perfect score.
+These are measured release-board results, not a claim of universal program
+understanding or identical performance on every machine. The sources are pinned,
+the sampling policy is deterministic, and repositories that expose gaps remain
+on the wider scheduled board.
 
-See [How the release evidence works](#how-the-release-evidence-works) for scope,
-reproduction commands, and the exact limitations of these numbers.
+## Change code with a map
 
-## Why agents reach for it
-
-- **One MCP tool, 18 explicit tasks.** The agent chooses a command and only the
-  parameters that command accepts; it does not have to discover a large toolbox.
-- **Small answers first.** Symbol handles, section projection, compact formatting,
-  limits, and output budgets keep repository exploration within context.
-- **Same facts everywhere.** CLI, MCP, and interactive mode share the command
-  registry, engine, cache, and formatters.
-- **Auditable uncertainty.** Confirmed and unverified edges never collapse into one
-  opaque confidence score.
-- **Useful next actions.** Machine-readable contracts explain the question answered,
-  the truth boundary, decision safety, and the next command worth running.
-- **Fast follow-up questions.** A persistent MCP process and incremental cache keep
-  the index warm without writing generated state into the repository.
-- **No toolchain ceremony.** UCN works across mixed-language repositories without
-  setting up nine language servers. Native tools remain the final authority when
-  compiler or runtime truth is required.
-
-Humans get the same advantages from the CLI: readable text by default, stable JSON
-with `--json`, and an interactive mode with `ucn --interactive`.
-
-## What you can ask
-
-The public vocabulary is intentionally task-shaped:
-
-| Need | Command |
-|---|---|
-| Orient in a repository | `repo [--sections=summary,files,stats,health] [--deep]` |
-| Understand one symbol | `show <symbol> [--sections=...]` |
-| Find definitions | `find <name> [--type=type] [--with-source]` |
-| Inventory every literal-name occurrence | `usages <name>` |
-| Search literal text, regex, or AST shapes | `search [term] [--regex] [structural flags]` |
-| Extract exact source | `source <symbol\|file:range>` |
-| Follow calls up or down | `trace <symbol> [--direction=callees\|callers]` |
-| Assess symbol or Git-diff impact | `impact [symbol]` |
-| Select directly or transitively linked tests | `tests <symbol> [--depth=N]` |
-| Validate a symbol or staged diff | `check [symbol]` |
-| Preview a refactor | `plan <symbol> --rename-to=...` |
-| Inspect imports, importers, or cycles | `deps [file] [--direction=...] [--cycles]` |
-| List public API | `api [file]` |
-| Find runtime roots | `entrypoints` |
-| Match server and client HTTP surfaces | `endpoints [--bridge]` |
-| Find conservative dead-code candidates | `deadcode` |
-| Audit likely missing awaits | `audit-async` |
-| Resolve runtime frames to source | `stacktrace <text>` |
-
-Run `ucn --help` for every accepted flag. A flag that does not apply to a
-command produces an explicit warning or MCP note instead of silently changing
-the question.
-
-### Compose broad questions with parameters
+Inspect a symbol before editing it, preview the refactor, then check the current
+Git change:
 
 ```bash
-# Ask only for the parts of a symbol you need
-ucn show parseRequest --sections=summary,callers,callees
-ucn show parseRequest --sections=source,tests,types
-
-# Follow execution down, callers up, or callers toward runtime roots
-ucn trace parseRequest --direction=callees --depth=3
-ucn trace parseRequest --direction=callers --depth=3
-ucn trace parseRequest --direction=callers --to=entrypoints
-
-# Direct tests versus the transitive impact closure
-ucn tests parseRequest
-ucn tests parseRequest --depth=3
-
-# A named symbol, or the current Git change when no symbol is given
-ucn impact parseRequest
-ucn impact --staged
-ucn check parseRequest
-ucn check --staged
-
-# Repository and dependency projections
-ucn repo --sections=files,stats,health --deep
-ucn deps src/server.ts --direction=both --depth=3
-ucn deps --cycles
-```
-
-`tests` reports static call/reference linkage, not runtime coverage. An empty
-answer warns about subprocess tests, reflection, generated code, and external
-harnesses that may still exercise the target.
-
-## Common workflows
-
-### Understand code before editing
-
-```bash
-ucn find parseRequest
-ucn show src/parser.ts:42:parseRequest
-ucn impact src/parser.ts:42:parseRequest
-ucn tests src/parser.ts:42:parseRequest --depth=3
-ucn source src/parser.ts:42:parseRequest
-```
-
-`show` can combine definition, signature, source, callers, callees, tests,
-types, dependencies, examples, and related symbols. Use `--sections` when you
-only need part of that answer.
-
-### Preview and check a refactor
-
-```bash
+ucn show parseRequest --sections=summary,callers,callees,tests
 ucn check parseRequest
 ucn plan parseRequest --rename-to=parseIncomingRequest
 ucn impact --staged
 ucn check --staged
 ```
 
-`plan` previews declaration, import/export, and call-site edits. Anything that
-cannot be represented as a safe one-line edit is marked `needsReview` rather
-than silently omitted.
+`check <symbol>` validates known call sites against the signature. `plan`
+previews declaration, import/export, and call-site edits; anything that cannot be
+represented safely is marked `needsReview`. Without a symbol, `impact` and
+`check` analyze the Git diff.
 
-### Search without changing the meaning of the query
+## Get the lay of the land
 
-```bash
-ucn search '$scope.$apply'             # literal by default
-ucn search 'TODO|FIXME' --regex        # regex is explicit
-ucn usages parseRequest --include-tests
-ucn search --type=call --receiver=client
+`repo` gives a fast project orientation: language mix, important directories,
+hot symbols, entry points, and analysis health.
+
+```text
+$ ucn repo
+
+PROJECT ORIENTATION — /path/to/project
+════════════════════════════════════════════════════════════
+202 files · 3043 symbols · language mix by symbols:
+  javascript 72%, typescript 8%, rust 6%, java 5%, go 4%, python 3%, csharp 2%
+
+TOP DIRS (by symbols):
+  core                828 symbols · 38 file(s)
+  languages           529 symbols · 13 file(s)
+  test                266 symbols · 39 file(s)
+
+HOT (most-called production functions):
+  langTraits — 117 call(s) · languages/index.js:560
+  nodeToLocation — 87 call(s) · languages/utils.js:32
+  codeUnitCompare — 73 call(s) · core/shared.js:15
+
+ENTRY POINTS: 46 — runtime 46
+TRUST: HIGH — 13 dynamic imports, 13 eval, 8 reflection, 5 computed dispatch
+
+Next: ucn show langTraits · ucn repo --sections=files --detailed ·
+  ucn repo --sections=health --deep
 ```
 
-Use `--code-only` to omit comments, strings, and docstrings. `usages` is the raw
-literal-name inventory and the escape hatch when you want to inspect every name
-match without semantic filtering. Regex search uses an RE2-compatible linear-time
-engine for ordinary patterns; unsafe nested repetition is rejected.
+Project-wide discovery also records recognizable source files UCN cannot parse.
+Mixed scopes are marked `PARTIAL`; all-unsupported scopes are marked
+`UNSUPPORTED`. Skipped files are listed with a plain-text and language-native
+analysis handoff instead of being presented as a clean zero-file project.
 
-### Inspect architecture and runtime roots
+## Map dependencies and API surfaces
 
 ```bash
-ucn repo --sections=files,stats,health --deep
-ucn deps src/server.ts --direction=both --depth=3
+ucn deps src/server.ts --direction=imports --detailed
+ucn deps src/server.ts --direction=importers --depth=3
+ucn deps --cycles
+ucn api
 ucn entrypoints --type=http
 ucn endpoints --bridge --unmatched
-ucn api src/server.ts
 ```
 
-`repo` reports language coverage and trust blind spots. If a scope contains
-unsupported source, it is marked `PARTIAL` or `UNSUPPORTED` and handed off to
-grep plus a language-native analyzer; skipped files are not presented as a
-clean result.
+`deps` follows imports, importers, or both directions and reports cycles. `api`
+lists public symbols. `entrypoints` finds runtime and framework roots.
+`endpoints --bridge` matches server routes with client requests across supported
+frameworks and languages, while keeping exact, partial, and uncertain matches
+separate.
 
-### Audit cleanup risks
+## Select tests and audit cleanup candidates
 
 ```bash
+ucn tests expandGlob                   # direct static links
+ucn tests expandGlob --depth=3         # tests across the impact closure
 ucn deadcode --exclude=test
 ucn usages candidateName
 ucn impact candidateName
 ucn audit-async
 ```
 
+`tests` reports static call/reference linkage, not runtime coverage. Empty
+results warn about subprocess tests, reflection, generated code, and external
+harnesses that may still exercise the target.
+
 `deadcode` is deliberately conservative and remains a candidate generator.
-Before deleting, inspect `usages`, `impact`, `entrypoints`, `api`, and
-`repo --sections=health --deep`, then run the native compiler/type checker and
-tests.
+Before deleting, inspect `usages`, `impact`, `entrypoints`, `api`, and repository
+health, then run the native compiler or type checker and tests.
 
-## AI setup
-
-### MCP: one tool named `ucn`
+## Extract and search without opening whole files
 
 ```bash
-# Claude Code
-claude mcp add ucn -- npx -y ucn --mcp
-
-# OpenAI Codex CLI
-codex mcp add ucn -- npx -y ucn --mcp
-
-# VS Code Copilot
-code --add-mcp '{"name":"ucn","command":"npx","args":["-y","ucn","--mcp"]}'
+ucn source core/discovery.js:314:expandGlob
+ucn source core/discovery.js --range=314-364
+ucn search '$scope.$apply'             # literal by default
+ucn search 'TODO|FIXME' --regex        # regex is explicit
+ucn search --type=call --receiver=client
+ucn usages expandGlob --include-tests
 ```
 
-Manual configuration:
+`source` extracts an exact function, class, or line range. `search` handles
+literal text, explicit regular expressions, and structural filters. `usages`
+provides the full literal-name inventory—calls, definitions, imports, references,
+comments, and strings—with `--code-only` available when only code is relevant.
 
-```json
-{
-  "mcpServers": {
-    "ucn": {
-      "command": "npx",
-      "args": ["-y", "ucn", "--mcp"]
-    }
-  }
-}
-```
+Regular-expression search uses an RE2-compatible linear-time engine for ordinary
+patterns. Unsafe nested repetition is rejected instead of running an unbounded
+expression.
 
-The MCP server exposes exactly one tool, `ucn`. Its `command` enum contains the
-18 public tasks, and its generated description lists the parameters accepted by
-each task. MCP uses snake-case names where needed, such as `audit_async`,
-`project_dir`, and `class_name`.
+## The 18-command surface
 
-### Agent skill
+| Task | Command |
+|---|---|
+| Repository orientation and health | `repo [--sections=summary,files,stats,health] [--deep]` |
+| Symbol summary and relationships | `show <symbol> [--sections=...]` |
+| Definition lookup | `find <name> [--type=type] [--with-source]` |
+| Complete literal-name inventory | `usages <name>` |
+| Literal, regex, or structural search | `search [term] [--regex] [structural flags]` |
+| Exact source extraction | `source <symbol\|file:range>` |
+| Downstream, upstream, or entry-point call trees | `trace <symbol> [--direction=...] [--to=entrypoints]` |
+| Symbol or Git-diff impact | `impact [symbol]` |
+| Direct or transitively linked tests | `tests <symbol> [--depth=N]` |
+| Signature or pre-commit validation | `check [symbol]` |
+| Refactor preview | `plan <symbol> --rename-to=...` |
+| Imports, importers, and cycles | `deps [file] [--direction=...] [--cycles]` |
+| Project or file public API | `api [file]` |
+| Runtime and framework roots | `entrypoints` |
+| Server/client HTTP surface | `endpoints [--bridge]` |
+| Conservative dead-code candidates | `deadcode` |
+| Likely missing awaits | `audit-async` |
+| Runtime frame resolution | `stacktrace <text>` |
+
+Run `ucn --help` for every accepted flag. Flags that do not apply to a command
+produce an explicit warning or MCP note instead of silently changing the task.
+
+Several commands cover related modes through parameters rather than separate
+verbs:
 
 ```bash
-# Claude Code
-mkdir -p ~/.claude/skills
-cp -r "$(npm root -g)/ucn/.claude/skills/ucn" ~/.claude/skills/
+ucn show parseRequest --sections=summary,callers,callees
+ucn show parseRequest --sections=source,tests,types
 
-# OpenAI Codex CLI
-mkdir -p ~/.agents/skills
-cp -r "$(npm root -g)/ucn/.claude/skills/ucn" ~/.agents/skills/
+ucn trace parseRequest --direction=callees --depth=3
+ucn trace parseRequest --direction=callers --depth=3
+ucn trace parseRequest --direction=callers --to=entrypoints
+
+ucn impact parseRequest
+ucn impact --staged
+
+ucn check parseRequest
+ucn check --staged
 ```
 
-The skill teaches an agent when to use UCN, when grep is better, how to pin
-symbols, and how to interpret confirmed, unverified, account, and completeness
-signals. It is guidance over the same engine, not a separate implementation.
+## Same engine, different transport
 
-## Language coverage
+CLI, MCP, file mode, project mode, glob mode, and interactive mode resolve
+commands through the same registry, parameter normalization, execution handlers,
+project index, cache, and public formatters.
 
-All parsers feed the same versioned, data-only language IR and index path.
-Sequential and worker builds are tested for equivalent symbols, calls, imports,
-and evidence.
+- The CLI prints readable text by default. `--json` returns a stable machine-
+  readable envelope.
+- MCP exposes exactly one tool named `ucn`; its `command` enum contains the 18
+  public tasks and its generated description lists each task's parameters.
+- CLI commands and flags use hyphenated spelling. MCP uses snake case where
+  needed, such as `audit_async`, `project_dir`, and `class_name`.
+- A persistent MCP process keeps the index warm across calls. CLI invocations
+  reuse the same incremental disk cache.
 
-- **JavaScript / TypeScript / JSX / TSX**: functions, classes, imports/exports,
-  typed receivers, aliases, callbacks, async flow, and common framework roots.
-- **Python**: functions, classes, annotations, decorators, imports, comprehensions,
-  context-manager bindings, async flow, and framework roots.
-- **Go, Rust, and Java**: nominal receivers, methods, inheritance/traits/interfaces,
-  package or path ownership, overload/arity discipline, and framework roots.
-- **C**: functions, structs, macros, includes, calls, entry points, and API analysis.
-- **C++**: C coverage plus classes, methods, constructors, inheritance, namespaces,
-  overloads, templates, and typed field receivers.
-- **C#**: namespaces, classes/interfaces/records, fields/properties, attributes,
-  overload-aware calls, async flow, top-level programs, .NET stack frames, and
-  ASP.NET/HttpClient endpoint analysis.
-- **HTML**: inline JavaScript and `on*` event handlers.
-
-For C and C++, `compile_commands.json` improves header-language, include-path,
-and ownership context when available. UCN also retains AST-proven definitions,
-calls, and usages from recoverable conditional-preprocessor branches, while
-making no claim about which branch a particular build activates.
-
-## CLI, JSON, MCP, and output limits
-
-Every surface resolves through the same registry, parameter normalization,
-execution handler, and formatter. CLI JSON uses a stable envelope:
+CLI JSON always uses one envelope:
 
 ```json
 {
@@ -367,16 +374,15 @@ execution handler, and formatter. CLI JSON uses a stable envelope:
 Failures keep the envelope with `data: null`, `meta.ok: false`, the command
 contract when known, and an `error` string.
 
-Text output defaults to 10K characters for targeted commands and 3K for broad
-commands, with a 100K ceiling. Set `--max-chars=N` in the CLI or `max_chars` in
-MCP. `--all` / `all=true` removes formatter item caps while retaining the hard
-transport ceiling. Truncated output preserves `ACCOUNT`, `CONTRACT`, `WARNING`,
-and related trust metadata. JSON remains complete and is not text-truncated.
+Targeted text commands default to a 10K-character budget and broad commands to
+3K, with a 100K ceiling. Set `--max-chars=N` in CLI or `max_chars` in MCP.
+`--all` / `all=true` removes formatter item caps while retaining the transport
+ceiling. Truncation preserves `ACCOUNT`, `CONTRACT`, `WARNING`, and related trust
+metadata. JSON remains complete and is not text-truncated.
 
-## Cache that stays out of the repository
+## Cache that stays out of the project
 
-UCN keeps its incremental cache under the user's cache root, not inside the
-project:
+UCN stores its incremental cache under the user's cache root:
 
 - `UCN_CACHE_DIR` when explicitly set
 - `$XDG_CACHE_HOME/ucn` on XDG systems
@@ -385,52 +391,76 @@ project:
 - `~/.cache/ucn` on other systems
 
 Canonical path hashes isolate same-named checkouts. `--no-cache` bypasses
-persistence, `--clear-cache` clears the current project's cache, and
+persistence, `--clear-cache` clears the current project, and
 `--clear-cache --all` clears all bounded UCN project caches. On first use, UCN
 migrates and removes the old `<project>/.ucn-cache` directory.
 
-## How the release evidence works
+## Language coverage
 
-The ten-repository publish board is:
+All parsers feed the same versioned, data-only language IR and index path.
+Sequential and worker builds are tested for equivalent symbols, calls, imports,
+and evidence.
 
-- preact-signals / ts-morph
-- httpx / Pyright
-- cobra and viper / gopls
-- ripgrep and clap / rust-analyzer
-- javapoet / JDT LS
-- newtonsoft-json / Roslyn
-- cjson and fmt / clangd
+- **JavaScript / TypeScript / JSX / TSX** - functions, classes, imports/exports,
+  typed receivers, aliases, callbacks, async flow, and common framework roots.
+- **Python** - functions, classes, annotations, decorators, imports,
+  comprehensions, context-manager bindings, async flow, and framework roots.
+- **Go, Rust, and Java** - nominal receivers, methods,
+  inheritance/traits/interfaces, package or path ownership, overload/arity
+  discipline, and framework roots.
+- **C** - functions, structs, macros, includes, calls, entry points, and API
+  analysis.
+- **C++** - C coverage plus classes, methods, constructors, inheritance,
+  namespaces, overloads, templates, and typed field receivers.
+- **C#** - namespaces, classes/interfaces/records, fields/properties, attributes,
+  overload-aware calls, async flow, top-level programs, .NET stack frames, and
+  ASP.NET/HttpClient endpoint analysis.
+- **HTML** - inline JavaScript and `on*` event handlers.
 
-Each semantic run selects a deterministic, reference-stratified sample of up to
-50 oracle symbols per repository. It measures confirmed precision, semantic
+For C and C++, `compile_commands.json` improves header-language, include-path,
+and ownership context when available. UCN retains AST-proven definitions, calls,
+and usages from recoverable conditional-preprocessor branches without claiming
+which branch a particular build activates.
+
+## Testing and reliability
+
+- **Regression discipline** - every fixed defect gets a focused test.
+- **Surface coverage** - all 18 commands run through CLI JSON, CLI text, and MCP.
+- **Language coverage** - parser and semantic regressions span every supported
+  source family.
+- **Architecture guards** - sequential/parallel build, cache round-trip, command
+  registry, handler, formatter, and transport parity are checked automatically.
+- **External ground truth** - real compilers and language servers adjudicate
+  caller, callee, command, and dead-code claims.
+- **Performance gates** - cold build, warm query, worker count, and peak memory
+  are release-blocking measurements.
+
+The publish policy requires 100% in-scope semantic recall and oracle-backed
+public-command recall, at least 98% confirmed precision, a conserved account for
+every sample, zero cross-command disagreements, and bounded ambiguity. The
+performance gate requires at least 10K indexed lines/second by wall time and 3K
+by CPU time, query p50 at most 75 ms, query p95 at most 250 ms, and separate
+1.5 GiB build and board peak-RSS ceilings.
+
+The semantic board draws a deterministic, reference-stratified sample of up to
+50 oracle symbols per repository. It records confirmed precision, semantic
 recall across confirmed plus visible unverified edges, observed-zero agreement,
-account conservation, unverified review burden, callee behavior, and the
-oracle-backed public commands `find`, `show`, `source`, `trace`, `impact`,
-`usages`, and `tests`.
+account conservation, review burden, callee behavior, and the oracle-backed
+public commands `find`, `show`, `source`, `trace`, `impact`, `usages`, and
+`tests`.
 
-The consistency gate independently compares overlapping claims from `find`,
-`show`, `source`, `impact`, `tests`, `check`, and caller `trace` using stable
-handles. Identity, source, tests, confirmed/unverified sites, evidence reasons,
-totals, and accounting must agree exactly. A mismatch fails with a minimal
-handle-and-field witness.
+The consistency board independently compares overlapping claims from `find`,
+`show`, `source`, `impact`, `tests`, `check`, and caller `trace`. Identity,
+source, tests, confirmed and unverified sites, evidence reasons, totals, and
+accounting must agree exactly. Any mismatch fails with a minimal witness.
 
-The dead-code arm checks default candidates against the same oracles and fails
-on an oracle-visible reference. The performance arm uses pinned file/line
-workloads, isolated processes, three cold builds, warm query samples, a fixed
-worker ceiling, and separate build/board memory gates. The public-surface agent
-harness executes all 18 commands through CLI JSON, CLI text, and MCP and checks
-selection, parameters, answer shape, parity, latency, and output size.
+The public-surface agent harness executes all 18 commands and checks selection,
+parameters, answer shape, transport parity, latency, and output size. Its
+checked-in plans are reference contract-conformance cases, not a claim that every
+live agent will choose perfectly; captured live-agent plans can be scored
+separately.
 
-The checked-in agent plans are reference contract-conformance cases, not a claim
-that every live agent will choose perfectly. Plans captured from real agents can
-be scored separately by the same harness.
-
-The wider scheduled matrix contains 22 pinned repositories plus rotating fresh
-targets. Configuration-dependent edges are reported separately and do not count
-as confirmed proof. Unverified precision is intentionally not presented as
-confirmed accuracy: those entries are review candidates.
-
-Reproduce the local checks and release gates with:
+Reproduce the local checks and full release board with:
 
 ```bash
 npm run verify
@@ -438,33 +468,107 @@ npm run benchmark:agent:gate
 npm run trust:gate
 ```
 
-The gate writes human-readable and raw reports under `eval/reports`; pinned
+The gates write human-readable and raw reports under `eval/reports`; pinned
 sources live in [`eval/lib/repos.js`](eval/lib/repos.js). Before tagging, the
-**Eval** GitHub workflow must also pass its **Pre-tag release dry run** on the
-actual Ubuntu runner.
+**Eval** GitHub workflow must pass its **Pre-tag release dry run** on the actual
+Ubuntu runner.
 
-## Limits worth knowing
+## AI setup
 
-- UCN performs static, single-project analysis. Dependencies such as
-  `node_modules` and `site-packages` are not indexed.
-- It does not execute code or provide compiler diagnostics.
-- Reflection, generated code, runtime registration, dynamic property access, and
-  external consumers can be invisible.
+### MCP
+
+```bash
+# Claude Code
+claude mcp add ucn -- npx -y ucn --mcp
+
+# OpenAI Codex CLI
+codex mcp add ucn -- npx -y ucn --mcp
+
+# VS Code Copilot
+code --add-mcp '{"name":"ucn","command":"npx","args":["-y","ucn","--mcp"]}'
+```
+
+<details>
+<summary>Manual MCP configuration</summary>
+
+```json
+{
+  "mcpServers": {
+    "ucn": {
+      "command": "npx",
+      "args": ["-y", "ucn", "--mcp"]
+    }
+  }
+}
+```
+
+VS Code uses `.vscode/mcp.json`:
+
+```json
+{
+  "servers": {
+    "ucn": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "ucn", "--mcp"]
+    }
+  }
+}
+```
+
+</details>
+
+### Agent Skill (no server needed)
+
+macOS / Linux:
+
+```bash
+# Claude Code
+mkdir -p ~/.claude/skills
+cp -r "$(npm root -g)/ucn/.claude/skills/ucn" ~/.claude/skills/
+
+# OpenAI Codex CLI
+mkdir -p ~/.agents/skills
+cp -r "$(npm root -g)/ucn/.claude/skills/ucn" ~/.agents/skills/
+```
+
+Windows PowerShell:
+
+```powershell
+$npmRoot = npm root -g
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.claude\skills"
+Copy-Item -Recurse "$npmRoot\ucn\.claude\skills\ucn" "$env:USERPROFILE\.claude\skills\"
+
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.agents\skills"
+Copy-Item -Recurse "$npmRoot\ucn\.claude\skills\ucn" "$env:USERPROFILE\.agents\skills\"
+```
+
+The skill teaches an agent how to orient, pin symbols, choose the smallest
+useful command, interpret evidence, and recover from incomplete answers. It is
+guidance over the same engine, not a separate implementation.
+
+## Limitations
+
+- Static, single-project analysis; dependencies such as `node_modules` and
+  `site-packages` are not indexed.
+- No runtime execution or compiler diagnostics.
+- Reflection, generated code, runtime registration, dynamic property access,
+  and external consumers can be invisible.
 - Interface, trait, template, macro, overload, and untyped-receiver dispatch may
   remain unverified instead of being guessed.
 - HTML has regression coverage but no independent compiler/LSP real-repository
   oracle.
-- C/C++ analysis does not run the preprocessor or compiler. Build-specific branch
-  activation, advanced templates, generated headers, and macro expansion can
-  remain unresolved.
-- C# analysis does not run Roslyn. Source generators, dynamic/reflection dispatch,
-  and external assembly semantics remain outside the static index.
+- C/C++ analysis does not run the preprocessor or compiler. Build-specific
+  branch activation, advanced templates, generated headers, and macro expansion
+  can remain unresolved.
+- C# analysis does not run Roslyn. Source generators, dynamic/reflection
+  dispatch, and external assembly semantics remain outside the static index.
 - Large repositories can take a few seconds on the first query. Later questions
   use the incremental cache.
 
-UCN is for fast, portable, auditable navigation. Use the compiler, type checker,
-test runner, or profiler when the decision requires compiler completeness or
-runtime truth.
+UCN is built for fast, portable, auditable code navigation. Use the native
+compiler, type checker, test runner, or profiler when a decision requires
+compiler completeness or runtime truth.
 
 ---
 
