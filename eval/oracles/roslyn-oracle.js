@@ -24,17 +24,24 @@ const roslynOracle = {
     async prepare(repoDir) {
         resolveDotnet();
         const projectConfig = prepareProjectConfig(repoDir);
+        // MSBuild writes its errors to STDOUT, so both streams must be
+        // captured — an ignored stdout once reduced a real CI build failure
+        // to a wrong guess about the SDK version.
         const build = spawnSync('dotnet', [
             'build', HELPER_PROJECT,
             '--configuration', 'Release',
             '--nologo',
             '--verbosity', 'quiet',
         ], {
-            stdio: ['ignore', 'ignore', 'inherit'],
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'pipe'],
         });
         if (build.status !== 0) {
-            throw new Error(
-                'Roslyn helper build failed (.NET 9+ SDK required)');
+            const detail = [build.stdout, build.stderr, build.error?.message]
+                .filter(Boolean).join('\n').trim();
+            const tail = detail.split('\n').slice(-15).join('\n');
+            throw new Error(`Roslyn helper build failed (exit ${build.status})` +
+                (tail ? `:\n${tail}` : ''));
         }
         const child = spawn('dotnet', [
             'run',

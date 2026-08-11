@@ -1138,9 +1138,19 @@ function sourceIdentifier(handle, absFile, line, character, fallback) {
 function canonicalOperatorName(raw) {
     const text = String(raw || '').trim();
     if (!text.startsWith('operator')) return null;
+    // Token set and output shape must stay in lockstep with
+    // `canonicalCallableName` in languages/c-family.js (the engine-side
+    // canon). This match is a PREFIX (clangd appends parameter lists), so
+    // multi-character alternatives must come before their prefixes —
+    // `operator++` used to fall through to the bare `+` alternative and
+    // truncate to "operator+".
     const symbolic = text.match(
-        /^operator\s*(\(\)|\[\]|<=>|<<=?|>>=?|->\*?|[+\-*/%<>=!&|^~](?:=)?)/)?.[1];
+        /^operator\s*(\(\)|\[\]|<=>|<<=?|>>=?|->\*?|\+\+|--|&&|\|\||,|[+\-*/%<>=!&|^~]=?)/)?.[1];
     if (symbolic) return `operator${symbolic}`;
+    const wordForm = text.match(/^operator\s+(new|delete)\s*(\[\s*\])?/);
+    if (wordForm) return `operator ${wordForm[1]}${wordForm[2] ? '[]' : ''}`;
+    const literal = text.match(/^operator\s*""\s*(_[A-Za-z0-9_]*)/);
+    if (literal) return `operator""${literal[1]}`;
     const conversion = text.match(
         /^operator\s+([A-Za-z_][A-Za-z0-9_:]*(?:\s*<[^()]*>)?)/)?.[1];
     if (!conversion) return null;
@@ -1521,4 +1531,6 @@ function inside(root, candidate) {
          !path.isAbsolute(relative));
 }
 
-module.exports = { clangdOracle };
+// canonicalOperatorName is exported for the lockstep test against the
+// engine-side canon (languages/c-family.js).
+module.exports = { clangdOracle, canonicalOperatorName };

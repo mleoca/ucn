@@ -780,10 +780,22 @@ function canonicalCallableName(raw) {
     if (!text.startsWith('operator')) return text;
     const rest = text.slice('operator'.length).trim();
     if (!rest) return 'operator';
-    if (/^(?:\(\)|\[\]|<=>|<<=?|>>=?|->\*?|[+\-*/%<>=!&|^~](?:=)?)$/
+    // Symbolic operator tokens, multi-character alternatives first. This set
+    // must stay in lockstep with `canonicalOperatorName` in
+    // eval/oracles/clangd-oracle.js — the eval pins UCN definitions by
+    // oracle-listed name, so a token missing HERE mis-names the definition
+    // (fmt's `operator++` landed in the conversion branch as "operator ++")
+    // and a token missing THERE truncates the oracle's name.
+    if (/^(?:\(\)|\[\]|<=>|<<=?|>>=?|->\*?|\+\+|--|&&|\|\||,|[+\-*/%<>=!&|^~]=?)$/
         .test(rest)) {
         return `operator${rest}`;
     }
+    // Allocation operators keep their array suffix; user-defined literals are
+    // named by their suffix.
+    const wordForm = rest.match(/^(new|delete)\s*(\[\s*\])?$/);
+    if (wordForm) return `operator ${wordForm[1]}${wordForm[2] ? '[]' : ''}`;
+    const literal = rest.match(/^""\s*(_[A-Za-z0-9_]*)/);
+    if (literal) return `operator""${literal[1]}`;
     // Conversion operators are named by their destination type. Template
     // arguments are instantiation detail, not source-level callable identity.
     const destination = rest.replace(/\s*\(\).*/s, '')

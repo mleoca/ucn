@@ -451,6 +451,73 @@ describe('C++ language support', () => {
         assert.equal(conversion?.returnType, 'Box');
     });
 
+    it('canonicalizes increment, logical, comma, allocation, and literal operators', () => {
+        // fix: `operator++` fell through the symbolic-token set into the
+        // conversion branch ("operator ++"), so fmt's 16 operator++
+        // definitions were unfindable and the eval's command-surface gate
+        // caught `find operator+@test/scan.h:96` as missing on the first
+        // Linux release dry run.
+        const code = [
+            'struct iterator {',
+            '  int v;',
+            '  auto operator++() -> iterator& { return *this; }',
+            '  iterator operator++(int) { return *this; }',
+            '  auto operator--() -> iterator& { return *this; }',
+            '  bool operator&&(const iterator& o) const { return v && o.v; }',
+            '  bool operator||(const iterator& o) const { return v || o.v; }',
+            '  int operator,(const iterator& o) const { return o.v; }',
+            '  int operator*() const { return v; }',
+            '  void* operator new(unsigned long n);',
+            '  void* operator new[](unsigned long n);',
+            '  void operator delete(void* p);',
+            '};',
+            'long operator""_px(unsigned long long v) { return (long) v; }',
+        ].join('\n');
+        const result = parse(code, 'cpp');
+        const iterator = result.classes.find(item => item.name === 'iterator');
+        const memberNames = iterator.members.map(item => item.name);
+        for (const expected of ['operator++', 'operator--', 'operator&&',
+            'operator||', 'operator,', 'operator*', 'operator new',
+            'operator new[]', 'operator delete']) {
+            assert.ok(memberNames.includes(expected),
+                `${expected} missing from ${JSON.stringify(memberNames)}`);
+        }
+        assert.equal(memberNames.filter(name => name === 'operator++').length, 2,
+            'both increment overloads must keep the full token');
+        assert.ok(result.functions.some(item => item.name === 'operator""_px'));
+    });
+
+    it('keeps the oracle operator canon in lockstep with the engine canon', () => {
+        // The eval pins UCN definitions by oracle-listed name, so the two
+        // canonicalizers must produce identical names. The oracle side is a
+        // PREFIX match over clangd documentSymbol names (parameter lists
+        // attached); `operator++(int)` used to truncate to "operator+".
+        const { canonicalOperatorName } = require('../eval/oracles/clangd-oracle');
+        const cases = [
+            ['operator++(int)', 'operator++'],
+            ['operator++()', 'operator++'],
+            ['operator--()', 'operator--'],
+            ['operator+(const uint128&, const uint128&)', 'operator+'],
+            ['operator+=(int)', 'operator+='],
+            ['operator&&(const iterator&)', 'operator&&'],
+            ['operator||(const iterator&)', 'operator||'],
+            ['operator,(const iterator&)', 'operator,'],
+            ['operator<=>(const iterator&)', 'operator<=>'],
+            ['operator<<(std::ostream&, int)', 'operator<<'],
+            ['operator->()', 'operator->'],
+            ['operator()(int)', 'operator()'],
+            ['operator[](int)', 'operator[]'],
+            ['operator new(unsigned long)', 'operator new'],
+            ['operator new[](unsigned long)', 'operator new[]'],
+            ['operator delete(void *)', 'operator delete'],
+            ['operator""_px(unsigned long long)', 'operator""_px'],
+            ['operator bool()', 'operator bool'],
+        ];
+        for (const [clangdName, expected] of cases) {
+            assert.equal(canonicalOperatorName(clangdName), expected, clangdName);
+        }
+    });
+
     it('extracts namespace-qualified template function calls by base name', () => {
         const code = [
             'namespace detail { template <typename T> int limit(); }',
