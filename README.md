@@ -200,7 +200,7 @@ ACCOUNT, CONTRACT, and WARNING lines survive the cut.
 Don't take the tiers on faith. Release gates re-derive UCN's answers from real
 compilers and language servers on a ten-repository board of pinned production
 codebases, and publishing is blocked unless they pass. The latest full
-release-board run:
+release-board run (2026-08-11):
 
 | Repository | Pinned commit | Oracle | Caller precision | Caller recall | Callee prec / recall | Command checks |
 |---|---|---|---:|---:|---:|---:|
@@ -221,11 +221,10 @@ in the oracle-visible sample, **8,000 / 8,000** cross-command consistency
 comparisons in agreement, **10 / 10** repositories inside the performance
 budget (slowest median cold build 15.4K lines/second by wall time, worst query
 p95 73.8 ms, highest peak RSS 771 MB), and 3,383 automated tests with no
-failures or skips. Reports: [semantic](eval/reports/oracle-eval-rollup-2026-08-11.md) ·
-[dead code](eval/reports/deadcode-eval-rollup-2026-08-11.md) ·
-[consistency](eval/reports/consistency-eval-2026-08-11.md) ·
-[performance](eval/reports/performance-gate-2026-08-11.md). Pinned sources:
-[`eval/lib/repos.js`](eval/lib/repos.js). Reproduce with `npm run trust:gate`.
+failures or skips. The same gates run in CI (the scheduled
+[Eval workflow](https://github.com/mleoca/ucn/actions/workflows/eval.yml) and
+every release tag), and `npm run trust:gate` reproduces the release board
+locally. Pinned sources: [`eval/lib/repos.js`](eval/lib/repos.js).
 
 Semantic runs draw a deterministic, reference-stratified sample of up to 50
 compiler/LSP symbols per repository, then check caller identity, callee
@@ -550,9 +549,9 @@ npm run verify                 # lint + full test suite
 npm run trust:gate             # the release board: semantic, dead-code, consistency, performance
 ```
 
-Reports land in [`eval/reports/`](eval/reports); the pinned manifest is
-[`eval/lib/repos.js`](eval/lib/repos.js). Before a tag, the Eval workflow's
-pre-tag dry run must pass on the actual CI runner.
+Gate runs write their reports under `eval/reports/` as local run artifacts;
+the pinned manifest is [`eval/lib/repos.js`](eval/lib/repos.js). Before a tag,
+the Eval workflow's pre-tag dry run must pass on the actual CI runner.
 
 ## AI setup
 
