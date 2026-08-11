@@ -10,7 +10,7 @@
 
 const { COMMAND_CONTRACTS } = require('../command-contracts');
 const { COMMAND_TRUST_MATRIX } = require('../trust-matrix');
-const { toCliName, toMcpName } = require('../registry');
+const { toCliName, toMcpName, formatSurfaceMessage } = require('../registry');
 
 const legacy = {
     ...require('./analysis'),
@@ -99,13 +99,39 @@ function presentationHints(surface = 'cli') {
     };
 }
 
-function formatSource(result) {
+function formatSource(result, hints = presentationHints()) {
+    const extractionHints = hints.surface === 'mcp'
+        ? {
+            maxLinesHint: 'use max_lines=<n>, or omit it for the full function',
+            classSourceHint: 'Use max_lines=<n> to see source, or run command=source with name=<method-handle> for an individual method.',
+        }
+        : {};
     const mode = modeOf('source', result);
     if (mode === 'lines' || (result && Array.isArray(result.lines))) {
         return legacy.formatLines(result);
     }
-    if (mode === 'class') return legacy.formatClassResult(result);
-    return legacy.formatFnResult(result);
+    if (mode === 'class') return legacy.formatClassResult(result, extractionHints);
+    return legacy.formatFnResult(result, extractionHints);
+}
+
+function projectContextText(text, selected) {
+    if (!text) return text;
+    const keepCallers = selected.has('callers');
+    const keepCallees = selected.has('callees');
+    if (keepCallers && keepCallees) return text;
+    const lines = text.split('\n');
+    const projected = [];
+    let band = null;
+    const metadata = /^(?:NON-CALL OCCURRENCES|ACCOUNT|CONTRACT|WARNING|FILTERED|CALLEE ACCOUNT):/;
+    for (const line of lines) {
+        if (/^CALLERS —/.test(line)) band = 'callers';
+        else if (/^CALLEES(?: —| \()/.test(line)) band = 'callees';
+        else if (metadata.test(line)) band = null;
+        if ((band === 'callers' && !keepCallers) ||
+            (band === 'callees' && !keepCallees)) continue;
+        projected.push(line);
+    }
+    return projected.join('\n').replace(/\n{3,}/g, '\n\n').trimEnd();
 }
 
 function formatShow(result, params = {}, hints = presentationHints()) {
@@ -115,14 +141,6 @@ function formatShow(result, params = {}, hints = presentationHints()) {
     if (result.summary) parts.push(block('SUMMARY', legacy.formatBrief(result.summary)));
     if (result.context) {
         const context = { ...result.context };
-        if (!selected.has('callers')) {
-            context.callers = [];
-            context.unverifiedCallers = [];
-        }
-        if (!selected.has('callees')) {
-            context.callees = [];
-            context.unverifiedCallees = [];
-        }
         const formatted = legacy.formatContext(context, {
             showConfidence: params.showConfidence !== false,
             compact: params.compact !== false,
@@ -130,9 +148,9 @@ function formatShow(result, params = {}, hints = presentationHints()) {
             allHint: hints.all,
             usagesHint: hints.usages(context.function || result.target),
         });
-        parts.push(block('RELATIONSHIPS', formatted.text));
+        parts.push(block('RELATIONSHIPS', projectContextText(formatted.text, selected)));
     }
-    if (result.source) parts.push(block('SOURCE', formatSource(result.source)));
+    if (result.source) parts.push(block('SOURCE', formatSource(result.source, hints)));
     if (result.dependencies) parts.push(block('DEPENDENCIES', legacy.formatSmart(result.dependencies)));
     if (result.tests) {
         parts.push(block('TESTS', formatTests(
@@ -141,9 +159,26 @@ function formatShow(result, params = {}, hints = presentationHints()) {
             hints,
         )));
     }
-    if (result.types) parts.push(block('TYPES', legacy.formatTypedef(result.types.types || [], result.target)));
+    if (result.types) {
+        const seen = new Set();
+        const types = (result.types.types || []).map(type => ({
+            ...type,
+            relativePath: type.relativePath || type.file,
+            startLine: type.startLine || type.line,
+        })).filter(type => {
+            const key = `${type.name}\0${type.type}\0${type.relativePath}\0${type.startLine}`;
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        });
+        parts.push(block('TYPES', legacy.formatTypedef(types, result.target)));
+    }
     if (result.example) parts.push(block('EXAMPLE', legacy.formatExample(result.example, result.target)));
-    if (result.related) parts.push(block('RELATED', legacy.formatRelated(result.related, { all: params.all, top: params.top })));
+    if (result.related) parts.push(block('RELATED', legacy.formatRelated(result.related, {
+        all: params.all,
+        top: params.top,
+        allHint: hints.all,
+    })));
 
     return parts.join('\n\n');
 }
@@ -161,7 +196,9 @@ function formatTrace(result, params = {}, hints = presentationHints()) {
     });
     if (mode === 'callers') return legacy.formatBlast(result, {
         ...traceHints,
-        allHint: 'Increase depth for a wider caller tree.',
+        allHint: hints.surface === 'mcp'
+            ? 'Use all=true to lift the per-node child cap; depth controls hops only.'
+            : 'Use --all to lift the per-node child cap; --depth controls hops only.',
     });
     return legacy.formatTrace(result, {
         ...traceHints,
@@ -181,14 +218,18 @@ function formatTests(result, params = {}, hints = presentationHints()) {
         : legacy.formatTests(result, params.name);
 }
 
-function formatDeps(result, params = {}) {
+function formatDeps(result, params = {}, hints = presentationHints()) {
     if (modeOf('deps', result) === 'cycles' || result.cycles) {
         return legacy.formatCircularDeps(result);
     }
     const parts = [legacy.formatGraph(result.graph, {
-        showAll: params.all || params.depth !== undefined,
+        showAll: params.all || params.depth != null,
         maxDepth: params.depth ?? 2,
         file: result.file,
+        depthHint: hints.surface === 'mcp'
+            ? 'Use depth=<n> for a deeper graph.'
+            : 'Use --depth=N for a deeper graph.',
+        allHint: hints.all,
     })];
     if (result.imports) parts.push(block('IMPORT DECLARATIONS', legacy.formatImports(result.imports, result.file)));
     if (result.importers) parts.push(block('IMPORTERS', legacy.formatExporters(result.importers, result.file)));
@@ -209,7 +250,10 @@ function formatRepo(result, params = {}, hints = presentationHints()) {
             topHint: hints.top,
         })));
     }
-    if (result.stats) parts.push(block('STATISTICS', legacy.formatStats(result.stats, { top: params.top || 0 })));
+    if (result.stats) parts.push(block('STATISTICS', legacy.formatStats(result.stats, {
+        top: params.top || 0,
+        topHint: hints.surface === 'mcp' ? 'use top=<n> to show more' : 'use --top=N to show more',
+    })));
     if (result.health) {
         parts.push(block('HEALTH', legacy.formatDoctor(result.health, {
             deepHint: hints.surface === 'mcp' ? 'use deep=true' : 'use --deep',
@@ -220,6 +264,12 @@ function formatRepo(result, params = {}, hints = presentationHints()) {
 
 function formatPublicText(command, result, params = {}, execution = {}) {
     const hints = presentationHints(execution.surface);
+    if (result?.scopeWarning?.hint) {
+        result.scopeWarning = {
+            ...result.scopeWarning,
+            hint: formatSurfaceMessage(result.scopeWarning.hint, execution.surface),
+        };
+    }
     let text;
     switch (command) {
         case 'show': text = formatShow(result, params, hints); break;
@@ -241,14 +291,24 @@ function formatPublicText(command, result, params = {}, execution = {}) {
         }); break;
         case 'search':
             text = execution.structural || result?.meta?.mode === 'structural'
-                ? legacy.formatStructuralSearch(result)
-                : legacy.formatSearch(result, params.term);
+                ? legacy.formatStructuralSearch(result, {
+                    topHint: hints.surface === 'mcp'
+                        ? 'Use top=<n> to see more.' : 'Use --top=N to see more.',
+                    unusedFlag: hints.surface === 'mcp' ? 'unused=true' : '--unused',
+                })
+                : legacy.formatSearch(result, params.term, {
+                    topHint: hints.surface === 'mcp'
+                        ? 'Use top=<n> to see more.' : 'Use --top=N to see more.',
+                    includeTestsHint: hints.surface === 'mcp'
+                        ? 'use include_tests=true to include'
+                        : 'use --include-tests to include',
+                });
             break;
-        case 'source': text = formatSource(result); break;
+        case 'source': text = formatSource(result, hints); break;
         case 'trace': text = formatTrace(result, params, hints); break;
         case 'impact': text = formatImpact(result, params); break;
         case 'tests': text = formatTests(result, params, hints); break;
-        case 'deps': text = formatDeps(result, params); break;
+        case 'deps': text = formatDeps(result, params, hints); break;
         case 'api': text = legacy.formatApi(result, params.file || '.'); break;
         case 'check':
             text = modeOf('check', result) === 'symbol'
@@ -260,14 +320,26 @@ function formatPublicText(command, result, params = {}, execution = {}) {
         case 'deadcode': text = legacy.formatDeadcode(result, {
             top: params.top || 0,
             topHint: hints.top,
+            ...(hints.surface === 'mcp' && {
+                decoratedHint: `${result.excludedDecorated || 0} decorated/annotated symbol(s) hidden (framework-registered). Use include_decorated=true to include them.`,
+                exportedHint: `${result.excludedExported || 0} exported symbol(s) excluded from the audit (public API may have external callers). Use include_exported=true to audit them.`,
+                externalContractHint: `${result.excludedExternalContract || 0} symbol(s) hidden (override an out-of-tree base class — reachable via external contract, not dead). Use include_exported=true to include them.`,
+            }),
         }); break;
         case 'entrypoints': text = legacy.formatEntrypoints(result); break;
-        case 'endpoints': text = legacy.formatEndpoints(result, { bridge: result._bridge, unmatched: result._unmatched }); break;
+        case 'endpoints': text = legacy.formatEndpoints(result, {
+            bridge: result._bridge,
+            unmatched: result._unmatched,
+            serverOnly: result._serverOnly,
+            clientOnly: result._clientOnly,
+        }); break;
         case 'stacktrace': text = legacy.formatStackTrace(result); break;
         case 'auditAsync': text = legacy.formatAuditAsync(result); break;
         default: throw new Error(`No public formatter for command: ${command}`);
     }
-    return appendNote(text, execution.note);
+    return appendNote(text, execution.note
+        ? formatSurfaceMessage(execution.note, execution.surface)
+        : execution.note);
 }
 
 function formatPublicJson(command, result, params = {}, execution = {}) {
@@ -285,11 +357,19 @@ function formatPublicJson(command, result, params = {}, execution = {}) {
         commandMeta = formatted.meta || {};
         data = formatted.data;
     }
-    if (command === 'deadcode' && result?.computedDispatch?.count > 0) {
-        commandMeta.computedDispatch = result.computedDispatch;
+    if (command === 'deadcode' && Array.isArray(result)) {
         commandMeta.deletionSafety = 'review-required';
-        if (result.excludedDynamicDispatch > 0) {
-            commandMeta.excludedDynamicDispatch = result.excludedDynamicDispatch;
+        commandMeta.excludedExported = result.excludedExported || 0;
+        commandMeta.excludedDecorated = result.excludedDecorated || 0;
+        commandMeta.excludedExternalContract = result.excludedExternalContract || 0;
+        commandMeta.excludedRuntimeContract = result.excludedRuntimeContract || 0;
+        commandMeta.pythonImplicitExportFiles = result.pythonImplicitExportFiles || 0;
+        commandMeta.excludedDynamicDispatch = result.excludedDynamicDispatch || 0;
+        commandMeta.computedDispatch = result.computedDispatch || { count: 0, names: [] };
+        if (result.coverage) commandMeta.coverage = result.coverage;
+        if (result.limitInfo) {
+            commandMeta.total = result.limitInfo.total;
+            commandMeta.truncated = true;
         }
     }
     if (command === 'search' && result?.meta) {
@@ -299,12 +379,26 @@ function formatPublicJson(command, result, params = {}, execution = {}) {
         commandMeta.truncatedMatches = result.meta.truncatedMatches;
         commandMeta.limit = result.meta.limit;
         if (result.meta.truncatedMatches > 0) commandMeta.truncated = true;
+        if (result.unsupportedMatches) commandMeta.unsupportedMatches = result.unsupportedMatches;
+    }
+    if (command === 'entrypoints' && result?.filterInfo) {
+        commandMeta.hiddenTestEntrypoints = result.filterInfo.hiddenTests;
+        commandMeta.testsIncluded = result.filterInfo.testsIncluded;
+        if (result.limitInfo) {
+            commandMeta.total = result.limitInfo.total;
+            commandMeta.truncated = true;
+        }
     }
     // Handles are the documented spine (`Pass the resulting handle to show/
     // impact/source`) — the JSON records must carry them, not make agents
     // concatenate relativePath:startLine:name themselves.
     if (command === 'find' && Array.isArray(result)) {
         const { formatSymbolHandle } = require('../shared');
+        if (result.findInfo) {
+            commandMeta.total = result.findInfo.total;
+            commandMeta.shown = result.findInfo.shown;
+            if (result.findInfo.shown < result.findInfo.total) commandMeta.truncated = true;
+        }
         data = result.map(item => {
             const handle = formatSymbolHandle(item);
             return handle ? { handle, ...item } : item;
@@ -314,6 +408,9 @@ function formatPublicJson(command, result, params = {}, execution = {}) {
     // account-shaped: the counts must be machine-readable, not note-only.
     if ((command === 'usages' || command === 'tests') && result?.unsupportedMatches) {
         commandMeta.unsupportedMatches = result.unsupportedMatches;
+    }
+    if (command === 'usages' && result?.analysisGaps) {
+        commandMeta.analysisGaps = result.analysisGaps;
     }
 
     const surfaceCommand = execution.surface === 'mcp'

@@ -285,7 +285,11 @@ const FRAMEWORK_PATTERNS = [
         type: 'jobs',
         framework: 'celery',
         detection: 'decorator',
-        pattern: /^(app\.task|shared_task|celery\.task)/,
+        // Celery instances are conventionally named app, celery, tasks, or
+        // something project-specific. The import requirement prevents an
+        // arbitrary object's `.task` decorator from becoming a job root.
+        pattern: /^(?:[A-Za-z_]\w*\.)?task\b|^shared_task\b/,
+        requireImportSignal: /^celery\b/,
     },
 
     // ── Test Frameworks ─────────────────────────────────────────────────
@@ -505,7 +509,7 @@ const FRAMEWORK_PATTERNS = [
         detection: 'filePath',
         // Match files under bin/ (any depth), or top-level index/main/cli/server in any directory.
         // The matcher is run against the project-relative path with forward slashes.
-        pathPattern: /(^|\/)bin\/[^/]+\.(js|ts|mjs|cjs)$|(^|\/)(index|main|cli|server)\.(js|ts|mjs|cjs)$/,
+        pathPattern: /(^|\/)bin\/[^/]+\.(js|ts|mjs|cjs)$|(^|\/)(main|cli|server)\.(js|ts|mjs|cjs)$/,
     },
 
     // Node shebang entry: any file whose first bytes are `#!/usr/bin/env node`
@@ -568,31 +572,27 @@ const FRAMEWORK_PATTERNS = [
         pathPattern: /(^|\/)management\/commands\/[^/]+\.py$/,
     },
 
-    // ── Catch-all fallbacks ─────────────────────────────────────────────
-
-    // Python: any decorator with '.' (attribute access) — framework registration heuristic
-    // Catches @app.route, @router.get, @celery.task, @something.hook, etc.
-    // Placed last so specific patterns match first (for better type/framework labeling).
+    // Explicit Python event/CLI decorators. Dotted syntax by itself is not
+    // registration evidence (`typing.overload`, `property.setter`, and
+    // `functools.wraps` are counterexamples).
     {
-        id: 'python-dotted-decorator',
+        id: 'flask-event-hook',
         languages: new Set(['python']),
         type: 'events',
-        framework: 'unknown',
+        framework: 'flask',
         detection: 'decorator',
-        pattern: /\./,
+        pattern: /^(app|bp|blueprint)\.(before_request|after_request|teardown_request|before_app_request|after_app_request|teardown_app_request|context_processor|url_value_preprocessor|url_defaults|errorhandler)/,
+        importSignal: /^flask\b/,
+    },
+    {
+        id: 'click-command',
+        languages: new Set(['python']),
+        type: 'cli',
+        framework: 'click',
+        detection: 'decorator',
+        pattern: /^(click\.)?(command|group)|^[A-Za-z_]\w*\.(command|group)$/,
     },
 
-    // Java: any non-standard annotation (not a keyword modifier or standard JDK annotation)
-    // Catches @Bean, @Scheduled, @EventListener, @Transactional, etc.
-    // Placed last so specific patterns match first.
-    {
-        id: 'java-custom-annotation',
-        languages: new Set(['java']),
-        type: 'di',
-        framework: 'unknown',
-        detection: 'modifier',
-        pattern: /^(?!public$|private$|protected$|static$|final$|abstract$|synchronized$|native$|default$|override$|deprecated$|suppresswarnings$|functionalinterface$|safevarargs$)/,
-    },
 ];
 
 // ============================================================================
@@ -608,10 +608,14 @@ const FRAMEWORK_PATTERNS = [
 function matchDecoratorOrModifier(symbol, language, fileEntry = null) {
     const decorators = symbol.decorators || [];
     const modifiers = symbol.modifiers || [];
+    const modules = (fileEntry?.imports || []).map(imp =>
+        typeof imp === 'string' ? imp : String(imp?.module || ''));
 
     const matches = [];
     for (const fp of FRAMEWORK_PATTERNS) {
         if (!fp.languages.has(language)) continue;
+        if (fp.requireImportSignal &&
+            !modules.some(moduleName => fp.requireImportSignal.test(moduleName))) continue;
 
         if (fp.detection === 'decorator') {
             const matched = decorators.find(d => fp.pattern.test(d));
@@ -631,8 +635,6 @@ function matchDecoratorOrModifier(symbol, language, fileEntry = null) {
     if (matches.length > 1 && fileEntry) {
         // fileEntry.imports holds module strings; parser-level records hold
         // { module } objects — accept both shapes.
-        const modules = (fileEntry.imports || []).map(imp =>
-            typeof imp === 'string' ? imp : String(imp?.module || ''));
         const importBacked = matches.find(m => m.pattern.importSignal &&
             modules.some(mod => m.pattern.importSignal.test(mod)));
         if (importBacked) return importBacked;
@@ -672,7 +674,8 @@ function buildCallbackEntrypointMap(index) {
     // registration was never seeded. The registration site is kept as
     // evidence (registrationFile/registrationLine).
     const resolveHandlerDef = (name, registrationFile) => {
-        const defs = index.symbols.get(name);
+        const defs = (index.symbols.get(name) || []).filter(definition =>
+            !NON_CALLABLE_TYPES.has(definition.type));
         if (!defs || defs.length === 0) return null;
         // Prefer a def in the registration file; defs are canonical-sorted,
         // so falling back to the first is deterministic.
@@ -697,7 +700,8 @@ function buildCallbackEntrypointMap(index) {
                         pattern.methodPattern.test(call.name)) {
                         // BUG M2 (interpolated paths): align with bridge.js's
                         // extractServerRoutes — skip routes whose path is interpolated.
-                        if (pattern.type === 'http' && call.firstStringArg && call.firstStringArgInterp) continue;
+                        if (pattern.type === 'http' && call.name.toLowerCase() !== 'use' &&
+                            (!call.firstStringArg || call.firstStringArgInterp)) continue;
                         // BUG M5: Express dual-purpose APIs — 1-arg .get('env') is a
                         // config getter, not a route registration.
                         if (pattern.framework === 'express' &&
@@ -733,11 +737,11 @@ function buildCallbackEntrypointMap(index) {
                     // not exported handler functions — they must not be marked as
                     // entry points. This aligns the HTTP Routes section with
                     // bridge.js's extractServerRoutes.
-                    if (!index.symbols.has(call.name)) continue;
+                    const def = resolveHandlerDef(call.name, filePath);
+                    if (!def) continue;
                     attributedLines.add(call.line);
 
                     if (!result.has(call.name)) {
-                        const def = resolveHandlerDef(call.name, filePath);
                         result.set(call.name, {
                             framework: route.pattern.framework,
                             type: route.pattern.type,
@@ -972,6 +976,7 @@ function detectEntrypoints(index, options = {}) {
             // Check name-based patterns (main, init, TestXxx, etc.)
             for (const np of namePatterns) {
                 if (!np.languages.has(fileEntry.language)) continue;
+                if (NON_CALLABLE_TYPES.has(symbol.type)) continue;
                 // Per-pattern symbol predicate (fix #243) — e.g. main must be
                 // a free function (Rust/Go) or a static method (Java)
                 if (np.symbolFilter && !np.symbolFilter(symbol)) continue;
@@ -1122,10 +1127,10 @@ function detectEntrypoints(index, options = {}) {
                 //     (3) already covers `if (require.main === module) { main(); }`.
             }
 
-            // If we identified at least one specific entry, use that set.
-            // Otherwise fall back to permissive (null) so a CLI file with neither
-            // `main()` nor a clear default-export is still seeded somehow.
-            narrowAllowedByFile.set(filePath, allowed.size > 0 ? allowed : null);
+            // Empty means no callable entry was proven. Do not turn an
+            // ordinary `index.ts`/`server.ts` module into an entry point by
+            // falling back to every symbol in the file.
+            narrowAllowedByFile.set(filePath, allowed);
         }
     }
 

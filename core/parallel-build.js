@@ -9,8 +9,31 @@
  */
 
 const os = require('os');
+const fs = require('fs');
 const path = require('path');
 const { Worker, MessageChannel, receiveMessageOnPort } = require('worker_threads');
+
+function partitionFiles(index, files, workerCount) {
+    const chunks = Array.from({ length: workerCount }, () => ({
+        files: [], bytes: 0,
+    }));
+    const weightedFiles = files.map((file, order) => {
+        let bytes = index.files.get(file)?.size;
+        if (!Number.isFinite(bytes)) {
+            try { bytes = fs.statSync(file).size; } catch (_) { bytes = 0; }
+        }
+        return { file, bytes, order };
+    }).sort((a, b) => b.bytes - a.bytes || a.order - b.order);
+    for (const weighted of weightedFiles) {
+        let target = chunks[0];
+        for (let i = 1; i < chunks.length; i++) {
+            if (chunks[i].bytes < target.bytes) target = chunks[i];
+        }
+        target.files.push(weighted.file);
+        target.bytes += weighted.bytes;
+    }
+    return chunks;
+}
 
 /**
  * Build index in parallel using worker threads.
@@ -28,10 +51,13 @@ function parallelBuild(index, files, options = {}) {
         : os.cpus().length;
     const autoWorkers = Math.max(availableCpus - 1, 1);
     const maxWorkers = (options.workerCount > 0) ? options.workerCount : autoWorkers;
+    const workerCap = options.maxWorkers > 0 ? options.maxWorkers : 8;
+    const minFilesPerWorker = options.minFilesPerWorker > 0
+        ? options.minFilesPerWorker : 100;
     const workerCount = Math.min(
         maxWorkers,
-        8,
-        Math.ceil(files.length / 100) // at least 100 files per worker
+        workerCap,
+        Math.ceil(files.length / minFilesPerWorker)
     );
 
     if (workerCount < 2) return false;
@@ -40,11 +66,14 @@ function parallelBuild(index, files, options = {}) {
         console.error(`Parallel build: ${workerCount} workers for ${files.length} files`);
     }
 
-    // Partition files round-robin for balanced work distribution
-    const chunks = Array.from({ length: workerCount }, () => []);
-    for (let i = 0; i < files.length; i++) {
-        chunks[i % workerCount].push(files[i]);
-    }
+    // Parsing cost is driven much more by source size than file count. A
+    // round-robin split can put several giant generated/template headers in
+    // one worker while peers finish tiny files, making the whole build wait
+    // on one straggler and retaining multiple large native ASTs together.
+    // Longest-processing-time scheduling by byte size is deterministic and
+    // gives a substantially tighter upper bound on both wall time and peak
+    // memory. Canonical index ordering after the merge remains unchanged.
+    const chunks = partitionFiles(index, files, workerCount);
 
     // Synchronization: one Int32 per worker in SharedArrayBuffer
     const sab = new SharedArrayBuffer(4 * workerCount);
@@ -59,7 +88,7 @@ function parallelBuild(index, files, options = {}) {
 
         // Build per-worker hash subset (each worker only needs hashes for its chunk)
         const workerHashes = Object.create(null);
-        for (const fp of chunks[i]) {
+        for (const fp of chunks[i].files) {
             const entry = index.files.get(fp);
             if (entry) {
                 workerHashes[fp] = { mtime: entry.mtime, size: entry.size, hash: entry.hash };
@@ -68,7 +97,7 @@ function parallelBuild(index, files, options = {}) {
 
         const worker = new Worker(path.join(__dirname, 'build-worker.js'), {
             workerData: {
-                files: chunks[i],
+                files: chunks[i].files,
                 rootDir: index.root,
                 existingHashes: workerHashes,
                 signal: sab,
@@ -165,4 +194,4 @@ function parallelBuild(index, files, options = {}) {
     return changed;
 }
 
-module.exports = { parallelBuild };
+module.exports = { parallelBuild, partitionFiles };

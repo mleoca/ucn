@@ -69,10 +69,14 @@ function formatFunctionJson(fn, code) {
  * Notes are NOT included — surfaces render those separately (e.g. stderr for CLI).
  * @param {{ entries: Array<{match, code}>, notes: string[] }} result
  */
-function formatFnResult(result) {
+function formatFnResult(result, options = {}) {
     const parts = [];
-    for (const { match, code } of result.entries) {
-        parts.push(formatFn(match, code));
+    for (const { match, code, truncated, shownLines, totalLines } of result.entries) {
+        let text = formatFn(match, code);
+        if (truncated) {
+            text += `\n... showing ${shownLines} of ${totalLines} lines (${options.maxLinesHint || 'use --max-lines=N or omit it for the full function'})`;
+        }
+        parts.push(text);
     }
     const separator = result.entries.length > 1 ? '\n\n' + '═'.repeat(60) + '\n\n' : '';
     return parts.join(separator);
@@ -83,9 +87,16 @@ function formatFnResult(result) {
  */
 function formatFnResultJson(result) {
     if (result.entries.length === 1) {
-        return formatFunctionJson(result.entries[0].match, result.entries[0].code);
+        const entry = result.entries[0];
+        const value = JSON.parse(formatFunctionJson(entry.match, entry.code));
+        if (entry.truncated) {
+            value.truncated = true;
+            value.shownLines = entry.shownLines;
+            value.totalLines = entry.totalLines;
+        }
+        return JSON.stringify(value, null, 2);
     }
-    const arr = result.entries.map(({ match, code }) => ({
+    const arr = result.entries.map(({ match, code, truncated, shownLines, totalLines }) => ({
         name: match.name,
         params: match.params,
         paramsStructured: match.paramsStructured || [],
@@ -101,6 +112,7 @@ function formatFnResultJson(result) {
         ...(match.isGenerator && { isGenerator: true }),
         file: match.relativePath || match.file,
         code,
+        ...(truncated && { truncated: true, shownLines, totalLines }),
     }));
     return JSON.stringify(arr, null, 2);
 }
@@ -109,7 +121,7 @@ function formatFnResultJson(result) {
  * Format class handler result (from execute.js).
  * @param {{ entries: Array<{match, code, methods?, summaryMode, truncated, totalLines, maxLines?}>, notes: string[] }} result
  */
-function formatClassResult(result) {
+function formatClassResult(result, options = {}) {
     const parts = [];
     for (const entry of result.entries) {
         if (entry.summaryMode) {
@@ -124,7 +136,7 @@ function formatClassResult(result) {
                     lines.push(`  ${formatFunctionSignature(m)}  [line ${m.startLine}]`);
                 }
             }
-            lines.push(`\nClass is ${entry.totalLines} lines. Use --max-lines=N to see source, or "source <method-handle>" for an individual method.`);
+            lines.push(`\nClass is ${entry.totalLines} lines. ${options.classSourceHint || 'Use --max-lines=N to see source, or "source <method-handle>" for an individual method.'}`);
             parts.push(lines.join('\n'));
         } else if (entry.truncated) {
             parts.push(formatClass(entry.match, entry.code) + `\n\n... showing ${entry.maxLines} of ${entry.totalLines} lines`);

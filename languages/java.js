@@ -64,7 +64,10 @@ function extractModifiers(node) {
                 }
                 continue;
             }
-            modifiers.push(mod.text);
+            // Comments are named children of a Java modifiers node in
+            // tree-sitter. Keyword modifiers are recovered from the bounded
+            // declaration prefix below; never turn arbitrary comment text
+            // into a semantic modifier/annotation.
         }
     }
 
@@ -842,6 +845,14 @@ function parse(code, parser) {
     const stateObjects = [];
     const processedFn = new Set();
     const processedCls = new Set();
+    let namespace = null;
+    for (let i = 0; i < tree.rootNode.namedChildCount; i++) {
+        const child = tree.rootNode.namedChild(i);
+        if (child.type === 'package_declaration') {
+            namespace = child.namedChild(0)?.text || null;
+            break;
+        }
+    }
 
     traverseTreeCached(tree.rootNode, (node) => {
         _processFunction(node, functions, processedFn, lines, code);
@@ -853,6 +864,11 @@ function parse(code, parser) {
     functions.sort((a, b) => a.startLine - b.startLine);
     classes.sort((a, b) => a.startLine - b.startLine);
     stateObjects.sort((a, b) => a.startLine - b.startLine);
+    if (namespace) {
+        for (const item of [...functions, ...classes, ...stateObjects]) {
+            if (!item.namespace) item.namespace = namespace;
+        }
+    }
 
     return {
         language: 'java',

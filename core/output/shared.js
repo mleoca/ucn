@@ -97,9 +97,28 @@ function formatFunctionSignature(fn) {
     // Generator marker
     if (fn.isGenerator) prefix.push('*');
 
+    // Data members are not callables.  Their declared type is stronger and
+    // more useful than the unknown-parameter sentinel (UCN5-171).
+    const dataMember = fn.type === 'field' || fn.type === 'state' ||
+        fn.memberType === 'field' || fn.memberType === 'property';
+    if (dataMember) {
+        let dataSig = fn.name;
+        const declaredType = fn.fieldType || fn.returnType;
+        if (declaredType) {
+            dataSig += `: ${String(declaredType).replace(/\s+/g, ' ').trim()}`;
+        }
+        return prefix.length > 0 ? `${prefix.join(' ')} ${dataSig}` : dataSig;
+    }
+
+    // Object-like macros expand as values, not calls. Function-like macros
+    // retain their real parameter list, including an empty `()` (UCN5-170).
+    if (fn.type === 'macro' && fn.functionLike === false) {
+        return prefix.length > 0 ? `${prefix.join(' ')} ${fn.name}` : fn.name;
+    }
+
     // Name + generics + params (concatenated without spaces)
     let sig = fn.name;
-    if (fn.generics) sig += fn.generics;
+    if (fn.generics) sig += String(fn.generics).replace(/\s+/g, ' ').trim();
     // If paramsStructured + paramTypes are available, render typed params
     const typed = renderTypedParams(fn);
     // When paramsStructured is an empty array, the function has zero params —
@@ -353,6 +372,8 @@ const ADVISORY_LABELS = {
     'scored-selection': 'examples picked by usage-quality scoring',
     'best-effort-frame-matching': 'frames matched by path similarity',
     'heuristic-route-matching': 'route↔request matches are heuristic (see per-match EXACT/PARTIAL/UNCERTAIN tiers)',
+    'incomplete-endpoint-inventory': 'AST inventory covers known framework patterns; absence is not proof that no endpoint exists',
+    'heuristic-route-matching-and-incomplete-inventory': 'AST inventory covers known framework patterns and route↔request matches are heuristic; absence is not proof that no endpoint exists',
 };
 
 /** Render the advisory line for a result's `advisory` field, or null. */

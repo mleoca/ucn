@@ -66,8 +66,14 @@ function treeAccountLine(ta) {
         `${ta.confirmedEdges} confirmed edge${ta.confirmedEdges === 1 ? '' : 's'} · ` +
         `${ta.unverifiedEdges} unverified${reasons ? ` (${reasons})` : ''} · ` +
         `${ta.excludedTotal} excluded${excludedReasons ? ` (${excludedReasons})` : ''}`;
+    if (ta.recursiveEdges > 0) {
+        line += ` · ${ta.recursiveEdges} self-recursive edge${ta.recursiveEdges === 1 ? '' : 's'} (not external impact)`;
+    }
     if (ta.filteredEdges > 0) line += ` · ${ta.filteredEdges} hidden by --exclude`;
     if (ta.depthLimitNodes > 0) line += ` · ${ta.depthLimitNodes} node${ta.depthLimitNodes === 1 ? '' : 's'} at depth limit (callers not searched)`;
+    if (ta.truncatedChildren > 0) {
+        line += ` · ${ta.truncatedChildren} child branch${ta.truncatedChildren === 1 ? '' : 'es'} not expanded (account covers the displayed subtree only)`;
+    }
     return line;
 }
 
@@ -324,6 +330,8 @@ function formatBlast(blast, options = {}) {
             lines.push(blast.expandUnverified
                 ? `Summary: no confirmed callers · ${unverifiedEdges} unverified edge${unverifiedEdges !== 1 ? 's' : ''} followed (${possiblyAffected || 0} possibly affected)`
                 : `Summary: no confirmed callers · ${unverifiedEdges} unverified edge${unverifiedEdges !== 1 ? 's' : ''} (${options.expandUnverifiedHint || '--expand-unverified'} to follow them)`);
+        } else if (blast.summary.selfRecursive) {
+            lines.push('Summary: No external callers found — this function is self-recursive; entry-point status is not established by the self-edge.');
         } else {
             lines.push('Summary: No callers found — this function is a root/entry point.');
         }
@@ -406,6 +414,8 @@ function formatReverseTrace(result, options = {}) {
         }
         if (node.entryPoint) {
             label += ' ★ entry point';
+        } else if (node.selfRecursive && (!node.children || node.children.length === 0)) {
+            label += ' ↻ self-recursive (no external caller proven)';
         } else if (node.unverifiedCallerCount > 0 && (!node.children || node.children.length === 0)) {
             label += ` ⚠ no confirmed callers — ${node.unverifiedCallerCount} unverified`;
         }
@@ -432,6 +442,8 @@ function formatReverseTrace(result, options = {}) {
     let rootLabel = result.root;
     if (result.tree && result.tree.entryPoint) {
         rootLabel += ' ★ entry point (no callers)';
+    } else if (result.tree && result.tree.selfRecursive && result.tree.children.length === 0) {
+        rootLabel += ' ↻ self-recursive (no external caller proven)';
     } else if (result.tree && result.tree.unverifiedCallerCount > 0 && result.tree.children.length === 0) {
         rootLabel += ` ⚠ no confirmed callers — ${result.tree.unverifiedCallerCount} unverified`;
     }
@@ -474,6 +486,8 @@ function formatReverseTrace(result, options = {}) {
             s = `Summary: ${totalEntryPoints} entry point${totalEntryPoints !== 1 ? 's' : ''} reach${totalEntryPoints === 1 ? 'es' : ''} ${result.root}${intermediates > 0 ? ` through ${intermediates} intermediate function${intermediates !== 1 ? 's' : ''}` : ' directly'}`;
         } else if (unverifiedEdges > 0) {
             s = `Summary: no confirmed callers — ${unverifiedEdges} unverified edge${unverifiedEdges !== 1 ? 's' : ''} (not an entry-point claim)`;
+        } else if (result.summary.selfRecursive) {
+            s = 'Summary: No external callers found — this function is self-recursive; no entry point is proven.';
         } else {
             s = 'Summary: No callers found — this function is itself an entry point.';
         }

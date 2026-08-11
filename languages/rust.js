@@ -20,6 +20,105 @@ function parseTree(parser, code) {
     return safeParse(parser, code, undefined, PARSE_OPTIONS);
 }
 
+const MACRO_ITEM_TOKENS = new Set([
+    'fn', 'struct', 'enum', 'union', 'trait', 'impl', 'type', 'const',
+    'static', 'mod', 'use', 'extern',
+]);
+const MACRO_ITEM_NODES = new Set([
+    'function_item', 'struct_item', 'enum_item', 'union_item', 'trait_item',
+    'impl_item', 'type_item', 'const_item', 'static_item', 'mod_item',
+    'use_declaration', 'foreign_mod_item',
+]);
+
+let lastDeclarationParser = null;
+let lastDeclarationCode = null;
+let lastDeclarationTrees = null;
+
+function macroInvocationIsItemPosition(node) {
+    if (node.parent?.type === 'source_file') return true;
+    if (node.parent?.type !== 'declaration_list') return false;
+    // A macro directly inside a module can emit items. An invocation inside
+    // an impl/trait body emits associated items and must not be reinterpreted
+    // as free functions or top-level types.
+    return node.parent.parent?.type === 'mod_item';
+}
+
+function tokenTreeMayDeclareItem(tokenTree) {
+    const pending = [tokenTree];
+    while (pending.length > 0) {
+        const current = pending.pop();
+        for (let index = 0; index < current.childCount; index++) {
+            const child = current.child(index);
+            if (MACRO_ITEM_TOKENS.has(child.type)) return true;
+            if (child.type === 'token_tree') pending.push(child);
+        }
+    }
+    return false;
+}
+
+function buildMacroItemRecoveryTree(code, parser, tree) {
+    const ranges = [];
+    traverseTreeCached(tree.rootNode, node => {
+        if (node.type !== 'macro_invocation' ||
+            !macroInvocationIsItemPosition(node)) return true;
+        const tokenTree = node.namedChildren.find(child => child.type === 'token_tree');
+        if (tokenTree && tokenTreeMayDeclareItem(tokenTree) &&
+            tokenTree.endIndex - tokenTree.startIndex > 2) {
+            ranges.push([tokenTree.startIndex + 1, tokenTree.endIndex - 1]);
+        }
+        // Its contents are opaque tokens in the primary tree; no nested AST
+        // invocation can be discovered by descending here.
+        return false;
+    });
+    if (ranges.length === 0) return null;
+
+    const masked = code.replace(/[^\r\n]/g, ' ').split('');
+    for (const [start, end] of ranges) {
+        for (let index = start; index < end; index++) masked[index] = code[index];
+        // Bound malformed macro DSL so it cannot absorb the next invocation.
+        if (end < masked.length && masked[end] !== '\n' && masked[end] !== '\r') {
+            masked[end] = ';';
+        }
+    }
+    const recovered = parseTree(parser, masked.join(''));
+    let itemCount = 0;
+    const declarationNameStarts = new Set();
+    traverseTreeCached(recovered.rootNode, node => {
+        if (MACRO_ITEM_NODES.has(node.type)) {
+            itemCount++;
+            const name = node.childForFieldName('name');
+            if (name) declarationNameStarts.add(name.startIndex);
+        }
+        return true;
+    });
+    if (itemCount === 0) return null;
+    return { tree: recovered, itemCount, declarationNameStarts };
+}
+
+/**
+ * Rust macro invocation bodies are token trees, even when they contain item
+ * declarations verbatim. Reparse only item-position bodies in a byte- and
+ * line-preserving synthetic source. The primary AST remains authoritative;
+ * the recovery tree contributes declarations the grammar otherwise hides.
+ */
+function declarationTrees(code, parser) {
+    if (parser === lastDeclarationParser && code === lastDeclarationCode &&
+        lastDeclarationTrees) return lastDeclarationTrees;
+    const primary = parseTree(parser, code);
+    const macro = buildMacroItemRecoveryTree(code, parser, primary);
+    const result = {
+        primary,
+        trees: macro ? [primary, macro.tree] : [primary],
+        macroItemRecovery: !!macro,
+        macroItemCount: macro?.itemCount || 0,
+        macroDeclarationNameStarts: macro?.declarationNameStarts || new Set(),
+    };
+    lastDeclarationParser = parser;
+    lastDeclarationCode = code;
+    lastDeclarationTrees = result;
+    return result;
+}
+
 /**
  * Extract return type from Rust function
  */
@@ -905,14 +1004,16 @@ function _processState(node, objects, lines) {
  * Find all functions in Rust code using tree-sitter
  */
 function findFunctions(code, parser) {
-    const tree = parseTree(parser, code);
+    const { trees } = declarationTrees(code, parser);
     const lines = code.split('\n');
     const functions = [];
     const processedRanges = new Set();
-    traverseTreeCached(tree.rootNode, (node) => {
-        _processFunction(node, functions, processedRanges, lines, code);
-        return true;
-    });
+    for (const tree of trees) {
+        traverseTreeCached(tree.rootNode, (node) => {
+            _processFunction(node, functions, processedRanges, lines, code);
+            return true;
+        });
+    }
     functions.sort((a, b) => a.startLine - b.startLine);
     return functions;
 }
@@ -932,16 +1033,18 @@ function extractGenerics(node) {
  * Find all types (structs, enums, traits, impls) in Rust code
  */
 function findClasses(code, parser) {
-    const tree = parseTree(parser, code);
+    const { trees } = declarationTrees(code, parser);
     const lines = code.split('\n');
     const types = [];
     const processedRanges = new Set();
-    traverseTreeCached(tree.rootNode, (node) => {
-        const matched = _processClass(node, types, processedRanges, lines, code);
-        // For impl_item, don't traverse into impl body (original behavior)
-        if (matched && node.type === 'impl_item') return false;
-        return true;
-    });
+    for (const tree of trees) {
+        traverseTreeCached(tree.rootNode, (node) => {
+            const matched = _processClass(node, types, processedRanges, lines, code);
+            // For impl_item, don't traverse into impl body (original behavior)
+            if (matched && node.type === 'impl_item') return false;
+            return true;
+        });
+    }
     _postProcessTraitImpls(types);
     types.sort((a, b) => a.startLine - b.startLine);
     return types;
@@ -1241,13 +1344,15 @@ function extractImplMembers(implNode, codeOrLines, typeName) {
  * Find state objects (const/static) in Rust code
  */
 function findStateObjects(code, parser) {
-    const tree = parseTree(parser, code);
+    const { trees } = declarationTrees(code, parser);
     const lines = code.split('\n');
     const objects = [];
-    traverseTreeCached(tree.rootNode, (node) => {
-        _processState(node, objects, lines);
-        return true;
-    });
+    for (const tree of trees) {
+        traverseTreeCached(tree.rootNode, (node) => {
+            _processState(node, objects, lines);
+            return true;
+        });
+    }
     objects.sort((a, b) => a.startLine - b.startLine);
     return objects;
 }
@@ -1256,17 +1361,20 @@ function findStateObjects(code, parser) {
  * Parse a Rust file completely
  */
 function parse(code, parser) {
-    const tree = parseTree(parser, code);
+    const declaration = declarationTrees(code, parser);
+    const tree = declaration.primary;
     const lines = code.split('\n');
     const functions = [], classes = [], stateObjects = [];
     const processedFn = new Set(), processedCls = new Set();
 
-    traverseTreeCached(tree.rootNode, (node) => {
-        _processFunction(node, functions, processedFn, lines, code);
-        _processClass(node, classes, processedCls, lines, code);
-        _processState(node, stateObjects, lines);
-        return true;  // always continue, never skip subtrees
-    });
+    for (const declarationTree of declaration.trees) {
+        traverseTreeCached(declarationTree.rootNode, (node) => {
+            _processFunction(node, functions, processedFn, lines, code);
+            _processClass(node, classes, processedCls, lines, code);
+            _processState(node, stateObjects, lines);
+            return true;  // always continue, never skip subtrees
+        });
+    }
 
     _postProcessTraitImpls(classes);
 
@@ -1276,7 +1384,9 @@ function parse(code, parser) {
 
     return {
         language: 'rust', totalLines: lines.length, functions, classes, stateObjects,
-        ...(tree.rootNode.hasError && { parseRecovery: true }),
+        ...((tree.rootNode.hasError || declaration.macroItemRecovery) && {
+            parseRecovery: true,
+        }),
         imports: [], exports: [],
     };
 }
@@ -2883,7 +2993,29 @@ function findCallsInCode(code, parser) {
         }
     });
 
-    return calls;
+    const declaration = declarationTrees(code, parser);
+    if (!declaration.macroItemRecovery) return calls;
+    const functions = findFunctions(code, parser);
+    return calls
+        .filter(call => !(call.inMacro &&
+            declaration.macroDeclarationNameStarts.has(call.callStart)))
+        .map(call => {
+            if (!call.inMacro || call.enclosingFunction) return call;
+            const owner = functions
+                .filter(fn => fn.startLine <= call.line && fn.endLine >= call.line)
+                .sort((left, right) =>
+                    (left.endLine - left.startLine) -
+                    (right.endLine - right.startLine))[0];
+            if (!owner) return call;
+            return {
+                ...call,
+                enclosingFunction: {
+                    name: owner.name,
+                    startLine: owner.startLine,
+                    endLine: owner.endLine,
+                },
+            };
+        });
 }
 
 /**
@@ -3027,8 +3159,9 @@ function findImportsInCode(code, parser) {
  * @returns {Array<{name: string, type: string, line: number}>}
  */
 function findExportsInCode(code, parser) {
-    const tree = parseTree(parser, code);
+    const { trees } = declarationTrees(code, parser);
     const exports = [];
+    const seen = new Set();
 
     function hasVisibility(node) {
         for (let i = 0; i < node.namedChildCount; i++) {
@@ -3040,7 +3173,15 @@ function findExportsInCode(code, parser) {
         return false;
     }
 
-    traverseTreeCached(tree.rootNode, (node) => {
+    const append = entry => {
+        const key = `${entry.name}\0${entry.type}\0${entry.line}\0${entry.alias || ''}`;
+        if (!seen.has(key)) {
+            seen.add(key);
+            exports.push(entry);
+        }
+    };
+
+    const collect = tree => traverseTreeCached(tree.rootNode, (node) => {
         // Public renamed re-exports: `pub use foo::bar as baz;` (also nested in
         // use lists: `pub use m::{a as b}`). name keeps the source symbol; alias
         // carries the external name callers use. Plain (un-renamed) `pub use`
@@ -3063,7 +3204,7 @@ function findExportsInCode(code, parser) {
                         }
                     }
                     if (local && aliasNode && aliasNode.text !== local) {
-                        exports.push({
+                        append({
                             name: local, type: 're-export', line,
                             source: srcNode.text, alias: aliasNode.text,
                         });
@@ -3080,7 +3221,7 @@ function findExportsInCode(code, parser) {
         if (node.type === 'function_item' && hasVisibility(node)) {
             const nameNode = node.childForFieldName('name');
             if (nameNode) {
-                exports.push({
+                append({
                     name: nameNode.text,
                     type: 'function',
                     line: node.startPosition.row + 1
@@ -3093,7 +3234,7 @@ function findExportsInCode(code, parser) {
         if (node.type === 'struct_item' && hasVisibility(node)) {
             const nameNode = node.childForFieldName('name');
             if (nameNode) {
-                exports.push({
+                append({
                     name: nameNode.text,
                     type: 'struct',
                     line: node.startPosition.row + 1
@@ -3106,7 +3247,7 @@ function findExportsInCode(code, parser) {
         if (node.type === 'enum_item' && hasVisibility(node)) {
             const nameNode = node.childForFieldName('name');
             if (nameNode) {
-                exports.push({
+                append({
                     name: nameNode.text,
                     type: 'enum',
                     line: node.startPosition.row + 1
@@ -3119,7 +3260,7 @@ function findExportsInCode(code, parser) {
         if (node.type === 'trait_item' && hasVisibility(node)) {
             const nameNode = node.childForFieldName('name');
             if (nameNode) {
-                exports.push({
+                append({
                     name: nameNode.text,
                     type: 'trait',
                     line: node.startPosition.row + 1
@@ -3132,7 +3273,7 @@ function findExportsInCode(code, parser) {
         if (node.type === 'mod_item' && hasVisibility(node)) {
             const nameNode = node.childForFieldName('name');
             if (nameNode) {
-                exports.push({
+                append({
                     name: nameNode.text,
                     type: 'module',
                     line: node.startPosition.row + 1
@@ -3145,7 +3286,7 @@ function findExportsInCode(code, parser) {
         if (node.type === 'type_item' && hasVisibility(node)) {
             const nameNode = node.childForFieldName('name');
             if (nameNode) {
-                exports.push({
+                append({
                     name: nameNode.text,
                     type: 'type',
                     line: node.startPosition.row + 1
@@ -3158,7 +3299,7 @@ function findExportsInCode(code, parser) {
         if (node.type === 'const_item' && hasVisibility(node)) {
             const nameNode = node.childForFieldName('name');
             if (nameNode) {
-                exports.push({
+                append({
                     name: nameNode.text,
                     type: 'const',
                     line: node.startPosition.row + 1
@@ -3171,7 +3312,7 @@ function findExportsInCode(code, parser) {
         if (node.type === 'static_item' && hasVisibility(node)) {
             const nameNode = node.childForFieldName('name');
             if (nameNode) {
-                exports.push({
+                append({
                     name: nameNode.text,
                     type: 'static',
                     line: node.startPosition.row + 1
@@ -3182,6 +3323,7 @@ function findExportsInCode(code, parser) {
 
         return true;
     });
+    for (const tree of trees) collect(tree);
 
     return exports;
 }

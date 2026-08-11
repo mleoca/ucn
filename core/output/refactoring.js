@@ -67,7 +67,10 @@ function formatPlan(plan, options = {}) {
     lines.push(`  Files affected: ${plan.filesAffected}`);
     if (plan.changeSummary) {
         const summary = plan.changeSummary;
-        lines.push(`  Definition ${summary.definitions}, calls/references ${summary.calls}, imports ${summary.imports}, exports ${summary.exports}, manual review ${summary.reviewRequired}`);
+        lines.push(`  Definition ${summary.definitions}, calls/references ${summary.calls}, imports ${summary.imports}, exports ${summary.exports}; manual review required for ${summary.reviewRequired} of these changes`);
+    }
+    if (plan.unchangedSites > 0) {
+        lines.push(`  ${plan.unchangedSites} existing call site${plan.unchangedSites === 1 ? '' : 's'} require no edit because the new parameter has a default.`);
     }
     if (plan.scopeWarning) {
         lines.push(`  Note: ${plan.scopeWarning.hint}`);
@@ -85,7 +88,7 @@ function formatPlan(plan, options = {}) {
 
     lines.push('BY FILE:');
     for (const [file, changes] of byFile) {
-        lines.push(`\n${file} (${changes.length} changes)`);
+        lines.push(`\n${file} (${changes.length} change${changes.length === 1 ? '' : 's'})`);
         for (const change of changes) {
             const kind = change.editKind ? ` [${change.editKind}]` : '';
             const review = change.needsReview ? ' [review required]' : '';
@@ -148,6 +151,7 @@ function formatPlanJson(plan) {
             totalChanges: plan.totalChanges,
             filesAffected: plan.filesAffected,
             ...(plan.changeSummary && { changeSummary: plan.changeSummary }),
+            ...(plan.unchangedSites > 0 && { unchangedSites: plan.unchangedSites }),
             changes: plan.changes.map(c => ({
                 file: c.file,
                 line: c.line,
@@ -360,7 +364,7 @@ function formatStackTrace(result) {
     const stAdvisory = advisoryLine(result.advisory);
     if (stAdvisory) lines.push(stAdvisory);
     if (result.skippedFrames > 0) {
-        lines.push(`(${result.skippedFrames} frame(s) without file:line — Unknown Source, native — skipped)`);
+        lines.push(`(${result.skippedFrames} runtime frame(s) outside the indexed project or without a resolvable project file — skipped)`);
     }
 
     for (let i = 0; i < result.frames.length; i++) {

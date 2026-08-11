@@ -477,8 +477,15 @@ function runCli(projectDir, call, json) {
         timeout: TIMEOUT_MS,
         stdio: ['ignore', 'pipe', 'pipe'],
     });
+    // `check` is both an analysis command and a CI gate. Exit 1 means the
+    // command ran successfully and found review-required diagnostics; exit 2
+    // means the check could not run. MCP expresses the former as a successful
+    // tool result containing findings, so score it as surface success here.
+    const canonical = canonicalCommand(call.command);
+    const successfulExecution = result.status === 0 ||
+        (canonical === 'check' && result.status === 1);
     return {
-        ok: result.status === 0 && !result.error,
+        ok: successfulExecution && !result.error,
         status: result.status,
         ms: elapsedMs(started),
         stdout: result.stdout || '',
@@ -566,6 +573,12 @@ function normalizeSurfaceGuidance(text) {
             '<detailed-guidance>')
         .replace(/(?:Use --top=N or --all|Use top=<n> or all=true) to show more\./g,
             '<top-guidance>')
+        .replace(/(?:Use --depth=N|Use depth=<n>) for a deeper graph\./g,
+            '<depth-guidance>')
+        .replace(/(?:--include-decorated|include_decorated=true)/g,
+            '<include-decorated>')
+        .replace(/(?:--include-exported|include_exported=true)/g,
+            '<include-exported>')
         .replace(/\((?:use --deep|use deep=true)\)/g, '(<deep-guidance>)')
         .replace(/\buse (?:--all|all=true)\b/g, 'use <all>')
         .replace(/(?:--expand-unverified|expand_unverified=true)/g, '<expand-unverified>');

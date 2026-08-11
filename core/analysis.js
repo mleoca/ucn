@@ -299,9 +299,12 @@ function context(index, name, options = {}) {
         !!(def.isMethod || def.type === 'method' || def.className);
 
     // Special handling for class/struct/interface types
-    if (['class', 'struct', 'interface', 'type', 'enum', 'record']
+    if (['class', 'struct', 'interface', 'type', 'enum', 'record', 'trait', 'namespace']
         .includes(def.type)) {
         const methods = index.findMethodsForType(name);
+        const members = (index.files.get(def.file)?.symbols || []).filter(symbol =>
+            symbol.className === def.name &&
+            ['field', 'constant', 'state'].includes(symbol.type));
 
         // Pin caller resolution to the resolved class definition — same as the
         // function path below. Without this, same-name classes in other files
@@ -336,6 +339,10 @@ function context(index, name, options = {}) {
         typeCallers = [...typeCallers].sort(byFileLine);
         typeUnverified = [...typeUnverified].sort(byFileLine);
 
+        const callerTotal = typeCallers.length;
+        if (options.maxCallers && options.maxCallers > 0) {
+            typeCallers = typeCallers.slice(0, options.maxCallers);
+        }
         const result = {
             type: def.type,
             name: name,
@@ -350,10 +357,16 @@ function context(index, name, options = {}) {
                 returnType: m.returnType,
                 receiver: m.receiver
             })),
+            members: members.map(member => ({
+                name: member.name,
+                type: member.type,
+                file: member.relativePath,
+                line: member.startLine,
+            })),
             // Also include places where the type is used in function parameters/returns
             callers: typeCallers,
             unverifiedCallers: typeUnverified,
-            meta: { account: typeAccount }
+            meta: { account: typeAccount, callerTotal }
         };
 
         if (warnings.length > 0) {
@@ -472,6 +485,14 @@ function context(index, name, options = {}) {
 
     const callerHistogram = buildHistogram(callers);
     const calleeHistogram = buildHistogram(callees);
+    const callerTotal = callers.length;
+    const calleeTotal = callees.length;
+    if (options.maxCallers && options.maxCallers > 0) {
+        callers = callers.slice(0, options.maxCallers);
+    }
+    if (options.maxCallees && options.maxCallees > 0) {
+        callees = callees.slice(0, options.maxCallees);
+    }
 
     const filesInScope = new Set([def.file]);
     callers.forEach(c => filesInScope.add(c.file));
@@ -505,6 +526,8 @@ function context(index, name, options = {}) {
             projectLanguage: index._getPredominantLanguage(),
             account,
             calleeAccount: rawCallees.calleeAccount,
+            callerTotal,
+            calleeTotal,
             // No detected entry points (e.g. library code) — reachability
             // markers are meaningless and suppressed by formatters. Omit the
             // field when the optional enrichment was not requested.
@@ -1706,7 +1729,7 @@ function diffImpact(index, options = {}) {
     try {
         gitRoot = execFileSync('git', ['rev-parse', '--show-toplevel'], { cwd: index.root, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
     } catch (e) {
-        throw new Error('Not a git repository. diff-impact requires git.', { cause: e });
+        throw new Error('Not a git repository. impact without a symbol requires git.', { cause: e });
     }
 
     // Build git diff command (use execFileSync to avoid shell expansion)
@@ -2317,6 +2340,9 @@ const _KNOWN_ASYNC_CALLEES = new Set([
 //   - void <expr>
 //   - <expr>.then() / .catch() (the call provides its own handler)
 const _FIRE_AND_FORGET_PROMISE_FNS = new Set(['all', 'allSettled', 'race', 'any']);
+const _ASYNCIO_CONSUMER_FNS = new Set([
+    'gather', 'create_task', 'ensure_future', 'wait', 'as_completed',
+]);
 
 /**
  * Run an async/await audit across the project.
@@ -2404,8 +2430,10 @@ function auditAsync(index, options = {}) {
                             if (obj && prop) {
                                 const objText = obj.text;
                                 const propText = prop.text;
-                                if ((objText === 'Promise' || objText === 'asyncio') &&
-                                    _FIRE_AND_FORGET_PROMISE_FNS.has(propText)) {
+                                if ((objText === 'Promise' &&
+                                    _FIRE_AND_FORGET_PROMISE_FNS.has(propText)) ||
+                                    (objText === 'asyncio' &&
+                                    _ASYNCIO_CONSUMER_FNS.has(propText))) {
                                     return true;
                                 }
                                 // .then(...) / .catch(...) — caller is providing a handler;
@@ -2669,9 +2697,30 @@ function auditAsync(index, options = {}) {
                                         _KNOWN_ASYNC_CALLEES.has(calleeName)) {
                                         // Check: is the call awaited?
                                         let awaited = false;
-                                        const p = node.parent;
-                                        if (p && (p.type === 'await_expression' || p.type === 'await')) {
-                                            awaited = true;
+                                        let current = node.parent;
+                                        let awaitDepth = 0;
+                                        while (current && awaitDepth++ < 5) {
+                                            if (current.type === 'await_expression' ||
+                                                current.type === 'await') {
+                                                awaited = true;
+                                                break;
+                                            }
+                                            // C#'s canonical
+                                            // `await Task().ConfigureAwait(false)`
+                                            // wraps the original invocation in
+                                            // a member-access + invocation
+                                            // chain before the await node.
+                                            if (language === 'csharp' && [
+                                                'member_access_expression',
+                                                'invocation_expression',
+                                                'conditional_access_expression',
+                                                'member_binding_expression',
+                                                'parenthesized_expression',
+                                            ].includes(current.type)) {
+                                                current = current.parent;
+                                                continue;
+                                            }
+                                            break;
                                         }
                                         if (!awaited && !isFireAndForget(node, language)) {
                                             issues.push({

@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.mleoca/ucn",
-  "description": "Auditable AST code intelligence for AI agents through one 18-command MCP tool, with JS/TS, Python, Go, Rust, Java, C/C++, C#, and HTML support.",
+  "description": "Auditable, conserved AST code intelligence for AI agents through one 18-command MCP tool, with JS/TS, Python, Go, Rust, Java, C/C++, C#, and HTML support.",
   "repository": {
     "url": "https://github.com/mleoca/ucn",
     "source": "github"

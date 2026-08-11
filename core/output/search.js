@@ -7,10 +7,11 @@ const { detectDoubleEscaping, advisoryLine } = require('./shared');
 /**
  * Format search command output
  */
-function formatSearch(results, term) {
+function formatSearch(results, term, options = {}) {
     const meta = results.meta;
 
-    const totalMatches = results.reduce((sum, r) => sum + r.matches.length, 0);
+    const shownMatches = results.reduce((sum, r) => sum + r.matches.length, 0);
+    const totalMatches = meta?.totalMatches ?? shownMatches;
     if (totalMatches === 0) {
         if (meta) {
             const scope = meta.filesSkipped > 0
@@ -23,8 +24,10 @@ function formatSearch(results, term) {
     }
 
     const lines = [];
-    const fileWord = results.length === 1 ? 'file' : 'files';
-    lines.push(`Found ${totalMatches} match${totalMatches === 1 ? '' : 'es'} for "${term}" in ${results.length} ${fileWord}:`);
+    const totalFiles = meta?.matchedFiles ?? meta?.totalMatchedFiles ?? results.length;
+    const fileWord = totalFiles === 1 ? 'file' : 'files';
+    const showing = shownMatches < totalMatches ? ` (showing ${shownMatches})` : '';
+    lines.push(`Found ${totalMatches} match${totalMatches === 1 ? '' : 'es'} for "${term}" in ${totalFiles} ${fileWord}${showing}:`);
     lines.push('═'.repeat(60));
 
     for (const result of results) {
@@ -45,11 +48,11 @@ function formatSearch(results, term) {
     }
 
     if (meta && meta.truncatedMatches > 0) {
-        lines.push(`\n${results.reduce((s, r) => s + r.matches.length, 0)} shown of ${meta.totalMatches} total matches. Use top= to see more.`);
+        lines.push(`\n${shownMatches} shown of ${meta.totalMatches} total matches. ${options.topHint || 'Use --top=N to see more.'}`);
     }
 
     if (meta && meta.testsExcluded && meta.filesSkipped > 0) {
-        lines.push(`\nNote: ${meta.filesSkipped} test file${meta.filesSkipped === 1 ? '' : 's'} hidden by default (use include_tests=true to include).`);
+        lines.push(`\nNote: ${meta.filesSkipped} test file${meta.filesSkipped === 1 ? '' : 's'} hidden by default (${options.includeTestsHint || 'use --include-tests to include'}).`);
     }
 
     return lines.join('\n');
@@ -84,7 +87,7 @@ function formatSearchJson(results, term) {
 /**
  * Format structural search results (index-based queries)
  */
-function formatStructuralSearch(result) {
+function formatStructuralSearch(result, options = {}) {
     const { results, meta } = result;
     const lines = [];
 
@@ -102,6 +105,10 @@ function formatStructuralSearch(result) {
 
     lines.push(`Structural search: ${queryStr}`);
     lines.push('═'.repeat(60));
+    if (meta.query.unused) {
+        lines.push(`NOTE: ${options.unusedFlag || '--unused'} lists callable symbols with no resolved call edge; it does not assess type/field/reference liveness and is not safe-delete proof. Confirm with deadcode and usages.`);
+        lines.push('');
+    }
 
     if (results.length === 0) {
         lines.push('No matches found.');
@@ -132,7 +139,7 @@ function formatStructuralSearch(result) {
     }
 
     if (meta.shown < meta.totalMatched) {
-        lines.push(`\n${meta.shown} of ${meta.totalMatched} shown. Use top= to see more.`);
+        lines.push(`\n${meta.shown} of ${meta.totalMatched} shown. ${options.topHint || 'Use --top=N to see more.'}`);
     }
 
     return lines.join('\n');

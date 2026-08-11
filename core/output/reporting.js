@@ -155,7 +155,7 @@ function formatStats(stats, options = {}) {
             lines.push(`  ${String(fn.lines).padStart(5)} lines  ${elideListText(fn.name, 100)}  (${loc})`);
         }
         if (stats.functions.length > top) {
-            lines.push(`  ... ${stats.functions.length - top} more (use --top=N to show more)`);
+            lines.push(`  ... ${stats.functions.length - top} more (${options.topHint || 'use --top=N to show more'})`);
         }
     }
 
@@ -181,7 +181,7 @@ function formatStats(stats, options = {}) {
                 }
             }
             if (total > items.length) {
-                lines.push(`  ... ${total - items.length} more (use --top=N to show more)`);
+                lines.push(`  ... ${total - items.length} more (${options.topHint || 'use --top=N to show more'})`);
             }
         }
     }
@@ -205,7 +205,9 @@ function formatStatsJson(stats) {
 function formatDeadcode(results, options = {}) {
     if (results.length === 0 && !results.excludedDecorated &&
         !results.excludedExported && !results.excludedExternalContract &&
-        !results.excludedDynamicDispatch && !results.computedDispatch?.count) {
+        !results.excludedRuntimeContract && !results.pythonImplicitExportFiles &&
+        !results.excludedDynamicDispatch && !results.computedDispatch?.count &&
+        results.coverage?.complete !== false) {
         return 'No dead code found.';
     }
 
@@ -277,11 +279,28 @@ function formatDeadcode(results, options = {}) {
         const extHint = options.externalContractHint || `${results.excludedExternalContract} symbol(s) hidden (override an out-of-tree base class — reachable via external contract, not dead). Use --include-exported to include them.`;
         lines.push(`\n${extHint}`);
     }
+    if (results.excludedRuntimeContract > 0) {
+        lines.push(`\n${results.excludedRuntimeContract} Java serialization callback(s) hidden (JVM runtime contract, not dead).`);
+    }
+    if (results.pythonImplicitExportFiles > 0) {
+        lines.push(`\nPython public-surface rule active in ${results.pythonImplicitExportFiles} file(s) without __all__: top-level non-underscore names are treated as externally reachable.`);
+    }
     if (results.excludedDynamicDispatch > 0) {
         lines.push(`\n${results.excludedDynamicDispatch} registry member(s) hidden because a matching computed dispatch (registry[key]()) may invoke them.`);
     }
     if (results.computedDispatch?.count > 0) {
         lines.push(`\nWARNING: ${results.computedDispatch.count} computed dispatch call(s) in ${results.computedDispatch.fileCount} file(s). Dead-code results are review candidates; runtime-selected members may not have a named static edge.`);
+    }
+    if (results.coverage?.complete === false) {
+        const c = results.coverage;
+        const reasonText = Object.entries(c.reasons || {})
+            .map(([reason, count]) => `${count} ${reason}`)
+            .join(', ');
+        if (c.claimsWithdrawn) {
+            lines.push(`\nWARNING: dead-code claims withdrawn because source coverage is incomplete (${reasonText || 'unknown gap'}).`);
+        } else {
+            lines.push(`\nWARNING: source coverage is incomplete (${reasonText || 'unknown gap'}); ${c.suppressedMatched || 0} candidate name(s) found in skipped source were suppressed.`);
+        }
     }
 
     if (lines.length === 0) {
@@ -311,8 +330,11 @@ function formatDeadcodeJson(results) {
             ...(results.excludedExported > 0 && { excludedExported: results.excludedExported }),
             ...(results.excludedDecorated > 0 && { excludedDecorated: results.excludedDecorated }),
             ...(results.excludedExternalContract > 0 && { excludedExternalContract: results.excludedExternalContract }),
+            ...(results.excludedRuntimeContract > 0 && { excludedRuntimeContract: results.excludedRuntimeContract }),
+            ...(results.pythonImplicitExportFiles > 0 && { pythonImplicitExportFiles: results.pythonImplicitExportFiles }),
             ...(results.excludedDynamicDispatch > 0 && { excludedDynamicDispatch: results.excludedDynamicDispatch }),
             ...(results.computedDispatch?.count > 0 && { computedDispatch: results.computedDispatch }),
+            ...(results.coverage?.complete === false && { coverage: results.coverage }),
             symbols: results.map(item => {
                 const handleSym = { ...item, relativePath: item.relativePath || item.file };
                 const handle = formatSymbolHandle(handleSym);
@@ -425,7 +447,7 @@ function formatEntrypointsJson(results) {
  */
 function formatOrient(result, options = {}) {
     const lines = [];
-    lines.push(`PROJECT ORIENTATION — ${result.root}`);
+    lines.push(`PROJECT ORIENTATION — ${result.root}${result.scope ? ` (scoped to ${result.scope})` : ''}`);
     lines.push('═'.repeat(60));
 
     // Size + language mix (percent by symbols, largest first)
@@ -468,17 +490,29 @@ function formatOrient(result, options = {}) {
 
     const bs = result.trust?.blindSpots || {};
     const bsParts = [];
-    if (bs.dynamicImports) bsParts.push(`${bs.dynamicImports} dynamic import(s)`);
+    if (bs.dynamicImports) {
+        const note = dynamicImportsNote(bs.dynamicImports, {
+            projectLanguage: result.projectLanguage || result.trust?.projectLanguage,
+        });
+        if (note) bsParts.push(note);
+    }
     if (bs.evalCalls) bsParts.push(`${bs.evalCalls} eval`);
     if (bs.reflection) bsParts.push(`${bs.reflection} reflection`);
     if (bs.parseFailures) bsParts.push(`${bs.parseFailures} parse failure(s)`);
+    if (bs.parseRecoveries) bsParts.push(`${bs.parseRecoveries} parser-recovery file(s)`);
     if (bs.unsupportedSources) bsParts.push(`${bs.unsupportedSources} unsupported source file(s)`);
+    if (bs.skippedSources) bsParts.push(`${bs.skippedSources} skipped source path(s)`);
     lines.push(`TRUST: ${result.trust?.level || 'UNKNOWN'}${bsParts.length ? ' — ' + bsParts.join(', ') : ''}  (${options.healthHint || 'ucn repo --sections=health --deep for detail'})`);
     if (result.unsupportedSources?.count > 0) {
         const languages = Object.entries(result.unsupportedSources.languages || {})
             .map(([language, count]) => `${language} ${count}`)
             .join(', ');
         lines.push(`SKIPPED SOURCE: ${result.unsupportedSources.count} file(s)${languages ? ` (${languages})` : ''} — use grep/ripgrep plus a language-native analyzer.`);
+    }
+    if (result.skippedSources?.count > 0) {
+        const reasons = Object.entries(result.skippedSources.reasons || {})
+            .map(([reason, count]) => `${reason} ${count}`).join(', ');
+        lines.push(`SKIPPED SOURCE: ${result.skippedSources.count} path(s) were not indexed${reasons ? ` (${reasons})` : ''} — completeness claims are withdrawn.`);
     }
     lines.push('');
 

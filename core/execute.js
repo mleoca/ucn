@@ -48,6 +48,45 @@ function requireTerm(term) {
     return null;
 }
 
+function editDistance(a, b) {
+    const prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+    for (let i = 1; i <= a.length; i++) {
+        let diagonal = prev[0];
+        prev[0] = i;
+        for (let j = 1; j <= b.length; j++) {
+            const above = prev[j];
+            prev[j] = Math.min(prev[j] + 1, prev[j - 1] + 1,
+                diagonal + (a[i - 1] === b[j - 1] ? 0 : 1));
+            diagonal = above;
+        }
+    }
+    return prev[b.length];
+}
+
+function symbolNotFound(index, name, label = 'Symbol') {
+    const query = String(name || '');
+    const lower = query.toLowerCase();
+    let best = null;
+    for (const candidate of index.symbols.keys()) {
+        const value = String(candidate);
+        const candidateLower = value.toLowerCase();
+        const distance = editDistance(lower, candidateLower);
+        const prefixBonus = candidateLower.startsWith(lower) || lower.startsWith(candidateLower)
+            ? -2 : 0;
+        const score = distance + prefixBonus;
+        if (!best || score < best.score ||
+            (score === best.score && value < best.value)) {
+            best = { value, score, distance };
+        }
+    }
+    const threshold = Math.max(2, Math.floor(query.length * 0.3));
+    if (best && best.distance <= threshold) {
+        return `${label} "${query}" not found. Did you mean "${best.value}"? ` +
+            'Use find to confirm the symbol and obtain a stable handle.';
+    }
+    return `${label} "${query}" not found. Use find with a shorter name, or search for a literal occurrence.`;
+}
+
 /**
  * Split Class.method syntax into className and methodName.
  * Returns { className, methodName } or null if not applicable.
@@ -60,10 +99,21 @@ function splitClassMethod(name) {
     if (dotIndex <= 0 || dotIndex === name.length - 1) return null;
     // Only split on first dot, and only if there's exactly one dot
     if (name.indexOf('.', dotIndex + 1) !== -1) return null;
-    return {
-        className: name.substring(0, dotIndex),
-        methodName: name.substring(dotIndex + 1)
-    };
+    const className = name.substring(0, dotIndex);
+    const methodName = name.substring(dotIndex + 1);
+    // This is authored identifier syntax, not a generic string splitter.
+    // Preserve computed names, malformed handles, paths, and source text.
+    const identifier = /^[\p{L}_$][\p{L}\p{N}_$]*$/u;
+    if (!identifier.test(className) || !identifier.test(methodName)) return null;
+    return { className, methodName };
+}
+
+function validateInFilter(index, value) {
+    if (!value) return null;
+    for (const [, fileEntry] of index.files) {
+        if (index.matchesFilters(fileEntry.relativePath, { in: value })) return null;
+    }
+    return `No files matched the 'in' directory filter '${value}'.`;
 }
 
 /**
@@ -95,12 +145,17 @@ function applyHandleSyntax(p) {
     if (!looksLikeHandle(p.name)) return;
     const h = parseSymbolHandle(p.name);
     if (!h) return;
+    p._handleFile = h.file;
+    p._handleLine = h.line;
     // Pull name out of handle. If the handle has no name suffix, we need to
     // recover it from the index — but at this layer we only have params.
     // The downstream resolveSymbol path will look up by file+line if name is empty.
     if (h.name) p.name = h.name;
     // Only override p.file/p.line if they weren't explicitly set by the user
-    if (h.file && !p.file) p.file = h.file;
+    if (h.file && !p.file) {
+        p.file = h.file;
+        p._fileFromHandle = true;
+    }
     if (h.line && !p.line) p.line = h.line;
 }
 
@@ -229,8 +284,12 @@ function treeNote(result) {
     // result.warnings are NOT copied here — the tree formatters render them
     // in the body (Note: lines under the header); copying them into the
     // handler note printed each warning twice (fix #237).
-    if (result?.tree?.truncatedChildren > 0) {
-        parts.push(`${result.tree.truncatedChildren} children truncated. Use --depth=N or --all to expand.`);
+    const countTruncated = node => !node ? 0 :
+        (node.truncatedChildren || 0) +
+        (node.children || []).reduce((sum, child) => sum + countTruncated(child), 0);
+    const truncatedChildren = countTruncated(result?.tree);
+    if (truncatedChildren > 0) {
+        parts.push(`${truncatedChildren} children truncated by the per-node cap. Use --all to expand them; --depth controls hops only.`);
     }
     if (result?.truncatedCallers > 0) {
         parts.push(`${result.truncatedCallers} callers truncated. Use --all to expand.`);
@@ -291,7 +350,10 @@ function checkDefinitionPin(index, p) {
         return list.length > 10 ? `${shown}\n  ... and ${list.length - 10} more` : shown;
     };
     if (p.file) {
-        const byFile = candidates.filter(d => d.relativePath && d.relativePath.includes(p.file));
+        const resolvedFile = index.resolveFilePathForQuery(p.file);
+        const byFile = typeof resolvedFile === 'string'
+            ? candidates.filter(d => d.file === resolvedFile)
+            : candidates.filter(d => d.relativePath && d.relativePath.includes(p.file));
         if (byFile.length === 0) {
             return `Symbol "${p.name}" not found in files matching "${p.file}". Found ${candidates.length} definition(s) elsewhere:\n${describe(candidates)}\nUse file= with a path fragment from the list above to disambiguate.`;
         }
@@ -439,11 +501,18 @@ const HANDLERS = {
         const originalTarget = p.name;
         const query = { ...p };
         applyClassMethodSyntax(query);
+        const fileErr = checkFilePatternMatch(index, query.file);
+        if (fileErr) return { ok: false, error: fileErr };
+        const classErr = validateClassName(index, query.name, query.className);
+        if (classErr) return { ok: false, error: classErr };
+        const pinErr = checkDefinitionPin(index, query);
+        if (pinErr) return { ok: false, error: pinErr };
         const resolved = index.resolveSymbol(query.name, {
             file: query.file,
             className: query.className,
             line: query.line,
         });
+        if (!resolved.def) return { ok: false, error: symbolNotFound(index, query.name) };
         // A composed answer must use one exact definition in every section.
         // Let the child handler provide the normal not-found/filter error, but
         // once resolution succeeds pin every composition to the selected file
@@ -463,73 +532,79 @@ const HANDLERS = {
             'show',
         );
         if (parsed.error) return { ok: false, error: parsed.error };
+        if (p.withTypes && !parsed.sections.includes('types')) parsed.sections.push('types');
 
         const selected = new Set(parsed.sections);
         const result = { target: originalTarget, sections: parsed.sections };
         const notes = (resolved.warnings || []).map(warning => warning.message);
         if (resolved.warnings?.length) result.warnings = resolved.warnings;
-        const run = (handler, params) => {
+        const run = (section, handler, params) => {
             const response = HANDLERS[handler](index, { ...params });
-            if (!response.ok) return response;
+            if (!response.ok) {
+                if (!result.unavailableSections) result.unavailableSections = [];
+                result.unavailableSections.push({ section, reason: response.error });
+                notes.push(`Section "${section}" unavailable: ${response.error}`);
+                return null;
+            }
             if (response.note) notes.push(response.note);
             return response;
         };
 
         if (selected.has('summary')) {
-            const response = run('brief', targetParams);
-            if (!response.ok) return response;
-            result.summary = response.result;
+            const response = run('summary', 'brief', targetParams);
+            if (response) result.summary = response.result;
         }
         if (selected.has('callers') || selected.has('callees')) {
-            const response = run('context', targetParams);
-            if (!response.ok) return response;
+            const response = run('relationships', 'context', targetParams);
+            if (response) {
             // Apply the projection in the engine result so text and JSON
             // expose the same sections. ACCOUNT/CONTRACT metadata stays
             // attached even when one relationship direction is omitted.
             result.context = { ...response.result };
             if (!selected.has('callers')) {
-                result.context.callers = [];
-                result.context.unverifiedCallers = [];
+                delete result.context.callers;
+                delete result.context.unverifiedCallers;
             }
             if (!selected.has('callees')) {
-                result.context.callees = [];
-                result.context.unverifiedCallees = [];
+                delete result.context.callees;
+                delete result.context.unverifiedCallees;
+            }
+            result.context.omittedSections = [
+                ...(!selected.has('callers') ? ['callers'] : []),
+                ...(!selected.has('callees') ? ['callees'] : []),
+            ];
             }
         }
         if (selected.has('source')) {
-            const response = run('source', targetParams);
-            if (!response.ok) return response;
-            result.source = response.result;
+            const response = run('source', 'source', targetParams);
+            if (response) result.source = response.result;
         }
         if (selected.has('dependencies')) {
-            const response = run('smart', targetParams);
-            if (!response.ok) return response;
-            result.dependencies = response.result;
+            const response = run('dependencies', 'smart', targetParams);
+            if (response) result.dependencies = response.result;
         }
         if (selected.has('tests')) {
-            const response = run('tests', { ...targetParams, depth: 0 });
-            if (!response.ok) return response;
-            result.tests = response.result;
+            const response = run('tests', 'tests', { ...targetParams, depth: 0 });
+            if (response) result.tests = response.result;
         }
         if (selected.has('types')) {
-            const response = run('about', {
+            const response = run('types', 'about', {
                 ...targetParams, withTypes: true, compact: true,
             });
-            if (!response.ok) return response;
-            result.types = {
-                types: response.result.types || [],
-                otherDefinitions: response.result.otherDefinitions || [],
-            };
+            if (response) {
+                result.types = {
+                    types: response.result.types || [],
+                    otherDefinitions: response.result.otherDefinitions || [],
+                };
+            }
         }
         if (selected.has('example')) {
-            const response = run('example', targetParams);
-            if (!response.ok) return response;
-            result.example = response.result;
+            const response = run('example', 'example', targetParams);
+            if (response) result.example = response.result;
         }
         if (selected.has('related')) {
-            const response = run('related', targetParams);
-            if (!response.ok) return response;
-            result.related = response.result;
+            const response = run('related', 'related', targetParams);
+            if (response) result.related = response.result;
         }
 
         const note = combineNotes(notes);
@@ -544,20 +619,42 @@ const HANDLERS = {
         }
         const err = requireName(p.name);
         if (err) return { ok: false, error: 'Symbol name or file range is required.' };
+        const query = { ...p };
+        applyClassMethodSyntax(query);
+        const fileErr = checkFilePatternMatch(index, query.file);
+        if (fileErr) return { ok: false, error: fileErr };
+        const classErr = validateClassName(index, query.name, query.className);
+        if (classErr) return { ok: false, error: classErr };
+        const pinErr = checkDefinitionPin(index, query);
+        if (pinErr) return { ok: false, error: pinErr };
 
-        const functionResult = HANDLERS.fn(index, { ...p });
-        if (functionResult.ok) {
-            addMode(functionResult.result, 'function');
-            return functionResult;
-        }
-        const classResult = HANDLERS.class(index, { ...p });
-        if (classResult.ok) {
-            addMode(classResult.result, 'class');
-            return classResult;
-        }
-        const specific = [functionResult.error, classResult.error].find(message =>
-            message && !/^(?:Function|Class) .+ not found\.$/.test(message));
-        return { ok: false, error: specific || `Symbol "${p.name}" not found.` };
+        // Use the same ranker as `show`; once selected, pin extraction to the
+        // exact definition so a second handler cannot choose differently.
+        const resolved = index.resolveSymbol(query.name, {
+            file: query.file,
+            className: query.className,
+            line: query.line,
+        });
+        if (!resolved.def) return { ok: false, error: symbolNotFound(index, query.name) };
+
+        const isClass = CLASS_KIND_TYPES.includes(resolved.def.type);
+        const targetParams = query.all ? query : {
+            ...query,
+            name: resolved.def.name,
+            file: resolved.def.relativePath,
+            line: resolved.def.nameLine || resolved.def.startLine,
+            ...(resolved.def.className && { className: resolved.def.className }),
+        };
+        const response = HANDLERS[isClass ? 'class' : 'fn'](index, targetParams);
+        if (!response.ok) return response;
+        addMode(response.result, isClass ? 'class' : 'function');
+        const notes = [
+            ...(resolved.warnings || []).map(warning => warning.message),
+            response.note,
+        ].filter(Boolean);
+        return notes.length > 0
+            ? { ...response, note: combineNotes(notes) }
+            : response;
     },
 
     deps: (index, p) => {
@@ -599,6 +696,10 @@ const HANDLERS = {
     },
 
     repo: (index, p) => {
+        const fileErr = checkFilePatternMatch(index, p.file);
+        if (fileErr) return { ok: false, error: fileErr };
+        const inErr = validateInFilter(index, p.in);
+        if (inErr) return { ok: false, error: inErr };
         const defaults = p.deep ? ['summary', 'health'] : ['summary'];
         const parsed = parseSections(p.sections, defaults, REPO_SECTIONS, 'repo');
         if (parsed.error) return { ok: false, error: parsed.error };
@@ -614,7 +715,13 @@ const HANDLERS = {
         };
         let failure;
         if (selected.has('summary')) failure = collect('summary', 'orient', p);
-        if (!failure && selected.has('files')) failure = collect('files', 'toc', p);
+        if (!failure && selected.has('files')) failure = collect('files', 'toc', {
+            ...p,
+            // repo's public limit caps the file result set. Direct toc's
+            // legacy symbol-list cap is intentionally not composed here.
+            top: p.top || p.limit,
+            limit: undefined,
+        });
         if (!failure && selected.has('stats')) failure = collect('stats', 'stats', p);
         if (!failure && selected.has('health')) failure = collect('health', 'doctor', p);
         if (failure) return failure;
@@ -652,7 +759,7 @@ const HANDLERS = {
                     return { ok: false, error: `Symbol "${p.name}" not found in ${filterDesc}. Found ${allDefs.length} definition(s) elsewhere:\n${locations}${more}\nUse file= with a path fragment from the list above to disambiguate.` };
                 }
             }
-            return { ok: false, error: `Symbol "${p.name}" not found.` };
+            return { ok: false, error: symbolNotFound(index, p.name) };
         }
         const tNote = truncationNote(index);
         return { ok: true, result, showConfidence: !!p.showConfidence, ...(tNote && { note: tNote }) };
@@ -670,10 +777,12 @@ const HANDLERS = {
         if (pinErr) return { ok: false, error: pinErr };
         const result = index.context(p.name, {
             ...buildCallerOptions(p),
+            maxCallers: num(p.top, undefined),
+            maxCallees: num(p.top, undefined),
             unreachableOnly: !!p.unreachableOnly,
             all: !!p.all,
         });
-        if (!result) return { ok: false, error: `Symbol "${p.name}" not found.` };
+        if (!result) return { ok: false, error: symbolNotFound(index, p.name) };
         const tNote = truncationNote(index);
         return { ok: true, result, showConfidence: !!p.showConfidence, ...(tNote && { note: tNote }) };
     },
@@ -700,7 +809,7 @@ const HANDLERS = {
             className: p.className,
             line: p.line,
             exclude: toExcludeArray(p.exclude),
-            top: num(p.top, undefined),
+            top: num(p.limit, undefined) || num(p.top, undefined),
             unreachableOnly: !!p.unreachableOnly,
             // BUG-H3: pass through user-supplied flags. impact defaults to including
             // method calls because "what breaks if I change this" should include
@@ -709,7 +818,7 @@ const HANDLERS = {
             ...(p.includeMethods !== undefined && { includeMethods: p.includeMethods }),
             ...(p.includeUncertain !== undefined && { includeUncertain: p.includeUncertain }),
         });
-        if (!result) return { ok: false, error: `Function "${p.name}" not found.` };
+        if (!result) return { ok: false, error: symbolNotFound(index, p.name, 'Function') };
         const tNote = truncationNote(index);
         addMode(result, 'symbol');
         return { ok: true, result, ...(tNote && { note: tNote }) };
@@ -729,10 +838,10 @@ const HANDLERS = {
         const result = index.blast(p.name, {
             ...buildCallerOptions(p),
             depth: depthVal ?? 3,
-            all: p.all || depthVal !== undefined,
+            all: !!p.all,
             expandUnverified: !!p.expandUnverified,
         });
-        if (!result) return { ok: false, error: `Function "${p.name}" not found.` };
+        if (!result) return { ok: false, error: symbolNotFound(index, p.name, 'Function') };
         const note = treeNote(result);
         const tNote = truncationNote(index);
         const combined = [note, tNote].filter(Boolean).join('\n') || undefined;
@@ -753,10 +862,10 @@ const HANDLERS = {
         const result = index.reverseTrace(p.name, {
             ...buildCallerOptions(p),
             depth: depthVal ?? 5,
-            all: p.all || depthVal !== undefined,
+            all: !!p.all,
             expandUnverified: !!p.expandUnverified,
         });
-        if (!result) return { ok: false, error: `Function "${p.name}" not found.` };
+        if (!result) return { ok: false, error: symbolNotFound(index, p.name, 'Function') };
         const note = treeNote(result);
         const tNote = truncationNote(index);
         const combined = [note, tNote].filter(Boolean).join('\n') || undefined;
@@ -777,7 +886,7 @@ const HANDLERS = {
             ...buildCallerOptions(p),
             withTypes: p.withTypes || false,
         });
-        if (!result) return { ok: false, error: `Function "${p.name}" not found.` };
+        if (!result) return { ok: false, error: symbolNotFound(index, p.name, 'Function') };
         const tNote = truncationNote(index);
         return { ok: true, result, ...(tNote && { note: tNote }) };
     },
@@ -813,10 +922,10 @@ const HANDLERS = {
         const result = index.trace(p.name, {
             ...buildCallerOptions(p),
             depth: depthVal ?? 3,
-            all: p.all || depthVal !== undefined,
+            all: !!p.all,
             expandUnverified: !!p.expandUnverified,
         });
-        if (!result) return { ok: false, error: `Function "${p.name}" not found.` };
+        if (!result) return { ok: false, error: symbolNotFound(index, p.name, 'Function') };
         const note = treeNote(result);
         const tNote = truncationNote(index);
         const combined = [note, tNote].filter(Boolean).join('\n') || undefined;
@@ -872,7 +981,7 @@ const HANDLERS = {
             top: num(p.top, undefined),
             all: p.all,
         });
-        if (!result) return { ok: false, error: `Function "${p.name}" not found.` };
+        if (!result) return { ok: false, error: symbolNotFound(index, p.name, 'Function') };
         const parts = [];
         if (result.similarNamesTotal > result.similarNames.length)
             parts.push(`similar names: showing ${result.similarNames.length} of ${result.similarNamesTotal}`);
@@ -900,7 +1009,7 @@ const HANDLERS = {
         // Thread the line pin (fix #249: a `lib.js:5:run` handle silently
         // resolved the OTHER same-name def — the pin's whole point).
         const result = brief(index, p.name, { file: p.file, className: p.className, line: p.line, git: !!p.git });
-        if (!result) return { ok: false, error: `Symbol "${p.name}" not found.` };
+        if (!result) return { ok: false, error: symbolNotFound(index, p.name) };
         return { ok: true, result };
     },
 
@@ -960,6 +1069,16 @@ const HANDLERS = {
     // ── Finding Code ────────────────────────────────────────────────────
 
     find: (index, p) => {
+        const inErr = validateInFilter(index, p.in);
+        if (inErr) return { ok: false, error: inErr };
+        const validFindTypes = new Set([
+            'type', 'function', 'class', 'variable', 'state', 'constant',
+            'field', 'macro', 'method', 'constructor', 'interface', 'enum',
+            'struct', 'trait', 'record', 'namespace',
+        ]);
+        if (p.type && !validFindTypes.has(p.type)) {
+            return { ok: false, error: `Invalid find type "${p.type}". Valid types: ${[...validFindTypes].join(', ')}.` };
+        }
         if (p.type === 'type') {
             const response = HANDLERS.typedef(index, { ...p });
             if (response.ok) {
@@ -993,16 +1112,11 @@ const HANDLERS = {
             const pinErr = checkDefinitionPin(index, p);
             if (pinErr) return { ok: false, error: pinErr };
         }
-        // Auto-include tests when pattern clearly targets test functions
-        // But only if the user didn't explicitly set include_tests=false
-        let includeTests = p.includeTests;
-        if (includeTests === undefined && p.line) {
-            // A stable handle is an explicit exact-definition request. Its
-            // target must not disappear merely because it lives in test code.
-            includeTests = true;
-        } else if (includeTests === undefined && p.name && /^test[_*?A-Z]/i.test(p.name)) {
-            includeTests = true;
-        }
+        // Symbol lookup is an inventory operation: a definition must not
+        // disappear merely because it lives in a test file. Call-bearing
+        // analysis commands retain their conservative test defaults; find
+        // includes every indexed definition unless explicitly asked not to.
+        const includeTests = p.includeTests !== false;
         const exclude = applyTestExclusions(p.exclude, includeTests);
         let result = index.find(p.name, {
             file: p.file,
@@ -1013,7 +1127,8 @@ const HANDLERS = {
         });
         const line = Number(p.line);
         if (p.line && Number.isFinite(line)) {
-            result = result.filter(item => item.startLine === line);
+            result = result.filter(item =>
+                item.startLine === line || item.nameLine === line);
         }
         if (p.type) {
             const kindGroups = {
@@ -1027,6 +1142,13 @@ const HANDLERS = {
         if (p.withSource) {
             result = result.map(item => ({ ...item, code: readAndExtract(item) }));
         }
+        const fullFindCount = result.length;
+        const nameWideDefinitionCounts = Object.fromEntries(
+            [...new Set(result.map(item => item.name))].map(name => [
+                name,
+                (index.symbols.get(name) || []).length,
+            ]),
+        );
         // Warn if exact mode silently disables glob expansion
         const notes = [];
         if (p.exact && p.name && (p.name.includes('*') || p.name.includes('?'))) {
@@ -1039,6 +1161,14 @@ const HANDLERS = {
             if (limited) notes.push(limitNote(limit, total));
             result = items;
         }
+        Object.defineProperty(result, 'findInfo', {
+            value: {
+                total: fullFindCount,
+                shown: result.length,
+                nameWideDefinitionCounts,
+            },
+            enumerable: false, writable: true, configurable: true,
+        });
         const tNote = truncationNote(index);
         if (tNote) notes.push(tNote);
         return { ok: true, result, note: notes.length ? notes.join('\n') : undefined };
@@ -1048,6 +1178,8 @@ const HANDLERS = {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
         applyClassMethodSyntax(p);
+        const inErr = validateInFilter(index, p.in);
+        if (inErr) return { ok: false, error: inErr };
         const exclude = applyTestExclusions(p.exclude, p.includeTests);
         const fileErr = checkFilePatternMatch(index, p.file);
         if (fileErr) return { ok: false, error: fileErr };
@@ -1067,7 +1199,11 @@ const HANDLERS = {
             codeOnly: p.codeOnly || false,
             context: num(p.context, 0),
             className: p.className,
-            file: p.file,
+            // A stable handle pins which definition is meant; it must not
+            // silently turn into a same-file-only usage scan. An explicit
+            // --file remains a deliberate scan scope.
+            file: p._fileFromHandle ? undefined : p.file,
+            definitionFile: p._fileFromHandle ? p.file : undefined,
             exclude: userExclude,
             in: p.in,
         });
@@ -1098,7 +1234,9 @@ const HANDLERS = {
                     // same-name definer sites (usageType 'definition' with
                     // isDefinition false) used to render in NO band.
                     references: result.filter(u => !u.isDefinition &&
-                        !['call', 'import', 'text'].includes(u.usageType)).length,
+                        !['call', 'import', 'text', 'definition'].includes(u.usageType)).length,
+                    otherDefinitions: result.filter(u => !u.isDefinition &&
+                        u.usageType === 'definition').length,
                     text: result.filter(u => u.usageType === 'text').length,
                 },
                 enumerable: false, writable: true, configurable: true,
@@ -1108,7 +1246,8 @@ const HANDLERS = {
         // must not silently omit matches in files UCN cannot parse (.rb in a
         // mixed repo). Counts ride a note + non-enumerable field; the
         // account-bearing commands list the actual sites.
-        const unsupportedMatches = require('./account').scanUnsupportedFiles(index, p.name);
+        const accountTools = require('./account');
+        const unsupportedMatches = accountTools.scanUnsupportedFiles(index, p.name);
         if (unsupportedMatches.lines > 0) {
             const langs = Object.keys(unsupportedMatches.languages).join(', ');
             notes.push(`${unsupportedMatches.lines} line(s) in ${unsupportedMatches.fileCount} ` +
@@ -1116,6 +1255,19 @@ const HANDLERS = {
                 'NOT analyzed by UCN; verify with grep/ripgrep.');
             Object.defineProperty(limited, 'unsupportedMatches', {
                 value: unsupportedMatches,
+                enumerable: false, writable: true, configurable: true,
+            });
+        }
+        const failed = accountTools.scanFailedFiles(index, p.name);
+        if (failed.unparsed.lines > 0) {
+            notes.push(`${failed.unparsed.lines} matching line(s) in ${failed.unparsed.fileCount} unparsed file(s) were not classified: ${failed.unparsed.files.join(', ')}.`);
+        }
+        if (failed.unreadableFiles.length > 0) {
+            notes.push(`${failed.unreadableFiles.length} unreadable file(s) could not be searched: ${failed.unreadableFiles.join(', ')}.`);
+        }
+        if (failed.unparsed.lines > 0 || failed.unreadableFiles.length > 0) {
+            Object.defineProperty(limited, 'analysisGaps', {
+                value: failed,
                 enumerable: false, writable: true, configurable: true,
             });
         }
@@ -1158,8 +1310,6 @@ const HANDLERS = {
                     if (remaining <= 0) {
                         if (syms.functions) syms.functions = [];
                         if (syms.classes) syms.classes = [];
-                        f.functions = 0;
-                        f.classes = 0;
                         continue;
                     }
                     const fns = syms.functions?.length || 0;
@@ -1170,15 +1320,12 @@ const HANDLERS = {
                         if (syms.functions && remaining > 0) {
                             syms.functions = syms.functions.slice(0, remaining);
                             remaining -= syms.functions.length;
-                            f.functions = syms.functions.length;
                         }
                         if (syms.classes && remaining > 0) {
                             syms.classes = syms.classes.slice(0, remaining);
                             remaining -= syms.classes.length;
-                            f.classes = syms.classes.length;
                         } else if (syms.classes) {
                             syms.classes = [];
-                            f.classes = 0;
                         }
                     }
                 }
@@ -1214,7 +1361,18 @@ const HANDLERS = {
                 top: topVal || 50,
             });
             if (result.meta.error) return { ok: false, error: result.meta.error };
-            return { ok: true, result, structural: true };
+            const unsupported = (!p.regex && (p.term || p.name))
+                ? require('./account').scanUnsupportedFiles(index, p.term || p.name)
+                : null;
+            let note;
+            if (unsupported?.lines > 0) {
+                Object.defineProperty(result, 'unsupportedMatches', {
+                    value: unsupported,
+                    enumerable: false, writable: true, configurable: true,
+                });
+                note = `${unsupported.lines} matching line(s) in ${unsupported.fileCount} unsupported-language file(s) were not structurally analyzed; verify with grep/ripgrep.`;
+            }
+            return { ok: true, result, structural: true, note };
         }
 
         const err = requireTerm(p.term);
@@ -1238,8 +1396,20 @@ const HANDLERS = {
             file: p.file,
         });
         if (result.meta) result.meta.testsExcluded = testsExcluded;
+        const notes = [];
+        if (!p.regex) {
+            const unsupported = require('./account').scanUnsupportedFiles(index, p.term);
+            if (unsupported.lines > 0) {
+                Object.defineProperty(result, 'unsupportedMatches', {
+                    value: unsupported,
+                    enumerable: false, writable: true, configurable: true,
+                });
+                notes.push(`${unsupported.lines} matching line(s) in ${unsupported.fileCount} unsupported-language file(s) were not searched; verify with grep/ripgrep.`);
+            }
+        }
         const tNote = truncationNote(index);
-        return { ok: true, result, ...(tNote && { note: tNote }) };
+        if (tNote) notes.push(tNote);
+        return { ok: true, result, ...(notes.length && { note: notes.join('\n') }) };
     },
 
     tests: (index, p) => {
@@ -1263,8 +1433,12 @@ const HANDLERS = {
         if (!testsTargetIsFile) applyClassMethodSyntax(p);
         if (testsTargetIsHandle && p.line) {
             const line = Number(p.line);
+            const resolvedFile = p.file ? index.resolveFilePathForQuery(p.file) : null;
             const pinned = (index.symbols.get(p.name) || []).filter(d =>
-                d.startLine === line && (!p.file || d.relativePath?.includes(p.file)));
+                (d.startLine === line || d.nameLine === line) &&
+                (!p.file || (typeof resolvedFile === 'string'
+                    ? d.file === resolvedFile
+                    : d.relativePath?.includes(p.file))));
             if (pinned.length === 1 && !p.className && pinned[0].className) {
                 p.className = pinned[0].className;
             }
@@ -1282,11 +1456,19 @@ const HANDLERS = {
                     const files = allDefs.map(d => d.relativePath).join(', ');
                     return { ok: false, error: `Symbol "${p.name}" not found in files matching "${p.file}". Defined in: ${files}` };
                 }
-                return { ok: false, error: `Symbol "${p.name}" not found.` };
+                return { ok: false, error: symbolNotFound(index, p.name) };
             }
         }
         const classErr = validateClassName(index, p.name, p.className);
         if (classErr) return { ok: false, error: classErr };
+        if (!testsTargetIsFile) {
+            const resolved = index.resolveSymbol(p.name, {
+                file: p.file,
+                className: p.className,
+                line: p.line,
+            });
+            if (!resolved.def) return { ok: false, error: symbolNotFound(index, p.name) };
+        }
         const result = index.tests(p.name, {
             callsOnly: p.callsOnly || false,
             className: p.className,
@@ -1334,7 +1516,7 @@ const HANDLERS = {
             ...buildCallerOptions(p),
             depth: depthVal ?? 3,
         });
-        if (!result) return { ok: false, error: `Function "${p.name}" not found.` };
+        if (!result) return { ok: false, error: symbolNotFound(index, p.name, 'Function') };
         const note = treeNote(result);
         const tNote = truncationNote(index);
         const selectionNote = result.testFiles.length === 0 ? NO_STATIC_TEST_LINK_NOTE : null;
@@ -1372,8 +1554,11 @@ const HANDLERS = {
             if (result.excludedExported != null) sliced.excludedExported = result.excludedExported;
             if (result.excludedDecorated != null) sliced.excludedDecorated = result.excludedDecorated;
             if (result.excludedExternalContract != null) sliced.excludedExternalContract = result.excludedExternalContract;
+            if (result.excludedRuntimeContract != null) sliced.excludedRuntimeContract = result.excludedRuntimeContract;
             if (result.excludedDynamicDispatch != null) sliced.excludedDynamicDispatch = result.excludedDynamicDispatch;
+            if (result.pythonImplicitExportFiles != null) sliced.pythonImplicitExportFiles = result.pythonImplicitExportFiles;
             if (result.computedDispatch != null) sliced.computedDispatch = result.computedDispatch;
+            if (result.coverage != null) sliced.coverage = result.coverage;
             // Truncation must be visible IN the JSON payload, not only in the
             // stderr note (fix #242) — the formatter reads this to emit
             // meta.total + truncated.
@@ -1409,25 +1594,50 @@ const HANDLERS = {
         const exclude = p.includeTests === true
             ? userExclude
             : addTestExclusions(userExclude);
-        let result = detectEntrypoints(index, {
+        const fullResult = detectEntrypoints(index, {
             type: p.type,
             framework: p.framework,
             file: p.file,
-            exclude,
+            exclude: userExclude,
         });
+        if (fullResult && fullResult.error) {
+            return { ok: false, error: fullResult.message || fullResult.error };
+        }
+        let result = p.includeTests === true
+            ? fullResult
+            : detectEntrypoints(index, {
+                type: p.type,
+                framework: p.framework,
+                file: p.file,
+                exclude,
+            });
         if (result && result.error) {
             return { ok: false, error: result.message || result.error };
         }
+        const hiddenTests = p.includeTests === true || !Array.isArray(fullResult)
+            ? 0
+            : Math.max(0, fullResult.length - result.length);
+        Object.defineProperty(result, 'filterInfo', {
+            value: { hiddenTests, testsIncluded: p.includeTests === true },
+            enumerable: false, writable: true, configurable: true,
+        });
         const limit = num(p.limit, undefined);
-        let note;
+        let note = hiddenTests > 0
+            ? `${hiddenTests} test-path entry point(s) hidden by default. Use --include-tests to include them.`
+            : undefined;
         if (limit && limit > 0 && Array.isArray(result) && result.length > limit) {
-            note = limitNote(limit, result.length);
+            const limitMessage = limitNote(limit, result.length);
+            note = note ? `${note}\n${limitMessage}` : limitMessage;
             const sliced = result.slice(0, limit);
             // Full-set size travels with the payload so --json can carry
             // meta.total + truncated (fix #247 — mirrors deadcode's #242
             // shape; the stderr note alone loses the signal).
             Object.defineProperty(sliced, 'limitInfo', {
                 value: { total: result.length, shown: limit },
+                enumerable: false, writable: true, configurable: true,
+            });
+            Object.defineProperty(sliced, 'filterInfo', {
+                value: result.filterInfo,
                 enumerable: false, writable: true, configurable: true,
             });
             result = sliced;
@@ -1467,6 +1677,24 @@ const HANDLERS = {
             prefix: p.prefix || null,
             showUncertain: !p.hideUncertain,
         });
+        if (p.framework != null && String(p.framework).trim() !== '') {
+            const framework = String(p.framework).trim().toLowerCase();
+            const known = new Set([
+                'actix', 'aspnet', 'aspnet-minimal', 'axios', 'axum',
+                'dotnet-httpclient', 'express', 'fastapi', 'fetch', 'flask',
+                'go-http', 'jax-rs', 'nestjs', 'nextjs', 'requests',
+                'reqwest', 'spring', 'spring-client', 'unknown-python',
+            ]);
+            if (!known.has(framework)) {
+                return { ok: false, error: `Invalid --framework value: "${p.framework}".` };
+            }
+            result.routes = result.routes.filter(route => route.framework === framework);
+            result.requests = result.requests.filter(request => request.framework === framework);
+            result.bridges = result.bridges.filter(bridge =>
+                bridge.route.framework === framework || bridge.request.framework === framework);
+            result.unmatchedRoutes = result.unmatchedRoutes.filter(route => route.framework === framework);
+            result.unmatchedRequests = result.unmatchedRequests.filter(request => request.framework === framework);
+        }
         // Apply --file pattern as an additional filter on routes/requests
         if (p.file) {
             const sub = String(p.file);
@@ -1525,6 +1753,8 @@ const HANDLERS = {
         // suppress the "Matched" section in unmatched-only mode.)
         result._bridge = wantBridge;
         result._unmatched = wantUnmatched;
+        result._serverOnly = !!p.serverOnly;
+        result._clientOnly = !!p.clientOnly;
         return { ok: true, result, note };
     },
 
@@ -1551,6 +1781,11 @@ const HANDLERS = {
 
         const entries = [];
         const notes = [];
+        const maxLines = num(p.maxLines, null);
+        if (p.maxLines != null &&
+            (maxLines === null || !Number.isInteger(maxLines) || maxLines < 1)) {
+            return { ok: false, error: '--max-lines must be a positive integer.' };
+        }
 
         for (const fnName of fnNames) {
             // For comma-separated names, each may have Class.method syntax
@@ -1606,8 +1841,14 @@ const HANDLERS = {
             // in-file matches were silently dropped in three languages).
             if (matches.length > 1 && p.all) {
                 for (const m of matches) {
-                    const code = readAndExtract(m);
-                    entries.push({ match: m, code });
+                    const fullCode = readAndExtract(m);
+                    const totalLines = m.endLine - m.startLine + 1;
+                    const truncated = !!maxLines && totalLines > maxLines;
+                    const code = truncated
+                        ? fullCode.split('\n').slice(0, maxLines).join('\n')
+                        : fullCode;
+                    entries.push({ match: m, code, totalLines, truncated,
+                        shownLines: truncated ? maxLines : totalLines });
                 }
                 continue;
             }
@@ -1623,8 +1864,14 @@ const HANDLERS = {
                 notes.push(`Found ${matches.length} ${what} for "${fnName}". Showing ${match.relativePath}:${match.startLine}. Also in: ${others}. ${disambiguationHint(matches, match, p.file)}`);
             }
 
-            const code = readAndExtract(match);
-            entries.push({ match, code });
+            const fullCode = readAndExtract(match);
+            const totalLines = match.endLine - match.startLine + 1;
+            const truncated = !!maxLines && totalLines > maxLines;
+            const code = truncated
+                ? fullCode.split('\n').slice(0, maxLines).join('\n')
+                : fullCode;
+            entries.push({ match, code, totalLines, truncated,
+                shownLines: truncated ? maxLines : totalLines });
         }
 
         if (entries.length === 0 && notes.length > 0) {
@@ -1662,7 +1909,7 @@ const HANDLERS = {
             if (fnMatches.length > 0) {
                 return { ok: false, error: `Class "${p.name}" not found — "${p.name}" is a ${fnMatches[0].type}. Use \`source ${p.name}\` instead.` };
             }
-            return { ok: false, error: `Class "${p.name}" not found.` };
+            return { ok: false, error: symbolNotFound(index, p.name, 'Class') };
         }
 
         const entries = [];
@@ -1869,7 +2116,7 @@ const HANDLERS = {
             ...(p.includeUncertain !== undefined && { includeUncertain: p.includeUncertain }),
         });
         if (result && result.found === false) {
-            return { ok: false, error: `Function "${p.name}" not found.` };
+            return { ok: false, error: symbolNotFound(index, p.name, 'Function') };
         }
         return { ok: true, result };
     },
@@ -1898,8 +2145,9 @@ const HANDLERS = {
             ...(p.line && { line: p.line }),
         });
         if (result && result.found === false) {
-            return { ok: false, error: `Function "${p.name}" not found.` };
+            return { ok: false, error: symbolNotFound(index, p.name, 'Function') };
         }
+        if (result && result.error) return { ok: false, error: result.error };
         return { ok: true, result };
     },
 
@@ -1911,9 +2159,21 @@ const HANDLERS = {
         });
         const limit = num(p.limit, undefined);
         let note;
-        if (limit && limit > 0 && result && result.changed && result.changed.length > limit) {
-            note = limitNote(limit, result.changed.length);
-            result = { ...result, changed: result.changed.slice(0, limit) };
+        if (limit && limit > 0 && result) {
+            const groups = ['functions', 'moduleLevelChanges', 'newFunctions', 'deletedFunctions'];
+            const total = groups.reduce((sum, key) => sum + (result[key]?.length || 0), 0);
+            if (total > limit) {
+                let remaining = limit;
+                const limited = { ...result };
+                for (const key of groups) {
+                    const values = result[key] || [];
+                    limited[key] = values.slice(0, Math.max(0, remaining));
+                    remaining -= limited[key].length;
+                }
+                limited.limitInfo = { total, shown: limit };
+                result = limited;
+                note = limitNote(limit, total);
+            }
         }
         return { ok: true, result, note };
     },
@@ -1951,7 +2211,19 @@ const HANDLERS = {
             const fileErr = checkFilePatternMatch(index, p.file);
             if (fileErr) return { ok: false, error: fileErr };
         }
-        let result = index.api(p.file);
+        if (p.in) {
+            let anyIn = false;
+            for (const [, fileEntry] of index.files) {
+                if (index.matchesFilters(fileEntry.relativePath, { in: p.in })) {
+                    anyIn = true;
+                    break;
+                }
+            }
+            if (!anyIn) {
+                return { ok: false, error: `No files matched the 'in' directory filter '${p.in}'.` };
+            }
+        }
+        let result = index.api(p.file, { in: p.in });
         if (p.file) {
             const fileErr = checkFileError(result, p.file);
             if (fileErr) return { ok: false, error: fileErr };
@@ -1961,12 +2233,19 @@ const HANDLERS = {
         let note;
         if (limit && limit > 0 && Array.isArray(result)) {
             const { items, total, limited } = applyLimit(result, limit);
+            const apiInfo = result.apiInfo;
             if (limited) {
                 note = limitNote(limit, total);
                 // Full-set size travels with the payload for --json
                 // (fix #251 — the deadcode/entrypoints #242/#247 shape).
                 Object.defineProperty(items, 'limitInfo', {
                     value: { total, shown: limit },
+                    enumerable: false, writable: true, configurable: true,
+                });
+            }
+            if (apiInfo) {
+                Object.defineProperty(items, 'apiInfo', {
+                    value: apiInfo,
                     enumerable: false, writable: true, configurable: true,
                 });
             }

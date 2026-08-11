@@ -323,11 +323,21 @@ function parseStackTrace(index, stackText) {
 
     // Track Go function names that appear on a line before the file:line
     let pendingGoFuncName = null;
+    // Rust backtraces likewise split `N: crate::path` and `at file.rs:L:C`
+    // across two physical lines.
+    let pendingRustFuncName = null;
     let skippedFrames = 0;
 
     for (const line of lines) {
         const trimmed = line.trim();
         if (!trimmed) continue;
+
+        const rustName = trimmed.match(/^\d+:\s+(.+)$/);
+        if (rustName && !/\.rs:\d+/.test(rustName[1])) {
+            pendingRustFuncName = rustName[1].trim();
+            pendingGoFuncName = null;
+            continue;
+        }
 
         // Try each pattern until one matches
         let matched = false;
@@ -358,7 +368,12 @@ function parseStackTrace(index, stackText) {
                     if (!extracted.funcName && pendingGoFuncName) {
                         extracted.funcName = pendingGoFuncName;
                     }
+                    if (!extracted.funcName && pendingRustFuncName &&
+                        /\.rs$/i.test(extracted.file)) {
+                        extracted.funcName = pendingRustFuncName;
+                    }
                     pendingGoFuncName = null;
+                    pendingRustFuncName = null;
                     frames.push(createStackFrame(
                         index,
                         extracted.file,
@@ -379,6 +394,7 @@ function parseStackTrace(index, stackText) {
             // unfound-file frames, which render found=false).
             if (/^at\s/.test(trimmed)) skippedFrames++;
             pendingGoFuncName = null; // Reset if line doesn't match any pattern
+            pendingRustFuncName = null;
         }
     }
 

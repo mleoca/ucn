@@ -18,6 +18,7 @@ const {
     getCliCommandSet,
     resolveCommand,
     suggestCommand,
+    v4MigrationHint,
     FLAG_APPLICABILITY,
     toCliName,
     FILE_LOCAL_COMMANDS,
@@ -28,6 +29,7 @@ const {
 const { buildPublicParams, isPublicCommand } = require('../core/public-command');
 const { execute } = require('../core/execute');
 const { applyOutputBudget, MAX_OUTPUT_CHARS } = require('../core/output-budget');
+const { clearAllCaches } = require('../core/cache');
 
 let activeCanonicalCommand = null;
 
@@ -43,10 +45,28 @@ class FlagValidationError extends Error {
 }
 
 function unknownCommandMessage(command, { interactive = false } = {}) {
+    const migration = v4MigrationHint(command, 'cli');
+    if (migration) return `Unknown command: ${command}. ${migration}`;
     const suggestion = suggestCommand(command, 'cli');
     const correction = suggestion ? ` Did you mean "${suggestion}"?` : '';
-    const help = interactive && !suggestion ? ' Type "help" for available commands.' : '';
+    const help = !suggestion
+        ? (interactive
+            ? ' Type "help" for available commands.'
+            : ' Run "ucn --help" for available commands.')
+        : '';
     return `Unknown command: ${command}.${correction}${help}`;
+}
+
+function resultExitCode(command, result) {
+    if (result && result.ok === false) return 2;
+    if (command !== 'check' || !result) return 0;
+    if (result.trust) {
+        return result.trust.status === 'READY_FOR_TOOLCHAIN' ? 0 : 1;
+    }
+    // Symbol-mode check (verify): a mismatch or unresolved call-site tier is
+    // review-required and must fail a CI gate.
+    return (Number(result.mismatches || 0) > 0 ||
+        Number(result.unverifiedCount || 0) > 0) ? 1 : 0;
 }
 
 /**
@@ -66,6 +86,13 @@ function validatePositiveInt(raw, flagName, { allowZero = false, cap = 10000000 
     const label = allowZero ? 'non-negative integer' : 'positive integer';
     const trimmed = String(raw).trim();
     if (trimmed === '') {
+        throw new FlagValidationError(`Invalid ${flagName} value: must be a ${label} (got "${raw}")`);
+    }
+    // CLI integer flags use canonical base-10 spelling. Number()/parseInt()
+    // accept exponent, decimal and hexadecimal forms (`1e1`, `2.5`, `0x10`),
+    // which is especially dangerous for source-line identity because a
+    // malformed pin can accidentally select a real definition.
+    if (!/^\d+$/.test(trimmed)) {
         throw new FlagValidationError(`Invalid ${flagName} value: must be a ${label} (got "${raw}")`);
     }
     const n = Number(trimmed);
@@ -108,6 +135,9 @@ function validateNumericFlags(flags) {
     // --max-files: positive integer, no zero.
     if (flags.maxFilesRaw != null) {
         flags.maxFiles = validatePositiveInt(flags.maxFilesRaw, '--max-files');
+    }
+    if (flags.lineRaw != null) {
+        flags.line = validatePositiveInt(flags.lineRaw, '--line');
     }
     // --max-lines: positive integer, no zero. Used by source.
     if (flags.maxLinesRaw != null) {
@@ -286,6 +316,7 @@ function parseFlags(tokens) {
         // Explicit line pin (fix #249: our own disambiguation notes advertise
         // line= but no surface accepted it).
         line: parseInt(getValueFlag('--line') || '0', 10) || undefined,
+        lineRaw: getValueFlag('--line'),
         limit: parseInt(getValueFlag('--limit') || '0') || undefined,
         limitRaw: getValueFlag('--limit'),
         maxFiles: parseInt(getValueFlag('--max-files') || '0') || undefined,
@@ -426,6 +457,7 @@ function formatCliText(command, result, params, execution, displayFlags) {
         maxChars: displayFlags?.maxChars,
         all: !!displayFlags?.all,
         surface: 'cli',
+        params,
     }).text;
 }
 
@@ -445,6 +477,13 @@ function main() {
         // document) clears the current project's cache — falling through to
         // the help banner made it a silent no-op.
         if (flags.clearCache) {
+            if (flags.all) {
+                const removed = clearAllCaches();
+                console.log(removed.length > 0
+                    ? 'All UCN user caches cleared'
+                    : 'No UCN user caches to clear');
+                process.exit(0);
+            }
             const index = new ProjectIndex('.');
             const removed = index.clearCache();
             console.log(removed.length > 0
@@ -533,7 +572,7 @@ const GLOBAL_FLAG_KEYS = new Set([
     'json', 'quiet', 'cache', 'clearCache', 'followSymlinks', 'maxFiles',
     'verbose', 'interactive', '_fileFromFileMode', 'topRaw',
     'limitRaw', 'maxFilesRaw', 'maxLinesRaw', 'depthRaw', 'contextRaw',
-    'workersRaw', 'maxChars', 'maxCharsRaw', 'minConfidenceRaw',
+    'workers', 'workersRaw', 'lineRaw', 'maxChars', 'maxCharsRaw', 'minConfidenceRaw',
 ]);
 
 /** Apply one command/flag policy across project, file, glob, and REPL modes. */
@@ -656,8 +695,8 @@ function runProjectCommand(rootDir, command, arg) {
     let cacheWasLoaded = false;
     if (flags.cache && !flags.clearCache) {
         const loaded = index.loadCache();
-        if (loaded) {
-            cacheWasLoaded = true;
+        cacheWasLoaded = !!loaded;
+        if (loaded && !flags.maxFiles) {
             if (!index.isCacheStale()) {
                 usedCache = true;
                 if (!flags.quiet) {
@@ -701,9 +740,8 @@ function runProjectCommand(rootDir, command, arg) {
         : formatCliText(canonical, publicExecution.result, publicParams, publicExecution, flags));
     // A gate that could not run (check outside git / bad base ref) must not
     // exit 0 — CI gating on the exit code would read "could not run" as "passed".
-    if (publicExecution.result && publicExecution.result.ok === false) {
-        process.exitCode = 2;
-    }
+    process.exitCode = Math.max(process.exitCode || 0,
+        resultExitCode(canonical, publicExecution.result));
     } catch (e) {
         if (!(e instanceof CommandError)) {
             emitCliError(`Error: ${e.message}`);
@@ -715,7 +753,7 @@ function runProjectCommand(rootDir, command, arg) {
         // On cache-hit runs, only re-save if callsCache was mutated OR
         // reachability was computed (MED-1: persists the BFS result so
         // subsequent cold invocations don't repeat the 7-11s tax).
-        if (flags.cache && (needsCacheSave || index.callsCacheDirty || index.reachabilityDirty)) {
+        if (flags.cache && (needsCacheSave || index.callsCacheDirty || index.reachabilityDirty || index.computedDispatchDirty)) {
             try { index.saveCache(); } catch (e) { /* best-effort */ }
         }
     }
@@ -756,9 +794,8 @@ function runGlobCommand(pattern, command, arg) {
             ...publicExecution, surface: 'cli',
         })
         : formatCliText(canonical, publicExecution.result, publicParams, publicExecution, flags));
-    if (publicExecution.result && publicExecution.result.ok === false) {
-        process.exitCode = 2;
-    }
+    process.exitCode = Math.max(process.exitCode || 0,
+        resultExitCode(canonical, publicExecution.result));
 }
 
 // ============================================================================
@@ -814,7 +851,7 @@ Common flags:
   --file=PATH --exclude=a,b --in=PATH --depth=N --top=N --limit=N
   --all --compact --no-compact --json --include-tests --class-name=X --line=N
   --range=N-M (source with --file=PATH)
-  --base=REF --staged --no-cache --clear-cache --max-files=N --workers=N
+  --base=REF --staged --no-cache --clear-cache [--all] --max-files=N --workers=N
   --max-chars=N (text output; default 10K targeted / 3K broad, ceiling 100K)
   Cache: per-user by default; set UCN_CACHE_DIR to override the cache root.
 
@@ -825,6 +862,12 @@ Global/build/output flags:
   --help -h --version -v --mcp --json --verbose --no-quiet --quiet
   --interactive -i --no-cache --clear-cache --no-follow-symlinks
   --max-files=N --max-chars=N --workers=N
+  --clear-cache --all clears every bounded per-user UCN project cache.
+
+Exit codes:
+  0  Command completed successfully; check found no blocking issues.
+  1  Findings, unsafe changes, validation failures, or invalid user input.
+  2  Command could not run (operational/environment failure).
 
 Boolean aliases:
   --no-include-methods --no-regex --show-confidence --hide-confidence
@@ -994,6 +1037,26 @@ Flags can be added per-command: show myFunc --sections=source,callers
             // global CLI mode. MED-2/MED-3/MED-5: bad values are rejected with
             // a helpful message instead of being silently coerced.
             validateNumericFlags(iflags);
+            // The REPL is an edit/query loop, not a frozen snapshot. Keep the
+            // symbol table and call cache on the same generation by checking
+            // source staleness before every command. getCachedCalls already
+            // refreshes individual call records lazily; without this matching
+            // rebuild a newly added definition was invisible while its calls
+            // appeared in neighbouring answers (UCN5-044).
+            if (index.isCacheStale()) {
+                console.log('Source changed; rebuilding index...');
+                index.build(null, {
+                    quiet: true,
+                    forceRebuild: true,
+                    followSymlinks: flags.followSymlinks,
+                    maxFiles: flags.maxFiles,
+                    workers: flags.workers,
+                });
+                if (flags.cache) {
+                    try { index.saveCache(); } catch (_) { /* best-effort */ }
+                }
+                console.log(`Index ready: ${index.files.size} files, ${index.symbols.size} unique symbol names`);
+            }
             const iCanonical = resolveCommand(command, 'cli') || command;
             executeInteractiveCommand(index, iCanonical, arg, iflags);
         } catch (e) {

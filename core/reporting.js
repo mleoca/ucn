@@ -14,6 +14,7 @@ const path = require('path');
 const { isTestFile } = require('./discovery');
 const { summarizeCommandTrust } = require('./trust-matrix');
 const { projectComputedDispatch } = require('./ast-analysis');
+const { langTraits } = require('../languages');
 
 function matchesReportingScope(index, relativePath, options = {}) {
     if (!relativePath) return false;
@@ -288,100 +289,54 @@ function getStats(index, options = {}) {
         //                              + (residual unresolved method calls split evenly)
         //   - falls back to methodByName[name] when no receiverType evidence exists.
         const hotList = [];
-        let usedHeuristicSplit = false;  // whether any row's count was approximated
+        const { findCallers } = require('./callers');
+        const scopedCallerQuery = !!(options.file || options.in ||
+            (options.exclude && options.exclude.length > 0));
+        const seenDefinitions = new Set();
         for (const [name, symbols] of index.symbols) {
-            // Filter to function-shaped definitions, dedup by file:line.
-            const seenLoc = new Set();
-            const locations = [];
-            let representative = null;
-            const ownerClasses = new Set();      // classes/receivers that own this name
-            for (const sym of symbols) {
-                if (!FUNCTION_TYPES.has(sym.type)) continue;
-                const relativePath = sym.relativePath ||
-                    (sym.file ? path.relative(index.root, sym.file) : '');
-                if (!matchesReportingScope(index, relativePath, options)) continue;
-                const locKey = `${relativePath}:${sym.startLine}`;
-                if (seenLoc.has(locKey)) continue;
-                seenLoc.add(locKey);
-                locations.push({
-                    file: relativePath,
-                    startLine: sym.startLine,
-                    endLine: sym.endLine,
-                    ...(sym.className && { className: sym.className }),
-                });
-                const owner = sym.className || (sym.receiver && sym.receiver.replace(/^\*/, ''));
-                if (owner) ownerClasses.add(owner);
-                if (!representative) representative = sym;
-            }
-            if (locations.length === 0) continue;
+            if (!index.calleeIndex?.has(name)) continue;
+            const callable = symbols.filter(symbol =>
+                FUNCTION_TYPES.has(symbol.type) &&
+                matchesReportingScope(index, symbol.relativePath, options));
+            for (const symbol of callable) {
+                const identity = `${symbol.file}:${symbol.startLine}:${name}:` +
+                    `${symbol.className || symbol.receiver || ''}:${symbol.params || ''}`;
+                if (seenDefinitions.has(identity)) continue;
+                seenDefinitions.add(identity);
 
-            // Decide if this row represents a standalone function or a method.
-            // Mixed-type defs (e.g. "tmp" defined as both a function and a class method
-            // somewhere) are rare; for them we use the representative's flavor and
-            // accept that the count may be approximate.
-            const isMethodRow = ownerClasses.size > 0 &&
-                (!representative || !!representative.className || !!representative.receiver);
-
-            let count;
-            let approximate = false;
-            if (!isMethodRow) {
-                // Standalone function (or top-level package call): use bare-name calls
-                // plus method-style calls where the receiver was an imported module
-                // alias (e.g. `lib.foo()` where `lib` is a require/import alias).
-                // We deliberately do NOT include arbitrary `obj.foo()` calls — those
-                // would inflate the count with unrelated method calls (the H2 bug).
-                count = (bareNameCounts.get(name) || 0) +
-                        (importedReceiverCounts.get(name) || 0);
-            } else {
-                // Method definition. Count only calls we can resolve to this owner:
-                //   - typed hits (receiverType matches one of this row's owner classes)
-                //   - self-method calls inside this owner class (counted via callerSymbol)
-                // Calls like `dict.get()` (no receiverType) are NOT attributed — they
-                // would inflate the count with builtin/unrelated method calls.
-                const selfShare = selfMethodByName.get(name) || 0;
-                const totalOwners = (classOwnersByName.get(name) || new Set()).size || 1;
-
-                let typedHits = 0;
-                for (const cls of ownerClasses) {
-                    const inner = methodByReceiverType.get(cls);
-                    if (inner) typedHits += (inner.get(name) || 0);
+                // A linked C/C++ prototype and implementation close to the
+                // same compiler identity. Show the implementation once.
+                if (symbol.isSignature && callable.some(candidate =>
+                    !candidate.isSignature &&
+                    (candidate.className || candidate.receiver || null) ===
+                        (symbol.className || symbol.receiver || null) &&
+                    (index.importGraph.get(candidate.file)?.has(symbol.file) ||
+                        index.importGraph.get(symbol.file)?.has(candidate.file)))) {
+                    continue;
                 }
 
-                // Self-method calls: split evenly across owner classes (each class's own
-                // self.method() resolves to itself). When this row covers all owners
-                // (locations cover the only class that has this method), give the full
-                // self-share to this row.
-                const selfShareForRow = selfShare * (ownerClasses.size / totalOwners);
-
-                count = typedHits + Math.round(selfShareForRow);
-                // If we used the self-method heuristic across multiple classes, mark approximate.
-                if (selfShare > 0 && totalOwners > 1) approximate = true;
+                const exact = findCallers(index, name, {
+                    targetDefinitions: [symbol],
+                    includeTests: true,
+                    collectAccount: true,
+                });
+                const count = exact.filter(caller =>
+                    caller.tier !== 'unverified' &&
+                    (!scopedCallerQuery || scopedPaths.has(caller.file)) &&
+                    (!options.productionCallsOnly ||
+                        !require('./shared').isTestPath(caller.relativePath || caller.file))).length;
+                if (count === 0) continue;
+                const owner = symbol.className ||
+                    (symbol.receiver || '').replace(/^\*/, '');
+                hotList.push({
+                    name: owner ? `${owner}.${name}` : name,
+                    file: symbol.relativePath,
+                    startLine: symbol.startLine,
+                    endLine: symbol.endLine,
+                    callCount: count,
+                    evidence: 'confirmed-callers',
+                });
             }
-            if (count === 0) continue; // skip dead symbols
-
-            if (approximate) usedHeuristicSplit = true;
-            // Sort locations by (file, startLine) for stable display.
-            locations.sort((a, b) =>
-                codeUnitCompare(a.file, b.file) ||
-                (a.startLine || 0) - (b.startLine || 0)
-            );
-            const primary = locations[0];
-            hotList.push({
-                // Use the representative symbol's className for display name
-                // (so "Foo.bar" is preserved when applicable). When defs
-                // disagree on className, just show the bare name.
-                name: representative && representative.className
-                    ? `${representative.className}.${name}`
-                    : name,
-                // Primary location remains for backward-compat with consumers
-                // that read `file`/`startLine`/`endLine` directly.
-                file: primary.file,
-                startLine: primary.startLine,
-                endLine: primary.endLine,
-                callCount: count,
-                ...(approximate && { approximate: true }),
-                ...(locations.length > 1 && { locations }),
-            });
         }
 
         // Stable order: callCount desc, then (relativePath, startLine) asc.
@@ -395,9 +350,7 @@ function getStats(index, options = {}) {
             top,
             total: hotList.length,
             items: hotList.slice(0, top),
-            ...(usedHeuristicSplit && {
-                note: 'Method-call counts approximated when receiver type was unknown — values within those rows may include unresolved calls split across owner classes.'
-            }),
+            note: 'Counts are confirmed caller-engine edges pinned to each displayed definition; unverified dispatch is excluded.',
         };
     }
 
@@ -543,7 +496,10 @@ function getToc(index, options = {}) {
 
     return {
         meta: {
-            complete: totalDynamic === 0,
+            // `complete` describes this returned list, while the narrower
+            // dynamic-import fact has an unambiguous name of its own.
+            complete: hiddenFiles === 0 && totalDynamic === 0,
+            noDynamicImports: totalDynamic === 0,
             skipped: 0,
             dynamicImports: totalDynamic,
             uncertain: 0,
@@ -583,6 +539,12 @@ function getToc(index, options = {}) {
  * @param {object} options - { deep, sampleSize, in, file }
  */
 function doctor(index, options = {}) {
+    const projectLanguage = index._getPredominantLanguage();
+    const staticSpecialImports = projectLanguage &&
+        !langTraits(projectLanguage)?.hasDynamicImports;
+    const importBlindspotLabel = staticSpecialImports
+        ? (projectLanguage === 'rust' ? 'glob import(s)' : 'blank/dot import(s)')
+        : 'dynamic import(s)';
     const normalizedExclude = Array.isArray(options.exclude)
         ? options.exclude.filter(Boolean)
         : (options.exclude
@@ -610,6 +572,7 @@ function doctor(index, options = {}) {
         unsupportedSources: {
             count: 0, fileCount: 0, files: [], languages: {}, extensions: {},
         },
+        skippedSources: { count: 0, fileCount: 0, files: [], reasons: {} },
     };
 
     // Reflection/eval signals come from the shared text-blind-spot counter
@@ -690,6 +653,18 @@ function doctor(index, options = {}) {
     }
     fileCounts.unsupported = blindSpots.unsupportedSources.fileCount;
 
+    for (const issue of index.discoveryIssues || []) {
+        const rel = issue.relativePath || '.';
+        if (!matchInFilter(rel)) continue;
+        const skipped = blindSpots.skippedSources;
+        skipped.count++;
+        skipped.fileCount++;
+        skipped.reasons[issue.reason || 'unknown'] =
+            (skipped.reasons[issue.reason || 'unknown'] || 0) + 1;
+        if (skipped.files.length < BLINDSPOT_FILE_CAP) skipped.files.push(rel);
+    }
+    fileCounts.skipped = blindSpots.skippedSources.fileCount;
+
     // Evidence profile — sampled only in deep mode. This is deliberately NOT
     // called "accuracy" or "coverage": it describes how UCN classified edges
     // it found. Compiler/LSP oracle evaluation is the accuracy measurement.
@@ -716,12 +691,17 @@ function doctor(index, options = {}) {
     if (blindSpots.computedDispatch.count > 0) {
         blindSignals.push(`${blindSpots.computedDispatch.count} computed dispatch call(s) in ${blindSpots.computedDispatch.fileCount} file(s)`);
     }
-    if (blindSpots.dynamicImports.count > 0) blindSignals.push(`${blindSpots.dynamicImports.count} dynamic import(s) in ${blindSpots.dynamicImports.fileCount} file(s)`);
+    if (blindSpots.dynamicImports.count > 0) blindSignals.push(`${blindSpots.dynamicImports.count} ${importBlindspotLabel} in ${blindSpots.dynamicImports.fileCount} file(s)`);
     if (blindSpots.unsupportedSources.count > 0) {
         const mix = Object.entries(blindSpots.unsupportedSources.languages)
             .map(([language, count]) => `${language} ${count}`)
             .join(', ');
         blindSignals.push(`${blindSpots.unsupportedSources.count} unsupported source file(s): ${mix}`);
+    }
+    if (blindSpots.skippedSources.count > 0) {
+        const reasons = Object.entries(blindSpots.skippedSources.reasons)
+            .map(([reason, count]) => `${reason} ${count}`).join(', ');
+        blindSignals.push(`${blindSpots.skippedSources.count} source discovery gap(s): ${reasons}`);
     }
 
     // Trust is task-specific. A healthy index can be excellent for navigation
@@ -730,7 +710,7 @@ function doctor(index, options = {}) {
     const unsupportedCount = blindSpots.unsupportedSources.count;
     const incompleteIndex = blindSpots.parseFailures.count > 0 ||
         blindSpots.parseRecoveries.count > 0 || cache.fresh === false ||
-        !!index.truncated || unsupportedCount > 0;
+        !!index.truncated || unsupportedCount > 0 || blindSpots.skippedSources.count > 0;
     const indexLevel = fileCounts.scanned === 0 && unsupportedCount > 0 ? 'UNSUPPORTED'
         : fileCounts.scanned === 0 ? 'UNKNOWN'
             : incompleteIndex ? 'PARTIAL' : 'HIGH';
@@ -743,6 +723,8 @@ function doctor(index, options = {}) {
                 ? `${blindSpots.parseRecoveries.count} file(s) required parser recovery; indexed results may be partial`
                 : cache.fresh === false ? 'index cache is stale'
                     : index.truncated ? `file discovery stopped at maxFiles=${index.truncated.maxFiles}`
+                        : blindSpots.skippedSources.count > 0
+                            ? `${blindSpots.skippedSources.count} source path(s) were not indexed; inspect discovery reasons`
                         : unsupportedCount > 0
                             ? `${fileCounts.scanned} supported file(s) indexed; ${unsupportedCount} unsupported source file(s) require grep/ripgrep`
                             : 'fresh index; no parse failures';
@@ -808,6 +790,7 @@ function doctor(index, options = {}) {
 
     return {
         root: index.root,
+        projectLanguage,
         version: require('../package.json').version,  // running ucn version — surfaces MCP/CLI drift (field-report #3)
         files: fileCounts,
         symbols: totalSymbols,
@@ -931,10 +914,21 @@ function orient(index, options = {}) {
         in: options.in,
         exclude: options.exclude,
     };
+    const { isTestPath } = require('./shared');
+    const hasProductionFiles = [...index.files.values()].some(fileEntry => {
+        const relativePath = fileEntry.relativePath;
+        return relativePath &&
+            matchesReportingScope(index, relativePath, scope) &&
+            !isTestPath(relativePath);
+    });
     const stats = getStats(index, {
         ...scope,
         hot: true,
         top: Math.min(top * 5, 200),
+        // A production-only call count is useful only when the selected scope
+        // actually contains production files. In an all-test repository it
+        // would erase the raw ranking that orient promises as its fallback.
+        productionCallsOnly: options.includeTests !== true && hasProductionFiles,
     });
     const health = doctor(index, scope);
 
@@ -991,7 +985,6 @@ function orient(index, options = {}) {
     // Orientation wants the ENGINE's hot functions, not fixture helpers —
     // prefer production-path entries (labeled as such by the formatter);
     // an all-test project falls back to the raw ranking.
-    const { isTestPath } = require('./shared');
     const allHot = (stats.hot?.items || []).map(i => ({
         name: i.name,
         file: i.file,
@@ -1006,6 +999,8 @@ function orient(index, options = {}) {
 
     return {
         root: stats.root,
+        ...(options.in && { scope: options.in }),
+        ...(options.file && !options.in && { scope: options.file }),
         files: stats.files,
         symbols: stats.symbols,
         buildTime: stats.buildTime,
@@ -1015,15 +1010,20 @@ function orient(index, options = {}) {
         entrypoints,
         trust: {
             level: health.trust,
+            projectLanguage: health.projectLanguage,
             blindSpots: {
                 dynamicImports: health.blindSpots?.dynamicImports?.count ?? 0,
                 evalCalls: health.blindSpots?.evalCalls?.count ?? 0,
                 reflection: health.blindSpots?.reflection?.count ?? 0,
                 parseFailures: health.blindSpots?.parseFailures?.count ?? 0,
+                parseRecoveries: health.blindSpots?.parseRecoveries?.count ?? 0,
                 unsupportedSources: health.blindSpots?.unsupportedSources?.count ?? 0,
+                skippedSources: health.blindSpots?.skippedSources?.count ?? 0,
             },
         },
         unsupportedSources: health.blindSpots?.unsupportedSources ?? null,
+        skippedSources: health.blindSpots?.skippedSources ?? null,
+        projectLanguage: health.projectLanguage,
         suggest: hottestProd ? hottestProd.name : null,
     };
 }

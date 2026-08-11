@@ -266,6 +266,9 @@ const LANGUAGES = {
             exportVisibility: 'linkage',
             typeQualifiedCallStyle: 'path',
             hasArityOverloads: true,
+            // C++ instance dispatch is virtual only when the declaration
+            // explicitly says virtual/override (unlike Java's implicit rule).
+            explicitVirtualDispatch: true,
             bareCallReachesMethods: true,
             // `obj.f()` performs member lookup and cannot bind a namespace
             // free function. `ns::f()` remains supported through isPathCall.
@@ -414,12 +417,12 @@ function getParser(language) {
  * @param {string} filePath - File path
  * @returns {string|null} Language name or null if unsupported
  */
-function detectLanguage(filePath) {
+function detectLanguage(filePath, projectRoot = null) {
     const rawExt = path.extname(filePath);
     const ext = rawExt.toLowerCase();
     if (ext === '.h') {
         const { detectHeaderLanguage } = require('../core/compilation-database');
-        return detectHeaderLanguage(filePath);
+        return detectHeaderLanguage(filePath, projectRoot);
     }
     return EXT_MAP[ext] || null;
 }

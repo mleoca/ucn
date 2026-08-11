@@ -28,6 +28,65 @@ const CANONICAL_COMMANDS = [
     'deadcode', 'auditAsync', 'stacktrace',
 ];
 
+// Directive guidance for retired v4 commands. These names remain invalid —
+// this is not a compatibility execution layer — but agents receive the exact
+// v5 command that answers the old intent instead of a dead end.
+const V4_COMMAND_MIGRATIONS = {
+    about:         { purpose: 'For a symbol summary', cli: 'ucn show <name>', mcp: 'command "show" with name' },
+    context:       { purpose: 'For callers and callees', cli: 'ucn show <name>', mcp: 'command "show" with name' },
+    smart:         { purpose: 'For source plus callees', cli: 'ucn show <name> --sections=source,callees', mcp: 'command "show" with name, sections="source,callees"' },
+    related:       { purpose: 'For related symbols', cli: 'ucn show <name> --sections=related', mcp: 'command "show" with name, sections="related"' },
+    example:       { purpose: 'For a call-site example', cli: 'ucn show <name> --sections=example', mcp: 'command "show" with name, sections="example"' },
+    brief:         { purpose: 'For a compact symbol summary', cli: 'ucn show <name> --compact', mcp: 'command "show" with name, compact=true' },
+    callers:       { purpose: 'For who calls a symbol', cli: 'ucn show <name> --sections=callers', mcp: 'command "show" with name, sections="callers"' },
+    callees:       { purpose: 'For what a symbol calls', cli: 'ucn show <name> --sections=callees', mcp: 'command "show" with name, sections="callees"' },
+    typedef:       { purpose: 'For a type definition', cli: 'ucn find <name> --type=type', mcp: 'command "find" with name, type="type"' },
+    blast:         { purpose: 'For the transitive caller tree', cli: 'ucn trace <name> --direction=callers', mcp: 'command "trace" with name, direction="callers"' },
+    reverseTrace:  { purpose: 'For entry-point paths', cli: 'ucn trace <name> --direction=callers --to=entrypoints', mcp: 'command "trace" with name, direction="callers", to="entrypoints"' },
+    toc:           { purpose: 'For the per-file symbol listing', cli: 'ucn repo --sections=files', mcp: 'command "repo" with sections="files"' },
+    stats:         { purpose: 'For project statistics', cli: 'ucn repo --sections=stats', mcp: 'command "repo" with sections="stats"' },
+    doctor:        { purpose: 'For index health and trust', cli: 'ucn repo --sections=health --deep', mcp: 'command "repo" with sections="health", deep=true' },
+    orient:        { purpose: 'For repository orientation', cli: 'ucn repo', mcp: 'command "repo"' },
+    affectedTests: { purpose: 'For transitively affected tests', cli: 'ucn tests <name> --depth=<n>', mcp: 'command "tests" with name, depth=<n>' },
+    fn:            { purpose: 'To extract a function', cli: 'ucn source <name>', mcp: 'command "source" with name' },
+    class:         { purpose: 'To extract a class', cli: 'ucn source <name>', mcp: 'command "source" with name' },
+    lines:         { purpose: 'To extract a line range', cli: 'ucn source <file> --range=<start-end>', mcp: 'command "source" with name=<file>, range="<start-end>"' },
+    expand:        { purpose: 'To expand a listed item', cli: 'ucn source <handle>', mcp: 'command "source" with name=<handle>' },
+    imports:       { purpose: 'For what a file imports', cli: 'ucn deps <file> --direction=imports', mcp: 'command "deps" with file, direction="imports"' },
+    exporters:     { purpose: 'For who imports a file', cli: 'ucn deps <file> --direction=importers', mcp: 'command "deps" with file, direction="importers"' },
+    graph:         { purpose: 'For a dependency graph', cli: 'ucn deps <file> --depth=<n>', mcp: 'command "deps" with file, depth=<n>' },
+    circularDeps:  { purpose: 'For circular dependencies', cli: 'ucn deps --cycles', mcp: 'command "deps" with cycles=true' },
+    fileExports:   { purpose: 'For a file public surface', cli: 'ucn api <file>', mcp: 'command "api" with file' },
+    verify:        { purpose: 'To validate call sites', cli: 'ucn check <name>', mcp: 'command "check" with name' },
+    diffImpact:    { purpose: 'For Git-diff impact', cli: 'ucn impact --base <ref>', mcp: 'command "impact" with base' },
+    stack:         { purpose: 'To analyze a stack trace', cli: 'ucn stacktrace "<paste>"', mcp: 'command "stacktrace" with stack' },
+};
+
+const V4_SPELLING_ALIASES = {
+    rtrace: 'reverseTrace', affected: 'affectedTests',
+    circular: 'circularDeps', cycles: 'circularDeps',
+    'what-exports': 'fileExports', 'what-imports': 'imports',
+    'who-imports': 'exporters',
+};
+const V4_MIGRATION_LOOKUP = new Map();
+{
+    const normalize = value => String(value).toLowerCase().replace(/[-_]/g, '');
+    for (const [name, entry] of Object.entries(V4_COMMAND_MIGRATIONS)) {
+        V4_MIGRATION_LOOKUP.set(normalize(name), entry);
+    }
+    for (const [alias, name] of Object.entries(V4_SPELLING_ALIASES)) {
+        V4_MIGRATION_LOOKUP.set(normalize(alias), V4_COMMAND_MIGRATIONS[name]);
+    }
+}
+
+function v4MigrationHint(name, surface = 'cli') {
+    if (!name || resolveCommand(String(name), surface)) return null;
+    const entry = V4_MIGRATION_LOOKUP.get(
+        String(name).toLowerCase().replace(/[-_]/g, ''));
+    if (!entry) return null;
+    return `${entry.purpose}, use: ${surface === 'mcp' ? entry.mcp : entry.cli}.`;
+}
+
 // ============================================================================
 // PARAM NORMALIZATION (snake_case → camelCase)
 // ============================================================================
@@ -78,12 +137,12 @@ const FLAG_APPLICABILITY = {
     find:         ['name', 'file', 'exclude', 'className', 'includeTests', 'limit', 'exact', 'in', 'compact', 'type', 'withSource'],
     usages:       ['name', 'file', 'exclude', 'className', 'includeTests', 'limit', 'codeOnly', 'context', 'in', 'compact', 'all'],
     search:       ['term', 'file', 'exclude', 'includeTests', 'top', 'limit', 'codeOnly', 'caseSensitive', 'context', 'regex', 'in', 'type', 'param', 'receiver', 'returns', 'decorator', 'exported', 'unused'],
-    source:       ['name', 'file', 'line', 'range', 'all', 'maxLines'],
-    trace:        ['name', 'file', 'exclude', 'className', 'line', 'direction', 'to', 'includeMethods', 'depth', 'all', 'minConfidence', 'expandUnverified'],
+    source:       ['name', 'file', 'className', 'line', 'range', 'all', 'maxLines'],
+    trace:        ['name', 'file', 'exclude', 'className', 'line', 'direction', 'to', 'includeMethods', 'depth', 'all', 'expandUnverified'],
     impact:       ['name', 'file', 'exclude', 'className', 'line', 'includeMethods', 'top', 'unreachableOnly', 'compact', 'base', 'staged', 'limit', 'all'],
-    tests:        ['name', 'file', 'exclude', 'className', 'line', 'callsOnly', 'depth', 'includeMethods', 'minConfidence', 'all'],
+    tests:        ['name', 'file', 'exclude', 'className', 'line', 'callsOnly', 'depth', 'includeMethods', 'all'],
     deps:         ['file', 'exclude', 'depth', 'direction', 'all', 'detailed', 'cycles'],
-    api:          ['file', 'limit'],
+    api:          ['file', 'in', 'limit'],
     check:        ['name', 'file', 'className', 'line', 'includeMethods', 'base', 'staged', 'limit'],
     plan:         ['name', 'file', 'className', 'line', 'addParam', 'removeParam', 'renameTo', 'defaultValue'],
     repo:         ['file', 'exclude', 'top', 'limit', 'all', 'detailed', 'topLevel', 'in', 'functions', 'hot', 'deep', 'sections'],
@@ -238,6 +297,50 @@ function formatSurfaceMessage(message, surface = 'cli') {
             );
         }
     }
+    const knownParams = new Set(Object.values(FLAG_APPLICABILITY).flat());
+    const booleanParams = new Set([
+        'includeTests', 'excludeTests', 'includeMethods', 'withTypes',
+        'codeOnly', 'caseSensitive', 'includeExported', 'includeDecorated',
+        'showConfidence', 'callsOnly', 'topLevel', 'followSymlinks',
+        'unreachableOnly', 'serverOnly', 'clientOnly', 'hideUncertain',
+        'expandUnverified', 'withSource', 'all', 'compact', 'exact',
+        'regex', 'exported', 'unused', 'staged', 'detailed', 'functions',
+        'hot', 'deep', 'cycles', 'bridge', 'unmatched', 'diverse', 'git',
+    ]);
+    if (surface === 'mcp') {
+        rendered = rendered.replace(/--([a-z][a-z0-9-]*)(?:=([^\s,.)]+))?/g,
+            (whole, flag, rawValue) => {
+                const camel = flag.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+                if (!knownParams.has(camel) && !['maxChars', 'maxFiles'].includes(camel)) {
+                    return whole;
+                }
+                const snake = REVERSE_PARAM_MAP[camel] || camel;
+                if (rawValue != null) {
+                    const value = rawValue === 'N' ? '<n>' : rawValue;
+                    return `${snake}=${value}`;
+                }
+                return booleanParams.has(camel) ? `${snake}=true` : snake;
+            });
+        rendered = rendered
+            .replace(/\b(line|top|limit|depth|max_lines|max_files|max_chars)=(?=\s|[,.]|$)/g, '$1=<n>')
+            .replace(/\b(file|in|exclude)=(?=\s|[,.]|$)/g, '$1=<path>')
+            .replace(/\bclass_name=(?=\s|[,.]|$)/g, 'class_name=<name>');
+    } else {
+        // Single-word parameters are intentionally absent from PARAM_MAP.
+        // Translate them only in parameter syntax (`file=`, not prose "file").
+        for (const param of knownParams) {
+            if (REVERSE_PARAM_MAP[param] || Object.values(PARAM_MAP).includes(param)) continue;
+            rendered = rendered.replace(
+                new RegExp(`(?<![A-Za-z0-9_-])${param}(?=\\s*=)`, 'g'),
+                `--${param.replace(/([a-z])([A-Z])/g, '$1-$2').toLowerCase()}`,
+            );
+        }
+        rendered = rendered.replace(/(--[a-z][a-z0-9-]*)=true\b/g, '$1');
+        rendered = rendered
+            .replace(/--(line|top|limit|depth|max-lines|max-files|max-chars)=(?=\s|[,.]|$)/g, '--$1=N')
+            .replace(/--(file|in|exclude)=(?=\s|[,.]|$)/g, '--$1=<path>')
+            .replace(/--class-name=(?=\s|[,.]|$)/g, '--class-name=<name>');
+    }
     return rendered;
 }
 
@@ -315,6 +418,8 @@ function generateMcpParamSection() {
 
 module.exports = {
     CANONICAL_COMMANDS,
+    V4_COMMAND_MIGRATIONS,
+    v4MigrationHint,
     PARAM_MAP,
     REVERSE_PARAM_MAP,
     FLAG_APPLICABILITY,

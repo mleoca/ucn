@@ -13,6 +13,7 @@ const {
     expandGlob, detectProjectPattern, parseGitignore, DEFAULT_IGNORES,
     classifyUnsupportedSourceFile,
 } = require('./discovery');
+const { codeUnitCompare } = require('./shared');
 
 // Read UCN version for cache invalidation
 const UCN_VERSION = require('../package.json').version;
@@ -20,6 +21,17 @@ const UCN_VERSION = require('../package.json').version;
 const CACHE_DIRECTORY_NAME = 'ucn';
 const CACHE_PROJECTS_DIRECTORY = 'projects';
 const LEGACY_CACHE_DIRECTORY = '.ucn-cache';
+const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const CACHE_PRUNE_INTERVAL_MS = 60 * 60 * 1000;
+const CACHE_MAX_PROJECTS = 128;
+const CACHE_MAX_BYTES = 1024 * 1024 * 1024;
+
+function discoveryRulesHash(root) {
+    const gitignore = path.join(root, '.gitignore');
+    let content = '';
+    try { content = fs.readFileSync(gitignore, 'utf8'); } catch { /* absent */ }
+    return crypto.createHash('md5').update(content).digest('hex');
+}
 
 /**
  * Resolve the per-user cache root without writing anything.
@@ -196,6 +208,102 @@ function clearProjectCache(projectRoot) {
         }
     }
     return removed;
+}
+
+function directorySize(root) {
+    let total = 0;
+    const pending = [root];
+    while (pending.length > 0) {
+        const current = pending.pop();
+        let entries;
+        try { entries = fs.readdirSync(current, { withFileTypes: true }); }
+        catch (_) { continue; }
+        for (const entry of entries) {
+            const target = path.join(current, entry.name);
+            if (entry.isSymbolicLink()) continue;
+            if (entry.isDirectory()) pending.push(target);
+            else {
+                try { total += fs.statSync(target).size; } catch (_) { /* raced */ }
+            }
+        }
+    }
+    return total;
+}
+
+/** Bound the shared per-user cache by age, project count, and total bytes. */
+function pruneUserCache({ force = false, now = Date.now() } = {}) {
+    const cacheRoot = getUserCacheRoot();
+    const projectsRoot = path.join(cacheRoot, CACHE_PROJECTS_DIRECTORY);
+    const marker = path.join(cacheRoot, '.last-pruned');
+    try {
+        if (!force && fs.existsSync(marker) &&
+            now - fs.statSync(marker).mtimeMs < CACHE_PRUNE_INTERVAL_MS) {
+            return { removed: [], skipped: true };
+        }
+    } catch (_) { /* run maintenance */ }
+    if (!fs.existsSync(projectsRoot)) return { removed: [], skipped: false };
+
+    const removed = [];
+    const entries = [];
+    for (const dirent of fs.readdirSync(projectsRoot, { withFileTypes: true })) {
+        if (!dirent.isDirectory() || dirent.isSymbolicLink()) continue;
+        const dir = path.join(projectsRoot, dirent.name);
+        const indexFile = path.join(dir, 'index.json');
+        let root = null;
+        let touched = 0;
+        try {
+            const stat = fs.statSync(indexFile);
+            touched = stat.mtimeMs;
+            const data = JSON.parse(fs.readFileSync(indexFile, 'utf8'));
+            root = data.root || null;
+            touched = Math.max(touched, Number(data.timestamp) || 0);
+        } catch (_) { /* malformed/incomplete cache expires below */ }
+        if (!root || !fs.existsSync(root) || now - touched > CACHE_TTL_MS) {
+            try {
+                fs.rmSync(dir, { recursive: true, force: true });
+                removed.push(dir);
+            } catch (_) { /* best effort */ }
+            continue;
+        }
+        entries.push({ dir, touched, bytes: null });
+    }
+
+    entries.sort((a, b) => a.touched - b.touched || codeUnitCompare(a.dir, b.dir));
+    while (entries.length > CACHE_MAX_PROJECTS) {
+        const victim = entries.shift();
+        try { fs.rmSync(victim.dir, { recursive: true, force: true }); removed.push(victim.dir); }
+        catch (_) { /* best effort */ }
+    }
+
+    let totalBytes = 0;
+    for (const entry of entries) {
+        entry.bytes = directorySize(entry.dir);
+        totalBytes += entry.bytes;
+    }
+    while (entries.length > 1 && totalBytes > CACHE_MAX_BYTES) {
+        const victim = entries.shift();
+        try {
+            fs.rmSync(victim.dir, { recursive: true, force: true });
+            removed.push(victim.dir);
+            totalBytes -= victim.bytes;
+        } catch (_) { /* best effort */ }
+    }
+    try {
+        fs.mkdirSync(cacheRoot, { recursive: true });
+        fs.writeFileSync(marker, String(now));
+    } catch (_) { /* maintenance must never block analysis */ }
+    return { removed, skipped: false, totalBytes, projects: entries.length };
+}
+
+function clearAllCaches() {
+    const cacheRoot = getUserCacheRoot();
+    try {
+        if (!fs.existsSync(cacheRoot)) return [];
+        fs.rmSync(cacheRoot, { recursive: true, force: true });
+        return [cacheRoot];
+    } catch (_) {
+        return [];
+    }
 }
 
 // Index/calls cache format version — bump when the persisted call-record or
@@ -488,7 +596,10 @@ function clearProjectCache(projectRoot) {
 // declared-field paths used for compiler-grade member ownership.
 // v157: C# cast receivers distinguish `((IFace)this).M()` from an arbitrary
 // interface-typed variable so explicit implementations are never overclaimed.
-const CACHE_FORMAT_VERSION = 157;
+// v159: importBindings persist source lines so rename plans can edit aliased
+// CJS/Python imports without relying on usage-kind heuristics.
+// v160: C# file entries persist project-wide `global using` modules.
+const CACHE_FORMAT_VERSION = 163;
 
 /**
  * Save index to cache file
@@ -524,6 +635,7 @@ function saveCache(index, cachePath) {
     // Hash config to detect when graph rebuild is needed on load
     const configHash = crypto.createHash('md5')
         .update(JSON.stringify(index.config || {})).digest('hex');
+    const discoveryHash = discoveryRulesHash(index.root);
 
     // Strip redundant fields from symbols and file entries to reduce cache size.
     // v6: All paths stored as relative paths (saves ~60% on large codebases).
@@ -601,6 +713,7 @@ function saveCache(index, cachePath) {
         version: CACHE_FORMAT_VERSION,
         ucnVersion: UCN_VERSION,  // Invalidate cache when UCN is updated
         configHash,
+        discoveryHash,
         root,
         // PERF-2: refresh buildTime on each save so partial rebuilds report
         // accurate stats. Falls back to original on first save.
@@ -619,9 +732,17 @@ function saveCache(index, cachePath) {
         unsupportedFiles: Array.isArray(index.unsupportedFiles)
             ? index.unsupportedFiles
             : [],
+        discoveryIssues: Array.isArray(index.discoveryIssues)
+            ? index.discoveryIssues
+            : [],
+        truncated: index.truncated || null,
         ...(reachableSymbolsRel !== undefined && {
             reachableSymbols: reachableSymbolsRel,
             reachableFingerprint,
+        }),
+        ...(index._computedDispatchBlindspots instanceof Map && {
+            computedDispatchBlindspots: [...index._computedDispatchBlindspots]
+                .map(([filePath, sites]) => [path.relative(root, filePath), sites]),
         }),
     };
 
@@ -637,6 +758,7 @@ function saveCache(index, cachePath) {
     if (index.reachabilityDirty) {
         index.reachabilityDirty = false;
     }
+    index.computedDispatchDirty = false;
 
     // Save callsCache sharded by directory for lazy loading.
     // Write to a temp directory first, then atomic swap to avoid data loss on crash.
@@ -684,6 +806,7 @@ function saveCache(index, cachePath) {
         }
     }
 
+    if (!cachePath) pruneUserCache();
     return cacheFile;
 }
 
@@ -834,6 +957,21 @@ function loadCache(index, cachePath) {
         index.unsupportedFiles = Array.isArray(cacheData.unsupportedFiles)
             ? cacheData.unsupportedFiles
             : [];
+        index.discoveryIssues = Array.isArray(cacheData.discoveryIssues)
+            ? cacheData.discoveryIssues
+            : [];
+        index.truncated = cacheData.truncated || null;
+        index._loadedConfigHash = cacheData.configHash || null;
+        index._loadedDiscoveryHash = cacheData.discoveryHash || null;
+        if (Array.isArray(cacheData.computedDispatchBlindspots)) {
+            index._computedDispatchBlindspots = new Map(
+                cacheData.computedDispatchBlindspots.map(([relPath, sites]) => [
+                    path.isAbsolute(relPath) ? relPath : toAbs(relPath),
+                    Array.isArray(sites) ? sites : [],
+                ]),
+            );
+            index.computedDispatchDirty = false;
+        }
 
         // Restore calleeIndex if persisted (v7 caches only; v8+ rebuilds lazily)
         if (Array.isArray(cacheData.calleeIndex)) {
@@ -889,6 +1027,15 @@ function loadCache(index, cachePath) {
  * @returns {boolean} - True if cache needs rebuilding
  */
 function isCacheStale(index) {
+    const currentConfigHash = crypto.createHash('md5')
+        .update(JSON.stringify(index.config || {})).digest('hex');
+    if (index._loadedConfigHash && currentConfigHash !== index._loadedConfigHash) {
+        return true;
+    }
+    if (index._loadedDiscoveryHash &&
+        discoveryRulesHash(index.root) !== index._loadedDiscoveryHash) {
+        return true;
+    }
     // Modified/deleted detection (stat sweep) runs UNCONDITIONALLY — agents
     // edit a file and re-query through MCP within seconds, and a stale answer
     // presented as fresh is the worst trust failure the tool can produce.
@@ -953,6 +1100,15 @@ function isCacheStale(index) {
     }
     const currentFiles = expandGlob(pattern, globOpts);
     const cachedPaths = new Set(index.files.keys());
+    const currentPaths = new Set(currentFiles);
+
+    // A cached file can still exist on disk while becoming excluded by a new
+    // .gitignore/.ucn.json rule. Treat that set contraction as stale too;
+    // otherwise ignored code remains queryable until an unrelated edit forces
+    // a rebuild.
+    for (const file of cachedPaths) {
+        if (!currentPaths.has(file)) return true;
+    }
 
     for (const file of currentFiles) {
         if (!cachedPaths.has(file) && !(index.failedFiles && index.failedFiles.has(file))) {
@@ -1132,5 +1288,6 @@ module.exports = {
     saveCache, loadCache, loadCallsCache, isCacheStale, ensureCallsCacheLoaded,
     getUserCacheRoot, getProjectCacheDir, getProjectCachePath,
     getLegacyProjectCacheDir, migrateLegacyProjectCache, clearProjectCache,
+    clearAllCaches, pruneUserCache,
     _computeReachabilityFingerprint, CACHE_FORMAT_VERSION,
 };

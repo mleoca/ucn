@@ -14,6 +14,18 @@ function signatureLine(sym) {
     const parts = [];
     if (sym.modifiers && sym.modifiers.length) parts.push(sym.modifiers.join(' '));
     let sig = sym.name;
+    if (sym.generics) sig += String(sym.generics).replace(/\s+/g, ' ').trim();
+    if (sym.type === 'field' || sym.type === 'state' ||
+        sym.memberType === 'field' || sym.memberType === 'property') {
+        const declaredType = sym.fieldType || sym.returnType;
+        if (declaredType) sig += `: ${String(declaredType).replace(/\s+/g, ' ').trim()}`;
+        parts.push(sig);
+        return parts.join(' ');
+    }
+    if (sym.type === 'macro' && sym.functionLike === false) {
+        parts.push(sig);
+        return parts.join(' ');
+    }
     const typed = renderTypedParams(sym);
     // If we have a structured-params array of length 0, the function has no params.
     // Render `()` rather than the legacy `(...)` placeholder.
@@ -54,6 +66,17 @@ function formatBrief(result) {
         if (sym.docstring) lines.push(`  "${sym.docstring}"`);
         const gitLineType = formatGitLine(result.git);
         if (gitLineType) lines.push(`  ${gitLineType}`);
+        return lines.join('\n');
+    }
+
+    if (result.kind === 'data') {
+        lines.push(signatureLine(sym));
+        lines.push(`  ${sym.file}:${sym.startLine}-${sym.endLine}  (${result.lineCount || 0} line${result.lineCount === 1 ? '' : 's'})`);
+        if (sym.handle) lines.push(`  handle: ${sym.handle}`);
+        if (sym.docstring) lines.push(`  "${sym.docstring}"`);
+        if (sym.className) lines.push(`  in class ${sym.className}`);
+        const gitLineData = formatGitLine(result.git);
+        if (gitLineData) lines.push(`  ${gitLineData}`);
         return lines.join('\n');
     }
 

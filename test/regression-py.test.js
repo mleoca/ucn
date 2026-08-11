@@ -2140,11 +2140,11 @@ describe('endpoints command (Python)', () => {
         const index = idx(FIXTURE);
         const { ok, result } = execute(index, 'endpoints', {});
         assert.ok(ok);
-        // Flask: 2 routes (app.route GET + POST on /users)
-        // FastAPI: app.get /users/<int:user_id>, router.get /items, router.post /items, router.delete /items/{id}
+        // Flask: app.route GET + POST and the Flask 2.x app.get shorthand.
+        // FastAPI: APIRouter get/post/delete routes.
         assert.strictEqual(result.meta.totalRoutes, 6, 'expected 6 routes');
-        assert.strictEqual(result.meta.byFramework.flask, 2);
-        assert.strictEqual(result.meta.byFramework.fastapi, 4);
+        assert.strictEqual(result.meta.byFramework.flask, 3);
+        assert.strictEqual(result.meta.byFramework.fastapi, 3);
     });
 
     it('Flask @app.route decorator detects method from methods=[...] kwarg', () => {

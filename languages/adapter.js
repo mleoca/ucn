@@ -63,6 +63,7 @@ function createLanguageAdapter(config) {
         grammar: config.treeSitterLang || config.name,
         traits: Object.freeze({ ...(config.traits || {}) }),
         capabilities,
+        managesOwnParseTree: !!languageModule.managesOwnParseTree,
         loadGrammar: config.treeSitterModule,
         parse(code, parser) {
             return languageModule.parse(code, parser);
@@ -86,16 +87,32 @@ function createLanguageAdapter(config) {
             return languageModule.isEntryPoint(symbol);
         },
         analyze(code, parser, file = null) {
-            const parsed = languageModule.parse(code, parser);
-            const imports = languageModule.findImportsInCode(code, parser);
-            const exports = languageModule.findExportsInCode(code, parser);
-            parsed.imports = imports;
-            parsed.exports = exports;
+            // Full-file indexing consumes immutable records, not native ASTs.
+            // Parsers with a heavier internal recovery cache (notably C/C++)
+            // may release analysis-only trees as soon as those records have
+            // been extracted. Direct parser/query calls omit this option and
+            // retain their bounded cross-operation cache.
+            const parsed = languageModule.parse(code, parser, {
+                releaseAnalysisTree: true,
+            });
+            const parseProvidesFacts = !!languageModule.parseProvidesAnalysisFacts;
+            const imports = parseProvidesFacts
+                ? (parsed.imports || [])
+                : languageModule.findImportsInCode(code, parser);
+            const exports = parseProvidesFacts
+                ? (parsed.exports || [])
+                : languageModule.findExportsInCode(code, parser);
+            if (!parseProvidesFacts) {
+                parsed.imports = imports;
+                parsed.exports = exports;
+            }
             const callOptions = {};
             if (config.traits?.hasReceiverPackageCalls) {
                 callOptions.imports = imports.flatMap(item => item.names || []);
             }
-            const calls = languageModule.findCallsInCode(code, parser, callOptions);
+            const calls = parseProvidesFacts && Array.isArray(parsed.calls)
+                ? parsed.calls
+                : languageModule.findCallsInCode(code, parser, callOptions);
             return createFileIR({
                 language: config.name,
                 file,

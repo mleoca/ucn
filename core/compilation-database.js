@@ -176,8 +176,10 @@ function projectBoundary(startDir) {
     return fallback;
 }
 
-function projectTranslationUnitConvention(filePath) {
-    const root = projectBoundary(path.dirname(filePath));
+function projectTranslationUnitConvention(filePath, projectRoot = null) {
+    const root = projectRoot
+        ? path.resolve(projectRoot)
+        : projectBoundary(path.dirname(filePath));
     if (conventionCache.has(root)) return conventionCache.get(root);
     let cpp = 0;
     let c = 0;
@@ -242,7 +244,7 @@ function detectHeaderLanguage(filePath, projectRoot = null) {
         const c = names.filter(name => C_EXTENSIONS.has(path.extname(name).toLowerCase())).length;
         if (cpp !== c) return cpp > c ? 'cpp' : 'c';
     } catch { /* default below */ }
-    const projectConvention = projectTranslationUnitConvention(filePath);
+    const projectConvention = projectTranslationUnitConvention(filePath, projectRoot);
     if (projectConvention) return projectConvention;
     return 'c';
 }

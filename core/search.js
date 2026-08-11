@@ -11,8 +11,9 @@ const path = require('path');
 const { escapeRegExp, codeUnitCompare, inlineTestRanges, lineInRanges, classDispatchNames, CALLABLE_SYMBOL_KINDS } = require('./shared');
 const { isTestFile } = require('./discovery');
 const { detectLanguage, getParser, getLanguageAdapter, langTraits } = require('../languages');
-const { getCachedCalls, _nameBindingReaches } = require('./callers');
+const { getCachedCalls } = require('./callers');
 const { extractImports } = require('./imports');
+const isSafeRegex = require('safe-regex2');
 
 /**
  * Build a glob-style matcher: * matches any sequence, ? matches one char.
@@ -26,7 +27,11 @@ function buildGlobMatcher(pattern, caseSensitive) {
     return (name) => regex.test(name);
 }
 
-const STRUCTURAL_TYPES = new Set(['function', 'class', 'call', 'method', 'type']);
+const STRUCTURAL_TYPES = new Set([
+    'function', 'class', 'call', 'method', 'type', 'constructor',
+    'state', 'field', 'constant', 'macro', 'variable',
+    'interface', 'enum', 'struct', 'trait', 'record', 'namespace',
+]);
 
 /**
  * Substring match. Case-insensitive by default.
@@ -171,9 +176,11 @@ function _applyFindFilters(index, matches, options) {
 
     // Filter by file pattern
     if (options.file) {
-        filtered = filtered.filter(m =>
-            m.relativePath && m.relativePath.includes(options.file)
-        );
+        const resolved = index.resolveFilePathForQuery(options.file);
+        filtered = typeof resolved === 'string'
+            ? filtered.filter(m => m.file === resolved)
+            : filtered.filter(m =>
+                m.relativePath && m.relativePath.includes(options.file));
     }
 
     // Apply semantic filters (--exclude, --in)
@@ -191,10 +198,29 @@ function _applyFindFilters(index, matches, options) {
     // Add per-symbol usage counts for disambiguation
     const withCounts = filtered.map(m => {
         const counts = index.countSymbolUsages(m);
+        // The fast count supplies cheap definition/import totals, but its
+        // name-only call bucket cannot distinguish json.dumps from a project
+        // dumps, or one class's save from another's. The public `find`
+        // activity count must use the same pinned caller adjudication as
+        // show/impact so command answers never contradict each other.
+        const callers = index.findCallers(m.name, {
+            targetDefinitions: [m],
+            includeTests: true,
+            collectAccount: true,
+        });
+        const confirmedCalls = callers.filter(caller =>
+            caller.tier !== 'unverified').length;
+        const exactCounts = {
+            ...counts,
+            calls: confirmedCalls,
+            total: confirmedCalls + counts.definitions + counts.imports +
+                (counts.references || 0),
+            countKind: 'pinned-caller-engine-excludes-references',
+        };
         return {
             ...m,
-            usageCount: counts.total,
-            usageCounts: counts  // { total, calls, definitions, imports, references }
+            usageCount: exactCounts.total,
+            usageCounts: exactCounts,
         };
     });
 
@@ -217,7 +243,8 @@ function usages(index, name, options = {}) {
     try {
     const usagesList = [];
 
-    // Resolve file pattern for --file filter
+    // Resolve file pattern for --file scan filter. A stable-handle caller can
+    // separately pin definitions with definitionFile while scanning globally.
     const fileFilterRaw = options.file ? index.resolveFilePathForQuery(options.file) : null;
     // resolveFilePathForQuery may return error objects for ambiguous/not-found — fall back to substring matching
     const fileFilter = typeof fileFilterRaw === 'string' ? fileFilterRaw : null;
@@ -228,7 +255,12 @@ function usages(index, name, options = {}) {
     if (options.className) {
         allDefinitions = allDefinitions.filter(d => d.className === options.className);
     }
-    if (fileFilter) {
+    const definitionFileRaw = options.definitionFile
+        ? index.resolveFilePathForQuery(options.definitionFile) : null;
+    const definitionFile = typeof definitionFileRaw === 'string' ? definitionFileRaw : null;
+    if (definitionFile) {
+        allDefinitions = allDefinitions.filter(d => d.file === definitionFile);
+    } else if (fileFilter) {
         allDefinitions = allDefinitions.filter(d => d.file === fileFilter);
     } else if (fileSubstring) {
         allDefinitions = allDefinitions.filter(d => d.relativePath && d.relativePath.includes(fileSubstring));
@@ -236,15 +268,13 @@ function usages(index, name, options = {}) {
     const definitions = options.exclude || options.in
         ? allDefinitions.filter(d => index.matchesFilters(d.relativePath, options))
         : allDefinitions;
-    const targetFiles = new Set(allDefinitions.map(d => d.file).filter(Boolean));
-
     for (const def of definitions) {
         usagesList.push({
             ...def,
             usageType: 'definition',
             isDefinition: true,
-            line: def.startLine,
-            content: index.getLineContent(def.file, def.startLine),
+            line: def.nameLine || def.startLine,
+            content: index.getLineContent(def.file, def.nameLine || def.startLine),
             signature: index.formatSignature(def)
         });
     }
@@ -273,148 +303,17 @@ function usages(index, name, options = {}) {
             // Try AST-based detection first (with per-operation cache)
             const astUsages = index._getCachedUsages(filePath, name);
             if (astUsages !== null) {
-                // Pre-compute: does any imported project file define this name?
-                // Used to filter namespace member expressions (e.g., DropdownMenuPrimitive.Separator)
-                // while keeping module access patterns (e.g., output.formatExample())
-                const _importedHasDef = new Map();
-                const importedFileHasDef = (receiver) => {
-                    const cacheKey = receiver || '';
-                    if (_importedHasDef.has(cacheKey)) return _importedHasDef.get(cacheKey);
-                    const importedFiles = index.importGraph.get(filePath);
-                    let found = false;
-                    if (importedFiles) for (const imp of importedFiles) {
-                        const impEntry = index.files.get(imp);
-                        if (impEntry?.symbols?.some(s => s.name === name)) {
-                            found = true;
-                            break;
-                        }
-                        // A module namespace may expose the target through a
-                        // re-export chain (`import httpx; httpx.URL(...)`,
-                        // where httpx/__init__.py re-exports URL).  Direct-file
-                        // symbol checks silently dropped these compiler-true
-                        // usages.  Reuse the caller engine's conservative
-                        // name-ownership chase: yes confirms; unknown stays
-                        // visible in this raw-usage inventory; only a proven
-                        // no is filtering evidence.
-                        if (targetFiles.size > 0 &&
-                            _nameBindingReaches(index, imp, name, targetFiles) !== 'no') {
-                            found = true;
-                            break;
-                        }
-                    }
-
-                    // Named namespace surfaces need one more ownership axis:
-                    // `import { util } from './core'; util.helper()` where
-                    // core exports `* as util` from the helper's module. The
-                    // imported file does not itself define `helper`; entering
-                    // the namespace is what reaches the owning file.
-                    if (!found && receiver && targetFiles.size > 0) {
-                        const queue = [];
-                        let unknown = false;
-                        for (const b of (fileEntry.importBindings || [])) {
-                            if (b.name !== receiver && b.alias !== receiver) continue;
-                            const rel = fileEntry.moduleResolved?.[b.module];
-                            if (rel) queue.push({ file: path.join(index.root, rel), attr: b.name, depth: 0 });
-                            else if (String(b.module).startsWith('.')) unknown = true;
-                        }
-                        const seen = new Set();
-                        while (!found && queue.length > 0) {
-                            const cur = queue.shift();
-                            const state = `${cur.file}\0${cur.attr || ''}`;
-                            if (seen.has(state)) continue;
-                            seen.add(state);
-                            if (targetFiles.has(cur.file)) { found = true; break; }
-                            if (cur.depth >= 4) { unknown = true; continue; }
-                            const fe = index.files.get(cur.file);
-                            if (!fe) { unknown = true; continue; }
-                            for (const e of (fe.exportDetails || [])) {
-                                if (!e.source) continue;
-                                let nextAttr;
-                                if (e.type === 're-export-all' && e.alias === cur.attr) {
-                                    nextAttr = null; // entered the namespace
-                                } else if (e.type === 're-export-all' && !e.alias && cur.attr) {
-                                    nextAttr = cur.attr; // transparent barrel
-                                } else if (e.type === 're-export' &&
-                                    (e.alias || e.name) === cur.attr) {
-                                    nextAttr = e.name;
-                                } else {
-                                    continue;
-                                }
-                                const rel = fe.moduleResolved?.[e.source];
-                                if (rel) {
-                                    queue.push({
-                                        file: path.join(index.root, rel),
-                                        attr: nextAttr,
-                                        depth: cur.depth + 1,
-                                    });
-                                } else if (String(e.source).startsWith('.')) {
-                                    unknown = true;
-                                }
-                            }
-                            // Dynamic/CJS export objects cannot prove that a
-                            // namespace property is unrelated. Keep the usage
-                            // visible rather than manufacturing a false miss.
-                            if ((fe.exportDetails || []).some(e =>
-                                e.type === 'exports' || e.type === 'module.exports') ||
-                                (fe.moduleAssignedNames || []).includes(cur.attr)) {
-                                unknown = true;
-                            }
-                        }
-                        if (!found && unknown) found = true;
-                    }
-                    _importedHasDef.set(cacheKey, found);
-                    return found;
-                };
-
-                // A qualified usage whose RECEIVER is a symbol defined in this
-                // file is never external-package noise — `Geometry.area(3, 4)`
-                // in the file declaring namespace Geometry was dropped by the
-                // receiver filter while find's usageCounts counted it (fix
-                // #241). Keyed on the receiver, not the target name: a file
-                // defining its own `Separator` while using external
-                // `Ns.Separator` must still filter the latter (bug #23).
-                const receiverDefinedHere = (recv) =>
-                    !!recv && fileEntry.symbols && fileEntry.symbols.some(s => s.name === recv);
-
                 for (const u of astUsages) {
                     // Skip if this is a definition line (already added above)
-                    if (definitions.some(d => d.file === filePath && d.startLine === u.line)) {
+                    if (definitions.some(d => d.file === filePath &&
+                        (d.startLine === u.line || d.nameLine === u.line))) {
                         continue;
                     }
 
-                    // Rust `Type::method` method values carry their owner from
-                    // the AST. Keep them only for a matching method owner;
-                    // class/struct queries must not absorb `Enum::Variant`
-                    // references that happen to share the target type name.
-                    // Owners are CALLABLE member defs only — an enum variant
-                    // member also carries className, and counting it as an
-                    // owner would let `Boundary::Grid` survive a struct-Grid
-                    // query via its own enum. Lowercase receivers are module
-                    // paths (`render::draw` reaches the free fn); `Self` is
-                    // the enclosing type — both keep escape-hatch visibility.
-                    if (fileEntry.language === 'rust' && u.scopedReference &&
-                        u.receiver && /^[A-Z]/.test(u.receiver) && u.receiver !== 'Self') {
-                        const methodOwners = new Set(definitions
-                            .filter(d => d.className && CALLABLE_SYMBOL_KINDS.has(d.type))
-                            .map(d => d.className));
-                        if (!methodOwners.has(u.receiver)) continue;
-                    }
-
-                    // Filter member expressions with unrelated receivers in JS/TS/Python.
-                    // Keeps: standalone usages, self/this/cls/super, method calls on known types,
-                    //        qualified usages whose receiver this file defines,
-                    //        and module access (output.fn()) when the imported file defines the name.
-                    // Filters: namespace access to external packages (DropdownMenuPrimitive.Separator).
-                    if (u.receiver && !['self', 'this', 'cls', 'super'].includes(u.receiver) &&
-                        fileEntry.language !== 'go' && fileEntry.language !== 'java' && fileEntry.language !== 'rust') {
-                        const hasMethodDef = definitions.some(d => d.className);
-                        const sameFileMember = definitions.some(d =>
-                            d.file === filePath && d.memberAssigned);
-                        if (!hasMethodDef && !sameFileMember && !receiverDefinedHere(u.receiver) &&
-                            !importedFileHasDef(u.receiver)) {
-                            continue;
-                        }
-                    }
+                    // `usages` is the literal-name escape hatch. Unlike callers,
+                    // it must never discard an AST occurrence merely because
+                    // ownership or receiver dispatch cannot be proven. Consumers
+                    // can use usageType/receiver plus `show` for semantic tiers.
 
                     const lineContent = lines[u.line - 1] || '';
 
@@ -578,6 +477,15 @@ function search(index, term, options = {}) {
                 { cause: e },
             );
         }
+        // V8 regular expressions can backtrack exponentially and there is no
+        // synchronous per-match timeout. Refuse unsafe repetition shapes
+        // before evaluating them on source; agents can hand those patterns to
+        // ripgrep's linear-time regex engine instead of wedging CLI/MCP.
+        if (!isSafeRegex(term)) {
+            throw new Error(
+                `Unsafe regular expression "${term}": nested or excessive repetition may cause catastrophic backtracking. Simplify the pattern or use ripgrep.`,
+            );
+        }
     } else {
         regex = new RegExp(escapeRegExp(term), regexFlags);
     }
@@ -611,7 +519,11 @@ function search(index, term, options = {}) {
                     try {
                         const parser = getParser(language);
                         const { findMatchesWithASTFilter } = require('../languages/utils');
-                        const astMatches = findMatchesWithASTFilter(content, term, parser, { codeOnly: true, regex: useRegex });
+                        const astMatches = findMatchesWithASTFilter(content, term, parser, {
+                            codeOnly: true,
+                            regex: useRegex,
+                            caseSensitive: options.caseSensitive,
+                        });
 
                         for (const m of astMatches) {
                             const match = {
@@ -693,6 +605,7 @@ function search(index, term, options = {}) {
 
     // Apply top limit (limits total matches across all files)
     const totalMatches = results.reduce((sum, r) => sum + r.matches.length, 0);
+    const totalMatchedFiles = results.length;
     let truncatedMatches = 0;
     if (options.top && options.top > 0 && totalMatches > options.top) {
         let remaining = options.top;
@@ -719,6 +632,7 @@ function search(index, term, options = {}) {
         totalFiles: index.files.size,
         mode: useRegex ? 'regex' : 'literal',
         totalMatches,
+        totalMatchedFiles,
         shownMatches: totalMatches - truncatedMatches,
         truncatedMatches,
         limit: options.top || null,
@@ -811,6 +725,9 @@ function structuralSearch(index, options = {}) {
                 const calls = getCachedCalls(index, filePath);
                 if (!calls) continue;
                 for (const call of calls) {
+                    // Potential callback/value references are useful to the
+                    // caller engine, but they are not invocations.
+                    if (call.isFunctionReference || call.isTypeReference) continue;
                     if (nameMatcher && !nameMatcher(call.name)) continue;
                     // Field-hop receivers (`tm.service.Save()`) carry
                     // receiverRoot/receiverField instead of receiver —
@@ -845,6 +762,8 @@ function structuralSearch(index, options = {}) {
             const classTypes = new Set(['class', 'struct', 'interface', 'impl', 'trait', 'record', 'enum']);
             const typeTypes = new Set(['type', 'enum', 'interface', 'trait', 'record', 'namespace']);
             const methodTypes = new Set(['method', 'constructor']);
+            const variableTypes = new Set(['state', 'field', 'constant', 'macro']);
+            const groupedTypes = new Set(['function', 'class', 'method', 'type', 'variable']);
 
             for (const [symbolName, definitions] of index.symbols) {
                 if (nameMatcher && !nameMatcher(symbolName)) continue;
@@ -855,6 +774,8 @@ function structuralSearch(index, options = {}) {
                     if (type === 'class' && !classTypes.has(def.type)) continue;
                     if (type === 'method' && !methodTypes.has(def.type) && !def.isMethod) continue;
                     if (type === 'type' && !typeTypes.has(def.type)) continue;
+                    if (type === 'variable' && !variableTypes.has(def.type)) continue;
+                    if (type && !groupedTypes.has(type) && def.type !== type) continue;
 
                     // File filters
                     const fileEntry = index.files.get(def.file);
@@ -892,16 +813,17 @@ function structuralSearch(index, options = {}) {
 
                     // Exported filter
                     if (exported) {
-                        const mods = def.modifiers || [];
-                        const isExp = (fileEntry && fileEntry.exports.includes(symbolName)) ||
-                            mods.includes('export') || mods.includes('public') ||
-                            mods.some(m => m.startsWith('pub')) ||
-                            (fileEntry && langTraits(fileEntry.language)?.exportVisibility === 'capitalization' && /^[A-Z]/.test(symbolName));
+                        const { symbolIsExported } = require('./graph');
+                        const isExp = fileEntry && symbolIsExported(
+                            def, fileEntry, new Set(fileEntry.exports || []));
                         if (!isExp) continue;
                     }
 
                     // Unused filter (expensive — last check)
                     if (unused) {
+                        // This query has call-edge semantics. Reference-live
+                        // types/classes/fields are handled by `deadcode`.
+                        if (!functionTypes.has(def.type)) continue;
                         // Named function expressions are consumed by their
                         // expression position — never "unused" (the deadcode
                         // twin of the bodyScopedName audit skip).
@@ -998,6 +920,10 @@ function structuralSearch(index, options = {}) {
                 }).filter(([, v]) => v !== undefined && v !== null)),
                 totalMatched: total,
                 shown: results.length,
+                ...(unused && {
+                    unusedScope: 'callable-symbols-only',
+                    unusedSafety: 'candidate-only; use deadcode before deletion',
+                }),
             }
         };
     } finally { index._endOp(); }
@@ -1692,7 +1618,8 @@ function tests(index, nameOrFile, options = {}) {
             const localSameName = (info.entry.symbols || []).some(s => s.name === searchTerm);
             const importsTargetName = (info.entry.importBindings || []).some(b => b.name === searchTerm);
             const explicitlyScopedToLocal = !!options.file && targetDefs.some(d => d.file === site.file);
-            if (localSameName && !importsTargetName && !explicitlyScopedToLocal && !site.receiver) continue;
+            if (localSameName && !importsTargetName && !explicitlyScopedToLocal &&
+                !site.receiver && !site.isMethod) continue;
 
             let fileResult = results.find(r => r.file === info.entry.relativePath);
             if (!fileResult) {

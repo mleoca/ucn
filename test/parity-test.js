@@ -224,9 +224,22 @@ describe('18-command CLI/MCP/interactive parity', () => {
         assert.strictEqual(tool.name, 'ucn');
         const commandSchema = tool.inputSchema.properties.command;
         assert.strictEqual(commandSchema.type, 'string');
-        assert.deepStrictEqual(commandSchema.enum, getMcpCommandEnum());
+        assert.deepStrictEqual(commandSchema.enum, getMcpCommandEnum(),
+            'MCP clients need a machine-readable v5 command vocabulary');
+        for (const command of getMcpCommandEnum()) {
+            assert.ok(commandSchema.description.includes(command),
+                `command description should enumerate ${command}`);
+        }
         assert.match(tool.description, /18 task-oriented commands/);
         assert.doesNotMatch(tool.description, /- about\b|- context\b|- blast\b/);
+    });
+
+    it('MCP rejects retired command names with directive migration guidance', async () => {
+        const result = await mcp.callTool({
+            command: 'toc', project_dir: dir,
+        });
+        assert.strictEqual(result.isError, true);
+        assert.match(result.text, /command "repo" with sections="files"/);
     });
 
     it('CLI JSON uses one stable envelope for every public command', () => {

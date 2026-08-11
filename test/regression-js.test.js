@@ -115,8 +115,8 @@ function caller2() {
 // BUG TESTS: Name matching should distinguish method calls
 // ============================================================================
 
-describe('Bug: usages should distinguish method calls from standalone calls', () => {
-    it('should not include JSON.parse when searching for parse', () => {
+describe('Raw usages inventory and semantic receiver resolution', () => {
+    it('includes JSON.parse in the literal-name inventory', () => {
         const tmpDir = path.join(require('os').tmpdir(), `ucn-test-method-${Date.now()}`);
         fs.mkdirSync(tmpDir, { recursive: true });
 
@@ -141,13 +141,14 @@ module.exports = { parse };
             const usages = index.usages('parse');
             const calls = usages.filter(u => u.usageType === 'call');
 
-            // Check if JSON.parse is incorrectly included
+            // `usages` is the grep-like literal-name inventory. It includes
+            // receiver-qualified occurrences; `show`/`impact` classify whether
+            // they can denote the pinned project definition.
             const hasJsonParse = calls.some(c =>
                 c.content && c.content.includes('JSON.parse')
             );
 
-            // Bug fixed: JSON.parse should not be counted as a call to parse()
-            assert.strictEqual(hasJsonParse, false, 'JSON.parse should not be counted as usage of parse()');
+            assert.strictEqual(hasJsonParse, true, 'JSON.parse should remain visible in raw usages');
         } finally {
             fs.rmSync(tmpDir, { recursive: true, force: true });
         }
@@ -191,7 +192,7 @@ module.exports = { parse };
         }
     });
 
-    it('should not include path.parse when searching for parse', () => {
+    it('includes path.parse in the literal-name inventory', () => {
         const tmpDir = path.join(require('os').tmpdir(), `ucn-test-path-${Date.now()}`);
         fs.mkdirSync(tmpDir, { recursive: true });
 
@@ -221,8 +222,7 @@ module.exports = { parse };
                 c.content && c.content.includes('path.parse')
             );
 
-            // Bug fixed: path.parse should not be counted as a call to parse()
-            assert.strictEqual(hasPathParse, false, 'path.parse should not be counted');
+            assert.strictEqual(hasPathParse, true, 'path.parse should remain visible in raw usages');
         } finally {
             fs.rmSync(tmpDir, { recursive: true, force: true });
         }
@@ -247,8 +247,11 @@ describe('Project-aware JavaScript receiver resolution', () => {
                 `local namespace usage must remain visible: ${JSON.stringify(calls)}`);
             assert.ok(calls.some(u => u.relativePath === 'barrel.mjs' && u.line === 2),
                 `re-exported namespace usage must remain visible: ${JSON.stringify(calls)}`);
-            assert.ok(!calls.some(u => u.relativePath === 'external.js'),
-                `external namespace must not borrow the project symbol: ${JSON.stringify(calls)}`);
+            assert.ok(calls.some(u => u.relativePath === 'external.js'),
+                `raw usages must retain the external literal-name occurrence: ${JSON.stringify(calls)}`);
+            const semantic = index.context('escapeRegex');
+            assert.ok(!semantic.callers.some(u => u.relativePath === 'external.js'),
+                'semantic callers must not attribute the external namespace to the project symbol');
         } finally { rm(dir); }
     });
 
@@ -4163,7 +4166,7 @@ main();
         } finally { rm(dir); }
     });
 
-    it('cause 2: bin/foo.ts is a runtime entry file', () => {
+    it('does not promote every export in bin/foo.ts without runtime evidence', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'bin/foo.ts': `
@@ -4173,14 +4176,14 @@ export function baz() {}
         });
         try {
             const { index, reach } = reachableSet(dir);
-            assert.ok(isReach(reach, index.symbols, 'bar'),
-                'bar is a runtime entry (bin/ file)');
-            assert.ok(isReach(reach, index.symbols, 'baz'),
-                'baz is transitively reachable');
+            assert.ok(!isReach(reach, index.symbols, 'bar'),
+                'a bin path alone is not evidence that every exported helper runs');
+            assert.ok(!isReach(reach, index.symbols, 'baz'),
+                'callee remains unreachable when no executable root was identified');
         } finally { rm(dir); }
     });
 
-    it('cause 2: server.ts is a runtime entry file', () => {
+    it('does not promote every export in server.ts without runtime evidence', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'server.ts': `
@@ -4190,10 +4193,10 @@ export function listen() {}
         });
         try {
             const { index, reach } = reachableSet(dir);
-            assert.ok(isReach(reach, index.symbols, 'startServer'),
-                'startServer reachable (server.ts entry)');
-            assert.ok(isReach(reach, index.symbols, 'listen'),
-                'listen is transitively reachable');
+            assert.ok(!isReach(reach, index.symbols, 'startServer'),
+                'a server filename alone is not evidence that every exported helper runs');
+            assert.ok(!isReach(reach, index.symbols, 'listen'),
+                'callee remains unreachable when no executable root was identified');
         } finally { rm(dir); }
     });
 
@@ -7348,7 +7351,7 @@ describe('fix #241 (JS/TS): usages classification and band exhaustiveness', () =
         } finally { rm(dir); }
     });
 
-    it('renders non-definition definer-shaped records in the REFERENCES band', () => {
+    it('renders non-definition definer-shaped records in the OTHER DEFINITIONS band', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'a.js': 'function target() { return 1; }\nmodule.exports = { target };',
@@ -7365,10 +7368,10 @@ describe('fix #241 (JS/TS): usages classification and band exhaustiveness', () =
             const json = JSON.parse(output.formatUsagesJson(r.result, 'target'));
             const d = json.data;
             assert.strictEqual(
-                d.definitionCount + d.callCount + d.importCount + d.referenceCount,
+                d.definitionCount + d.otherDefinitionCount + d.callCount + d.importCount + d.referenceCount,
                 d.definitionCount + d.totalUsages,
                 'bands partition the record set');
-            const listed = d.calls.length + d.imports.length + d.references.length;
+            const listed = d.otherDefinitions.length + d.calls.length + d.imports.length + d.references.length;
             assert.strictEqual(listed, d.totalUsages, 'every counted record is listed in a band');
         } finally { rm(dir); }
     });

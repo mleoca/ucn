@@ -112,6 +112,12 @@ describe('command trust matrix: fail-closed proof coverage', () => {
         assert.match(pkg.scripts['trust:gate'], /trust:gate:deadcode/);
         assert.match(pkg.scripts['trust:gate'], /trust:gate:consistency/);
         assert.match(pkg.scripts['trust:gate'], /trust:gate:performance/);
+        assert.ok(pkg.scripts['trust:gate'].indexOf('trust:gate:performance')
+            < pkg.scripts['trust:gate'].indexOf('trust:gate:semantic'),
+        'performance must run before verbose compiler oracles can perturb wall-clock measurements');
+        assert.ok(pkg.scripts['trust:gate:fast'].indexOf('run-performance-gate.js')
+            < pkg.scripts['trust:gate:fast'].indexOf('run-oracle-eval.js'),
+        'fast performance gate must also run before oracle output');
         const publish = fs.readFileSync(path.join(ROOT, '.github/workflows/publish.yml'), 'utf8');
         const weekly = fs.readFileSync(path.join(ROOT, '.github/workflows/eval.yml'), 'utf8');
         assert.match(publish, /npm run trust:gate/);

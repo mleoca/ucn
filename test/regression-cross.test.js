@@ -1257,7 +1257,7 @@ describe('Regression: deadcode uses relative paths for isTestFile', () => {
             fs.writeFileSync(path.join(tmpDir, 'setup.py'), '');
             fs.writeFileSync(path.join(toolsDir, '__init__.py'), '');
             fs.writeFileSync(path.join(toolsDir, 'helper.py'), `
-def unused_helper():
+def _unused_helper():
     return 42
 
 def used_helper():
@@ -1276,9 +1276,10 @@ def main():
             const dead = index.deadcode();
             const deadNames = dead.map(d => d.name);
 
-            // unused_helper should be flagged as dead code
-            assert.ok(deadNames.includes('unused_helper'),
-                `unused_helper should be flagged as dead code, got: ${deadNames.join(', ')}`);
+            // Private package helper should be flagged as dead code. Public
+            // names are an implicit Python package API when __all__ is absent.
+            assert.ok(deadNames.includes('_unused_helper'),
+                `_unused_helper should be flagged as dead code, got: ${deadNames.join(', ')}`);
 
             // used_helper should NOT be flagged
             assert.ok(!deadNames.includes('used_helper'),
@@ -1895,13 +1896,16 @@ it('deadcode returns exclusion counts for decorated and exported', () => {
     try {
         fs.writeFileSync(path.join(tmpDir, 'pyproject.toml'), '[project]\nname = "test"');
         fs.writeFileSync(path.join(tmpDir, 'app.py'), `
-import something
+from flask import Flask
+from celery import Celery
+app = Flask(__name__)
+tasks = Celery(__name__)
 
-@something.route('/a')
+@app.route('/a')
 def route_a():
     return 1
 
-@something.task
+@tasks.task
 def task_b():
     return 2
 
@@ -1912,7 +1916,7 @@ def plain_unused():
         index.build('**/*.py', { quiet: true });
 
         const dc = index.deadcode();
-        // route_a and task_b have '.' decorators — excluded
+        // Known framework registration decorators are excluded.
         assert.strictEqual(dc.excludedDecorated, 2, 'Should exclude 2 decorated symbols');
         // plain_unused should be in results
         const names = dc.map(d => d.name);

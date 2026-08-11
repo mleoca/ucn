@@ -2497,6 +2497,78 @@ describe('fix: stacked attribute macros recover fully', () => {
     });
 });
 
+describe('C/C++ preprocessor configuration conservation', () => {
+    it('indexes and resolves AST-proven calls from both conditional branches', () => {
+        const dir = tmp({
+            'branches.c': [
+                'void target(void) {}',
+                '#ifdef MODE',
+                'void branch_a(void) { target(); }',
+                '#else',
+                'void branch_b(void) { target(); }',
+                '#endif',
+                'void use(int x) {',
+                '  if (x) {',
+                '#ifdef FEATURE',
+                '    if (x > 1) {',
+                '#endif',
+                '      target();',
+                '#ifdef FEATURE',
+                '    }',
+                '#endif',
+                '  }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.equal(index.find('branch_a', { skipCounts: true }).length, 1);
+            assert.equal(index.find('branch_b', { skipCounts: true }).length, 1);
+            const context = index.context('target');
+            assert.deepEqual(context.callers.map(call => call.line), [3, 5, 12]);
+            assert.deepEqual(context.unverifiedCallers, []);
+            assert.equal(context.meta.account.conserved, true);
+            assert.equal(context.meta.account.unaccounted, 0);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('retains recovery metadata after the source memo turns over', () => {
+        const adapter = getLanguageAdapter('c');
+        const parser = getParser('c');
+        const source = suffix => [
+            `/* ${suffix} */`,
+            'void target(void) {}',
+            '#ifdef MODE',
+            'void branch_a(void) { target(); }',
+            '#else',
+            'void branch_b(void) { target(); }',
+            '#endif',
+            'void use(int x) {',
+            '  if (x) {',
+            '#ifdef FEATURE',
+            '    if (x > 1) {',
+            '#endif',
+            '      target();',
+            '#ifdef FEATURE',
+            '    }',
+            '#endif',
+            '  }',
+            '}',
+        ].join('\n');
+        const first = source(0);
+        for (let i = 0; i < 12; i++) adapter.parse(source(i), parser);
+        assert.deepEqual(
+            adapter.findUsages(first, 'target', parser)
+                .filter(usage => usage.usageType === 'call')
+                .map(usage => usage.line)
+                .sort((a, b) => a - b),
+            [4, 6, 13],
+        );
+    });
+});
+
 describe('v5 C++ compile-time call identity', () => {
     it('recovers explicit call-operator template syntax from the AST', () => {
         const code = [

@@ -62,8 +62,10 @@ class ProjectIndex {
         this.buildTime = null;
         this.callsCache = new Map();     // filePath -> { mtime, hash, calls, content }
         this.callsCacheDirty = false;    // set by getCachedCalls when entries are added or mutated
+        this.computedDispatchDirty = false; // persisted project-wide AST blind-spot inventory
         this.failedFiles = new Set();    // files that failed to index (e.g. large minified bundles)
         this.unsupportedFiles = [];      // common source files skipped by the parser registry
+        this.discoveryIssues = [];       // explicit reasons the index may be partial
         this._opContentCache = null;     // per-operation file content cache (Map<filePath, string>)
         this._opUsagesCache = null;      // per-operation findUsagesInCode cache (Map<"file:name", usages[]>)
         this._opTreeCache = null;        // per-operation parsed-tree cache (Map<filePath, tree|null>, bounded FIFO)
@@ -256,7 +258,12 @@ class ProjectIndex {
             if (cached !== undefined) return cached;
         }
 
-        const lang = detectLanguage(filePath);
+        // Header language is resolved during indexing from compilation
+        // databases/include context. Re-detecting `.h` here can choose C for
+        // a C++ header and silently drop member/template usages from the raw
+        // inventory. The indexed language is the authoritative parse mode.
+        const lang = this.files.get(filePath)?.language ||
+            detectLanguage(filePath, this.root);
         const langModule = getLanguageAdapter(lang);
         if (!langModule || typeof langModule.findUsagesInCode !== 'function') return null;
 
@@ -275,7 +282,8 @@ class ProjectIndex {
             if (!parser) return null;
             // Language modules that accept a pre-parsed tree (4th param) reuse
             // the per-operation tree cache; others (html) parse internally.
-            const tree = langModule.findUsagesInCode.length >= 4
+            const tree = langModule.findUsagesInCode.length >= 4 &&
+                !langModule.managesOwnParseTree
                 ? this._getParsedTree(filePath, content, lang)
                 : null;
             const usages = langModule.findUsagesInCode(content, name, parser, tree);
@@ -297,7 +305,7 @@ class ProjectIndex {
             try {
                 return JSON.parse(fs.readFileSync(jsonPath, 'utf-8'));
             } catch (e) {
-                // Config load failed, use defaults
+                this.configError = `.ucn.json could not be parsed: ${e.message}`;
             }
         }
         return {};
@@ -327,6 +335,21 @@ class ProjectIndex {
         let files;
         const implicitProjectDiscovery = !Array.isArray(pattern) && !pattern;
         this.unsupportedFiles = [];
+        this.discoveryIssues = [];
+        const discoveryIssueKeys = new Set();
+        const recordDiscoveryIssue = (issue) => {
+            const rel = path.relative(this.root, issue.path || this.root) || '.';
+            const key = `${issue.reason}\0${rel}`;
+            if (discoveryIssueKeys.has(key)) return;
+            discoveryIssueKeys.add(key);
+            this.discoveryIssues.push({ ...issue, relativePath: rel, path: undefined });
+        };
+        if (this.configError) {
+            recordDiscoveryIssue({
+                path: path.join(this.root, '.ucn.json'),
+                kind: 'file', reason: 'invalid-config', detail: this.configError,
+            });
+        }
         if (Array.isArray(pattern)) {
             files = pattern;
         } else {
@@ -337,15 +360,21 @@ class ProjectIndex {
             const globOpts = {
                 root: this.root,
                 maxFiles: options.maxFiles || this.config.maxFiles || 50000,
+                maxDepth: options.maxDepth ?? this.config.maxDepth,
+                maxFileSize: options.maxFileSize ?? this.config.maxFileSize,
                 followSymlinks: options.followSymlinks
             };
 
             // Merge .gitignore and .ucn.json exclude into file discovery
             const gitignorePatterns = parseGitignore(this.root);
-            const configExclude = this.config.exclude || [];
+            const configExclude = Array.isArray(this.config.exclude)
+                ? this.config.exclude
+                : (this.config.exclude ? [String(this.config.exclude)] : []);
             if (gitignorePatterns.length > 0 || configExclude.length > 0) {
                 globOpts.ignores = [...DEFAULT_IGNORES, ...gitignorePatterns, ...configExclude];
             }
+            globOpts.disclosureIgnores = configExclude;
+            globOpts.onDiscoveryIssue = recordDiscoveryIssue;
 
             if (implicitProjectDiscovery) {
                 globOpts.onSkippedFile = (filePath) => {
@@ -359,12 +388,14 @@ class ProjectIndex {
             }
             files = expandGlob(pattern, globOpts);
             this.unsupportedFiles.sort((a, b) => compareNames(a.relativePath, b.relativePath));
+            this.discoveryIssues.sort((a, b) => compareNames(a.relativePath, b.relativePath));
         }
 
         // Track if files were truncated by maxFiles limit
         const maxFiles = options.maxFiles || this.config.maxFiles || 50000;
-        if (!Array.isArray(pattern) && files.length >= maxFiles) {
-            this.truncated = { indexed: files.length, maxFiles };
+        const maxFileIssues = this.discoveryIssues.filter(issue => issue.reason === 'max-files');
+        if (!Array.isArray(pattern) && maxFileIssues.length > 0) {
+            this.truncated = { indexed: files.length, maxFiles, skipped: maxFileIssues.length };
         } else {
             this.truncated = null;
         }
@@ -417,13 +448,32 @@ class ProjectIndex {
         const workersSetting = options.workers;
         const envWorkers = parseInt(process.env.UCN_WORKERS, 10);
         const disableParallel = workersSetting === 0 || envWorkers === 0;
+        const explicitWorkerCount = workersSetting > 0 || envWorkers > 0;
         let usedParallel = false;
 
-        if (!disableParallel && files.length > 150) {
+        // C/C++ recovery performs materially heavier parser work per file
+        // (attribute normalization plus bounded preprocessor views). Medium
+        // native projects therefore benefit from workers well before the
+        // generic 150-file crossover; measured release repos cross over at
+        // roughly 25 C-family files.
+        const cFamilyFileCount = files.reduce((count, filePath) => {
+            const language = detectLanguage(filePath, this.root);
+            return count + (language === 'c' || language === 'cpp' ? 1 : 0);
+        }, 0);
+        const parallelWorthwhile = files.length > 150 || cFamilyFileCount >= 25;
+        if (!disableParallel && parallelWorthwhile) {
             try {
                 const { parallelBuild } = require('./parallel-build');
                 const result = parallelBuild(this, files, {
                     workerCount: workersSetting > 0 ? workersSetting : (envWorkers > 0 ? envWorkers : undefined),
+                    // Native C/C++ parsing is memory-bandwidth and allocation
+                    // heavy. Real-repo measurements show four balanced
+                    // workers outperform 5-8 while keeping peak RSS safely
+                    // below the release ceiling. Explicit user settings keep
+                    // the ordinary eight-worker safety cap.
+                    maxWorkers: cFamilyFileCount >= 25 && !explicitWorkerCount
+                        ? 4 : 8,
+                    minFilesPerWorker: cFamilyFileCount >= 25 ? 10 : 100,
                     quiet,
                 });
                 if (result !== false) {
@@ -523,7 +573,7 @@ class ProjectIndex {
             this.removeFileSymbols(filePath);
         }
 
-        const language = detectLanguage(filePath);
+        const language = detectLanguage(filePath, this.root);
         if (!language) return;
 
         const adapter = getLanguageAdapter(language);
@@ -1034,9 +1084,11 @@ class ProjectIndex {
 
         // Filter by file if specified
         if (options.file) {
-            const filtered = definitions.filter(d =>
-                d.relativePath && d.relativePath.includes(options.file)
-            );
+            const resolvedFile = this.resolveFilePathForQuery(options.file);
+            const filtered = typeof resolvedFile === 'string'
+                ? definitions.filter(d => d.file === resolvedFile)
+                : definitions.filter(d =>
+                    d.relativePath && d.relativePath.includes(options.file));
             if (filtered.length > 0) {
                 definitions = filtered;
             }
@@ -1510,7 +1562,7 @@ class ProjectIndex {
      * @returns {boolean} true if ALL occurrences of name are inside strings
      */
     isInsideStringAST(content, lineNum, line, name, filePath) {
-        const language = detectLanguage(filePath);
+        const language = detectLanguage(filePath, this.root);
         if (!language) {
             return false; // Unsupported language - assume not inside string
         }
@@ -1631,6 +1683,18 @@ class ProjectIndex {
             parts.push(def.modifiers.join(' '));
         }
         parts.push(def.name);
+        const dataMember = def.type === 'field' || def.type === 'state' ||
+            def.memberType === 'field' || def.memberType === 'property';
+        if (dataMember) {
+            const declaredType = def.fieldType || def.returnType;
+            if (declaredType) {
+                parts.push(`: ${String(declaredType).replace(/\s+/g, ' ').trim()}`);
+            }
+            return parts.join(' ');
+        }
+        if (def.type === 'macro' && def.functionLike === false) {
+            return parts.join(' ');
+        }
         if (def.params !== undefined) {
             // Prefer typed rendering when paramTypes/paramsStructured carry annotations
             const { renderTypedParams } = require('./output/shared');
@@ -1655,7 +1719,7 @@ class ProjectIndex {
      * @returns {string} 'call', 'import', 'definition', or 'reference'
      */
     classifyUsageAST(content, lineNum, name, filePath) {
-        const language = detectLanguage(filePath);
+        const language = detectLanguage(filePath, this.root);
         if (!language) {
             return null; // Signal to use fallback
         }
@@ -1694,7 +1758,7 @@ class ProjectIndex {
      * @returns {boolean}
      */
     isCommentOrStringAtPosition(content, lineNum, column, filePath) {
-        const language = detectLanguage(filePath);
+        const language = detectLanguage(filePath, this.root);
         if (!language) {
             return false; // Can't determine, assume code
         }

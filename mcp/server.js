@@ -41,6 +41,7 @@ const {
     generateMcpParamSection,
     resolveCommand,
     suggestCommand,
+    v4MigrationHint,
     formatSurfaceMessage,
 } = require('../core/registry');
 const { execute } = require('../core/execute');
@@ -54,6 +55,9 @@ const indexCache = new Map(); // projectDir → { index, checkedAt }
 const MAX_CACHE_SIZE = 10;
 
 function getIndex(projectDir, options) {
+    if (typeof projectDir !== 'string' || projectDir.trim().length === 0) {
+        throw new Error('project_dir is required and must be a non-empty path.');
+    }
     const maxFiles = options && options.maxFiles;
     const followSymlinks = options && options.followSymlinks;
     const absDir = path.resolve(projectDir);
@@ -121,12 +125,13 @@ const server = new McpServer({
 // TOOL HELPERS
 // ============================================================================
 
-function toolResult(text, command, maxChars, suffixNote) {
+function toolResult(text, command, maxChars, suffixNote, params = {}) {
     const suffix = suffixNote || '';
     const budget = applyOutputBudget(text, {
         command,
         maxChars,
         surface: 'mcp',
+        params,
     });
     const response = { content: [{ type: 'text', text: budget.text + suffix }] };
     if (budget.truncated) {
@@ -262,11 +267,13 @@ server.registerTool(
     {
         description: TOOL_DESCRIPTION,
         inputSchema: z.object(Object.assign(INPUT_SHAPE, {
-            // Keep command discovery machine-readable. Retired names are not
-            // accepted: one strict v5 enum is easier for agents and clients
-            // to validate than a compatibility layer hidden in prose.
-            command: z.enum(getMcpCommandEnum()).describe('UCN task command.'),
-            project_dir: z.string().describe('Absolute or relative path to the project root directory'),
+            // Runtime validation stays string-based so retired v4 names reach
+            // directive migration guidance. Zod metadata publishes the strict
+            // v5 enum to MCP clients without making retired names aliases.
+            command: z.string()
+                .meta({ enum: getMcpCommandEnum() })
+                .describe(`UCN task command. One of: ${getMcpCommandEnum().join(', ')}.`),
+            project_dir: z.string().trim().min(1, 'project_dir is required and must be a non-empty path.').describe('Non-empty absolute path, or a path relative to the MCP server process working directory, identifying the project to analyze.'),
             name: z.string().optional().describe('Symbol name or stable path:line:name handle. Used by show/find/usages/source/trace/impact/tests/check/plan.'),
             file: z.string().optional().describe('File target for source/deps/api or a symbol-disambiguation filter.'),
             sections: z.string().optional().describe('Comma-separated projection. show: summary,callers,callees,source,dependencies,tests,types,example,related. repo: summary,files,stats,health.'),
@@ -276,7 +283,7 @@ server.registerTool(
             include_methods: z.boolean().optional().describe('Include method callees where receiver evidence permits. Caller-bearing views always tier method sites.'),
             expand_unverified: z.boolean().optional().describe('trace callers: follow unverified edges; downstream nodes remain marked possible, never confirmed.'),
             min_confidence: z.number().min(0).max(1).optional().describe('Minimum ordinal evidence weight (legacy name; not a probability) for caller/callee edges'),
-            show_confidence: z.boolean().optional().describe('Show resolution-evidence labels. Numeric weights are ordinal, not probabilities.'),
+            show_confidence: z.boolean().optional().describe('show: resolution-evidence labels default to visible; set false to hide them. Numeric weights are ordinal, not probabilities.'),
             unreachable_only: z.boolean().optional().describe('show/impact: retain only relationships unreachable from detected entry points.'),
             with_types: z.boolean().optional().describe('show: include related type definitions.'),
             with_source: z.boolean().optional().describe('Attach exact source to find results.'),
@@ -309,7 +316,7 @@ server.registerTool(
             base: z.string().optional().describe('Git ref to diff against (default: HEAD). E.g. "HEAD~3", "main", a commit SHA'),
             staged: z.boolean().optional().describe('impact/check without a symbol: analyze staged changes.'),
             deep: z.boolean().optional().describe('repo: include health and sample the ordinal resolution-evidence profile, not accuracy.'),
-            compact: z.boolean().optional().describe('Token-efficient show/impact/usages output.'),
+            compact: z.boolean().optional().describe('Compact output defaults to true for show/impact and false for usages; set the opposite value to change that command\'s presentation.'),
             case_sensitive: z.boolean().optional().describe('Case-sensitive search (default: false, case-insensitive)'),
             all: z.boolean().optional().describe('Lift formatter and result caps where supported.'),
             top_level: z.boolean().optional().describe('repo files: show only top-level functions.'),
@@ -319,7 +326,7 @@ server.registerTool(
             max_files: z.number().int().positive().max(10000000).optional().describe('Max files to index (default: 10000). Use for very large codebases. Must be a positive integer.'),
             max_chars: z.number().int().positive().max(100000).optional().describe('Max output chars before truncation. Targeted commands default to 10K; broad commands default to 3K. Maximum: 100K. all=true lifts formatter caps but keeps the 100K transport ceiling.'),
             // Structural search flags (search command)
-            type: z.string().optional().describe('Symbol type filter for structural search: function, class, call, method, type. Triggers index-based search.'),
+            type: z.string().optional().describe('Symbol type filter for structural search: function, class, call, method, type, state, field, constant, macro. Triggers index-based search.'),
             param: z.string().optional().describe('Filter by parameter name or type (structural search). E.g. "Request", "ctx".'),
             receiver: z.string().optional().describe('Filter calls by receiver (structural search, type=call). E.g. "db", "http".'),
             returns: z.string().optional().describe('Filter by return type (structural search). E.g. "Promise", "error".'),
@@ -345,6 +352,8 @@ server.registerTool(
         // Defensive validation for direct/internal handler calls. MCP clients
         // normally fail at the strict command enum before reaching this path.
         if (!resolveCommand(command, 'mcp')) {
+            const migration = v4MigrationHint(command, 'mcp');
+            if (migration) return toolError(`Unknown command: ${command}. ${migration}`);
             const suggestion = suggestCommand(command, 'mcp');
             return toolError(`Unknown command: ${command}.` +
                 (suggestion ? ` Did you mean "${suggestion}"?` : '') +
@@ -367,6 +376,28 @@ server.registerTool(
         const strippedParams = [];
         const canonicalCommand = resolveCommand(command, 'mcp') || command;
         const applicable = FLAG_APPLICABILITY[canonicalCommand];
+        let projectScopeNote = null;
+        // Match the CLI's directory-target convenience. The index still lives
+        // at the repository root for cross-file resolution, while commands
+        // supporting `in` receive the requested subdirectory as an implicit
+        // result scope. Commands without such a scope disclose the widening.
+        try {
+            const requestedDir = path.resolve(project_dir);
+            if (fs.existsSync(requestedDir) && fs.statSync(requestedDir).isDirectory()) {
+                const projectRoot = findProjectRoot(requestedDir);
+                if (requestedDir !== projectRoot && requestedDir.startsWith(projectRoot + path.sep)) {
+                    const relativeScope = path.relative(projectRoot, requestedDir);
+                    if (applicable?.includes('in')) {
+                        if (!ep.in) ep.in = relativeScope;
+                        projectScopeNote = `project_dir resolved to repository root; results scoped with in=${ep.in}.`;
+                    } else {
+                        projectScopeNote = `project_dir resolved to repository root ${projectRoot}; '${command}' has no in parameter, so results cover the repository root.`;
+                    }
+                }
+            }
+        } catch (_) {
+            // getIndex below owns the authoritative path error.
+        }
         if (applicable) {
             // Truly global options — apply to all commands (build/display control).
             // Command-specific params (name, term, stack, range, etc.) are in FLAG_APPLICABILITY.
@@ -382,20 +413,26 @@ server.registerTool(
         }
 
         // all=true lifts formatter caps and raises MCP output to its hard ceiling.
-        const maxChars = ep.all ? MAX_OUTPUT_CHARS : ep.maxChars;
+        // `all` lifts formatter caps; an explicit transport budget remains a
+        // hard caller-controlled ceiling.
+        const maxChars = ep.maxChars ?? (ep.all ? MAX_OUTPUT_CHARS : undefined);
 
         // Build stripping note (appended inside truncation boundary on success paths)
         const noteParts = [];
         if (strippedParams.length > 0) {
             noteParts.push(`${strippedParams.join(', ')} ignored (not applicable to ${command}).`);
         }
+        if (ep.includeMethods && ['impact', 'trace', 'tests', 'check'].includes(canonicalCommand)) {
+            noteParts.push(`include_methods=true has no effect on '${command}' — method calls are always tiered by receiver evidence.`);
+        }
+        if (projectScopeNote) noteParts.push(projectScopeNote);
         noteParts.push(...unknownParamNotes);
         const strippedNote = noteParts.length > 0
             ? '\n\n' + noteParts.map(part => `Note: ${part}`).join('\n')
             : '';
 
         // Wrap toolResult to auto-inject command + maxChars + stripping note
-        const tr = (text) => toolResult(text, command, maxChars, strippedNote);
+        const tr = (text) => toolResult(text, command, maxChars, strippedNote, ep);
         // Wrap toolError to include stripping note on error paths too
         const te = strippedNote
             ? (msg) => toolError(msg + strippedNote)
@@ -467,7 +504,7 @@ server.registerTool(
             // so we save here to avoid re-parsing all files on every MCP session.
             // MED-1: also persist when reachability was computed in-process so
             // long-lived MCP servers carry the BFS result forward to disk.
-            if (index && (index.callsCacheDirty || index.reachabilityDirty)) {
+            if (index && (index.callsCacheDirty || index.reachabilityDirty || index.computedDispatchDirty)) {
                 try { index.saveCache(); } catch (_) { /* best-effort */ }
                 index.callsCacheDirty = false;
             }

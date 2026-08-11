@@ -36,7 +36,7 @@ function processFile(filePath) {
         return { filePath, skipped: true, mtimeUpdate: stat.mtimeMs, sizeUpdate: stat.size };
     }
 
-    const language = detectLanguage(filePath);
+    const language = detectLanguage(filePath, rootDir);
     if (!language) return { filePath, skipped: true };
 
     // One adapter analysis produces the complete, validated file IR consumed

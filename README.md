@@ -67,7 +67,7 @@ reported as a clean zero-file project.
 
 The command registry contains machine-checked contracts for every public command: its primary question, explicit modes, truth boundary, output shape, safety class, examples, proof coverage, and next useful command. Every parser feeds the same versioned, data-only language IR through one adapter and one index-ingestion path; sequential and worker builds therefore preserve the same symbols, calls, imports, and evidence fields.
 
-C support includes functions, structs, macros, includes, calls, entry points, and public/API analysis. C++ adds classes, methods, constructors, inheritance, namespaces, and typed field receivers. C# adds namespaces, classes/interfaces/records, fields/properties, attributes, overload-aware calls, async flow, top-level programs, .NET stack frames, and ASP.NET/HttpClient endpoint analysis. When available, `compile_commands.json` supplies C/C++ header-language and include-path context.
+C support includes functions, structs, macros, includes, calls, entry points, and public/API analysis. C++ adds classes, methods, constructors, inheritance, namespaces, and typed field receivers. C/C++ recovery retains AST-proven definitions, calls, and usages from mutually exclusive preprocessor branches instead of silently selecting one source inventory; it still does not claim which branch a particular build activates. C# adds namespaces, classes/interfaces/records, fields/properties, attributes, overload-aware calls, async flow, top-level programs, .NET stack frames, and ASP.NET/HttpClient endpoint analysis. When available, `compile_commands.json` supplies C/C++ header-language and include-path context.
 
 ### Composable commands
 
@@ -293,6 +293,8 @@ The suite covers parsers, the shared IR/adapter boundary, index/cache equivalenc
 
 Release gates compare semantic answers with ts-morph, Pyright, gopls, rust-analyzer, JDT LS, clangd, and Roslyn on pinned real repositories, limit unverified review burden, audit dead-code claims, and enforce cold/warm latency and peak-memory policies. A deterministic, stratified stable-handle board also requires overlapping `find`, `show`, `source`, `impact`, `tests`, `check`, and caller `trace` claims to agree exactly: target identity, source and direct-test projections, confirmed and unverified caller-site multisets, evidence reasons, totals, and caller accounting. Any disagreement fails with a minimal handle-and-field witness. The semantic board publishes both the human-readable report and its raw JSON source, including true edges left unverified, actionable candidate-set p50/p95/max, zero-actionable-ambiguity target rate, effective review items, raw false-candidate amplification, and reason families. Actionable false candidates count individually; a named runtime-dispatch family counts as one agent-facing review item while every raw site remains auditable.
 
+The publish-blocking policy requires 100% in-scope semantic recall and public-command recall, at least 98% confirmed-tier precision, a conserved account for every sample, zero cross-command disagreements, and bounded ambiguity (at most 10% exact true edges left unverified, p95 at most five actionable candidates, and at most 0.10 effective review items per oracle edge). The portable performance board uses three independent process-isolated runs per repository: cold throughput is gated on the median while the worst observed peak memory must pass. It requires at least 10K indexed LOC/s on repositories of 5K+ LOC, query p50 at most 75 ms, query p95 at most 250 ms, and peak RSS at most 1.5 GiB. These are release floors, not claims that every repository or dynamic runtime behavior is covered.
+
 The ten-repository publish-blocking board is preact-signals, httpx, cobra, viper, ripgrep, clap, javapoet, newtonsoft-json, cjson, and fmt. The wider scheduled semantic matrix contains 22 pinned repositories: zod, preact-signals, express, httpx, rich, cobra, grpc-go, ripgrep, cursive, gson, clap, hono, zustand, viper, chi, javapoet, jsoup, click, fastify, newtonsoft-json, cjson, and fmt.
 
 The public-surface agent harness replays task plans through CLI JSON, CLI text,
@@ -322,7 +324,7 @@ Published evidence lives under [`eval/reports`](eval/reports), with pinned sourc
 - Reflection and generated/runtime-registered edges can be invisible.
 - Interface, trait, and untyped-receiver dispatch may remain unverified rather than being guessed.
 - HTML support covers inline JavaScript and event handlers; it has no independent compiler/LSP real-repository oracle.
-- C/C++ analysis does not run the preprocessor or compiler; build-specific macros, advanced templates, generated headers, and conditional compilation can remain unresolved. `compile_commands.json` improves header/include ownership when present.
+- C/C++ analysis does not run the preprocessor or compiler. It inventories AST-proven facts across recoverable conditional branches, but build-specific activation, advanced templates, generated headers, and macro expansion can remain unresolved. `compile_commands.json` improves header/include ownership when present.
 - C# analysis does not run Roslyn; source generators, dynamic/reflection dispatch, and external assembly semantics remain outside the static index.
 - Large repositories can take a few seconds on the first query; later queries use the incremental cache.
 

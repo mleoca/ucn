@@ -195,6 +195,11 @@ function trace(index, name, options = {}) {
             children: []
         };
 
+        // A depth frontier is a node label, not a partially analyzed node.
+        // Do not expose only its unverified callee band while suppressing its
+        // confirmed children; both evidence tiers expand at the same depth.
+        if (currentDepth >= maxDepth) return node;
+
         if (dir === 'down' || dir === 'both') {
             let callees = calleeCache.get(key);
             if (!callees) {
@@ -347,15 +352,18 @@ function blast(index, name, options = {}) {
         let maxDepthReached = 0;
         let rootRaw = null;
         let rootFiltered = 0;
+        let rootSelfRecursive = false;
         const treeAccount = {
             nodesExpanded: 0,
             confirmedEdges: 0,
+            recursiveEdges: 0,
             unverifiedEdges: 0,
             unverifiedByReason: {},
             excludedTotal: 0,
             excludedByReason: {},
             filteredEdges: 0,
             depthLimitNodes: 0,
+            truncatedChildren: 0,
         };
 
         const buildCallerTree = (funcDef, currentDepth, chainUnverified) => {
@@ -407,6 +415,15 @@ function blast(index, name, options = {}) {
                     treeAccount.filteredEdges += before - callers.length;
                     if (currentDepth === 0) rootFiltered += before - callers.length;
                 }
+                const recursiveCallers = callers.filter(c =>
+                    c.callerFile === funcDef.file &&
+                    c.callerStartLine === funcDef.startLine);
+                if (recursiveCallers.length > 0) {
+                    callers = callers.filter(c => !recursiveCallers.includes(c));
+                    node.selfRecursive = true;
+                    treeAccount.recursiveEdges += recursiveCallers.length;
+                    if (currentDepth === 0) rootSelfRecursive = true;
+                }
                 treeAccount.confirmedEdges += callers.length;
                 if (collect && !chainUnverified) {
                     for (const c of callers) collect.onConfirmed?.(funcDef, c);
@@ -445,6 +462,7 @@ function blast(index, name, options = {}) {
 
                 if (callerEntries.length > maxChildren) {
                     node.truncatedChildren = callerEntries.length - maxChildren;
+                    treeAccount.truncatedChildren += node.truncatedChildren;
                     // Count truncated callers in summary
                     for (const { def: cDef } of callerEntries.slice(maxChildren)) {
                         const tKey = `${cDef.file}:${cDef.startLine}`;
@@ -536,6 +554,7 @@ function blast(index, name, options = {}) {
                 maxDepthReached,
                 unverifiedEdges: treeAccount.unverifiedEdges,
                 ...(expandUnverified && { possiblyAffected: possiblyAffectedSet.size }),
+                ...(rootSelfRecursive && { selfRecursive: true }),
             },
             warnings: warnings.length > 0 ? warnings : undefined
         };
@@ -581,6 +600,7 @@ function reverseTrace(index, name, options = {}) {
         const treeAccount = {
             nodesExpanded: 0,
             confirmedEdges: 0,
+            recursiveEdges: 0,
             unverifiedEdges: 0,
             unverifiedByReason: {},
             excludedTotal: 0,
@@ -600,7 +620,14 @@ function reverseTrace(index, name, options = {}) {
                 unv = unv.filter(c => index.matchesFilters(c.relativePath, { exclude }));
                 if (isExpansion) treeAccount.filteredEdges += before - conf.length - unv.length;
             }
-            return { confirmed: conf, unverified: unv, raw };
+            const recursive = conf.filter(c =>
+                c.callerFile === funcDef.file &&
+                c.callerStartLine === funcDef.startLine);
+            if (recursive.length > 0) {
+                conf = conf.filter(c => !recursive.includes(c));
+                if (isExpansion) treeAccount.recursiveEdges += recursive.length;
+            }
+            return { confirmed: conf, unverified: unv, recursive, raw };
         };
 
         const buildCallerTree = (funcDef, currentDepth, chainUnverified) => {
@@ -629,7 +656,8 @@ function reverseTrace(index, name, options = {}) {
             };
 
             if (currentDepth < maxDepth) {
-                const { confirmed, unverified, raw } = nodeCallers(funcDef, true);
+                const { confirmed, unverified, recursive, raw } = nodeCallers(funcDef, true);
+                if (recursive.length > 0) node.selfRecursive = true;
                 treeAccount.nodesExpanded++;
                 _aggregateExcluded(treeAccount, raw);
                 if (currentDepth === 0) {
@@ -666,7 +694,8 @@ function reverseTrace(index, name, options = {}) {
                         const cKey = `${cDef.file}:${cDef.startLine}`;
                         if (!visited.has(cKey)) {
                             const tiers = nodeCallers(cDef, false);
-                            if (tiers.confirmed.length === 0 && tiers.unverified.length === 0) {
+                            if (tiers.confirmed.length === 0 && tiers.unverified.length === 0 &&
+                                tiers.recursive.length === 0) {
                                 entryPoints.push({ name: cDef.name, file: cDef.relativePath || path.relative(index.root, cDef.file), line: cDef.startLine });
                             }
                         }
@@ -688,9 +717,11 @@ function reverseTrace(index, name, options = {}) {
                 // Entry point only when BOTH tiers are empty; unverified-only
                 // nodes are visibly not-confirmed instead.
                 if (callerEntries.length === 0 && currentDepth > 0) {
-                    if (unverified.length === 0) {
+                    if (unverified.length === 0 && recursive.length === 0) {
                         node.entryPoint = true;
                         entryPoints.push({ name: funcDef.name, file: funcDef.relativePath, line: funcDef.startLine });
+                    } else if (recursive.length > 0) {
+                        node.selfRecursive = true;
                     } else {
                         node.unverifiedCallerCount = unverified.length;
                     }
@@ -700,9 +731,11 @@ function reverseTrace(index, name, options = {}) {
                 treeAccount.depthLimitNodes++;
                 const tiers = nodeCallers(funcDef, false);
                 if (tiers.confirmed.filter(c => c.callerName).length === 0) {
-                    if (tiers.unverified.length === 0) {
+                    if (tiers.unverified.length === 0 && tiers.recursive.length === 0) {
                         node.entryPoint = true;
                         entryPoints.push({ name: funcDef.name, file: funcDef.relativePath, line: funcDef.startLine });
+                    } else if (tiers.recursive.length > 0) {
+                        node.selfRecursive = true;
                     } else {
                         node.unverifiedCallerCount = tiers.unverified.length;
                     }
@@ -716,7 +749,7 @@ function reverseTrace(index, name, options = {}) {
 
         // Also mark root as entry point if it has no callers in either tier
         if (tree && tree.children.length === 0 && maxDepth > 0) {
-            if (rootUnverifiedCount === 0) {
+            if (rootUnverifiedCount === 0 && !tree.selfRecursive) {
                 tree.entryPoint = true;
                 entryPoints.push({ name: def.name, file: def.relativePath, line: def.startLine });
             } else {
@@ -771,6 +804,7 @@ function reverseTrace(index, name, options = {}) {
                 totalFunctions: visited.size - 1, // exclude root
                 maxDepthReached,
                 unverifiedEdges: treeAccount.unverifiedEdges,
+                ...(tree?.selfRecursive && { selfRecursive: true }),
             },
             warnings: warnings.length > 0 ? warnings : undefined
         };

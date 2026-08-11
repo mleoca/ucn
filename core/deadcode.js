@@ -6,7 +6,9 @@
  */
 
 const { detectLanguage, getParser, getLanguageAdapter, safeParse, langTraits } = require('../languages');
-const { dirname: pathDirname } = require('path');
+const fs = require('fs');
+const path = require('path');
+const { dirname: pathDirname } = path;
 const { isTestFile } = require('./discovery');
 const { isFrameworkEntrypoint } = require('./entrypoints');
 const { splitParentList } = require('./graph-build');
@@ -47,11 +49,17 @@ const _UNIVERSAL_ROOTS = new Set(['object', 'Object']);
 const _PY_NON_DISPATCHING_BASES = new Set(['Generic']);
 
 /** True when a base name resolves to NO in-project class/struct/interface/trait/record (an out-of-tree type). */
-function _baseIsExternal(index, bare, lang) {
+function _baseIsExternal(index, bare, lang, fromDef) {
     if (!bare || _UNIVERSAL_ROOTS.has(bare)) return false;
     if (lang === 'python' && _PY_NON_DISPATCHING_BASES.has(bare)) return false;
     const defs = index.symbols.get(bare);
-    return !(defs && defs.some(d => _CLASS_KINDS.includes(d.type)));
+    return !(defs && defs.some(d => _CLASS_KINDS.includes(d.type) &&
+        // `class EnvironBuilder(werkzeug.test.EnvironBuilder)` must not
+        // resolve its qualified OUT-OF-TREE base back to itself merely
+        // because both have the same bare name. A definition cannot be its
+        // own base; only a distinct project definition is resolution evidence.
+        !(fromDef && d.file === fromDef.file && d.startLine === fromDef.startLine &&
+            d.endLine === fromDef.endLine && d.type === fromDef.type)));
 }
 
 // Bounded heritage-closure depth (fix #270) — matches the engine's other
@@ -100,7 +108,7 @@ function _heritageReachesExternalBase(index, classDef, lang, followImplements) {
                 const bare = _bareBaseName(raw);
                 if (!bare || seen.has(bare)) continue;
                 seen.add(bare);
-                if (_baseIsExternal(index, bare, lang)) return true;
+                if (_baseIsExternal(index, bare, lang, def)) return true;
                 for (const pd of index.symbols.get(bare) || []) {
                     if (_CLASS_KINDS.includes(pd.type)) next.push(pd);
                 }
@@ -174,6 +182,29 @@ function overridesOutOfTreeBase(index, symbol) {
     return false;
 }
 
+// Go satisfies interfaces implicitly, so no `implements` edge exists for
+// compiler/stdlib callbacks. A zero textual usage for one of these exact
+// method shapes is not evidence of deadness (sort.Interface, http.Handler,
+// io.Reader, encoding marshalers, database/sql contracts, errors helpers).
+const GO_PROTOCOL_METHODS = new Map([
+    ['Len', 0], ['Less', 2], ['Swap', 2], ['ServeHTTP', 2],
+    ['Error', 0], ['String', 0], ['Read', 1], ['Write', 1], ['Close', 0],
+    ['Seek', 2], ['ReadAt', 2], ['WriteAt', 2], ['ReadByte', 0],
+    ['WriteByte', 1], ['ReadRune', 0], ['UnreadByte', 0], ['UnreadRune', 0],
+    ['MarshalJSON', 0], ['UnmarshalJSON', 1], ['MarshalText', 0],
+    ['UnmarshalText', 1], ['MarshalBinary', 0], ['UnmarshalBinary', 1],
+    ['Scan', 1], ['Value', 0], ['LogValue', 0], ['Unwrap', 0],
+    ['Is', 1], ['As', 1],
+]);
+
+function goImplicitExternalContract(symbol) {
+    if (!symbol.className || !GO_PROTOCOL_METHODS.has(symbol.name)) return false;
+    const arity = Array.isArray(symbol.paramsStructured)
+        ? symbol.paramsStructured.length
+        : null;
+    return arity == null || arity === GO_PROTOCOL_METHODS.get(symbol.name);
+}
+
 // Symbol types whose definition NAME line provably cannot reference a
 // same-name VALUE — used to stop same-name defs keeping each other alive
 // (fix #243). 'state' and 'field' stay OUT: `helper = other.helper` and
@@ -214,12 +245,113 @@ function nameOnlySelfRecursive(index, name) {
         for (const call of calls) {
             if (call.name !== name && call.resolvedName !== name &&
                 !(call.resolvedNames && call.resolvedNames.includes(name))) continue;
-            const inside = defs.some(d => d.file === f &&
+            const containing = defs.filter(d => d.file === f &&
                 call.line >= d.startLine && call.line <= d.endLine);
-            if (!inside) return false;
+            if (containing.length !== 1) return false;
+            const def = containing[0];
+            const enc = call.enclosingFunction;
+
+            // A class constructed only inside its own otherwise-unreachable
+            // impl/class body is not made externally live by that cycle.
+            if ((def.type === 'impl' || _CLASS_KINDS.includes(def.type) ||
+                CLASS_AUDIT_KINDS.includes(def.type)) && call.isConstructor) {
+                continue;
+            }
+            if (!enc || enc.name !== def.name ||
+                (enc.startLine != null && enc.startLine !== def.startLine)) return false;
+
+            // Name equality and lexical containment are not dispatch
+            // identity. `new Inner().emit()` inside Outer.emit(),
+            // `super().m()`, and `self.storage.clear()` all used to be called
+            // "self recursion". Only receiver-less standalone functions and
+            // explicit self/this receivers pinned to the same class qualify.
+            if (def.className) {
+                const language = index.files.get(f)?.language;
+                const nominalUnqualified = !call.isMethod && !call.receiver &&
+                    langTraits(language)?.typeSystem === 'nominal';
+                if (!nominalUnqualified &&
+                    !['self', 'this', 'cls', 'Self'].includes(call.receiver)) return false;
+                if (enc.className && enc.className !== def.className) return false;
+            } else if (call.isMethod || call.receiver || call.receiverType ||
+                call.receiverCall || call.receiverRoot) {
+                return false;
+            }
         }
     }
     return true;
+}
+
+/**
+ * Scan source that was discovered but could not be semantically indexed.
+ * Dead-code is a deletion-oriented command, so a readable skipped file that
+ * mentions a candidate suppresses that candidate; an unreadable or
+ * directory-sized gap withdraws all claims because no name-specific proof is
+ * possible. The returned object is deliberately serializable and becomes
+ * part of both text and JSON output.
+ */
+function scanDeadcodeCoverage(index, names) {
+    const matchedNames = new Set();
+    const files = new Set();
+    const unreadableFiles = new Set();
+    const reasons = {};
+    let unknownCoverage = false;
+    let parseRecoveries = 0;
+
+    const recordReason = (reason) => {
+        const key = reason || 'unknown';
+        reasons[key] = (reasons[key] || 0) + 1;
+    };
+    const scanContent = (content) => {
+        const identifiers = new Set(String(content).match(/\b[a-zA-Z_]\w*\b/g) || []);
+        for (const name of names) {
+            if (/^[a-zA-Z_]\w*$/.test(name)
+                ? identifiers.has(name)
+                : String(content).includes(name)) matchedNames.add(name);
+        }
+    };
+    const scanFile = (absPath, rel, reason) => {
+        files.add(rel);
+        recordReason(reason);
+        try {
+            const stat = fs.statSync(absPath);
+            if (!stat.isFile()) {
+                unknownCoverage = true;
+                return;
+            }
+            scanContent(index._readFile(absPath));
+        } catch (_) {
+            unreadableFiles.add(rel);
+            unknownCoverage = true;
+        }
+    };
+
+    for (const failedPath of index.failedFiles || []) {
+        if (index.files.has(failedPath)) continue;
+        scanFile(failedPath, path.relative(index.root, failedPath), 'parse-failure');
+    }
+    for (const skipped of index.unsupportedFiles || []) {
+        const rel = skipped.relativePath;
+        scanFile(path.join(index.root, rel), rel, 'unsupported-language');
+    }
+    for (const issue of index.discoveryIssues || []) {
+        const rel = issue.relativePath || '.';
+        scanFile(path.join(index.root, rel), rel, issue.reason || 'discovery-gap');
+    }
+    for (const [, fileEntry] of index.files) {
+        if (fileEntry.parseRecovery || fileEntry.parseError) parseRecoveries++;
+    }
+    if (parseRecoveries > 0) reasons['parse-recovery'] = parseRecoveries;
+
+    return {
+        complete: files.size === 0 && parseRecoveries === 0,
+        claimsWithdrawn: unknownCoverage,
+        suppressedMatched: matchedNames.size,
+        files: [...files].sort(codeUnitCompare),
+        unreadableFiles: [...unreadableFiles].sort(codeUnitCompare),
+        reasons,
+        parseRecoveries,
+        matchedNames,
+    };
 }
 
 /** Check if a position in a line is inside a string literal (quotes/backticks).
@@ -445,6 +577,21 @@ function symbolIsExported(index, symbol, fileEntry) {
         return true;
     }
     const traits = langTraits(fileEntry.language);
+    // Python's language-level public surface is every top-level non-underscore
+    // name when __all__ is absent. Apply the same rule here as `api`: deadcode
+    // is deletion-oriented and cannot see downstream package consumers.
+    // When __all__ exists it remains the authoritative allow-list.
+    const hasPythonAll = fileEntry.language === 'python' &&
+        (fileEntry.exportDetails || []).some(exp => exp.type === '__all__');
+    if (fileEntry.language === 'python' && isPythonPackageFile(index, fileEntry) && !hasPythonAll &&
+        name && !name.startsWith('_')) {
+        if (!symbol.className && !symbol.isMethod) return true;
+        if (symbol.className && !mods.includes('private')) {
+            const cls = (index.symbols.get(symbol.className) || []).find(candidate =>
+                candidate.file === symbol.file && candidate.type === 'class');
+            if (cls && !cls.name.startsWith('_')) return true;
+        }
+    }
     if (traits?.exportVisibility === 'capitalization') {
         return /^[A-Z]/.test(name);
     }
@@ -464,6 +611,53 @@ function symbolIsExported(index, symbol, fileEntry) {
     return false;
 }
 
+function isPythonPackageFile(index, fileEntry) {
+    if (fileEntry?.language !== 'python' || !fileEntry.relativePath) return false;
+    let dir = path.dirname(path.join(index.root, fileEntry.relativePath));
+    while (dir === index.root || dir.startsWith(`${index.root}${path.sep}`)) {
+        if (fs.existsSync(path.join(dir, '__init__.py'))) return true;
+        if (dir === index.root) break;
+        const parent = path.dirname(dir);
+        if (parent === dir) break;
+        dir = parent;
+    }
+    return false;
+}
+
+const JAVA_SERIALIZATION_CALLBACKS = new Set([
+    'readResolve', 'writeReplace', 'readObject', 'writeObject',
+    'readObjectNoData',
+]);
+
+/**
+ * Java serialization invokes these callbacks reflectively, so there is no
+ * text call edge. Require a Serializable/Externalizable heritage path before
+ * suppressing a dead-code claim; name alone is not enough.
+ */
+function isJavaSerializationCallback(index, symbol, fileEntry) {
+    if (fileEntry?.language !== 'java' || !symbol.className ||
+        !JAVA_SERIALIZATION_CALLBACKS.has(symbol.name)) return false;
+    const head = value => String(value || '')
+        .replace(/<.*$/, '').split(/[.$]/).pop().trim();
+    const seen = new Set();
+    const serializable = className => {
+        const normalized = head(className);
+        if (!normalized || seen.has(normalized)) return false;
+        if (normalized === 'Serializable' || normalized === 'Externalizable') return true;
+        seen.add(normalized);
+        const defs = (index.symbols.get(normalized) || []).filter(candidate =>
+            ['class', 'interface', 'record', 'enum'].includes(candidate.type));
+        return defs.some(definition => {
+            const implemented = Array.isArray(definition.implements)
+                ? definition.implements : String(definition.implements || '').split(',');
+            const parents = [definition.extends, ...implemented]
+                .filter(Boolean).map(head);
+            return parents.some(serializable);
+        });
+    };
+    return serializable(symbol.className);
+}
+
 /**
  * Find dead code (unused functions/classes)
  * @param {object} index - ProjectIndex instance
@@ -477,13 +671,18 @@ function deadcode(index, options = {}) {
     let excludedDecorated = 0;
     let excludedExported = 0;
     let excludedExternalContract = 0;
+    let excludedRuntimeContract = 0;
     let excludedDynamicDispatch = 0;
     const computedDispatchByFile = projectComputedDispatch(index);
+    const computedDispatchReceivers = new Set();
     const computedDispatchInfo = { count: 0, fileCount: 0, files: [] };
     for (const [dispatchFile, sites] of computedDispatchByFile) {
         const fe = index.files.get(dispatchFile);
         if (!fe || !index.matchesFilters(fe.relativePath, options)) continue;
         computedDispatchInfo.count += sites.length;
+        for (const site of sites) {
+            if (site.receiver) computedDispatchReceivers.add(site.receiver);
+        }
         computedDispatchInfo.fileCount++;
         if (computedDispatchInfo.files.length < 10) {
             computedDispatchInfo.files.push(fe.relativePath);
@@ -559,6 +758,16 @@ function deadcode(index, options = {}) {
             }
         }
         potentiallyDeadNames = filteredNames;
+    }
+
+    const coverage = scanDeadcodeCoverage(index, potentiallyDeadNames);
+    const coverageSuppressedNames = new Set(coverage.matchedNames);
+    if (coverage.claimsWithdrawn) {
+        // An unreadable file/directory can contain a use of any candidate.
+        // Returning no deletion candidates is the only sound verdict.
+        potentiallyDeadNames.clear();
+    } else {
+        for (const name of coverage.matchedNames) potentiallyDeadNames.delete(name);
     }
 
     // Export-site line ranges per file (lazy, --include-exported only): the
@@ -658,6 +867,7 @@ function deadcode(index, options = {}) {
     // alive). Other languages keep the string skip: their in-string names
     // are reflection (a documented limitation), not a language feature.
     const classKindNames = new Set();
+    const memberReferenceNames = new Set();
     for (const name of potentiallyDeadNames) {
         const defs = index.symbols.get(name) || [];
         if (defs.some(s => ACCESSOR_KINDS.has(s.type))) {
@@ -665,6 +875,9 @@ function deadcode(index, options = {}) {
         }
         if (defs.some(s => classAuditSet.has(s.type))) {
             classKindNames.add(name);
+        }
+        if (defs.some(s => !!s.className || classAuditSet.has(s.type))) {
+            memberReferenceNames.add(name);
         }
     }
 
@@ -766,9 +979,18 @@ function deadcode(index, options = {}) {
                                 // v3 getters whose only references are
                                 // chained reads; the empty-receiver drop
                                 // fired before the accessor exemption).
-                                if (!receiver && !isDecoratorRef && !accessorNames.has(name)) continue;
+                                if (!receiver && !isDecoratorRef &&
+                                    !memberReferenceNames.has(name) &&
+                                    !accessorNames.has(name)) continue;
+                                // Unknown/chained receivers are unresolved,
+                                // not negative evidence. Keep the reference
+                                // unscoped so method values and nested static
+                                // paths cannot produce false deletion claims.
                                 if (['this', 'self', 'cls'].includes(receiver)) {
-                                    dottedScope = 'same-file';
+                                    // An inherited member may live in another
+                                    // file; same-file scoping drops exactly the
+                                    // base definition this syntax consumes.
+                                    dottedScope = undefined;
                                 } else {
                                     const binding = (fileEntry.importBindings || [])
                                         .find(b => b.name === receiver);
@@ -790,7 +1012,9 @@ function deadcode(index, options = {}) {
                                     }
                                     if (resolved) {
                                         dottedScope = resolved;
-                                    } else if (!isDecoratorRef && !accessorNames.has(name)) {
+                                    } else if (!isDecoratorRef &&
+                                        !memberReferenceNames.has(name) &&
+                                        !accessorNames.has(name)) {
                                         continue;
                                     }
                                     // decorator with unresolvable receiver, or
@@ -836,6 +1060,7 @@ function deadcode(index, options = {}) {
     }
 
     for (const [name, symbols] of index.symbols) {
+        if (coverage.claimsWithdrawn || coverageSuppressedNames.has(name)) continue;
         // Definition NAME lines of same-name def-kind symbols are
         // declarations, not usages — two never-called same-name methods used
         // to keep each other alive (fix #243: three unreferenced `delete`
@@ -897,6 +1122,16 @@ function deadcode(index, options = {}) {
                 continue;
             }
 
+            // These callable surfaces are invoked by syntax that never
+            // contains their indexed name (`a < b`, `bag[i]`). A name-based
+            // dead-code proof is impossible without compiler operator/indexer
+            // binding, so they are outside this audit rather than false
+            // deletion candidates.
+            if (/^operator(?:\b|[^a-zA-Z0-9_$])/.test(symbol.name) ||
+                symbol.name === 'this[]') {
+                continue;
+            }
+
             // Skip test files unless requested
             if (!options.includeTests && isTestFile(symbol.relativePath, lang)) {
                 continue;
@@ -929,6 +1164,10 @@ function deadcode(index, options = {}) {
             // Each language module declares its own isEntryPoint() rules.
             const langModule = getLanguageAdapter(lang);
             if (langModule.isEntryPoint?.(symbol)) {
+                continue;
+            }
+            if (isJavaSerializationCallback(index, symbol, fileEntry)) {
+                excludedRuntimeContract++;
                 continue;
             }
 
@@ -976,6 +1215,12 @@ function deadcode(index, options = {}) {
             if (classAuditSet.has(symbol.type)) {
                 const members = (fileEntry?.symbols || []).filter(s =>
                     s !== symbol && s.className === name);
+                // A type reached only through one of its members is still
+                // live. This is the normal invocation form for C# extension
+                // containers and other static helper types.
+                if (members.some(m => index.calleeIndex.has(m.name))) {
+                    continue;
+                }
                 if (members.some(m => langModule.isEntryPoint?.(m))) {
                     continue;
                 }
@@ -1047,7 +1292,8 @@ function deadcode(index, options = {}) {
                 // in-project references is not evidence of deadness there.
                 const isExternalContract = classAuditSet.has(symbol.type)
                     ? _heritageReachesExternalBase(index, symbol, lang, false)
-                    : overridesOutOfTreeBase(index, symbol);
+                    : overridesOutOfTreeBase(index, symbol) ||
+                        (lang === 'go' && goImplicitExternalContract(symbol));
                 if (isExternalContract && !options.includeExported) {
                     excludedExternalContract++;
                     continue;
@@ -1091,8 +1337,7 @@ function deadcode(index, options = {}) {
                 // unsafe. Hide them from candidates and report the exclusion.
                 const dynamicallyDispatched = symbol.registryMember &&
                     symbol.registryContainer &&
-                    (computedDispatchByFile.get(symbol.file) || []).some(site =>
-                        site.receiver === symbol.registryContainer);
+                    computedDispatchReceivers.has(symbol.registryContainer);
                 if (dynamicallyDispatched) {
                     excludedDynamicDispatch++;
                     continue;
@@ -1131,8 +1376,21 @@ function deadcode(index, options = {}) {
     results.excludedDecorated = excludedDecorated;
     results.excludedExported = excludedExported;
     results.excludedExternalContract = excludedExternalContract;
+    results.excludedRuntimeContract = excludedRuntimeContract;
     results.excludedDynamicDispatch = excludedDynamicDispatch;
     results.computedDispatch = computedDispatchInfo;
+    results.coverage = {
+        complete: coverage.complete,
+        claimsWithdrawn: coverage.claimsWithdrawn,
+        suppressedMatched: coverage.suppressedMatched,
+        files: coverage.files,
+        unreadableFiles: coverage.unreadableFiles,
+        reasons: coverage.reasons,
+        parseRecoveries: coverage.parseRecoveries,
+    };
+    results.pythonImplicitExportFiles = [...index.files.values()].filter(entry =>
+        isPythonPackageFile(index, entry) &&
+        !(entry.exportDetails || []).some(exp => exp.type === '__all__')).length;
 
     return results;
     } finally { index._endOp(); }

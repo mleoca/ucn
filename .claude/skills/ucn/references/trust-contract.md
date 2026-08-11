@@ -50,6 +50,10 @@ Semantic recall can be complete while the result is still impractical: a true ed
 
 Configuration-gated candidates remain visible but are not labeled false when the compiler/LSP oracle did not score them. The raw JSON rollup is the source of truth for these fields; the Markdown report is generated from the same data.
 
+The publish-blocking portable-AST ceilings are: at most 10% of exact true edges left unverified, at most 20% within any sufficiently sampled symbol kind, at least 80% of targets with zero actionable ambiguity, actionable-candidate p95 at most five, and at most 0.10 effective review items per oracle edge. The semantic gate separately requires 100% in-scope recall, at least 98% confirmed-tier precision, full conservation, and 100% public-command proof recall. Passing these sampled floors is release evidence, not runtime-completeness proof.
+
+The performance gate runs each pinned repository in three independent processes. It applies cold-throughput floors to the median run, but uses the worst observed peak RSS so memory failures cannot be averaged away. The composite release gate runs this stage first so verbose compiler-oracle output and report consumers cannot perturb its wall-clock samples.
+
 ## Truncation
 
 CLI and MCP text share the same 10K targeted / 3K broad default budgets and

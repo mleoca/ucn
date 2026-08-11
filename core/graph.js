@@ -88,6 +88,7 @@ function imports(index, filePath) {
                 names: imp.names,
                 type: imp.type,
                 resolved: resolvedPath ? path.relative(index.root, resolvedPath) : null,
+                indexed: !!(resolvedPath && index.files.has(resolvedPath)),
                 isExternal: !resolvedPath,
                 // A string-literal dynamic import (import('./x'), importlib.import_module("x"))
                 // is still mechanically dynamic even when the path resolves —
@@ -110,6 +111,35 @@ function imports(index, filePath) {
  */
 function symbolIsExported(symbol, fileEntry, exportedNames) {
     const modifiers = symbol.modifiers || [];
+    // Python's language-level public surface is convention based when the
+    // module does not declare __all__: top-level non-underscore names are
+    // public. Keep explicit __all__ authoritative when present.
+    if (fileEntry.language === 'python' &&
+        !(fileEntry.moduleAssignedNames || []).includes('__all__') &&
+        !symbol.className && !symbol.isMethod) {
+        return !!symbol.name && !symbol.name.startsWith('_');
+    }
+    if ((fileEntry.language === 'csharp' || fileEntry.language === 'java') &&
+        (symbol.className || symbol.enclosingType)) {
+        const typeKinds = new Set([
+            'class', 'struct', 'interface', 'record', 'enum', 'type',
+        ]);
+        const typeIsPublic = (name, namespace, seen = new Set()) => {
+            const identity = `${namespace || ''}\0${name}`;
+            if (seen.has(identity)) return false;
+            seen.add(identity);
+            return (fileEntry.symbols || []).some(candidate => {
+                if (!typeKinds.has(candidate.type) || candidate.name !== name ||
+                    (candidate.namespace || null) !== (namespace || null) ||
+                    !(candidate.modifiers || []).includes('public')) return false;
+                return !candidate.enclosingType || typeIsPublic(
+                    candidate.enclosingType, candidate.namespace,
+                    new Set(seen));
+            });
+        };
+        if (!typeIsPublic(symbol.className || symbol.enclosingType,
+            symbol.namespace)) return false;
+    }
     if (modifiers.includes('export') || modifiers.includes('public')) return true;
     if (modifiers.some(m => typeof m === 'string' && /^pub\b/.test(m))) return true;
     if (langTraits(fileEntry.language)?.exportVisibility === 'capitalization' &&
@@ -519,6 +549,8 @@ function fileExports(index, filePath, _visited) {
  */
 function api(index, filePath, options = {}) {
     const results = [];
+    let scopedFiles = 0;
+    let pythonImplicitFiles = 0;
 
     let fileIterator;
     if (filePath) {
@@ -543,95 +575,33 @@ function api(index, filePath, options = {}) {
         fileIterator = index.files.entries();
     }
 
-    for (const [, fileEntry] of fileIterator) {
+    for (const [absPath, fileEntry] of fileIterator) {
         if (!fileEntry) continue;
+        if (options.in &&
+            !index.matchesFilters(fileEntry.relativePath, { in: options.in })) {
+            continue;
+        }
 
         // Skip test files by default (test classes aren't part of public API)
         if (!options.includeTests && isTestFile(fileEntry.relativePath, fileEntry.language)) {
             continue;
         }
-
-        const exportedNames = new Set(fileEntry.exports);
-
-        for (const symbol of fileEntry.symbols) {
-            if (symbol.type === 'impl') continue;
-            if (symbolIsExported(symbol, fileEntry, exportedNames)) {
-                results.push({
-                    name: symbol.name,
-                    type: symbol.type,
-                    file: fileEntry.relativePath,
-                    startLine: symbol.startLine,
-                    endLine: symbol.endLine,
-                    ...(symbol.className && { className: symbol.className }),
-                    params: symbol.params,
-                    returnType: symbol.returnType,
-                    signature: formatExportSignature(index, symbol)
-                });
-            }
+        scopedFiles++;
+        if (fileEntry.language === 'python' && fileEntry.exports.length === 0) {
+            pythonImplicitFiles++;
         }
-
-        // Add variable exports (export const/let/var) not matched to symbols
-        if (fileEntry.exportDetails) {
-            const matchedNames = new Set(results.filter(r => r.file === fileEntry.relativePath).map(r => r.name));
-            for (const exp of fileEntry.exportDetails) {
-                if (exp.isVariable && !matchedNames.has(exp.name)) {
-                    const sig = `${exp.declKind} ${exp.name}${exp.typeAnnotation ? ': ' + exp.typeAnnotation : ''}`;
-                    results.push({
-                        name: exp.name,
-                        type: 'variable',
-                        file: fileEntry.relativePath,
-                        startLine: exp.line,
-                        endLine: exp.line,
-                        params: undefined,
-                        returnType: exp.typeAnnotation || null,
-                        signature: sig
-                    });
-                    matchedNames.add(exp.name);
-                }
-            }
-            // The fix #245 fileExports discipline, api side (fix #251 — the
-            // two commands diverged on the same file): consumers import the
-            // ALIAS, and clause-exported names with no indexed symbol
-            // (class/function expressions) are still API surface.
-            for (const exp of fileEntry.exportDetails) {
-                if (!exp || !exp.name || exp.module) continue;
-                if (exp.alias && exp.alias !== exp.name) {
-                    const entry = results.find(r =>
-                        r.file === fileEntry.relativePath && r.name === exp.name && !r.sourceName);
-                    if (entry) {
-                        entry.sourceName = exp.name;
-                        entry.name = exp.alias;
-                        if (entry.signature) {
-                            entry.signature = entry.signature.replace(exp.name, exp.alias);
-                        }
-                        matchedNames.add(exp.alias);
-                        continue;
-                    }
-                }
-                const shown = exp.alias || exp.name;
-                if (!matchedNames.has(shown) && !matchedNames.has(exp.name) &&
-                    exportedNames.has(exp.name)) {
-                    results.push({
-                        name: shown,
-                        ...(exp.alias && exp.alias !== exp.name && { sourceName: exp.name }),
-                        type: 'export',
-                        file: fileEntry.relativePath,
-                        startLine: exp.line || 1,
-                        endLine: exp.line || 1,
-                        params: undefined,
-                        returnType: null,
-                        signature: shown,
-                    });
-                    matchedNames.add(shown);
-                }
-            }
-        }
+        const exports = fileExports(index, absPath);
+        if (Array.isArray(exports)) results.push(...exports);
     }
 
     // Rule 11: (file, line) ordering regardless of parse order — file mode
     // used to emit symbols in extraction order (fix #251).
     results.sort((a, b) => codeUnitCompare(a.file, b.file) ||
         (a.startLine - b.startLine) || codeUnitCompare(a.name, b.name));
+    Object.defineProperty(results, 'apiInfo', {
+        value: { scopedFiles, pythonImplicitFiles },
+        enumerable: false, writable: true, configurable: true,
+    });
     return results;
 }
 
@@ -855,4 +825,7 @@ function circularDeps(index, options = {}) {
     }
 }
 
-module.exports = { imports, exporters, fileExports, api, graph, circularDeps };
+module.exports = {
+    imports, exporters, fileExports, api, graph, circularDeps,
+    symbolIsExported,
+};

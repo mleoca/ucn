@@ -38,8 +38,10 @@ const repoArg = readArg('--repo');
 const repoNames = repoArg ? new Set(repoArg.split(',').map(s => s.trim()).filter(Boolean)) : null;
 const queryCount = positiveInteger('--queries', 40);
 const startupSamples = positiveInteger('--startup-samples', 3);
+const processSamples = positiveInteger('--samples', releaseOnly ? 3 : 1);
 const workerRepoName = readArg('--worker-repo');
 const workerResultPath = readArg('--worker-result');
+const workerQuiet = args.includes('--worker-quiet');
 const budgets = {
     minColdLocPerSec: positiveNumber('--min-cold-loc-sec', DEFAULT_BUDGETS.minColdLocPerSec),
     maxCacheLoadMs: positiveNumber('--max-cache-load-ms', DEFAULT_BUDGETS.maxCacheLoadMs),
@@ -106,7 +108,9 @@ function callableBoard(index, limit) {
 async function evaluateRepo(repo) {
     const clone = cloneAtCommit(repo);
     const target = resolveTarget(clone, repo);
-    process.stdout.write(`\n=== ${repo.name} (${repo.language}) @ ${repo.commit.slice(0, 8)} ===\n`);
+    if (!workerQuiet) {
+        process.stdout.write(`\n=== ${repo.name} (${repo.language}) @ ${repo.commit.slice(0, 8)} ===\n`);
+    }
 
     if (global.gc) global.gc();
     let cold = new ProjectIndex(target);
@@ -197,18 +201,20 @@ async function evaluateRepo(repo) {
         .sort((a, b) => b.durationMs - a.durationMs)
         .slice(0, 5);
 
-    process.stdout.write(`  ${fileCount} files, ${lines} LOC | cold ${coldMs}ms (${coldLocPerSec} LOC/s) | ` +
-        `cache load median ${cacheLoadMs}ms + first query median ${firstQueryMs}ms ` +
-        `(max ${firstSummary.max}ms, n=${firstSummary.count}, ratio ${warmColdRatio})\n`);
-    process.stdout.write(`  context board n=${queryTimes.length} | p50 ${queryP50Ms}ms | p95 ${queryP95Ms}ms | ` +
-        `RSS ${rssMb}MB, peak ${peakRssMb}MB | errors ${queryErrors}` +
-        `${failures.length ? ` | FAIL: ${failures.join('; ')}` : ''}` +
-        `${warnings.length ? ` | NOTE: ${warnings.join('; ')}` : ''}\n`);
-    if (queryP95Ms > budgets.maxQueryP95Ms ||
-        slowestQueries[0]?.durationMs > budgets.maxQueryP95Ms) {
-        process.stdout.write(`  slowest: ${slowestQueries.map(query =>
-            `${query.file}:${query.line}:${query.name} ${query.durationMs}ms`)
-            .join(' | ')}\n`);
+    if (!workerQuiet) {
+        process.stdout.write(`  ${fileCount} files, ${lines} LOC | cold ${coldMs}ms (${coldLocPerSec} LOC/s) | ` +
+            `cache load median ${cacheLoadMs}ms + first query median ${firstQueryMs}ms ` +
+            `(max ${firstSummary.max}ms, n=${firstSummary.count}, ratio ${warmColdRatio})\n`);
+        process.stdout.write(`  context board n=${queryTimes.length} | p50 ${queryP50Ms}ms | p95 ${queryP95Ms}ms | ` +
+            `RSS ${rssMb}MB, peak ${peakRssMb}MB | errors ${queryErrors}` +
+            `${failures.length ? ` | FAIL: ${failures.join('; ')}` : ''}` +
+            `${warnings.length ? ` | NOTE: ${warnings.join('; ')}` : ''}\n`);
+        if (queryP95Ms > budgets.maxQueryP95Ms ||
+            slowestQueries[0]?.durationMs > budgets.maxQueryP95Ms) {
+            process.stdout.write(`  slowest: ${slowestQueries.map(query =>
+                `${query.file}:${query.line}:${query.name} ${query.durationMs}ms`)
+                .join(' | ')}\n`);
+        }
     }
 
     return {
@@ -250,7 +256,87 @@ function workerArgs(repo, resultPath) {
         passthrough.push(args[i]);
     }
     return [...process.execArgv, __filename, ...passthrough,
-        '--worker-repo', repo.name, '--worker-result', resultPath];
+        '--worker-repo', repo.name, '--worker-result', resultPath,
+        '--worker-quiet'];
+}
+
+function aggregateRepoRuns(repo, runs) {
+    if (runs.some(run => run.error)) {
+        const errors = runs.filter(run => run.error).map(run => run.error);
+        return {
+            repo: repo.name,
+            language: repo.language,
+            error: `${errors.length}/${runs.length} isolated sample(s) failed: ${errors.join('; ')}`,
+            failures: errors,
+        };
+    }
+    const median = values => summarizeSamples(values).median;
+    const coldSamplesMs = runs.map(run => run.coldMs);
+    const coldMs = median(coldSamplesMs);
+    const lines = runs[0].lines;
+    const cacheLoadSamplesMs = runs.flatMap(run => run.cacheLoadSamplesMs || [run.cacheLoadMs]);
+    const firstQuerySamplesMs = runs.flatMap(run => run.firstQuerySamplesMs || [run.firstQueryMs]);
+    const cacheLoadMs = median(cacheLoadSamplesMs);
+    const firstQueryMs = median(firstQuerySamplesMs);
+    const firstSummary = summarizeSamples(firstQuerySamplesMs);
+    const metrics = {
+        lines,
+        coldMs,
+        coldLocPerSec: rate(lines * 1000, coldMs),
+        cacheLoadMs,
+        firstQueryMs,
+        warmColdRatio: rate(cacheLoadMs + firstQueryMs, coldMs),
+        queryP50Ms: median(runs.map(run => run.queryP50Ms)),
+        queryP95Ms: median(runs.map(run => run.queryP95Ms)),
+        // Memory safety is not averaged away: one real over-budget process
+        // is enough to fail the release even when the other samples are low.
+        peakRssMb: Math.max(...runs.map(run => run.peakRssMb)),
+        queryErrors: runs.reduce((sum, run) => sum + run.queryErrors, 0),
+    };
+    const { failures, warnings } = evaluatePerformanceBudgets(metrics, budgets);
+    const slowestQueries = runs.flatMap(run => run.slowestQueries || [])
+        .sort((a, b) => b.durationMs - a.durationMs)
+        .slice(0, 5);
+    return {
+        ...runs[0],
+        ...metrics,
+        coldSamplesMs,
+        processSamples: runs.length,
+        cacheSaveMs: median(runs.map(run => run.cacheSaveMs)),
+        cacheLoadSamplesMs,
+        firstQuerySamplesMs,
+        firstQueryMaxMs: firstSummary.max,
+        firstQuerySpreadMs: firstSummary.spread,
+        queryCount: runs[0].queryCount,
+        queryMaxMs: Math.max(...runs.map(run => run.queryMaxMs)),
+        slowestQueries,
+        rssMb: Math.max(...runs.map(run => run.rssMb)),
+        failures,
+        warnings,
+    };
+}
+
+function printResult(repo, result) {
+    process.stdout.write(`\n=== ${repo.name} (${repo.language}) @ ${repo.commit.slice(0, 8)} ===\n`);
+    if (result.error) {
+        process.stdout.write(`  FAILED ${result.error}\n`);
+        return;
+    }
+    process.stdout.write(`  ${result.files} files, ${result.lines} LOC | cold median ${result.coldMs}ms ` +
+        `(${result.coldLocPerSec} LOC/s; samples ${result.coldSamplesMs.join(', ')}) | ` +
+        `cache load median ${result.cacheLoadMs}ms + first query median ${result.firstQueryMs}ms ` +
+        `(max ${result.firstQueryMaxMs}ms, ratio ${result.warmColdRatio})\n`);
+    process.stdout.write(`  context board n=${result.queryCount} x ${result.processSamples} | ` +
+        `p50 ${result.queryP50Ms}ms | p95 ${result.queryP95Ms}ms | ` +
+        `RSS ${result.rssMb}MB, worst peak ${result.peakRssMb}MB | errors ${result.queryErrors}` +
+        `${result.failures.length ? ` | FAIL: ${result.failures.join('; ')}` : ''}` +
+        `${result.warnings.length ? ` | NOTE: ${result.warnings.join('; ')}` : ''}\n`);
+    if (result.queryP95Ms > budgets.maxQueryP95Ms ||
+        result.slowestQueries[0]?.durationMs > budgets.maxQueryP95Ms) {
+        process.stdout.write(`  slowest: ${result.slowestQueries.map(query =>
+            `${query.file}:${query.line}:${query.name} ${query.durationMs}ms`)
+            .join(' | ')}\n`);
+    }
 }
 
 async function workerMain() {
@@ -281,22 +367,27 @@ async function main() {
     const workerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-perf-workers-'));
     try {
         for (const repo of repos) {
-            const resultPath = path.join(workerDir, `${repo.name}.json`);
-            const child = spawnSync(process.execPath, workerArgs(repo, resultPath), {
-                cwd: process.cwd(),
-                env: process.env,
-                stdio: 'inherit',
-                timeout: 10 * 60 * 1000,
-            });
-            if (child.error || child.status !== 0 || !fs.existsSync(resultPath)) {
-                const message = child.error?.message || `performance worker exited ${child.status}`;
-                results.push({ repo: repo.name, language: repo.language, error: message, failures: [message] });
-                failed = true;
-                continue;
+            const runs = [];
+            for (let sample = 0; sample < processSamples; sample++) {
+                const resultPath = path.join(workerDir, `${repo.name}-${sample}.json`);
+                const child = spawnSync(process.execPath, workerArgs(repo, resultPath), {
+                    cwd: process.cwd(),
+                    env: process.env,
+                    stdio: 'inherit',
+                    timeout: 10 * 60 * 1000,
+                });
+                if (child.error || child.status !== 0 || !fs.existsSync(resultPath)) {
+                    const message = child.error?.message ||
+                        `performance worker exited ${child.status}`;
+                    runs.push({ error: message });
+                    continue;
+                }
+                runs.push(JSON.parse(fs.readFileSync(resultPath, 'utf8')));
             }
-            const result = JSON.parse(fs.readFileSync(resultPath, 'utf8'));
+            const result = aggregateRepoRuns(repo, runs);
             results.push(result);
-            if (result.failures.length) failed = true;
+            printResult(repo, result);
+            if (result.failures.length || result.error) failed = true;
         }
     } finally {
         fs.rmSync(workerDir, { recursive: true, force: true });
@@ -304,14 +395,15 @@ async function main() {
 
     fs.mkdirSync(REPORTS_DIR, { recursive: true });
     const date = new Date().toISOString().slice(0, 10);
-    const report = { date, budgets, results, passed: !failed };
+    const report = { date, budgets, processSamples, results, passed: !failed };
     const jsonPath = path.join(REPORTS_DIR, `performance-gate-${date}.json`);
     fs.writeFileSync(jsonPath, JSON.stringify(report, null, 2));
 
     const md = [
         `# UCN performance gate - ${date}`,
         '',
-        `Real pinned repositories; cold AST build, ${startupSamples} isolated persisted-index startup samples, ` +
+        `Real pinned repositories; ${processSamples} isolated cold-build process samples, ` +
+            `${startupSamples} persisted-index startup samples per process, ` +
             'and a steady-state pinned `context` board.',
         '',
         '| repo | files | LOC | cold | LOC/s | cache load median | first query median/max | warm/cold | query p50 | query p95 | peak RSS | result |',
@@ -336,4 +428,9 @@ if (require.main === module) {
     });
 }
 
-module.exports = { evaluateRepo, percentile, callableBoard };
+module.exports = {
+    evaluateRepo,
+    aggregateRepoRuns,
+    percentile,
+    callableBoard,
+};

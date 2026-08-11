@@ -115,6 +115,10 @@ function brief(index, name, options = {}) {
             ...(def.paramsStructured && { paramsStructured: def.paramsStructured }),
             ...(def.paramTypes && { paramTypes: def.paramTypes }),
             ...(def.returnType && { returnType: def.returnType }),
+            ...(def.fieldType && { fieldType: def.fieldType }),
+            ...(def.memberType && { memberType: def.memberType }),
+            ...(def.generics && { generics: def.generics }),
+            ...(def.functionLike !== undefined && { functionLike: def.functionLike }),
             ...(def.modifiers && def.modifiers.length && { modifiers: def.modifiers }),
             ...(def.decorators && def.decorators.length && { decorators: def.decorators }),
             ...(def.docstring && { docstring: firstSentence(def.docstring) }),
@@ -132,12 +136,25 @@ function brief(index, name, options = {}) {
         }
 
         // For non-callable types (class/struct/interface/type), most fields don't apply
-        if (['class', 'struct', 'interface', 'type', 'enum'].includes(def.type)) {
+        if (['class', 'struct', 'interface', 'type', 'enum', 'record',
+            'trait', 'namespace'].includes(def.type)) {
             return {
                 symbol,
                 kind: 'type',
                 lineCount: (def.endLine || def.startLine) - def.startLine + 1,
                 memberCount: countMembers(index, def),
+                ...(gitInfo && { git: gitInfo }),
+            };
+        }
+
+        const isData = def.type === 'field' || def.type === 'state' ||
+            def.memberType === 'field' || def.memberType === 'property' ||
+            (def.type === 'macro' && def.functionLike === false);
+        if (isData) {
+            return {
+                symbol,
+                kind: 'data',
+                lineCount: (def.endLine || def.startLine) - def.startLine + 1,
                 ...(gitInfo && { git: gitInfo }),
             };
         }

@@ -415,6 +415,12 @@ function findClasses(code, parser) {
         const bases = baseList?.namedChildren.map(child => child.text) || [];
         const { startLine, endLine, indent } = nodeToLocation(node, lines);
         const attrs = attributeData(node);
+        let enclosingType;
+        for (let parent = node.parent; parent; parent = parent.parent) {
+            if (!TYPE_DECLARATIONS.has(parent.type)) continue;
+            enclosingType = parent.childForFieldName('name')?.text;
+            if (enclosingType) break;
+        }
         classes.push({
             name: nameNode.text,
             type,
@@ -422,6 +428,7 @@ function findClasses(code, parser) {
             endLine,
             indent,
             modifiers: modifiersOf(node),
+            ...(enclosingType && { enclosingType }),
             ...(namespaceOf(node, tree) && { namespace: namespaceOf(node, tree) }),
             members,
             ...classifyBases(bases, type, fileTypeKinds),
@@ -577,6 +584,50 @@ function enclosingClassName(node) {
         }
     }
     return null;
+}
+
+/** Whether a bare identifier is a field/property/event of the enclosing type. */
+function enclosingTypeDeclaresMember(node, memberName) {
+    let typeNode = null;
+    for (let parent = node?.parent; parent; parent = parent.parent) {
+        if (TYPE_DECLARATIONS.has(parent.type)) {
+            typeNode = parent;
+            break;
+        }
+    }
+    const body = typeNode?.childForFieldName('body') ||
+        typeNode?.namedChildren.find(child => child.type === 'declaration_list');
+    if (!body) return false;
+    const stack = [...(body.namedChildren || [])];
+    while (stack.length > 0) {
+        const current = stack.pop();
+        if (TYPE_DECLARATIONS.has(current.type)) continue;
+        if (current.type === 'property_declaration' ||
+            current.type === 'event_declaration') {
+            if (current.childForFieldName('name')?.text === memberName) return true;
+            continue;
+        }
+        if (current.type === 'field_declaration' ||
+            current.type === 'event_field_declaration') {
+            for (const child of current.namedChildren || []) {
+                const variables = child.type === 'variable_declaration'
+                    ? child.namedChildren : [child];
+                if (variables.some(variable =>
+                    variable.type === 'variable_declarator' &&
+                    variable.childForFieldName('name')?.text === memberName)) {
+                    return true;
+                }
+            }
+            continue;
+        }
+        // Preprocessor containers can wrap real declarations. Descend through
+        // those and the type body, but never into methods/accessors where a
+        // same-named local would not make the receiver a class member.
+        if (current.type.startsWith('preproc_') || current.type === 'declaration_list') {
+            stack.push(...(current.namedChildren || []));
+        }
+    }
+    return false;
 }
 
 const CALLABLE_SCOPE_NODES = new Set([
@@ -1112,7 +1163,8 @@ function findCallsInCode(code, parser) {
             const receiverIsTypeQualified = !!(identity.isMethod &&
                 unwrappedReceiverNode?.type === 'identifier' &&
                 /^[A-Z]/.test(identity.receiver || '') &&
-                !variableTypes.has(identity.receiver));
+                !variableTypes.has(identity.receiver) &&
+                !enclosingTypeDeclaresMember(node, identity.receiver));
             const currentNamespace = namespaceOf(node, tree);
             let receiverCall = null;
             let receiverCallIsMethod = false;
@@ -1239,6 +1291,7 @@ function findImportsInCode(code, parser) {
             names: nameNode ? [nameNode.text] : ['*'],
             type: 'using',
             line: node.startPosition.row + 1,
+            ...(node.text.trimStart().startsWith('global using ') && { global: true }),
         });
         return false;
     });
@@ -1329,11 +1382,6 @@ function findExportsInCodeShallow(code, parser) {
     for (const cls of classes) {
         if (cls.modifiers.includes('public')) {
             exports.push({ name: cls.name, type: 'export', line: cls.startLine });
-        }
-        for (const member of cls.members || []) {
-            if (member.modifiers?.includes('public')) {
-                exports.push({ name: member.name, type: 'export', line: member.startLine });
-            }
         }
     }
     return exports;

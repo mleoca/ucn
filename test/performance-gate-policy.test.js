@@ -10,6 +10,7 @@ const {
     summarizeSamples,
     evaluatePerformanceBudgets,
 } = require('../eval/performance-gate-policy');
+const { aggregateRepoRuns } = require('../eval/run-performance-gate');
 
 function healthyMetrics(overrides = {}) {
     return {
@@ -33,6 +34,28 @@ describe('performance gate policy', () => {
         assert.equal(summary.median, 456);
         assert.equal(summary.max, 722);
         assert.equal(summary.spread, 284);
+    });
+
+    it('aggregates isolated cold processes by median but never averages away peak memory', () => {
+        const run = (coldMs, peakRssMb) => ({
+            repo: 'fixture', language: 'cpp', commit: 'abc', files: 20,
+            lines: 80000, coldMs, coldLocPerSec: 0, cacheSaveMs: 10,
+            cacheLoadMs: 20, cacheLoadSamplesMs: [20, 21, 22],
+            firstQueryMs: 30, firstQuerySamplesMs: [29, 30, 31],
+            firstQueryMaxMs: 31, firstQuerySpreadMs: 2,
+            warmColdRatio: 0.01, queryCount: 40, queryP50Ms: 10,
+            queryP95Ms: 20, queryMaxMs: 40, slowestQueries: [],
+            queryErrors: 0, rssMb: 500, peakRssMb,
+            failures: [], warnings: [],
+        });
+        const result = aggregateRepoRuns(
+            { name: 'fixture', language: 'cpp' },
+            [run(3000, 700), run(9000, 800), run(4000, 1600)],
+        );
+        assert.equal(result.coldMs, 4000);
+        assert.equal(result.coldLocPerSec, 20000);
+        assert.equal(result.peakRssMb, 1600);
+        assert.ok(result.failures.some(failure => failure.includes('peak RSS')));
     });
 
     it('matches the failed GitHub runner case as a host-normalized warning', () => {

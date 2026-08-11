@@ -190,19 +190,34 @@ function computedDispatchSites(content, language) {
         if (!parser) return [];
         const tree = safeParse(parser, content);
         const sites = [];
+        const seen = new Set();
+        const record = (node, callee, expression) => {
+            const indexNode = indexNodeForComputedCallee(callee);
+            if (!indexNode || LITERAL_INDEX_NODES.has(indexNode.type)) return;
+            const receiver = computedReceiver(callee);
+            if (!receiver) return;
+            const key = `${callee.startIndex}:${callee.endIndex}`;
+            if (seen.has(key)) return;
+            seen.add(key);
+            sites.push({
+                line: node.startPosition.row + 1,
+                receiver,
+                expression: expression || node.text,
+            });
+        };
         walkNamed(tree.rootNode, node => {
             let callee = null;
             if (node.type === 'call_expression' || node.type === 'call' ||
                 node.type === 'invocation_expression') {
                 callee = node.childForFieldName('function');
             }
-            const indexNode = indexNodeForComputedCallee(callee);
-            if (!indexNode || LITERAL_INDEX_NODES.has(indexNode.type)) return true;
-            sites.push({
-                line: node.startPosition.row + 1,
-                receiver: computedReceiver(callee),
-                expression: node.text,
-            });
+            record(node, callee);
+
+            // Two-step dispatch: `const h = handlers[key]; h()`. The index
+            // access itself is the decisive blind spot; whether the selected
+            // value is called later may cross control-flow boundaries, so the
+            // safe syntax-only verdict records the dynamic access here.
+            if (indexNodeForComputedCallee(node)) record(node, node);
             return true;
         });
         return sites;
@@ -228,6 +243,7 @@ function projectComputedDispatch(index) {
         }
     }
     index._computedDispatchBlindspots = byFile;
+    index.computedDispatchDirty = true;
     return byFile;
 }
 

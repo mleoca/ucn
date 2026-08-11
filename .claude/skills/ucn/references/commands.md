@@ -84,4 +84,4 @@ Omit the target for the current project. A target may be a file, directory, or q
 
 ## Language notes
 
-Supported source families are JavaScript/TypeScript/TSX, Python, Go, Rust, Java, C, C++, C#, and HTML inline JavaScript/event handlers. C/C++ consumes `compile_commands.json` when present for header-language and include-path context. UCN remains portable AST analysis: it does not run a compiler, preprocessor, Roslyn, or an LSP during normal queries.
+Supported source families are JavaScript/TypeScript/TSX, Python, Go, Rust, Java, C, C++, C#, and HTML inline JavaScript/event handlers. C/C++ consumes `compile_commands.json` when present for header-language and include-path context, and retains AST-proven facts across recoverable preprocessor branches. UCN remains portable AST analysis: it does not run a compiler, preprocessor, Roslyn, or an LSP during normal queries, and it does not assert which conditional branch a build activates.

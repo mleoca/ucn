@@ -587,7 +587,8 @@ function _processFunction(node, functions, processedRanges, lines) {
 
                     if (isArrow || isFnExpr) {
                         processedRanges.add(rangeKey);
-                        const paramsNode = valueNode.childForFieldName('parameters');
+                        const paramsNode = valueNode.childForFieldName('parameters') ||
+                            valueNode.childForFieldName('parameter');
                         const { startLine, endLine, indent } = nodeToLocation(node, lines);
                         const returnType = extractReturnType(valueNode);
                         const generics = extractGenerics(valueNode);
@@ -733,7 +734,16 @@ function _processFunction(node, functions, processedRanges, lines) {
                              rightNode.type === 'generator_function';
 
             if (isArrow || isFnExpr) {
-                const name = getAssignmentName(leftNode);
+                const isCommonJsDefault = leftNode.text === 'module.exports';
+                const expressionName = isFnExpr
+                    ? rightNode.childForFieldName('name')?.text : null;
+                // `module.exports = function transformer(){}` exports the
+                // function expression, not a symbol called "exports". Keep
+                // its authored name when present; anonymous defaults use the
+                // same `default` identity exposed by the API surface.
+                const name = isCommonJsDefault
+                    ? (expressionName || 'default')
+                    : getAssignmentName(leftNode);
                 if (name) {
                     processedRanges.add(rangeKey);
                     const paramsNode = rightNode.childForFieldName('parameters');
@@ -754,7 +764,7 @@ function _processFunction(node, functions, processedRanges, lines) {
                         indent,
                         isArrow,
                         isGenerator: isGen,
-                        modifiers: [],
+                        modifiers: isCommonJsDefault ? ['export'] : [],
                         // A property-assignment def (Reply.prototype.serialize
                         // = function, exports.h = () => ...) creates NO
                         // lexical name — a bare call in the file can never

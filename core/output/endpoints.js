@@ -26,7 +26,7 @@ function formatEndpoints(result, options = {}) {
     const showBridge = options.bridge;
 
     if (!showBridge) {
-        return formatRoutesAndRequests(routes, requests, meta, options);
+        return formatRoutesAndRequests(routes, requests, meta, options, result.advisory);
     }
     return formatBridges(bridges, unmatchedRoutes, unmatchedRequests, meta, options, result.advisory);
 }
@@ -48,7 +48,7 @@ function uniqueMatchPercent(bridges, totalRequests) {
     return Math.min(100, Math.max(0, pct));
 }
 
-function formatRoutesAndRequests(routes, requests, meta, options) {
+function formatRoutesAndRequests(routes, requests, meta, options, advisory = null) {
     const lines = [];
     const showServer = !options.clientOnly;
     const showClient = !options.serverOnly;
@@ -109,6 +109,8 @@ function formatRoutesAndRequests(routes, requests, meta, options) {
         }
     }
 
+    const routeAdvisory = advisoryLine(advisory);
+    if (routeAdvisory) lines.push('', routeAdvisory);
     return lines.join('\n').trimEnd();
 }
 
@@ -220,6 +222,7 @@ function formatEndpointsJson(result, options = {}) {
         meta: {
             ok: true,
             ...meta,
+            ...(result.advisory && { advisory: result.advisory }),
             // HIGH-2: signal to consumers that bridges array was suppressed
             // because the user filtered to unmatched-only.
             ...(unmatchedOnly && { filterMode: 'unmatched' }),

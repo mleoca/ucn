@@ -18,6 +18,7 @@ const {
     extractStringArg,
 } = require('./utils');
 const { createHash } = require('crypto');
+const { isMainThread } = require('worker_threads');
 const { PARSE_OPTIONS, safeParse } = require('./index');
 
 const TYPE_NODES = new Set([
@@ -272,6 +273,16 @@ function countParseErrors(node) {
 // one-time cost per file content.
 const RECOVERY_MEMO_MAX = 8;
 const recoveryMemo = new Map();
+// Whether the selected tree differs from the literal-source parse. A recovered
+// tree can be completely error-free, so `tree.rootNode.hasError` alone cannot
+// disclose that conditional-compilation or attribute recovery was required.
+const recoveryAppliedMemo = new Map();
+const recoveryAppliedByTree = new WeakMap();
+// A selected conditional tree may be derived from an attribute-normalized
+// all-source view.  Keep that byte/line-preserving source with the selected
+// native tree so secondary extraction does not reintroduce the declaration
+// macros that recovery already proved were syntactic adapters.
+const allSourceRecoveryByTree = new WeakMap();
 // C/C++ usage, test, and consistency queries revisit the same files across
 // separate operations. A recovered tree is immutable, so retain a bounded
 // content-addressed LRU per grammar instead of reparsing it for every symbol.
@@ -281,6 +292,11 @@ const recoveryMemo = new Map();
 const TREE_CACHE_MAX_ENTRIES = 128;
 const TREE_CACHE_MAX_SOURCE_BYTES = 32 * 1024 * 1024;
 const treeCacheByParser = new WeakMap();
+// Secondary all-source AST for a selected conditional tree. Weak keys tie its
+// lifetime to the bounded primary-tree LRU, so repeated extractors and agent
+// queries pay one additional parse per recovered file instead of one per
+// symbol. This is critical for template-heavy C++ headers.
+const allSourceTreeBySelected = new WeakMap();
 // Replacement-list nodes are opaque leaves in the C grammars. Usage queries
 // used to traverse an entire (sometimes 100k-node) header for every requested
 // name merely to rediscover the same handful of macro definitions. Trees are
@@ -339,24 +355,180 @@ function cacheCFamilyTree(parser, key, tree, sourceBytes) {
     }
 }
 
+function releaseCFamilyTree(parser, code, tree) {
+    const cache = treeCacheByParser.get(parser);
+    if (cache) {
+        const key = treeCacheKey(code);
+        const entry = cache.entries.get(key);
+        if (entry?.tree === tree) {
+            cache.entries.delete(key);
+            cache.sourceBytes -= entry.sourceBytes;
+        }
+    }
+    const allSource = allSourceTreeBySelected.get(tree);
+    allSourceTreeBySelected.delete(tree);
+    // Build workers are short-lived and terminate immediately after handing
+    // immutable IR back to the parent. Dropping ownership here lets their
+    // isolate reclaim all native trees in one teardown; eagerly walking and
+    // deleting every tree serialized worker completion and cost >10% cold
+    // throughput on fmt. The main process is long-lived, so direct/sequential
+    // indexing still releases native memory deterministically.
+    if (isMainThread) {
+        allSource?.delete?.();
+        tree?.delete?.();
+    }
+}
+
+function blankLine(line) {
+    return line.replace(/[^\r\n]/g, ' ');
+}
+
+function preprocessorDirective(line) {
+    const content = line.replace(/[\r\n]+$/, '');
+    const match = content.match(/^\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b(.*)$/);
+    if (!match) return null;
+    let condition = match[2].trim();
+    const defined = condition.match(/^defined\s*(?:\(\s*([A-Za-z_]\w*)\s*\)|([A-Za-z_]\w*))$/);
+    if (defined) condition = defined[1] || defined[2];
+    return { kind: match[1], condition };
+}
+
+/**
+ * Produce a bounded set of coherent preprocessor configurations while
+ * preserving every byte and line offset. Tree-sitter models directives but
+ * cannot represent braces whose opening and closing tokens live in separate
+ * `#ifdef` regions. Parsing one concrete configuration is the same structural
+ * view a compiler gets after preprocessing; trying several configurations
+ * avoids silently swallowing the declarations that follow the malformed
+ * region. This is syntax recovery, not a text-based symbol extractor.
+ */
+function conditionalRecoverySources(code) {
+    const lines = code.match(/.*(?:\r\n|\n|\r|$)/g)?.filter(Boolean) || [];
+    const directives = lines.map(preprocessorDirective);
+    const keys = [];
+    for (const directive of directives) {
+        if (!directive || !['if', 'ifdef', 'ifndef', 'elif'].includes(directive.kind)) {
+            continue;
+        }
+        const condition = directive.condition;
+        if (!condition || condition === '0' || condition === '1') continue;
+        if (!keys.includes(condition)) keys.push(condition);
+    }
+    if (!directives.some(Boolean)) return [];
+
+    const assignments = [];
+    const addAssignment = values => {
+        const key = keys.map(name => values.get(name) ? '1' : '0').join('');
+        if (!assignments.some(entry => entry.key === key)) {
+            assignments.push({ key, values });
+        }
+    };
+    addAssignment(new Map(keys.map(key => [key, true])));
+    addAssignment(new Map(keys.map(key => [key, false])));
+    // Mixed configurations matter when two independent feature gates jointly
+    // shape a declaration. Bound the search so pathological generated headers
+    // do not create exponential parse work.
+    for (const key of keys.slice(0, 6)) {
+        addAssignment(new Map(keys.map(name => [name, name === key])));
+        addAssignment(new Map(keys.map(name => [name, name !== key])));
+    }
+
+    const evaluate = (condition, values) => {
+        if (condition === '0') return false;
+        if (condition === '1') return true;
+        return values.get(condition) ?? true;
+    };
+    const sources = [];
+    for (const { values } of assignments) {
+        const stack = [];
+        let active = true;
+        const selected = [];
+        let valid = true;
+        for (let index = 0; index < lines.length; index++) {
+            const line = lines[index];
+            const directive = directives[index];
+            if (!directive) {
+                selected.push(active ? line : blankLine(line));
+                continue;
+            }
+            selected.push(blankLine(line));
+            if (directive.kind === 'if' || directive.kind === 'ifdef' ||
+                directive.kind === 'ifndef') {
+                let branch = evaluate(directive.condition, values);
+                if (directive.kind === 'ifndef') branch = !branch;
+                const frame = {
+                    parentActive: active,
+                    branchTaken: branch,
+                };
+                stack.push(frame);
+                active = frame.parentActive && branch;
+            } else if (directive.kind === 'elif') {
+                const frame = stack[stack.length - 1];
+                if (!frame) { valid = false; break; }
+                const branch = !frame.branchTaken &&
+                    evaluate(directive.condition, values);
+                frame.branchTaken ||= branch;
+                active = frame.parentActive && branch;
+            } else if (directive.kind === 'else') {
+                const frame = stack[stack.length - 1];
+                if (!frame) { valid = false; break; }
+                const branch = !frame.branchTaken;
+                frame.branchTaken = true;
+                active = frame.parentActive && branch;
+            } else {
+                const frame = stack.pop();
+                if (!frame) { valid = false; break; }
+                active = frame.parentActive;
+            }
+        }
+        if (!valid || stack.length > 0) continue;
+        const source = selected.join('');
+        if (!sources.includes(source)) sources.push(source);
+    }
+    return sources;
+}
+
+function treeStructureScore(tree) {
+    let declarations = 0;
+    let calls = 0;
+    traverseTreeCached(tree.rootNode, node => {
+        if (node.type === 'function_definition' ||
+            node.type === 'class_specifier' ||
+            node.type === 'struct_specifier' ||
+            node.type === 'union_specifier' ||
+            node.type === 'enum_specifier' ||
+            node.type === 'type_definition') declarations++;
+        else if (node.type === 'call_expression') calls++;
+        return true;
+    });
+    return declarations * 1000 + calls;
+}
+
 function parseTree(parser, code) {
     const cacheKey = treeCacheKey(code);
     const cached = cachedCFamilyTree(parser, cacheKey);
     if (cached) return cached;
     const tree = safeParse(parser, code, undefined, PARSE_OPTIONS);
-    if (recoveryMemo.has(code)) {
+    if (recoveryMemo.has(code) && !recoveryAppliedMemo.get(code)) {
         const blanked = recoveryMemo.get(code);
         const selected = blanked === null
             ? tree : safeParse(parser, blanked, undefined, PARSE_OPTIONS);
         if (selected !== tree) tree.delete?.();
+        allSourceRecoveryByTree.set(selected, null);
+        recoveryAppliedByTree.set(selected, selected.rootNode.hasError);
         cacheCFamilyTree(parser, cacheKey, selected, Buffer.byteLength(code));
         return selected;
     }
     const initialRanges = macroTypeRanges(tree, code);
     if (!tree.rootNode.hasError && initialRanges.length === 0) {
         recoveryMemo.set(code, null);
+        recoveryAppliedMemo.set(code, false);
+        allSourceRecoveryByTree.set(tree, null);
+        recoveryAppliedByTree.set(tree, false);
         if (recoveryMemo.size > RECOVERY_MEMO_MAX) {
-            recoveryMemo.delete(recoveryMemo.keys().next().value);
+            const oldest = recoveryMemo.keys().next().value;
+            recoveryMemo.delete(oldest);
+            recoveryAppliedMemo.delete(oldest);
         }
         cacheCFamilyTree(parser, cacheKey, tree, Buffer.byteLength(code));
         return tree;
@@ -369,7 +541,13 @@ function parseTree(parser, code) {
     let best = null;
     let bestCode = null;
     let bestErrors = countParseErrors(tree.rootNode);
-    const parsedTrees = [tree];
+    const originalHasError = tree.rootNode.hasError;
+    const liveTrees = new Set([tree]);
+    const releaseTree = candidate => {
+        if (!candidate || !liveTrees.has(candidate)) return;
+        liveTrees.delete(candidate);
+        candidate.delete?.();
+    };
     for (let attempt = 0; attempt < 8; attempt++) {
         const ranges = attempt === 0
             ? initialRanges : macroTypeRanges(workingTree, current);
@@ -379,30 +557,128 @@ function parseTree(parser, code) {
             next = next.slice(0, start) + ' '.repeat(end - start) + next.slice(end);
         }
         const candidate = safeParse(parser, next, undefined, PARSE_OPTIONS);
-        parsedTrees.push(candidate);
+        liveTrees.add(candidate);
         const errors = countParseErrors(candidate.rootNode);
-        if (errors > bestErrors) break;
+        if (errors > bestErrors) {
+            releaseTree(candidate);
+            break;
+        }
+        const previousWorking = workingTree;
         current = next;
         workingTree = candidate;
         if (errors < bestErrors ||
-            (!tree.rootNode.hasError && attempt === 0 &&
+            (!originalHasError && attempt === 0 &&
              errors === bestErrors)) {
+            const previousBest = best;
             best = candidate;
             bestCode = next;
             bestErrors = errors;
+            if (previousBest && previousBest !== tree) {
+                releaseTree(previousBest);
+            }
+        }
+        if (previousWorking !== tree && previousWorking !== best) {
+            releaseTree(previousWorking);
         }
         if (!candidate.rootNode.hasError) break;
     }
+    if (workingTree !== tree && workingTree !== best) releaseTree(workingTree);
+    const attributeSelected = best || tree;
+    const attributeSource = bestCode || code;
+    let selectedErrors = countParseErrors(attributeSelected.rootNode);
+    let selectedScore = treeStructureScore(attributeSelected);
+    let conditionalApplied = false;
+    // Conditional branches may contain matching braces separated across two
+    // directives. Parse coherent feature configurations and prefer fewer
+    // syntax errors, then the richest declaration/call view.
+    if (attributeSelected.rootNode.hasError) {
+        for (const candidateSource of conditionalRecoverySources(attributeSource)) {
+            const candidate = safeParse(parser, candidateSource, undefined, PARSE_OPTIONS);
+            liveTrees.add(candidate);
+            const errors = countParseErrors(candidate.rootNode);
+            const score = treeStructureScore(candidate);
+            if (errors < selectedErrors ||
+                (errors === selectedErrors && score > selectedScore)) {
+                const previousBest = best;
+                best = candidate;
+                bestCode = candidateSource;
+                selectedErrors = errors;
+                selectedScore = score;
+                conditionalApplied = true;
+                if (previousBest && previousBest !== tree) {
+                    releaseTree(previousBest);
+                }
+            } else {
+                releaseTree(candidate);
+            }
+        }
+    }
     recoveryMemo.set(code, best ? bestCode : null);
+    // Deterministic attribute/visibility macro normalization is treated like
+    // ordinary parser adaptation once it yields a clean tree. Conditional
+    // configuration selection is inherently partial and must remain visible.
+    recoveryAppliedMemo.set(code, conditionalApplied);
     if (recoveryMemo.size > RECOVERY_MEMO_MAX) {
-        recoveryMemo.delete(recoveryMemo.keys().next().value);
+        const oldest = recoveryMemo.keys().next().value;
+        recoveryMemo.delete(oldest);
+        recoveryAppliedMemo.delete(oldest);
     }
     const selected = best || tree;
-    for (const parsed of parsedTrees) {
-        if (parsed !== selected) parsed.delete?.();
+    allSourceRecoveryByTree.set(
+        selected,
+        conditionalApplied && attributeSource !== code ? attributeSource :
+            conditionalApplied ? code : null,
+    );
+    recoveryAppliedByTree.set(
+        selected,
+        conditionalApplied || selected.rootNode.hasError,
+    );
+    for (const parsed of liveTrees) {
+        if (parsed !== selected) releaseTree(parsed);
     }
     cacheCFamilyTree(parser, cacheKey, selected, Buffer.byteLength(code));
     return selected;
+}
+
+function parseRecoveryApplied(code, tree) {
+    return recoveryAppliedByTree.get(tree) ??
+        (recoveryAppliedMemo.get(code) || tree.rootNode.hasError);
+}
+
+/**
+ * Return the literal-source AST when parseTree selected a concrete
+ * preprocessor configuration.  The selected tree is the best view for
+ * ownership and type evidence, but it cannot represent declarations/calls in
+ * mutually-exclusive branches.  The literal tree still contains many of
+ * those nodes as structurally valid children of preprocessor nodes.  Querying
+ * both gives C/C++ the same all-source inventory contract as grep without
+ * pretending the branch-only call sites are active in the selected build.
+ */
+function literalRecoveryTree(parser, code, selected) {
+    const allSource = allSourceRecoveryByTree.get(selected);
+    if (!parseRecoveryApplied(code, selected) || !allSource) return null;
+    const cached = allSourceTreeBySelected.get(selected);
+    if (cached) return cached;
+    const literal = safeParse(
+        parser,
+        allSource,
+        undefined,
+        PARSE_OPTIONS,
+    );
+    allSourceTreeBySelected.set(selected, literal);
+    return literal;
+}
+
+function mergeExtracted(primary, secondary, keyOf) {
+    const merged = [...primary];
+    const seen = new Set(primary.map(keyOf));
+    for (const item of secondary) {
+        const key = keyOf(item);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        merged.push(item);
+    }
+    return merged;
 }
 
 function unwrapDeclarator(node) {
@@ -585,13 +861,23 @@ function classIdentity(node) {
 
 function modifiersOf(node, extra = []) {
     const modifiers = new Set(extra);
-    for (const child of node.namedChildren || []) {
+    for (const child of node.children || []) {
+        if (child.type === 'virtual') modifiers.add('virtual');
         if (child.type === 'storage_class_specifier' ||
             child.type === 'type_qualifier' ||
             child.type === 'virtual_specifier' ||
             child.type === 'access_specifier') {
             modifiers.add(child.text);
         }
+    }
+    // `override`/`final` live under the function_declarator rather than as
+    // direct children of the definition. Preserve those explicit C++
+    // virtual-dispatch facts without scraping declaration text.
+    const stack = [...(node.namedChildren || [])];
+    while (stack.length > 0) {
+        const child = stack.pop();
+        if (child.type === 'virtual_specifier') modifiers.add(child.text);
+        else stack.push(...(child.namedChildren || []));
     }
     return [...modifiers];
 }
@@ -797,6 +1083,27 @@ function classMembers(node, lines, mode) {
     let access = node.type === 'class_specifier' ? 'private' : 'public';
     const members = [];
     for (const child of body.namedChildren || []) {
+        // Enumerators are declarations in an enum body, not ordinary C/C++
+        // field_declaration nodes. Index them as named constant members so
+        // they remain navigable across find/search/usages.
+        if (node.type === 'enum_specifier' && child.type === 'enumerator') {
+            const nameNode = child.childForFieldName('name') ||
+                (child.namedChildren || []).find(candidate =>
+                    candidate.type === 'identifier');
+            if (nameNode?.text) {
+                const { startLine, endLine, indent } = nodeToLocation(nameNode, lines);
+                members.push({
+                    name: nameNode.text,
+                    startLine,
+                    endLine,
+                    indent,
+                    modifiers: ['public'],
+                    memberType: 'field',
+                    fieldType: identity.ownerName || identity.name,
+                });
+            }
+            continue;
+        }
         if (child.type === 'access_specifier') {
             access = child.text;
             continue;
@@ -852,21 +1159,15 @@ function typedefEntries(node, lines) {
     return entries;
 }
 
-function findClasses(code, parser, mode) {
-    const tree = parseTree(parser, code);
-    const lines = code.split('\n');
+function findClassesInTree(code, tree, mode, sourceLines = null) {
+    const lines = sourceLines || code.split('\n');
     const classes = [];
     const seen = new Set();
     // Names with a bodied definition in this file: bodyless occurrences of
     // the same name (forward declarations, `struct S` in a parameter or
     // field type position) are references to it, never second definitions.
     const bodiedNames = new Set();
-    traverseTreeCached(tree.rootNode, node => {
-        if (!CLASS_NODES.has(node.type)) return true;
-        const bodiedName = node.childForFieldName('body') && classIdentity(node)?.name;
-        if (bodiedName) bodiedNames.add(bodiedName);
-        return true;
-    });
+    const bodylessEntries = new Set();
     const forwardDeclared = new Set();
     traverseTreeCached(tree.rootNode, node => {
         if (mode === 'cpp' && node.type === 'alias_declaration') {
@@ -905,7 +1206,10 @@ function findClasses(code, parser, mode) {
         if (!CLASS_NODES.has(node.type)) return true;
         const identity = classIdentity(node);
         if (!identity?.name) return true;
-        if (!node.childForFieldName('body')) {
+        const hasBody = !!node.childForFieldName('body');
+        if (hasBody) {
+            bodiedNames.add(identity.name);
+        } else {
             if (bodiedNames.has(identity.name)) return true;
             // A bodyless specifier is only a DECLARATION at declaration
             // level (`struct S;`); in a type position (`void f(struct S *)`)
@@ -931,7 +1235,7 @@ function findClasses(code, parser, mode) {
         if (mode === 'c' || node.type !== 'class_specifier' || modifiers.includes('public')) {
             modifiers.push('public');
         }
-        classes.push({
+        const entry = {
             name: identity.name,
             ...(identity.ownerName !== identity.name && {
                 specialization: identity.ownerName,
@@ -950,15 +1254,34 @@ function findClasses(code, parser, mode) {
             }),
             ...(bases.length > 0 && { extends: bases.join(', ') }),
             docstring: extractJSDocstring(lines, startLine),
-        });
+        };
+        classes.push(entry);
+        if (!hasBody) bodylessEntries.add(entry);
         return true;
     });
-    return classes;
+    // A forward declaration can precede its body. Filtering after the single
+    // traversal preserves the old "body wins" result without paying a full
+    // preliminary tree walk merely to discover future bodied names.
+    return classes.filter(entry =>
+        !bodylessEntries.has(entry) || !bodiedNames.has(entry.name));
 }
 
-function findFunctions(code, parser, mode) {
+function findClasses(code, parser, mode) {
     const tree = parseTree(parser, code);
-    const lines = code.split('\n');
+    const primary = findClassesInTree(code, tree, mode);
+    const literal = literalRecoveryTree(parser, code, tree);
+    if (!literal) return primary;
+    try {
+        return mergeExtracted(
+            primary,
+            findClassesInTree(code, literal, mode),
+            item => `${item.name}:${item.startLine}:${item.type}:${item.namespace || ''}`,
+        );
+    } finally { /* cached with the selected tree */ }
+}
+
+function findFunctionsInTree(code, tree, mode, sourceLines = null) {
+    const lines = sourceLines || code.split('\n');
     const functions = [];
     const seen = new Set();
     traverseTreeCached(tree.rootNode, node => {
@@ -1014,9 +1337,21 @@ function findFunctions(code, parser, mode) {
     return functions;
 }
 
-function findStateObjects(code, parser) {
+function findFunctions(code, parser, mode) {
     const tree = parseTree(parser, code);
-    const lines = code.split('\n');
+    const primary = findFunctionsInTree(code, tree, mode);
+    const literal = literalRecoveryTree(parser, code, tree);
+    if (!literal) return primary;
+    try {
+        return mergeExtracted(
+            primary,
+            findFunctionsInTree(code, literal, mode),
+            item => `${item.name}:${item.startLine}:${item.className || ''}:${item.isSignature ? 1 : 0}`,
+        );
+    } finally { /* cached with the selected tree */ }
+}
+
+function findStateObjectsInTree(tree, lines) {
     const states = [];
     traverseTreeCached(tree.rootNode, node => {
         if (node.type !== 'declaration') return true;
@@ -1040,20 +1375,23 @@ function findStateObjects(code, parser) {
     return states;
 }
 
-function findMacros(code, parser) {
-    const tree = parseTree(parser, code);
-    const lines = code.split('\n');
+function findStateObjects(code, parser) {
+    return findStateObjectsInTree(parseTree(parser, code), code.split('\n'));
+}
+
+function findMacrosInTree(tree, lines) {
     const macros = [];
-    traverseTreeCached(tree.rootNode, node => {
-        if (node.type !== 'preproc_function_def' && node.type !== 'preproc_def') {
-            return true;
-        }
+    for (const node of macroDefinitionNodes(tree)) {
         const nameNode = node.childForFieldName('name') ||
             (node.namedChildren || []).find(child => child.type === 'identifier');
-        if (!nameNode) return false;
+        if (!nameNode) continue;
         const paramsNode = node.childForFieldName('parameters') ||
             (node.namedChildren || []).find(child => child.type === 'preproc_params');
-        const { startLine, endLine, indent } = nodeToLocation(node, lines);
+        const { startLine, indent } = nodeToLocation(node, lines);
+        // Preprocessor nodes include their terminating newline, so a node
+        // ending at column zero belongs to the preceding physical line.
+        const endLine = Math.max(startLine,
+            node.endPosition.row + (node.endPosition.column > 0 ? 1 : 0));
         macros.push({
             name: nameNode.text,
             startLine,
@@ -1069,9 +1407,12 @@ function findMacros(code, parser) {
             functionLike: node.type === 'preproc_function_def',
             docstring: extractJSDocstring(lines, startLine),
         });
-        return false;
-    });
+    }
     return macros;
+}
+
+function findMacros(code, parser) {
+    return findMacrosInTree(parseTree(parser, code), code.split('\n'));
 }
 
 function enclosingFunctionOf(node) {
@@ -1154,6 +1495,7 @@ function variableDeclarators(node) {
  */
 function buildVariableTypes(tree) {
     const bindings = [];
+    const fieldTypes = new Map();
     // tree-sitter must preserve C++'s most-vexing-parse ambiguity and can
     // represent `T value(factory())` as a block-scope function declarator.
     // A later `value.method()` use proves that spelling denotes an object in
@@ -1161,15 +1503,46 @@ function buildVariableTypes(tree) {
     // Record only those use-proven direct initializers, never every ambiguous
     // block declaration.
     const memberReceiverUses = [];
-    traverseTree(tree.rootNode, node => {
-        if (node.type !== 'field_expression') return true;
-        const argument = node.childForFieldName('argument') || node.namedChild(0);
-        if (argument?.type === 'identifier') {
-            memberReceiverUses.push({ name: argument.text, at: argument.startIndex });
+    const ambiguousDirectInitializers = [];
+    const addBindings = (node, type, pointeeType, scope, declarators) => {
+        for (const declarator of declarators) {
+            const identity = declaratorIdentity(declarator);
+            if (!identity.name) continue;
+            bindings.push({
+                name: identity.name,
+                type,
+                ...(pointeeType && { pointeeType }),
+                declaredAt: node.type === 'parameter_declaration'
+                    ? scope.startIndex : declarator.startIndex,
+                scopeStart: scope.startIndex,
+                scopeEnd: scope.endIndex,
+            });
         }
-        return true;
-    });
+    };
     traverseTree(tree.rootNode, node => {
+        if (node.type === 'field_expression') {
+            const argument = node.childForFieldName('argument') || node.namedChild(0);
+            if (argument?.type === 'identifier') {
+                memberReceiverUses.push({ name: argument.text, at: argument.startIndex });
+            }
+            return true;
+        }
+        if (node.type === 'field_declaration' && !functionDeclarator(node)) {
+            const owner = enclosingClassName(node);
+            const typeNode = node.childForFieldName('type') ||
+                node.namedChildren.find(child => TYPE_NODES.has(child.type));
+            const fieldType = typeName(typeNode);
+            if (!owner || !fieldType) return true;
+            for (const child of node.namedChildren || []) {
+                if (!IDENTIFIER_NODES.has(child.type) &&
+                    child.type !== 'field_declarator') continue;
+                const identity = declaratorIdentity(child);
+                if (identity.name && identity.name !== typeNode?.text) {
+                    fieldTypes.set(`${owner}.${identity.name}`, fieldType);
+                }
+            }
+            return true;
+        }
         if (node.type !== 'parameter_declaration' && node.type !== 'declaration') {
             return true;
         }
@@ -1193,34 +1566,32 @@ function buildVariableTypes(tree) {
             return typeName({ text: match[1] }) || undefined;
         })();
         const scope = variableBindingScope(node);
-        let declarators = variableDeclarators(node);
+        const declarators = variableDeclarators(node);
         if (declarators.length === 0 && node.type === 'declaration' &&
             node.parent?.type === 'compound_statement') {
             const direct = node.childForFieldName('declarator');
             const identity = direct?.type === 'function_declarator'
                 ? declaratorIdentity(direct) : null;
-            if (identity?.name && memberReceiverUses.some(use =>
-                use.name === identity.name &&
-                use.at > direct.endIndex &&
-                scope.startIndex <= use.at && use.at < scope.endIndex)) {
-                declarators = [direct];
+            if (identity?.name) {
+                ambiguousDirectInitializers.push({
+                    node, type, pointeeType, scope, direct, name: identity.name,
+                });
             }
+            return true;
         }
-        for (const declarator of declarators) {
-            const identity = declaratorIdentity(declarator);
-            if (!identity.name) continue;
-            bindings.push({
-                name: identity.name,
-                type,
-                ...(pointeeType && { pointeeType }),
-                declaredAt: node.type === 'parameter_declaration'
-                    ? scope.startIndex : declarator.startIndex,
-                scopeStart: scope.startIndex,
-                scopeEnd: scope.endIndex,
-            });
-        }
+        addBindings(node, type, pointeeType, scope, declarators);
         return true;
     });
+    for (const candidate of ambiguousDirectInitializers) {
+        if (memberReceiverUses.some(use =>
+            use.name === candidate.name &&
+            use.at > candidate.direct.endIndex &&
+            candidate.scope.startIndex <= use.at &&
+            use.at < candidate.scope.endIndex)) {
+            addBindings(candidate.node, candidate.type, candidate.pointeeType,
+                candidate.scope, [candidate.direct]);
+        }
+    }
     const resolveBinding = (name, atNode) => {
         if (!name || !atNode) return undefined;
         const at = atNode.startIndex;
@@ -1240,28 +1611,8 @@ function buildVariableTypes(tree) {
         getPointee: (name, atNode) =>
             resolveBinding(name, atNode)?.pointeeType,
         has: (name, atNode) => resolveBinding(name, atNode) !== undefined,
+        fieldTypes,
     };
-}
-
-function buildFieldTypes(tree) {
-    const map = new Map();
-    traverseTree(tree.rootNode, node => {
-        if (node.type !== 'field_declaration' || functionDeclarator(node)) return true;
-        const owner = enclosingClassName(node);
-        const typeNode = node.childForFieldName('type') ||
-            node.namedChildren.find(child => TYPE_NODES.has(child.type));
-        const fieldType = typeName(typeNode);
-        if (!owner || !fieldType) return true;
-        for (const child of node.namedChildren || []) {
-            if (!IDENTIFIER_NODES.has(child.type) && child.type !== 'field_declarator') continue;
-            const identity = declaratorIdentity(child);
-            if (identity.name && identity.name !== typeNode?.text) {
-                map.set(`${owner}.${identity.name}`, fieldType);
-            }
-        }
-        return true;
-    });
-    return map;
 }
 
 function stringLiteralKind(node) {
@@ -1566,11 +1917,11 @@ function fieldReceiverPath(node) {
     return { root: base.root, fields: [...base.fields, field.text] };
 }
 
-function findCallsInCode(code, parser, _options = {}, existingTree = null,
+function findCallsInTree(code, parser, _options = {}, existingTree = null,
     includeMacroBodies = true) {
     const tree = existingTree || parseTree(parser, code);
     const variableTypes = buildVariableTypes(tree);
-    const fieldTypes = buildFieldTypes(tree);
+    const fieldTypes = variableTypes.fieldTypes;
     const calls = [];
     traverseTree(tree.rootNode, node => {
         const recoveredOperator = recoveredExplicitCallOperator(
@@ -1745,6 +2096,44 @@ function findCallsInCode(code, parser, _options = {}, existingTree = null,
     return calls;
 }
 
+function callIdentityKey(call) {
+    return [
+        call.name,
+        call.line,
+        call.column ?? '',
+        call.callStart ?? '',
+        call.callEnd ?? '',
+        call.isMethod ? 1 : 0,
+        call.isConstructor ? 1 : 0,
+        call.inMacroBody ? 1 : 0,
+    ].join(':');
+}
+
+function findCallsInCode(code, parser, options = {}, existingTree = null,
+    includeMacroBodies = true) {
+    // Synthetic macro-body parses and other explicit trees are already exact
+    // views supplied by the caller.  Only whole-file extraction participates
+    // in preprocessor-configuration conservation.
+    if (existingTree) {
+        return findCallsInTree(
+            code, parser, options, existingTree, includeMacroBodies);
+    }
+    const tree = parseTree(parser, code);
+    const primary = findCallsInTree(
+        code, parser, options, tree, includeMacroBodies);
+    const literal = literalRecoveryTree(parser, code, tree);
+    if (!literal) return primary;
+    try {
+        const literalCalls = findCallsInTree(
+            code, parser, options, literal, includeMacroBodies)
+            .map(call => ({ ...call, configurationVariant: true }));
+        // Selected-configuration facts retain their stronger evidence.  Only
+        // literal-only sites carry configurationVariant and are therefore
+        // routed to the visible unverified tier by callers.js.
+        return mergeExtracted(primary, literalCalls, callIdentityKey);
+    } finally { /* cached with the selected tree */ }
+}
+
 /**
  * Parse C/C++ replacement lists as executable syntax without treating the
  * preprocessor's opaque `preproc_arg` token as text evidence. Tree-sitter does
@@ -1826,8 +2215,7 @@ function findMacroBodyCalls(tree, code, parser, onlyName = null) {
     return calls;
 }
 
-function findImportsInCode(code, parser) {
-    const tree = parseTree(parser, code);
+function findImportsInTree(code, tree) {
     const imports = [];
     traverseTreeCached(tree.rootNode, node => {
         if (node.type !== 'preproc_include') return true;
@@ -1846,15 +2234,37 @@ function findImportsInCode(code, parser) {
     return imports;
 }
 
+function findImportsInCode(code, parser) {
+    const tree = parseTree(parser, code);
+    const primary = findImportsInTree(code, tree);
+    const literal = literalRecoveryTree(parser, code, tree);
+    if (!literal) return primary;
+    try {
+        return mergeExtracted(
+            primary,
+            findImportsInTree(code, literal),
+            item => `${item.module}:${item.line}:${item.type}`,
+        );
+    } finally { /* cached with the selected tree */ }
+}
+
 function findUsagesInCode(code, name, parser, existingTree) {
-    // Pre-parsed trees from generic callers bypass the macro-attribute
-    // recovery in parseTree — reject errored ones so usage classification
-    // sees the same recovered parse as symbol extraction.
-    const tree = (existingTree && !existingTree.rootNode.hasError)
-        ? existingTree
-        : parseTree(parser, code);
+    // Usage is the raw literal-name inventory. The literal C/C++ tree retains
+    // identifiers from every preprocessor branch and is sufficient for
+    // occurrence kind/line classification; symbol ownership still comes from
+    // the recovered index. Reusing ProjectIndex's raw tree avoids replaying
+    // expensive conditional recovery for every queried name.
+    const tree = existingTree ||
+        safeParse(parser, code, undefined, PARSE_OPTIONS);
     const usages = [];
-    visitNameNodes(tree, code, name, node => {
+    const seenUsages = new Set();
+    const addUsage = usage => {
+        const key = `${usage.line}:${usage.column ?? ''}:${usage.usageType}:${usage.receiver || ''}`;
+        if (seenUsages.has(key)) return;
+        seenUsages.add(key);
+        usages.push(usage);
+    };
+    const collectTreeUsages = sourceTree => visitNameNodes(sourceTree, code, name, node => {
         if (!IDENTIFIER_NODES.has(node.type) || node.text !== name) return;
         let usageType = 'reference';
         let receiver = null;
@@ -1910,13 +2320,14 @@ function findUsagesInCode(code, name, parser, existingTree) {
         // discovery and usage presentation; receiver-qualified forms above
         // retain their explicit receiver instead.
         if (!receiver) receiver = enclosingClassName(node);
-        usages.push({
+        addUsage({
             line: node.startPosition.row + 1,
             column: node.startPosition.column,
             usageType,
             ...(receiver && { receiver }),
         });
     });
+    collectTreeUsages(tree);
     // Replacement lists are opaque preproc_arg nodes in the C grammars. The
     // call extractor reparses those AST-proven regions; surface the resulting
     // call usages here as well so callers/callees, usages, and tests share one
@@ -1924,12 +2335,13 @@ function findUsagesInCode(code, name, parser, existingTree) {
     const seenCalls = new Set(usages
         .filter(usage => usage.usageType === 'call')
         .map(usage => `${usage.line}:${usage.column ?? ''}`));
-    for (const call of findMacroBodyCalls(tree, code, parser, name)) {
+    const macroCalls = findMacroBodyCalls(tree, code, parser, name);
+    for (const call of macroCalls) {
         if (call.name !== name) continue;
         const key = `${call.line}:${call.column ?? ''}`;
         if (seenCalls.has(key)) continue;
         seenCalls.add(key);
-        usages.push({
+        addUsage({
             line: call.line,
             column: call.column,
             usageType: 'call',
@@ -1951,19 +2363,71 @@ function isEntryPoint(symbol) {
     return getEntryPointKind(symbol) !== null;
 }
 
-function parse(code, parser, mode) {
+function parse(code, parser, mode, options = {}) {
     const tree = parseTree(parser, code);
-    return {
-        language: mode,
-        totalLines: code.length === 0 ? 0 : code.split('\n').length,
-        functions: findFunctions(code, parser, mode),
-        classes: findClasses(code, parser, mode),
-        stateObjects: findStateObjects(code, parser),
-        macros: findMacros(code, parser),
-        imports: findImportsInCode(code, parser),
-        exports: findExportsInCodeShallow(code, parser, mode),
-        ...(tree.rootNode.hasError && { parseRecovery: true }),
-    };
+    const literal = literalRecoveryTree(parser, code, tree);
+    try {
+        const lines = code.split('\n');
+        const functions = literal
+            ? mergeExtracted(
+                findFunctionsInTree(code, tree, mode, lines),
+                findFunctionsInTree(code, literal, mode, lines),
+                item => `${item.name}:${item.startLine}:${item.className || ''}:${item.isSignature ? 1 : 0}`,
+            )
+            : findFunctionsInTree(code, tree, mode, lines);
+        const classes = literal
+            ? mergeExtracted(
+                findClassesInTree(code, tree, mode, lines),
+                findClassesInTree(code, literal, mode, lines),
+                item => `${item.name}:${item.startLine}:${item.type}:${item.namespace || ''}`,
+            )
+            : findClassesInTree(code, tree, mode, lines);
+        const imports = literal
+            ? mergeExtracted(
+                findImportsInTree(code, tree),
+                findImportsInTree(code, literal),
+                item => `${item.module}:${item.line}:${item.type}`,
+            )
+            : findImportsInTree(code, tree);
+        const primaryCalls = findCallsInTree(code, parser, {}, tree, true);
+        const calls = literal
+            ? mergeExtracted(
+                primaryCalls,
+                findCallsInTree(code, parser, {}, literal, true)
+                    .map(call => ({ ...call, configurationVariant: true })),
+                callIdentityKey,
+            )
+            : primaryCalls;
+        const result = {
+            language: mode,
+            totalLines: code.length === 0 ? 0 : lines.length,
+            functions,
+            classes,
+            stateObjects: findStateObjectsInTree(tree, lines),
+            macros: findMacrosInTree(tree, lines),
+            imports,
+            exports: [
+                ...functions
+                    .filter(fn => !fn.modifiers.includes('static'))
+                    .map(fn => ({ name: fn.name, type: 'export', line: fn.startLine })),
+                ...classes.map(cls => ({ name: cls.name, type: 'export', line: cls.startLine })),
+            ],
+            ...(parseRecoveryApplied(code, tree) && { parseRecovery: true }),
+        };
+        // Adapter-only full-analysis fact: keep the public parse result shape
+        // stable while avoiding a second pair of whole-tree call walks during
+        // indexing.
+        Object.defineProperty(result, 'calls', {
+            value: calls,
+            enumerable: false,
+            configurable: true,
+        });
+        return result;
+    } finally {
+        if (options.releaseAnalysisTree) {
+            releaseCFamilyTree(parser, code, tree);
+        }
+    }
 }
 
 function findExportsInCodeShallow(code, parser, mode) {
@@ -1979,6 +2443,7 @@ function findExportsInCodeShallow(code, parser, mode) {
 
 function createCFamilyLanguage(mode) {
     return {
+        parseProvidesAnalysisFacts: true,
         findFunctions: (code, parser) => findFunctions(code, parser, mode),
         findClasses: (code, parser) => findClasses(code, parser, mode),
         findStateObjects,
@@ -1989,7 +2454,7 @@ function createCFamilyLanguage(mode) {
         findUsagesInCode,
         isEntryPoint,
         getEntryPointKind,
-        parse: (code, parser) => parse(code, parser, mode),
+        parse: (code, parser, options) => parse(code, parser, mode, options),
     };
 }
 

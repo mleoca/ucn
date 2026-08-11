@@ -2270,6 +2270,33 @@ function findExportsInCode(code, parser) {
     const exports = [];
 
     traverseTreeCached(tree.rootNode, (node) => {
+        // PEP 484 explicit re-export idiom:
+        // `from .core import public_thing as public_thing`. The redundant
+        // alias is deliberate compiler/tooling evidence that the imported
+        // name belongs to this module's public surface even without __all__.
+        if (node.type === 'import_from_statement') {
+            let source = '';
+            for (let index = 0; index < node.namedChildCount; index++) {
+                const child = node.namedChild(index);
+                if (!source && (child.type === 'dotted_name' ||
+                    child.type === 'relative_import')) {
+                    source = child.text;
+                    continue;
+                }
+                if (child.type !== 'aliased_import') continue;
+                const imported = child.namedChild(0);
+                const alias = child.namedChild(1);
+                if (imported?.text && alias?.text === imported.text) {
+                    exports.push({
+                        name: alias.text,
+                        type: 're-export',
+                        source,
+                        line: node.startPosition.row + 1,
+                    });
+                }
+            }
+            return true;
+        }
         // Look for __all__ = [...]
         if (node.type === 'expression_statement') {
             const child = node.namedChild(0);

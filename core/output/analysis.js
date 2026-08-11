@@ -146,6 +146,14 @@ function formatAccountLines(account) {
     if (account.unreadableFiles && account.unreadableFiles.length > 0) {
         lines.push(`WARNING: ${account.unreadableFiles.length} unreadable file(s) skipped: ${account.unreadableFiles.join(', ')}`);
     }
+    if (account.skippedSources && account.skippedSources.length > 0) {
+        const shown = account.skippedSources.slice(0, 5)
+            .map(issue => `${issue.relativePath} (${issue.reason})`);
+        lines.push(`WARNING: ${account.skippedSources.length} source discovery gap(s) make this index partial: ${shown.join(', ')}`);
+        if (account.skippedSources.length > shown.length) {
+            lines.push(`  ... and ${account.skippedSources.length - shown.length} more; run repo --sections=health for the full reason set.`);
+        }
+    }
     if (account.filtered && account.filtered.total > 0) {
         const parts = [];
         const f = account.filtered.byFlag || {};
@@ -357,7 +365,7 @@ function formatContext(ctx, options = {}) {
     let itemNum = 1;
 
     // Handle struct/interface types
-    if (ctx.type && ['class', 'struct', 'interface', 'type'].includes(ctx.type)) {
+    if (ctx.type && ['class', 'struct', 'interface', 'type', 'enum', 'record', 'trait', 'namespace'].includes(ctx.type)) {
         lines.push(`Context for ${ctx.type} ${ctx.name}:`);
         lines.push('═'.repeat(60));
 
@@ -386,8 +394,20 @@ function formatContext(ctx, options = {}) {
             });
         }
 
+        const members = ctx.members || [];
+        if (members.length > 0) {
+            lines.push(`\nMEMBERS (${members.length}):`);
+            for (const member of members) {
+                lines.push(`  ${member.name} (${member.type})`);
+                lines.push(`    ${member.file}:${member.line}`);
+            }
+        }
+
         const callers = ctx.callers || [];
-        lines.push(`\nCALLERS — CONFIRMED (${callers.length}):`);
+        const typeCallerTotal = ctx.meta?.callerTotal ?? callers.length;
+        const typeCallerLabel = typeCallerTotal > callers.length
+            ? `${callers.length} shown of ${typeCallerTotal}` : `${callers.length}`;
+        lines.push(`\nCALLERS — CONFIRMED (${typeCallerLabel}):`);
         for (const c of callers) {
             const callerName = c.callerName ? ` [${c.callerName}]` : '';
             lines.push(`  [${itemNum}] ${c.relativePath}:${c.line}${callerName}`);
@@ -476,9 +496,12 @@ function formatContext(ctx, options = {}) {
     const callers = ctx.callers || [];
     const prodCallers = callers.filter(c => !isTestEntry(c));
     const testCallers = callers.filter(c => isTestEntry(c));
-    const tierHeader = testCallers.length > 0
-        ? `CALLERS — CONFIRMED (${callers.length}, ${prodCallers.length} prod + ${testCallers.length} test):`
-        : `CALLERS — CONFIRMED (${callers.length}):`;
+    const callerTotal = ctx.meta?.callerTotal ?? callers.length;
+    const tierHeader = callerTotal > callers.length
+        ? `CALLERS — CONFIRMED (${callers.length} shown of ${callerTotal}):`
+        : testCallers.length > 0
+            ? `CALLERS — CONFIRMED (${callers.length}, ${prodCallers.length} prod + ${testCallers.length} test):`
+            : `CALLERS — CONFIRMED (${callers.length}):`;
     lines.push(`${compact ? '' : '\n'}${tierHeader}`);
     const callerEvidence = options.showConfidence !== false ? formatEvidenceLine(callers) : null;
     if (callerEvidence) lines.push(callerEvidence);
@@ -656,7 +679,10 @@ function formatContext(ctx, options = {}) {
     }
 
     const callees = ctx.callees || [];
-    lines.push(`${compact ? '' : '\n'}CALLEES (${callees.length}):`);
+    const calleeTotal = ctx.meta?.calleeTotal ?? callees.length;
+    const calleeLabel = calleeTotal > callees.length
+        ? `${callees.length} shown of ${calleeTotal}` : `${callees.length}`;
+    lines.push(`${compact ? '' : '\n'}CALLEES (${calleeLabel}):`);
     const calleeEvidence = options.showConfidence !== false ? formatEvidenceLine(callees) : null;
     if (calleeEvidence) lines.push(calleeEvidence);
     const calleeReach = reachabilityDisplay(callees, hasEntrypoints, 'callee');

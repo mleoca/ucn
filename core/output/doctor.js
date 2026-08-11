@@ -4,6 +4,8 @@
 
 'use strict';
 
+const { langTraits } = require('../../languages');
+
 function formatDoctor(result, options = {}) {
     if (!result) return 'No project to analyze.';
     const lines = [];
@@ -65,20 +67,28 @@ function formatDoctor(result, options = {}) {
     lines.push('');
     lines.push('Blind spots:');
     const bs = result.blindSpots || {};
+    const staticSpecialImports = result.projectLanguage &&
+        !langTraits(result.projectLanguage)?.hasDynamicImports;
+    const importLabel = staticSpecialImports
+        ? (result.projectLanguage === 'rust' ? 'Glob imports' : 'Blank/dot imports')
+        : 'Dynamic imports';
     const bsLines = [
-        ['Dynamic imports', bs.dynamicImports],
+        [importLabel, bs.dynamicImports],
         ['Eval/exec calls', bs.evalCalls],
         ['Reflection',      bs.reflection],
         ['Computed dispatch', bs.computedDispatch],
         ['Parse failures',  bs.parseFailures],
         ['Parser recovery', bs.parseRecoveries],
         ['Unsupported source', bs.unsupportedSources],
+        ['Skipped source', bs.skippedSources],
     ];
     const unitFor = {
-        'Dynamic imports': 'import', 'Eval/exec calls': 'use', Reflection: 'use',
+        'Dynamic imports': 'import', 'Blank/dot imports': 'import',
+        'Glob imports': 'import', 'Eval/exec calls': 'use', Reflection: 'use',
         'Computed dispatch': 'call',
         'Parse failures': 'failure',
         'Unsupported source': 'file',
+        'Skipped source': 'path',
     };
     let anyBlindSpot = false;
     for (const [label, info] of bsLines) {
@@ -98,6 +108,11 @@ function formatDoctor(result, options = {}) {
                     .join(', ');
                 lines.push(`  ${label}: ${fileCount} file${fileCount === 1 ? '' : 's'} skipped${languages ? ` (${languages})` : ''}`);
                 lines.push('    Handoff: use grep/ripgrep and a language-native analyzer for these files.');
+            } else if (label === 'Skipped source') {
+                const reasons = Object.entries(info.reasons || {})
+                    .map(([reason, count]) => `${reason} ${count}`).join(', ');
+                lines.push(`  ${label}: ${fileCount} path${fileCount === 1 ? '' : 's'} not indexed${reasons ? ` (${reasons})` : ''}`);
+                lines.push('    The index is partial; adjust .ucn.json or discovery limits before relying on completeness-sensitive commands.');
             } else {
                 lines.push(`  ${label}: ${info.count} ${unit}${info.count === 1 ? '' : 's'} in ${fileCount} file${fileCount === 1 ? '' : 's'}`);
             }

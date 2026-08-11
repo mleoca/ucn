@@ -29,11 +29,10 @@ const DEFAULT_IGNORES = [
     '.eggs',
     '*.egg-info',
 
-    // Build outputs
-    'dist',
+    // Framework-owned build outputs with unambiguous names. Generic names
+    // such as build/dist/out/coverage are intentionally NOT here: real,
+    // git-tracked source trees use them at arbitrary depths.
     '*-dist',
-    'build',
-    'out',
     '.next',
     'next.lock',
     '.nuxt',
@@ -47,8 +46,7 @@ const DEFAULT_IGNORES = [
     'storybook-static',
     '_site',
 
-    // Test/coverage
-    'coverage',
+    // Test/coverage tool metadata
     '.nyc_output',
     '.pytest_cache',
     '.mypy_cache',
@@ -96,6 +94,7 @@ const TEST_PATTERNS = {
     javascript: [
         /\.test\.(js|jsx|ts|tsx|mjs|cjs)$/,
         /\.spec\.(js|jsx|ts|tsx|mjs|cjs)$/,
+        /(^|\/)(test|spec)\.(js|jsx|ts|tsx|mjs|cjs)$/,
         /__tests__\//,
         /(^|\/)tests?\//,
         /\.test$/
@@ -103,6 +102,7 @@ const TEST_PATTERNS = {
     typescript: [
         /\.test\.(ts|tsx)$/,
         /\.spec\.(ts|tsx)$/,
+        /(^|\/)(test|spec)\.(ts|tsx)$/,
         /__tests__\//,
         /(^|\/)tests?\//
     ],
@@ -162,11 +162,15 @@ function parseGitignore(projectRoot) {
     const patterns = [];
     for (const rawLine of content.split('\n')) {
         const line = rawLine.trim();
-        // Skip empty lines, comments, negation patterns
-        if (!line || line.startsWith('#') || line.startsWith('!')) continue;
+        // Keep negations and ordering: gitignore is a last-match-wins rule.
+        if (!line || line.startsWith('#')) continue;
+
+        const negated = line.startsWith('!');
+        const body = negated ? line.slice(1) : line;
+        if (!body) continue;
 
         // Strip trailing slash (directory indicator) — shouldIgnore checks names, not types
-        let pattern = line.endsWith('/') ? line.slice(0, -1) : line;
+        let pattern = body.endsWith('/') ? body.slice(0, -1) : body;
 
         // Leading slash = ANCHORED to the .gitignore's directory (fix #226).
         // git semantics: `/locale` ignores only the root-level locale, never
@@ -178,18 +182,14 @@ function parseGitignore(projectRoot) {
         const anchored = pattern.startsWith('/');
         if (anchored) pattern = pattern.slice(1);
 
-        // Skip patterns with interior path separators — shouldIgnore matches
-        // single name segments, not full paths. Patterns like "foo/bar" would
-        // need walkDir-level support.
-        if (pattern.includes('/')) continue;
-
         // Skip empty after stripping
         if (!pattern) continue;
 
         // Avoid duplicating built-in ignores
-        if (DEFAULT_IGNORES.includes(pattern)) continue;
+        if (!negated && DEFAULT_IGNORES.includes(pattern)) continue;
 
-        patterns.push(anchored ? '/' + pattern : pattern);
+        const normalized = anchored ? '/' + pattern : pattern;
+        patterns.push((negated ? '!' : '') + normalized);
     }
 
     return patterns;
@@ -219,8 +219,9 @@ function compareNames(a, b) {
 function expandGlob(pattern, options = {}) {
     const root = path.resolve(options.root || process.cwd());
     const ignores = options.ignores || DEFAULT_IGNORES;
-    const maxDepth = options.maxDepth || 20;
-    const maxFiles = options.maxFiles || 50000;
+    const maxDepth = options.maxDepth ?? 1000;
+    const maxFiles = options.maxFiles ?? 50000;
+    const maxFileSize = options.maxFileSize ?? (8 * 1024 * 1024);
     const followSymlinks = options.followSymlinks !== false; // default true
 
     // Handle home directory expansion
@@ -238,14 +239,24 @@ function expandGlob(pattern, options = {}) {
         recursive,
         ignores,
         maxDepth,
+        maxFileSize,
         followSymlinks,
         // Anchored gitignore patterns ('/name') apply only to entries directly
         // under the project root — the .gitignore's own directory (fix #226).
         anchorRoot: root,
         onSkippedFile: options.onSkippedFile,
+        onDiscoveryIssue: options.onDiscoveryIssue,
+        disclosureIgnores: options.disclosureIgnores,
         onFile: (filePath) => {
             if (files.length < maxFiles) {
                 files.push(filePath);
+            } else if (options.onDiscoveryIssue) {
+                options.onDiscoveryIssue({
+                    path: filePath,
+                    kind: 'file',
+                    reason: 'max-files',
+                    detail: `discovery exceeded maxFiles=${maxFiles}`,
+                });
             }
         }
     });
@@ -314,7 +325,13 @@ function globToRegex(glob) {
  * Walk a directory tree, calling onFile for each matching file
  */
 function walkDir(dir, options, depth = 0, visited = new Set()) {
-    if (depth > options.maxDepth) return;
+    if (depth > options.maxDepth) {
+        options.onDiscoveryIssue?.({
+            path: dir, kind: 'directory', reason: 'max-depth',
+            detail: `discovery exceeded maxDepth=${options.maxDepth}`,
+        });
+        return;
+    }
     if (!fs.existsSync(dir)) return;
 
     // Track visited directories to avoid circular symlinks
@@ -322,6 +339,10 @@ function walkDir(dir, options, depth = 0, visited = new Set()) {
     try {
         realDir = fs.realpathSync(dir);
     } catch (e) {
+        options.onDiscoveryIssue?.({
+            path: dir, kind: 'directory', reason: 'unreadable-directory',
+            detail: e.message,
+        });
         return; // broken symlink
     }
     if (visited.has(realDir)) return;
@@ -331,6 +352,10 @@ function walkDir(dir, options, depth = 0, visited = new Set()) {
     try {
         entries = fs.readdirSync(dir, { withFileTypes: true });
     } catch (e) {
+        options.onDiscoveryIssue?.({
+            path: dir, kind: 'directory', reason: 'unreadable-directory',
+            detail: e.message,
+        });
         return;
     }
 
@@ -341,6 +366,7 @@ function walkDir(dir, options, depth = 0, visited = new Set()) {
     for (const entry of entries) {
         const fullPath = path.join(dir, entry.name);
 
+        const entryIsDirectory = entry.isDirectory();
         if (shouldIgnore(
             entry.name,
             options.ignores,
@@ -348,7 +374,26 @@ function walkDir(dir, options, depth = 0, visited = new Set()) {
             dir === options.anchorRoot,
             options.anchorRoot,
             fullPath,
-        )) continue;
+            entryIsDirectory,
+        )) {
+            if (options.disclosureIgnores && shouldIgnore(
+                entry.name,
+                options.disclosureIgnores,
+                dir,
+                dir === options.anchorRoot,
+                options.anchorRoot,
+                fullPath,
+                entryIsDirectory,
+            )) {
+                options.onDiscoveryIssue?.({
+                    path: fullPath,
+                    kind: entryIsDirectory ? 'directory' : 'file',
+                    reason: 'config-exclude',
+                    detail: 'excluded by .ucn.json',
+                });
+            }
+            continue;
+        }
 
         let isDir = entry.isDirectory();
         let isFile = entry.isFile();
@@ -370,6 +415,22 @@ function walkDir(dir, options, depth = 0, visited = new Set()) {
             }
         } else if (isFile) {
             if (options.filePattern.test(entry.name)) {
+                let size;
+                try { size = fs.statSync(fullPath).size; } catch (e) {
+                    options.onDiscoveryIssue?.({
+                        path: fullPath, kind: 'file', reason: 'unreadable-file',
+                        detail: e.message,
+                    });
+                    continue;
+                }
+                if (size > options.maxFileSize) {
+                    options.onDiscoveryIssue?.({
+                        path: fullPath, kind: 'file', reason: 'max-file-size',
+                        detail: `${size} bytes exceeds maxFileSize=${options.maxFileSize}`,
+                        size,
+                    });
+                    continue;
+                }
                 options.onFile(fullPath);
             } else if (options.onSkippedFile) {
                 options.onSkippedFile(fullPath);
@@ -399,9 +460,13 @@ function shouldIgnore(
     atAnchorRoot = false,
     anchorRoot,
     fullPath,
+    isDirectory = false,
 ) {
-    // Check unconditional ignores
-    for (let pattern of ignores) {
+    let ignored = false;
+    for (const rawPattern of ignores) {
+        const negated = rawPattern.charCodeAt(0) === 33 /* ! */;
+        let pattern = negated ? rawPattern.slice(1) : rawPattern;
+        let matched = false;
         if (pattern.includes('/') && anchorRoot && fullPath) {
             const normalizedPattern = pattern.replace(/^\/+/, '')
                 .replaceAll('\\', '/');
@@ -417,24 +482,46 @@ function shouldIgnore(
                 : null;
             if (regex.test(relative) ||
                 (directoryPrefix && relative === directoryPrefix)) {
-                return true;
+                matched = true;
             }
-            continue;
-        }
-        if (pattern.charCodeAt(0) === 47 /* '/' */) {
+        } else if (pattern.charCodeAt(0) === 47 /* '/' */) {
             if (!atAnchorRoot) continue;
             pattern = pattern.slice(1);
-        }
-        if (pattern.includes('*')) {
+            matched = pattern.includes('*')
+                ? globToRegex(pattern).test(name)
+                : name === pattern;
+        } else if (pattern.includes('*')) {
             let regex = _globRegexCache.get(pattern);
             if (!regex) {
                 regex = globToRegex(pattern);
                 _globRegexCache.set(pattern, regex);
             }
-            if (regex.test(name)) return true;
+            if (regex.test(name)) matched = true;
         } else if (name === pattern) {
-            return true;
+            matched = true;
         }
+        if (matched) ignored = !negated;
+    }
+
+    // A later negation can re-include a descendant. Keep walking a currently
+    // ignored directory whenever such a rule might apply below it.
+    if (ignored && isDirectory && anchorRoot && fullPath) {
+        const relative = path.relative(anchorRoot, fullPath).replaceAll(path.sep, '/');
+        const mayReincludeDescendant = ignores.some(raw => {
+            if (!raw.startsWith('!')) return false;
+            const pattern = raw.slice(1).replace(/^\/+/, '');
+            return pattern.includes('/') &&
+                (pattern.startsWith(relative + '/') || pattern.includes('**'));
+        });
+        if (mayReincludeDescendant) ignored = false;
+    }
+    if (ignored) {
+        return true;
+    }
+
+    // A negated rule is only meaningful after a positive rule matched.
+    if (ignores.some(pattern => pattern.startsWith('!'))) {
+        // Fall through to conditional ignores.
     }
 
     // Check conditional ignores (only if parentDir provided)

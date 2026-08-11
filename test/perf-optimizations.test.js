@@ -11,6 +11,7 @@ const fs = require('fs');
 const path = require('path');
 const { tmp, rm, idx } = require('./helpers');
 const { execute } = require('../core/execute');
+const { partitionFiles } = require('../core/parallel-build');
 const {
     saveCache, loadCache, isCacheStale, getProjectCacheDir, getProjectCachePath,
     CACHE_FORMAT_VERSION,
@@ -41,6 +42,22 @@ function main() { a.Run(); }
 module.exports = { main };
 `,
 };
+
+describe('perf: size-aware worker scheduling', () => {
+    it('separates giant sources instead of balancing only file counts', () => {
+        const sizes = new Map([
+            ['huge-a', { size: 500 }],
+            ['huge-b', { size: 450 }],
+            ['small-a', { size: 30 }],
+            ['small-b', { size: 20 }],
+        ]);
+        const chunks = partitionFiles({ files: sizes }, [...sizes.keys()], 2);
+        assert.strictEqual(chunks.length, 2);
+        assert.ok(!chunks.some(chunk =>
+            chunk.files.includes('huge-a') && chunk.files.includes('huge-b')));
+        assert.deepStrictEqual(chunks.map(chunk => chunk.bytes), [500, 500]);
+    });
+});
 
 // ── findEnclosingFunction op cache ────────────────────────────────────────────
 
@@ -667,6 +684,7 @@ function b() { c(); }
 function c() { return 1; }
 function unused() { return 2; }
 module.exports = { main };
+main();
 `,
         });
         try {
@@ -695,7 +713,7 @@ module.exports = { main };
     it('discards cached _reachableSymbols when index drifts after load', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
-            'index.js': 'function main() { return 1; }\nmodule.exports = { main };',
+            'index.js': 'function main() { return 1; }\nmodule.exports = { main };\nmain();',
         });
         try {
             const { ProjectIndex } = require('../core/project');
@@ -737,7 +755,7 @@ module.exports = { main };
         for (let i = 0; i < N; i++) {
             body += `function fn${i}() { return ${i === 0 ? 1 : `fn${i - 1}()`}; }\n`;
         }
-        body += `module.exports = { fn0, fn${N - 1} };\n`;
+        body += `module.exports = { fn0, fn${N - 1} };\nfn${N - 1}();\n`;
         files['index.js'] = body;
         const dir = tmp(files);
         try {
@@ -779,6 +797,7 @@ function b() { c(); }
 function c() { return 1; }
 function unused() { return 2; }
 module.exports = { main };
+main();
 `,
         });
         try {
@@ -805,6 +824,7 @@ function b() { c(); }
 function c() { return 1; }
 function unused() { return 2; }
 module.exports = { main };
+main();
 `,
         });
         try {
@@ -842,6 +862,7 @@ function b() { c(); }
 function c() { return 1; }
 function unused() { return 2; }
 module.exports = { main };
+main();
 `,
         });
         try {

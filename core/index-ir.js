@@ -16,6 +16,7 @@ function createImportBindings(imports) {
             return {
                 name,
                 module: item.module,
+                ...(item.line != null && { line: item.line }),
                 ...(rename && { alias: rename.local }),
                 ...(item.defaultLike && { defaultLike: true }),
             };
@@ -44,6 +45,7 @@ function createFileEntryFromIR({
         mtime,
         size,
         imports: imports.map(item => item.module),
+        globalImports: imports.filter(item => item.global).map(item => item.module),
         importNames: imports.flatMap(item => item.names || []),
         importBindings: createImportBindings(imports),
         exports: exports.map(item => item.name),
@@ -73,7 +75,7 @@ const OPTIONAL_SYMBOL_FIELDS = Object.freeze([
     'lexicalScopeStartLine', 'lexicalScopeEndLine',
     'returnTypeQualifier', 'macroNeverReturns', 'callbackParamTypes', 'iteratorItemType',
     'returnedConcreteType', 'returnedConstructors', 'templateDependent',
-    'linkage',
+    'linkage', 'functionLike',
 ]);
 
 function materializeSymbol(fileEntry, item) {
@@ -95,7 +97,10 @@ function materializeSymbol(fileEntry, item) {
     for (const field of OPTIONAL_SYMBOL_FIELDS) {
         if (item[field] === undefined || item[field] === null) continue;
         if (Array.isArray(item[field]) && item[field].length === 0) continue;
-        if (item[field] === false) continue;
+        // Most false feature flags are omitted for compactness, but
+        // functionLike=false is the semantic distinction between an
+        // object-like macro and a callable macro (UCN5-170).
+        if (item[field] === false && field !== 'functionLike') continue;
         symbol[field] = item[field];
     }
     return symbol;

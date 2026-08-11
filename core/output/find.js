@@ -118,14 +118,18 @@ function formatFindDetailed(symbols, query, options = {}) {
             (sameNameDefinitionCounts.get(symbol.name) || 0) + 1,
         );
     }
+    for (const [name, count] of Object.entries(symbols.findInfo?.nameWideDefinitionCounts || {})) {
+        sameNameDefinitionCounts.set(name, count);
+    }
     const limit = all ? symbols.length : (top > 0 ? top : DEFAULT_LIMIT);
     const showing = Math.min(limit, symbols.length);
-    const hidden = symbols.length - showing;
+    const total = symbols.findInfo?.total ?? symbols.length;
+    const hidden = Math.max(0, total - showing);
 
     if (hidden > 0) {
-        lines.push(`Found ${symbols.length} match(es) for "${query}" (showing top ${showing}):`);
+        lines.push(`Found ${total} match(es) for "${query}" (showing top ${showing}):`);
     } else {
-        lines.push(`Found ${symbols.length} match(es) for "${query}":`);
+        lines.push(`Found ${total} match(es) for "${query}":`);
     }
     if (!compact) lines.push('─'.repeat(60));
 
@@ -275,12 +279,13 @@ function formatUsagesJson(usages, name) {
     const calls = refs.filter(u => u.usageType === 'call');
     const imports = refs.filter(u => u.usageType === 'import');
     const textOccurrences = refs.filter(u => u.usageType === 'text');
+    const otherDefinitions = refs.filter(u => u.usageType === 'definition');
     // Exhaustive complement (fix #241): a non-definition record that is
     // neither call nor import lands in references — same-name definer sites
     // (usageType 'definition', isDefinition false: shadowing locals, other
     // defs of the name) used to inflate totals while rendering in NO band.
     const references = refs.filter(u =>
-        !['call', 'import', 'text'].includes(u.usageType));
+        !['call', 'import', 'text', 'definition'].includes(u.usageType));
 
     // Each usage record points at a call site. We emit a per-occurrence handle
     // pointing at the SITE itself in the form "relativePath:line:callerName"
@@ -316,6 +321,7 @@ function formatUsagesJson(usages, name) {
             callCount: sc ? sc.calls : calls.length,
             importCount: sc ? sc.imports : imports.length,
             referenceCount: sc ? sc.references : references.length,
+            otherDefinitionCount: sc ? (sc.otherDefinitions || 0) : otherDefinitions.length,
             textCount: sc ? (sc.text || 0) : textOccurrences.length,
             totalUsages: sc
                 ? (sc.calls + sc.imports + sc.references + (sc.text || 0))
@@ -336,6 +342,7 @@ function formatUsagesJson(usages, name) {
             }),
             calls: calls.map(formatUsage),
             imports: imports.map(formatUsage),
+            otherDefinitions: otherDefinitions.map(formatUsage),
             references: references.map(formatUsage),
             textOccurrences: textOccurrences.map(u => ({
                 ...formatUsage(u),
@@ -354,9 +361,9 @@ function formatUsages(usages, name, options = {}) {
     const calls = usages.filter(u => u.usageType === 'call');
     const imports = usages.filter(u => u.usageType === 'import');
     const textOccurrences = usages.filter(u => u.usageType === 'text');
-    // Exhaustive complement (fix #241) — see formatUsagesJson.
+    const otherDefinitions = usages.filter(u => !u.isDefinition && u.usageType === 'definition');
     const refs = usages.filter(u => !u.isDefinition &&
-        !['call', 'import', 'text'].includes(u.usageType));
+        !['call', 'import', 'text', 'definition'].includes(u.usageType));
 
     // Under --limit the listed entries are truncated but the summary must
     // describe the FULL result set (fix #237) — the handler attaches the
@@ -367,7 +374,7 @@ function formatUsages(usages, name, options = {}) {
     // reference is a `reference` here even when the engine confirms it as a
     // caller. ACCOUNT lines in show/impact are engine-adjudicated, so the
     // two breakdowns can legitimately differ; both count lines.
-    lines.push(`Usages of "${name}" (syntax-classified): ${sc ? sc.definitions : defs.length} definitions, ${sc ? sc.calls : calls.length} calls, ${sc ? sc.imports : imports.length} imports, ${sc ? sc.references : refs.length} references, ${sc ? (sc.text || 0) : textOccurrences.length} other-text`);
+    lines.push(`Usages of "${name}" (syntax-classified): ${sc ? sc.definitions : defs.length} definitions, ${sc ? (sc.otherDefinitions || 0) : otherDefinitions.length} other definitions, ${sc ? sc.calls : calls.length} calls, ${sc ? sc.imports : imports.length} imports, ${sc ? sc.references : refs.length} references, ${sc ? (sc.text || 0) : textOccurrences.length} other-text`);
     if (!compact) lines.push('═'.repeat(60));
 
     function renderContextLines(usage) {
@@ -420,6 +427,14 @@ function formatUsages(usages, name, options = {}) {
                 lines.push(`  ${i.relativePath}:${i.line}`);
                 lines.push(`    ${i.content.trim()}`);
             }
+        }
+    }
+
+    if (otherDefinitions.length > 0) {
+        lines.push(`${compact ? '' : '\n'}OTHER DEFINITIONS (same spelling; not references to the selected target):`);
+        for (const d of otherDefinitions) {
+            const expression = d.content ? d.content.trim() : '';
+            lines.push(`  ${d.relativePath}:${d.line}${expression ? `\n    ${expression}` : ''}`);
         }
     }
 

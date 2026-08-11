@@ -23,7 +23,9 @@ function formatImports(imports, filePath) {
         for (const imp of internal) {
             lines.push(`  ${imp.module}`);
             if (imp.resolved) {
-                lines.push(`    -> ${imp.resolved}`);
+                lines.push(`    -> ${imp.resolved}${imp.indexed === false
+                    ? ' (not indexed; absent from dependency graph)'
+                    : ''}`);
             }
             if (imp.names && imp.names.length > 0 && imp.names[0] !== '*') {
                 lines.push(`    ${imp.names.join(', ')}`);
@@ -73,6 +75,7 @@ function formatImportsJson(imports, filePath) {
             names: i.names,
             type: i.type,
             resolved: i.resolved || null,
+            indexed: i.resolved ? i.indexed !== false : false,
             isDynamic: !!i.isDynamic,
             line: i.line ?? null
         }))
@@ -170,10 +173,6 @@ function formatApi(symbols, filePath) {
 
     if (symbols.length === 0) {
         lines.push('  (none found)');
-        if (filePath && filePath.endsWith('.py')) {
-            lines.push('');
-            lines.push('Note: Python requires __all__ for export detection. Use repo --sections=files --detailed to see all functions/classes.');
-        }
     } else {
         // Group by file, then dedup overloads within each file group.
         const byFile = new Map();
@@ -194,6 +193,10 @@ function formatApi(symbols, filePath) {
             lines.push('');
         }
     }
+    if (symbols.apiInfo?.pythonImplicitFiles > 0) {
+        lines.push('');
+        lines.push('Note: Python files without __all__ use the standard top-level non-underscore public-name convention; explicit `from X import Y as Y` re-exports are included.');
+    }
 
     return lines.join('\n');
 }
@@ -212,6 +215,9 @@ function formatApiJson(symbols, filePath) {
             command: 'api',
             count: deduped.length,
             ...(li && { total: li.total, truncated: true }),
+            ...(symbols.apiInfo?.pythonImplicitFiles > 0 && {
+                note: 'Python files without __all__ use the top-level non-underscore public-name convention; explicit redundant-alias re-exports are included.',
+            }),
         },
         ...(filePath && { file: filePath }),
         data: {

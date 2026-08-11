@@ -8,6 +8,86 @@
 const { detectLanguage, getParser, getLanguageAdapter, safeParse, langTraits } = require('../languages');
 const { escapeRegExp, codeUnitCompare } = require('./shared');
 
+function codeUnitColumnForByteColumn(line, byteColumn) {
+    if (!Number.isInteger(byteColumn) || byteColumn < 0) return null;
+    let bytes = 0;
+    for (let i = 0; i <= line.length; i++) {
+        if (bytes === byteColumn) return i;
+        if (i === line.length) break;
+        const cp = line.codePointAt(i);
+        const ch = String.fromCodePoint(cp);
+        bytes += Buffer.byteLength(ch);
+        if (ch.length === 2) i++;
+    }
+    return null;
+}
+
+/** Replace only AST identifier tokens on one source line. */
+function renameIdentifierTokens(index, filePath, lineNumber, oldName, newName,
+    preferredByteColumns = null, expectedCallCount = null) {
+    const absolute = filePath && require('path').isAbsolute(filePath)
+        ? filePath : require('path').join(index.root, filePath || '');
+    const content = index._readFile(absolute);
+    const sourceLine = content.split('\n')[lineNumber - 1] || '';
+    let byteColumns = Array.isArray(preferredByteColumns)
+        ? preferredByteColumns.filter(Number.isInteger) : [];
+
+    if (byteColumns.length === 0) {
+        const language = index.files.get(absolute)?.language ||
+            detectLanguage(absolute, index.root);
+        const parser = language && getParser(language);
+        const tree = parser && (index._getParsedTree?.(absolute, content, language) ||
+            safeParse(parser, content));
+        if (tree) {
+            const targetRow = lineNumber - 1;
+            const stack = [tree.rootNode];
+            while (stack.length > 0) {
+                const node = stack.pop();
+                if (node.endPosition.row < targetRow ||
+                    node.startPosition.row > targetRow) continue;
+                if (node.startPosition.row === targetRow && node.text === oldName &&
+                    /identifier(?:_pattern)?$/.test(node.type)) {
+                    let eligible = preferredByteColumns == null;
+                    if (!eligible) {
+                        const callTypes = new Set([
+                            'call', 'call_expression', 'method_invocation',
+                            'invocation_expression', 'method_call_expression',
+                        ]);
+                        for (let parent = node.parent, depth = 0;
+                            parent && depth < 5; parent = parent.parent, depth++) {
+                            if (!callTypes.has(parent.type)) continue;
+                            const target = parent.childForFieldName('function') ||
+                                parent.childForFieldName('name') ||
+                                parent.childForFieldName('method') ||
+                                parent.namedChild(0);
+                            if (target && node.startIndex >= target.startIndex &&
+                                node.endIndex <= target.endIndex) eligible = true;
+                            break;
+                        }
+                    }
+                    if (eligible) byteColumns.push(node.startPosition.column);
+                    continue;
+                }
+                stack.push(...(node.namedChildren || []));
+            }
+        }
+    }
+
+    const columns = [...new Set(byteColumns
+        .map(column => codeUnitColumnForByteColumn(sourceLine, column))
+        .filter(Number.isInteger))].sort((a, b) => b - a);
+    if (expectedCallCount != null && columns.length !== expectedCallCount) {
+        return { source: sourceLine.trim(), renamed: sourceLine.trim(), count: 0 };
+    }
+    let renamed = sourceLine;
+    for (const column of columns) {
+        if (renamed.slice(column, column + oldName.length) !== oldName) continue;
+        renamed = renamed.slice(0, column) + newName +
+            renamed.slice(column + oldName.length);
+    }
+    return { source: sourceLine.trim(), renamed: renamed.trim(), count: columns.length };
+}
+
 // ============================================================================
 // CALL-SITE CLASSIFICATION (Feature A)
 // ============================================================================
@@ -169,7 +249,8 @@ function _collectCallNodes(node, callTypes, targetRow, funcName, limit, out = []
             // JS/TS constructor: new ClassName(args) — class is in 'constructor'
             // field (fix #230: these sites used to fall out as "Could not
             // parse call arguments" and every class verify went uncertain).
-            const ctorNode = node.childForFieldName('constructor');
+            const ctorNode = node.childForFieldName('constructor') ||
+                node.childForFieldName('type');
             if (ctorNode) {
                 const typeName = ctorNode.text.replace(/<.*>$/, '').split('.').pop();
                 if (typeName === funcName) out.push(node);
@@ -196,9 +277,14 @@ function _collectCallNodes(node, callTypes, targetRow, funcName, limit, out = []
                 const indirectTarget = indirectObject?.type === 'member_expression'
                     ? indirectObject.childForFieldName('property')?.text
                     : indirectObject?.text;
-                const funcText = funcNode.type === 'member_expression' || funcNode.type === 'selector_expression' || funcNode.type === 'field_expression' || funcNode.type === 'attribute'
-                    ? (funcNode.childForFieldName('property') || funcNode.childForFieldName('field') || funcNode.childForFieldName('attribute') || funcNode.namedChild(funcNode.namedChildCount - 1))?.text
-                    : funcNode.type === 'scoped_identifier'
+                const funcText = funcNode.type === 'member_expression' ||
+                    funcNode.type === 'member_access_expression' ||
+                    funcNode.type === 'selector_expression' ||
+                    funcNode.type === 'field_expression' || funcNode.type === 'attribute'
+                    ? (funcNode.childForFieldName('property') || funcNode.childForFieldName('name') ||
+                        funcNode.childForFieldName('field') || funcNode.childForFieldName('attribute') ||
+                        funcNode.namedChild(funcNode.namedChildCount - 1))?.text
+                    : funcNode.type === 'scoped_identifier' || funcNode.type === 'qualified_identifier'
                     ? (funcNode.childForFieldName('name') || funcNode.namedChild(funcNode.namedChildCount - 1))?.text
                     : funcNode.text;
                 if (funcText === funcName || indirectTarget === funcName) out.push(node);
@@ -487,7 +573,7 @@ function extractArrowTypesFromVarDecl(index, def) {
  * @returns {Array<Array<object>>|null}
  */
 function _constructorParamLists(index, def, lang) {
-    if (!def || !def.file || !['class', 'enum', 'record'].includes(def.type)) return null;
+    if (!def || !def.file || !['class', 'struct', 'enum', 'record'].includes(def.type)) return null;
     const lists = [];
     const endLine = def.endLine != null ? def.endLine : Infinity;
     const inRange = (d) => d.file === def.file &&
@@ -665,7 +751,9 @@ function computePlanCallSites(index, name, def) {
         const analysis = analyzeCallSite(index, call, name, occurrence);
         sites.push({
             file: call.relativePath,
+            absoluteFile: call.file,
             line: call.line,
+            ...(Number.isInteger(c.column) && { column: c.column }),
             expression: (call.content || '').trim(),
             args: analysis.args,
             argCount: analysis.argCount,
@@ -744,7 +832,7 @@ function analyzeCallSite(index, call, funcName, occurrence = 0) {
 
         // Call node types vary by language
         const callTypes = new Set(['call_expression', 'call', 'method_invocation',
-            'object_creation_expression', 'new_expression']);
+            'invocation_expression', 'object_creation_expression', 'new_expression']);
         const targetRow = call.line - 1; // tree-sitter is 0-indexed
 
         // Find the call expression at the target line matching funcName
@@ -780,7 +868,9 @@ function analyzeCallSite(index, call, funcName, occurrence = 0) {
 
         let args = [];
         for (let i = 0; i < argsNode.namedChildCount; i++) {
-            args.push(argsNode.namedChild(i).text.trim());
+            const argNode = argsNode.namedChild(i);
+            if (argNode.type.includes('comment')) continue;
+            args.push(argNode.text.trim());
         }
 
         // Function.prototype indirection has a precise, AST-visible argument
@@ -822,7 +912,9 @@ function analyzeCallSite(index, call, funcName, occurrence = 0) {
             }
             args = [];
             for (let i = 0; i < arrayArg.namedChildCount; i++) {
-                args.push(arrayArg.namedChild(i).text.trim());
+                const argNode = arrayArg.namedChild(i);
+                if (argNode.type.includes('comment')) continue;
+                args.push(argNode.text.trim());
             }
         }
 
@@ -884,7 +976,8 @@ function analyzeCallShape(index, filePath, lineNum, funcName) {
             index._treeCache.set(filePath, tree);
         }
 
-        const callTypes = new Set(['call_expression', 'call', 'method_invocation', 'object_creation_expression']);
+        const callTypes = new Set(['call_expression', 'call', 'method_invocation',
+            'invocation_expression', 'object_creation_expression', 'new_expression']);
         const callNode = findCallNode(tree.rootNode, callTypes, lineNum - 1, funcName);
         if (!callNode) return null;
 
@@ -897,6 +990,7 @@ function analyzeCallShape(index, filePath, lineNum, funcName) {
         const argTexts = [];
         for (let i = 0; i < argsNode.namedChildCount; i++) {
             const argNode = argsNode.namedChild(i);
+            if (argNode.type.includes('comment')) continue;
             argKinds.push(classifyArgNode(argNode));
             argTexts.push(argNode.text.trim());
         }
@@ -1096,6 +1190,11 @@ function verify(index, name, options = {}) {
         content: c.content,
         usageType: 'call',
         receiver: c.receiver,
+        // Preserve receiver identity through the usage-shaped adapter. Go
+        // permits a local value to have the same spelling as its type; only
+        // a type-qualified call is a method expression with an explicit
+        // receiver argument.
+        receiverType: c.receiverType,
         callerFile: c.callerFile,
         callerStartLine: c.callerStartLine,
     }));
@@ -1167,7 +1266,8 @@ function verify(index, name, options = {}) {
         const targetTypeName = def.className || (def.receiver || '').replace(/^\*/, '');
         if (targetTypeName && call.receiver === targetTypeName && argCount > 0) {
             const qualStyle = langTraits(lang)?.typeQualifiedCallStyle;
-            if ((qualStyle === 'method-expr' && def.receiver) ||
+            if ((qualStyle === 'method-expr' && def.receiver &&
+                !call.receiverType) ||
                 (qualStyle === 'path' && def.isMethod)) {
                 argCount -= 1;
             }
@@ -1452,6 +1552,7 @@ function plan(index, name, options = {}) {
     let newSignature = currentSignature;
     let operation = null;
     let changes = [];
+    let unchangedSites = 0;
 
     if (options.addParam) {
         // Check if parameter already exists
@@ -1511,7 +1612,11 @@ function plan(index, name, options = {}) {
         for (const site of planCallSites) {
             let suggestion;
             if (options.defaultValue && langHasDefaults) {
-                suggestion = `No change needed (has default value)`;
+                // The default makes the existing call valid. Keep the fact in
+                // metadata, but do not inflate the concrete edit plan with a
+                // no-op entry (UCN5-166).
+                unchangedSites++;
+                continue;
             } else if (options.defaultValue) {
                 suggestion = `Add argument: ${options.defaultValue} (no default parameter values in ${planFileEntry?.language || 'this language'})`;
             } else {
@@ -1609,19 +1714,53 @@ function plan(index, name, options = {}) {
         // line appears ONCE however many call records it holds (fix #230 —
         // the non-global regex left the inner call behind and emitted a
         // duplicate entry per record).
-        const renamedLines = new Set();
+        const callLines = new Map();
         for (const site of planCallSites) {
             const lineKey = `${site.file}:${site.line}`;
-            if (renamedLines.has(lineKey)) continue;
-            renamedLines.add(lineKey);
-            const newExpression = site.expression.replace(
-                new RegExp('\\b' + escapeRegExp(name) + '\\b', 'g'),
-                options.renameTo
-            );
+            const group = callLines.get(lineKey) || {
+                file: site.file,
+                absoluteFile: site.absoluteFile,
+                line: site.line,
+                expression: site.expression,
+                columns: [],
+                missingColumn: false,
+                callCount: 0,
+            };
+            group.callCount++;
+            if (Number.isInteger(site.column)) group.columns.push(site.column);
+            else group.missingColumn = true;
+            callLines.set(lineKey, group);
+        }
+        for (const site of callLines.values()) {
+            const edit = renameIdentifierTokens(index,
+                site.absoluteFile || site.file, site.line, name,
+                options.renameTo, site.missingColumn ? [] : site.columns,
+                site.callCount);
+            const newExpression = edit.renamed;
+            // A confirmed call through an import alias (`xf()`) is a real
+            // caller but the alias spelling does not change. The required
+            // edit is the import's source-side name; never emit a byte-for-
+            // byte no-op that makes the plan look complete.
+            if (newExpression === edit.source) {
+                // Missing parser columns mean UCN can prove the edit is
+                // required but cannot safely synthesize it. Never fall back
+                // to whole-line regex replacement.
+                if (site.missingColumn) {
+                    changes.push({
+                        file: site.file,
+                        line: site.line,
+                        expression: edit.source,
+                        suggestion: `Rename call identifier "${name}" to "${options.renameTo}" manually`,
+                        needsReview: true,
+                        editKind: 'call',
+                    });
+                }
+                continue;
+            }
             changes.push({
                 file: site.file,
                 line: site.line,
-                expression: site.expression,
+                expression: edit.source,
                 suggestion: `Rename to: ${newExpression}`,
                 newExpression,
                 editKind: 'call',
@@ -1651,14 +1790,14 @@ function plan(index, name, options = {}) {
                 _nameBindingReaches(index, imp.file, name, renameTargetFiles) === 'no') {
                 continue;
             }
-            const newImport = imp.content.trim().replace(
-                new RegExp('\\b' + escapeRegExp(name) + '\\b'),
-                options.renameTo
-            );
+            const edit = renameIdentifierTokens(index, imp.file,
+                imp.line, name, options.renameTo);
+            const newImport = edit.renamed;
+            if (newImport === edit.source) continue;
             changes.push({
                 file: imp.relativePath || imp.file,
                 line: imp.line,
-                expression: imp.content.trim(),
+                expression: edit.source,
                 suggestion: `Update import: ${newImport}`,
                 newExpression: newImport,
                 isImport: true,
@@ -1666,35 +1805,159 @@ function plan(index, name, options = {}) {
             });
         }
 
+        // Renamed CJS/Python imports are intentionally surfaced as reference
+        // usages by their parsers, so usageType alone cannot find the import
+        // line. importBindings retains the original/local pair and line.
+        for (const [filePath, fileEntry] of index.files) {
+            for (const binding of fileEntry.importBindings || []) {
+                const localAlias = binding.alias || (fileEntry.importAliases || [])
+                    .find(alias => alias.original === binding.name)?.local;
+                if (binding.name !== name || !localAlias ||
+                    localAlias === name || !binding.line) continue;
+                if (_nameBindingReaches(index, filePath, name,
+                    renameTargetFiles) === 'no') continue;
+                const rel = fileEntry.relativePath || filePath;
+                if (changes.some(change =>
+                    change.file === rel && change.line === binding.line)) continue;
+                const edit = renameIdentifierTokens(index, filePath,
+                    binding.line, name, options.renameTo);
+                const sourceLine = edit.source;
+                const newImport = edit.renamed;
+                if (newImport === sourceLine) continue;
+                changes.push({
+                    file: rel,
+                    line: binding.line,
+                    expression: sourceLine,
+                    suggestion: `Update import: ${newImport}`,
+                    newExpression: newImport,
+                    isImport: true,
+                    editKind: 'import',
+                });
+            }
+        }
+
         // Export surfaces owned by the selected definition are declaration
         // references too. In particular, CommonJS shorthand
         // `module.exports = { helper }` must be renamed or the otherwise
         // complete caller/import edit set breaks the module API.
-        const targetEntry = index.files.get(def.file);
-        for (const exported of targetEntry?.exportDetails || []) {
-            if ((exported.name !== name && exported.alias !== name) ||
-                !exported.line) continue;
-            const exportFile = def.relativePath || def.file;
-            if (changes.some(change =>
-                change.file === exportFile && change.line === exported.line)) {
-                continue;
+        const fileReachesTarget = (start) => {
+            const seen = new Set();
+            let frontier = [start];
+            for (let depth = 0; depth <= 8 && frontier.length; depth++) {
+                const next = [];
+                for (const current of frontier) {
+                    if (renameTargetFiles.has(current)) return true;
+                    if (seen.has(current)) continue;
+                    seen.add(current);
+                    for (const imported of index.importGraph.get(current) || []) next.push(imported);
+                }
+                frontier = next;
             }
-            const sourceLine = index.getLineContent(def.file, exported.line).trim();
-            const occurrencePattern = new RegExp(
-                '\\b' + escapeRegExp(name) + '\\b', 'g');
-            const occurrences = sourceLine.match(occurrencePattern)?.length || 0;
-            const newExpression = sourceLine.replace(
-                occurrencePattern, options.renameTo);
-            changes.push({
-                file: exportFile,
-                line: exported.line,
-                expression: sourceLine,
-                suggestion: `Update export: ${newExpression}`,
-                newExpression,
-                isExport: true,
-                editKind: 'export',
-                ...(occurrences > 1 && { needsReview: true }),
-            });
+            return false;
+        };
+        for (const [exportPath, targetEntry] of index.files) {
+            for (const exported of targetEntry.exportDetails || []) {
+                if ((exported.name !== name && exported.alias !== name) ||
+                    !exported.line) continue;
+                const ownership = _nameBindingReaches(
+                    index, exportPath, name, renameTargetFiles, 8);
+                if (ownership === 'no' ||
+                    (ownership === 'unknown' && !fileReachesTarget(exportPath))) continue;
+                const exportFile = targetEntry.relativePath || exportPath;
+                if (changes.some(change =>
+                    change.file === exportFile && change.line === exported.line)) {
+                    continue;
+                }
+                const edit = renameIdentifierTokens(index, exportPath,
+                    exported.line, name, options.renameTo);
+                const sourceLine = edit.source;
+                const occurrences = edit.count;
+                const newExpression = edit.renamed;
+                if (newExpression === sourceLine) continue;
+                changes.push({
+                    file: exportFile,
+                    line: exported.line,
+                    expression: sourceLine,
+                    suggestion: `Update export: ${newExpression}`,
+                    newExpression,
+                    isExport: true,
+                    editKind: 'export',
+                    ...(occurrences > 1 && { needsReview: true }),
+                });
+            }
+        }
+
+        // Renaming a virtual/overridden member is one hierarchy-wide change.
+        // Leaving descendant declarations behind either fails compilation
+        // (Java/C#/TS override) or silently changes dispatch (Python/JS).
+        if (def.className) {
+            const descendants = new Set();
+            const queue = [def.className];
+            while (queue.length > 0 && descendants.size < 5000) {
+                const parent = queue.shift();
+                for (const child of index.extendedByGraph.get(parent) || []) {
+                    const childName = typeof child === 'string' ? child : child.name;
+                    if (!childName || descendants.has(childName)) continue;
+                    descendants.add(childName);
+                    queue.push(childName);
+                }
+            }
+            for (const override of index.symbols.get(name) || []) {
+                if (!override.className || !descendants.has(override.className)) continue;
+                const line = override.nameLine || override.startLine;
+                const rel = override.relativePath || override.file;
+                if (changes.some(change => change.file === rel && change.line === line)) continue;
+                const edit = renameIdentifierTokens(index, override.file,
+                    line, name, options.renameTo);
+                const sourceLine = edit.source;
+                const newExpression = edit.renamed;
+                if (newExpression === sourceLine) continue;
+                changes.push({
+                    file: rel,
+                    line,
+                    expression: sourceLine,
+                    suggestion: `Update overriding definition: ${newExpression}`,
+                    newExpression,
+                    isDefinition: true,
+                    editKind: 'definition',
+                });
+            }
+        }
+
+        // C/C++ declarations and definitions are one compiler symbol. A
+        // selected implementation must carry its matching header prototype,
+        // and selecting the prototype must carry the implementation.
+        if (planLang === 'c' || planLang === 'cpp') {
+            const ownerOf = symbol => symbol.className ||
+                (symbol.receiver || '').replace(/^\*/, '') || null;
+            const signatureOf = symbol => (symbol.paramsStructured || []).map(param =>
+                String(param.type || param.name || '').replace(/\s+/g, '')).join(',');
+            const linked = candidate => candidate.file === def.file ||
+                index.importGraph.get(def.file)?.has(candidate.file) ||
+                index.importGraph.get(candidate.file)?.has(def.file);
+            for (const sibling of index.symbols.get(name) || []) {
+                if (sibling === def || ownerOf(sibling) !== ownerOf(def) ||
+                    signatureOf(sibling) !== signatureOf(def) ||
+                    !(sibling.isSignature || def.isSignature) || !linked(sibling)) continue;
+                const siblingLang = index.files.get(sibling.file)?.language;
+                if (siblingLang !== planLang &&
+                    !new Set(['c', 'cpp']).has(siblingLang)) continue;
+                const line = sibling.nameLine || sibling.startLine;
+                const rel = sibling.relativePath || sibling.file;
+                if (changes.some(change => change.file === rel && change.line === line)) continue;
+                const edit = renameIdentifierTokens(index, sibling.file,
+                    line, name, options.renameTo);
+                if (edit.renamed === edit.source) continue;
+                changes.push({
+                    file: rel,
+                    line,
+                    expression: edit.source,
+                    suggestion: `Update paired declaration: ${edit.renamed}`,
+                    newExpression: edit.renamed,
+                    isDefinition: true,
+                    editKind: 'definition',
+                });
+            }
         }
     }
 
@@ -1712,9 +1975,8 @@ function plan(index, name, options = {}) {
         existingDefinitionLine.isDefinition = true;
         existingDefinitionLine.editKind = 'definition';
         if (options.renameTo) {
-            const renamed = existingDefinitionLine.expression.replace(
-                new RegExp('\\b' + escapeRegExp(name) + '\\b', 'g'),
-                options.renameTo);
+            const renamed = renameIdentifierTokens(index, def.file,
+                definitionLine, name, options.renameTo).renamed;
             existingDefinitionLine.newExpression = renamed;
             existingDefinitionLine.suggestion = `Update definition: ${renamed}`;
         }
@@ -1727,9 +1989,8 @@ function plan(index, name, options = {}) {
             editKind: 'definition',
         };
         if (options.renameTo) {
-            const renamed = definitionSource.replace(
-                new RegExp('\\b' + escapeRegExp(name) + '\\b'),
-                options.renameTo);
+            const renamed = renameIdentifierTokens(index, def.file,
+                definitionLine, name, options.renameTo).renamed;
             definitionChange.newExpression = renamed;
             definitionChange.suggestion = `Update definition: ${renamed}`;
         } else {
@@ -1744,11 +2005,13 @@ function plan(index, name, options = {}) {
     }
 
     const changeSummary = {
-        definitions: changes.filter(change => change.isDefinition).length,
-        calls: changes.filter(change =>
-            !change.isDefinition && !change.isImport && !change.isExport).length,
-        imports: changes.filter(change => change.isImport).length,
-        exports: changes.filter(change => change.isExport).length,
+        // editKind is a partition: a public declaration that is also an
+        // export remains one definition edit, never two summary buckets.
+        definitions: changes.filter(change => change.editKind === 'definition').length,
+        calls: changes.filter(change => change.editKind === 'call' ||
+            !change.editKind).length,
+        imports: changes.filter(change => change.editKind === 'import').length,
+        exports: changes.filter(change => change.editKind === 'export').length,
         reviewRequired: changes.filter(change => change.needsReview).length,
     };
 
@@ -1773,6 +2036,7 @@ function plan(index, name, options = {}) {
         filesAffected: new Set(changes.map(c => c.file)).size,
         changeSummary,
         changes,
+        ...(unchangedSites > 0 && { unchangedSites }),
         // v4 tiered contract: sites that MAY also need this change but lack
         // binding/receiver evidence — review manually before refactoring.
         unverifiedCount: planUnverified.length,

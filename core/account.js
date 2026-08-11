@@ -104,32 +104,7 @@ function computeGroundSet(index, name) {
 
     // Failed-to-parse files are still text: their matching lines are part of
     // the ground set, classified as `unparsed` (loud degradation, not silence).
-    const unparsed = { fileCount: 0, lines: 0, files: [] };
-    const unreadableFiles = [];
-    if (index.failedFiles && index.failedFiles.size > 0) {
-        for (const failedPath of index.failedFiles) {
-            if (index.files.has(failedPath)) continue; // indexed despite earlier failure
-            let content;
-            try {
-                content = fs.readFileSync(failedPath, 'utf-8');
-            } catch (e) {
-                unreadableFiles.push(path.relative(index.root, failedPath));
-                continue;
-            }
-            if (!content.includes(name)) continue;
-            const lines = content.split('\n');
-            let matched = 0;
-            for (let i = 0; i < lines.length; i++) {
-                if (wordRe.test(lines[i])) matched++;
-            }
-            if (matched > 0) {
-                unparsed.fileCount++;
-                unparsed.lines += matched;
-                unparsed.files.push(path.relative(index.root, failedPath));
-            }
-        }
-        unparsed.files.sort();
-    }
+    const { unparsed, unreadableFiles } = scanFailedFiles(index, name);
 
     // Unsupported-language source files (discovery classified them as source,
     // the parser registry cannot read them) are still text the contract must
@@ -138,6 +113,8 @@ function computeGroundSet(index, name) {
     // `unsupported`, with sites listed so the caller answer strictly
     // dominates grep instead of silently under-reporting it.
     const unsupported = scanUnsupportedFiles(index, name, { unreadableFiles });
+    const skippedSources = Array.isArray(index.discoveryIssues)
+        ? index.discoveryIssues.map(issue => ({ ...issue })) : [];
     unreadableFiles.sort();
 
     return {
@@ -147,7 +124,41 @@ function computeGroundSet(index, name) {
         unparsed,
         unsupported,
         unreadableFiles,
+        skippedSources,
     };
+}
+
+/** Scan only files the parser/index could not ingest. */
+function scanFailedFiles(index, name) {
+    const unparsed = { fileCount: 0, lines: 0, files: [] };
+    const unreadableFiles = [];
+    if (!index.failedFiles || index.failedFiles.size === 0) {
+        return { unparsed, unreadableFiles };
+    }
+    const wordRe = new RegExp('\\b' + escapeRegExp(name) + '\\b');
+    for (const failedPath of index.failedFiles) {
+        if (index.files.has(failedPath)) continue;
+        let content;
+        try {
+            content = fs.readFileSync(failedPath, 'utf-8');
+        } catch (_) {
+            unreadableFiles.push(path.relative(index.root, failedPath));
+            continue;
+        }
+        if (!content.includes(name)) continue;
+        let matched = 0;
+        for (const line of content.split('\n')) {
+            if (wordRe.test(line)) matched++;
+        }
+        if (matched > 0) {
+            unparsed.fileCount++;
+            unparsed.lines += matched;
+            unparsed.files.push(path.relative(index.root, failedPath));
+        }
+    }
+    unparsed.files.sort(codeUnitCompare);
+    unreadableFiles.sort(codeUnitCompare);
+    return { unparsed, unreadableFiles };
 }
 
 /**
@@ -412,7 +423,8 @@ function buildAccount(index, name, parts) {
     const textComplete = unaccounted === 0 &&
         groundSet.unparsed.fileCount === 0 &&
         unsupported.lines === 0 &&
-        groundSet.unreadableFiles.length === 0;
+        groundSet.unreadableFiles.length === 0 &&
+        (!groundSet.skippedSources || groundSet.skippedSources.length === 0);
     const observedTextZero = textComplete && confirmed === 0 && unverified === 0 &&
         beyondText.count === 0;
 
@@ -427,6 +439,7 @@ function buildAccount(index, name, parts) {
         unparsed: groundSet.unparsed,
         unsupported,
         unreadableFiles: groundSet.unreadableFiles,
+        skippedSources: groundSet.skippedSources || [],
         beyondText,
         unaccounted,
         conserved: unaccounted === 0,
@@ -467,4 +480,5 @@ module.exports = {
     classifyGroundLines,
     buildAccount,
     scanUnsupportedFiles,
+    scanFailedFiles,
 };

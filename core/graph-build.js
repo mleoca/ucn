@@ -7,7 +7,59 @@
 
 const path = require('path');
 const { resolveImport } = require('./imports');
-const { langTraits } = require('../languages');
+const { langTraits, getParser, safeParse } = require('../languages');
+
+function _javaPackageTypes(index) {
+    const packages = new Map();
+    for (const [filePath, fileEntry] of index.files) {
+        if (fileEntry.language !== 'java') continue;
+        for (const symbol of fileEntry.symbols || []) {
+            if (!symbol.namespace || !['class', 'interface', 'record', 'enum'].includes(symbol.type)) continue;
+            let names = packages.get(symbol.namespace);
+            if (!names) { names = new Map(); packages.set(symbol.namespace, names); }
+            let files = names.get(symbol.name);
+            if (!files) { files = new Set(); names.set(symbol.name, files); }
+            files.add(filePath);
+        }
+    }
+    return packages;
+}
+
+/** Collect same-package Java type references from AST roles that denote types. */
+function _javaSamePackageDependencies(index, filePath, fileEntry, packageTypes) {
+    const packageName = (fileEntry.symbols || []).find(symbol => symbol.namespace)?.namespace;
+    const candidates = packageTypes.get(packageName);
+    if (!packageName || !candidates || candidates.size === 0) return [];
+    let tree;
+    try {
+        tree = safeParse(getParser('java'), index._readFile(filePath));
+    } catch (_) {
+        return [];
+    }
+    const referenced = new Set();
+    const walk = node => {
+        if (node.type === 'type_identifier' && candidates.has(node.text)) {
+            referenced.add(node.text);
+        } else if (node.type === 'identifier' && candidates.has(node.text)) {
+            const parent = node.parent;
+            if (parent && ((parent.type === 'method_invocation' &&
+                parent.childForFieldName('object')?.id === node.id) ||
+                (parent.type === 'field_access' &&
+                parent.childForFieldName('object')?.id === node.id))) {
+                referenced.add(node.text);
+            }
+        }
+        for (let i = 0; i < node.namedChildCount; i++) walk(node.namedChild(i));
+    };
+    walk(tree.rootNode);
+    const out = new Set();
+    for (const name of referenced) {
+        for (const target of candidates.get(name) || []) {
+            if (target !== filePath) out.add(target);
+        }
+    }
+    return [...out];
+}
 
 /**
  * Build directory→files index for O(1) same-package lookups.
@@ -127,7 +179,9 @@ function buildImportGraph(index) {
     const dirToGoFiles = new Map();
     // Pre-build filename→files map for Java import resolution (O(1) vs O(n) scan)
     const javaFileIndex = new Map();
+    const javaPackageTypes = _javaPackageTypes(index);
     const csharpNamespaceIndex = _buildCSharpNamespaceIndex(index);
+    const csharpGlobalImports = new Set();
     for (const [fp, fe] of index.files) {
         if (langTraits(fe.language)?.packageScope === 'directory') {
             const dir = path.dirname(fp);
@@ -137,6 +191,10 @@ function buildImportGraph(index) {
             const name = path.basename(fp, '.java');
             if (!javaFileIndex.has(name)) javaFileIndex.set(name, []);
             javaFileIndex.get(name).push(fp);
+        } else if (fe.language === 'csharp') {
+            for (const moduleName of (fe.globalImports || [])) {
+                if (moduleName) csharpGlobalImports.add(moduleName);
+            }
         }
     }
 
@@ -151,7 +209,10 @@ function buildImportGraph(index) {
         // names is not evidence about THIS name's module).
         const moduleResolved = {};
 
-        for (const importModule of fileEntry.imports) {
+        const effectiveImports = fileEntry.language === 'csharp'
+            ? [...(fileEntry.imports || []), ...csharpGlobalImports]
+            : (fileEntry.imports || []);
+        for (const importModule of effectiveImports) {
             // Skip null modules (e.g., dynamic include! macros in Rust)
             if (!importModule) continue;
 
@@ -205,10 +266,11 @@ function buildImportGraph(index) {
                 if (langTraits(fileEntry.language)?.packageScope === 'directory') {
                     const pkgDir = path.dirname(resolved);
                     const dirFiles = dirToGoFiles.get(pkgDir) || [];
-                    const importerIsTest = filePath.endsWith('_test.go');
                     for (const fp of dirFiles) {
-                        if (fp !== resolved) {
-                            if (!importerIsTest && fp.endsWith('_test.go')) continue;
+                        if (fp !== resolved && fp !== filePath) {
+                            // Test files are compilation inputs, never part of
+                            // an importable Go package surface.
+                            if (fp.endsWith('_test.go')) continue;
                             filesToLink.push(fp);
                         }
                     }
@@ -221,6 +283,19 @@ function buildImportGraph(index) {
                     }
                     index.exportGraph.get(linkedFile).add(filePath);
                 }
+            }
+        }
+
+        // Java same-package visibility needs no import declaration. Add only
+        // AST-proven type/static-qualifier references, not a package clique.
+        if (fileEntry.language === 'java') {
+            for (const linkedFile of _javaSamePackageDependencies(
+                index, filePath, fileEntry, javaPackageTypes)) {
+                importedFiles.add(linkedFile);
+                if (!index.exportGraph.has(linkedFile)) {
+                    index.exportGraph.set(linkedFile, new Set());
+                }
+                index.exportGraph.get(linkedFile).add(filePath);
             }
         }
 

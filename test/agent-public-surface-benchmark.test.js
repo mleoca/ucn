@@ -157,10 +157,12 @@ describe('public-surface agent benchmark contract', () => {
     it('normalizes only CLI/MCP-native guidance for semantic parity', () => {
         const cli = 'ACCOUNT: 3 = 2 confirmed + 1 unverified\n' +
             'Next: ucn show run · ucn repo --sections=health --deep\n' +
-            'Use --limit=N to return and display more results.';
+            'Use --limit=N to return and display more results.\n' +
+            'Use --depth=N for a deeper graph.';
         const mcp = 'ACCOUNT: 3 = 2 confirmed + 1 unverified\n' +
             'Next: command=show name=run · command=repo sections=health deep=true\n' +
-            'Use limit=<n> to return and display more results.';
+            'Use limit=<n> to return and display more results.\n' +
+            'Use depth=<n> for a deeper graph.';
         assert.strictEqual(normalizeSurfaceGuidance(cli), normalizeSurfaceGuidance(mcp));
         assert.notStrictEqual(
             normalizeSurfaceGuidance(cli.replace('confirmed', 'excluded')),

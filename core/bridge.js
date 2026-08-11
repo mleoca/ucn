@@ -280,6 +280,21 @@ function extractServerRoutes(index) {
     }
 
     const routes = [];
+    const mountedPrefixes = collectProjectRouterMounts(index);
+    const pythonReceiverFrameworks = new Map();
+    for (const [filePath, entry] of index.files) {
+        if (entry.language !== 'python') continue;
+        const receiverMap = new Map();
+        for (const call of getCachedCalls(index, filePath) || []) {
+            if (!call.assignedTo) continue;
+            if (call.name === 'Flask' || call.name === 'Blueprint') {
+                receiverMap.set(call.assignedTo, 'flask');
+            } else if (call.name === 'FastAPI' || call.name === 'APIRouter') {
+                receiverMap.set(call.assignedTo, 'fastapi');
+            }
+        }
+        pythonReceiverFrameworks.set(filePath, receiverMap);
+    }
 
     // 1) Decorator/annotation/attribute-based routes (NestJS, Flask/FastAPI, Spring, JAX-RS, Actix).
     //    Iterate symbols once and look at their decoratorsWithArgs/annotationsWithArgs/attributesWithArgs.
@@ -314,7 +329,8 @@ function extractServerRoutes(index) {
                 classPrefix = classPrefixByFileClass.get(`${sym.file}:${sym.className}`) || '';
             }
 
-            const declRoutes = collectMethodRoutes(sym, lang, classPrefix);
+            const declRoutes = collectMethodRoutes(sym, lang, classPrefix, fileEntry,
+                pythonReceiverFrameworks.get(sym.file));
             for (const r of declRoutes) {
                 routes.push({
                     method: r.method,
@@ -338,9 +354,19 @@ function extractServerRoutes(index) {
         const lang = fileEntry.language;
         const calls = getCachedCalls(index, filePath);
         if (!calls || calls.length === 0) continue;
+        const routerReceivers = collectRouterReceivers(calls, lang);
+
+        const groupPrefixes = new Map();
+        for (const call of calls) {
+            if (!/^(Group|group|nest)$/.test(call.name) ||
+                !call.assignedTo || !call.firstStringArg ||
+                !routerReceivers.has(call.assignedTo)) continue;
+            const parent = groupPrefixes.get(call.receiver) || '';
+            groupPrefixes.set(call.assignedTo, joinRoutePath(parent, call.firstStringArg));
+        }
 
         for (const call of calls) {
-            const r = matchCallPatternRoute(call, lang);
+            const r = matchCallPatternRoute(call, lang, routerReceivers);
             if (!r) continue;
 
             // Resolve handler name from arg position 1 if call.firstStringArg is set.
@@ -348,17 +374,24 @@ function extractServerRoutes(index) {
             // call on the same line — we look for it.
             const handlerName = findHandlerCallback(calls, call.line, call) || '<anonymous>';
 
-            routes.push({
-                method: r.method,
-                path: r.path,
-                normalizedPath: normalizePath(r.path),
-                handler: handlerName,
-                file: fileEntry.relativePath || filePath,
-                absoluteFile: filePath,
-                line: call.line,
-                framework: r.framework,
-                raw: `${r.method} ${r.path}`,
-            });
+            const receiverKey = `${filePath}:${call.receiver || ''}`;
+            const prefixes = mountedPrefixes.get(receiverKey) ||
+                (groupPrefixes.has(call.receiver) ? [groupPrefixes.get(call.receiver)] : ['']);
+            for (const prefix of prefixes) {
+                const fullPath = prefix ? joinRoutePath(prefix, r.path) : r.path;
+                routes.push({
+                    method: r.method,
+                    path: fullPath,
+                    normalizedPath: normalizePath(fullPath),
+                    handler: handlerName,
+                    file: fileEntry.relativePath || filePath,
+                    absoluteFile: filePath,
+                    line: call.line,
+                    framework: r.framework,
+                    ...(prefix && { mountPrefix: prefix }),
+                    raw: `${r.method} ${fullPath}`,
+                });
+            }
         }
     }
 
@@ -413,7 +446,8 @@ function collectClassPrefixes(sym, lang) {
 /**
  * Return zero or more route objects {method, path, framework, raw} for a method/function symbol.
  */
-function collectMethodRoutes(sym, lang, classPrefix) {
+function collectMethodRoutes(sym, lang, classPrefix, fileEntry = null,
+    pythonReceiverFramework = null) {
     const out = [];
 
     // ── JS/TS decorators (NestJS) ────────────────────────────────────
@@ -436,7 +470,7 @@ function collectMethodRoutes(sym, lang, classPrefix) {
     if (lang === 'python' && sym.decorators) {
         for (const decRaw of sym.decorators) {
             // Decorator text in Python is the full source: "app.route('/users', methods=['GET'])"
-            const r = parsePythonDecoratorFull(decRaw);
+            const r = parsePythonDecoratorFull(decRaw, fileEntry, pythonReceiverFramework);
             if (r) {
                 out.push({
                     method: r.method,
@@ -539,7 +573,7 @@ function collectMethodRoutes(sym, lang, classPrefix) {
  *   "router.post('/items')"
  * Returns { method, path, framework } or null.
  */
-function parsePythonDecoratorFull(raw) {
+function parsePythonDecoratorFull(raw, fileEntry = null, receiverFramework = null) {
     if (typeof raw !== 'string') return null;
     // Match receiver.verb('path', ...)
     const m = raw.match(/^([A-Za-z_][A-Za-z0-9_]*)\.([a-z]+)\s*\(\s*(['"])([^'"]*)\3/);
@@ -559,9 +593,51 @@ function parsePythonDecoratorFull(raw) {
         return { method: 'GET', path: pathStr, framework: 'flask' };
     }
     if (['get','post','put','delete','patch','options','head'].includes(verb)) {
-        return { method: verb.toUpperCase(), path: pathStr, framework: 'fastapi' };
+        const modules = (fileEntry?.imports || []).map(value =>
+            typeof value === 'string' ? value : String(value?.module || ''));
+        const framework = receiverFramework?.get(m[1]) ||
+            (modules.some(module => /^flask\b/.test(module)) &&
+             !modules.some(module => /^fastapi\b/.test(module))
+                ? 'flask' : modules.some(module => /^fastapi\b/.test(module)) &&
+                  !modules.some(module => /^flask\b/.test(module))
+                    ? 'fastapi' : 'unknown-python');
+        return { method: verb.toUpperCase(), path: pathStr, framework };
     }
     return null;
+}
+
+/** Map exported router receiver variables to their literal project mounts. */
+function collectProjectRouterMounts(index) {
+    const mounts = new Map();
+    for (const [filePath, fileEntry] of index.files) {
+        if (!['javascript', 'typescript', 'tsx'].includes(fileEntry.language)) continue;
+        const calls = getCachedCalls(index, filePath) || [];
+        for (const call of calls) {
+            if (call.name !== 'use' || !call.receiver || !call.firstStringArg ||
+                (call.argCount != null && call.argCount < 2)) continue;
+            const refs = calls.filter(candidate => candidate.line === call.line &&
+                candidate !== call && (candidate.isFunctionReference || candidate.isPotentialCallback));
+            for (const ref of refs) {
+                const binding = (fileEntry.importBindings || []).find(item => item.name === ref.name);
+                const rel = binding && fileEntry.moduleResolved?.[binding.module];
+                if (!rel) continue;
+                const targetFile = path.join(index.root, rel);
+                const targetEntry = index.files.get(targetFile);
+                if (!targetEntry) continue;
+                const exportedReceivers = (targetEntry.exportDetails || [])
+                    .filter(exp => exp.type === 'module.exports' || exp.isDefault ||
+                        exp.kind === 'default' || exp.type === 'export-default')
+                    .map(exp => exp.localName || exp.name).filter(Boolean);
+                for (const receiver of exportedReceivers) {
+                    const key = `${targetFile}:${receiver}`;
+                    const list = mounts.get(key) || [];
+                    if (!list.includes(call.firstStringArg)) list.push(call.firstStringArg);
+                    mounts.set(key, list);
+                }
+            }
+        }
+    }
+    return mounts;
 }
 
 /**
@@ -574,10 +650,51 @@ function parseSpringRequestMappingMethod(argsRaw) {
     return m ? m[1] : null;
 }
 
+/** Infer router values from AST call/assignment evidence, independent of the
+ * variable's spelling. Legacy receiver-name patterns remain seeds for code
+ * where the factory assignment is outside the indexed file. */
+function collectRouterReceivers(calls, lang) {
+    const receivers = new Set();
+    const patterns = SERVER_RECEIVER_PATTERNS[lang] || [];
+    for (const call of calls) {
+        if (call.receiver && patterns.some(pattern =>
+            pattern.receiverPattern.test(call.receiver))) {
+            receivers.add(call.receiver);
+        }
+        if (!call.assignedTo) continue;
+        const receiver = String(call.receiver || '');
+        const factory = (
+            (['javascript', 'typescript'].includes(lang) &&
+                /^(Router|express|fastify|Koa)$/.test(call.name)) ||
+            (lang === 'go' && (
+                /^(NewRouter|NewServeMux|Default)$/.test(call.name) ||
+                (call.name === 'New' && /^(gin|echo|chi|fiber|mux|http)$/i.test(receiver)))) ||
+            (lang === 'rust' && call.name === 'new' && /Router$/.test(receiver)) ||
+            (lang === 'csharp' && call.name === 'Build')
+        );
+        if (factory) receivers.add(call.assignedTo);
+    }
+
+    // Router groups/nests produce another router. Iterate because nested
+    // groups are common (`admin := api.Group(...); v2 := admin.Group(...)`).
+    let changed = true;
+    while (changed) {
+        changed = false;
+        for (const call of calls) {
+            if (!call.assignedTo || !call.receiver ||
+                !/^(Group|group|nest|NewGroup)$/.test(call.name) ||
+                !receivers.has(call.receiver) || receivers.has(call.assignedTo)) continue;
+            receivers.add(call.assignedTo);
+            changed = true;
+        }
+    }
+    return receivers;
+}
+
 /**
  * Match a call against server route patterns. Returns {method, path, framework} or null.
  */
-function matchCallPatternRoute(call, lang) {
+function matchCallPatternRoute(call, lang, routerReceivers = null) {
     if (!call.firstStringArg) return null;
 
     // Path-call patterns (Rust): handled outside (router.route, router.nest captured below)
@@ -587,7 +704,8 @@ function matchCallPatternRoute(call, lang) {
     // For Express/Gin/etc, the call is method-call: app.get('/path', handler)
     for (const p of patterns) {
         if (!call.receiver) continue;
-        if (!p.receiverPattern.test(call.receiver)) continue;
+        if (!routerReceivers?.has(call.receiver) &&
+            !p.receiverPattern.test(call.receiver)) continue;
         if (!p.methodPattern.test(call.name)) continue;
 
         // BUG M5: Express has dual-purpose APIs where 1-arg .get/.set are config
@@ -745,6 +863,18 @@ function extractClientRequests(index) {
             if (!call.firstStringArg) continue;
             const r = matchClientRequest(call, lang, calls);
             if (!r) continue;
+
+            // Python's common `session.get("key")` / `s.get("key")`
+            // dictionary and ORM idioms are not HTTP requests.  Without
+            // receiver-type evidence, require the string to have a URL/path
+            // shape before claiming an outbound request.  This deliberately
+            // keeps absolute URLs and normal relative API paths while
+            // rejecting cache/session keys (UCN5-162).
+            if (lang === 'python' &&
+                !call.firstStringArg.startsWith('/') &&
+                !call.firstStringArg.includes('://')) {
+                continue;
+            }
 
             const callerName = call.enclosingFunction?.name || '<top-level>';
             const callerStartLine = call.enclosingFunction?.startLine;
@@ -1116,10 +1246,12 @@ function endpoints(index, options = {}) {
     }
 
     return {
-        // Advisory when bridging (v4 two-tier surface): route↔request
-        // matching is heuristic (per-match tiers EXACT/PARTIAL/UNCERTAIN),
-        // not a verified claim. Route/request EXTRACTION is AST-based.
-        ...(opts.bridge && { advisory: 'heuristic-route-matching' }),
+        // Endpoint extraction is AST-based but bounded to known framework
+        // patterns; a missing route is never proof that no endpoint exists.
+        // Bridge matching adds a second heuristic layer.
+        advisory: opts.bridge
+            ? 'heuristic-route-matching-and-incomplete-inventory'
+            : 'incomplete-endpoint-inventory',
         routes,
         requests,
         bridges,

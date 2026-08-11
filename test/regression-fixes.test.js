@@ -287,7 +287,7 @@ next.lock/
 # Negation (should be skipped)
 !important.log
 
-# Path patterns (should be skipped)
+# Path patterns (preserved for git-compatible matching)
 src/generated/output.js
 config/local.json
 
@@ -310,10 +310,10 @@ config/local.json
         assert.ok(!patterns.includes('tmp_build'), 'Anchored pattern must not appear unanchored');
         assert.ok(patterns.includes('*.bak'), 'Should include *.bak glob');
         assert.ok(!patterns.includes('node_modules'), 'Should skip node_modules (already in DEFAULT_IGNORES)');
-        assert.ok(!patterns.includes('!important.log'), 'Should skip negation patterns');
-        assert.ok(!patterns.includes('important.log'), 'Should skip negation patterns');
-        assert.ok(!patterns.some(p => p.slice(1).includes('/')),
-            'Should skip patterns with interior path separators (leading anchor slash allowed)');
+        assert.ok(patterns.includes('!important.log'),
+            'Should preserve negation patterns for git-compatible re-inclusion');
+        assert.ok(patterns.includes('src/generated/output.js'));
+        assert.ok(patterns.includes('config/local.json'));
         assert.ok(patterns.includes('*.log'), 'Should include *.log');
     } finally {
         fs.rmSync(tmpDir, { recursive: true, force: true });

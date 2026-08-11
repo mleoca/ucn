@@ -70,6 +70,16 @@ function parseStructuredParams(paramsNode, language) {
 
     const params = [];
 
+    // Paren-less JS/TS arrows expose their sole parameter directly instead
+    // of wrapping it in formal_parameters.
+    if ((language === 'javascript' || language === 'typescript' || language === 'tsx') &&
+        paramsNode.type === 'identifier') {
+        const paramInfo = {};
+        parseJSParam(paramsNode, paramInfo);
+        if (paramInfo.name) params.push(paramInfo);
+        return params;
+    }
+
     for (let i = 0; i < paramsNode.namedChildCount; i++) {
         const param = paramsNode.namedChild(i);
         const paramInfo = {};
@@ -171,6 +181,13 @@ function parsePythonParam(param, info) {
         const typeNode = param.childForFieldName('type');
         if (nameNode) info.name = nameNode.text;
         if (typeNode) info.type = typeNode.text;
+        // Python wraps annotated splats in typed_parameter, with the actual
+        // `*args` / `**kwargs` node as its first named child. Treating those
+        // as ordinary required parameters makes every short call look broken.
+        if (nameNode && (nameNode.type === 'list_splat_pattern' ||
+            nameNode.type === 'dictionary_splat_pattern')) {
+            info.rest = true;
+        }
     } else if (param.type === 'default_parameter' || param.type === 'typed_default_parameter') {
         const nameNode = param.childForFieldName('name');
         const valueNode = param.childForFieldName('value');
@@ -625,7 +642,7 @@ function isMatchInCommentOrString(rootNode, line, lineContent, term) {
  * @param {string} content - File content
  * @param {string} term - Search term
  * @param {object} parser - Tree-sitter parser
- * @param {object} options - { codeOnly: boolean }
+ * @param {object} options - { codeOnly: boolean, regex?: boolean, caseSensitive?: boolean }
  * @returns {Array<{line: number, content: string, column: number}>}
  */
 function findMatchesWithASTFilter(content, term, parser, options = {}) {
@@ -636,10 +653,11 @@ function findMatchesWithASTFilter(content, term, parser, options = {}) {
 
     // Default: regex mode ON. Use raw pattern unless regex=false.
     let regex;
+    const flags = options.caseSensitive ? 'g' : 'gi';
     if (options.regex !== false) {
-        try { regex = new RegExp(term, 'gi'); } catch (e) { regex = new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'); }
+        try { regex = new RegExp(term, flags); } catch (e) { regex = new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags); }
     } else {
-        regex = new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+        regex = new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags);
     }
 
     lines.forEach((line, idx) => {
@@ -651,6 +669,10 @@ function findMatchesWithASTFilter(content, term, parser, options = {}) {
 
         while ((match = regex.exec(line)) !== null) {
             const column = match.index;
+            // RegExp.exec does not advance after an empty match. Advance it
+            // explicitly before any filtering/continue path so patterns such
+            // as `.*`, `x*`, `^`, and `\b` cannot wedge CLI or MCP searches.
+            if (match[0].length === 0) regex.lastIndex = match.index + 1;
 
             if (options.codeOnly) {
                 const tokenType = getTokenTypeAtPosition(tree.rootNode, lineNum, column);

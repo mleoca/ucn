@@ -2102,6 +2102,26 @@ function findCallers(index, name, options = {}) {
                     });
                     if (inferredRoot?.type) fieldHopRootType = inferredRoot.type;
                 }
+                // Go's parser preserves the package qualifier on a declared
+                // root type (`r *http.Response; r.Body.Close()`). If that
+                // qualifier is an unresolved external import, every field on
+                // the root is owned outside this project. A unique local
+                // method name is not identity evidence for the field value.
+                if (fileEntry.language === 'go' && fieldHopRootType &&
+                    call.receiverRootTypeQualifier && !call.receiverExternalFlow) {
+                    const qualifier = call.receiverRootTypeQualifier;
+                    const binding = (fileEntry.importBindings || [])
+                        .find(item => item.name === qualifier);
+                    const resolved = binding && fileEntry.moduleResolved?.[binding.module];
+                    if (binding && !resolved) {
+                        call = {
+                            ...call,
+                            receiverExternalFlow:
+                                `${qualifier}.${fieldHopRootType}.${call.receiverField}`,
+                            receiverExternalConcreteFlow: true,
+                        };
+                    }
+                }
                 if (!fieldHopRootType && call.receiverField && call.receiverRoot === 'this' &&
                     !resolvedBySameClass &&
                     (langTraits(fileEntry.language)?.typeSystem === 'structural' ||
@@ -2121,6 +2141,9 @@ function findCallers(index, name, options = {}) {
                         call = {
                             ...call,
                             receiverTypeFlowFile: hopInfo.fromFile,
+                            ...(hopInfo.namespace && {
+                                receiverTypeNamespace: hopInfo.namespace,
+                            }),
                         };
                     }
                     // Provably-external declared field type (fix #268,
@@ -3019,7 +3042,9 @@ function findCallers(index, name, options = {}) {
                                     const identity = _resolveReceiverTypeIdentity(
                                         index, call.receiverTypeFlowFile || filePath, knownType, targetDefs,
                                         call.receiverTypeFlowFile ? undefined : call.line,
-                                        call.receiverTypeNamespace || call.receiverTypeQualifier);
+                                        call.receiverTypeNamespace ||
+                                            call.receiverRootNamespace ||
+                                            call.receiverTypeQualifier);
                                     if (identity === 'other') {
                                         receiverTypeValidated = false;
                                     } else if (identity === 'unknown') {
@@ -4016,6 +4041,24 @@ function findCallers(index, name, options = {}) {
                     if (call.isMethod && !call.receiverIsModule && !recvSubmoduleRel) {
                         const tTypes = dispatchTargetTypes(targetDefs2);
                         const typeQualifiedReceiver = !!(call.receiver && tTypes.has(call.receiver));
+                        const knownDispatchType = call.receiverType ||
+                            fieldHopType || fieldDispatchType;
+                        // A compiler/parser-known receiver type that is not a
+                        // target type defeats the single-owner heuristic even
+                        // when this method name has only one project owner.
+                        // It may be a structural/external type or a dynamic
+                        // supertype of the target, so keep it visible rather
+                        // than confirming or excluding by spelling alone.
+                        if (!typeQualifiedReceiver && knownDispatchType &&
+                            !tTypes.has(knownDispatchType)) {
+                            routeUnverified(filePath, fileEntry, call,
+                                'possible-dispatch', calledAs, {
+                                    dispatchVia: knownDispatchType,
+                                    dispatchCandidates:
+                                        countDispatchCandidates(knownDispatchType),
+                                });
+                            continue;
+                        }
                         // A local receiver whose nearest assignment the flow
                         // machinery examined and could NOT type holds a value
                         // of unknown provenance (`local = factory()`) — the
@@ -4190,6 +4233,41 @@ function findCallers(index, name, options = {}) {
                             break;
                         }
                     }
+                    // C/C++ bind free-function names through the current
+                    // translation unit and included declarations rather than
+                    // importBindings. A wrong-arity call to a same-file
+                    // definition, or to an included header declaration whose
+                    // callable shape agrees with the pinned implementation,
+                    // is a compiler error at THIS target — exactly the site
+                    // `check` must report. Do not extend this to member targets
+                    // or unrelated project files: `write(...)` may still be a
+                    // libc function that merely shares a project spelling.
+                    if (!arityNameEvidence &&
+                        (fileEntry.language === 'c' || fileEntry.language === 'cpp') &&
+                        targetDefs.length > 0 && targetDefs.every(definition =>
+                            !definition.className && !definition.receiver)) {
+                        arityNameEvidence = tFiles.has(filePath);
+                        if (!arityNameEvidence) {
+                            const contractKey = definition => {
+                                const params = definition.paramsStructured;
+                                if (!Array.isArray(params)) return null;
+                                const types = params.map(param =>
+                                    String(param?.type || '?')
+                                        .replace(/\s+/g, ' ').trim()).join(',');
+                                return `${definition.namespace || ''}\0${params.length}\0${types}`;
+                            };
+                            const targetContracts = new Set(targetDefs
+                                .map(contractKey).filter(Boolean));
+                            arityNameEvidence = definitions.some(definition => {
+                                if (definition.className || definition.receiver ||
+                                    definition.file === filePath) return false;
+                                const key = contractKey(definition);
+                                return key && targetContracts.has(key) &&
+                                    _importReaches(index, filePath,
+                                        new Set([definition.file]));
+                            });
+                        }
+                    }
                     if (!arityNameEvidence) {
                         recordExcluded(filePath, call.line, 'arity-mismatch');
                         continue;
@@ -4236,6 +4314,9 @@ function findCallers(index, name, options = {}) {
                         // positive project-scope identity evidence.
                         hasSingleOwnerEvidence: !!(collectAccount && call.isMethod &&
                             !call.inMacroDefinition && !call.isMacro &&
+                            !call.receiverType && !fieldHopType &&
+                            !fieldDispatchType && !call.receiverExternalFlow &&
+                            !call.receiverQualifiedFlow &&
                             targetDefs2.some(d => !NON_CALLABLE_TYPES.has(d.type) &&
                                 (d.className || d.receiver)) &&
                             methodOwnerKeys().size === 1),
@@ -4819,6 +4900,28 @@ function findCallees(index, definition, options = {}) {
                     const fields = call.receiverFields || [call.receiverField];
                     fieldHopType = _declaredFieldPathType(index, hopRoot, fields,
                         language, fieldHopInfo, call.receiverRootNamespace);
+                    // Imported Go root types outside this project have no
+                    // indexed field table. The attempted field hop is still
+                    // owned by that external type and must not fall through
+                    // to a same-name project method's single-owner shortcut.
+                    if (!fieldHopType && language === 'go') {
+                        const qualified = String(hopRoot).replace(/^\*+/, '')
+                            .match(/^([A-Za-z_]\w*)\.([A-Za-z_]\w*)$/);
+                        const qualifier = call.receiverRootTypeQualifier ||
+                            qualified?.[1];
+                        const bare = qualified?.[2] ||
+                            String(hopRoot).replace(/^\*+/, '');
+                        if (qualifier && bare) {
+                            const hasProjectType = (index.symbols.get(bare) || [])
+                                .some(candidate => IDENTITY_TYPE_KINDS.has(candidate.type));
+                            const origin = _resolveFlowTypeOrigin(
+                                index, def.file, bare, qualifier);
+                            if ((!hasProjectType || !origin?.fromFile) &&
+                                _goQualifierNamesImport(index, def.file, qualifier)) {
+                                fieldHopInfo.externalVia = `${qualifier}.${bare}`;
+                            }
+                        }
+                    }
                     if (!fieldHopType) {
                         if (fields.length === 1) {
                             fieldDispatchType = _declaredFieldInterfaceType(
@@ -5453,7 +5556,9 @@ function findCallees(index, definition, options = {}) {
                 }
                 const hasBinding = fileEntry?.bindings?.some(b => b.name === call.name);
                 const inSameFile = syms.some(s => s.file === def.file);
-                if (!hasBinding && !inSameFile) {
+                const inSamePackage = langTraits(language)?.packageScope === 'directory' &&
+                    syms.some(s => path.dirname(s.file) === path.dirname(def.file));
+                if (!hasBinding && !inSameFile && !inSamePackage) {
                     noteSite(siteId, 'excluded', 'callback-no-evidence', call);
                     continue;
                 }
@@ -5616,6 +5721,13 @@ function findCallees(index, definition, options = {}) {
                         const sibling = (fe?.bindings || []).filter(b => b.name === call.name);
                         if (sibling.length > 0) bindings = bindings.concat(sibling);
                     }
+                }
+                // A constructor/composite-literal record names a type/value
+                // constructor. A same-named field is never a legal target.
+                // Apply after package-scope expansion so sibling fields cannot
+                // re-enter the candidate set.
+                if (call.isConstructor) {
+                    bindings = bindings.filter(binding => binding.type !== 'field');
                 }
                 // Method call with no binding for the method name:
                 // Different strategies by language family:
@@ -9493,6 +9605,7 @@ function _declaredFieldType(index, rootType, fieldName, language, info, rootName
     if (aliasBase) typeName = aliasBase;
     if (info) {
         const origins = new Set();
+        const namespaces = new Set();
         let complete = true;
         for (const field of onType) {
             if (!field.file) {
@@ -9502,6 +9615,7 @@ function _declaredFieldType(index, rootType, fieldName, language, info, rootName
             const rawText = isAccessor(field) ? field.returnType : field.fieldType;
             const qualifier = language === 'java'
                 ? _javaNestedTypeQualifier(rawText) : undefined;
+            if (qualifier) namespaces.add(qualifier);
             const origin = _resolveFlowTypeOrigin(
                 index, field.file, typeName, qualifier);
             if (!origin?.fromFile) {
@@ -9512,6 +9626,13 @@ function _declaredFieldType(index, rootType, fieldName, language, info, rootName
         }
         if (complete && origins.size === 1) {
             info.fromFile = [...origins][0];
+        }
+        if (language === 'java' && namespaces.size === 1) {
+            // Preserve nested-type identity (`Code.Builder`) independently
+            // from the root object's lexical owner (`Envelope.Builder`).
+            // Reusing receiverRootNamespace here attributes the field to the
+            // wrong same-named nested class.
+            info.namespace = [...namespaces][0];
         }
     }
     // Generic type parameters by convention (T, K, V1 — fix #220,
@@ -10066,6 +10187,47 @@ const _CSHARP_TYPE_ALIASES = new Map([
     ['System.Int64', 'long'],
 ]);
 
+// Compiler-known BCL inheritance used by extension-method binding. Keep the
+// table at the generic type head: `_csharpTypeIdentity` deliberately strips
+// type arguments, while assignability of List<T> to IEnumerable<T> is stable.
+const _CSHARP_PLATFORM_BASES = new Map([
+    ['List', new Set(['IEnumerable', 'ICollection', 'IList', 'IReadOnlyCollection', 'IReadOnlyList'])],
+    ['HashSet', new Set(['IEnumerable', 'ICollection', 'IReadOnlyCollection', 'ISet'])],
+    ['Dictionary', new Set(['IEnumerable', 'ICollection', 'IDictionary', 'IReadOnlyCollection', 'IReadOnlyDictionary'])],
+    ['Collection', new Set(['IEnumerable', 'ICollection', 'IList', 'IReadOnlyCollection', 'IReadOnlyList'])],
+    ['IList', new Set(['IEnumerable', 'ICollection'])],
+    ['ICollection', new Set(['IEnumerable'])],
+    ['IReadOnlyList', new Set(['IEnumerable', 'IReadOnlyCollection'])],
+    ['IReadOnlyCollection', new Set(['IEnumerable'])],
+]);
+
+function _csharpTypeAssignable(index, actualType, expectedType) {
+    if (!actualType || !expectedType) return false;
+    const seen = new Set();
+    const queue = [actualType];
+    while (queue.length > 0 && seen.size < 128) {
+        const current = queue.shift();
+        if (!current || seen.has(current)) continue;
+        seen.add(current);
+        if (current === expectedType ||
+            _CSHARP_PLATFORM_BASES.get(current)?.has(expectedType)) return true;
+        for (const parent of index._getInheritanceParents?.(current) || []) {
+            const name = typeof parent === 'string' ? parent : parent?.name;
+            if (name && !seen.has(name)) queue.push(name);
+        }
+        // C# class `implements` records are deliberately kept outside the
+        // dispatch inheritance graph, but they are compiler-grade
+        // assignability evidence for extension receiver parameters.
+        for (const definition of index.symbols.get(current) || []) {
+            for (const implemented of definition.implements || []) {
+                const name = _csharpTypeIdentity(implemented);
+                if (name && !seen.has(name)) queue.push(name);
+            }
+        }
+    }
+    return false;
+}
+
 function _csharpTypeIdentity(raw) {
     if (!raw) return null;
     let value = String(raw).trim()
@@ -10095,8 +10257,11 @@ function _csharpExtensionCallMatches(index, filePath, fileEntry, call, targetDef
             return false;
         }
         const receiver = def.paramsStructured[0];
-        if (!receiver?.extensionReceiver ||
-            _csharpTypeIdentity(receiver.type) !== actualType) {
+        const expectedType = receiver?.extensionReceiver
+            ? _csharpTypeIdentity(receiver.type) : null;
+        const assignable = !!expectedType &&
+            _csharpTypeAssignable(index, actualType, expectedType);
+        if (!assignable) {
             return false;
         }
         const namespace = def.namespace || null;
@@ -10144,7 +10309,8 @@ function _callArityCompatible(call, targetDefs, language) {
         const unboundForm =
             (qualifiedStyle === 'path' && hasExplicitSelf && call.isPathCall) ||
             (qualifiedStyle === 'method-expr' &&
-                !!call.receiver && call.receiver === defType);
+                !!call.receiver && call.receiver === defType &&
+                !call.receiverType);
         const variadic = params.some(p => p && p.rest);
         const max = variadic ? Infinity :
             params.length + (isMethodDef && unboundForm ? 1 : 0);
@@ -11400,6 +11566,35 @@ function _dispatchCapableSupertype(index, language, typeName, targetDefs, defini
     // every C# member is virtual, so require the recorded relationship.
     if (language === 'csharp' && _isDispatchAncestor(index, typeName, targetDefs)) {
         return true;
+    }
+    if (traits.explicitVirtualDispatch &&
+        _isDispatchAncestor(index, typeName, targetDefs)) {
+        const virtual = new Set(['virtual', 'override']);
+        const targetName = targetDefs[0]?.name;
+        const ownerNames = new Set();
+        const queue = targetDefs.map(definition => ({
+            name: definition.className ||
+                (definition.receiver || '').replace(/^\*/, ''),
+            file: definition.file,
+        })).filter(item => item.name);
+        while (queue.length > 0) {
+            const current = queue.shift();
+            if (ownerNames.has(current.name)) continue;
+            ownerNames.add(current.name);
+            for (const parent of index._getInheritanceParents(
+                current.name, current.file) || []) {
+                queue.push({
+                    name: parent,
+                    file: index._resolveClassFile
+                        ? index._resolveClassFile(parent, current.file)
+                        : current.file,
+                });
+            }
+        }
+        return (definitions || index.symbols.get(targetName) || []).some(definition =>
+            ownerNames.has(definition.className ||
+                (definition.receiver || '').replace(/^\*/, '')) &&
+            (definition.modifiers || []).some(modifier => virtual.has(modifier)));
     }
     if (traits.allMethodsVirtual) {
         return _isDispatchAncestor(index, typeName, targetDefs);

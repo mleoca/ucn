@@ -1520,10 +1520,9 @@ e();
         }
     });
 
-    // MEDIUM-6: same-named functions in different files must NOT each show
-    // the global call count duplicated. Aggregate to a single row with
-    // additional locations listed.
-    it('hot list aggregates same-named definitions in one row (MEDIUM-6)', () => {
+    // Same-named functions must be pinned independently; an uncalled sibling
+    // never inherits the active definition's count.
+    it('hot list attributes same-named definitions independently', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'a.js': "function shared() { return 'a'; }\nmodule.exports = { shared };",
@@ -1537,8 +1536,10 @@ e();
             assert.strictEqual(sharedItems.length, 1,
                 `expected exactly one row for 'shared', got ${sharedItems.length}`);
             const row = sharedItems[0];
-            assert.ok(Array.isArray(row.locations) && row.locations.length === 2,
-                `expected 2 locations on the aggregated row, got ${JSON.stringify(row.locations)}`);
+            assert.strictEqual(row.file, 'a.js');
+            assert.strictEqual(row.callCount, 3);
+            assert.strictEqual(row.locations, undefined,
+                'the uncalled b.js definition must not be folded into this handle');
         } finally { rm(dir); }
     });
 
@@ -2111,7 +2112,7 @@ describe('MCP parameter parity: all and top_level', () => {
 
     it('shared deps formatter respects all in showAll', () => {
         const publicOutput = fs.readFileSync(path.join(__dirname, '..', 'core', 'output', 'public.js'), 'utf-8');
-        assert.ok(publicOutput.includes('showAll: params.all || params.depth !== undefined'),
+        assert.ok(publicOutput.includes('showAll: params.all || params.depth != null'),
             'deps graph presentation should include all in showAll');
     });
 
@@ -2308,6 +2309,9 @@ module.exports = { getUsers, createUser, helper };
         const dir = tmp({
             'pyproject.toml': '[project]\nname = "test"',
             'app.py': `
+from celery import Celery
+celery = Celery(__name__)
+
 @app.route('/a')
 def route_a():
     return 1
@@ -2374,11 +2378,14 @@ def db():
         const dir = tmp({
             'pyproject.toml': '[project]\nname = "test"',
             'app.py': `
+from celery import Celery
+tasks = Celery(__name__)
+
 @app.route('/a')
 def route_a():
     return 1
 
-@something.task
+@tasks.task
 def task_b():
     return 2
 
@@ -2397,9 +2404,7 @@ def plain_unused():
         } finally { rm(dir); }
     });
 
-    // --- backward compatibility: catch-all fallbacks in entrypoints.js ---
-
-    it('deadcode excludes Python function with unknown dotted decorator via catch-all', () => {
+    it('deadcode does not mistake an unknown dotted decorator for registration', () => {
         const dir = tmp({
             'pyproject.toml': '[project]\nname = "test"',
             'hooks.py': `
@@ -2415,12 +2420,12 @@ def plain_unused():
             const index = idx(dir);
             const dc = index.deadcode();
             const names = dc.map(d => d.name);
-            assert.ok(!names.includes('my_hook_handler'),
-                'function with unknown dotted decorator (@something.hook) should be excluded from deadcode');
+            assert.ok(names.includes('my_hook_handler'),
+                'unknown dotted syntax is not framework-registration evidence');
             assert.ok(names.includes('plain_unused'),
                 'function without decorator should remain in deadcode');
-            assert.ok(dc.excludedDecorated >= 1,
-                'should count at least 1 excluded decorated symbol');
+            assert.strictEqual(dc.excludedDecorated, 0,
+                'unknown dotted syntax should not inflate framework exclusions');
         } finally { rm(dir); }
     });
 

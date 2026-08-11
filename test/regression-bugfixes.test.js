@@ -954,11 +954,9 @@ describe('fix #13: plan rejects duplicate parameter', () => {
         });
         try {
             const index = idx(dir);
-            const { ok, result } = execute(index, 'plan', { name: 'fetch', addParam: 'timeout' });
-            assert.ok(ok, 'should return ok (found the function)');
-            assert.ok(result.error, 'should have error field');
-            assert.ok(result.error.includes('already exists'), `should say "already exists", got: ${result.error}`);
-            assert.deepStrictEqual(result.currentParams, ['url', 'timeout']);
+            const { ok, error } = execute(index, 'plan', { name: 'fetch', addParam: 'timeout' });
+            assert.ok(!ok, 'invalid plans are command errors, not successful payloads');
+            assert.ok(error.includes('already exists'), `should say "already exists", got: ${error}`);
         } finally {
             rm(dir);
         }
@@ -990,10 +988,9 @@ describe('fix #13: plan rejects duplicate parameter', () => {
         });
         try {
             const index = idx(dir);
-            const { ok, result } = execute(index, 'plan', { name: 'transform', addParam: 'verbose', defaultValue: 'True' });
-            assert.ok(ok);
-            assert.ok(result.error, 'should detect duplicate');
-            assert.ok(result.error.includes('already exists'));
+            const { ok, error } = execute(index, 'plan', { name: 'transform', addParam: 'verbose', defaultValue: 'True' });
+            assert.ok(!ok);
+            assert.ok(error.includes('already exists'));
         } finally {
             rm(dir);
         }
@@ -2067,8 +2064,8 @@ def cleanup():
 // BUG #23: usages receiver tracking for member expressions
 // ============================================================================
 
-describe('Bug #23: usages filters external namespace member expressions', () => {
-    it('should filter Ns.Separator but keep standalone Separator (JS)', () => {
+describe('Bug #23: usages inventories namespace member expressions', () => {
+    it('keeps Ns.Separator and standalone Separator in raw usages (JS)', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'app.jsx': `
@@ -2084,9 +2081,10 @@ function Menu() {
         try {
             const index = idx(dir);
             const usages = index.usages('Separator');
-            // Ns.Separator should be FILTERED (external namespace access)
+            // Raw usages is intentionally exhaustive; semantic commands own
+            // target attribution and external-package filtering.
             const nsUsage = usages.find(u => u.receiver === 'Ns');
-            assert.ok(!nsUsage, 'Ns.Separator should be filtered out');
+            assert.ok(nsUsage, 'Ns.Separator should remain visible');
             // Standalone definition should remain
             const defUsage = usages.find(u => u.isDefinition);
             assert.ok(defUsage, 'standalone Separator definition should exist');
@@ -2111,7 +2109,7 @@ function Menu() {
         }
     });
 
-    it('should filter external namespace member expressions (Python)', () => {
+    it('keeps external namespace member expressions in raw usages (Python)', () => {
         const dir = tmp({
             'setup.py': 'from setuptools import setup',
             'app.py': `
@@ -2126,9 +2124,8 @@ x = os.path
         try {
             const index = idx(dir);
             const usages = index.usages('path');
-            // os.path should be FILTERED (os is external, no project file defines path via import)
             const osUsage = usages.find(u => u.receiver === 'os' && !u.isDefinition);
-            assert.ok(!osUsage, 'os.path should be filtered — os is external');
+            assert.ok(osUsage, 'os.path should remain visible in raw usages');
             // Local path() definition should remain
             const defUsage = usages.find(u => u.isDefinition);
             assert.ok(defUsage, 'standalone path() definition should exist');

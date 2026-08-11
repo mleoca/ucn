@@ -4029,8 +4029,8 @@ describe('R3-NEW-1: about histogram includes shadow callers', () => {
 // R3-NEW-4: about disambiguation count aligns with find's filtered count
 // ============================================================================
 
-describe('R3-NEW-4: about/find count alignment for ambiguous symbols', () => {
-    it('about disambiguation message excludes test files like find does', () => {
+describe('R3-NEW-4: lookup inventory and analysis scope are explicit', () => {
+    it('find inventories test definitions while about keeps its analysis scope', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'a.js': 'function shared() { return 1; }\nmodule.exports = { shared };',
@@ -4041,13 +4041,13 @@ describe('R3-NEW-4: about/find count alignment for ambiguous symbols', () => {
         });
         try {
             const index = idx(dir);
-            // find should exclude test files (default behavior)
+            // find is a symbol inventory and includes every indexed definition.
             const findRes = execute(index, 'find', { name: 'shared', exact: true });
             assert.ok(findRes.ok);
             const findCount = findRes.result.length;
-            assert.strictEqual(findCount, 2, 'find should return 2 (test files excluded)');
+            assert.strictEqual(findCount, 5, 'find should include test definitions');
 
-            // about's warning message should reflect the same count
+            // about remains a conservative production analysis by default.
             const aboutRes = execute(index, 'about', { name: 'shared' });
             assert.ok(aboutRes.ok);
             const about = aboutRes.result;
@@ -4057,8 +4057,8 @@ describe('R3-NEW-4: about/find count alignment for ambiguous symbols', () => {
                 if (ambiguous) {
                     assert.match(
                         ambiguous.message,
-                        new RegExp(`Found ${findCount} definitions`),
-                        `about's warning should say "Found ${findCount}" matching find's filtered count, got: ${ambiguous.message}`
+                        /Found 2 definitions/,
+                        `about should describe its production scope, got: ${ambiguous.message}`
                     );
                 }
             }
@@ -4869,7 +4869,7 @@ describe('fix #237: W7 command-level batch', () => {
             assert.ok(r.ok);
             assert.strictEqual(r.result.length, 1, 'listed entries truncated to the limit');
             const text = output.formatUsages(r.result, 'helper');
-            assert.match(text, /1 definitions, 2 calls, 1 imports/,
+            assert.match(text, /1 definitions, 0 other definitions, 2 calls, 1 imports/,
                 `summary reflects the full set: ${text.split('\n')[0]}`);
             const json = JSON.parse(output.formatUsagesJson(r.result, 'helper'));
             assert.strictEqual(json.data.callCount, 2, 'JSON callCount is the full count');
@@ -6463,11 +6463,11 @@ describe('fix: plan rename/param-name validation', () => {
         try {
             const index = idx(dir);
             const js = execute(index, 'plan', { name: 'greet', renameTo: 'class' });
-            assert.ok(js.ok && js.result.error, 'reserved-word rename reports an in-band error');
-            assert.ok(js.result.error.includes('reserved word in javascript'), js.result.error);
+            assert.ok(!js.ok, 'reserved-word rename reports a command error');
+            assert.ok(js.error.includes('reserved word in javascript'), js.error);
             const py = execute(index, 'plan', { name: 'fetch_data', renameTo: 'lambda' });
-            assert.ok(py.ok && py.result.error);
-            assert.ok(py.result.error.includes('reserved word in python'), py.result.error);
+            assert.ok(!py.ok);
+            assert.ok(py.error.includes('reserved word in python'), py.error);
             // A word reserved in Python but not JS stays allowed for JS targets.
             const jsOk = execute(index, 'plan', { name: 'greet', renameTo: 'lambda' });
             assert.ok(jsOk.ok && !jsOk.result.error,
@@ -6482,10 +6482,9 @@ describe('fix: plan rename/param-name validation', () => {
         });
         try {
             const index = idx(dir);
-            const { ok, result } = execute(index, 'plan', { name: 'greet', renameTo: 'greet' });
-            assert.ok(ok);
-            assert.ok(result.error, 'same-name rename must report, not plan');
-            assert.ok(result.error.includes('matches the current name'), result.error);
+            const { ok, error } = execute(index, 'plan', { name: 'greet', renameTo: 'greet' });
+            assert.ok(!ok);
+            assert.ok(error.includes('matches the current name'), error);
         } finally { rm(dir); }
     });
 });
