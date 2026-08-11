@@ -51,7 +51,7 @@ compilers and language servers (ts-morph, Pyright, gopls, rust-analyzer,
 JDT LS, Roslyn, clangd) on pinned production repositories. See
 [Answers you can trust](#answers-you-can-trust).
 
-<img src="assets/demo.svg" alt="ucn show on ripgrep: signature, 123 confirmed callers with evidence types, and the ACCOUNT line reconciling all 136 occurrences of the name" width="100%">
+<img src="https://raw.githubusercontent.com/mleoca/ucn/main/assets/demo.svg" alt="ucn show on ripgrep: signature, 123 confirmed callers with evidence types, and the ACCOUNT line reconciling all 136 occurrences of the name" width="100%">
 
 <sub>Real output: one `ucn show` on [ripgrep](https://github.com/BurntSushi/ripgrep) - signature, 123 proven callers with their evidence, and an account of every occurrence of the name. No files opened.</sub>
 
