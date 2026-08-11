@@ -53,19 +53,26 @@ const GATING_BUDGETS = Object.freeze({
 });
 
 // Measured, not invented. Laptop = reference host (10 cores, Apple M1 Pro);
-// CI = GitHub Actions ubuntu-latest 4 cores, run 31502994635, same commit and
-// the same 4/4 worker pin, which is why the whole gap is core speed.
+// CI = GitHub Actions ubuntu-latest, 4 vCPUs on 2 physical cores.
 //
-// CI measured 1.8652x (fmt) / 1.9297x (cjson) slower than the laptop run it
-// was compared against -- but that laptop run was itself 1.222x slower than
-// the freshly pinned reference state, so against HOST_REFERENCE the runner
-// derives to 1.8652 x 1.222 = 2.279. cjson reproduces it independently at
-// 2.276; two languages agreeing to 0.1% is what makes the model credible.
+// The first design derived a 2.28x host factor from engine throughput and
+// assumed the probe would read it. The first real ubuntu runs (31510902344,
+// 31510897360, 2026-08-11) refuted that: the probe read 1.1549 and 1.0757
+// while the engine measured 2.0-2.7x below reference -- a single-threaded
+// JavaScript scan cannot see 4-workers-on-2-cores hyperthread contention or
+// native parse bandwidth. What the probe DID do is stabilize within the
+// class: raw best samples across the two runner SKUs disagreed by 11%,
+// normalized bests by 3.4%. Hence fix #279: each host class carries its own
+// pinned baselines and the ratio guard gates everywhere, while the absolute
+// floors stay a reference-class claim.
 const BASELINES = {
     cjson: { locPerSec: 22063.733, locPerCpuSec: 6525.627 },
     fmt: { locPerSec: 19341.363, locPerCpuSec: 5918.444 },
 };
-const CI_HOST_FACTOR = 2.279;
+const LINUX_BASELINES = {
+    cjson: { locPerSec: 10352.722, locPerCpuSec: 3244.233 },
+    fmt: { locPerSec: 9346.428, locPerCpuSec: 2908.951 },
+};
 
 function boardMetrics(repo, overrides = {}) {
     const shape = repo === 'fmt'
@@ -88,6 +95,16 @@ function boardMetrics(repo, overrides = {}) {
         queryErrors: 0,
         ...overrides,
     };
+}
+
+function linuxBoard(repo, overrides = {}) {
+    return boardMetrics(repo, {
+        hostClass: 'linux-x64',
+        baselineHostClass: 'linux-x64',
+        baselineLocPerSec: LINUX_BASELINES[repo].locPerSec,
+        baselineLocPerCpuSec: LINUX_BASELINES[repo].locPerCpuSec,
+        ...overrides,
+    });
 }
 
 describe('performance gate host normalization', () => {
@@ -121,63 +138,94 @@ describe('performance gate host normalization', () => {
     });
 
     it('passes the healthy GitHub runner numbers that used to fail the gate', () => {
-        // The exact CI measurement that blocked the release. Nothing had
-        // regressed; the budget simply had no notion of the hardware. Only
-        // medians were recorded, so they stand in for the best sample too,
-        // which makes this strictly stricter than a real run.
-        const cjson = evaluatePerformanceBudgets(boardMetrics('cjson', {
-            coldLocPerSec: 8918.426, coldLocPerCpuSec: 2866.676,
-            buildPeakRssMb: 415.4, boardPeakRssMb: 455.7, hostFactor: CI_HOST_FACTOR,
-        }), GATING_BUDGETS);
-        const fmt = evaluatePerformanceBudgets(boardMetrics('fmt', {
-            coldLocPerSec: 8297.705, coldLocPerCpuSec: 2597.271,
-            buildPeakRssMb: 1035.8, boardPeakRssMb: 1243.3, hostFactor: CI_HOST_FACTOR,
-        }), GATING_BUDGETS);
-        assert.deepEqual(cjson.failures, []);
-        assert.deepEqual(fmt.failures, []);
-        // The report must show reference-hardware terms, not just a verdict:
-        // the runner reconstructs the reference-host figure almost exactly.
-        assert.equal(fmt.normalizedColdLocPerCpuSec, 5919.181);
-        assert.equal(fmt.cpuThroughputRatio, 1.0001);
+        // The four real per-repo measurements from the two 2026-08-11 ubuntu
+        // runs, two different runner SKUs (probe factors 1.1549 and 1.0757).
+        // The engine is byte-identical to the green reference board; only the
+        // hardware differs. The class pins carry the cross-class step the
+        // probe cannot see, and the probe stabilizes the SKU spread.
+        const runs = [
+            ['cjson', { coldLocPerSec: 8619.673, coldLocPerCpuSec: 2799.324,
+                peakColdLocPerSec: 8665.939, peakColdLocPerCpuSec: 2809.103,
+                buildPeakRssMb: 415.2, boardPeakRssMb: 452.6, hostFactor: 1.1549 }],
+            ['fmt', { coldLocPerSec: 8033.928, coldLocPerCpuSec: 2513.759,
+                peakColdLocPerSec: 8092.933, peakColdLocPerCpuSec: 2518.79,
+                buildPeakRssMb: 1057.1, boardPeakRssMb: 1265, hostFactor: 1.1549 }],
+            ['cjson', { coldLocPerSec: 9287.721, coldLocPerCpuSec: 2926.126,
+                peakColdLocPerSec: 9624.172, peakColdLocPerCpuSec: 2940.44,
+                buildPeakRssMb: 416, boardPeakRssMb: 451.2, hostFactor: 1.0757 }],
+            ['fmt', { coldLocPerSec: 8333.936, coldLocPerCpuSec: 2610.549,
+                peakColdLocPerSec: 8483.311, peakColdLocPerCpuSec: 2613.632,
+                buildPeakRssMb: 1036, boardPeakRssMb: 1250.7, hostFactor: 1.0757 }],
+        ];
+        for (const [repo, overrides] of runs) {
+            const verdict = evaluatePerformanceBudgets(
+                linuxBoard(repo, overrides), GATING_BUDGETS);
+            assert.deepEqual(verdict.failures, [],
+                `${repo} at probe factor ${overrides.hostFactor}`);
+            assert.ok(verdict.cpuThroughputRatio >= 0.96,
+                `${repo}: ${verdict.cpuThroughputRatio}`);
+        }
+        // The floors still report, as advisory, so a board reader sees the
+        // reference claim is not met on this class.
+        const fmt = evaluatePerformanceBudgets(linuxBoard('fmt', runs[1][1]), GATING_BUDGETS);
+        assert.ok(fmt.warnings.some(w => /reference-hardware claim/.test(w)));
     });
 
     it('fails a 1.5x-degraded version of those same runner numbers', () => {
         // Engine regression on the runner: the host factor is unchanged, so
-        // the loss shows up in full.
-        const fmt = evaluatePerformanceBudgets(boardMetrics('fmt', {
-            coldLocPerSec: 8297.705 / 1.5, coldLocPerCpuSec: 2597.271 / 1.5,
-            hostFactor: CI_HOST_FACTOR,
+        // the loss shows up in full against the class pin.
+        const fmt = evaluatePerformanceBudgets(linuxBoard('fmt', {
+            coldLocPerSec: 8333.936 / 1.5, coldLocPerCpuSec: 2610.549 / 1.5,
+            hostFactor: 1.0757,
         }), GATING_BUDGETS);
         assert.ok(fmt.failures.some(f => /the pinned fmt baseline/.test(f)));
         assert.ok(fmt.cpuThroughputRatio < 0.7, String(fmt.cpuThroughputRatio));
     });
 
     it('fails those same runner numbers when the host factor is unavailable', () => {
-        // Fail-closed is fail-STRICT: no calibration means factor 1, so an
-        // unknown host is judged at the reference floors and a release run
-        // additionally says why it could not normalize.
-        const verdict = evaluatePerformanceBudgets(boardMetrics('fmt', {
-            coldLocPerSec: 8297.705, coldLocPerCpuSec: 2597.271,
+        // Fail-closed is fail-STRICT: no calibration means factor 1 (which
+        // understates throughput, so ratios only get harder to pass) and a
+        // gating run refuses to proceed silently.
+        const verdict = evaluatePerformanceBudgets(linuxBoard('fmt', {
+            coldLocPerSec: 8333.936, coldLocPerCpuSec: 2610.549,
+            peakColdLocPerSec: 8483.311, peakColdLocPerCpuSec: 2613.632,
         }), GATING_BUDGETS);
         assert.ok(verdict.failures.some(f => /host calibration missing/.test(f)));
-        assert.ok(verdict.failures.some(f => /cold CPU throughput/.test(f)));
         assert.equal(verdict.hostFactor, 1);
     });
 
+    it('keeps the floors hard off-class when no class baseline gates the repository', () => {
+        // Fail-strict: an unpinned host class is judged at the reference
+        // floors, which can only false-alarm, never false-pass.
+        const verdict = evaluatePerformanceBudgets(linuxBoard('fmt', {
+            coldLocPerSec: 8333.936, coldLocPerCpuSec: 2610.549, hostFactor: 1.0757,
+            baselineLocPerSec: undefined, baselineLocPerCpuSec: undefined,
+            baselineHostClass: null,
+        }), GATING_BUDGETS);
+        assert.ok(verdict.failures.some(f => /cold CPU throughput/.test(f)));
+        assert.ok(verdict.failures.some(f => /cold wall throughput/.test(f)));
+        assert.ok(verdict.warnings.some(w =>
+            /no pinned throughput baseline for fmt on linux-x64/.test(w)));
+    });
+
     it('keeps the R2-003 wall regression release-blocking on every host', () => {
-        // Regression (a): fmt at 8075 LOC/s wall on reference hardware. The
-        // same code on the CI runner measures 8075/1.9 raw, and normalization
-        // reconstructs the reference figure, so the verdict is host-invariant.
+        // Regression (a): fmt at 8075 LOC/s wall on reference hardware, which
+        // is 0.4175x the pinned wall baseline. On the reference class the
+        // absolute floor catches it; on the ubuntu class the same
+        // proportional loss lands at ~0.41x the class pin and the ratio guard
+        // catches it. Release-blocking on both, through different mechanisms.
         const onReference = evaluatePerformanceBudgets(boardMetrics('fmt', {
             coldLocPerSec: 8075, coldLocPerCpuSec: 4163, hostFactor: 1.0,
+            hostClass: 'darwin-arm64',
         }), GATING_BUDGETS);
-        const onRunner = evaluatePerformanceBudgets(boardMetrics('fmt', {
-            coldLocPerSec: 8075 / CI_HOST_FACTOR,
-            coldLocPerCpuSec: 4163 / CI_HOST_FACTOR,
-            hostFactor: CI_HOST_FACTOR,
+        const onRunner = evaluatePerformanceBudgets(linuxBoard('fmt', {
+            coldLocPerSec: 3541.8, coldLocPerCpuSec: 2610.549,
+            peakColdLocPerSec: 3541.8, peakColdLocPerCpuSec: 2613.632,
+            hostFactor: 1.0757,
         }), GATING_BUDGETS);
         assert.ok(onReference.failures.some(f => /cold wall throughput/.test(f)));
-        assert.ok(onRunner.failures.some(f => /cold wall throughput/.test(f)));
+        assert.ok(onRunner.failures.some(f =>
+            /cold wall throughput .*the pinned fmt baseline/.test(f)));
     });
 
     it('fails the C-family recovery-bound regression that clears every absolute floor', () => {
@@ -199,14 +247,17 @@ describe('performance gate host normalization', () => {
         assert.ok(onReference.cpuThroughputRatio < 0.8, String(onReference.cpuThroughputRatio));
         assert.ok(onReference.failures.some(f => /the pinned fmt baseline/.test(f)));
 
-        const onRunner = evaluatePerformanceBudgets(boardMetrics('fmt', {
-            coldLocPerSec: measured.coldLocPerSec / CI_HOST_FACTOR,
-            coldLocPerCpuSec: measured.coldLocPerCpuSec / CI_HOST_FACTOR,
-            peakColdLocPerSec: measured.peakColdLocPerSec / CI_HOST_FACTOR,
-            peakColdLocPerCpuSec: measured.peakColdLocPerCpuSec / CI_HOST_FACTOR,
-            hostFactor: CI_HOST_FACTOR,
+        // On the ubuntu class the same regression shows as CPU work while
+        // wall stays healthy (parallelism hides it there too): only the
+        // class-pinned CPU ratio can see it.
+        const onRunner = evaluatePerformanceBudgets(linuxBoard('fmt', {
+            coldLocPerSec: 8333.936, coldLocPerCpuSec: 2610.549 * 0.76,
+            peakColdLocPerSec: 8483.311, peakColdLocPerCpuSec: 2613.632 * 0.76,
+            hostFactor: 1.0757,
         }), GATING_BUDGETS);
         assert.ok(onRunner.failures.some(f => /the pinned fmt baseline/.test(f)));
+        assert.ok(onRunner.wallThroughputRatio >= DEFAULT_BUDGETS.minWallThroughputRatio,
+            'wall must stay healthy so only the CPU ratio catches it');
 
         // The other measured run of the same regression, unnormalized.
         const secondRun = evaluatePerformanceBudgets(boardMetrics('fmt', {
@@ -219,15 +270,24 @@ describe('performance gate host normalization', () => {
 
     it('separates healthy from regressed by a wide margin on both sides', () => {
         // The threshold is only trustworthy if it is not sitting inside either
-        // distribution. Measured on the reference host: every healthy sample
-        // lands >= 0.97 and every regressed sample <= 0.77, with the 0.87
-        // floor roughly centred in the empty band between them.
-        const ratio = (peakCpu, hostFactor) => evaluatePerformanceBudgets(boardMetrics('fmt', {
+        // distribution -- on BOTH host classes. Measured: every healthy sample
+        // (reference re-runs plus all four real ubuntu measurements) lands
+        // >= 0.96 and every regressed sample <= 0.77, with the 0.87 floor
+        // roughly centred in the empty band between them.
+        const refRatio = (peakCpu, hostFactor) => evaluatePerformanceBudgets(boardMetrics('fmt', {
             coldLocPerSec: 18000, coldLocPerCpuSec: peakCpu,
             peakColdLocPerSec: 18000, peakColdLocPerCpuSec: peakCpu, hostFactor,
         }), GATING_BUDGETS).cpuThroughputRatio;
-        const healthy = [ratio(5681.516, 1.0417), ratio(5700.898, 1.0122), ratio(2597.271, CI_HOST_FACTOR)];
-        const regressed = [ratio(4293.428, 1.0504), ratio(4310.09, 1.0)];
+        const linuxRatio = (repo, peakCpu, hostFactor) => evaluatePerformanceBudgets(
+            linuxBoard(repo, {
+                coldLocPerSec: 9000, coldLocPerCpuSec: peakCpu,
+                peakColdLocPerSec: 9000, peakColdLocPerCpuSec: peakCpu, hostFactor,
+            }), GATING_BUDGETS).cpuThroughputRatio;
+        const healthy = [refRatio(5681.516, 1.0417), refRatio(5700.898, 1.0122),
+            linuxRatio('cjson', 2809.103, 1.1549), linuxRatio('fmt', 2518.79, 1.1549),
+            linuxRatio('cjson', 2940.44, 1.0757), linuxRatio('fmt', 2613.632, 1.0757)];
+        const regressed = [refRatio(4293.428, 1.0504), refRatio(4310.09, 1.0),
+            linuxRatio('fmt', 2613.632 * 0.76, 1.0757)];
         assert.ok(Math.min(...healthy) > DEFAULT_BUDGETS.minCpuThroughputRatio + 0.09,
             `healthy floor margin too thin: ${Math.min(...healthy)}`);
         assert.ok(Math.max(...regressed) < DEFAULT_BUDGETS.minCpuThroughputRatio - 0.09,
@@ -335,11 +395,14 @@ describe('performance gate host normalization', () => {
         assert.ok(verdict.warnings.some(w => /no pinned throughput baseline/.test(w)));
     });
 
-    it('pins a reference-host throughput baseline for the gated smoke repositories', () => {
+    it('pins reference and linux-x64 throughput baselines for the gated smoke repositories', () => {
         for (const name of ['cjson', 'fmt']) {
             const repo = RELEASE_REPOS.find(candidate => candidate.name === name);
-            assert.ok(repo.performanceBaseline?.locPerSec > 0, name);
-            assert.ok(repo.performanceBaseline?.locPerCpuSec > 0, name);
+            // deepEqual against the test fixtures so the numbers these tests
+            // replay can never drift from the pins the real gate uses.
+            assert.deepEqual(repo.performanceBaseline, BASELINES[name], name);
+            assert.deepEqual(repo.performanceBaselineByHost?.['linux-x64'],
+                LINUX_BASELINES[name], `${name} linux-x64`);
         }
     });
 

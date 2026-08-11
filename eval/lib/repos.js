@@ -288,6 +288,10 @@ const REPOS = [
         // Reference-host throughput, from the full release board (see the
         // performanceBaseline note on fmt below).
         performanceBaseline: { locPerSec: 22063.733, locPerCpuSec: 6525.627 },
+        // Per-host-class pins (see the fmt note below for the model).
+        performanceBaselineByHost: {
+            'linux-x64': { locPerSec: 10352.722, locPerCpuSec: 3244.233 },
+        },
         // cJSON vendors the Unity test framework (including generated
         // expectdata and Unity's own examples). Semantic/deadcode oracle rows
         // measure the cJSON library rather than a second unrelated C
@@ -319,6 +323,21 @@ const REPOS = [
         // a deliberate, explained speed change; lowering a baseline to clear a
         // red gate makes the regression the new normal.
         performanceBaseline: { locPerSec: 19341.363, locPerCpuSec: 5918.444 },
+        // Per-host-class pins (fix #279). The probe factor bridges SKU
+        // variation WITHIN a class but cannot bridge ACROSS classes: on
+        // ubuntu-latest the probe reads 1.08-1.15 while the engine measures
+        // 2.0-2.7x below reference (single-thread JavaScript cannot see
+        // 4-workers-on-2-cores hyperthread contention or native parse
+        // bandwidth), so each non-reference class carries its own pins and the
+        // absolute floors go advisory there. Pinned from the two 2026-08-11
+        // ubuntu runs (31510902344, 31510897360) as probe-normalized best
+        // samples: the two runner SKUs disagreed by 11% raw and 3.4%
+        // normalized, which is the probe doing its intra-class job. Same
+        // discipline as above: normalized values, best isolated sample, never
+        // re-pin to clear a red gate.
+        performanceBaselineByHost: {
+            'linux-x64': { locPerSec: 9346.428, locPerCpuSec: 2908.951 },
+        },
         // fmt vendors GoogleTest under test/gtest and its test translation
         // units include "gmock/..." from that include root. Without this,
         // clangd treats TEST(...) and other macros as undeclared functions,

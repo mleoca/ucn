@@ -42,6 +42,22 @@ const {
 
 const CALIBRATION_SCRIPT = path.join(__dirname, 'lib', 'host-calibration.js');
 
+// The platform-arch class this process runs on. The reference class gates the
+// absolute throughput floors and pins `performanceBaseline`; every other
+// class gates throughput through its own `performanceBaselineByHost` entry
+// (fix #279 -- the probe bridges SKU variation within a class, not across
+// classes).
+const HOST_CLASS = `${process.platform}-${process.arch}`;
+
+function repoBaseline(repo) {
+    if (HOST_CLASS === HOST_REFERENCE.hostClass) {
+        return repo.performanceBaseline
+            ? { ...repo.performanceBaseline, hostClass: HOST_CLASS } : null;
+    }
+    const pinned = repo.performanceBaselineByHost?.[HOST_CLASS];
+    return pinned ? { ...pinned, hostClass: HOST_CLASS } : null;
+}
+
 const args = process.argv.slice(2);
 const releaseOnly = args.includes('--release');
 const repoArg = readArg('--repo');
@@ -188,6 +204,7 @@ function hostMetricFields() {
     return {
         hostFactor: state.valid ? state.hostFactor : null,
         hostCalibrationError: state.error,
+        hostClass: HOST_CLASS,
     };
 }
 
@@ -340,8 +357,9 @@ async function evaluateRepo(repo) {
         // One process: its own sample is also the best one.
         peakColdLocPerSec: coldLocPerSec,
         peakColdLocPerCpuSec: coldLocPerCpuSec,
-        baselineLocPerSec: repo.performanceBaseline?.locPerSec,
-        baselineLocPerCpuSec: repo.performanceBaseline?.locPerCpuSec,
+        baselineLocPerSec: repoBaseline(repo)?.locPerSec,
+        baselineLocPerCpuSec: repoBaseline(repo)?.locPerCpuSec,
+        baselineHostClass: repoBaseline(repo)?.hostClass ?? null,
         ...hostMetricFields(),
         cacheLoadMs, firstQueryMs, warmColdRatio,
         queryP50Ms, queryP95Ms, buildPeakRssMb, boardPeakRssMb,
@@ -386,8 +404,10 @@ async function evaluateRepo(repo) {
         coldCpuMs,
         coldLocPerSec,
         coldLocPerCpuSec,
-        baselineLocPerSec: repo.performanceBaseline?.locPerSec,
-        baselineLocPerCpuSec: repo.performanceBaseline?.locPerCpuSec,
+        baselineLocPerSec: repoBaseline(repo)?.locPerSec,
+        baselineLocPerCpuSec: repoBaseline(repo)?.locPerCpuSec,
+        baselineHostClass: repoBaseline(repo)?.hostClass ?? null,
+        hostClass: HOST_CLASS,
         hostFactor: verdict.hostFactor,
         normalizedColdLocPerSec: verdict.normalizedColdLocPerSec,
         normalizedColdLocPerCpuSec: verdict.normalizedColdLocPerCpuSec,
@@ -474,8 +494,9 @@ function aggregateRepoRuns(repo, runs) {
         // this workload, which is what the pinned baseline records.
         peakColdLocPerSec: rate(lines * 1000, Math.min(...coldSamplesMs)),
         peakColdLocPerCpuSec: rate(lines * 1000, Math.min(...coldCpuSamplesMs)),
-        baselineLocPerSec: repo.performanceBaseline?.locPerSec,
-        baselineLocPerCpuSec: repo.performanceBaseline?.locPerCpuSec,
+        baselineLocPerSec: repoBaseline(repo)?.locPerSec,
+        baselineLocPerCpuSec: repoBaseline(repo)?.locPerCpuSec,
+        baselineHostClass: repoBaseline(repo)?.hostClass ?? null,
         ...hostMetricFields(),
         cacheLoadMs,
         firstQueryMs,
@@ -541,12 +562,15 @@ function printResult(repo, result) {
     // The throughput verdict is only readable if the host term is visible:
     // raw measurement, the factor applied, the reference-hardware value it
     // implies, and how that compares with the pinned healthy baseline.
+    const offClass = result.hostClass != null && result.hostClass !== HOST_REFERENCE.hostClass;
     const baselineNote = result.baselineLocPerCpuSec == null
-        ? 'no pinned baseline'
+        ? `no pinned baseline for host class ${result.hostClass ?? HOST_REFERENCE.hostClass}`
         : `best ${result.peakNormalizedColdLocPerSec}/${result.peakNormalizedColdLocPerCpuSec} ` +
-          `vs baseline ${result.baselineLocPerSec}/${result.baselineLocPerCpuSec} = ` +
+          `vs ${result.baselineHostClass ?? 'pinned'} baseline ` +
+          `${result.baselineLocPerSec}/${result.baselineLocPerCpuSec} = ` +
           `${result.wallThroughputRatio ?? '-'}x wall, ${result.cpuThroughputRatio ?? '-'}x CPU`;
-    process.stdout.write(`  host factor ${result.hostFactor} -> reference-hardware ` +
+    process.stdout.write(`  host factor ${result.hostFactor} -> ` +
+        `${offClass ? 'class-normalized' : 'reference-hardware'} ` +
         `${result.normalizedColdLocPerSec} LOC/s wall, ` +
         `${result.normalizedColdLocPerCpuSec} LOC/CPU-s | ${baselineNote}\n`);
     process.stdout.write(`  context board n=${result.queryCount} x ${result.processSamples} | ` +
@@ -720,6 +744,8 @@ async function main() {
     const host = {
         platform: process.platform,
         arch: process.arch,
+        hostClass: HOST_CLASS,
+        referenceHostClass: HOST_REFERENCE.hostClass,
         availableParallelism: typeof os.availableParallelism === 'function'
             ? os.availableParallelism() : os.cpus().length,
         requestedWorkerCount,
@@ -765,12 +791,17 @@ async function main() {
         `Host: ${host.platform}/${host.arch}; available parallelism ${host.availableParallelism}; ` +
             `worker pin ${host.requestedWorkerCount ?? 'auto'}.`,
         '',
-        `${describeHostCalibration()}. Throughput budgets are stated on reference hardware ` +
-            `(${HOST_REFERENCE.host}); the "ref" columns are the measured value scaled by the ` +
-            'host factor, and the "vs base" column compares them with the pinned healthy ' +
-            'baseline for that repository. Memory budgets are deliberately never scaled.',
+        `${describeHostCalibration()}. Host class ${HOST_CLASS}` +
+            `${HOST_CLASS === HOST_REFERENCE.hostClass
+                ? ' (the reference class: absolute floors gate here)'
+                : ' (not the reference class: absolute floors are advisory wherever a ' +
+                  'class baseline gates)'}. ` +
+            `Throughput budgets are stated on reference hardware (${HOST_REFERENCE.host}); ` +
+            'the "norm" columns are the measured value scaled by the host factor, and the ' +
+            '"vs base" column compares them with the pinned healthy baseline for this host ' +
+            'class. Memory budgets are deliberately never scaled.',
         '',
-        '| repo | files | LOC | cold wall | wall LOC/s (ref) | CPU LOC/s (ref) | vs base wall/CPU | workers | cache load median | first query median/max | warm/cold | query p50 | query p95 | build/board peak RSS | result |',
+        '| repo | files | LOC | cold wall | wall LOC/s (norm) | CPU LOC/s (norm) | vs base wall/CPU | workers | cache load median | first query median/max | warm/cold | query p50 | query p95 | build/board peak RSS | result |',
         '|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|',
         ...results.map(r => r.error
             ? `| ${r.repo} | - | - | - | - | - | - | - | - | - | - | - | - | - | **ERROR: ${r.error}** |`
@@ -806,7 +837,7 @@ async function main() {
         `Full release board: ${rollup.completeReleaseBoard ? 'complete' : 'incomplete'}; ` +
             `result: ${rollup.passed ? 'PASS' : 'NOT RELEASE-QUALIFIED'}.`,
         '',
-        '| repo | scope | samples | host factor | CPU LOC/s (ref) | wall LOC/s (ref) | result |',
+        '| repo | scope | samples | host factor | CPU LOC/s (norm) | wall LOC/s (norm) | result |',
         '|---|---|---:|---:|---:|---:|---|',
         ...rollup.results.map(result =>
             `| ${result.repo} | ${result.evidence.scope || 'unknown'} | ` +

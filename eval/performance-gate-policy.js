@@ -10,7 +10,9 @@
  * host against the reference below with a frozen pure-JavaScript probe, and the
  * floors are compared against `measured x hostFactor` — the value the engine
  * would have produced on reference hardware. Budget VALUES never move; only
- * their units become "LOC/s on reference hardware".
+ * their units become "LOC/s on reference hardware". That reconstruction is
+ * only valid WITHIN the reference host class (see `hostClass` below); other
+ * classes pin their own per-repo baselines and gate on ratios against those.
  *
  * RE-PIN PROTOCOL. Run `node eval/lib/host-calibration.js --pin` on a quiet
  * reference machine and paste the result here when, and only when:
@@ -32,6 +34,14 @@ const HOST_REFERENCE = Object.freeze({
     names: 514,
     wallMs: 40.0,
     host: 'darwin/arm64, Apple M1 Pro, 10 cores, node v24.8.0, pinned 2026-08-11',
+    // The platform-arch class the absolute floors are a claim about. The probe
+    // factor bridges SKU variation WITHIN a class; it provably cannot bridge
+    // ACROSS classes (fix #279): on ubuntu-latest the probe reads 1.08-1.15
+    // while the engine measures 2.0-2.7x slower than reference, because a
+    // single-threaded JavaScript scan cannot see 4-workers-on-2-cores
+    // hyperthread contention or native tree-sitter parse bandwidth. Other
+    // classes gate throughput through `performanceBaselineByHost` pins.
+    hostClass: 'darwin-arm64',
 });
 
 // Trusted band for the host factor, reference-relative.
@@ -41,11 +51,10 @@ const HOST_REFERENCE = Object.freeze({
 // than laxer. Below the floor a host is more than twice as fast as the
 // reference, which is a re-pin event, so relief stops growing. Both edges warn.
 //
-// The cap is 3.0 because GitHub's 4-core ubuntu-latest runner derives to ~2.28
-// against this reference (independently reproduced by cjson and fmt, agreeing
-// to 0.1%). A cap of 2.5 would have left that real runner only 9% of headroom,
-// and clamping a legitimately slow runner produces exactly the spurious red
-// this normalization exists to remove.
+// Measured factors to date sit in 1.01-1.16 (reference-class re-runs and both
+// observed ubuntu-latest SKUs), so the band is generous; it exists to bound a
+// pathological reading, not to bridge host classes -- that is what per-class
+// baselines are for (fix #279).
 const MIN_HOST_FACTOR = 0.5;
 const MAX_HOST_FACTOR = 3.0;
 
@@ -74,9 +83,11 @@ const DEFAULT_BUDGETS = Object.freeze({
     // PASSED the whole gate (4275 LOC/CPU-s vs the 3000 floor, 16426 LOC/s vs
     // the 10000 floor, 1305MB vs the 1536MB budget, exit 0 -- measured). These
     // ratios compare host-normalized throughput against the pinned per-repo
-    // baseline, where the same regression reads 0.71x. CPU is the tighter of
-    // the two because parallelism hides CPU-work regressions in wall time.
-    // Only repositories carrying `performanceBaseline` are gated.
+    // baseline for the CURRENT host class (`performanceBaseline` on the
+    // reference class, `performanceBaselineByHost[class]` elsewhere), where
+    // the same regression reads 0.71x. CPU is the tighter of the two because
+    // parallelism hides CPU-work regressions in wall time. Only repositories
+    // carrying a baseline for the running class are ratio-gated.
     minCpuThroughputRatio: 0.87,
     minWallThroughputRatio: 0.80,
     requireThroughputBaselines: false,
@@ -205,24 +216,45 @@ function evaluatePerformanceBudgets(metrics, budgets = DEFAULT_BUDGETS) {
     const wallNote = hostFactor === 1 ? ''
         : ` (raw ${metrics.coldLocPerSec} x host factor ${hostFactor})`;
 
+    // The absolute floors are a claim about the REFERENCE host class (fix
+    // #279): the probe factor bridges SKU variation within a class, never
+    // across classes. Off the reference class they demote to warnings EXACTLY
+    // when a class-matched per-repo baseline gates the repository instead;
+    // with no class baseline they stay hard, which can only false-alarm,
+    // never false-pass.
+    const offReferenceClass = metrics.hostClass != null &&
+        metrics.hostClass !== HOST_REFERENCE.hostClass;
+    const classBaselineGates = offReferenceClass &&
+        metrics.baselineHostClass === metrics.hostClass &&
+        Number.isFinite(metrics.baselineLocPerCpuSec) && metrics.baselineLocPerCpuSec > 0;
+    const advisoryFloorSuffix = `; the absolute floors are a reference-hardware claim -- on ` +
+        `${metrics.hostClass} the pinned ${metrics.repo} baseline gates throughput`;
+
     if (substantialProject && normalizedColdLocPerCpuSec < budgets.minColdLocPerCpuSec) {
-        failures.push(`cold CPU throughput ${normalizedColdLocPerCpuSec} LOC/CPU-s${note} < ` +
-            budgets.minColdLocPerCpuSec);
+        const message = `cold CPU throughput ${normalizedColdLocPerCpuSec} LOC/CPU-s${note} < ` +
+            budgets.minColdLocPerCpuSec;
+        if (classBaselineGates) warnings.push(`${message}${advisoryFloorSuffix}`);
+        else failures.push(message);
     }
     if (substantialProject && normalizedColdLocPerSec < budgets.minColdLocPerSec) {
         const message = `cold wall throughput ${normalizedColdLocPerSec} LOC/s${wallNote} < ` +
             `${budgets.minColdLocPerSec}`;
-        if (budgets.requireColdWallThroughput) {
+        if (classBaselineGates) {
+            warnings.push(`${message}${advisoryFloorSuffix}`);
+        } else if (budgets.requireColdWallThroughput) {
             failures.push(message);
         } else {
             warnings.push(`${message}; inspect runner contention and worker telemetry`);
         }
     }
 
-    // Per-repository regression guard against the pinned reference-host
-    // baseline. Same normalization as the floors, so the verdict is identical
-    // on every host; the ratio is what makes a regression that stays above the
-    // absolute floors visible.
+    // Per-repository regression guard against the pinned baseline for the
+    // running host class. Same normalization as the floors, so the verdict is
+    // identical on every host of the class; the ratio is what makes a
+    // regression that stays above the absolute floors visible. Measured on the
+    // two 2026-08-11 ubuntu runs: raw best samples disagreed by 11% across
+    // runner SKUs while normalized bests agreed to 3.4% -- the probe earns its
+    // keep as the intra-class stabilizer.
     //
     // Estimator: the BEST isolated process sample, not the median the floors
     // use. Both the baseline and this reading are capability measurements, and
@@ -262,8 +294,9 @@ function evaluatePerformanceBudgets(metrics, budgets = DEFAULT_BUDGETS) {
     }
     if (substantialProject && budgets.requireThroughputBaselines &&
         !(Number.isFinite(baselineCpu) && baselineCpu > 0)) {
-        warnings.push(`no pinned throughput baseline for ${metrics.repo}; only the absolute ` +
-            'floors gate this repository');
+        warnings.push(`no pinned throughput baseline for ${metrics.repo}` +
+            (offReferenceClass ? ` on ${metrics.hostClass}` : '') +
+            '; only the absolute floors gate this repository');
     }
 
     if (metrics.expectedFiles != null && metrics.files !== metrics.expectedFiles) {
