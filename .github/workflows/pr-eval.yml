@@ -31,6 +31,9 @@ jobs:
 
       - run: npm ci
 
+      - name: C-family performance smoke (fixed four-worker shape)
+        run: npm run trust:gate:performance:pr
+
       - name: Oracle eval gate (preact-signals + httpx)
         run: npm run trust:gate:fast
 

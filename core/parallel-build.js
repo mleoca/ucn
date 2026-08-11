@@ -60,7 +60,11 @@ function parallelBuild(index, files, options = {}) {
         Math.ceil(files.length / minFilesPerWorker)
     );
 
-    if (workerCount < 2) return false;
+    if (workerCount < 2) {
+        index.lastBuildWorkerCount = 1;
+        return false;
+    }
+    index.lastBuildWorkerCount = workerCount;
 
     if (!options.quiet) {
         console.error(`Parallel build: ${workerCount} workers for ${files.length} files`);

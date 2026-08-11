@@ -57,6 +57,21 @@ describe('perf: size-aware worker scheduling', () => {
             chunk.files.includes('huge-a') && chunk.files.includes('huge-b')));
         assert.deepStrictEqual(chunks.map(chunk => chunk.bytes), [500, 500]);
     });
+
+    it('honors an explicit worker count as the measured build shape', () => {
+        const files = { 'package.json': '{"name":"workers"}' };
+        for (let i = 0; i < 8; i++) {
+            files[`src/file-${i}.js`] = `export function f${i}(){ return ${i}; }`;
+        }
+        const dir = tmp(files);
+        try {
+            const index = new (require('../core/project').ProjectIndex)(dir);
+            index.build(null, { quiet: true, workers: 4 });
+            assert.strictEqual(index.lastBuildRequestedWorkers, 4);
+            assert.strictEqual(index.lastBuildWorkerCount, 4);
+            assert.strictEqual(index.lastBuildParallelEligible, true);
+        } finally { rm(dir); }
+    });
 });
 
 // ── findEnclosingFunction op cache ────────────────────────────────────────────

@@ -12,8 +12,31 @@ const { execute } = require('../core/execute');
 const { getLanguageAdapter, getParser } = require('../languages');
 const { ProjectIndex } = require('../core/project');
 const { applyOutputBudget } = require('../core/output-budget');
+const { collectRollupResults } = require('../eval/run-deadcode-eval');
 
 describe('UCN v5 release-readiness audit regressions', () => {
+    it('release follow-up: deadcode rollups merge every same-day repository row', () => {
+        const date = '2026-08-11';
+        const files = {};
+        for (let i = 0; i < 10; i++) {
+            const repo = `repo-${i}`;
+            files[`deadcode-eval-${repo}-oracle-${date}.json`] = JSON.stringify({
+                repo, oracle: 'oracle', arms: [],
+            });
+        }
+        const dir = tmp(files);
+        try {
+            const rows = collectRollupResults(dir, date, [{
+                repo: 'repo-3', oracle: 'new-oracle', arms: [],
+            }]);
+            assert.equal(rows.length, 10);
+            assert.deepEqual(rows.map(row => row.repo),
+                Array.from({ length: 10 }, (_, i) => `repo-${i}`).sort());
+            assert.equal(rows.find(row => row.repo === 'repo-3').oracle,
+                'new-oracle');
+        } finally { rm(dir); }
+    });
+
     it('R2-001: plan follows file-qualified inheritance identity', () => {
         const dir = tmp({
             'package.json': '{"name":"plan2"}',

@@ -81,6 +81,24 @@ function readArgValue(argv, flag) {
 
 function key(file, line) { return `${file}:${line}`; }
 
+function collectRollupResults(reportsDir, date, currentResults) {
+    const byRepo = new Map();
+    const suffix = `-${date}.json`;
+    for (const file of fs.readdirSync(reportsDir)) {
+        if (!file.startsWith('deadcode-eval-') ||
+            !file.endsWith(suffix) || file.includes('rollup')) continue;
+        try {
+            const prior = JSON.parse(fs.readFileSync(path.join(reportsDir, file), 'utf8'));
+            if (prior?.repo) byRepo.set(prior.repo, prior);
+        } catch { /* an incomplete artifact cannot erase valid rows */ }
+    }
+    for (const result of currentResults) {
+        if (result?.repo) byRepo.set(result.repo, result);
+    }
+    return [...byRepo.values()].sort((a, b) =>
+        a.repo < b.repo ? -1 : a.repo > b.repo ? 1 : 0);
+}
+
 /**
  * Resolve the symbol record behind a deadcode claim so the verdict can
  * exclude definition-position references (startLine vs nameLine — decorator/
@@ -385,6 +403,28 @@ async function main() {
         }
     }
 
+    // A dated rollup represents every same-day per-repo artifact, not merely
+    // the subset selected by the latest invocation. Current results override
+    // older rows for the same repository, while gate status remains scoped to
+    // this invocation.
+    const rollupResults = collectRollupResults(REPORTS_DIR, date, results);
+    const generatedAt = new Date().toISOString();
+    const rollupPayload = {
+        schemaVersion: 1,
+        generatedAt,
+        board: {
+            date,
+            sampleSize,
+            arm: armFilter,
+            release: releaseOnly,
+            repositories: rollupResults.map(result => result.repo),
+        },
+        results: rollupResults,
+    };
+    const rollupJsonPath = path.join(
+        REPORTS_DIR, `deadcode-eval-rollup-${date}.json`);
+    fs.writeFileSync(rollupJsonPath, JSON.stringify(rollupPayload, null, 2));
+
     const lines = [
         `# Deadcode eval: ${date}`,
         '',
@@ -396,7 +436,7 @@ async function main() {
         '| repo | oracle | arm | claims | sampled | agreed-dead | false-dead | outside-universe | unpinnable |',
         '|---|---|---|---|---|---|---|---|---|',
     ];
-    for (const r of results) {
+    for (const r of rollupResults) {
         if (r.error) { lines.push(`| ${r.repo} | n/a | n/a | n/a | n/a | n/a | n/a | n/a | ERROR: ${r.error} |`); continue; }
         for (const { summary: s } of r.arms) {
             lines.push(`| ${r.repo} | ${r.oracle} | ${s.arm} | ${s.claims} | ${s.sampled} | ${s.agreedDead} | **${s.falseDead}** | ${s.outsideUniverse} | ${s.unpinnable} |`);
@@ -405,9 +445,17 @@ async function main() {
     lines.push('');
     const mdPath = path.join(REPORTS_DIR, `deadcode-eval-rollup-${date}.md`);
     fs.writeFileSync(mdPath, lines.join('\n'));
-    process.stdout.write(`\nwrote ${path.relative(process.cwd(), mdPath)}\n`);
+    process.stdout.write(`\nwrote ${path.relative(process.cwd(), rollupJsonPath)}` +
+        `\nwrote ${path.relative(process.cwd(), mdPath)}\n`);
 
     process.exit(gateFailed ? 1 : 0);
 }
 
-main();
+if (require.main === module) {
+    main().catch(error => {
+        process.stderr.write(`${error.stack || error.message}\n`);
+        process.exitCode = 1;
+    });
+}
+
+module.exports = { collectRollupResults };

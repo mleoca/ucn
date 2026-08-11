@@ -12,7 +12,8 @@ name: Eval
 #    when a default-arm claim has a reference UCN missed (false-dead gate)
 #  - consistency: deterministic stable-handle board requires overlapping find,
 #    show, source, impact, tests, check, and caller-trace claims to agree exactly
-# Separate from ci.yml: heavier, network-dependent, weekly + on demand.
+# Separate from ci.yml: heavier, network-dependent, weekly + on demand. A
+# manual dispatch from main is the required pre-tag release dry run.
 
 on:
   workflow_dispatch:
@@ -74,22 +75,32 @@ jobs:
       - run: npm ci
 
       - name: Conservation eval (pinned repos)
+        if: github.event_name == 'schedule'
         run: node eval/conservation-real.js
 
       - name: "Oracle eval (gate: missing-unexplained = 0)"
+        if: github.event_name == 'schedule'
         run: node eval/run-oracle-eval.js
 
       - name: "Fresh-repo oracle eval (2 unpinned repos, weekly rotation — generalization gate)"
+        if: github.event_name == 'schedule'
         run: node eval/run-oracle-eval.js --fresh 2 --max-unscored-ratio 0.10
 
       - name: "Deadcode eval (gate: default-arm false-dead = 0)"
+        if: github.event_name == 'schedule'
         run: node eval/run-deadcode-eval.js --sample 300
 
       - name: "Cross-command consistency (gate: disagreements = 0)"
+        if: github.event_name == 'schedule'
         run: npm run trust:gate:consistency
 
       - name: "Performance gate (cold build, warm cache, semantic query p95)"
+        if: github.event_name == 'schedule'
         run: npm run trust:gate:performance
+
+      - name: "Pre-tag release dry run (publish-blocking board)"
+        if: github.event_name == 'workflow_dispatch'
+        run: npm run trust:gate
 
       - name: Upload reports
         if: always()

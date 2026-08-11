@@ -2,12 +2,17 @@
 
 const DEFAULT_BUDGETS = Object.freeze({
     minColdLocPerSec: 10000,
+    // CPU time is process-wide (including worker threads), so this floor is
+    // stable across runner parallelism. Set from the measured post-fix native
+    // board baseline with roughly 1.5x regression headroom.
+    minColdLocPerCpuSec: 3000,
     maxCacheLoadMs: 1500,
     maxFirstQueryMs: 500,
     maxWarmColdRatio: 0.65,
     maxQueryP50Ms: 75,
     maxQueryP95Ms: 250,
-    maxRssMb: 1536,
+    maxBuildRssMb: 1536,
+    maxBoardRssMb: 1536,
 });
 
 function percentile(values, fraction) {
@@ -44,17 +49,24 @@ function evaluatePerformanceBudgets(metrics, budgets = DEFAULT_BUDGETS) {
     const failures = [];
     const warnings = [];
 
+    if (metrics.lines >= 5000 &&
+        metrics.coldLocPerCpuSec < budgets.minColdLocPerCpuSec) {
+        failures.push(`cold CPU throughput ${metrics.coldLocPerCpuSec} LOC/CPU-s < ` +
+            budgets.minColdLocPerCpuSec);
+    }
     if (metrics.lines >= 5000 && metrics.coldLocPerSec < budgets.minColdLocPerSec) {
-        failures.push(`cold throughput ${metrics.coldLocPerSec} LOC/s < ${budgets.minColdLocPerSec}`);
+        warnings.push(`cold wall throughput ${metrics.coldLocPerSec} LOC/s < ` +
+            `${budgets.minColdLocPerSec}; inspect runner contention and worker telemetry`);
     }
     if (metrics.cacheLoadMs > budgets.maxCacheLoadMs) {
         failures.push(`cache load ${metrics.cacheLoadMs}ms > ${budgets.maxCacheLoadMs}ms`);
     }
 
     const absoluteStartupSlow = metrics.firstQueryMs > budgets.maxFirstQueryMs;
-    const ratioStartupSlow = metrics.coldMs >= 500 &&
+    const substantialProject = metrics.lines >= 5000;
+    const ratioStartupSlow = substantialProject &&
         metrics.warmColdRatio > budgets.maxWarmColdRatio;
-    if (metrics.coldMs < 500) {
+    if (!substantialProject) {
         if (absoluteStartupSlow) {
             failures.push(`first semantic query ${metrics.firstQueryMs}ms > ${budgets.maxFirstQueryMs}ms`);
         }
@@ -75,8 +87,17 @@ function evaluatePerformanceBudgets(metrics, budgets = DEFAULT_BUDGETS) {
     if (metrics.queryP95Ms > budgets.maxQueryP95Ms) {
         failures.push(`query p95 ${metrics.queryP95Ms}ms > ${budgets.maxQueryP95Ms}ms`);
     }
-    if (metrics.peakRssMb > budgets.maxRssMb) {
-        failures.push(`peak RSS ${metrics.peakRssMb}MB > ${budgets.maxRssMb}MB`);
+    if (metrics.buildPeakRssMb > budgets.maxBuildRssMb) {
+        failures.push(`build peak RSS ${metrics.buildPeakRssMb}MB > ` +
+            `${budgets.maxBuildRssMb}MB`);
+    }
+    if (metrics.boardPeakRssMb > budgets.maxBoardRssMb) {
+        failures.push(`board peak RSS ${metrics.boardPeakRssMb}MB > ` +
+            `${budgets.maxBoardRssMb}MB`);
+    }
+    if (metrics.workerPinMismatch) {
+        failures.push(`worker pin requested ${metrics.requestedWorkerCount}, ` +
+            `but build used ${metrics.actualWorkerCount}`);
     }
     if (metrics.queryErrors > 0) failures.push(`${metrics.queryErrors} semantic query error(s)`);
 

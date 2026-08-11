@@ -9,6 +9,30 @@ const { getLanguageAdapter, getParser, detectLanguage } = require('../languages'
 const { resolveImport } = require('../core/imports');
 const { execute } = require('../core/execute');
 const { tmp, rm, idx } = require('./helpers');
+const {
+    conditionalRecoverySources,
+    mergeExtracted,
+} = require('../languages/c-family');
+
+describe('C-family recovery resource and ordering contracts', () => {
+    it('skips whole-file conditional sweeps above the native-tree memory cap', () => {
+        const ordinary = '#if FEATURE\nint enabled;\n#else\nint disabled;\n#endif\n';
+        assert.ok(conditionalRecoverySources(ordinary).length >= 2);
+        const amalgamation = ordinary + ' '.repeat(256 * 1024);
+        assert.deepEqual(conditionalRecoverySources(amalgamation), []);
+    });
+
+    it('sorts facts contributed by secondary recovery trees into source order', () => {
+        const merged = mergeExtracted(
+            [{ name: 'later', line: 8, column: 2 }],
+            [{ name: 'earlier', line: 3, column: 4 },
+                { name: 'middle', line: 8, column: 1 }],
+            item => item.name,
+        );
+        assert.deepEqual(merged.map(item => item.name),
+            ['earlier', 'middle', 'later']);
+    });
+});
 
 describe('C language support', () => {
     it('extracts includes, structs, functions, parameters, and calls', () => {

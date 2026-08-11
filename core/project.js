@@ -60,6 +60,12 @@ class ProjectIndex {
         this.extendedByGraph = new Map(); // parentName -> [childInfo]
         this.config = this.loadConfig();
         this.buildTime = null;
+        // Build telemetry is intentionally transient (never cached). Release
+        // performance gates use it to prove the requested worker shape was
+        // actually exercised instead of inferring parallelism from host CPUs.
+        this.lastBuildWorkerCount = 1;
+        this.lastBuildParallelEligible = false;
+        this.lastBuildRequestedWorkers = null;
         this.callsCache = new Map();     // filePath -> { mtime, hash, calls, content }
         this.callsCacheDirty = false;    // set by getCachedCalls when entries are added or mutated
         this.computedDispatchDirty = false; // persisted project-wide AST blind-spot inventory
@@ -451,6 +457,10 @@ class ProjectIndex {
         const envWorkers = parseInt(process.env.UCN_WORKERS, 10);
         const disableParallel = workersSetting === 0 || envWorkers === 0;
         const explicitWorkerCount = workersSetting > 0 || envWorkers > 0;
+        const requestedWorkerCount = workersSetting > 0
+            ? workersSetting : (envWorkers > 0 ? envWorkers : null);
+        this.lastBuildWorkerCount = 1;
+        this.lastBuildRequestedWorkers = requestedWorkerCount;
         let usedParallel = false;
 
         // C/C++ recovery performs materially heavier parser work per file
@@ -462,7 +472,13 @@ class ProjectIndex {
             const language = detectLanguage(filePath, this.root);
             return count + (language === 'c' || language === 'cpp' ? 1 : 0);
         }, 0);
-        const parallelWorthwhile = files.length > 150 || cFamilyFileCount >= 25;
+        // An explicit worker count is a request for a reproducible execution
+        // shape (not merely an upper bound). This is useful to users tuning a
+        // constrained host and lets the release gate compare like with like.
+        const parallelWorthwhile = explicitWorkerCount
+            ? files.length >= 2
+            : files.length > 150 || cFamilyFileCount >= 25;
+        this.lastBuildParallelEligible = !disableParallel && parallelWorthwhile;
         if (!disableParallel && parallelWorthwhile) {
             try {
                 const { parallelBuild } = require('./parallel-build');
@@ -475,7 +491,8 @@ class ProjectIndex {
                     // retain the ordinary eight-worker safety cap.
                     maxWorkers: cFamilyFileCount >= 25 && !explicitWorkerCount
                         ? 5 : 8,
-                    minFilesPerWorker: cFamilyFileCount >= 25 ? 10 : 100,
+                    minFilesPerWorker: explicitWorkerCount
+                        ? 1 : (cFamilyFileCount >= 25 ? 10 : 100),
                     quiet,
                 });
                 if (result !== false) {
@@ -484,6 +501,7 @@ class ProjectIndex {
                     usedParallel = true;
                 }
             } catch (e) {
+                this.lastBuildWorkerCount = 1;
                 if (!quiet) {
                     console.error(`Parallel build failed, falling back to sequential: ${e.message}`);
                 }

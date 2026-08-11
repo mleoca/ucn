@@ -42,14 +42,19 @@ const processSamples = positiveInteger('--samples', releaseOnly ? 3 : 1);
 const workerRepoName = readArg('--worker-repo');
 const workerResultPath = readArg('--worker-result');
 const workerQuiet = args.includes('--worker-quiet');
+const requestedWorkerCount = envPositiveInteger('UCN_WORKERS');
+const legacyMaxRssMb = positiveNumber('--max-rss-mb', DEFAULT_BUDGETS.maxBuildRssMb);
 const budgets = {
     minColdLocPerSec: positiveNumber('--min-cold-loc-sec', DEFAULT_BUDGETS.minColdLocPerSec),
+    minColdLocPerCpuSec: positiveNumber(
+        '--min-cold-loc-cpu-sec', DEFAULT_BUDGETS.minColdLocPerCpuSec),
     maxCacheLoadMs: positiveNumber('--max-cache-load-ms', DEFAULT_BUDGETS.maxCacheLoadMs),
     maxFirstQueryMs: positiveNumber('--max-first-query-ms', DEFAULT_BUDGETS.maxFirstQueryMs),
     maxWarmColdRatio: positiveNumber('--max-warm-cold-ratio', DEFAULT_BUDGETS.maxWarmColdRatio),
     maxQueryP50Ms: positiveNumber('--max-query-p50-ms', DEFAULT_BUDGETS.maxQueryP50Ms),
     maxQueryP95Ms: positiveNumber('--max-query-p95-ms', DEFAULT_BUDGETS.maxQueryP95Ms),
-    maxRssMb: positiveNumber('--max-rss-mb', DEFAULT_BUDGETS.maxRssMb),
+    maxBuildRssMb: positiveNumber('--max-build-rss-mb', legacyMaxRssMb),
+    maxBoardRssMb: positiveNumber('--max-board-rss-mb', legacyMaxRssMb),
 };
 const REPORTS_DIR = path.resolve(
     process.env.UCN_EVAL_REPORTS_DIR || path.join(__dirname, 'reports'));
@@ -73,6 +78,16 @@ function positiveNumber(flag, fallback) {
 function positiveInteger(flag, fallback) {
     const value = positiveNumber(flag, fallback);
     if (!Number.isInteger(value)) throw new Error(`${flag} must be a positive integer (got ${value})`);
+    return value;
+}
+
+function envPositiveInteger(name) {
+    const raw = process.env[name];
+    if (raw == null || raw === '') return null;
+    const value = Number(raw);
+    if (!Number.isInteger(value) || value <= 0) {
+        throw new Error(`${name} must be a positive integer (got ${raw})`);
+    }
     return value;
 }
 
@@ -114,12 +129,24 @@ async function evaluateRepo(repo) {
 
     if (global.gc) global.gc();
     let cold = new ProjectIndex(target);
+    const coldCpuStart = process.cpuUsage();
     const coldStart = performance.now();
     cold.build(null, { quiet: true });
     const coldMs = elapsed(coldStart);
+    const coldCpuUsage = process.cpuUsage(coldCpuStart);
+    const coldCpuMs = Number(((coldCpuUsage.user + coldCpuUsage.system) / 1000).toFixed(3));
+    const buildPeakRssMb = Number((process.resourceUsage().maxRSS / 1024).toFixed(1));
     const lines = indexLineCount(cold);
     const fileCount = cold.files.size;
     const coldLocPerSec = rate(lines * 1000, coldMs);
+    const coldLocPerCpuSec = rate(lines * 1000, coldCpuMs);
+    const availableParallelism = typeof os.availableParallelism === 'function'
+        ? os.availableParallelism() : os.cpus().length;
+    const actualWorkerCount = cold.lastBuildWorkerCount || 1;
+    const expectedWorkerCount = requestedWorkerCount == null
+        ? null : Math.min(requestedWorkerCount, Math.max(fileCount, 1));
+    const workerPinMismatch = expectedWorkerCount != null &&
+        actualWorkerCount !== expectedWorkerCount;
 
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `ucn-perf-${repo.name}-`));
     const cachePath = path.join(tempDir, 'index.json');
@@ -189,11 +216,13 @@ async function evaluateRepo(repo) {
     const queryP95Ms = Number(percentile(queryTimes, 0.95).toFixed(3));
     if (global.gc) global.gc();
     const rssMb = Number((process.memoryUsage().rss / 1024 / 1024).toFixed(1));
-    const peakRssMb = Number((process.resourceUsage().maxRSS / 1024).toFixed(1));
+    const boardPeakRssMb = Number((process.resourceUsage().maxRSS / 1024).toFixed(1));
     const warmColdRatio = rate(cacheLoadMs + firstQueryMs, coldMs);
     const metrics = {
-        lines, coldMs, coldLocPerSec, cacheLoadMs, firstQueryMs, warmColdRatio,
-        queryP50Ms, queryP95Ms, peakRssMb, queryErrors,
+        lines, coldMs, coldCpuMs, coldLocPerSec, coldLocPerCpuSec,
+        cacheLoadMs, firstQueryMs, warmColdRatio,
+        queryP50Ms, queryP95Ms, buildPeakRssMb, boardPeakRssMb,
+        requestedWorkerCount, actualWorkerCount, workerPinMismatch, queryErrors,
     };
     const { failures, warnings } = evaluatePerformanceBudgets(metrics, budgets);
     const firstSummary = summarizeSamples(firstQuerySamplesMs);
@@ -202,11 +231,15 @@ async function evaluateRepo(repo) {
         .slice(0, 5);
 
     if (!workerQuiet) {
-        process.stdout.write(`  ${fileCount} files, ${lines} LOC | cold ${coldMs}ms (${coldLocPerSec} LOC/s) | ` +
+        process.stdout.write(`  ${fileCount} files, ${lines} LOC | cold ${coldMs}ms ` +
+            `(${coldLocPerSec} LOC/s wall; ${coldCpuMs} CPU-ms, ` +
+            `${coldLocPerCpuSec} LOC/CPU-s) | ` +
             `cache load median ${cacheLoadMs}ms + first query median ${firstQueryMs}ms ` +
             `(max ${firstSummary.max}ms, n=${firstSummary.count}, ratio ${warmColdRatio})\n`);
         process.stdout.write(`  context board n=${queryTimes.length} | p50 ${queryP50Ms}ms | p95 ${queryP95Ms}ms | ` +
-            `RSS ${rssMb}MB, peak ${peakRssMb}MB | errors ${queryErrors}` +
+            `RSS ${rssMb}MB, build/board peak ${buildPeakRssMb}/${boardPeakRssMb}MB | ` +
+            `workers ${actualWorkerCount}${requestedWorkerCount == null ? ' auto' : `/${requestedWorkerCount} pinned`} ` +
+            `(host ${availableParallelism}) | errors ${queryErrors}` +
             `${failures.length ? ` | FAIL: ${failures.join('; ')}` : ''}` +
             `${warnings.length ? ` | NOTE: ${warnings.join('; ')}` : ''}\n`);
         if (queryP95Ms > budgets.maxQueryP95Ms ||
@@ -224,7 +257,9 @@ async function evaluateRepo(repo) {
         files: fileCount,
         lines,
         coldMs,
+        coldCpuMs,
         coldLocPerSec,
+        coldLocPerCpuSec,
         cacheSaveMs,
         cacheLoadMs,
         cacheLoadSamplesMs,
@@ -240,7 +275,15 @@ async function evaluateRepo(repo) {
         slowestQueries,
         queryErrors,
         rssMb,
-        peakRssMb,
+        buildPeakRssMb,
+        boardPeakRssMb,
+        // Retained in raw reports as a convenience alias; policy evaluates
+        // the two phase-specific values above.
+        peakRssMb: boardPeakRssMb,
+        availableParallelism,
+        requestedWorkerCount,
+        actualWorkerCount,
+        workerPinMismatch,
         failures,
         warnings,
     };
@@ -272,7 +315,9 @@ function aggregateRepoRuns(repo, runs) {
     }
     const median = values => summarizeSamples(values).median;
     const coldSamplesMs = runs.map(run => run.coldMs);
+    const coldCpuSamplesMs = runs.map(run => run.coldCpuMs);
     const coldMs = median(coldSamplesMs);
+    const coldCpuMs = median(coldCpuSamplesMs);
     const lines = runs[0].lines;
     const cacheLoadSamplesMs = runs.flatMap(run => run.cacheLoadSamplesMs || [run.cacheLoadMs]);
     const firstQuerySamplesMs = runs.flatMap(run => run.firstQuerySamplesMs || [run.firstQueryMs]);
@@ -282,7 +327,9 @@ function aggregateRepoRuns(repo, runs) {
     const metrics = {
         lines,
         coldMs,
+        coldCpuMs,
         coldLocPerSec: rate(lines * 1000, coldMs),
+        coldLocPerCpuSec: rate(lines * 1000, coldCpuMs),
         cacheLoadMs,
         firstQueryMs,
         warmColdRatio: rate(cacheLoadMs + firstQueryMs, coldMs),
@@ -290,7 +337,12 @@ function aggregateRepoRuns(repo, runs) {
         queryP95Ms: median(runs.map(run => run.queryP95Ms)),
         // Memory safety is not averaged away: one real over-budget process
         // is enough to fail the release even when the other samples are low.
-        peakRssMb: Math.max(...runs.map(run => run.peakRssMb)),
+        buildPeakRssMb: Math.max(...runs.map(run => run.buildPeakRssMb)),
+        boardPeakRssMb: Math.max(...runs.map(run => run.boardPeakRssMb)),
+        requestedWorkerCount: runs[0].requestedWorkerCount,
+        actualWorkerCount: runs[0].actualWorkerCount,
+        workerPinMismatch: runs.some(run => run.workerPinMismatch) ||
+            runs.some(run => run.actualWorkerCount !== runs[0].actualWorkerCount),
         queryErrors: runs.reduce((sum, run) => sum + run.queryErrors, 0),
     };
     const { failures, warnings } = evaluatePerformanceBudgets(metrics, budgets);
@@ -301,6 +353,7 @@ function aggregateRepoRuns(repo, runs) {
         ...runs[0],
         ...metrics,
         coldSamplesMs,
+        coldCpuSamplesMs,
         processSamples: runs.length,
         cacheSaveMs: median(runs.map(run => run.cacheSaveMs)),
         cacheLoadSamplesMs,
@@ -311,6 +364,8 @@ function aggregateRepoRuns(repo, runs) {
         queryMaxMs: Math.max(...runs.map(run => run.queryMaxMs)),
         slowestQueries,
         rssMb: Math.max(...runs.map(run => run.rssMb)),
+        peakRssMb: metrics.boardPeakRssMb,
+        availableParallelism: runs[0].availableParallelism,
         failures,
         warnings,
     };
@@ -323,12 +378,18 @@ function printResult(repo, result) {
         return;
     }
     process.stdout.write(`  ${result.files} files, ${result.lines} LOC | cold median ${result.coldMs}ms ` +
-        `(${result.coldLocPerSec} LOC/s; samples ${result.coldSamplesMs.join(', ')}) | ` +
+        `(${result.coldLocPerSec} LOC/s wall; ${result.coldLocPerCpuSec} LOC/CPU-s; ` +
+        `wall samples ${result.coldSamplesMs.join(', ')}; CPU samples ` +
+        `${result.coldCpuSamplesMs.join(', ')}) | ` +
         `cache load median ${result.cacheLoadMs}ms + first query median ${result.firstQueryMs}ms ` +
         `(max ${result.firstQueryMaxMs}ms, ratio ${result.warmColdRatio})\n`);
     process.stdout.write(`  context board n=${result.queryCount} x ${result.processSamples} | ` +
         `p50 ${result.queryP50Ms}ms | p95 ${result.queryP95Ms}ms | ` +
-        `RSS ${result.rssMb}MB, worst peak ${result.peakRssMb}MB | errors ${result.queryErrors}` +
+        `RSS ${result.rssMb}MB, worst build/board peak ` +
+        `${result.buildPeakRssMb}/${result.boardPeakRssMb}MB | workers ` +
+        `${result.actualWorkerCount}${result.requestedWorkerCount == null
+            ? ' auto' : `/${result.requestedWorkerCount} pinned`} ` +
+        `(host ${result.availableParallelism}) | errors ${result.queryErrors}` +
         `${result.failures.length ? ` | FAIL: ${result.failures.join('; ')}` : ''}` +
         `${result.warnings.length ? ` | NOTE: ${result.warnings.join('; ')}` : ''}\n`);
     if (result.queryP95Ms > budgets.maxQueryP95Ms ||
@@ -395,7 +456,14 @@ async function main() {
 
     fs.mkdirSync(REPORTS_DIR, { recursive: true });
     const date = new Date().toISOString().slice(0, 10);
-    const report = { date, budgets, processSamples, results, passed: !failed };
+    const host = {
+        platform: process.platform,
+        arch: process.arch,
+        availableParallelism: typeof os.availableParallelism === 'function'
+            ? os.availableParallelism() : os.cpus().length,
+        requestedWorkerCount,
+    };
+    const report = { date, budgets, host, processSamples, results, passed: !failed };
     const jsonPath = path.join(REPORTS_DIR, `performance-gate-${date}.json`);
     fs.writeFileSync(jsonPath, JSON.stringify(report, null, 2));
 
@@ -406,11 +474,14 @@ async function main() {
             `${startupSamples} persisted-index startup samples per process, ` +
             'and a steady-state pinned `context` board.',
         '',
-        '| repo | files | LOC | cold | LOC/s | cache load median | first query median/max | warm/cold | query p50 | query p95 | peak RSS | result |',
-        '|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|',
+        `Host: ${host.platform}/${host.arch}; available parallelism ${host.availableParallelism}; ` +
+            `worker pin ${host.requestedWorkerCount ?? 'auto'}.`,
+        '',
+        '| repo | files | LOC | cold wall | wall LOC/s | CPU LOC/s | workers | cache load median | first query median/max | warm/cold | query p50 | query p95 | build/board peak RSS | result |',
+        '|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|',
         ...results.map(r => r.error
-            ? `| ${r.repo} | - | - | - | - | - | - | - | - | - | - | **ERROR: ${r.error}** |`
-            : `| ${r.repo} | ${r.files} | ${r.lines} | ${r.coldMs}ms | ${r.coldLocPerSec} | ${r.cacheLoadMs}ms | ${r.firstQueryMs}/${r.firstQueryMaxMs}ms | ${r.warmColdRatio} | ${r.queryP50Ms}ms | ${r.queryP95Ms}ms | ${r.peakRssMb}MB | ${r.failures.length ? `**FAIL:** ${r.failures.join('; ')}` : r.warnings.length ? `PASS (${r.warnings.join('; ')})` : 'PASS'} |`),
+            ? `| ${r.repo} | - | - | - | - | - | - | - | - | - | - | - | - | **ERROR: ${r.error}** |`
+            : `| ${r.repo} | ${r.files} | ${r.lines} | ${r.coldMs}ms | ${r.coldLocPerSec} | ${r.coldLocPerCpuSec} | ${r.actualWorkerCount}${r.requestedWorkerCount == null ? '' : `/${r.requestedWorkerCount}`} | ${r.cacheLoadMs}ms | ${r.firstQueryMs}/${r.firstQueryMaxMs}ms | ${r.warmColdRatio} | ${r.queryP50Ms}ms | ${r.queryP95Ms}ms | ${r.buildPeakRssMb}/${r.boardPeakRssMb}MB | ${r.failures.length ? `**FAIL:** ${r.failures.join('; ')}` : r.warnings.length ? `PASS (${r.warnings.join('; ')})` : 'PASS'} |`),
         '',
         `Budgets: ${JSON.stringify(budgets)}.`,
     ];

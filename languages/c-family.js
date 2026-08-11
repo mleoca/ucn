@@ -412,8 +412,20 @@ function preprocessorDirective(line) {
  * view a compiler gets after preprocessing; trying several configurations
  * avoids silently swallowing the declarations that follow the malformed
  * region. This is syntax recovery, not a text-based symbol extractor.
+ *
+ * The search is bounded twice: by how many feature keys may vary (below), and
+ * by source size. Each configuration is a whole-file reparse, so the sweep
+ * costs O(configurations x file size) in simultaneously-live native ASTs.
+ * tree-sitter 0.21 does not expose Tree#delete, which means a synchronous
+ * build cannot reclaim those trees until V8 runs their finalizers. Large
+ * amalgamated/generated sources are therefore kept on the literal AST view;
+ * unlike ordinary translation units, sweeping them multiplies memory without
+ * a reliable way to release it during the build.
  */
+const CONDITIONAL_RECOVERY_MAX_BYTES = 256 * 1024;
+
 function conditionalRecoverySources(code) {
+    if (Buffer.byteLength(code) > CONDITIONAL_RECOVERY_MAX_BYTES) return [];
     const lines = code.match(/.*(?:\r\n|\n|\r|$)/g)?.filter(Boolean) || [];
     const directives = lines.map(preprocessorDirective);
     const keys = [];
@@ -707,7 +719,13 @@ function mergeExtracted(primary, secondary, keyOf) {
         seen.add(key);
         merged.push(item);
     }
-    return merged;
+    // Secondary recovery trees may contribute an earlier source item after a
+    // later primary item. Preserve the public source-order contract instead
+    // of exposing merge history through callers, usages, or JSON output.
+    return merged.sort((a, b) =>
+        ((a.line ?? a.startLine ?? 0) - (b.line ?? b.startLine ?? 0)) ||
+        ((a.column ?? a.startColumn ?? 0) - (b.column ?? b.startColumn ?? 0)) ||
+        ((a.callStart ?? 0) - (b.callStart ?? 0)));
 }
 
 function unwrapDeclarator(node) {
@@ -2753,4 +2771,9 @@ function createCFamilyLanguage(mode) {
     };
 }
 
-module.exports = { createCFamilyLanguage };
+module.exports = {
+    createCFamilyLanguage,
+    // Deterministic test seams for the recovery memory/order contracts.
+    conditionalRecoverySources,
+    mergeExtracted,
+};
