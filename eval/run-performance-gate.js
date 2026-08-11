@@ -33,10 +33,14 @@ const {
 } = require('./lib/repos');
 const {
     DEFAULT_BUDGETS,
+    HOST_REFERENCE,
     percentile,
     summarizeSamples,
+    resolveHostFactor,
     evaluatePerformanceBudgets,
 } = require('./performance-gate-policy');
+
+const CALIBRATION_SCRIPT = path.join(__dirname, 'lib', 'host-calibration.js');
 
 const args = process.argv.slice(2);
 const releaseOnly = args.includes('--release');
@@ -52,11 +56,28 @@ const requestedWorkerCount = envPositiveInteger('UCN_WORKERS');
 const requireColdWallThroughput = releaseOnly ||
     args.includes('--require-wall-throughput');
 const legacyMaxRssMb = positiveNumber('--max-rss-mb', DEFAULT_BUDGETS.maxBuildRssMb);
+// Debugging aid only: it lets a human replay another host's arithmetic. Gating
+// runs measure the factor instead, because a hand-set factor is exactly how a
+// regression would be normalized away.
+const hostFactorOverride = positiveNumber('--host-factor', null);
+if (hostFactorOverride != null && requireColdWallThroughput) {
+    throw new Error('--host-factor is a debugging aid and cannot be combined with ' +
+        '--release or --require-wall-throughput; gating runs measure the host themselves');
+}
 const budgets = {
     minColdLocPerSec: positiveNumber('--min-cold-loc-sec', DEFAULT_BUDGETS.minColdLocPerSec),
     minColdLocPerCpuSec: positiveNumber(
         '--min-cold-loc-cpu-sec', DEFAULT_BUDGETS.minColdLocPerCpuSec),
+    minCpuThroughputRatio: positiveNumber(
+        '--min-cpu-throughput-ratio', DEFAULT_BUDGETS.minCpuThroughputRatio),
+    minWallThroughputRatio: positiveNumber(
+        '--min-wall-throughput-ratio', DEFAULT_BUDGETS.minWallThroughputRatio),
     requireColdWallThroughput,
+    // A gating run measures on reference-normalized terms or not at all: both
+    // the per-repo baselines and a trustworthy host factor become mandatory
+    // exactly when wall throughput becomes release-blocking.
+    requireThroughputBaselines: requireColdWallThroughput,
+    requireHostCalibration: requireColdWallThroughput,
     maxCacheLoadMs: positiveNumber('--max-cache-load-ms', DEFAULT_BUDGETS.maxCacheLoadMs),
     maxFirstQueryMs: positiveNumber('--max-first-query-ms', DEFAULT_BUDGETS.maxFirstQueryMs),
     maxWarmColdRatio: positiveNumber('--max-warm-cold-ratio', DEFAULT_BUDGETS.maxWarmColdRatio),
@@ -98,6 +119,87 @@ function envPositiveInteger(name) {
         throw new Error(`${name} must be a positive integer (got ${raw})`);
     }
     return value;
+}
+
+// Never measured until a run explicitly initializes it, so importing this
+// module (unit tests do) costs nothing and yields the historical verdicts.
+const UNCALIBRATED = Object.freeze({
+    hostFactor: null, rawHostFactor: null, valid: false, clamped: false,
+    error: null, source: 'not measured', calibration: null,
+});
+let hostState = null;
+function hostCalibrationState() { return hostState || UNCALIBRATED; }
+
+/**
+ * Measure this host with the frozen probe, in a short-lived child process so
+ * its heap can never enter this process's `maxRSS` high-water mark and no JIT
+ * or heap state crosses between probe and engine in either direction. The
+ * parent measures once and exports the reading, so the per-repo workers
+ * inherit the same factor instead of re-measuring under different load.
+ */
+function collectHostCalibration() {
+    const inherited = process.env.UCN_HOST_CALIBRATION;
+    if (inherited) {
+        try { return { calibration: JSON.parse(inherited), source: 'inherited' }; }
+        catch { return { calibration: null, source: 'inherited value was unparseable' }; }
+    }
+    const child = spawnSync(process.execPath, [CALIBRATION_SCRIPT, '--json'], {
+        encoding: 'utf8',
+        timeout: 5 * 60 * 1000,
+    });
+    if (child.error || child.status !== 0) {
+        return {
+            calibration: null,
+            source: `probe failed (${child.error?.message ||
+                child.stderr?.trim() || `exit ${child.status}`})`,
+        };
+    }
+    try {
+        const calibration = JSON.parse(child.stdout);
+        process.env.UCN_HOST_CALIBRATION = JSON.stringify(calibration);
+        return { calibration, source: 'measured' };
+    } catch {
+        return { calibration: null, source: 'probe emitted unparseable JSON' };
+    }
+}
+
+function initializeHostCalibration() {
+    if (hostFactorOverride != null) {
+        return {
+            hostFactor: hostFactorOverride, rawHostFactor: hostFactorOverride,
+            valid: true, clamped: false, error: null,
+            source: '--host-factor override', calibration: null,
+        };
+    }
+    const { calibration, source } = collectHostCalibration();
+    const state = resolveHostFactor(calibration);
+    return {
+        ...state,
+        source,
+        calibration,
+        error: state.error
+            ? (calibration == null ? `host calibration unavailable: ${source}` : state.error)
+            : null,
+    };
+}
+
+function hostMetricFields() {
+    const state = hostCalibrationState();
+    return {
+        hostFactor: state.valid ? state.hostFactor : null,
+        hostCalibrationError: state.error,
+    };
+}
+
+function describeHostCalibration() {
+    const state = hostCalibrationState();
+    if (state.source === 'not measured') return 'host calibration: not measured (factor 1.0)';
+    if (!state.valid) return `host calibration: UNUSABLE - ${state.error} (factor 1.0)`;
+    const measured = state.calibration
+        ? `${state.calibration.wallMs}ms vs reference ${HOST_REFERENCE.wallMs}ms`
+        : 'supplied by flag';
+    return `host calibration: ${measured} -> host factor ${state.hostFactor}` +
+        `${state.clamped ? ` (clamped from ${state.rawHostFactor})` : ''} [${state.source}]`;
 }
 
 function elapsed(start) { return Number((performance.now() - start).toFixed(3)); }
@@ -235,11 +337,18 @@ async function evaluateRepo(repo) {
         expectedFiles: repo.performanceWorkload?.files,
         expectedLines: repo.performanceWorkload?.lines,
         coldMs, coldCpuMs, coldLocPerSec, coldLocPerCpuSec,
+        // One process: its own sample is also the best one.
+        peakColdLocPerSec: coldLocPerSec,
+        peakColdLocPerCpuSec: coldLocPerCpuSec,
+        baselineLocPerSec: repo.performanceBaseline?.locPerSec,
+        baselineLocPerCpuSec: repo.performanceBaseline?.locPerCpuSec,
+        ...hostMetricFields(),
         cacheLoadMs, firstQueryMs, warmColdRatio,
         queryP50Ms, queryP95Ms, buildPeakRssMb, boardPeakRssMb,
         requestedWorkerCount, actualWorkerCount, workerPinMismatch, queryErrors,
     };
-    const { failures, warnings } = evaluatePerformanceBudgets(metrics, budgets);
+    const verdict = evaluatePerformanceBudgets(metrics, budgets);
+    const { failures, warnings } = verdict;
     const firstSummary = summarizeSamples(firstQuerySamplesMs);
     const slowestQueries = [...querySamples]
         .sort((a, b) => b.durationMs - a.durationMs)
@@ -277,6 +386,15 @@ async function evaluateRepo(repo) {
         coldCpuMs,
         coldLocPerSec,
         coldLocPerCpuSec,
+        baselineLocPerSec: repo.performanceBaseline?.locPerSec,
+        baselineLocPerCpuSec: repo.performanceBaseline?.locPerCpuSec,
+        hostFactor: verdict.hostFactor,
+        normalizedColdLocPerSec: verdict.normalizedColdLocPerSec,
+        normalizedColdLocPerCpuSec: verdict.normalizedColdLocPerCpuSec,
+        peakNormalizedColdLocPerSec: verdict.peakNormalizedColdLocPerSec,
+        peakNormalizedColdLocPerCpuSec: verdict.peakNormalizedColdLocPerCpuSec,
+        cpuThroughputRatio: verdict.cpuThroughputRatio,
+        wallThroughputRatio: verdict.wallThroughputRatio,
         cacheSaveMs,
         cacheLoadMs,
         cacheLoadSamplesMs,
@@ -352,6 +470,13 @@ function aggregateRepoRuns(repo, runs) {
         coldCpuMs,
         coldLocPerSec: rate(lines * 1000, coldMs),
         coldLocPerCpuSec: rate(lines * 1000, coldCpuMs),
+        // Fastest isolated process: the machine's demonstrated capability on
+        // this workload, which is what the pinned baseline records.
+        peakColdLocPerSec: rate(lines * 1000, Math.min(...coldSamplesMs)),
+        peakColdLocPerCpuSec: rate(lines * 1000, Math.min(...coldCpuSamplesMs)),
+        baselineLocPerSec: repo.performanceBaseline?.locPerSec,
+        baselineLocPerCpuSec: repo.performanceBaseline?.locPerCpuSec,
+        ...hostMetricFields(),
         cacheLoadMs,
         firstQueryMs,
         warmColdRatio: rate(cacheLoadMs + firstQueryMs, coldMs),
@@ -367,13 +492,21 @@ function aggregateRepoRuns(repo, runs) {
             runs.some(run => run.actualWorkerCount !== runs[0].actualWorkerCount),
         queryErrors: runs.reduce((sum, run) => sum + run.queryErrors, 0),
     };
-    const { failures, warnings } = evaluatePerformanceBudgets(metrics, budgets);
+    const verdict = evaluatePerformanceBudgets(metrics, budgets);
+    const { failures, warnings } = verdict;
     const slowestQueries = runs.flatMap(run => run.slowestQueries || [])
         .sort((a, b) => b.durationMs - a.durationMs)
         .slice(0, 5);
     return {
         ...runs[0],
         ...metrics,
+        hostFactor: verdict.hostFactor,
+        normalizedColdLocPerSec: verdict.normalizedColdLocPerSec,
+        normalizedColdLocPerCpuSec: verdict.normalizedColdLocPerCpuSec,
+        peakNormalizedColdLocPerSec: verdict.peakNormalizedColdLocPerSec,
+        peakNormalizedColdLocPerCpuSec: verdict.peakNormalizedColdLocPerCpuSec,
+        cpuThroughputRatio: verdict.cpuThroughputRatio,
+        wallThroughputRatio: verdict.wallThroughputRatio,
         coldSamplesMs,
         coldCpuSamplesMs,
         processSamples: runs.length,
@@ -405,6 +538,17 @@ function printResult(repo, result) {
         `${result.coldCpuSamplesMs.join(', ')}) | ` +
         `cache load median ${result.cacheLoadMs}ms + first query median ${result.firstQueryMs}ms ` +
         `(max ${result.firstQueryMaxMs}ms, ratio ${result.warmColdRatio})\n`);
+    // The throughput verdict is only readable if the host term is visible:
+    // raw measurement, the factor applied, the reference-hardware value it
+    // implies, and how that compares with the pinned healthy baseline.
+    const baselineNote = result.baselineLocPerCpuSec == null
+        ? 'no pinned baseline'
+        : `best ${result.peakNormalizedColdLocPerSec}/${result.peakNormalizedColdLocPerCpuSec} ` +
+          `vs baseline ${result.baselineLocPerSec}/${result.baselineLocPerCpuSec} = ` +
+          `${result.wallThroughputRatio ?? '-'}x wall, ${result.cpuThroughputRatio ?? '-'}x CPU`;
+    process.stdout.write(`  host factor ${result.hostFactor} -> reference-hardware ` +
+        `${result.normalizedColdLocPerSec} LOC/s wall, ` +
+        `${result.normalizedColdLocPerCpuSec} LOC/CPU-s | ${baselineNote}\n`);
     process.stdout.write(`  context board n=${result.queryCount} x ${result.processSamples} | ` +
         `p50 ${result.queryP50Ms}ms | p95 ${result.queryP95Ms}ms | ` +
         `RSS ${result.rssMb}MB, worst build/board peak ` +
@@ -512,6 +656,8 @@ function collectPerformanceRollup(reportsDir, date, currentReport = null,
 
 async function workerMain() {
     if (!workerResultPath) throw new Error('--worker-result is required with --worker-repo');
+    // Inherited from the parent through the environment; never re-measured.
+    hostState = initializeHostCalibration();
     const repo = REPOS.find(candidate => candidate.name === workerRepoName);
     if (!repo) throw new Error(`Unknown worker repository: ${workerRepoName}`);
     let result;
@@ -532,6 +678,10 @@ async function main() {
         const missing = [...repoNames].filter(name => !repos.some(repo => repo.name === name));
         if (missing.length) throw new Error(`Unknown repositories: ${missing.join(', ')}`);
     }
+
+    // Measured once, before any repository work, and exported to the workers.
+    hostState = initializeHostCalibration();
+    process.stdout.write(`${describeHostCalibration()}\n`);
 
     const results = [];
     let failed = false;
@@ -566,12 +716,23 @@ async function main() {
 
     fs.mkdirSync(REPORTS_DIR, { recursive: true });
     const date = new Date().toISOString().slice(0, 10);
+    const calibrationState = hostCalibrationState();
     const host = {
         platform: process.platform,
         arch: process.arch,
         availableParallelism: typeof os.availableParallelism === 'function'
             ? os.availableParallelism() : os.cpus().length,
         requestedWorkerCount,
+        calibration: {
+            source: calibrationState.source,
+            valid: calibrationState.valid,
+            hostFactor: calibrationState.hostFactor,
+            rawHostFactor: calibrationState.rawHostFactor,
+            clamped: calibrationState.clamped,
+            error: calibrationState.error,
+            measured: calibrationState.calibration,
+            reference: HOST_REFERENCE,
+        },
     };
     const isFullRelease = releaseOnly && !repoNames &&
         repos.length === RELEASE_REPO_NAMES.length &&
@@ -604,11 +765,16 @@ async function main() {
         `Host: ${host.platform}/${host.arch}; available parallelism ${host.availableParallelism}; ` +
             `worker pin ${host.requestedWorkerCount ?? 'auto'}.`,
         '',
-        '| repo | files | LOC | cold wall | wall LOC/s | CPU LOC/s | workers | cache load median | first query median/max | warm/cold | query p50 | query p95 | build/board peak RSS | result |',
-        '|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|',
+        `${describeHostCalibration()}. Throughput budgets are stated on reference hardware ` +
+            `(${HOST_REFERENCE.host}); the "ref" columns are the measured value scaled by the ` +
+            'host factor, and the "vs base" column compares them with the pinned healthy ' +
+            'baseline for that repository. Memory budgets are deliberately never scaled.',
+        '',
+        '| repo | files | LOC | cold wall | wall LOC/s (ref) | CPU LOC/s (ref) | vs base wall/CPU | workers | cache load median | first query median/max | warm/cold | query p50 | query p95 | build/board peak RSS | result |',
+        '|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|',
         ...results.map(r => r.error
-            ? `| ${r.repo} | - | - | - | - | - | - | - | - | - | - | - | - | **ERROR: ${r.error}** |`
-            : `| ${r.repo} | ${r.files} | ${r.lines} | ${r.coldMs}ms | ${r.coldLocPerSec} | ${r.coldLocPerCpuSec} | ${r.actualWorkerCount}${r.requestedWorkerCount == null ? '' : `/${r.requestedWorkerCount}`} | ${r.cacheLoadMs}ms | ${r.firstQueryMs}/${r.firstQueryMaxMs}ms | ${r.warmColdRatio} | ${r.queryP50Ms}ms | ${r.queryP95Ms}ms | ${r.buildPeakRssMb}/${r.boardPeakRssMb}MB | ${r.failures.length ? `**FAIL:** ${r.failures.join('; ')}` : r.warnings.length ? `PASS (${r.warnings.join('; ')})` : 'PASS'} |`),
+            ? `| ${r.repo} | - | - | - | - | - | - | - | - | - | - | - | - | - | **ERROR: ${r.error}** |`
+            : `| ${r.repo} | ${r.files} | ${r.lines} | ${r.coldMs}ms | ${r.coldLocPerSec} (${r.normalizedColdLocPerSec}) | ${r.coldLocPerCpuSec} (${r.normalizedColdLocPerCpuSec}) | ${r.wallThroughputRatio ?? '-'}/${r.cpuThroughputRatio ?? '-'} | ${r.actualWorkerCount}${r.requestedWorkerCount == null ? '' : `/${r.requestedWorkerCount}`} | ${r.cacheLoadMs}ms | ${r.firstQueryMs}/${r.firstQueryMaxMs}ms | ${r.warmColdRatio} | ${r.queryP50Ms}ms | ${r.queryP95Ms}ms | ${r.buildPeakRssMb}/${r.boardPeakRssMb}MB | ${r.failures.length ? `**FAIL:** ${r.failures.join('; ')}` : r.warnings.length ? `PASS (${r.warnings.join('; ')})` : 'PASS'} |`),
         '',
         `Budgets: ${JSON.stringify(budgets)}.`,
     ];
@@ -640,12 +806,13 @@ async function main() {
         `Full release board: ${rollup.completeReleaseBoard ? 'complete' : 'incomplete'}; ` +
             `result: ${rollup.passed ? 'PASS' : 'NOT RELEASE-QUALIFIED'}.`,
         '',
-        '| repo | scope | samples | CPU LOC/s | wall LOC/s | result |',
-        '|---|---|---:|---:|---:|---|',
+        '| repo | scope | samples | host factor | CPU LOC/s (ref) | wall LOC/s (ref) | result |',
+        '|---|---|---:|---:|---:|---:|---|',
         ...rollup.results.map(result =>
             `| ${result.repo} | ${result.evidence.scope || 'unknown'} | ` +
-            `${result.evidence.processSamples || '-'} | ${result.coldLocPerCpuSec ?? '-'} | ` +
-            `${result.coldLocPerSec ?? '-'} | ` +
+            `${result.evidence.processSamples || '-'} | ${result.hostFactor ?? '-'} | ` +
+            `${result.coldLocPerCpuSec ?? '-'} (${result.normalizedColdLocPerCpuSec ?? '-'}) | ` +
+            `${result.coldLocPerSec ?? '-'} (${result.normalizedColdLocPerSec ?? '-'}) | ` +
             `${result.error || (result.failures || []).join('; ') || 'PASS'} |`),
     ];
     fs.writeFileSync(rollupMdPath, rollupLines.join('\n'));

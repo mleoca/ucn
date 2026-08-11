@@ -285,6 +285,9 @@ const REPOS = [
         // resulting workload so discovery changes cannot silently recalibrate
         // performance evidence.
         performanceWorkload: { files: 101, lines: 22652 },
+        // Reference-host throughput, from the full release board (see the
+        // performanceBaseline note on fmt below).
+        performanceBaseline: { locPerSec: 22063.733, locPerCpuSec: 6525.627 },
         // cJSON vendors the Unity test framework (including generated
         // expectdata and Unity's own examples). Semantic/deadcode oracle rows
         // measure the cJSON library rather than a second unrelated C
@@ -303,6 +306,19 @@ const REPOS = [
         language: 'cpp',
         targetCandidates: ['.'],
         performanceWorkload: { files: 75, lines: 69630 },
+        // Demonstrated healthy throughput on REFERENCE hardware: best of the
+        // isolated cold-build samples, host-normalized. The gate allows a 13%
+        // loss against this (minCpuThroughputRatio) before failing.
+        //
+        // Pin from a full `--release` board on a quiet reference machine, and
+        // ALWAYS from host-normalized values -- an un-normalized baseline
+        // records the machine's mood rather than the engine's speed. Measured
+        // 2026-08-11: healthy re-runs land at 0.975-1.00 of these, while
+        // disabling the C-family recovery bound lands at 0.76, so the 0.87
+        // floor sits with ~12% clearance on both sides. Re-pin only alongside
+        // a deliberate, explained speed change; lowering a baseline to clear a
+        // red gate makes the regression the new normal.
+        performanceBaseline: { locPerSec: 19341.363, locPerCpuSec: 5918.444 },
         // fmt vendors GoogleTest under test/gtest and its test translation
         // units include "gmock/..." from that include root. Without this,
         // clangd treats TEST(...) and other macros as undeclared functions,
