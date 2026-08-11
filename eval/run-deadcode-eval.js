@@ -55,6 +55,8 @@ const { jediOracle } = require('./oracles/jedi-oracle');
 const { goplsOracle } = require('./oracles/gopls-oracle');
 const { rustAnalyzerOracle } = require('./oracles/rust-analyzer-oracle');
 const { jdtlsOracle } = require('./oracles/jdtls-oracle');
+const { roslynOracle } = require('./oracles/roslyn-oracle');
+const { clangdOracle } = require('./oracles/clangd-oracle');
 
 const args = process.argv.slice(2);
 const releaseOnly = args.includes('--release');
@@ -67,7 +69,8 @@ const REPORTS_DIR = path.resolve(
     process.env.UCN_EVAL_REPORTS_DIR || path.join(__dirname, 'reports'));
 
 // Same precedence as run-oracle-eval.js: first language match wins.
-const ORACLES = [tsMorphOracle, pyrightOracle, jediOracle, goplsOracle, rustAnalyzerOracle, jdtlsOracle]
+const ORACLES = [tsMorphOracle, pyrightOracle, jediOracle, goplsOracle,
+    rustAnalyzerOracle, jdtlsOracle, roslynOracle, clangdOracle]
     .map(validateOracle)
     .filter(o => !oracleFilter || o.name === oracleFilter);
 
@@ -122,6 +125,28 @@ async function evaluateRepo(repo, oracle) {
     const target = resolveTarget(repoPath, repo);
 
     const index = new ProjectIndex(target);
+    // Keep UCN and the compiler on one explicit repository universe. This
+    // mirrors run-oracle-eval: vendored frameworks are not dead-code targets,
+    // while compiler include paths remain available for parsing project tests.
+    const configuredIncludePaths = [];
+    for (let i = 0; i < (repo.clangFlags || []).length; i++) {
+        const flag = String(repo.clangFlags[i]);
+        if (flag === '-I' && repo.clangFlags[i + 1]) {
+            configuredIncludePaths.push(String(repo.clangFlags[++i]));
+        } else if (flag.startsWith('-I') && flag.length > 2) {
+            configuredIncludePaths.push(flag.slice(2));
+        }
+    }
+    if (configuredIncludePaths.length > 0) {
+        index.config.includePaths = configuredIncludePaths;
+    }
+    if ((repo.oracleExclude || []).length > 0) {
+        index.config.exclude = [
+            ...(index.config.exclude || []),
+            ...repo.oracleExclude.map(relative =>
+                `${String(relative).replace(/\/+$/, '')}/**`),
+        ];
+    }
     index.build(null, { quiet: true });
     const indexedFiles = new Set([...index.files.values()].map(fe => fe.relativePath));
     process.stdout.write(`  UCN indexed ${indexedFiles.size} files\n`);
@@ -140,14 +165,45 @@ async function evaluateRepo(repo, oracle) {
         arms.push({ arm: 'exported', claims: r.result.filter(c => c.isExported) });
     }
 
-    const handle = await oracle.prepare(target);
+    const armResults = [];
+    // No compiler query can add a false-dead verdict when the engine made no
+    // deletion claim. Starting a language server in that case is pure gate
+    // overhead (clap's cold rust-analyzer PrimeCaches pass takes ~12 minutes).
+    // Preserve a full, explicit zero-result arm in the report so this is a
+    // measurable abstention, not a silently skipped repository.
+    if (arms.every(({ claims }) => claims.length === 0)) {
+        for (const { arm } of arms) {
+            const summary = {
+                arm,
+                claims: 0,
+                sampled: 0,
+                verified: 0,
+                agreedDead: 0,
+                falseDead: 0,
+                outsideUniverse: 0,
+                unpinnable: 0,
+                falseDeadRate: 0,
+            };
+            process.stdout.write(
+                `  [${arm}] claims 0 | sampled 0 | agreed-dead 0 | ` +
+                'FALSE-DEAD 0 | outside-universe 0 | unpinnable 0 ' +
+                '(oracle not started: empty claim set)\n');
+            armResults.push({ summary, perClaim: [] });
+        }
+        return {
+            repo: repo.name, oracle: oracle.name, commit: repo.commit,
+            indexedFiles: indexedFiles.size,
+            arms: armResults,
+        };
+    }
+
+    const handle = await oracle.prepare(target, { repo });
     // Oracle paths are relative to the prepared target; UCN paths are relative
     // to its detected project root (possibly a parent). Same normalization as
     // run-oracle-eval.js.
     const toUcnRel = (f) => path.relative(index.root, path.join(target, f));
     const toOracleRel = (f) => path.relative(target, path.join(index.root, f));
 
-    const armResults = [];
     for (const { arm, claims } of arms) {
         // Seeded shuffle + cap — LSP findReferences costs real time per claim.
         const rand = seededRandom(0xDEADC0DE);
@@ -291,6 +347,15 @@ async function main() {
     const oracleRepos = baseRepos.filter(r =>
         ORACLES.some(o => o.languages.includes(r.language)) &&
         (!repoFilterSet || repoFilterSet.has(r.name)));
+    const requestedRepos = baseRepos.filter(r =>
+        !repoFilterSet || repoFilterSet.has(r.name));
+    const unsupportedRepos = requestedRepos.filter(r =>
+        !ORACLES.some(o => o.languages.includes(r.language)));
+    if (unsupportedRepos.length > 0) {
+        console.error(`No deadcode oracle for: ${unsupportedRepos
+            .map(r => `${r.name} (${r.language})`).join(', ')}.`);
+        process.exit(1);
+    }
     if (oracleRepos.length === 0) {
         console.error(`No matching repos for oracle languages${repoFilter ? ` and --repo ${repoFilter}` : ''}.`);
         process.exit(1);

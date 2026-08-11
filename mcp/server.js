@@ -239,13 +239,13 @@ Use UCN for semantic questions: exact definitions, symbol-aware callers/callees,
 18 task-oriented commands:
 - repo: repository overview; sections=files,stats,health adds detail. Reports skipped unsupported source explicitly and hands it to grep/language-native tooling.
 - show: one symbol; sections=summary,callers,callees,source,dependencies,tests,types,example,related.
-- find/usages/search/source: locate definitions, literal-name occurrences, literal text (regex=true is explicit), AST structure, or exact source.
+- find/usages/search/source: locate definitions, literal-name occurrences, literal text (regex=true selects the linear-time RE2-compatible engine), AST structure, or exact source. Find activity is pinned confirmed + visible-unverified candidates; proved other-target calls are separate.
 - trace: direction=callees or callers; to=entrypoints follows callers to roots.
 - impact: symbol impact when name is set; Git-diff impact when it is omitted.
 - tests: static direct links by default; depth>0 includes transitive affected links. Empty results are not runtime coverage proof.
 - deps/api/entrypoints/endpoints: architecture and public surfaces.
 - check: symbol signature check when name is set; precommit check when omitted. plan previews the selected declaration plus indexed call/import/export edits.
-- deadcode/audit_async/stacktrace: focused audits and runtime evidence. Computed dispatch is reported as a health/deletion blind spot.
+- deadcode/audit_async/stacktrace: focused audits and runtime evidence. Computed dispatch is reported as a health/deletion blind spot; unknown decorators and member-assigned handlers are withheld from default dead-code claims.
 
 CONFIRMED carries target-identity evidence. UNVERIFIED is possible and requires review. ACCOUNT conserves observed literal-name lines; an observed-text zero never claims semantic completeness or safe deletion. Evidence weights are ordinal, not probabilities. Warnings, excluded reasons, and contract metadata remain visible when caller evidence is returned. Release evaluation cross-checks overlapping stable-handle claims across find, show, source, impact, tests, check, and caller trace, and compares pinned real-repository samples with ts-morph, Pyright, gopls, rust-analyzer, JDT LS, clangd, and Roslyn.` + generateMcpParamSection();
 
@@ -302,7 +302,7 @@ server.registerTool(
             to: z.enum(['entrypoints']).optional().describe('trace with direction=callers: continue toward entry points.'),
             cycles: z.boolean().optional().describe('deps: report circular imports instead of a file graph.'),
             term: z.string().optional().describe('Literal search term by default. Set regex=true only for regular-expression syntax.'),
-            regex: z.boolean().optional().describe('Treat search term as a regular expression (default: false/literal).'),
+            regex: z.boolean().optional().describe('Treat search term as a regular expression (default: false/literal). Ordinary patterns run in an RE2-compatible linear-time engine; unsafe nested repetition is rejected.'),
             functions: z.boolean().optional().describe('repo stats: include per-function line counts sorted by size.'),
             hot: z.boolean().optional().describe('repo stats: include the top N most-called functions.'),
             diverse: z.boolean().optional().describe('show example: return representatives from distinct argument shapes.'),
@@ -456,6 +456,15 @@ server.registerTool(
             // execute() handler, and public formatter are shared with CLI;
             // command-specific switches are no longer part of the contract.
             index = getIndex(project_dir, ep);
+            // Validate an explicit source file before execute() can read it.
+            // Post-result checks are still retained below for symbol-derived
+            // paths, but a range request may point at a real file outside the
+            // project and must fail before any content leaves the process.
+            if (canonicalCommand === 'source' && ep.file) {
+                const sourcePath = resolveAndValidatePath(index, ep.file);
+                if (typeof sourcePath !== 'string') return sourcePath;
+                ep.file = path.relative(index.root, sourcePath);
+            }
             const execution = execute(index, canonicalCommand, ep);
             if (!execution.ok) {
                 return te(formatSurfaceMessage(execution.error, 'mcp'));

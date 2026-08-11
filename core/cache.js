@@ -10,7 +10,7 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 const {
-    expandGlob, detectProjectPattern, parseGitignore, DEFAULT_IGNORES,
+    expandGlob, detectProjectPattern, parseGitignore, gitTrackedPaths, DEFAULT_IGNORES,
     classifyUnsupportedSourceFile,
 } = require('./discovery');
 const { codeUnitCompare } = require('./shared');
@@ -27,10 +27,7 @@ const CACHE_MAX_PROJECTS = 128;
 const CACHE_MAX_BYTES = 1024 * 1024 * 1024;
 
 function discoveryRulesHash(root) {
-    const gitignore = path.join(root, '.gitignore');
-    let content = '';
-    try { content = fs.readFileSync(gitignore, 'utf8'); } catch { /* absent */ }
-    return crypto.createHash('md5').update(content).digest('hex');
+    return crypto.createHash('md5').update(parseGitignore(root).join('\0')).digest('hex');
 }
 
 /**
@@ -599,7 +596,10 @@ function clearAllCaches() {
 // v159: importBindings persist source lines so rename plans can edit aliased
 // CJS/Python imports without relying on usage-kind heuristics.
 // v160: C# file entries persist project-wide `global using` modules.
-const CACHE_FORMAT_VERSION = 163;
+// v166: C++ nested aliases persist their lexical owner ranges, and `auto`
+// return functions persist a unanimously inferred local concrete type. v165
+// was used during prerelease development before both fields were complete.
+const CACHE_FORMAT_VERSION = 166;
 
 /**
  * Save index to cache file
@@ -1094,9 +1094,11 @@ function isCacheStale(index) {
         },
     };
     const gitignorePatterns = parseGitignore(index.root);
+    globOpts.gitignorePatterns = gitignorePatterns;
+    globOpts.trackedPaths = gitTrackedPaths(index.root);
     const configExclude = index.config.exclude || [];
-    if (gitignorePatterns.length > 0 || configExclude.length > 0) {
-        globOpts.ignores = [...DEFAULT_IGNORES, ...gitignorePatterns, ...configExclude];
+    if (configExclude.length > 0) {
+        globOpts.ignores = [...DEFAULT_IGNORES, ...configExclude];
     }
     const currentFiles = expandGlob(pattern, globOpts);
     const cachedPaths = new Set(index.files.keys());

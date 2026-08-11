@@ -121,8 +121,12 @@ describe('command trust matrix: fail-closed proof coverage', () => {
         const publish = fs.readFileSync(path.join(ROOT, '.github/workflows/publish.yml'), 'utf8');
         const weekly = fs.readFileSync(path.join(ROOT, '.github/workflows/eval.yml'), 'utf8');
         assert.match(publish, /npm run trust:gate/);
+        assert.match(publish, /clangd-18/);
+        assert.match(publish, /setup-dotnet@v5/);
         assert.match(weekly, /trust:gate:consistency/);
         assert.match(weekly, /trust:gate:performance/);
+        assert.match(weekly, /clangd-18/);
+        assert.match(weekly, /setup-dotnet@v5/);
     });
 
     it('keeps one machine-readable release board across gates and documentation', () => {

@@ -80,11 +80,25 @@ function symbolNotFound(index, name, label = 'Symbol') {
         }
     }
     const threshold = Math.max(2, Math.floor(query.length * 0.3));
+    let message;
     if (best && best.distance <= threshold) {
-        return `${label} "${query}" not found. Did you mean "${best.value}"? ` +
+        message = `${label} "${query}" not found. Did you mean "${best.value}"? ` +
             'Use find to confirm the symbol and obtain a stable handle.';
+    } else {
+        message = `${label} "${query}" not found. Use find with a shorter name, or search for a literal occurrence.`;
     }
-    return `${label} "${query}" not found. Use find with a shorter name, or search for a literal occurrence.`;
+    const unsupported = require('./account').scanUnsupportedFiles(index, query);
+    if (unsupported.lines > 0) {
+        const languages = Object.keys(unsupported.languages).join(', ');
+        message += ` ${unsupported.lines} literal match(es) exist in ` +
+            `${unsupported.fileCount} unsupported-language file(s)` +
+            `${languages ? ` (${languages})` : ''}; this is not a semantic zero. ` +
+            'Use grep/ripgrep plus a language-native analyzer.';
+    } else if (index.unsupportedFiles?.length > 0) {
+        message += ` UCN skipped ${index.unsupportedFiles.length} unsupported source ` +
+            `file(s), so this is not a repository-wide semantic zero; verify with grep/ripgrep.`;
+    }
+    return message;
 }
 
 /**
@@ -213,9 +227,21 @@ function disambiguationHint(matches, chosen, fileGiven) {
 }
 
 /** Check if a file-based result has a file error. */
-function checkFileError(result, file) {
+function checkFileError(result, file, index = null) {
     if (!result) return null;
     if (result.error === 'file-not-found') {
+        if (index) {
+            const exactUnsupported = (index.unsupportedFiles || []).find(entry =>
+                entry.relativePath === file || entry.relativePath.endsWith('/' + file));
+            const candidate = path.isAbsolute(file)
+                ? path.resolve(file) : path.resolve(index.root, file);
+            if (exactUnsupported || fs.existsSync(candidate)) {
+                const language = exactUnsupported?.language ||
+                    exactUnsupported?.extension || 'unsupported/excluded';
+                return `File exists but is not indexed by UCN: ${file} (${language}). ` +
+                    'Use grep/ripgrep plus a language-native analyzer.';
+            }
+        }
         return `File not found in project: ${file}`;
     }
     if (result.error === 'file-ambiguous') {
@@ -386,10 +412,16 @@ const REPO_SECTIONS = new Set(['summary', 'files', 'stats', 'health']);
 
 /** Parse a comma-separated/array section selector with validation. */
 function parseSections(value, defaults, allowed, command) {
-    const raw = value == null || value === ''
+    const supplied = value != null && value !== '';
+    const raw = !supplied
         ? defaults
         : (Array.isArray(value) ? value : String(value).split(','));
     const sections = [...new Set(raw.map(s => String(s).trim().toLowerCase()).filter(Boolean))];
+    if (supplied && sections.length === 0) {
+        return {
+            error: `No valid ${command} sections were provided. Available: ${[...allowed].join(', ')}.`,
+        };
+    }
     const invalid = sections.filter(s => !allowed.has(s));
     if (invalid.length > 0) {
         return {
@@ -1154,6 +1186,20 @@ const HANDLERS = {
         if (p.exact && p.name && (p.name.includes('*') || p.name.includes('?'))) {
             notes.push(`Note: exact=true treats "${p.name}" as a literal name (glob expansion disabled).`);
         }
+        let unsupportedMatches = null;
+        if (fullFindCount === 0 && index.unsupportedFiles?.length > 0) {
+            unsupportedMatches = require('./account').scanUnsupportedFiles(index, p.name);
+            const languages = Object.keys(unsupportedMatches.languages).join(', ');
+            if (unsupportedMatches.lines > 0) {
+                notes.push(`${unsupportedMatches.lines} literal match(es) exist in ` +
+                    `${unsupportedMatches.fileCount} unsupported-language file(s)` +
+                    `${languages ? ` (${languages})` : ''}; this is not a semantic zero. ` +
+                    'Use grep/ripgrep plus a language-native analyzer.');
+            } else {
+                notes.push(`UCN skipped ${index.unsupportedFiles.length} unsupported source ` +
+                    'file(s), so this is not a repository-wide semantic zero; verify with grep/ripgrep.');
+            }
+        }
         // Apply limit
         const limit = num(p.limit, undefined);
         if (limit && limit > 0) {
@@ -1169,6 +1215,12 @@ const HANDLERS = {
             },
             enumerable: false, writable: true, configurable: true,
         });
+        if (unsupportedMatches) {
+            Object.defineProperty(result, 'unsupportedMatches', {
+                value: unsupportedMatches,
+                enumerable: false, writable: true, configurable: true,
+            });
+        }
         const tNote = truncationNote(index);
         if (tNote) notes.push(tNote);
         return { ok: true, result, note: notes.length ? notes.join('\n') : undefined };
@@ -1461,21 +1513,31 @@ const HANDLERS = {
         }
         const classErr = validateClassName(index, p.name, p.className);
         if (classErr) return { ok: false, error: classErr };
+        let testsResolution = null;
         if (!testsTargetIsFile) {
-            const resolved = index.resolveSymbol(p.name, {
+            testsResolution = index.resolveSymbol(p.name, {
                 file: p.file,
                 className: p.className,
                 line: p.line,
             });
-            if (!resolved.def) return { ok: false, error: symbolNotFound(index, p.name) };
+            if (!testsResolution.def) return { ok: false, error: symbolNotFound(index, p.name) };
         }
         const result = index.tests(p.name, {
             callsOnly: p.callsOnly || false,
             className: p.className,
-            file: p.file,
+            // Bare ambiguous names use the same deterministic definition as
+            // the rest of the semantic surface. The warning below discloses
+            // that choice and gives the caller a stable file= escape hatch.
+            file: p.file || testsResolution?.def?.relativePath,
             exclude: toExcludeArray(p.exclude),
         });
         addMode(result, 'direct');
+        if (testsResolution?.warnings?.length > 0) {
+            Object.defineProperty(result, 'warnings', {
+                value: testsResolution.warnings,
+                enumerable: false, writable: true, configurable: true,
+            });
+        }
         const testNotes = [];
         if (result.length === 0) testNotes.push(NO_STATIC_TEST_LINK_NOTE);
         // Mixed-language honesty: test files in unsupported languages (RSpec
@@ -1686,7 +1748,10 @@ const HANDLERS = {
                 'reqwest', 'spring', 'spring-client', 'unknown-python',
             ]);
             if (!known.has(framework)) {
-                return { ok: false, error: `Invalid --framework value: "${p.framework}".` };
+                return {
+                    ok: false,
+                    error: `Invalid --framework value: "${p.framework}". Valid: ${[...known].join(', ')}.`,
+                };
             }
             result.routes = result.routes.filter(route => route.framework === framework);
             result.requests = result.requests.filter(request => request.framework === framework);
@@ -1709,9 +1774,7 @@ const HANDLERS = {
         // Apply --exclude patterns to route/request files (deadcode-style boundary matching)
         const exclude = toExcludeArray(p.exclude);
         if (exclude.length > 0) {
-            const regexes = exclude.map(pat =>
-                new RegExp('(^|[/._-])' + pat + 's?([/._-]|$)', 'i'));
-            const matches = (file) => regexes.some(rx => rx.test(file));
+            const matches = (file) => !index.matchesFilters(file, { exclude });
             result.routes = result.routes.filter(r => !matches(r.file));
             result.requests = result.requests.filter(r => !matches(r.file));
             result.bridges = result.bridges.filter(b => !matches(b.route.file) && !matches(b.request.file));
@@ -1951,7 +2014,7 @@ const HANDLERS = {
 
         // Large class summary mode (>200 lines, no maxLines)
         if (totalLines > 200 && !maxLines) {
-            const methods = index.findMethodsForType(match.name);
+            const methods = index.findMethodsForType(match.name, match);
             entries.push({ match, code: null, methods, totalLines, summaryMode: true, truncated: false });
             return { ok: true, result: { entries }, note: notes.length ? notes.map(n => 'Note: ' + n).join('\n') : undefined };
         }
@@ -1999,7 +2062,7 @@ const HANDLERS = {
         // reported "File not found" — factually wrong; imports/exporters
         // list the candidates for the same input).
         const resolved = index.resolveFilePathForQuery(p.file);
-        const resolveErr = checkFileError(typeof resolved === 'string' ? null : resolved, p.file);
+        const resolveErr = checkFileError(typeof resolved === 'string' ? null : resolved, p.file, index);
         if (resolveErr) return { ok: false, error: resolveErr };
         const filePath = resolved;
 
@@ -2040,7 +2103,7 @@ const HANDLERS = {
         const err = requireFile(p.file);
         if (err) return { ok: false, error: err };
         const result = index.imports(p.file);
-        const fileErr = checkFileError(result, p.file);
+        const fileErr = checkFileError(result, p.file, index);
         if (fileErr) return { ok: false, error: fileErr };
         return { ok: true, result };
     },
@@ -2049,7 +2112,7 @@ const HANDLERS = {
         const err = requireFile(p.file);
         if (err) return { ok: false, error: err };
         const result = index.exporters(p.file);
-        const fileErr = checkFileError(result, p.file);
+        const fileErr = checkFileError(result, p.file, index);
         if (fileErr) return { ok: false, error: fileErr };
         return { ok: true, result };
     },
@@ -2058,7 +2121,7 @@ const HANDLERS = {
         const err = requireFile(p.file);
         if (err) return { ok: false, error: err };
         const result = index.fileExports(p.file);
-        const fileErr = checkFileError(result, p.file);
+        const fileErr = checkFileError(result, p.file, index);
         if (fileErr) return { ok: false, error: fileErr };
         return { ok: true, result };
     },
@@ -2073,7 +2136,7 @@ const HANDLERS = {
         if (result && result.error === 'invalid-direction') {
             return { ok: false, error: result.message };
         }
-        const fileErr = checkFileError(result, p.file);
+        const fileErr = checkFileError(result, p.file, index);
         if (fileErr) return { ok: false, error: fileErr };
         return { ok: true, result };
     },
@@ -2225,7 +2288,7 @@ const HANDLERS = {
         }
         let result = index.api(p.file, { in: p.in });
         if (p.file) {
-            const fileErr = checkFileError(result, p.file);
+            const fileErr = checkFileError(result, p.file, index);
             if (fileErr) return { ok: false, error: fileErr };
         }
         // Apply limit to api results (api returns an array)

@@ -134,13 +134,22 @@ const clangdOracle = {
                 continue;
             }
             const relFile = path.relative(handle.root, absFile);
+            // clangd emits two DocumentSymbols for `typedef struct Name {}`:
+            // one on the record name and one on the closing typedef alias.
+            // They are one compiler type and UCN indexes the record start.
+            // Anonymous records also expose a synthetic `(anonymous struct)`
+            // whose selection range points at the `struct` keyword. Sampling
+            // either artifact creates an impossible public `find` target.
+            const namedRecords = collectNamedRecordDeclarations(response || []);
             const visit = (entry, containers = []) => {
                 if (!entry) return;
                 const mappedKind = oracleKind(entry.kind);
                 const range = entry.selectionRange ||
                     entry.location?.range || entry.range;
                 const semanticName = documentSymbolName(entry.name);
-                if (mappedKind && range) {
+                const compilerArtifact = isAnonymousRecordSymbol(entry) ||
+                    isRedundantRecordTypedef(entry, namedRecords);
+                if (mappedKind && range && !compilerArtifact) {
                     const line = range.start.line + 1;
                     const name = sourceIdentifier(
                         handle, absFile, line, range.start.character,
@@ -570,6 +579,43 @@ function isContainerSymbol(kind) {
         kind === SYMBOL_KIND.CLASS ||
         kind === SYMBOL_KIND.STRUCT ||
         kind === SYMBOL_KIND.INTERFACE;
+}
+
+function collectNamedRecordDeclarations(entries) {
+    const records = [];
+    const visit = entry => {
+        if (!entry) return;
+        const name = documentSymbolName(entry.name);
+        if ((entry.kind === SYMBOL_KIND.CLASS ||
+            entry.kind === SYMBOL_KIND.STRUCT ||
+            entry.kind === SYMBOL_KIND.INTERFACE) &&
+            entry.detail !== 'type alias' && name &&
+            !isAnonymousRecordSymbol(entry)) {
+            records.push({
+                name,
+                startLine: entry.range?.start?.line,
+                endLine: entry.range?.end?.line,
+            });
+        }
+        for (const child of entry.children || []) visit(child);
+    };
+    for (const entry of entries || []) visit(entry);
+    return records;
+}
+
+function isAnonymousRecordSymbol(entry) {
+    return /\b(?:anonymous|unnamed)\b/i.test(String(entry?.name || ''));
+}
+
+function isRedundantRecordTypedef(entry, namedRecords) {
+    if (entry?.detail !== 'type alias') return false;
+    const name = documentSymbolName(entry.name);
+    const startLine = entry.range?.start?.line;
+    const endLine = entry.range?.end?.line;
+    return !!name && namedRecords.some(record =>
+        record.name === name &&
+        record.startLine === startLine &&
+        record.endLine === endLine);
 }
 
 function callableIdentityKey(entry, containers = []) {

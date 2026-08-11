@@ -2778,10 +2778,14 @@ describe('fix: tests() className scoping', () => {
         });
         try {
             const index = idx(dir);
-            // Without className: both test files match 'save'
+            // Without className, semantic commands select one deterministic
+            // definition and disclose the ambiguity instead of unioning
+            // unrelated same-name methods.
             const allTests = execute(index, 'tests', { name: 'save' });
             assert.ok(allTests.ok);
-            assert.ok(allTests.result.length >= 2, 'Without className, both test files should match');
+            assert.ok(allTests.result.length >= 1, 'The selected definition should retain its test link');
+            assert.ok(allTests.result.warnings?.length > 0,
+                'Ambiguous selection must remain visible');
 
             // With className=A: only a.test.js should match
             const aTests = execute(index, 'tests', { name: 'save', className: 'A' });
@@ -3248,8 +3252,9 @@ describe('AST-based tests(): cross-language className scoping', () => {
             assert.ok(bTests.ok);
             assert.ok(bTests.result.length > 0, 'Should find test file for B');
             const bMatches = bTests.result.flatMap(r => r.matches);
-            assert.ok(bMatches.some(m => m.matchType === 'call' && m.content.includes('svc.save')),
-                'Should include svc.save() as call (B instance)');
+            assert.ok(bMatches.some(m => ['call', 'unverified-call'].includes(m.matchType) &&
+                m.content.includes('svc.save')),
+            'Should include svc.save() with an honest evidence tier');
             assert.ok(!bMatches.some(m => m.matchType === 'call' && m.content.includes('a.save')),
                 'Should not include a.save() call (A instance)');
         } finally {

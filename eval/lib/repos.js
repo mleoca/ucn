@@ -272,6 +272,11 @@ const REPOS = [
         language: 'c',
         targetCandidates: ['.'],
         clangFlags: ['-DCJSON_HIDE_SYMBOLS=0'],
+        // cJSON vendors the Unity test framework (including generated
+        // expectdata and Unity's own examples). The release row measures the
+        // cJSON library, not a second unrelated C framework; keep project
+        // tests, but remove vendored Unity from both UCN and oracle universes.
+        oracleExclude: ['tests/unity'],
     },
     {
         // Template-heavy modern C++ library spanning headers and source

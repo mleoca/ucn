@@ -1957,14 +1957,18 @@ describe('Bug Hunt: expand cache LRU only refreshes matched entry', () => {
 
 describe('Bug Hunt: interactive parseInteractiveFlags space-separated values', () => {
     it('should handle --in with space-separated value', () => {
-        const { execFileSync } = require('child_process');
-        const result = execFileSync('node', [CLI_PATH, '--interactive'], {
-            input: 'find main --in core\nquit\n',
-            encoding: 'utf-8',
-            timeout: 60000,
+        const dir = tmp({
+            'package.json': '{}',
+            'core/main.js': 'function main() { return 1; }\nmodule.exports = { main };',
+            'other.js': 'function main() { return 2; }\nmodule.exports = { main };',
         });
-        // Should not error about unknown flags
-        assert.ok(!result.includes('Unknown flag'), `should accept --in with space, got: ${result}`);
+        try {
+            const result = runInteractive(dir, ['find main --in core']);
+            assert.ok(!result.includes('Unknown flag'),
+                `should accept --in with space, got: ${result}`);
+            assert.match(result, /core\/main\.js/);
+            assert.doesNotMatch(result, /other\.js/);
+        } finally { rm(dir); }
     });
 });
 

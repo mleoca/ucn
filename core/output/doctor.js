@@ -27,7 +27,7 @@ function formatDoctor(result, options = {}) {
     if (langEntries.length) {
         const totalFiles = langEntries.reduce((s, [, v]) => s + v.files, 0) || 1;
         const langStr = langEntries.map(([name, v]) => `${name} (${Math.round(v.files / totalFiles * 100)}%)`).join(', ');
-        lines.push(`Languages: ${langStr}`);
+        lines.push(`Languages (by indexed files): ${langStr}`);
     }
 
     // Cache state

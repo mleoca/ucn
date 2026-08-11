@@ -134,7 +134,9 @@ CLI and MCP text use one shared output budget: targeted commands default to
 10K characters, broad commands to 3K, and both have a 100K ceiling. CLI can
 set `--max-chars=N`; MCP can set `max_chars`. `--all`/`all=true` lifts
 formatter caps while retaining the ceiling. Truncation preserves omitted
-`ACCOUNT`, `CONTRACT`, `WARNING`, and related trust lines.
+`ACCOUNT`, `CONTRACT`, `WARNING`, and related trust lines. The requested limit
+is a hard transport ceiling that includes the truncation notice and preserved
+metadata; JSON remains complete and is not text-truncated.
 
 ## Cache location
 
@@ -181,7 +183,10 @@ Treat `deadcode` as a candidate generator. Before deleting, inspect `usages`, `i
 Computed/indexed dispatch such as `handlers[key]()` is reported as a health
 blind spot. Object-literal registry members reached through that shape are
 withheld from dead-code candidates, and any remaining result is still
-review-only.
+review-only. Unknown decorators/annotations and member-assigned event handlers
+are withheld by default because the annotation or assignment may itself be the
+only runtime registration evidence. Language-local descriptor mechanics such
+as Python `@property` remain auditable instead of being blanket-excluded.
 
 ## Common workflows
 
@@ -196,6 +201,9 @@ ucn source src/parser.ts:42:parseRequest
 ```
 
 Stable handles (`file:line:name`) pin duplicate names to one definition.
+`find` activity is also pinned: its call count is confirmed plus visibly
+unverified candidates for that definition. Same-name calls proved to belong to
+another target are disclosed separately and never inflate the total.
 
 ### Preview and check a refactor
 
@@ -226,6 +234,10 @@ ucn usages parseRequest --include-tests
 
 Use `--code-only` to omit comment/string/docstring text. `usages` is a literal-name
 inventory, not proof that every occurrence binds to one selected definition.
+Regex search uses an RE2-compatible linear-time engine for ordinary patterns.
+Advanced JavaScript-only constructs use a guarded compatibility path; unsafe
+nested repetition is rejected with a recommendation to simplify it or use
+ripgrep.
 
 ### Inspect architecture
 

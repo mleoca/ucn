@@ -757,6 +757,7 @@ function computePlanCallSites(index, name, def) {
             expression: (call.content || '').trim(),
             args: analysis.args,
             argCount: analysis.argCount,
+            ...(c.calledAs && { calledAs: c.calledAs }),
         });
     }
     clearTreeCache(index);
@@ -1138,7 +1139,7 @@ function identifyCallPatterns(callSites, funcName) {
 function verify(index, name, options = {}) {
     index._beginOp();
     try {
-    const { def } = index.resolveSymbol(name, { file: options.file, className: options.className, line: options.line });
+    const { def, warnings } = index.resolveSymbol(name, { file: options.file, className: options.className, line: options.line });
     if (!def) {
         return { found: false, function: name };
     }
@@ -1159,7 +1160,17 @@ function verify(index, name, options = {}) {
     const selfParams = langTraits(lang)?.selfParam;
     const stripSelf = (list) => (selfParams && list.length > 0 && list[0] && selfParams.includes(list[0].name))
         ? list.slice(1) : list;
+    let callableIdentityParams = null;
+    if (!ctorParamLists && ['c', 'cpp'].includes(lang)) {
+        const { _closeCallableIdentityGroup } = require('./callers');
+        const family = _closeCallableIdentityGroup(
+            index, [def], index.symbols.get(name) || [def]);
+        callableIdentityParams = family
+            .filter(member => Array.isArray(member.paramsStructured))
+            .map(member => member.paramsStructured);
+    }
     const rawParamLists = ctorParamLists ||
+        (callableIdentityParams?.length ? callableIdentityParams : null) ||
         [(arrowTypes?.paramsStructured) || def.paramsStructured || []];
     const params = stripSelf(rawParamLists[0]);
     const arities = rawParamLists.map(l => {
@@ -1423,7 +1434,8 @@ function verify(index, name, options = {}) {
         unverifiedSites: sweepUnverified.map(unverifiedSiteShape),
         account,
         patterns: patternsAgg,
-        scopeWarning
+        scopeWarning,
+        ...(warnings.length > 0 && { warnings }),
     };
     } finally { index._endOp(); }
 }
@@ -1725,13 +1737,20 @@ function plan(index, name, options = {}) {
                 columns: [],
                 missingColumn: false,
                 callCount: 0,
+                calledAs: site.calledAs,
             };
+            if (group.calledAs !== site.calledAs) group.calledAs = null;
             group.callCount++;
             if (Number.isInteger(site.column)) group.columns.push(site.column);
             else group.missingColumn = true;
             callLines.set(lineKey, group);
         }
         for (const site of callLines.values()) {
+            // A renamed import preserves its local alias (`old as local` /
+            // `{ old: local }`). The caller engine carries the authored name
+            // in calledAs; that token must remain unchanged while the import's
+            // source-side identifier is edited below.
+            if (site.calledAs && site.calledAs !== name) continue;
             const edit = renameIdentifierTokens(index,
                 site.absoluteFile || site.file, site.line, name,
                 options.renameTo, site.missingColumn ? [] : site.columns,
@@ -1840,29 +1859,19 @@ function plan(index, name, options = {}) {
         // references too. In particular, CommonJS shorthand
         // `module.exports = { helper }` must be renamed or the otherwise
         // complete caller/import edit set breaks the module API.
-        const fileReachesTarget = (start) => {
-            const seen = new Set();
-            let frontier = [start];
-            for (let depth = 0; depth <= 8 && frontier.length; depth++) {
-                const next = [];
-                for (const current of frontier) {
-                    if (renameTargetFiles.has(current)) return true;
-                    if (seen.has(current)) continue;
-                    seen.add(current);
-                    for (const imported of index.importGraph.get(current) || []) next.push(imported);
-                }
-                frontier = next;
-            }
-            return false;
-        };
         for (const [exportPath, targetEntry] of index.files) {
             for (const exported of targetEntry.exportDetails || []) {
                 if ((exported.name !== name && exported.alias !== name) ||
                     !exported.line) continue;
                 const ownership = _nameBindingReaches(
                     index, exportPath, name, renameTargetFiles, 8);
-                if (ownership === 'no' ||
-                    (ownership === 'unknown' && !fileReachesTarget(exportPath))) continue;
+                // Transitive file reachability is not name ownership. A file
+                // can import the target somewhere in its dependency closure
+                // while exporting its own same-spelled local declaration.
+                // Edit the target's own export, or a positively-resolved
+                // re-export chain; unknown CJS/dynamic surfaces are unsafe to
+                // rewrite mechanically.
+                if (exportPath !== def.file && ownership !== 'yes') continue;
                 const exportFile = targetEntry.relativePath || exportPath;
                 if (changes.some(change =>
                     change.file === exportFile && change.line === exported.line)) {
@@ -1891,19 +1900,34 @@ function plan(index, name, options = {}) {
         // Leaving descendant declarations behind either fails compilation
         // (Java/C#/TS override) or silently changes dispatch (Python/JS).
         if (def.className) {
-            const descendants = new Set();
-            const queue = [def.className];
+            // Inheritance identity is (class name, defining file), not just
+            // the spelling. Repositories routinely contain two Handler/Base
+            // classes in unrelated packages. Follow only children whose base
+            // resolves from the child's scope to this exact parent file.
+            const identityKey = (className, file) => `${file || ''}\0${className}`;
+            const descendants = new Map();
+            const queue = [{ name: def.className, file: def.file }];
+            const visited = new Set([identityKey(def.className, def.file)]);
             while (queue.length > 0 && descendants.size < 5000) {
                 const parent = queue.shift();
-                for (const child of index.extendedByGraph.get(parent) || []) {
+                for (const child of index.extendedByGraph.get(parent.name) || []) {
                     const childName = typeof child === 'string' ? child : child.name;
-                    if (!childName || descendants.has(childName)) continue;
-                    descendants.add(childName);
-                    queue.push(childName);
+                    const childFile = typeof child === 'string'
+                        ? index._resolveClassFile(childName, parent.file)
+                        : child.file;
+                    if (!childName || !childFile) continue;
+                    const parentFile = index._resolveClassFile(parent.name, childFile);
+                    if (parentFile !== parent.file) continue;
+                    const key = identityKey(childName, childFile);
+                    if (visited.has(key)) continue;
+                    visited.add(key);
+                    descendants.set(key, { name: childName, file: childFile });
+                    queue.push({ name: childName, file: childFile });
                 }
             }
             for (const override of index.symbols.get(name) || []) {
-                if (!override.className || !descendants.has(override.className)) continue;
+                if (!override.className ||
+                    !descendants.has(identityKey(override.className, override.file))) continue;
                 const line = override.nameLine || override.startLine;
                 const rel = override.relativePath || override.file;
                 if (changes.some(change => change.file === rel && change.line === line)) continue;
@@ -2042,7 +2066,8 @@ function plan(index, name, options = {}) {
         unverifiedCount: planUnverified.length,
         unverifiedSites: planUnverified,
         account: planAccount,
-        scopeWarning: impactScopeWarning
+        scopeWarning: impactScopeWarning,
+        ...(resolved.warnings.length > 0 && { warnings: resolved.warnings }),
     };
     } finally { index._endOp(); }
 }

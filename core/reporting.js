@@ -9,7 +9,6 @@
 
 const fs = require('fs');
 const { codeUnitCompare, CALLABLE_SYMBOL_KINDS } = require('./shared');
-const { _declaredFieldType, _projectTopLevelNames } = require('./callers');
 const path = require('path');
 const { isTestFile } = require('./discovery');
 const { summarizeCommandTrust } = require('./trust-matrix');
@@ -128,177 +127,47 @@ function getStats(index, options = {}) {
             index.buildCalleeIndex();
         }
 
-        // BUG-H2: aggregate calls by *resolution kind* so a method call like
-        // `dict.get()` doesn't get attributed to a standalone `function get()`.
-        //
-        // Buckets per name:
-        //   bareNameCounts[name]     — calls with !isMethod (e.g. `get()`)
-        //   methodByReceiverType[t][name] — calls with isMethod and inferred receiverType
-        //   methodByName[name]       — all isMethod calls (fallback denominator)
-        //   importedReceiverCounts[name] — method calls whose receiver is an imported
-        //                                  module alias in the calling file (e.g.
-        //                                  `mod.foo()` where `mod` is a require alias).
-        //                                  These resolve like top-level function calls.
-        //
-        // self/this/cls/super counted under bareNameCounts since they always resolve
-        // to the enclosing class's method (handled in attribution below).
-        // We dedupe per file by (name, line) so multi-record call sites count once.
-        const SELF_RECEIVERS = new Set(['self', 'this', 'cls', 'super']);
-        const bareNameCounts = new Map();           // name -> count
-        const methodByReceiverType = new Map();      // receiverType -> Map(name -> count)
-        const methodByName = new Map();              // name -> count of all method calls
-        const selfMethodByName = new Map();          // name -> count of self/this.name() calls
-        const importedReceiverCounts = new Map();    // name -> count of `mod.name()` calls
-                                                     //          where mod is an import alias
-
-        // Pre-compute import-alias sets per file. Used to distinguish `mod.foo()`
-        // (resolves to top-level foo) from `obj.foo()` on a local variable.
-        const fileImportAliases = new Map();         // filePath -> Set<string> of alias names
-        const fieldHopCache = new Map();             // rootType\0field -> declared type|null
-        // Names import-bound to an EXTERNAL module, per file (fix #256,
-        // dogfood-measured: 895 node:test `describe(...)` calls in test
-        // files were attributed to a project closure named `describe` —
-        // the #215 name discipline says an externally-bound bare name
-        // cannot reach a project def, so it never counts toward the hot
-        // leaderboard). Relative modules, resolved modules, and resolver
-        // gaps (first segment names a project path) all stay countable.
-        const fileExternalNames = new Map();         // filePath -> Set<string>
-        for (const [filePath, fileEntry] of scopedFiles) {
-            const aliases = new Set();
-            // importNames are the named imports/exports brought into this file.
-            // importAliases (when present) carry namespace import aliases (e.g.
-            // `import * as mod from "..."` → 'mod').
-            for (const n of (fileEntry.importNames || [])) aliases.add(n);
-            if (Array.isArray(fileEntry.importAliases)) {
-                for (const a of fileEntry.importAliases) {
-                    if (a && a.local) aliases.add(a.local);
-                }
-            }
-            fileImportAliases.set(filePath, aliases);
-            let ext = null;
-            for (const b of (fileEntry.importBindings || [])) {
-                const mod = String(b.module || '');
-                if (!b.name || !mod || mod.startsWith('.') || mod.startsWith('/')) continue;
-                if (fileEntry.moduleResolved && fileEntry.moduleResolved[mod]) continue;
-                const firstSeg = mod.split(/[./]/).filter(Boolean)[0];
-                if (firstSeg && _projectTopLevelNames(index).has(firstSeg)) continue;
-                (ext || (ext = new Set())).add(b.name);
-            }
-            if (ext) fileExternalNames.set(filePath, ext);
-        }
-
+        // Build a cheap, provenance-independent upper bound per spelling.
+        // Every confirmed caller must first exist as a call record bearing the
+        // target name (or resolved import alias), so this count can safely
+        // decide which definitions are capable of entering the requested top
+        // N. Exact pinned caller resolution is then run only until no unseen
+        // candidate can beat the current Nth result.
+        const rawUpperByName = new Map();
         for (const [filePath, entry] of index.callsCache) {
             if (!scopedPaths.has(filePath)) continue;
+            if (index.files.get(filePath)?.isBundled) continue;
             if (!entry || !Array.isArray(entry.calls)) continue;
             const seenInFile = new Set();
-            const aliasesForFile = fileImportAliases.get(filePath) || new Set();
             for (const c of entry.calls) {
                 if (!c || !c.name) continue;
                 const key = `${c.name}::${c.line || 0}`;
-                if (seenInFile.has(key)) continue;
-                seenInFile.add(key);
-
-                const isSelfMethod = c.isMethod && SELF_RECEIVERS.has(c.receiver);
-                if (!c.isMethod) {
-                    // Bare-name call: foo() or pkg.Foo() (Go package call has receiver
-                    // but isMethod:false — keep counting under bareName since they
-                    // resolve like top-level functions in their package).
-                    // Externally-bound names are the external library's calls,
-                    // never a project def's (fix #256).
-                    if (fileExternalNames.get(filePath)?.has(c.name)) continue;
-                    bareNameCounts.set(c.name, (bareNameCounts.get(c.name) || 0) + 1);
-                } else if (isSelfMethod) {
-                    // self/this.foo() — attributed to the enclosing class's foo
-                    selfMethodByName.set(c.name, (selfMethodByName.get(c.name) || 0) + 1);
-                    methodByName.set(c.name, (methodByName.get(c.name) || 0) + 1);
-                } else {
-                    methodByName.set(c.name, (methodByName.get(c.name) || 0) + 1);
-                    // Module-alias receiver? `mod.foo()` where `mod` was imported here.
-                    // Treat the call as resolving to a top-level `foo` (the standalone
-                    // function exported from `mod`).
-                    if (c.receiver && aliasesForFile.has(c.receiver)) {
-                        importedReceiverCounts.set(c.name,
-                            (importedReceiverCounts.get(c.name) || 0) + 1);
-                    }
-                    // Field-access receivers (fix #251): `tm.service.Save()`
-                    // carries receiverRootType, not receiverType — the same
-                    // #202/#231 declared-field hop the caller/callee engine
-                    // uses. Without it, edges `context` confirms were
-                    // invisible to the hot leaderboard.
-                    let recvType = c.receiverType;
-                    if (!recvType && c.receiverField && c.receiverRootType) {
-                        const hopKey = `${c.receiverRootType}\u0000${c.receiverField}`;
-                        if (!fieldHopCache.has(hopKey)) {
-                            const lang = index.files.get(filePath)?.language;
-                            fieldHopCache.set(hopKey,
-                                lang ? _declaredFieldType(index, c.receiverRootType, c.receiverField, lang) : null);
-                        }
-                        recvType = fieldHopCache.get(hopKey);
-                    }
-                    if (recvType) {
-                        let inner = methodByReceiverType.get(recvType);
-                        if (!inner) {
-                            inner = new Map();
-                            methodByReceiverType.set(recvType, inner);
-                        }
-                        inner.set(c.name, (inner.get(c.name) || 0) + 1);
-                    }
+                if (!seenInFile.has(key)) {
+                    seenInFile.add(key);
+                    rawUpperByName.set(c.name, (rawUpperByName.get(c.name) || 0) + 1);
                 }
-                // Also account for resolvedName aliases (e.g. `import {foo as bar}; bar()`
-                // resolves to `foo`). Treat the resolved form the same way as the original.
                 if (c.resolvedName && c.resolvedName !== c.name) {
                     const rkey = `${c.resolvedName}::${c.line || 0}`;
                     if (!seenInFile.has(rkey)) {
                         seenInFile.add(rkey);
-                        if (!c.isMethod) {
-                            bareNameCounts.set(c.resolvedName,
-                                (bareNameCounts.get(c.resolvedName) || 0) + 1);
-                        }
+                        rawUpperByName.set(c.resolvedName,
+                            (rawUpperByName.get(c.resolvedName) || 0) + 1);
                     }
                 }
             }
         }
 
-        // For each name, count how many distinct classes/types own a method with
-        // that name (used to split method-call counts when receiverType is unknown).
-        const classOwnersByName = new Map();         // name -> Set<className>
-        for (const [name, symbols] of index.symbols) {
-            for (const sym of symbols) {
-                if (!FUNCTION_TYPES.has(sym.type)) continue;
-                if (!matchesReportingScope(index, sym.relativePath, options)) continue;
-                const owner = sym.className || (sym.receiver && sym.receiver.replace(/^\*/, ''));
-                if (owner) {
-                    let s = classOwnersByName.get(name);
-                    if (!s) { s = new Set(); classOwnersByName.set(name, s); }
-                    s.add(owner);
-                }
-            }
-        }
-
-        // MEDIUM-6: aggregate by name. Multiple definitions of the same name
-        // in different files (e.g. `tmp` in test/helpers/index.js AND
-        // test/accuracy.test.js) previously each got the GLOBAL call count,
-        // duplicating the row and inflating the leaderboard. We now emit
-        // one row per name with a `locations` list, so the user sees both
-        // definitions but the count appears exactly once.
-        //
-        // BUG-H2: with the buckets above, attribute counts per (name, ownerClass):
-        //   - standalone function:   bareNameCounts[name]
-        //   - class method (Foo.bar): methodByReceiverType[Foo][bar]
-        //                              + selfMethodByName[bar] / numOwnerClasses
-        //                              + (residual unresolved method calls split evenly)
-        //   - falls back to methodByName[name] when no receiverType evidence exists.
-        const hotList = [];
-        const { findCallers } = require('./callers');
-        const scopedCallerQuery = !!(options.file || options.in ||
-            (options.exclude && options.exclude.length > 0));
+        const candidates = [];
         const seenDefinitions = new Set();
         for (const [name, symbols] of index.symbols) {
-            if (!index.calleeIndex?.has(name)) continue;
+            const upper = rawUpperByName.get(name) || 0;
+            if (upper === 0) continue;
             const callable = symbols.filter(symbol =>
                 FUNCTION_TYPES.has(symbol.type) &&
                 matchesReportingScope(index, symbol.relativePath, options));
             for (const symbol of callable) {
+                if (index.files.get(symbol.file)?.isBundled) continue;
+                if (options.productionCallsOnly && require('./shared').isTestPath(symbol.relativePath)) continue;
                 const identity = `${symbol.file}:${symbol.startLine}:${name}:` +
                     `${symbol.className || symbol.receiver || ''}:${symbol.params || ''}`;
                 if (seenDefinitions.has(identity)) continue;
@@ -314,28 +183,55 @@ function getStats(index, options = {}) {
                         index.importGraph.get(symbol.file)?.has(candidate.file)))) {
                     continue;
                 }
+                candidates.push({ name, symbol, upper });
+            }
+        }
+        candidates.sort((a, b) =>
+            (b.upper - a.upper) ||
+            codeUnitCompare(a.symbol.relativePath, b.symbol.relativePath) ||
+            (a.symbol.startLine || 0) - (b.symbol.startLine || 0));
 
+        const hotList = [];
+        const { findCallers } = require('./callers');
+        const scopedCallerQuery = !!(options.file || options.in ||
+            (options.exclude && options.exclude.length > 0));
+        let refined = 0;
+        if (top > 0) {
+            for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex++) {
+                const { name, symbol } = candidates[candidateIndex];
                 const exact = findCallers(index, name, {
                     targetDefinitions: [symbol],
                     includeTests: true,
                     collectAccount: true,
                 });
+                refined++;
                 const count = exact.filter(caller =>
                     caller.tier !== 'unverified' &&
                     (!scopedCallerQuery || scopedPaths.has(caller.file)) &&
+                    !index.files.get(caller.file)?.isBundled &&
                     (!options.productionCallsOnly ||
                         !require('./shared').isTestPath(caller.relativePath || caller.file))).length;
-                if (count === 0) continue;
-                const owner = symbol.className ||
-                    (symbol.receiver || '').replace(/^\*/, '');
-                hotList.push({
-                    name: owner ? `${owner}.${name}` : name,
-                    file: symbol.relativePath,
-                    startLine: symbol.startLine,
-                    endLine: symbol.endLine,
-                    callCount: count,
-                    evidence: 'confirmed-callers',
-                });
+                if (count > 0) {
+                    const owner = symbol.className ||
+                        (symbol.receiver || '').replace(/^\*/, '');
+                    hotList.push({
+                        name: owner ? `${owner}.${name}` : name,
+                        file: symbol.relativePath,
+                        startLine: symbol.startLine,
+                        endLine: symbol.endLine,
+                        callCount: count,
+                        evidence: 'confirmed-callers',
+                    });
+                }
+                hotList.sort((a, b) =>
+                    (b.callCount - a.callCount) ||
+                    codeUnitCompare(a.file, b.file) ||
+                    (a.startLine || 0) - (b.startLine || 0));
+                if (hotList.length >= top) {
+                    const threshold = hotList[top - 1].callCount;
+                    const nextUpper = candidates[candidateIndex + 1]?.upper ?? -1;
+                    if (nextUpper < threshold) break;
+                }
             }
         }
 
@@ -348,9 +244,13 @@ function getStats(index, options = {}) {
 
         stats.hot = {
             top,
-            total: hotList.length,
+            total: refined === candidates.length ? hotList.length : candidates.length,
+            totalKind: refined === candidates.length ? 'confirmed' : 'raw-call-candidates',
+            refined,
             items: hotList.slice(0, top),
-            note: 'Counts are confirmed caller-engine edges pinned to each displayed definition; unverified dispatch is excluded.',
+            note: refined === candidates.length
+                ? 'Counts are confirmed caller-engine edges pinned to each displayed definition; unverified dispatch is excluded.'
+                : `Displayed counts are exact confirmed caller-engine edges; ${candidates.length} raw candidates were bounded and ${refined} required exact refinement.`,
         };
     }
 
@@ -907,8 +807,6 @@ function computeEvidenceProfile(index, { sampleSize, matchInFilter }) {
  */
 function orient(index, options = {}) {
     const top = options.top || 8;
-    // Fetch a deeper hot list so production functions survive the filter
-    // below even when test helpers dominate raw call counts.
     const scope = {
         file: options.file,
         in: options.in,
@@ -924,7 +822,7 @@ function orient(index, options = {}) {
     const stats = getStats(index, {
         ...scope,
         hot: true,
-        top: Math.min(top * 5, 200),
+        top,
         // A production-only call count is useful only when the selected scope
         // actually contains production files. In an all-test repository it
         // would erase the raw ranking that orient promises as its fallback.
@@ -1006,7 +904,14 @@ function orient(index, options = {}) {
         buildTime: stats.buildTime,
         byLanguage: stats.byLanguage,
         dirs,
-        hot: { total: stats.hot?.total ?? 0, top, production, items: hotItems },
+        hot: {
+            total: stats.hot?.total ?? 0,
+            totalKind: stats.hot?.totalKind || 'confirmed',
+            refined: stats.hot?.refined ?? 0,
+            top,
+            production,
+            items: hotItems,
+        },
         entrypoints,
         trust: {
             level: health.trust,
@@ -1015,6 +920,7 @@ function orient(index, options = {}) {
                 dynamicImports: health.blindSpots?.dynamicImports?.count ?? 0,
                 evalCalls: health.blindSpots?.evalCalls?.count ?? 0,
                 reflection: health.blindSpots?.reflection?.count ?? 0,
+                computedDispatch: health.blindSpots?.computedDispatch?.count ?? 0,
                 parseFailures: health.blindSpots?.parseFailures?.count ?? 0,
                 parseRecoveries: health.blindSpots?.parseRecoveries?.count ?? 0,
                 unsupportedSources: health.blindSpots?.unsupportedSources?.count ?? 0,

@@ -240,6 +240,16 @@ function macroTypeRanges(tree, code) {
         if (!typeNode || typeNode.type !== 'type_identifier') return true;
         const directError = !!directErrorNode;
         const identity = declaratorIdentity(functionDeclarator(node));
+        // `MACRO Type::Type(...) : Base{...} { ... }` is parsed as a
+        // declaration whose initializer consumes the base brace and whose
+        // real body becomes a sibling compound_statement. A qualified
+        // constructor cannot have a return type, so an all-caps type token is
+        // compiler-proven decoration and may be blanked safely.
+        const qualifiedConstructorMacro = node.type === 'declaration' &&
+            node.hasError && isMacroToken(typeNode.text) &&
+            identity?.className &&
+            (identity.name === identity.className ||
+             identity.name === `~${identity.className}`);
         // Stacked attribute macros (`A B extern void (*fp)(void *);`) split
         // into a fragment declaration [type_identifier, identifier,
         // MISSING ';'] plus a clean tail — no ERROR node, so the evidence is
@@ -248,7 +258,8 @@ function macroTypeRanges(tree, code) {
         // macro) and removes the phantom state var the fragment indexed.
         const bareFragment = declaratorNode && declaratorNode.type === 'identifier' &&
             node.namedChildCount === 2 && hasMissingChild(node);
-        if (directError || bareFragment || RESERVED_TYPE_KEYWORDS.has(identity?.name)) {
+        if (directError || bareFragment || qualifiedConstructorMacro ||
+            RESERVED_TYPE_KEYWORDS.has(identity?.name)) {
             ranges.push([typeNode.startIndex, typeNode.endIndex]);
         }
         return true;
@@ -491,16 +502,25 @@ function conditionalRecoverySources(code) {
 function treeStructureScore(tree) {
     let declarations = 0;
     let calls = 0;
-    traverseTreeCached(tree.rootNode, node => {
-        if (node.type === 'function_definition' ||
-            node.type === 'class_specifier' ||
-            node.type === 'struct_specifier' ||
-            node.type === 'union_specifier' ||
-            node.type === 'enum_specifier' ||
-            node.type === 'type_definition') declarations++;
-        else if (node.type === 'call_expression') calls++;
-        return true;
-    });
+    const declarationTypes = new Set([
+        'function_definition', 'class_specifier', 'struct_specifier',
+        'union_specifier', 'enum_specifier', 'type_definition',
+    ]);
+    const cursor = tree.walk();
+    let entered = true;
+    while (entered) {
+        const type = cursor.nodeType;
+        if (declarationTypes.has(type)) declarations++;
+        else if (type === 'call_expression') calls++;
+        if (cursor.gotoFirstChild()) continue;
+        while (!cursor.gotoNextSibling()) {
+            if (!cursor.gotoParent()) {
+                entered = false;
+                break;
+            }
+        }
+    }
+    cursor.delete?.();
     return declarations * 1000 + calls;
 }
 
@@ -586,7 +606,7 @@ function parseTree(parser, code) {
     const attributeSelected = best || tree;
     const attributeSource = bestCode || code;
     let selectedErrors = countParseErrors(attributeSelected.rootNode);
-    let selectedScore = treeStructureScore(attributeSelected);
+    let selectedScore = null;
     let conditionalApplied = false;
     // Conditional branches may contain matching braces separated across two
     // directives. Parse coherent feature configurations and prefer fewer
@@ -596,13 +616,22 @@ function parseTree(parser, code) {
             const candidate = safeParse(parser, candidateSource, undefined, PARSE_OPTIONS);
             liveTrees.add(candidate);
             const errors = countParseErrors(candidate.rootNode);
-            const score = treeStructureScore(candidate);
-            if (errors < selectedErrors ||
-                (errors === selectedErrors && score > selectedScore)) {
+            let score = null;
+            let improves = errors < selectedErrors;
+            if (errors === selectedErrors) {
+                if (selectedScore == null) {
+                    selectedScore = treeStructureScore(best || attributeSelected);
+                }
+                score = treeStructureScore(candidate);
+                improves = score > selectedScore;
+            }
+            if (improves) {
                 const previousBest = best;
                 best = candidate;
                 bestCode = candidateSource;
                 selectedErrors = errors;
+                // A strictly lower error count resets the tie baseline; defer
+                // its structural walk until a later equal-error candidate.
                 selectedScore = score;
                 conditionalApplied = true;
                 if (previousBest && previousBest !== tree) {
@@ -811,6 +840,16 @@ function enclosingClassName(node) {
     return identity?.ownerName || identity?.name || null;
 }
 
+function enclosingTypeScope(node) {
+    const identity = enclosingClass(node);
+    if (!identity?.node) return {};
+    return {
+        enclosingType: identity.ownerName || identity.name,
+        lexicalScopeStartLine: identity.node.startPosition.row + 1,
+        lexicalScopeEndLine: identity.node.endPosition.row + 1,
+    };
+}
+
 function enclosingNamespace(node) {
     const parts = [];
     for (let parent = node?.parent; parent; parent = parent.parent) {
@@ -968,6 +1007,111 @@ function structuredParams(paramsNode) {
     }
     if (result.length === 1 && result[0].name === 'void') return [];
     return result;
+}
+
+function skipLexicalRegion(code, index) {
+    if (code.startsWith('//', index)) {
+        const newline = code.indexOf('\n', index + 2);
+        return newline < 0 ? code.length : newline;
+    }
+    if (code.startsWith('/*', index)) {
+        const end = code.indexOf('*/', index + 2);
+        return end < 0 ? code.length : end + 2;
+    }
+    if (code.startsWith('R"', index)) {
+        const open = code.indexOf('(', index + 2);
+        if (open >= 0 && open - (index + 2) <= 16) {
+            const delimiter = code.slice(index + 2, open);
+            const close = code.indexOf(`)${delimiter}"`, open + 1);
+            if (close >= 0) return close + delimiter.length + 2;
+        }
+    }
+    const quote = code[index];
+    if (quote !== '"' && quote !== "'") return null;
+    for (let cursor = index + 1; cursor < code.length; cursor++) {
+        if (code[cursor] === '\\') cursor++;
+        else if (code[cursor] === quote) return cursor + 1;
+    }
+    return code.length;
+}
+
+function balancedTokenEnd(code, openIndex, openToken, closeToken) {
+    let depth = 0;
+    for (let index = openIndex; index < code.length; index++) {
+        const skipped = skipLexicalRegion(code, index);
+        if (skipped != null) {
+            index = skipped - 1;
+            continue;
+        }
+        if (code[index] === openToken) depth++;
+        else if (code[index] === closeToken && --depth === 0) return index + 1;
+    }
+    return null;
+}
+
+function cppConstructorBodyOpen(code, paramsEnd) {
+    let inInitializers = false;
+    let initializerComplete = false;
+    for (let index = paramsEnd; index < code.length; index++) {
+        const skipped = skipLexicalRegion(code, index);
+        if (skipped != null) {
+            index = skipped - 1;
+            continue;
+        }
+        const character = code[index];
+        if (!inInitializers) {
+            if (character === ':') {
+                inInitializers = true;
+                initializerComplete = false;
+            } else if (character === '{') {
+                return index;
+            } else if (character === ';' || character === '=') {
+                return null;
+            }
+            continue;
+        }
+        if (/\s/.test(character)) continue;
+        if (character === ',') {
+            initializerComplete = false;
+            continue;
+        }
+        if (character === '{' && initializerComplete) return index;
+        if (character === '(' || character === '{') {
+            const end = balancedTokenEnd(
+                code, index, character, character === '(' ? ')' : '}');
+            if (end == null) return null;
+            index = end - 1;
+            initializerComplete = true;
+            continue;
+        }
+        // After a complete mem-initializer, the only legal top-level tokens
+        // are a comma or the function body's opening brace. Attributes and
+        // comments were consumed above; ordinary identifier characters here
+        // belong to the next mem-initializer's name.
+    }
+    return null;
+}
+
+function functionRangeEnd(code, node, paramsNode, isConstructor, mode) {
+    if (node.type !== 'function_definition') return null;
+    const astBody = node.childForFieldName('body');
+    let open = astBody?.startIndex;
+    if (mode === 'cpp' && isConstructor && paramsNode) {
+        open = cppConstructorBodyOpen(code, paramsNode.endIndex) ?? open;
+    }
+    if (open == null || code[open] !== '{') return null;
+    return balancedTokenEnd(code, open, '{', '}');
+}
+
+function lineNumberAtIndex(lineStarts, index) {
+    let low = 0;
+    let high = lineStarts.length;
+    while (low + 1 < high) {
+        const mid = (low + high) >> 1;
+        if (lineStarts[mid] <= index) low = mid;
+        else high = mid;
+    }
+    return low + 1;
 }
 
 function returnTypeOf(node) {
@@ -1149,6 +1293,7 @@ function typedefEntries(node, lines) {
             indent,
             modifiers: ['public'],
             members: [],
+            ...enclosingTypeScope(node),
             ...(enclosingNamespace(node) && {
                 namespace: enclosingNamespace(node),
             }),
@@ -1191,6 +1336,7 @@ function findClassesInTree(code, tree, mode, sourceLines = null) {
                 indent,
                 modifiers: ['public'],
                 members: [],
+                ...enclosingTypeScope(node),
                 ...(enclosingNamespace(node) && {
                     namespace: enclosingNamespace(node),
                 }),
@@ -1282,8 +1428,13 @@ function findClasses(code, parser, mode) {
 
 function findFunctionsInTree(code, tree, mode, sourceLines = null) {
     const lines = sourceLines || code.split('\n');
+    const lineStarts = [0];
+    for (let index = 0; index < code.length; index++) {
+        if (code.charCodeAt(index) === 10) lineStarts.push(index + 1);
+    }
     const functions = [];
     const seen = new Set();
+    const variableTypes = mode === 'cpp' ? buildVariableTypes(tree) : null;
     traverseTreeCached(tree.rootNode, node => {
         if (!FUNCTION_CONTAINERS.has(node.type)) return true;
         const declarator = functionDeclarator(node);
@@ -1296,11 +1447,21 @@ function findFunctionsInTree(code, tree, mode, sourceLines = null) {
         if (seen.has(key)) return false;
         seen.add(key);
         const paramsNode = parameterListOf(declarator);
-        const { startLine, endLine, indent } = nodeToLocation(node, lines);
+        const location = nodeToLocation(node, lines);
+        const startLine = location.startLine;
+        const indent = location.indent;
         const isConstructor = mode === 'cpp' && !!identity.className &&
             (identity.name === identity.className || identity.name === `~${identity.className}`);
+        const lexicalEnd = functionRangeEnd(
+            code, node, paramsNode, isConstructor, mode);
+        const endLine = lexicalEnd == null
+            ? location.endLine
+            : lineNumberAtIndex(lineStarts, Math.max(0, lexicalEnd - 1));
         const modifiers = modifiersOf(node);
         if (!modifiers.includes('static')) modifiers.push('export');
+        const returnedConcreteType = mode === 'cpp' && variableTypes
+            ? inferredAutoReturnType(node, variableTypes)
+            : null;
         functions.push({
             name: identity.name,
             params: paramsNode ? paramsNode.text.replace(/^\(|\)$/g, '').trim() : '...',
@@ -1325,6 +1486,7 @@ function findFunctionsInTree(code, tree, mode, sourceLines = null) {
             ...(mode === 'cpp' && isTemplateDependentCallable(node) && {
                 templateDependent: true,
             }),
+            ...(returnedConcreteType && { returnedConcreteType }),
             ...(mode === 'cpp' && cLanguageLinkage(node) && {
                 linkage: cLanguageLinkage(node),
             }),
@@ -1335,6 +1497,82 @@ function findFunctionsInTree(code, tree, mode, sourceLines = null) {
         return false;
     });
     return functions;
+}
+
+/**
+ * C++ `auto` return deduction is compiler-exact when every return statement
+ * yields a local whose declared/inferred type agrees. This is intentionally
+ * narrower than expression type inference; unknown or mixed returns abstain.
+ */
+function inferredAutoReturnType(functionNode, variableTypes) {
+    const declared = returnTypeOf(functionNode);
+    if (!/^auto\b/.test(String(declared || '').trim())) return null;
+    const body = functionNode.childForFieldName('body');
+    if (!body) return null;
+    const autoBindings = [];
+    traverseTree(body, node => {
+        if (node !== body &&
+            (node.type === 'function_definition' ||
+             node.type === 'lambda_expression')) return false;
+        if (node !== body && CLASS_NODES.has(node.type)) return false;
+        if (node.type !== 'declaration') return true;
+        const typeNode = node.childForFieldName('type') ||
+            (node.namedChildren || []).find(child => TYPE_NODES.has(child.type));
+        if (typeName(typeNode) !== 'auto') return true;
+        const scope = variableBindingScope(node);
+        for (const declarator of variableDeclarators(node)) {
+            const identity = declaratorIdentity(declarator);
+            const value = declarator.childForFieldName('value');
+            if (!identity.name || value?.type !== 'call_expression') continue;
+            const callee = callIdentity(value.childForFieldName('function'));
+            if (!callee.name) continue;
+            autoBindings.push({
+                name: identity.name,
+                type: callee.name,
+                declaredAt: declarator.startIndex,
+                scopeStart: scope.startIndex,
+                scopeEnd: scope.endIndex,
+            });
+        }
+        return true;
+    });
+    const autoTypeAt = (name, node) => autoBindings
+        .filter(binding => binding.name === name &&
+            binding.scopeStart <= node.startIndex &&
+            node.startIndex < binding.scopeEnd &&
+            binding.declaredAt <= node.startIndex)
+        .sort((left, right) =>
+            (left.scopeEnd - left.scopeStart) -
+                (right.scopeEnd - right.scopeStart) ||
+            right.declaredAt - left.declaredAt)[0]?.type;
+    const types = [];
+    let incomplete = false;
+    const stack = [body];
+    while (stack.length > 0) {
+        const node = stack.pop();
+        if (node !== body &&
+            (node.type === 'function_definition' ||
+             node.type === 'lambda_expression')) continue;
+        if (node !== body && CLASS_NODES.has(node.type)) continue;
+        if (node.type === 'return_statement') {
+            let value = node.namedChild(0);
+            while (value?.type === 'parenthesized_expression') {
+                value = value.namedChild(0);
+            }
+            const type = value?.type === 'identifier'
+                ? (variableTypes.get(value.text, node) ||
+                    autoTypeAt(value.text, node))
+                : null;
+            if (type) types.push(type);
+            else incomplete = true;
+            continue;
+        }
+        for (let index = node.namedChildCount - 1; index >= 0; index--) {
+            stack.push(node.namedChild(index));
+        }
+    }
+    return !incomplete && types.length > 0 && new Set(types).size === 1
+        ? types[0] : null;
 }
 
 function findFunctions(code, parser, mode) {
@@ -1356,8 +1594,13 @@ function findStateObjectsInTree(tree, lines) {
     traverseTreeCached(tree.rootNode, node => {
         if (node.type !== 'declaration') return true;
         if (functionDeclarator(node)) return false;
-        const parentType = node.parent?.type;
-        if (parentType !== 'translation_unit' && parentType !== 'declaration_list') return false;
+        // A top-level declaration may be wrapped in one or more preprocessor
+        // condition nodes.  Treat those wrappers as transparent: both arms of
+        // an #if/#else remain part of the source inventory even though only
+        // one arm can exist in any particular build configuration.
+        let scope = node.parent;
+        while (scope && /^preproc_/.test(scope.type)) scope = scope.parent;
+        if (scope?.type !== 'translation_unit' && scope?.type !== 'declaration_list') return false;
         for (const child of node.namedChildren || []) {
             const identity = declaratorIdentity(child);
             if (!identity.name || TYPE_NODES.has(child.type)) continue;
@@ -1376,7 +1619,13 @@ function findStateObjectsInTree(tree, lines) {
 }
 
 function findStateObjects(code, parser) {
-    return findStateObjectsInTree(parseTree(parser, code), code.split('\n'));
+    const tree = parseTree(parser, code);
+    const lines = code.split('\n');
+    const primary = findStateObjectsInTree(tree, lines);
+    const literal = literalRecoveryTree(parser, code, tree);
+    return literal ? mergeExtracted(primary,
+        findStateObjectsInTree(literal, lines),
+        item => `${item.name}:${item.startLine}`) : primary;
 }
 
 function findMacrosInTree(tree, lines) {
@@ -1412,7 +1661,13 @@ function findMacrosInTree(tree, lines) {
 }
 
 function findMacros(code, parser) {
-    return findMacrosInTree(parseTree(parser, code), code.split('\n'));
+    const tree = parseTree(parser, code);
+    const lines = code.split('\n');
+    const primary = findMacrosInTree(tree, lines);
+    const literal = literalRecoveryTree(parser, code, tree);
+    return literal ? mergeExtracted(primary,
+        findMacrosInTree(literal, lines),
+        item => `${item.name}:${item.startLine}:${item.functionLike ? 1 : 0}`) : primary;
 }
 
 function enclosingFunctionOf(node) {
@@ -1760,7 +2015,7 @@ function callIdentity(fnNode) {
             fnNode.namedChildren[fnNode.namedChildCount - 1];
         const scopeNode = fnNode.childForFieldName('scope') || fnNode.namedChild(0);
         const globalQualified = fnNode.text.startsWith('::') &&
-            (!scopeNode || scopeNode === rawNameNode);
+            (!scopeNode || sameNode(scopeNode, rawNameNode));
         if (globalQualified) {
             return {
                 name: rawNameNode?.text,
@@ -2109,20 +2364,44 @@ function callIdentityKey(call) {
     ].join(':');
 }
 
+function attributeCallsToLexicalFunctions(calls, functions) {
+    const bodies = functions.filter(fn => !fn.isSignature)
+        .sort((a, b) =>
+            ((a.endLine - a.startLine) - (b.endLine - b.startLine)) ||
+            b.startLine - a.startLine);
+    for (const call of calls) {
+        const owner = bodies.find(fn =>
+            fn.startLine <= call.line && call.line <= fn.endLine);
+        if (!owner) continue;
+        call.enclosingFunction = {
+            name: owner.name,
+            startLine: owner.startLine,
+            endLine: owner.endLine,
+            ...(owner.className && { className: owner.className }),
+        };
+    }
+    return calls;
+}
+
 function findCallsInCode(code, parser, options = {}, existingTree = null,
-    includeMacroBodies = true) {
+    includeMacroBodies = true, mode = 'cpp') {
     // Synthetic macro-body parses and other explicit trees are already exact
     // views supplied by the caller.  Only whole-file extraction participates
     // in preprocessor-configuration conservation.
     if (existingTree) {
-        return findCallsInTree(
+        const calls = findCallsInTree(
             code, parser, options, existingTree, includeMacroBodies);
+        const functions = findFunctionsInTree(code, existingTree, mode);
+        return attributeCallsToLexicalFunctions(calls, functions);
     }
     const tree = parseTree(parser, code);
     const primary = findCallsInTree(
         code, parser, options, tree, includeMacroBodies);
     const literal = literalRecoveryTree(parser, code, tree);
-    if (!literal) return primary;
+    if (!literal) {
+        return attributeCallsToLexicalFunctions(
+            primary, findFunctionsInTree(code, tree, mode));
+    }
     try {
         const literalCalls = findCallsInTree(
             code, parser, options, literal, includeMacroBodies)
@@ -2130,7 +2409,13 @@ function findCallsInCode(code, parser, options = {}, existingTree = null,
         // Selected-configuration facts retain their stronger evidence.  Only
         // literal-only sites carry configurationVariant and are therefore
         // routed to the visible unverified tier by callers.js.
-        return mergeExtracted(primary, literalCalls, callIdentityKey);
+        const calls = mergeExtracted(primary, literalCalls, callIdentityKey);
+        const functions = mergeExtracted(
+            findFunctionsInTree(code, tree, mode),
+            findFunctionsInTree(code, literal, mode),
+            item => `${item.name}:${item.startLine}:${item.className || ''}:${item.isSignature ? 1 : 0}`,
+        );
+        return attributeCallsToLexicalFunctions(calls, functions);
     } finally { /* cached with the selected tree */ }
 }
 
@@ -2398,13 +2683,22 @@ function parse(code, parser, mode, options = {}) {
                 callIdentityKey,
             )
             : primaryCalls;
+        attributeCallsToLexicalFunctions(calls, functions);
         const result = {
             language: mode,
             totalLines: code.length === 0 ? 0 : lines.length,
             functions,
             classes,
-            stateObjects: findStateObjectsInTree(tree, lines),
-            macros: findMacrosInTree(tree, lines),
+            stateObjects: literal
+                ? mergeExtracted(findStateObjectsInTree(tree, lines),
+                    findStateObjectsInTree(literal, lines),
+                    item => `${item.name}:${item.startLine}`)
+                : findStateObjectsInTree(tree, lines),
+            macros: literal
+                ? mergeExtracted(findMacrosInTree(tree, lines),
+                    findMacrosInTree(literal, lines),
+                    item => `${item.name}:${item.startLine}:${item.functionLike ? 1 : 0}`)
+                : findMacrosInTree(tree, lines),
             imports,
             exports: [
                 ...functions
@@ -2448,7 +2742,8 @@ function createCFamilyLanguage(mode) {
         findClasses: (code, parser) => findClasses(code, parser, mode),
         findStateObjects,
         findMacros,
-        findCallsInCode,
+        findCallsInCode: (code, parser, options, existingTree, includeMacroBodies) =>
+            findCallsInCode(code, parser, options, existingTree, includeMacroBodies, mode),
         findImportsInCode,
         findExportsInCode: (code, parser) => findExportsInCodeShallow(code, parser, mode),
         findUsagesInCode,

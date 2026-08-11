@@ -3351,10 +3351,16 @@ function findExportsInCode(code, parser) {
                             for (let i = 0; i < rightNode.namedChildCount; i++) {
                                 const prop = rightNode.namedChild(i);
                                 if (prop.type === 'shorthand_property_identifier') {
-                                    exports.push({ name: prop.text, type: 'module.exports', line });
+                                    exports.push({ name: prop.text, localName: prop.text, type: 'module.exports', line });
                                 } else if (prop.type === 'pair') {
                                     const key = prop.childForFieldName('key');
-                                    if (key) exports.push({ name: key.text, type: 'module.exports', line });
+                                    const value = prop.childForFieldName('value');
+                                    if (key) exports.push({
+                                        name: key.text,
+                                        ...(value?.type === 'identifier' && { localName: value.text }),
+                                        type: 'module.exports',
+                                        line,
+                                    });
                                 } else if (prop.type === 'method_definition') {
                                     // Shorthand methods are exports too
                                     // (fix #252 — `module.exports =
@@ -3362,7 +3368,7 @@ function findExportsInCode(code, parser) {
                                     // export list, so deadcode audited a
                                     // require()-reachable function).
                                     const mName = prop.childForFieldName('name');
-                                    if (mName) exports.push({ name: mName.text, type: 'module.exports', line });
+                                    if (mName) exports.push({ name: mName.text, localName: mName.text, type: 'module.exports', line });
                                 } else if (prop.type === 'spread_element') {
                                     // CommonJS barrel: `module.exports = {
                                     // ...require('./public') }`. This is the
@@ -3396,7 +3402,7 @@ function findExportsInCode(code, parser) {
                             }
                         } else if (rightNode && rightNode.type === 'identifier') {
                             // module.exports = something
-                            exports.push({ name: rightNode.text, type: 'module.exports', line });
+                            exports.push({ name: rightNode.text, localName: rightNode.text, type: 'module.exports', line });
                         } else {
                             exports.push({ name: 'default', type: 'module.exports', line });
                         }
@@ -3406,7 +3412,13 @@ function findExportsInCode(code, parser) {
                     // exports.name = ...
                     if (objNode.text === 'exports') {
                         const line = node.startPosition.row + 1;
-                        exports.push({ name: propNode.text, type: 'exports', line });
+                        const rightNode = node.childForFieldName('right');
+                        exports.push({
+                            name: propNode.text,
+                            ...(rightNode?.type === 'identifier' && { localName: rightNode.text }),
+                            type: 'exports',
+                            line,
+                        });
                         return true;
                     }
 

@@ -23,11 +23,22 @@ test/public-repos-bugs.json
 test/public-repos-test.js
 test/agent-understanding-benchmark-report.json
 test/agent-understanding-benchmark-report.md
+test/agent-public-surface-benchmark-report.json
+test/agent-public-surface-benchmark-report.md
+test/real-repo-stress-analysis.js
+test/real-repo-stress-report.json
+test/real-repo-stress-report.md
+test/fixtures/**/obj/
 test/bug-hunting/
 
+# Internal audits/proposals are local working material; v5's published docs
+# remain the tracked README, MCP surface, and packaged agent skill.
+docs/
 
-# Eval reports: JSON snapshots are large/regenerable; markdown roll-ups are committed
+# Eval reports are reproducible run artifacts. Existing historical roll-ups remain
+# tracked, but new local runs must not leak into commits or release tarballs.
 eval/reports/*.json
+eval/reports/*.md
 
 # Compiler-oracle helper build products
 eval/oracles/roslyn-helper/bin/

@@ -37,6 +37,16 @@ jobs:
       - name: Install rust-analyzer (Rust release oracle)
         run: rustup component add rust-analyzer rust-src
 
+      - name: Install clangd 18 (C/C++ release oracle)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clangd-18
+          sudo ln -sf /usr/bin/clangd-18 /usr/local/bin/clangd
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 9.0.x
+
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
@@ -52,7 +62,7 @@ jobs:
       - run: npm ci
       - run: npm run lint
       - run: npm test
-      - name: Release trust gate (seven repos across five external oracles)
+      - name: Release trust gate (ten repos across seven external oracles)
         run: npm run trust:gate
 
   publish-npm:

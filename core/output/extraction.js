@@ -17,11 +17,11 @@ function formatFn(match, fnCode) {
     lines.push(`${match.relativePath}:${match.startLine}`);
     // Class attribution: three same-name `clear` methods under --all were
     // indistinguishable without their owning class (fix #248).
-    const sig = formatFunctionSignature(match);
-    const attributed = match.className && !sig.includes(`${match.className}.`)
-        ? `${match.className}.${sig}`
-        : sig;
-    lines.push(`${lineRange(match.startLine, match.endLine)} ${attributed}`);
+    const signatureTarget = match.className
+        ? { ...match, name: `${match.className}.${match.name}` }
+        : match;
+    const sig = formatFunctionSignature(signatureTarget);
+    lines.push(`${lineRange(match.startLine, match.endLine)} ${sig}`);
     lines.push('─'.repeat(60));
     lines.push(fnCode);
     return lines.join('\n');

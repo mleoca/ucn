@@ -61,7 +61,11 @@ function resultExitCode(command, result) {
     if (result && result.ok === false) return 2;
     if (command !== 'check' || !result) return 0;
     if (result.trust) {
-        return result.trust.status === 'READY_FOR_TOOLCHAIN' ? 0 : 1;
+        // Target-less pre-commit check distinguishes advisory review from a
+        // blocking validation failure. Export/reference review remains
+        // machine-readable in trust.status but does not make every ordinary
+        // body edit fail CI; incomplete accounts and signature drift do.
+        return result.trust.status === 'BLOCKED' ? 1 : 0;
     }
     // Symbol-mode check (verify): a mismatch or unresolved call-site tier is
     // review-required and must fail a CI gate.

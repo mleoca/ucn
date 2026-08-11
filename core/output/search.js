@@ -398,6 +398,11 @@ function formatTypedefJson(types, name) {
 function formatTests(tests, name) {
     const lines = [`Tests for "${name}":\n`];
 
+    for (const warning of tests?.warnings || []) {
+        lines.push(`Note: ${warning.message}`);
+    }
+    if (tests?.warnings?.length > 0) lines.push('');
+
     if (!tests || !Array.isArray(tests) || tests.length === 0) {
         lines.push('  (no statically linked tests found)');
     } else {
@@ -434,6 +439,7 @@ function formatTestsJson(tests, name) {
     const safe = Array.isArray(tests) ? tests : [];
     return JSON.stringify({
         query: name,
+        ...(safe.warnings?.length > 0 && { warnings: safe.warnings }),
         testFileCount: safe.length,
         totalMatches: safe.reduce((sum, t) => sum + (t.matches?.length || 0), 0),
         testFiles: safe

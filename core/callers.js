@@ -1127,8 +1127,10 @@ function findCallers(index, name, options = {}) {
                             } };
                         foldCtxCache.set(filePath, foldCtx);
                     }
-                    const flowEntry = _foldChainedReceiverType(index, fileEntry, filePath, call, foldCtx)
-                        || _nominalChainedReceiverType(index, call, fileEntry, filePath);
+                    const flowEntry = _foldChainedReceiverType(
+                        index, fileEntry, filePath, call, foldCtx) ||
+                        _nominalChainedReceiverType(
+                            index, call, fileEntry, filePath);
                     if (flowEntry && flowEntry.externalVia) {
                         call = {
                             ...call,
@@ -2692,6 +2694,12 @@ function findCallers(index, name, options = {}) {
                     !resolvedBySameClass &&
                     (!call.isPathCall || cppTypeQualifiedPath) &&
                     langTraits(fileEntry.language)?.typeSystem === 'nominal') {
+                    if (call.globalQualified &&
+                        targetDefs.length > 0 &&
+                        targetDefs.every(d => d.className || d.receiver)) {
+                        recordExcluded(filePath, call.line, 'global-qualified');
+                        continue;
+                    }
                     const targetHasClass = targetDefs.some(d => d.className);
                     if (call.isMethod && !targetHasClass) {
                         // Method call but target is a standalone function — skip
@@ -2925,7 +2933,10 @@ function findCallers(index, name, options = {}) {
                 const normalizedReceiverType = call.receiverType
                     ? (_aliasBaseAtOrigin(
                         index, call.receiverType,
-                        call.receiverTypeFlowFile || filePath) ||
+                        call.receiverTypeFlowFile || filePath,
+                        !call.receiverTypeFlowFile ||
+                            call.receiverTypeFlowFile === filePath
+                            ? call.line : undefined) ||
                         _pureAliasBase(index, call.receiverType) ||
                         call.receiverType)
                     : null;
@@ -2959,7 +2970,10 @@ function findCallers(index, name, options = {}) {
                         if (knownType) {
                             knownType = _aliasBaseAtOrigin(
                                 index, knownType,
-                                call.receiverTypeFlowFile || filePath) ||
+                                call.receiverTypeFlowFile || filePath,
+                                !call.receiverTypeFlowFile ||
+                                    call.receiverTypeFlowFile === filePath
+                                    ? call.line : undefined) ||
                                 _pureAliasBase(index, knownType) ||
                                 knownType;
                         }
@@ -3914,7 +3928,28 @@ function findCallers(index, name, options = {}) {
                     }
                     const tTypes = dispatchTargetTypes(targetDefs2);
                     const enclosingClass = callerSymbol && callerSymbol.className;
-                    if (enclosingClass && tTypes.has(enclosingClass)) {
+                    const lexicalOwnerTypes = new Set(
+                        enclosingClass ? [enclosingClass] : []);
+                    if (enclosingClass &&
+                        (fileEntry.language === 'java' ||
+                         fileEntry.language === 'csharp')) {
+                        let current = enclosingClass;
+                        const namespace = callerSymbol?.namespace || null;
+                        while (current) {
+                            const declaration = (index.symbols.get(current) || [])
+                                .find(symbol => IDENTITY_TYPE_KINDS.has(symbol.type) &&
+                                    symbol.file === filePath &&
+                                    (fileEntry.language !== 'csharp' ||
+                                     (symbol.namespace || null) === namespace));
+                            current = declaration?.enclosingType || null;
+                            if (current) lexicalOwnerTypes.add(current);
+                        }
+                    }
+                    // Nested Java/C# types have lexical access to static
+                    // members of every enclosing type. C# partial outer
+                    // classes may place that member in another file, but the
+                    // namespace+outer-type identity remains compiler-exact.
+                    if ([...lexicalOwnerTypes].some(owner => tTypes.has(owner))) {
                         resolvedBySameClass = true;
                     } else {
                         // C#/Java bare member lookup starts in the enclosing
@@ -6318,6 +6353,8 @@ function findCallees(index, definition, options = {}) {
         const callerIsTest = defFileEntry && isTestFile(defFileEntry.relativePath, defFileEntry.language);
         // Pre-compute import graph for callee confidence scoring
         const callerImportSet = index.importGraph.get(def.file) || new Set();
+        const cFamilyVisibleFiles = ['c', 'cpp'].includes(language)
+            ? _cppVisibleFiles(index, def.file) : null;
 
         for (const { name: calleeName, bindingId, count, isConstructor, sites, siteIds, isFunctionReference } of callees.values()) {
             const claimSites = (bucket, reason) => {
@@ -6333,37 +6370,56 @@ function findCallees(index, definition, options = {}) {
                 claimSites('external', null);
                 continue;
             }
-            if (symbols.length > 0) {
-                let callee = symbols[0];
+            // File-scope `static` C/C++ functions have internal linkage. A
+            // call in another source translation unit cannot bind to them,
+            // even when a name-only ranking would otherwise prefer that
+            // production definition over a test helper. A directly or
+            // transitively included file remains eligible: C projects often
+            // include a private `.c` file in white-box tests, making that
+            // static definition part of the test's translation unit.
+            const resolutionSymbols = symbols.filter(candidate => {
+                const candidateLanguage = index.files.get(candidate.file)?.language;
+                const fileLocalStatic = ['c', 'cpp'].includes(candidateLanguage) &&
+                    candidate.modifiers?.includes('static') &&
+                    !candidate.className && !candidate.receiver;
+                if (!fileLocalStatic || candidate.file === def.file) return true;
+                return cFamilyVisibleFiles?.has(candidate.file);
+            });
+            if (resolutionSymbols.length === 0) {
+                claimSites('external', null);
+                continue;
+            }
+            if (resolutionSymbols.length > 0) {
+                let callee = resolutionSymbols[0];
 
                 // If we have a binding ID, find the exact matching symbol
-                if (bindingId && symbols.length > 1) {
-                    const exactMatch = symbols.find(s => s.bindingId === bindingId);
+                if (bindingId && resolutionSymbols.length > 1) {
+                    const exactMatch = resolutionSymbols.find(s => s.bindingId === bindingId);
                     if (exactMatch) {
                         callee = exactMatch;
                     }
-                } else if (symbols.length > 1) {
+                } else if (resolutionSymbols.length > 1) {
                     // Priority 1: Same file, but different definition (for overloads)
-                    const sameFileDifferent = symbols.find(s => s.file === def.file && s.startLine !== def.startLine);
-                    const sameFile = symbols.find(s => s.file === def.file);
+                    const sameFileDifferent = resolutionSymbols.find(s => s.file === def.file && s.startLine !== def.startLine);
+                    const sameFile = resolutionSymbols.find(s => s.file === def.file);
                     if (sameFileDifferent && calleeName === def.name) {
                         callee = sameFileDifferent;
                     } else if (sameFile) {
                         callee = sameFile;
                     } else {
                         // Priority 2: Same directory (package)
-                        const sameDir = symbols.find(s => path.dirname(s.file) === defDir);
+                        const sameDir = resolutionSymbols.find(s => path.dirname(s.file) === defDir);
                         if (sameDir) {
                             callee = sameDir;
                         } else {
                             // Priority 2.5: Imported file — check if the caller's file imports
                             // from any of the candidate callee files (using importGraph)
-                            const importedCallee = symbols.find(s => callerImportSet.has(s.file));
+                            const importedCallee = resolutionSymbols.find(s => callerImportSet.has(s.file));
                             if (importedCallee) {
                                 callee = importedCallee;
                             } else if (defReceiver) {
                                 // Priority 3: Same receiver type (for methods)
-                                const sameReceiver = symbols.find(s => s.receiver === defReceiver);
+                                const sameReceiver = resolutionSymbols.find(s => s.receiver === defReceiver);
                                 if (sameReceiver) {
                                     callee = sameReceiver;
                                 }
@@ -6374,7 +6430,7 @@ function findCallees(index, definition, options = {}) {
                     if (!bindingId) {
                         const calleeFileEntry = index.files.get(callee.file);
                         if (calleeFileEntry && calleeFileEntry.isBundled) {
-                            const nonBundled = symbols.find(s => {
+                            const nonBundled = resolutionSymbols.find(s => {
                                 const fe = index.files.get(s.file);
                                 return fe && !fe.isBundled;
                             });
@@ -6382,10 +6438,10 @@ function findCallees(index, definition, options = {}) {
                         }
                     }
                     // Priority 5: If default is a test file, prefer non-test
-                    if (!bindingId) {
+                    if (!bindingId && !callerIsTest) {
                         const calleeFileEntry = index.files.get(callee.file);
                         if (calleeFileEntry && isTestFile(calleeFileEntry.relativePath, calleeFileEntry.language)) {
-                            const nonTest = symbols.find(s => {
+                            const nonTest = resolutionSymbols.find(s => {
                                 const fe = index.files.get(s.file);
                                 return fe && !isTestFile(fe.relativePath, fe.language);
                             });
@@ -6394,14 +6450,15 @@ function findCallees(index, definition, options = {}) {
                     }
                     // Priority 6: Usage-based tiebreaker for cross-language/cross-directory ambiguity
                     // Matches resolveSymbol() scoring logic in project.js
-                    if (!bindingId && callee === symbols[0] && symbols.length > 1) {
+                    if (!bindingId && callee === resolutionSymbols[0] && resolutionSymbols.length > 1) {
                         const typeOrder = new Set(['class', 'struct', 'interface', 'type', 'impl']);
-                        const scored = symbols.map(s => {
+                        const scored = resolutionSymbols.map(s => {
                             let score = 0;
                             const fe = index.files.get(s.file);
                             const rp = fe ? fe.relativePath : (s.relativePath || '');
                             if (typeOrder.has(s.type)) score += 1000;
-                            if (isTestFile(rp, detectLanguage(s.file))) score -= 500;
+                            if (!callerIsTest &&
+                                isTestFile(rp, detectLanguage(s.file))) score -= 500;
                             if (/^(examples?|docs?|vendor|third[_-]?party|benchmarks?|samples?)\//i.test(rp)) score -= 300;
                             if (/^(lib|src|core|internal|pkg|crates)\//i.test(rp)) score += 200;
                             return { symbol: s, score };
@@ -6451,7 +6508,7 @@ function findCallees(index, definition, options = {}) {
 
                 const calleeScored = scoreEdge({
                     hasBindingId: !!bindingId,
-                    hasImportEvidence: !!bindingId || (symbols && symbols.length === 1) ||
+                    hasImportEvidence: !!bindingId || resolutionSymbols.length === 1 ||
                         (callee.file === def.file) || callerImportSet.has(callee.file),
                     isUncertain: false, // uncertain callees already filtered above
                 });
@@ -7172,8 +7229,13 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
                         constructorFlow.externalConcrete);
                     continue;
                 }
-                returnType = !nominal && chosen.returnedConcreteType
-                    ? chosen.returnedConcreteType : chosen.returnType;
+                const compilerDeducedConcrete = language === 'cpp' &&
+                    /^auto\b/.test(String(chosen.returnType || '').trim())
+                    ? _cppAutoReturnConcreteType(index, chosen)
+                    : null;
+                returnType = compilerDeducedConcrete ||
+                    (!nominal && chosen.returnedConcreteType
+                        ? chosen.returnedConcreteType : chosen.returnType);
                 returnedFunctionResult = chosen.returnedFunctionResult;
                 fromFile = chosen.file;
                 returnDefinition = chosen;
@@ -8209,6 +8271,20 @@ function _nameBindingReaches(index, startAbs, name, targetFiles, maxDepth = 4) {
             const fe = index.files.get(abs);
             if (!fe) { unknown = true; continue; }
 
+            // A concrete local export shadows every transitive dependency of
+            // the same spelling. `module.exports = { helper }` in widgets.js
+            // makes widgets.helper the local helper even if widgets imports a
+            // different helper several hops below. Parser-provided localName
+            // keeps this proof limited to syntactically-owned CJS exports;
+            // dynamic assignments remain unknown.
+            const localExports = (fe.exportDetails || []).filter(e =>
+                !e.source && (e.alias || e.name) === attr && e.localName);
+            if (localExports.some(e => (index.symbols.get(e.localName) || [])
+                .some(definition => definition.file === abs &&
+                    !NON_CALLABLE_TYPES.has(definition.type)))) {
+                return 'no';
+            }
+
             const enqueue = (module, nextAttr) => {
                 const rel = fe.moduleResolved && fe.moduleResolved[module];
                 if (!rel) {
@@ -8950,14 +9026,33 @@ function _closeCallableIdentityGroup(index, targetDefs, definitions) {
  * disagree across modules; once an import pins one module, that module's
  * alias is compiler identity and can safely participate in exclusion.
  */
-function _aliasBaseAtOrigin(index, typeName, originFile) {
+function _aliasBaseAtOrigin(index, typeName, originFile, originLine = null) {
     if (!typeName || !originFile) return null;
     let current = typeName;
     const seen = new Set([current]);
     for (let hop = 0; hop < 4; hop++) {
-        const localDefs = (index.symbols.get(current) || []).filter(d =>
+        let localDefs = (index.symbols.get(current) || []).filter(d =>
             d.file === originFile &&
             (d.type === 'type' || IDENTITY_TYPE_KINDS.has(d.type)));
+        if (originLine != null && localDefs.length > 1) {
+            const scoped = localDefs.filter(d =>
+                d.lexicalScopeStartLine != null &&
+                d.lexicalScopeEndLine != null &&
+                d.lexicalScopeStartLine <= originLine &&
+                originLine <= d.lexicalScopeEndLine);
+            if (scoped.length > 0) {
+                const narrowest = Math.min(...scoped.map(d =>
+                    d.lexicalScopeEndLine - d.lexicalScopeStartLine));
+                localDefs = scoped.filter(d =>
+                    d.lexicalScopeEndLine - d.lexicalScopeStartLine === narrowest);
+            } else {
+                // Aliases declared in sibling classes/scopes are not visible
+                // merely because they share a source file and spelling.
+                localDefs = localDefs.filter(d =>
+                    d.lexicalScopeStartLine == null ||
+                    d.lexicalScopeEndLine == null);
+            }
+        }
         if (localDefs.length === 0) {
             return current === typeName ? null : current;
         }
@@ -9013,6 +9108,29 @@ function _pureAliasBase(index, typeName) {
         current = base;
     }
     return current;
+}
+
+/**
+ * Validate a parser-observed `auto local = Candidate(); return local;` as a
+ * C++ functional construction. The syntax can also call a factory function,
+ * so only a uniquely visible project type with no visible standalone
+ * callable of that spelling becomes return-type evidence.
+ */
+function _cppAutoReturnConcreteType(index, definition) {
+    const candidate = definition?.returnedConcreteType;
+    if (!candidate || !definition.file) return null;
+    const visible = _cppVisibleFiles(index, definition.file);
+    const symbols = index.symbols.get(candidate) || [];
+    const types = symbols.filter(symbol =>
+        IDENTITY_TYPE_KINDS.has(symbol.type) &&
+        (symbol.file === definition.file || visible.has(symbol.file)));
+    if (types.length === 0 ||
+        new Set(types.map(symbol => symbol.file)).size !== 1) return null;
+    const standalone = symbols.filter(symbol =>
+        !NON_CALLABLE_TYPES.has(symbol.type) &&
+        !symbol.className && !symbol.receiver &&
+        (symbol.file === definition.file || visible.has(symbol.file)));
+    return standalone.length === 0 ? candidate : null;
 }
 
 // Does the qualifier of a Go pkg.Type field annotation name one of the
@@ -10285,6 +10403,7 @@ function _csharpExtensionCallMatches(index, filePath, fileEntry, call, targetDef
  * plain callable — unknown never excludes.
  */
 function _callArityCompatible(call, targetDefs, language) {
+    if (call?.argCount == null) return true;
     const traits = langTraits(language);
     const selfNames = new Set((traits?.selfParam || [])
         .map(s => String(s).replace(/&|mut\s*/g, '').trim()));
@@ -12116,6 +12235,19 @@ function _nominalChainedReceiverType(index, call, fileEntry, filePath) {
         producer = chosen;
     }
     const selfClass = producer.className || (producer.receiver || '').replace(/^\*/, '') || undefined;
+    if (language === 'cpp') {
+        const concrete = _cppAutoReturnConcreteType(index, producer);
+        if (concrete) {
+            const origin = _resolveFlowTypeOrigin(
+                index, producer.file || filePath, concrete);
+            if (origin) {
+                return {
+                    type: concrete,
+                    ...(origin.fromFile && { fromFile: origin.fromFile }),
+                };
+            }
+        }
+    }
     const parsed = _returnTypeNameNominal(producer.returnType, language, { selfClass });
     if (!parsed) return null;
     const origin = _resolveFlowTypeOrigin(index, producer.file || filePath, parsed.name, parsed.qualifier);
@@ -13039,6 +13171,19 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
     }
     if (!chosen || !chosen.returnType) return null;
     if (nominal) {
+        if (language === 'cpp') {
+            const concrete = _cppAutoReturnConcreteType(index, chosen);
+            if (concrete) {
+                const origin = _resolveFlowTypeOrigin(
+                    index, chosen.file || filePath, concrete);
+                if (origin) {
+                    return {
+                        type: concrete,
+                        ...(origin.fromFile && { fromFile: origin.fromFile }),
+                    };
+                }
+            }
+        }
         const parsed = _returnTypeNameNominal(chosen.returnType, language, {});
         if (!parsed) return null;
         const origin = _resolveFlowTypeOrigin(index, chosen.file || filePath, parsed.name, parsed.qualifier);
@@ -13278,4 +13423,4 @@ function findCallbackUsages(index, name) {
     return usages;
 }
 
-module.exports = { getCachedCalls, findCallers, findCallees, getInstanceAttributeTypes, findCallbackUsages, _nameBindingReaches, _declaredFieldType, _projectTopLevelNames };
+module.exports = { getCachedCalls, findCallers, findCallees, getInstanceAttributeTypes, findCallbackUsages, _nameBindingReaches, _declaredFieldType, _projectTopLevelNames, _callArityCompatible, _closeCallableIdentityGroup };

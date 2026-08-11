@@ -301,7 +301,7 @@ function context(index, name, options = {}) {
     // Special handling for class/struct/interface types
     if (['class', 'struct', 'interface', 'type', 'enum', 'record', 'trait', 'namespace']
         .includes(def.type)) {
-        const methods = index.findMethodsForType(name);
+        const methods = index.findMethodsForType(name, def);
         const members = (index.files.get(def.file)?.symbols || []).filter(symbol =>
             symbol.className === def.name &&
             ['field', 'constant', 'state'].includes(symbol.type));
@@ -917,7 +917,7 @@ function related(index, name, options = {}) {
 function impact(index, name, options = {}) {
     index._beginOp();
     try {
-    const { def } = index.resolveSymbol(name, { file: options.file, className: options.className, line: options.line });
+    const { def, warnings } = index.resolveSymbol(name, { file: options.file, className: options.className, line: options.line });
     if (!def) {
         return null;
     }
@@ -1233,7 +1233,8 @@ function impact(index, name, options = {}) {
                 sites: [...sites].sort((s1, s2) => (s1.line || 0) - (s2.line || 0))
             })),
         patterns,
-        scopeWarning
+        scopeWarning,
+        ...(warnings.length > 0 && { warnings }),
     };
     } finally { index._endOp(); }
 }

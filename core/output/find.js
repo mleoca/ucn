@@ -26,7 +26,7 @@ function firstSentenceShort(text) {
 /**
  * Format find command output
  */
-function formatFind(symbols, query, top) {
+function formatFind(symbols, query, top = undefined) {
     if (symbols.length === 0) {
         return `No symbols found for "${query}"`;
     }
@@ -55,13 +55,21 @@ function formatFind(symbols, query, top) {
         if (s.usageCounts !== undefined) {
             const c = s.usageCounts;
             const parts = [];
-            if (c.calls > 0) parts.push(`${c.calls} calls`);
+            if (c.calls > 0 && c.confirmedCalls !== undefined) {
+                const tiers = [];
+                if (c.confirmedCalls > 0) tiers.push(`${c.confirmedCalls} confirmed`);
+                if (c.unverifiedCalls > 0) tiers.push(`${c.unverifiedCalls} unverified`);
+                parts.push(`${c.calls} target call candidate(s) (${tiers.join(', ')})`);
+            } else if (c.calls > 0) parts.push(`${c.calls} calls`);
             if (c.definitions > 0) parts.push(`${c.definitions} def`);
             if (c.imports > 0) parts.push(`${c.imports} imports`);
             if (c.references > 0) parts.push(`${c.references} refs`);
+            const excluded = c.otherTargetCalls > 0
+                ? `; ${c.otherTargetCalls} same-name call(s) excluded as another target`
+                : '';
             lines.push(parts.length > 0
-                ? `  (${c.total} usages: ${parts.join(', ')})`
-                : `  (${c.total} usages)`);
+                ? `  (${c.total} usages: ${parts.join(', ')}${excluded})`
+                : `  (${c.total} usages${excluded})`);
         } else if (s.usageCount !== undefined) {
             lines.push(`  (${s.usageCount} usages)`);
         }
@@ -185,7 +193,12 @@ function formatFindDetailed(symbols, query, options = {}) {
         if (s.usageCounts !== undefined) {
             const c = s.usageCounts;
             const parts = [];
-            if (c.calls > 0) parts.push(`${c.calls} calls`);
+            if (c.calls > 0 && c.confirmedCalls !== undefined) {
+                const tiers = [];
+                if (c.confirmedCalls > 0) tiers.push(`${c.confirmedCalls} confirmed`);
+                if (c.unverifiedCalls > 0) tiers.push(`${c.unverifiedCalls} unverified`);
+                parts.push(`${c.calls} target call candidate(s) (${tiers.join(', ')})`);
+            } else if (c.calls > 0) parts.push(`${c.calls} calls`);
             if (c.definitions > 0) parts.push(`${c.definitions} def`);
             if (c.imports > 0) parts.push(`${c.imports} imports`);
             if (c.references > 0) parts.push(`${c.references} refs`);
@@ -194,7 +207,10 @@ function formatFindDetailed(symbols, query, options = {}) {
             const boundary = c.complete === false
                 ? '; references not counted — use usages for the full inventory'
                 : '';
-            lines.push(`  (${c.total} ${scope}${label}: ${parts.join(', ')}${boundary})`);
+            const excluded = c.otherTargetCalls > 0
+                ? `; ${c.otherTargetCalls} same-name call(s) excluded as another target`
+                : '';
+            lines.push(`  (${c.total} ${scope}${label}: ${parts.join(', ')}${boundary}${excluded})`);
         } else if (s.usageCount !== undefined) {
             lines.push(`  (${s.usageCount} usages)`);
         }

@@ -275,7 +275,7 @@ describe('blast: transitive blast radius', () => {
         }
     });
 
-    it('module-level callers are skipped (no crash)', () => {
+    it('module-level callers are preserved as synthetic scope nodes', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
@@ -285,9 +285,9 @@ describe('blast: transitive blast radius', () => {
             const index = idx(dir);
             const result = index.blast('helper', { depth: 2 });
             assert.ok(result, 'should not crash');
-            // Module-level caller (val = helper()) should be filtered out
-            assert.strictEqual(result.tree.children.length, 0,
-                'module-level caller should be skipped');
+            assert.strictEqual(result.tree.children.length, 1);
+            assert.equal(result.tree.children[0].name, '(module/anonymous scope)');
+            assert.equal(result.treeAccount.confirmedEdges, 1);
         } finally {
             rm(dir);
         }

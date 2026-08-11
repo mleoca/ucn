@@ -2771,7 +2771,7 @@ describe('formatOrient', () => {
         };
         const text = formatOrient(mock);
         assert.ok(text.includes('PROJECT ORIENTATION — /p'));
-        assert.ok(text.includes('3 files · 12 symbols · javascript 83%, python 17%'));
+        assert.ok(text.includes('3 files · 12 symbols · language mix by symbols: javascript 83%, python 17%'));
         assert.ok(text.includes('TOP DIRS'));
         assert.ok(text.includes('HOT (most-called production functions, top 1 of 4):'));
         assert.ok(text.includes('run — 7 call(s) · src/a.js:3'));

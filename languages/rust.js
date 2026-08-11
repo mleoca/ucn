@@ -1277,6 +1277,7 @@ function extractImplMembers(implNode, codeOrLines, typeName) {
     const members = [];
     const bodyNode = implNode.childForFieldName('body');
     if (!bodyNode) return members;
+    const implAttributes = extractAttributes(implNode, codeOrLines);
 
     for (let i = 0; i < bodyNode.namedChildCount; i++) {
         const child = bodyNode.namedChild(i);
@@ -1310,6 +1311,9 @@ function extractImplMembers(implNode, codeOrLines, typeName) {
                 if (firstLine.includes('const fn')) modifiers.push('const');
                 if (firstLine.includes('extern ')) modifiers.push('extern');
                 for (const attr of attributes) modifiers.push(attr);
+                for (const attr of implAttributes) {
+                    if (!modifiers.includes(attr)) modifiers.push(attr);
+                }
                 if (inCfgTest) modifiers.push('cfg_test_module');
 
                 const memberGenerics = extractGenerics(child);

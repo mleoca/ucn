@@ -753,6 +753,9 @@ function formatImpact(impact, options = {}) {
     if (!compact) lines.push('═'.repeat(60));
     lines.push(`${impact.file}:${impact.startLine}`);
     if (!compact) lines.push(impact.signature);
+    for (const warning of impact.warnings || []) {
+        lines.push(`Note: ${warning.message}`);
+    }
     if (!compact) lines.push('');
 
     // Summary (confirmed + unverified tiers reported separately)

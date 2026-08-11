@@ -86,20 +86,23 @@ function _aggregateExcluded(treeAccount, raw) {
 function _resolveCallerEntries(index, callers, exclude) {
     const uniqueCallers = new Map();
     for (const c of callers) {
-        if (!c.callerName) continue; // skip module-level code
         if (exclude.length > 0 && !index.matchesFilters(c.relativePath, { exclude })) continue;
-        const callerKey = c.callerStartLine
+        const hasNamedCaller = !!c.callerName;
+        const callerName = c.callerName || '(module/anonymous scope)';
+        const callerStartLine = hasNamedCaller ? c.callerStartLine : c.line;
+        const callerKey = hasNamedCaller && c.callerStartLine
             ? `${c.callerFile}:${c.callerStartLine}`
-            : `${c.callerFile}:${c.callerName}`;
+            : `${c.callerFile}:${callerName}:${callerStartLine || c.line || 0}`;
         if (!uniqueCallers.has(callerKey)) {
             uniqueCallers.set(callerKey, {
-                name: c.callerName,
+                name: callerName,
                 file: c.callerFile,
                 relativePath: c.relativePath,
-                startLine: c.callerStartLine,
-                endLine: c.callerEndLine,
+                startLine: callerStartLine,
+                endLine: hasNamedCaller ? c.callerEndLine : c.line,
                 callSites: 1,
                 reason: c.reason,
+                syntheticScope: !hasNamedCaller,
             });
         } else {
             uniqueCallers.get(callerKey).callSites++;
@@ -121,6 +124,7 @@ function _resolveCallerEntries(index, callers, exclude) {
                 type: 'function'
             };
         }
+        if (caller.syntheticScope) callerDef.syntheticScope = true;
         callerEntries.push({ def: callerDef, callSites: caller.callSites, reason: caller.reason });
     }
 
@@ -730,7 +734,7 @@ function reverseTrace(index, name, options = {}) {
                 // At depth limit: check if this node is an entry point
                 treeAccount.depthLimitNodes++;
                 const tiers = nodeCallers(funcDef, false);
-                if (tiers.confirmed.filter(c => c.callerName).length === 0) {
+                if (tiers.confirmed.length === 0) {
                     if (tiers.unverified.length === 0 && tiers.recursive.length === 0) {
                         node.entryPoint = true;
                         entryPoints.push({ name: funcDef.name, file: funcDef.relativePath, line: funcDef.startLine });
@@ -749,7 +753,10 @@ function reverseTrace(index, name, options = {}) {
 
         // Also mark root as entry point if it has no callers in either tier
         if (tree && tree.children.length === 0 && maxDepth > 0) {
-            if (rootUnverifiedCount === 0 && !tree.selfRecursive) {
+            const rootConfirmedCount = rootRaw
+                ? rootRaw.filter(c => c.tier !== 'unverified').length
+                : 0;
+            if (rootConfirmedCount === 0 && rootUnverifiedCount === 0 && !tree.selfRecursive) {
                 tree.entryPoint = true;
                 entryPoints.push({ name: def.name, file: def.relativePath, line: def.startLine });
             } else {

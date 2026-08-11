@@ -12,7 +12,7 @@ const { dirname: pathDirname } = path;
 const { isTestFile } = require('./discovery');
 const { isFrameworkEntrypoint } = require('./entrypoints');
 const { splitParentList } = require('./graph-build');
-const { isOverrideMarked, codeUnitCompare, lineInRanges, maskBlockComments } = require('./shared');
+const { isOverrideMarked, codeUnitCompare, lineInRanges, maskBlockComments, escapeRegExp } = require('./shared');
 const { projectComputedDispatch } = require('./ast-analysis');
 
 const _CLASS_KINDS = ['class', 'struct', 'interface', 'trait', 'record'];
@@ -22,6 +22,45 @@ const _CLASS_KINDS = ['class', 'struct', 'interface', 'trait', 'record'];
 // impl block belongs to its struct — the struct claim covers it); 'type'
 // aliases and macros stay out (deferred — each is its own claim family).
 const CLASS_AUDIT_KINDS = ['class', 'struct', 'interface', 'trait', 'record', 'enum', 'namespace'];
+
+// These Python decorators change descriptor/call syntax, but do not register
+// the callable with an external runtime. They therefore remain eligible for a
+// name/usage-based dead-code proof. Every other unknown decorator/annotation
+// stays conservative: it may be the only evidence of framework registration.
+const _NON_REGISTERING_DECORATORS = new Set([
+    'property',
+    'classmethod',
+    'staticmethod',
+]);
+
+function _decoratorName(value) {
+    const raw = typeof value === 'string'
+        ? value
+        : value?.name || value?.decorator || value?.annotation || value?.attribute;
+    if (!raw) return null;
+    return String(raw).trim().replace(/^@/, '').split('(')[0].trim();
+}
+
+function hasUnknownRegistrationDecorator(symbol) {
+    const values = [
+        symbol.decorators,
+        symbol.decoratorsWithArgs,
+        symbol.annotationsWithArgs,
+        symbol.attributesWithArgs,
+    ].flatMap(items => Array.isArray(items) ? items : []);
+
+    return values.some(value => {
+        const qualified = _decoratorName(value);
+        if (!qualified) return false;
+        const bare = qualified.split(/\.|::/).pop();
+        if (_NON_REGISTERING_DECORATORS.has(bare)) return false;
+        // `@name.getter`, `@name.setter`, and `@name.deleter` install an
+        // accessor on an already local property; they are not external
+        // framework registration boundaries.
+        if (['getter', 'setter', 'deleter'].includes(bare)) return false;
+        return true;
+    });
+}
 
 /** Strip a base-type expression to its bare name: `Mapping[str, int]`→Mapping, `java.util.List<Foo>`→List, `a::b::C`→C. */
 function _bareBaseName(raw) {
@@ -251,10 +290,22 @@ function nameOnlySelfRecursive(index, name) {
             const def = containing[0];
             const enc = call.enclosingFunction;
 
+            // Same spelling and lexical containment do not make an overload
+            // recursive. Nominal compilers bind by signature: render() calling
+            // render("x", 2) reaches its sibling overload, so treating that
+            // edge as self-recursion creates a false-dead deletion claim.
+            const { _callArityCompatible } = require('./callers');
+            const language = index.files.get(f)?.language;
+            if (!_callArityCompatible(call, [def], language)) return false;
+
             // A class constructed only inside its own otherwise-unreachable
             // impl/class body is not made externally live by that cycle.
             if ((def.type === 'impl' || _CLASS_KINDS.includes(def.type) ||
                 CLASS_AUDIT_KINDS.includes(def.type)) && call.isConstructor) {
+                // Java enum constants invoke their matching constructor by
+                // language definition. That is compiler-required wiring, not
+                // the constructor recursively calling itself.
+                if (call.enumConstant) return false;
                 continue;
             }
             if (!enc || enc.name !== def.name ||
@@ -266,7 +317,6 @@ function nameOnlySelfRecursive(index, name) {
             // "self recursion". Only receiver-less standalone functions and
             // explicit self/this receivers pinned to the same class qualify.
             if (def.className) {
-                const language = index.files.get(f)?.language;
                 const nominalUnqualified = !call.isMethod && !call.receiver &&
                     langTraits(language)?.typeSystem === 'nominal';
                 if (!nominalUnqualified &&
@@ -939,8 +989,12 @@ function deadcode(index, options = {}) {
                             // Skip if inside a string literal — EXCEPT class-
                             // kind names in Python (fix #253a): `x: "Foo"`
                             // forward references are real type references.
+                            const rustAttributePath = fileEntry.language === 'rust' &&
+                                /^\s*#\[\s*serde\s*\(/.test(line) &&
+                                new RegExp(`\\b(?:serialize_with|deserialize_with|default|with)\\s*=\\s*["'][^"']*\\b${escapeRegExp(name)}\\b`).test(line);
                             if (isInsideString(line, pos, fileEntry.language) &&
-                                !(fileEntry.language === 'python' && classKindNames.has(name))) continue;
+                                !(fileEntry.language === 'python' && classKindNames.has(name)) &&
+                                !rustAttributePath) continue;
                             // Property/field access (preceded by '.'), not a
                             // call: resolve the RECEIVER (fix #216, express-
                             // measured false-dead — `app.all(route, user.load)`
@@ -1113,7 +1167,6 @@ function deadcode(index, options = {}) {
             if (symbol.bodyScopedName) {
                 continue;
             }
-
             const fileEntry = index.files.get(symbol.file);
             const lang = fileEntry?.language;
 
@@ -1128,7 +1181,17 @@ function deadcode(index, options = {}) {
             // binding, so they are outside this audit rather than false
             // deletion candidates.
             if (/^operator(?:\b|[^a-zA-Z0-9_$])/.test(symbol.name) ||
-                symbol.name === 'this[]') {
+                symbol.name === 'this[]' ||
+                ((lang === 'c' || lang === 'cpp') && symbol.name.startsWith('~'))) {
+                continue;
+            }
+
+            // Rust procedural-macro runtime surfaces are invoked outside the
+            // source call graph. PyO3 exposes every #[pymethods] member to
+            // CPython and invokes #[pymodule_init] from generated module glue.
+            if (lang === 'rust' && (symbol.modifiers || []).some(modifier =>
+                modifier === 'pymethods' || modifier === 'pymodule_init')) {
+                excludedRuntimeContract++;
                 continue;
             }
 
@@ -1171,18 +1234,45 @@ function deadcode(index, options = {}) {
                 continue;
             }
 
+            // Explicit interface implementations are compiler-required and
+            // are normally invoked only through the interface, so a name scan
+            // cannot observe their liveness. Removing one breaks the type's
+            // contract (CS0535); classify it with other external contracts.
+            if (lang === 'csharp' && symbol.explicitInterface) {
+                excludedExternalContract++;
+                continue;
+            }
+
             // Framework entry point detection — excluded by default to reduce noise
             // Detects decorator/annotation patterns (Python, Java, Rust, JS/TS) and
             // call-pattern-based registration (Express routes, Gin handlers, etc.)
             // These functions are invoked by frameworks, not by user code.
             const hasFrameworkEntrypoint = isFrameworkEntrypoint(symbol, index);
+            const hasDecoratorMetadata = hasUnknownRegistrationDecorator(symbol);
 
-            if (hasFrameworkEntrypoint && !options.includeDecorated) {
+            // Unknown decorators are conservative runtime-registration
+            // boundaries. A decorator necessarily consumes/replaces the
+            // callable, and framework registries commonly invoke it without
+            // a textual name reference. The curated detector adds labels,
+            // but must never be the safety boundary for deletion claims.
+            if ((hasFrameworkEntrypoint || hasDecoratorMetadata) &&
+                !options.includeDecorated) {
                 excludedDecorated++;
                 continue;
             }
 
             const isExported = symbolIsExported(index, symbol, fileEntry);
+
+            // `target.onmessage = function ...` / `target.onopen = (...) =>`
+            // is itself the runtime registration. The assigned function has
+            // no free name that could produce a later usage record, so a zero
+            // name count is not deletion evidence. CommonJS export assignments
+            // use the same syntax shape but remain auditable when the caller
+            // explicitly enables exported-surface review.
+            if (symbol.memberAssigned && !symbol.registryMember && !isExported) {
+                excludedRuntimeContract++;
+                continue;
+            }
 
             // Skip exported unless requested
             if (isExported && !options.includeExported) {
@@ -1224,7 +1314,8 @@ function deadcode(index, options = {}) {
                 if (members.some(m => langModule.isEntryPoint?.(m))) {
                     continue;
                 }
-                if (members.some(m => isFrameworkEntrypoint(m, index))) {
+                if (members.some(m => isFrameworkEntrypoint(m, index) ||
+                    hasUnknownRegistrationDecorator(m))) {
                     if (!options.includeDecorated) {
                         excludedDecorated++;
                         continue;

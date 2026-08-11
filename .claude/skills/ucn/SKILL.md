@@ -34,7 +34,8 @@ the same text budget: targeted commands default to 10K output characters,
 broad commands to 3K, with a 100K hard ceiling. Use CLI `--max-chars`, MCP
 `max_chars`, a narrower file/directory scope, or a smaller section projection
 when necessary. Truncation must retain the accounting/contract lines needed to
-interpret the answer.
+interpret the answer, and the requested limit includes both the notice and the
+preserved metadata.
 
 Persistent indexes live in a per-user, project-keyed cache rather than the analyzed repository. Set `UCN_CACHE_DIR` to override the cache root; CLI `--no-cache` bypasses persistence and `--clear-cache` removes the current project's cache. Legacy `<project>/.ucn-cache` directories are migrated on first use.
 
@@ -57,6 +58,11 @@ For caller-bearing `show`, `impact`, `trace`, `tests`, and `check` views:
 - `FILTERED` means query options hid evidence.
 
 An observed-text zero is not semantic zero or safe-delete proof. Numeric evidence values are ordinal ranking weights, not probabilities.
+
+When a plain name selects more than one definition, action-oriented commands
+(`impact`, `tests`, `check`, and `plan`) carry the same ambiguity warning as
+`show`/`source`/`trace`. Prefer a stable handle; never treat the auto-selected
+definition as an implicit repository-wide target.
 
 ## Choose a command
 
@@ -93,12 +99,18 @@ An observed-text zero is not semantic zero or safe-delete proof. Numeric evidenc
 
 ## Deletion protocol
 
-Treat `deadcode` as a candidate generator. Before deletion, inspect `usages`, `impact`, `entrypoints`, `api`, and `repo --sections=health --deep`; then corroborate with the compiler/type checker and tests. Computed dispatch such as `handlers[key]()` is a reported blind spot; registry members reached by a modeled computed receiver are withheld, but all remaining candidates are still review-only. Never delete solely from `deadcode` or an observed-text-zero result.
+Treat `deadcode` as a candidate generator. Before deletion, inspect `usages`, `impact`, `entrypoints`, `api`, and `repo --sections=health --deep`; then corroborate with the compiler/type checker and tests. Computed dispatch such as `handlers[key]()` is a reported blind spot; registry members reached by a modeled computed receiver are withheld. Unknown decorators/annotations and member-assigned event handlers are also withheld by default because they can be the registration itself. All remaining candidates are still review-only. Never delete solely from `deadcode` or an observed-text-zero result.
 
 `usages` includes comment/string/docstring occurrences in an `OTHER TEXT` section unless
 `--code-only` is set. This is a literal-name inventory, not exact target
 binding. `search` treats its term literally by default; pass `--regex` only
-when regular-expression semantics are intended.
+when regular-expression semantics are intended. Ordinary regex patterns run
+through an RE2-compatible linear-time engine; unsafe nested repetition is
+rejected, and unsupported advanced syntax should be handed to ripgrep.
+
+`find` activity counts are definition-pinned: confirmed plus visible unverified
+call candidates. Calls proved to belong to another same-name target are
+disclosed separately and excluded from the activity total.
 
 `plan` always includes the selected declaration plus indexed call/import/export
 previews. Read `changeSummary`, and manually review any edit marked

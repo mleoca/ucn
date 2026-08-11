@@ -74,6 +74,8 @@ describe('Oracle contract', () => {
                 'Parent construct_parent() { return Parent(); }',
                 'template <typename T> void dependent_target(T);',
                 'template <typename T> void dependent_use(T value) { dependent_target(value); }',
+                'typedef struct { int value; } AnonymousAlias;',
+                'typedef struct NamedRecord { int value; } NamedRecord;',
             ].join('\n'),
             'third_party/bundled.cpp': 'void bundled_target() {}',
         });
@@ -104,6 +106,14 @@ describe('Oracle contract', () => {
             assert.ok(parent, 'clangd should enumerate the parent class');
             assert.ok(!symbols.some(symbol => symbol.line === 7),
                 'macro-generated declarations are not source symbols');
+            assert.ok(!symbols.some(symbol => symbol.name === 'struct'),
+                'anonymous records do not become a synthetic `struct` symbol');
+            assert.ok(symbols.some(symbol =>
+                symbol.name === 'AnonymousAlias' && symbol.line === 143),
+            'anonymous typedefs remain available by their source alias');
+            assert.deepEqual(symbols.filter(symbol =>
+                symbol.name === 'NamedRecord').map(symbol => symbol.line), [144],
+            'a named typedef record is sampled once at its declaration');
             assert.ok(!symbols.some(symbol =>
                 symbol.name === 'bundled_target'),
             'repository oracle exclusions keep vendored targets off the board');

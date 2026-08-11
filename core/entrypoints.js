@@ -1201,8 +1201,8 @@ function detectEntrypoints(index, options = {}) {
         const raw = Array.isArray(options.exclude) ? options.exclude : options.exclude.split(',');
         const patterns = raw.map(s => s.trim()).filter(Boolean);
         if (patterns.length > 0) {
-            const regexes = patterns.map(p => new RegExp(`(^|[/._-])${p}s?([/._-]|$)`, 'i'));
-            filtered = filtered.filter(e => !regexes.some(r => r.test(e.file)));
+            filtered = filtered.filter(e =>
+                index.matchesFilters(e.file, { exclude: patterns }));
         }
     }
 

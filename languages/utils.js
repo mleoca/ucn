@@ -653,6 +653,7 @@ function findMatchesWithASTFilter(content, term, parser, options = {}) {
 
     // Default: regex mode ON. Use raw pattern unless regex=false.
     let regex;
+    const compiledRegex = options.compiledRegex || null;
     const flags = options.caseSensitive ? 'g' : 'gi';
     if (options.regex !== false) {
         try { regex = new RegExp(term, flags); } catch (e) { regex = new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags); }
@@ -663,6 +664,20 @@ function findMatchesWithASTFilter(content, term, parser, options = {}) {
     lines.forEach((line, idx) => {
         const lineNum = idx + 1;
         let match;
+
+        if (compiledRegex) {
+            const matcher = compiledRegex.matcher(line);
+            while (matcher.find()) {
+                const column = matcher.start();
+                if (options.codeOnly) {
+                    const tokenType = getTokenTypeAtPosition(tree.rootNode, lineNum, column);
+                    if (tokenType !== 'code') continue;
+                }
+                matches.push({ line: lineNum, content: line, column });
+                break; // Result contract is one record per matching line.
+            }
+            return;
+        }
 
         // Reset regex for each line
         regex.lastIndex = 0;

@@ -53,7 +53,8 @@ const NESTING_NODES = new Set([
 const LITERAL_INDEX_NODES = new Set([
     'string', 'string_literal', 'raw_string_literal', 'interpreted_string_literal',
     'character', 'char_literal',
-    'number', 'integer', 'integer_literal', 'float', 'float_literal',
+    'number', 'integer', 'integer_literal', 'int_literal',
+    'number_literal', 'decimal_integer_literal', 'float', 'float_literal',
     'true', 'false', 'null', 'none',
 ]);
 
@@ -191,6 +192,13 @@ function computedDispatchSites(content, language) {
         const tree = safeParse(parser, content);
         const sites = [];
         const seen = new Set();
+        const selectedByLocal = new Map();
+        const calledLocals = new Set();
+        const scopeKey = node => {
+            let current = node?.parent;
+            while (current && !CALLABLE_NODES.has(current.type)) current = current.parent;
+            return current ? `${current.startIndex}:${current.endIndex}` : 'module';
+        };
         const record = (node, callee, expression) => {
             const indexNode = indexNodeForComputedCallee(callee);
             if (!indexNode || LITERAL_INDEX_NODES.has(indexNode.type)) return;
@@ -213,13 +221,30 @@ function computedDispatchSites(content, language) {
             }
             record(node, callee);
 
-            // Two-step dispatch: `const h = handlers[key]; h()`. The index
-            // access itself is the decisive blind spot; whether the selected
-            // value is called later may cross control-flow boundaries, so the
-            // safe syntax-only verdict records the dynamic access here.
-            if (indexNodeForComputedCallee(node)) record(node, node);
+            if (callee?.type === 'identifier') {
+                calledLocals.add(`${scopeKey(node)}\0${callee.text}`);
+            }
+
+            // Two-step dispatch: `const h = handlers[key]; h()`. Record the
+            // dynamic access only when its bound local is actually invoked in
+            // the same callable scope. Ordinary indexing (`xs[i]`) is a value
+            // read and says nothing about runtime-selected call targets.
+            if (node.type === 'variable_declarator' ||
+                node.type === 'assignment_expression' ||
+                node.type === 'assignment') {
+                const left = node.childForFieldName('name') ||
+                    node.childForFieldName('left');
+                const right = node.childForFieldName('value') ||
+                    node.childForFieldName('right');
+                if (left?.type === 'identifier' && indexNodeForComputedCallee(right)) {
+                    selectedByLocal.set(`${scopeKey(node)}\0${left.text}`, { node, right });
+                }
+            }
             return true;
         });
+        for (const [key, selection] of selectedByLocal) {
+            if (calledLocals.has(key)) record(selection.node, selection.right);
+        }
         return sites;
     } catch (error) {
         return [];

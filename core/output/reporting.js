@@ -162,7 +162,10 @@ function formatStats(stats, options = {}) {
     if (stats.hot) {
         const items = stats.hot.items || [];
         const total = stats.hot.total || items.length;
-        lines.push(`\nHottest functions (top ${items.length} of ${total} called):`);
+        const population = stats.hot.totalKind === 'raw-call-candidates'
+            ? `${total} raw candidates`
+            : `${total} called`;
+        lines.push(`\nHottest functions (top ${items.length} of ${population}):`);
         if (items.length === 0) {
             lines.push('  (no inbound calls detected)');
         } else {
@@ -458,7 +461,8 @@ function formatOrient(result, options = {}) {
     const langStr = langs
         .map(l => `${l.lang} ${Math.round((l.symbols / totalSym) * 100)}%`)
         .join(', ');
-    lines.push(`${result.files} files · ${result.symbols} symbols · ${langStr || 'supported languages: none'}`);
+    lines.push(`${result.files} files · ${result.symbols} symbols · ` +
+        `language mix by symbols: ${langStr || 'none'}`);
     lines.push('');
 
     if (result.dirs?.length) {
@@ -472,7 +476,10 @@ function formatOrient(result, options = {}) {
 
     if (result.hot?.items?.length) {
         const scope = result.hot.production ? 'production functions' : 'functions';
-        lines.push(`HOT (most-called ${scope}, top ${result.hot.items.length} of ${result.hot.total}):`);
+        const population = result.hot.totalKind === 'raw-call-candidates'
+            ? `${result.hot.total} raw candidates`
+            : result.hot.total;
+        lines.push(`HOT (most-called ${scope}, top ${result.hot.items.length} of ${population}):`);
         for (const h of result.hot.items) {
             const label = h.className ? `${h.className}.${h.name}` : h.name;
             lines.push(`  ${label} — ${h.callCount} call(s) · ${h.file}:${h.line}`);
@@ -498,6 +505,7 @@ function formatOrient(result, options = {}) {
     }
     if (bs.evalCalls) bsParts.push(`${bs.evalCalls} eval`);
     if (bs.reflection) bsParts.push(`${bs.reflection} reflection`);
+    if (bs.computedDispatch) bsParts.push(`${bs.computedDispatch} computed dispatch`);
     if (bs.parseFailures) bsParts.push(`${bs.parseFailures} parse failure(s)`);
     if (bs.parseRecoveries) bsParts.push(`${bs.parseRecoveries} parser-recovery file(s)`);
     if (bs.unsupportedSources) bsParts.push(`${bs.unsupportedSources} unsupported source file(s)`);

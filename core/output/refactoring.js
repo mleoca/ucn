@@ -54,6 +54,9 @@ function formatPlan(plan, options = {}) {
     lines.push(`Refactoring plan: ${plan.operation}`);
     lines.push('═'.repeat(60));
     lines.push(`${plan.file}:${plan.startLine}`);
+    for (const warning of plan.warnings || []) {
+        lines.push(`Note: ${warning.message}`);
+    }
     lines.push('');
 
     // Before/After
@@ -139,6 +142,7 @@ function formatPlanJson(plan) {
             complete: (plan.unverifiedCount || 0) === 0,
             unverified: plan.unverifiedCount || 0,
             ...(plan.account && { account: plan.account }),
+            ...(plan.warnings?.length > 0 && { warnings: plan.warnings }),
         },
         data: {
             found: true,
@@ -206,6 +210,9 @@ function formatVerify(result, options = {}) {
     lines.push('═'.repeat(60));
     lines.push(`${result.file}:${result.startLine}`);
     lines.push(result.signature);
+    for (const warning of result.warnings || []) {
+        lines.push(`Note: ${warning.message}`);
+    }
     lines.push('');
 
     // Expected args (max null = unbounded rest param)
@@ -227,6 +234,9 @@ function formatVerify(result, options = {}) {
         status = '⚠ All calls uncertain (no resolved sites)';
     } else if (result.uncertain > 0) {
         status = `⚠ Partial verification: ${result.valid} valid, ${result.uncertain} uncertain`;
+    } else if (result.unverifiedCount > 0) {
+        status = `⚠ ${result.valid} confirmed call${result.valid === 1 ? '' : 's'} valid; ` +
+            `${result.unverifiedCount} unverified site${result.unverifiedCount === 1 ? '' : 's'} not arg-checked`;
     } else {
         status = '✓ All calls valid';
     }
@@ -312,6 +322,7 @@ function formatVerifyJson(result) {
             uncertain: result.uncertain,
             unverified: result.unverifiedCount || 0,
             ...(result.account && { account: result.account }),
+            ...(result.warnings?.length > 0 && { warnings: result.warnings }),
         },
         data: {
             found: true,

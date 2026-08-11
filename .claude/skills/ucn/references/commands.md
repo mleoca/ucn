@@ -12,9 +12,9 @@ structural or code-only search.
 | Command | Purpose |
 |---|---|
 | `show <handle>` | Default symbol summary, callers, and callees. Select `summary,callers,callees,source,dependencies,tests,types,example,related` with `--sections`. |
-| `find <name>` | Locate definitions and stable handles. Use `--type=type` for type-like definitions, `--limit=N` as the single result cap, and `--with-source` to attach bodies. |
+| `find <name>` | Locate definitions and stable handles. Activity counts are pinned call candidates (confirmed + visible unverified); proved other-target calls are separate. Use `--type=type`, `--limit=N`, and `--with-source` as needed. |
 | `usages <name>` | Inventory definitions, calls, imports, type references, and literal comment/string/docstring text. Those text sites appear under `OTHER TEXT` unless `--code-only`. |
-| `search [pattern]` | Literal text search by default; add `--regex` for regular expressions, or use structural filters such as `--type`, `--param`, `--receiver`, `--returns`, or `--decorator`. |
+| `search [pattern]` | Literal text search by default; add `--regex` for RE2-compatible linear-time regular expressions, or use structural filters such as `--type`, `--param`, `--receiver`, `--returns`, or `--decorator`. Unsafe nested repetition is rejected; use ripgrep for unsupported advanced syntax. |
 | `source <handle\|file:range>` | Extract a function, class-like declaration, or exact line range. |
 | `trace <handle>` | Traverse callees by default. Use `--direction=callers` for blast radius and add `--to=entrypoints` for paths to roots. |
 
@@ -41,7 +41,7 @@ structural or code-only search.
 
 | Command | Purpose |
 |---|---|
-| `deadcode` | Conservative unreferenced-symbol candidates for review. Computed-dispatch registry members are withheld when modeled; health reports the remaining blind spot. |
+| `deadcode` | Conservative unreferenced-symbol candidates for review. Modeled computed-dispatch members, unknown decorated/annotated callables, and member-assigned event handlers are withheld by default. |
 | `audit-async` | Potential missing-await sites in JavaScript/TypeScript/Python and C#. MCP spelling: `audit_async`. |
 | `stacktrace <text>` | Advisory stack-frame parsing and source lookup. |
 
@@ -61,7 +61,7 @@ Symbol-listing commands emit handles such as `src/api.ts:42:handler`. Pass the f
 | `--depth=N` | Set trace/dependency/test traversal depth. |
 | `--direction=<value>` | Select trace or dependency direction. |
 | `--all` | Lift result and formatter caps where supported. It is recommended only for commands that accept it. |
-| `--max-chars=N` | Set the CLI text budget (10K targeted / 3K broad by default; 100K ceiling). MCP spelling: `max_chars`. JSON is not transport-truncated. |
+| `--max-chars=N` | Set the hard CLI text budget, including notices and preserved trust metadata (10K targeted / 3K broad by default; 100K ceiling). MCP spelling: `max_chars`. JSON is not transport-truncated. |
 | `--compact` / `--no-compact` | Select token-efficient or full semantic output. |
 | `--range=N-M` | Extract an explicit line range with `source --file=<path>`. |
 | `--json` | Emit the stable CLI `{ meta, data }` envelope; `meta.contract` carries the truth boundary, decision safety, and next actions. |

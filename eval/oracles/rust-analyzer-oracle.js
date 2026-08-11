@@ -27,7 +27,12 @@ const { LspClient, pathToUri, uriToPath } = require('./lsp-client');
 const { makeHelperHandle } = require('./jsonl-helper');
 
 const HELPER_MANIFEST = path.join(__dirname, 'rust-ast-helper', 'Cargo.toml');
-const QUIESCENT_TIMEOUT_MS = 600000; // first run executes build scripts via cargo
+// `serverStatus.quiescent` includes rust-analyzer's PrimeCaches pass, not just
+// Cargo metadata. Large workspaces can finish that pass after ten minutes on
+// a cold/contended runner (clap measured ~11.5 minutes locally). Keep the
+// compiler-grade barrier and allow bounded headroom rather than querying an
+// incomplete index.
+const QUIESCENT_TIMEOUT_MS = 900000;
 
 const rustAnalyzerOracle = {
     name: 'rust-analyzer',
@@ -44,38 +49,50 @@ const rustAnalyzerOracle = {
             stdio: ['pipe', 'pipe', 'inherit'],
         });
         const helper = makeHelperHandle(helperChild, { label: 'rust ast helper' });
-        const banner = JSON.parse(await helper.expectLine());
-        if (!banner.ok) throw new Error(`rust ast helper failed to start: ${banner.error}`);
+        let lsp = null;
+        try {
+            const banner = JSON.parse(await helper.expectLine());
+            if (!banner.ok) throw new Error(`rust ast helper failed to start: ${banner.error}`);
 
-        let quiesced;
-        const quiescent = new Promise((resolve, reject) => {
-            quiesced = resolve;
-            setTimeout(() => reject(new Error(`rust-analyzer not quiescent after ${QUIESCENT_TIMEOUT_MS}ms`)),
-                QUIESCENT_TIMEOUT_MS).unref();
-        });
-        const lsp = new LspClient(ra, [], {
-            capabilities: { experimental: { serverStatusNotification: true } },
-            onNotification: (method, params) => {
-                if (method === 'experimental/serverStatus' && params?.quiescent) quiesced(params);
-            },
-        });
-        // Evaluate the all-source contract, not only Cargo's default feature
-        // projection. Otherwise valid calls under `#[cfg(feature = ...)]`
-        // are mislabeled as UCN false positives merely because rust-analyzer
-        // marked that source inactive in this one configuration.
-        await lsp.initialize(workspaceRoot, {
-            checkOnSave: false,
-            cargo: { features: 'all', allTargets: true },
-        });
-        process.stdout.write('  waiting for rust-analyzer to load the workspace (cargo metadata + build scripts)...\n');
-        const status = await quiescent;
-        if (status.health && status.health !== 'ok') {
-            process.stdout.write(`  ⚠ rust-analyzer health: ${status.health} ${status.message || ''}\n`);
+            let quiesced;
+            const quiescent = new Promise((resolve, reject) => {
+                quiesced = resolve;
+                setTimeout(() => reject(new Error(`rust-analyzer not quiescent after ${QUIESCENT_TIMEOUT_MS}ms`)),
+                    QUIESCENT_TIMEOUT_MS).unref();
+            });
+            lsp = new LspClient(ra, [], {
+                capabilities: { experimental: { serverStatusNotification: true } },
+                onNotification: (method, params) => {
+                    if (method === 'experimental/serverStatus' && params?.quiescent) quiesced(params);
+                },
+            });
+            // Evaluate the all-source contract, not only Cargo's default feature
+            // projection. Otherwise valid calls under `#[cfg(feature = ...)]`
+            // are mislabeled as UCN false positives merely because rust-analyzer
+            // marked that source inactive in this one configuration.
+            await lsp.initialize(workspaceRoot, {
+                checkOnSave: false,
+                cargo: { features: 'all', allTargets: true },
+            });
+            process.stdout.write('  waiting for rust-analyzer to load the workspace (cargo metadata + build scripts)...\n');
+            const status = await quiescent;
+            if (status.health && status.health !== 'ok') {
+                process.stdout.write(`  ⚠ rust-analyzer health: ${status.health} ${status.message || ''}\n`);
+            }
+            const version = spawnSync(ra, ['--version'], { stdio: 'pipe' }).stdout?.toString().trim() || 'unknown';
+            process.stdout.write(`  ${version} (workspace root ${path.relative(repoDir, workspaceRoot) || '.'})\n`);
+
+            return { lsp, helper, root: repoDir, workspaceRoot, opened: new Set() };
+        } catch (error) {
+            // A prepare failure happens before run-oracle-eval owns a handle,
+            // so its normal finally/dispose path cannot help. Close both
+            // subprocesses here; otherwise a timed-out PrimeCaches pass keeps
+            // consuming resources and contaminates later language rows.
+            try { helperChild.stdin.write(JSON.stringify({ op: 'shutdown' }) + '\n'); } catch { /* gone */ }
+            try { helperChild.kill(); } catch { /* gone */ }
+            try { lsp?.kill(); } catch { /* gone */ }
+            throw error;
         }
-        const version = spawnSync(ra, ['--version'], { stdio: 'pipe' }).stdout?.toString().trim() || 'unknown';
-        process.stdout.write(`  ${version} (workspace root ${path.relative(repoDir, workspaceRoot) || '.'})\n`);
-
-        return { lsp, helper, root: repoDir, workspaceRoot, opened: new Set() };
     },
 
     /** syn-enumerated defs (fns, impl methods, structs/enums-as-class). */

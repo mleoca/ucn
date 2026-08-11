@@ -1,8 +1,8 @@
 name: Eval
 
 # Reliability/accuracy evaluation on pinned real repos:
-#  - conservation: account invariant + engine-gap metrics (19 pinned repos,
-#    covering JavaScript/TypeScript, Python, Go, Rust, and Java)
+#  - conservation: account invariant + engine-gap metrics (22 pinned repos,
+#    covering JavaScript/TypeScript, Python, Go, Rust, Java, C/C++, and C#)
 #  - oracle: tiered caller answers vs compiler/LSP ground truth (ts-morph for
 #    TS repos; pyright-langserver over LSP for Python, jedi available as a
 #    second opinion via --oracle jedi with a self-bootstrapping venv; gopls
@@ -45,6 +45,16 @@ jobs:
         run: |
           rustup component add rust-analyzer rust-src
           rust-analyzer --version
+
+      - name: Install clangd 18 (C/C++ oracle)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clangd-18
+          sudo ln -sf /usr/bin/clangd-18 /usr/local/bin/clangd
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 9.0.x
 
       - uses: actions/setup-java@v5
         with:

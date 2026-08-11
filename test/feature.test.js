@@ -2404,7 +2404,7 @@ def plain_unused():
         } finally { rm(dir); }
     });
 
-    it('deadcode does not mistake an unknown dotted decorator for registration', () => {
+    it('deadcode conservatively withholds unknown dotted decorators', () => {
         const dir = tmp({
             'pyproject.toml': '[project]\nname = "test"',
             'hooks.py': `
@@ -2420,12 +2420,12 @@ def plain_unused():
             const index = idx(dir);
             const dc = index.deadcode();
             const names = dc.map(d => d.name);
-            assert.ok(names.includes('my_hook_handler'),
-                'unknown dotted syntax is not framework-registration evidence');
+            assert.ok(!names.includes('my_hook_handler'),
+                'an unknown decorator may be the only runtime-registration evidence');
             assert.ok(names.includes('plain_unused'),
                 'function without decorator should remain in deadcode');
-            assert.strictEqual(dc.excludedDecorated, 0,
-                'unknown dotted syntax should not inflate framework exclusions');
+            assert.strictEqual(dc.excludedDecorated, 1,
+                'the conservative decorator boundary should be disclosed');
         } finally { rm(dir); }
     });
 

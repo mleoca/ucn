@@ -10,7 +10,7 @@ const path = require('path');
 const crypto = require('crypto');
 const {
     expandGlob, findProjectRoot, detectProjectPattern, isTestFile,
-    parseGitignore, DEFAULT_IGNORES, compareNames, classifyUnsupportedSourceFile,
+    parseGitignore, gitTrackedPaths, DEFAULT_IGNORES, compareNames, classifyUnsupportedSourceFile,
 } = require('./discovery');
 const { cleanHtmlScriptTags } = require('./parser');
 const { detectLanguage, getParser, getLanguageAdapter, safeParse, langTraits, PARSE_OPTIONS } = require('../languages');
@@ -314,10 +314,10 @@ class ProjectIndex {
     /**
      * Build index for files matching pattern
      *
-     * @param {string} pattern - Glob pattern (e.g., "**\/*.js")
+     * @param {string|null} [pattern=null] - Glob pattern (e.g., "**\/*.js")
      * @param {object} options - { forceRebuild, maxFiles, quiet }
      */
-    build(pattern, options = {}) {
+    build(pattern = null, options = {}) {
         const startTime = Date.now();
         const quiet = options.quiet !== false;
 
@@ -367,11 +367,13 @@ class ProjectIndex {
 
             // Merge .gitignore and .ucn.json exclude into file discovery
             const gitignorePatterns = parseGitignore(this.root);
+            globOpts.gitignorePatterns = gitignorePatterns;
+            globOpts.trackedPaths = gitTrackedPaths(this.root);
             const configExclude = Array.isArray(this.config.exclude)
                 ? this.config.exclude
                 : (this.config.exclude ? [String(this.config.exclude)] : []);
-            if (gitignorePatterns.length > 0 || configExclude.length > 0) {
-                globOpts.ignores = [...DEFAULT_IGNORES, ...gitignorePatterns, ...configExclude];
+            if (configExclude.length > 0) {
+                globOpts.ignores = [...DEFAULT_IGNORES, ...configExclude];
             }
             globOpts.disclosureIgnores = configExclude;
             globOpts.onDiscoveryIssue = recordDiscoveryIssue;
@@ -466,13 +468,13 @@ class ProjectIndex {
                 const { parallelBuild } = require('./parallel-build');
                 const result = parallelBuild(this, files, {
                     workerCount: workersSetting > 0 ? workersSetting : (envWorkers > 0 ? envWorkers : undefined),
-                    // Native C/C++ parsing is memory-bandwidth and allocation
-                    // heavy. Real-repo measurements show four balanced
-                    // workers outperform 5-8 while keeping peak RSS safely
-                    // below the release ceiling. Explicit user settings keep
-                    // the ordinary eight-worker safety cap.
+                    // After the recovery scorer stopped repeatedly walking
+                    // every candidate tree, real-repo sweeps put the native
+                    // throughput knee at 5-6 workers. Default to the lower
+                    // knee (five) for RSS headroom; explicit user settings
+                    // retain the ordinary eight-worker safety cap.
                     maxWorkers: cFamilyFileCount >= 25 && !explicitWorkerCount
-                        ? 4 : 8,
+                        ? 5 : 8,
                     minFilesPerWorker: cFamilyFileCount >= 25 ? 10 : 100,
                     quiet,
                 });
@@ -608,8 +610,12 @@ class ProjectIndex {
         const isBundled = (() => {
             // Webpack bundles contain __webpack_require__ or __webpack_modules__
             if (content.includes('__webpack_require__') || content.includes('__webpack_modules__')) return true;
-            // Minified files: very few lines but large content (avg > 500 chars/line)
-            if (lineCount > 0 && lineCount < 50 && content.length / lineCount > 500) return true;
+            // Minified files: large content with extreme bytes/line. Bundlers
+            // often insert 50-200 licence/chunk-separator lines, so an
+            // arbitrary <50 cap lets the same bytes flip classification when
+            // a banner is added. The size floor protects authored small files.
+            if (lineCount > 0 && content.length >= 100 * 1024 &&
+                content.length / lineCount > 500) return true;
             // Very long single lines (> 1000 chars) in most of the file suggest minification
             if (lineCount > 0 && longLineCount > 0 && longLineCount / lineCount > 0.3) return true;
             return false;
@@ -1500,10 +1506,52 @@ class ProjectIndex {
      * @param {string} typeName - The class/struct/interface name
      * @returns {Array} Methods belonging to this type
      */
-    findMethodsForType(typeName) {
+    findMethodsForType(typeName, definition = null) {
         const methods = [];
         // Match both "TypeName" and "*TypeName" receivers (for Go/Rust pointer receivers)
         const baseTypeName = typeName.replace(/^\*/, '');
+
+        const targetLanguage = definition?.file
+            ? this.files.get(definition.file)?.language : null;
+        const targetNamespace = definition?.namespace || null;
+        const targetDir = definition?.file ? path.dirname(definition.file) : null;
+        const sameCompilerType = symbol => {
+            if (!definition || !targetLanguage) return true;
+            const language = this.files.get(symbol.file)?.language;
+            if (language !== targetLanguage) return false;
+            if (['javascript', 'typescript', 'tsx', 'python', 'html']
+                .includes(targetLanguage)) return symbol.file === definition.file;
+            if (targetLanguage === 'go') return path.dirname(symbol.file) === targetDir;
+            if (targetLanguage === 'java' || targetLanguage === 'csharp') {
+                return (symbol.namespace || null) === targetNamespace;
+            }
+            if (targetLanguage === 'c' || targetLanguage === 'cpp') {
+                if (symbol.file === definition.file) return true;
+                const reachable = (from, to) => {
+                    const queue = [from];
+                    const seen = new Set(queue);
+                    for (let depth = 0; queue.length > 0 && depth < 16; depth++) {
+                        const current = queue.shift();
+                        for (const imported of this.importGraph.get(current) || []) {
+                            if (imported === to) return true;
+                            if (!seen.has(imported)) {
+                                seen.add(imported);
+                                queue.push(imported);
+                            }
+                        }
+                    }
+                    return false;
+                };
+                return reachable(symbol.file, definition.file) ||
+                    reachable(definition.file, symbol.file);
+            }
+            if (targetLanguage === 'rust') {
+                const typeDefs = (this.symbols.get(baseTypeName) || []).filter(candidate =>
+                    ['struct', 'enum', 'trait', 'type'].includes(candidate.type));
+                return typeDefs.length === 1 || symbol.file === definition.file;
+            }
+            return symbol.file === definition.file;
+        };
 
         for (const [, symbols] of this.symbols) {
             for (const symbol of symbols) {
@@ -1516,7 +1564,7 @@ class ProjectIndex {
                 // Also matches Rust associated functions (have receiver but isMethod=false)
                 if (symbol.receiver) {
                     const receiverBase = symbol.receiver.replace(/^\*/, '');
-                    if (receiverBase === baseTypeName) {
+                    if (receiverBase === baseTypeName && sameCompilerType(symbol)) {
                         methods.push(symbol);
                         continue;
                     }
@@ -1525,7 +1573,8 @@ class ProjectIndex {
                 // Check Python/Java/JS-style className (class members)
                 // Must be a method type, not just any symbol with className
                 if (symbol.className === baseTypeName &&
-                    (symbol.isMethod || symbol.type === 'method' || symbol.type === 'constructor')) {
+                    (symbol.isMethod || symbol.type === 'method' || symbol.type === 'constructor') &&
+                    sameCompilerType(symbol)) {
                     methods.push(symbol);
                     continue;
                 }

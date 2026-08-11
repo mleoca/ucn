@@ -37,6 +37,17 @@ function appendNote(text, note) {
     return note ? `${text}\n\n${note}` : text;
 }
 
+/** Canonicalize object keys so JSON bytes do not depend on index provenance. */
+function canonicalJsonValue(value) {
+    if (Array.isArray(value)) return value.map(canonicalJsonValue);
+    if (!value || typeof value !== 'object') return value;
+    const canonical = {};
+    for (const key of Object.keys(value).sort()) {
+        canonical[key] = canonicalJsonValue(value[key]);
+    }
+    return canonical;
+}
+
 function contractMeta(command) {
     const contract = COMMAND_CONTRACTS[command];
     const trust = COMMAND_TRUST_MATRIX[command];
@@ -346,6 +357,13 @@ function formatPublicJson(command, result, params = {}, execution = {}) {
     let commandMeta = {};
     let data = result;
 
+    // Ambiguous bare-name resolution is a surface-level trust decision. Keep
+    // it in the common envelope even for array results (notably `tests`, whose
+    // auxiliary metadata is intentionally non-enumerable).
+    if (result?.warnings?.length > 0) {
+        commandMeta.warnings = result.warnings;
+    }
+
     // Keep the stable public envelope while reusing the endpoint serializer's
     // trimmed records and aggregate metadata. This prevents private routing
     // fields from leaking and preserves the established machine contract.
@@ -406,7 +424,8 @@ function formatPublicJson(command, result, params = {}, execution = {}) {
     }
     // Mixed-language disclosure for commands whose result is not
     // account-shaped: the counts must be machine-readable, not note-only.
-    if ((command === 'usages' || command === 'tests') && result?.unsupportedMatches) {
+    if ((command === 'find' || command === 'usages' || command === 'tests') &&
+        result?.unsupportedMatches) {
         commandMeta.unsupportedMatches = result.unsupportedMatches;
     }
     if (command === 'usages' && result?.analysisGaps) {
@@ -432,7 +451,7 @@ function formatPublicJson(command, result, params = {}, execution = {}) {
         },
         data,
     };
-    return JSON.stringify(envelope, null, 2);
+    return JSON.stringify(canonicalJsonValue(envelope), null, 2);
 }
 
 module.exports = {

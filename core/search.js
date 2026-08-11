@@ -14,6 +14,13 @@ const { detectLanguage, getParser, getLanguageAdapter, langTraits } = require('.
 const { getCachedCalls } = require('./callers');
 const { extractImports } = require('./imports');
 const isSafeRegex = require('safe-regex2');
+const { RE2JS } = require('re2js');
+
+// Keep the established search-input contract for the canonical catastrophic
+// nested-single-atom family even though the RE2-compatible engine could run it
+// safely. Rejecting these patterns avoids silently changing behavior if an
+// advanced construct later forces the guarded JavaScript fallback.
+const NESTED_SINGLE_ATOM_REPEAT = /\((?:\?:)?(?:\\.|\[[^\]]*\]|[^\\()[\]{}|?+*])(?:[+*]|\{\d+(?:,\d*)?\})\)(?:[+*]|\{\d+(?:,\d*)?\})/;
 
 /**
  * Build a glob-style matcher: * matches any sequence, ? matches one char.
@@ -210,12 +217,23 @@ function _applyFindFilters(index, matches, options) {
         });
         const confirmedCalls = callers.filter(caller =>
             caller.tier !== 'unverified').length;
+        const unverifiedCalls = callers.unverifiedEntries?.length || 0;
+        const otherTargetCalls = callers.accountRaw?.excludedEntries?.length || 0;
+        // `find` is an inventory/orientation command. Its activity headline
+        // must not turn engine abstention into "0 calls", but it also must not
+        // attribute calls adjudicated as a different same-name target to this
+        // pinned definition. Report confirmed + visible unverified candidates;
+        // retain excluded same-name calls as an explicit boundary only.
+        const targetCallCandidates = confirmedCalls + unverifiedCalls;
         const exactCounts = {
             ...counts,
-            calls: confirmedCalls,
-            total: confirmedCalls + counts.definitions + counts.imports +
+            calls: targetCallCandidates,
+            confirmedCalls,
+            unverifiedCalls,
+            otherTargetCalls,
+            total: targetCallCandidates + counts.definitions + counts.imports +
                 (counts.references || 0),
-            countKind: 'pinned-caller-engine-excludes-references',
+            countKind: 'target-call-candidates-with-tier-breakdown-excludes-references',
         };
         return {
             ...m,
@@ -468,7 +486,13 @@ function search(index, term, options = {}) {
     const regexFlags = options.caseSensitive ? 'g' : 'gi';
     const useRegex = options.regex === true; // Safe default: literal text
     let regex;
+    let linearRegex = null;
     if (useRegex) {
+        if (NESTED_SINGLE_ATOM_REPEAT.test(term)) {
+            throw new Error(
+                `Unsafe regular expression "${term}": nested repetition is not accepted. Simplify it or use ripgrep.`,
+            );
+        }
         try {
             regex = new RegExp(term, regexFlags);
         } catch (e) {
@@ -477,14 +501,22 @@ function search(index, term, options = {}) {
                 { cause: e },
             );
         }
-        // V8 regular expressions can backtrack exponentially and there is no
-        // synchronous per-match timeout. Refuse unsafe repetition shapes
-        // before evaluating them on source; agents can hand those patterns to
-        // ripgrep's linear-time regex engine instead of wedging CLI/MCP.
-        if (!isSafeRegex(term)) {
-            throw new Error(
-                `Unsafe regular expression "${term}": nested or excessive repetition may cause catastrophic backtracking. Simplify the pattern or use ripgrep.`,
-            );
+        // Prefer the RE2-compatible DFA engine: ordinary code-search patterns
+        // stay linear-time even for ambiguous repetition such as `(a|a)*`.
+        // Advanced JavaScript-only constructs (backreferences/lookarounds)
+        // retain V8 compatibility only when the conservative fallback guard
+        // can establish that their repetition shape is safe.
+        try {
+            let re2Flags = options.caseSensitive ? 0 : RE2JS.CASE_INSENSITIVE;
+            if (/\(\?<([=!])/.test(term)) re2Flags |= RE2JS.LOOKBEHINDS;
+            linearRegex = RE2JS.compile(term, re2Flags);
+        } catch (re2Error) {
+            if (!isSafeRegex(term)) {
+                throw new Error(
+                    `Unsafe regular expression "${term}": this JavaScript-only pattern cannot run in UCN's linear-time engine and its repetition shape may backtrack catastrophically. Simplify it or use ripgrep.`,
+                    { cause: re2Error },
+                );
+            }
         }
     } else {
         regex = new RegExp(escapeRegExp(term), regexFlags);
@@ -523,6 +555,7 @@ function search(index, term, options = {}) {
                             codeOnly: true,
                             regex: useRegex,
                             caseSensitive: options.caseSensitive,
+                            compiledRegex: linearRegex,
                         });
 
                         for (const m of astMatches) {
@@ -562,8 +595,9 @@ function search(index, term, options = {}) {
 
             // Fallback to regex-based search (non-codeOnly or unsupported language)
             lines.forEach((line, idx) => {
-                regex.lastIndex = 0; // Reset regex state
-                if (regex.test(line)) {
+                regex.lastIndex = 0; // Reset V8 fallback state
+                if ((linearRegex && linearRegex.test(line)) ||
+                    (!linearRegex && regex.test(line))) {
                     const lineNum = idx + 1;
                     // Skip if codeOnly and line is comment/string
                     if (options.codeOnly && index.isCommentOrStringAtPosition(content, lineNum, 0, filePath)) {
@@ -1358,6 +1392,14 @@ function tests(index, nameOrFile, options = {}) {
             if (!isFilePath && !content.includes(searchTerm) && !linkedRecords) continue;
             if (isFilePath && !linkedRecords && provenFileSites.length === 0) continue;
             const sourceFileLinked = !sourceFileFilter || sourceFileFilter.has(testPath);
+            // A class-qualified query can still identify a possible test link
+            // in source layouts that have no modeled module edge (notably
+            // Rust macro/test fixtures). Keep it visibly unverified when the
+            // test contains an AST reference to the exact class name; never
+            // promote that hint to confirmed source ownership.
+            const classIdentityHint = !sourceFileLinked && className &&
+                (index._getCachedUsages(testPath, className) || []).some(u =>
+                    u.usageType !== 'definition' && u.usageType !== 'import');
 
             // AST-based usage detection
             // A file path is not a symbol. Its basename must never be sent
@@ -1373,7 +1415,7 @@ function tests(index, nameOrFile, options = {}) {
             // test. Ordinary calls/references still require source ownership.
             const hasAttributeReference = astUsages.some(u => u.inAttribute &&
                 (!testRanges || lineInRanges(u.line, testRanges)));
-            if (!sourceFileLinked && !hasAttributeReference) continue;
+            if (!sourceFileLinked && !hasAttributeReference && !classIdentityHint) continue;
             // className scoping normally requires the class or a dispatching
             // descendant in the file. Generated attribute references are the
             // conservative exception: they carry an explicit unverified tier.
@@ -1417,7 +1459,7 @@ function tests(index, nameOrFile, options = {}) {
 
             for (const usage of astUsages) {
                 if (usage.usageType === 'definition') continue; // not relevant in test files
-                if (!sourceFileLinked && !usage.inAttribute) continue;
+                if (!sourceFileLinked && !usage.inAttribute && !classIdentityHint) continue;
                 // Inline-test-promoted file: only lines inside the test
                 // ranges are test code (fix #244).
                 if (testRanges && !lineInRanges(usage.line, testRanges)) continue;
@@ -1435,7 +1477,7 @@ function tests(index, nameOrFile, options = {}) {
                 if (usage.usageType === 'import') {
                     matchType = 'import';
                 } else if (usage.usageType === 'call') {
-                    matchType = 'call';
+                    matchType = classIdentityHint ? 'unverified-call' : 'call';
                 } else {
                     // 'reference' — check if inside string literal
                     matchType = strPattern.test(lineContent) ? 'string-ref' :
@@ -1443,7 +1485,7 @@ function tests(index, nameOrFile, options = {}) {
                 }
 
                 // className scoping for calls: check receiver
-                if (className && matchType === 'call') {
+                if (className && (matchType === 'call' || matchType === 'unverified-call')) {
                     if (!_receiverMatchesClass(usage, dispatchNames, instanceTypeMap, lineContent, searchTerm)) continue;
                 }
 
@@ -1473,7 +1515,11 @@ function tests(index, nameOrFile, options = {}) {
                 matches.push({
                     line: usage.line,
                     content: lineContent.trim(),
-                    matchType
+                    matchType,
+                    ...(matchType === 'unverified-call' && {
+                        evidenceTier: 'unverified',
+                        reason: 'class-reference-without-source-ownership',
+                    }),
                 });
             }
 
@@ -1553,7 +1599,7 @@ function tests(index, nameOrFile, options = {}) {
             }
 
             const filtered = options.callsOnly
-                ? finalMatches.filter(m => m.matchType === 'call' || m.matchType === 'test-case')
+                ? finalMatches.filter(m => ['call', 'unverified-call', 'test-case'].includes(m.matchType))
                 : finalMatches;
             if (filtered.length > 0) {
                 results.push({
