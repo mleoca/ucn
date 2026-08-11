@@ -456,3 +456,21 @@ describe('v5 release-surface adversarial regressions', () => {
         }
     });
 });
+
+describe('MCP registry manifest constraints', () => {
+    // The v5.0.1 publish run reached npm and then died at the MCP registry
+    // with a 422: the registry enforces description <= 100 characters, which
+    // nothing validated pre-tag. server.json is release metadata — every
+    // registry-enforced bound must fail HERE, not after the tag is pushed.
+    it('keeps server.json inside the registry validation limits', () => {
+        const manifest = JSON.parse(
+            fs.readFileSync(`${__dirname}/../server.json`, 'utf8'));
+        assert.ok(manifest.description.length <= 100,
+            `description is ${manifest.description.length} chars; the MCP ` +
+            'registry rejects anything over 100');
+        const pkg = JSON.parse(
+            fs.readFileSync(`${__dirname}/../package.json`, 'utf8'));
+        assert.equal(manifest.version, pkg.version,
+            'server.json version must track package.json (sync-server-version.js)');
+    });
+});
