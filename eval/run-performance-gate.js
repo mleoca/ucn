@@ -24,7 +24,13 @@ const { performance } = require('perf_hooks');
 
 const { ProjectIndex } = require('../core/project');
 const { execute } = require('../core/execute');
-const { REPOS, RELEASE_REPOS, cloneAtCommit, resolveTarget } = require('./lib/repos');
+const {
+    REPOS,
+    RELEASE_REPOS,
+    RELEASE_REPO_NAMES,
+    cloneAtCommit,
+    resolveTarget,
+} = require('./lib/repos');
 const {
     DEFAULT_BUDGETS,
     percentile,
@@ -43,11 +49,14 @@ const workerRepoName = readArg('--worker-repo');
 const workerResultPath = readArg('--worker-result');
 const workerQuiet = args.includes('--worker-quiet');
 const requestedWorkerCount = envPositiveInteger('UCN_WORKERS');
+const requireColdWallThroughput = releaseOnly ||
+    args.includes('--require-wall-throughput');
 const legacyMaxRssMb = positiveNumber('--max-rss-mb', DEFAULT_BUDGETS.maxBuildRssMb);
 const budgets = {
     minColdLocPerSec: positiveNumber('--min-cold-loc-sec', DEFAULT_BUDGETS.minColdLocPerSec),
     minColdLocPerCpuSec: positiveNumber(
         '--min-cold-loc-cpu-sec', DEFAULT_BUDGETS.minColdLocPerCpuSec),
+    requireColdWallThroughput,
     maxCacheLoadMs: positiveNumber('--max-cache-load-ms', DEFAULT_BUDGETS.maxCacheLoadMs),
     maxFirstQueryMs: positiveNumber('--max-first-query-ms', DEFAULT_BUDGETS.maxFirstQueryMs),
     maxWarmColdRatio: positiveNumber('--max-warm-cold-ratio', DEFAULT_BUDGETS.maxWarmColdRatio),
@@ -219,7 +228,13 @@ async function evaluateRepo(repo) {
     const boardPeakRssMb = Number((process.resourceUsage().maxRSS / 1024).toFixed(1));
     const warmColdRatio = rate(cacheLoadMs + firstQueryMs, coldMs);
     const metrics = {
-        lines, coldMs, coldCpuMs, coldLocPerSec, coldLocPerCpuSec,
+        repo: repo.name,
+        commit: repo.commit,
+        files: fileCount,
+        lines,
+        expectedFiles: repo.performanceWorkload?.files,
+        expectedLines: repo.performanceWorkload?.lines,
+        coldMs, coldCpuMs, coldLocPerSec, coldLocPerCpuSec,
         cacheLoadMs, firstQueryMs, warmColdRatio,
         queryP50Ms, queryP95Ms, buildPeakRssMb, boardPeakRssMb,
         requestedWorkerCount, actualWorkerCount, workerPinMismatch, queryErrors,
@@ -256,6 +271,8 @@ async function evaluateRepo(repo) {
         commit: repo.commit,
         files: fileCount,
         lines,
+        expectedFiles: repo.performanceWorkload?.files,
+        expectedLines: repo.performanceWorkload?.lines,
         coldMs,
         coldCpuMs,
         coldLocPerSec,
@@ -325,7 +342,12 @@ function aggregateRepoRuns(repo, runs) {
     const firstQueryMs = median(firstQuerySamplesMs);
     const firstSummary = summarizeSamples(firstQuerySamplesMs);
     const metrics = {
+        repo: repo.name,
+        commit: runs[0].commit,
+        files: runs[0].files,
         lines,
+        expectedFiles: runs[0].expectedFiles,
+        expectedLines: runs[0].expectedLines,
         coldMs,
         coldCpuMs,
         coldLocPerSec: rate(lines * 1000, coldMs),
@@ -400,6 +422,94 @@ function printResult(repo, result) {
     }
 }
 
+function performanceScope(isFullRelease, repos) {
+    if (isFullRelease) return 'release';
+    const names = repos.map(repo => repo.name).sort();
+    return `scoped-${names.join('-') || 'none'}`;
+}
+
+function candidateIsStronger(candidate, current) {
+    if (!current) return true;
+    const candidateRelease = candidate.report.release ? 1 : 0;
+    const currentRelease = current.report.release ? 1 : 0;
+    if (candidateRelease !== currentRelease) return candidateRelease > currentRelease;
+    const candidateSamples = candidate.report.processSamples || 0;
+    const currentSamples = current.report.processSamples || 0;
+    if (candidateSamples !== currentSamples) return candidateSamples > currentSamples;
+    return String(candidate.report.generatedAt || '') >=
+        String(current.report.generatedAt || '');
+}
+
+/**
+ * Merge same-day invocation reports without allowing a scoped smoke run to
+ * erase stronger full-board evidence. A rollup is release-complete only when
+ * every required row came from a full release invocation; a collection of
+ * partial runs remains useful evidence but cannot impersonate that gate.
+ */
+function collectPerformanceRollup(reportsDir, date, currentReport = null,
+    requiredRepos = RELEASE_REPO_NAMES) {
+    const reports = [];
+    const suffix = `-${date}.json`;
+    if (fs.existsSync(reportsDir)) {
+        for (const file of fs.readdirSync(reportsDir)) {
+            if (!file.startsWith('performance-gate-run-') ||
+                !file.endsWith(suffix)) continue;
+            try {
+                reports.push({
+                    source: file,
+                    report: JSON.parse(fs.readFileSync(path.join(reportsDir, file), 'utf8')),
+                });
+            } catch { /* incomplete artifacts never replace valid evidence */ }
+        }
+    }
+    if (currentReport) reports.push({ source: '(current invocation)', report: currentReport });
+
+    const byRepo = new Map();
+    for (const candidate of reports) {
+        for (const result of candidate.report.results || []) {
+            if (!result?.repo) continue;
+            const prior = byRepo.get(result.repo);
+            const row = { ...candidate, result };
+            if (candidateIsStronger(row, prior)) byRepo.set(result.repo, row);
+        }
+    }
+
+    const requiredOrder = new Map(requiredRepos.map((name, i) => [name, i]));
+    const selected = [...byRepo.values()].sort((a, b) => {
+        const ai = requiredOrder.has(a.result.repo)
+            ? requiredOrder.get(a.result.repo) : Number.MAX_SAFE_INTEGER;
+        const bi = requiredOrder.has(b.result.repo)
+            ? requiredOrder.get(b.result.repo) : Number.MAX_SAFE_INTEGER;
+        return ai - bi || a.result.repo.localeCompare(b.result.repo);
+    });
+    const releaseRows = new Set(selected
+        .filter(candidate => candidate.report.release)
+        .map(candidate => candidate.result.repo));
+    const completeReleaseBoard = requiredRepos.every(name => releaseRows.has(name));
+    const results = selected.map(candidate => ({
+        ...candidate.result,
+        evidence: {
+            source: candidate.source,
+            scope: candidate.report.scope,
+            release: Boolean(candidate.report.release),
+            processSamples: candidate.report.processSamples,
+            generatedAt: candidate.report.generatedAt,
+        },
+    }));
+    const passed = completeReleaseBoard && results
+        .filter(result => requiredOrder.has(result.repo))
+        .every(result => !result.error && (result.failures || []).length === 0);
+    return {
+        schemaVersion: 2,
+        generatedAt: new Date().toISOString(),
+        date,
+        requiredRepos: [...requiredRepos],
+        completeReleaseBoard,
+        passed,
+        results,
+    };
+}
+
 async function workerMain() {
     if (!workerResultPath) throw new Error('--worker-result is required with --worker-repo');
     const repo = REPOS.find(candidate => candidate.name === workerRepoName);
@@ -463,8 +573,25 @@ async function main() {
             ? os.availableParallelism() : os.cpus().length,
         requestedWorkerCount,
     };
-    const report = { date, budgets, host, processSamples, results, passed: !failed };
-    const jsonPath = path.join(REPORTS_DIR, `performance-gate-${date}.json`);
+    const isFullRelease = releaseOnly && !repoNames &&
+        repos.length === RELEASE_REPO_NAMES.length &&
+        repos.every(repo => RELEASE_REPO_NAMES.includes(repo.name));
+    const scope = performanceScope(isFullRelease, repos);
+    const generatedAt = new Date().toISOString();
+    const report = {
+        schemaVersion: 2,
+        generatedAt,
+        date,
+        scope,
+        release: isFullRelease,
+        budgets,
+        host,
+        processSamples,
+        results,
+        passed: !failed,
+    };
+    const jsonPath = path.join(REPORTS_DIR,
+        `performance-gate-run-${scope}-${date}.json`);
     fs.writeFileSync(jsonPath, JSON.stringify(report, null, 2));
 
     const md = [
@@ -485,9 +612,46 @@ async function main() {
         '',
         `Budgets: ${JSON.stringify(budgets)}.`,
     ];
-    const mdPath = path.join(REPORTS_DIR, `performance-gate-${date}.md`);
+    const mdPath = path.join(REPORTS_DIR,
+        `performance-gate-run-${scope}-${date}.md`);
     fs.writeFileSync(mdPath, md.join('\n'));
-    process.stdout.write(`\nwrote ${path.relative(process.cwd(), jsonPath)}\nwrote ${path.relative(process.cwd(), mdPath)}\n`);
+
+    // Keep the historical full-board path for consumers, but scoped runs can
+    // never overwrite it. The rollup additionally preserves strongest-row
+    // provenance across all same-day invocations.
+    const written = [jsonPath, mdPath];
+    if (isFullRelease) {
+        const legacyJsonPath = path.join(REPORTS_DIR, `performance-gate-${date}.json`);
+        const legacyMdPath = path.join(REPORTS_DIR, `performance-gate-${date}.md`);
+        fs.writeFileSync(legacyJsonPath, JSON.stringify(report, null, 2));
+        fs.writeFileSync(legacyMdPath, md.join('\n'));
+        written.push(legacyJsonPath, legacyMdPath);
+    }
+
+    const rollup = collectPerformanceRollup(REPORTS_DIR, date, report);
+    const rollupJsonPath = path.join(REPORTS_DIR,
+        `performance-gate-rollup-${date}.json`);
+    const rollupMdPath = path.join(REPORTS_DIR,
+        `performance-gate-rollup-${date}.md`);
+    fs.writeFileSync(rollupJsonPath, JSON.stringify(rollup, null, 2));
+    const rollupLines = [
+        `# UCN performance rollup - ${date}`,
+        '',
+        `Full release board: ${rollup.completeReleaseBoard ? 'complete' : 'incomplete'}; ` +
+            `result: ${rollup.passed ? 'PASS' : 'NOT RELEASE-QUALIFIED'}.`,
+        '',
+        '| repo | scope | samples | CPU LOC/s | wall LOC/s | result |',
+        '|---|---|---:|---:|---:|---|',
+        ...rollup.results.map(result =>
+            `| ${result.repo} | ${result.evidence.scope || 'unknown'} | ` +
+            `${result.evidence.processSamples || '-'} | ${result.coldLocPerCpuSec ?? '-'} | ` +
+            `${result.coldLocPerSec ?? '-'} | ` +
+            `${result.error || (result.failures || []).join('; ') || 'PASS'} |`),
+    ];
+    fs.writeFileSync(rollupMdPath, rollupLines.join('\n'));
+    written.push(rollupJsonPath, rollupMdPath);
+    process.stdout.write(`\n${written.map(file =>
+        `wrote ${path.relative(process.cwd(), file)}`).join('\n')}\n`);
     process.exitCode = failed ? 1 : 0;
 }
 
@@ -502,6 +666,8 @@ if (require.main === module) {
 module.exports = {
     evaluateRepo,
     aggregateRepoRuns,
+    collectPerformanceRollup,
+    performanceScope,
     percentile,
     callableBoard,
 };

@@ -4,13 +4,18 @@ const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('path');
 const { spawnSync } = require('child_process');
+const { tmp, rm } = require('./helpers');
+const { RELEASE_REPOS, RELEASE_REPO_NAMES } = require('../eval/lib/repos');
 
 const {
     DEFAULT_BUDGETS,
     summarizeSamples,
     evaluatePerformanceBudgets,
 } = require('../eval/performance-gate-policy');
-const { aggregateRepoRuns } = require('../eval/run-performance-gate');
+const {
+    aggregateRepoRuns,
+    collectPerformanceRollup,
+} = require('../eval/run-performance-gate');
 
 function healthyMetrics(overrides = {}) {
     return {
@@ -100,6 +105,35 @@ describe('performance gate policy', () => {
         assert.ok(slowCpu.failures.some(failure => failure.includes('CPU throughput')));
     });
 
+    it('makes the known fmt regression release-blocking through measured wall throughput', () => {
+        const metrics = healthyMetrics({
+            repo: 'fmt',
+            files: 75,
+            lines: 69630,
+            coldLocPerSec: 8075,
+            coldLocPerCpuSec: 4163,
+        });
+        const exploratory = evaluatePerformanceBudgets(metrics);
+        assert.deepEqual(exploratory.failures, []);
+        assert.ok(exploratory.warnings.some(warning => warning.includes('wall throughput')));
+
+        const release = evaluatePerformanceBudgets(metrics, {
+            ...DEFAULT_BUDGETS,
+            requireColdWallThroughput: true,
+        });
+        assert.ok(release.failures.some(failure => failure.includes('wall throughput')));
+    });
+
+    it('fails when a pinned repository workload silently changes', () => {
+        const verdict = evaluatePerformanceBudgets(healthyMetrics({
+            files: 101,
+            lines: 22652,
+            expectedFiles: 101,
+            expectedLines: 14199,
+        }));
+        assert.ok(verdict.failures.some(failure => failure.includes('workload LOC')));
+    });
+
     it('fails a real startup regression when absolute and relative budgets both regress', () => {
         const verdict = evaluatePerformanceBudgets(healthyMetrics({
             coldMs: 1000,
@@ -154,6 +188,68 @@ describe('performance gate policy', () => {
             workerPinMismatch: true,
         }));
         assert.ok(verdict.failures.some(failure => failure.includes('worker pin')));
+    });
+
+    it('pins an exact file and LOC workload for every release repository', () => {
+        assert.deepEqual(RELEASE_REPOS.map(repo => repo.name), RELEASE_REPO_NAMES);
+        for (const repo of RELEASE_REPOS) {
+            assert.ok(Number.isInteger(repo.performanceWorkload?.files), repo.name);
+            assert.ok(Number.isInteger(repo.performanceWorkload?.lines), repo.name);
+        }
+        const cjson = RELEASE_REPOS.find(repo => repo.name === 'cjson');
+        assert.deepEqual(cjson.performanceWorkload, { files: 101, lines: 22652 });
+    });
+
+    it('keeps a scoped smoke run from overwriting stronger full-board evidence', () => {
+        const date = '2026-08-11';
+        const result = (repo, coldLocPerCpuSec) => ({
+            repo,
+            coldLocPerCpuSec,
+            coldLocPerSec: 12000,
+            failures: [],
+        });
+        const release = {
+            generatedAt: `${date}T10:00:00.000Z`,
+            scope: 'release',
+            release: true,
+            processSamples: 3,
+            results: RELEASE_REPO_NAMES.map(name => result(name, 5000)),
+        };
+        const scoped = {
+            generatedAt: `${date}T11:00:00.000Z`,
+            scope: 'scoped-cjson-fmt',
+            release: false,
+            processSamples: 3,
+            results: [result('cjson', 1), result('fmt', 1)],
+        };
+        const dir = tmp({
+            [`performance-gate-run-release-${date}.json`]: JSON.stringify(release),
+            [`performance-gate-run-scoped-cjson-fmt-${date}.json`]: JSON.stringify(scoped),
+        });
+        try {
+            const rollup = collectPerformanceRollup(dir, date);
+            assert.equal(rollup.completeReleaseBoard, true);
+            assert.equal(rollup.passed, true);
+            assert.equal(rollup.results.length, RELEASE_REPO_NAMES.length);
+            const cjson = rollup.results.find(row => row.repo === 'cjson');
+            assert.equal(cjson.coldLocPerCpuSec, 5000);
+            assert.equal(cjson.evidence.scope, 'release');
+        } finally { rm(dir); }
+    });
+
+    it('never calls a collection of scoped reports a complete release board', () => {
+        const date = '2026-08-11';
+        const scoped = {
+            generatedAt: `${date}T11:00:00.000Z`,
+            scope: 'scoped-all',
+            release: false,
+            processSamples: 3,
+            results: RELEASE_REPO_NAMES.map(repo => ({ repo, failures: [] })),
+        };
+        const rollup = collectPerformanceRollup('/does/not/exist', date, scoped);
+        assert.equal(rollup.results.length, RELEASE_REPO_NAMES.length);
+        assert.equal(rollup.completeReleaseBoard, false);
+        assert.equal(rollup.passed, false);
     });
 
     it('rejects missing and fractional query-count values before repository setup', () => {

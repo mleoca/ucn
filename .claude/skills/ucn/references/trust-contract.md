@@ -52,7 +52,7 @@ Configuration-gated candidates remain visible but are not labeled false when the
 
 The publish-blocking portable-AST ceilings are: at most 10% of exact true edges left unverified, at most 20% within any sufficiently sampled symbol kind, at least 80% of targets with zero actionable ambiguity, actionable-candidate p95 at most five, and at most 0.10 effective review items per oracle edge. The semantic gate separately requires 100% in-scope recall, at least 98% confirmed-tier precision, full conservation, and 100% public-command proof recall. Passing these sampled floors is release evidence, not runtime-completeness proof.
 
-The performance gate runs each pinned repository in three independent processes. It applies cold-throughput floors to the median run, but uses the worst observed peak RSS so memory failures cannot be averaged away. The composite release gate runs this stage first so verbose compiler-oracle output and report consumers cannot perturb its wall-clock samples.
+The performance gate runs each pinned repository in three independent processes with a fixed worker shape. Publish and PR gates require both CPU and wall-throughput floors on the median run, pin the expected file/LOC workload, and use the worst observed build/full-board peak RSS so memory failures cannot be averaged away. Exploratory one-process runs keep wall throughput diagnostic. Scoped reports are separate from the full release artifact; the dated rollup is release-qualified only when every required row came from a full release invocation. The composite release gate runs this stage first so verbose compiler-oracle output and report consumers cannot perturb its samples.
 
 ## Truncation
 

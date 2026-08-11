@@ -6,6 +6,11 @@ const DEFAULT_BUDGETS = Object.freeze({
     // stable across runner parallelism. Set from the measured post-fix native
     // board baseline with roughly 1.5x regression headroom.
     minColdLocPerCpuSec: 3000,
+    // Exploratory one-sample runs keep wall time diagnostic. Publish and PR
+    // scripts turn this on and aggregate three isolated processes, making
+    // actual agent latency a release requirement without treating one noisy
+    // process as a regression.
+    requireColdWallThroughput: false,
     maxCacheLoadMs: 1500,
     maxFirstQueryMs: 500,
     maxWarmColdRatio: 0.65,
@@ -55,8 +60,19 @@ function evaluatePerformanceBudgets(metrics, budgets = DEFAULT_BUDGETS) {
             budgets.minColdLocPerCpuSec);
     }
     if (metrics.lines >= 5000 && metrics.coldLocPerSec < budgets.minColdLocPerSec) {
-        warnings.push(`cold wall throughput ${metrics.coldLocPerSec} LOC/s < ` +
-            `${budgets.minColdLocPerSec}; inspect runner contention and worker telemetry`);
+        const message = `cold wall throughput ${metrics.coldLocPerSec} LOC/s < ` +
+            `${budgets.minColdLocPerSec}`;
+        if (budgets.requireColdWallThroughput) {
+            failures.push(message);
+        } else {
+            warnings.push(`${message}; inspect runner contention and worker telemetry`);
+        }
+    }
+    if (metrics.expectedFiles != null && metrics.files !== metrics.expectedFiles) {
+        failures.push(`workload file count ${metrics.files} != pinned ${metrics.expectedFiles}`);
+    }
+    if (metrics.expectedLines != null && metrics.lines !== metrics.expectedLines) {
+        failures.push(`workload LOC ${metrics.lines} != pinned ${metrics.expectedLines}`);
     }
     if (metrics.cacheLoadMs > budgets.maxCacheLoadMs) {
         failures.push(`cache load ${metrics.cacheLoadMs}ms > ${budgets.maxCacheLoadMs}ms`);

@@ -25,7 +25,7 @@
     "trust:gate:semantic": "node eval/run-oracle-eval.js --release --min-precision 0.98 --max-unscored-ratio 0.10",
     "trust:gate:deadcode": "node eval/run-deadcode-eval.js --release --sample 100 --arm default",
     "trust:gate:performance": "UCN_WORKERS=4 node --expose-gc eval/run-performance-gate.js --release --queries 40",
-    "trust:gate:performance:pr": "UCN_WORKERS=4 node --expose-gc eval/run-performance-gate.js --repo cjson,fmt --samples 1 --queries 40",
+    "trust:gate:performance:pr": "UCN_WORKERS=4 node --expose-gc eval/run-performance-gate.js --repo cjson,fmt --samples 3 --queries 40 --require-wall-throughput",
     "trust:gate:consistency": "node eval/run-consistency-eval.js --release --sample 40",
     "trust:gate:agent": "node test/agent-public-surface-benchmark.js --gate",
     "trust:gate:fast": "node --expose-gc eval/run-performance-gate.js --repo preact-signals,httpx --queries 20 && node eval/run-oracle-eval.js --repo preact-signals,httpx --min-precision 0.98 && node eval/run-consistency-eval.js --repo preact-signals,httpx --sample 20 --gate",

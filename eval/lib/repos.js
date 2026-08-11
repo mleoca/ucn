@@ -31,6 +31,7 @@ const REPOS = [
         commit: 'e0ce9fdf92df7f0ece2c89d44554c39f36dc6882',
         language: 'typescript',
         targetCandidates: ['packages/core/src'],
+        performanceWorkload: { files: 2, lines: 4196 },
     },
     {
         // Plain JavaScript (no annotations, no tsconfig): CJS, prototype
@@ -59,6 +60,7 @@ const REPOS = [
         commit: 'b5addb64f0161ff6bfe94c124ef76f6a1fba5254',
         language: 'python',
         targetCandidates: ['httpx'],
+        performanceWorkload: { files: 61, lines: 17807 },
     },
     {
         // Dispatch-heavy second Python repo (the grpc-go/cursive analog):
@@ -78,6 +80,7 @@ const REPOS = [
         commit: 'ad460ea8f249db69c943a365fb84f3a59042d54e',
         language: 'go',
         targetCandidates: ['.'],
+        performanceWorkload: { files: 36, lines: 16765 },
     },
     {
         // Dispatch-heavy Go: interface-registry dispatch (resource-type
@@ -98,6 +101,7 @@ const REPOS = [
         commit: '82313cf95849bfe425109ad9506a52154879b1b1',
         language: 'rust',
         targetCandidates: ['crates/core'],
+        performanceWorkload: { files: 100, lines: 52338 },
     },
     {
         // Dispatch-heavy Rust: Box<dyn View> registry — dozens of View/
@@ -132,6 +136,7 @@ const REPOS = [
         commit: 'd3e59a9ab214910b9dad02921b7ef42c6400de9b',
         language: 'rust',
         targetCandidates: ['.'],
+        performanceWorkload: { files: 330, lines: 83356 },
     },
     {
         // Handler-callback-heavy TypeScript (graduated from FRESH_POOL
@@ -175,6 +180,7 @@ const REPOS = [
         commit: '528f7416c4b56a4948673984b190bf8713f0c3c4',
         language: 'go',
         targetCandidates: ['.'],
+        performanceWorkload: { files: 33, lines: 7194 },
     },
     {
         // Router-interface Go (graduated from FRESH_POOL 2026-07-03 — used
@@ -205,6 +211,7 @@ const REPOS = [
         commit: 'b9017a9503b76e11b4ad4c1a9f050e2d29112cb0',
         language: 'java',
         targetCandidates: ['javapoet/src/main/java', 'src/main/java'],
+        performanceWorkload: { files: 39, lines: 12212 },
     },
     {
         // State-machine-dispatch Java (graduated from FRESH_POOL 2026-07-03
@@ -261,6 +268,7 @@ const REPOS = [
         commit: '4f73e74372445108d2c1bda37b36e6f5e43402e0',
         language: 'csharp',
         targetCandidates: ['Src/Newtonsoft.Json'],
+        performanceWorkload: { files: 240, lines: 69132 },
     },
     {
         // Widely embedded ANSI C library with public-header declarations,
@@ -272,10 +280,17 @@ const REPOS = [
         language: 'c',
         targetCandidates: ['.'],
         clangFlags: ['-DCJSON_HIDE_SYMBOLS=0'],
+        // Git-tracked files intentionally outrank built-in artifact ignores.
+        // This includes 46 C files under the vendored Unity tree; pin the
+        // resulting workload so discovery changes cannot silently recalibrate
+        // performance evidence.
+        performanceWorkload: { files: 101, lines: 22652 },
         // cJSON vendors the Unity test framework (including generated
-        // expectdata and Unity's own examples). The release row measures the
-        // cJSON library, not a second unrelated C framework; keep project
-        // tests, but remove vendored Unity from both UCN and oracle universes.
+        // expectdata and Unity's own examples). Semantic/deadcode oracle rows
+        // measure the cJSON library rather than a second unrelated C
+        // framework, so those evaluators remove Unity from both universes.
+        // The performance board intentionally keeps every tracked source and
+        // pins that larger workload above.
         oracleExclude: ['tests/unity'],
     },
     {
@@ -287,6 +302,7 @@ const REPOS = [
         commit: 'e424e3f2e607da02742f73db84873b8084fc714c',
         language: 'cpp',
         targetCandidates: ['.'],
+        performanceWorkload: { files: 75, lines: 69630 },
         // fmt vendors GoogleTest under test/gtest and its test translation
         // units include "gmock/..." from that include root. Without this,
         // clangd treats TEST(...) and other macros as undeclared functions,
