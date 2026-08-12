@@ -3448,3 +3448,200 @@ describe('fix: entrypoints excludes test files by default', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #282: router mount-prefix composition (endpoints)', () => {
+    const { extractServerRoutes } = require('../core/bridge');
+
+    it('FastAPI: APIRouter(prefix=) and include_router(prefix=) both apply', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'a.py': [
+                'from fastapi import APIRouter',
+                '',
+                'router = APIRouter(prefix="/api/things", tags=["t"])',
+                '',
+                '@router.get("/list")',
+                'def list_things():',
+                '    return []',
+            ].join('\n'),
+            'b.py': [
+                'from fastapi import APIRouter',
+                '',
+                'router = APIRouter()',
+                '',
+                '@router.get("/items")',
+                'def list_items():',
+                '    return []',
+            ].join('\n'),
+            'app.py': [
+                'from fastapi import FastAPI',
+                '',
+                'import a',
+                'import b',
+                '',
+                'app = FastAPI()',
+                'app.include_router(a.router)',
+                'app.include_router(b.router, prefix="/api/v2")',
+            ].join('\n'),
+        });
+        try {
+            const routes = extractServerRoutes(idx(dir));
+            const paths = routes.map(r => r.path);
+            assert.ok(paths.includes('/api/things/list'),
+                `constructor prefix must apply, got: ${paths}`);
+            assert.ok(paths.includes('/api/v2/items'),
+                `include_router prefix must apply, got: ${paths}`);
+            const prefixed = routes.find(r => r.path === '/api/things/list');
+            assert.strictEqual(prefixed.mountPrefix, '/api/things');
+        } finally { rm(dir); }
+    });
+
+    it('FastAPI: nested include_router chains compose transitively', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'sub.py': [
+                'from fastapi import APIRouter',
+                '',
+                'router = APIRouter(prefix="/inner")',
+                '',
+                '@router.get("/leaf")',
+                'def leaf():',
+                '    return []',
+            ].join('\n'),
+            'mid.py': [
+                'from fastapi import APIRouter',
+                'from sub import router as sub_router',
+                '',
+                'router = APIRouter(prefix="/mid")',
+                'router.include_router(sub_router, prefix="/nested")',
+                '',
+                '@router.get("/direct")',
+                'def direct():',
+                '    return []',
+            ].join('\n'),
+            'app.py': [
+                'from fastapi import FastAPI',
+                '',
+                'import mid',
+                '',
+                'app = FastAPI()',
+                'app.include_router(mid.router, prefix="/api")',
+            ].join('\n'),
+        });
+        try {
+            const paths = extractServerRoutes(idx(dir)).map(r => r.path);
+            assert.ok(paths.includes('/api/mid/direct'), `got: ${paths}`);
+            assert.ok(paths.includes('/api/mid/nested/inner/leaf'),
+                `three-hop chain must compose, got: ${paths}`);
+        } finally { rm(dir); }
+    });
+
+    it('Flask: register_blueprint url_prefix REPLACES the blueprint prefix', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'views.py': [
+                'from flask import Blueprint',
+                '',
+                'bp = Blueprint("views", __name__, url_prefix="/pages")',
+                '',
+                '@bp.get("/home")',
+                'def home():',
+                '    return ""',
+            ].join('\n'),
+            'app.py': [
+                'from flask import Flask',
+                '',
+                'from views import bp',
+                '',
+                'app = Flask(__name__)',
+                'app.register_blueprint(bp, url_prefix="/site")',
+            ].join('\n'),
+        });
+        try {
+            const paths = extractServerRoutes(idx(dir)).map(r => r.path);
+            assert.ok(paths.includes('/site/home'),
+                `explicit url_prefix overrides the constructor one, got: ${paths}`);
+            assert.ok(!paths.includes('/site/pages/home'),
+                'Flask register_blueprint prefixes must not compose');
+        } finally { rm(dir); }
+    });
+
+    it('Flask: register_blueprint without url_prefix keeps the blueprint prefix', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'views.py': [
+                'from flask import Blueprint',
+                '',
+                'bp = Blueprint("views", __name__, url_prefix="/pages")',
+                '',
+                '@bp.get("/home")',
+                'def home():',
+                '    return ""',
+            ].join('\n'),
+            'app.py': [
+                'from flask import Flask',
+                '',
+                'from views import bp',
+                '',
+                'app = Flask(__name__)',
+                'app.register_blueprint(bp)',
+            ].join('\n'),
+        });
+        try {
+            const paths = extractServerRoutes(idx(dir)).map(r => r.path);
+            assert.ok(paths.includes('/pages/home'), `got: ${paths}`);
+        } finally { rm(dir); }
+    });
+
+    it('Express: same-file app.use mounts prefix local routers', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'users.js': [
+                "const express = require('express');",
+                'const router = express.Router();',
+                '',
+                "router.get('/list', function listUsers(req, res) { res.json([]); });",
+                '',
+                'module.exports = router;',
+            ].join('\n'),
+            'app.js': [
+                "const express = require('express');",
+                "const usersRouter = require('./users');",
+                '',
+                'const app = express();',
+                'const admin = express.Router();',
+                "admin.get('/stats', function adminStats(req, res) { res.json({}); });",
+                '',
+                "app.use('/api/users', usersRouter);",
+                "app.use('/admin', admin);",
+            ].join('\n'),
+        });
+        try {
+            const paths = extractServerRoutes(idx(dir)).map(r => r.path);
+            assert.ok(paths.includes('/api/users/list'),
+                `cross-file mount must apply, got: ${paths}`);
+            assert.ok(paths.includes('/admin/stats'),
+                `same-file mount must apply, got: ${paths}`);
+        } finally { rm(dir); }
+    });
+
+    it('unresolvable mounts leave routes at their bare path (no invention)', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'a.py': [
+                'from fastapi import APIRouter',
+                '',
+                'router = APIRouter()',
+                '',
+                '@router.get("/loose")',
+                'def loose():',
+                '    return []',
+            ].join('\n'),
+        });
+        try {
+            const routes = extractServerRoutes(idx(dir));
+            assert.strictEqual(routes[0].path, '/loose');
+            assert.strictEqual(routes[0].mountPrefix, undefined);
+        } finally { rm(dir); }
+    });
+});

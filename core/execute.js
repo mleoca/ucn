@@ -65,6 +65,15 @@ function editDistance(a, b) {
 
 function symbolNotFound(index, name, label = 'Symbol') {
     const query = String(name || '');
+    // Malformed handle (fix #283): `path:name` is a handle missing its line
+    // segment, not a symbol whose name contains a colon (identifiers can't).
+    // Saying "not found" here steered users into concluding the index missed
+    // the symbol. Single colon only — Rust `Type::method` paths never match.
+    const handleish = query.match(/^([^:]+):([A-Za-z_$][\w$]*)$/);
+    if (handleish && /[/\\]|\.[A-Za-z0-9]{1,8}$/.test(handleish[1])) {
+        return `Malformed handle "${query}": expected file:line:name. ` +
+            `Run find "${handleish[2]}" to get the exact handle.`;
+    }
     const lower = query.toLowerCase();
     let best = null;
     for (const candidate of index.symbols.keys()) {
@@ -822,7 +831,13 @@ const HANDLERS = {
     impact: (index, p) => {
         // Public v5 overload: no symbol means Git-diff impact. This replaces
         // the separate diff-impact command without changing the symbol path.
-        if (!p.name || (typeof p.name === 'string' && !p.name.trim())) {
+        // An EXPLICIT empty string is an error, not diff mode (fix #283): a
+        // pipeline whose handle extraction produced "" would otherwise get a
+        // diff answer indistinguishable from "this symbol has no callers".
+        if (typeof p.name === 'string' && p.name.trim() === '') {
+            return { ok: false, error: 'Empty symbol target. Omit the argument entirely for Git-diff impact, or pass a symbol name/handle.' };
+        }
+        if (p.name == null) {
             const response = HANDLERS.diffImpact(index, { ...p });
             if (response.ok) addMode(response.result, 'diff');
             return response;
@@ -1078,6 +1093,10 @@ const HANDLERS = {
     check: (index, p) => {
         // Public v5 overload: a symbol target performs the former verify
         // operation; a target-less invocation remains the diff/precommit check.
+        // An EXPLICIT empty string is an error, not diff mode (fix #283).
+        if (typeof p.name === 'string' && p.name.trim() === '') {
+            return { ok: false, error: 'Empty symbol target. Omit the argument entirely for the pre-commit diff check, or pass a symbol name/handle.' };
+        }
         if (p.name && String(p.name).trim()) {
             const response = HANDLERS.verify(index, { ...p });
             if (response.ok) addMode(response.result, 'symbol');

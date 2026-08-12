@@ -274,7 +274,13 @@ function formatVerify(result, options = {}) {
             const flags = _formatPatternFlags(m.patterns);
             lines.push(`  ${m.file}:${m.line}${flags}`);
             lines.push(`    ${m.expression}`);
-            lines.push(`    Expected ${m.expected}, got ${m.actual}: [${m.args?.join(', ') || ''}]`);
+            // fix #281: keyword-binding problems carry their own sentence —
+            // the raw count fits, so "Expected N, got N" would be misleading.
+            if (m.problem) {
+                lines.push(`    ${m.problem}: [${m.args?.join(', ') || ''}]`);
+            } else {
+                lines.push(`    Expected ${m.expected}, got ${m.actual}: [${m.args?.join(', ') || ''}]`);
+            }
         }
     }
 
@@ -343,6 +349,7 @@ function formatVerifyJson(result) {
                 expression: m.expression,
                 expected: m.expected,
                 actual: m.actual,
+                ...(m.problem && { problem: m.problem }),
                 args: m.args || [],
                 patterns: m.patterns,
             })),

@@ -599,7 +599,7 @@ function clearAllCaches() {
 // v166: C++ nested aliases persist their lexical owner ranges, and `auto`
 // return functions persist a unanimously inferred local concrete type. v165
 // was used during prerelease development before both fields were complete.
-const CACHE_FORMAT_VERSION = 166;
+const CACHE_FORMAT_VERSION = 167;
 
 /**
  * Save index to cache file

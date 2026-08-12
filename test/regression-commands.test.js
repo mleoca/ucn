@@ -6520,3 +6520,71 @@ describe('fix: --min-confidence CLI validation', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #283: surface-trust batch (handles, empty targets, check wording)', () => {
+    const PY_FIXTURE = {
+        'requirements.txt': '',
+        'lib.py': 'def helper(a):\n    return a\n',
+        'main.py': 'from lib import helper\n\nhelper(1)\n',
+    };
+
+    it('a path:name handle missing its line says "malformed", not "not found"', () => {
+        const dir = tmp(PY_FIXTURE);
+        try {
+            const r = execute(idx(dir), 'impact', { name: 'lib.py:helper' });
+            assert.strictEqual(r.ok, false);
+            assert.match(r.error, /Malformed handle "lib\.py:helper"/);
+            assert.match(r.error, /expected file:line:name/);
+            assert.match(r.error, /find "helper"/);
+        } finally { rm(dir); }
+    });
+
+    it('valid handles and Rust-style :: paths are untouched by the malformed check', () => {
+        const dir = tmp(PY_FIXTURE);
+        try {
+            const index = idx(dir);
+            const ok = execute(index, 'impact', { name: 'lib.py:1:helper' });
+            assert.strictEqual(ok.ok, true, JSON.stringify(ok.error));
+            const rust = execute(index, 'impact', { name: 'Type::method' });
+            assert.strictEqual(rust.ok, false);
+            assert.ok(!/Malformed handle/.test(rust.error),
+                ':: paths must not be flagged as malformed handles');
+        } finally { rm(dir); }
+    });
+
+    it('an explicit empty-string target errors instead of selecting diff mode', () => {
+        const dir = tmp(PY_FIXTURE);
+        try {
+            const index = idx(dir);
+            for (const cmd of ['impact', 'check']) {
+                const r = execute(index, cmd, { name: '' });
+                assert.strictEqual(r.ok, false, `${cmd} must reject ""`);
+                assert.match(r.error, /Empty symbol target/);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('buildPublicParams passes an explicit empty arg through to the handler', () => {
+        const { buildPublicParams } = require('../core/public-command');
+        assert.strictEqual(buildPublicParams('impact', '', {}).name, '');
+        assert.strictEqual(buildPublicParams('check', '', {}).name, '');
+        assert.ok(!('name' in buildPublicParams('impact', undefined, {})),
+            'omitted arg keeps diff mode');
+    });
+
+    it('check on a diff with only non-source changes says so', () => {
+        const { execFileSync } = require('child_process');
+        const dir = tmp(PY_FIXTURE);
+        try {
+            const git = (...a) => execFileSync('git', a, { cwd: dir, stdio: 'ignore' });
+            git('init', '-q');
+            git('add', '-A');
+            git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init');
+            fs.appendFileSync(path.join(dir, 'requirements.txt'), 'requests\n');
+            const r = execute(idx(dir), 'check', {});
+            assert.strictEqual(r.ok, true, JSON.stringify(r.error));
+            assert.match(r.result.reason,
+                /1 changed path\(s\), all outside supported source files/);
+        } finally { rm(dir); }
+    });
+});

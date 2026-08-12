@@ -80,9 +80,28 @@ function parseStructuredParams(paramsNode, language) {
         return params;
     }
 
+    // Python binding-position markers (fix #281): a bare `*` makes every later
+    // param keyword-only, a bare `/` makes every earlier param positional-only,
+    // and `*args` plays the same separator role as `*`. Dropping them collapsed
+    // `f(a, *, b)` to `f(a, b)` and verify green-lit guaranteed TypeErrors.
+    let pyKeywordOnly = false;
+
     for (let i = 0; i < paramsNode.namedChildCount; i++) {
         const param = paramsNode.namedChild(i);
         const paramInfo = {};
+
+        if (language === 'python') {
+            if (param.type === 'keyword_separator') {
+                pyKeywordOnly = true;
+                continue;
+            }
+            if (param.type === 'positional_separator') {
+                for (const prev of params) {
+                    if (!prev.rest) prev.positionalOnly = true;
+                }
+                continue;
+            }
+        }
 
         // Different handling per language
         if (language === 'javascript' || language === 'typescript' || language === 'tsx') {
@@ -98,6 +117,13 @@ function parseStructuredParams(paramsNode, language) {
         }
 
         if (paramInfo.name) {
+            if (language === 'python') {
+                if (pyKeywordOnly && !paramInfo.rest) paramInfo.keywordOnly = true;
+                // `*args` ends the positional section exactly like a bare `*`.
+                if (paramInfo.rest && /^\*(?!\*)/.test(String(paramInfo.name))) {
+                    pyKeywordOnly = true;
+                }
+            }
             params.push(paramInfo);
             // Go multi-name declarations: `a, b int` → expand additional params
             if (paramInfo._additionalNames) {

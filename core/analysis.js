@@ -1768,6 +1768,8 @@ function diffImpact(index, options = {}) {
     if (!diffText || !diffText.trim()) {
         return {
             base: staged ? '(staged)' : base,
+            changedPaths: 0,
+            nonSourcePaths: 0,
             functions: [],
             moduleLevelChanges: [],
             newFunctions: [],
@@ -1803,9 +1805,13 @@ function diffImpact(index, options = {}) {
     let totalCallSites = 0;
     let totalUnverifiedSites = 0;
 
+    // fix #283: count changed paths the analysis can't see (docs, config,
+    // unsupported languages) so "no changes to analyze" can say why.
+    let nonSourcePaths = 0;
+
     for (const change of changes) {
         const lang = detectLanguage(change.filePath);
-        if (!lang) continue;
+        if (!lang) { nonSourcePaths++; continue; }
 
         const fileEntry = index.files.get(change.filePath);
 
@@ -2172,6 +2178,8 @@ function diffImpact(index, options = {}) {
 
     return {
         base: staged ? '(staged)' : base,
+        changedPaths: changes.length,
+        nonSourcePaths,
         functions,
         moduleLevelChanges,
         newFunctions,

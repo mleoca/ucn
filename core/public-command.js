@@ -31,10 +31,13 @@ function buildPublicParams(command, arg, params = {}) {
     switch (command) {
         case 'search': return { ...clean, term: arg || clean.term };
         case 'source': return parseSourceTarget(arg || clean.name, clean);
-        case 'impact': return { ...clean, ...(arg ? { name: arg } : {}) };
+        // fix #283: an EXPLICIT empty-string arg must reach the handler (which
+        // rejects it) instead of silently selecting diff mode — `arg ? ...`
+        // made `impact ""` indistinguishable from `impact`.
+        case 'impact': return { ...clean, ...(arg != null ? { name: arg } : {}) };
         case 'deps': return { ...clean, file: arg || clean.file };
         case 'api': return { ...clean, file: arg || clean.file };
-        case 'check': return { ...clean, ...(arg ? { name: arg } : {}) };
+        case 'check': return { ...clean, ...(arg != null ? { name: arg } : {}) };
         case 'stacktrace': return { ...clean, stack: clean.stack || arg };
         default: return clean;
     }

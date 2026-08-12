@@ -80,13 +80,25 @@ function check(index, options = {}) {
     ];
 
     if (!dr || (modified.length === 0 && added.length === 0 && deleted.length === 0)) {
+        // fix #283: say what the diff actually contained. "no changes
+        // detected" with three changed files reads as a false negative in a
+        // pre-commit hook — the truth is the changes are outside what the
+        // symbol analysis can see.
+        const changedPaths = dr?.changedPaths || 0;
+        const nonSourcePaths = dr?.nonSourcePaths || 0;
+        let reason = 'no changes detected';
+        if (changedPaths > 0 && nonSourcePaths === changedPaths) {
+            reason = `${changedPaths} changed path(s), all outside supported source files`;
+        } else if (changedPaths > 0) {
+            reason = 'no callable-symbol changes in the diff';
+        }
         return {
             base: options.base || 'HEAD',
             staged: !!options.staged,
             ok: true,
             status: 'clean',
             empty: true,
-            reason: 'no changes detected',
+            reason,
         };
     }
 

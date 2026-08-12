@@ -55,6 +55,13 @@ const STRUCTURAL_TRAITS = {
     // Whether `Type(...)` constructs a class without a `new` token. Python
     // classes are ordinary callable objects; JS/TS classes require `new`.
     classesCallableWithoutNew: false,
+    // Whether call sites bind arguments by parameter NAME (Python keyword
+    // arguments). Drives verify/check keyword binding validation (fix #281):
+    // keyword names checked against the signature, keyword-only/positional-only
+    // markers honored, required coverage enforced. Languages without named
+    // arguments must stay false — a JS call with fewer args than params is
+    // legal, so required-coverage checks would false-flag.
+    keywordArguments: false,
 };
 const NOMINAL_TRAITS = {
     typeSystem: 'nominal',
@@ -64,6 +71,11 @@ const NOMINAL_TRAITS = {
     exportVisibility: 'keyword',
     hasDynamicImports: true,
     testDirs: [],
+    // Call sites don't bind arguments by parameter name here (see
+    // STRUCTURAL_TRAITS.keywordArguments — Python overrides true). C# HAS
+    // named arguments but its parser doesn't record them yet; the trait stays
+    // false there until that family is measured (fix #281, classified-deferred).
+    keywordArguments: false,
     // Go/Java/Rust have no default parameter values — see STRUCTURAL_TRAITS.
     hasDefaultParams: false,
     // Whether ANY instance method call can dynamically dispatch to a subtype
@@ -177,6 +189,9 @@ const LANGUAGES = {
             // from-imports bind values only (`import * as ns` is parser-marked).
             submoduleImports: true,
             classesCallableWithoutNew: true,
+            // Call sites bind by parameter name (f(x=1)); signatures carry
+            // keyword-only (`*`) and positional-only (`/`) markers (fix #281).
+            keywordArguments: true,
             testFileCandidates: (base, ext) => [`test_${base}.py`, `${base}_test.py`],
             testDirs: ['tests'],
         },

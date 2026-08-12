@@ -210,6 +210,11 @@ function formatDiffImpact(result, options = {}) {
     parts.push(`${s.totalCallSites || 0} call sites across ${s.affectedFiles || 0} files`);
     if (s.unverifiedCallSites > 0) parts.push(`${s.unverifiedCallSites} unverified`);
     lines.push(parts.join(', '));
+    // fix #283: changed paths outside supported source are invisible to the
+    // symbol analysis — disclose instead of silently narrowing the diff.
+    if (result.nonSourcePaths > 0) {
+        lines.push(`Note: ${result.nonSourcePaths} changed path(s) outside supported source files not analyzed.`);
+    }
     lines.push('');
 
     // Modified functions

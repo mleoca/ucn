@@ -8,10 +8,13 @@
  * server route — across language boundaries.
  *
  * REUSES the call cache (getCachedCalls) and AST-derived symbol metadata
- * (decoratorsWithArgs/annotationsWithArgs/attributesWithArgs). The only file
- * I/O is index-driven; we never re-parse files. Extraction results are cached
- * lazily on `index._endpointsCache` and invalidated on rebuild via the same
- * mechanism as `_reachableSymbols`.
+ * (decoratorsWithArgs/annotationsWithArgs/attributesWithArgs). File I/O is
+ * index-driven; the one re-parse is the router-mount scan (fix #282), which
+ * AST-parses only the files whose call cache mentions a router factory or an
+ * include/mount call — keyword arguments (`prefix=`) and mount references
+ * aren't in the call cache. Extraction results are cached lazily on
+ * `index._endpointsCache` and invalidated on rebuild via the same mechanism
+ * as `_reachableSymbols`.
  *
  * Output shape:
  *   serverRoutes: [{ method, path, normalizedPath, handler, file, line, framework, raw }]
@@ -26,6 +29,7 @@ const fs = require('fs');
 const { codeUnitCompare } = require('./shared');
 const path = require('path');
 const { getCachedCalls } = require('./callers');
+const { getParser, safeParse } = require('../languages');
 
 // ============================================================================
 // HTTP METHOD CONSTANTS
@@ -84,6 +88,57 @@ function joinRoutePath(prefix, sub) {
     if (!s) return p || '/';
     if (!p) return '/' + s;
     return p + '/' + s;
+}
+
+/** Join two PREFIX fragments (fix #282). Unlike joinRoutePath, two empty
+ *  fragments compose to '' — a router with no mount prefix anywhere must not
+ *  gain a spurious '/'. */
+function joinPrefixes(a, b) {
+    if (!a) return b || '';
+    if (!b) return a;
+    return a.replace(/\/+$/, '') + '/' + b.replace(/^\/+/, '');
+}
+
+/**
+ * Compose mount-prefix chains transitively (fix #282). A router's full
+ * prefix = (each mounter's full prefix + the mount-call prefix) + its own
+ * constructor prefix — FastAPI/Flask include semantics; Express has no
+ * constructor prefix so `ctorPrefixes` is simply empty there.
+ *
+ * @param {Map<string, Array<{mounterKey: string|null, prefix: string, overridesCtor?: boolean}>>} edges
+ *        targetKey -> incoming mounts (mounterKey null = unresolvable mounter,
+ *        treated as a root). `overridesCtor` models Flask's register_blueprint
+ *        semantics: an explicit url_prefix REPLACES the blueprint's own prefix
+ *        (FastAPI's include_router prefix composes with it instead).
+ * @param {Map<string, string>} ctorPrefixes - key -> constructor prefix
+ * @returns {Map<string, string[]>} key -> composed full prefixes (sorted)
+ */
+function composeMountPrefixes(edges, ctorPrefixes) {
+    const memo = new Map();
+    const resolve = (key, depth, stack) => {
+        if (key == null) return [''];
+        if (memo.has(key)) return memo.get(key);
+        if (depth > 8 || stack.has(key)) return [''];
+        stack.add(key);
+        const own = ctorPrefixes.get(key) || '';
+        const incoming = edges.get(key) || [];
+        const full = incoming.length === 0 ? [own]
+            : incoming.flatMap(e => resolve(e.mounterKey, depth + 1, stack)
+                .map(parentFull => joinPrefixes(joinPrefixes(parentFull, e.prefix),
+                    e.overridesCtor ? '' : own)));
+        const out = [...new Set(full.length ? full : [own])].sort(codeUnitCompare);
+        stack.delete(key);
+        memo.set(key, out);
+        return out;
+    };
+    // Only router keys are exposed — mounter-only keys (the app object) are
+    // resolved for composition but would shadow group-prefix fallbacks if kept.
+    const routerKeys = new Set([...edges.keys(), ...ctorPrefixes.keys()]);
+    const out = new Map();
+    for (const key of [...routerKeys].sort(codeUnitCompare)) {
+        out.set(key, resolve(key, 0, new Set()));
+    }
+    return out;
 }
 
 // ============================================================================
@@ -281,6 +336,7 @@ function extractServerRoutes(index) {
 
     const routes = [];
     const mountedPrefixes = collectProjectRouterMounts(index);
+    const pythonMounts = collectPythonRouterMounts(index);
     const pythonReceiverFrameworks = new Map();
     for (const [filePath, entry] of index.files) {
         if (entry.language !== 'python') continue;
@@ -332,18 +388,26 @@ function extractServerRoutes(index) {
             const declRoutes = collectMethodRoutes(sym, lang, classPrefix, fileEntry,
                 pythonReceiverFrameworks.get(sym.file));
             for (const r of declRoutes) {
-                routes.push({
-                    method: r.method,
-                    path: r.path,
-                    normalizedPath: normalizePath(r.path),
-                    handler: sym.name,
-                    file: sym.relativePath || sym.file,
-                    absoluteFile: sym.file,
-                    line: sym.startLine,
-                    framework: r.framework,
-                    classPrefix: classPrefix || undefined,
-                    raw: r.raw || `${r.method} ${r.path}`,
-                });
+                // fix #282: FastAPI/Flask routers serve under their composed
+                // mount prefixes (APIRouter(prefix=) + include_router(prefix=)).
+                const prefixes = (lang === 'python' && r.receiver &&
+                    pythonMounts.get(`${sym.file}:${r.receiver}`)) || [''];
+                for (const prefix of prefixes) {
+                    const fullPath = prefix ? joinRoutePath(prefix, r.path) : r.path;
+                    routes.push({
+                        method: r.method,
+                        path: fullPath,
+                        normalizedPath: normalizePath(fullPath),
+                        handler: sym.name,
+                        file: sym.relativePath || sym.file,
+                        absoluteFile: sym.file,
+                        line: sym.startLine,
+                        framework: r.framework,
+                        classPrefix: classPrefix || undefined,
+                        ...(prefix && { mountPrefix: prefix }),
+                        raw: r.raw || `${r.method} ${fullPath}`,
+                    });
+                }
             }
         }
     }
@@ -476,6 +540,9 @@ function collectMethodRoutes(sym, lang, classPrefix, fileEntry = null,
                     method: r.method,
                     path: r.path,
                     framework: r.framework,
+                    // fix #282: the decorator's receiver variable keys the
+                    // composed mount-prefix lookup in extractServerRoutes.
+                    receiver: r.receiver,
                 });
             }
         }
@@ -587,10 +654,10 @@ function parsePythonDecoratorFull(raw, fileEntry = null, receiverFramework = nul
             const methods = methodsMatch[1].split(',').map(s => s.trim().replace(/['"]/g, '').toUpperCase()).filter(Boolean);
             // Caller will receive ONE entry; we return GET if methods empty, else first.
             if (methods.length > 0) {
-                return { method: methods[0], path: pathStr, framework: 'flask' };
+                return { method: methods[0], path: pathStr, framework: 'flask', receiver: m[1] };
             }
         }
-        return { method: 'GET', path: pathStr, framework: 'flask' };
+        return { method: 'GET', path: pathStr, framework: 'flask', receiver: m[1] };
     }
     if (['get','post','put','delete','patch','options','head'].includes(verb)) {
         const modules = (fileEntry?.imports || []).map(value =>
@@ -601,43 +668,193 @@ function parsePythonDecoratorFull(raw, fileEntry = null, receiverFramework = nul
                 ? 'flask' : modules.some(module => /^fastapi\b/.test(module)) &&
                   !modules.some(module => /^flask\b/.test(module))
                     ? 'fastapi' : 'unknown-python');
-        return { method: verb.toUpperCase(), path: pathStr, framework };
+        return { method: verb.toUpperCase(), path: pathStr, framework, receiver: m[1] };
     }
     return null;
 }
 
-/** Map exported router receiver variables to their literal project mounts. */
+// ── Python router mounts (fix #282) ─────────────────────────────────────────
+// FastAPI: `router = APIRouter(prefix="/api")` + `app.include_router(r, prefix="/v2")`.
+// Flask:   `bp = Blueprint(..., url_prefix="/api")` + `app.register_blueprint(bp, url_prefix="/v2")`.
+// Neither prefix mechanism is in the call cache (both are keyword arguments,
+// and the mounted router is a non-string argument), so every route rendered
+// with its bare decorator path — /list for the real /api/things/list — and
+// --bridge matched nothing on a prefixed application.
+const PY_ROUTER_FACTORIES = new Set(['APIRouter', 'Blueprint']);
+const PY_INCLUDE_METHODS = new Set(['include_router', 'register_blueprint']);
+const PY_PREFIX_KWARGS = new Set(['prefix', 'url_prefix']);
+
+/** Unquote a Python string literal node ("/api", '/api', r"/api"). */
+function pyStringText(node) {
+    if (!node || node.type !== 'string') return null;
+    const m = node.text.match(/^[rbuf]{0,2}(['"])([\s\S]*)\1$/i);
+    return m ? m[2] : null;
+}
+
+/** First `prefix=`/`url_prefix=` string keyword argument of a call node. */
+function pyPrefixKwarg(argsNode) {
+    if (!argsNode) return null;
+    for (let i = 0; i < argsNode.namedChildCount; i++) {
+        const arg = argsNode.namedChild(i);
+        if (arg.type !== 'keyword_argument') continue;
+        const nameNode = arg.childForFieldName('name') || arg.namedChild(0);
+        if (!nameNode || !PY_PREFIX_KWARGS.has(nameNode.text)) continue;
+        const valueNode = arg.childForFieldName('value') || arg.namedChild(1);
+        return pyStringText(valueNode);
+    }
+    return null;
+}
+
+/**
+ * Map Python router variables to their composed mount prefixes.
+ * Returns Map `${absFile}:${routerVar}` -> [full prefix strings].
+ * Only files whose call cache mentions a router factory or include call are
+ * AST-parsed; unresolvable mount references contribute no edge (the route
+ * keeps its bare path — conservative under the advisory contract).
+ */
+function collectPythonRouterMounts(index) {
+    const relevant = [];
+    for (const [filePath, entry] of index.files) {
+        if (entry.language !== 'python') continue;
+        const calls = getCachedCalls(index, filePath) || [];
+        if (calls.some(c => (PY_ROUTER_FACTORIES.has(c.name) && c.assignedTo) ||
+            PY_INCLUDE_METHODS.has(c.name))) {
+            relevant.push([filePath, entry]);
+        }
+    }
+    if (relevant.length === 0) return new Map();
+    let parser;
+    try { parser = getParser('python'); } catch (e) { return new Map(); }
+    if (!parser) return new Map();
+
+    const ctorPrefixes = new Map();
+    const edges = new Map();
+    for (const [filePath, entry] of relevant) {
+        let tree = null;
+        try {
+            tree = safeParse(parser, fs.readFileSync(filePath, 'utf8'));
+        } catch (e) { /* unreadable/unparseable → no prefixes from this file */ }
+        if (!tree) continue;
+        const visit = (node) => {
+            if (node.type === 'call') visitPyRouterCall(node, filePath, entry, index, ctorPrefixes, edges);
+            for (let i = 0; i < node.namedChildCount; i++) visit(node.namedChild(i));
+        };
+        visit(tree.rootNode);
+    }
+    return composeMountPrefixes(edges, ctorPrefixes);
+}
+
+function visitPyRouterCall(callNode, filePath, entry, index, ctorPrefixes, edges) {
+    const fn = callNode.childForFieldName('function');
+    if (!fn) return;
+
+    // `<var> = APIRouter(prefix="/api")` — constructor prefix.
+    if (fn.type === 'identifier' && PY_ROUTER_FACTORIES.has(fn.text)) {
+        const parent = callNode.parent;
+        if (!parent || parent.type !== 'assignment') return;
+        const left = parent.childForFieldName('left');
+        if (!left || left.type !== 'identifier') return;
+        const prefix = pyPrefixKwarg(callNode.childForFieldName('arguments'));
+        if (prefix) ctorPrefixes.set(`${filePath}:${left.text}`, prefix);
+        return;
+    }
+
+    // `<recv>.include_router(<ref>, prefix="/v2")` — mount edge.
+    if (fn.type !== 'attribute') return;
+    const attrNode = fn.childForFieldName('attribute');
+    if (!attrNode || !PY_INCLUDE_METHODS.has(attrNode.text)) return;
+    const recvNode = fn.childForFieldName('object');
+    // Non-identifier receivers (self.app, factories) can't be keyed — treat
+    // as a root mounter so the edge prefix still applies.
+    const mounterKey = recvNode && recvNode.type === 'identifier'
+        ? `${filePath}:${recvNode.text}` : null;
+    const argsNode = callNode.childForFieldName('arguments');
+    if (!argsNode) return;
+    let refNode = null;
+    for (let i = 0; i < argsNode.namedChildCount; i++) {
+        const arg = argsNode.namedChild(i);
+        if (arg.type === 'keyword_argument' || arg.type.includes('comment')) continue;
+        refNode = arg;
+        break;
+    }
+    if (!refNode) return;
+    const explicitPrefix = pyPrefixKwarg(argsNode);
+    const prefix = explicitPrefix || '';
+    // Flask: register_blueprint's url_prefix REPLACES the blueprint's own
+    // url_prefix; FastAPI's include_router prefix composes with it.
+    const overridesCtor = explicitPrefix != null && attrNode.text === 'register_blueprint';
+
+    let targetKey = null;
+    if (refNode.type === 'attribute') {
+        // `app.include_router(mod.router)` — module attribute.
+        const obj = refNode.childForFieldName('object');
+        const attr = refNode.childForFieldName('attribute');
+        if (obj && obj.type === 'identifier' && attr) {
+            const binding = (entry.importBindings || []).find(b => b.name === obj.text);
+            const rel = binding && entry.moduleResolved?.[binding.module];
+            if (rel) targetKey = `${path.join(index.root, rel)}:${attr.text}`;
+        }
+    } else if (refNode.type === 'identifier') {
+        // Bare name: alias-aware from-import first, then same-file variable.
+        const aliasEntry = (entry.importAliases || []).find(a => a.local === refNode.text);
+        const original = aliasEntry ? aliasEntry.original : refNode.text;
+        const binding = (entry.importBindings || []).find(b =>
+            b.name === original && entry.moduleResolved?.[b.module]);
+        targetKey = binding
+            ? `${path.join(index.root, entry.moduleResolved[binding.module])}:${original}`
+            : `${filePath}:${refNode.text}`;
+    }
+    if (!targetKey) return;
+    const list = edges.get(targetKey) || [];
+    list.push({ mounterKey, prefix, ...(overridesCtor && { overridesCtor }) });
+    edges.set(targetKey, list);
+}
+
+/** Map exported router receiver variables to their literal project mounts.
+ *  fix #282: same-file mounts (`app.use('/api', localRouter)`), NAMED-export
+ *  routers, and transitive composition (`app.use('/api', parent)` +
+ *  `parent.use('/sub', child)` → child serves under /api/sub). */
 function collectProjectRouterMounts(index) {
-    const mounts = new Map();
+    const edges = new Map();
     for (const [filePath, fileEntry] of index.files) {
         if (!['javascript', 'typescript', 'tsx'].includes(fileEntry.language)) continue;
         const calls = getCachedCalls(index, filePath) || [];
+        const localRouters = collectRouterReceivers(calls, fileEntry.language);
         for (const call of calls) {
             if (call.name !== 'use' || !call.receiver || !call.firstStringArg ||
                 (call.argCount != null && call.argCount < 2)) continue;
+            const mounterKey = `${filePath}:${call.receiver}`;
             const refs = calls.filter(candidate => candidate.line === call.line &&
                 candidate !== call && (candidate.isFunctionReference || candidate.isPotentialCallback));
             for (const ref of refs) {
+                const targetKeys = [];
                 const binding = (fileEntry.importBindings || []).find(item => item.name === ref.name);
                 const rel = binding && fileEntry.moduleResolved?.[binding.module];
-                if (!rel) continue;
-                const targetFile = path.join(index.root, rel);
-                const targetEntry = index.files.get(targetFile);
-                if (!targetEntry) continue;
-                const exportedReceivers = (targetEntry.exportDetails || [])
-                    .filter(exp => exp.type === 'module.exports' || exp.isDefault ||
-                        exp.kind === 'default' || exp.type === 'export-default')
-                    .map(exp => exp.localName || exp.name).filter(Boolean);
-                for (const receiver of exportedReceivers) {
-                    const key = `${targetFile}:${receiver}`;
-                    const list = mounts.get(key) || [];
-                    if (!list.includes(call.firstStringArg)) list.push(call.firstStringArg);
-                    mounts.set(key, list);
+                if (rel) {
+                    const targetFile = path.join(index.root, rel);
+                    const targetEntry = index.files.get(targetFile);
+                    if (targetEntry) {
+                        const exportedReceivers = (targetEntry.exportDetails || [])
+                            .filter(exp => exp.type === 'module.exports' || exp.isDefault ||
+                                exp.kind === 'default' || exp.type === 'export-default' ||
+                                exp.name === ref.name)
+                            .map(exp => exp.localName || exp.name).filter(Boolean);
+                        for (const receiver of exportedReceivers) {
+                            targetKeys.push(`${targetFile}:${receiver}`);
+                        }
+                    }
+                } else if (localRouters.has(ref.name)) {
+                    targetKeys.push(`${filePath}:${ref.name}`);
+                }
+                for (const key of targetKeys) {
+                    const list = edges.get(key) || [];
+                    list.push({ mounterKey, prefix: call.firstStringArg });
+                    edges.set(key, list);
                 }
             }
         }
     }
-    return mounts;
+    return composeMountPrefixes(edges, new Map());
 }
 
 /**

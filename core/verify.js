@@ -413,13 +413,28 @@ function formatTypedSignature(def, overrides = {}) {
     const ps = overrides.paramsStructured != null ? overrides.paramsStructured : def.paramsStructured;
     if (Array.isArray(ps)) {
         const paramTypes = def.paramTypes || {};
-        const parts2 = ps.map(p => {
+        // Python binding-position markers (fix #281): re-render the bare `*`
+        // before the first keyword-only param (unless `*args` already plays
+        // that role) and the `/` after the last positional-only param, so the
+        // displayed signature matches the source contract.
+        const lastPosOnly = ps.reduce(
+            (acc, p, i) => (p && p.positionalOnly ? i : acc), -1);
+        let starShown = false;
+        const parts2 = [];
+        ps.forEach((p, i) => {
             // Apply paramTypes mapping when paramsStructured doesn't carry types
             const merged = { ...p };
             if (!merged.type && paramTypes[p.name]) merged.type = paramTypes[p.name];
-            return formatTypedParam(merged);
+            if (p && p.rest && /^\*(?!\*)/.test(String(p.name))) starShown = true;
+            if (!starShown && p && p.keywordOnly) {
+                parts2.push('*');
+                starShown = true;
+            }
+            const tok = formatTypedParam(merged);
+            if (tok) parts2.push(tok);
+            if (i === lastPosOnly) parts2.push('/');
         });
-        parts.push(`(${parts2.filter(Boolean).join(', ')})`);
+        parts.push(`(${parts2.join(', ')})`);
     } else if (def.params !== undefined) {
         parts.push(`(${def.params})`);
     }
@@ -874,6 +889,28 @@ function analyzeCallSite(index, call, funcName, occurrence = 0) {
             args.push(argNode.text.trim());
         }
 
+        // Python argument structure (fix #281): keyword arguments bind by
+        // NAME, and `*seq` / `**map` unpacking makes the argument count
+        // non-static. Both were invisible before — keyword args counted as
+        // positional slots and unpacking fell through to a hard mismatch.
+        const keywordArgNames = [];
+        let unpackingArgs = 0;
+        let pyPositional = 0;
+        if (language === 'python') {
+            for (let i = 0; i < argsNode.namedChildCount; i++) {
+                const argNode = argsNode.namedChild(i);
+                if (argNode.type.includes('comment')) continue;
+                if (argNode.type === 'keyword_argument') {
+                    const nameNode = argNode.childForFieldName('name') || argNode.namedChild(0);
+                    if (nameNode) keywordArgNames.push(nameNode.text);
+                } else if (argNode.type === 'list_splat' || argNode.type === 'dictionary_splat') {
+                    unpackingArgs++;
+                } else {
+                    pyPositional++;
+                }
+            }
+        }
+
         // Function.prototype indirection has a precise, AST-visible argument
         // mapping. `fn.call(thisArg, a, b)` invokes fn(a, b). `fn.apply`
         // is countable only when its argument array is a literal. `bind`
@@ -922,7 +959,9 @@ function analyzeCallSite(index, call, funcName, occurrence = 0) {
         return {
             args,
             argCount: args.length,
-            hasSpread: args.some(a => a.startsWith('...')),
+            hasSpread: args.some(a => a.startsWith('...')) || unpackingArgs > 0,
+            ...(unpackingArgs > 0 && { unpackingSpread: true }),
+            ...(language === 'python' && { positionalCount: pyPositional, keywordArgNames }),
             hasVariable: args.some(a => /^[a-zA-Z_]\w*$/.test(a)),
             isMethodCall,
             ...(indirectKind && { indirectKind }),
@@ -1129,6 +1168,70 @@ function identifyCallPatterns(callSites, funcName) {
     return patterns;
 }
 
+// Decorators that provably keep the declared call interface. Any OTHER
+// decorator may reshape the signature (click/celery/functools partials), so
+// keyword-binding violations against the declared parameters route to the
+// UNCERTAIN band instead of hard mismatches (fix #281 — the #205 "decorators
+// reshape signatures" rule applied to verify's claim).
+const SIGNATURE_PRESERVING_DECORATORS = new Set([
+    'staticmethod', 'classmethod', 'abstractmethod', 'override', 'final',
+]);
+
+/**
+ * Bind a keyword-argument call against structured parameters (fix #281).
+ * Mirrors the interpreter's rules: positional args fill non-keyword-only
+ * slots in order, each keyword arg must name a known non-positional-only
+ * parameter (unless `**kwargs` absorbs it), and every required parameter
+ * must end up bound. Returns problem strings (empty = binds cleanly).
+ * Callers gate on the `keywordArguments` trait — languages without named
+ * arguments allow short calls, so required-coverage would false-flag.
+ */
+function bindKeywordCall(params, analysis) {
+    const problems = [];
+    const isListRest = p => p.rest && /^\*(?!\*)/.test(String(p.name));
+    const isDictRest = p => p.rest && /^\*\*/.test(String(p.name));
+    const slots = params.filter(p => !p.rest && !p.keywordOnly);
+    const hasListRest = params.some(isListRest);
+    const hasDictRest = params.some(isDictRest);
+    const positional = analysis.positionalCount != null
+        ? analysis.positionalCount : analysis.argCount;
+    const tooManyPositional = positional > slots.length && !hasListRest;
+    if (tooManyPositional) {
+        problems.push(`takes ${slots.length} positional argument(s) but ` +
+            `${positional} ${positional === 1 ? 'was' : 'were'} given`);
+    }
+    const bound = new Set(
+        slots.slice(0, Math.min(positional, slots.length)).map(p => p.name));
+    for (const kw of analysis.keywordArgNames || []) {
+        const param = params.find(p => !p.rest && p.name === kw);
+        if (!param) {
+            if (!hasDictRest) problems.push(`unexpected keyword argument '${kw}'`);
+        } else if (param.positionalOnly) {
+            // With **kwargs the name is absorbed there — but then the
+            // positional-only parameter itself stays unbound (missing check).
+            if (!hasDictRest) {
+                problems.push(`'${kw}' is positional-only and cannot be passed by keyword`);
+            }
+        } else if (bound.has(kw)) {
+            problems.push(`got multiple values for argument '${kw}'`);
+        } else {
+            bound.add(kw);
+        }
+    }
+    // Skip required-coverage when positionals already overflowed — the extra
+    // positionals were almost certainly aimed at the unbound keyword-only
+    // params, and the interpreter reports only the positional error too.
+    if (!tooManyPositional) {
+        const missing = params
+            .filter(p => !p.rest && !p.optional && p.default === undefined && !bound.has(p.name))
+            .map(p => `'${p.name}'`);
+        if (missing.length > 0) {
+            problems.push(`missing required argument(s): ${missing.join(', ')}`);
+        }
+    }
+    return problems;
+}
+
 /**
  * Verify that all call sites match a function's signature
  * @param {object} index - ProjectIndex instance
@@ -1216,6 +1319,18 @@ function verify(index, name, options = {}) {
 
     const defIsMethod = !!(def.isMethod || def.type === 'method' || def.className);
 
+    // fix #281: keyword-argument binding validation. Applies only where the
+    // language binds by name (Python), the target has ONE parameter list
+    // (overload groups keep the count-range check), and the arity isn't an
+    // inherited-constructor unknown.
+    const keywordBindable = langTraits(lang)?.keywordArguments === true &&
+        rawParamLists.length === 1 && !inheritedCtorOnly;
+    const decoratorReshapes = keywordBindable && Array.isArray(def.decorators) &&
+        def.decorators.some(d => {
+            const dName = String(d).replace(/^@/, '').split('(')[0].trim();
+            return !SIGNATURE_PRESERVING_DECORATORS.has(dName.split('.').pop());
+        });
+
     // Helper: extract pattern flags (Feature A/B) from analyzeCallSite result.
     // Reused so each valid/mismatch/uncertain entry carries the same shape.
     function patternFlagsFrom(a) {
@@ -1261,7 +1376,9 @@ function verify(index, name, options = {}) {
                 file: call.relativePath,
                 line: call.line,
                 expression: call.content.trim(),
-                reason: 'Uses spread operator',
+                reason: analysis.unpackingSpread
+                    ? 'Uses argument unpacking (*/**) — argument count is not static'
+                    : 'Uses spread operator',
                 patterns: patternFlagsFrom(analysis),
                 ...carry,
             });
@@ -1285,51 +1402,69 @@ function verify(index, name, options = {}) {
         }
 
         // Check if arg count is valid
-        if (hasRest) {
-            // With rest param, need at least minArgs
-            if (argCount >= minArgs) {
-                valid.push({
-                    file: call.relativePath,
-                    line: call.line,
-                    patterns: patternFlagsFrom(analysis),
-                    ...carry,
-                });
-            } else {
-                mismatches.push({
-                    file: call.relativePath,
-                    line: call.line,
-                    expression: call.content.trim(),
-                    expected: `at least ${minArgs} arg(s)`,
-                    actual: argCount,
-                    args: analysis.args,
-                    patterns: patternFlagsFrom(analysis),
-                    ...carry,
-                });
-            }
-        } else {
-            // Without rest, need between minArgs and expectedParamCount
-            if (argCount >= minArgs && argCount <= expectedParamCount) {
-                valid.push({
-                    file: call.relativePath,
-                    line: call.line,
-                    patterns: patternFlagsFrom(analysis),
-                    ...carry,
-                });
-            } else {
-                mismatches.push({
-                    file: call.relativePath,
-                    line: call.line,
-                    expression: call.content.trim(),
-                    expected: minArgs === expectedParamCount
+        const countOk = hasRest
+            ? argCount >= minArgs
+            : (argCount >= minArgs && argCount <= expectedParamCount);
+        if (!countOk) {
+            mismatches.push({
+                file: call.relativePath,
+                line: call.line,
+                expression: call.content.trim(),
+                expected: hasRest
+                    ? `at least ${minArgs} arg(s)`
+                    : (minArgs === expectedParamCount
                         ? `${expectedParamCount} arg(s)`
-                        : `${minArgs}-${expectedParamCount} arg(s)`,
+                        : `${minArgs}-${expectedParamCount} arg(s)`),
+                actual: argCount,
+                args: analysis.args,
+                patterns: patternFlagsFrom(analysis),
+                ...carry,
+            });
+            continue;
+        }
+
+        // fix #281: the count fits — for keyword-binding languages, check the
+        // NAME-level contract too (keyword-only slots, unknown keyword names,
+        // required coverage). A reshaping decorator demotes violations to
+        // UNCERTAIN: the declared parameters may not be the call interface.
+        const bindingProblems = keywordBindable ? bindKeywordCall(params, analysis) : [];
+        if (bindingProblems.length > 0) {
+            if (decoratorReshapes) {
+                uncertain.push({
+                    file: call.relativePath,
+                    line: call.line,
+                    expression: call.content.trim(),
+                    reason: `Against the declared parameters: ${bindingProblems.join('; ')}. ` +
+                        'The definition is decorated, and the decorator may reshape the call interface.',
+                    patterns: patternFlagsFrom(analysis),
+                    ...carry,
+                });
+            } else {
+                mismatches.push({
+                    file: call.relativePath,
+                    line: call.line,
+                    expression: call.content.trim(),
+                    expected: hasRest
+                        ? `at least ${minArgs} arg(s)`
+                        : (minArgs === expectedParamCount
+                            ? `${expectedParamCount} arg(s)`
+                            : `${minArgs}-${expectedParamCount} arg(s)`),
                     actual: argCount,
                     args: analysis.args,
+                    problem: bindingProblems.join('; '),
                     patterns: patternFlagsFrom(analysis),
                     ...carry,
                 });
             }
+            continue;
         }
+
+        valid.push({
+            file: call.relativePath,
+            line: call.line,
+            patterns: patternFlagsFrom(analysis),
+            ...carry,
+        });
     }
     clearTreeCache(index);
 
@@ -1415,7 +1550,10 @@ function verify(index, name, options = {}) {
         params: params.map(p => ({
             name: p.name,
             optional: p.optional || p.default !== undefined,
-            hasDefault: p.default !== undefined
+            hasDefault: p.default !== undefined,
+            // fix #281: binding-position markers (Python `*` / `/`)
+            ...(p.keywordOnly && { keywordOnly: true }),
+            ...(p.positionalOnly && { positionalOnly: true }),
         })),
         // max: null = unbounded (rest param) — typed for JSON consumers;
         // the text formatter renders it as `${min}+` (fix #230, was the

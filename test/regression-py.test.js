@@ -4711,3 +4711,136 @@ describe('Python capability-guard dispatch provenance', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #281: keyword-argument binding validation in verify/check', () => {
+    const FIXTURE = {
+        'requirements.txt': '',
+        'lib.py': [
+            'def kwonly(a, *, b):',
+            '    return a + b',
+            '',
+            'def named(a, b=1):',
+            '    return a',
+            '',
+            'def posonly(a, /, b):',
+            '    return a + b',
+            '',
+            'def absorb(a, **kw):',
+            '    return a',
+            '',
+            'def spread(a, *rest, tail=None):',
+            '    return a',
+        ].join('\n'),
+        'main.py': [
+            'from lib import kwonly, named, posonly, absorb, spread',
+            '',
+            'kwonly(1, 2)',        // TypeError: takes 1 positional argument
+            'kwonly(1, b=2)',      // valid
+            'kwonly(b=2, a=1)',    // valid
+            'named(1, z=9)',       // TypeError: unexpected keyword 'z'
+            'named(b=2)',          // TypeError: missing required 'a'
+            'posonly(a=1, b=2)',   // TypeError: 'a' is positional-only
+            'absorb(1, other=3)',  // valid (**kw absorbs)
+            'spread(1, 2, 3, tail=9)',  // valid (*rest + keyword-only tail)
+            'args = (1, 2)',
+            'kwonly(*args)',       // statically unknowable → uncertain
+        ].join('\n'),
+    };
+
+    it('signature keeps the bare * separator and keyword-only calls bind by name', () => {
+        const dir = tmp(FIXTURE);
+        try {
+            const index = idx(dir);
+            const r = index.verify('kwonly');
+            assert.ok(r.signature.includes('(a, *, b)'),
+                `signature must render the * separator, got: ${r.signature}`);
+            assert.strictEqual(r.valid, 2, 'kwonly(1, b=2) and kwonly(b=2, a=1) are valid');
+            assert.strictEqual(r.mismatches, 1, 'kwonly(1, 2) is a guaranteed TypeError');
+            const m = r.mismatchDetails[0];
+            assert.strictEqual(m.line, 3);
+            assert.match(m.problem, /takes 1 positional argument/);
+            const kw = r.params.find(p => p.name === 'b');
+            assert.strictEqual(kw.keywordOnly, true, 'b is keyword-only in JSON params');
+        } finally { rm(dir); }
+    });
+
+    it('unknown keyword names and missing required args are mismatches', () => {
+        const dir = tmp(FIXTURE);
+        try {
+            const index = idx(dir);
+            const r = index.verify('named');
+            assert.strictEqual(r.mismatches, 2);
+            const unknown = r.mismatchDetails.find(m => m.line === 6);
+            assert.match(unknown.problem, /unexpected keyword argument 'z'/);
+            const missing = r.mismatchDetails.find(m => m.line === 7);
+            assert.match(missing.problem, /missing required argument\(s\): 'a'/);
+        } finally { rm(dir); }
+    });
+
+    it('positional-only params reject keyword passing; **kwargs and *args absorb', () => {
+        const dir = tmp(FIXTURE);
+        try {
+            const index = idx(dir);
+            const pos = index.verify('posonly');
+            assert.ok(pos.signature.includes('(a, /, b)'),
+                `signature must render the / separator, got: ${pos.signature}`);
+            assert.strictEqual(pos.mismatches, 1);
+            assert.match(pos.mismatchDetails[0].problem, /positional-only/);
+            assert.strictEqual(index.verify('absorb').mismatches, 0);
+            assert.strictEqual(index.verify('spread').mismatches, 0);
+        } finally { rm(dir); }
+    });
+
+    it('call-site argument unpacking routes to UNCERTAIN, not mismatch (P1-3)', () => {
+        const dir = tmp(FIXTURE);
+        try {
+            const index = idx(dir);
+            const r = index.verify('kwonly');
+            assert.strictEqual(r.uncertain, 1, 'kwonly(*args) is statically unknowable');
+            assert.match(r.uncertainDetails[0].reason, /argument unpacking/);
+            assert.ok(!r.mismatchDetails.some(m => m.line === 12),
+                'the unpacking site must not appear in mismatches');
+        } finally { rm(dir); }
+    });
+
+    it('reshaping decorators demote binding violations to uncertain', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'lib.py': [
+                'import functools',
+                '',
+                'def deco(f):',
+                '    @functools.wraps(f)',
+                '    def inner(*args, **kw):',
+                '        return f(*args, **kw)',
+                '    return inner',
+                '',
+                '@deco',
+                'def wrapped(a, *, b):',
+                '    return a + b',
+                '',
+                'class Box:',
+                '    @staticmethod',
+                '    def make(a, *, b):',
+                '        return a + b',
+            ].join('\n'),
+            'main.py': [
+                'from lib import wrapped, Box',
+                '',
+                'wrapped(1, 2)',
+                'Box.make(1, 2)',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const w = index.verify('wrapped');
+            assert.strictEqual(w.mismatches, 0,
+                'decorator may reshape the interface — never a hard mismatch');
+            assert.strictEqual(w.uncertain, 1);
+            assert.match(w.uncertainDetails[0].reason, /decorator may reshape/);
+            const s = index.verify('make');
+            assert.strictEqual(s.mismatches, 1,
+                '@staticmethod preserves the signature — violation stays a mismatch');
+        } finally { rm(dir); }
+    });
+});
