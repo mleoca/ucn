@@ -2,8 +2,36 @@
  * core/shared.js - Shared utility functions used by both CLI and MCP server
  */
 
+const fs = require('fs');
+const path = require('path');
 const { isTestFile } = require('./discovery');
 const { detectLanguage } = require('./parser');
+
+/**
+ * Security containment check (fix #285): is `candidate` inside `root`?
+ *
+ * UCN only ever reads files it discovered under the project root. Any code
+ * path that resolves a caller-supplied path string (stack traces, handles)
+ * must gate the read on this before touching disk, or a crafted input like
+ * `File "/etc/passwd"` or `../../secret` exfiltrates arbitrary files through
+ * the tool surface (CLI and, more dangerously, the MCP tool agents call).
+ *
+ * Symlinks are followed via realpath so a link INSIDE the project cannot
+ * resolve to a target outside it. Non-existent candidates fall back to a
+ * lexical resolve — the caller still gates the read on existence.
+ * Comparison is boundary-correct: a sibling directory whose name merely
+ * shares the root's prefix (`/a/b` vs `/a/bee`) is not "inside".
+ */
+function isPathInsideRoot(root, candidate) {
+    if (!root || !candidate) return false;
+    let realRoot;
+    try { realRoot = fs.realpathSync(root); } catch { realRoot = path.resolve(root); }
+    let realCandidate;
+    try { realCandidate = fs.realpathSync(candidate); } catch { realCandidate = path.resolve(candidate); }
+    const rel = path.relative(realRoot, realCandidate);
+    return rel === '' ||
+        (rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel));
+}
 
 /**
  * Code-unit string comparison (rule 11 / fix #227): output ordering is part
@@ -453,4 +481,5 @@ module.exports = {
     isOverrideMarked,
     hasTextBlindspots,
     countTextBlindspots,
+    isPathInsideRoot,
 };

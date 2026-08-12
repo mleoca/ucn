@@ -7,6 +7,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { isPathInsideRoot } = require('./shared');
 
 /**
  * Calculate path similarity score between two file paths
@@ -85,9 +86,14 @@ function findBestMatchingFile(index, filePath, funcName, lineNum) {
     }
 
     if (candidates.length === 0) {
-        // Try absolute path
-        const absPath = path.isAbsolute(filePath) ? filePath : path.join(index.root, filePath);
-        if (fs.existsSync(absPath)) {
+        // A frame that matched no indexed file may still point at a real file
+        // inside the project the walker skipped (a build artifact, an ignored
+        // path). Resolve it and show it — but ONLY inside the project root.
+        // The frame path is caller-supplied and untrusted; without this gate
+        // `File "/etc/passwd"` or `../../secret` would exfiltrate arbitrary
+        // files through the tool surface (fix #285 — GHSA/issue #4).
+        const absPath = path.resolve(index.root, filePath);
+        if (isPathInsideRoot(index.root, absPath) && fs.existsSync(absPath)) {
             return {
                 path: absPath,
                 relativePath: path.relative(index.root, absPath),
@@ -159,6 +165,16 @@ function createStackFrame(index, filePath, lineNum, funcName, col, rawLine) {
 
     // Find the best matching file using improved algorithm
     const match = findBestMatchingFile(index, filePath, funcName, lineNum);
+
+    if (match && !isPathInsideRoot(index.root, match.path)) {
+        // Defense in depth: never read outside the project root even if a
+        // future matcher change returns such a path (fix #285). The frame is
+        // reported as located-but-unreadable rather than leaking content.
+        frame.matchedFile = match.relativePath;
+        frame.confidence = match.confidence;
+        frame.error = 'resolved outside project root; not read';
+        return frame;
+    }
 
     if (match) {
         const resolvedPath = match.path;

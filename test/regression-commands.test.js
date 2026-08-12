@@ -5805,6 +5805,69 @@ describe('fix #251: G8 command surface', () => {
         } finally { rm(dir); }
     });
 
+    // fix #285 (issue #4): the stacktrace frame path is caller-supplied and
+    // untrusted. Before the fix, a frame pointing outside the project root
+    // (`File "/etc/passwd"` or `../secret`) was resolved and its first lines
+    // returned — arbitrary file disclosure through the tool, most dangerously
+    // via the MCP surface agents call. Reads are now gated on root containment.
+    it('stacktrace: never reads files outside the project root', () => {
+        const dir = tmp({
+            'package.json': '{"name":"sec"}',
+            'app.js': 'function f(){ return 1; }\n',
+            // In-root, unindexed (unsupported language): the legit fallback
+            // must still resolve it — containment blocks escapes, not this.
+            'notes.txt': 'alpha\nbeta in-root note\ngamma\n',
+        });
+        // A secret sibling OUTSIDE the project root, plus a symlink to it
+        // planted INSIDE the root (realpath must still block that escape).
+        const secret = path.join(dir, '..', `sec-secret-${process.pid}.txt`);
+        fs.writeFileSync(secret, 'SECRET_TOKEN=must-not-leak\n');
+        const absSecret = fs.realpathSync(secret);
+        // A SUPPORTED-extension secret out of root, symlinked in as `leak.js`.
+        // Discovery follows the link and stores the in-root lexical path, so
+        // `leak.js` becomes an INDEXED candidate — the frame resolves through
+        // the candidate loop, not the unindexed fallback, exercising the
+        // defense-in-depth guard in createStackFrame (realpath escapes root).
+        const secretJs = path.join(dir, '..', `sec-secret-${process.pid}.js`);
+        fs.writeFileSync(secretJs, 'const SECRET_TOKEN = "must-not-leak";\n');
+        const absSecretJs = fs.realpathSync(secretJs);
+        let indexedSymlink = false;
+        try {
+            fs.symlinkSync(absSecret, path.join(dir, 'link.txt'));
+            fs.symlinkSync(absSecretJs, path.join(dir, 'leak.js'));
+            indexedSymlink = true;
+        } catch { /* symlink may be unavailable; the other vectors still run */ }
+        try {
+            const index = idx(dir);
+            const leaks = (r) => JSON.stringify(r).includes('SECRET_TOKEN');
+
+            const vectors = ['/etc/passwd', absSecret, '../' + path.basename(secret), 'link.txt'];
+            if (indexedSymlink) vectors.push('leak.js');
+            for (const frameFile of vectors) {
+                const r = execute(index, 'stacktrace', {
+                    stack: `File "${frameFile}", line 1, in f`,
+                }).result;
+                assert.ok(r.frames.length >= 1, `frame parsed for ${frameFile}`);
+                assert.strictEqual(r.frames[0].found, false,
+                    `out-of-root frame must not resolve: ${frameFile}`);
+                assert.ok(!r.frames[0].code, `no code returned for ${frameFile}`);
+                assert.ok(!leaks(r), `must not leak content for ${frameFile}`);
+            }
+
+            // Legit in-root files still resolve — indexed and unindexed.
+            const indexed = execute(index, 'stacktrace', { stack: 'File "app.js", line 1, in f' }).result;
+            assert.ok(indexed.frames[0].found && /return 1/.test(indexed.frames[0].code),
+                'in-root indexed file still resolves');
+            const unindexed = execute(index, 'stacktrace', { stack: 'File "notes.txt", line 2, in f' }).result;
+            assert.ok(unindexed.frames[0].found && /in-root note/.test(unindexed.frames[0].code),
+                'in-root unindexed file still resolves via the fallback');
+        } finally {
+            fs.rmSync(absSecret, { force: true });
+            fs.rmSync(absSecretJs, { force: true });
+            rm(dir);
+        }
+    });
+
     it('member visibility: Java public fields/enum constants and Rust trait-impl methods in api', () => {
         const dir = tmp({
             'Cargo.toml': '[package]\nname="t"',
