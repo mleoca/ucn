@@ -133,17 +133,12 @@ function toolResult(text, command, maxChars, suffixNote, params = {}) {
         surface: 'mcp',
         params,
     });
-    const response = { content: [{ type: 'text', text: budget.text + suffix }] };
-    if (budget.truncated) {
-        response.structuredContent = {
-            truncated: true,
-            fullChars: budget.fullChars,
-            requestedLimit: budget.requestedLimit,
-            contractMetadata: budget.contractMetadata,
-            contractMetadataComplete: budget.contractMetadataComplete,
-        };
-    }
-    return response;
+    // The text block is the ONLY payload channel. Truncation facts live in the
+    // text itself (the OUTPUT TRUNCATED notice carries full size, limit, and
+    // narrowing hints; preserved contract lines follow). A structuredContent
+    // side-channel is rendered INSTEAD of content by MCP clients that prefer
+    // structured results, which discards the entire answer (fix #284).
+    return { content: [{ type: 'text', text: budget.text + suffix }] };
 }
 
 function toolError(message) {
@@ -324,7 +319,7 @@ server.registerTool(
             line: z.number().int().positive().optional().describe('Definition line pin. Resolves the symbol defined at this exact line (the middle component of a file:line:name handle). Disambiguates same-file same-name definitions.'),
             limit: z.number().int().positive().max(1000000).optional().describe('Max results to return (default: 500). Caps find, usages, search, deadcode, api, and repo files. Must be a positive integer.'),
             max_files: z.number().int().positive().max(10000000).optional().describe('Max files to index (default: 10000). Use for very large codebases. Must be a positive integer.'),
-            max_chars: z.number().int().positive().max(100000).optional().describe('Max output chars before truncation. Targeted commands default to 10K; broad commands default to 3K. Maximum: 100K. all=true lifts formatter caps but keeps the 100K transport ceiling.'),
+            max_chars: z.number().int().positive().max(100000).optional().describe('Max output chars before truncation. Broad sweep commands (repo, entrypoints, endpoints, deadcode, deps, check, audit_async) default to 3K; all other commands default to 10K. Maximum: 100K. all=true lifts formatter caps but keeps the 100K transport ceiling.'),
             // Structural search flags (search command)
             type: z.string().optional().describe('Symbol type filter for structural search: function, class, call, method, type, state, field, constant, macro. Triggers index-based search.'),
             param: z.string().optional().describe('Filter by parameter name or type (structural search). E.g. "Request", "ctx".'),

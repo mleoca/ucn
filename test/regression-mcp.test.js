@@ -478,8 +478,14 @@ describe('MCP two-tier output limits', () => {
     });
 
     it('BROAD_COMMANDS set includes the correct commands', () => {
-        for (const cmd of ['repo', 'entrypoints', 'endpoints', 'tests', 'deadcode', 'usages', 'deps', 'check', 'auditAsync']) {
+        for (const cmd of ['repo', 'entrypoints', 'endpoints', 'deadcode', 'deps', 'check', 'auditAsync']) {
             assert.ok(BROAD_COMMANDS.has(cmd), `BROAD_COMMANDS should include ${cmd}`);
+        }
+        // Symbol-targeted commands are never broad: they require a name, so
+        // the remedy for a big answer is usually more text, not a filter
+        // (fix #284 — usages/tests moved to the 10K targeted tier).
+        for (const cmd of ['usages', 'tests', 'show', 'find', 'trace', 'impact']) {
+            assert.ok(!BROAD_COMMANDS.has(cmd), `BROAD_COMMANDS must not include ${cmd}`);
         }
     });
 
@@ -490,10 +496,13 @@ describe('MCP two-tier output limits', () => {
             command: 'repo',
             surface: 'mcp',
         }).requestedLimit, 3000);
-        assert.strictEqual(applyOutputBudget('x'.repeat(11000), {
-            command: 'show',
-            surface: 'mcp',
-        }).requestedLimit, 10000);
+        for (const command of ['show', 'usages', 'tests']) {
+            for (const surface of ['mcp', 'cli']) {
+                assert.strictEqual(applyOutputBudget('x'.repeat(11000), {
+                    command, surface,
+                }).requestedLimit, 10000, `${command} on ${surface}`);
+            }
+        }
     });
 
     it('each broad command has a narrowing hint', () => {
@@ -550,8 +559,10 @@ describe('MCP two-tier output limits', () => {
             assert.ok(text.includes('PRESERVED CONTRACT METADATA'), text);
             assert.ok(text.includes('ACCOUNT: "target"'), text);
             assert.ok(text.includes('CONTRACT: literal-name text partition complete'), text);
-            assert.strictEqual(res.result?.structuredContent?.truncated, true);
-            assert.strictEqual(res.result?.structuredContent?.contractMetadataComplete, true);
+            // Fix #284: no structuredContent side-channel — clients that
+            // prefer structured results would render it INSTEAD of the text
+            // and discard the entire payload. The text block is the response.
+            assert.strictEqual(res.result?.structuredContent, undefined);
         } finally {
             client.stop();
             rm(dir);
@@ -800,6 +811,83 @@ describe('fix: MCP surfaces unknown, typo\'d, and camelCase params', () => {
                 `valid params must not trigger notes, got: ${validText}`);
         } finally {
             if (client) client.stop();
+            clearProjectCache(dir);
+            rm(dir);
+        }
+    });
+});
+
+// =============================================================================
+// Fix #284: MCP truncation must never lose the payload
+// =============================================================================
+// MCP clients that prefer structured results render structuredContent INSTEAD
+// of the content blocks. 5.0.3 attached truncation metadata there, so every
+// truncated answer on the agent surface collapsed to a JSON stub with zero
+// routes/usages/callers. The text block is now the whole response, and
+// symbol-targeted usages/tests moved from the 3K broad tier to the 10K
+// targeted tier the docs describe.
+describe('fix #284: truncated MCP responses keep the payload in the text block', () => {
+    it('truncated endpoints keeps head routes and has no structuredContent', async () => {
+        const routes = ['from fastapi import APIRouter', 'router = APIRouter(prefix="/api")', ''];
+        for (let i = 0; i < 60; i++) {
+            routes.push(`@router.get("/resource_number_${String(i).padStart(3, '0')}/list")`);
+            routes.push(`def list_resource_${String(i).padStart(3, '0')}():`);
+            routes.push(`    return {"id": ${i}}`);
+            routes.push('');
+        }
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "trunc-routes"\n',
+            'app/routes.py': routes.join('\n'),
+        });
+        const client = new McpClient();
+        try {
+            await client.start();
+            await client.initialize();
+            const res = await client.callTool('ucn', {
+                command: 'endpoints', project_dir: dir, server_only: true,
+            });
+            const text = res.result?.content?.map(c => c.text).join('') || '';
+            assert.ok(text.includes('OUTPUT TRUNCATED'), text.slice(-400));
+            assert.ok(text.includes('/api/resource_number_000/list'),
+                `head of the route listing must survive truncation: ${text.slice(0, 300)}`);
+            assert.strictEqual(res.result?.structuredContent, undefined,
+                'structuredContent must be absent — clients render it instead of the text');
+        } finally {
+            client.stop();
+            clearProjectCache(dir);
+            rm(dir);
+        }
+    });
+
+    it('usages defaults to the 10K targeted tier on MCP', async () => {
+        // ~6K of usages output: over the old 3K broad tier, under 10K.
+        const users = {};
+        for (let f = 0; f < 3; f++) {
+            const lines = ['const { widget } = require("./lib");', ''];
+            for (let i = 0; i < 30; i++) {
+                lines.push(`function consumer_${f}_${i}() { return widget(${i}); }`);
+            }
+            users[`user${f}.js`] = lines.join('\n');
+        }
+        const dir = tmp({
+            'package.json': '{"name":"usages-tier"}',
+            'lib.js': 'function widget(x) { return x; }\nmodule.exports = { widget };\n',
+            ...users,
+        });
+        const client = new McpClient();
+        try {
+            await client.start();
+            await client.initialize();
+            const res = await client.callTool('ucn', {
+                command: 'usages', project_dir: dir, name: 'widget',
+            });
+            const text = res.result?.content?.map(c => c.text).join('') || '';
+            assert.ok(text.length > 3000,
+                `usages must not truncate at the broad 3K tier (got ${text.length} chars)`);
+            assert.ok(!text.includes('OUTPUT TRUNCATED'),
+                `sub-10K usages output must be complete: ${text.slice(-300)}`);
+        } finally {
+            client.stop();
             clearProjectCache(dir);
             rm(dir);
         }

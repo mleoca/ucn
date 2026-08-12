@@ -153,10 +153,12 @@ const FLAG_APPLICABILITY = {
     auditAsync:   ['file', 'exclude', 'limit'],
 };
 
-// Commands whose output is project-wide — truncation means you need a filter, not more text.
-// Used by MCP server for tighter default output limits.
+// Project/change-wide sweep commands with no required symbol argument —
+// truncation means you need a filter, not more text. Drives the shared
+// CLI/MCP output budget: broad commands default to 3K chars, everything
+// else (symbol-targeted commands like usages/tests included) to 10K.
 const BROAD_COMMANDS = new Set([
-    'repo', 'entrypoints', 'endpoints', 'tests', 'deadcode', 'usages',
+    'repo', 'entrypoints', 'endpoints', 'deadcode',
     'deps', 'check', 'auditAsync',
 ]);
 

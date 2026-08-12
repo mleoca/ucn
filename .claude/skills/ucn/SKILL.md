@@ -30,12 +30,14 @@ The release board independently cross-checks overlapping stable-handle answers f
 Publish-blocking semantic gates also compare stratified samples from pinned real repositories with independent language-native oracles: ts-morph, Pyright, gopls, rust-analyzer, JDT LS, clangd, and Roslyn. This validates the measured static evidence classes; it does not turn dynamic dispatch, generated code, reflection, or external dependencies into complete runtime knowledge.
 
 MCP keeps its process and project index warm across calls. CLI and MCP share
-the same text budget: targeted commands default to 10K output characters,
-broad commands to 3K, with a 100K hard ceiling. Use CLI `--max-chars`, MCP
-`max_chars`, a narrower file/directory scope, or a smaller section projection
-when necessary. Truncation must retain the accounting/contract lines needed to
-interpret the answer, and the requested limit includes both the notice and the
-preserved metadata.
+the same text budget: broad sweep commands (`repo`, `entrypoints`,
+`endpoints`, `deadcode`, `deps`, `check`, `audit-async`) default to 3K output
+characters, all other commands to 10K, with a 100K hard ceiling. Use CLI
+`--max-chars`, MCP `max_chars`, a narrower file/directory scope, or a smaller
+section projection when necessary. Truncated output keeps the head of the
+answer, a notice stating the full size and limit, and the accounting/contract
+lines needed to interpret what remains; the requested limit includes all
+three. The text block is the whole response on every surface.
 
 Persistent indexes live in a per-user, project-keyed cache rather than the analyzed repository. Set `UCN_CACHE_DIR` to override the cache root; CLI `--no-cache` bypasses persistence and `--clear-cache` removes the current project's cache. Legacy `<project>/.ucn-cache` directories are migrated on first use.
 
