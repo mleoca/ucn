@@ -128,6 +128,29 @@ export default function main() {}`;
         assert.ok(result.functions.some(f => f.name === 'publicFn'));
         assert.ok(result.functions.some(f => f.name === 'main' || f.name === 'default'));
     });
+
+    it('infers receiver-preserving methods and nested lexical callable scope', () => {
+        const code = [
+            'function outer() {',
+            '  const recursive = () => recursive()',
+            '}',
+            'class Builder {',
+            '  chain() { return this }',
+            '  mixed(value) { if (value) return this; return value }',
+            '}',
+            'Builder.prototype.next = function () { return this }',
+        ].join('\n');
+        const result = parse(code, 'javascript');
+        const builder = result.classes.find(type => type.name === 'Builder');
+        assert.strictEqual(builder.members.find(member => member.name === 'chain').returnType,
+            'this');
+        assert.strictEqual(builder.members.find(member => member.name === 'mixed').returnType,
+            undefined, 'a competing return value defeats receiver identity');
+        assert.strictEqual(result.functions.find(fn => fn.name === 'next').returnType, 'this');
+        const recursive = result.functions.find(fn => fn.name === 'recursive');
+        assert.ok(recursive.lexicalScopeStartLine <= recursive.startLine);
+        assert.ok(recursive.lexicalScopeEndLine >= recursive.endLine);
+    });
 });
 
 // ============================================================================

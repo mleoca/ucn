@@ -599,6 +599,8 @@ function clearAllCaches() {
 // v166: C++ nested aliases persist their lexical owner ranges, and `auto`
 // return functions persist a unanimously inferred local concrete type. v165
 // was used during prerelease development before both fields were complete.
+// v173: JS/TS fluent methods persist AST-proven `this` return identity, and
+// nested const/arrow callables persist their enclosing lexical owner range.
 // v172: immutable JS/TS class-member aliases materialize their local and
 // exported callable identities, preserving declared return types through
 // factory aliases and chained receivers.
@@ -615,7 +617,7 @@ function clearAllCaches() {
 // object they patch (`console.log = fn` → 'console') — so the builtin-global
 // exclusion can see cross-file that a project def rebinds the global's
 // member (fix #286a); impl-kind symbols leave the bindings table (#286b).
-const CACHE_FORMAT_VERSION = 172;
+const CACHE_FORMAT_VERSION = 173;
 
 /**
  * Save index to cache file

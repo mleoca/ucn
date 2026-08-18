@@ -168,7 +168,15 @@ describe('UCN v5 release-readiness audit regressions', () => {
 
         const rustOracle = fs.readFileSync(
             path.join(__dirname, '../eval/oracles/rust-analyzer-oracle.js'), 'utf8');
-        assert.match(rustOracle, /QUIESCENT_TIMEOUT_MS = 900000/);
+        assert.match(rustOracle, /UCN_EVAL_RUST_QUIESCENT_TIMEOUT_MS/,
+            'the compiler readiness bound remains explicitly configurable');
+        assert.match(rustOracle, /configuredQuiescentTimeout : 900000/,
+            'the default readiness wait remains bounded at fifteen minutes');
+        assert.match(rustOracle, /cachePriming: \{ enable: false \}/,
+            'the batch oracle must not block semantic readiness on cache warming');
+        assert.match(rustOracle, /didChangeWatchedFiles: \{ dynamicRegistration: true \}/);
+        assert.match(rustOracle, /files: \{ watcher: 'client' \}/,
+            'immutable eval clones must not depend on a platform filesystem watcher');
         assert.match(rustOracle, /helperChild\.kill\(\)/);
         assert.match(rustOracle, /lsp\?\.kill\(\)/);
     });

@@ -2403,6 +2403,11 @@ describe('index reliability: cache round-trip and incremental rebuild identity',
             'const cachedFactory = CachedFactory.create;',
             'export { cachedFactory as makeCached };',
         ].join('\n'),
+        'self-return.js': [
+            'function Fluent() {}',
+            'Fluent.prototype.next = function () { return this }',
+            'function outer() { const nested = () => nested(); return nested() }',
+        ].join('\n'),
     };
 
     it('loadCache reproduces the exact symbol table, file entries, and calls', () => {

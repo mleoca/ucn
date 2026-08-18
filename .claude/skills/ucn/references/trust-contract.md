@@ -41,11 +41,12 @@ Even when all eight hold, `account.contract.semanticComplete` remains false. Use
 
 Semantic recall can be complete while the result is still impractical: a true edge may be present only in a large unverified set. Release evaluation therefore measures both placement and the amount of review an agent must perform.
 
-- `trueEdgeUnverifiedRate` is the share of semantic oracle edges found only in the unverified tier.
+- `trueEdgeUnverifiedRate` is the share of statically exact oracle edges found only in the unverified tier. Runtime-polymorphic, compiler-dependent template, and oracle-unresolved references remain in the all-oracle view but never inflate the exact denominator.
 - `zeroActionableUnverifiedTargetRate` is the share of reviewed targets with no actionable ambiguity.
 - `actionableUnverifiedCandidatesP50`, `actionableUnverifiedCandidatesP95`, and `actionableUnverifiedCandidatesMax` measure actionable candidate-set size per target.
 - `unverifiedReviewItemsPerOracleEdge` measures effective review work relative to the oracle workload. Actionable false candidates count individually; each named runtime-dispatch family counts once.
 - `rawFalseUnverifiedPerOracleEdge` preserves the ungrouped false-candidate amplification for auditability.
+- `runtimeDependentOracleEdges`, `compilerDependentOracleEdges`, and `oracleAbstentionEdges` disclose why all-oracle coverage is broader than exact target identity.
 - `unverifiedReasons` groups candidates by the engine reason that kept them out of the confirmed tier.
 
 Configuration-gated candidates remain visible but are not labeled false when the compiler/LSP oracle did not score them. The raw JSON rollup is the source of truth for these fields; the Markdown report is generated from the same data.

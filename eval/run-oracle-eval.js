@@ -75,6 +75,7 @@ const {
     summarizeReviewBurden,
     evaluateReviewBurden,
     evaluateOracleCoverage,
+    closeJsTsDeclarationIdentity,
 } = require('./oracle-gate-policy');
 const { tsMorphOracle } = require('./oracles/ts-morph-oracle');
 const { pyrightOracle } = require('./oracles/pyright-oracle');
@@ -166,6 +167,10 @@ function optionalNonNegativeArg(flag, integer = false) {
 
 function key(file, line) { return `${file}:${line}`; }
 
+function isExactOracleCall(call) {
+    return !call?.uncertaintyClass;
+}
+
 const SYMBOL_KINDS = ['function', 'method', 'class'];
 
 function emptyPlacement() {
@@ -191,6 +196,9 @@ function emptyKindTotals() {
         unverifiedReasons: {},
         oracleCallEdges: 0,
         exactOracleCallEdges: 0,
+        runtimeOracleCallEdges: 0,
+        compileTimeOracleCallEdges: 0,
+        unresolvedOracleCallEdges: 0,
         placement: emptyPlacement(),
         exactPlacement: emptyPlacement(),
     };
@@ -330,6 +338,9 @@ async function evaluateRepo(repo, oracle) {
         unverifiedReasons: {},
         oracleCallEdges: 0,
         exactOracleCallEdges: 0,
+        runtimeOracleCallEdges: 0,
+        compileTimeOracleCallEdges: 0,
+        unresolvedOracleCallEdges: 0,
         placement: emptyPlacement(),
         exactPlacement: emptyPlacement(),
         zeroCases: 0, zeroAgreed: 0,
@@ -506,6 +517,14 @@ async function evaluateRepo(repo, oracle) {
                 }
             }
         }
+        if (targetDef && ['javascript', 'typescript'].includes(targetLanguage)) {
+            for (const equivalent of closeJsTsDeclarationIdentity(
+                sameNameDefs, targetDef)) {
+                if (!targetIdentityDefs.includes(equivalent)) {
+                    targetIdentityDefs.push(equivalent);
+                }
+            }
+        }
         if (targetDef && ['c', 'cpp'].includes(targetLanguage)) {
             const typeSignature = definition => {
                 if (!Array.isArray(definition.paramsStructured)) return null;
@@ -523,8 +542,7 @@ async function evaluateRepo(repo, oracle) {
                 targetSignature !== null &&
                 typeSignature(definition) === targetSignature);
             const targetExactOracleKeys = new Set(rawOracleCalls
-                .filter(reference =>
-                    reference.uncertaintyClass !== 'compile-time-dispatch')
+                .filter(isExactOracleCall)
                 .map(reference => key(reference.file, reference.line)));
             const reachesFile = (from, destination) => {
                 if (from === destination) return true;
@@ -566,8 +584,7 @@ async function evaluateRepo(repo, oracle) {
                 const equivalentExactOracleKeys = equivalentOracleSymbol
                     ? new Set((refCache.get(equivalentOracleSymbol) || [])
                         .filter(reference => reference.kind === 'call' &&
-                            reference.uncertaintyClass !==
-                                'compile-time-dispatch')
+                            isExactOracleCall(reference))
                         .map(reference => key(reference.file, reference.line)))
                     : null;
                 const sameCompilerReferenceFamily =
@@ -954,7 +971,7 @@ async function evaluateRepo(repo, oracle) {
         const exactPlacement = emptyPlacement();
         for (const oc of oracleCalls) {
             const k = key(oc.file, oc.line);
-            const exact = oc.uncertaintyClass !== 'compile-time-dispatch';
+            const exact = isExactOracleCall(oc);
             const place = field => {
                 placement[field]++;
                 if (exact) exactPlacement[field]++;
@@ -1015,8 +1032,7 @@ async function evaluateRepo(repo, oracle) {
         {
             const seenPrecisionDefs = new Set();
             for (const oc of oracleCalls) {
-                const exactOracleEdge =
-                    oc.uncertaintyClass !== 'compile-time-dispatch';
+                const exactOracleEdge = isExactOracleCall(oc);
                 const placeCallee = field => {
                     calleePlacement[field]++;
                     if (exactOracleEdge) exactCalleePlacement[field]++;
@@ -1150,8 +1166,7 @@ async function evaluateRepo(repo, oracle) {
             // source-site contract. A UCN zero agrees when no eligible source
             // edge remains, not only when the compiler returned no runtime
             // edge whatsoever.
-            const exactOracleCallsForSymbol = oracleCalls.filter(call =>
-                call.uncertaintyClass !== 'compile-time-dispatch').length;
+            const exactOracleCallsForSymbol = oracleCalls.filter(isExactOracleCall).length;
             if (exactOracleCallsForSymbol === exactPlacement.missingExplained) {
                 totals.zeroAgreed++;
             }
@@ -1172,8 +1187,13 @@ async function evaluateRepo(repo, oracle) {
         totals.unverifiedUnscored += unverifiedUnscored;
         mergeReasonStats(totals.unverifiedReasons, unverifiedReasonStats);
         totals.oracleCallEdges += oracleCalls.length;
-        totals.exactOracleCallEdges += oracleCalls.filter(call =>
-            call.uncertaintyClass !== 'compile-time-dispatch').length;
+        totals.exactOracleCallEdges += oracleCalls.filter(isExactOracleCall).length;
+        totals.runtimeOracleCallEdges += oracleCalls.filter(call =>
+            call.uncertaintyClass === 'runtime-dispatch').length;
+        totals.compileTimeOracleCallEdges += oracleCalls.filter(call =>
+            call.uncertaintyClass === 'compile-time-dispatch').length;
+        totals.unresolvedOracleCallEdges += oracleCalls.filter(call =>
+            call.uncertaintyClass === 'oracle-unresolved').length;
         for (const k of Object.keys(placement)) totals.placement[camel(k)] += placement[k];
         for (const k of Object.keys(exactPlacement)) {
             totals.exactPlacement[camel(k)] += exactPlacement[k];
@@ -1192,8 +1212,13 @@ async function evaluateRepo(repo, oracle) {
         kt.unverifiedUnscored += unverifiedUnscored;
         mergeReasonStats(kt.unverifiedReasons, unverifiedReasonStats);
         kt.oracleCallEdges += oracleCalls.length;
-        kt.exactOracleCallEdges += oracleCalls.filter(call =>
-            call.uncertaintyClass !== 'compile-time-dispatch').length;
+        kt.exactOracleCallEdges += oracleCalls.filter(isExactOracleCall).length;
+        kt.runtimeOracleCallEdges += oracleCalls.filter(call =>
+            call.uncertaintyClass === 'runtime-dispatch').length;
+        kt.compileTimeOracleCallEdges += oracleCalls.filter(call =>
+            call.uncertaintyClass === 'compile-time-dispatch').length;
+        kt.unresolvedOracleCallEdges += oracleCalls.filter(call =>
+            call.uncertaintyClass === 'oracle-unresolved').length;
         for (const k of Object.keys(placement)) kt.placement[k] += placement[k];
         for (const k of Object.keys(exactPlacement)) {
             kt.exactPlacement[k] += exactPlacement[k];
@@ -1231,8 +1256,9 @@ async function evaluateRepo(repo, oracle) {
             compileTimeDispatchUnscored,
             unverifiedReasons: finalizeReasonStats(unverifiedReasonStats),
             placement,
-            exactOracleCalls: oracleCalls.filter(call =>
-                call.uncertaintyClass !== 'compile-time-dispatch').length,
+            exactOracleCalls: oracleCalls.filter(isExactOracleCall).length,
+            runtimeOracleCalls: oracleCalls.filter(call =>
+                call.uncertaintyClass === 'runtime-dispatch').length,
             compileTimeOracleCalls: oracleCalls.filter(call =>
                 call.uncertaintyClass === 'compile-time-dispatch').length,
             exactPlacement,
@@ -1290,6 +1316,9 @@ async function evaluateRepo(repo, oracle) {
         placement: totals.placement,
         exactOracleCallEdges: totals.exactOracleCallEdges,
         exactPlacement: totals.exactPlacement,
+        runtimeOracleCallEdges: totals.runtimeOracleCallEdges,
+        compileTimeOracleCallEdges: totals.compileTimeOracleCallEdges,
+        unresolvedOracleCallEdges: totals.unresolvedOracleCallEdges,
         unverifiedEdges: totals.unverifiedEdges,
         unverifiedHits: totals.unverifiedHits,
         unverifiedUnscored: totals.unverifiedUnscored,
@@ -1307,6 +1336,9 @@ async function evaluateRepo(repo, oracle) {
             placement: kt.placement,
             exactOracleCallEdges: kt.exactOracleCallEdges,
             exactPlacement: kt.exactPlacement,
+            runtimeOracleCallEdges: kt.runtimeOracleCallEdges,
+            compileTimeOracleCallEdges: kt.compileTimeOracleCallEdges,
+            unresolvedOracleCallEdges: kt.unresolvedOracleCallEdges,
             unverifiedEdges: kt.unverifiedEdges,
             unverifiedHits: kt.unverifiedHits,
             unverifiedUnscored: kt.unverifiedUnscored,
@@ -1315,8 +1347,9 @@ async function evaluateRepo(repo, oracle) {
             sampled: kt.sampled,
             oracleCallEdges: kt.oracleCallEdges,
             exactOracleCallEdges: kt.exactOracleCallEdges,
-            compileTimeOracleCallEdges:
-                kt.oracleCallEdges - kt.exactOracleCallEdges,
+            runtimeOracleCallEdges: kt.runtimeOracleCallEdges,
+            compileTimeOracleCallEdges: kt.compileTimeOracleCallEdges,
+            unresolvedOracleCallEdges: kt.unresolvedOracleCallEdges,
             confirmedEdges: kt.confirmedEdges,
             confirmedHits: kt.confirmedHits,
             confirmedUnscored: kt.confirmedUnscored,
@@ -1349,8 +1382,9 @@ async function evaluateRepo(repo, oracle) {
         errors: perSymbol.filter(s => s.error).length,
         oracleCallEdges: totals.oracleCallEdges,
         exactOracleCallEdges: totals.exactOracleCallEdges,
-        compileTimeOracleCallEdges:
-            totals.oracleCallEdges - totals.exactOracleCallEdges,
+        runtimeOracleCallEdges: totals.runtimeOracleCallEdges,
+        compileTimeOracleCallEdges: totals.compileTimeOracleCallEdges,
+        unresolvedOracleCallEdges: totals.unresolvedOracleCallEdges,
         confirmedEdges: totals.confirmedEdges,
         confirmedScoredEdges: tier1ScoredEdges,
         confirmedUnscored: totals.confirmedUnscored,
@@ -1425,9 +1459,11 @@ async function evaluateRepo(repo, oracle) {
         `all oracle-edge unverified ${pct(reviewBurden.allOracleEdgeUnverifiedRate)} | ` +
         `zero-actionable-ambiguity targets ${pct(reviewBurden.zeroActionableUnverifiedTargetRate)} | ` +
         `actionable candidates p50/p95/max ${reviewBurden.actionableUnverifiedCandidatesP50}/${reviewBurden.actionableUnverifiedCandidatesP95}/${reviewBurden.actionableUnverifiedCandidatesMax} | ` +
-        `runtime dispatch ${reviewBurden.runtimeDispatchSites} sites/${reviewBurden.runtimeDispatchGroups} families | ` +
+        `runtime dispatch ${reviewBurden.runtimeDispatchSites} sites/${reviewBurden.runtimeDispatchGroups} families ` +
+        `(${reviewBurden.runtimeDependentOracleEdges} oracle edges) | ` +
         `compile-time dispatch ${reviewBurden.compileTimeDispatchSites} sites/${reviewBurden.compileTimeDispatchGroups} families ` +
         `(${reviewBurden.compilerDependentOracleEdges} oracle edges) | ` +
+        `oracle abstentions ${reviewBurden.oracleAbstentionEdges} edges | ` +
         `effective review items/oracle-edge ${reviewBurden.unverifiedReviewItemsPerOracleEdge} ` +
         `(${reviewBurden.unverifiedReviewItems}; raw false candidates ` +
         `${reviewBurden.rawFalseUnverifiedCandidates})\n`);
@@ -1708,23 +1744,24 @@ async function main() {
     lines.push('target has no actionable ambiguity, and how many effective review items');
     lines.push('the engine creates. Actionable false candidates count individually; named');
     lines.push('runtime-dispatch and compiler-dependent template families count once because');
-    lines.push('that is how agents receive them. Exact and compiler-dependent oracle edges');
-    lines.push('remain separate so a dependent may-reach result is never called exact.');
+    lines.push('that is how agents receive them. Exact, runtime-dependent, compiler-dependent,');
+    lines.push('and oracle-unresolved edges remain separate, so a may-reach result or oracle');
+    lines.push('abstention is never called exact.');
     lines.push('Raw candidates and raw false counts remain visible. Configuration-unscored');
     lines.push('candidates stay visible but are not labeled false.');
     lines.push('');
-    lines.push('| repo | exact true-edge unverified | all oracle-edge unverified | zero actionable ambiguity | actionable p50/p95/max | runtime sites/families | compile-time sites/families | compiler-dependent oracle edges | raw unverified | raw false | effective review items | items/oracle edge | top reasons |');
-    lines.push('|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|');
+    lines.push('| repo | exact true-edge unverified | all oracle-edge unverified | zero actionable ambiguity | actionable p50/p95/max | runtime sites/families | compile-time sites/families | compiler-dependent oracle edges | oracle abstentions | raw unverified | raw false | effective review items | items/oracle edge | top reasons |');
+    lines.push('|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|');
     for (const { summary: s } of rollupResults) {
         if (s.error) continue;
         const b = s.reviewBurden;
         if (!b) {
-            lines.push(`| ${s.repo} | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | report predates schema v4 |`);
+            lines.push(`| ${s.repo} | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | report predates schema v4 |`);
             continue;
         }
         const reasons = Object.entries(s.unverifiedReasons || {}).slice(0, 3)
             .map(([reason, row]) => `${reason} (${row.candidates})`).join(', ') || 'none';
-        lines.push(`| ${s.repo} | ${pct(b.trueEdgeUnverifiedRate)} (${b.trueEdgesUnverified}/${b.exactSemanticEligibleEdges}) | ${pct(b.allOracleEdgeUnverifiedRate)} (${b.allOracleEdgesUnverified}/${b.semanticEligibleEdges}) | ${pct(b.zeroActionableUnverifiedTargetRate)} (${b.zeroActionableUnverifiedTargets}/${b.reviewedSymbols}) | ${b.actionableUnverifiedCandidatesP50}/${b.actionableUnverifiedCandidatesP95}/${b.actionableUnverifiedCandidatesMax} | ${b.runtimeDispatchSites}/${b.runtimeDispatchGroups} | ${b.compileTimeDispatchSites}/${b.compileTimeDispatchGroups} | ${b.compilerDependentOracleEdges} | ${b.unverifiedCandidates} | ${b.rawFalseUnverifiedCandidates} | ${b.unverifiedReviewItems} | ${b.unverifiedReviewItemsPerOracleEdge} | ${reasons} |`);
+        lines.push(`| ${s.repo} | ${pct(b.trueEdgeUnverifiedRate)} (${b.trueEdgesUnverified}/${b.exactSemanticEligibleEdges}) | ${pct(b.allOracleEdgeUnverifiedRate)} (${b.allOracleEdgesUnverified}/${b.semanticEligibleEdges}) | ${pct(b.zeroActionableUnverifiedTargetRate)} (${b.zeroActionableUnverifiedTargets}/${b.reviewedSymbols}) | ${b.actionableUnverifiedCandidatesP50}/${b.actionableUnverifiedCandidatesP95}/${b.actionableUnverifiedCandidatesMax} | ${b.runtimeDispatchSites}/${b.runtimeDispatchGroups} | ${b.compileTimeDispatchSites}/${b.compileTimeDispatchGroups} | ${b.compilerDependentOracleEdges} | ${b.oracleAbstentionEdges} | ${b.unverifiedCandidates} | ${b.rawFalseUnverifiedCandidates} | ${b.unverifiedReviewItems} | ${b.unverifiedReviewItemsPerOracleEdge} | ${reasons} |`);
     }
     lines.push('');
     lines.push('## Oracle-backed command surface');

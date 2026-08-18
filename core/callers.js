@@ -2884,9 +2884,14 @@ function findCallers(index, name, options = {}) {
                             // chase is definitive only on fully-modeled ESM/
                             // Python surfaces — 'unknown' (CJS, stars, module
                             // assignments) falls back to file-level reach.
-                            const verdict = _nameBindingReaches(index, resolvedAbs, call.name, tFiles);
+                            const ambiguousCjsMember =
+                                _cjsMemberOwnershipAmbiguous(index, resolvedAbs, call.name);
+                            const verdict = ambiguousCjsMember
+                                ? 'unknown'
+                                : _nameBindingReaches(index, resolvedAbs, call.name, tFiles);
                             if (verdict === 'yes' ||
-                                (verdict === 'unknown' && _importReaches(index, resolvedAbs, tFiles))) {
+                                (verdict === 'unknown' && !ambiguousCjsMember &&
+                                 _importReaches(index, resolvedAbs, tFiles))) {
                                 reaches = true; break;
                             }
                             if (verdict === 'no') definitiveOtherBindings++;
@@ -8497,6 +8502,20 @@ function _nameBindingReaches(index, startAbs, name, targetFiles, maxDepth = 4) {
 }
 
 /**
+ * A CommonJS object export whose requested member has no statically-owned
+ * local value cannot prove callable identity. For example,
+ * `module.exports = { run: available ? nativeRun : fallback }` exposes the
+ * local fallback only on one runtime branch. File-level import reachability
+ * must not upgrade that conditional value to a confirmed edge.
+ */
+function _cjsMemberOwnershipAmbiguous(index, file, memberName) {
+    const fe = index.files.get(file);
+    return !!fe && (fe.exportDetails || []).some(exp =>
+        exp.type === 'module.exports' && !exp.defaultLike && !exp.source &&
+        (exp.alias || exp.name) === memberName && !exp.localName);
+}
+
+/**
  * Resolve a member reached through an exported ESM namespace object.
  *
  * Supported exact shapes:
@@ -9728,13 +9747,28 @@ function _calleeExportDefinitions(index, startAbs, exposedName, language, call, 
             };
 
             const details = fe.exportDetails || [];
+            const localDetails = details.filter(e =>
+                !e.source && (e.alias || e.name) === attr);
+            const ambiguousCjsMember = localDetails.some(e =>
+                e.type === 'module.exports' && !e.defaultLike && !e.localName);
             const localExposed = fe.language === 'python' ||
-                (fe.exports || []).includes(attr) ||
-                details.some(e => !e.source && (e.alias || e.name) === attr);
-            if (localExposed) {
-                for (const d of (index.symbols.get(attr) || [])) {
-                    if (d.file === abs && shapeMatches(d)) {
-                        matches.set(`${d.file}:${d.startLine}`, d);
+                (fe.exports || []).includes(attr) || localDetails.length > 0;
+            if (ambiguousCjsMember) {
+                // `module.exports = { run: condition ? native : fallback }`
+                // exposes no single callable identity. The caller direction
+                // routes this visible; trace-down must make the same abstention
+                // instead of selecting a same-named local fallback.
+                unknown = true;
+            } else if (localExposed) {
+                const localNames = new Set([attr]);
+                for (const detail of localDetails) {
+                    if (detail.localName) localNames.add(detail.localName);
+                }
+                for (const localName of localNames) {
+                    for (const d of (index.symbols.get(localName) || [])) {
+                        if (d.file === abs && shapeMatches(d)) {
+                            matches.set(`${d.file}:${d.startLine}`, d);
+                        }
                     }
                 }
             }

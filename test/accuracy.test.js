@@ -308,13 +308,18 @@ describe('Oracle contract', () => {
             const refs = await tsMorphOracle.findReferences(handle, {
                 name: 'add', file: 'smart.ts', line: 3,
             });
-            const calls = refs.filter(r => r.kind === 'call')
-                .map(r => `${r.file}:${r.line}`);
+            const callRefs = refs.filter(r => r.kind === 'call');
+            const calls = callRefs.map(r => `${r.file}:${r.line}`);
             assert.ok(calls.includes('use.ts:5'), `interface dispatch remains potential: ${calls}`);
             assert.ok(calls.includes('use.ts:6'), `exact SmartRouter call remains: ${calls}`);
             assert.ok(!calls.includes('use.ts:7'), `concrete sibling call is not SmartRouter.add: ${calls}`);
             assert.ok(!calls.includes('use.ts:8'),
                 `standalone function installed as a sibling field is not SmartRouter.add: ${calls}`);
+            assert.equal(callRefs.find(ref => ref.line === 5).uncertaintyClass,
+                'runtime-dispatch');
+            assert.equal(callRefs.find(ref => ref.line === 5).oracleResolution, 'may-reach');
+            assert.equal(callRefs.find(ref => ref.line === 6).oracleResolution, 'exact');
+            assert.equal(callRefs.find(ref => ref.line === 6).uncertaintyClass, undefined);
         } finally { rm(d); }
     });
 
@@ -419,6 +424,33 @@ describe('Oracle contract', () => {
                 `structurally compatible interface dispatch remains potential: ${calls}`);
             assert.ok(!calls.includes('signal.ts:10'),
                 `unrelated concrete sibling call is excluded: ${calls}`);
+            const dispatch = refs.find(ref => ref.kind === 'call' && ref.line === 8);
+            assert.equal(dispatch.uncertaintyClass, 'runtime-dispatch');
+        } finally { rm(d); }
+    });
+
+    it('ts-morph sampling excludes nested runtime-object monkey patches', async () => {
+        const d = tmp({
+            'plain.js': [
+                'function Reply() {}',
+                'Reply.prototype.send = function () {}',
+                'function install(reply) {',
+                '  reply.send = () => {}',
+                '  console.log = () => {}',
+                '}',
+                'const local = () => {}',
+            ].join('\n'),
+        });
+        try {
+            const handle = await tsMorphOracle.prepare(d);
+            const symbols = await tsMorphOracle.listSymbols(handle, {});
+            const keys = symbols.map(symbol => `${symbol.name}:${symbol.line}`);
+            assert.ok(keys.includes('send:2'), 'stable prototype ownership remains eligible');
+            assert.ok(keys.includes('local:7'), 'lexical callable identity remains eligible');
+            assert.ok(!keys.includes('send:4'),
+                'one-object runtime patches are not exact target-oracle symbols');
+            assert.ok(!keys.includes('log:5'),
+                'nested global monkey patches cannot claim unrelated properties');
         } finally { rm(d); }
     });
 });

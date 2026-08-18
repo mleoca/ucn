@@ -436,6 +436,34 @@ function extractReturnedConcreteType(node) {
 }
 
 /**
+ * Whether every explicit value-producing return yields the current receiver.
+ * A fallthrough/empty return cannot feed a subsequent chained call, so it does
+ * not compete with `this`; any other returned value makes the result unknown.
+ */
+function returnsReceiverSelf(node) {
+    const body = node.childForFieldName('body');
+    if (!body) return false;
+    let sawSelf = false;
+    const stack = [body];
+    while (stack.length > 0) {
+        const current = stack.pop();
+        if (current !== body && FUNCTION_SCOPE_NODES.has(current.type)) continue;
+        if (current.type === 'class_declaration' || current.type === 'class') continue;
+        if (current.type === 'return_statement') {
+            const value = current.namedChild(0);
+            if (!value) continue;
+            if (value.type !== 'this') return false;
+            sawSelf = true;
+            continue;
+        }
+        for (let i = current.namedChildCount - 1; i >= 0; i--) {
+            stack.push(current.namedChild(i));
+        }
+    }
+    return sawSelf;
+}
+
+/**
  * Process a node for function extraction (single-pass helper)
  * Returns true if node was matched, false otherwise
  */
@@ -618,6 +646,7 @@ function _processFunction(node, functions, processedRanges, lines) {
                             isGenerator: isGen,
                             isAsync,
                             modifiers,
+                            ...lexicalOwnerRange(node),
                             ...typeAnno,
                             ...(generics && { generics }),
                             ...(docstring && { docstring })
@@ -699,8 +728,14 @@ function _processFunction(node, functions, processedRanges, lines) {
         if (processedRanges.has(rangeKey)) return false;
 
         const leftNode = node.childForFieldName('left');
-        const isPrototypeAssignment = leftNode && leftNode.type === 'member_expression' &&
-            leftNode.text.includes('.prototype.');
+        const assignedObject = leftNode?.type === 'member_expression'
+            ? leftNode.childForFieldName('object') : null;
+        const prototypeBase = assignedObject?.type === 'member_expression' &&
+            assignedObject.childForFieldName('property')?.text === 'prototype'
+            ? assignedObject.childForFieldName('object') : null;
+        const prototypeOwner = prototypeBase?.type === 'identifier'
+            ? prototypeBase.text : null;
+        const isPrototypeAssignment = !!prototypeOwner;
 
         // For non-prototype assignments, check if nested
         if (!isPrototypeAssignment) {
@@ -748,7 +783,8 @@ function _processFunction(node, functions, processedRanges, lines) {
                     processedRanges.add(rangeKey);
                     const paramsNode = rightNode.childForFieldName('parameters');
                     const { startLine, endLine, indent } = nodeToLocation(node, lines);
-                    const returnType = extractReturnType(rightNode);
+                    const returnType = extractReturnType(rightNode) ||
+                        (prototypeOwner && returnsReceiverSelf(rightNode) ? 'this' : null);
                     const generics = extractGenerics(rightNode);
                     const docstring = extractJSDocstring(lines, startLine);
                     const isGen = isGenerator(rightNode);
@@ -781,9 +817,7 @@ function _processFunction(node, functions, processedRanges, lines) {
                         ...(leftNode.type === 'member_expression' &&
                             leftNode.childForFieldName('object')?.type === 'identifier' &&
                             { assignedReceiver: leftNode.childForFieldName('object').text }),
-                        ...(leftNode.type === 'member_expression' &&
-                            /^([A-Za-z_$][\w$]*)\.prototype\.[A-Za-z_$][\w$]*$/.test(leftNode.text) &&
-                            { className: leftNode.text.split('.')[0], isMethod: true }),
+                        ...(prototypeOwner && { className: prototypeOwner, isMethod: true }),
                         ...typeAnno,
                         ...(generics && { generics }),
                         ...(docstring && { docstring })
@@ -1265,7 +1299,8 @@ function extractClassMembers(classNode, codeOrLines) {
                 }
 
                 const isAsync = text.match(/^\s*(?:(?:public|private|protected)\s+)?(?:static\s+)?(?:override\s+)?async\s/) !== null;
-                const returnType = extractReturnType(child);
+                const returnType = extractReturnType(child) ||
+                    (returnsReceiverSelf(child) ? 'this' : null);
                 const docstring = extractJSDocstring(code, startLine);
                 const paramsStructured = parseStructuredParams(paramsNode, 'javascript');
                 const typeAnno = buildTypeAnnotations(paramsStructured, returnType, code, startLine, true);

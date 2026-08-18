@@ -27,12 +27,16 @@ const { LspClient, pathToUri, uriToPath } = require('./lsp-client');
 const { makeHelperHandle } = require('./jsonl-helper');
 
 const HELPER_MANIFEST = path.join(__dirname, 'rust-ast-helper', 'Cargo.toml');
-// `serverStatus.quiescent` includes rust-analyzer's PrimeCaches pass, not just
-// Cargo metadata. Large workspaces can finish that pass after ten minutes on
-// a cold/contended runner (clap measured ~11.5 minutes locally). Keep the
-// compiler-grade barrier and allow bounded headroom rather than querying an
-// incomplete index.
-const QUIESCENT_TIMEOUT_MS = 900000;
+// `serverStatus.quiescent` is rust-analyzer's semantic-readiness barrier. The
+// evaluator disables optional cache priming below: it is a latency optimization
+// that can stall independently after the workspace is ready, and reference
+// queries populate the same semantic caches lazily. Keep a bounded failure
+// instead of querying an incomplete workspace. CI can override the bound
+// explicitly without weakening readiness semantics.
+const configuredQuiescentTimeout = Number.parseInt(
+    process.env.UCN_EVAL_RUST_QUIESCENT_TIMEOUT_MS || '', 10);
+const QUIESCENT_TIMEOUT_MS = Number.isFinite(configuredQuiescentTimeout) &&
+    configuredQuiescentTimeout > 0 ? configuredQuiescentTimeout : 900000;
 
 const rustAnalyzerOracle = {
     name: 'rust-analyzer',
@@ -61,7 +65,12 @@ const rustAnalyzerOracle = {
                     QUIESCENT_TIMEOUT_MS).unref();
             });
             lsp = new LspClient(ra, [], {
-                capabilities: { experimental: { serverStatusNotification: true } },
+                capabilities: {
+                    workspace: {
+                        didChangeWatchedFiles: { dynamicRegistration: true },
+                    },
+                    experimental: { serverStatusNotification: true },
+                },
                 onNotification: (method, params) => {
                     if (method === 'experimental/serverStatus' && params?.quiescent) quiesced(params);
                 },
@@ -72,6 +81,11 @@ const rustAnalyzerOracle = {
             // marked that source inactive in this one configuration.
             await lsp.initialize(workspaceRoot, {
                 checkOnSave: false,
+                cachePriming: { enable: false },
+                // Pinned eval clones are immutable while queried. Let the
+                // minimal client own change notifications so macOS's server
+                // watcher cannot strand VFS readiness at N-1 roots.
+                files: { watcher: 'client' },
                 cargo: { features: 'all', allTargets: true },
             });
             process.stdout.write('  waiting for rust-analyzer to load the workspace (cargo metadata + build scripts)...\n');

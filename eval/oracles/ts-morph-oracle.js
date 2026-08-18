@@ -109,7 +109,8 @@ const tsMorphOracle = {
             // property/variable name) so the symbol universes align. Gated to
             // JS projects so TS repos' historical samples stay byte-stable.
             if (handle.isJsProject && wanted.has('function')) {
-                for (const { name, line } of jsAssignedFunctions(sf)) {
+                for (const { name, line, oracleEligible } of jsAssignedFunctions(sf)) {
+                    if (!oracleEligible) continue;
                     out.push({ name, file: rel, line, kind: 'function' });
                 }
             }
@@ -161,7 +162,14 @@ const tsMorphOracle = {
                     kind,
                     ...(kind === 'call' && {
                         oracleResolution: reach === 'unresolved'
-                            ? 'unresolved' : 'may-reach',
+                            ? 'unresolved'
+                            : (reach === 'runtime-dispatch' ? 'may-reach' : 'exact'),
+                        ...(reach === 'runtime-dispatch' && {
+                            uncertaintyClass: 'runtime-dispatch',
+                        }),
+                        ...(reach === 'unresolved' && {
+                            uncertaintyClass: 'oracle-unresolved',
+                        }),
                     }),
                 });
             }
@@ -188,7 +196,14 @@ const tsMorphOracle = {
                     column: node.getStart() - node.getStartLinePos(),
                     kind: 'call',
                     oracleResolution: reach === 'unresolved'
-                        ? 'unresolved' : 'may-reach',
+                        ? 'unresolved'
+                        : (reach === 'runtime-dispatch' ? 'may-reach' : 'exact'),
+                    ...(reach === 'runtime-dispatch' && {
+                        uncertaintyClass: 'runtime-dispatch',
+                    }),
+                    ...(reach === 'unresolved' && {
+                        uncertaintyClass: 'oracle-unresolved',
+                    }),
                 });
             }
         }
@@ -291,7 +306,7 @@ function findTsConfig(dir) {
 }
 
 function methodCallMayReach(handle, targetDecl, referenceNode, SyntaxKind) {
-    if (targetDecl.getKind() !== SyntaxKind.MethodDeclaration) return 'resolved';
+    if (targetDecl.getKind() !== SyntaxKind.MethodDeclaration) return 'exact';
     const targetOwner = targetDecl.getFirstAncestorByKind(SyntaxKind.ClassDeclaration);
     if (!targetOwner) return 'unresolved';
 
@@ -304,7 +319,7 @@ function methodCallMayReach(handle, targetDecl, referenceNode, SyntaxKind) {
         const grand = parent.getParent();
         if (grand?.getKind() === SyntaxKind.CallExpression && grand.getExpression() === parent) call = grand;
     }
-    if (!call) return 'resolved';
+    if (!call) return 'exact';
 
     let signatureDecl;
     try {
@@ -327,14 +342,27 @@ function methodCallMayReach(handle, targetDecl, referenceNode, SyntaxKind) {
                 handle, call, targetOwner, SyntaxKind);
             if (receiverVerdict === true ||
                 interfaceShapeMayReachTarget(sigInterface, targetOwner)) {
-                return 'resolved';
+                return 'runtime-dispatch';
             }
             return receiverVerdict === null ? 'unresolved' : false;
         }
         return signatureDecl.getKind() === SyntaxKind.FunctionDeclaration
             ? false : 'unresolved';
     }
-    if (sameDeclarationOwner(targetOwner, sigOwner)) return 'resolved';
+    if (sameDeclarationOwner(targetOwner, sigOwner)) {
+        // Plain-JS language-service projects can select the sampled method's
+        // declaration for an `any`/unknown receiver solely because the name
+        // matches. That is an oracle abstention, not exact runtime identity
+        // (Fastify's ContentType.toString vs arbitrary values). Preserve exact
+        // credit when the receiver type itself can reach the target owner.
+        if (handle.isJsProject) {
+            const receiverVerdict = receiverTypeMayReachTarget(
+                handle, call, targetOwner, SyntaxKind);
+            if (receiverVerdict === null) return 'unresolved';
+            if (receiverVerdict === false) return false;
+        }
+        return 'exact';
+    }
 
     // A call resolved to a base declaration may execute the target override.
     // A call resolved to a different concrete sibling cannot.
@@ -344,7 +372,7 @@ function methodCallMayReach(handle, targetDecl, referenceNode, SyntaxKind) {
         const key = `${base.getSourceFile().getFilePath()}:${base.getStart()}`;
         if (visited.has(key)) break;
         visited.add(key);
-        if (sameDeclarationOwner(base, sigOwner)) return 'resolved';
+        if (sameDeclarationOwner(base, sigOwner)) return 'runtime-dispatch';
         base = base.getBaseClass();
     }
     return false;
@@ -436,6 +464,11 @@ function dedupeReferences(refs) {
  */
 function jsAssignedFunctions(sf) {
     const { SyntaxKind } = require('ts-morph');
+    const functionKinds = new Set([
+        SyntaxKind.FunctionDeclaration, SyntaxKind.FunctionExpression,
+        SyntaxKind.ArrowFunction, SyntaxKind.MethodDeclaration,
+        SyntaxKind.Constructor,
+    ]);
     const out = [];
     for (const v of sf.getDescendantsOfKind(SyntaxKind.VariableDeclaration)) {
         const init = v.getInitializer();
@@ -443,7 +476,10 @@ function jsAssignedFunctions(sf) {
         const k = init.getKind();
         if ((k === SyntaxKind.ArrowFunction || k === SyntaxKind.FunctionExpression) &&
             v.getNameNode().getKind() === SyntaxKind.Identifier) {
-            out.push({ name: v.getName(), line: v.getStartLineNumber(), anchor: v });
+            out.push({
+                name: v.getName(), line: v.getStartLineNumber(), anchor: v,
+                oracleEligible: true,
+            });
         }
     }
     for (const bin of sf.getDescendantsOfKind(SyntaxKind.BinaryExpression)) {
@@ -457,7 +493,21 @@ function jsAssignedFunctions(sf) {
         const name = fnName || lhs.getNameNode().getText();
         if (!name) continue;
         const anchor = fnName ? rhs : lhs.getNameNode();
-        out.push({ name, line: bin.getStartLineNumber(), anchor });
+        const owner = lhs.getExpression();
+        const stablePrototype = owner.getKind() === SyntaxKind.PropertyAccessExpression &&
+            owner.getNameNode().getText() === 'prototype' &&
+            owner.getExpression().getKind() === SyntaxKind.Identifier;
+        const nested = !!bin.getFirstAncestor(ancestor =>
+            functionKinds.has(ancestor.getKind()));
+        out.push({
+            name, line: bin.getStartLineNumber(), anchor,
+            // A nested `reply.send = fn`/`console.log = fn` patch is scoped to
+            // one runtime object. TypeScript's rename references structurally
+            // group unrelated properties with it, so it cannot serve as an
+            // exact target oracle. Prototype and module-scope ownership remain
+            // eligible; UCN still indexes every patch independently.
+            oracleEligible: stablePrototype || !nested,
+        });
     }
     return out;
 }

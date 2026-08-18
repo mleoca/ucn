@@ -55,6 +55,9 @@ function summarizeReviewBurden({
     placement = {},
     exactOracleCallEdges = oracleCallEdges,
     exactPlacement = placement,
+    runtimeOracleCallEdges = 0,
+    compileTimeOracleCallEdges = 0,
+    unresolvedOracleCallEdges = 0,
     unverifiedEdges = 0,
     unverifiedHits = 0,
     unverifiedUnscored = 0,
@@ -85,13 +88,23 @@ function summarizeReviewBurden({
         actionableUnverifiedScored - actionableUnverifiedHits);
     const semanticEligibleEdges = Math.max(0,
         oracleCallEdges - (placement.missingExplained || 0));
-    // clangd can identify a conservative template-overload family while the
-    // exact specialization remains dependent on substitution/constraints.
+    // Runtime polymorphism and compiler-dependent templates both identify a
+    // family that MAY reach the target, not one statically exact definition.
     // Keep those edges in semantic recall, but do not mislabel them as exact
-    // target edges. The strict placement gate is over statically exact oracle
-    // edges; compiler-dependent edges have their own visible counts/families.
+    // target identity. Each family remains visible and separately charged.
     const exactSemanticEligibleEdges = Math.max(0,
         exactOracleCallEdges - (exactPlacement.missingExplained || 0));
+    const nonExactOracleEdges = Math.max(0,
+        semanticEligibleEdges - exactSemanticEligibleEdges);
+    const runtimeDependentOracleEdges = Math.min(
+        nonExactOracleEdges, Math.max(0, runtimeOracleCallEdges));
+    const compilerDependentOracleEdges = Math.min(
+        Math.max(0, nonExactOracleEdges - runtimeDependentOracleEdges),
+        Math.max(0, compileTimeOracleCallEdges));
+    const oracleAbstentionEdges = Math.min(
+        Math.max(0, nonExactOracleEdges - runtimeDependentOracleEdges -
+            compilerDependentOracleEdges),
+        Math.max(0, unresolvedOracleCallEdges));
     const trueEdgesUnverified = exactPlacement.unverified || 0;
     const allOracleEdgesUnverified = placement.unverified || 0;
     const unverifiedScoredEdges = Math.max(0, unverifiedEdges - unverifiedUnscored);
@@ -126,8 +139,10 @@ function summarizeReviewBurden({
         compileTimeDispatchReviewItems: compileTimeDispatchGroups,
         semanticEligibleEdges,
         exactSemanticEligibleEdges,
-        compilerDependentOracleEdges: Math.max(0,
-            semanticEligibleEdges - exactSemanticEligibleEdges),
+        nonExactOracleEdges,
+        runtimeDependentOracleEdges,
+        compilerDependentOracleEdges,
+        oracleAbstentionEdges,
         trueEdgesUnverified,
         trueEdgeUnverifiedRate: roundedRate(
             trueEdgesUnverified, exactSemanticEligibleEdges),
@@ -266,6 +281,38 @@ function evaluateOracleCoverage(summary, maxUnscoredRatio) {
     };
 }
 
+/**
+ * Close a TypeScript overload/declaration surface over its one runtime
+ * implementation. The language service commonly resolves calls to an
+ * overload signature (or a `declare class` method) while UCN correctly pins
+ * the adjacent function body / prototype assignment. They are one callable
+ * identity only when file, lexical scope, namespace, and owner agree and the
+ * group has exactly one implementation.
+ */
+function closeJsTsDeclarationIdentity(definitions, target) {
+    if (!target) return [];
+    const callableKinds = new Set([
+        'function', 'method', 'constructor', 'get', 'set',
+    ]);
+    const sameSlot = (definitions || []).filter(definition =>
+        definition.file === target.file &&
+        (definition.className || null) === (target.className || null) &&
+        (definition.namespace || null) === (target.namespace || null) &&
+        (definition.lexicalScopeStartLine || null) ===
+            (target.lexicalScopeStartLine || null) &&
+        (definition.lexicalScopeEndLine || null) ===
+            (target.lexicalScopeEndLine || null) &&
+        (definition.isSignature || definition.memberAssigned ||
+            callableKinds.has(definition.type)));
+    const signatures = sameSlot.filter(definition => definition.isSignature);
+    const implementations = sameSlot.filter(definition => !definition.isSignature);
+    if (signatures.length === 0 || implementations.length !== 1 ||
+        !sameSlot.includes(target)) {
+        return [target];
+    }
+    return sameSlot;
+}
+
 module.exports = {
     PORTABLE_AST_REVIEW_BUDGETS,
     optionalRate,
@@ -273,4 +320,5 @@ module.exports = {
     summarizeReviewBurden,
     evaluateReviewBurden,
     evaluateOracleCoverage,
+    closeJsTsDeclarationIdentity,
 };

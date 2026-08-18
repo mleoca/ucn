@@ -7708,6 +7708,111 @@ describe('fix #290: immutable class-member factory aliases preserve return types
     });
 });
 
+describe('fix #291: plain-JS fluent self returns and closure bindings', () => {
+    it('folds prototype builder chains only when every value return is this', () => {
+        const dir = tmp({
+            'builder.js': [
+                'function Reply() {}',
+                'Reply.prototype.header = function () { return this }',
+                'Reply.prototype.code = function (ok) { if (ok) return this; return }',
+                'Reply.prototype.send = function () {}',
+                'function Other() {}',
+                'Other.prototype.send = function () {}',
+                'function direct() { return new Reply().header().code(true).send() }',
+                'function local() { const reply = new Reply(); return reply.code(true).send() }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const replySend = execute(index, 'context', { name: 'builder.js:4:send' });
+            assert.ok(replySend.ok);
+            assert.deepStrictEqual(replySend.result.callers.map(call => call.line), [7, 8]);
+            assert.ok(replySend.result.meta.account.conserved);
+
+            const otherSend = execute(index, 'context', { name: 'builder.js:6:send' });
+            assert.ok(otherSend.ok);
+            assert.strictEqual(otherSend.result.callers.length, 0);
+            assert.deepStrictEqual(otherSend.result.unverifiedCallers.map(call => call.line),
+                [7, 8], 'a structural sibling remains visible but is never promoted');
+            assert.ok(otherSend.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('keeps a nested const function binding visible inside child closures', () => {
+        const dir = tmp({
+            'nested.js': [
+                'function harness() {',
+                '  const createNestedRoutes = (depth) => {',
+                '    if (depth > 0) register(() => createNestedRoutes(depth - 1))',
+                '  }',
+                '  createNestedRoutes(2)',
+                '}',
+            ].join('\n'),
+            'decoy.js': 'const createNestedRoutes = () => {}\n',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', {
+                name: 'nested.js:2:createNestedRoutes',
+            });
+            assert.ok(result.ok);
+            assert.deepStrictEqual(result.result.callers.map(call => call.line), [3, 5]);
+            assert.ok(!result.result.unverifiedCallers.some(call =>
+                call.relativePath === 'nested.js'));
+            assert.ok(result.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('keeps conditional CommonJS member ownership unverified', () => {
+        const dir = tmp({
+            'fallback.js': [
+                'function maybe() {}',
+                'function stable() {}',
+                'module.exports = {',
+                '  maybe: globalThis.useNative ? Promise.resolve.bind(Promise) : maybe,',
+                '  stable',
+                '}',
+            ].join('\n'),
+            'consumer.js': [
+                "const helpers = require('./fallback')",
+                'function run() {',
+                '  helpers.maybe()',
+                '  helpers.stable()',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const maybe = execute(index, 'context', { name: 'fallback.js:1:maybe' });
+            assert.ok(maybe.ok);
+            assert.strictEqual(maybe.result.callers.length, 0);
+            assert.ok(maybe.result.unverifiedCallers.some(call =>
+                call.relativePath === 'consumer.js' && call.line === 3));
+            assert.ok(maybe.result.meta.account.conserved);
+
+            const stable = execute(index, 'context', { name: 'fallback.js:2:stable' });
+            assert.ok(stable.ok);
+            assert.ok(stable.result.callers.some(call =>
+                call.relativePath === 'consumer.js' && call.line === 4));
+            assert.ok(stable.result.meta.account.conserved);
+
+            const run = index.symbols.get('run')[0];
+            const callees = index.findCallees(run, {
+                collectAccount: true,
+                includeMethods: true,
+            });
+            assert.ok(!callees.some(callee =>
+                callee.name === 'maybe' && callee.relativePath === 'fallback.js'),
+            'callee direction must not confirm a runtime-conditional export');
+            assert.ok(callees.unverifiedCallees.some(callee =>
+                callee.name === 'maybe' && callee.sites.includes(3)));
+            assert.ok(callees.some(callee =>
+                callee.name === 'stable' && callee.relativePath === 'fallback.js'));
+            assert.ok(callees.calleeAccount.conserved);
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #232: related honors the definition pin', () => {
     it('errors when --file matches no definition of the symbol', () => {
         // Campaign G1-rust BUG-6 / G1-py BUG-3 / G1-ts BUG-2 (three cells

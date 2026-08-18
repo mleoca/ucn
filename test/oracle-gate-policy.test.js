@@ -12,9 +12,43 @@ const {
     summarizeReviewBurden,
     evaluateReviewBurden,
     evaluateOracleCoverage,
+    closeJsTsDeclarationIdentity,
 } = require('../eval/oracle-gate-policy');
 
 describe('oracle gate policy', () => {
+    it('closes TypeScript overloads and declare methods over one implementation', () => {
+        const file = '/repo/src/index.ts';
+        const overloads = [
+            { file, type: 'function', startLine: 10, isSignature: true },
+            { file, type: 'function', startLine: 11, isSignature: true },
+            { file, type: 'function', startLine: 12 },
+            { file, type: 'function', startLine: 30,
+                lexicalScopeStartLine: 29, lexicalScopeEndLine: 35 },
+        ];
+        assert.deepEqual(
+            closeJsTsDeclarationIdentity(overloads, overloads[2]),
+            overloads.slice(0, 3));
+
+        const declared = { file, type: 'method', startLine: 40,
+            className: 'Effect', isSignature: true };
+        const installed = { file, type: 'function', startLine: 60,
+            className: 'Effect', memberAssigned: true };
+        assert.deepEqual(
+            closeJsTsDeclarationIdentity([declared, installed], declared),
+            [declared, installed]);
+    });
+
+    it('never merges duplicate names across owners or lexical scopes', () => {
+        const target = { file: '/repo/a.ts', type: 'function', startLine: 10,
+            isSignature: true, lexicalScopeStartLine: 1, lexicalScopeEndLine: 20 };
+        const otherScope = { file: target.file, type: 'function', startLine: 11,
+            lexicalScopeStartLine: 30, lexicalScopeEndLine: 40 };
+        const otherOwner = { file: target.file, type: 'method', startLine: 12,
+            className: 'Other' };
+        assert.deepEqual(closeJsTsDeclarationIdentity(
+            [target, otherScope, otherOwner], target), [target]);
+    });
+
     it('validates rate arguments instead of letting NaN disable a release gate', () => {
         assert.equal(optionalRate('0.98', '--min-precision'), 0.98);
         assert.equal(optionalRate(null, '--min-precision'), null);
@@ -75,7 +109,10 @@ describe('oracle gate policy', () => {
             compileTimeDispatchReviewItems: 0,
             semanticEligibleEdges: 18,
             exactSemanticEligibleEdges: 18,
+            nonExactOracleEdges: 0,
+            runtimeDependentOracleEdges: 0,
             compilerDependentOracleEdges: 0,
+            oracleAbstentionEdges: 0,
             trueEdgesUnverified: 4,
             trueEdgeUnverifiedRate: 0.2222,
             allOracleEdgesUnverified: 4,
@@ -146,6 +183,32 @@ describe('oracle gate policy', () => {
             'one named runtime boundary is one agent-facing review item');
     });
 
+    it('separates runtime-polymorphic families from exact target identity', () => {
+        const metrics = summarizeReviewBurden({
+            symbols: [{
+                actionableUnverified: 0,
+                runtimeDispatchSites: 21,
+                runtimeDispatchGroups: 1,
+                runtimeDispatchHits: 20,
+            }],
+            oracleCallEdges: 100,
+            placement: { unverified: 22 },
+            exactOracleCallEdges: 80,
+            exactPlacement: { unverified: 2 },
+            runtimeOracleCallEdges: 20,
+            unverifiedEdges: 21,
+            unverifiedHits: 20,
+        });
+        assert.equal(metrics.nonExactOracleEdges, 20);
+        assert.equal(metrics.runtimeDependentOracleEdges, 20);
+        assert.equal(metrics.compilerDependentOracleEdges, 0);
+        assert.equal(metrics.oracleAbstentionEdges, 0);
+        assert.equal(metrics.trueEdgeUnverifiedRate, 0.025,
+            'strict placement uses only statically exact target identity');
+        assert.equal(metrics.allOracleEdgeUnverifiedRate, 0.22,
+            'runtime may-dispatch edges remain in the semantic universe');
+    });
+
     it('separates compiler-dependent template families from exact oracle edges', () => {
         const metrics = summarizeReviewBurden({
             symbols: [{
@@ -159,10 +222,14 @@ describe('oracle gate policy', () => {
             placement: { unverified: 22 },
             exactOracleCallEdges: 80,
             exactPlacement: { unverified: 2 },
+            compileTimeOracleCallEdges: 20,
             unverifiedEdges: 43,
             unverifiedHits: 22,
         });
+        assert.equal(metrics.nonExactOracleEdges, 20);
+        assert.equal(metrics.runtimeDependentOracleEdges, 0);
         assert.equal(metrics.compilerDependentOracleEdges, 20);
+        assert.equal(metrics.oracleAbstentionEdges, 0);
         assert.equal(metrics.trueEdgeUnverifiedRate, 0.025,
             'the strict rate contains only statically exact oracle identity');
         assert.equal(metrics.allOracleEdgeUnverifiedRate, 0.22,
@@ -174,6 +241,21 @@ describe('oracle gate policy', () => {
             'one named compiler handoff is one agent-facing review family');
         assert.equal(metrics.rawFalseUnverifiedCandidates, 21,
             'raw candidates are never removed from the audit');
+    });
+
+    it('separates unresolved oracle references from exact target identity', () => {
+        const metrics = summarizeReviewBurden({
+            symbols: [{ actionableUnverified: 0 }],
+            oracleCallEdges: 100,
+            placement: { unverified: 22 },
+            exactOracleCallEdges: 80,
+            exactPlacement: { unverified: 2 },
+            unresolvedOracleCallEdges: 20,
+        });
+        assert.equal(metrics.nonExactOracleEdges, 20);
+        assert.equal(metrics.oracleAbstentionEdges, 20);
+        assert.equal(metrics.trueEdgeUnverifiedRate, 0.025);
+        assert.equal(metrics.allOracleEdgeUnverifiedRate, 0.22);
     });
 
     it('accepts the measured Clap configuration coverage', () => {
