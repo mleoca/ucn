@@ -184,6 +184,28 @@ function identity<T>(arg: T): T {
         assert.strictEqual(result.functions.length, 1);
         assert.ok(result.functions[0].generics);
     });
+
+    it('records immutable module-scope class-member callable aliases', () => {
+        const code = `
+class Widget {
+    static create = (): Widget => new Widget();
+}
+const factory = Widget.create;
+let mutableFactory = Widget.create;
+function local() {
+    const nestedFactory = Widget.create;
+}`;
+        const result = parse(code, 'typescript');
+        assert.deepStrictEqual(result.callableAliases, [{
+            name: 'factory',
+            owner: 'Widget',
+            member: 'create',
+            startLine: 5,
+            endLine: 5,
+        }]);
+        assert.ok(result.classes[0].members.find(member => member.name === 'create')
+            .modifiers.includes('static'));
+    });
 });
 
 // ============================================================================

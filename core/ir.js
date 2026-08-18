@@ -53,7 +53,8 @@ function normalizeSymbol(symbol, family, language, kind, owner = null) {
         'namespace', 'lexicalScopeStartLine', 'lexicalScopeEndLine',
         'returnTypeQualifier', 'macroNeverReturns', 'callbackParamTypes', 'iteratorItemType',
         'returnedConcreteType', 'returnedConstructors', 'templateDependent',
-        'linkage', 'functionLike',
+        'linkage', 'functionLike', 'callableAlias', 'exportedAlias',
+        'aliasOwner', 'aliasMember',
     ];
     for (const field of passthrough) {
         if (symbol[field] !== undefined && symbol[field] !== null) {
@@ -114,6 +115,51 @@ function createFileIR({
     for (const symbol of stateObjects) append(symbol, 'state', 'state');
     for (const symbol of macros) append(symbol,
         symbol.functionLike ? 'callable' : 'state', 'macro');
+    // An immutable module-scope member alias has the callable signature of
+    // the class member it captures: `const make = Widget.create`. Materialize
+    // the local value and each explicit export alias as real function symbols
+    // only when its member is static and every declared return type agrees.
+    // This is compiler-visible identity; mutable aliases and ambiguous
+    // overload returns were rejected by the parser/agreement gate above.
+    for (const alias of (parsed.callableAliases || [])) {
+        const sources = normalizedSymbols.filter(symbol =>
+            symbol.name === alias.member && symbol.owner === alias.owner &&
+            (symbol.params !== undefined || symbol.paramsStructured) &&
+            (symbol.modifiers?.includes('static') ||
+                String(symbol.memberType || symbol.kind).startsWith('static')) &&
+            symbol.returnType);
+        if (sources.length === 0) continue;
+        const sourceReturns = new Set(sources.map(source => source.returnType));
+        if (sourceReturns.size !== 1) continue;
+        const source = sources[0];
+        const exported = (parsed.exports || []).filter(item =>
+            !item.source && item.name === alias.name);
+        const exposed = exported.map(item => ({
+            name: item.type === 'default' ? 'default' : (item.alias || item.name),
+            line: item.line || alias.startLine,
+        }));
+        const localIsExported = exposed.some(item => item.name === alias.name);
+        const makeAlias = (name, startLine, isExported, exportedAlias = false) => ({
+            bindingId: `callable-alias:${alias.owner}.${alias.member}:${name}:${startLine}`,
+            name,
+            startLine,
+            endLine: startLine,
+            params: source.params,
+            ...(source.paramsStructured && { paramsStructured: source.paramsStructured }),
+            returnType: source.returnType,
+            modifiers: isExported ? ['export'] : [],
+            callableAlias: true,
+            ...(exportedAlias && { exportedAlias: true }),
+            aliasOwner: alias.owner,
+            aliasMember: alias.member,
+        });
+        append(makeAlias(alias.name, alias.startLine, localIsExported),
+            'callable', 'function');
+        for (const item of exposed) {
+            if (item.name === alias.name) continue;
+            append(makeAlias(item.name, item.line, true, true), 'callable', 'function');
+        }
+    }
     const imports = [...(parsed.imports || [])];
     return {
         schemaVersion: IR_SCHEMA_VERSION,

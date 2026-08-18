@@ -7588,6 +7588,126 @@ describe('fix #289: exported ESM namespace objects preserve member ownership', (
     });
 });
 
+describe('fix #290: immutable class-member factory aliases preserve return types', () => {
+    it('types local and exported-alias factory chains without guessing', () => {
+        // zod-measured: `const stringType = ZodString.create; export {
+        // stringType as string }` preserves the static create signature.
+        // Without that callable identity, z.string().default() lost the
+        // ZodString receiver before the first chained method.
+        const dir = tmp({
+            'package.json': '{"name":"t","type":"module"}',
+            'factory.ts': [
+                'export class Widget {',
+                '  run() { return "widget"; }',
+                '  static create = (): Widget => new Widget();',
+                '}',
+                'export class Other { run() { return "other"; } }',
+                'const widgetFactory = Widget.create;',
+                'export { widgetFactory as widget, widgetFactory as widgetAgain };',
+                'widgetFactory().run();',
+            ].join('\n'),
+            'barrel.ts': "export * from './factory.js';\n",
+            'namespace.ts': [
+                "import * as api from './barrel.js';",
+                'export { api };',
+            ].join('\n'),
+            'use.ts': [
+                "import { api } from './namespace.js';",
+                'api.widget().run();',
+                'api.widgetAgain().run();',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const localAlias = (index.symbols.get('widgetFactory') || [])
+                .find(symbol => symbol.callableAlias);
+            assert.ok(localAlias);
+            assert.strictEqual(localAlias.returnType, 'Widget');
+            assert.strictEqual(localAlias.aliasOwner, 'Widget');
+            assert.strictEqual(localAlias.aliasMember, 'create');
+            const exportedAlias = (index.symbols.get('widget') || [])
+                .find(symbol => symbol.callableAlias);
+            assert.ok(exportedAlias);
+            assert.ok(exportedAlias.modifiers.includes('export'));
+            const secondExportedAlias = (index.symbols.get('widgetAgain') || [])
+                .find(symbol => symbol.callableAlias);
+            assert.ok(secondExportedAlias);
+            assert.notStrictEqual(exportedAlias.bindingId, secondExportedAlias.bindingId);
+            const factoryEntry = [...index.files.values()]
+                .find(entry => entry.relativePath === 'factory.ts');
+            assert.ok(!factoryEntry.bindings.some(binding =>
+                binding.name === 'widget' || binding.name === 'widgetAgain'),
+            'export-only alias names must not become lexical bindings');
+
+            const own = execute(index, 'context', { name: 'factory.ts:2:run' });
+            assert.ok(own.ok);
+            assert.deepStrictEqual(own.result.callers.map(call =>
+                `${call.relativePath}:${call.line}`),
+            ['factory.ts:8', 'use.ts:2', 'use.ts:3']);
+            assert.ok(!own.result.unverifiedCallers.some(call =>
+                ['factory.ts', 'use.ts'].includes(call.relativePath)));
+            assert.ok(own.result.meta.account.conserved);
+
+            const sibling = execute(index, 'context', { name: 'factory.ts:5:run' });
+            assert.ok(sibling.ok);
+            assert.ok(!sibling.result.callers.some(call => call.relativePath === 'use.ts'));
+            assert.ok(!sibling.result.unverifiedCallers.some(call =>
+                call.relativePath === 'use.ts'));
+            assert.strictEqual(
+                sibling.result.meta.account.excluded.byReason['receiver-type-mismatch'].count,
+                3);
+            assert.ok(sibling.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('keeps mutable, object-owned, and conflicting-return aliases untyped', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t","type":"module"}',
+            'factory.ts': [
+                'export class A { run() {} }',
+                'export class B { run() {} }',
+                'class Ambiguous {',
+                '  static make(value: string): A;',
+                '  static make(value: number): B;',
+                '  static make(value: unknown) { return value ? new A() : new B(); }',
+                '  instance(): A { return new A(); }',
+                '}',
+                'const conflicting = Ambiguous.make;',
+                'let mutable = Ambiguous.make;',
+                'const ordinary = client.make;',
+                'const invalidInstance = Ambiguous.instance;',
+                'export { conflicting, mutable, ordinary, invalidInstance };',
+            ].join('\n'),
+            'use.ts': [
+                "import * as api from './factory.js';",
+                'api.conflicting("x").run();',
+                'api.mutable("x").run();',
+                'api.ordinary("x").run();',
+                'api.invalidInstance().run();',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.ok(!(index.symbols.get('conflicting') || [])
+                .some(symbol => symbol.callableAlias));
+            assert.ok(!(index.symbols.get('mutable') || [])
+                .some(symbol => symbol.callableAlias));
+            assert.ok(!(index.symbols.get('ordinary') || [])
+                .some(symbol => symbol.callableAlias));
+            assert.ok(!(index.symbols.get('invalidInstance') || [])
+                .some(symbol => symbol.callableAlias));
+            for (const handle of ['factory.ts:1:run', 'factory.ts:2:run']) {
+                const result = execute(index, 'context', { name: handle });
+                assert.ok(result.ok);
+                assert.ok(result.result.unverifiedCallers.some(call =>
+                    call.relativePath === 'use.ts'),
+                'unproven alias return types must remain visible for review');
+                assert.ok(result.result.meta.account.conserved);
+            }
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #232: related honors the definition pin', () => {
     it('errors when --file matches no definition of the symbol', () => {
         // Campaign G1-rust BUG-6 / G1-py BUG-3 / G1-ts BUG-2 (three cells

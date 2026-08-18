@@ -76,7 +76,8 @@ const OPTIONAL_SYMBOL_FIELDS = Object.freeze([
     'lexicalScopeStartLine', 'lexicalScopeEndLine',
     'returnTypeQualifier', 'macroNeverReturns', 'callbackParamTypes', 'iteratorItemType',
     'returnedConcreteType', 'returnedConstructors', 'templateDependent',
-    'linkage', 'functionLike',
+    'linkage', 'functionLike', 'callableAlias', 'exportedAlias',
+    'aliasOwner', 'aliasMember',
 ]);
 
 function materializeSymbol(fileEntry, item) {
@@ -92,7 +93,9 @@ function materializeSymbol(fileEntry, item) {
         returnType: item.returnType,
         modifiers: item.modifiers,
         docstring: item.docstring,
-        bindingId: `${fileEntry.relativePath}:${item.kind}:${item.startLine}`,
+        bindingId: item.id
+            ? `${fileEntry.relativePath}:${item.id}`
+            : `${fileEntry.relativePath}:${item.kind}:${item.startLine}`,
         ...(item.owner && { className: item.owner }),
     };
     for (const field of OPTIONAL_SYMBOL_FIELDS) {
@@ -115,7 +118,8 @@ function addIRSymbol(fileEntry, item, symbolTable = null) {
     // binding of ColorPair from the cross-file struct, excluding a compiler-
     // true composite-literal caller as other-definition). The struct/enum
     // claim covers the impl — same discipline as deadcode's CLASS_AUDIT_KINDS.
-    if (!item.memberAssigned && !item.bodyScopedName && item.kind !== 'impl') {
+    if (!item.memberAssigned && !item.bodyScopedName && !item.exportedAlias &&
+        item.kind !== 'impl') {
         fileEntry.bindings.push({
             id: symbol.bindingId,
             name: symbol.name,

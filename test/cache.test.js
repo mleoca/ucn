@@ -2396,6 +2396,13 @@ describe('index reliability: cache round-trip and incremental rebuild identity',
             "import * as namespace from './esm-dep.js';",
             'export { fallback, local, namespace };',
         ].join('\n'),
+        'callable-alias.ts': [
+            'export class CachedFactory {',
+            '  static create = (): CachedFactory => new CachedFactory();',
+            '}',
+            'const cachedFactory = CachedFactory.create;',
+            'export { cachedFactory as makeCached };',
+        ].join('\n'),
     };
 
     it('loadCache reproduces the exact symbol table, file entries, and calls', () => {

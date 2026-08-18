@@ -13344,6 +13344,16 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
         const cands = (index.symbols.get(name) || [])
             .filter(d => !NON_CALLABLE_TYPES.has(d.type) && d.returnType && !d.className);
         let matches = cands.filter(d => d.file === modFile);
+        // A named/default import may itself be an exported namespace object
+        // (`import { z } from 'zod/v3'; z.string()`). Resolve the producer
+        // name through that exact namespace identity before the older
+        // one-hop barrel fallback. Exported callable-alias symbols then carry
+        // the captured class member's declared return type into the chain.
+        if (matches.length === 0) {
+            matches = cands.filter(definition =>
+                _importedNamespaceMemberOwnership(
+                    index, fileEntry, record, new Set([definition.file]))?.verdict === 'yes');
+        }
         if (matches.length === 0) {
             const hop = index.importGraph.get(modFile);
             if (hop) matches = cands.filter(d => hop.has(d.file));

@@ -599,6 +599,9 @@ function clearAllCaches() {
 // v166: C++ nested aliases persist their lexical owner ranges, and `auto`
 // return functions persist a unanimously inferred local concrete type. v165
 // was used during prerelease development before both fields were complete.
+// v172: immutable JS/TS class-member aliases materialize their local and
+// exported callable identities, preserving declared return types through
+// factory aliases and chained receivers.
 // v171: import bindings persist their syntactic kind (named/default/namespace)
 // so an exported ESM namespace object can carry exact member ownership through
 // a downstream named or default import.
@@ -612,7 +615,7 @@ function clearAllCaches() {
 // object they patch (`console.log = fn` → 'console') — so the builtin-global
 // exclusion can see cross-file that a project def rebinds the global's
 // member (fix #286a); impl-kind symbols leave the bindings table (#286b).
-const CACHE_FORMAT_VERSION = 171;
+const CACHE_FORMAT_VERSION = 172;
 
 /**
  * Save index to cache file
@@ -653,7 +656,9 @@ function saveCache(index, cachePath) {
     // Strip redundant fields from symbols and file entries to reduce cache size.
     // v6: All paths stored as relative paths (saves ~60% on large codebases).
     // symbol.file = path.join(root, symbol.relativePath) — reconstructable
-    // symbol.bindingId = relativePath:type:startLine — reconstructable
+    // Default symbol.bindingId = relativePath:type:startLine — reconstructable.
+    // Preserve non-default IDs: synthetic declarations can share a source line
+    // and need their explicit identity to survive a cache round-trip.
     // fileEntry.path = Map key — redundant
     // fileEntry.relativePath = now the Map key — redundant
     const root = index.root;
@@ -661,6 +666,12 @@ function saveCache(index, cachePath) {
     for (const [name, defs] of index.symbols) {
         const stripped = defs.map(s => {
             const { file, bindingId, ...rest } = s;
+            const defaultBindingId = s.relativePath && s.type && s.startLine
+                ? `${s.relativePath}:${s.type}:${s.startLine}`
+                : null;
+            if (bindingId && bindingId !== defaultBindingId) {
+                rest.bindingId = bindingId;
+            }
             return rest;
         });
         strippedSymbols.push([name, stripped]);
@@ -910,12 +921,15 @@ function loadCache(index, cachePath) {
                 const fileEntry = index.files.get(s.file);
                 if (fileEntry) {
                     fileEntry.symbols.push(s);
-                    fileEntry.bindings.push({
-                        id: s.bindingId,
-                        name: s.name,
-                        type: s.type,
-                        startLine: s.startLine
-                    });
+                    if (!s.memberAssigned && !s.bodyScopedName && !s.exportedAlias &&
+                        s.type !== 'impl') {
+                        fileEntry.bindings.push({
+                            id: s.bindingId,
+                            name: s.name,
+                            type: s.type,
+                            startLine: s.startLine
+                        });
+                    }
                 }
             }
         }

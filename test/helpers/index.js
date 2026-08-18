@@ -291,6 +291,8 @@ function indexSnapshot(index) {
             importAliases: (fe.importAliases || []).map(a => `${a.original} ${a.local}`).sort(),
             exportDetails: (fe.exportDetails || []).map(e => JSON.stringify(e)).sort(),
             moduleAssignedNames: [...(fe.moduleAssignedNames || [])].sort(),
+            bindings: (fe.bindings || []).map(binding => JSON.stringify(Object.fromEntries(
+                Object.entries(binding).sort(([a], [b]) => a.localeCompare(b))))).sort(),
             parseRecovery: !!fe.parseRecovery,
         }))
         .sort((a, b) => a.relativePath.localeCompare(b.relativePath));

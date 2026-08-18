@@ -1379,6 +1379,8 @@ function extractClassMembers(classNode, codeOrLines) {
                 const name = nameNode.text;
                 const valueNode = child.childForFieldName('value');
                 const isArrow = valueNode && valueNode.type === 'arrow_function';
+                const isStatic = Array.from({ length: child.childCount }, (_, ci) => child.child(ci))
+                    .some(part => part.type === 'static');
 
                 // Collect decorators — children of the field node (TS) or preceding siblings (JS)
                 const fieldDecorators = [];
@@ -1417,6 +1419,7 @@ function extractClassMembers(classNode, codeOrLines) {
                         startLine,
                         endLine,
                         memberType: name.startsWith('#') ? 'private' : 'field',
+                        ...(isStatic && { modifiers: ['static'] }),
                         isArrow: true,
                         isMethod: true,  // Arrow fields are callable like methods
                         ...typeAnno,
@@ -1434,6 +1437,7 @@ function extractClassMembers(classNode, codeOrLines) {
                         startLine,
                         endLine,
                         memberType: name.startsWith('#') ? 'private field' : 'field',
+                        ...(isStatic && { modifiers: ['static'] }),
                         ...(fieldType && { fieldType }),
                         ...(fieldDecorators.length > 0 && { decorators: fieldDecorators })
                         // Not a method - regular field
@@ -1492,6 +1496,48 @@ function _processState(node, objects, lines) {
 }
 
 /**
+ * Record immutable module-scope aliases of a statically named class member.
+ *
+ * `const make = Widget.create` preserves the member's compiler-visible
+ * callable signature.  The normalized IR can therefore expose both the local
+ * callable value and any `export { make as widget }` surface without guessing
+ * from a later call spelling.  Mutable/local/object aliases deliberately stay
+ * out: they need data-flow evidence, not a declaration-shape shortcut.
+ */
+function _processCallableAlias(node, aliases) {
+    if (node.type !== 'lexical_declaration' || !isModuleScope(node)) return false;
+    const declarationKind = node.child(0)?.text;
+    if (declarationKind !== 'const') return false;
+
+    let matched = false;
+    for (let i = 0; i < node.namedChildCount; i++) {
+        const declarator = node.namedChild(i);
+        if (declarator.type !== 'variable_declarator') continue;
+        const nameNode = declarator.childForFieldName('name');
+        let valueNode = declarator.childForFieldName('value');
+        if (nameNode?.type !== 'identifier' || !valueNode) continue;
+        while (valueNode && ['parenthesized_expression', 'as_expression',
+            'satisfies_expression', 'type_assertion'].includes(valueNode.type)) {
+            valueNode = valueNode.namedChild(0);
+        }
+        if (valueNode?.type !== 'member_expression') continue;
+        const owner = valueNode.childForFieldName('object');
+        const member = valueNode.childForFieldName('property');
+        if (owner?.type !== 'identifier' ||
+            !['identifier', 'property_identifier'].includes(member?.type)) continue;
+        aliases.push({
+            name: nameNode.text,
+            owner: owner.text,
+            member: member.text,
+            startLine: declarator.startPosition.row + 1,
+            endLine: declarator.endPosition.row + 1,
+        });
+        matched = true;
+    }
+    return matched;
+}
+
+/**
  * Find state objects (CONFIG, constants, etc.)
  */
 function findStateObjects(code, parser) {
@@ -1515,13 +1561,14 @@ function findStateObjects(code, parser) {
 function parse(code, parser) {
     const tree = parseTree(parser, code);
     const lines = code.split('\n');
-    const functions = [], classes = [], stateObjects = [];
+    const functions = [], classes = [], stateObjects = [], callableAliases = [];
     const processedFn = new Set(), processedCls = new Set();
 
     traverseTreeCached(tree.rootNode, (node) => {
         _processFunction(node, functions, processedFn, lines);
         _processClass(node, classes, processedCls, lines);
         _processState(node, stateObjects, lines);
+        _processCallableAlias(node, callableAliases);
         return true; // always continue, never skip subtrees
     });
 
@@ -1561,6 +1608,7 @@ function parse(code, parser) {
         declarationTokens.sort((a, b) => a.startIndex - b.startIndex);
 
         const recoveredFunctions = [], recoveredClasses = [], recoveredState = [];
+        const recoveredCallableAliases = [];
         for (let i = 0; i < declarationTokens.length; i++) {
             const token = declarationTokens[i];
             const next = declarationTokens[i + 1];
@@ -1569,12 +1617,13 @@ function parse(code, parser) {
             if (!fragment.trim()) continue;
             const fragmentTree = parseTree(parser, fragment);
             const fragmentLines = fragment.split('\n');
-            const ff = [], fc = [], fs = [];
+            const ff = [], fc = [], fs = [], fa = [];
             const pf = new Set(), pc = new Set();
             traverseTreeCached(fragmentTree.rootNode, (node) => {
                 _processFunction(node, ff, pf, fragmentLines);
                 _processClass(node, fc, pc, fragmentLines);
                 _processState(node, fs, fragmentLines);
+                _processCallableAlias(node, fa);
                 return true;
             });
             const lineOffset = token.startPosition.row;
@@ -1592,6 +1641,7 @@ function parse(code, parser) {
             for (const item of ff) { shiftLines(item); recoveredFunctions.push(item); }
             for (const item of fc) { shiftLines(item); recoveredClasses.push(item); }
             for (const item of fs) { shiftLines(item); recoveredState.push(item); }
+            for (const item of fa) { shiftLines(item); recoveredCallableAliases.push(item); }
         }
 
         const mergeUnique = (target, additions, kind) => {
@@ -1604,11 +1654,21 @@ function parse(code, parser) {
         mergeUnique(functions, recoveredFunctions, 'function');
         mergeUnique(classes, recoveredClasses, 'class');
         mergeUnique(stateObjects, recoveredState, 'state');
+        const aliasKeys = new Set(callableAliases.map(alias =>
+            `${alias.name}\0${alias.owner}\0${alias.member}\0${alias.startLine}`));
+        for (const alias of recoveredCallableAliases) {
+            const key = `${alias.name}\0${alias.owner}\0${alias.member}\0${alias.startLine}`;
+            if (!aliasKeys.has(key)) {
+                aliasKeys.add(key);
+                callableAliases.push(alias);
+            }
+        }
     }
 
     functions.sort((a, b) => a.startLine - b.startLine);
     classes.sort((a, b) => a.startLine - b.startLine);
     stateObjects.sort((a, b) => a.startLine - b.startLine);
+    callableAliases.sort((a, b) => a.startLine - b.startLine);
 
     return {
         language: 'javascript',
@@ -1616,6 +1676,7 @@ function parse(code, parser) {
         functions,
         classes,
         stateObjects,
+        callableAliases,
         ...(tree.rootNode.hasError && { parseRecovery: true }),
         imports: [],  // Handled by core/imports.js
         exports: []   // Handled by core/imports.js
