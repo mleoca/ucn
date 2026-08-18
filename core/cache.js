@@ -599,6 +599,9 @@ function clearAllCaches() {
 // v166: C++ nested aliases persist their lexical owner ranges, and `auto`
 // return functions persist a unanimously inferred local concrete type. v165
 // was used during prerelease development before both fields were complete.
+// v170: statically-owned CommonJS property assignments persist their local
+// callable identity, allowing exact module ownership to exclude a different
+// same-name export without treating all CJS surfaces as opaque.
 // v169: CommonJS export details distinguish the value assigned directly to
 // module.exports (`defaultLike`) from property exports; this prevents a
 // namespace require from becoming a confirmed call to every exported member.
@@ -606,7 +609,7 @@ function clearAllCaches() {
 // object they patch (`console.log = fn` → 'console') — so the builtin-global
 // exclusion can see cross-file that a project def rebinds the global's
 // member (fix #286a); impl-kind symbols leave the bindings table (#286b).
-const CACHE_FORMAT_VERSION = 169;
+const CACHE_FORMAT_VERSION = 170;
 
 /**
  * Save index to cache file

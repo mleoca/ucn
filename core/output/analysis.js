@@ -74,6 +74,23 @@ function isTestEntry(entry) {
     return isTestPath(entry.relativePath || entry.file || '');
 }
 
+function formatAmbiguityCandidates(lines, ambiguity) {
+    if (!ambiguity?.items?.length) return;
+    const owners = ambiguity.dispatchOwners
+        ? `; ${ambiguity.dispatchOwners} dispatch owners` : '';
+    lines.push(`  competing definitions (${ambiguity.totalDefinitions}${owners}):`);
+    for (const candidate of ambiguity.items) {
+        const owner = candidate.owner
+            ? ` on ${candidate.owner}${candidate.memberAssignment ? ' (member assignment)' : ''}` : '';
+        const selected = candidate.selected ? ' [selected target]' : '';
+        lines.push(`    - ${candidate.handle} — ${candidate.type}${owner}${selected}`);
+    }
+    if (ambiguity.truncated) {
+        lines.push(`    (+${ambiguity.totalDefinitions - ambiguity.items.length} more — ` +
+            `use find ${ambiguity.name})`);
+    }
+}
+
 /**
  * Render the conservation contract lines: ACCOUNT and CONTRACT (always),
  * WARNING (unparsed files containing the symbol), FILTERED (display-filter
@@ -273,6 +290,9 @@ function formatContextJson(context) {
                             ? 'runtime-dispatch' : 'actionable-ambiguity'),
                     ...(c.dispatchFamily && { dispatchFamily: c.dispatchFamily }),
                 })),
+                ...(context.ambiguityCandidates && {
+                    ambiguityCandidates: context.ambiguityCandidates,
+                }),
                 ...(context.warnings && { warnings: context.warnings })
             }
         });
@@ -327,6 +347,9 @@ function formatContextJson(context) {
                         ? 'runtime-dispatch' : 'actionable-ambiguity'),
                 ...(c.dispatchFamily && { dispatchFamily: c.dispatchFamily }),
             })),
+            ...(context.ambiguityCandidates && {
+                ambiguityCandidates: context.ambiguityCandidates,
+            }),
             callees: callees.map(c => ({
                 name: c.name,
                 type: c.type,
@@ -427,6 +450,7 @@ function formatContext(ctx, options = {}) {
         const typeUnverified = ctx.unverifiedCallers || [];
         if (typeUnverified.length > 0) {
             lines.push(`\nCALLERS — UNVERIFIED (${typeUnverified.length}) — call syntax, no binding/receiver evidence:`);
+            formatAmbiguityCandidates(lines, ctx.ambiguityCandidates);
             const cap = 10;
             let shown = 0;
             for (const u of typeUnverified) {
@@ -653,6 +677,7 @@ function formatContext(ctx, options = {}) {
     // Always visible and capped at 10 one-liners unless --all.
     if (actionableUnverified.length > 0) {
         lines.push(`${compact ? '' : '\n'}CALLERS — UNVERIFIED (${actionableUnverified.length}) — call syntax, no binding/receiver evidence:`);
+        formatAmbiguityCandidates(lines, ctx.ambiguityCandidates);
         const cap = (ctx.meta && ctx.meta.all) ? Infinity : 10;
         let shown = 0;
         for (const u of actionableUnverified) {

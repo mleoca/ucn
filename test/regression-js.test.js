@@ -7318,6 +7318,146 @@ describe('fix #286i: CommonJS property exports are not callable defaults', () =>
     });
 });
 
+describe('fix #287: inline CommonJS property exports retain local identity', () => {
+    it('an exactly resolved namespace excludes a different inline property definition', () => {
+        // fastify-measured: both input-validation.js and helper.js define
+        // `module.exports.payloadMethod = function ...`. Calls through the
+        // exactly resolved helper module stayed no-import-link for the input
+        // target because the inline export record dropped its local symbol.
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'a.js': 'module.exports.work = function () { return "a"; };\n',
+            'b.js': 'exports.work = () => "b";\n',
+            'use.js': [
+                "require('./a').work();",
+                "require('./b').work();",
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const aDef = (index.symbols.get('work') || [])
+                .find(definition => definition.relativePath === 'a.js');
+            assert.ok(aDef, 'inline CommonJS function is indexed');
+            const aExports = index.files.get(aDef.file).exportDetails;
+            assert.ok(aExports.some(exp =>
+                exp.name === 'work' && exp.localName === 'work'),
+                `inline export must retain local identity: ${JSON.stringify(aExports)}`);
+
+            const r = execute(index, 'context', { name: 'a.js:1:work' });
+            assert.ok(r.ok, `context failed: ${r.error}`);
+            assert.ok(r.result.callers.some(c =>
+                c.relativePath === 'use.js' && c.line === 1),
+                `own namespace call must confirm: ${JSON.stringify(r.result.callers)}`);
+            assert.ok(!r.result.unverifiedCallers.some(c =>
+                c.relativePath === 'use.js' && c.line === 2),
+                `other namespace must not remain unverified: ${JSON.stringify(r.result.unverifiedCallers)}`);
+            assert.strictEqual(
+                r.result.meta.account.excluded.byReason['other-definition-import'].count,
+                1);
+            assert.ok(r.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('keeps dynamic CommonJS property values opaque', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'a.js': 'module.exports.work = function () { return "a"; };\n',
+            'dynamic.js': 'module.exports.work = makeValue();\n',
+            'use.js': "require('./dynamic').work();\n",
+        });
+        try {
+            const index = idx(dir);
+            const dynamicEntry = [...index.files.values()]
+                .find(entry => entry.relativePath === 'dynamic.js');
+            const exp = dynamicEntry.exportDetails.find(item => item.name === 'work');
+            assert.ok(exp, 'dynamic property export is recorded');
+            assert.strictEqual(exp.localName, undefined,
+                'dynamic value must not manufacture local identity');
+
+            const r = execute(index, 'context', { name: 'a.js:1:work' });
+            assert.ok(r.ok);
+            assert.ok(r.result.unverifiedCallers.some(c =>
+                c.relativePath === 'use.js' && c.reason === 'no-import-link'),
+                'unmodelled dynamic export must remain visible');
+            assert.ok(r.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('pins a renamed require binding through the direct CommonJS default', () => {
+        // fastify-measured: `const validate = require('./config-validator')`
+        // calls the directly exported validate10, never hooks.js's unrelated
+        // validate. The require-local name is not the export's local name.
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'hooks.js': 'function validate(value) { return value; }\nmodule.exports = { validate };\n',
+            'generated.js': [
+                'function validate10(value) { return !!value; }',
+                'module.exports = validate10;',
+            ].join('\n'),
+            'use.js': [
+                "const validate = require('./generated');",
+                'validate({ ok: true });',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'hooks.js:1:validate' });
+            assert.ok(r.ok);
+            assert.ok(!r.result.unverifiedCallers.some(c => c.relativePath === 'use.js'),
+                `direct default owner is exact: ${JSON.stringify(r.result.unverifiedCallers)}`);
+            assert.strictEqual(
+                r.result.meta.account.excluded.byReason['other-definition-import'].count,
+                1);
+            assert.ok(r.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('keeps a dynamically produced CommonJS default unresolved', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'hooks.js': 'function validate(value) { return value; }\nmodule.exports = { validate };\n',
+            'dynamic.js': 'module.exports = makeValidator();\n',
+            'use.js': "const validate = require('./dynamic');\nvalidate({ ok: true });\n",
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'hooks.js:1:validate' });
+            assert.ok(r.ok);
+            assert.ok(r.result.unverifiedCallers.some(c => c.relativePath === 'use.js'),
+                'dynamic default must remain visible');
+            assert.ok(r.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #288: context explains same-name ambiguity with stable handles', () => {
+    it('lists the selected and competing method definitions once', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'models.js': [
+                'class Alpha { run() { return "a"; } }',
+                'class Beta { run() { return "b"; } }',
+                'function invoke(value) { return value.run(); }',
+                'module.exports = { Alpha, Beta, invoke };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'models.js:1:run' });
+            assert.ok(r.ok);
+            assert.ok(r.result.unverifiedCallers.some(c => c.line === 3),
+                'untyped receiver stays unverified');
+            assert.strictEqual(r.result.ambiguityCandidates.totalDefinitions, 2);
+            assert.deepStrictEqual(
+                r.result.ambiguityCandidates.items.map(item => item.handle),
+                ['models.js:1:run', 'models.js:2:run']);
+            assert.strictEqual(r.result.ambiguityCandidates.items[0].selected, true);
+            assert.strictEqual(r.result.ambiguityCandidates.items[1].selected, false);
+            assert.ok(r.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #232: related honors the definition pin', () => {
     it('errors when --file matches no definition of the symbol', () => {
         // Campaign G1-rust BUG-6 / G1-py BUG-3 / G1-ts BUG-2 (three cells

@@ -3217,6 +3217,22 @@ function findImportsInCode(code, parser) {
 }
 
 /**
+ * Return the local symbol created or referenced by a statically-owned
+ * CommonJS property assignment. Dynamic expressions deliberately return
+ * undefined: `exports.x = factory()` and `exports.x = other.y` may be
+ * re-exports or arbitrary values, so they are not exclusion-grade identity.
+ */
+function cjsAssignedLocalName(valueNode, exposedName) {
+    if (!valueNode) return undefined;
+    if (valueNode.type === 'identifier') return valueNode.text;
+    if (['function_expression', 'generator_function', 'arrow_function', 'class']
+        .includes(valueNode.type)) {
+        return valueNode.childForFieldName('name')?.text || exposedName;
+    }
+    return undefined;
+}
+
+/**
  * Find all exports in JavaScript/TypeScript code using tree-sitter AST
  * @param {string} code - Source code to analyze
  * @param {object} parser - Tree-sitter parser instance
@@ -3408,12 +3424,15 @@ function findExportsInCode(code, parser) {
                                 } else if (prop.type === 'pair') {
                                     const key = prop.childForFieldName('key');
                                     const value = prop.childForFieldName('value');
-                                    if (key) exports.push({
-                                        name: key.text,
-                                        ...(value?.type === 'identifier' && { localName: value.text }),
-                                        type: 'module.exports',
-                                        line,
-                                    });
+                                    if (key) {
+                                        const localName = cjsAssignedLocalName(value, key.text);
+                                        exports.push({
+                                            name: key.text,
+                                            ...(localName && { localName }),
+                                            type: 'module.exports',
+                                            line,
+                                        });
+                                    }
                                 } else if (prop.type === 'method_definition') {
                                     // Shorthand methods are exports too
                                     // (fix #252 — `module.exports =
@@ -3478,9 +3497,10 @@ function findExportsInCode(code, parser) {
                     if (objNode.text === 'exports') {
                         const line = node.startPosition.row + 1;
                         const rightNode = node.childForFieldName('right');
+                        const localName = cjsAssignedLocalName(rightNode, propNode.text);
                         exports.push({
                             name: propNode.text,
-                            ...(rightNode?.type === 'identifier' && { localName: rightNode.text }),
+                            ...(localName && { localName }),
                             type: 'exports',
                             line,
                         });
@@ -3490,7 +3510,11 @@ function findExportsInCode(code, parser) {
                     // module.exports.name = ...
                     if (objNode.type === 'member_expression' && objNode.text === 'module.exports') {
                         const line = node.startPosition.row + 1;
-                        exports.push({ name: propNode.text, type: 'module.exports', line });
+                        const rightNode = node.childForFieldName('right');
+                        const localName = cjsAssignedLocalName(rightNode, propNode.text);
+                        exports.push({ name: propNode.text,
+                            ...(localName && { localName }),
+                            type: 'module.exports', line });
                         return true;
                     }
                 }

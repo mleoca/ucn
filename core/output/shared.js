@@ -338,7 +338,7 @@ function formatGitLine(git) {
  * Display label for an unverified-tier entry's reason. Dispatch-tiered
  * entries (nominal languages) carry attribution metadata: the declared
  * supertype the call dispatches through (dispatchVia) and how many
- * same-name definitions the dispatch could land on (dispatchCandidates).
+ * distinct same-name owners the dispatch could land on (dispatchCandidates).
  */
 function unverifiedReasonLabel(entry) {
     if (!entry || !entry.reason) return '';
@@ -356,7 +356,7 @@ function unverifiedReasonLabel(entry) {
             : `possible-dispatch via ${entry.dispatchVia}`;
     }
     if (entry.reason === 'method-ambiguous' && entry.dispatchCandidates > 1) {
-        return `method-ambiguous — ${entry.dispatchCandidates} same-name definitions`;
+        return `method-ambiguous — ${entry.dispatchCandidates} dispatch owners`;
     }
     if (entry.reason === 'overload-ambiguous' && entry.dispatchCandidates > 1) {
         return `overload-ambiguous — 1 of ${entry.dispatchCandidates} applicable overloads`;

@@ -2386,6 +2386,10 @@ describe('index reliability: cache round-trip and incremental rebuild identity',
             'module.exports = direct;',
             'module.exports.property = property;',
         ].join('\n'),
+        'inline.js': [
+            'module.exports.inline = function () { return 3; };',
+            'exports.arrow = () => 4;',
+        ].join('\n'),
     };
 
     it('loadCache reproduces the exact symbol table, file entries, and calls', () => {

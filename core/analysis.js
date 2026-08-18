@@ -12,7 +12,8 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const { parse } = require('./parser');
 const { detectLanguage, langTraits } = require('../languages');
-const { NON_CALLABLE_TYPES, addTestExclusions, countTextBlindspots, codeUnitCompare } = require('./shared');
+const { NON_CALLABLE_TYPES, addTestExclusions, countTextBlindspots,
+    codeUnitCompare, formatSymbolHandle } = require('./shared');
 const { isTestFile } = require('./discovery');
 const { computeReachability, symbolKey } = require('./entrypoints');
 const { getLanguageAdapter } = require('../languages');
@@ -22,6 +23,60 @@ const { projectComputedDispatch } = require('./ast-analysis');
 // Used to flag call sites whose enclosing function is an arrow callback
 // passed to one of these (the common pattern in mocha/jest/vitest).
 const _JS_TEST_FRAMEWORK_CALLS = new Set(['describe', 'it', 'test', 'spec', 'context', 'suite']);
+
+/**
+ * Give agents the exact indexed definitions behind a same-name ambiguity.
+ * Candidate handles live once on the context result rather than being copied
+ * onto every unverified site (a single broad name can have thousands).
+ */
+function buildAmbiguityCandidates(index, name, selected, unverified) {
+    const relevant = (unverified || []).filter(site =>
+        site.reason === 'method-ambiguous' || site.reason === 'ambiguous-binding');
+    if (relevant.length === 0) return null;
+    const byHandle = new Map();
+    for (const definition of (index.symbols.get(name) || [])) {
+        if (!definition.file || !definition.startLine) continue;
+        const handle = formatSymbolHandle(definition);
+        if (handle && !byHandle.has(handle)) byHandle.set(handle, definition);
+    }
+    const definitions = [...byHandle.values()]
+        .sort((a, b) => {
+            const aSelected = a.bindingId === selected.bindingId ||
+                (a.file === selected.file && a.startLine === selected.startLine);
+            const bSelected = b.bindingId === selected.bindingId ||
+                (b.file === selected.file && b.startLine === selected.startLine);
+            if (aSelected !== bSelected) return aSelected ? -1 : 1;
+            const fileCmp = codeUnitCompare(a.relativePath || a.file, b.relativePath || b.file);
+            if (fileCmp !== 0) return fileCmp;
+            if (a.startLine !== b.startLine) return a.startLine - b.startLine;
+            return codeUnitCompare(a.type, b.type);
+        });
+    if (definitions.length < 2) return null;
+    const limit = 12;
+    const items = definitions.slice(0, limit).map(definition => ({
+        handle: formatSymbolHandle(definition),
+        type: definition.type,
+        ...(definition.className && { owner: definition.className }),
+        ...(!definition.className && definition.receiver && {
+            owner: definition.receiver.replace(/^\*/, ''),
+        }),
+        ...(!definition.className && !definition.receiver && definition.assignedReceiver && {
+            owner: definition.assignedReceiver,
+            memberAssignment: true,
+        }),
+        selected: definition.bindingId === selected.bindingId ||
+            (definition.file === selected.file && definition.startLine === selected.startLine),
+    }));
+    const dispatchOwners = Math.max(0, ...relevant
+        .map(site => Number(site.dispatchCandidates) || 0));
+    return {
+        name,
+        totalDefinitions: definitions.length,
+        ...(dispatchOwners > 0 && { dispatchOwners }),
+        items,
+        truncated: definitions.length > items.length,
+    };
+}
 
 /**
  * Tag each call site with `inTestCase` based on its enclosing function's
@@ -338,6 +393,8 @@ function context(index, name, options = {}) {
 
         typeCallers = [...typeCallers].sort(byFileLine);
         typeUnverified = [...typeUnverified].sort(byFileLine);
+        const typeAmbiguityCandidates = buildAmbiguityCandidates(
+            index, name, def, typeUnverified);
 
         const callerTotal = typeCallers.length;
         if (options.maxCallers && options.maxCallers > 0) {
@@ -366,6 +423,9 @@ function context(index, name, options = {}) {
             // Also include places where the type is used in function parameters/returns
             callers: typeCallers,
             unverifiedCallers: typeUnverified,
+            ...(typeAmbiguityCandidates && {
+                ambiguityCandidates: typeAmbiguityCandidates,
+            }),
             meta: { account: typeAccount, callerTotal }
         };
 
@@ -485,6 +545,8 @@ function context(index, name, options = {}) {
 
     const callerHistogram = buildHistogram(callers);
     const calleeHistogram = buildHistogram(callees);
+    const ambiguityCandidates = buildAmbiguityCandidates(
+        index, name, def, unverifiedCallers);
     const callerTotal = callers.length;
     const calleeTotal = callees.length;
     if (options.maxCallers && options.maxCallers > 0) {
@@ -512,6 +574,7 @@ function context(index, name, options = {}) {
         returnType: def.returnType,
         callers,
         unverifiedCallers,
+        ...(ambiguityCandidates && { ambiguityCandidates }),
         callees,
         unverifiedCallees: rawCallees.unverifiedCallees || [],
         callerHistogram,

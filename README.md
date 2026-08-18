@@ -638,7 +638,9 @@ answers. It's guidance over the same engine, not a second implementation.
   and external consumers can be invisible. UCN reports these blind spots
   (`repo --sections=health --deep`) rather than pretending they don't exist.
 - Interface, trait, template, overload, and untyped-receiver dispatch may stay
-  in the UNVERIFIED tier with a reason instead of being guessed.
+  in the UNVERIFIED tier with a reason instead of being guessed. When
+  same-name definitions compete, `show` lists their stable handles once so
+  agents can see exactly what needs disambiguation.
 - C/C++ analysis doesn't run the preprocessor or compiler; build-specific
   branches, advanced templates, and macro expansion can remain unresolved. C#
   analysis doesn't run Roslyn; source generators and external assembly

@@ -2617,7 +2617,9 @@ function findCallers(index, name, options = {}) {
                                 continue;
                             }
                             const resolvedAbs = path.join(index.root, rel);
-                            const verdict = _nameBindingReaches(index, resolvedAbs, b.name, tFiles);
+                            const verdict = b.defaultLike
+                                ? _defaultBindingReaches(index, resolvedAbs, tFiles)
+                                : _nameBindingReaches(index, resolvedAbs, b.name, tFiles);
                             if (verdict === 'yes') { reaches = true; break; }
                             if (verdict === 'unknown') undetermined = true;
                         }
@@ -2822,8 +2824,9 @@ function findCallers(index, name, options = {}) {
                 // binding (name-level — the file importing the target for
                 // other names proves nothing): binding module external →
                 // excluded; resolves to a project file that doesn't reach a
-                // target (directly or one re-export hop) → visible, not
-                // excluded (deep barrel chains exceed the hop budget);
+                // target by a definitive name-level `no` → excluded as another
+                // definition; an unknown chain stays visible (deep barrels and
+                // dynamic CJS surfaces can exceed the modeled ownership);
                 // unresolved-but-project-looking → visible (resolver gap).
                 if (!bindingId && !resolvedBySameClass && call.isMethod &&
                     (call.receiverIsModule || recvSubmoduleRel) &&
@@ -2833,6 +2836,9 @@ function findCallers(index, name, options = {}) {
                     if (recvBindings.length > 0 && !tFiles.has(filePath)) {
                         let reaches = false;
                         let projectish = false;
+                        let undetermined = false;
+                        let resolvedBindings = 0;
+                        let definitiveOtherBindings = 0;
                         for (const b of recvBindings) {
                             const rel = (fileEntry.moduleResolved && fileEntry.moduleResolved[b.module]) ||
                                 recvSubmoduleRel;
@@ -2842,10 +2848,12 @@ function findCallers(index, name, options = {}) {
                                 if (mod.startsWith('.') ||
                                     (firstSeg && _projectTopLevelNames(index).has(firstSeg))) {
                                     projectish = true;
+                                    undetermined = true;
                                 }
                                 continue;
                             }
                             projectish = true;
+                            resolvedBindings++;
                             const resolvedAbs = path.join(index.root, rel);
                             // Name-level ownership (fix #217 applied to module
                             // receivers — zod family D): `z._default(...)` asks
@@ -2860,10 +2868,17 @@ function findCallers(index, name, options = {}) {
                                 (verdict === 'unknown' && _importReaches(index, resolvedAbs, tFiles))) {
                                 reaches = true; break;
                             }
+                            if (verdict === 'no') definitiveOtherBindings++;
+                            else undetermined = true;
                         }
                         if (!reaches) {
                             if (!projectish) {
                                 recordExcluded(filePath, call.line, 'external-package');
+                                continue;
+                            }
+                            if (!undetermined && resolvedBindings > 0 &&
+                                definitiveOtherBindings === resolvedBindings) {
+                                recordExcluded(filePath, call.line, 'other-definition-import');
                                 continue;
                             }
                             if (collectAccount) {
@@ -8456,6 +8471,51 @@ function _nameBindingReaches(index, startAbs, name, targetFiles, maxDepth = 4) {
         frontier = next;
     }
     if (frontier.length > 0) unknown = true; // depth exhausted with live paths
+    return unknown ? 'unknown' : 'no';
+}
+
+/**
+ * Ownership chase for a CommonJS default-like require binding:
+ * `const local = require('./module')`. The local binding name says nothing
+ * about the exporting file's symbol; the direct `module.exports = value`
+ * record does. A locally defined callable is a definitive dead end for a
+ * target in another file, an imported value is chased, and dynamic values
+ * remain unknown. This is exclusion-grade only when every live path is known.
+ */
+function _defaultBindingReaches(index, startAbs, targetFiles, maxDepth = 4, visited = new Set()) {
+    if (targetFiles.has(startAbs)) return 'yes';
+    if (maxDepth < 0 || visited.has(startAbs)) return 'unknown';
+    visited.add(startAbs);
+    const fe = index.files.get(startAbs);
+    if (!fe) return 'unknown';
+
+    const defaults = (fe.exportDetails || []).filter(exp =>
+        exp.type === 'module.exports' && exp.defaultLike);
+    if (defaults.length === 0) return 'unknown';
+
+    let unknown = false;
+    for (const exp of defaults) {
+        const localName = exp.localName || exp.name;
+        if (!localName) { unknown = true; continue; }
+        const localCallable = (index.symbols.get(localName) || []).some(definition =>
+            definition.file === startAbs && !NON_CALLABLE_TYPES.has(definition.type));
+        if (localCallable) continue;
+
+        const bindings = (fe.importBindings || []).filter(binding =>
+            binding.name === localName || binding.alias === localName);
+        if (bindings.length === 0) { unknown = true; continue; }
+        for (const binding of bindings) {
+            const rel = fe.moduleResolved?.[binding.module];
+            if (!rel) { unknown = true; continue; }
+            const nextAbs = path.join(index.root, rel);
+            const verdict = binding.defaultLike
+                ? _defaultBindingReaches(
+                    index, nextAbs, targetFiles, maxDepth - 1, new Set(visited))
+                : _nameBindingReaches(index, nextAbs, binding.name, targetFiles, maxDepth - 1);
+            if (verdict === 'yes') return 'yes';
+            if (verdict === 'unknown') unknown = true;
+        }
+    }
     return unknown ? 'unknown' : 'no';
 }
 

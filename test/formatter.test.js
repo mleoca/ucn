@@ -1117,6 +1117,48 @@ describe('New Formatter Coverage', () => {
             assert.strictEqual(expandable.length, 2, 'Unverified entries are expandable');
         });
 
+        it('identifies competing definitions once for same-name ambiguity', () => {
+            const ctx = {
+                function: 'send',
+                file: 'lib/reply.js',
+                startLine: 10,
+                endLine: 20,
+                callers: [],
+                unverifiedCallers: [
+                    { relativePath: 'route.js', line: 4, content: 'reply.send()',
+                        reason: 'method-ambiguous', dispatchCandidates: 2 },
+                    { relativePath: 'other.js', line: 9, content: 'res.send()',
+                        reason: 'method-ambiguous', dispatchCandidates: 2 },
+                ],
+                ambiguityCandidates: {
+                    name: 'send',
+                    totalDefinitions: 2,
+                    dispatchOwners: 2,
+                    items: [
+                        { handle: 'lib/reply.js:10:send', type: 'function',
+                            owner: 'Reply', selected: true },
+                        { handle: 'test/mock.js:3:send', type: 'function',
+                            owner: 'reply', memberAssignment: true, selected: false },
+                    ],
+                    truncated: false,
+                },
+                callees: [],
+                meta: { complete: false, uncertain: 2 },
+            };
+            const { text } = output.formatContext(ctx);
+            assert.ok(text.includes('competing definitions (2; 2 dispatch owners):'));
+            assert.ok(text.includes('lib/reply.js:10:send — function on Reply [selected target]'));
+            assert.ok(text.includes(
+                'test/mock.js:3:send — function on reply (member assignment)'));
+            assert.ok(text.includes('(method-ambiguous — 2 dispatch owners)'));
+            assert.strictEqual(text.match(/lib\/reply\.js:10:send/g).length, 1,
+                'definition list renders once, not once per unverified site');
+
+            const json = JSON.parse(output.formatContextJson(ctx));
+            assert.strictEqual(json.data.ambiguityCandidates.totalDefinitions, 2);
+            assert.strictEqual(json.data.ambiguityCandidates.items[0].selected, true);
+        });
+
         it('caps unverified display at 10 with a +more hint, --all lifts it', () => {
             const mk = (i) => ({ relativePath: 'a.js', line: i + 1, content: `m.fn(${i})`, reason: 'method-no-evidence' });
             const ctx = {

@@ -53,7 +53,7 @@ not an accuracy grade.
 For caller-bearing `show`, `impact`, `trace`, `tests`, and `check` views:
 
 - `CONFIRMED` has binding, receiver, import, or ownership evidence for the pinned target.
-- `UNVERIFIED` is a possible target with insufficient identity evidence. Review it before a breaking change.
+- `UNVERIFIED` is a possible target with insufficient identity evidence. Review it before a breaking change. When same-name definitions cause the ambiguity, `show` lists their stable handles once above the sites so the competing targets are explicit.
 - `ACCOUNT` partitions observed literal-name lines into confirmed, unverified, non-call, excluded, and unresolved buckets. In mixed-language repositories it also counts occurrences in unsupported-language source files.
 - `CONTRACT` states the scope and completeness of that observed-text partition. When unsupported-language files contain the name, it says so explicitly and the partition-complete claim is limited to supported languages.
 - `WARNING` identifies unreadable, unparsed, or partially indexed files, and lists unsupported-language occurrence sites (file:line plus the line text) so nothing grep would show is hidden. `usages` and `tests` carry the same disclosure as a note.
