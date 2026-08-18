@@ -67,8 +67,10 @@ function buildAmbiguityCandidates(index, name, selected, unverified) {
         selected: definition.bindingId === selected.bindingId ||
             (definition.file === selected.file && definition.startLine === selected.startLine),
     }));
-    const dispatchOwners = Math.max(0, ...relevant
-        .map(site => Number(site.dispatchCandidates) || 0));
+    // reduce, not Math.max(...spread): a broad name on a monorepo can carry
+    // enough unverified sites to overflow the argument list.
+    const dispatchOwners = relevant.reduce(
+        (max, site) => Math.max(max, Number(site.dispatchCandidates) || 0), 0);
     return {
         name,
         totalDefinitions: definitions.length,

@@ -8434,12 +8434,24 @@ function _nameBindingReaches(index, startAbs, name, targetFiles, maxDepth = 4) {
             // makes widgets.helper the local helper even if widgets imports a
             // different helper several hops below. Parser-provided localName
             // keeps this proof limited to syntactically-owned CJS exports;
-            // dynamic assignments remain unknown.
+            // dynamic assignments remain unknown — including a COMPETING
+            // record for the same name without static ownership
+            // (`exports.run = run;` then `if (native) exports.run =
+            // require('./native').run;`) and a whole-surface reassignment
+            // (`module.exports = require('./impl')`): either one can rebind
+            // the member at runtime, so the static record alone never proves
+            // a dead end (fix #292).
             const localExports = (fe.exportDetails || []).filter(e =>
-                !e.source && (e.alias || e.name) === attr && e.localName);
-            if (localExports.some(e => (index.symbols.get(e.localName) || [])
-                .some(definition => definition.file === abs &&
-                    !NON_CALLABLE_TYPES.has(definition.type)))) {
+                !e.source && (e.alias || e.name) === attr);
+            const staticOwner = localExports.some(e => e.localName &&
+                (index.symbols.get(e.localName) || [])
+                    .some(definition => definition.file === abs &&
+                        !NON_CALLABLE_TYPES.has(definition.type)));
+            const competingDynamic = localExports.some(e => !e.localName) ||
+                (fe.exportDetails || []).some(e => !e.source &&
+                    e.defaultLike && e.type === 'module.exports' &&
+                    (e.alias || e.name) !== attr);
+            if (staticOwner && !competingDynamic) {
                 return 'no';
             }
 
@@ -8510,8 +8522,12 @@ function _nameBindingReaches(index, startAbs, name, targetFiles, maxDepth = 4) {
  */
 function _cjsMemberOwnershipAmbiguous(index, file, memberName) {
     const fe = index.files.get(file);
+    // Both CJS assignment families count: `module.exports = { x: cond ? a : b }`
+    // records type 'module.exports'; `exports.x = <dynamic>` records type
+    // 'exports' (fix #292 — the sequential native/fallback feature-detect idiom).
     return !!fe && (fe.exportDetails || []).some(exp =>
-        exp.type === 'module.exports' && !exp.defaultLike && !exp.source &&
+        (exp.type === 'module.exports' || exp.type === 'exports') &&
+        !exp.defaultLike && !exp.source &&
         (exp.alias || exp.name) === memberName && !exp.localName);
 }
 
@@ -8716,8 +8732,17 @@ function _defaultBindingReaches(index, startAbs, targetFiles, maxDepth = 4, visi
     for (const exp of defaults) {
         const localName = exp.localName || exp.name;
         if (!localName) { unknown = true; continue; }
+        // Without parser-proven syntactic ownership (localName), the record's
+        // name falls back to the synthesized 'default' — which a DYNAMIC
+        // reassignment (`module.exports = require('./impl')`) shares with an
+        // earlier anonymous default. Only a local callable declared AT the
+        // record's own line proves that this record is the local value
+        // (fix #292 — a name-only match must never dead-end the live import
+        // path of the competing dynamic record).
         const localCallable = (index.symbols.get(localName) || []).some(definition =>
-            definition.file === startAbs && !NON_CALLABLE_TYPES.has(definition.type));
+            definition.file === startAbs && !NON_CALLABLE_TYPES.has(definition.type) &&
+            (exp.localName || definition.startLine === exp.line ||
+                (definition.startLine <= exp.line && definition.endLine >= exp.line)));
         if (localCallable) continue;
 
         const bindings = (fe.importBindings || []).filter(binding =>
@@ -9750,7 +9775,8 @@ function _calleeExportDefinitions(index, startAbs, exposedName, language, call, 
             const localDetails = details.filter(e =>
                 !e.source && (e.alias || e.name) === attr);
             const ambiguousCjsMember = localDetails.some(e =>
-                e.type === 'module.exports' && !e.defaultLike && !e.localName);
+                (e.type === 'module.exports' || e.type === 'exports') &&
+                !e.defaultLike && !e.localName);
             const localExposed = fe.language === 'python' ||
                 (fe.exports || []).includes(attr) || localDetails.length > 0;
             if (ambiguousCjsMember) {

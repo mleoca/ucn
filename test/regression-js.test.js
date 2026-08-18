@@ -7813,6 +7813,197 @@ describe('fix #291: plain-JS fluent self returns and closure bindings', () => {
     });
 });
 
+describe('fix #292: sequential exports.x reassignment never proves a dead end', () => {
+    const conditionalFixture = {
+        'mod.js': [
+            "function run() { return 'fallback'; }",
+            'exports.run = run;',
+            "if (process.env.NATIVE) exports.run = require('./native').run;",
+        ].join('\n'),
+        'native.js': [
+            "function run() { return 'native'; }",
+            'module.exports = { run };',
+        ].join('\n'),
+        'app.js': [
+            "const mod = require('./mod');",
+            'function main() { return mod.run(); }',
+        ].join('\n'),
+    };
+
+    it('keeps the caller visible under the reassignment target pin', () => {
+        // The native/fallback feature-detect idiom: `exports.run = run;` then
+        // `if (native) exports.run = require('./native').run;`. The static
+        // record alone excluded app.js's caller as other-definition-import —
+        // a false zero-caller answer for native.js's run (the dynamic record
+        // records type 'exports', which the ownership-ambiguity guard only
+        // matched as 'module.exports').
+        const dir = tmp(conditionalFixture);
+        try {
+            const index = idx(dir);
+            const native = execute(index, 'context', { name: 'native.js:1:run' });
+            assert.ok(native.ok);
+            assert.strictEqual(native.result.callers.length, 0);
+            assert.ok(native.result.unverifiedCallers.some(call =>
+                call.relativePath === 'app.js' && call.line === 2),
+            'the conditional dispatch caller must stay visible, never excluded');
+            assert.ok(native.result.meta.account.conserved);
+
+            // The local fallback pin makes the same abstention for the
+            // cross-file call (its own `exports.run = run` line stays a
+            // confirmed same-file function reference — the #221 family).
+            const fallback = execute(index, 'context', { name: 'mod.js:1:run' });
+            assert.ok(fallback.ok);
+            assert.ok(!fallback.result.callers.some(call =>
+                call.relativePath === 'app.js'),
+            'the runtime-conditional member never confirms the consumer');
+            assert.ok(fallback.result.unverifiedCallers.some(call =>
+                call.relativePath === 'app.js' && call.line === 2));
+        } finally { rm(dir); }
+    });
+
+    it('trace-down abstains instead of confirming the local fallback', () => {
+        const dir = tmp(conditionalFixture);
+        try {
+            const index = idx(dir);
+            const main = index.symbols.get('main')[0];
+            const callees = index.findCallees(main, {
+                collectAccount: true,
+                includeMethods: true,
+            });
+            assert.ok(!callees.some(callee => callee.name === 'run'),
+                'callee direction must not confirm a conditionally rebound export');
+            assert.ok(callees.unverifiedCallees.some(callee =>
+                callee.name === 'run' && callee.sites.includes(2)));
+            assert.ok(callees.calleeAccount.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('purely static exports keep the definitive ownership dead end', () => {
+        // Counter-probe: without a competing dynamic record the #291
+        // relaxation must survive — the static local export still excludes
+        // callers under a foreign same-name pin and confirms locally.
+        const dir = tmp({
+            'mod.js': [
+                "function run() { return 'fallback'; }",
+                'exports.run = run;',
+            ].join('\n'),
+            'native.js': [
+                "function run() { return 'native'; }",
+                'module.exports = { run };',
+            ].join('\n'),
+            'app.js': [
+                "const mod = require('./mod');",
+                'function main() { return mod.run(); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const native = execute(index, 'context', { name: 'native.js:1:run' });
+            assert.ok(native.ok);
+            assert.strictEqual(native.result.callers.length, 0);
+            assert.ok(!native.result.unverifiedCallers.some(call =>
+                call.relativePath === 'app.js'),
+            'statically-owned foreign member stays excluded, not visible');
+            assert.ok(native.result.meta.account.conserved);
+
+            const local = execute(index, 'context', { name: 'mod.js:1:run' });
+            assert.ok(local.ok);
+            assert.ok(local.result.callers.some(call =>
+                call.relativePath === 'app.js' && call.line === 2),
+            'the statically-owned local member keeps its confirmed caller');
+        } finally { rm(dir); }
+    });
+
+    it('a dynamic default reassignment never dead-ends behind an anonymous default', () => {
+        // `module.exports = function () {}` synthesizes a 'default' symbol;
+        // a later `module.exports = require('./impl')` record carries the
+        // same fallback name — the name-only match must not treat the dynamic
+        // record as locally owned and exclude the live import path (the #217
+        // name-shadow chase runs `_defaultBindingReaches` for defaultLike
+        // bindings: `const helper = require('./lib'); helper()` under the
+        // pin of impl.js's helper, which lib's default may BE at runtime).
+        const dir = tmp({
+            'impl.js': [
+                'function helper() { return 1; }',
+                'module.exports = helper;',
+            ].join('\n'),
+            'lib.js': [
+                'module.exports = function () { return 0; };',
+                "if (process.env.IMPL) module.exports = require('./impl');",
+            ].join('\n'),
+            'consumer.js': [
+                "const helper = require('./lib');",
+                'function main() { return helper(); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const impl = execute(index, 'context', { name: 'impl.js:1:helper' });
+            assert.ok(impl.ok);
+            const shown = [...impl.result.callers, ...impl.result.unverifiedCallers];
+            assert.ok(shown.some(call =>
+                call.relativePath === 'consumer.js' && call.line === 2),
+            'the possibly-rebound default call must stay visible under the impl pin');
+            assert.ok(impl.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('an anonymous-only default keeps its dead end for foreign pins', () => {
+        const dir = tmp({
+            'impl.js': [
+                'function helper() { return 1; }',
+                'module.exports = helper;',
+            ].join('\n'),
+            'lib.js': 'module.exports = function () { return 0; };\n',
+            'consumer.js': [
+                "const helper = require('./lib');",
+                'function main() { return helper(); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const impl = execute(index, 'context', { name: 'impl.js:1:helper' });
+            assert.ok(impl.ok);
+            const shown = [...impl.result.callers, ...impl.result.unverifiedCallers];
+            assert.ok(!shown.some(call => call.relativePath === 'consumer.js'),
+                'a statically anonymous default never reaches a foreign pin');
+            assert.ok(impl.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('a whole-surface module.exports reassignment defeats member dead ends', () => {
+        // `exports.run = run; module.exports = require('./native')` rebinds
+        // the entire export surface — the member-level static record must not
+        // exclude the true native caller.
+        const dir = tmp({
+            'surface.js': [
+                "function run() { return 'shadowed'; }",
+                'exports.run = run;',
+                "module.exports = require('./native');",
+            ].join('\n'),
+            'native.js': [
+                "function run() { return 'native'; }",
+                'module.exports = { run };',
+            ].join('\n'),
+            'app.js': [
+                "const mod = require('./surface');",
+                'function main() { return mod.run(); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const native = execute(index, 'context', { name: 'native.js:1:run' });
+            assert.ok(native.ok);
+            const shown = [...native.result.callers,
+                ...native.result.unverifiedCallers];
+            assert.ok(shown.some(call =>
+                call.relativePath === 'app.js' && call.line === 2),
+            'the true caller through the reassigned surface must be shown');
+            assert.ok(native.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #232: related honors the definition pin', () => {
     it('errors when --file matches no definition of the symbol', () => {
         // Campaign G1-rust BUG-6 / G1-py BUG-3 / G1-ts BUG-2 (three cells

@@ -313,6 +313,27 @@ function closeJsTsDeclarationIdentity(definitions, target) {
     return sameSlot;
 }
 
+/**
+ * Deferred adjudication verdict for an oracle-unresolved call reference the
+ * engine did NOT show (fix #286d, refined by #292). The oracle's reference
+ * search could not bind the site; its exact definition lookup at the site
+ * decides:
+ *   'target'      → keep, gate-bearing: a positive pin is compiler-grade
+ *                   identity, so the engine genuinely missed a true edge.
+ *   'other'       → drop: a broad-family reference to a different definition.
+ *   'unresolved'  → drop as a measured oracle abstention — never punish the
+ *                   engine for excluding a site the oracle cannot pin.
+ *   'unavailable' → keep, report-only: the oracle has no definition lookup
+ *                   at all, so the edge stays loud in placement without
+ *                   hard-gating on a weak oracle's name-match references.
+ */
+function adjudicateDeferredUnresolved(status) {
+    if (status === 'target') return { keep: true, gateBearing: true };
+    if (status === 'other') return { keep: false, bucket: 'broad' };
+    if (status === 'unresolved') return { keep: false, bucket: 'abstention' };
+    return { keep: true, gateBearing: false };
+}
+
 module.exports = {
     PORTABLE_AST_REVIEW_BUDGETS,
     optionalRate,
@@ -321,4 +342,5 @@ module.exports = {
     evaluateReviewBurden,
     evaluateOracleCoverage,
     closeJsTsDeclarationIdentity,
+    adjudicateDeferredUnresolved,
 };

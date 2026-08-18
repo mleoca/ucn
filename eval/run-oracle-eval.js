@@ -76,6 +76,7 @@ const {
     evaluateReviewBurden,
     evaluateOracleCoverage,
     closeJsTsDeclarationIdentity,
+    adjudicateDeferredUnresolved,
 } = require('./oracle-gate-policy');
 const { tsMorphOracle } = require('./oracles/ts-morph-oracle');
 const { pyrightOracle } = require('./oracles/pyright-oracle');
@@ -343,6 +344,7 @@ async function evaluateRepo(repo, oracle) {
         unresolvedOracleCallEdges: 0,
         placement: emptyPlacement(),
         exactPlacement: emptyPlacement(),
+        runtimeDispatchAccountedNotShown: 0,
         zeroCases: 0, zeroAgreed: 0,
         conserved: 0, evaluated: 0,
     };
@@ -353,6 +355,7 @@ async function evaluateRepo(repo, oracle) {
     const unexplainedSamples = [];
     const semanticMissingSamples = [];
     const allOracleSemanticMissingSamples = [];
+    const runtimeDispatchNotShownSamples = [];
     const calleeAnswerCache = new Map();
     const calleeFalsePositiveSamples = [];
     const calleeUnexplainedSamples = [];
@@ -662,12 +665,23 @@ async function evaluateRepo(repo, oracle) {
             } else if (status === 'target') {
                 adjudicatedOracleCalls.push(oc);
                 definitionValidatedOracleCalls++;
+                // Same rule as the deferred pass: a positive definition pin
+                // is compiler-grade identity — the edge is gate-bearing even
+                // when the reference search abstained (fix #292).
+                if (oc.uncertaintyClass === 'oracle-unresolved') {
+                    delete oc.uncertaintyClass;
+                }
             } else if (status === 'unresolved') {
                 // A rename-oriented reference search plus an unresolved exact
                 // definition is not compiler ground truth for THIS repeated
-                // method. Keep the abstention measurable, but never punish
-                // the engine for excluding a site the oracle cannot pin.
-                definitionUnresolvedReferenceEdges++;
+                // method — but whether the ENGINE shows the edge is not known
+                // yet at this point. Defer (fix #292): an edge the engine
+                // shows stays in the universe; only a not-shown one drops as
+                // a measured abstention. The verdict is stashed so the
+                // deferred pass never re-queries the oracle.
+                oc._pendingUnresolved = true;
+                oc._definitionStatus = 'unresolved';
+                adjudicatedOracleCalls.push(oc);
             } else {
                 adjudicatedOracleCalls.push(oc);
             }
@@ -773,20 +787,31 @@ async function evaluateRepo(repo, oracle) {
             for (const oc of oracleCalls) {
                 if (!oc._pendingUnresolved) { kept.push(oc); continue; }
                 delete oc._pendingUnresolved;
+                const stashedStatus = oc._definitionStatus;
+                delete oc._definitionStatus;
                 const k = key(oc.file, oc.line);
                 if (confirmedKeys.has(k) || unverifiedKeys.has(k)) {
                     kept.push(oc);
                     continue;
                 }
-                const status = await definitionStatus(
+                const status = stashedStatus || await definitionStatus(
                     oc.file, oc.line, sym.name, targetIdentityDefs, oc.column);
-                if (status === 'other') {
-                    oracleBroadReferenceEdges++;
-                } else if (status === 'unresolved') {
-                    definitionUnresolvedReferenceEdges++;
-                } else {
-                    kept.push(oc);
-                    if (status === 'target') definitionValidatedOracleCalls++;
+                const verdict = adjudicateDeferredUnresolved(status);
+                if (!verdict.keep) {
+                    if (verdict.bucket === 'broad') oracleBroadReferenceEdges++;
+                    else definitionUnresolvedReferenceEdges++;
+                    continue;
+                }
+                kept.push(oc);
+                if (verdict.gateBearing) {
+                    definitionValidatedOracleCalls++;
+                    // A positive definition pin at the site is compiler-grade
+                    // identity: the miss re-enters the exact (gate-bearing)
+                    // universe (fix #292 — restores #286d's "'target' keeps
+                    // it a genuine, gate-bearing miss" semantics after the
+                    // oracle-unresolved uncertainty class made kept edges
+                    // silently non-exact).
+                    delete oc.uncertaintyClass;
                 }
             }
             oracleCalls.length = 0;
@@ -1004,6 +1029,15 @@ async function evaluateRepo(repo, oracle) {
                 };
                 pushSample(allOracleSemanticMissingSamples, sample);
                 if (exact) pushSample(semanticMissingSamples, sample);
+                // A compiler-attested may-dispatch edge the engine EXCLUDED
+                // with reason. Engine physics route possible-dispatch demote-
+                // only (visible), so this bucket gates at 0 (fix #292 —
+                // restores the sensitivity the runtime-dispatch class removed
+                // from the exact gates).
+                if (oc.uncertaintyClass === 'runtime-dispatch') {
+                    totals.runtimeDispatchAccountedNotShown++;
+                    pushSample(runtimeDispatchNotShownSamples, sample);
+                }
             } else {
                 place('missingUnexplained');
                 const sample = {
@@ -1410,6 +1444,15 @@ async function evaluateRepo(repo, oracle) {
         semanticRecall,
         semanticMissing,
         missingUnexplained: totals.exactPlacement.missingUnexplained,
+        // All-class hard floor (fix #292): an oracle edge UCN neither showed
+        // nor accounted for is a conservation lie regardless of its dispatch
+        // class — gated at 0 alongside the exact gate. Likewise a compiler-
+        // attested may-dispatch edge the engine EXCLUDED with reason violates
+        // demote-only physics (possible-dispatch is visible, never excluded).
+        allOracleMissingUnexplained: totals.placement.missingUnexplained,
+        runtimeDispatchAccountedNotShown:
+            totals.runtimeDispatchAccountedNotShown,
+        runtimeDispatchNotShownSamples,
         unexplainedSamples,
         semanticMissingSamples,
         allOracleSemanticRecall,
@@ -1445,6 +1488,8 @@ async function evaluateRepo(repo, oracle) {
         allOracleCalleeSemanticMissing,
         calleeMissingUnexplained:
             calleeTotals.exactPlacement.missingUnexplained,
+        calleeAllOracleMissingUnexplained:
+            calleeTotals.placement.missingUnexplained,
         calleeUnexplainedSamples,
         calleeSemanticMissingSamples,
         commandProof,
@@ -1616,6 +1661,20 @@ async function main() {
             }
             if (result.summary.semanticMissing > 0) gateFailed = true;
             if (result.summary.calleeSemanticMissing > 0) gateFailed = true;
+            // All-class floors (fix #292): unaccounted edges and excluded
+            // may-dispatch edges gate at 0 regardless of uncertainty class.
+            if (result.summary.allOracleMissingUnexplained > 0) {
+                process.stdout.write(`  ⚠ GATE FAILURE: ${result.summary.allOracleMissingUnexplained} non-exact oracle call edge(s) unexplained\n`);
+                gateFailed = true;
+            }
+            if (result.summary.calleeAllOracleMissingUnexplained > 0) {
+                process.stdout.write(`  ⚠ GATE FAILURE: ${result.summary.calleeAllOracleMissingUnexplained} non-exact callee edge(s) unexplained\n`);
+                gateFailed = true;
+            }
+            if (result.summary.runtimeDispatchAccountedNotShown > 0) {
+                process.stdout.write(`  ⚠ GATE FAILURE: ${result.summary.runtimeDispatchAccountedNotShown} runtime-dispatch oracle edge(s) excluded-with-reason: ${JSON.stringify((result.summary.runtimeDispatchNotShownSamples || []).slice(0, 3))}\n`);
+                gateFailed = true;
+            }
             if (result.summary.definitionLookupErrors > 0) gateFailed = true;
             if (result.summary.sourceStatusErrors > 0) gateFailed = true;
             if (result.summary.commandProof.failures > 0) gateFailed = true;

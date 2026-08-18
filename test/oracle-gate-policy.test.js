@@ -411,3 +411,27 @@ describe('fix #286h: declared-weak definition lookup uses a capability ceiling',
         assert.ok(verdict.failures.some(f => f.includes('definition-unresolved')));
     });
 });
+
+describe('fix #292: deferred unresolved adjudication is gate-bearing on a positive pin', () => {
+    const { adjudicateDeferredUnresolved } = require('../eval/oracle-gate-policy');
+
+    it('a target pin keeps the edge and restores gate-bearing status', () => {
+        assert.deepStrictEqual(adjudicateDeferredUnresolved('target'),
+            { keep: true, gateBearing: true });
+    });
+
+    it('a broad-family pin drops the edge as a different definition', () => {
+        assert.deepStrictEqual(adjudicateDeferredUnresolved('other'),
+            { keep: false, bucket: 'broad' });
+    });
+
+    it('an oracle abstention drops the edge without punishing the engine', () => {
+        assert.deepStrictEqual(adjudicateDeferredUnresolved('unresolved'),
+            { keep: false, bucket: 'abstention' });
+    });
+
+    it('an unavailable lookup keeps the edge loud but never hard-gates', () => {
+        assert.deepStrictEqual(adjudicateDeferredUnresolved('unavailable'),
+            { keep: true, gateBearing: false });
+    });
+});
