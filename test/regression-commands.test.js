@@ -6651,3 +6651,320 @@ describe('fix #283: surface-trust batch (handles, empty targets, check wording)'
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// FIX #293: plan --rename-to closes the rename set
+// (outcome-eval flask, 2026-08-18: reference-position usages, overload
+// groups, and the full dispatch slot were missing from changes[], so a
+// plan-following rename shipped uncompilable code)
+// ============================================================================
+
+describe('fix #293: plan rename closure — reference-position usages', () => {
+    it('includes a nested function\'s return reference, not a sibling\'s', () => {
+        const dir = tmp({
+            'app.py': [
+                'def outer_a():',
+                '    def deco(f):',
+                '        return f',
+                '    return deco',
+                '',
+                'def outer_b():',
+                '    def deco(f):',
+                '        return f',
+                '    return deco',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'plan',
+                { name: 'app.py:2:deco', renameTo: 'deco2' });
+            assert.ok(result.ok, result.error?.message);
+            const refs = result.result.changes.filter(c => c.editKind === 'reference');
+            assert.deepStrictEqual(refs.map(r => `${r.file}:${r.line}`), ['app.py:4'],
+                'outer_a return edited, outer_b return untouched');
+            assert.strictEqual(refs[0].newExpression.trim(), 'return deco2');
+        } finally { rm(dir); }
+    });
+
+    it('includes a keyword-argument callback reference to a module function', () => {
+        const dir = tmp({
+            'cli.py': [
+                'import click',
+                '',
+                'def set_debug(ctx, param, value):',
+                '    return value',
+                '',
+                '@click.option("--debug", callback=set_debug)',
+                'def run(debug):',
+                '    return debug',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'plan',
+                { name: 'set_debug', renameTo: 'set_debug2' });
+            assert.ok(result.ok);
+            const refs = result.result.changes.filter(c => c.editKind === 'reference');
+            assert.ok(refs.some(r => r.file === 'cli.py' && r.line === 6),
+                `callback= reference must be planned; got ${JSON.stringify(refs)}`);
+            assert.strictEqual(result.result.changeSummary.references, refs.length);
+        } finally { rm(dir); }
+    });
+
+    it('includes self/cls-received method-value references inside the class', () => {
+        const dir = tmp({
+            'app.py': [
+                'class App:',
+                '    def handler(self, ctx):',
+                '        return ctx',
+                '',
+                '    def table(cls):',
+                '        return [cls.handler]',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'plan',
+                { name: 'App.handler', renameTo: 'handler2' });
+            assert.ok(result.ok);
+            const refs = result.result.changes.filter(c => c.editKind === 'reference');
+            assert.ok(refs.some(r => r.line === 6), 'cls.handler value reference planned');
+        } finally { rm(dir); }
+    });
+
+    it('never edits a same-name method reference with a foreign receiver', () => {
+        const dir = tmp({
+            'app.py': [
+                'class App:',
+                '    def handler(self, ctx):',
+                '        return ctx',
+                '',
+                '    def table(self, other):',
+                '        return [other.handler]',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'plan',
+                { name: 'App.handler', renameTo: 'handler2' });
+            assert.ok(result.ok);
+            const refs = result.result.changes.filter(c => c.editKind === 'reference');
+            assert.ok(!refs.some(r => r.line === 6),
+                'other.handler carries no self/cls/this evidence');
+        } finally { rm(dir); }
+    });
+
+    it('edits cross-file references with a positive import chase, skips foreign imports', () => {
+        const dir = tmp({
+            'lib.py': 'def helper():\n    return 1\n',
+            'other.py': 'def helper():\n    return 2\n',
+            'reg.py': 'from lib import helper\n\nTABLE = {"h": helper}\n',
+            'foreign.py': 'from other import helper\n\nOTHER = {"h": helper}\n',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'plan',
+                { name: 'lib.py:1:helper', renameTo: 'helper2' });
+            assert.ok(result.ok);
+            const refs = result.result.changes.filter(c => c.editKind === 'reference');
+            assert.ok(refs.some(r => r.file === 'reg.py' && r.line === 3 && !r.needsReview),
+                `owned cross-file reference planned; got ${JSON.stringify(refs)}`);
+            assert.ok(!refs.some(r => r.file === 'foreign.py'),
+                'reference bound to other.py\'s helper is not this rename');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #293: plan rename closure — overload groups', () => {
+    it('renames every Python @overload stub with the implementation', () => {
+        const dir = tmp({
+            'lib.py': [
+                'from typing import overload',
+                '',
+                '@overload',
+                'def parse(value: int) -> int: ...',
+                '@overload',
+                'def parse(value: str) -> str: ...',
+                'def parse(value):',
+                '    return value',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'plan',
+                { name: 'lib.py:7:parse', renameTo: 'parse2' });
+            assert.ok(result.ok);
+            const defs = result.result.changes.filter(c => c.editKind === 'definition');
+            const lines = defs.map(d => d.line).sort((a, b) => a - b);
+            assert.deepStrictEqual(lines, [4, 6, 7],
+                `both stubs + implementation planned; got ${JSON.stringify(defs)}`);
+        } finally { rm(dir); }
+    });
+
+    it('renames TS overload signatures with the implementation', () => {
+        const dir = tmp({
+            'lib.ts': [
+                'export function parse(value: number): number;',
+                'export function parse(value: string): string;',
+                'export function parse(value: unknown): unknown {',
+                '    return value;',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'plan',
+                { name: 'lib.ts:3:parse', renameTo: 'parse2' });
+            assert.ok(result.ok);
+            const defs = result.result.changes.filter(c => c.editKind === 'definition');
+            assert.deepStrictEqual(defs.map(d => d.line).sort((a, b) => a - b), [1, 2, 3]);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #293: plan rename closure — dispatch slot roots at the topmost definer', () => {
+    it('pinning a mid-hierarchy override renames base and sibling overrides', () => {
+        const dir = tmp({
+            'tags.py': [
+                'class JSONTag:',
+                '    def check(self, value):',
+                '        return False',
+                '',
+                'class TagDict(JSONTag):',
+                '    def check(self, value):',
+                '        return isinstance(value, dict)',
+                '',
+                'class TagList(JSONTag):',
+                '    def check(self, value):',
+                '        return isinstance(value, list)',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            // Pin the MIDDLE subclass override, not the base.
+            const result = execute(index, 'plan',
+                { name: 'tags.py:6:check', renameTo: 'check2' });
+            assert.ok(result.ok);
+            const defs = result.result.changes.filter(c => c.editKind === 'definition');
+            assert.deepStrictEqual(defs.map(d => d.line).sort((a, b) => a - b), [2, 6, 10],
+                `base + both overrides planned; got ${JSON.stringify(defs)}`);
+            assert.ok(defs.some(d => d.line === 2 &&
+                d.suggestion.startsWith('Update base definition')));
+        } finally { rm(dir); }
+    });
+
+    it('an unrelated same-name class method never joins the slot', () => {
+        const dir = tmp({
+            'tags.py': [
+                'class JSONTag:',
+                '    def check(self, value):',
+                '        return False',
+                '',
+                'class TagDict(JSONTag):',
+                '    def check(self, value):',
+                '        return isinstance(value, dict)',
+                '',
+                'class Unrelated:',
+                '    def check(self, value):',
+                '        return None',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'plan',
+                { name: 'tags.py:6:check', renameTo: 'check2' });
+            assert.ok(result.ok);
+            const defs = result.result.changes.filter(c => c.editKind === 'definition');
+            assert.ok(!defs.some(d => d.line === 10),
+                'Unrelated.check is not part of the JSONTag dispatch slot');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #293: plan rename synthesizes edits for column-less reference-style sites', () => {
+    it('renames a Go assignment function reference and a callback-position reference', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/m\n\ngo 1.21\n',
+            'server.go': [
+                'package main',
+                '',
+                'func checkOrigin(ok bool) bool {',
+                '\treturn ok',
+                '}',
+                '',
+                'func setup() func(bool) bool {',
+                '\tchecker := checkOrigin',
+                '\treturn checker',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'plan',
+                { name: 'checkOrigin', renameTo: 'checkOrigin2' });
+            assert.ok(result.ok);
+            const site = result.result.changes.find(c => c.line === 8);
+            assert.ok(site, 'assignment reference site planned');
+            assert.ok(!site.needsReview,
+                `edit must be synthesized, not manual: ${JSON.stringify(site)}`);
+            assert.strictEqual(site.newExpression, 'checker := checkOrigin2');
+        } finally { rm(dir); }
+    });
+
+    it('refuses the all-identifier fallback when the row mixes an unrelated same-name token', () => {
+        const dir = tmp({
+            'app.js': [
+                'function job() { return 1; }',
+                'function run(job2) {',
+                '    const job = job2 || null; return [job, job2];',
+                '}',
+                'const table = { j: job };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'plan',
+                { name: 'app.js:1:job', renameTo: 'task' });
+            assert.ok(result.ok);
+            // Line 3's `job` is run()'s local — never an edit of the pin.
+            // In-function rows of a module-scope pin surface as review-only.
+            const row = result.result.changes.find(c => c.line === 3);
+            assert.ok(!row || (row.needsReview && !row.newExpression),
+                `shadowing local line must not receive a synthesized rename: ${JSON.stringify(row)}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #293: slot rename unions every member\'s call sites', () => {
+    it('a base-typed caller joins the changes under a subclass pin', () => {
+        const dir = tmp({
+            'tags.py': [
+                'class JSONTag:',
+                '    def check(self, value):',
+                '        return False',
+                '',
+                'class TagDict(JSONTag):',
+                '    def check(self, value):',
+                '        return isinstance(value, dict)',
+                '',
+                'def scan(tag: JSONTag, value):',
+                '    return tag.check(value)',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            // Pin the SUBCLASS override; the base-typed call site at line 10
+            // is a confirmed caller of the BASE member — same slot, same
+            // rename, so it must be a planned change, not a leftover.
+            const result = execute(index, 'plan',
+                { name: 'tags.py:6:check', renameTo: 'check2' });
+            assert.ok(result.ok);
+            const site = result.result.changes.find(c =>
+                c.line === 10 && c.editKind === 'call');
+            assert.ok(site, `base-typed call site planned via slot union: ` +
+                JSON.stringify(result.result.changes));
+            assert.ok(!result.result.unverifiedSites.some(u => u.line === 10),
+                'a slot-confirmed site leaves the unverified band');
+        } finally { rm(dir); }
+    });
+});

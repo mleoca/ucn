@@ -6,7 +6,7 @@
  */
 
 const { detectLanguage, getParser, getLanguageAdapter, safeParse, langTraits } = require('../languages');
-const { escapeRegExp, codeUnitCompare } = require('./shared');
+const { escapeRegExp, codeUnitCompare, NON_CALLABLE_TYPES } = require('./shared');
 
 function codeUnitColumnForByteColumn(line, byteColumn) {
     if (!Number.isInteger(byteColumn) || byteColumn < 0) return null;
@@ -1864,8 +1864,9 @@ function plan(index, name, options = {}) {
         // line appears ONCE however many call records it holds (fix #230 —
         // the non-global regex left the inner call behind and emitted a
         // duplicate entry per record).
+        const emitRenameCallSites = (siteList) => {
         const callLines = new Map();
-        for (const site of planCallSites) {
+        for (const site of siteList) {
             const lineKey = `${site.file}:${site.line}`;
             const group = callLines.get(lineKey) || {
                 file: site.file,
@@ -1889,10 +1890,22 @@ function plan(index, name, options = {}) {
             // in calledAs; that token must remain unchanged while the import's
             // source-side identifier is edited below.
             if (site.calledAs && site.calledAs !== name) continue;
-            const edit = renameIdentifierTokens(index,
+            let edit = renameIdentifierTokens(index,
                 site.absoluteFile || site.file, site.line, name,
                 options.renameTo, site.missingColumn ? [] : site.columns,
                 site.callCount);
+            // Column-less records restrict token eligibility to
+            // call-expression targets — which finds nothing for confirmed
+            // function-REFERENCE sites (`handler = serveWs`, macro-interior
+            // calls whose records carry no column). Retry in all-identifier
+            // mode: still AST tokens only, still refused unless the row's
+            // token count equals the engine's record count, so a line mixing
+            // the target with an unrelated same-name token stays manual.
+            if (edit.renamed === edit.source && site.missingColumn) {
+                edit = renameIdentifierTokens(index,
+                    site.absoluteFile || site.file, site.line, name,
+                    options.renameTo, null, site.callCount);
+            }
             const newExpression = edit.renamed;
             // A confirmed call through an import alias (`xf()`) is a real
             // caller but the alias spelling does not change. The required
@@ -1923,6 +1936,8 @@ function plan(index, name, options = {}) {
                 editKind: 'call',
             });
         }
+        };
+        emitRenameCallSites(planCallSites);
 
         // Also include import statements that reference the renamed function.
         // Name ownership (fix #230, the #217 rule): an import of the same
@@ -2034,6 +2049,37 @@ function plan(index, name, options = {}) {
             }
         }
 
+        // Overload signatures and their implementation are ONE callable
+        // (fix #265A, def side): renaming any member must rename the whole
+        // group, or the survivors keep the old name and the compiler rejects
+        // the group (TS 2394 / pyright reportInconsistentOverload). Same
+        // closure the caller engine uses (isSignature-gated, so Java arity
+        // overloads — separate bindable methods — never close).
+        {
+            const { _closeCallableIdentityGroup } = require('./callers');
+            const identityGroup = _closeCallableIdentityGroup(
+                index, [def], definitions);
+            for (const member of identityGroup) {
+                if (member === def) continue;
+                const line = member.nameLine || member.startLine;
+                const rel = member.relativePath || member.file;
+                if (changes.some(change =>
+                    change.file === rel && change.line === line)) continue;
+                const edit = renameIdentifierTokens(index, member.file,
+                    line, name, options.renameTo);
+                if (edit.renamed === edit.source) continue;
+                changes.push({
+                    file: rel,
+                    line,
+                    expression: edit.source,
+                    suggestion: `Update overload signature: ${edit.renamed}`,
+                    newExpression: edit.renamed,
+                    isDefinition: true,
+                    editKind: 'definition',
+                });
+            }
+        }
+
         // Renaming a virtual/overridden member is one hierarchy-wide change.
         // Leaving descendant declarations behind either fails compilation
         // (Java/C#/TS override) or silently changes dispatch (Python/JS).
@@ -2043,9 +2089,67 @@ function plan(index, name, options = {}) {
             // classes in unrelated packages. Follow only children whose base
             // resolves from the child's scope to this exact parent file.
             const identityKey = (className, file) => `${file || ''}\0${className}`;
+
+            // The pinned member may itself be an override: the dispatch slot
+            // is rooted at the TOPMOST project ancestor defining the name
+            // (flask PassList.check → JSONTag.check → every sibling
+            // override; outcome-eval 2026-08-18). Climb the extends chain
+            // with the same identity discipline, emit each ancestor definer,
+            // then walk DOWN from the root so sibling overrides join too.
+            // Arity-overload languages require the ancestor's signature to
+            // be the same virtual slot (a same-name different-arity Java
+            // method is a sibling, never the root).
+            let slotRoot = { name: def.className, file: def.file };
+            const slotAncestors = [];
+            const climbed = new Set([identityKey(slotRoot.name, slotRoot.file)]);
+            for (let hop = 0; hop < 8; hop++) {
+                const parents = index._getInheritanceParents(
+                    slotRoot.name, slotRoot.file) || [];
+                let moved = false;
+                for (const parentName of parents) {
+                    const parentFile = index._resolveClassFile(parentName, slotRoot.file);
+                    if (!parentFile) continue;
+                    const parentDef = (index.symbols.get(name) || []).find(symbol =>
+                        symbol.className === parentName && symbol.file === parentFile &&
+                        !NON_CALLABLE_TYPES.has(symbol.type));
+                    if (!parentDef) continue;
+                    if (langTraits(planLang)?.hasArityOverloads &&
+                        (parentDef.paramsStructured || []).length !==
+                        (def.paramsStructured || []).length) continue;
+                    const key = identityKey(parentName, parentFile);
+                    if (climbed.has(key)) break;
+                    climbed.add(key);
+                    slotRoot = { name: parentName, file: parentFile };
+                    slotAncestors.push({ className: parentName, file: parentFile, def: parentDef });
+                    moved = true;
+                    break;
+                }
+                if (!moved) break;
+            }
+            const slotMemberDefs = [];
+            for (const ancestor of slotAncestors) {
+                slotMemberDefs.push(ancestor.def);
+                const line = ancestor.def.nameLine || ancestor.def.startLine;
+                const rel = ancestor.def.relativePath || ancestor.def.file;
+                if (changes.some(change =>
+                    change.file === rel && change.line === line)) continue;
+                const edit = renameIdentifierTokens(index, ancestor.def.file,
+                    line, name, options.renameTo);
+                if (edit.renamed === edit.source) continue;
+                changes.push({
+                    file: rel,
+                    line,
+                    expression: edit.source,
+                    suggestion: `Update base definition: ${edit.renamed}`,
+                    newExpression: edit.renamed,
+                    isDefinition: true,
+                    editKind: 'definition',
+                });
+            }
+
             const descendants = new Map();
-            const queue = [{ name: def.className, file: def.file }];
-            const visited = new Set([identityKey(def.className, def.file)]);
+            const queue = [{ name: slotRoot.name, file: slotRoot.file }];
+            const visited = new Set([identityKey(slotRoot.name, slotRoot.file)]);
             while (queue.length > 0 && descendants.size < 5000) {
                 const parent = queue.shift();
                 for (const child of index.extendedByGraph.get(parent.name) || []) {
@@ -2066,6 +2170,13 @@ function plan(index, name, options = {}) {
             for (const override of index.symbols.get(name) || []) {
                 if (!override.className ||
                     !descendants.has(identityKey(override.className, override.file))) continue;
+                // Slot-rooting can put the pin's OWN class in the descendant
+                // set. The pin handles itself; same-class siblings (Java
+                // arity overloads, TS/Python signature stubs) belong to the
+                // identity-group pass, never the hierarchy walk.
+                if (override.className === def.className &&
+                    override.file === def.file &&
+                    override.startLine !== def.startLine) continue;
                 const line = override.nameLine || override.startLine;
                 const rel = override.relativePath || override.file;
                 if (changes.some(change => change.file === rel && change.line === line)) continue;
@@ -2083,7 +2194,59 @@ function plan(index, name, options = {}) {
                     isDefinition: true,
                     editKind: 'definition',
                 });
+                slotMemberDefs.push(override);
             }
+
+            // A slot rename must also carry every member's CALL sites — the
+            // pin's sweep answers for the pin only (a TagDict-typed caller
+            // of TagDict.check is a confirmed caller of the SLOT being
+            // renamed, absent from PassList.check's answer). Union the
+            // members' sweeps; their unverified candidates join the visible
+            // band with slot attribution. Bounded — a pathological slot
+            // discloses the cut instead of sweeping forever.
+            const SLOT_SWEEP_CAP = 25;
+            const seenSiteLines = new Set([
+                ...planCallSites.map(site => `${site.file}:${site.line}`),
+                ...changes.map(change => `${change.file}:${change.line}`),
+            ]);
+            const slotMemberSites = [];
+            for (const memberDef of slotMemberDefs.slice(0, SLOT_SWEEP_CAP)) {
+                const memberSweep = computePlanCallSites(index, name, memberDef);
+                for (const site of memberSweep.sites) {
+                    const key = `${site.file}:${site.line}`;
+                    if (seenSiteLines.has(key)) continue;
+                    seenSiteLines.add(key);
+                    slotMemberSites.push(site);
+                }
+                for (const site of memberSweep.unverifiedSites) {
+                    if (planUnverified.some(existing =>
+                        existing.file === site.file &&
+                        existing.line === site.line)) continue;
+                    if (seenSiteLines.has(`${site.file}:${site.line}`)) continue;
+                    planUnverified.push({
+                        ...site,
+                        slotMember: memberDef.className,
+                    });
+                }
+            }
+            if (slotMemberDefs.length > SLOT_SWEEP_CAP) {
+                resolved.warnings.push({
+                    message: `Dispatch slot has ${slotMemberDefs.length} member ` +
+                        `definitions; call sites were swept for the first ` +
+                        `${SLOT_SWEEP_CAP} — review the rest manually.`,
+                });
+            }
+            emitRenameCallSites(slotMemberSites);
+            // A site a slot member's sweep CONFIRMED is a planned edit now —
+            // it no longer belongs in the pin's "may need this change" band.
+            const changedLines = new Set(changes.map(change =>
+                `${change.file}:${change.line}`));
+            const keptUnverified = planUnverified.filter(site =>
+                !changedLines.has(`${site.file}:${site.line}`));
+            planUnverified.length = 0;
+            planUnverified.push(...keptUnverified);
+            planUnverified.sort((a, b) => codeUnitCompare(a.file, b.file) ||
+                a.line - b.line);
         }
 
         // C/C++ declarations and definitions are one compiler symbol. A
@@ -2119,6 +2282,163 @@ function plan(index, name, options = {}) {
                     isDefinition: true,
                     editKind: 'definition',
                 });
+            }
+        }
+
+        // Reference-position usages are rename edits too (outcome-eval
+        // flask, 2026-08-18): `return decorator`, `callback=handler`,
+        // `cls.method` values. Call syntax flows through the tiered sweep;
+        // references never did — a plan-following rename left them on the
+        // old name and the toolchain rejected the result. Evidence
+        // discipline mirrors the caller engine:
+        //   - same-file, non-method pin: nearest-binder containment — the
+        //     innermost same-name def whose scope container holds the line
+        //     must be the pin (a sibling nested `decorator` keeps its own
+        //     references; ties bind nothing);
+        //   - same-file, method pin: self/cls/this-received inside the
+        //     pin's class range (receiver evidence read from the line);
+        //   - cross-file, non-method pin: the #217 import-ownership chase —
+        //     'yes' edits, 'unknown' surfaces needsReview (no synthesized
+        //     edit), 'no' skips;
+        //   - cross-file method references are receiver-blind here:
+        //     call-shaped sites already flow through the sweep and the
+        //     unverified band.
+        // Shadow discipline (the #215/#203 concern — text rows carry no
+        // localShadow flag): a module-scope pin auto-edits only rows that
+        // sit at MODULE scope themselves (`TABLE = {"h": helper}`,
+        // `module.exports = { helper }`, decorator argument lists). A row
+        // inside some function body may reference a shadowing local
+        // (`const job = job2`), and argument-position references inside
+        // functions are the parser's #221 records — the sweep's domain —
+        // so those rows surface needsReview instead of a synthesized edit.
+        // A NESTED pin's own container is exempt: inside it the pin IS the
+        // binder (`return decorator`).
+        {
+            const fileSymbols = index.files.get(def.file)?.symbols || [];
+            const scopeKinds = new Set(['function', 'method', 'constructor',
+                'private', 'get', 'set', 'property', 'classmethod', 'special']);
+            const rangeOf = symbol => ({
+                start: symbol.startLine,
+                end: symbol.endLine || symbol.startLine,
+            });
+            const containerOf = (symbol) => {
+                const target = rangeOf(symbol);
+                let best = null;
+                for (const candidate of fileSymbols) {
+                    if (candidate === symbol || !scopeKinds.has(candidate.type)) continue;
+                    const range = rangeOf(candidate);
+                    if (!(range.start <= target.start && range.end >= target.end)) continue;
+                    if (range.start === target.start && range.end === target.end) continue;
+                    if (!best || (range.end - range.start) < (best.end - best.start)) {
+                        best = range;
+                    }
+                }
+                return best; // null = module scope
+            };
+            const binders = definitions
+                .filter(candidate => candidate.file === def.file &&
+                    !NON_CALLABLE_TYPES.has(candidate.type))
+                .map(candidate => ({ def: candidate, container: containerOf(candidate) }));
+            const classKinds = new Set(['class', 'struct', 'interface', 'trait',
+                'record', 'enum', 'namespace']);
+            const pinClassRange = def.className
+                ? fileSymbols.find(symbol => symbol.name === def.className &&
+                    classKinds.has(symbol.type) &&
+                    symbol.startLine <= def.startLine &&
+                    (symbol.endLine || symbol.startLine) >= (def.endLine || def.startLine))
+                : null;
+            const selfReceived = new RegExp(
+                `(?:^|[^A-Za-z0-9_$.])(?:self|cls|this)\\s*\\.\\s*` +
+                `${escapeRegExp(name)}(?![A-Za-z0-9_$])`);
+            const unverifiedLines = new Set(planUnverified.map(site =>
+                `${site.file}:${site.line}`));
+            const insideFunctionLike = (filePath, line) => {
+                const symbols = index.files.get(filePath)?.symbols || [];
+                return symbols.some(symbol => scopeKinds.has(symbol.type) &&
+                    symbol.startLine <= line &&
+                    (symbol.endLine || symbol.startLine) >= line);
+            };
+            const pinContainer = containerOf(def);
+            for (const ref of usages) {
+                if (ref.usageType !== 'reference' || ref.isDefinition) continue;
+                const rel = ref.relativePath || ref.file;
+                if (changes.some(change =>
+                    change.file === rel && change.line === ref.line)) continue;
+                if (unverifiedLines.has(`${rel}:${ref.line}`)) continue;
+                let verdict = null;
+                if (ref.file === def.file) {
+                    if (def.className) {
+                        const lineText = ref.content ||
+                            index.getLineContent(def.file, ref.line) || '';
+                        if (pinClassRange && ref.line >= pinClassRange.startLine &&
+                            ref.line <= (pinClassRange.endLine || Infinity) &&
+                            selfReceived.test(lineText)) {
+                            verdict = 'edit';
+                        }
+                    } else {
+                        let winner = null;
+                        let ambiguous = false;
+                        for (const binder of binders) {
+                            const contains = !binder.container ||
+                                (binder.container.start <= ref.line &&
+                                    binder.container.end >= ref.line);
+                            if (!contains) continue;
+                            const size = binder.container
+                                ? binder.container.end - binder.container.start
+                                : Infinity;
+                            if (!winner || size < winner.size) {
+                                winner = { def: binder.def, size };
+                                ambiguous = false;
+                            } else if (size === winner.size &&
+                                binder.def !== winner.def) {
+                                ambiguous = true;
+                            }
+                        }
+                        if (winner && !ambiguous && winner.def === def) {
+                            if (pinContainer) {
+                                verdict = 'edit'; // nested pin binds its container
+                            } else if (!insideFunctionLike(def.file, ref.line)) {
+                                verdict = 'edit'; // module-scope row, module pin
+                            } else {
+                                verdict = 'review'; // possible local shadow
+                            }
+                        }
+                    }
+                } else if (!def.className) {
+                    const ownership = _nameBindingReaches(
+                        index, ref.file, name, renameTargetFiles);
+                    if (ownership === 'yes' &&
+                        !insideFunctionLike(ref.file, ref.line)) {
+                        verdict = 'edit';
+                    } else if (ownership !== 'no') {
+                        verdict = 'review';
+                    }
+                }
+                if (!verdict) continue;
+                if (verdict === 'edit') {
+                    const edit = renameIdentifierTokens(index, ref.file,
+                        ref.line, name, options.renameTo);
+                    if (edit.renamed === edit.source) continue;
+                    changes.push({
+                        file: rel,
+                        line: ref.line,
+                        expression: edit.source,
+                        suggestion: `Update reference: ${edit.renamed}`,
+                        newExpression: edit.renamed,
+                        editKind: 'reference',
+                    });
+                } else {
+                    changes.push({
+                        file: rel,
+                        line: ref.line,
+                        expression: (ref.content || '').trim(),
+                        suggestion: `Verify this reference resolves to ` +
+                            `${name} at ${def.relativePath || def.file}:` +
+                            `${def.startLine} before renaming`,
+                        needsReview: true,
+                        editKind: 'reference',
+                    });
+                }
             }
         }
     }
@@ -2174,6 +2494,7 @@ function plan(index, name, options = {}) {
             !change.editKind).length,
         imports: changes.filter(change => change.editKind === 'import').length,
         exports: changes.filter(change => change.editKind === 'export').length,
+        references: changes.filter(change => change.editKind === 'reference').length,
         reviewRequired: changes.filter(change => change.needsReview).length,
     };
 

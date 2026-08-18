@@ -70,7 +70,7 @@ function formatPlan(plan, options = {}) {
     lines.push(`  Files affected: ${plan.filesAffected}`);
     if (plan.changeSummary) {
         const summary = plan.changeSummary;
-        lines.push(`  Definition ${summary.definitions}, calls/references ${summary.calls}, imports ${summary.imports}, exports ${summary.exports}; manual review required for ${summary.reviewRequired} of these changes`);
+        lines.push(`  Definition ${summary.definitions}, calls ${summary.calls}, references ${summary.references || 0}, imports ${summary.imports}, exports ${summary.exports}; manual review required for ${summary.reviewRequired} of these changes`);
     }
     if (plan.unchangedSites > 0) {
         lines.push(`  ${plan.unchangedSites} existing call site${plan.unchangedSites === 1 ? '' : 's'} require no edit because the new parameter has a default.`);

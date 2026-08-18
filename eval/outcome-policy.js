@@ -126,6 +126,10 @@ function siteKey(site) {
 function armSitesFromPlan(planData, mode) {
     const sites = [];
     for (const change of planData.changes || []) {
+        // A needsReview entry without a synthesized edit is an explicit
+        // "verify before renaming" — the scripted agent defers those rather
+        // than blindly rewriting the line.
+        if (change.needsReview && !change.newExpression) continue;
         sites.push({ file: change.file, line: change.line, kind: change.editKind });
     }
     const escalationFiles = [];
