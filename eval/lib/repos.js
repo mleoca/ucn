@@ -397,6 +397,27 @@ const FRESH_POOL = [
     { name: 'serde_json', url: 'https://github.com/serde-rs/json', language: 'rust', targetCandidates: ['.'] },
 ];
 
+// ============================================================================
+// OUTCOME-EVAL POOL (task-outcome instrument)
+// ============================================================================
+// Repos for eval/run-outcome-eval.js: the same mechanical task (rename /
+// safe-delete) executed by fixed scripted policies that differ only in the
+// discovery tool (text grep vs UCN's public CLI), judged by the language
+// toolchain — never by the engine's own metrics. Same holdout discipline as
+// FRESH_POOL: unpinned (HEAD resolved per run, SHA recorded in the report)
+// and NEVER used to tune a fix — a repo whose outcome findings drive
+// engineering graduates into REPOS and is replaced here. flask/serde_json
+// overlap FRESH_POOL deliberately (both arms measure, neither tunes); a
+// graduation removes the repo from BOTH pools. Only languages with a working
+// toolchain judge belong here (go vet / cargo check / pyright); plain-JS
+// repos have no static judge and TS repos need installed deps for a
+// meaningful tsc run, so both stay out until a safe judge exists.
+const OUTCOME_POOL = [
+    { name: 'websocket', url: 'https://github.com/gorilla/websocket', language: 'go', targetCandidates: ['.'] },
+    { name: 'flask', url: 'https://github.com/pallets/flask', language: 'python', targetCandidates: ['.'] },
+    { name: 'serde_json', url: 'https://github.com/serde-rs/json', language: 'rust', targetCandidates: ['.'] },
+];
+
 /**
  * Resolve a fresh repo's current HEAD SHA (no clone — ls-remote) and pin the
  * repo object to it, so cloneAtCommit and the report machinery work
@@ -476,6 +497,7 @@ module.exports = {
     RELEASE_REPOS,
     RELEASE_REPO_NAMES,
     FRESH_POOL,
+    OUTCOME_POOL,
     EVAL_TEMP_DIR,
     cloneAtCommit,
     resolveTarget,
