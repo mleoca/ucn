@@ -4267,3 +4267,106 @@ describe('v5 Java nested-type callee identity', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #286c (Java): static-imported field receivers resolve as values', () => {
+    it('a capitalized static-imported field types the receiver by its declared type', () => {
+        // jsoup-measured (scheduled eval, 2026-08-17): `import static
+        // ...SimpleBufferedInput.BufferPool` binds BufferPool.borrow() to the
+        // SoftPool-typed field, but the capitalized receiver took the
+        // static-call reading and excluded the compiler-true caller
+        // receiver-other-class.
+        const dir = tmp({
+            'com/ex/Pool.java': [
+                'package com.ex;',
+                '',
+                'public class Pool {',
+                '    public byte[] borrow() {',
+                '        return new byte[16];',
+                '    }',
+                '}',
+                '',
+            ].join('\n'),
+            'com/ex/Owner.java': [
+                'package com.ex;',
+                '',
+                'public class Owner {',
+                '    static final Pool BufferPool = new Pool();',
+                '}',
+                '',
+            ].join('\n'),
+            'com/ex/User.java': [
+                'package com.ex;',
+                '',
+                'import static com.ex.Owner.BufferPool;',
+                '',
+                'public class User {',
+                '    byte[] use() {',
+                '        return BufferPool.borrow();',
+                '    }',
+                '}',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'com/ex/Pool.java:4:borrow' });
+            assert.ok(r.ok, `context failed: ${r.error}`);
+            assert.ok(r.result.callers.some(c =>
+                c.relativePath === 'com/ex/User.java' && c.line === 7),
+                `static-imported field call must confirm: ${JSON.stringify(r.result.callers)}`);
+            const excl = r.result.meta.account.excluded.byReason || {};
+            assert.ok(!excl['receiver-other-class'],
+                `must not exclude receiver-other-class: ${JSON.stringify(excl)}`);
+            assert.ok(r.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('a static import naming a nested type keeps static-call semantics', () => {
+        // Counter-probe: `import static com.ex.Holder.Inner` imports a TYPE —
+        // Inner.borrow() stays a static-qualified call against the nested
+        // class, never a field-typed value receiver.
+        const dir = tmp({
+            'com/ex/Pool2.java': [
+                'package com.ex;',
+                '',
+                'public class Pool2 {',
+                '    public byte[] borrow() {',
+                '        return new byte[16];',
+                '    }',
+                '}',
+                '',
+            ].join('\n'),
+            'com/ex/Holder.java': [
+                'package com.ex;',
+                '',
+                'public class Holder {',
+                '    public static class Inner {',
+                '        static byte[] borrow() {',
+                '            return new byte[4];',
+                '        }',
+                '    }',
+                '}',
+                '',
+            ].join('\n'),
+            'com/ex/User2.java': [
+                'package com.ex;',
+                '',
+                'import static com.ex.Holder.Inner;',
+                '',
+                'public class User2 {',
+                '    byte[] use() {',
+                '        return Inner.borrow();',
+                '    }',
+                '}',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'com/ex/Pool2.java:4:borrow' });
+            assert.ok(r.ok);
+            assert.ok(!r.result.callers.some(c => c.relativePath === 'com/ex/User2.java'),
+                'Inner.borrow() must never confirm against Pool2.borrow');
+        } finally { rm(dir); }
+    });
+});

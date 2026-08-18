@@ -774,6 +774,13 @@ function _processFunction(node, functions, processedRanges, lines) {
                         // assignments carry their class so typed-receiver
                         // method resolution reaches them.
                         ...(leftNode.type === 'member_expression' && { memberAssigned: true }),
+                        // One-hop member assignments record the object they
+                        // patch (fix #286a: `console.log = () => {}` — the
+                        // builtin-global exclusion must see cross-file that
+                        // the project rebinds this global's member).
+                        ...(leftNode.type === 'member_expression' &&
+                            leftNode.childForFieldName('object')?.type === 'identifier' &&
+                            { assignedReceiver: leftNode.childForFieldName('object').text }),
                         ...(leftNode.type === 'member_expression' &&
                             /^([A-Za-z_$][\w$]*)\.prototype\.[A-Za-z_$][\w$]*$/.test(leftNode.text) &&
                             { className: leftNode.text.split('.')[0], isMethod: true }),
@@ -1654,6 +1661,40 @@ const JS_LITERAL_ASSIGN_TYPES = {
 const TS_PREDEFINED_RECEIVER_TYPES = new Set(['string', 'number', 'boolean', 'bigint', 'symbol']);
 
 /**
+ * Companion to tsTypeName: the namespace qualifier that owns the annotated
+ * name (fix #286e — `app: ns.Flask` must carry 'ns' so two same-name classes
+ * resolve by declaration origin, not directory proximity).
+ */
+function tsTypeQualifier(node) {
+    if (!node) return undefined;
+    switch (node.type) {
+        case 'nested_type_identifier': {
+            const last = node.namedChild(node.namedChildCount - 1);
+            const start = node.startIndex;
+            return last && last.startIndex > start
+                ? node.text.slice(0, last.startIndex - start).replace(/\.$/, '') || undefined
+                : undefined;
+        }
+        case 'generic_type':
+            return tsTypeQualifier(node.namedChild(0));
+        case 'union_type': {
+            for (let i = 0; i < node.namedChildCount; i++) {
+                const c = node.namedChild(i);
+                if (c.type === 'nested_type_identifier' || c.type === 'generic_type') {
+                    const q = tsTypeQualifier(c);
+                    if (q) return q;
+                }
+            }
+            return undefined;
+        }
+        case 'parenthesized_type':
+            return tsTypeQualifier(node.namedChild(0));
+        default:
+            return undefined;
+    }
+}
+
+/**
  * Extract a single concrete type name from a TS type node. Conservative by
  * design: a wrong type would exclude true callers downstream
  * (receiver-type-mismatch), so anything ambiguous returns undefined.
@@ -2180,6 +2221,12 @@ function findCallsInCode(code, parser) {
                     if (typeName) {
                         localVarTypes.set(nameNode.text, typeName);
                         declaredTypeVars.add(nameNode.text);
+                        const annotationQualifier = tsTypeQualifier(typeId);
+                        if (annotationQualifier) {
+                            localVarTypeQualifiers.set(nameNode.text, annotationQualifier);
+                        } else {
+                            localVarTypeQualifiers.delete(nameNode.text);
+                        }
                     }
                 } else if (initNode && JS_LITERAL_ASSIGN_TYPES[initNode.type]) {
                     // Literal declaration types the variable (fix #262):
@@ -2200,6 +2247,12 @@ function findCallsInCode(code, parser) {
                 if (typeName) {
                     localVarTypes.set(pat.text, typeName);
                     declaredTypeVars.add(pat.text);
+                    const annotationQualifier = tsTypeQualifier(inner);
+                    if (annotationQualifier) {
+                        localVarTypeQualifiers.set(pat.text, annotationQualifier);
+                    } else {
+                        localVarTypeQualifiers.delete(pat.text);
+                    }
                 }
             }
         }
@@ -3402,9 +3455,21 @@ function findExportsInCode(code, parser) {
                             }
                         } else if (rightNode && rightNode.type === 'identifier') {
                             // module.exports = something
-                            exports.push({ name: rightNode.text, localName: rightNode.text, type: 'module.exports', line });
+                            exports.push({ name: rightNode.text, localName: rightNode.text,
+                                type: 'module.exports', defaultLike: true, line });
                         } else {
-                            exports.push({ name: 'default', type: 'module.exports', line });
+                            // A named function/class expression still exports
+                            // one callable default. Preserve its LOCAL symbol
+                            // identity so `require('./mod')()` resolves back
+                            // to the declaration; anonymous expressions use
+                            // the parser's synthetic `default` symbol.
+                            const localName = rightNode &&
+                                ['function_expression', 'generator_function', 'class'].includes(rightNode.type)
+                                ? rightNode.childForFieldName('name')?.text
+                                : undefined;
+                            exports.push({ name: 'default',
+                                ...(localName && { localName }),
+                                type: 'module.exports', defaultLike: true, line });
                         }
                         return true;
                     }

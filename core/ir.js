@@ -47,7 +47,7 @@ function normalizeSymbol(symbol, family, language, kind, owner = null) {
         'isNested', 'enclosingType', 'isMethod', 'memberType', 'fieldType',
         'aliasOf', 'derefTarget', 'decorators', 'decoratorsWithArgs',
         'annotationsWithArgs', 'attributesWithArgs', 'nameLine', 'traitImpl',
-        'traitName', 'isSignature', 'memberAssigned', 'bodyScopedName',
+        'traitName', 'isSignature', 'memberAssigned', 'assignedReceiver', 'bodyScopedName',
         'registryMember', 'registryContainer', 'isConstructor',
         'isExtensionMethod', 'extensionReceiver', 'explicitInterface',
         'namespace', 'lexicalScopeStartLine', 'lexicalScopeEndLine',

@@ -2378,6 +2378,14 @@ describe('index reliability: cache round-trip and incremental rebuild identity',
             'export function gamma() { const a = new Alpha(); return a.compute(beta(3)); }',
         ].join('\n'),
         'c.ts': 'export function gone() { return 1; }',
+        // CommonJS direct-vs-property export identity must survive cache
+        // round-trips (fix #286i).
+        'default.js': [
+            'function direct() { return 1; }',
+            'function property() { return 2; }',
+            'module.exports = direct;',
+            'module.exports.property = property;',
+        ].join('\n'),
     };
 
     it('loadCache reproduces the exact symbol table, file entries, and calls', () => {

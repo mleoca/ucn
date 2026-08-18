@@ -4844,3 +4844,57 @@ describe('fix #281: keyword-argument binding validation in verify/check', () => 
         } finally { rm(dir); }
     });
 });
+
+describe('fix #286e: annotated module-qualified receiver identity', () => {
+    it('app: pkg.Flask confirms against the base class despite a same-name test subclass', () => {
+        // flask-measured (fresh arm, 2026-08-18): `app: flask.Flask` typed
+        // the receiver bare 'Flask'; with tests/test_config.py defining its
+        // own `class Flask(flask.Flask)`, origin resolution fell back to
+        // directory proximity, picked the test subclass, and excluded the
+        // compiler-true `app.register_blueprint(...)` caller
+        // receiver-type-mismatch — a false zero-caller answer.
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "pkg"\n',
+            'src/pkg/__init__.py': 'from .app import Flask as Flask\n',
+            'src/pkg/sansio/__init__.py': '',
+            'src/pkg/sansio/app.py': 'class App:\n    def register_blueprint(self, blueprint):\n        return blueprint\n',
+            'src/pkg/app.py': 'from .sansio.app import App\n\n\nclass Flask(App):\n    def run(self):\n        return 1\n',
+            'tests/test_app.py': 'import pkg\n\n\ndef test_register(app: pkg.Flask) -> None:\n    app.register_blueprint(object())\n',
+            'tests/test_config.py': 'import pkg\n\n\nclass Flask(pkg.Flask):\n    pass\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'src/pkg/sansio/app.py:2:register_blueprint' });
+            assert.ok(r.ok, `context failed: ${r.error}`);
+            assert.ok(r.result.callers.some(c =>
+                c.relativePath === 'tests/test_app.py' && c.line === 5),
+                `annotated pkg.Flask receiver must confirm: ${JSON.stringify(r.result.callers)}`);
+            const excl = r.result.meta.account.excluded.byReason || {};
+            assert.ok(!excl['receiver-type-mismatch'],
+                `must not exclude the annotated receiver: ${JSON.stringify(excl)}`);
+            assert.ok(r.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #286f: nested local class is a resolvable callee', () => {
+    it('Foo("bar") inside the defining function confirms the nested class edge', () => {
+        // flask-measured: `class Foo` inside test_custom_tag; the localShadow
+        // gate excluded the constructor call local-shadow while the oracle
+        // pins the nested class (callee semantic-recall gate failure).
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "t"\n',
+            'lib.py': 'def helper():\n    return 1\n',
+            'test_thing.py': 'def test_custom():\n    class Foo:\n        def __init__(self, data):\n            self.data = data\n\n    assert Foo("bar").data == "bar"\n',
+        });
+        try {
+            const index = idx(dir);
+            const callees = index.findCallees('test_custom', {
+                collectAccount: true, file: 'test_thing.py',
+            });
+            assert.ok([...callees].some(e =>
+                e.name === 'Foo' && e.relativePath === 'test_thing.py'),
+                `nested class must be a confirmed callee: ${JSON.stringify([...callees].map(e => e.name))}`);
+        } finally { rm(dir); }
+    });
+});

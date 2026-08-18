@@ -17,13 +17,18 @@ name: Eval
 
 on:
   workflow_dispatch:
+    inputs:
+      full:
+        description: "Also run the schedule-only arms (full-board conservation/oracle/fresh/deadcode/consistency/performance) — rehearses the Monday board on demand"
+        type: boolean
+        default: false
   schedule:
     - cron: '0 6 * * 1'   # Mondays 06:00 UTC
 
 jobs:
   eval:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v5
 
@@ -75,27 +80,27 @@ jobs:
       - run: npm ci
 
       - name: Conservation eval (pinned repos)
-        if: github.event_name == 'schedule'
+        if: github.event_name == 'schedule' || inputs.full
         run: node eval/conservation-real.js
 
       - name: "Oracle eval (gate: missing-unexplained = 0)"
-        if: github.event_name == 'schedule'
+        if: github.event_name == 'schedule' || inputs.full
         run: node eval/run-oracle-eval.js
 
       - name: "Fresh-repo oracle eval (2 unpinned repos, weekly rotation — generalization gate)"
-        if: github.event_name == 'schedule'
+        if: github.event_name == 'schedule' || inputs.full
         run: node eval/run-oracle-eval.js --fresh 2 --max-unscored-ratio 0.10
 
       - name: "Deadcode eval (gate: default-arm false-dead = 0)"
-        if: github.event_name == 'schedule'
+        if: github.event_name == 'schedule' || inputs.full
         run: node eval/run-deadcode-eval.js --sample 300
 
       - name: "Cross-command consistency (gate: disagreements = 0)"
-        if: github.event_name == 'schedule'
+        if: github.event_name == 'schedule' || inputs.full
         run: npm run trust:gate:consistency
 
       - name: "Performance gate (cold build, warm cache, semantic query p95)"
-        if: github.event_name == 'schedule'
+        if: github.event_name == 'schedule' || inputs.full
         run: npm run trust:gate:performance
 
       - name: "Pre-tag release dry run (publish-blocking board)"

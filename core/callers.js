@@ -148,6 +148,54 @@ function _javaPackageKey(relativePath) {
     return path.posix.dirname(packagePath);
 }
 
+/**
+ * Resolve a capitalized Java receiver NAME through the file's static imports
+ * to a static FIELD's declared type (fix #286c, jsoup-measured: `import
+ * static ...SimpleBufferedInput.BufferPool` binds `BufferPool.borrow()` to
+ * the SoftPool-typed field — javac resolves single-static-imports ahead of
+ * the capitalized static-call reading). Returns the declared type HEAD, or
+ * null when the name isn't a static-imported field (a static import naming a
+ * nested TYPE keeps type-qualified semantics), the field has no usable
+ * declared type, or the type head is package-qualified (unpinnable here —
+ * the #268(4a) qualified-field discipline).
+ */
+function _javaStaticImportedFieldType(index, fileEntry, receiverName) {
+    if (!receiverName || !fileEntry) return null;
+    // Single-static-imports only: the import record cannot distinguish a
+    // STATIC wildcard (`import static Owner.*` — imports fields) from a
+    // package wildcard (`import com.ex.*` — types only), and typing a
+    // receiver from a field javac never binds could exclude a true edge.
+    const candidates = [];
+    for (const im of (fileEntry.importBindings || [])) {
+        const mod = String(im.module || '');
+        if (im.name === receiverName && mod.endsWith('.' + receiverName)) {
+            const rel = fileEntry.moduleResolved && fileEntry.moduleResolved[mod];
+            if (rel) candidates.push(rel);
+            break;
+        }
+    }
+    for (const rel of candidates) {
+        const entry = index.files.get(path.join(index.root, rel));
+        if (!entry) continue;
+        // The import binding shape also matches plain class imports
+        // (`import com.ex.BufferPool`): any resolved TYPE of the name —
+        // top-level or nested — keeps static-call semantics.
+        const namedType = (entry.symbols || []).some(s =>
+            s.name === receiverName &&
+            ['class', 'interface', 'enum', 'record', 'annotation'].includes(s.type));
+        if (namedType) return null;
+        const field = (entry.symbols || []).find(s =>
+            s.name === receiverName && s.className &&
+            (s.type === 'field' || s.memberType === 'field') &&
+            (s.modifiers || []).includes('static'));
+        if (!field) continue;
+        const head = String(field.fieldType || '').replace(/<[\s\S]*$/, '').trim();
+        if (!head || head.includes('.') || head.endsWith('[]')) return null;
+        return head;
+    }
+    return null;
+}
+
 function _javaConstructorDisposition(index, filePath, fileEntry, call, targetDefs) {
     const typeKinds = new Set(['class', 'record', 'enum']);
     const targets = (targetDefs || []).filter(d => typeKinds.has(d.type));
@@ -435,7 +483,8 @@ function findCallers(index, name, options = {}) {
             const moduleFile = path.join(index.root, rel);
             if (!aliasTargetFiles.has(moduleFile)) continue;
             const exported = index.files.get(moduleFile)?.exportDetails || [];
-            if (!exported.some(e => e.type === 'module.exports' && e.name === name)) continue;
+            if (!exported.some(e => e.type === 'module.exports' &&
+                e.defaultLike && (e.localName || e.name) === name)) continue;
             if (!importAliasLocals.has(fp)) importAliasLocals.set(fp, new Set());
             importAliasLocals.get(fp).add(b.alias || b.name);
         }
@@ -1792,6 +1841,21 @@ function findCallers(index, name, options = {}) {
                         options.targetDefinitions || definitions);
                     if (resolvedByExtensionMethod) receiverTypeValidated = true;
                 }
+                // A static-imported FIELD shadows the capitalized static-
+                // qualifier reading (fix #286c, jsoup-measured): javac binds
+                // `BufferPool.borrow()` to the SoftPool-typed field imported
+                // by `import static ...SimpleBufferedInput.BufferPool`, never
+                // to a class named BufferPool. The declared type is compiler-
+                // true — feed it to the normal nominal receiver physics.
+                if (call.isMethod && !call.receiverType && call.receiver &&
+                    fileEntry.language === 'java' && /^[A-Z]/.test(call.receiver)) {
+                    const staticFieldType = _javaStaticImportedFieldType(
+                        index, fileEntry, call.receiver);
+                    if (staticFieldType) {
+                        call = { ...call, receiverType: staticFieldType,
+                            receiverIsTypeQualified: false };
+                    }
+                }
                 if (collectAccount && call.isMethod && !call.receiverType &&
                     fileEntry.language === 'java' && /^[A-Z]/.test(call.receiver || '')) {
                     // Java permits inherited static methods to be invoked
@@ -3077,7 +3141,8 @@ function findCallers(index, name, options = {}) {
                                     if (sameNameTypeDefs.length > 1 ||
                                         (call.receiverTypeQualifier && call.receiverTypeFlowFile)) {
                                         const identity = _resolveStructuralFlowTypeIdentity(
-                                            index, call.receiverTypeFlowFile || filePath, knownType, targetDefs);
+                                            index, call.receiverTypeFlowFile || filePath, knownType, targetDefs,
+                                            call.receiverTypeFlowFile ? undefined : call.receiverTypeQualifier);
                                         if (identity === 'other') {
                                             receiverTypeValidated = false;
                                         } else if (identity === 'unknown') {
@@ -3093,7 +3158,8 @@ function findCallers(index, name, options = {}) {
                                 // exact declaration and walk its file-scoped
                                 // ancestry before treating it as unrelated.
                                 const identity = _resolveStructuralFlowTypeIdentity(
-                                    index, call.receiverTypeFlowFile || filePath, knownType, targetDefs);
+                                    index, call.receiverTypeFlowFile || filePath, knownType, targetDefs,
+                                    call.receiverTypeFlowFile ? undefined : call.receiverTypeQualifier);
                                 if (identity === 'target') {
                                     receiverTypeValidated = true;
                                 } else if (identity === 'unknown') {
@@ -4153,6 +4219,22 @@ function findCallers(index, name, options = {}) {
                             (index.symbols.get(call.receiver) || []).length === 0 &&
                             !fileEntry.bindings?.some(b => b.name === call.receiver) &&
                             !call.receiverMemberAssigned) {
+                            // A candidate target that IS a member assignment
+                            // onto this same global (fix #286a, fastify-
+                            // measured: `console.log = () => {}` in a test's
+                            // beforeEach) patches the host object process-
+                            // wide — the assignment's own file cannot scope
+                            // it, so every `console.log(...)` site MAY
+                            // dispatch into the project def. Demote-only:
+                            // visible possible-dispatch, never confirmed,
+                            // never excluded.
+                            if (targetDefs2.some(d => d.memberAssigned &&
+                                d.assignedReceiver === call.receiver)) {
+                                routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
+                                    dispatchVia: `${call.receiver} — builtin global patched in project`,
+                                });
+                                continue;
+                            }
                             recordExcluded(filePath, call.line, 'external-package');
                             continue;
                         }
@@ -4879,11 +4961,15 @@ function findCallees(index, definition, options = {}) {
 
             // Parser-proven lexical shadow: a parameter/local named `option`
             // cannot call an imported/project `option`. A nested local
-            // function with that name is the one safe exception and remains
-            // eligible for exact same-file resolution below.
+            // function — or a nested CLASS, whose bare name constructs it
+            // (fix #286f, flask-measured: `class Foo` inside test_custom_tag,
+            // `Foo("bar")` excluded local-shadow while the oracle pins the
+            // nested class) — is the safe exception and remains eligible for
+            // exact same-file resolution below.
             if (call.localShadow && !call.resolvedName && !call.resolvedNames) {
                 const localTarget = (index.symbols.get(call.name) || []).some(s =>
-                    s.file === def.file && !NON_CALLABLE_TYPES.has(s.type) &&
+                    s.file === def.file &&
+                    (s.type === 'class' || !NON_CALLABLE_TYPES.has(s.type)) &&
                     s.startLine >= def.startLine && s.endLine <= def.endLine &&
                     s.startLine <= call.line);
                 if (!localTarget) {
@@ -7834,7 +7920,7 @@ function _rustBindingResolvedFiles(index, fileEntry, filePath, binding) {
  *    trusted (a use/import of an external type can shadow it invisibly)
  *  - no project type def at all: external name — safe, can't conflate
  */
-function _resolveFlowTypeOrigin(index, producerFile, typeName, qualifier) {
+function _resolveFlowTypeOrigin(index, producerFile, typeName, qualifier = undefined) {
     const opCache = index._opFlowTypeOriginCache;
     const cacheKey = `${producerFile}\x00${typeName}\x00${qualifier || ''}`;
     if (opCache?.has(cacheKey)) return opCache.get(cacheKey);
@@ -7897,6 +7983,36 @@ function _resolveFlowTypeOrigin(index, producerFile, typeName, qualifier) {
                     return finish({ fromFile: reachable[0].file });
                 }
             }
+        }
+        // Structural module qualifier (fix #286e, flask-measured):
+        // `app: flask.Flask` names the type through the imported module.
+        // Resolve the module binding and pin the unique reachable
+        // declaration — name-chase through modeled re-exports first, the
+        // bounded file-level closure as fallback (the #277 rails). An
+        // unresolvable qualifier is 'unknown', never proximity-guessed.
+        if (fe && ['python', 'javascript', 'typescript', 'tsx'].includes(fe.language)) {
+            const resolvedRels = new Set();
+            const direct = fe.moduleResolved?.[qualifier];
+            if (direct) resolvedRels.add(direct);
+            for (const b of (fe.importBindings || [])) {
+                if (b.name !== qualifier && b.alias !== qualifier) continue;
+                const rel = fe.moduleResolved?.[b.module];
+                if (rel) resolvedRels.add(rel);
+            }
+            for (const rel of resolvedRels) {
+                const start = path.join(index.root, rel);
+                const named = typeDefs.filter(d => d.file === start ||
+                    _nameBindingReaches(index, start, typeName, new Set([d.file])) === 'yes');
+                if (new Set(named.map(d => d.file)).size === 1) {
+                    return finish({ fromFile: named[0].file });
+                }
+                const reachable = typeDefs.filter(d => d.file === start ||
+                    _importReaches(index, start, new Set([d.file])));
+                if (new Set(reachable.map(d => d.file)).size === 1) {
+                    return finish({ fromFile: reachable[0].file });
+                }
+            }
+            return finish(null);
         }
         const inPkg = fe && _qualifiedProducerDefs(index, fe, qualifier, typeDefs);
         if (inPkg && inPkg.length > 0 && new Set(inPkg.map(d => d.file)).size === 1) {
@@ -8688,8 +8804,8 @@ function _resolveReceiverTypeIdentity(index, filePath, knownType, targetDefs, li
  * CustomCommand extends click.Command), while parallel package versions may
  * reuse every class name (zod v3/v4 ZodArray -> ZodType).
  */
-function _resolveStructuralFlowTypeIdentity(index, originFile, knownType, targetDefs) {
-    const origin = _resolveFlowTypeOrigin(index, originFile, knownType);
+function _resolveStructuralFlowTypeIdentity(index, originFile, knownType, targetDefs, qualifier) {
+    const origin = _resolveFlowTypeOrigin(index, originFile, knownType, qualifier);
     if (!origin?.fromFile) return 'unknown';
     const targetOwners = new Set(targetDefs
         .map(d => d.className || (d.receiver && d.receiver.replace(/^\*/, '')))
@@ -9368,8 +9484,9 @@ function _calleeExportDefinitions(index, startAbs, exposedName, language, call, 
             // never to namespace.member() routing.
             if (options.allowDefaultExport && depth === 0) {
                 for (const e of details) {
-                    if (e.type !== 'module.exports' || !e.name) continue;
-                    for (const d of (index.symbols.get(e.name) || [])) {
+                    if (e.type !== 'module.exports' || !e.defaultLike || !e.name) continue;
+                    const localName = e.localName || e.name;
+                    for (const d of (index.symbols.get(localName) || [])) {
                         if (d.file === abs && shapeMatches(d)) {
                             matches.set(`${d.file}:${d.startLine}`, d);
                         }

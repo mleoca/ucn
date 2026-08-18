@@ -69,7 +69,7 @@ const OPTIONAL_SYMBOL_FIELDS = Object.freeze([
     'enclosingType', 'isMethod', 'receiver', 'memberType', 'fieldType',
     'aliasOf', 'derefTarget', 'decorators', 'decoratorsWithArgs',
     'annotationsWithArgs', 'attributesWithArgs', 'nameLine', 'traitImpl',
-    'traitName', 'isSignature', 'memberAssigned', 'bodyScopedName',
+    'traitName', 'isSignature', 'memberAssigned', 'assignedReceiver', 'bodyScopedName',
     'registryMember', 'registryContainer', 'namespace',
     'isExtensionMethod', 'extensionReceiver', 'explicitInterface',
     'lexicalScopeStartLine', 'lexicalScopeEndLine',
@@ -109,7 +109,12 @@ function materializeSymbol(fileEntry, item) {
 function addIRSymbol(fileEntry, item, symbolTable = null) {
     const symbol = materializeSymbol(fileEntry, item);
     fileEntry.symbols.push(symbol);
-    if (!item.memberAssigned && !item.bodyScopedName) {
+    // A Rust `impl X`/`impl Trait for X` block introduces NO name into any
+    // scope (fix #286b, cursive-measured: the impl symbol stole the bare-name
+    // binding of ColorPair from the cross-file struct, excluding a compiler-
+    // true composite-literal caller as other-definition). The struct/enum
+    // claim covers the impl — same discipline as deadcode's CLASS_AUDIT_KINDS.
+    if (!item.memberAssigned && !item.bodyScopedName && item.kind !== 'impl') {
         fileEntry.bindings.push({
             id: symbol.bindingId,
             name: symbol.name,

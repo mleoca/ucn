@@ -835,7 +835,8 @@ function collectProjectRouterMounts(index) {
                     const targetEntry = index.files.get(targetFile);
                     if (targetEntry) {
                         const exportedReceivers = (targetEntry.exportDetails || [])
-                            .filter(exp => exp.type === 'module.exports' || exp.isDefault ||
+                            .filter(exp => (exp.type === 'module.exports' && exp.defaultLike) ||
+                                exp.isDefault ||
                                 exp.kind === 'default' || exp.type === 'export-default' ||
                                 exp.name === ref.name)
                             .map(exp => exp.localName || exp.name).filter(Boolean);

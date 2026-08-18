@@ -763,7 +763,7 @@ main();
         }
     });
 
-    it('warm computeReachability is at least as fast as cold (cache hit)', () => {
+    it('warm computeReachability uses the persisted result without recomputing', () => {
         const N = 30;
         const files = { 'package.json': '{"name":"test"}' };
         let body = '';
@@ -777,22 +777,20 @@ main();
             const { ProjectIndex } = require('../core/project');
             const { computeReachability } = require('../core/entrypoints');
 
-            const t0 = Date.now();
             const index1 = new ProjectIndex(dir);
             index1.build(null, { quiet: true });
             computeReachability(index1);
             index1.saveCache();
-            const cold = Date.now() - t0;
 
-            const t1 = Date.now();
             const index2 = new ProjectIndex(dir);
             assert.ok(index2.loadCache(), 'cache should load');
+            const restored = index2._reachableSymbols;
             const warmReachable = computeReachability(index2);
-            const warm = Date.now() - t1;
             assert.ok(warmReachable.size > 0, 'warm reachable should be non-empty');
-            // Generous bound — anything ≤ cold * 0.6 (or under 50ms absolute) is a clear win.
-            assert.ok(warm <= Math.max(50, cold * 0.6),
-                `warm ${warm}ms should be <= cold ${cold}ms * 0.6`);
+            assert.strictEqual(warmReachable, restored,
+                'cache hit should return the persisted Set instead of running the BFS');
+            assert.ok(!index2.reachabilityDirty,
+                'reading persisted reachability should not mark it for another cache write');
         } finally {
             rm(dir);
         }
@@ -1341,6 +1339,8 @@ describe('index reliability: parallel build equals sequential build', () => {
         spec['rich4.js'] = [
             'const factory = require("./rich5");',
             'test("boot", function bootPhase() { return factory(); });',
+            // one-hop member assignment carries assignedReceiver (fix #286)
+            'console.warn = () => {};',
             'module.exports = { go: () => factory() };',
         ].join('\n');
         spec['rich5.js'] = [

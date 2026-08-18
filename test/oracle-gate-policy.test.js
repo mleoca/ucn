@@ -257,3 +257,75 @@ describe('oracle gate policy', () => {
         }
     });
 });
+
+describe('fix #286g: coverage gate separates configuration gating from oracle abstention', () => {
+    const { evaluateOracleCoverage } = require('../eval/oracle-gate-policy');
+
+    it('definition-unresolved abstentions pass the hard bound up to the 3x ceiling', () => {
+        // flask-measured: 27.85% of confirmed edges were pyright abstentions
+        // on pytest-fixture receivers — engine-correct confirmations the
+        // oracle cannot type. The hard configuration bound must not fire.
+        const verdict = evaluateOracleCoverage({
+            confirmedEdges: 100,
+            confirmedUnscored: 28,
+            confirmedAbstentionUnscored: 28,
+        }, 0.10);
+        assert.deepStrictEqual(verdict.failures, []);
+        assert.ok(Math.abs(verdict.precisionAbstentionRatio - 0.28) < 1e-9);
+        assert.strictEqual(verdict.precisionConfigGatedRatio, 0);
+    });
+
+    it('a runaway abstention band still fails loudly', () => {
+        const verdict = evaluateOracleCoverage({
+            confirmedEdges: 100,
+            confirmedUnscored: 40,
+            confirmedAbstentionUnscored: 40,
+        }, 0.10);
+        assert.ok(verdict.failures.some(f => f.includes('oracle-abstention')));
+    });
+
+    it('true configuration gating keeps the hard bound', () => {
+        const verdict = evaluateOracleCoverage({
+            confirmedEdges: 100,
+            confirmedUnscored: 15,
+            confirmedAbstentionUnscored: 0,
+        }, 0.10);
+        assert.ok(verdict.failures.some(f => f.includes('configuration-unscored')));
+    });
+});
+
+describe('fix #286h: declared-weak definition lookup uses a capability ceiling', () => {
+    const { evaluateOracleCoverage } = require('../eval/oracle-gate-policy');
+
+    it('plain-JS oracle mode does not fail the definition-unresolved prong', () => {
+        const verdict = evaluateOracleCoverage({
+            confirmedEdges: 100,
+            definitionAdjudicationUniverse: 100,
+            definitionUnresolvedReferenceEdges: 54,
+            definitionLookupWeak: true,
+            definitionUnresolvedRatioCeiling: 0.60,
+        }, 0.10);
+        assert.deepStrictEqual(verdict.failures, []);
+    });
+
+    it('a declared-weak oracle still fails when definition lookup is totally blind', () => {
+        const verdict = evaluateOracleCoverage({
+            confirmedEdges: 100,
+            definitionAdjudicationUniverse: 100,
+            definitionUnresolvedReferenceEdges: 100,
+            definitionLookupWeak: true,
+            definitionUnresolvedRatioCeiling: 0.60,
+        }, 0.10);
+        assert.ok(verdict.failures.some(f =>
+            f.includes('definition-unresolved oracle ratio 100.00% > 60.00%')));
+    });
+
+    it('a full-capability oracle keeps the prong', () => {
+        const verdict = evaluateOracleCoverage({
+            confirmedEdges: 100,
+            definitionAdjudicationUniverse: 100,
+            definitionUnresolvedReferenceEdges: 54,
+        }, 0.10);
+        assert.ok(verdict.failures.some(f => f.includes('definition-unresolved')));
+    });
+});

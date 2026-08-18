@@ -686,6 +686,67 @@ function typeNameFromAnnotation(typeNode) {
     return typeNameFromExpr(inner);
 }
 
+/**
+ * Companion to typeNameFromAnnotation: the dotted module qualifier that owns
+ * the annotated name (fix #286e, flask-measured: `app: flask.Flask` typed the
+ * receiver bare 'Flask', and with a second test-local Flask class the origin
+ * fell back to directory proximity and excluded a compiler-true caller).
+ * Returns undefined when the annotation carries no qualifier.
+ */
+function typeQualifierFromAnnotation(typeNode) {
+    if (!typeNode) return undefined;
+    const inner = typeNode.namedChildCount > 0 ? typeNode.namedChild(0) : null;
+    return typeQualifierFromExpr(inner);
+}
+
+function typeQualifierFromExpr(node) {
+    if (!node) return undefined;
+    switch (node.type) {
+        case 'attribute':
+            return node.childForFieldName('object')?.text;
+        case 'parenthesized_expression':
+            return node.namedChildCount === 1
+                ? typeQualifierFromExpr(node.namedChild(0)) : undefined;
+        case 'binary_operator': {
+            const left = node.namedChild(0);
+            const right = node.namedChild(1);
+            if (left?.type === 'none' && right?.type !== 'none') return typeQualifierFromExpr(right);
+            if (right?.type === 'none' && left?.type !== 'none') return typeQualifierFromExpr(left);
+            return undefined;
+        }
+        case 'subscript': {
+            const base = typeNameFromExpr(node.childForFieldName('value'));
+            if (PY_TYPE_WRAPPERS.has(base)) {
+                return typeQualifierFromExpr(node.childForFieldName('subscript'));
+            }
+            return undefined;
+        }
+        case 'generic_type': {
+            const base = typeNameFromExpr(node.namedChild(0));
+            if (PY_TYPE_WRAPPERS.has(base)) {
+                const params = node.namedChild(1);
+                const firstType = params && params.namedChildCount > 0 ? params.namedChild(0) : null;
+                return typeQualifierFromAnnotation(firstType);
+            }
+            return undefined;
+        }
+        case 'string': {
+            for (let i = 0; i < node.childCount; i++) {
+                const c = node.child(i);
+                if (c.type === 'string_content') {
+                    const txt = c.text.trim();
+                    if (/^[A-Za-z_][\w.]*$/.test(txt) && txt.includes('.')) {
+                        return txt.split('.').slice(0, -1).join('.');
+                    }
+                }
+            }
+            return undefined;
+        }
+        default:
+            return undefined;
+    }
+}
+
 function typeNamesFromAnnotation(typeNode) {
     if (!typeNode) return [];
     const inner = typeNode.namedChildCount > 0 ? typeNode.namedChild(0) : null;
@@ -1470,6 +1531,15 @@ function findCallsInCode(code, parser) {
                 if (receiverType && !['self', 'cls'].includes(nameNode.text)) {
                     localVarTypes.set(nameNode.text, receiverType);
                     declaredVarTypes.set(nameNode.text, receiverType);
+                    // The annotation's module qualifier is identity (fix
+                    // #286e) — splat params got a builtin type, no qualifier.
+                    const annotationQualifier = receiverType === typeName
+                        ? typeQualifierFromAnnotation(typeNode) : undefined;
+                    if (annotationQualifier) {
+                        localVarTypeQualifiers.set(nameNode.text, annotationQualifier);
+                    } else {
+                        localVarTypeQualifiers.delete(nameNode.text);
+                    }
                 }
                 if (unionTypes.length > 1) localVarUnionTypes.set(nameNode.text, unionTypes);
                 else localVarUnionTypes.delete(nameNode.text);
@@ -1599,8 +1669,15 @@ function findCallsInCode(code, parser) {
                     if (declaredType) localVarTypes.set(left.text, declaredType);
                 } else {
                     // An annotation is the authoritative type source; a
-                    // previous constructor qualifier must not survive it.
-                    localVarTypeQualifiers.delete(left.text);
+                    // previous constructor qualifier must not survive it —
+                    // the annotation's OWN qualifier does (fix #286e).
+                    const annotationQualifier = typeNameFromAnnotation(typeNode)
+                        ? typeQualifierFromAnnotation(typeNode) : undefined;
+                    if (annotationQualifier) {
+                        localVarTypeQualifiers.set(left.text, annotationQualifier);
+                    } else {
+                        localVarTypeQualifiers.delete(left.text);
+                    }
                 }
                 // Preserve a declared collection contract through the common
                 // normalization idiom `x = {} if x is None else x`. The

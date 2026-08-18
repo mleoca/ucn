@@ -5136,3 +5136,51 @@ describe('v5 Rust evidence: imports, patterns, fields, and return flow', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #286b (Rust): impl blocks never bind the type name', () => {
+    it('a composite literal confirms against the cross-file struct, not the same-file impl', () => {
+        // cursive-measured (scheduled eval, 2026-08-17): `impl Resolvable for
+        // crate::style::ColorPair` at resolvable.rs:895 stole the bare-name
+        // binding, so the compiler-true `ColorPair { .. }` literal at :1603
+        // was excluded other-definition under the struct pin — a Rust impl
+        // block introduces NO name into any scope.
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"',
+            'src/lib.rs': 'pub mod thing;\npub mod builder;\n',
+            'src/thing.rs': 'pub struct Thing {\n    pub a: u32,\n}\n',
+            'src/builder.rs': [
+                'pub trait Resolvable {',
+                '    fn resolve(&self) -> u32;',
+                '}',
+                '',
+                'impl Resolvable for crate::thing::Thing {',
+                '    fn resolve(&self) -> u32 {',
+                '        self.a',
+                '    }',
+                '}',
+                '',
+                'pub fn make() -> u32 {',
+                '    use crate::thing::Thing;',
+                '    let t = Thing { a: 1 };',
+                '    t.resolve()',
+                '}',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const implBound = [...index.files.values()].some(fe =>
+                (fe.bindings || []).some(b => b.name === 'Thing' && b.type === 'impl'));
+            assert.ok(!implBound, 'impl symbols must not enter the bindings table');
+            const r = execute(index, 'context', { name: 'src/thing.rs:1:Thing' });
+            assert.ok(r.ok, `context failed: ${r.error}`);
+            assert.ok(r.result.callers.some(c =>
+                c.relativePath === 'src/builder.rs' && c.line === 13),
+                `Thing { .. } literal must confirm against the struct: ${JSON.stringify(r.result.callers)}`);
+            const excl = r.result.meta.account.excluded.byReason || {};
+            assert.ok(!excl['other-definition'],
+                `literal must not be excluded other-definition: ${JSON.stringify(excl)}`);
+            assert.ok(r.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+});

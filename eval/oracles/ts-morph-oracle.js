@@ -64,7 +64,18 @@ const tsMorphOracle = {
                 path.join(projectRoot, '**/*.jsx'));
         }
         project.addSourceFilesAtPaths(globs);
-        return { project, root: projectRoot, ts, isJsProject: !tsConfigPath };
+        // No tsconfig = plain-JavaScript oracle mode: reference search still
+        // works through the language service, but definition lookup mostly
+        // returns [] (an explicit abstention). Declare that capability so the
+        // coverage gate can contextualize the definition-unresolved ratio
+        // instead of failing every plain-JS repo on oracle blindness
+        // (fix #286h, dayjs-measured: 54% unresolved, every engine gate green).
+        return { project, root: projectRoot, ts, isJsProject: !tsConfigPath,
+            definitionLookupWeak: !tsConfigPath,
+            // dayjs-measured at 54%. Keep an explicit ceiling so declaring a
+            // weaker capability never turns total oracle blindness into a
+            // passing release board.
+            ...(!tsConfigPath && { definitionUnresolvedRatioCeiling: 0.60 }) };
     },
 
     /**

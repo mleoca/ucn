@@ -361,6 +361,10 @@ async function evaluateRepo(repo, oracle) {
     let definitionUnresolvedReferenceEdges = 0;
     let definitionLookupErrors = 0;
     let configurationGatedUnscored = 0;
+    let confirmedConfigurationUnscored = 0;
+    let confirmedAbstentionUnscored = 0;
+    let unverifiedConfigurationUnscored = 0;
+    let unverifiedAbstentionUnscored = 0;
     let sourceStatusErrors = 0;
     let calleeUnscoredSites = 0;
     const sourceStatusCache = new Map();
@@ -598,13 +602,28 @@ async function evaluateRepo(repo, oracle) {
         // repeated project symbol name, exact definition lookup is therefore
         // the authority: an edge statically bound to another definition must
         // not inflate either this target's recall or its apparent precision.
-        const needsDefinitionAdjudication =
+        const canAdjudicateDefinitions =
             !oracle.exactReferenceIdentity &&
-            sameNameDefs.length > 1 &&
             typeof oracle.resolveDefinition === 'function';
+        const needsDefinitionAdjudication =
+            canAdjudicateDefinitions && sameNameDefs.length > 1;
         const adjudicatedOracleCalls = [];
         for (const oc of rawOracleCalls) {
             if (!needsDefinitionAdjudication) {
+                // An oracle-declared-unresolved call reference is a name
+                // match the oracle could not bind (fix #286d, zod-measured:
+                // benchmark-suite `.add(...)` on an untyped external import
+                // credited to $ZodRegistry.add gated as a semantic-recall
+                // miss). Single-def names skip adjudication here, but such
+                // an edge must not GATE if the engine excluded it — tag it
+                // for the deferred not-shown adjudication below. Adjudicating
+                // the whole universe instead is wrong: a plain-JS repo is
+                // MOSTLY unresolved (dayjs: 54% of edges dropped, coverage
+                // gate red).
+                if (canAdjudicateDefinitions &&
+                    oc.oracleResolution === 'unresolved') {
+                    oc._pendingUnresolved = true;
+                }
                 adjudicatedOracleCalls.push(oc);
                 continue;
             }
@@ -723,6 +742,39 @@ async function evaluateRepo(repo, oracle) {
 
         const confirmedKeys = new Set(confirmed.map(c => key(c.file, c.line)));
         const unverifiedKeys = new Set(unverified.map(c => key(c.file, c.line)));
+        // Deferred adjudication for oracle-unresolved references (fix #286d):
+        // edges the engine SHOWS need no lookup — they stay in the universe
+        // untouched (the dayjs lesson: plain-JS repos are mostly unresolved).
+        // Only an unresolved edge the engine did NOT show is definition-
+        // adjudicated: 'target' keeps it (a genuine, gate-bearing miss),
+        // 'other' is a broad-family ref, 'unresolved' is an oracle
+        // abstention — never punish the engine for excluding a site the
+        // oracle cannot pin. 'unavailable' (no pinnable target defs) keeps
+        // the edge — adjudication is impossible, stay loud.
+        if (oracleCalls.some(oc => oc._pendingUnresolved)) {
+            const kept = [];
+            for (const oc of oracleCalls) {
+                if (!oc._pendingUnresolved) { kept.push(oc); continue; }
+                delete oc._pendingUnresolved;
+                const k = key(oc.file, oc.line);
+                if (confirmedKeys.has(k) || unverifiedKeys.has(k)) {
+                    kept.push(oc);
+                    continue;
+                }
+                const status = await definitionStatus(
+                    oc.file, oc.line, sym.name, targetIdentityDefs, oc.column);
+                if (status === 'other') {
+                    oracleBroadReferenceEdges++;
+                } else if (status === 'unresolved') {
+                    definitionUnresolvedReferenceEdges++;
+                } else {
+                    kept.push(oc);
+                    if (status === 'target') definitionValidatedOracleCalls++;
+                }
+            }
+            oracleCalls.length = 0;
+            oracleCalls.push(...kept);
+        }
         const oracleKeys = new Set(oracleCalls.map(c => key(c.file, c.line)));
 
         // Tier precision. Function/method answers are CALL edges — verified
@@ -821,6 +873,11 @@ async function evaluateRepo(repo, oracle) {
             if (verdict.hit && verdict.definitionValidated) definitionValidatedConfirmed++;
             if (!verdict.scorable) {
                 configurationGatedUnscored++;
+                if (verdict.abstention === 'definition-unresolved') {
+                    confirmedAbstentionUnscored++;
+                } else {
+                    confirmedConfigurationUnscored++;
+                }
                 pushSample(confirmedUnscoredSamples, {
                     symbol: sym.name,
                     target: `${sym.file}:${sym.line}`,
@@ -849,6 +906,11 @@ async function evaluateRepo(repo, oracle) {
                 else if (compileTimeDispatch) compileTimeDispatchUnscored++;
                 else actionableUnverifiedUnscored++;
                 configurationGatedUnscored++;
+                if (verdict.abstention === 'definition-unresolved') {
+                    unverifiedAbstentionUnscored++;
+                } else {
+                    unverifiedConfigurationUnscored++;
+                }
                 pushSample(unverifiedUnscoredSamples, {
                     symbol: sym.name,
                     target: `${sym.file}:${sym.line}`,
@@ -1276,6 +1338,10 @@ async function evaluateRepo(repo, oracle) {
     const summary = {
         repo: repo.name,
         oracle: oracle.name,
+        ...(handle?.definitionLookupWeak && { definitionLookupWeak: true }),
+        ...(Number.isFinite(handle?.definitionUnresolvedRatioCeiling) && {
+            definitionUnresolvedRatioCeiling: handle.definitionUnresolvedRatioCeiling,
+        }),
         commit: repo.commit,
         indexedFiles: indexedFiles.size,
         sampled: sampled.length,
@@ -1329,6 +1395,10 @@ async function evaluateRepo(repo, oracle) {
         definitionLookupErrors,
         oracleBroadReferenceEdges,
         configurationGatedUnscored,
+        confirmedConfigurationUnscored,
+        confirmedAbstentionUnscored,
+        unverifiedConfigurationUnscored,
+        unverifiedAbstentionUnscored,
         sourceStatusErrors,
         calleeUnscoredSites,
         calleeFalsePositiveSamples,
@@ -1382,8 +1452,14 @@ async function evaluateRepo(repo, oracle) {
             `broad-family refs excluded ${summary.oracleBroadReferenceEdges} | ` +
             `unresolved ${summary.definitionUnresolvedReferenceEdges} | errors ${summary.definitionLookupErrors}\n`);
     }
-    if (typeof oracle.isConfigurationGated === 'function') {
-        process.stdout.write(`  configuration coverage: ${summary.configurationGatedUnscored} precision edge(s) unscored, ` +
+    if (typeof oracle.isConfigurationGated === 'function' || handle?.definitionLookupWeak) {
+        process.stdout.write(`  oracle coverage: ` +
+            `${summary.confirmedConfigurationUnscored + summary.confirmedAbstentionUnscored} confirmed edge(s) unscored ` +
+            `(${summary.confirmedConfigurationUnscored} configuration, ` +
+            `${summary.confirmedAbstentionUnscored} definition-unresolved), ` +
+            `${summary.unverifiedConfigurationUnscored + summary.unverifiedAbstentionUnscored} unverified edge(s) unscored ` +
+            `(${summary.unverifiedConfigurationUnscored} configuration, ` +
+            `${summary.unverifiedAbstentionUnscored} definition-unresolved), ` +
             `${summary.calleeUnscoredSites} callee site(s) unscored | status errors ${summary.sourceStatusErrors}\n`);
     }
     if (summary.missingUnexplained > 0) {
@@ -1509,6 +1585,10 @@ async function main() {
             if (result.summary.commandProof.failures > 0) gateFailed = true;
             const coverageGate = evaluateOracleCoverage(result.summary, maxUnscoredRatio);
             result.summary.precisionUnscoredRatio = Number(coverageGate.precisionUnscoredRatio.toFixed(4));
+            result.summary.precisionConfigGatedRatio = Number(
+                coverageGate.precisionConfigGatedRatio.toFixed(4));
+            result.summary.precisionAbstentionRatio = Number(
+                coverageGate.precisionAbstentionRatio.toFixed(4));
             result.summary.unverifiedUnscoredRatio = Number(
                 coverageGate.unverifiedUnscoredRatio.toFixed(4));
             result.summary.calleeUnscoredRatio = Number(coverageGate.calleeUnscoredRatio.toFixed(4));

@@ -7158,6 +7158,166 @@ describe('fix #232 (JS/TS): builtin-global receivers and optional-chaining recei
     });
 });
 
+describe('fix #286: member-assigned builtin-global targets stay visible cross-file', () => {
+    it('console.log = fn in one file keeps console.log() sites visible in others', () => {
+        // fastify-measured (scheduled eval, 2026-08-17): a test's beforeEach
+        // silencer `console.log = () => {}` was the oracle-true target of
+        // every console.log site, but the #232 exclusion only honored the
+        // per-file receiverMemberAssigned flag — 45 edges excluded
+        // external-package, semantic-recall and observed-zero gates red.
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'silence.test.js': 'console.log = () => {}\n',
+            'use.js': 'function run() {\n  console.log("hi");\n  return 1;\n}\nmodule.exports = { run };\n',
+        });
+        try {
+            const index = idx(dir);
+            const def = (index.symbols.get('log') || [])
+                .find(d => d.relativePath === 'silence.test.js');
+            assert.ok(def?.memberAssigned, 'assignment def indexed');
+            assert.strictEqual(def.assignedReceiver, 'console',
+                'def records the patched global');
+            const r = execute(index, 'context', { name: 'log' });
+            assert.ok(r.ok, `context failed: ${r.error}`);
+            const unverified = r.result.unverifiedCallers || [];
+            assert.ok(unverified.some(u => u.relativePath === 'use.js' &&
+                u.reason === 'possible-dispatch'),
+                `console.log site must route visible possible-dispatch: ${JSON.stringify(unverified)}`);
+            assert.ok(!r.result.callers.some(c => c.relativePath === 'use.js'),
+                'never confirmed — the patch is dynamic');
+            const excl = r.result.meta?.account?.excluded?.byReason || {};
+            assert.ok(!excl['external-package'],
+                `must not be excluded external-package: ${JSON.stringify(excl)}`);
+            assert.ok(r.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('a member assignment on a NON-global does not defeat the console exclusion', () => {
+        // Counter-probe: `foo.log = fn` patches foo, not console — unshadowed
+        // console.log sites stay excluded external-package.
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'bag.js': 'const foo = {};\nfoo.log = () => {}\nmodule.exports = { foo };\n',
+            'use.js': 'function run() {\n  console.log("hi");\n}\nmodule.exports = { run };\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'log' });
+            assert.ok(r.ok);
+            assert.ok(!r.result.callers.some(c => c.relativePath === 'use.js'));
+            assert.ok(!(r.result.unverifiedCallers || [])
+                .some(u => u.relativePath === 'use.js'));
+            assert.strictEqual(
+                r.result.meta.account.excluded.byReason['external-package'].count,
+                1);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #286e (TS): annotated namespace-qualified receiver identity', () => {
+    it('value: api.Widget pins the imported declaration despite a same-name decoy', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'src/api.ts': [
+                'export class Widget {',
+                '  render(): string { return "api"; }',
+                '}',
+            ].join('\n'),
+            'src/decoy.ts': [
+                'export class Widget {',
+                '  render(): string { return "decoy"; }',
+                '}',
+            ].join('\n'),
+            'src/use.ts': [
+                'import * as api from "./api";',
+                'export function use(value: api.Widget): string {',
+                '  return value.render();',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'src/api.ts:2:render' });
+            assert.ok(r.ok, `context failed: ${r.error}`);
+            assert.ok(r.result.callers.some(c =>
+                c.relativePath === 'src/use.ts' && c.line === 3),
+                `namespace-qualified receiver must confirm: ${JSON.stringify(r.result.callers)}`);
+            const excl = r.result.meta.account.excluded.byReason || {};
+            assert.ok(!excl['receiver-type-mismatch'],
+                `must not choose the decoy by proximity: ${JSON.stringify(excl)}`);
+            assert.ok(r.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #286i: CommonJS property exports are not callable defaults', () => {
+    it('does not fan out a namespace require use to every property export', () => {
+        // fastify-measured: `module.exports.appendStackTrace = appendStackTrace`
+        // made `Object.keys(errors)` look like a confirmed caller of the
+        // function because every module.exports entry was treated as the
+        // value returned directly by require().
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'errors.js': [
+                'const codes = {};',
+                'function appendStackTrace(oldErr, newErr) { return newErr; }',
+                'module.exports = codes;',
+                'module.exports.appendStackTrace = appendStackTrace;',
+            ].join('\n'),
+            'use.js': [
+                "const errors = require('./errors');",
+                'function list() { return Object.keys(errors); }',
+                'module.exports = { list };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', {
+                name: 'errors.js:2:appendStackTrace',
+            });
+            assert.ok(r.ok, `context failed: ${r.error}`);
+            assert.ok(!r.result.callers.some(c => c.relativePath === 'use.js'),
+                `namespace use must not confirm the property function: ${JSON.stringify(r.result.callers)}`);
+            assert.strictEqual(r.result.meta.account.beyondText.count, 0);
+            assert.ok(r.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('keeps a function assigned directly to module.exports callable by its require alias', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'run.js': 'function run() { return 1; }\nmodule.exports = run;\n',
+            'use.js': "const execute = require('./run');\nexecute();\n",
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'run.js:1:run' });
+            assert.ok(r.ok);
+            assert.ok(r.result.callers.some(c =>
+                c.relativePath === 'use.js' && c.line === 2 && c.calledAs === 'execute'),
+                `callable default alias must stay confirmed: ${JSON.stringify(r.result.callers)}`);
+            assert.ok(r.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('preserves the local identity of a named callable default expression', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'run.js': 'module.exports = function run() { return 1; };\n',
+            'use.js': "const execute = require('./run');\nexecute();\n",
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'run.js:1:run' });
+            assert.ok(r.ok);
+            assert.ok(r.result.callers.some(c =>
+                c.relativePath === 'use.js' && c.line === 2 && c.calledAs === 'execute'),
+                `named default expression must resolve: ${JSON.stringify(r.result.callers)}`);
+            assert.ok(r.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #232: related honors the definition pin', () => {
     it('errors when --file matches no definition of the symbol', () => {
         // Campaign G1-rust BUG-6 / G1-py BUG-3 / G1-ts BUG-2 (three cells
