@@ -345,6 +345,7 @@ async function evaluateRepo(repo, oracle) {
         placement: emptyPlacement(),
         exactPlacement: emptyPlacement(),
         runtimeDispatchAccountedNotShown: 0,
+        gateMissingUnexplained: 0,
         zeroCases: 0, zeroAgreed: 0,
         conserved: 0, evaluated: 0,
     };
@@ -365,6 +366,7 @@ async function evaluateRepo(repo, oracle) {
         hits: 0,
         placement: emptyCalleePlacement(),
         exactPlacement: emptyCalleePlacement(),
+        gateMissingUnexplained: 0,
     };
     const commandProof = createCommandProofSummary();
     const definitionCache = new Map();
@@ -1040,6 +1042,15 @@ async function evaluateRepo(repo, oracle) {
                 }
             } else {
                 place('missingUnexplained');
+                // Hard-floor counter (fix #292): exact, runtime-dispatch, and
+                // oracle-unresolved edges gate at 0. Compile-time-dispatch
+                // stays report-only per the pre-existing design — compiler
+                // template/overload family attributions are conservative
+                // candidate sets whose non-exact band is oracle-environment-
+                // dependent (fmt: 0 local clangd edges vs 4 on CI clangd-18).
+                if (oc.uncertaintyClass !== 'compile-time-dispatch') {
+                    totals.gateMissingUnexplained++;
+                }
                 const sample = {
                     category: 'missingUnexplained', symbol: sym.name, target: `${sym.file}:${sym.line}`,
                     edge: k, text: lineText(index.root, oc.file, oc.line),
@@ -1179,6 +1190,12 @@ async function evaluateRepo(repo, oracle) {
                     });
                 } else {
                     placeCallee('missingUnexplained');
+                    // Same hard-floor rule as the caller arm (fix #292):
+                    // compile-time-dispatch callee attributions stay
+                    // report-only.
+                    if (oc.uncertaintyClass !== 'compile-time-dispatch') {
+                        calleeTotals.gateMissingUnexplained++;
+                    }
                     if (exactOracleEdge) pushSample(calleeSemanticMissingSamples, {
                         category: 'missingUnexplained', symbol: sym.name, target: `${sym.file}:${sym.line}`,
                         edge: key(oc.file, oc.line), enclosing: encl.name,
@@ -1444,12 +1461,15 @@ async function evaluateRepo(repo, oracle) {
         semanticRecall,
         semanticMissing,
         missingUnexplained: totals.exactPlacement.missingUnexplained,
-        // All-class hard floor (fix #292): an oracle edge UCN neither showed
-        // nor accounted for is a conservation lie regardless of its dispatch
-        // class — gated at 0 alongside the exact gate. Likewise a compiler-
-        // attested may-dispatch edge the engine EXCLUDED with reason violates
-        // demote-only physics (possible-dispatch is visible, never excluded).
+        // Hard floors (fix #292): an oracle edge UCN neither showed nor
+        // accounted for gates at 0 for the exact, runtime-dispatch, and
+        // oracle-unresolved classes; compile-time-dispatch stays report-only
+        // (pre-existing design — its non-exact band is oracle-environment-
+        // dependent). Likewise a compiler-attested may-dispatch edge the
+        // engine EXCLUDED with reason violates demote-only physics
+        // (possible-dispatch is visible, never excluded).
         allOracleMissingUnexplained: totals.placement.missingUnexplained,
+        gateMissingUnexplained: totals.gateMissingUnexplained,
         runtimeDispatchAccountedNotShown:
             totals.runtimeDispatchAccountedNotShown,
         runtimeDispatchNotShownSamples,
@@ -1490,6 +1510,7 @@ async function evaluateRepo(repo, oracle) {
             calleeTotals.exactPlacement.missingUnexplained,
         calleeAllOracleMissingUnexplained:
             calleeTotals.placement.missingUnexplained,
+        calleeGateMissingUnexplained: calleeTotals.gateMissingUnexplained,
         calleeUnexplainedSamples,
         calleeSemanticMissingSamples,
         commandProof,
@@ -1661,14 +1682,18 @@ async function main() {
             }
             if (result.summary.semanticMissing > 0) gateFailed = true;
             if (result.summary.calleeSemanticMissing > 0) gateFailed = true;
-            // All-class floors (fix #292): unaccounted edges and excluded
-            // may-dispatch edges gate at 0 regardless of uncertainty class.
-            if (result.summary.allOracleMissingUnexplained > 0) {
-                process.stdout.write(`  ⚠ GATE FAILURE: ${result.summary.allOracleMissingUnexplained} non-exact oracle call edge(s) unexplained\n`);
+            // Class-aware floors (fix #292): unaccounted exact, runtime-
+            // dispatch, and oracle-unresolved edges gate at 0 in both arms;
+            // compile-time-dispatch stays report-only (its non-exact band is
+            // oracle-environment-dependent — fmt measured 0 local clangd
+            // edges vs 4 on CI clangd-18). Excluded may-dispatch edges gate
+            // unconditionally.
+            if (result.summary.gateMissingUnexplained > 0) {
+                process.stdout.write(`  ⚠ GATE FAILURE: ${result.summary.gateMissingUnexplained} non-exact oracle call edge(s) unexplained\n`);
                 gateFailed = true;
             }
-            if (result.summary.calleeAllOracleMissingUnexplained > 0) {
-                process.stdout.write(`  ⚠ GATE FAILURE: ${result.summary.calleeAllOracleMissingUnexplained} non-exact callee edge(s) unexplained\n`);
+            if (result.summary.calleeGateMissingUnexplained > 0) {
+                process.stdout.write(`  ⚠ GATE FAILURE: ${result.summary.calleeGateMissingUnexplained} non-exact callee edge(s) unexplained\n`);
                 gateFailed = true;
             }
             if (result.summary.runtimeDispatchAccountedNotShown > 0) {
