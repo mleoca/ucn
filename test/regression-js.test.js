@@ -7458,6 +7458,136 @@ describe('fix #288: context explains same-name ambiguity with stable handles', (
     });
 });
 
+describe('fix #289: exported ESM namespace objects preserve member ownership', () => {
+    it('resolves named, renamed, default, and direct namespace re-exports', () => {
+        // zod-measured: `import { z } from "zod/v3"; z.string()` imports a
+        // namespace object re-exported by index.ts. Losing that value identity
+        // left the true v3 edge and every foreign v4 `string` target in the
+        // same method-ambiguous tier.
+        const dir = tmp({
+            'package.json': '{"name":"t","type":"module"}',
+            'impl-a.ts': 'export function run() { return "a"; }\n',
+            'impl-b.ts': 'export function run() { return "b"; }\n',
+            'index.ts': [
+                "import * as api from './impl-a.js';",
+                'export { api };',
+            ].join('\n'),
+            'default.ts': [
+                "import * as api from './impl-a.js';",
+                'export default api;',
+            ].join('\n'),
+            'direct.ts': "export * as api from './impl-a.js';\n",
+            'relay.ts': "export { api } from './direct.js';\n",
+            'star.ts': "export * from './index.js';\n",
+            'nested-source.ts': "export * as nested from './impl-a.js';\n",
+            'nested-index.ts': [
+                "import * as api from './nested-source.js';",
+                'export { api };',
+            ].join('\n'),
+            'use.ts': [
+                "import { api as namedApi } from './index.js';",
+                "import defaultApi from './default.js';",
+                "import { api as directApi } from './relay.js';",
+                "import { api as starApi } from './star.js';",
+                "import { api as nestedApi } from './nested-index.js';",
+                'namedApi.run();',
+                'defaultApi.run();',
+                'directApi.run();',
+                'starApi.run();',
+                'nestedApi.nested.run();',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const useEntry = [...index.files.values()]
+                .find(entry => entry.relativePath === 'use.ts');
+            assert.ok(useEntry.importBindings.some(binding =>
+                binding.name === 'api' && binding.alias === 'namedApi' &&
+                binding.kind === 'named'));
+            assert.ok(useEntry.importBindings.some(binding =>
+                binding.name === 'defaultApi' && binding.kind === 'default'));
+            const indexEntry = [...index.files.values()]
+                .find(entry => entry.relativePath === 'index.ts');
+            assert.ok(indexEntry.importBindings.some(binding =>
+                binding.name === 'api' && binding.kind === 'namespace'));
+
+            const own = execute(index, 'context', { name: 'impl-a.ts:1:run' });
+            assert.ok(own.ok);
+            assert.deepStrictEqual(
+                own.result.callers.filter(call => call.relativePath === 'use.ts')
+                    .map(call => call.line),
+                [6, 7, 8, 9, 10]);
+            assert.ok(!own.result.unverifiedCallers.some(call =>
+                call.relativePath === 'use.ts'));
+            assert.ok(own.result.meta.account.conserved);
+
+            const other = execute(index, 'context', { name: 'impl-b.ts:1:run' });
+            assert.ok(other.ok);
+            assert.ok(!other.result.unverifiedCallers.some(call =>
+                call.relativePath === 'use.ts'));
+            assert.strictEqual(
+                other.result.meta.account.excluded.byReason['other-definition-import'].count,
+                5);
+            assert.ok(other.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('does not treat an ordinary imported object as a namespace', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t","type":"module"}',
+            'target.ts': 'export function run() { return true; }\n',
+            'value.ts': [
+                'export const api = makeClient();',
+                'export const nested = makeClient();',
+            ].join('\n'),
+            'container.ts': [
+                "import * as root from './value.js';",
+                'export { root };',
+            ].join('\n'),
+            'use.ts': [
+                "import { api } from './value.js';",
+                "import { root } from './container.js';",
+                'api.run();',
+                'root.nested.run();',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', { name: 'target.ts:1:run' });
+            assert.ok(result.ok);
+            assert.deepStrictEqual(result.result.unverifiedCallers
+                .filter(call => call.relativePath === 'use.ts')
+                .map(call => call.line), [3, 4],
+            'ordinary object members must remain visible without namespace proof');
+            assert.ok(result.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('keeps competing export-star namespace providers unresolved', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t","type":"module"}',
+            'a.ts': 'export function run() { return "a"; }\n',
+            'b.ts': 'export function run() { return "b"; }\n',
+            'ns-a.ts': "export * as api from './a.js';\n",
+            'ns-b.ts': "export * as api from './b.js';\n",
+            'barrel.ts': [
+                "export * from './ns-a.js';",
+                "export * from './ns-b.js';",
+            ].join('\n'),
+            'use.ts': "import { api } from './barrel.js';\napi.run();\n",
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', { name: 'a.ts:1:run' });
+            assert.ok(result.ok);
+            assert.ok(result.result.unverifiedCallers.some(call =>
+                call.relativePath === 'use.ts' && call.line === 2),
+            'an ambiguous export-star surface must never manufacture ownership');
+            assert.ok(result.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #232: related honors the definition pin', () => {
     it('errors when --file matches no definition of the symbol', () => {
         // Campaign G1-rust BUG-6 / G1-py BUG-3 / G1-ts BUG-2 (three cells

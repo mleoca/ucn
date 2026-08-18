@@ -2390,6 +2390,12 @@ describe('index reliability: cache round-trip and incremental rebuild identity',
             'module.exports.inline = function () { return 3; };',
             'exports.arrow = () => 4;',
         ].join('\n'),
+        'esm-dep.ts': 'export const named = 1; export default named;',
+        'esm-imports.ts': [
+            "import fallback, { named as local } from './esm-dep.js';",
+            "import * as namespace from './esm-dep.js';",
+            'export { fallback, local, namespace };',
+        ].join('\n'),
     };
 
     it('loadCache reproduces the exact symbol table, file entries, and calls', () => {

@@ -319,6 +319,8 @@ function findCallers(index, name, options = {}) {
     const typeQueryTargets = options.targetDefinitions || definitions;
     const targetIsTypeQuery = typeQueryTargets.length > 0 &&
         typeQueryTargets.every(target => IDENTITY_TYPE_KINDS.has(target.type));
+    const targetDefinitionFiles = new Set(
+        typeQueryTargets.map(definition => definition.file).filter(Boolean));
 
     // Possible-dispatch tiering inputs (nominal contract surface) — all fixed
     // per query, computed lazily once. targetTypes mirrors the receiver-class
@@ -606,6 +608,8 @@ function findCallers(index, name, options = {}) {
         try {
             const calls = getCachedCalls(index, filePath);
             if (!calls) continue;
+            const structuralLanguage =
+                langTraits(fileEntry.language)?.typeSystem === 'structural';
 
             for (let call of calls) {
                 // Skip if not matching our target name (also check alias resolution)
@@ -2306,6 +2310,16 @@ function findCallers(index, name, options = {}) {
                     }
                 }
 
+                // Resolve this before the generic untyped-field guard below:
+                // `api.nested.run()` is syntactically a field receiver, but an
+                // exported namespace chain can make both hops compiler-exact.
+                const recvExportedNamespace = (!call.receiverIsModule && call.isMethod &&
+                    (call.receiver || call.receiverRoot) &&
+                    structuralLanguage)
+                    ? _importedNamespaceMemberOwnership(
+                        index, fileEntry, call, targetDefinitionFiles)
+                    : null;
+
                 // Go package-owned value receiver (`io.Discard.Write`). The
                 // imported package owns `Discard`; file/package method-name
                 // bindings cannot identify its concrete type. Keep the edge
@@ -2327,7 +2341,7 @@ function findCallers(index, name, options = {}) {
                 // allowing a same-file `query` definition to claim it.
                 if (collectAccount && call.isMethod && call.receiverField &&
                     !call.receiverType && !fieldHopType && !fieldDispatchType &&
-                    !resolvedBySameClass &&
+                    !resolvedBySameClass && !recvExportedNamespace &&
                     ['javascript', 'typescript', 'tsx', 'html'].includes(
                         fileEntry.language)) {
                     routeUnverified(
@@ -2797,12 +2811,18 @@ function findCallers(index, name, options = {}) {
                 const recvSubmoduleRel = (!call.receiverIsModule && call.isMethod && call.receiver &&
                     langTraits(fileEntry.language)?.typeSystem === 'structural')
                     ? _submoduleReceiverModule(index, fileEntry, call.receiver) : null;
+                // A named/default import can itself be an exported namespace
+                // object: `import { z } from './index'; z.string()`, where
+                // index does `import * as z from './api'; export { z }`.
+                // Preserve that compiler-exact namespace identity without
+                // treating arbitrary imported object values as modules.
 
                 // Module receiver: httpx.get() / ns.helper() dispatches to a
                 // module export — it can never be a CLASS METHOD call. Applies
                 // only when every target is a class method; standalone-function
                 // and class (constructor) targets keep flowing on import evidence.
-                if (!bindingId && !resolvedBySameClass && call.isMethod && call.receiverIsModule &&
+                if ((!bindingId || recvExportedNamespace) && !resolvedBySameClass && call.isMethod &&
+                    (call.receiverIsModule || recvExportedNamespace) &&
                     langTraits(fileEntry.language)?.typeSystem === 'structural' &&
                     targetDefs.length > 0 && targetDefs.every(d => d.className)) {
                     isUncertain = true;
@@ -2828,17 +2848,18 @@ function findCallers(index, name, options = {}) {
                 // definition; an unknown chain stays visible (deep barrels and
                 // dynamic CJS surfaces can exceed the modeled ownership);
                 // unresolved-but-project-looking → visible (resolver gap).
-                if (!bindingId && !resolvedBySameClass && call.isMethod &&
-                    (call.receiverIsModule || recvSubmoduleRel) &&
+                if ((!bindingId || recvExportedNamespace) && !resolvedBySameClass && call.isMethod &&
+                    (call.receiverIsModule || recvSubmoduleRel || recvExportedNamespace) &&
                     langTraits(fileEntry.language)?.typeSystem === 'structural') {
-                    const recvBindings = _structuralModuleBindings(fileEntry, call);
-                    const tFiles = new Set(targetDefs.map(d => d.file).filter(Boolean));
-                    if (recvBindings.length > 0 && !tFiles.has(filePath)) {
-                        let reaches = false;
-                        let projectish = false;
-                        let undetermined = false;
-                        let resolvedBindings = 0;
-                        let definitiveOtherBindings = 0;
+                    const recvBindings = recvExportedNamespace
+                        ? [] : _structuralModuleBindings(fileEntry, call);
+                    const tFiles = targetDefinitionFiles;
+                    if ((recvBindings.length > 0 || recvExportedNamespace) && !tFiles.has(filePath)) {
+                        let reaches = recvExportedNamespace?.verdict === 'yes';
+                        let projectish = !!recvExportedNamespace;
+                        let undetermined = recvExportedNamespace?.verdict === 'unknown';
+                        let resolvedBindings = recvExportedNamespace ? 1 : 0;
+                        let definitiveOtherBindings = recvExportedNamespace?.verdict === 'no' ? 1 : 0;
                         for (const b of recvBindings) {
                             const rel = (fileEntry.moduleResolved && fileEntry.moduleResolved[b.module]) ||
                                 recvSubmoduleRel;
@@ -4154,7 +4175,8 @@ function findCallers(index, name, options = {}) {
                     // module-ownership block above already routed the ones
                     // whose module doesn't reach the target. Submodule
                     // receivers (fix #224) are module receivers too.
-                    if (call.isMethod && !call.receiverIsModule && !recvSubmoduleRel) {
+                    if (call.isMethod && !call.receiverIsModule &&
+                        !recvSubmoduleRel && !call.moduleOwnedPath) {
                         const tTypes = dispatchTargetTypes(targetDefs2);
                         const typeQualifiedReceiver = !!(call.receiver && tTypes.has(call.receiver));
                         const knownDispatchType = call.receiverType ||
@@ -8472,6 +8494,184 @@ function _nameBindingReaches(index, startAbs, name, targetFiles, maxDepth = 4) {
     }
     if (frontier.length > 0) unknown = true; // depth exhausted with live paths
     return unknown ? 'unknown' : 'no';
+}
+
+/**
+ * Resolve a member reached through an exported ESM namespace object.
+ *
+ * Supported exact shapes:
+ *   import * as api from './impl'; export { api };
+ *   import * as api from './impl'; export default api;
+ *   export * as api from './impl';
+ *   export { api } from './barrel'; // recursively, when api is one above
+ *
+ * A plain exported object/value is deliberately not recognized. The caller
+ * must remain in the ordinary structural receiver tier unless the export path
+ * proves that the value is a module namespace exotic object.
+ *
+ * @returns {{ verdict: 'yes'|'no'|'unknown' }|null}
+ */
+function _namespaceExportMemberReaches(
+    index, startAbs, exportedName, memberName, targetFiles, maxDepth = 4,
+    visited = new Set(), memberPath = []
+) {
+    if (maxDepth < 0) return { verdict: 'unknown' };
+    const stateKey = `${startAbs}\x00${exportedName}\x00${memberPath.join('.')}\x00${memberName}`;
+    if (visited.has(stateKey)) return { verdict: 'unknown' };
+    visited.add(stateKey);
+    const fe = index.files.get(startAbs);
+    if (!fe) return null;
+
+    let recognized = false;
+    let unknown = false;
+    let explicitExport = false;
+    const followMember = moduleName => {
+        const rel = fe.moduleResolved?.[moduleName];
+        if (!rel) {
+            unknown = true;
+            return 'unknown';
+        }
+        const nextAbs = path.join(index.root, rel);
+        if (memberPath.length > 0) {
+            const nested = _namespaceExportMemberReaches(
+                index, nextAbs, memberPath[0], memberName, targetFiles,
+                maxDepth - 1, new Set(visited), memberPath.slice(1));
+            // The outer value is proven to be a namespace, but its requested
+            // field is an ordinary/unmodeled value rather than another proven
+            // namespace. That is uncertainty, never exclusion evidence.
+            return nested?.verdict || 'unknown';
+        }
+        return _nameBindingReaches(index, nextAbs, memberName, targetFiles, maxDepth - 1);
+    };
+    const absorb = verdict => {
+        if (verdict === 'yes') return true;
+        if (verdict === 'unknown') unknown = true;
+        return false;
+    };
+
+    for (const exp of (fe.exportDetails || [])) {
+        // `export * as api from './impl'` is direct namespace identity.
+        if (exp.type === 're-export-all' && exp.alias === exportedName) {
+            explicitExport = true;
+            recognized = true;
+            if (absorb(followMember(exp.source))) return { verdict: 'yes' };
+            continue;
+        }
+
+        const exposed = exp.type === 'default' ? 'default' : (exp.alias || exp.name);
+        if (exposed !== exportedName) continue;
+        explicitExport = true;
+
+        // `export { api } from './barrel'`: the source-side value may itself
+        // be a namespace export. Recurse under its source-side name.
+        if (exp.type === 're-export' && exp.source) {
+            const rel = fe.moduleResolved?.[exp.source];
+            if (!rel) {
+                unknown = true;
+                recognized = true;
+                continue;
+            }
+            const nested = _namespaceExportMemberReaches(
+                index, path.join(index.root, rel), exp.name, memberName,
+                targetFiles, maxDepth - 1, new Set(visited), memberPath);
+            if (nested) {
+                recognized = true;
+                if (nested.verdict === 'yes') return { verdict: 'yes' };
+                if (nested.verdict === 'unknown') unknown = true;
+            }
+            continue;
+        }
+
+        // `import * as api ...; export { api }` / `export default api`.
+        if (!exp.source && (exp.type === 'named' || exp.type === 'default')) {
+            const localName = exp.name;
+            const namespaceBindings = (fe.importBindings || []).filter(binding =>
+                (binding.alias || binding.name) === localName && binding.kind === 'namespace');
+            for (const binding of namespaceBindings) {
+                recognized = true;
+                if (absorb(followMember(binding.module))) return { verdict: 'yes' };
+            }
+        }
+    }
+
+    // `export * from './barrel'` forwards named namespace-object exports too.
+    // Explicit local/named exports shadow star exports, so only chase stars
+    // when this file has no explicit surface for the requested name. Default
+    // is never forwarded by export-star.
+    if (!explicitExport && exportedName !== 'default') {
+        const starExports = (fe.exportDetails || []).filter(exp =>
+            exp.type === 're-export-all' && !exp.alias && exp.source);
+        const starVerdicts = [];
+        for (const exp of starExports) {
+            const rel = fe.moduleResolved?.[exp.source];
+            if (!rel) {
+                unknown = true;
+                continue;
+            }
+            const nested = _namespaceExportMemberReaches(
+                index, path.join(index.root, rel), exportedName, memberName,
+                targetFiles, maxDepth - 1, new Set(visited), memberPath);
+            if (!nested) continue;
+            recognized = true;
+            starVerdicts.push(nested.verdict);
+        }
+        if (starVerdicts.length > 0) {
+            // With several export-star providers, another star may expose the
+            // same name and make the ESM binding ambiguous. We currently do
+            // not compute full `ResolveExport` sets, so multi-star barrels are
+            // demotion-only even when one path reaches the target.
+            if (starExports.length > 1) unknown = true;
+            else if (starVerdicts.includes('yes')) return { verdict: 'yes' };
+            if (starVerdicts.includes('unknown')) unknown = true;
+        }
+    }
+
+    if (!recognized) return null;
+    return { verdict: unknown ? 'unknown' : 'no' };
+}
+
+/**
+ * Determine whether a structural receiver imported by name/default is a
+ * statically exported namespace object, and if so whether its requested member
+ * can reach the pinned target files. Multiple live bindings must agree before
+ * a negative becomes exclusion-grade.
+ */
+function _importedNamespaceMemberOwnership(index, fileEntry, call, targetFiles) {
+    const receiver = call.receiver || call.receiverRoot;
+    const memberPath = call.receiver
+        ? [] : (call.receiverFields || (call.receiverField ? [call.receiverField] : []));
+    const bindings = (fileEntry.importBindings || []).filter(binding =>
+        (binding.alias || binding.name) === receiver &&
+        (binding.kind === 'named' || binding.kind === 'default' || binding.kind === 'namespace'));
+    if (bindings.length === 0) return null;
+
+    let recognized = 0;
+    let unknown = false;
+    for (const binding of bindings) {
+        const rel = fileEntry.moduleResolved?.[binding.module];
+        if (!rel) continue;
+        const startAbs = path.join(index.root, rel);
+        let result;
+        if (binding.kind === 'namespace') {
+            result = memberPath.length > 0
+                ? _namespaceExportMemberReaches(
+                    index, startAbs, memberPath[0], call.name, targetFiles,
+                    4, new Set(), memberPath.slice(1))
+                : { verdict: _nameBindingReaches(index, startAbs, call.name, targetFiles) };
+        } else {
+            const exportedName = binding.kind === 'default' ? 'default' : binding.name;
+            result = _namespaceExportMemberReaches(
+                index, startAbs, exportedName, call.name, targetFiles,
+                4, new Set(), memberPath);
+        }
+        if (!result) continue;
+        recognized++;
+        if (result.verdict === 'yes') return { verdict: 'yes' };
+        if (result.verdict === 'unknown') unknown = true;
+    }
+    if (recognized === 0) return null;
+    if (recognized !== bindings.length) unknown = true;
+    return { verdict: unknown ? 'unknown' : 'no' };
 }
 
 /**

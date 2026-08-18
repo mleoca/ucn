@@ -16,6 +16,7 @@ function createImportBindings(imports) {
             return {
                 name,
                 module: item.module,
+                ...(item.type && { kind: item.type }),
                 ...(item.line != null && { line: item.line }),
                 ...(rename && { alias: rename.local }),
                 ...(item.defaultLike && { defaultLike: true }),

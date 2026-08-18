@@ -283,7 +283,10 @@ function indexSnapshot(index) {
             // be identical across build paths — build-worker.js once dropped
             // importBindings entirely and the snapshot missed it.
             importNames: [...(fe.importNames || [])].sort(),
-            importBindings: (fe.importBindings || []).map(b => `${b.name} ${b.module}`).sort(),
+            importBindings: (fe.importBindings || [])
+                .map(binding => JSON.stringify(Object.fromEntries(
+                    Object.entries(binding).sort(([a], [b]) => a.localeCompare(b)))))
+                .sort(),
             globalImports: [...(fe.globalImports || [])].sort(),
             importAliases: (fe.importAliases || []).map(a => `${a.original} ${a.local}`).sort(),
             exportDetails: (fe.exportDetails || []).map(e => JSON.stringify(e)).sort(),
