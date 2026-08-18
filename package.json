@@ -1,6 +1,6 @@
 {
   "name": "ucn",
-  "version": "5.1.0",
+  "version": "5.1.1",
   "mcpName": "io.github.mleoca/ucn",
   "description": "Auditable AST code intelligence for AI agents: 18 task-oriented commands through one MCP tool, CLI, or agent skill. Supports JS/TS, Python, Go, Rust, Java, C, C++, C#, and HTML.",
   "main": "index.js",
