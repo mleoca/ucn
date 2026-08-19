@@ -2205,6 +2205,126 @@ function plan(index, name, options = {}) {
                 slotMemberDefs.push(override);
             }
 
+            // Rust trait slots (fix #296, serde-as_cast-measured): trait
+            // impls carry `traitName` markers, not extends edges — the climb
+            // and descendant walk above cannot see them, so renaming a trait
+            // method left every impl (and the trait declaration, under an
+            // impl pin) behind. Close the slot over the trait's own
+            // declaration member and every indexed impl member implementing
+            // it, with file-identity discipline (two crates may define
+            // same-named traits — a member joins only when its trait
+            // resolves to the pin's trait FILE).
+            const slotTraitNames = new Set();
+            let pinTraitFile = null;
+            if (def.traitName) {
+                slotTraitNames.add(def.traitName);
+                pinTraitFile = index._resolveClassFile(def.traitName, def.file) || null;
+            } else if ((index.symbols.get(def.className) || []).some(d =>
+                d.type === 'trait' && d.file === def.file)) {
+                slotTraitNames.add(def.className);
+                pinTraitFile = def.file;
+            }
+            if (slotTraitNames.size > 0 && pinTraitFile) {
+                const traitName = [...slotTraitNames][0];
+                for (const member of index.symbols.get(name) || []) {
+                    if (member.file === def.file && member.startLine === def.startLine) continue;
+                    if (NON_CALLABLE_TYPES.has(member.type)) continue;
+                    let inSlot = false;
+                    if (member.traitName === traitName) {
+                        inSlot = index._resolveClassFile(traitName, member.file) === pinTraitFile;
+                    } else if (member.className === traitName && member.file === pinTraitFile &&
+                        (index.symbols.get(traitName) || []).some(d =>
+                            d.type === 'trait' && d.file === member.file)) {
+                        inSlot = true; // the trait's own declaration member
+                    }
+                    if (!inSlot) continue;
+                    const line = member.nameLine || member.startLine;
+                    const rel = member.relativePath || member.file;
+                    if (!changes.some(change => change.file === rel && change.line === line)) {
+                        const edit = renameIdentifierTokens(index, member.file,
+                            line, name, options.renameTo);
+                        if (edit.renamed !== edit.source) {
+                            changes.push({
+                                file: rel,
+                                line,
+                                expression: edit.source,
+                                suggestion: `Update trait-slot definition: ${edit.renamed}`,
+                                newExpression: edit.renamed,
+                                isDefinition: true,
+                                editKind: 'definition',
+                            });
+                        }
+                    }
+                    slotMemberDefs.push(member);
+                }
+                // Macro-generated impls are invisible to the index (the
+                // as_cast_impl! family: the `fn` lives in a macro_rules body,
+                // no impl_item node exists). A definition-shaped ground line
+                // no indexed def claims, sitting inside a macro_rules body
+                // whose token tree names `impl … <Trait>`, implements the
+                // renamed slot — compiler-connected via the impl header, so
+                // the edit is synthesized mechanically.
+                const { computeGroundSet } = require('./account');
+                const macroGround = computeGroundSet(index, name);
+                const fnRe = new RegExp(`\\bfn\\s+${escapeRegExp(name)}\\b`);
+                const implRe = new RegExp(
+                    `\\bimpl\\b[^;{}]{0,160}\\b${escapeRegExp(traitName)}\\b`);
+                for (const [macroFile, lineNos] of macroGround.perFile) {
+                    const macroEntry = index.files.get(macroFile);
+                    if (!macroEntry || macroEntry.language !== 'rust') continue;
+                    const claimed = new Set((index.symbols.get(name) || [])
+                        .filter(d => d.file === macroFile)
+                        .map(d => d.nameLine || d.startLine));
+                    let macroTree = null;
+                    let macroNodes = null;
+                    for (const lineNo of lineNos) {
+                        if (claimed.has(lineNo)) continue;
+                        const rel = macroEntry.relativePath || macroFile;
+                        if (changes.some(change =>
+                            change.file === rel && change.line === lineNo)) continue;
+                        const content = index._readFile(macroFile);
+                        if (!fnRe.test(content.split('\n')[lineNo - 1] || '')) continue;
+                        if (macroTree === null) {
+                            const parser = getParser('rust');
+                            macroTree = (parser &&
+                                (index._getParsedTree?.(macroFile, content, 'rust') ||
+                                    safeParse(parser, content))) || false;
+                            macroNodes = [];
+                            if (macroTree) {
+                                const stack = [macroTree.rootNode];
+                                while (stack.length > 0) {
+                                    const node = stack.pop();
+                                    if (node.type === 'macro_definition') {
+                                        macroNodes.push(node);
+                                        continue;
+                                    }
+                                    for (let i = 0; i < node.namedChildCount; i++) {
+                                        stack.push(node.namedChild(i));
+                                    }
+                                }
+                            }
+                        }
+                        if (!macroTree || !macroNodes) continue;
+                        const mac = macroNodes.find(m =>
+                            m.startPosition.row + 1 <= lineNo &&
+                            m.endPosition.row + 1 >= lineNo);
+                        if (!mac || !implRe.test(mac.text)) continue;
+                        const edit = renameIdentifierTokens(index, macroFile,
+                            lineNo, name, options.renameTo);
+                        if (edit.renamed === edit.source) continue;
+                        changes.push({
+                            file: rel,
+                            line: lineNo,
+                            expression: edit.source,
+                            suggestion: `Update macro-generated trait implementation: ${edit.renamed}`,
+                            newExpression: edit.renamed,
+                            isDefinition: true,
+                            editKind: 'definition',
+                        });
+                    }
+                }
+            }
+
             // A slot rename must also carry every member's CALL sites — the
             // pin's sweep answers for the pin only (a TagDict-typed caller
             // of TagDict.check is a confirmed caller of the SLOT being

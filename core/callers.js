@@ -3511,6 +3511,31 @@ function findCallers(index, name, options = {}) {
                                     // resolution above owns it.
                                     if (call.isPathCall && /^[A-Z]/.test(receiverSegment) &&
                                         receiverSegment !== 'Self') {
+                                        // Generic-param carve-out (fix #296 — the
+                                        // #222(2) single-def branch had this, the
+                                        // multi-def fallback didn't): `F::as_cast(x)`
+                                        // instantiates with ANY bound-satisfying
+                                        // type — visible, never excluded.
+                                        if (collectAccount &&
+                                            /^[A-Z][A-Z0-9]?$/.test(receiverSegment) &&
+                                            !(index.symbols.get(receiverSegment) || []).some(d => IDENTITY_TYPE_KINDS.has(d.type))) {
+                                            routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs, {
+                                                dispatchCandidates: methodOwnerKeys().size,
+                                            });
+                                            continue;
+                                        }
+                                        // Trait-declaration pin (fix #296): a
+                                        // concrete non-target receiver can
+                                        // implement the pinned trait — route
+                                        // visible, never exclude.
+                                        const traitVia = collectAccount &&
+                                            _traitDeclPinImplementorRoute(index, fileEntry, receiverSegment, targetDefs);
+                                        if (traitVia) {
+                                            routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
+                                                dispatchVia: `${receiverSegment} — ${traitVia} implementor`,
+                                            });
+                                            continue;
+                                        }
                                         isUncertain = true;
                                         typeMismatch = true;
                                         if (collectAccount) {
@@ -3865,6 +3890,21 @@ function findCallers(index, name, options = {}) {
                                 !(index.symbols.get(pathReceiverSegment) || []).some(d => IDENTITY_TYPE_KINDS.has(d.type))) {
                                 routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs, {
                                     dispatchCandidates: methodOwnerKeys().size,
+                                });
+                                continue;
+                            }
+                            // Trait-declaration pin (fix #296, serde-as_cast-
+                            // measured): `u64::as_cast` / `Limb::as_cast` /
+                            // `Self::Unsigned::as_cast` under the trait's own
+                            // method pin dispatch through the pinned slot —
+                            // macro-generated impls are invisible to the
+                            // index, so the receiver not being a target type
+                            // proves nothing. Route visible, never exclude.
+                            const traitVia2 = _traitDeclPinImplementorRoute(
+                                index, fileEntry, pathReceiverSegment, targetDefs2);
+                            if (traitVia2) {
+                                routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
+                                    dispatchVia: `${pathReceiverSegment} — ${traitVia2} implementor`,
                                 });
                                 continue;
                             }
@@ -9282,6 +9322,50 @@ function _resolveStructuralFlowTypeIdentity(index, originFile, knownType, target
         }
     }
     return sawUnresolved ? 'unknown' : 'other';
+}
+
+/**
+ * Trait-declaration pin gate (fix #296, serde-as_cast-measured): when the
+ * pinned target is a TRAIT's own method declaration, a path call on a
+ * concrete NON-target receiver (`u64::as_cast`, `Limb::as_cast`,
+ * `Self::Unsigned::as_cast`) is not evidence against the edge — any type
+ * (external primitives, macro-generated impls UCN cannot index, aliases)
+ * can implement a project trait, and the call dispatches through the pinned
+ * slot. Returns the trait's name when the gate applies: the caller routes
+ * possible-dispatch "via <Recv> — trait implementor" instead of excluding
+ * path-type-mismatch. Two refusals keep the exclusion sound elsewhere:
+ * impl-member pins (a foreign-type path call binds a DIFFERENT slot member
+ * — static dispatch, exclusion correct), and receivers resolving to a
+ * project type whose only same-name members provably belong to another
+ * surface (inherent members / other traits — Rust resolves inherent first).
+ */
+function _traitDeclPinImplementorRoute(index, fileEntry, receiverSegment, targetDefs) {
+    if (langTraits(fileEntry.language)?.typeQualifiedCallStyle !== 'path') return null;
+    let traitName = null;
+    for (const td of targetDefs || []) {
+        if (!td.className || td.traitName) continue;
+        const classDefs = index.symbols.get(td.className) || [];
+        if (classDefs.some(d => d.type === 'trait' && d.file === td.file)) {
+            traitName = td.className;
+            break;
+        }
+    }
+    if (!traitName) return null;
+    // Receiver resolving to a project type: its indexed same-name members
+    // decide. An inherent member or a different trait's impl owns the call
+    // (keep the exclusion); a member implementing THIS trait — or no indexed
+    // member at all (macro-generated impls are invisible) — routes visible.
+    const recvTypeDefs = (index.symbols.get(receiverSegment) || [])
+        .filter(d => IDENTITY_TYPE_KINDS.has(d.type));
+    if (recvTypeDefs.length > 0) {
+        const targetName = targetDefs[0] && targetDefs[0].name;
+        const members = (index.symbols.get(targetName) || [])
+            .filter(d => d.className === receiverSegment);
+        if (members.length > 0 && members.every(m => m.traitName !== traitName)) {
+            return null;
+        }
+    }
+    return traitName;
 }
 
 /**

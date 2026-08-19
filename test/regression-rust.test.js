@@ -5184,3 +5184,171 @@ describe('fix #286b (Rust): impl blocks never bind the type name', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #296: trait-declaration pins and path-receiver implementors', () => {
+    const traitFixture = {
+        'Cargo.toml': '[package]\nname = "rust_trait"\nversion = "0.1.0"\n',
+        'src/lib.rs': 'pub mod num;\npub mod algo;\n',
+        'src/num.rs': [
+            'pub trait AsCast {',
+            '    fn as_cast(n: u32) -> Self;',
+            '}',
+            '',
+            'macro_rules! as_cast_impl {',
+            '    ($ty:ident) => {',
+            '        impl AsCast for $ty {',
+            '            #[inline]',
+            '            fn as_cast(n: u32) -> Self {',
+            '                n as $ty',
+            '            }',
+            '        }',
+            '    };',
+            '}',
+            '',
+            'as_cast_impl!(u64);',
+            'as_cast_impl!(i64);',
+            '',
+            'impl AsCast for i32 {',
+            '    fn as_cast(n: u32) -> Self {',
+            '        n as i32',
+            '    }',
+            '}',
+            '',
+            'pub type Limb = u64;',
+        ].join('\n') + '\n',
+        'src/algo.rs': [
+            'use crate::num::{AsCast, Limb};',
+            '',
+            'pub fn generic_use<F: AsCast>(x: u32) -> F {',
+            '    F::as_cast(x)',
+            '}',
+            '',
+            'pub fn concrete_use(x: u32) -> u64 {',
+            '    Limb::as_cast(x)',
+            '}',
+        ].join('\n') + '\n',
+    };
+
+    it('concrete path receivers route visible under the trait-declaration pin', () => {
+        const dir = tmp(traitFixture);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'src/num.rs:2:as_cast' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const unv = r.result.unverifiedCallers || [];
+            const concrete = unv.find(u => u.line === 8 && u.relativePath === 'src/algo.rs');
+            assert.ok(concrete, `Limb::as_cast must stay visible: ${JSON.stringify(unv)}`);
+            assert.strictEqual(concrete.reason, 'possible-dispatch');
+            assert.match(String(concrete.dispatchVia || ''), /AsCast implementor/);
+            const generic = unv.find(u => u.line === 4 && u.relativePath === 'src/algo.rs');
+            assert.ok(generic, 'F::as_cast must stay visible (multi-def generic carve-out)');
+            assert.strictEqual(generic.reason, 'method-ambiguous');
+            const excl = r.result.meta.account.excluded.byReason || {};
+            assert.ok(!excl['path-type-mismatch'],
+                `trait pin must not exclude implementor calls: ${JSON.stringify(excl)}`);
+            assert.ok(r.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('an impl-member pin keeps the exclusion (static dispatch to another impl)', () => {
+        const dir = tmp(traitFixture);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'src/num.rs:20:as_cast' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const excl = r.result.meta.account.excluded.byReason || {};
+            assert.ok(excl['path-type-mismatch'],
+                `Limb::as_cast binds u64's impl, never i32's: ${JSON.stringify(excl)}`);
+        } finally { rm(dir); }
+    });
+
+    it('a struct inherent-method pin keeps the exclusion (ripgrep Config family)', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "cfgpin"\nversion = "0.1.0"\n',
+            'src/lib.rs': 'pub mod a;\npub mod b;\n',
+            'src/a.rs': 'pub struct Config;\nimpl Config {\n    pub fn fresh() -> Self {\n        Config\n    }\n}\n',
+            'src/b.rs': 'pub struct Other;\nimpl Other {\n    pub fn fresh() -> Self {\n        Other\n    }\n}\n\npub fn probe() -> Other {\n    Other::fresh()\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'src/a.rs:3:fresh' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            assert.strictEqual((r.result.callers || []).length, 0);
+            const excl = r.result.meta.account.excluded.byReason || {};
+            assert.ok(excl['path-type-mismatch'],
+                `Other::fresh must stay excluded under Config's pin: ${JSON.stringify(excl)}`);
+        } finally { rm(dir); }
+    });
+
+    it('a receiver with an inherent same-name member keeps the exclusion under the trait pin', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "inh"\nversion = "0.1.0"\n',
+            'src/lib.rs': 'pub mod t;\npub mod own;\npub mod u;\n',
+            'src/t.rs': 'pub trait Convert {\n    fn morph(n: u32) -> Self;\n}\n',
+            'src/own.rs': 'pub struct Own;\nimpl Own {\n    pub fn morph(_n: u32) -> Self {\n        Own\n    }\n}\n',
+            'src/u.rs': 'use crate::own::Own;\n\npub fn probe(x: u32) -> Own {\n    Own::morph(x)\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'src/t.rs:2:morph' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const excl = r.result.meta.account.excluded.byReason || {};
+            assert.ok(excl['path-type-mismatch'],
+                `Own's inherent morph owns Own::morph — Rust resolves inherent first: ${JSON.stringify(excl)}`);
+        } finally { rm(dir); }
+    });
+
+    it('plan --rename-to closes the trait slot incl. macro-generated impls', () => {
+        const dir = tmp(traitFixture);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', {
+                name: 'src/num.rs:2:as_cast', renameTo: 'as_cast_v2',
+            });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const changeLines = (r.result.changes || [])
+                .filter(c => c.file === 'src/num.rs').map(c => c.line).sort((a, b) => a - b);
+            assert.deepStrictEqual(changeLines, [2, 9, 20],
+                `trait decl + macro body + explicit impl: ${JSON.stringify(r.result.changes)}`);
+            const macroChange = r.result.changes.find(c => c.line === 9);
+            assert.match(String(macroChange.newExpression || ''), /as_cast_v2/);
+            const unvLines = (r.result.unverifiedSites || []).map(u => u.line).sort((a, b) => a - b);
+            assert.deepStrictEqual(unvLines, [4, 8],
+                'both call sites visible for the contract arm');
+        } finally { rm(dir); }
+    });
+
+    it('a macro not naming the trait is never edited (foreign-macro counter-probe)', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "foreignmac"\nversion = "0.1.0"\n',
+            'src/lib.rs': 'pub mod t;\npub mod m;\n',
+            'src/t.rs': 'pub trait Convert {\n    fn morph(n: u32) -> Self;\n}\n\nimpl Convert for i32 {\n    fn morph(n: u32) -> Self {\n        n as i32\n    }\n}\n',
+            'src/m.rs': [
+                'pub trait OtherTrait {',
+                '    fn morph(n: u32) -> Self;',
+                '}',
+                '',
+                'macro_rules! other_impl {',
+                '    ($ty:ident) => {',
+                '        impl OtherTrait for $ty {',
+                '            fn morph(n: u32) -> Self {',
+                '                n as $ty',
+                '            }',
+                '        }',
+                '    };',
+                '}',
+                '',
+                'other_impl!(u64);',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', {
+                name: 'src/t.rs:2:morph', renameTo: 'morph_v2',
+            });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            assert.ok(!(r.result.changes || []).some(c => c.file === 'src/m.rs' && c.line === 8),
+                `OtherTrait's macro body must not be edited under Convert's pin: ${JSON.stringify(r.result.changes)}`);
+        } finally { rm(dir); }
+    });
+});
