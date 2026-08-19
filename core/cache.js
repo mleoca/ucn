@@ -617,7 +617,7 @@ function clearAllCaches() {
 // object they patch (`console.log = fn` → 'console') — so the builtin-global
 // exclusion can see cross-file that a project def rebinds the global's
 // member (fix #286a); impl-kind symbols leave the bindings table (#286b).
-const CACHE_FORMAT_VERSION = 174;
+const CACHE_FORMAT_VERSION = 175;
 
 /**
  * Save index to cache file

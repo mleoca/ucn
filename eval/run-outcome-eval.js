@@ -362,6 +362,9 @@ function collectRenameProposals(repoPath, contentByFile, task) {
             },
             'ucn-contract': {
                 sites: contract.sites,
+                // External-attributed unverified sites the arm defers
+                // (disclosure — the policy skipped them deliberately).
+                deferredExternalSites: contract.deferredExternal.length,
                 cost: {
                     outputChars: planText.stdout.length + escalationChars,
                     toolCalls: 1 + escalationCalls,
@@ -614,6 +617,8 @@ function runRepo(repo, options) {
                     newErrorCount: newKeys.length,
                     newErrorSamples: newKeys.slice(0, 3),
                     proposedSites: armProposal.sites.length,
+                    ...(armProposal.deferredExternalSites > 0 &&
+                        { deferredExternalSites: armProposal.deferredExternalSites }),
                     sites: armProposal.sites.slice(0, 50).map(policy.siteKey),
                     noEffectEdits: applied.noEffectEdits,
                     judgeMs: result.ms,

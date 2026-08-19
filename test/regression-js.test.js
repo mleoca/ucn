@@ -9860,3 +9860,73 @@ describe('fix #294: for-of external-producer receivers demote single-owner (JS t
         } finally { rm(dir); }
     });
 });
+
+describe('fix #295: method-value references with typed receivers (JS twin)', () => {
+    it('constructor-typed t.check in general argument position confirms', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'src/tag.js': [
+                'class JSONTag {',
+                '    check(value) {',
+                "        throw new Error('NotImplemented');",
+                '    }',
+                '}',
+                'module.exports = { JSONTag };',
+            ].join('\n') + '\n',
+            'src/app.js': [
+                "const { JSONTag } = require('./tag');",
+                '',
+                'function expectRaises(fn, arg) {',
+                '    try { fn(arg); } catch (e) { return e; }',
+                '}',
+                '',
+                'function testCheck() {',
+                '    const t = new JSONTag();',
+                '    return expectRaises(t.check, null);',
+                '}',
+                'module.exports = { testCheck };',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'check', file: 'src/tag.js' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const site = (r.result.callers || []).find(c => c.line === 9);
+            assert.ok(site, `member value must confirm: ${JSON.stringify(r.result.meta.account)}`);
+            assert.strictEqual(site.isFunctionReference, true);
+            assert.ok(r.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('a typed receiver of another class never confirms (mismatch direction)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'src/tag.js': [
+                'class JSONTag {',
+                '    check(value) { return 1; }',
+                '}',
+                'class OtherTag {',
+                '    check(value) { return 2; }',
+                '}',
+                'module.exports = { JSONTag, OtherTag };',
+            ].join('\n') + '\n',
+            'src/app.js': [
+                "const { JSONTag, OtherTag } = require('./tag');",
+                '',
+                'function probe(run) {',
+                '    const o = new OtherTag();',
+                '    run(o.check, 1);',
+                '}',
+                'module.exports = { probe };',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'src/tag.js:2:check' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            assert.ok(!(r.result.callers || []).some(c => c.line === 5),
+                `wrong-class member value must not confirm the JSONTag pin: ${JSON.stringify(r.result.callers)}`);
+            assert.ok(r.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+});

@@ -2795,11 +2795,17 @@ function findCallsInCode(code, parser) {
                                 const propNode = arg.childForFieldName('property');
                                 const objNode = arg.childForFieldName('object');
                                 if (propNode && !SKIP_IDENTS.has(propNode.text)) {
+                                    const hofRecv = objNode?.type === 'identifier' ? objNode.text : undefined;
+                                    // Same typing evidence as the general-arg
+                                    // member-value shape (fix #295) — tier must
+                                    // not depend on argument position (#234).
+                                    const hofRecvType = hofRecv ? localVarTypes.get(hofRecv) : undefined;
                                     calls.push({
                                         name: propNode.text,
                                         line: arg.startPosition.row + 1,
                                         isMethod: true,
-                                        receiver: objNode?.type === 'identifier' ? objNode.text : undefined,
+                                        receiver: hofRecv,
+                                        ...(hofRecvType && { receiverType: hofRecvType }),
                                         isFunctionReference: true,
                                         enclosingFunction
                                     });
@@ -2829,6 +2835,29 @@ function findCallsInCode(code, parser) {
                                 ...(isShadowedByLocal(arg, arg.text) && { localShadow: true }),
                                 enclosingFunction
                             });
+                        }
+                        // Method-value references (fix #295): `expectRaises(t.check, null)`
+                        // passes the method value t.check — one-hop identifier
+                        // receivers, typed from the same localVarTypes evidence
+                        // method calls use. No isPotentialCallback: the record
+                        // rides the MAIN path's full receiver physics (the HOF
+                        // member-value convention above).
+                        if (arg.type === 'member_expression') {
+                            const mvProp = arg.childForFieldName('property');
+                            const mvObj = arg.childForFieldName('object');
+                            if (mvProp && mvObj?.type === 'identifier' &&
+                                !SKIP_IDENTS.has(mvProp.text) && !SKIP_IDENTS.has(mvObj.text)) {
+                                const mvType = localVarTypes.get(mvObj.text);
+                                calls.push({
+                                    name: mvProp.text,
+                                    line: arg.startPosition.row + 1,
+                                    isMethod: true,
+                                    receiver: mvObj.text,
+                                    ...(mvType && { receiverType: mvType }),
+                                    isFunctionReference: true,
+                                    enclosingFunction
+                                });
+                            }
                         }
                         // Scan object literal args for function refs in property values
                         // e.g., doRequest({onSuccess: handleSuccess, onError: handleError})

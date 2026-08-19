@@ -84,6 +84,14 @@ describe('outcome-policy: arm proposal extraction', () => {
         unverifiedSites: [
             { file: 'lib.py', line: 10, reason: 'method-ambiguous' },
             { file: 'app.py', line: 5, reason: 'method-ambiguous' },
+            // External-attributed dispatch (fix #294 flask ep.load family):
+            // the contract arm must DEFER this site, not rename it.
+            { file: 'ext.py', line: 3, reason: 'possible-dispatch',
+                dispatchVia: 'importlib.metadata.entry_points', externalContract: true },
+            // Module-attribute dispatch (flask.json.load family): the name
+            // binds the module's export surface — defer likewise.
+            { file: 'mod.py', line: 8, reason: 'possible-dispatch',
+                dispatchVia: 'flask.json — module attribute', moduleAttribute: true },
         ],
         account: {
             unparsed: { files: ['legacy/old.js'] },
@@ -95,6 +103,7 @@ describe('outcome-policy: arm proposal extraction', () => {
         const result = policy.armSitesFromPlan(planData, 'confirmed');
         assert.strictEqual(result.sites.length, 3);
         assert.deepStrictEqual(result.escalationFiles, []);
+        assert.deepStrictEqual(result.deferredExternal, []);
     });
 
     it('contract mode adds unverified sites (deduped) and escalation files', () => {
@@ -108,6 +117,46 @@ describe('outcome-policy: arm proposal extraction', () => {
         const result = policy.armSitesFromPlan(planData, 'contract');
         assert.deepStrictEqual(result.sites.map(policy.siteKey),
             ['app.py:1', 'app.py:5', 'lib.py:2', 'lib.py:10']);
+    });
+
+    it('contract mode defers external and module-attribute unverified sites', () => {
+        const result = policy.armSitesFromPlan(planData, 'contract');
+        assert.ok(!result.sites.some(site => site.file === 'ext.py'),
+            'external-attributed site must not be a rename site');
+        assert.ok(!result.sites.some(site => site.file === 'mod.py'),
+            'module-attribute site must not be a rename site');
+        assert.deepStrictEqual(result.deferredExternal,
+            [{ file: 'ext.py', line: 3 }, { file: 'mod.py', line: 8 }]);
+    });
+
+    it('slot-attributed possible-dispatch sites keep applying', () => {
+        // Generic-param / supertype dispatch attribution: the site CAN bind
+        // the renamed slot — deferring it would miss a true site (the serde
+        // exponent contract win rides on this).
+        const doc = {
+            changes: [],
+            unverifiedSites: [
+                { file: 'app.rs', line: 9, reason: 'possible-dispatch',
+                    dispatchVia: 'TStore' },
+            ],
+        };
+        const result = policy.armSitesFromPlan(doc, 'contract');
+        assert.deepStrictEqual(result.sites.map(policy.siteKey), ['app.rs:9']);
+        assert.deepStrictEqual(result.deferredExternal, []);
+    });
+
+    it('a deferred external line already confirmed elsewhere stays edited', () => {
+        // Confirmed evidence outranks: the change entry survives even when an
+        // external-attributed unverified entry shares the file:line.
+        const doc = {
+            changes: [{ file: 'x.py', line: 4, editKind: 'call' }],
+            unverifiedSites: [
+                { file: 'x.py', line: 4, reason: 'possible-dispatch', externalContract: true },
+            ],
+        };
+        const result = policy.armSitesFromPlan(doc, 'contract');
+        assert.deepStrictEqual(result.sites.map(policy.siteKey), ['x.py:4']);
+        assert.strictEqual(result.sites[0].kind, 'call');
     });
 });
 

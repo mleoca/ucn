@@ -2152,6 +2152,36 @@ function findCallsInCode(code, parser) {
                             enclosingFunction
                         });
                     }
+                    // Method-value references (fix #295, flask-check-measured):
+                    // `pytest.raises(NIE, t.check, None)` passes the bound
+                    // method t.check — an attribute argument on a one-hop
+                    // identifier receiver is a potential method value, typed
+                    // from the same localVarTypes evidence method calls use.
+                    // No isPotentialCallback: the record rides the MAIN path's
+                    // full receiver physics (the JS HOF member-value
+                    // convention), not the bare-name callback fast path.
+                    // self/cls receivers (same-class values) and module-alias
+                    // receivers (name-level ownership physics) are
+                    // classified-deferred families — not emitted.
+                    if (arg.type === 'attribute') {
+                        const mvObj = arg.childForFieldName('object');
+                        const mvAttr = arg.childForFieldName('attribute');
+                        if (mvObj?.type === 'identifier' && mvAttr &&
+                            !PYTHON_SKIP.has(mvObj.text) &&
+                            !moduleAliases.has(mvObj.text) &&
+                            !PYTHON_SKIP.has(mvAttr.text)) {
+                            const mvType = localVarTypes.get(mvObj.text);
+                            calls.push({
+                                name: mvAttr.text,
+                                line: mvAttr.startPosition.row + 1,
+                                isMethod: true,
+                                receiver: mvObj.text,
+                                ...(mvType && { receiverType: mvType }),
+                                isFunctionReference: true,
+                                enclosingFunction
+                            });
+                        }
+                    }
                     // Scan dict literal args for function refs in values
                     // e.g., do_request({'on_success': handle_success})
                     if (arg.type === 'dictionary') {

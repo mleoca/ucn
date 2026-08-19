@@ -122,6 +122,22 @@ function siteKey(site) {
  *   mode 'contract':  + visible unverified sites, plus escalation files the
  *                     account discloses as never analyzed (unparsed +
  *                     unsupported), which the arm must grep itself.
+ *
+ * Contract-arm non-slot deferral (flask-measured, 2026-08-19): an unverified
+ * site whose name binds a surface OUTSIDE the rename set is a disclosure,
+ * not a rename site — editing it breaks the foreign binding while leaving it
+ * never breaks the build. Two engine labels mark that shape:
+ *   - `externalContract: true` (external-producer flow, override-marker
+ *     contract, universal builtin name): flask `rename load` edited
+ *     `ep.load()` — stdlib EntryPoint.load — and broke pyright;
+ *   - `moduleAttribute: true` (fix #294 module-rooted dotted receivers):
+ *     `flask.json.load(out)` binds the module-level `load` function, not the
+ *     pinned JSONProvider.load — editing it broke pyright the same way.
+ * Ambiguity entries (method-ambiguous, overload-ambiguous) and dispatch-slot
+ * attributions (generic-param / supertype possible-dispatch) keep applying:
+ * those sites CAN bind the renamed slot, and plan's #293 closure renames the
+ * slot's definitions. Deferred sites are returned for disclosure, never
+ * silently dropped.
  */
 function armSitesFromPlan(planData, mode) {
     const sites = [];
@@ -133,8 +149,13 @@ function armSitesFromPlan(planData, mode) {
         sites.push({ file: change.file, line: change.line, kind: change.editKind });
     }
     const escalationFiles = [];
+    const deferredExternal = [];
     if (mode === 'contract') {
         for (const site of planData.unverifiedSites || []) {
+            if (site.externalContract || site.moduleAttribute) {
+                deferredExternal.push({ file: site.file, line: site.line });
+                continue;
+            }
             sites.push({ file: site.file, line: site.line, kind: 'unverified' });
         }
         const account = planData.account || {};
@@ -153,6 +174,8 @@ function armSitesFromPlan(planData, mode) {
         sites: [...unique.values()].sort((a, b) =>
             codeUnitCompare(a.file, b.file) || a.line - b.line),
         escalationFiles: [...new Set(escalationFiles)].sort(codeUnitCompare),
+        deferredExternal: deferredExternal.sort((a, b) =>
+            codeUnitCompare(a.file, b.file) || a.line - b.line),
     };
 }
 

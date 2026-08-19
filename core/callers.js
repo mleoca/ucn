@@ -4300,6 +4300,14 @@ function findCallers(index, name, options = {}) {
                                 const field = call.receiverField ? `.${call.receiverField}` : '';
                                 routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
                                     dispatchVia: `${call.receiverRoot}${field} — module attribute`,
+                                    // Structured marker (outcome-eval-measured,
+                                    // 2026-08-19): the site's name binds the
+                                    // module's export surface, not the pinned
+                                    // def — rename policies defer these like
+                                    // external contracts (renaming the line
+                                    // edits whatever the module exports under
+                                    // the name, which the engine could not pin).
+                                    moduleAttribute: true,
                                 });
                                 continue;
                             }

@@ -734,6 +734,14 @@ function unverifiedSiteShape(u) {
         ...(u.reason && { reason: u.reason }),
         ...(u.dispatchVia && { dispatchVia: u.dispatchVia }),
         ...(u.dispatchCandidates != null && { dispatchCandidates: u.dispatchCandidates }),
+        // External attribution (fixes #210/#220(6)/#265D): the engine already
+        // labels these routes; the JSON site must carry the flag so consumers
+        // can tell "satisfied by a contract outside the project" from
+        // project-attributed dispatch (the text band renders it already).
+        ...(u.externalContract && { externalContract: true }),
+        // Module-attribute attribution (fix #294): the name binds the module's
+        // export surface — a non-slot surface for rename purposes.
+        ...(u.moduleAttribute && { moduleAttribute: true }),
     };
 }
 

@@ -5019,6 +5019,37 @@ describe('fix #294: for-loop external-producer receivers demote single-owner', (
         } finally { rm(dir); }
     });
 
+    it('plan exposes externalContract on the deferred unverified site', () => {
+        // The outcome eval's contract arm defers external-attributed sites;
+        // that policy reads `externalContract` off plan's unverifiedSites —
+        // pin the field end-to-end (unverifiedSiteShape passthrough).
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "pkg"\n',
+            'pkg/__init__.py': '',
+            'pkg/provider.py': 'class Provider:\n    def load(self, fp):\n        return fp.read()\n',
+            'pkg/cli.py': [
+                'import importlib.metadata',
+                '',
+                '',
+                'class Group:',
+                '    def register(self):',
+                '        for ep in importlib.metadata.entry_points(group="x"):',
+                '            self.add(ep.load(), ep.name)',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', {
+                name: 'load', renameTo: 'load_v2', file: 'pkg/provider.py',
+            });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const site = (r.result.unverifiedSites || []).find(u => u.line === 7);
+            assert.ok(site, `ep.load() must sit in the unverified band: ${JSON.stringify(r.result.unverifiedSites)}`);
+            assert.strictEqual(site.externalContract, true);
+            assert.match(String(site.dispatchVia || ''), /entry_points/);
+        } finally { rm(dir); }
+    });
+
     it('a project-internal loop producer keeps single-owner confirmation (counter-probe)', () => {
         const dir = tmp({
             'pyproject.toml': '[project]\nname = "pkg"\n',
@@ -5072,6 +5103,17 @@ describe('fix #294: module-rooted dotted receivers demote single-owner', () => {
             assert.ok(entry, `site must stay visible: ${JSON.stringify(unv)}`);
             assert.strictEqual(entry.reason, 'possible-dispatch');
             assert.match(String(entry.dispatchVia || ''), /module attribute/);
+            assert.strictEqual(entry.moduleAttribute, true,
+                'route must carry the structured moduleAttribute marker');
+            // Plan threads the marker through unverifiedSiteShape — the
+            // outcome eval's contract arm defers on it.
+            const p = execute(index, 'plan', {
+                name: 'load', renameTo: 'load_v2', file: 'pkg/provider.py',
+            });
+            assert.ok(p.ok, JSON.stringify(p.error));
+            const site = (p.result.unverifiedSites || []).find(u => u.line === 5);
+            assert.ok(site, JSON.stringify(p.result.unverifiedSites));
+            assert.strictEqual(site.moduleAttribute, true);
         } finally { rm(dir); }
     });
 
@@ -5131,6 +5173,150 @@ describe('fix #294b: submodule receivers chase from the submodule file', () => {
             const excl = r.result.meta.account.excluded.byReason || {};
             assert.ok(!excl['other-definition-import'],
                 `must not exclude through the from-module: ${JSON.stringify(excl)}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #295: method-value references with typed receivers', () => {
+    const tagFixture = {
+        'pyproject.toml': '[project]\nname = "pkg"\n',
+        'pkg/__init__.py': '',
+        'pkg/tag.py': [
+            'class JSONTag:',
+            '    def check(self, value):',
+            '        raise NotImplementedError',
+        ].join('\n') + '\n',
+        'pkg/test_tag.py': [
+            'import pytest',
+            'from pkg.tag import JSONTag',
+            '',
+            '',
+            'def test_check():',
+            '    t = JSONTag()',
+            '    pytest.raises(NotImplementedError, t.check, None)',
+        ].join('\n') + '\n',
+    };
+
+    it('constructor-typed t.check in argument position confirms (flask check family)', () => {
+        const dir = tmp(tagFixture);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'check', file: 'pkg/tag.py' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const site = (r.result.callers || []).find(c => c.line === 7);
+            assert.ok(site, `method value must confirm: ${JSON.stringify(r.result.meta.account)}`);
+            assert.strictEqual(site.isFunctionReference, true);
+            assert.ok(r.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('plan --rename-to edits the method-value site', () => {
+        const dir = tmp(tagFixture);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', {
+                name: 'check', renameTo: 'check_v2', file: 'pkg/tag.py',
+            });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const change = (r.result.changes || []).find(c =>
+                c.file === 'pkg/test_tag.py' && c.line === 7);
+            assert.ok(change, JSON.stringify(r.result.changes));
+            assert.match(String(change.suggestion || change.newExpression || ''), /t\.check_v2/);
+        } finally { rm(dir); }
+    });
+
+    it('a typed receiver of another class excludes; untyped multi-owner routes visible', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "pkg"\n',
+            'pkg/__init__.py': '',
+            'pkg/tag.py': [
+                'class JSONTag:',
+                '    def check(self, value):',
+                '        raise NotImplementedError',
+                '',
+                '',
+                'class OtherTag:',
+                '    def check(self, value):',
+                '        return True',
+            ].join('\n') + '\n',
+            'pkg/uses.py': [
+                'from pkg.tag import JSONTag, OtherTag',
+                '',
+                '',
+                'def probe_mismatch(run):',
+                '    o = OtherTag()',
+                '    run(o.check, 1)',
+                '',
+                '',
+                'def probe_untyped(x, run):',
+                '    run(x.check, 2)',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'pkg/tag.py:2:check' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            assert.strictEqual((r.result.callers || []).length, 0,
+                `no confirm through wrong/untyped receivers: ${JSON.stringify(r.result.callers)}`);
+            const unv = r.result.unverifiedCallers || [];
+            assert.ok(unv.some(u => u.line === 10 && u.reason === 'method-ambiguous'),
+                `untyped receiver must stay visible: ${JSON.stringify(unv)}`);
+            const excl = r.result.meta.account.excluded.byReason || {};
+            assert.ok(excl['receiver-type-mismatch'],
+                `typed mismatch must exclude: ${JSON.stringify(excl)}`);
+            assert.ok(r.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('an attribute reference never confirms a standalone-function pin', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "pkg"\n',
+            'pkg/__init__.py': '',
+            'pkg/tag.py': 'class JSONTag:\n    def check(self, value):\n        raise NotImplementedError\n',
+            'pkg/other.py': [
+                'def check(value):',
+                '    return bool(value)',
+                '',
+                '',
+                'def probe(run, t):',
+                '    run(t.check, None)',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'pkg/other.py:1:check' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            assert.strictEqual((r.result.callers || []).length, 0,
+                `attribute ref must not bind the bare function: ${JSON.stringify(r.result.callers)}`);
+        } finally { rm(dir); }
+    });
+
+    it('self/cls and module-alias receivers are not emitted (classified-deferred)', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "pkg"\n',
+            'pkg/__init__.py': '',
+            'pkg/tag.py': 'class JSONTag:\n    def check(self, value):\n        raise NotImplementedError\n',
+            'pkg/uses.py': [
+                'import pkg.tag as tagmod',
+                '',
+                '',
+                'class Suite:',
+                '    def helper(self):',
+                '        return None',
+                '',
+                '    def probe(self, run):',
+                '        run(self.helper, 1)',
+                '        run(tagmod.check, 2)',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            // Neither shape may CONFIRM through the new emission; current
+            // behavior (text reference) is preserved.
+            const r = execute(index, 'context', { name: 'check', file: 'pkg/tag.py' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            assert.strictEqual((r.result.callers || []).length, 0,
+                JSON.stringify(r.result.callers));
         } finally { rm(dir); }
     });
 });
