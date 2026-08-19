@@ -490,7 +490,16 @@ function jsAssignedFunctions(sf) {
         const rk = rhs.getKind();
         if (rk !== SyntaxKind.FunctionExpression && rk !== SyntaxKind.ArrowFunction) continue;
         const fnName = rk === SyntaxKind.FunctionExpression ? (rhs.getName ? rhs.getName() : null) : null;
-        const name = fnName || lhs.getNameNode().getText();
+        // Whole-surface CJS default (`module.exports = function () {}`) has
+        // no lexical name — UCN synthesizes 'default' (the #271/#292 shape).
+        // The property name 'exports' is not a name UCN's find can resolve
+        // (dayjs karma.sauce.conf.js broke the command-surface probe); align
+        // with the engine's naming rule so the universes stay pinned.
+        const wholeSurfaceDefault = !fnName &&
+            lhs.getNameNode().getText() === 'exports' &&
+            lhs.getExpression().getKind() === SyntaxKind.Identifier &&
+            lhs.getExpression().getText() === 'module';
+        const name = fnName || (wholeSurfaceDefault ? 'default' : lhs.getNameNode().getText());
         if (!name) continue;
         const anchor = fnName ? rhs : lhs.getNameNode();
         const owner = lhs.getExpression();

@@ -9828,3 +9828,35 @@ describe('v5 module and lexical ownership regressions', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #294: for-of external-producer receivers demote single-owner (JS twin)', () => {
+    it('item.load() over externalMod.entries() routes possible-dispatch', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'provider.js': 'class Provider {\n    load(fp) { return fp; }\n}\nmodule.exports = { Provider };\n',
+            'cli.js': [
+                "const registry = require('some-external-registry');",
+                '',
+                'function registerAll(group) {',
+                '    for (const item of registry.entries(group)) {',
+                '        item.load();',
+                '    }',
+                '}',
+                'module.exports = { registerAll };',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'load', file: 'provider.js' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const confirmed = r.result.callers || [];
+            assert.ok(!confirmed.some(c => c.line === 5),
+                `external loop var must not confirm: ${JSON.stringify(confirmed.map(c => c.line))}`);
+            const unv = r.result.unverifiedCallers || [];
+            const entry = unv.find(u => u.line === 5);
+            assert.ok(entry, `site must stay visible: ${JSON.stringify(unv)}`);
+            assert.strictEqual(entry.reason, 'possible-dispatch');
+            assert.match(String(entry.dispatchVia || ''), /registry\.entries/);
+        } finally { rm(dir); }
+    });
+});

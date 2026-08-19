@@ -4898,3 +4898,239 @@ describe('fix #286f: nested local class is a resolvable callee', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #294: stdlib-shadowing subpackage import must not confirm a self-caller', () => {
+    // flask-measured: `import json as _json` inside src/flask/json/__init__.py
+    // is the STDLIB json (Python 3 absolute imports reach sys.path roots only),
+    // yet `_json.dump(obj, fp)` was a CONFIRMED self-recursive caller of
+    // flask's own `dump` — an import cycle (json/__init__ → wrappers →
+    // json/__init__) laundered same-file membership into import-edge
+    // evidence, and the module-ownership gate skipped same-file pins.
+    const files = {
+        'pyproject.toml': '[project]\nname = "pkg"\n',
+        'src/pkg/__init__.py': 'from . import json as json\n',
+        'src/pkg/json/__init__.py': [
+            'import json as _json',
+            'import typing as t',
+            '',
+            'from .provider import _default',
+            '',
+            'if t.TYPE_CHECKING:',
+            '    from ..wrappers import Response',
+            '',
+            '',
+            'def dump(obj, fp):',
+            '    if obj is None:',
+            '        _json.dump(obj, fp, default=_default)',
+        ].join('\n') + '\n',
+        'src/pkg/json/provider.py': 'class JSONProvider:\n    def dump(self, obj, fp):\n        fp.write(str(obj))\n\n\ndef _default(o):\n    return str(o)\n',
+        'src/pkg/wrappers.py': 'from . import json\n\n\nclass Request:\n    json_module = json\n',
+    };
+
+    it('excludes the aliased stdlib call as external-package (module receiver, same-file pin)', () => {
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'dump', file: 'src/pkg/json/__init__.py' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const confirmed = r.result.callers || [];
+            assert.strictEqual(confirmed.length, 0,
+                `stdlib _json.dump must not confirm: ${JSON.stringify(confirmed.map(c => c.line))}`);
+            const excl = r.result.meta.account.excluded.byReason || {};
+            assert.ok(excl['external-package'],
+                `expected external-package exclusion: ${JSON.stringify(excl)}`);
+            assert.ok(r.result.meta.account.conserved, 'conservation must hold');
+        } finally { rm(dir); }
+    });
+
+    it('an import cycle back into the pin file is not import-edge evidence', () => {
+        // Same fixture minus the module-receiver angle: the wrappers cycle
+        // alone must not upgrade a same-file method call to scope-match.
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const callers = index.findCallers('dump', {
+                targetDefinitions: (index.symbols.get('dump') || []).filter(d =>
+                    d.relativePath === 'src/pkg/json/__init__.py'),
+            });
+            assert.ok(![...callers].some(c => c.line === 12 && c.tier === 'confirmed'),
+                `legacy mode must not confirm the stdlib call: ${JSON.stringify([...callers])}`);
+        } finally { rm(dir); }
+    });
+
+    it('a self-module import still confirms (counter-probe)', () => {
+        const dir = tmp({
+            'pkg/__init__.py': [
+                'import pkg as p',
+                '',
+                '',
+                'def dump(obj):',
+                '    return obj',
+                '',
+                '',
+                'def caller(x):',
+                '    return p.dump(x)',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'dump' });
+            assert.ok(r.ok);
+            const confirmed = r.result.callers || [];
+            assert.ok(confirmed.some(c => c.callerName === 'caller'),
+                `self-module import must confirm: ${JSON.stringify(confirmed)}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #294: for-loop external-producer receivers demote single-owner', () => {
+    it('ep.load() over importlib.metadata.entry_points() routes possible-dispatch', () => {
+        // flask-measured: `for ep in importlib.metadata.entry_points(...)`
+        // yields external EntryPoint objects, yet ep.load() confirmed the
+        // project's only `load` method via single-owner. The loop variable's
+        // provenance is the external producer — demote-only, never excluded.
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "pkg"\n',
+            'pkg/__init__.py': '',
+            'pkg/provider.py': 'class Provider:\n    def load(self, fp):\n        return fp.read()\n',
+            'pkg/cli.py': [
+                'import importlib.metadata',
+                '',
+                '',
+                'class Group:',
+                '    def register(self):',
+                '        for ep in importlib.metadata.entry_points(group="x"):',
+                '            self.add(ep.load(), ep.name)',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'load', file: 'pkg/provider.py' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const confirmed = r.result.callers || [];
+            assert.strictEqual(confirmed.length, 0,
+                `external loop var must not confirm: ${JSON.stringify(confirmed.map(c => c.line))}`);
+            const unv = r.result.unverifiedCallers || [];
+            const entry = unv.find(u => u.line === 7);
+            assert.ok(entry, `site must stay visible: ${JSON.stringify(unv)}`);
+            assert.strictEqual(entry.reason, 'possible-dispatch');
+            assert.match(String(entry.dispatchVia || ''), /entry_points/);
+            assert.ok(r.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('a project-internal loop producer keeps single-owner confirmation (counter-probe)', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "pkg"\n',
+            'pkg/__init__.py': '',
+            'pkg/codec.py': 'class Codec:\n    def decode(self, data):\n        return data\n',
+            'pkg/run.py': [
+                'def get_codecs():',
+                '    return []',
+                '',
+                '',
+                'def run(data):',
+                '    for codec in get_codecs():',
+                '        codec.decode(data)',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'decode', file: 'pkg/codec.py' });
+            assert.ok(r.ok);
+            const confirmed = r.result.callers || [];
+            assert.ok(confirmed.some(c => c.line === 7),
+                `project loop producer keeps #204 single-owner physics: ${JSON.stringify(r.result.meta.account)}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #294: module-rooted dotted receivers demote single-owner', () => {
+    it('pkg.sub.load() with `import pkg` routes possible-dispatch via the module attribute', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "pkg"\n',
+            'pkg/__init__.py': 'from . import provider\n',
+            'pkg/provider.py': 'class Provider:\n    def load(self, fp):\n        return fp.read()\n',
+            'tests/test_app.py': [
+                'import pkg',
+                '',
+                '',
+                'def test_load(out):',
+                '    rv = pkg.provider.load(out)',
+                '    return rv',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'load', file: 'pkg/provider.py' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const confirmed = r.result.callers || [];
+            assert.strictEqual(confirmed.length, 0,
+                `module attribute access must not confirm the method: ${JSON.stringify(confirmed.map(c => c.line))}`);
+            const unv = r.result.unverifiedCallers || [];
+            const entry = unv.find(u => u.line === 5);
+            assert.ok(entry, `site must stay visible: ${JSON.stringify(unv)}`);
+            assert.strictEqual(entry.reason, 'possible-dispatch');
+            assert.match(String(entry.dispatchVia || ''), /module attribute/);
+        } finally { rm(dir); }
+    });
+
+    it('a from-import SYMBOL root keeps normal physics (counter-probe, #224 discipline)', () => {
+        // `from .globals import current_app` binds a value, not a module —
+        // current_app.json.load() keeps single-owner confirmation.
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "pkg"\n',
+            'pkg/__init__.py': '',
+            'pkg/globals.py': 'current_app = None\n',
+            'pkg/provider.py': 'class Provider:\n    def load(self, fp):\n        return fp.read()\n',
+            'pkg/api.py': [
+                'from .globals import current_app',
+                '',
+                '',
+                'def load(fp):',
+                '    return current_app.json.load(fp)',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'load', file: 'pkg/provider.py' });
+            assert.ok(r.ok);
+            const confirmed = r.result.callers || [];
+            assert.ok(confirmed.some(c => c.line === 5),
+                `symbol-rooted attr chain keeps single-owner confirm: ${JSON.stringify(r.result.meta.account)}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #294b: submodule receivers chase from the submodule file', () => {
+    it('`from . import cli; cli.AppGroup()` confirms the submodule class edge', () => {
+        // flask fresh-arm-measured: moduleResolved['.'] (the from-module)
+        // shadowed the composed '.cli' spec, so the ownership chase rooted at
+        // pkg/__init__.py — where the name dead-ends — and excluded a
+        // compiler-true constructor edge other-definition-import.
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "pkg"\n',
+            'pkg/__init__.py': 'from .app import App\n',
+            'pkg/cli.py': 'class AppGroup:\n    def command(self):\n        return 1\n',
+            'pkg/app.py': [
+                'from . import cli',
+                '',
+                '',
+                'class App:',
+                '    def __init__(self):',
+                '        self.cli = cli.AppGroup()',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'AppGroup', file: 'pkg/cli.py' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const confirmed = r.result.callers || [];
+            assert.ok(confirmed.some(c => c.relativePath === 'pkg/app.py' && c.line === 6),
+                `submodule constructor edge must confirm: ${JSON.stringify(r.result.meta.account)}`);
+            const excl = r.result.meta.account.excluded.byReason || {};
+            assert.ok(!excl['other-definition-import'],
+                `must not exclude through the from-module: ${JSON.stringify(excl)}`);
+        } finally { rm(dir); }
+    });
+});

@@ -2854,15 +2854,32 @@ function findCallers(index, name, options = {}) {
                     const recvBindings = recvExportedNamespace
                         ? [] : _structuralModuleBindings(fileEntry, call);
                     const tFiles = targetDefinitionFiles;
-                    if ((recvBindings.length > 0 || recvExportedNamespace) && !tFiles.has(filePath)) {
+                    // Same-file targets get NO bypass (fix #294, flask-measured:
+                    // `import json as _json; _json.dump(...)` in the file
+                    // defining flask's own `dump` confirmed a self-recursive
+                    // caller — the module indirection REPLACES file scope, so
+                    // ownership adjudicates regardless of where the pin sits;
+                    // the Go twin already excludes same-file package-qualified
+                    // targets). A self-module import stays confirmable: a
+                    // binding resolving into a target file reaches immediately.
+                    if (recvBindings.length > 0 || recvExportedNamespace) {
                         let reaches = recvExportedNamespace?.verdict === 'yes';
                         let projectish = !!recvExportedNamespace;
                         let undetermined = recvExportedNamespace?.verdict === 'unknown';
                         let resolvedBindings = recvExportedNamespace ? 1 : 0;
                         let definitiveOtherBindings = recvExportedNamespace?.verdict === 'no' ? 1 : 0;
                         for (const b of recvBindings) {
-                            const rel = (fileEntry.moduleResolved && fileEntry.moduleResolved[b.module]) ||
-                                recvSubmoduleRel;
+                            // A #224-proven submodule receiver chases from the
+                            // SUBMODULE file, never the from-module (fix #294b,
+                            // flask fresh-arm-measured: `from . import cli;
+                            // cli.AppGroup()` chased flask/__init__.py — where
+                            // 'AppGroup' dead-ends — because moduleResolved['.']
+                            // shadowed the composed '.cli' spec, excluding a
+                            // compiler-true constructor edge other-definition-
+                            // import. Python binds the submodule OBJECT; its
+                            // attributes live in the submodule file.
+                            const rel = recvSubmoduleRel ||
+                                (fileEntry.moduleResolved && fileEntry.moduleResolved[b.module]);
                             if (!rel) {
                                 const mod = String(b.module);
                                 const firstSeg = mod.split(/[./]/).filter(Boolean)[0];
@@ -3641,12 +3658,21 @@ function findCallers(index, name, options = {}) {
                 const targetDefs2 = options.targetDefinitions || definitions;
                 const targetFiles2 = new Set(targetDefs2.map(d => d.file).filter(Boolean));
                 const callerImports = index.importGraph.get(filePath);
-                let importEdgeLink = !!(callerImports && setSome(callerImports, imp => targetFiles2.has(imp)));
+                // The caller's OWN file never counts as an import-edge hit
+                // (fix #294): an import cycle (flask json/__init__ →
+                // wrappers → json/__init__) would launder same-file
+                // membership into "import edge" evidence, bypassing the
+                // same-file clause's receiver guard below. Same-file
+                // evidence is governed there, not here.
+                let importEdgeLink = !!(callerImports && setSome(callerImports,
+                    imp => imp !== filePath && targetFiles2.has(imp)));
                 // Check one level of re-exports (barrel files) for import evidence
                 if (!importEdgeLink && callerImports) {
                     for (const imp of callerImports) {
+                        if (imp === filePath) continue;
                         const transImports = index.importGraph.get(imp);
-                        if (transImports && setSome(transImports, ti => targetFiles2.has(ti))) {
+                        if (transImports && setSome(transImports,
+                            ti => ti !== filePath && targetFiles2.has(ti))) {
                             importEdgeLink = true;
                             break;
                         }
@@ -4249,6 +4275,34 @@ function findCallers(index, name, options = {}) {
                                 dispatchVia: call.receiverQualifiedFlow,
                             });
                             continue;
+                        }
+                        // Module-rooted dotted receiver (fix #294, flask-
+                        // measured: `flask.json.load(out)` — receiverRoot
+                        // resolves to a MODULE import binding, so the call
+                        // dispatches through a module attribute the field-hop
+                        // machinery cannot type. Single project-wide ownership
+                        // of the method name is not evidence about a module
+                        // attribute's value: demote-only, visible, attributed
+                        // via the dotted path. A root the hop DID type is
+                        // handled above (knownDispatchType); a from-import
+                        // root counts only when the resolver PROVED it a
+                        // submodule (#224 — a from-import name may be a
+                        // plain symbol, never assume).
+                        if (!typeQualifiedReceiver && !knownDispatchType &&
+                            call.receiverRoot && !call.receiverRootType &&
+                            langTraits(fileEntry.language)?.typeSystem === 'structural') {
+                            const rootBinding = (fileEntry.importBindings || []).find(b =>
+                                b && b.name === call.receiverRoot);
+                            const rootIsModule = !!rootBinding && (
+                                rootBinding.kind === 'import' ||
+                                !!_submoduleReceiverModule(index, fileEntry, call.receiverRoot));
+                            if (rootIsModule) {
+                                const field = call.receiverField ? `.${call.receiverField}` : '';
+                                routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
+                                    dispatchVia: `${call.receiverRoot}${field} — module attribute`,
+                                });
+                                continue;
+                            }
                         }
                         // Unshadowed builtin-global receiver (fix #232):
                         // JSON.parse/console.log resolve on the host object,
@@ -6921,6 +6975,22 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
     };
     for (const call of calls) {
         if (!call.assignedTo) continue;
+        // For-loop iteration provenance (fix #294, flask-measured: `for ep in
+        // importlib.metadata.entry_points(...)` — ep.load() confirmed
+        // JSONProvider.load via single-owner while ep is an external
+        // EntryPoint). The loop variable holds an ELEMENT of the producer's
+        // result — the return annotation types the container, never the
+        // element, so assignedIter records NEVER type positively. External
+        // module-qualified producers stamp external provenance (the
+        // #220(6)/#222(4) demote-only rail: blocks single-owner confirmation,
+        // never excludes). Bare-call and untyped producers add nothing —
+        // sorted()/filter() wrappers routinely yield project values, and
+        // demoting those has no measured evidence.
+        if (call.assignedIter) {
+            const via = _iterExternalProducerVia(index, fileEntry, call);
+            if (via) routeUnknownAssignment(call, via);
+            continue;
+        }
         const delegatedUnwrapAssignment = language === 'rust' &&
             call.receiverCall && calls.some(candidate =>
                 candidate !== call &&
@@ -9578,6 +9648,40 @@ function _goQualifierNamesImport(index, fieldFile, qualifier) {
 // wins so import "k8s.io/client-go/kubernetes/scheme" prefers a def in
 // .../kubernetes/scheme/ over .../kubeadm/scheme/). Extracted for reuse:
 // the parser marks some package calls isMethod:false (fix #268).
+/**
+ * External-producer attribution for a for-loop iterable call (fix #294).
+ * Only module-qualified producers count: the module boundary is the
+ * externality evidence (`importlib.metadata.entry_points(...)`,
+ * `os.walk(...)`). Same externality test as #209/#222 — relative or
+ * project-ish modules are resolver gaps, never externality evidence.
+ * Returns the attribution string or null.
+ */
+function _iterExternalProducerVia(index, fileEntry, call) {
+    if (!fileEntry || langTraits(fileEntry.language)?.typeSystem === 'nominal') return null;
+    const externalModule = (mod) => {
+        if (!mod || mod.startsWith('.')) return false;
+        if (fileEntry.moduleResolved?.[mod]) return false;
+        const firstSeg = mod.split(/[./]/).filter(Boolean)[0];
+        return !(firstSeg && _projectTopLevelNames(index).has(firstSeg));
+    };
+    if (call.isMethod && call.receiverIsModule && call.receiver) {
+        const binding = _structuralModuleBindings(fileEntry, call)[0];
+        if (binding && externalModule(String(binding.module))) {
+            return `${call.receiver}.${call.name}`;
+        }
+        return null;
+    }
+    if (call.receiverRoot && !call.receiverRootType) {
+        const binding = (fileEntry.importBindings || []).find(b =>
+            b && b.name === call.receiverRoot && b.kind === 'import');
+        if (binding && externalModule(String(binding.module))) {
+            const field = call.receiverField ? `.${call.receiverField}` : '';
+            return `${call.receiverRoot}${field}.${call.name}`;
+        }
+    }
+    return null;
+}
+
 function _structuralModuleBindings(fileEntry, call) {
     if (call?.receiverModuleSpecifier) {
         return [{

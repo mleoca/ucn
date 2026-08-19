@@ -1076,6 +1076,35 @@ function assignmentTargetOf(callNode) {
     return undefined;
 }
 
+/**
+ * For-loop iteration target of a call used as the iterable:
+ * `for ep in entry_points(...)` / comprehension `for x in items()`.
+ * The loop variable holds an ELEMENT of the producer's result, never the
+ * return type itself — consumers must only use this for provenance
+ * (external-producer demotion), never positive typing (fix #294).
+ */
+function iterTargetOf(callNode) {
+    let n = callNode;
+    let p = n.parent;
+    if (p && p.type === 'await') { n = p; p = n.parent; }
+    if (!p || (p.type !== 'for_statement' && p.type !== 'for_in_clause')) return undefined;
+    const right = p.childForFieldName('right');
+    if (!right || right.id !== n.id) return undefined;
+    const left = p.childForFieldName('left');
+    if (!left) return undefined;
+    const names = [];
+    if (left.type === 'identifier') {
+        names.push(left.text);
+    } else if (left.type === 'pattern_list' || left.type === 'tuple_pattern') {
+        for (let i = 0; i < left.namedChildCount; i++) {
+            const c = left.namedChild(i);
+            if (c.type === 'identifier') names.push(c.text);
+        }
+    }
+    if (names.length === 0) return undefined;
+    return { first: names[0], rest: names.slice(1) };
+}
+
 function contextTargetOf(callNode) {
     const pattern = callNode?.parent;
     if (pattern?.type !== 'as_pattern' ||
@@ -1830,7 +1859,26 @@ function findCallsInCode(code, parser) {
             const enclosingFunction = getCurrentEnclosingFunction();
             let uncertain = false;
             const assignedContext = contextTargetOf(node);
-            const assignedTo = assignmentTargetOf(node) || assignedContext;
+            let assignedTo = assignmentTargetOf(node) || assignedContext;
+            // For-loop iterable producer (fix #294): the loop variable's
+            // provenance comes from this call. assignedIter marks that the
+            // variable holds an ELEMENT, not the return value — the flow map
+            // uses it for external-producer demotion only, never typing.
+            let assignedIter = false;
+            let assignedIterRest = null;
+            if (!assignedTo) {
+                const iterTarget = iterTargetOf(node);
+                if (iterTarget) {
+                    assignedTo = iterTarget.first;
+                    assignedIterRest = iterTarget.rest;
+                    assignedIter = true;
+                }
+            }
+            const assignedIterFields = {
+                ...(assignedIter && { assignedIter: true }),
+                ...(assignedIter && assignedIterRest && assignedIterRest.length > 0 &&
+                    { assignedTupleRest: assignedIterRest }),
+            };
 
             // Call-site arg count (positional + keyword) for arity pruning.
             // *args/**kwargs splats make the count open-ended — flag them so
@@ -1870,6 +1918,7 @@ function findCallsInCode(code, parser) {
                         ...(recvType && { receiverType: recvType }),
                         ...(recvIsModule && { receiverIsModule: true }),
                         ...(assignedTo && { assignedTo }),
+                        ...assignedIterFields,
                         ...(assignedContext && { assignedContext: true }),
                         argCount,
                         ...(argSpread && { argSpread: true }),
@@ -1886,6 +1935,7 @@ function findCallsInCode(code, parser) {
                         line: node.startPosition.row + 1,
                         isMethod: false,
                         ...(assignedTo && { assignedTo }),
+                        ...assignedIterFields,
                         ...(assignedContext && { assignedContext: true }),
                         argCount,
                         ...(argSpread && { argSpread: true }),
@@ -2067,6 +2117,7 @@ function findCallsInCode(code, parser) {
                             receiverCapabilityGuard: capabilityGuard,
                         }),
                         ...(assignedTo && { assignedTo }),
+                        ...assignedIterFields,
                         ...(assignedContext && { assignedContext: true }),
                         argCount,
                         ...(argSpread && { argSpread: true }),

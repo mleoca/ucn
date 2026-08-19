@@ -1855,6 +1855,34 @@ function jsAssignmentTargetOf(callNode) {
 }
 
 /**
+ * For-of iteration target of a call used as the iterable:
+ * `for (const x of getItems())`. The loop variable holds an ELEMENT of the
+ * producer's result, never the return value — provenance only (fix #294).
+ */
+function jsIterTargetOf(callNode) {
+    let n = callNode;
+    let p = n.parent;
+    if (p && p.type === 'await_expression') { n = p; p = n.parent; }
+    if (!p || p.type !== 'for_in_statement') return undefined;
+    if (p.childForFieldName('operator')?.text !== 'of') return undefined;
+    const right = p.childForFieldName('right');
+    if (!right || right.id !== n.id) return undefined;
+    const left = p.childForFieldName('left');
+    if (!left) return undefined;
+    const names = [];
+    if (left.type === 'identifier') {
+        names.push(left.text);
+    } else if (left.type === 'array_pattern') {
+        for (let i = 0; i < left.namedChildCount; i++) {
+            const c = left.namedChild(i);
+            if (c.type === 'identifier') names.push(c.text);
+        }
+    }
+    if (names.length === 0) return undefined;
+    return { first: names[0], rest: names.slice(1) };
+}
+
+/**
  * Type name from a new-expression constructor node: new Foo() or new pkg.Foo().
  */
 function jsConstructorTypeName(ctorNode) {
@@ -2463,7 +2491,18 @@ function findCallsInCode(code, parser) {
                 const resolvedName = typeof alias === 'string' ? alias : undefined;
                 const resolvedNames = Array.isArray(alias) ? alias : undefined;
                 const firstArg = getFirstStringArg(node);
-                const assignedTo = jsAssignmentTargetOf(node);
+                let assignedTo = jsAssignmentTargetOf(node);
+                let assignedIterFields = {};
+                if (!assignedTo) {
+                    const iterTarget = jsIterTargetOf(node);
+                    if (iterTarget) {
+                        assignedTo = iterTarget.first;
+                        assignedIterFields = {
+                            assignedIter: true,
+                            ...(iterTarget.rest.length > 0 && { assignedTupleRest: iterTarget.rest }),
+                        };
+                    }
+                }
                 // MEDIUM-5: capture explicit method for fetch(url, { method }).
                 const optionsMethod = funcNode.text === 'fetch'
                     ? getOptionsMethod(node, 1)
@@ -2477,6 +2516,7 @@ function findCallsInCode(code, parser) {
                     callEnd: node.endIndex,
                     isMethod: false,
                     ...(assignedTo && { assignedTo }),
+                    ...assignedIterFields,
                     enclosingFunction,
                     uncertain,
                     ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp }),
@@ -2658,7 +2698,19 @@ function findCallsInCode(code, parser) {
                                 !localVarTypes.has(receiver));
                         const firstArg = getFirstStringArg(node);
                         const argCount = getArgCount(node);
-                        const assignedTo = jsAssignmentTargetOf(node);
+                        let assignedTo = jsAssignmentTargetOf(node);
+                        let assignedIterFields = {};
+                        if (!assignedTo) {
+                            const iterTarget = jsIterTargetOf(node);
+                            if (iterTarget) {
+                                assignedTo = iterTarget.first;
+                                assignedIterFields = {
+                                    assignedIter: true,
+                                    ...(iterTarget.rest.length > 0 &&
+                                        { assignedTupleRest: iterTarget.rest }),
+                                };
+                            }
+                        }
                         calls.push({
                             name: propName,
                             // Multi-line chains (builder.x()\n.y()) must report
@@ -2694,6 +2746,7 @@ function findCallsInCode(code, parser) {
                             ...(receiverCallStart != null && { receiverCallStart }),
                             ...(receiverCallEnd != null && { receiverCallEnd }),
                             ...(assignedTo && { assignedTo }),
+                            ...assignedIterFields,
                             enclosingFunction,
                             uncertain,
                             ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp }),
