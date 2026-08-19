@@ -720,7 +720,7 @@ function contractedCallerSweep(index, name, def) {
         return (a.line || 0) - (b.line || 0);
     });
 
-    return { confirmed, unverified, account };
+    return { confirmed, unverified, account, groundSet };
 }
 
 /** Map an unverified sweep entry to the public site shape (relative `file`). */
@@ -755,7 +755,7 @@ function unverifiedSiteShape(u) {
  * @returns {{ sites: Array, unverifiedSites: Array, account: object }}
  */
 function computePlanCallSites(index, name, def) {
-    const { confirmed, unverified, account } = contractedCallerSweep(index, name, def);
+    const { confirmed, unverified, account, groundSet } = contractedCallerSweep(index, name, def);
 
     const sites = [];
     const planLineSeen = new Map(); // 'file:line' -> per-line ordinal (fix #231)
@@ -790,7 +790,7 @@ function computePlanCallSites(index, name, def) {
         if (fc !== 0) return fc;
         return (a.line || 0) - (b.line || 0);
     });
-    return { sites, unverifiedSites: unverified.map(unverifiedSiteShape), account };
+    return { sites, unverifiedSites: unverified.map(unverifiedSiteShape), account, groundSet };
 }
 
 /**
@@ -1664,8 +1664,8 @@ function plan(index, name, options = {}) {
     // run contractedCallerSweep (v4 tiered contract), so plan and verify stay
     // in lock-step by construction. Unverified candidates are NOT planned
     // (they may target another symbol) but stay visible with reasons.
-    const { sites: planCallSites, unverifiedSites: planUnverified, account: planAccount } =
-        computePlanCallSites(index, name, def);
+    const { sites: planCallSites, unverifiedSites: planUnverified, account: planAccount,
+        groundSet: planGroundSet } = computePlanCallSites(index, name, def);
     const impactScopeWarning = computePlanScopeWarning(index, name, def, options);
 
     // Reject ambiguous multi-op invocations rather than silently coalescing.
@@ -2264,8 +2264,10 @@ function plan(index, name, options = {}) {
                 // whose token tree names `impl … <Trait>`, implements the
                 // renamed slot — compiler-connected via the impl header, so
                 // the edit is synthesized mechanically.
-                const { computeGroundSet } = require('./account');
-                const macroGround = computeGroundSet(index, name);
+                // The sweep already computed the ground set for this exact
+                // name (contractedCallerSweep) — reuse it instead of a second
+                // full-repo text scan (read-only by contract).
+                const macroGround = planGroundSet;
                 const fnRe = new RegExp(`\\bfn\\s+${escapeRegExp(name)}\\b`);
                 const implRe = new RegExp(
                     `\\bimpl\\b[^;{}]{0,160}\\b${escapeRegExp(traitName)}\\b`);

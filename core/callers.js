@@ -13492,18 +13492,26 @@ function _rustClosureReceiverType(index, fileEntry, filePath, call, ctx) {
 function _typeOfCallResultFold(index, fileEntry, filePath, record, ctx, consumerAwaited) {
     if (ctx.memo.has(record)) return ctx.memo.get(record);
     // Real builder APIs routinely exceed 64 hops (clap's benchmark command
-    // has ~160). Keep a generous hard safety bound; failed results are not
-    // memoized because a depth-budget failure is contextual — caching it
-    // poisoned shorter suffix queries later in the same operation.
-    if (ctx.visiting.has(record) || ctx.visiting.size > 256) return null;
+    // has ~160). Keep a generous hard safety bound. A cycle/depth refusal is
+    // CONTEXTUAL (it depends on the visiting path), so any null whose subtree
+    // tripped the bound must not be cached — caching it poisoned shorter
+    // suffix queries later in the same operation. A null with NO trip in its
+    // subtree is universal (the producer shape is untypeable regardless of
+    // path) and IS cached: without that, an untypeable chain re-walks its
+    // whole producer prefix per consumer (clap `unwrap`: 76s -> linear).
+    if (ctx.visiting.has(record) || ctx.visiting.size > 256) {
+        ctx.foldTrips = (ctx.foldTrips || 0) + 1;
+        return null;
+    }
     ctx.visiting.add(record);
+    const tripsBefore = ctx.foldTrips || 0;
     let out;
     try {
         out = _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, consumerAwaited);
     } finally {
         ctx.visiting.delete(record);
     }
-    if (out) ctx.memo.set(record, out);
+    if (out || (ctx.foldTrips || 0) === tripsBefore) ctx.memo.set(record, out ?? null);
     return out;
 }
 
