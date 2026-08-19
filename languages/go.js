@@ -920,6 +920,37 @@ function findCallsInCode(code, parser, options = {}) {
         return refNode && isShadowedByLocal(refNode, varName)
             ? undefined : packageTypeQualifiers.get(varName);
     };
+    // Compiler-true receiver type from a composite-literal receiver
+    // expression (fix #298, websocket-measured — the #220(7) typing-sources
+    // family): `(&Kit{...}).Run`, `(&net.Dialer{}).DialContext(...)`,
+    // `Kit{}.Walk(...)`. Unwraps parens and the & — the literal's TYPE is the
+    // receiver's dynamic type. Anonymous types (slice/map/array/struct
+    // literals) return null: they never receive project methods.
+    const literalReceiverInfo = (operandNode) => {
+        let n = operandNode;
+        if (n?.type === 'parenthesized_expression') {
+            n = n.namedChildCount > 0 ? n.namedChild(0) : null;
+        }
+        if (n?.type === 'unary_expression') {
+            n = n.namedChildCount > 0 ? n.namedChild(0) : null;
+        }
+        if (!n || n.type !== 'composite_literal') return null;
+        let typeNode = n.childForFieldName('type');
+        if (typeNode?.type === 'generic_type') {
+            typeNode = typeNode.namedChildCount > 0 ? typeNode.namedChild(0) : null;
+        }
+        if (typeNode?.type === 'qualified_type') {
+            const pkg = typeNode.childForFieldName('package')?.text;
+            const name = typeNode.childForFieldName('name')?.text;
+            return name
+                ? { receiverType: name, ...(pkg && { receiverTypeQualifier: pkg }) }
+                : null;
+        }
+        if (typeNode?.type === 'type_identifier') {
+            return { receiverType: typeNode.text };
+        }
+        return null;
+    };
     // Is the FIRST scope-chain hit for this variable a New*-prefix GUESS
     // (fix #266, viper-measured)? `registry := NewCodecRegistry()` types
     // registry as 'CodecRegistry' by NAME CONVENTION — the actual return
@@ -1130,6 +1161,24 @@ function findCallsInCode(code, parser, options = {}) {
                                     }
                                 }
                             }
+                        } else if (val.type === 'type_assertion_expression') {
+                            // d, ok := dialer.(proxy.ContextDialer) — the
+                            // asserted type IS d's static type (fix #298,
+                            // websocket-measured: `return d.DialContext, nil`
+                            // through the assertion). Compiler-true.
+                            const typeNode = val.childForFieldName('type');
+                            typeName = extractTypeName(typeNode);
+                            typeQualifier = extractTypeQualifier(typeNode);
+                        } else if (val.type === 'identifier') {
+                            // Var-copy: d := cstDialer — Go is statically
+                            // typed, so the copy shares the source variable's
+                            // type (fix #298; guess-ness propagates).
+                            typeName = getReceiverType(val.text, val) || null;
+                            if (typeName) {
+                                typeQualifier =
+                                    getReceiverTypeQualifier(val.text, val) || null;
+                                typeGuessed = isGuessedType(val.text);
+                            }
                         }
                         if (typeName) {
                             typeMap.set(names[vi], typeName);
@@ -1163,9 +1212,29 @@ function findCallsInCode(code, parser, options = {}) {
             if (varTypeMap) {
                 const recordSpec = (spec) => {
                     if (spec.type !== 'var_spec') return;
-                    const typeName = extractTypeName(spec.childForFieldName('type'));
-                    if (!typeName) return;
-                    const qualifier = extractTypeQualifier(spec.childForFieldName('type'));
+                    let typeName = extractTypeName(spec.childForFieldName('type'));
+                    let qualifier = typeName
+                        ? extractTypeQualifier(spec.childForFieldName('type')) : null;
+                    if (!typeName) {
+                        // var cstDialer = Dialer{...} — the initializer's
+                        // composite-literal type IS the variable's type
+                        // (fix #298, websocket-measured: `d := cstDialer`
+                        // copies then call DialContext). Single-value specs
+                        // only; multi-value pairing stays untyped.
+                        const valueNode = spec.childForFieldName('value');
+                        let init = valueNode?.type === 'expression_list' &&
+                            valueNode.namedChildCount === 1
+                            ? valueNode.namedChild(0) : null;
+                        if (init?.type === 'unary_expression') {
+                            init = init.namedChildCount > 0 ? init.namedChild(0) : null;
+                        }
+                        if (init?.type === 'composite_literal') {
+                            const tn = init.childForFieldName('type');
+                            typeName = extractTypeName(tn);
+                            qualifier = extractTypeQualifier(tn);
+                        }
+                        if (!typeName) return;
+                    }
                     for (let j = 0; j < spec.namedChildCount; j++) {
                         const id = spec.namedChild(j);
                         if (id.type === 'identifier') {
@@ -1300,10 +1369,19 @@ function findCallsInCode(code, parser, options = {}) {
                     // Distinguish pkg.Func() (package-qualified) from obj.Method()
                     // If receiver is a known import alias, this is a package call, not a method call
                     const isPkgCall = receiver && importAliases.has(receiver);
-                    const receiverType = (!isPkgCall && receiver)
+                    let receiverType = (!isPkgCall && receiver)
                         ? getReceiverType(receiver, operandNode) : undefined;
-                    const receiverTypeQualifier = receiverType
+                    let receiverTypeQualifier = receiverType
                         ? getReceiverTypeQualifier(receiver, operandNode) : undefined;
+                    // Composite-literal receiver (fix #298):
+                    // (&Kit{...}).Run(...) — compiler-true type, never guessed.
+                    if (!receiver && !receiverType) {
+                        const lit = literalReceiverInfo(operandNode);
+                        if (lit) {
+                            receiverType = lit.receiverType;
+                            receiverTypeQualifier = lit.receiverTypeQualifier;
+                        }
+                    }
                     // fix #202: one-hop declared-field receivers — h.inner.Run().
                     // receiverRoot/Field/RootType let findCallers hop to the
                     // field's declared struct-field type cross-file.
@@ -1457,10 +1535,19 @@ function findCallsInCode(code, parser, options = {}) {
                 const operandNode = node.childForFieldName('operand');
                 if (fieldNode && operandNode) {
                     const receiver = operandNode.type === 'identifier' ? operandNode.text : undefined;
-                    const receiverType = receiver
+                    let receiverType = receiver
                         ? getReceiverType(receiver, operandNode) : undefined;
-                    const receiverTypeQualifier = receiverType
+                    let receiverTypeQualifier = receiverType
                         ? getReceiverTypeQualifier(receiver, operandNode) : undefined;
+                    // Composite-literal receiver (fix #298): the literal's
+                    // type is compiler-true, never guessed.
+                    if (!receiver && !receiverType) {
+                        const lit = literalReceiverInfo(operandNode);
+                        if (lit) {
+                            receiverType = lit.receiverType;
+                            receiverTypeQualifier = lit.receiverTypeQualifier;
+                        }
+                    }
                     const enclosingFunction = getCurrentEnclosingFunction();
                     calls.push({
                         name: fieldNode.text,
@@ -1469,7 +1556,7 @@ function findCallsInCode(code, parser, options = {}) {
                         receiver,
                         ...(receiverType && { receiverType }),
                         ...(receiverTypeQualifier && { receiverTypeQualifier }),
-                        ...(receiverType && isGuessedType(receiver) && { receiverTypeGuessed: true }),
+                        ...(receiverType && receiver && isGuessedType(receiver) && { receiverTypeGuessed: true }),
                         enclosingFunction,
                         isPotentialCallback: true,
                         uncertain: false
@@ -1517,10 +1604,18 @@ function findCallsInCode(code, parser, options = {}) {
                         const operandNode = rhs.childForFieldName('operand');
                         if (fieldNode && operandNode) {
                             const receiver = operandNode.type === 'identifier' ? operandNode.text : undefined;
-                            const receiverType = receiver
+                            let receiverType = receiver
                                 ? getReceiverType(receiver, operandNode) : undefined;
-                            const receiverTypeQualifier = receiverType
+                            let receiverTypeQualifier = receiverType
                                 ? getReceiverTypeQualifier(receiver, operandNode) : undefined;
+                            // Composite-literal receiver (fix #298).
+                            if (!receiver && !receiverType) {
+                                const lit = literalReceiverInfo(operandNode);
+                                if (lit) {
+                                    receiverType = lit.receiverType;
+                                    receiverTypeQualifier = lit.receiverTypeQualifier;
+                                }
+                            }
                             const enclosingFunction = getCurrentEnclosingFunction();
                             calls.push({
                                 name: fieldNode.text,
@@ -1529,7 +1624,7 @@ function findCallsInCode(code, parser, options = {}) {
                                 receiver,
                                 ...(receiverType && { receiverType }),
                                 ...(receiverTypeQualifier && { receiverTypeQualifier }),
-                                ...(receiverType && isGuessedType(receiver) && { receiverTypeGuessed: true }),
+                                ...(receiverType && receiver && isGuessedType(receiver) && { receiverTypeGuessed: true }),
                                 enclosingFunction,
                                 isPotentialCallback: true,
                                 uncertain: false
@@ -1554,6 +1649,50 @@ function findCallsInCode(code, parser, options = {}) {
                         }
                     }
                 }
+            }
+        }
+
+        // Method values in RETURN position (fix #298, websocket-measured):
+        // `return (&httpProxyDialer{...}).DialContext, nil` is the
+        // compile-breaking reference a rename sweep must see — it was
+        // invisible (no record at all). Selector values only; plain
+        // identifier returns (`return err`) stay unemitted — every returned
+        // variable would join the calls cache (classified-deferred).
+        if (node.type === 'return_statement') {
+            const exprList = node.namedChildCount > 0 ? node.namedChild(0) : null;
+            const values = exprList?.type === 'expression_list'
+                ? exprList.namedChildren
+                : (exprList ? [exprList] : []);
+            for (const val of values) {
+                if (val.type !== 'selector_expression') continue;
+                const fieldNode = val.childForFieldName('field');
+                const operandNode = val.childForFieldName('operand');
+                if (!fieldNode || !operandNode) continue;
+                const receiver = operandNode.type === 'identifier' ? operandNode.text : undefined;
+                let receiverType = receiver
+                    ? getReceiverType(receiver, operandNode) : undefined;
+                let receiverTypeQualifier = receiverType
+                    ? getReceiverTypeQualifier(receiver, operandNode) : undefined;
+                if (!receiver && !receiverType) {
+                    const lit = literalReceiverInfo(operandNode);
+                    if (lit) {
+                        receiverType = lit.receiverType;
+                        receiverTypeQualifier = lit.receiverTypeQualifier;
+                    }
+                }
+                calls.push({
+                    name: fieldNode.text,
+                    // #223 name-node convention: the field's own line.
+                    line: fieldNode.startPosition.row + 1,
+                    isMethod: true,
+                    receiver,
+                    ...(receiverType && { receiverType }),
+                    ...(receiverTypeQualifier && { receiverTypeQualifier }),
+                    ...(receiverType && receiver && isGuessedType(receiver) && { receiverTypeGuessed: true }),
+                    enclosingFunction: getCurrentEnclosingFunction(),
+                    isPotentialCallback: true,
+                    uncertain: false
+                });
             }
         }
 
@@ -1616,10 +1755,18 @@ function findCallsInCode(code, parser, options = {}) {
                     const operandNode = valueNode.childForFieldName('operand');
                     if (fieldNode && operandNode) {
                         const receiver = operandNode.type === 'identifier' ? operandNode.text : undefined;
-                        const receiverType = receiver
+                        let receiverType = receiver
                             ? getReceiverType(receiver, operandNode) : undefined;
-                        const receiverTypeQualifier = receiverType
+                        let receiverTypeQualifier = receiverType
                             ? getReceiverTypeQualifier(receiver, operandNode) : undefined;
+                        // Composite-literal receiver (fix #298).
+                        if (!receiver && !receiverType) {
+                            const lit = literalReceiverInfo(operandNode);
+                            if (lit) {
+                                receiverType = lit.receiverType;
+                                receiverTypeQualifier = lit.receiverTypeQualifier;
+                            }
+                        }
                         const enclosingFunction = getCurrentEnclosingFunction();
                         calls.push({
                             name: fieldNode.text,
@@ -1628,7 +1775,7 @@ function findCallsInCode(code, parser, options = {}) {
                             receiver,
                             ...(receiverType && { receiverType }),
                             ...(receiverTypeQualifier && { receiverTypeQualifier }),
-                            ...(receiverType && isGuessedType(receiver) && { receiverTypeGuessed: true }),
+                            ...(receiverType && receiver && isGuessedType(receiver) && { receiverTypeGuessed: true }),
                             enclosingFunction,
                             isPotentialCallback: true,
                             uncertain: false,

@@ -1412,7 +1412,50 @@ function findCallers(index, name, options = {}) {
                             if (td.className) targetTypes.add(td.className);
                             if (td.receiver) targetTypes.add(td.receiver.replace(/^\*/, ''));
                         }
-                        if (targetTypes.size > 0 && call.receiver && call.receiverType &&
+                        // Qualified receiver types resolve their package FIRST
+                        // (fix #298 — the #273 gate's callback twin):
+                        // `netDial = (&net.Dialer{}).DialContext` is net's
+                        // Dialer; the bare name must never match a project
+                        // `Dialer` pin, and the external contract must carry
+                        // its label so consumers can defer the site.
+                        if (fileEntry.language === 'go' &&
+                            call.receiverType && call.receiverTypeQualifier) {
+                            const cbQualified = _goQualifiedReceiverType(
+                                index, fileEntry, call.receiverTypeQualifier,
+                                call.receiverType);
+                            if (cbQualified) {
+                                const cbIsContract = cbQualified.kind === 'project' &&
+                                    cbQualified.defs.some(d =>
+                                        d.type === 'interface' || d.type === 'trait');
+                                if (cbQualified.kind !== 'project' || cbIsContract) {
+                                    if (collectAccount) {
+                                        const cbPlatformConcrete = cbQualified.kind !== 'project' &&
+                                            getLanguageAdapter('go')?.isPlatformConcreteType?.(
+                                                call.receiverTypeQualifier, call.receiverType);
+                                        if (cbPlatformConcrete) {
+                                            recordExcluded(filePath, call.line, 'external-package');
+                                        } else {
+                                            routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
+                                                dispatchVia: cbQualified.via,
+                                                dispatchCandidates: countDispatchCandidates(call.receiverType),
+                                                ...(cbQualified.kind !== 'project' && { externalContract: true }),
+                                            });
+                                        }
+                                    }
+                                    continue;
+                                }
+                            } else {
+                                // Unresolvable qualifier — the bare type name
+                                // must not match a project pin (#206c). Visible,
+                                // never validated, never excluded.
+                                if (collectAccount) {
+                                    routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs,
+                                        { dispatchCandidates: countDispatchCandidates(call.receiverType) });
+                                }
+                                continue;
+                            }
+                        }
+                        if (targetTypes.size > 0 && call.receiverType &&
                             !targetTypes.has(call.receiverType)) {
                             // Raw-set mismatch — check the CLOSED set (aliases +
                             // non-overriding subtypes incl. Go embedding) before

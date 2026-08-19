@@ -6639,3 +6639,156 @@ func use() string {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #298: composite-literal receivers + Go value-position method references (websocket-measured)', () => {
+    const FIX298_FILES = {
+        'go.mod': 'module probe298\ngo 1.21\n',
+        'kit.go': `package main
+
+import (
+	"context"
+	"net"
+)
+
+type Kit struct{ n int }
+
+func (k *Kit) Run(x string) error { return nil }
+
+type Other struct{}
+
+func (o *Other) Run(x string) error { return nil }
+
+type fnT func(x string) error
+
+func provide() (fnT, error) {
+	return (&Kit{n: 1}).Run, nil
+}
+
+func direct() error {
+	return (&Kit{n: 2}).Run("a")
+}
+
+func external(ctx context.Context) {
+	c, _ := (&net.Dialer{}).DialContext(ctx, "tcp", "x")
+	_ = c
+}
+
+type pDialer struct{}
+
+func (p *pDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	return nil, nil
+}
+`,
+        'typing.go': `package main
+
+import "context"
+
+type Sink interface {
+	DialContext(ctx context.Context, network, addr string) error
+}
+
+var pkgKit = Kit{n: 9}
+
+func viaAssertion(v interface{}) (func(string) error, error) {
+	if d, ok := v.(Sink); ok {
+		_ = d
+	}
+	return nil, nil
+}
+
+func viaCopy() error {
+	d := pkgKit
+	return d.Run("z")
+}
+`,
+    };
+    const fix298Line = (file, needle) =>
+        FIX298_FILES[file].split('\n').findIndex(l => l.includes(needle)) + 1;
+
+    it('confirms literal-receiver calls and method values under the owning pin', () => {
+        const dir = tmp(FIX298_FILES);
+        try {
+            const index = idx(dir);
+            const { findCallers } = require('../core/callers');
+            const def = (index.symbols.get('Run') || []).find(d => (d.receiver || '').includes('Kit'));
+            const res = findCallers(index, 'Run', {
+                targetDefinitions: [def], includeTests: true, collectAccount: true });
+            const sites = res.map(c => `${path.basename(c.file)}:${c.line}`);
+            const valueLine = fix298Line('kit.go', 'return (&Kit{n: 1}).Run, nil');
+            const callLine = fix298Line('kit.go', 'return (&Kit{n: 2}).Run("a")');
+            assert.ok(sites.includes(`kit.go:${valueLine}`),
+                `return-position method value must confirm: ${JSON.stringify(sites)}`);
+            assert.ok(sites.includes(`kit.go:${callLine}`),
+                `literal-receiver call must confirm: ${JSON.stringify(sites)}`);
+        } finally { rm(dir); }
+    });
+
+    it('excludes literal-receiver sites under a different owner pin (compiler-true, never guessed)', () => {
+        const dir = tmp(FIX298_FILES);
+        try {
+            const index = idx(dir);
+            const { findCallers } = require('../core/callers');
+            const def = (index.symbols.get('Run') || []).find(d => (d.receiver || '').includes('Other'));
+            const res = findCallers(index, 'Run', {
+                targetDefinitions: [def], includeTests: true, collectAccount: true });
+            assert.strictEqual(res.length, 0, 'no confirmed callers for Other.Run');
+            const excluded = (res.accountRaw?.excludedEntries || []).filter(e => e.reason === 'receiver-type-mismatch');
+            const valueLine = fix298Line('kit.go', 'return (&Kit{n: 1}).Run, nil');
+            const callLine = fix298Line('kit.go', 'return (&Kit{n: 2}).Run("a")');
+            assert.ok(excluded.some(e => e.line === valueLine) && excluded.some(e => e.line === callLine),
+                `Kit-literal sites must be excluded with reason: ${JSON.stringify(res.accountRaw?.excludedEntries)}`);
+        } finally { rm(dir); }
+    });
+
+    it('labels external qualified-literal receivers externalContract and never bare-name matches a project pin', () => {
+        const dir = tmp(FIX298_FILES);
+        try {
+            const index = idx(dir);
+            const { findCallers } = require('../core/callers');
+            const def = (index.symbols.get('DialContext') || []).find(d => (d.receiver || '').includes('pDialer'));
+            const res = findCallers(index, 'DialContext', {
+                targetDefinitions: [def], includeTests: true, collectAccount: true });
+            assert.strictEqual(res.length, 0, 'the net.Dialer site must never confirm a project pin');
+            const extLine = fix298Line('kit.go', '(&net.Dialer{}).DialContext(ctx');
+            const ext = (res.unverifiedEntries || []).find(u => u.line === extLine);
+            assert.strictEqual(ext?.reason, 'possible-dispatch');
+            assert.strictEqual(ext?.externalContract, true,
+                `external literal receiver carries the deferral label: ${JSON.stringify(res.unverifiedEntries)}`);
+        } finally { rm(dir); }
+    });
+
+    it('types receivers from type assertions, var copies, and untyped var initializers', () => {
+        const dir = tmp(FIX298_FILES);
+        try {
+            const index = idx(dir);
+            const entry = index.callsCache.get(path.join(dir, 'typing.go'));
+            const copyLine = fix298Line('typing.go', 'return d.Run("z")');
+            const runCall = entry.calls.find(c => c.name === 'Run' && c.line === copyLine);
+            assert.strictEqual(runCall?.receiverType, 'Kit',
+                `var-copy of an initializer-typed package var types the receiver: ${JSON.stringify(runCall)}`);
+            const { findCallers } = require('../core/callers');
+            const def = (index.symbols.get('Run') || []).find(d => (d.receiver || '').includes('Kit'));
+            const res = findCallers(index, 'Run', {
+                targetDefinitions: [def], includeTests: true, collectAccount: true });
+            assert.ok(res.some(c => c.line === copyLine && String(c.file).endsWith('typing.go')),
+                'the var-copy call confirms under Kit.Run');
+        } finally { rm(dir); }
+    });
+
+    it('plan --rename-to edits the return-position method value site', () => {
+        const dir = tmp(FIX298_FILES);
+        try {
+            const index = idx(dir);
+            const defLine = fix298Line('kit.go', 'func (k *Kit) Run(');
+            const result = execute(index, 'plan', {
+                name: `kit.go:${defLine}:Run`, renameTo: 'RunV2' });
+            assert.ok(result.ok, JSON.stringify(result.error));
+            const changes = result.result.changes || [];
+            const valueEdit = changes.find(c =>
+                c.line === fix298Line('kit.go', 'return (&Kit{n: 1}).Run, nil'));
+            assert.ok(valueEdit, `plan must edit the method-value line: ${JSON.stringify(changes.map(c => c.file + ':' + c.line))}`);
+            assert.ok(String(valueEdit.newExpression || valueEdit.suggestion).includes('RunV2'),
+                JSON.stringify(valueEdit));
+        } finally { rm(dir); }
+    });
+});
