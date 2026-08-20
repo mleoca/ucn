@@ -34,6 +34,27 @@ describe('outcome-policy: identifier rename mechanics', () => {
     });
 });
 
+describe('outcome-policy: definition-line rename', () => {
+    it('renames only the first occurrence — params/types sharing the name survive', () => {
+        assert.strictEqual(
+            policy.renameFirstOnLine(
+                '  public JsonWriter value(long value) throws IOException {',
+                'value', 'value_ucnq'),
+            '  public JsonWriter value_ucnq(long value) throws IOException {');
+        assert.strictEqual(
+            policy.renameFirstOnLine(
+                'func (r *Route) BuildVarsFunc(f BuildVarsFunc) *Route {',
+                'BuildVarsFunc', 'BVF2'),
+            'func (r *Route) BVF2(f BuildVarsFunc) *Route {');
+    });
+
+    it('word-boundary only, and a no-match line is returned unchanged', () => {
+        assert.strictEqual(
+            policy.renameFirstOnLine('let valuex = value2;', 'value', 'v2'),
+            'let valuex = value2;');
+    });
+});
+
 describe('outcome-policy: import stripping', () => {
     it('strips one name from a Python import list', () => {
         assert.strictEqual(
@@ -258,6 +279,18 @@ describe('outcome-policy: judge parsing and error diffing', () => {
         assert.strictEqual(keys.length, 1);
         assert.deepStrictEqual(
             policy.diffErrorKeys(policy.parseCargoErrors(text.split('\n')[0]), keys), []);
+    });
+
+    it('parses javac errors, relative keys, footer ignored, echoes deduped', () => {
+        const text = [
+            'gson/src/main/java/com/google/gson/JsonArray.java:106: error: method add(Number) is already defined',
+            'gson/src/main/java/com/google/gson/JsonArray.java:106: error: method add(Number) is already defined',
+            'gson/src/main/java/com/google/gson/Gson.java:50: warning: [deprecation] x',
+            '2 errors',
+        ].join('\n');
+        const keys = policy.parseJavacErrors(text);
+        assert.strictEqual(keys.length, 1);
+        assert.ok(keys[0].startsWith('gson/src/main/java/com/google/gson/JsonArray.java|'));
     });
 
     it('parses pyright JSON errors only', () => {

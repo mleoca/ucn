@@ -55,6 +55,9 @@
  *   node eval/run-outcome-eval.js --seed 7
  *   node eval/run-outcome-eval.js --tuned               # pinned OUTCOME_TUNED set
  *   node eval/run-outcome-eval.js --gate                # tuned set + hard thresholds (exit 1)
+ *   node eval/run-outcome-eval.js --oracle-targets      # LSP-enumerated candidate universe
+ *   node eval/run-outcome-eval.js --seeds 42,7,101      # one board per seed
+ *   node eval/run-outcome-eval.js --repo gson --targets gson/src/.../JsonArray.java:106:add
  */
 
 'use strict';
@@ -89,6 +92,7 @@ const LANG_EXTENSIONS = {
     go: ['.go'],
     python: ['.py'],
     rust: ['.rs'],
+    java: ['.java'],
     typescript: ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'],
     javascript: ['.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx'],
 };
@@ -222,9 +226,101 @@ function makeJudge(repo, repoPath) {
                     return { keys: policy.parsePyrightErrors(doc, fs.realpathSync(repoPath)), ms: out.ms };
                 },
             };
+        case 'java': {
+            const javac = resolveJavac();
+            const outDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'ucn-javac-'));
+            return {
+                // Main source set only: test sources need external deps
+                // (junit etc.) a bare javac cannot resolve, so breakage in
+                // test files is INVISIBLE to this judge (disclosed). Missing
+                // third-party imports in main sources produce stable errors
+                // the baseline diff removes.
+                label: 'javac (main source set — test sources not judged)',
+                run() {
+                    const sources = collectJavaSources(repoPath);
+                    if (sources.length === 0) throw new Error('no java sources found');
+                    const argFile = path.join(outDir, 'sources.txt');
+                    // Repo-relative paths (cwd is repoPath): javac echoes
+                    // them verbatim, so error keys come out relative.
+                    fs.writeFileSync(argFile, sources.map(source =>
+                        `"${path.relative(repoPath, source).replace(/\\/g, '/')}"`).join('\n'));
+                    const out = spawnJudge(javac, ['-d', path.join(outDir, 'classes'),
+                        '-proc:none', '-nowarn', '-Xmaxerrs', '10000',
+                        `@${argFile}`], repoPath);
+                    return {
+                        keys: policy.parseJavacErrors(`${out.stdout}\n${out.stderr}`),
+                        ms: out.ms,
+                    };
+                },
+            };
+        }
         default:
             return null;
     }
+}
+
+/** JDK 17+ javac, mirroring the jdtls oracle's resolution chain:
+ *  $UCN_EVAL_JAVA (path to java — sibling javac), $JAVA_HOME, PATH, then
+ *  Homebrew's keg-only openjdk. macOS ships a /usr/bin/javac STUB that
+ *  errors "Unable to locate a Java Runtime" — the -version probe filters it. */
+function resolveJavac() {
+    const candidates = [
+        process.env.UCN_EVAL_JAVA &&
+            path.join(path.dirname(process.env.UCN_EVAL_JAVA), 'javac'),
+        process.env.JAVA_HOME && path.join(process.env.JAVA_HOME, 'bin', 'javac'),
+        'javac',
+        '/opt/homebrew/opt/openjdk/bin/javac',
+        '/usr/local/opt/openjdk/bin/javac',
+    ].filter(Boolean);
+    for (const candidate of candidates) {
+        const probe = spawnSync(candidate, ['-version'], { encoding: 'utf8', timeout: 30000 });
+        if (probe.status === 0 && !probe.error) return candidate;
+    }
+    throw new Error('javac (JDK 17+) not found — set UCN_EVAL_JAVA or JAVA_HOME');
+}
+
+/** Main-source-set .java files (Maven `src/main/java` trees when present,
+ *  else every non-test .java). Listed fresh per judge run — deletions and
+ *  renames change the set. */
+function collectJavaSources(repoPath) {
+    const sources = [];
+    const mainRoots = [];
+    const stack = [repoPath];
+    while (stack.length > 0) {
+        const current = stack.pop();
+        for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+            if (entry.name.startsWith('.') || SKIP_DIRS.has(entry.name)) continue;
+            const absolute = path.join(current, entry.name);
+            if (!entry.isDirectory()) continue;
+            if (entry.name === 'src' &&
+                fs.existsSync(path.join(absolute, 'main', 'java'))) {
+                mainRoots.push(path.join(absolute, 'main', 'java'));
+            } else {
+                stack.push(absolute);
+            }
+        }
+    }
+    const collect = (root, filter) => {
+        const dirs = [root];
+        while (dirs.length > 0) {
+            const current = dirs.pop();
+            for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+                if (entry.name.startsWith('.') || SKIP_DIRS.has(entry.name)) continue;
+                const absolute = path.join(current, entry.name);
+                if (entry.isDirectory()) { dirs.push(absolute); continue; }
+                if (!entry.name.endsWith('.java')) continue;
+                if (filter && !filter(absolute)) continue;
+                sources.push(absolute);
+            }
+        }
+    };
+    if (mainRoots.length > 0) {
+        for (const root of mainRoots.sort(codeUnitCompare)) collect(root);
+    } else {
+        collect(repoPath, absolute =>
+            !isTestPath(path.relative(repoPath, absolute).replace(/\\/g, '/')));
+    }
+    return sources.sort(codeUnitCompare);
 }
 
 function restoreRepo(repoPath) {
@@ -284,6 +380,104 @@ function candidateDefs(index, repo, contentByFile) {
         a.startLine - b.startLine || codeUnitCompare(a.name, b.name));
 }
 
+// ── Oracle-enumerated targets (kills sampling self-selection) ───────────────
+//
+// Default sampling draws candidates from index.symbols, so a definition UCN
+// fails to index can never become a task — the eval can't see its own
+// blind spots. --oracle-targets enumerates the candidate universe from the
+// language server's symbol list instead (the same oracles the caller eval
+// trusts), matches each oracle def back to the index, and keeps the
+// unmatched ones as rename-only tasks where the UCN arms take a measured
+// penalty (empty proposals) instead of the task silently disappearing.
+// Used for HOLDOUT measurement runs; the pinned --gate keeps index-based
+// sampling (deterministic, no LSP dependence on the gating path).
+
+const ORACLE_BY_LANGUAGE = {
+    go: () => require('./oracles/gopls-oracle').goplsOracle,
+    python: () => require('./oracles/pyright-oracle').pyrightOracle,
+    rust: () => require('./oracles/rust-analyzer-oracle').rustAnalyzerOracle,
+};
+
+async function oracleCandidateDefs(repo, repoPath, index, contentByFile, log) {
+    const loadOracle = ORACLE_BY_LANGUAGE[repo.language];
+    if (!loadOracle) {
+        throw new Error(`--oracle-targets: no symbol oracle for ${repo.language}`);
+    }
+    const oracle = loadOracle();
+    let handle = null;
+    try {
+        handle = await oracle.prepare(repoPath);
+        const symbols = await oracle.listSymbols(handle,
+            { kinds: ['function', 'method'] });
+        log(`oracle ${oracle.name} lists ${symbols.length} function/method symbols`);
+
+        // Index defs by name+file for containment matching (oracle lines
+        // follow UCN's start-line conventions per the oracle invariants;
+        // containment absorbs decorator/attribute line deltas).
+        const indexed = candidateDefs(index, repo, contentByFile);
+        const byNameFile = new Map();
+        for (const candidate of indexed) {
+            const key = `${candidate.name}\0${candidate.relativePath}`;
+            if (!byNameFile.has(key)) byNameFile.set(key, []);
+            byNameFile.get(key).push(candidate);
+        }
+
+        const matched = [];
+        const missing = [];
+        const seen = new Set();
+        for (const symbol of symbols) {
+            if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(symbol.name)) continue;
+            if (symbol.name.length < 3 || /^__.*__$/.test(symbol.name)) continue;
+            if (isTestPath(symbol.file)) continue;
+            const dedupeKey = `${symbol.name}\0${symbol.file}\0${symbol.line}`;
+            if (seen.has(dedupeKey)) continue;
+            seen.add(dedupeKey);
+            const candidates = byNameFile.get(`${symbol.name}\0${symbol.file}`) || [];
+            const hit = candidates.find(candidate =>
+                symbol.line >= candidate.startLine && symbol.line <= candidate.endLine);
+            if (hit) {
+                if (!hit.oracleEnumerated) {
+                    hit.oracleEnumerated = true;
+                    matched.push(hit);
+                }
+                continue;
+            }
+            // Not in UCN's index — a rename-only task IF the name occurs on
+            // the oracle's definition line (the harness needs a def line to
+            // rename). No range → no delete task.
+            const content = contentByFile.get(symbol.file);
+            const lineText = content ? (content.split('\n')[symbol.line - 1] || '') : '';
+            const pattern = policy.identifierRegex(symbol.name);
+            pattern.lastIndex = 0;
+            if (!pattern.test(lineText)) continue;
+            missing.push({
+                name: symbol.name,
+                relativePath: symbol.file,
+                startLine: symbol.line,
+                endLine: symbol.line,
+                nameLine: symbol.line,
+                type: symbol.kind,
+                className: null,
+                sameNameDefs: (index.symbols.get(symbol.name) || []).length,
+                indexMissing: true,
+            });
+        }
+        missing.sort((a, b) => codeUnitCompare(a.relativePath, b.relativePath) ||
+            a.startLine - b.startLine || codeUnitCompare(a.name, b.name));
+        return {
+            oracleName: oracle.name,
+            oracleSymbols: seen.size,
+            matched,
+            missing,
+            all: [...matched, ...missing].sort((a, b) =>
+                codeUnitCompare(a.relativePath, b.relativePath) ||
+                a.startLine - b.startLine || codeUnitCompare(a.name, b.name)),
+        };
+    } finally {
+        if (handle && oracle.dispose) await oracle.dispose(handle);
+    }
+}
+
 function sampleWithout(candidates, count, rand) {
     const pool = [...candidates];
     const picked = [];
@@ -318,6 +512,37 @@ function collectRenameProposals(repoPath, contentByFile, task) {
     const newName = task.name + RENAME_SUFFIX;
     const planJson = cliJson(repoPath,
         ['plan', handle, `--rename-to=${newName}`]);
+    if (!planJson.ok && task.indexMissing) {
+        // Oracle-enumerated def UCN never indexed: the UCN arms cannot plan
+        // it. That is a measured outcome (empty proposals — the def rename
+        // alone ships, and existing references break), never a dropped task.
+        const grepStarted = nowMs();
+        const grep = policy.grepProposal(contentByFile, task.name);
+        const grepMs = Number((nowMs() - grepStarted).toFixed(1));
+        const failedCost = {
+            outputChars: (planJson.error || '').length,
+            toolCalls: 1,
+            wallMs: planJson.ms || 0,
+        };
+        return {
+            newName,
+            handle,
+            planFailedIndexMissing: true,
+            arms: {
+                grep: {
+                    sites: grep.sites,
+                    cost: {
+                        outputChars: grep.outputChars,
+                        scannedBytes: grep.scannedBytes,
+                        toolCalls: 1,
+                        wallMs: grepMs,
+                    },
+                },
+                'ucn-confirmed': { sites: [], planFailed: true, cost: failedCost },
+                'ucn-contract': { sites: [], planFailed: true, cost: failedCost },
+            },
+        };
+    }
     if (!planJson.ok) return { error: `plan failed: ${planJson.error}` };
     const planText = runCli(repoPath, ['plan', handle, `--rename-to=${newName}`]);
     const planData = planJson.doc.data || {};
@@ -381,16 +606,71 @@ function collectRenameProposals(repoPath, contentByFile, task) {
 function applyRenameArm(repoPath, contentByFile, task, proposal, armSites) {
     const newName = proposal.newName;
     const byFile = new Map();
-    const addSite = (file, line) => {
-        if (!byFile.has(file)) byFile.set(file, new Set());
-        byFile.get(file).add(line);
+    const defByFile = new Map();
+    const addSite = (map, file, line) => {
+        if (!map.has(file)) map.set(file, new Set());
+        map.get(file).add(line);
     };
-    addSite(task.relativePath, task.nameLine); // the def rename is given
-    for (const site of armSites) addSite(site.file, site.line);
+    // Definition-kind sites (plan's own def/overload-group/slot-sibling
+    // emissions) take FIRST-occurrence semantics like the pinned def line —
+    // `func (r *Router) BuildVarsFunc(f BuildVarsFunc)` repeats the symbol
+    // as a TYPE. Call/import/reference/text sites keep all-occurrence
+    // (line granularity is the instrument's design); a line carrying both
+    // kinds keeps site semantics.
+    for (const site of armSites) {
+        if (site.kind === 'definition') addSite(defByFile, site.file, site.line);
+        else addSite(byFile, site.file, site.line);
+    }
+    for (const [file, lineSet] of defByFile) {
+        for (const line of lineSet) {
+            if (byFile.get(file)?.has(line)) continue;
+            if (file === task.relativePath && line === task.nameLine) continue;
+            const content = contentByFile.get(file);
+            if (content == null) continue;
+            const lines = fs.readFileSync(path.join(repoPath, file), 'utf8').split('\n');
+            const index = line - 1;
+            if (index >= 0 && index < lines.length) {
+                lines[index] = policy.renameFirstOnLine(lines[index], task.name, newName);
+                fs.writeFileSync(path.join(repoPath, file), lines.join('\n'));
+            }
+        }
+    }
+
+    // The def rename is given to every arm: first-occurrence-only on the
+    // name line (a def line can repeat the symbol as a param/type — see
+    // renameFirstOnLine). When an arm ALSO proposed the def line as a site
+    // (one-line recursive functions), site semantics win via the loop.
+    const defProposed = byFile.get(task.relativePath)?.has(task.nameLine);
+    if (!defProposed && contentByFile.has(task.relativePath)) {
+        // Read the WORKING TREE, never the pristine snapshot — the
+        // definition-site pass above may already have renamed sibling
+        // overload/slot defs in this same file (writing pristine content
+        // back erased them: flask check/template_filter, gate4-measured).
+        let defContent;
+        try {
+            defContent = fs.readFileSync(
+                path.join(repoPath, task.relativePath), 'utf8');
+        } catch (_) {
+            defContent = contentByFile.get(task.relativePath);
+        }
+        const lines = defContent.split('\n');
+        const index = task.nameLine - 1;
+        if (index >= 0 && index < lines.length) {
+            lines[index] = policy.renameFirstOnLine(lines[index], task.name, newName);
+        }
+        fs.writeFileSync(path.join(repoPath, task.relativePath), lines.join('\n'));
+    }
 
     let noEffectEdits = 0;
     for (const [file, lineSet] of byFile) {
-        const content = contentByFile.get(file);
+        // Read the working tree, not the pristine snapshot — the def rename
+        // above may already have touched this file.
+        let content;
+        try {
+            content = fs.readFileSync(path.join(repoPath, file), 'utf8');
+        } catch (_) {
+            content = contentByFile.get(file);
+        }
         if (content == null) { noEffectEdits += lineSet.size; continue; }
         const result = policy.applyRenameToContent(
             content, [...lineSet], task.name, newName);
@@ -540,7 +820,37 @@ function collectDeleteVerdicts(repoPath, contentByFile, task, sharedAudit) {
 
 // ── Per-repo run ────────────────────────────────────────────────────────────
 
-function runRepo(repo, options) {
+/** Resolve --targets handles (file:line:name) against the index. */
+function resolveTargetHandles(index, contentByFile, handles) {
+    return handles.map(handleText => {
+        const match = handleText.match(/^(.+):(\d+):([A-Za-z_$][A-Za-z0-9_$]*)$/);
+        if (!match) {
+            throw new Error(`--targets: malformed handle "${handleText}" (want file:line:name)`);
+        }
+        const [, file, lineRaw, name] = match;
+        const line = Number(lineRaw);
+        const defs = (index.symbols.get(name) || []).filter(def =>
+            path.relative(index.root, def.file).replace(/\\/g, '/') === file &&
+            def.startLine === line);
+        if (defs.length === 0) {
+            throw new Error(`--targets: ${handleText} not found in the index`);
+        }
+        const def = defs[0];
+        return {
+            name,
+            relativePath: file,
+            startLine: def.startLine,
+            endLine: def.endLine || def.startLine,
+            nameLine: defNameLine(contentByFile, file, def, name) ?? def.startLine,
+            type: def.type,
+            className: def.className || null,
+            sameNameDefs: (index.symbols.get(name) || []).length,
+            directedTarget: true,
+        };
+    });
+}
+
+async function runRepo(repo, options) {
     const log = message => process.stdout.write(`[${repo.name}] ${message}\n`);
     const tuned = REPOS.some(pinned => pinned.name === repo.name) ||
         OUTCOME_TUNED.some(pinned => pinned.name === repo.name);
@@ -566,19 +876,37 @@ function runRepo(repo, options) {
     log(`baseline: ${baseline.keys.length} pre-existing error key(s), ${baseline.ms}ms`);
 
     const rand = seededRandom(options.seed);
-    const candidates = candidateDefs(index, repo, contentByFile);
+    let candidates = candidateDefs(index, repo, contentByFile);
+    let oracleTargetInfo = null;
+    if (options.oracleTargets) {
+        oracleTargetInfo = await oracleCandidateDefs(
+            repo, repoPath, index, contentByFile, log);
+        candidates = oracleTargetInfo.all;
+        log(`oracle universe: ${oracleTargetInfo.oracleSymbols} symbols — ` +
+            `${oracleTargetInfo.matched.length} matched in index, ` +
+            `${oracleTargetInfo.missing.length} missing from index`);
+    }
 
     // Rename targets: symbols with at least one occurrence outside the def
-    // (a zero-reference rename discriminates nothing).
-    const renameCandidates = candidates.filter(candidate =>
-        occurrencesOutsideDef(contentByFile, candidate) >= 1);
-    const renameTasksSampled = sampleWithout(renameCandidates, options.renameTasks, rand);
+    // (a zero-reference rename discriminates nothing). --targets overrides
+    // sampling with directed handles (e.g. overload-family pins).
+    let renameTasksSampled;
+    if (options.targets && options.targets.length > 0) {
+        renameTasksSampled = resolveTargetHandles(index, contentByFile, options.targets);
+    } else {
+        const renameCandidates = candidates.filter(candidate =>
+            occurrencesOutsideDef(contentByFile, candidate) >= 1);
+        renameTasksSampled = sampleWithout(renameCandidates, options.renameTasks, rand);
+    }
 
     // Delete targets: stratified low-usage symbols (0 vs 1-6 occurrences).
-    const withOccurrences = candidates.map(candidate => ({
-        candidate,
-        occurrences: occurrencesOutsideDef(contentByFile, candidate),
-    }));
+    // Index-backed candidates only — an oracle-only def has no known range,
+    // and the standard deletion needs one.
+    const withOccurrences = candidates.filter(candidate => !candidate.indexMissing)
+        .map(candidate => ({
+            candidate,
+            occurrences: occurrencesOutsideDef(contentByFile, candidate),
+        }));
     const zeroUse = withOccurrences.filter(row => row.occurrences === 0).map(row => row.candidate);
     const lowUse = withOccurrences.filter(row => row.occurrences >= 1 && row.occurrences <= 6)
         .map(row => row.candidate);
@@ -636,6 +964,8 @@ function runRepo(repo, options) {
             name: task.name,
             kind: task.type,
             sameNameDefs: task.sameNameDefs,
+            ...(task.indexMissing && { indexMissing: true }),
+            ...(task.directedTarget && { directedTarget: true }),
             arms: {},
         };
         for (const arm of ARMS) {
@@ -658,6 +988,7 @@ function runRepo(repo, options) {
                     newErrorCount: newKeys.length,
                     newErrorSamples: newKeys.slice(0, 3),
                     proposedSites: armProposal.sites.length,
+                    ...(armProposal.planFailed && { planFailed: true }),
                     ...(armProposal.deferredExternalSites > 0 &&
                         { deferredExternalSites: armProposal.deferredExternalSites }),
                     sites: armProposal.sites.slice(0, 50).map(policy.siteKey),
@@ -720,6 +1051,18 @@ function runRepo(repo, options) {
         indexBuildMs: Math.round(indexBuildMs),
         baseline: { errorKeys: baseline.keys.length, ms: baseline.ms },
         candidates: candidates.length,
+        targetSource: (options.targets && options.targets.length > 0) ? 'directed'
+            : options.oracleTargets ? 'oracle' : 'index',
+        ...(oracleTargetInfo && {
+            oracleTargets: {
+                oracle: oracleTargetInfo.oracleName,
+                symbols: oracleTargetInfo.oracleSymbols,
+                matchedInIndex: oracleTargetInfo.matched.length,
+                missingFromIndex: oracleTargetInfo.missing.length,
+                missingSample: oracleTargetInfo.missing.slice(0, 10).map(candidate =>
+                    `${candidate.relativePath}:${candidate.startLine}:${candidate.name}`),
+            },
+        }),
         judgeErrors,
         renameProposalErrors: renameRows.filter(row => row.proposal.error).length,
         deleteProposalErrors: deleteRows.filter(row => row.verdicts.error).length,
@@ -853,20 +1196,45 @@ function findRepo(name) {
     return null;
 }
 
-function main() {
+function parseSeed(raw) {
+    const seed = Number.parseInt(raw, raw.startsWith('0x') ? 16 : 10);
+    if (!Number.isFinite(seed)) throw new Error(`seed must be a number (got ${raw})`);
+    return seed;
+}
+
+const DEFAULT_SEED = 42;
+
+async function main() {
     const argv = process.argv.slice(2);
     const seedRaw = readArgValue(argv, '--seed');
-    const seed = seedRaw == null ? 42 : Number.parseInt(seedRaw, seedRaw.startsWith('0x') ? 16 : 10);
-    if (!Number.isFinite(seed)) throw new Error(`--seed must be a number (got ${seedRaw})`);
+    const seedsRaw = readArgValue(argv, '--seeds');
+    // --seeds 42,7,101 runs the whole board once per seed. Non-default seeds
+    // write their own report filenames (suffix AFTER the date, so the dated
+    // rollup regex never merges them — the oracle-eval convention).
+    const seeds = seedsRaw
+        ? seedsRaw.split(',').map(value => parseSeed(value.trim()))
+        : [seedRaw == null ? DEFAULT_SEED : parseSeed(seedRaw)];
     const renameTasks = Number(readArgValue(argv, '--rename-tasks') || 10);
     const deleteTasks = Number(readArgValue(argv, '--delete-tasks') || 6);
     const repoFilterRaw = readArgValue(argv, '--repo');
+    const targetsRaw = readArgValue(argv, '--targets');
+    const targets = targetsRaw
+        ? targetsRaw.split(',').map(value => value.trim()).filter(Boolean)
+        : null;
+    const oracleTargets = argv.includes('--oracle-targets');
     // --gate: run the PINNED tuned regression set and fail on the explicit
     // thresholds in OUTCOME_GATE_THRESHOLDS (pinned commit + fixed seed →
     // deterministic tasks; unpinned holdouts never gate). --tuned runs the
     // same set without gating.
     const gateMode = argv.includes('--gate');
     const tunedMode = gateMode || argv.includes('--tuned');
+    if (gateMode && (oracleTargets || targets || seeds.length > 1)) {
+        throw new Error('--gate is the deterministic pinned board: ' +
+            '--oracle-targets/--targets/--seeds are measurement-mode flags');
+    }
+    if (targets && !repoFilterRaw) {
+        throw new Error('--targets needs --repo (handles are repo-relative)');
+    }
 
     let repos;
     if (repoFilterRaw) {
@@ -885,25 +1253,32 @@ function main() {
         repos = OUTCOME_POOL.map(repo => ({ ...repo }));
     }
 
-    const options = { seed, renameTasks, deleteTasks };
     const reports = [];
     let failures = 0;
-    for (const repo of repos) {
-        try {
-            const report = runRepo(repo, options);
-            reports.push(report);
-            const date = report.generatedAt.slice(0, 10);
-            const jsonPath = path.join(REPORTS_DIR, `outcome-eval-${repo.name}-${date}.json`);
-            fs.writeFileSync(jsonPath, JSON.stringify(report, null, 2));
-            process.stdout.write(`[${repo.name}] JSON: ${jsonPath}\n`);
-        } catch (error) {
-            failures++;
-            process.stderr.write(`[${repo.name}] FAILED: ${error.stack || error.message}\n`);
+    for (const seed of seeds) {
+        const options = { seed, renameTasks, deleteTasks, targets, oracleTargets };
+        for (const repo of repos) {
+            try {
+                const report = await runRepo(repo, options);
+                reports.push(report);
+                const date = report.generatedAt.slice(0, 10);
+                const suffix = seed === DEFAULT_SEED ? '' : `-seed${seed}`;
+                const jsonPath = path.join(REPORTS_DIR,
+                    `outcome-eval-${repo.name}-${date}${suffix}.json`);
+                fs.writeFileSync(jsonPath, JSON.stringify(report, null, 2));
+                process.stdout.write(`[${repo.name}] JSON: ${jsonPath}\n`);
+            } catch (error) {
+                failures++;
+                process.stderr.write(`[${repo.name}] FAILED: ${error.stack || error.message}\n`);
+            }
         }
     }
 
-    if (reports.length > 0) {
-        const date = reports[0].generatedAt.slice(0, 10);
+    // The dated rollup holds CANONICAL (default-seed) reports only; other
+    // seeds keep their own suffixed JSONs.
+    const canonical = reports.filter(report => report.seed === DEFAULT_SEED);
+    if (canonical.length > 0) {
+        const date = canonical[0].generatedAt.slice(0, 10);
         // Merge every same-dated per-repo JSON so partial runs never truncate
         // the dated rollup (the #271 report convention).
         const merged = new Map();
@@ -915,7 +1290,7 @@ function main() {
                 merged.set(doc.repo, doc);
             } catch (_) { /* unreadable partial — skip */ }
         }
-        for (const report of reports) merged.set(report.repo, report);
+        for (const report of canonical) merged.set(report.repo, report);
         const all = [...merged.values()].sort((a, b) => codeUnitCompare(a.repo, b.repo));
         const mdPath = path.join(REPORTS_DIR, `outcome-eval-${date}.md`);
         fs.writeFileSync(mdPath, formatMarkdown(all));
@@ -923,12 +1298,14 @@ function main() {
     }
 
     for (const report of reports) {
+        const label = report.seed === DEFAULT_SEED
+            ? report.repo : `${report.repo} (seed ${report.seed})`;
         const rename = report.rename.aggregate.perArm;
-        process.stdout.write(`${report.repo}: rename broken-build ` +
+        process.stdout.write(`${label}: rename broken-build ` +
             ARMS.map(arm => `${arm}=${rename[arm] ? rename[arm].brokenBuildRate : '-'}`).join(' ') + '\n');
         // Delete arms are part of the headline, never an appendix.
         const del = report.delete.aggregate.perArm;
-        process.stdout.write(`${report.repo}: delete falseSafe ` +
+        process.stdout.write(`${label}: delete falseSafe ` +
             ARMS.map(arm => del[arm]
                 ? `${arm}=${del[arm].falseSafe}/${del[arm].saidSafe}` +
                     (del[arm].review > 0 ? ` (review ${del[arm].review})` : '')
@@ -954,4 +1331,9 @@ function main() {
     if (failures > 0) process.exitCode = 1;
 }
 
-if (require.main === module) main();
+if (require.main === module) {
+    main().catch(error => {
+        process.stderr.write(`${error.stack || error.message}\n`);
+        process.exit(1);
+    });
+}

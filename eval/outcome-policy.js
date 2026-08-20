@@ -40,6 +40,22 @@ function renameOnLine(line, name, newName) {
     return line.replace(identifierRegex(name), newName);
 }
 
+/** Replace only the FIRST word-boundary occurrence — the definition-line
+ *  rename. A def line can repeat the symbol as something else entirely:
+ *  Java `public JsonWriter value(long value)` repeats it as a PARAMETER,
+ *  Go `func (r *Route) BuildVarsFunc(f BuildVarsFunc) *Route` as a TYPE —
+ *  renaming those breaks the body/type while the declared name comes first
+ *  on its own line in every supported grammar. Proposed SITES keep
+ *  all-occurrence semantics (line granularity is the instrument's design). */
+function renameFirstOnLine(line, name, newName) {
+    const pattern = identifierRegex(name);
+    pattern.lastIndex = 0;
+    const match = pattern.exec(line);
+    if (!match) return line;
+    return line.slice(0, match.index) + newName +
+        line.slice(match.index + name.length);
+}
+
 /**
  * Apply a rename to file content at the proposed 1-based lines only.
  * Returns { content, replacedLines, noEffectLines } — a proposed line where
@@ -369,6 +385,23 @@ function parsePyrightErrors(doc, root) {
     return keys;
 }
 
+/** javac output → error keys (`path:line: error: message`; the `N errors`
+ *  footer and warnings are ignored). Keys are deduped like cargo's — javac
+ *  repeats a diagnostic when a file is reached through several compilation
+ *  paths. Pass root to relativize absolute paths for report readability. */
+function parseJavacErrors(text, root) {
+    const keys = new Set();
+    const prefix = root ? String(root).replace(/\/?$/, '/') : null;
+    for (const raw of String(text || '').split('\n')) {
+        const match = raw.match(/^(.+?\.java):(\d+):\s*error:\s*(.+)$/);
+        if (!match) continue;
+        let file = match[1];
+        if (prefix && file.startsWith(prefix)) file = file.slice(prefix.length);
+        keys.add(`${file}|${truncateMessage(match[3])}`);
+    }
+    return [...keys];
+}
+
 /** tsc --noEmit output → error keys. */
 function parseTscErrors(text) {
     const keys = [];
@@ -564,6 +597,7 @@ module.exports = {
     codeUnitCompare,
     identifierRegex,
     renameOnLine,
+    renameFirstOnLine,
     applyRenameToContent,
     applyDeleteToContent,
     stripNameFromImportLine,
@@ -580,6 +614,7 @@ module.exports = {
     parseGoErrors,
     parseCargoErrors,
     parsePyrightErrors,
+    parseJavacErrors,
     parseTscErrors,
     diffErrorKeys,
     aggregateRenameTasks,
