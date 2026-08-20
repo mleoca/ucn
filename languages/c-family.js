@@ -964,6 +964,24 @@ function isTemplateDependentCallable(node) {
     return false;
 }
 
+// `template <> bool f<bool>(...)` is a FULL specialization: the same compiler
+// symbol as its primary template, selected by substitution rather than
+// overload resolution (fix #299). Every enclosing template head must be
+// empty — one non-empty parameter list means a member of a class template
+// (partial-specialization territory for classes; ordinary dependence here).
+function isFullSpecializationCallable(node) {
+    let sawTemplateHead = false;
+    for (let parent = node?.parent; parent; parent = parent.parent) {
+        if (parent.type === 'template_declaration') {
+            const params = parent.childForFieldName('parameters');
+            if (!params || params.namedChildCount > 0) return false;
+            sawTemplateHead = true;
+        }
+        if (parent.type === 'translation_unit') break;
+    }
+    return sawTemplateHead;
+}
+
 // Full type text for a NAMED parameter: the parameter's own text with the
 // name removed — `const char *s` → `const char *`, `int **pp` → `int **`,
 // `void (*cb)(int)` → `void (*)(int)`. Reading around the identifier keeps
@@ -1216,6 +1234,9 @@ function memberFromNode(node, className, access, lines, mode) {
         className,
         ...(mode === 'cpp' && isTemplateDependentCallable(node) && {
             templateDependent: true,
+        }),
+        ...(mode === 'cpp' && isFullSpecializationCallable(node) && {
+            isSpecialization: true,
         }),
         ...(mode === 'cpp' && cLanguageLinkage(node) && {
             linkage: cLanguageLinkage(node),
@@ -1515,6 +1536,9 @@ function findFunctionsInTree(code, tree, mode, sourceLines = null) {
             }),
             ...(mode === 'cpp' && isTemplateDependentCallable(node) && {
                 templateDependent: true,
+            }),
+            ...(mode === 'cpp' && isFullSpecializationCallable(node) && {
+                isSpecialization: true,
             }),
             ...(returnedConcreteType && { returnedConcreteType }),
             ...(mode === 'cpp' && cLanguageLinkage(node) && {
@@ -1997,6 +2021,18 @@ function staticArgumentKind(node, variableTypes) {
                     child.type === 'type_descriptor' || TYPE_NODES.has(child.type));
             const type = typeName(typeNode);
             if (type) return `type:${type}`;
+        }
+        // Bare-identifier producers are name-resolvable (fix #299B): mark
+        // them `bcall:` so the overload discipline can type the argument
+        // from the producer's declared return type. A local callable
+        // variable shadows the project name — those record plain 'expr'
+        // (the #203 localShadow rule at kind-recording time). Member,
+        // qualified, and template-explicit producers keep `call:NAME`.
+        if (identity.name && !identity.isMethod && !identity.isPathCall &&
+            identity.nameNode && IDENTIFIER_NODES.has(identity.nameNode.type) &&
+            fnNode && IDENTIFIER_NODES.has(fnNode.type)) {
+            if (variableTypes?.get(identity.name, node)) return 'expr';
+            return `bcall:${identity.name}`;
         }
         return identity.name ? `call:${identity.name}` : 'expr';
     }

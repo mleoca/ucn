@@ -617,7 +617,11 @@ function clearAllCaches() {
 // object they patch (`console.log = fn` → 'console') — so the builtin-global
 // exclusion can see cross-file that a project def rebinds the global's
 // member (fix #286a); impl-kind symbols leave the bindings table (#286b).
-const CACHE_FORMAT_VERSION = 176;
+// v177: C++ `template <>` full-specialization defs persist isSpecialization
+// (fix #299A — identity closure with the primary template), and C++
+// argument-position calls through a local callable variable record kind
+// 'expr' instead of call:NAME (fix #299B shadow guard).
+const CACHE_FORMAT_VERSION = 177;
 
 /**
  * Save index to cache file

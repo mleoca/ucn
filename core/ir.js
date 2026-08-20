@@ -53,6 +53,7 @@ function normalizeSymbol(symbol, family, language, kind, owner = null) {
         'namespace', 'lexicalScopeStartLine', 'lexicalScopeEndLine',
         'returnTypeQualifier', 'macroNeverReturns', 'callbackParamTypes', 'iteratorItemType',
         'returnedConcreteType', 'returnedConstructors', 'templateDependent',
+        'isSpecialization',
         'linkage', 'functionLike', 'callableAlias', 'exportedAlias',
         'aliasOwner', 'aliasMember',
     ];

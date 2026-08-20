@@ -2715,3 +2715,248 @@ describe('v5 C++ compile-time call identity', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #299: C++ overload-ambiguous promotion by static shape', () => {
+    // (A) A `template <>` full specialization is the SAME function as its
+    // primary template — name lookup finds the template, specialization
+    // choice is instantiation, not overload resolution. Pinning either
+    // member must confirm call sites instead of routing overload-ambiguous.
+    it('closes a full specialization into the primary template identity', () => {
+        const dir = tmp({
+            'spec.h': [
+                'template <class Item> inline Item read_item(const unsigned char* data) {',
+                '  Item item{};',
+                '  return item;',
+                '}',
+                'template <> inline bool read_item<bool>(const unsigned char* data) {',
+                '  return *data != 0;',
+                '}',
+            ].join('\n'),
+            'user.cc': [
+                '#include "spec.h"',
+                'int use(const unsigned char* d) {',
+                '  auto f = read_item<float>(d);',
+                '  auto b = read_item<bool>(d);',
+                '  return int(f) + int(b);',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const defs = index.symbols.get('read_item');
+            assert.equal(defs.length, 2);
+            const primary = defs.find(d => d.startLine === 1);
+            const specialization = defs.find(d => d.startLine === 5);
+            assert.ok(primary && specialization);
+            assert.equal(specialization.isSpecialization, true);
+            assert.ok(!primary.isSpecialization);
+            for (const pin of [primary, specialization]) {
+                const result = index.findCallers('read_item', {
+                    targetDefinitions: [pin],
+                    collectAccount: true,
+                    includeMethods: true,
+                });
+                const lines = result.map(c => c.line).sort();
+                assert.deepEqual(lines, [3, 4],
+                    `pin @${pin.startLine}: both sites confirm — got ` +
+                    JSON.stringify(result.map(c => `${c.line}:${c.resolution}`)) +
+                    ` unverified=` + JSON.stringify(
+                        (result.account?.unverifiedEntries || []).map(e => e.line)));
+            }
+        } finally { rm(dir); }
+    });
+
+    // (C) Exact-concrete-type most-specific: when every argument position
+    // carries a concrete static type and exactly one NON-template overload
+    // matches all of them exactly, the compiler picks it (identity conversion
+    // beats integral conversion; non-template beats template on ties).
+    it('selects the exact-type overload and excludes the sibling', () => {
+        const dir = tmp({
+            'digits.hpp': [
+                'inline int span_of(unsigned long long n) { return 20; }',
+                'inline int span_of(unsigned int n) { return 10; }',
+                'template <typename T>',
+                'int span_of(const T& n) { return 0; }',
+                'inline int wide_user() {',
+                '  unsigned long long big = 9000000000ULL;',
+                '  return span_of(big);',
+                '}',
+                'inline int narrow_user() {',
+                '  unsigned int small = 42;',
+                '  return span_of(small);',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const widePin = index.symbols.get('span_of').find(d => d.startLine === 1);
+            const result = index.findCallers('span_of', {
+                targetDefinitions: [widePin],
+                collectAccount: true,
+                includeMethods: true,
+            });
+            assert.deepEqual(result.map(c => c.line), [7],
+                'only the unsigned long long site confirms: ' +
+                JSON.stringify(result.map(c => c.line)));
+            assert.ok(result.accountRaw.excludedEntries.some(e =>
+                e.line === 11 && e.reason === 'overload-mismatch'),
+                'the unsigned int site binds the sibling exactly: ' +
+                JSON.stringify(result.accountRaw.excludedEntries));
+        } finally { rm(dir); }
+    });
+
+    it('refuses exact-type selection for caller template params and literals', () => {
+        const dir = tmp({
+            'refuse.hpp': [
+                'inline int span_of(unsigned long long n) { return 20; }',
+                'inline int span_of(unsigned int n) { return 10; }',
+                'template <typename UInt> int generic_user(UInt value) {',
+                '  return span_of(value);',
+                '}',
+                'inline int literal_user() {',
+                '  return span_of(42);',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const widePin = index.symbols.get('span_of').find(d => d.startLine === 1);
+            const result = index.findCallers('span_of', {
+                targetDefinitions: [widePin],
+                collectAccount: true,
+                includeMethods: true,
+            });
+            assert.deepEqual(result.map(c => c.line), [],
+                'neither site is statically decidable: ' +
+                JSON.stringify(result.map(c => c.line)));
+            const unverifiedLines = (result.unverifiedEntries || [])
+                .map(e => e.line).sort();
+            assert.deepEqual(unverifiedLines, [4, 7],
+                'both sites stay visible: ' + JSON.stringify(unverifiedLines));
+        } finally { rm(dir); }
+    });
+
+    // (B) Producer-return argument typing: `paint(tint(3))` types the
+    // argument from tint's declared return type — composing with the exact
+    // winner to decide the overload. Local callables shadowing the producer
+    // name and disagreeing producer overloads both refuse.
+    it('types arguments from a unique agreed producer return type', () => {
+        const dir = tmp({
+            'paint.hpp': [
+                'struct style { int v; };',
+                'inline style tint(int c) { return style{c}; }',
+                'inline int paint(style s) { return 1; }',
+                'inline int paint(unsigned int width) { return 2; }',
+                'inline int producer_user() { return paint(tint(3)); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const stylePin = index.symbols.get('paint').find(d => d.startLine === 3);
+            const widthPin = index.symbols.get('paint').find(d => d.startLine === 4);
+            const styleResult = index.findCallers('paint', {
+                targetDefinitions: [stylePin],
+                collectAccount: true,
+                includeMethods: true,
+            });
+            assert.deepEqual(styleResult.map(c => c.line), [5],
+                'the tint-producing site binds paint(style): ' +
+                JSON.stringify(styleResult.map(c => c.line)));
+            const widthResult = index.findCallers('paint', {
+                targetDefinitions: [widthPin],
+                collectAccount: true,
+                includeMethods: true,
+            });
+            assert.deepEqual(widthResult.map(c => c.line), [],
+                'the site never confirms the width overload');
+            assert.ok(widthResult.accountRaw.excludedEntries.some(e =>
+                e.line === 5 && e.reason === 'overload-mismatch'),
+                'excluded with reason: ' +
+                JSON.stringify(widthResult.accountRaw.excludedEntries));
+        } finally { rm(dir); }
+    });
+
+    it('local callables shadowing the producer name refuse the typing', () => {
+        const dir = tmp({
+            'shadow.hpp': [
+                'struct style { int v; };',
+                'inline style tint(int c) { return style{c}; }',
+                'inline int paint(style s) { return 1; }',
+                'inline int paint(unsigned int width) { return 2; }',
+                'inline int shadow_user(unsigned int (*tint)(int)) {',
+                '  return paint(tint(4));',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const widthPin = index.symbols.get('paint').find(d => d.startLine === 4);
+            const result = index.findCallers('paint', {
+                targetDefinitions: [widthPin],
+                collectAccount: true,
+                includeMethods: true,
+            });
+            assert.ok(!result.accountRaw.excludedEntries.some(e => e.line === 6),
+                'the shadowed producer must never exclude the true caller: ' +
+                JSON.stringify(result.accountRaw.excludedEntries));
+        } finally { rm(dir); }
+    });
+
+    it('disagreeing producer overload returns refuse the typing', () => {
+        const dir = tmp({
+            'mixed.hpp': [
+                'struct style { int v; };',
+                'inline style mixed(int c) { return style{c}; }',
+                'inline unsigned int mixed(long c) { return 2u; }',
+                'inline int paint(style s) { return 1; }',
+                'inline int paint(unsigned int width) { return 2; }',
+                'inline int mixed_user() { return paint(mixed(3)); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const widthPin = index.symbols.get('paint').find(d => d.startLine === 5);
+            const result = index.findCallers('paint', {
+                targetDefinitions: [widthPin],
+                collectAccount: true,
+                includeMethods: true,
+            });
+            assert.deepEqual(result.map(c => c.line), [],
+                'no confirmation without agreement');
+            assert.ok(!result.accountRaw.excludedEntries.some(e => e.line === 6),
+                'no exclusion without agreement: ' +
+                JSON.stringify(result.accountRaw.excludedEntries));
+            assert.ok((result.unverifiedEntries || []).some(e => e.line === 6),
+                'the site stays visible');
+        } finally { rm(dir); }
+    });
+
+    it('refuses specialization closure when several primaries could own it', () => {
+        const dir = tmp({
+            'multi.h': [
+                'template <class A> int pick(const unsigned char* data) { return 1; }',
+                'template <class A, class B> int pick(const unsigned char* data) { return 2; }',
+                'template <> inline int pick<bool>(const unsigned char* data) { return 3; }',
+            ].join('\n'),
+            'muser.cc': [
+                '#include "multi.h"',
+                'int muse(const unsigned char* d) {',
+                '  return pick<char>(d);',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const defs = index.symbols.get('pick');
+            const first = defs.find(d => d.startLine === 1);
+            const result = index.findCallers('pick', {
+                targetDefinitions: [first],
+                collectAccount: true,
+                includeMethods: true,
+            });
+            assert.equal(result.length, 0,
+                'ambiguous primary ownership must not confirm: ' +
+                JSON.stringify(result.map(c => c.line)));
+        } finally { rm(dir); }
+    });
+});

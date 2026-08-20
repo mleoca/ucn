@@ -9642,6 +9642,38 @@ function _closeCallableIdentityGroup(index, targetDefs, definitions) {
             expanded.push(candidate);
         }
     }
+
+    // C++ full specializations (`template <> bool f<bool>(...)`) are the SAME
+    // compiler symbol as their primary template: name lookup finds the
+    // template, and the specialization is selected by substitution, never by
+    // overload resolution (fix #299). Closure requires exactly ONE primary
+    // template with the owner identity — with several primaries the compiler
+    // matches the specialization by signature substitution, which is not
+    // grep-reliability evidence, so the group refuses and sites stay visible.
+    for (const target of targetDefs) {
+        if (cFamilyLanguage(target) !== 'cpp') continue;
+        if (!target.isSpecialization && !target.templateDependent) continue;
+        const related = definitions.filter(d =>
+            !NON_CALLABLE_TYPES.has(d.type) &&
+            cFamilyLanguage(d) === 'cpp' && sameOwner(target, d) &&
+            (d.isSpecialization || (d.templateDependent && !d.isSignature)));
+        const primaries = related.filter(d => !d.isSpecialization);
+        const specializations = related.filter(d => d.isSpecialization);
+        if (primaries.length !== 1 || specializations.length === 0) continue;
+        if (!related.some(d => d === target ||
+            (d.file === target.file && d.startLine === target.startLine))) {
+            continue;
+        }
+        const primary = primaries[0];
+        for (const candidate of related) {
+            if (candidate !== primary &&
+                !includesDeclaration(candidate, primary)) continue;
+            if (targetDefs.includes(candidate) ||
+                (expanded && expanded.includes(candidate))) continue;
+            if (!expanded) expanded = [...targetDefs];
+            expanded.push(candidate);
+        }
+    }
     return expanded || targetDefs;
 }
 
@@ -10143,7 +10175,8 @@ function _calleeOverloadSelect(index, call, matches, language) {
         applicable = _preferFixedArityOverloads(
             index, call, applicable, language);
         if (applicable.length > 1) {
-            const mostSpecific = _javaMostSpecificOverload(index, applicable, call);
+            const mostSpecific = _javaMostSpecificOverload(
+                index, applicable, call, language);
             if (mostSpecific) return { match: mostSpecific };
         }
     }
@@ -11164,6 +11197,28 @@ const JAVA_FINAL_REFERENCE_TYPES = new Set([
     'Integer', 'Long', 'Float', 'Double', 'Void',
 ]);
 
+// Complete reference-supertype sets for JDK value types (fix #299D): these
+// types are final (or effectively closed) with a fixed, fully-known
+// ancestry, so an argument statically typed as one of them can bind ONLY a
+// parameter type in this list (plus Object/generics, handled earlier). A
+// project class shadowing one of these simple names disables the denial —
+// the guard is tDefs.length === 0 at the use site. Modern-JDK marker
+// interfaces (Constable, ConstantDesc) are included so their params never
+// get falsely denied.
+const JAVA_PLATFORM_VALUE_ANCESTRY = new Map([
+    ['Integer', ['Number', 'Comparable', 'Serializable', 'Constable', 'ConstantDesc']],
+    ['Long', ['Number', 'Comparable', 'Serializable', 'Constable', 'ConstantDesc']],
+    ['Short', ['Number', 'Comparable', 'Serializable', 'Constable', 'ConstantDesc']],
+    ['Byte', ['Number', 'Comparable', 'Serializable', 'Constable', 'ConstantDesc']],
+    ['Float', ['Number', 'Comparable', 'Serializable', 'Constable', 'ConstantDesc']],
+    ['Double', ['Number', 'Comparable', 'Serializable', 'Constable', 'ConstantDesc']],
+    ['Character', ['Comparable', 'Serializable', 'Constable']],
+    ['Boolean', ['Comparable', 'Serializable', 'Constable']],
+    ['String', ['CharSequence', 'Comparable', 'Serializable', 'Constable', 'ConstantDesc']],
+    ['BigInteger', ['Number', 'Comparable', 'Serializable']],
+    ['BigDecimal', ['Number', 'Comparable', 'Serializable']],
+]);
+
 // Which parameter types a call-site literal kind can bind (Java overload
 // resolution: identity, widening, boxing — plus the boxed types' interfaces).
 // Anything not provably incompatible MATCHES: only certainty excludes.
@@ -11175,7 +11230,36 @@ const JAVA_KIND_TYPES = {
     float: ['float', 'double', 'Float', 'Number', 'Comparable', 'Serializable'],
     double: ['double', 'Double', 'Number', 'Comparable', 'Serializable'],
     boolean: ['boolean', 'Boolean', 'Comparable', 'Serializable'],
+    // Not literal kinds (no short/byte literals in Java) — these entries
+    // serve the value-typed conversion checks (fix #299D).
+    short: ['short', 'int', 'long', 'float', 'double', 'Short', 'Number', 'Comparable', 'Serializable'],
+    byte: ['byte', 'short', 'int', 'long', 'float', 'double', 'Byte', 'Number', 'Comparable', 'Serializable'],
 };
+
+// Unboxing is defined for exactly these wrapper types (JLS 5.1.8).
+const JAVA_WRAPPER_PRIMITIVES = new Map([
+    ['Integer', 'int'], ['Long', 'long'], ['Short', 'short'], ['Byte', 'byte'],
+    ['Character', 'char'], ['Boolean', 'boolean'],
+    ['Float', 'float'], ['Double', 'double'],
+]);
+
+// Declared types of the JDK numeric-constant fields (fix #299D): exact
+// compiler contracts, consulted only when no project field shadows the
+// owner/field pair.
+const JAVA_PLATFORM_FIELD_TYPES = new Map([
+    ['Float.NaN', 'float'], ['Float.POSITIVE_INFINITY', 'float'],
+    ['Float.NEGATIVE_INFINITY', 'float'], ['Float.MIN_VALUE', 'float'],
+    ['Float.MAX_VALUE', 'float'], ['Float.MIN_NORMAL', 'float'],
+    ['Double.NaN', 'double'], ['Double.POSITIVE_INFINITY', 'double'],
+    ['Double.NEGATIVE_INFINITY', 'double'], ['Double.MIN_VALUE', 'double'],
+    ['Double.MAX_VALUE', 'double'], ['Double.MIN_NORMAL', 'double'],
+    ['Integer.MAX_VALUE', 'int'], ['Integer.MIN_VALUE', 'int'],
+    ['Long.MAX_VALUE', 'long'], ['Long.MIN_VALUE', 'long'],
+    ['Short.MAX_VALUE', 'short'], ['Short.MIN_VALUE', 'short'],
+    ['Byte.MAX_VALUE', 'byte'], ['Byte.MIN_VALUE', 'byte'],
+    ['Character.MAX_VALUE', 'char'], ['Character.MIN_VALUE', 'char'],
+    ['Boolean.TRUE', 'Boolean'], ['Boolean.FALSE', 'Boolean'],
+]);
 
 // Exact subset of C# implicit conversions for compiler-owned closed types.
 // Returns null when user-defined conversions or external ancestry could
@@ -11234,6 +11318,19 @@ function _csharpKnownTypeAssignable(actualRaw, expectedRaw) {
 // name-based guesses. They close the common portable-AST gap where overload
 // resolution depends on the return type of a library call.
 const JAVA_PLATFORM_METHOD_RETURNS = new Map([
+    // Exact JDK factory contracts (fix #299D): valueOf on the boxed and
+    // arbitrary-precision types returns the owner type itself.
+    ['java.math.BigInteger#valueOf', 'java.math.BigInteger'],
+    ['java.math.BigDecimal#valueOf', 'java.math.BigDecimal'],
+    ['java.lang.Integer#valueOf', 'java.lang.Integer'],
+    ['java.lang.Long#valueOf', 'java.lang.Long'],
+    ['java.lang.Short#valueOf', 'java.lang.Short'],
+    ['java.lang.Byte#valueOf', 'java.lang.Byte'],
+    ['java.lang.Float#valueOf', 'java.lang.Float'],
+    ['java.lang.Double#valueOf', 'java.lang.Double'],
+    ['java.lang.Boolean#valueOf', 'java.lang.Boolean'],
+    ['java.lang.Character#valueOf', 'java.lang.Character'],
+    ['java.lang.String#valueOf', 'java.lang.String'],
     ['java.lang.Object#getClass', 'java.lang.Class'],
     ['java.lang.Class#getEnclosingClass', 'java.lang.Class'],
     ['java.lang.Class#getDeclaringClass', 'java.lang.Class'],
@@ -11483,7 +11580,13 @@ function _javaOwnerFieldType(index, owner, fieldName) {
         definition.className === ownerSimple &&
         (definition.type === 'field' || definition.memberType === 'field') &&
         definition.fieldType);
-    if (fields.length === 0) return null;
+    if (fields.length === 0) {
+        // JDK constant-field contracts (fix #299D): Float.NaN is a float,
+        // Boolean.TRUE a Boolean. Project fields, checked above, always
+        // outrank the platform table.
+        return JAVA_PLATFORM_FIELD_TYPES.get(`${ownerSimple}.${fieldName}`) ||
+            null;
+    }
 
     const types = new Set();
     for (const field of fields) {
@@ -11598,6 +11701,27 @@ function _javaArgKindMatches(index, kind, paramType, language) {
         if (tSimple === bare) return true;
         const platformAssignable = _javaPlatformAssignable(t, bare);
         if (platformAssignable !== null) return platformAssignable;
+        // A primitive argument type has closed conversion targets (fix
+        // #299D): identity, widening, its own box, and the box's interfaces
+        // — exactly the literal-kind table. This must precede the
+        // final-reference denial below, which is boxing-blind (char DOES
+        // bind a Character parameter). No project class can shadow a
+        // primitive name, so no tDefs guard is needed.
+        if (language === 'java' && JAVA_PRIMITIVES.has(tSimple) &&
+            JAVA_KIND_TYPES[tSimple]) {
+            return JAVA_KIND_TYPES[tSimple].includes(bare);
+        }
+        // A reference-typed argument reaches a primitive parameter only
+        // through unboxing, defined for exactly the eight wrapper types
+        // (then widening). Any other reference type — project, JDK, or
+        // unknown — provably cannot bind a primitive parameter (fix #299D).
+        if (language === 'java' && JAVA_PRIMITIVES.has(bare) &&
+            !JAVA_PRIMITIVES.has(tSimple) && !/^[A-Z][0-9]?$/.test(tSimple)) {
+            const unboxed = JAVA_WRAPPER_PRIMITIVES.get(tSimple);
+            return unboxed != null &&
+                (unboxed === bare ||
+                 JAVA_KIND_TYPES[unboxed]?.includes(bare) === true);
+        }
         // These java.lang types are final. A statically known different type
         // can never bind their overload, even when the argument type's own
         // ancestry ends in external Object and is therefore incomplete.
@@ -11619,6 +11743,14 @@ function _javaArgKindMatches(index, kind, paramType, language) {
             d.type === 'enum' || d.type === 'struct' ||
             d.modifiers?.includes('sealed'))) {
             return false;
+        }
+        if (language === 'java' && tDefs.length === 0) {
+            // JDK value types have a complete, closed ancestry (fix #299D):
+            // an Integer-typed argument can never bind add(JsonElement).
+            // The no-project-def guard keeps a project class shadowing the
+            // simple name in normal resolution.
+            const valueAncestry = JAVA_PLATFORM_VALUE_ANCESTRY.get(tSimple);
+            if (valueAncestry) return valueAncestry.includes(bare);
         }
         if (tDefs.length === 0) return true; // external arg type — unknowable
         const asTarget = [{ className: tSimple, file: tDefs[0].file }];
@@ -11758,7 +11890,8 @@ function _cppArgKindMatches(kind, paramType) {
     if (kind === 'null') {
         return !['number', 'bool', 'character'].includes(expected.kind);
     }
-    if (kind.startsWith('type:') || kind.startsWith('call:')) {
+    if (kind.startsWith('type:') || kind.startsWith('call:') ||
+        kind.startsWith('bcall:')) {
         const actualType = kind.slice(kind.indexOf(':') + 1);
         const actual = _cppTypeCategory(actualType);
         if (actual.head && expected.head && actual.head === expected.head) return true;
@@ -11873,7 +12006,7 @@ function _javaTypeAtLeastAsSpecific(index, subType, superType, subDef) {
 // when every argument position is at least as specific as every competing
 // candidate and at least one position is strictly more specific. Unknown
 // relationships stay ambiguous.
-function _javaMostSpecificOverload(index, applicable, call) {
+function _javaMostSpecificOverload(index, applicable, call, language) {
     const argCount = call.argCount;
     if (!Number.isInteger(argCount) || applicable.length < 2) return null;
     // Compiler-visible exact static types outrank candidates whose external
@@ -11907,6 +12040,64 @@ function _javaMostSpecificOverload(index, applicable, call) {
         if (best > 0) {
             const winners = ranked.filter(item => item.exact === best);
             if (winners.length === 1) return winners[0].definition;
+        }
+    }
+    // JLS 15.12.2 phase discipline (fix #299D): when EVERY argument's static
+    // type is a known primitive, strict-invocation candidates (identity or
+    // primitive widening, fixed arity — phase 1) exclude boxing candidates
+    // (phase 2) from the race entirely; among widening targets the narrowest
+    // is most specific (an int literal binds value(long), not value(float)/
+    // value(double)/value(Number)). Varargs params are phase 3 and never
+    // count as strict. Any non-primitive or unknown position refuses — phase
+    // membership must be provable for every argument.
+    if (language === 'java' && Array.isArray(call.argKinds) &&
+        call.argKinds.length >= argCount && argCount > 0) {
+        const primOf = (kind) => {
+            if (!kind || typeof kind !== 'string') return null;
+            if (JAVA_PRIMITIVES.has(kind)) return kind; // literal kinds
+            const staticType = _javaStaticTypeForKind(index, kind);
+            const simple = staticType ? staticType.split('.').pop() : null;
+            return simple && JAVA_PRIMITIVES.has(simple) ? simple : null;
+        };
+        const prims = [];
+        for (let i = 0; i < argCount; i++) prims.push(primOf(call.argKinds[i]));
+        if (prims.every(Boolean)) {
+            const strictAt = (prim, definition, i) => {
+                const param = _javaParamAt(definition, i, call);
+                if (!param || param.rest) return false;
+                const bare = _javaBareParamType(param);
+                return bare !== null && JAVA_PRIMITIVES.has(bare) &&
+                    (prim === bare ||
+                     JAVA_KIND_TYPES[prim]?.includes(bare) === true);
+            };
+            const strict = applicable.filter(definition => {
+                for (let i = 0; i < argCount; i++) {
+                    if (!strictAt(prims[i], definition, i)) return false;
+                }
+                return true;
+            });
+            if (strict.length === 1) return strict[0];
+            if (strict.length > 1) {
+                const dominatesPrim = (a, b) => {
+                    let strictly = false;
+                    for (let i = 0; i < argCount; i++) {
+                        const at = _javaBareParamType(_javaParamAt(a, i, call));
+                        const bt = _javaBareParamType(_javaParamAt(b, i, call));
+                        if (at === bt) continue;
+                        if (!JAVA_PRIMITIVES.has(bt) ||
+                            JAVA_KIND_TYPES[at]?.includes(bt) !== true) {
+                            return false;
+                        }
+                        strictly = true;
+                    }
+                    return strictly;
+                };
+                const winners = strict.filter(a =>
+                    strict.every(b => a === b || dominatesPrim(a, b)));
+                if (winners.length === 1) return winners[0];
+                return null; // strict phase engaged but unranked — visible
+            }
+            // no strict candidate: boxing phase — general ranking decides
         }
     }
     const dominates = (a, b) => {
@@ -12147,6 +12338,17 @@ function _overloadDiscipline(index, call, targetDefs, definitions, callerFile) {
     // constrained templates can share an identical function signature while
     // remaining distinct compiler overloads.
     const pinSigs = new Set(targetDefs.map(typeSig).filter(s => s !== null));
+    // Occupied dispatch slots (fix #299D): an ancestor def whose signature
+    // matches ANY family member of the descendant class is that member's
+    // override/hiding slot — the same bindable method, never an extra
+    // sibling. Without this, JsonTreeWriter's fully-overridden value(...)
+    // family double-counted every JsonWriter overload and the exact-type
+    // winner was never unique (two value(String) "candidates").
+    const familySigs = new Set(pinSigs);
+    for (const d of family) {
+        const sig = typeSig(d);
+        if (sig !== null) familySigs.add(sig);
+    }
     const pinFile = targetDefs.find(d => d.file)?.file;
     const seenCls = new Set(targetOwners);
     const queue = [...targetOwners];
@@ -12163,13 +12365,33 @@ function _overloadDiscipline(index, call, targetDefs, definitions, callerFile) {
             for (const d of definitions) {
                 if (NON_CALLABLE_TYPES.has(d.type) || d.className !== pName) continue;
                 const sig = typeSig(d);
-                if (sig !== null && pinSigs.has(sig)) continue; // override slot
+                if (sig !== null && familySigs.has(sig)) continue; // occupied slot
+                if (sig !== null) familySigs.add(sig);
                 family.push(d);
             }
         }
     }
     if (family.length <= 1) return null;
     if (family.every(d => pinnedKeys.has(`${d.file}:${d.startLine}`))) return null;
+    // Producer-return argument typing (fix #299B): a bare-identifier
+    // producer (`paint(tint(3))`) types its argument position from the
+    // project's declared return type — the #199/#207 return-type-flow rail
+    // at the argument site. Resolution demands a unique project identity
+    // with full return-text agreement; anything less keeps the opaque
+    // `bcall:` kind (matches everything, no decision either way).
+    if (targetLanguage === 'cpp' && Array.isArray(call.argKinds) &&
+        call.argKinds.some(kind => typeof kind === 'string' &&
+            kind.startsWith('bcall:'))) {
+        const resolvedKinds = call.argKinds.map(kind => {
+            if (typeof kind !== 'string' || !kind.startsWith('bcall:')) return kind;
+            const producerReturn = _cppBareProducerReturnType(
+                index, kind.slice('bcall:'.length));
+            return producerReturn ? `type:${producerReturn}` : kind;
+        });
+        if (resolvedKinds.some((kind, i) => kind !== call.argKinds[i])) {
+            call = { ...call, argKinds: resolvedKinds };
+        }
+    }
     let applicable = family.filter(d => _overloadApplicable(index, call, d));
     if (applicable.length === 0) return null; // shape fits nothing we model — no claim
     if (targetLanguage === 'java' || targetLanguage === 'csharp') {
@@ -12178,7 +12400,8 @@ function _overloadDiscipline(index, call, targetDefs, definitions, callerFile) {
     }
     const mostSpecific = (targetLanguage === 'java' ||
         targetLanguage === 'csharp')
-        ? _javaMostSpecificOverload(index, applicable, call) : null;
+        ? _javaMostSpecificOverload(index, applicable, call, targetLanguage)
+        : null;
     if (mostSpecific) {
         return pinnedKeys.has(`${mostSpecific.file}:${mostSpecific.startLine}`)
             ? null : 'other-overload';
@@ -12190,6 +12413,13 @@ function _overloadDiscipline(index, call, targetDefs, definitions, callerFile) {
         return null;
     }
     if (applicable.length === 1) return null; // uniquely the pinned overload
+    if (targetLanguage === 'cpp') {
+        const winner = _cppExactOverloadWinner(call, applicable);
+        if (winner) {
+            return pinnedKeys.has(`${winner.file}:${winner.startLine}`)
+                ? null : 'other-overload';
+        }
+    }
     const compileTimeDispatch = targetLanguage === 'cpp';
     const templateOnly = compileTimeDispatch &&
         applicable.every(definition => definition.templateDependent);
@@ -12203,6 +12433,121 @@ function _overloadDiscipline(index, call, targetDefs, definitions, callerFile) {
                 : `${call.name} C++ overload set`,
         }),
     };
+}
+
+// C++ exact-static-type overload selection (fix #299C): when every argument
+// position carries a concrete static type (`type:X` from declared locals or
+// casts) and exactly one NON-template candidate matches every position at
+// Exact Match rank, the compiler selects it — identity conversion outranks
+// every other conversion sequence, and non-template beats template on the
+// tie-break. Template winners are refused (their param text can name their
+// own template parameters, and SFINAE can disable them invisibly); literal
+// and `expr` kinds refuse the whole selection (integer literals rank equally
+// against sibling integer widths). Exactness is deliberately narrower than
+// the compiler's Exact Match class: by-value top-level const is ignored and
+// `const X&` binding accepted, but non-const refs (cast rvalues can't bind),
+// rvalue refs, and pointer-pointee qualification changes all refuse — a
+// missed exact match keeps the site visible, a wrong one would exclude a
+// true caller.
+function _cppNormalizeTypeText(text) {
+    if (!text) return null;
+    return String(text).replace(/\s+/g, ' ')
+        .replace(/\s*([*&])\s*/g, ' $1').trim() || null;
+}
+
+function _cppStripTopLevelConst(text) {
+    if (!text || /[*&]$/.test(text)) return text;
+    return text.replace(/^const /, '').replace(/^volatile /, '');
+}
+
+function _cppExactParamMatch(paramType, argType) {
+    const param = _cppNormalizeTypeText(paramType);
+    const arg = _cppStripTopLevelConst(_cppNormalizeTypeText(argType));
+    if (!param || !arg) return false;
+    return param === arg ||
+        _cppStripTopLevelConst(param) === arg ||
+        param === `const ${arg} &`;
+}
+
+// Resolve a bare-identifier producer name to its declared return type
+// (fix #299B). Discipline mirrors the #199/#207 return-type-flow rails:
+// every callable def of the name project-wide must live in a C-family file
+// and agree on ONE full normalized return text. Type defs sharing the name
+// refuse (the bare call may be a constructor), template producers refuse
+// (their substituted return is instantiation-dependent), `auto` without a
+// recorded trailing type refuses, and return-less defs are ignored only
+// when they are declarations whose parameter shape matches a return-bearing
+// def — a C++ declaration's return type must match its definition, so a
+// ret-less signature there is a parse gap on the SAME entity, never a
+// hidden disagreeing overload.
+function _cppBareProducerReturnType(index, producerName) {
+    if (!producerName) return null;
+    const defs = (index.symbols.get(producerName) || []);
+    if (defs.length === 0) return null;
+    const paramKey = (def) => Array.isArray(def.paramsStructured)
+        ? def.paramsStructured.map(param =>
+            _cppNormalizeTypeText(param?.type) || '?').join('\0')
+        : null;
+    const returnBearing = [];
+    const returnLess = [];
+    for (const def of defs) {
+        const language = index.files.get(def.file)?.language;
+        if (language !== 'c' && language !== 'cpp') return null;
+        if (NON_CALLABLE_TYPES.has(def.type)) return null; // constructor risk
+        if (def.isSpecialization) continue; // same entity as its primary
+        if (def.returnType) returnBearing.push(def);
+        else returnLess.push(def);
+    }
+    if (returnBearing.length === 0) return null;
+    for (const def of returnLess) {
+        if (!def.isSignature) return null;
+        const key = paramKey(def);
+        if (key === null ||
+            !returnBearing.some(other => paramKey(other) === key)) {
+            return null;
+        }
+    }
+    let agreed = null;
+    for (const def of returnBearing) {
+        if (def.templateDependent) return null;
+        const returnText = _cppNormalizeTypeText(def.returnType);
+        if (!returnText || /^auto\b/.test(returnText)) return null;
+        if (agreed === null) agreed = returnText;
+        else if (agreed !== returnText) return null;
+    }
+    return agreed;
+}
+
+function _cppExactOverloadWinner(call, applicable) {
+    const kinds = call.argKinds;
+    if (!Array.isArray(kinds) || !Number.isInteger(call.argCount) ||
+        call.argCount === 0 || kinds.length < call.argCount) return null;
+    const argTypes = [];
+    for (let i = 0; i < call.argCount; i++) {
+        const kind = kinds[i];
+        if (typeof kind !== 'string' || !kind.startsWith('type:')) return null;
+        const argType = kind.slice('type:'.length);
+        if (!argType) return null;
+        argTypes.push(argType);
+    }
+    let winner = null;
+    for (const def of applicable) {
+        if (def.templateDependent || def.isSpecialization) continue;
+        const ps = def.paramsStructured;
+        if (!Array.isArray(ps) || ps.length < call.argCount) continue;
+        if (ps.some(param => param && (param.rest || param.variadic))) continue;
+        let exact = true;
+        for (let i = 0; i < call.argCount; i++) {
+            if (!_cppExactParamMatch(ps[i]?.type, argTypes[i])) {
+                exact = false;
+                break;
+            }
+        }
+        if (!exact) continue;
+        if (winner) return null; // two exact candidates — refuse
+        winner = def;
+    }
+    return winner;
 }
 
 /**
@@ -14117,4 +14462,4 @@ function findCallbackUsages(index, name) {
     return usages;
 }
 
-module.exports = { getCachedCalls, findCallers, findCallees, getInstanceAttributeTypes, findCallbackUsages, _nameBindingReaches, _declaredFieldType, _projectTopLevelNames, _callArityCompatible, _closeCallableIdentityGroup };
+module.exports = { getCachedCalls, findCallers, findCallees, getInstanceAttributeTypes, findCallbackUsages, _nameBindingReaches, _declaredFieldType, _projectTopLevelNames, _callArityCompatible, _closeCallableIdentityGroup, _overloadDiscipline, _overloadApplicable };

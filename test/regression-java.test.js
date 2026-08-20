@@ -4370,3 +4370,147 @@ describe('fix #286c (Java): static-imported field receivers resolve as values', 
         } finally { rm(dir); }
     });
 });
+
+describe('fix #299D: Java overload-ambiguous promotion by static shape', () => {
+    const writerFixture = () => tmp({
+        'Writer.java': [
+            'public class Writer {',
+            '  public Writer value(String v) { return this; }',
+            '  public Writer value(boolean v) { return this; }',
+            '  public Writer value(float v) { return this; }',
+            '  public Writer value(double v) { return this; }',
+            '  public Writer value(long v) { return this; }',
+            '  public Writer value(Number v) { return this; }',
+            '}',
+        ].join('\n'),
+        'TreeWriter.java': [
+            'public class TreeWriter extends Writer {',
+            '  @Override public Writer value(String v) { return this; }',
+            '  @Override public Writer value(boolean v) { return this; }',
+            '  @Override public Writer value(float v) { return this; }',
+            '  @Override public Writer value(double v) { return this; }',
+            '  @Override public Writer value(long v) { return this; }',
+            '  @Override public Writer value(Number v) { return this; }',
+            '}',
+        ].join('\n'),
+        'Use.java': [
+            'public class Use {',
+            '  void run(TreeWriter w) {',
+            '    w.value(7);',
+            '    w.value("s");',
+            '    w.value((Number) get());',
+            '    w.value(Float.NaN);',
+            '  }',
+            '  Object get() { return null; }',
+            '}',
+        ].join('\n'),
+    });
+
+    it('an int literal binds value(long): widening beats boxing, narrowest wins', () => {
+        const dir = writerFixture();
+        try {
+            const index = idx(dir);
+            const longPin = (index.symbols.get('value') || []).find(d =>
+                d.className === 'TreeWriter' && d.paramsStructured?.[0]?.type === 'long');
+            const result = index.findCallers('value', {
+                targetDefinitions: [longPin],
+                collectAccount: true,
+                includeMethods: true,
+            });
+            assert.deepStrictEqual(result.map(c => c.line), [3],
+                'only the int-literal site: ' + JSON.stringify(result.map(c => c.line)));
+            const excluded = result.accountRaw.excludedEntries;
+            assert.ok(excluded.some(e => e.line === 4 && e.reason === 'overload-mismatch'),
+                'the String site binds value(String): ' + JSON.stringify(excluded));
+            assert.ok(excluded.some(e => e.line === 5 && e.reason === 'overload-mismatch'),
+                'the cast-Number site binds value(Number): ' + JSON.stringify(excluded));
+            assert.ok(excluded.some(e => e.line === 6 && e.reason === 'overload-mismatch'),
+                'Float.NaN is a float — binds value(float): ' + JSON.stringify(excluded));
+        } finally { rm(dir); }
+    });
+
+    it('overridden ancestor slots never re-enter the family as siblings', () => {
+        const dir = writerFixture();
+        try {
+            const index = idx(dir);
+            const numberPin = (index.symbols.get('value') || []).find(d =>
+                d.className === 'TreeWriter' && d.paramsStructured?.[0]?.type === 'Number');
+            const result = index.findCallers('value', {
+                targetDefinitions: [numberPin],
+                collectAccount: true,
+                includeMethods: true,
+            });
+            assert.deepStrictEqual(result.map(c => c.line), [5],
+                'the cast-Number site confirms uniquely: ' +
+                JSON.stringify(result.map(c => c.line)));
+        } finally { rm(dir); }
+    });
+
+    const sinkFixture = (extra = {}) => tmp({
+        'Element.java': 'public class Element {}',
+        'Sink.java': [
+            'public class Sink {',
+            '  public void add(Boolean b) {}',
+            '  public void add(Character c) {}',
+            '  public void add(Number n) {}',
+            '  public void add(String s) {}',
+            '  public void add(Element e) {}',
+            '}',
+        ].join('\n'),
+        'UseSink.java': [
+            'import java.math.BigInteger;',
+            'public class UseSink {',
+            '  void run(Sink s) {',
+            '    s.add((Integer) box());',
+            '    s.add(BigInteger.valueOf(9));',
+            '    s.add((char) c());',
+            '    s.add((Boolean) box());',
+            '  }',
+            '  Object box() { return null; }',
+            '  char c() { return 120; }',
+            '}',
+        ].join('\n'),
+        ...extra,
+    });
+
+    it('platform value types decide reference overloads', () => {
+        const dir = sinkFixture();
+        try {
+            const index = idx(dir);
+            const numberPin = (index.symbols.get('add') || []).find(d =>
+                d.className === 'Sink' && d.paramsStructured?.[0]?.type === 'Number');
+            const result = index.findCallers('add', {
+                targetDefinitions: [numberPin],
+                collectAccount: true,
+                includeMethods: true,
+            });
+            assert.deepStrictEqual(result.map(c => c.line).sort((a, b) => a - b), [4, 5],
+                'Integer cast + BigInteger.valueOf bind add(Number): ' +
+                JSON.stringify(result.map(c => c.line)));
+            const excluded = result.accountRaw.excludedEntries;
+            assert.ok(excluded.some(e => e.line === 6 && e.reason === 'overload-mismatch'),
+                'char boxes to Character, never Number: ' + JSON.stringify(excluded));
+            assert.ok(excluded.some(e => e.line === 7 && e.reason === 'overload-mismatch'),
+                'Boolean binds add(Boolean): ' + JSON.stringify(excluded));
+        } finally { rm(dir); }
+    });
+
+    it('a project class shadowing a platform name refuses the ancestry denial', () => {
+        const dir = sinkFixture({
+            'Integer.java': 'public class Integer extends Element {}',
+        });
+        try {
+            const index = idx(dir);
+            const elementPin = (index.symbols.get('add') || []).find(d =>
+                d.className === 'Sink' && d.paramsStructured?.[0]?.type === 'Element');
+            const result = index.findCallers('add', {
+                targetDefinitions: [elementPin],
+                collectAccount: true,
+                includeMethods: true,
+            });
+            assert.ok(!result.accountRaw.excludedEntries.some(e => e.line === 4),
+                'the project Integer may bind add(Element): ' +
+                JSON.stringify(result.accountRaw.excludedEntries));
+        } finally { rm(dir); }
+    });
+});
