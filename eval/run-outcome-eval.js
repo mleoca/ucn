@@ -53,6 +53,8 @@
  *   node eval/run-outcome-eval.js --repo websocket
  *   node eval/run-outcome-eval.js --repo flask --rename-tasks 8 --delete-tasks 4
  *   node eval/run-outcome-eval.js --seed 7
+ *   node eval/run-outcome-eval.js --tuned               # pinned OUTCOME_TUNED set
+ *   node eval/run-outcome-eval.js --gate                # tuned set + hard thresholds (exit 1)
  */
 
 'use strict';
@@ -65,6 +67,7 @@ const {
     REPOS,
     FRESH_POOL,
     OUTCOME_POOL,
+    OUTCOME_TUNED = [],
     cloneAtCommit,
     resolveFreshCommit,
     seededRandom,
@@ -465,7 +468,7 @@ function judgeWithGoImportRepair(judge, repoPath, baselineKeys, language) {
     return { newKeys, ms: result.ms, repairs };
 }
 
-function collectDeleteVerdicts(repoPath, contentByFile, task) {
+function collectDeleteVerdicts(repoPath, contentByFile, task, sharedAudit) {
     const handle = `${task.relativePath}:${task.startLine}:${task.name}`;
     const showJson = cliJson(repoPath,
         ['show', handle, '--sections=summary,callers']);
@@ -486,33 +489,48 @@ function collectDeleteVerdicts(repoPath, contentByFile, task) {
             endLine: task.endLine,
         })
         : { safe: false, usageEvidence: -1 };
-    // The contract policy consults both: confirmed callers OR usage evidence
-    // block the deletion.
-    const contract = {
-        safe: confirmed.safe && contractBase.safe,
-        usageEvidence: contractBase.usageEvidence,
+    // Tri-state contract verdict: confirmed callers or usage evidence →
+    // unsafe; zero evidence is 'safe' only when the engine's default
+    // deadcode audit CLAIMS the symbol dead (every shield the audit encodes
+    // — exported exclusion, external contracts, heritage closure — lands
+    // here as 'review' instead of a blind 'safe').
+    const audit = sharedAudit && sharedAudit.data
+        ? policy.deadcodeClaimForTask(sharedAudit.data, task)
+        : null;
+    const tri = policy.deleteVerdictTriState({
         confirmedCallers: confirmed.confirmedCallers,
-    };
+        usageEvidence: contractBase.usageEvidence,
+        audit,
+    });
+
+    // The scripted contract agent runs the audit once per repo and reuses it
+    // across delete triages — each verdict pays an amortized share.
+    const auditShare = sharedAudit ? sharedAudit.share : { outputChars: 0, toolCalls: 0 };
 
     return {
         handle,
         arms: {
             grep: {
+                verdict: grep.safe ? 'safe' : 'unsafe',
                 safe: grep.safe,
                 evidence: grep.usageEvidence,
                 cost: { outputChars: grep.outputChars, scannedBytes: grep.scannedBytes, toolCalls: 1, wallMs: 0 },
             },
             'ucn-confirmed': {
+                verdict: confirmed.safe ? 'safe' : 'unsafe',
                 safe: confirmed.safe,
                 evidence: confirmed.confirmedCallers,
                 cost: { outputChars: showText.stdout.length, toolCalls: 1, wallMs: showText.ms },
             },
             'ucn-contract': {
-                safe: contract.safe,
-                evidence: Math.max(contract.usageEvidence, contract.confirmedCallers),
+                verdict: tri.verdict,
+                verdictReason: tri.reason,
+                safe: tri.verdict === 'safe',
+                evidence: Math.max(contractBase.usageEvidence, confirmed.confirmedCallers),
                 cost: {
-                    outputChars: showText.stdout.length + usagesText.stdout.length,
-                    toolCalls: 2,
+                    outputChars: showText.stdout.length + usagesText.stdout.length +
+                        auditShare.outputChars,
+                    toolCalls: 2 + auditShare.toolCalls,
                     wallMs: showText.ms + usagesText.ms,
                 },
             },
@@ -524,7 +542,8 @@ function collectDeleteVerdicts(repoPath, contentByFile, task) {
 
 function runRepo(repo, options) {
     const log = message => process.stdout.write(`[${repo.name}] ${message}\n`);
-    const tuned = REPOS.some(pinned => pinned.name === repo.name);
+    const tuned = REPOS.some(pinned => pinned.name === repo.name) ||
+        OUTCOME_TUNED.some(pinned => pinned.name === repo.name);
 
     if (!repo.commit) resolveFreshCommit(repo);
     log(`clone @ ${repo.commit.slice(0, 10)}`);
@@ -578,9 +597,31 @@ function runRepo(repo, options) {
         renameRows.push({ task, proposal });
         if (proposal.error) log(`  rename ${task.name}: ${proposal.error}`);
     }
+    // One shared deadcode audit per repo for the contract arm's tri-state
+    // delete verdicts; its cost is amortized over the delete tasks.
+    let sharedAudit = null;
+    if (deleteTasksSampled.length > 0) {
+        const auditJson = cliJson(repoPath, ['deadcode']);
+        const auditText = runCli(repoPath, ['deadcode']);
+        if (auditJson.ok) {
+            sharedAudit = {
+                data: auditJson.doc || {},
+                outputChars: auditText.stdout.length,
+                wallMs: auditText.ms,
+                share: {
+                    outputChars: Math.round(
+                        auditText.stdout.length / deleteTasksSampled.length),
+                    toolCalls: Number(
+                        (1 / deleteTasksSampled.length).toFixed(2)),
+                },
+            };
+        } else {
+            log(`  deadcode audit failed (contract delete verdicts route review): ${auditJson.error}`);
+        }
+    }
     const deleteRows = [];
     for (const task of deleteTasksSampled) {
-        const verdicts = collectDeleteVerdicts(repoPath, contentByFile, task);
+        const verdicts = collectDeleteVerdicts(repoPath, contentByFile, task, sharedAudit);
         deleteRows.push({ task, verdicts });
         if (verdicts.error) log(`  delete ${task.name}: ${verdicts.error}`);
     }
@@ -657,7 +698,7 @@ function runRepo(repo, options) {
             };
             deleteResults.push(row);
             const armSummary = ARMS.map(arm =>
-                `${arm}=${verdicts.arms[arm].safe ? 'safe' : 'unsafe'}`).join(' ');
+                `${arm}=${policy.armDeleteVerdict(verdicts.arms[arm])}`).join(' ');
             log(`  delete ${task.name}: ground=${row.groundBroken ? 'BREAKS' : 'clean'} ${armSummary}`);
         } catch (error) {
             judgeErrors++;
@@ -668,7 +709,7 @@ function runRepo(repo, options) {
     }
 
     const report = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         generatedAt: new Date().toISOString(),
         repo: repo.name,
         language: repo.language,
@@ -680,6 +721,15 @@ function runRepo(repo, options) {
         baseline: { errorKeys: baseline.keys.length, ms: baseline.ms },
         candidates: candidates.length,
         judgeErrors,
+        renameProposalErrors: renameRows.filter(row => row.proposal.error).length,
+        deleteProposalErrors: deleteRows.filter(row => row.verdicts.error).length,
+        ...(sharedAudit && {
+            sharedAudit: {
+                outputChars: sharedAudit.outputChars,
+                wallMs: sharedAudit.wallMs,
+                amortizedOver: deleteTasksSampled.length,
+            },
+        }),
         rename: {
             tasks: renameResults,
             aggregate: policy.aggregateRenameTasks(renameResults, ARMS),
@@ -692,6 +742,7 @@ function runRepo(repo, options) {
             'Judge verdicts are lower bounds on breakage: type-checkers cannot see dynamically dispatched call sites (untyped receivers), string/comment damage, or runtime-only failures.',
             'falseUnsafe counts are upper bounds: a compile-clean deletion can still be runtime-unsafe.',
             'Tasks where every arm broke carry no discriminating signal (allArmsBroke) — typically renames of interface/contract members every arm would need extra knowledge to complete.',
+            "The contract arm's delete verdict is tri-state: 'review' means zero text evidence but not provably dead by the default deadcode audit (exported symbols, external contracts, entry points). falseSafe is computed over 'safe' verdicts only; review rows are reported with their ground outcomes.",
         ],
     };
     return report;
@@ -715,14 +766,15 @@ function formatArmTable(aggregate) {
 
 function formatDeleteTable(aggregate) {
     const lines = [
-        '| arm | tasks | said safe | false-safe (dangerous) | false-safe rate | false-unsafe (upper bound) | judge agreement | avg output chars |',
-        '|---|---:|---:|---:|---:|---:|---:|---:|',
+        '| arm | tasks | said safe | false-safe (dangerous) | false-safe rate | false-unsafe (upper bound) | review | review broke / clean | judge agreement (decisive) | avg output chars |',
+        '|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|',
     ];
     for (const arm of ARMS) {
         const row = aggregate.perArm[arm];
-        if (!row) { lines.push(`| ${arm} | 0 | - | - | - | - | - | - |`); continue; }
+        if (!row) { lines.push(`| ${arm} | 0 | - | - | - | - | - | - | - | - |`); continue; }
         lines.push(`| ${arm} | ${row.tasks} | ${row.saidSafe} | ${row.falseSafe} | ${row.falseSafeRate} | ` +
-            `${row.falseUnsafeUpperBound} | ${row.agreementWithJudge} | ${row.avgOutputChars} |`);
+            `${row.falseUnsafeUpperBound} | ${row.review} | ${row.reviewGroundBroken} / ${row.reviewGroundClean} | ` +
+            `${row.agreementWithJudge} | ${row.avgOutputChars} |`);
     }
     return lines;
 }
@@ -794,7 +846,7 @@ function formatMarkdown(reports) {
 // ── Main ────────────────────────────────────────────────────────────────────
 
 function findRepo(name) {
-    for (const pool of [OUTCOME_POOL, FRESH_POOL, REPOS]) {
+    for (const pool of [OUTCOME_TUNED, OUTCOME_POOL, FRESH_POOL, REPOS]) {
         const found = pool.find(repo => repo.name === name);
         if (found) return { ...found };
     }
@@ -809,15 +861,26 @@ function main() {
     const renameTasks = Number(readArgValue(argv, '--rename-tasks') || 10);
     const deleteTasks = Number(readArgValue(argv, '--delete-tasks') || 6);
     const repoFilterRaw = readArgValue(argv, '--repo');
+    // --gate: run the PINNED tuned regression set and fail on the explicit
+    // thresholds in OUTCOME_GATE_THRESHOLDS (pinned commit + fixed seed →
+    // deterministic tasks; unpinned holdouts never gate). --tuned runs the
+    // same set without gating.
+    const gateMode = argv.includes('--gate');
+    const tunedMode = gateMode || argv.includes('--tuned');
 
     let repos;
     if (repoFilterRaw) {
         repos = repoFilterRaw.split(',').map(value => value.trim()).filter(Boolean)
             .map(name => {
                 const repo = findRepo(name);
-                if (!repo) throw new Error(`Unknown repo "${name}" (not in OUTCOME_POOL/FRESH_POOL/REPOS)`);
+                if (!repo) throw new Error(`Unknown repo "${name}" (not in OUTCOME_TUNED/OUTCOME_POOL/FRESH_POOL/REPOS)`);
                 return repo;
             });
+    } else if (tunedMode) {
+        if (OUTCOME_TUNED.length === 0) {
+            throw new Error('--tuned/--gate need a non-empty OUTCOME_TUNED set in eval/lib/repos.js');
+        }
+        repos = OUTCOME_TUNED.map(repo => ({ ...repo }));
     } else {
         repos = OUTCOME_POOL.map(repo => ({ ...repo }));
     }
@@ -863,6 +926,30 @@ function main() {
         const rename = report.rename.aggregate.perArm;
         process.stdout.write(`${report.repo}: rename broken-build ` +
             ARMS.map(arm => `${arm}=${rename[arm] ? rename[arm].brokenBuildRate : '-'}`).join(' ') + '\n');
+        // Delete arms are part of the headline, never an appendix.
+        const del = report.delete.aggregate.perArm;
+        process.stdout.write(`${report.repo}: delete falseSafe ` +
+            ARMS.map(arm => del[arm]
+                ? `${arm}=${del[arm].falseSafe}/${del[arm].saidSafe}` +
+                    (del[arm].review > 0 ? ` (review ${del[arm].review})` : '')
+                : `${arm}=-`).join(' ') + '\n');
+    }
+
+    if (gateMode) {
+        const gateFailures = policy.evaluateOutcomeGate(reports);
+        if (reports.length < repos.length) {
+            gateFailures.push(`only ${reports.length}/${repos.length} tuned repos produced reports`);
+        }
+        if (gateFailures.length > 0) {
+            process.stdout.write('OUTCOME GATE: FAIL\n');
+            for (const failure of gateFailures) process.stdout.write(`  - ${failure}\n`);
+            process.exitCode = 1;
+        } else {
+            process.stdout.write('OUTCOME GATE: PASS ' +
+                `(${reports.length} tuned repos; thresholds: judgeErrors 0, ` +
+                'proposalErrors 0, contract delete falseSafe 0, ' +
+                'contract rename <= grep baseline)\n');
+        }
     }
     if (failures > 0) process.exitCode = 1;
 }

@@ -28,7 +28,7 @@ on:
 jobs:
   eval:
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 210
     steps:
       - uses: actions/checkout@v5
 
@@ -102,6 +102,16 @@ jobs:
       - name: "Performance gate (cold build, warm cache, semantic query p95)"
         if: github.event_name == 'schedule' || inputs.full
         run: npm run trust:gate:performance
+
+      # Task-outcome gate on the PINNED tuned set (websocket/flask/serde_json —
+      # the repos whose outcome findings drove fixes #293-#298; pinned commit +
+      # fixed seed → deterministic tasks). Thresholds: judge/proposal errors 0,
+      # contract delete falseSafe 0, contract rename <= grep baseline. Runs on
+      # every trigger; deliberately NOT in npm run trust:gate until this step
+      # has a green run on this runner (the #292b rule: a new gate must run on
+      # the enforcing environment before any tag push relies on it).
+      - name: "Outcome gate (pinned tuned set, toolchain-judged)"
+        run: node eval/run-outcome-eval.js --gate
 
       - name: "Pre-tag release dry run (publish-blocking board)"
         if: github.event_name == 'workflow_dispatch'

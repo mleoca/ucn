@@ -393,8 +393,13 @@ const RELEASE_REPOS = Object.freeze(RELEASE_REPO_NAMES.map(name => {
 // only where the language server needs a specific project-model root (Java).
 const FRESH_POOL = [
     { name: 'dayjs', url: 'https://github.com/iamkun/dayjs', language: 'javascript', targetCandidates: ['.'] },
-    { name: 'flask', url: 'https://github.com/pallets/flask', language: 'python', targetCandidates: ['.'] },
-    { name: 'serde_json', url: 'https://github.com/serde-rs/json', language: 'rust', targetCandidates: ['.'] },
+    // flask and serde_json graduated OUT 2026-08-20: their outcome-board
+    // findings drove fixes #293-#296 (flask: plan rename-closure + module
+    // receivers; serde_json: trait-slot closure), which is tuning under the
+    // holdout rule regardless of which instrument surfaced the family. They
+    // are pinned in OUTCOME_TUNED as regression rows.
+    { name: 'attrs', url: 'https://github.com/python-attrs/attrs', language: 'python', targetCandidates: ['.'] },
+    { name: 'itertools', url: 'https://github.com/rust-itertools/itertools', language: 'rust', targetCandidates: ['.'] },
 ];
 
 // ============================================================================
@@ -405,17 +410,32 @@ const FRESH_POOL = [
 // discovery tool (text grep vs UCN's public CLI), judged by the language
 // toolchain — never by the engine's own metrics. Same holdout discipline as
 // FRESH_POOL: unpinned (HEAD resolved per run, SHA recorded in the report)
-// and NEVER used to tune a fix — a repo whose outcome findings drive
-// engineering graduates into REPOS and is replaced here. flask/serde_json
-// overlap FRESH_POOL deliberately (both arms measure, neither tunes); a
-// graduation removes the repo from BOTH pools. Only languages with a working
-// toolchain judge belong here (go vet / cargo check / pyright); plain-JS
-// repos have no static judge and TS repos need installed deps for a
-// meaningful tsc run, so both stay out until a safe judge exists.
+// and NEVER used to tune a fix. The graduation trigger is the FIRST time a
+// repo's findings drive engineering, not repeated iteration — the original
+// websocket/flask/serde_json pool drove fixes #293-#298 across several
+// board reruns while still labeled "held out", which made their scores
+// training-set validation (the 2026-08-20 review finding). A graduated repo
+// moves to OUTCOME_TUNED (pinned, gate-bearing regression rows) and leaves
+// BOTH pools. Only languages with a working toolchain judge belong here
+// (go vet / cargo check / pyright); plain-JS repos have no static judge and
+// TS repos need installed deps for a meaningful tsc run, so both stay out
+// until a safe judge exists.
 const OUTCOME_POOL = [
-    { name: 'websocket', url: 'https://github.com/gorilla/websocket', language: 'go', targetCandidates: ['.'] },
-    { name: 'flask', url: 'https://github.com/pallets/flask', language: 'python', targetCandidates: ['.'] },
-    { name: 'serde_json', url: 'https://github.com/serde-rs/json', language: 'rust', targetCandidates: ['.'] },
+    { name: 'mux', url: 'https://github.com/gorilla/mux', language: 'go', targetCandidates: ['.'] },
+    { name: 'requests', url: 'https://github.com/psf/requests', language: 'python', targetCandidates: ['.'] },
+    { name: 'rust-csv', url: 'https://github.com/BurntSushi/rust-csv', language: 'rust', targetCandidates: ['.'] },
+];
+
+// Graduated outcome repos: PINNED at the commits their 2026-08-19 boards
+// measured, run by `eval:outcome --tuned` and gated by `--gate` (pinned
+// commit + fixed seed → deterministic tasks, so the board is a regression
+// pin, deterministic up to toolchain version). These repos' findings drove
+// fixes #293-#298; their rows are regression evidence, never holdout
+// evidence, and the reports mark them tunedRepo:true.
+const OUTCOME_TUNED = [
+    { name: 'websocket', url: 'https://github.com/gorilla/websocket', language: 'go', commit: 'e064f32e3674d9d79a8fd417b5bc06fa5c6cad8f', targetCandidates: ['.'] },
+    { name: 'flask', url: 'https://github.com/pallets/flask', language: 'python', commit: 'd318b683471101618febed18996405ad26462110', targetCandidates: ['.'] },
+    { name: 'serde_json', url: 'https://github.com/serde-rs/json', language: 'rust', commit: 'afdf6fc67247dd7fa4fcde1381e6ecc6bcc7a30e', targetCandidates: ['.'] },
 ];
 
 /**
@@ -498,6 +518,7 @@ module.exports = {
     RELEASE_REPO_NAMES,
     FRESH_POOL,
     OUTCOME_POOL,
+    OUTCOME_TUNED,
     EVAL_TEMP_DIR,
     cloneAtCommit,
     resolveTarget,

@@ -245,6 +245,21 @@ describe('outcome-policy: judge parsing and error diffing', () => {
         assert.ok(keys[0].includes('cannot find function'));
     });
 
+    it('dedupes cargo compilation-context echoes of one diagnostic', () => {
+        // rust-csv-measured: benches/bench.rs compiles as bench AND test
+        // target under --all-targets — a dirty bench emits the crate-level
+        // `#![feature]` error twice while the cached baseline replayed it
+        // once, so the multiset diff manufactured a phantom new error.
+        const text = [
+            'benches/bench.rs:1:1: error[E0554]: `#![feature]` may not be used on the stable release channel',
+            'benches/bench.rs:1:1: error[E0554]: `#![feature]` may not be used on the stable release channel',
+        ].join('\n');
+        const keys = policy.parseCargoErrors(text);
+        assert.strictEqual(keys.length, 1);
+        assert.deepStrictEqual(
+            policy.diffErrorKeys(policy.parseCargoErrors(text.split('\n')[0]), keys), []);
+    });
+
     it('parses pyright JSON errors only', () => {
         const doc = {
             generalDiagnostics: [
@@ -314,5 +329,146 @@ describe('outcome-policy: aggregation', () => {
         assert.strictEqual(agg.perArm.grep.falseSafe, 0);
         assert.strictEqual(agg.perArm.grep.falseUnsafeUpperBound, 1);
         assert.strictEqual(agg.perArm.grep.agreementWithJudge, 0.5);
+    });
+
+    it('review rows abstain: excluded from falseSafe and decisive agreement', () => {
+        const tasks = [
+            // Review on a deletion that DID break — the tier intercepted it.
+            { groundBroken: true, arms: { grep: { safe: true }, 'ucn-contract': { verdict: 'review' } } },
+            // Review on a clean deletion — the over-caution upper bound.
+            { groundBroken: false, arms: { grep: { safe: true }, 'ucn-contract': { verdict: 'review' } } },
+            // Decisive verdicts still count normally.
+            { groundBroken: false, arms: { grep: { safe: true }, 'ucn-contract': { verdict: 'safe' } } },
+            { groundBroken: true, arms: { grep: { safe: false }, 'ucn-contract': { verdict: 'unsafe' } } },
+        ];
+        const agg = policy.aggregateDeleteTasks(tasks, arms);
+        const contract = agg.perArm['ucn-contract'];
+        assert.strictEqual(contract.review, 2);
+        assert.strictEqual(contract.reviewGroundBroken, 1);
+        assert.strictEqual(contract.reviewGroundClean, 1);
+        assert.strictEqual(contract.saidSafe, 1);
+        assert.strictEqual(contract.falseSafe, 0);
+        assert.strictEqual(contract.agreementWithJudge, 1); // 2/2 decisive
+        // The binary grep arm keeps its shape: one falseSafe (task 1).
+        assert.strictEqual(agg.perArm.grep.falseSafe, 1);
+    });
+});
+
+describe('outcome-policy: tri-state delete verdict', () => {
+    it('usage evidence and confirmed callers are always unsafe', () => {
+        assert.strictEqual(policy.deleteVerdictTriState({
+            confirmedCallers: 2, usageEvidence: 0, audit: { claimed: true },
+        }).verdict, 'unsafe');
+        assert.strictEqual(policy.deleteVerdictTriState({
+            confirmedCallers: 0, usageEvidence: 3, audit: { claimed: true },
+        }).verdict, 'unsafe');
+    });
+
+    it('zero evidence is safe only when the audit claims the symbol dead', () => {
+        const claimed = policy.deleteVerdictTriState({
+            confirmedCallers: 0, usageEvidence: 0,
+            audit: { claimed: true, claimsWithdrawn: false },
+        });
+        assert.strictEqual(claimed.verdict, 'safe');
+        assert.strictEqual(claimed.reason, 'claimed-dead-by-audit');
+        // The websocket Temporary/Timeout family: zero text evidence, but the
+        // default audit excludes exported symbols — review, never safe.
+        const unclaimed = policy.deleteVerdictTriState({
+            confirmedCallers: 0, usageEvidence: 0,
+            audit: { claimed: false, claimsWithdrawn: false },
+        });
+        assert.strictEqual(unclaimed.verdict, 'review');
+        assert.strictEqual(unclaimed.reason, 'not-claimed-by-audit');
+    });
+
+    it('an unusable audit or usages answer routes review, never safe', () => {
+        assert.strictEqual(policy.deleteVerdictTriState({
+            confirmedCallers: 0, usageEvidence: 0, audit: null,
+        }).verdict, 'review');
+        assert.strictEqual(policy.deleteVerdictTriState({
+            confirmedCallers: 0, usageEvidence: -1, audit: { claimed: true },
+        }).verdict, 'review');
+        assert.strictEqual(policy.deleteVerdictTriState({
+            confirmedCallers: 0, usageEvidence: 0,
+            audit: { claimed: true, claimsWithdrawn: true },
+        }).verdict, 'review');
+    });
+
+    it('deadcodeClaimForTask matches by name, file and definition range', () => {
+        const data = {
+            symbols: [
+                { name: 'helper', file: 'lib/util.py', startLine: 10, endLine: 14 },
+            ],
+            coverage: { complete: false, claimsWithdrawn: true },
+        };
+        const hit = policy.deadcodeClaimForTask(data, {
+            name: 'helper', relativePath: 'lib/util.py', startLine: 10, endLine: 14,
+        });
+        assert.strictEqual(hit.claimed, true);
+        assert.strictEqual(hit.claimsWithdrawn, true);
+        const otherFile = policy.deadcodeClaimForTask(data, {
+            name: 'helper', relativePath: 'lib/other.py', startLine: 10, endLine: 14,
+        });
+        assert.strictEqual(otherFile.claimed, false);
+    });
+
+    it('accepts the public CLI document shape (data array + meta.coverage)', () => {
+        const doc = {
+            data: [{ name: 'orphanHelper', file: 'main.go', startLine: 9, endLine: 9 }],
+            meta: { coverage: { complete: true, claimsWithdrawn: false } },
+        };
+        const hit = policy.deadcodeClaimForTask(doc, {
+            name: 'orphanHelper', relativePath: 'main.go', startLine: 9, endLine: 9,
+        });
+        assert.strictEqual(hit.claimed, true);
+        assert.strictEqual(hit.claimsWithdrawn, false);
+        const withdrawn = policy.deadcodeClaimForTask({
+            data: [], meta: { coverage: { complete: false, claimsWithdrawn: true } },
+        }, { name: 'x', relativePath: 'y.go', startLine: 1, endLine: 1 });
+        assert.strictEqual(withdrawn.claimsWithdrawn, true);
+    });
+});
+
+describe('outcome-policy: gate thresholds', () => {
+    const cleanReport = () => ({
+        repo: 'demo',
+        judgeErrors: 0,
+        renameProposalErrors: 0,
+        deleteProposalErrors: 0,
+        rename: { aggregate: { perArm: {
+            grep: { brokenBuildRate: 0.3 },
+            'ucn-contract': { brokenBuildRate: 0.1 },
+        } } },
+        delete: { aggregate: { perArm: {
+            'ucn-contract': { falseSafe: 0, saidSafe: 2 },
+        } } },
+    });
+
+    it('passes a clean report', () => {
+        assert.deepStrictEqual(policy.evaluateOutcomeGate([cleanReport()]), []);
+    });
+
+    it('fails on contract delete falseSafe, judge errors, proposal errors', () => {
+        const bad = cleanReport();
+        bad.judgeErrors = 1;
+        bad.deleteProposalErrors = 2;
+        bad.delete.aggregate.perArm['ucn-contract'].falseSafe = 1;
+        const failures = policy.evaluateOutcomeGate([bad]);
+        assert.strictEqual(failures.length, 3);
+        assert.ok(failures.some(text => text.includes('judge error')));
+        assert.ok(failures.some(text => text.includes('proposal failure')));
+        assert.ok(failures.some(text => text.includes('falseSafe')));
+    });
+
+    it('fails when the contract rename rate exceeds the grep baseline', () => {
+        const bad = cleanReport();
+        bad.rename.aggregate.perArm['ucn-contract'].brokenBuildRate = 0.4;
+        const failures = policy.evaluateOutcomeGate([bad]);
+        assert.strictEqual(failures.length, 1);
+        assert.ok(failures[0].includes('exceeds grep baseline'));
+        // Equal to the baseline is acceptable — grep is the floor, not a margin.
+        const even = cleanReport();
+        even.rename.aggregate.perArm['ucn-contract'].brokenBuildRate = 0.3;
+        assert.deepStrictEqual(policy.evaluateOutcomeGate([even]), []);
     });
 });

@@ -263,6 +263,62 @@ function grepDeleteVerdict(contentByFile, name, defFile, startLine, endLine) {
     return { safe: evidence === 0, usageEvidence: evidence, scannedBytes, outputChars };
 }
 
+/**
+ * Membership of one task's definition in a `deadcode --json` answer.
+ * The audit's claim set is the engine's actual deletability surface: a claim
+ * means the DEFAULT audit — exported, decorated, contract-shielded and
+ * entry-point symbols already excluded — found no usage evidence. A symbol
+ * the audit declines to claim is not thereby proven live; it is proven
+ * "not provably dead by this audit", which is exactly the review tier.
+ * claimsWithdrawn mirrors the audit's own coverage honesty — a withdrawn
+ * claim set proves nothing in either direction.
+ */
+function deadcodeClaimForTask(deadcodeDoc, task) {
+    // Accept the public CLI document ({ data: [claims], meta: { coverage } })
+    // and the internal result shape ({ symbols, coverage }).
+    const doc = deadcodeDoc || {};
+    const symbols = Array.isArray(doc.data) ? doc.data
+        : Array.isArray(doc.symbols) ? doc.symbols
+            : (doc.data && doc.data.symbols) || [];
+    const coverage = (doc.meta && doc.meta.coverage) || doc.coverage ||
+        (doc.data && doc.data.coverage) || null;
+    const claimed = symbols.some(symbol =>
+        symbol.name === task.name &&
+        symbol.file === task.relativePath &&
+        symbol.startLine >= task.startLine &&
+        symbol.startLine <= (task.endLine || task.startLine));
+    return {
+        claimed,
+        claimsWithdrawn: !!(coverage && coverage.claimsWithdrawn),
+    };
+}
+
+/**
+ * Tri-state contract-arm delete verdict: 'unsafe' | 'safe' | 'review'.
+ *
+ * The binary contract verdict said "safe" whenever text evidence was zero —
+ * but zero text evidence cannot prove a method deletable in languages with
+ * implicit contracts (websocket's net.Error Temporary/Timeout methods have
+ * no project references, and deleting them breaks interface satisfaction
+ * every text/AST arm is blind to). The engine's deadcode audit encodes every
+ * shield it has (exported exclusion, external-contract routing, heritage
+ * closure, entry points), so:
+ *   - any confirmed caller or usage evidence         → unsafe
+ *   - zero evidence AND the default audit CLAIMS it  → safe
+ *   - zero evidence, not claimed (or audit unusable) → review
+ * Review is the honest third answer a grep arm cannot give: "no text
+ * evidence, but not provably dead — verify the contract surface first."
+ */
+function deleteVerdictTriState({ confirmedCallers, usageEvidence, audit }) {
+    if (confirmedCallers > 0) return { verdict: 'unsafe', reason: 'confirmed-callers' };
+    if (usageEvidence > 0) return { verdict: 'unsafe', reason: 'usage-evidence' };
+    if (usageEvidence < 0) return { verdict: 'review', reason: 'usages-unavailable' };
+    if (!audit) return { verdict: 'review', reason: 'audit-unavailable' };
+    if (audit.claimsWithdrawn) return { verdict: 'review', reason: 'audit-coverage-incomplete' };
+    if (audit.claimed) return { verdict: 'safe', reason: 'claimed-dead-by-audit' };
+    return { verdict: 'review', reason: 'not-claimed-by-audit' };
+}
+
 // ── Judge-output parsing (error keys are line-INDEPENDENT so deletions that
 //    shift line numbers do not manufacture phantom "new" errors) ─────────────
 
@@ -281,14 +337,22 @@ function parseGoErrors(text) {
     return keys;
 }
 
-/** `cargo check --message-format=short` output → error keys. */
+/** `cargo check --message-format=short` output → error keys.
+ *  Keys are DEDUPED: cargo compiles one file under several target contexts
+ *  (bench + test for benches/*.rs with --all-targets), and cached vs dirty
+ *  targets replay diagnostics asymmetrically — a pristine baseline emitted
+ *  `#![feature] may not be used` ONCE while the same repo with a touched
+ *  bench file emitted it twice (rust-csv-measured, 2026-08-20). The multiset
+ *  diff then manufactured a phantom "new" error for any arm that edits a
+ *  bench file. Identical file|message keys are compilation-context echoes,
+ *  not distinct errors. */
 function parseCargoErrors(text) {
-    const keys = [];
+    const keys = new Set();
     for (const raw of String(text || '').split('\n')) {
         const match = raw.match(/^(.+?\.rs):(\d+):(\d+):\s*error(?:\[[^\]]+\])?:\s*(.+)$/);
-        if (match) keys.push(`${match[1]}|${truncateMessage(match[4])}`);
+        if (match) keys.add(`${match[1]}|${truncateMessage(match[4])}`);
     }
-    return keys;
+    return [...keys];
 }
 
 /** pyright --outputjson document → error keys (errors only, warnings out).
@@ -387,12 +451,22 @@ function aggregateRenameTasks(tasks, armNames) {
     return { perArm, allArmsBroke, allArmsClean, pairedCleanVsBroken: paired };
 }
 
+/** Arm verdict as a tri-state string; binary arms map safe→'safe' else
+ *  'unsafe'. Only the contract arm currently emits 'review'. */
+function armDeleteVerdict(row) {
+    if (typeof row.verdict === 'string') return row.verdict;
+    return row.safe ? 'safe' : 'unsafe';
+}
+
 /**
  * Aggregate delete-triage verdicts against the judged ground outcome.
- * Each task: { groundBroken, arms: { <armName>: { safe, cost } } }.
+ * Each task: { groundBroken, arms: { <armName>: { safe | verdict, cost } } }.
  * falseSafeRate is the dangerous direction (arm said safe, deletion broke the
- * build); falseUnsafeRate is an upper bound only — a compile-clean deletion
- * can still be runtime-unsafe, which the compiler judge cannot see.
+ * build) and is computed over 'safe' verdicts only. Review rows are counted
+ * separately with their ground outcomes — reviewGroundBroken is the breakage
+ * the review tier intercepted, reviewGroundClean the over-caution upper
+ * bound (a compile-clean deletion can still be runtime-unsafe, which the
+ * compiler judge cannot see; falseUnsafe has the same upper-bound caveat).
  */
 function aggregateDeleteTasks(tasks, armNames) {
     const perArm = {};
@@ -401,18 +475,28 @@ function aggregateDeleteTasks(tasks, armNames) {
             .map(task => ({ ground: task.groundBroken, verdict: task.arms[arm] }))
             .filter(row => row.verdict);
         if (rows.length === 0) { perArm[arm] = null; continue; }
-        const saidSafe = rows.filter(row => row.verdict.safe);
-        const saidUnsafe = rows.filter(row => !row.verdict.safe);
+        const byVerdict = verdict => rows.filter(row =>
+            armDeleteVerdict(row.verdict) === verdict);
+        const saidSafe = byVerdict('safe');
+        const saidUnsafe = byVerdict('unsafe');
+        const review = byVerdict('review');
         const falseSafe = saidSafe.filter(row => row.ground).length;
         const falseUnsafe = saidUnsafe.filter(row => !row.ground).length;
+        const decisive = saidSafe.length + saidUnsafe.length;
+        const decisiveCorrect = saidSafe.filter(row => !row.ground).length +
+            saidUnsafe.filter(row => row.ground).length;
         perArm[arm] = {
             tasks: rows.length,
             saidSafe: saidSafe.length,
             falseSafe,
             falseSafeRate: round(saidSafe.length === 0 ? 0 : falseSafe / saidSafe.length),
+            saidUnsafe: saidUnsafe.length,
             falseUnsafeUpperBound: falseUnsafe,
-            agreementWithJudge: round(rows.filter(row =>
-                row.verdict.safe === !row.ground).length / rows.length),
+            review: review.length,
+            reviewGroundBroken: review.filter(row => row.ground).length,
+            reviewGroundClean: review.filter(row => !row.ground).length,
+            // Agreement over decisive verdicts only; review abstains.
+            agreementWithJudge: round(decisive === 0 ? 0 : decisiveCorrect / decisive),
             avgOutputChars: Math.round(rows.reduce((sum, row) =>
                 sum + ((row.verdict.cost && row.verdict.cost.outputChars) || 0), 0) / rows.length),
             avgToolCalls: round(rows.reduce((sum, row) =>
@@ -420,6 +504,60 @@ function aggregateDeleteTasks(tasks, armNames) {
         };
     }
     return { perArm };
+}
+
+// ── Gate policy (pinned tuned set only — unpinned holdouts never gate) ──────
+
+/**
+ * Explicit release thresholds for the outcome instrument, applied to the
+ * PINNED tuned regression set (same commit + same seed → same tasks, so the
+ * board is deterministic up to toolchain version). The contract arm is the
+ * surface UCN tells agents to follow, so it is the arm under gate:
+ *   - infra soundness: zero judge errors, zero proposal (plan/show) failures;
+ *   - falseSafe = 0: a 'safe' delete verdict that breaks the build is the
+ *     dangerous direction and never acceptable on tuned repos;
+ *   - rename no-regression: contract broken-build rate must not exceed the
+ *     grep baseline on the same tasks (text search is the floor).
+ */
+const OUTCOME_GATE_THRESHOLDS = Object.freeze({
+    maxJudgeErrors: 0,
+    maxProposalErrors: 0,
+    maxContractDeleteFalseSafe: 0,
+    contractRenameNoWorseThanGrep: true,
+});
+
+function evaluateOutcomeGate(reports, thresholds = OUTCOME_GATE_THRESHOLDS) {
+    const failures = [];
+    for (const report of reports) {
+        const repo = report.repo;
+        if ((report.judgeErrors || 0) > thresholds.maxJudgeErrors) {
+            failures.push(`${repo}: ${report.judgeErrors} judge error(s) ` +
+                `(max ${thresholds.maxJudgeErrors})`);
+        }
+        const proposalErrors = (report.renameProposalErrors || 0) +
+            (report.deleteProposalErrors || 0);
+        if (proposalErrors > thresholds.maxProposalErrors) {
+            failures.push(`${repo}: ${proposalErrors} proposal failure(s) ` +
+                `(max ${thresholds.maxProposalErrors})`);
+        }
+        const deleteArm = report.delete && report.delete.aggregate.perArm['ucn-contract'];
+        if (deleteArm && deleteArm.falseSafe > thresholds.maxContractDeleteFalseSafe) {
+            failures.push(`${repo}: contract delete falseSafe ${deleteArm.falseSafe} ` +
+                `(max ${thresholds.maxContractDeleteFalseSafe})`);
+        }
+        if (thresholds.contractRenameNoWorseThanGrep && report.rename) {
+            const perArm = report.rename.aggregate.perArm;
+            const grep = perArm.grep;
+            const contract = perArm['ucn-contract'];
+            if (grep && contract &&
+                contract.brokenBuildRate > grep.brokenBuildRate) {
+                failures.push(`${repo}: contract rename broken-build ` +
+                    `${contract.brokenBuildRate} exceeds grep baseline ` +
+                    `${grep.brokenBuildRate}`);
+            }
+        }
+    }
+    return failures;
 }
 
 module.exports = {
@@ -434,6 +572,11 @@ module.exports = {
     deleteVerdictFromShow,
     deleteVerdictFromUsages,
     grepDeleteVerdict,
+    deadcodeClaimForTask,
+    deleteVerdictTriState,
+    armDeleteVerdict,
+    OUTCOME_GATE_THRESHOLDS,
+    evaluateOutcomeGate,
     parseGoErrors,
     parseCargoErrors,
     parsePyrightErrors,
