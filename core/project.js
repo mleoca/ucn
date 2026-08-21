@@ -943,6 +943,28 @@ class ProjectIndex {
     }
 
     /**
+     * Def-exact inheritance parents (fix #300): resolve parents for ONE
+     * specific class definition by (file, startLine). Same-name classes in
+     * one file (function-local test classes) carry different parents; the
+     * file-granular lookup above conflates them. Returns null when no entry
+     * matches — for a known def that means it extends nothing (entries are
+     * only recorded for extends-bearing defs), which callers must treat as
+     * "no parents", never fall back to a sibling def's edges.
+     * @param {string} className
+     * @param {string} contextFile
+     * @param {number} defStartLine
+     * @returns {string[]|null}
+     */
+    _getInheritanceParentsAt(className, contextFile, defStartLine) {
+        const entries = this.extendsGraph.get(className);
+        if (!entries || entries.length === 0) return null;
+        if (typeof entries[0] !== 'object' || entries[0].file === undefined) return null;
+        const match = entries.find(e => e.file === contextFile &&
+            e.startLine === defStartLine);
+        return match ? match.parents : null;
+    }
+
+    /**
      * Resolve which file a class is defined in, preferring contextFile.
      * Used during inheritance BFS to find grandparent chains.
      * @param {string} className - Class name to resolve

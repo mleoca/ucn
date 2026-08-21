@@ -5643,3 +5643,82 @@ describe('fix #261: zero-candidate method calls route external', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #300: cross-case receiver-name match is never exclusion evidence', () => {
+    it('rust: cross-case class match routes visible method-ambiguous', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "f300a"\nversion = "0.1.0"\n',
+            'src/lib.rs': [
+                'pub struct TupleWindows { pub n: u32 }',
+                '',
+                'impl TupleWindows {',
+                '    pub fn next(&mut self) -> Option<u32> { None }',
+                '}',
+                '',
+                'pub struct Other { pub m: u32 }',
+                '',
+                'impl Other {',
+                '    pub fn next(&mut self) -> Option<u32> { None }',
+                '}',
+                '',
+                'pub fn drive<F: Fn() -> TupleWindows>(mk: F) -> Option<u32> {',
+                '    let mut iter = mk();',
+                '    iter.next()',
+                '}',
+            ].join('\n') + '\n',
+            // Test-file struct whose name matches the receiver only across case —
+            // the itertools family: `struct Iter` poisoned every `iter` receiver.
+            'tests/quick.rs': [
+                'struct Iter { k: u32 }',
+                '',
+                'impl Iter {',
+                '    fn next(&mut self) -> Option<u32> { None }',
+                '}',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'src/lib.rs:4:next' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const unv = r.result.unverifiedCallers || [];
+            const site = unv.find(u => u.relativePath === 'src/lib.rs' && u.line === 15);
+            assert.ok(site, `iter.next() must stay visible: ${JSON.stringify(unv)}`);
+            assert.strictEqual(site.reason, 'method-ambiguous');
+            const excl = r.result.meta.account.excluded.byReason || {};
+            assert.ok(!excl['receiver-other-class'],
+                `cross-case guess must not exclude: ${JSON.stringify(excl)}`);
+            assert.ok(r.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('go: exact-case class match keeps the exclusion (the grpc-go bb family)', () => {
+        const dir = tmp({
+            'go.mod': 'module f300ago\n\ngo 1.21\n',
+            'main.go': [
+                'package main',
+                '',
+                'type bb struct{ n int }',
+                '',
+                'func (b *bb) Parse(s string) int { return b.n }',
+                '',
+                'type cc struct{ m int }',
+                '',
+                'func (c *cc) Parse(s string) int { return c.m }',
+                '',
+                'func run(mk func() *bb) int {',
+                '\tbb := mk()',
+                '\treturn bb.Parse("x")',
+                '}',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'main.go:9:Parse' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const excl = r.result.meta.account.excluded.byReason || {};
+            assert.ok(excl['receiver-other-class'],
+                `exact-case name match must keep excluding: ${JSON.stringify(excl)}`);
+            assert.ok(r.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+});

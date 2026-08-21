@@ -6,6 +6,7 @@
  */
 
 const { detectLanguage, getParser, getLanguageAdapter, safeParse, langTraits } = require('../languages');
+const { sameNode } = require('../languages/utils');
 const { escapeRegExp, codeUnitCompare, NON_CALLABLE_TYPES } = require('./shared');
 
 function codeUnitColumnForByteColumn(line, byteColumn) {
@@ -24,13 +25,14 @@ function codeUnitColumnForByteColumn(line, byteColumn) {
 
 /** Replace only AST identifier tokens on one source line. */
 function renameIdentifierTokens(index, filePath, lineNumber, oldName, newName,
-    preferredByteColumns = null, expectedCallCount = null) {
+    preferredByteColumns = null, expectedCallCount = null, tokenOptions = {}) {
     const absolute = filePath && require('path').isAbsolute(filePath)
         ? filePath : require('path').join(index.root, filePath || '');
     const content = index._readFile(absolute);
     const sourceLine = content.split('\n')[lineNumber - 1] || '';
     let byteColumns = Array.isArray(preferredByteColumns)
         ? preferredByteColumns.filter(Number.isInteger) : [];
+    const defNameByteColumns = [];
 
     if (byteColumns.length === 0) {
         const language = index.files.get(absolute)?.language ||
@@ -65,12 +67,36 @@ function renameIdentifierTokens(index, filePath, lineNumber, oldName, newName,
                             break;
                         }
                     }
-                    if (eligible) byteColumns.push(node.startPosition.column);
+                    if (eligible) {
+                        byteColumns.push(node.startPosition.column);
+                        // Definition-name token: the identifier that IS its
+                        // parent's `name` field (method_declaration name,
+                        // function_definition name, variable_declarator name).
+                        // Wrapper identity via sameNode (#233 — wrappers are
+                        // not reference-stable across walks).
+                        if (tokenOptions.definitionNameOnly && node.parent) {
+                            const nameChild = node.parent.childForFieldName?.('name');
+                            if (nameChild && sameNode(nameChild, node)) {
+                                defNameByteColumns.push(node.startPosition.column);
+                            }
+                        }
+                    }
                     continue;
                 }
                 stack.push(...(node.namedChildren || []));
             }
         }
+    }
+
+    // Definition-line discipline (fix #300, mux-measured): a def line can
+    // repeat the symbol as a parameter TYPE (`func (r *Route) BuildVarsFunc(f
+    // BuildVarsFunc) *Route`) — renaming every token breaks the type
+    // reference. Rename only the definition's own NAME token (AST name field;
+    // first occurrence as fallback) — javac/gopls rename semantics.
+    if (tokenOptions.definitionNameOnly && byteColumns.length > 1) {
+        byteColumns = defNameByteColumns.length > 0
+            ? [defNameByteColumns[0]]
+            : [Math.min(...byteColumns)];
     }
 
     const columns = [...new Set(byteColumns
@@ -2033,6 +2059,23 @@ function plan(index, name, options = {}) {
                 // re-export chain; unknown CJS/dynamic surfaces are unsafe to
                 // rewrite mechanically.
                 if (exportPath !== def.file && ownership !== 'yes') continue;
+                // Symbol identity (fix #300, mux-measured): a name-keyed
+                // export list records one entry per same-named symbol — under
+                // the METHOD pin (r *Route) BuildVarsFunc, the entry anchored
+                // at the same-named TYPE's definition line (`type
+                // BuildVarsFunc func(...)`) is the type's export surface, not
+                // the method's; renaming it silently renames the type and
+                // breaks every type reference. Skip entries whose line hosts
+                // a different same-named definition. CJS surfaces
+                // (`module.exports = { helper }`) have no def at their line
+                // and keep flowing.
+                const defsAtExportLine = (index.symbols.get(name) || []).filter(d =>
+                    d.file === exportPath &&
+                    (d.startLine === exported.line ||
+                        (d.nameLine ?? d.startLine) === exported.line));
+                const pinnedAtExportLine = defsAtExportLine.some(d =>
+                    d.file === def.file && d.startLine === def.startLine);
+                if (defsAtExportLine.length > 0 && !pinnedAtExportLine) continue;
                 const exportFile = targetEntry.relativePath || exportPath;
                 if (changes.some(change =>
                     change.file === exportFile && change.line === exported.line)) {
@@ -2057,6 +2100,77 @@ function plan(index, name, options = {}) {
             }
         }
 
+        // Python __all__ string entries are rename edits (fix #300,
+        // requests-measured): `__all__ = (..., "put", ...)` names the
+        // module-level binding by STRING — after the def and the import that
+        // binds it are renamed, the dangling entry is a compiler-checked
+        // break (pyright reportUnsupportedDunderAll). grep sees inside
+        // strings; the plan must too. Scan exactly the files whose
+        // module-level binding of the name this plan renames: the pin's own
+        // module (module-level pins only) and every file receiving an
+        // [import] edit. AST-detected: string elements of an __all__
+        // assignment matching the name exactly; dynamic __all__ manipulation
+        // stays out of scope.
+        if (!def.className) {
+            const pathMod = require('path');
+            const dunderFiles = new Set([def.file]);
+            for (const change of changes) {
+                if (change.editKind !== 'import') continue;
+                const abs = pathMod.isAbsolute(change.file)
+                    ? change.file : pathMod.join(index.root, change.file);
+                dunderFiles.add(abs);
+            }
+            for (const abs of dunderFiles) {
+                const fe = index.files.get(abs);
+                if (!fe || fe.language !== 'python') continue;
+                let content;
+                try { content = index._readFile(abs); } catch { continue; }
+                if (!content.includes('__all__')) continue;
+                const parser = getParser('python');
+                const tree = parser && (index._getParsedTree?.(abs, content, 'python') ||
+                    safeParse(parser, content));
+                if (!tree) continue;
+                const lines = content.split('\n');
+                const rel = fe.relativePath || abs;
+                const stack = [tree.rootNode];
+                while (stack.length > 0) {
+                    const node = stack.pop();
+                    if (node.type === 'assignment' || node.type === 'augmented_assignment') {
+                        const left = node.childForFieldName('left');
+                        if (left?.text !== '__all__') continue;
+                        const right = node.childForFieldName('right');
+                        if (!right) continue;
+                        const strStack = [right];
+                        while (strStack.length > 0) {
+                            const s = strStack.pop();
+                            if (s.type === 'string') {
+                                const inner = s.text.replace(/^[rbuf]*["']/i, '').replace(/["']$/, '');
+                                if (inner !== name) continue;
+                                const lineNo = s.startPosition.row + 1;
+                                if (changes.some(c => c.file === rel && c.line === lineNo)) continue;
+                                const sourceLine = lines[lineNo - 1] || '';
+                                const quoteRe = new RegExp(`(["'])${escapeRegExp(name)}\\1`, 'g');
+                                const newLine = sourceLine.replace(quoteRe, `$1${options.renameTo}$1`);
+                                if (newLine === sourceLine) continue;
+                                changes.push({
+                                    file: rel,
+                                    line: lineNo,
+                                    expression: sourceLine.trim(),
+                                    suggestion: `Update __all__ entry: ${newLine.trim()}`,
+                                    newExpression: newLine.trim(),
+                                    editKind: 'reference',
+                                });
+                            } else {
+                                for (let i = 0; i < s.namedChildCount; i++) strStack.push(s.namedChild(i));
+                            }
+                        }
+                        continue;
+                    }
+                    for (let i = 0; i < node.namedChildCount; i++) stack.push(node.namedChild(i));
+                }
+            }
+        }
+
         // Overload signatures and their implementation are ONE callable
         // (fix #265A, def side): renaming any member must rename the whole
         // group, or the survivors keep the old name and the compiler rejects
@@ -2074,7 +2188,8 @@ function plan(index, name, options = {}) {
                 if (changes.some(change =>
                     change.file === rel && change.line === line)) continue;
                 const edit = renameIdentifierTokens(index, member.file,
-                    line, name, options.renameTo);
+                    line, name, options.renameTo,
+                    null, null, { definitionNameOnly: true });
                 if (edit.renamed === edit.source) continue;
                 changes.push({
                     file: rel,
@@ -2142,7 +2257,8 @@ function plan(index, name, options = {}) {
                 if (changes.some(change =>
                     change.file === rel && change.line === line)) continue;
                 const edit = renameIdentifierTokens(index, ancestor.def.file,
-                    line, name, options.renameTo);
+                    line, name, options.renameTo,
+                    null, null, { definitionNameOnly: true });
                 if (edit.renamed === edit.source) continue;
                 changes.push({
                     file: rel,
@@ -2189,7 +2305,8 @@ function plan(index, name, options = {}) {
                 const rel = override.relativePath || override.file;
                 if (changes.some(change => change.file === rel && change.line === line)) continue;
                 const edit = renameIdentifierTokens(index, override.file,
-                    line, name, options.renameTo);
+                    line, name, options.renameTo,
+                    null, null, { definitionNameOnly: true });
                 const sourceLine = edit.source;
                 const newExpression = edit.renamed;
                 if (newExpression === sourceLine) continue;
@@ -2242,7 +2359,8 @@ function plan(index, name, options = {}) {
                     const rel = member.relativePath || member.file;
                     if (!changes.some(change => change.file === rel && change.line === line)) {
                         const edit = renameIdentifierTokens(index, member.file,
-                            line, name, options.renameTo);
+                            line, name, options.renameTo,
+                            null, null, { definitionNameOnly: true });
                         if (edit.renamed !== edit.source) {
                             changes.push({
                                 file: rel,
@@ -2312,7 +2430,8 @@ function plan(index, name, options = {}) {
                             m.endPosition.row + 1 >= lineNo);
                         if (!mac || !implRe.test(mac.text)) continue;
                         const edit = renameIdentifierTokens(index, macroFile,
-                            lineNo, name, options.renameTo);
+                            lineNo, name, options.renameTo,
+                            null, null, { definitionNameOnly: true });
                         if (edit.renamed === edit.source) continue;
                         changes.push({
                             file: rel,
@@ -2401,7 +2520,8 @@ function plan(index, name, options = {}) {
                 const rel = sibling.relativePath || sibling.file;
                 if (changes.some(change => change.file === rel && change.line === line)) continue;
                 const edit = renameIdentifierTokens(index, sibling.file,
-                    line, name, options.renameTo);
+                    line, name, options.renameTo,
+                    null, null, { definitionNameOnly: true });
                 if (edit.renamed === edit.source) continue;
                 changes.push({
                     file: rel,
@@ -2588,7 +2708,8 @@ function plan(index, name, options = {}) {
         existingDefinitionLine.editKind = 'definition';
         if (options.renameTo) {
             const renamed = renameIdentifierTokens(index, def.file,
-                definitionLine, name, options.renameTo).renamed;
+                definitionLine, name, options.renameTo,
+                null, null, { definitionNameOnly: true }).renamed;
             existingDefinitionLine.newExpression = renamed;
             existingDefinitionLine.suggestion = `Update definition: ${renamed}`;
         }
@@ -2602,7 +2723,8 @@ function plan(index, name, options = {}) {
         };
         if (options.renameTo) {
             const renamed = renameIdentifierTokens(index, def.file,
-                definitionLine, name, options.renameTo).renamed;
+                definitionLine, name, options.renameTo,
+                null, null, { definitionNameOnly: true }).renamed;
             definitionChange.newExpression = renamed;
             definitionChange.suggestion = `Update definition: ${renamed}`;
         } else {

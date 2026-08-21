@@ -5352,3 +5352,126 @@ describe('fix #296: trait-declaration pins and path-receiver implementors', () =
         } finally { rm(dir); }
     });
 });
+
+describe('fix #300: mod declaration never self-contains (powerset::powerset)', () => {
+    const modFixture = {
+        'Cargo.toml': '[package]\nname = "f300b"\nversion = "0.1.0"\n',
+        'src/lib.rs': [
+            'mod powerset;',
+            '',
+            'pub use crate::powerset::Powerset;',
+            '',
+            'pub trait Itertools: Iterator {',
+            '    fn powerset(self) -> Powerset',
+            '    where',
+            '        Self: Sized,',
+            '    {',
+            '        powerset::powerset(self)',
+            '    }',
+            '}',
+        ].join('\n') + '\n',
+        'src/powerset.rs': [
+            'pub struct Powerset {',
+            '    pub n: usize,',
+            '}',
+            '',
+            'pub fn powerset<I>(_src: I) -> Powerset {',
+            '    Powerset { n: 0 }',
+            '}',
+        ].join('\n') + '\n',
+    };
+
+    it('module-qualified call confirms under the free-fn pin (#260 ownership)', () => {
+        const dir = tmp(modFixture);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'src/powerset.rs:5:powerset' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const caller = (r.result.callers || []).find(c =>
+                c.relativePath === 'src/lib.rs' && c.line === 10);
+            assert.ok(caller, `powerset::powerset(self) must confirm: ${JSON.stringify(r.result.callers)}`);
+            const excl = r.result.meta.account.excluded.byReason || {};
+            assert.ok(!excl['other-definition'],
+                `mod declaration must not self-contain: ${JSON.stringify(excl)}`);
+            assert.ok(r.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('trait-method pin keeps the exclusion (module owns the name elsewhere)', () => {
+        const dir = tmp(modFixture);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'src/lib.rs:6:powerset' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            assert.strictEqual((r.result.callers || []).length, 0);
+            const excl = r.result.meta.account.excluded.byReason || {};
+            assert.ok(excl['other-definition'],
+                `module ownership must exclude under the trait pin: ${JSON.stringify(excl)}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #300: bare imported name owns the callee (use free::merge_join_by)', () => {
+    it('resolves the imported free fn, never the same-name trait method', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "f300d"\nversion = "0.1.0"\n',
+            'src/lib.rs': [
+                'pub mod free;',
+                'pub mod merge_join;',
+                '',
+                'use crate::merge_join::merge_join_by;',
+                '',
+                'pub trait Itertools: Iterator {',
+                '    fn merge_join_by(self, other: u32) -> u32',
+                '    where',
+                '        Self: Sized,',
+                '    {',
+                '        merge_join_by(1, other)',
+                '    }',
+                '}',
+            ].join('\n') + '\n',
+            'src/free.rs': 'pub use crate::merge_join::merge_join_by;\n',
+            'src/merge_join.rs': [
+                'pub fn merge_join_by(left: u32, right: u32) -> u32 {',
+                '    left + right',
+                '}',
+            ].join('\n') + '\n',
+            'tests/merge_join.rs': [
+                'use f300d::free::merge_join_by;',
+                '',
+                '#[test]',
+                'fn empty() {',
+                '    let out = merge_join_by(1, 2);',
+                '    assert_eq!(out, 3);',
+                '}',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const { findCallees } = require('../core/callers');
+            const def = (index.symbols.get('empty') || [])
+                .find(d => d.file.endsWith('tests/merge_join.rs'));
+            assert.ok(def, 'test fn indexed');
+            const callees = findCallees(index, def, { collectAccount: true });
+            const edge = callees.find(c => c.name === 'merge_join_by');
+            assert.ok(edge, 'edge exists');
+            assert.ok(edge.file.endsWith('src/merge_join.rs'),
+                `must resolve the imported free fn, got ${edge.file}:${edge.startLine}`);
+            assert.ok(!edge.className,
+                `bare call must never bind the trait method: ${JSON.stringify(edge.className)}`);
+            assert.ok(callees.calleeAccount.conserved);
+
+            // The trait wrapper's OWN body: the bare call inside
+            // Itertools::merge_join_by must resolve the free fn, never a
+            // self-edge through the file bindings table (#220(4), callee).
+            const traitDef = (index.symbols.get('merge_join_by') || [])
+                .find(d => d.className === 'Itertools');
+            const inner = findCallees(index, traitDef, { collectAccount: true, includeMethods: true });
+            const innerEdge = inner.find(c => c.name === 'merge_join_by');
+            assert.ok(innerEdge, 'inner edge exists');
+            assert.ok(innerEdge.file.endsWith('src/merge_join.rs'),
+                `trait body resolves the free fn, not itself: ${innerEdge.file}:${innerEdge.startLine}`);
+            assert.ok(inner.calleeAccount.conserved);
+        } finally { rm(dir); }
+    });
+});

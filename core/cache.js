@@ -621,7 +621,14 @@ function clearAllCaches() {
 // (fix #299A — identity closure with the primary template), and C++
 // argument-position calls through a local callable variable record kind
 // 'expr' instead of call:NAME (fix #299B shadow guard).
-const CACHE_FORMAT_VERSION = 177;
+// v178: extendsGraph entries persist the defining symbol's startLine so
+// scope-aware consumers can pick the right def when several same-name
+// classes live in one file — function-local test subclasses (fix #300,
+// attrs-measured); Go range VALUE variables are typed from the container's
+// element type (declared fields/params/vars/literals — `for _, route :=
+// range r.routes` types route as Route; fix #300, mux-measured), changing
+// persisted call-record receiverTypes.
+const CACHE_FORMAT_VERSION = 178;
 
 /**
  * Save index to cache file

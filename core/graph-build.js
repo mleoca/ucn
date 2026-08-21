@@ -451,6 +451,12 @@ function buildInheritanceGraph(index) {
                 }
                 index.extendsGraph.get(symbol.name).push({
                     file: filePath,
+                    // Per-def anchor (fix #300, attrs-measured): five
+                    // function-local `class C2Slots(...)` defs in one file
+                    // carry DIFFERENT parents — file-granular lookup returned
+                    // the first entry for all of them. startLine lets scope-
+                    // aware consumers pick the def the call site actually sees.
+                    startLine: symbol.startLine,
                     parents: resolvedParents
                 });
 

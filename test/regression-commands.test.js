@@ -6968,3 +6968,57 @@ describe('fix #293: slot rename unions every member\'s call sites', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #300: plan export-pass symbol identity + def-line name-only rename', () => {
+    const muxShape = {
+        'go.mod': 'module f300e\n\ngo 1.21\n',
+        'route.go': [
+            'package f300e',
+            '',
+            '// BuildVarsFunc is the function signature type.',
+            'type BuildVarsFunc func(map[string]string) map[string]string',
+            '',
+            'type Route struct{ buildVarsFunc BuildVarsFunc }',
+            '',
+            '// BuildVarsFunc sets the func.',
+            'func (r *Route) BuildVarsFunc(f BuildVarsFunc) *Route {',
+            '\tr.buildVarsFunc = f',
+            '\treturn r',
+            '}',
+        ].join('\n') + '\n',
+    };
+
+    it('method pin never emits the same-named TYPE line as an export edit', () => {
+        const dir = tmp(muxShape);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', {
+                name: 'route.go:9:BuildVarsFunc', renameTo: 'BuildVarsFn',
+            });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const changes = r.result.changes || [];
+            assert.ok(!changes.some(c => c.line === 4),
+                `type def line must not be edited under the method pin: ${JSON.stringify(changes)}`);
+            const defEdit = changes.find(c => c.line === 9 && c.editKind === 'definition');
+            assert.ok(defEdit, 'definition edit present');
+            assert.strictEqual(defEdit.newExpression,
+                'func (r *Route) BuildVarsFn(f BuildVarsFunc) *Route {',
+                'param TYPE must keep its name — def rename is name-token only');
+        } finally { rm(dir); }
+    });
+
+    it('type pin renames only its own definition line', () => {
+        const dir = tmp(muxShape);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', {
+                name: 'route.go:4:BuildVarsFunc', renameTo: 'BuildVarsFn',
+            });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const changes = r.result.changes || [];
+            assert.ok(changes.some(c => c.line === 4 && c.editKind === 'definition'));
+            assert.ok(!changes.some(c => c.line === 9),
+                `method def line must not be edited under the type pin: ${JSON.stringify(changes)}`);
+        } finally { rm(dir); }
+    });
+});

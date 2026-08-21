@@ -146,7 +146,7 @@ describe('command trust matrix: fail-closed proof coverage', () => {
             assert.doesNotMatch(script, /--repo/, `${script} must not duplicate the release list`);
         }
         assert.match(readme, /ten-repository/i);
-        assert.match(readme, /22 pinned repositories/i);
+        assert.match(readme, /24 pinned repositories/i);
         for (const name of RELEASE_REPO_NAMES) {
             assert.ok(readme.includes(name), `README must name release repository ${name}`);
         }

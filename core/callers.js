@@ -3243,7 +3243,14 @@ function findCallers(index, name, options = {}) {
                                         (call.receiverTypeQualifier && call.receiverTypeFlowFile)) {
                                         const identity = _resolveStructuralFlowTypeIdentity(
                                             index, call.receiverTypeFlowFile || filePath, knownType, targetDefs,
-                                            call.receiverTypeFlowFile ? undefined : call.receiverTypeQualifier);
+                                            call.receiverTypeFlowFile ? undefined : call.receiverTypeQualifier,
+                                            (call.receiverTypeFlowFile &&
+                                                call.receiverTypeFlowFile !== filePath) ? undefined : {
+                                                file: filePath,
+                                                line: call.line,
+                                                scopeStart: call.enclosingFunction?.startLine,
+                                                scopeEnd: call.enclosingFunction?.endLine,
+                                            });
                                         if (identity === 'other') {
                                             receiverTypeValidated = false;
                                         } else if (identity === 'unknown') {
@@ -3260,7 +3267,14 @@ function findCallers(index, name, options = {}) {
                                 // ancestry before treating it as unrelated.
                                 const identity = _resolveStructuralFlowTypeIdentity(
                                     index, call.receiverTypeFlowFile || filePath, knownType, targetDefs,
-                                    call.receiverTypeFlowFile ? undefined : call.receiverTypeQualifier);
+                                    call.receiverTypeFlowFile ? undefined : call.receiverTypeQualifier,
+                                    (call.receiverTypeFlowFile &&
+                                        call.receiverTypeFlowFile !== filePath) ? undefined : {
+                                        file: filePath,
+                                        line: call.line,
+                                        scopeStart: call.enclosingFunction?.startLine,
+                                        scopeEnd: call.enclosingFunction?.endLine,
+                                    });
                                 if (identity === 'target') {
                                     receiverTypeValidated = true;
                                 } else if (identity === 'unknown') {
@@ -3595,7 +3609,9 @@ function findCallers(index, name, options = {}) {
                                         const t = d.className || (d.receiver && d.receiver.replace(/^\*/, ''));
                                         if (t && !targetTypes.has(t)) nonTargetClasses.add(t);
                                     }
-                                    const matchesOther = [...nonTargetClasses].some(cn => cn.toLowerCase() === receiverLower);
+                                    const matchesOtherExact = [...nonTargetClasses].some(cn => cn === receiverSegment);
+                                    const matchesOther = matchesOtherExact ||
+                                        [...nonTargetClasses].some(cn => cn.toLowerCase() === receiverLower);
                                     if (matchesOther) {
                                         isUncertain = true;
                                         typeMismatch = true;
@@ -3612,6 +3628,21 @@ function findCallers(index, name, options = {}) {
                                                 routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
                                                     dispatchVia: dispatchSuper,
                                                     dispatchCandidates: countDispatchCandidates(dispatchSuper),
+                                                });
+                                                continue;
+                                            }
+                                            // fix #300: a CROSS-CASE receiver-name→class
+                                            // match is the naming-convention guess
+                                            // (`storage` ~ `Storage`) — a guess is never
+                                            // exclusion evidence (#266(2)). itertools-
+                                            // measured: a test-file `struct Iter` poisoned
+                                            // every `iter`-named receiver project-wide,
+                                            // excluding rust-analyzer-attested true edges.
+                                            // Exact-case matches keep excluding (grpc-go
+                                            // names builder structs and locals both `bb`).
+                                            if (!matchesOtherExact) {
+                                                routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs, {
+                                                    dispatchCandidates: methodOwnerKeys().size,
                                                 });
                                                 continue;
                                             }
@@ -5824,8 +5855,18 @@ function findCallees(index, definition, options = {}) {
             const shadowsBuiltin = !call.receiver && (
                 fileEntry?.importBindings?.some(b => b.name === call.name) ||
                 fileEntry?.bindings?.some(b => b.name === call.name));
-            if (!selfShaped && !call.receiverIsModule && !shadowsBuiltin &&
-                index.isKeyword(call.name, language)) {
+            // A method call on a receiver TYPED to a project class is
+            // evidence for a project method, not the builtin (fix #300,
+            // attrs callee arm: `c2.classmethod()` on constructor-typed
+            // C2Slots was routed external because `classmethod` sits in the
+            // Python builtin set — the #238 self-shaped exemption's typed-
+            // receiver twin). The receiver-type routing below decides.
+            const typedProjectReceiver = call.isMethod && call.receiverType &&
+                typeof call.receiverType === 'string' &&
+                (index.symbols.get(call.receiverType) || [])
+                    .some(d => IDENTITY_TYPE_KINDS.has(d.type));
+            if (!selfShaped && !typedProjectReceiver && !call.receiverIsModule &&
+                !shadowsBuiltin && index.isKeyword(call.name, language)) {
                 noteSite(siteId, 'external', null, call);
                 continue;
             }
@@ -5934,8 +5975,17 @@ function findCallees(index, definition, options = {}) {
             // name through the same #217 export-chain discipline used for
             // module receivers. Only intercept when an explicit binding of
             // this name exists; ordinary locals continue to lexical binding.
-            if (!call.isMethod && !call.receiver &&
-                langTraits(language)?.typeSystem === 'structural') {
+            // fix #300 (itertools-measured): the gate covers every language
+            // where a bare call cannot denote a method (#220(4)) — Rust
+            // `use itertools::free::merge_join_by;` owns the bare name, and
+            // canonical-order def selection was confirming the TRAIT METHOD
+            // (lib.rs Itertools::merge_join_by) instead of the imported free
+            // fn. Go item-level import bindings don't exist (package-
+            // qualified imports only), so the route is a structural+Rust
+            // change in practice; Java (bareCallReachesMethods) keeps its
+            // implicit-this/static-import machinery.
+            if (!call.isMethod && !call.receiver && !call.isConstructor &&
+                !langTraits(language)?.bareCallReachesMethods) {
                 const importRoute = _calleeStructuralImportedNameRoute(index, fileEntry, call, language);
                 if (importRoute) {
                     if (importRoute.matches?.length) {
@@ -5965,6 +6015,12 @@ function findCallees(index, definition, options = {}) {
             let isUncertain = call.uncertain;
             let uncertainReason = null; // account-mode reason for the unverified bucket
             let compilerResolvedBare = false;
+            // A bare call can never bind a METHOD def in languages without
+            // implicit-this (fix #300, #220(4) on the callee side) — drives
+            // the bindings filter below and the finalization kind rule.
+            const bareKindFiltered = !call.isMethod && !call.receiver &&
+                !call.isConstructor &&
+                !langTraits(language)?.bareCallReachesMethods;
             if (!call.bindingId && language === 'cpp' &&
                 !call.isMethod && !call.receiver && !call.isConstructor) {
                 // C++ namespace/free-function lookup is declaration-order
@@ -6037,6 +6093,16 @@ function findCallees(index, definition, options = {}) {
                 if (call.isConstructor) {
                     bindings = bindings.filter(binding => binding.type !== 'field');
                 }
+                // A bare call can never bind a METHOD def (fix #300, the
+                // caller side's #220(4)/#222(3) filter brought to the callee
+                // direction): inside Itertools::merge_join_by, the body's
+                // `merge_join_by(self, other, cmp_fn)` bound the ENCLOSING
+                // trait method through the file bindings table and confirmed
+                // a self-edge — the compiler's target is the free fn. Java
+                // (bareCallReachesMethods: implicit-this) keeps its bindings.
+                if (bareKindFiltered) {
+                    bindings = bindings.filter(binding => binding.type !== 'method');
+                }
                 // Method call with no binding for the method name:
                 // Different strategies by language family:
                 if (bindings.length === 0 && call.isMethod) {
@@ -6048,7 +6114,12 @@ function findCallees(index, definition, options = {}) {
                         // CacheService.set. Builtin-typed receivers are host calls;
                         // a receiver typed to a project class resolves to that class
                         // (or an ancestor defining the method), never by bare name.
-                        const route = _calleeReceiverTypeRoute(index, call, localTypes, language);
+                        const route = _calleeReceiverTypeRoute(index, call, localTypes, language, {
+                            file: def.file,
+                            line: call.line,
+                            scopeStart: def.startLine,
+                            scopeEnd: def.endLine,
+                        });
                         if (route?.external) {
                             noteSite(siteId, 'external', null, call);
                             continue;
@@ -6443,6 +6514,10 @@ function findCallees(index, definition, options = {}) {
                     name: effectiveName,
                     bindingId: bindingResolved,
                     count: 1,
+                    // Name-keyed entries from bare calls carry the #220(4)
+                    // kind rule into finalization (fix #300): the resolver
+                    // there must never select a method-kind def for them.
+                    ...(bareKindFiltered && !bindingResolved && { bareNonMethod: true }),
                     ...(call.isConstructor && { isConstructor: true }),
                     ...(collectAccount && {
                         sites: [call.line],
@@ -6629,14 +6704,24 @@ function findCallees(index, definition, options = {}) {
         const cFamilyVisibleFiles = ['c', 'cpp'].includes(language)
             ? _cppVisibleFiles(index, def.file) : null;
 
-        for (const { name: calleeName, bindingId, count, isConstructor, sites, siteIds, isFunctionReference } of callees.values()) {
+        for (const { name: calleeName, bindingId, count, isConstructor, sites, siteIds, isFunctionReference, bareNonMethod } of callees.values()) {
             const claimSites = (bucket, reason) => {
                 if (!collectAccount || !siteIds) return;
                 for (let i = 0; i < siteIds.length; i++) {
                     noteSite(siteIds[i], bucket, reason, { name: calleeName, line: sites[i] });
                 }
             };
-            const symbols = index.symbols.get(calleeName);
+            let symbols = index.symbols.get(calleeName);
+            if (symbols && symbols.length > 0 && bareNonMethod) {
+                // fix #300 (#220(4), callee finalization): a bare call's
+                // candidate set never includes METHOD defs — without this the
+                // same-file priority selected the enclosing trait method for
+                // `merge_join_by(self, other, cmp_fn)` inside its own trait
+                // wrapper, fabricating a self-edge over the imported free fn.
+                const nonMethod = symbols.filter(s =>
+                    !(s.className || s.receiver) || NON_CALLABLE_TYPES.has(s.type));
+                if (nonMethod.length > 0) symbols = nonMethod;
+            }
             if (!symbols || symbols.length === 0) {
                 // Name not in the symbol table — external library, builtin, or
                 // unindexed code. Visible in the callee account, not an edge.
@@ -9269,7 +9354,29 @@ function _resolveReceiverTypeIdentity(index, filePath, knownType, targetDefs, li
  * CustomCommand extends click.Command), while parallel package versions may
  * reuse every class name (zod v3/v4 ZodArray -> ZodType).
  */
-function _resolveStructuralFlowTypeIdentity(index, originFile, knownType, targetDefs, qualifier) {
+/**
+ * Scope-correct same-file type-def selection (fix #300, attrs-measured):
+ * when a type name has SEVERAL class-kind defs in one file (each test
+ * function defining its own local `class C2Slots(...)`), the def the call
+ * site actually sees is the one declared inside the call's own enclosing
+ * function before the call line — Python/JS lexical scoping. Returns that
+ * def, or null when the shape doesn't apply (single def, no scope info, no
+ * local declaration in range) — null means "keep existing behavior".
+ */
+function _scopedSameFileTypeDef(index, name, file, site) {
+    if (!site || site.line == null ||
+        site.scopeStart == null || site.scopeEnd == null) return null;
+    const defs = (index.symbols.get(name) || []).filter(d =>
+        IDENTITY_TYPE_KINDS.has(d.type) && d.file === file);
+    if (defs.length <= 1) return null;
+    const scoped = defs.filter(d =>
+        d.startLine >= site.scopeStart && d.startLine <= site.scopeEnd &&
+        d.startLine <= site.line);
+    if (scoped.length === 0) return null;
+    return scoped.reduce((a, b) => (b.startLine > a.startLine ? b : a));
+}
+
+function _resolveStructuralFlowTypeIdentity(index, originFile, knownType, targetDefs, qualifier, site) {
     const origin = _resolveFlowTypeOrigin(index, originFile, knownType, qualifier);
     if (!origin?.fromFile) return 'unknown';
     const targetOwners = new Set(targetDefs
@@ -9342,7 +9449,16 @@ function _resolveStructuralFlowTypeIdentity(index, originFile, knownType, target
         return { name: parent, file: parentFile };
     };
 
-    const queue = [{ name: knownType, file: origin.fromFile }];
+    // Scope-correct first hop (fix #300): when the receiver's type name has
+    // several same-file class defs, seed the walk with the def the call site
+    // lexically sees — its per-def extends entry, never a sibling def's.
+    // Guard: the site's line ranges describe the CALL file — they only
+    // select defs when the type actually resolves there (an imported type's
+    // defining file has unrelated line geometry).
+    const scopedFirst = (site && site.file === origin.fromFile)
+        ? _scopedSameFileTypeDef(index, knownType, origin.fromFile, site) : null;
+    const queue = [{ name: knownType, file: origin.fromFile,
+        defStartLine: scopedFirst?.startLine }];
     const visited = new Set();
     let sawUnresolved = direct === 'unknown';
     while (queue.length > 0 && visited.size < 128) {
@@ -9354,7 +9470,9 @@ function _resolveStructuralFlowTypeIdentity(index, originFile, knownType, target
         // ancestor slot. In that case ancestry is evidence for the other
         // definition, not the pinned one.
         if (overridesPinnedSlot(cur.name, cur.file)) continue;
-        const parents = index._getInheritanceParents(cur.name, cur.file) || [];
+        const parents = cur.defStartLine != null
+            ? (index._getInheritanceParentsAt?.(cur.name, cur.file, cur.defStartLine) || [])
+            : (index._getInheritanceParents(cur.name, cur.file) || []);
         for (const parent of parents) {
             const edge = parentOrigin(parent, cur.file);
             const verdict = ownerIdentity(edge.name, edge.file);
@@ -10653,7 +10771,14 @@ function _namespaceContainedDef(index, fileEntry, callFileAbs, receiverName, cal
     if (nsDefs.length === 0) return null;
     const candidates = restrictDefs ||
         (index.symbols.get(calleeName) || []).filter(s => !NON_CALLABLE_TYPES.has(s.type));
+    // Self-containment guard (fix #300, itertools-measured): when receiver
+    // and callee share one name (`powerset::powerset`), the candidate list IS
+    // the nsDefs list — a body-less `mod powerset;` declaration (range 1..1)
+    // "contains" itself and was returned as the "other definition", excluding
+    // the compiler-true module-qualified call. A container is never its own
+    // contained member.
     const contained = candidates.filter(d => nsDefs.some(ns =>
+        ns !== d &&
         ns.file === d.file && ns.startLine <= d.startLine &&
         (ns.endLine ?? Infinity) >= (d.endLine ?? d.startLine)));
     if (contained.length === 0) return null;
@@ -10868,9 +10993,28 @@ function _calleeLanguageCompatible(index, def, callerLanguage) {
  * receiver typed Child legitimately reaches methods defined on Base (the
  * #198 ancestor rule, callee direction). Includes the type itself.
  */
-function _receiverTypeAncestors(index, typeName, maxHops = 6) {
+function _receiverTypeAncestors(index, typeName, maxHops = 6, scopeRef = null) {
     const seen = new Set([typeName]);
     let frontier = [typeName];
+    // Scope-correct FIRST hop (fix #300, attrs callee arm): with several
+    // same-file same-name class defs (function-local test subclasses), the
+    // name-granular parent lookup returns the first def's parents for all of
+    // them — the callee walk then lands on the WRONG base's method. Seed
+    // hop 0 from the def the call site lexically sees.
+    if (scopeRef?.file) {
+        const scoped = _scopedSameFileTypeDef(index, typeName, scopeRef.file, scopeRef);
+        if (scoped) {
+            const parents = index._getInheritanceParentsAt?.(
+                typeName, scopeRef.file, scoped.startLine) || [];
+            const next = [];
+            for (const p of parents) {
+                const pName = typeof p === 'string' ? p : p?.name;
+                if (pName && !seen.has(pName)) { seen.add(pName); next.push(pName); }
+            }
+            frontier = next;
+            maxHops -= 1;
+        }
+    }
     for (let hop = 0; hop < maxHops && frontier.length; hop++) {
         const next = [];
         for (const cls of frontier) {
@@ -10896,7 +11040,7 @@ function _receiverTypeAncestors(index, typeName, maxHops = 6) {
  *                      never confirmed by bare-name resolution
  *   null             — receiver type unknown; existing heuristics decide
  */
-function _calleeReceiverTypeRoute(index, call, localTypes, language) {
+function _calleeReceiverTypeRoute(index, call, localTypes, language, scopeRef = null) {
     const raw = call.receiverType || localTypes?.get(call.receiver);
     if (!raw || typeof raw !== 'string') return null;
     const head = _structuralTypeHead(raw, { index, language }) || raw;
@@ -10906,7 +11050,7 @@ function _calleeReceiverTypeRoute(index, call, localTypes, language) {
         _calleeLanguageCompatible(index, d, language));
     let matches = defs.filter(d => d.className === head || d.className === norm);
     if (matches.length === 0 && defs.length > 0) {
-        const ancestors = _receiverTypeAncestors(index, head);
+        const ancestors = _receiverTypeAncestors(index, head, 6, scopeRef);
         matches = defs.filter(d => ancestors.has(d.className));
     }
     if (matches.length === 1) return { resolve: matches[0] };
@@ -10982,7 +11126,12 @@ function _calleeSingleOwnerMatch(index, def, fileEntry, call, name, language, fl
         const head = _structuralTypeHead(call.receiverType, { index, language }) || call.receiverType;
         const norm = head;
         if (head !== owner && norm !== owner &&
-            !_receiverTypeAncestors(index, head).has(owner)) return null;
+            !_receiverTypeAncestors(index, head, 6, {
+                file: def.file,
+                line: call.line,
+                scopeStart: def.startLine,
+                scopeEnd: def.endLine,
+            }).has(owner)) return null;
     }
     if (traits?.typeSystem === 'nominal' && call.argCount != null &&
         !_callArityCompatible(call, ownerDefs, language)) return null;

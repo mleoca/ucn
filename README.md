@@ -234,10 +234,11 @@ external population. Unverified precision is reported separately and is
 intentionally much lower on dispatch-heavy code: those entries are review
 candidates, never confirmed claims.
 
-Beyond the publish gate, a scheduled board re-checks 22 pinned repositories
+Beyond the publish gate, a scheduled board re-checks 24 pinned repositories
 across every supported oracle language (zod, express, hono, zustand, fastify,
-rich, click, grpc-go, chi, cursive, gson, jsoup, and friends), plus a rotating
-fresh-repo arm of codebases the engine was never tuned on. Repositories that
+rich, click, attrs, grpc-go, chi, cursive, itertools, gson, jsoup, and
+friends), plus a rotating fresh-repo arm of codebases the engine was never
+tuned on. Repositories that
 expose a gap stay on the board; they don't get removed to keep a table pretty.
 These are measured results on pinned code, not a claim of universal program
 understanding or identical performance on every machine.

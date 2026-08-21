@@ -349,6 +349,40 @@ const REPOS = [
         // declarations as target symbols.
         oracleExclude: ['test/gtest'],
     },
+    {
+        // Function-local test-subclass Python (graduated from FRESH_POOL
+        // 2026-08-20 — used to tune fix #300C). Every test function defines
+        // its own local `class C2Slots(C1Slots)` with DIFFERENT parents
+        // sharing one name; motivated per-def extendsGraph startLine anchors
+        // + the scope-correct first hop in structural identity and the
+        // callee ancestor walk, plus the typed-project-receiver exemption in
+        // the builtin-name filter (`c2.classmethod()`). Known honest
+        // residual: `C2Slots = attr.s(...)(SimpleOrdinaryClass)` local
+        // variable assignments type the receiver by constructor NAME
+        // (classified, deferred).
+        name: 'attrs',
+        url: 'https://github.com/python-attrs/attrs',
+        commit: '30fd617c45854a5555550c9a0bf921bc3ee28786',
+        language: 'python',
+        targetCandidates: ['.'],
+    },
+    {
+        // Iterator-adaptor Rust with free-fn/trait-method name pairs
+        // (graduated from FRESH_POOL 2026-08-20 — used to tune fixes
+        // #300A/B/D). Motivated the cross-case receiver-name exclusion
+        // demotion (test-file `struct Iter` poisoned every `iter` receiver),
+        // the `mod powerset;` self-containment guard, and the callee-side
+        // bare-call ownership + kind discipline (`use free::merge_join_by`
+        // resolves the free fn; the trait wrapper's own body never
+        // self-edges). Known honest residual: heavy method-ambiguous band on
+        // `next`/`size_hint` (dozens of iterator impls — untyped receivers
+        // stay visible by design).
+        name: 'itertools',
+        url: 'https://github.com/rust-itertools/itertools',
+        commit: 'af6d17d3f4a963c087e81b327b957966e1169ff5',
+        language: 'rust',
+        targetCandidates: ['.'],
+    },
 ];
 
 // Publish-blocking board. Keep this as a named subset of REPOS so every
@@ -398,8 +432,11 @@ const FRESH_POOL = [
     // receivers; serde_json: trait-slot closure), which is tuning under the
     // holdout rule regardless of which instrument surfaced the family. They
     // are pinned in OUTCOME_TUNED as regression rows.
-    { name: 'attrs', url: 'https://github.com/python-attrs/attrs', language: 'python', targetCandidates: ['.'] },
-    { name: 'itertools', url: 'https://github.com/rust-itertools/itertools', language: 'rust', targetCandidates: ['.'] },
+    // attrs and itertools graduated OUT 2026-08-20 (same day they entered —
+    // their first red draw drove fix #300 families A-D): pinned in REPOS at
+    // the tuned SHAs. Replacements below are untuned.
+    { name: 'jinja', url: 'https://github.com/pallets/jinja', language: 'python', targetCandidates: ['.'] },
+    { name: 'rayon', url: 'https://github.com/rayon-rs/rayon', language: 'rust', targetCandidates: ['.'] },
 ];
 
 // ============================================================================
@@ -421,9 +458,16 @@ const FRESH_POOL = [
 // TS repos need installed deps for a meaningful tsc run, so both stay out
 // until a safe judge exists.
 const OUTCOME_POOL = [
-    { name: 'mux', url: 'https://github.com/gorilla/mux', language: 'go', targetCandidates: ['.'] },
-    { name: 'requests', url: 'https://github.com/psf/requests', language: 'python', targetCandidates: ['.'] },
+    // mux and requests graduated OUT 2026-08-20: their holdout-board rows
+    // drove fix #300 families E (plan export-pass symbol identity +
+    // name-token-only def renames — mux BuildVarsFunc), F (__all__ string
+    // entries — requests put) and G (Go range-element typing — mux Match's
+    // caller placement). Pinned in OUTCOME_TUNED. rust-csv stays: its rows
+    // classified family H (ambiguity-application policy), which is not yet
+    // engineered.
     { name: 'rust-csv', url: 'https://github.com/BurntSushi/rust-csv', language: 'rust', targetCandidates: ['.'] },
+    { name: 'httprouter', url: 'https://github.com/julienschmidt/httprouter', language: 'go', targetCandidates: ['.'] },
+    { name: 'werkzeug', url: 'https://github.com/pallets/werkzeug', language: 'python', targetCandidates: ['.'] },
 ];
 
 // Graduated outcome repos: PINNED at the commits their 2026-08-19 boards
@@ -436,6 +480,17 @@ const OUTCOME_TUNED = [
     { name: 'websocket', url: 'https://github.com/gorilla/websocket', language: 'go', commit: 'e064f32e3674d9d79a8fd417b5bc06fa5c6cad8f', targetCandidates: ['.'] },
     { name: 'flask', url: 'https://github.com/pallets/flask', language: 'python', commit: 'd318b683471101618febed18996405ad26462110', targetCandidates: ['.'] },
     { name: 'serde_json', url: 'https://github.com/serde-rs/json', language: 'rust', commit: 'afdf6fc67247dd7fa4fcde1381e6ecc6bcc7a30e', targetCandidates: ['.'] },
+    // Graduated 2026-08-20 (drove fix #300 E/F/G) at their board SHAs.
+    // gate: false — their remaining contract-broken rows are CLASSIFIED
+    // engine gaps (mux Match: Go interface-slot rename closure; mux
+    // PathPrefix + rust-csv escape/quoting: family H ambiguity-application;
+    // requests put: module-attribute references in plan's reference pass),
+    // so per-repo contract≤grep would red the CI gate by construction. They
+    // run under --tuned as pinned measurement rows; they join the gate only
+    // after those families land AND a green run on the enforcing
+    // environment (#292b).
+    { name: 'mux', url: 'https://github.com/gorilla/mux', language: 'go', commit: 'db9d1d0073d27a0a2d9a8c1bc52aa0af4374d265', targetCandidates: ['.'], gate: false },
+    { name: 'requests', url: 'https://github.com/psf/requests', language: 'python', commit: '8f8b212de8c2129d7954c6cd373762880375620a', targetCandidates: ['.'], gate: false },
 ];
 
 /**

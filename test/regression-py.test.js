@@ -5320,3 +5320,218 @@ describe('fix #295: method-value references with typed receivers', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #300: function-local subclass defs resolve by call-site scope', () => {
+    const localSubclassFixture = {
+        'base.py': [
+            'class C1:',
+            '    @classmethod',
+            '    def helper(cls):',
+            '        return "one"',
+            '',
+            '',
+            'class C1Slots:',
+            '    @classmethod',
+            '    def helper(cls):',
+            '        return "two"',
+        ].join('\n') + '\n',
+        // Two function-local classes SHARING a name with DIFFERENT parents —
+        // the attrs test_slots.py shape. File-granular parent lookup used the
+        // first def's parents for both, excluding the compiler-true edge.
+        'test_local.py': [
+            'from base import C1, C1Slots',
+            '',
+            '',
+            'def test_from_c1():',
+            '    class C2Slots(C1):',
+            '        pass',
+            '',
+            '    c2 = C2Slots()',
+            '    c2.helper()',
+            '',
+            '',
+            'def test_from_slots():',
+            '    class C2Slots(C1Slots):',
+            '        pass',
+            '',
+            '    c2 = C2Slots()',
+            '    c2.helper()',
+        ].join('\n') + '\n',
+    };
+
+    it('confirms the call whose local subclass extends the pinned class', () => {
+        const dir = tmp(localSubclassFixture);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'base.py:9:helper' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const callers = r.result.callers || [];
+            assert.ok(callers.some(c => c.relativePath === 'test_local.py' && c.line === 17),
+                `C2Slots(C1Slots) call must confirm: ${JSON.stringify(callers)}`);
+            assert.ok(!callers.some(c => c.line === 9),
+                'C2Slots(C1) call must NOT confirm under the C1Slots pin');
+            assert.ok(r.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('mirror pin: the sibling call confirms, this one is excluded', () => {
+        const dir = tmp(localSubclassFixture);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'base.py:3:helper' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const callers = r.result.callers || [];
+            assert.ok(callers.some(c => c.relativePath === 'test_local.py' && c.line === 9),
+                `C2Slots(C1) call must confirm under the C1 pin: ${JSON.stringify(callers)}`);
+            assert.ok(!callers.some(c => c.line === 17),
+                'C2Slots(C1Slots) call must NOT confirm under the C1 pin');
+            const excl = r.result.meta.account.excluded.byReason || {};
+            assert.ok(excl['receiver-type-mismatch'],
+                `scope-correct exclusion expected: ${JSON.stringify(excl)}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #300: plan renames Python __all__ string entries', () => {
+    const dunderFixture = {
+        'pkg/api.py': [
+            'def put(url, data=None):',
+            '    return url',
+            '',
+            '',
+            'def get(url):',
+            '    return url',
+        ].join('\n') + '\n',
+        'pkg/__init__.py': [
+            'from pkg.api import get, put',
+            '',
+            '__all__ = (',
+            '    "get",',
+            '    "put",',
+            ')',
+            '',
+            'OTHER = {"put": 1}',
+        ].join('\n') + '\n',
+    };
+
+    it('emits the __all__ entry, never unrelated same-text strings', () => {
+        const dir = tmp(dunderFixture);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', {
+                name: 'pkg/api.py:1:put', renameTo: 'put_req',
+            });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const changes = r.result.changes || [];
+            const dunder = changes.find(c =>
+                c.file === 'pkg/__init__.py' && c.line === 5);
+            assert.ok(dunder, `__all__ entry must be edited: ${JSON.stringify(changes)}`);
+            assert.strictEqual(dunder.newExpression, '"put_req",');
+            assert.ok(!changes.some(c => c.file === 'pkg/__init__.py' && c.line === 8),
+                'dict-key string outside __all__ must never be edited');
+            assert.ok(!changes.some(c => c.line === 4 && c.file === 'pkg/__init__.py'),
+                'sibling "get" entry untouched');
+        } finally { rm(dir); }
+    });
+
+    it('method pins never trigger the __all__ pass', () => {
+        const dir = tmp({
+            'mod.py': [
+                'class Box:',
+                '    def put(self, x):',
+                '        return x',
+                '',
+                '__all__ = ["put"]',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', {
+                name: 'mod.py:2:put', renameTo: 'put_req',
+            });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const changes = r.result.changes || [];
+            assert.ok(!changes.some(c => c.line === 5),
+                `a METHOD rename leaves module __all__ alone: ${JSON.stringify(changes)}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #300: callee twin — scope-correct ancestry + typed-receiver builtin names', () => {
+    it('findCallees resolves inherited calls through the scoped local subclass', () => {
+        const dir = tmp({
+            'base.py': [
+                'class C1:',
+                '    @classmethod',
+                '    def classmethod(cls):',
+                '        return "one"',
+                '',
+                '',
+                'class C1Slots:',
+                '    @classmethod',
+                '    def classmethod(cls):',
+                '        return "two"',
+            ].join('\n') + '\n',
+            'test_local.py': [
+                'from base import C1, C1Slots',
+                '',
+                '',
+                'def test_from_c1():',
+                '    class C2Slots(C1):',
+                '        pass',
+                '',
+                '    c2 = C2Slots()',
+                '    c2.classmethod()',
+                '',
+                '',
+                'def test_from_slots():',
+                '    class C2Slots(C1Slots):',
+                '        pass',
+                '',
+                '    c2 = C2Slots()',
+                '    c2.classmethod()',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const { findCallees } = require('../core/callers');
+            const fromSlots = (index.symbols.get('test_from_slots') || [])[0];
+            const r1 = findCallees(index, fromSlots, { collectAccount: true });
+            const e1 = r1.find(c => c.name === 'classmethod');
+            assert.ok(e1, 'edge exists (builtin-name filter must not eat a typed-receiver call)');
+            assert.strictEqual(e1.className, 'C1Slots',
+                `slots test resolves to C1Slots.classmethod: ${JSON.stringify(e1)}`);
+            const fromC1 = (index.symbols.get('test_from_c1') || [])[0];
+            const r2 = findCallees(index, fromC1, { collectAccount: true });
+            const e2 = r2.find(c => c.name === 'classmethod');
+            assert.ok(e2, 'edge exists');
+            assert.strictEqual(e2.className, 'C1',
+                `nonslots test resolves to C1.classmethod: ${JSON.stringify(e2)}`);
+            assert.ok(r1.calleeAccount.conserved && r2.calleeAccount.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('untyped receivers keep the builtin-name external route', () => {
+        const dir = tmp({
+            'mod.py': [
+                'class Box:',
+                '    @classmethod',
+                '    def classmethod(cls):',
+                '        return 1',
+                '',
+                '',
+                'def run(x):',
+                '    return x.classmethod()',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const { findCallees } = require('../core/callers');
+            const run = (index.symbols.get('run') || [])[0];
+            const r = findCallees(index, run, { collectAccount: true });
+            assert.ok(!r.some(c => c.name === 'classmethod'),
+                'an UNTYPED receiver must not confirm through the builtin name');
+            assert.ok(r.calleeAccount.conserved);
+        } finally { rm(dir); }
+    });
+});

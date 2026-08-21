@@ -6792,3 +6792,94 @@ func viaCopy() error {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #300: range VALUE variables typed from the container element', () => {
+    it('for _, route := range r.routes confirms at receiver-hint', () => {
+        const dir = tmp({
+            'go.mod': 'module f300g\n\ngo 1.21\n',
+            'mux.go': [
+                'package f300g',
+                '',
+                'type Route struct{ name string }',
+                '',
+                'func (r *Route) Match(s string) bool { return r.name == s }',
+                '',
+                'type Router struct{ routes []*Route }',
+                '',
+                'func (r *Router) Match(s string) bool {',
+                '\tfor _, route := range r.routes {',
+                '\t\tif route.Match(s) {',
+                '\t\t\treturn true',
+                '\t\t}',
+                '\t}',
+                '\treturn false',
+                '}',
+                '',
+                'type Other struct{ name string }',
+                '',
+                'func (o *Other) Match(s string) bool { return o.name == s }',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'mux.go:5:Match' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const caller = (r.result.callers || []).find(c => c.line === 11);
+            assert.ok(caller, `range-typed receiver must confirm: ${JSON.stringify(r.result.callers)}`);
+            assert.strictEqual(caller.resolution, 'receiver-hint');
+            assert.ok(r.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('parameter and local declared containers type range elements; unknowns stay untyped', () => {
+        const dir = tmp({
+            'go.mod': 'module f300g2\n\ngo 1.21\n',
+            'lib.go': [
+                'package f300g2',
+                '',
+                'type Job struct{ id int }',
+                '',
+                'func (j *Job) Run() int { return j.id }',
+                '',
+                'type Task struct{ id int }',
+                '',
+                'func (t *Task) Run() int { return t.id }',
+                '',
+                'func drainParam(jobs []*Job) int {',
+                '\ttotal := 0',
+                '\tfor _, j := range jobs {',
+                '\t\ttotal += j.Run()',
+                '\t}',
+                '\treturn total',
+                '}',
+                '',
+                'func drainLocal() int {',
+                '\tvar pending []*Job',
+                '\ttotal := 0',
+                '\tfor _, j := range pending {',
+                '\t\ttotal += j.Run()',
+                '\t}',
+                '\treturn total',
+                '}',
+                '',
+                'func drainUnknown(src map[string]interface{}) {',
+                '\tfor _, j := range src {',
+                '\t\t_ = j',
+                '\t}',
+                '}',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'lib.go:5:Run' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const lines = (r.result.callers || []).map(c => c.line).sort((a, b) => a - b);
+            assert.deepStrictEqual(lines, [14, 23],
+                `param + local container ranges must confirm: ${JSON.stringify(r.result.callers)}`);
+            // Mirror pin: Task.Run must NOT claim the Job-typed sites
+            const r2 = execute(index, 'context', { name: 'lib.go:9:Run' });
+            assert.strictEqual((r2.result.callers || []).length, 0,
+                'Job-typed range receivers are excluded under the Task pin');
+        } finally { rm(dir); }
+    });
+});

@@ -741,6 +741,12 @@ function findCallsInCode(code, parser, options = {}) {
     const packageTypeQualifiers = new Map();
     // Names whose scope type is a New*-prefix GUESS (fix #266) — per scope
     const scopeGuesses = new Map();
+    // Container-typed variables (slice/map/array declared TYPE TEXT) for
+    // range-element typing (fix #300, mux-measured): `for _, route := range
+    // r.routes` types route from the field's declared []*Route. Element
+    // types are compiler-true — Go range yields the container's element.
+    const scopeContainerTypes = new Map();   // scopeStartLine -> Map<name, typeText>
+    const packageContainerTypes = new Map();
     // Track function-typed parameter names per scope (scopeStartLine -> Set<name>)
     const funcParamScopes = new Map();
 
@@ -804,6 +810,7 @@ function findCallsInCode(code, parser, options = {}) {
         const typeMap = new Map();
         const typeQualifierMap = new Map();
         const funcParamNames = new Set();
+        const containerMap = new Map();
 
         // Method receiver: func (f *Framework) Method()
         if (node.type === 'method_declaration') {
@@ -844,6 +851,10 @@ function findCallsInCode(code, parser, options = {}) {
                     if (nameNodes.length === 0) continue;
                     if (typeNode.type === 'function_type') {
                         for (const nn of nameNodes) funcParamNames.add(nn.text);
+                    } else if (CONTAINER_TYPE_NODES.has(typeNode.type)) {
+                        // Container-typed parameter (fix #300): the range
+                        // VALUE var over it gets the element type.
+                        for (const nn of nameNodes) containerMap.set(nn.text, typeNode.text);
                     } else {
                         const typeName = extractTypeName(typeNode);
                         if (typeName) {
@@ -858,7 +869,7 @@ function findCallsInCode(code, parser, options = {}) {
             }
         }
 
-        return { typeMap, typeQualifierMap, funcParamNames };
+        return { typeMap, typeQualifierMap, funcParamNames, containerMap };
     };
 
     // Helper to extract function name from a function node
@@ -965,6 +976,66 @@ function findCallsInCode(code, parser, options = {}) {
             }
         }
         return false;
+    };
+    // Range-element typing helpers (fix #300). Container type TEXT for a
+    // variable declared as a slice/map/array; element extraction from that
+    // text; and a lazily built same-file struct→fields map so a selector
+    // iterable (`range r.routes`) resolves through the receiver's struct.
+    const lookupContainerType = (varName) => {
+        for (let i = functionStack.length - 1; i >= 0; i--) {
+            const m = scopeContainerTypes.get(functionStack[i].startLine);
+            if (m?.has(varName)) return m.get(varName);
+        }
+        return packageContainerTypes.get(varName);
+    };
+    const CONTAINER_TYPE_NODES = new Set(['slice_type', 'map_type', 'array_type']);
+    const containerElementType = (typeText) => {
+        if (!typeText) return null;
+        const t = String(typeText).trim();
+        let m = t.match(/^\[\d*\]\s*(.+)$/s);          // []T and [N]T
+        if (!m) m = t.match(/^map\[[^\]]+\]\s*(.+)$/s); // map[K]V → V
+        if (!m) return null;
+        const el = m[1].trim().replace(/^\*/, '').trim();
+        const qm = el.match(/^([A-Za-z_]\w*)\.([A-Za-z_]\w*)$/);
+        if (qm) return { type: qm[2], qualifier: qm[1] };
+        return /^[A-Za-z_]\w*$/.test(el) ? { type: el, qualifier: null } : null;
+    };
+    let structFieldsCache = null;
+    const getStructFields = () => {
+        if (structFieldsCache) return structFieldsCache;
+        structFieldsCache = new Map();
+        const stack = [tree.rootNode];
+        while (stack.length > 0) {
+            const n = stack.pop();
+            if (n.type === 'type_declaration') {
+                for (let i = 0; i < n.namedChildCount; i++) {
+                    const spec = n.namedChild(i);
+                    if (spec.type !== 'type_spec') continue;
+                    const nameNode = spec.childForFieldName('name');
+                    const typeNode = spec.childForFieldName('type');
+                    if (!nameNode || typeNode?.type !== 'struct_type') continue;
+                    const fields = new Map();
+                    for (let j = 0; j < typeNode.namedChildCount; j++) {
+                        const list = typeNode.namedChild(j);
+                        if (list.type !== 'field_declaration_list') continue;
+                        for (let k = 0; k < list.namedChildCount; k++) {
+                            const fd = list.namedChild(k);
+                            if (fd.type !== 'field_declaration') continue;
+                            const ftype = fd.childForFieldName('type');
+                            if (!ftype) continue;
+                            for (let x = 0; x < fd.namedChildCount; x++) {
+                                const fn = fd.namedChild(x);
+                                if (fn.type === 'field_identifier') fields.set(fn.text, ftype.text);
+                            }
+                        }
+                    }
+                    structFieldsCache.set(nameNode.text, fields);
+                }
+                continue;
+            }
+            for (let i = 0; i < n.namedChildCount; i++) stack.push(n.namedChild(i));
+        }
+        return structFieldsCache;
     };
 
     // fix #203 (Go): is a bare-identifier function REFERENCE shadowed by an
@@ -1074,11 +1145,58 @@ function findCallsInCode(code, parser, options = {}) {
                 endLine: node.endPosition.row + 1
             };
             functionStack.push(entry);
-            const { typeMap, typeQualifierMap, funcParamNames } = buildScopeTypeMap(node);
+            const { typeMap, typeQualifierMap, funcParamNames, containerMap } = buildScopeTypeMap(node);
             scopeTypes.set(entry.startLine, typeMap);
             scopeTypeQualifiers.set(entry.startLine, typeQualifierMap);
+            scopeContainerTypes.set(entry.startLine, containerMap || new Map());
             if (funcParamNames.size > 0) {
                 funcParamScopes.set(entry.startLine, funcParamNames);
+            }
+        }
+
+        // Range-element typing (fix #300, mux-measured): `for _, route :=
+        // range r.routes` — the VALUE variable's compile-time type is the
+        // container's element type. Sources: a selector iterable whose root
+        // is a typed var and whose field's declaring struct lives in this
+        // file (declared field text `[]*Route`), or an identifier iterable
+        // declared/parameterized with a container type. Only the two-var
+        // form's SECOND variable is typed (single-var range yields the
+        // index/key); untypeable shapes stay untyped — never guessed.
+        if (node.type === 'range_clause' && functionStack.length > 0) {
+            const left = node.childForFieldName('left');
+            const right = node.childForFieldName('right');
+            const vars = left && left.type === 'expression_list'
+                ? Array.from({ length: left.namedChildCount }, (_, i) => left.namedChild(i))
+                : [];
+            const valueVar = vars.length === 2 && vars[1].type === 'identifier' &&
+                vars[1].text !== '_' ? vars[1].text : null;
+            if (valueVar && right) {
+                let containerText = null;
+                if (right.type === 'selector_expression') {
+                    const operand = right.childForFieldName('operand');
+                    const fieldN = right.childForFieldName('field');
+                    if (operand?.type === 'identifier' && fieldN &&
+                        !isGuessedType(operand.text)) {
+                        const rootType = getReceiverType(operand.text, operand);
+                        if (rootType) {
+                            containerText = getStructFields().get(rootType)?.get(fieldN.text) || null;
+                        }
+                    }
+                } else if (right.type === 'identifier') {
+                    containerText = lookupContainerType(right.text);
+                }
+                const el = containerElementType(containerText);
+                if (el) {
+                    const scopeKey = functionStack[functionStack.length - 1].startLine;
+                    const typeMap = scopeTypes.get(scopeKey);
+                    if (typeMap) {
+                        typeMap.set(valueVar, el.type);
+                        const qualifiers = scopeTypeQualifiers.get(scopeKey);
+                        if (el.qualifier) qualifiers?.set(valueVar, el.qualifier);
+                        else qualifiers?.delete(valueVar);
+                        scopeGuesses.get(scopeKey)?.delete(valueVar);
+                    }
+                }
             }
         }
 
@@ -1107,6 +1225,13 @@ function findCallsInCode(code, parser, options = {}) {
                         // &Type{...} or Type{...}
                         if (val.type === 'composite_literal') {
                             const typeNode = val.childForFieldName('type');
+                            if (typeNode && CONTAINER_TYPE_NODES.has(typeNode.type)) {
+                                // xs := []*Route{...} — container literal
+                                // feeds range-element typing (fix #300).
+                                scopeContainerTypes.get(scopeKey)
+                                    ?.set(names[vi], typeNode.text);
+                                continue;
+                            }
                             typeName = extractTypeName(typeNode);
                             typeQualifier = extractTypeQualifier(typeNode);
                         } else if (val.type === 'unary_expression' && val.childCount > 0) {
@@ -1210,8 +1335,23 @@ function findCallsInCode(code, parser, options = {}) {
             const varQualifierMap = scopeKey == null
                 ? packageTypeQualifiers : scopeTypeQualifiers.get(scopeKey);
             if (varTypeMap) {
+                const varContainerMap = scopeKey == null
+                    ? packageContainerTypes : scopeContainerTypes.get(scopeKey);
                 const recordSpec = (spec) => {
                     if (spec.type !== 'var_spec') return;
+                    const declaredType = spec.childForFieldName('type');
+                    // Container-typed declaration (fix #300): `var routes
+                    // []*Route` feeds range-element typing.
+                    if (declaredType && CONTAINER_TYPE_NODES.has(declaredType.type) &&
+                        varContainerMap) {
+                        for (let j = 0; j < spec.namedChildCount; j++) {
+                            const id = spec.namedChild(j);
+                            if (id.type === 'identifier') {
+                                varContainerMap.set(id.text, declaredType.text);
+                            }
+                        }
+                        return;
+                    }
                     let typeName = extractTypeName(spec.childForFieldName('type'));
                     let qualifier = typeName
                         ? extractTypeQualifier(spec.childForFieldName('type')) : null;

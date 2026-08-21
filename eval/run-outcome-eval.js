@@ -1248,7 +1248,13 @@ async function main() {
         if (OUTCOME_TUNED.length === 0) {
             throw new Error('--tuned/--gate need a non-empty OUTCOME_TUNED set in eval/lib/repos.js');
         }
-        repos = OUTCOME_TUNED.map(repo => ({ ...repo }));
+        // gate: false rows are pinned measurement rows whose remaining
+        // broken rows are classified engine gaps — they run under --tuned
+        // but join the hard gate only once those families land (#292b: a
+        // new gate row needs a green run on the enforcing environment).
+        repos = OUTCOME_TUNED
+            .filter(repo => !gateMode || repo.gate !== false)
+            .map(repo => ({ ...repo }));
     } else {
         repos = OUTCOME_POOL.map(repo => ({ ...repo }));
     }
