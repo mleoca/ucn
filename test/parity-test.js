@@ -145,11 +145,15 @@ describe('single-router architecture', () => {
             for (const param of params) {
                 const surface = REVERSE_PARAM_MAP[param] || param;
                 assert.ok(generated.includes(surface), `${command}.${surface}`);
-                assert.match(mcpCode, new RegExp(`\\n\\s*${surface}:\\s*z\\.`), `${surface} schema`);
+                assert.match(mcpCode,
+                    new RegExp(`\\n\\s*${surface}:\\s*(?:stringParam|booleanParam|integerParam|numberParam)\\(`),
+                    `${surface} schema`);
             }
         }
         for (const snake of Object.keys(PARAM_MAP)) {
-            assert.match(mcpCode, new RegExp(`\\n\\s*${snake}:\\s*z\\.`), `${snake} schema`);
+            assert.match(mcpCode,
+                new RegExp(`\\n\\s*${snake}:\\s*(?:stringParam|booleanParam|integerParam|numberParam)\\(`),
+                `${snake} schema`);
         }
     });
 });

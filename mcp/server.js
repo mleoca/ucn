@@ -9,22 +9,7 @@
 
 const fs = require('fs');
 const path = require('path');
-
-// ============================================================================
-// MCP SDK IMPORTS (dynamic, to handle missing dependency gracefully)
-// ============================================================================
-
-let McpServer, StdioServerTransport, z;
-
-try {
-    ({ McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js'));
-    ({ StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js'));
-    z = require('zod');
-} catch (e) {
-    console.error('Missing dependencies. Install with:');
-    console.error('  npm install @modelcontextprotocol/sdk zod');
-    process.exit(1);
-}
+const { StdioMcpServer } = require('./stdio-server');
 
 // ============================================================================
 // UCN CORE IMPORTS
@@ -116,7 +101,7 @@ function getIndex(projectDir, options) {
 // SERVER SETUP
 // ============================================================================
 
-const server = new McpServer({
+const server = new StdioMcpServer({
     name: 'ucn',
     version: require('../package.json').version
 });
@@ -249,97 +234,109 @@ CONFIRMED carries target-identity evidence. UNVERIFIED is possible and requires 
 // and made the single MCP tool difficult for agents to parse.
 const TOOL_DESCRIPTION = CONCISE_TOOL_DESCRIPTION;
 
-// The schema shape is named so the handler can distinguish known keys from
-// unknown/typo'd/camelCase ones — z.object() would otherwise strip them
-// silently, and a silently ignored parameter changes the answer with no
-// signal (e.g. include_test:true returning untested-filtered results).
+const stringParam = (description, extra = {}) => ({ type: 'string', description, ...extra });
+const booleanParam = description => ({ type: 'boolean', description });
+const integerParam = (description, extra = {}) => ({ type: 'integer', description, ...extra });
+const numberParam = (description, extra = {}) => ({ type: 'number', description, ...extra });
+
+// Keep the public JSON Schema and runtime validation rules in one dependency-
+// free object. Unknown keys remain allowed so the handler can return typo and
+// applicability guidance instead of silently changing the requested answer.
 const INPUT_SHAPE = {
-    command: null, // assigned below (needs z at load time)
+    command: stringParam(
+        `UCN task command. One of: ${getMcpCommandEnum().join(', ')}.`,
+        { enum: getMcpCommandEnum() },
+    ),
+    project_dir: stringParam('Non-empty absolute path, or a path relative to the MCP server process working directory, identifying the project to analyze.', { minLength: 1 }),
+    name: stringParam('Symbol name or stable path:line:name handle. Used by show/find/usages/source/trace/impact/tests/check/plan.'),
+    file: stringParam('File target for source/deps/api or a symbol-disambiguation filter.'),
+    sections: stringParam('Comma-separated projection. show: summary,callers,callees,source,dependencies,tests,types,example,related. repo: summary,files,stats,health.'),
+    exclude: stringParam('Comma-separated patterns to exclude (e.g. "test,mock,vendor")'),
+    include_tests: booleanParam('Include test files in results (excluded by default)'),
+    exclude_tests: booleanParam('Explicit spelling of the default test-file exclusion (entrypoints). Use include_tests=true to include test files.'),
+    include_methods: booleanParam('Include method callees where receiver evidence permits. Caller-bearing views always tier method sites.'),
+    expand_unverified: booleanParam('trace callers: follow unverified edges; downstream nodes remain marked possible, never confirmed.'),
+    min_confidence: numberParam('Minimum ordinal evidence weight (legacy name; not a probability) for caller/callee edges', { minimum: 0, maximum: 1 }),
+    show_confidence: booleanParam('show: resolution-evidence labels default to visible; set false to hide them. Numeric weights are ordinal, not probabilities.'),
+    unreachable_only: booleanParam('show/impact: retain only relationships unreachable from detected entry points.'),
+    with_types: booleanParam('show: include related type definitions.'),
+    with_source: booleanParam('Attach exact source to find results.'),
+    detailed: booleanParam('repo files: show symbols per file; deps: include import declarations and importers.'),
+    exact: booleanParam('Exact name match only (no substring matching)'),
+    in: stringParam('Only search in this directory path (e.g. "src/core")'),
+    top: integerParam('Max results to show (default: 10). Must be a positive integer.', { exclusiveMinimum: 0, maximum: 10000 }),
+    depth: integerParam('Max depth (default: 3 for trace, 2 for deps); expands all children. Non-negative integer.', { minimum: 0, maximum: 100 }),
+    code_only: booleanParam('Exclude matches in comments and strings'),
+    context: integerParam('Lines of context around each match. Non-negative integer.', { minimum: 0, maximum: 1000 }),
+    include_exported: booleanParam('Include exported symbols in deadcode results'),
+    include_decorated: booleanParam('Include decorated/annotated symbols in deadcode results'),
+    calls_only: booleanParam('tests: retain direct calls and test-case matches only.'),
+    max_lines: integerParam('source: maximum lines for large class-like declarations.', { exclusiveMinimum: 0, maximum: 1000000 }),
+    direction: stringParam('trace: callees/callers. deps: imports/importers/both.', { enum: ['callees', 'callers', 'imports', 'importers', 'both'] }),
+    to: stringParam('trace with direction=callers: continue toward entry points.', { enum: ['entrypoints'] }),
+    cycles: booleanParam('deps: report circular imports instead of a file graph.'),
+    term: stringParam('Literal search term by default. Set regex=true only for regular-expression syntax.'),
+    regex: booleanParam('Treat search term as a regular expression (default: false/literal). Ordinary patterns run in an RE2-compatible linear-time engine; unsafe nested repetition is rejected.'),
+    functions: booleanParam('repo stats: include per-function line counts sorted by size.'),
+    hot: booleanParam('repo stats: include the top N most-called functions.'),
+    diverse: booleanParam('show example: return representatives from distinct argument shapes.'),
+    git: booleanParam('show summary: attach last-modified, author, and recent-change metadata.'),
+    add_param: stringParam('Parameter name to add (plan command)'),
+    remove_param: stringParam('Parameter name to remove (plan command)'),
+    rename_to: stringParam('New function name (plan command)'),
+    default_value: stringParam('Default value for added parameter (plan command)'),
+    stack: stringParam('The stack trace text to parse (stacktrace command)'),
+    range: stringParam('source line range, e.g. "10-20" or "15"; requires file.'),
+    base: stringParam('Git ref to diff against (default: HEAD). E.g. "HEAD~3", "main", a commit SHA'),
+    staged: booleanParam('impact/check without a symbol: analyze staged changes.'),
+    deep: booleanParam('repo: include health and sample the ordinal resolution-evidence profile, not accuracy.'),
+    compact: booleanParam('Compact output defaults to true for show/impact and false for usages; set the opposite value to change that command\'s presentation.'),
+    case_sensitive: booleanParam('Case-sensitive search (default: false, case-insensitive)'),
+    all: booleanParam('Lift formatter and result caps where supported.'),
+    top_level: booleanParam('repo files: show only top-level functions.'),
+    class_name: stringParam('Class name to scope method analysis (e.g. "MarketDataFetcher" for close)'),
+    line: integerParam('Definition line pin. Resolves the symbol defined at this exact line (the middle component of a file:line:name handle). Disambiguates same-file same-name definitions.', { exclusiveMinimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
+    limit: integerParam('Max results to return (default: 500). Caps find, usages, search, deadcode, api, and repo files. Must be a positive integer.', { exclusiveMinimum: 0, maximum: 1000000 }),
+    max_files: integerParam('Max files to index (default: 10000). Use for very large codebases. Must be a positive integer.', { exclusiveMinimum: 0, maximum: 10000000 }),
+    max_chars: integerParam('Max output chars before truncation. Broad sweep commands (repo, entrypoints, endpoints, deadcode, deps, check, audit_async) default to 3K; all other commands default to 10K. Maximum: 100K. all=true lifts formatter caps but keeps the 100K transport ceiling.', { exclusiveMinimum: 0, maximum: 100000 }),
+    type: stringParam('Symbol type filter for structural search: function, class, call, method, type, state, field, constant, macro. Triggers index-based search.'),
+    param: stringParam('Filter by parameter name or type (structural search). E.g. "Request", "ctx".'),
+    receiver: stringParam('Filter calls by receiver (structural search, type=call). E.g. "db", "http".'),
+    returns: stringParam('Filter by return type (structural search). E.g. "Promise", "error".'),
+    decorator: stringParam('Filter by decorator/annotation (structural search). E.g. "Route", "Test".'),
+    exported: booleanParam('Only exported/public symbols (structural search).'),
+    unused: booleanParam('Only symbols with zero callers (structural search).'),
+    framework: stringParam('Filter entrypoints by framework (e.g. "express", "spring", "flask"). Comma-separated for multiple.'),
+    follow_symlinks: booleanParam('Follow symlinks during file discovery (default: true)'),
+    bridge: booleanParam('Match server routes to client requests (endpoints command).'),
+    server_only: booleanParam('Only list server routes (endpoints command).'),
+    client_only: booleanParam('Only list client requests (endpoints command).'),
+    unmatched: booleanParam('Only show unmatched routes/requests (endpoints command).'),
+    method: stringParam('Filter by HTTP method (e.g. "GET", "POST") for endpoints.'),
+    prefix: stringParam('Filter routes/requests by path prefix (endpoints command).'),
+    hide_uncertain: booleanParam('Hide uncertain (interpolated-path) bridges (endpoints command).'),
+};
+
+const INPUT_SCHEMA = {
+    $schema: 'https://json-schema.org/draft/2020-12/schema',
+    type: 'object',
+    properties: INPUT_SHAPE,
+    required: ['command', 'project_dir'],
+    additionalProperties: {},
 };
 
 server.registerTool(
     'ucn',
     {
         description: TOOL_DESCRIPTION,
-        inputSchema: z.object(Object.assign(INPUT_SHAPE, {
-            // Runtime validation stays string-based so retired v4 names reach
-            // directive migration guidance. Zod metadata publishes the strict
-            // v5 enum to MCP clients without making retired names aliases.
-            command: z.string()
-                .meta({ enum: getMcpCommandEnum() })
-                .describe(`UCN task command. One of: ${getMcpCommandEnum().join(', ')}.`),
-            project_dir: z.string().trim().min(1, 'project_dir is required and must be a non-empty path.').describe('Non-empty absolute path, or a path relative to the MCP server process working directory, identifying the project to analyze.'),
-            name: z.string().optional().describe('Symbol name or stable path:line:name handle. Used by show/find/usages/source/trace/impact/tests/check/plan.'),
-            file: z.string().optional().describe('File target for source/deps/api or a symbol-disambiguation filter.'),
-            sections: z.string().optional().describe('Comma-separated projection. show: summary,callers,callees,source,dependencies,tests,types,example,related. repo: summary,files,stats,health.'),
-            exclude: z.string().optional().describe('Comma-separated patterns to exclude (e.g. "test,mock,vendor")'),
-            include_tests: z.boolean().optional().describe('Include test files in results (excluded by default)'),
-            exclude_tests: z.boolean().optional().describe('Explicit spelling of the default test-file exclusion (entrypoints). Use include_tests=true to include test files.'),
-            include_methods: z.boolean().optional().describe('Include method callees where receiver evidence permits. Caller-bearing views always tier method sites.'),
-            expand_unverified: z.boolean().optional().describe('trace callers: follow unverified edges; downstream nodes remain marked possible, never confirmed.'),
-            min_confidence: z.number().min(0).max(1).optional().describe('Minimum ordinal evidence weight (legacy name; not a probability) for caller/callee edges'),
-            show_confidence: z.boolean().optional().describe('show: resolution-evidence labels default to visible; set false to hide them. Numeric weights are ordinal, not probabilities.'),
-            unreachable_only: z.boolean().optional().describe('show/impact: retain only relationships unreachable from detected entry points.'),
-            with_types: z.boolean().optional().describe('show: include related type definitions.'),
-            with_source: z.boolean().optional().describe('Attach exact source to find results.'),
-            detailed: z.boolean().optional().describe('repo files: show symbols per file; deps: include import declarations and importers.'),
-            exact: z.boolean().optional().describe('Exact name match only (no substring matching)'),
-            in: z.string().optional().describe('Only search in this directory path (e.g. "src/core")'),
-            top: z.number().int().positive().max(10000).optional().describe('Max results to show (default: 10). Must be a positive integer.'),
-            depth: z.number().int().nonnegative().max(100).optional().describe('Max depth (default: 3 for trace, 2 for deps); expands all children. Non-negative integer.'),
-            code_only: z.boolean().optional().describe('Exclude matches in comments and strings'),
-            context: z.number().int().nonnegative().max(1000).optional().describe('Lines of context around each match. Non-negative integer.'),
-            include_exported: z.boolean().optional().describe('Include exported symbols in deadcode results'),
-            include_decorated: z.boolean().optional().describe('Include decorated/annotated symbols in deadcode results'),
-            calls_only: z.boolean().optional().describe('tests: retain direct calls and test-case matches only.'),
-            max_lines: z.number().int().positive().max(1000000).optional().describe('source: maximum lines for large class-like declarations.'),
-            direction: z.enum(['callees', 'callers', 'imports', 'importers', 'both']).optional().describe('trace: callees/callers. deps: imports/importers/both.'),
-            to: z.enum(['entrypoints']).optional().describe('trace with direction=callers: continue toward entry points.'),
-            cycles: z.boolean().optional().describe('deps: report circular imports instead of a file graph.'),
-            term: z.string().optional().describe('Literal search term by default. Set regex=true only for regular-expression syntax.'),
-            regex: z.boolean().optional().describe('Treat search term as a regular expression (default: false/literal). Ordinary patterns run in an RE2-compatible linear-time engine; unsafe nested repetition is rejected.'),
-            functions: z.boolean().optional().describe('repo stats: include per-function line counts sorted by size.'),
-            hot: z.boolean().optional().describe('repo stats: include the top N most-called functions.'),
-            diverse: z.boolean().optional().describe('show example: return representatives from distinct argument shapes.'),
-            git: z.boolean().optional().describe('show summary: attach last-modified, author, and recent-change metadata.'),
-            add_param: z.string().optional().describe('Parameter name to add (plan command)'),
-            remove_param: z.string().optional().describe('Parameter name to remove (plan command)'),
-            rename_to: z.string().optional().describe('New function name (plan command)'),
-            default_value: z.string().optional().describe('Default value for added parameter (plan command)'),
-            stack: z.string().optional().describe('The stack trace text to parse (stacktrace command)'),
-            range: z.string().optional().describe('source line range, e.g. "10-20" or "15"; requires file.'),
-            base: z.string().optional().describe('Git ref to diff against (default: HEAD). E.g. "HEAD~3", "main", a commit SHA'),
-            staged: z.boolean().optional().describe('impact/check without a symbol: analyze staged changes.'),
-            deep: z.boolean().optional().describe('repo: include health and sample the ordinal resolution-evidence profile, not accuracy.'),
-            compact: z.boolean().optional().describe('Compact output defaults to true for show/impact and false for usages; set the opposite value to change that command\'s presentation.'),
-            case_sensitive: z.boolean().optional().describe('Case-sensitive search (default: false, case-insensitive)'),
-            all: z.boolean().optional().describe('Lift formatter and result caps where supported.'),
-            top_level: z.boolean().optional().describe('repo files: show only top-level functions.'),
-            class_name: z.string().optional().describe('Class name to scope method analysis (e.g. "MarketDataFetcher" for close)'),
-            line: z.number().int().positive().optional().describe('Definition line pin. Resolves the symbol defined at this exact line (the middle component of a file:line:name handle). Disambiguates same-file same-name definitions.'),
-            limit: z.number().int().positive().max(1000000).optional().describe('Max results to return (default: 500). Caps find, usages, search, deadcode, api, and repo files. Must be a positive integer.'),
-            max_files: z.number().int().positive().max(10000000).optional().describe('Max files to index (default: 10000). Use for very large codebases. Must be a positive integer.'),
-            max_chars: z.number().int().positive().max(100000).optional().describe('Max output chars before truncation. Broad sweep commands (repo, entrypoints, endpoints, deadcode, deps, check, audit_async) default to 3K; all other commands default to 10K. Maximum: 100K. all=true lifts formatter caps but keeps the 100K transport ceiling.'),
-            // Structural search flags (search command)
-            type: z.string().optional().describe('Symbol type filter for structural search: function, class, call, method, type, state, field, constant, macro. Triggers index-based search.'),
-            param: z.string().optional().describe('Filter by parameter name or type (structural search). E.g. "Request", "ctx".'),
-            receiver: z.string().optional().describe('Filter calls by receiver (structural search, type=call). E.g. "db", "http".'),
-            returns: z.string().optional().describe('Filter by return type (structural search). E.g. "Promise", "error".'),
-            decorator: z.string().optional().describe('Filter by decorator/annotation (structural search). E.g. "Route", "Test".'),
-            exported: z.boolean().optional().describe('Only exported/public symbols (structural search).'),
-            unused: z.boolean().optional().describe('Only symbols with zero callers (structural search).'),
-            framework: z.string().optional().describe('Filter entrypoints by framework (e.g. "express", "spring", "flask"). Comma-separated for multiple.'),
-            follow_symlinks: z.boolean().optional().describe('Follow symlinks during file discovery (default: true)'),
-            // endpoints command
-            bridge: z.boolean().optional().describe('Match server routes to client requests (endpoints command).'),
-            server_only: z.boolean().optional().describe('Only list server routes (endpoints command).'),
-            client_only: z.boolean().optional().describe('Only list client requests (endpoints command).'),
-            unmatched: z.boolean().optional().describe('Only show unmatched routes/requests (endpoints command).'),
-            method: z.string().optional().describe('Filter by HTTP method (e.g. "GET", "POST") for endpoints.'),
-            prefix: z.string().optional().describe('Filter routes/requests by path prefix (endpoints command).'),
-            hide_uncertain: z.boolean().optional().describe('Hide uncertain (interpolated-path) bridges (endpoints command).')
-
-        })).passthrough()
+        inputSchema: INPUT_SCHEMA,
+        annotations: {
+            title: 'Universal Code Navigator',
+            readOnlyHint: true,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: false,
+        },
     },
     async (args) => {
         const { command, project_dir, ...rawParams } = args;
@@ -521,8 +518,7 @@ server.registerTool(
 // ============================================================================
 
 async function main() {
-    const transport = new StdioServerTransport();
-    await server.connect(transport);
+    server.connect();
     // Print the running version so MCP-vs-CLI drift is visible (field-report #3:
     // a stale `npx -y ucn` cache can silently run an older engine than the CLI).
     console.error(`UCN MCP server v${require('../package.json').version} running on stdio`);

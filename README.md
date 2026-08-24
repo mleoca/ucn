@@ -39,6 +39,8 @@ It's deliberately lightweight:
 
 - **No required background process** - the CLI parses on demand, answers, and
   exits. MCP stays warm only when you choose to run it.
+- **No HTTP or network stack** - MCP uses a local, dependency-free stdio
+  transport; UCN never opens a port.
 - **No language servers, no compilation** - tree-sitter does the analysis
   without building the project.
 - **No config** - point it at a directory and ask.

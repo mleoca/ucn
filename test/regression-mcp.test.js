@@ -573,7 +573,7 @@ describe('MCP two-tier output limits', () => {
 // =============================================================================
 // MED-4: MCP numeric range validation (Round 5 audit)
 // =============================================================================
-describe('MED-4: MCP rejects out-of-range numeric params via Zod', () => {
+describe('MED-4: MCP rejects out-of-range numeric params via its published schema', () => {
     let client;
     before(async () => {
         client = new McpClient();
@@ -583,15 +583,15 @@ describe('MED-4: MCP rejects out-of-range numeric params via Zod', () => {
     after(() => { if (client) client.stop(); });
 
     // Helper: extract any user-visible error text from an MCP response.
-    // Zod validation errors come back as JSON-RPC error responses (res.error)
-    // OR as content with isError:true (depending on how MCP wraps the throw).
+    // Schema validation errors are returned as visible tool errors so agents
+    // can correct the input without losing the response payload.
     function errText(res) {
         if (res.error) return res.error.message || JSON.stringify(res.error);
         const content = res.result && res.result.content;
         return (content && content[0] && content[0].text) || '';
     }
 
-    it('top=1e100 is rejected by Zod (max cap)', async () => {
+    it('top=1e100 is rejected by the schema maximum', async () => {
         const res = await client.callTool('ucn', {
             command: 'show', project_dir: PROJECT_DIR, name: 'main', top: 1e100,
         });
@@ -663,11 +663,11 @@ describe('MED-4: MCP rejects out-of-range numeric params via Zod', () => {
         const res = await client.callTool('ucn', {
             command: 'trace', project_dir: PROJECT_DIR, name: 'main', depth: 0,
         });
-        // depth=0 should not be a Zod validation error. It may still produce
+        // depth=0 should not be a schema validation error. It may still produce
         // an empty/short result, but no isError due to schema rejection.
-        const zodFailed = res.error || (res.result && res.result.isError === true &&
+        const schemaFailed = res.error || (res.result && res.result.isError === true &&
             /must be|expected|number|integer|positive/i.test(errText(res)));
-        assert.ok(!zodFailed, `depth=0 should not fail Zod validation, got: ${errText(res).slice(0, 200)}`);
+        assert.ok(!schemaFailed, `depth=0 should not fail schema validation, got: ${errText(res).slice(0, 200)}`);
     });
 
     it('depth=-1 is rejected (must be non-negative)', async () => {
@@ -682,11 +682,10 @@ describe('MED-4: MCP rejects out-of-range numeric params via Zod', () => {
         const res = await client.callTool('ucn', {
             command: 'show', project_dir: PROJECT_DIR, name: 'main', top: 10,
         });
-        // Should succeed (or at worst, fail for other reasons — not Zod).
-        // Just verify no Zod validation error.
-        const zodFailed = res.error || (res.result && res.result.isError === true &&
+        // Should succeed (or at worst, fail for another engine reason).
+        const schemaFailed = res.error || (res.result && res.result.isError === true &&
             /must be|integer|less than|positive/i.test(errText(res)));
-        assert.ok(!zodFailed, `valid top=10 should not fail Zod, got: ${errText(res).slice(0, 200)}`);
+        assert.ok(!schemaFailed, `valid top=10 should not fail schema validation, got: ${errText(res).slice(0, 200)}`);
     });
 
     it('min_confidence=2.0 is rejected (must be in [0,1])', async () => {
