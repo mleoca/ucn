@@ -13,7 +13,10 @@ const {
 } = require('../mcp/stdio-server');
 
 const SERVER_PATH = path.join(__dirname, '..', 'mcp', 'server.js');
-const PROJECT_DIR = path.join(__dirname, '..');
+// Protocol behavior does not need to index UCN itself. A deterministic small
+// fixture keeps these transport tests responsive even when the full test suite
+// is saturating the machine with parser and compiler-oracle work.
+const PROJECT_DIR = path.join(__dirname, 'fixtures', 'javascript');
 const clients = new Set();
 
 class ProtocolClient {
