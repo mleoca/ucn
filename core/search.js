@@ -352,6 +352,15 @@ function usages(index, name, options = {}) {
                         usageType: u.usageType,
                         isDefinition: false,
                         ...(u.receiver && { receiver: u.receiver }),
+                        // Refactoring internals need the exact AST token and
+                        // receiver provenance, but the public usages JSON is a
+                        // stable line-oriented inventory. Keep this opt-in so
+                        // plan gains precision without changing that surface.
+                        ...(options.internalEvidence && {
+                            ...(Number.isInteger(u.column) && { column: u.column }),
+                            ...(u.receiverIsModule && { receiverIsModule: true }),
+                            ...(u.receiverLocalBinding && { receiverLocalBinding: true }),
+                        }),
                         ...(callerSym && {
                             callerName: callerSym.name,
                             callerStartLine: callerSym.startLine

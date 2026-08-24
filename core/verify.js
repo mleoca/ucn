@@ -1982,9 +1982,19 @@ function plan(index, name, options = {}) {
         // 'no' (the binding provably resolves elsewhere) skips; 'unknown'
         // (CJS surfaces, star imports, resolver gaps) keeps the import —
         // a missed import breaks the rename just as surely.
-        const { _nameBindingReaches } = require('./callers');
+        const {
+            _nameBindingReaches,
+            _moduleAttributeBindingReaches,
+        } = require('./callers');
         const renameTargetFiles = new Set([def.file]);
-        const usages = index.usages(name, { codeOnly: true });
+        // A rename plan is repository-wide. The caller sweep already includes
+        // tests; the import/reference sweep must not silently hide them via
+        // usages()' navigation-oriented default test exclusion.
+        const usages = index.usages(name, {
+            codeOnly: true,
+            includeTests: true,
+            internalEvidence: true,
+        });
         const importUsages = usages.filter(u => u.usageType === 'import' && !u.isDefinition);
         for (const imp of importUsages) {
             // Skip if already covered by a call site change in the same file:line
@@ -2655,19 +2665,37 @@ function plan(index, name, options = {}) {
                         }
                     }
                 } else if (!def.className) {
-                    const ownership = _nameBindingReaches(
-                        index, ref.file, name, renameTargetFiles);
-                    if (ownership === 'yes' &&
-                        !insideFunctionLike(ref.file, ref.line)) {
+                    // Module-attribute references carry stronger evidence
+                    // than a bare name: `import requests; requests.put` binds
+                    // through requests' export chain even inside a function.
+                    // Parser-side local-shadow evidence is a hard guard — a
+                    // parameter/assignment named requests defeats the import.
+                    const moduleOwnership = ref.receiver &&
+                        !ref.receiverLocalBinding
+                        ? _moduleAttributeBindingReaches(
+                            index, ref.file, ref.receiver, name,
+                            renameTargetFiles)
+                        : null;
+                    if (moduleOwnership === 'yes') {
                         verdict = 'edit';
-                    } else if (ownership !== 'no') {
+                    } else if (moduleOwnership === 'unknown') {
                         verdict = 'review';
+                    } else if (!ref.receiver) {
+                        const ownership = _nameBindingReaches(
+                            index, ref.file, name, renameTargetFiles);
+                        if (ownership === 'yes' &&
+                            !insideFunctionLike(ref.file, ref.line)) {
+                            verdict = 'edit';
+                        } else if (ownership !== 'no') {
+                            verdict = 'review';
+                        }
                     }
                 }
                 if (!verdict) continue;
                 if (verdict === 'edit') {
                     const edit = renameIdentifierTokens(index, ref.file,
-                        ref.line, name, options.renameTo);
+                        ref.line, name, options.renameTo,
+                        Number.isInteger(ref.column) ? [ref.column] : null);
                     if (edit.renamed === edit.source) continue;
                     changes.push({
                         file: rel,

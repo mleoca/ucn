@@ -9032,6 +9032,58 @@ function _submoduleReceiverModule(index, fileEntry, receiverName) {
 }
 
 /**
+ * Does a module-qualified member reference (`pkg.name`) reach the pinned
+ * definition files? This is the value-position counterpart of structural
+ * module-call routing. It deliberately accepts only parser-proven module
+ * imports (or Python from-imports resolved as actual submodules), so an
+ * imported class/value named `pkg` cannot borrow a module's exports.
+ *
+ * Returns `yes`, `no`, `unknown`, or null when the receiver is not a modeled
+ * module binding.
+ */
+function _moduleAttributeBindingReaches(index, filePath, receiverName, name,
+    targetFiles, maxDepth = 8) {
+    const fileEntry = index.files.get(filePath);
+    if (!fileEntry || !receiverName || !name ||
+        langTraits(fileEntry.language)?.typeSystem !== 'structural') return null;
+
+    const starts = new Set();
+    let matchedBinding = false;
+    let unknown = false;
+    const submoduleRel = _submoduleReceiverModule(index, fileEntry, receiverName);
+    if (submoduleRel) {
+        matchedBinding = true;
+        starts.add(path.isAbsolute(submoduleRel)
+            ? submoduleRel : path.join(index.root, submoduleRel));
+    }
+
+    for (const binding of (fileEntry.importBindings || [])) {
+        if (binding.name !== receiverName && binding.alias !== receiverName) continue;
+        // Python `import pkg [as p]` is a module binding. A `from pkg import
+        // Value` binding is not, unless _submoduleReceiverModule proved that
+        // Value is itself a project submodule above.
+        if (fileEntry.language === 'python' && binding.kind !== 'import') continue;
+        matchedBinding = true;
+        const rel = fileEntry.moduleResolved?.[binding.module];
+        if (!rel) {
+            unknown = true;
+            continue;
+        }
+        starts.add(path.isAbsolute(rel) ? rel : path.join(index.root, rel));
+    }
+
+    if (!matchedBinding) return null;
+    for (const start of starts) {
+        const verdict = _nameBindingReaches(
+            index, start, name, targetFiles, maxDepth);
+        if (verdict === 'yes') return 'yes';
+        if (verdict === 'unknown') unknown = true;
+    }
+    if (unknown || starts.size === 0) return 'unknown';
+    return 'no';
+}
+
+/**
  * Bounded-depth reachability over the import graph: can `fromAbs` reach any
  * target file through re-export/import chains? Barrel hierarchies routinely
  * run 2-3 hops (zod: v4/index → classic/index → schemas), so name-level
@@ -14611,4 +14663,4 @@ function findCallbackUsages(index, name) {
     return usages;
 }
 
-module.exports = { getCachedCalls, findCallers, findCallees, getInstanceAttributeTypes, findCallbackUsages, _nameBindingReaches, _declaredFieldType, _projectTopLevelNames, _callArityCompatible, _closeCallableIdentityGroup, _overloadDiscipline, _overloadApplicable };
+module.exports = { getCachedCalls, findCallers, findCallees, getInstanceAttributeTypes, findCallbackUsages, _nameBindingReaches, _moduleAttributeBindingReaches, _declaredFieldType, _projectTopLevelNames, _callArityCompatible, _closeCallableIdentityGroup, _overloadDiscipline, _overloadApplicable };

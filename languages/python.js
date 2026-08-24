@@ -1260,6 +1260,116 @@ function pickleRoundTripSource(node) {
     return value?.type === 'identifier' ? value.text : null;
 }
 
+function pythonTargetBindsName(left, name) {
+    if (!left) return false;
+    if (left.type === 'identifier' && left.text === name) return true;
+    if (left.type === 'pattern_list' || left.type === 'tuple_pattern') {
+        for (let i = 0; i < left.namedChildCount; i++) {
+            if (left.namedChild(i).type === 'identifier' &&
+                left.namedChild(i).text === name) return true;
+        }
+    }
+    return false;
+}
+
+function pythonScopeBindsName(scopeNode, name) {
+    for (let i = 0; i < scopeNode.namedChildCount; i++) {
+        const child = scopeNode.namedChild(i);
+        if (child.type === 'function_definition' ||
+            child.type === 'async_function_definition' ||
+            child.type === 'class_definition') {
+            // The nested body is a separate scope, but the declaration name
+            // binds in this scope.
+            if (child.childForFieldName('name')?.text === name) return true;
+            continue;
+        }
+        if (child.type === 'lambda') continue;
+        if (child.type === 'assignment' ||
+            child.type === 'augmented_assignment' ||
+            child.type === 'named_expression') {
+            if (pythonTargetBindsName(
+                child.childForFieldName('left') || child.childForFieldName('name'),
+                name)) return true;
+        } else if (child.type === 'for_statement') {
+            if (pythonTargetBindsName(child.childForFieldName('left'), name)) return true;
+        } else if (child.type === 'with_statement') {
+            const text = child.namedChild(0)?.text || '';
+            const match = text.match(/\bas\s+([A-Za-z_][A-Za-z0-9_]*)/);
+            if (match && match[1] === name) return true;
+        }
+        if (pythonScopeBindsName(child, name)) return true;
+    }
+    return false;
+}
+
+const PY_COMPREHENSIONS = new Set([
+    'generator_expression', 'list_comprehension', 'set_comprehension',
+    'dictionary_comprehension',
+]);
+
+// Python locals are function-scoped: an assignment anywhere in the function
+// shadows an imported module for every reference in that function. Keep this
+// shared between call records and reference records so plan cannot promote a
+// receiver that callers would reject as locally rebound.
+function isPythonNameShadowedAt(refNode, name) {
+    for (let parent = refNode.parent; parent; parent = parent.parent) {
+        if (PY_COMPREHENSIONS.has(parent.type)) {
+            for (let i = 0; i < parent.namedChildCount; i++) {
+                const clause = parent.namedChild(i);
+                if (clause.type === 'for_in_clause' &&
+                    pythonTargetBindsName(clause.childForFieldName('left'), name)) {
+                    return true;
+                }
+            }
+        }
+        if (parent.type === 'lambda') {
+            const params = parent.childForFieldName('parameters');
+            if (params) for (let i = 0; i < params.namedChildCount; i++) {
+                const param = params.namedChild(i);
+                if (param.type === 'identifier' && param.text === name) return true;
+                if (param.type === 'default_parameter' &&
+                    param.childForFieldName('name')?.text === name) return true;
+            }
+        }
+        if (parent.type === 'function_definition' ||
+            parent.type === 'async_function_definition') {
+            const params = parent.childForFieldName('parameters');
+            if (params) {
+                for (let i = 0; i < params.namedChildCount; i++) {
+                    const param = params.namedChild(i);
+                    const paramName = param.type === 'identifier'
+                        ? param
+                        : (param.childForFieldName('name') || param.namedChild(0));
+                    if (paramName?.type === 'identifier' &&
+                        paramName.text === name) return true;
+                }
+            }
+            const body = parent.childForFieldName('body');
+            return body ? pythonScopeBindsName(body, name) : false;
+        }
+    }
+    return false;
+}
+
+function pythonModuleAliases(tree) {
+    const aliases = new Set();
+    traverseTreeCached(tree.rootNode, node => {
+        if (node.type !== 'import_statement') return true;
+        for (let i = 0; i < node.namedChildCount; i++) {
+            const child = node.namedChild(i);
+            if (child.type === 'dotted_name') {
+                const first = child.namedChild(0);
+                if (first?.type === 'identifier') aliases.add(first.text);
+            } else if (child.type === 'aliased_import') {
+                const alias = child.childForFieldName('alias');
+                if (alias?.type === 'identifier') aliases.add(alias.text);
+            }
+        }
+        return true;
+    });
+    return aliases;
+}
+
 function findCallsInCode(code, parser) {
     const tree = parseTree(parser, code);
     const calls = [];
@@ -1402,90 +1512,7 @@ function findCallsInCode(code, parser) {
         };
     };
 
-    // fix #203: is a bare-identifier function REFERENCE shadowed by a local of
-    // the enclosing function? Python locals are FUNCTION-scoped and an
-    // assignment ANYWHERE in the function makes the name local for ALL its
-    // references (UnboundLocalError semantics) — so scan the whole enclosing
-    // function subtree (excluding nested function bodies, which are separate
-    // scopes) for assignment/for/with-as/walrus bindings of the name.
-    // Enclosing-function PARAMS are checked at query time in findCallers.
-    const _targetBindsName = (left, name) => {
-        if (!left) return false;
-        if (left.type === 'identifier' && left.text === name) return true;
-        if (left.type === 'pattern_list' || left.type === 'tuple_pattern') {
-            for (let j = 0; j < left.namedChildCount; j++) {
-                if (left.namedChild(j).type === 'identifier' && left.namedChild(j).text === name) return true;
-            }
-        }
-        return false;
-    };
-    const _bindsNameInScope = (scopeNode, name) => {
-        for (let i = 0; i < scopeNode.namedChildCount; i++) {
-            const c = scopeNode.namedChild(i);
-            if (c.type === 'function_definition' || c.type === 'async_function_definition' ||
-                c.type === 'class_definition') {
-                // The body is a separate scope, but the DEF NAME itself is an
-                // assignment in THIS scope (fix #218: a nested `def get_style`
-                // shadows the name for sibling references).
-                if (c.childForFieldName('name')?.text === name) return true;
-                continue;
-            }
-            if (c.type === 'lambda') continue; // separate scope, no name
-            if (c.type === 'assignment' || c.type === 'augmented_assignment' || c.type === 'named_expression') {
-                if (_targetBindsName(c.childForFieldName('left') || c.childForFieldName('name'), name)) return true;
-            } else if (c.type === 'for_statement') {
-                if (_targetBindsName(c.childForFieldName('left'), name)) return true;
-            } else if (c.type === 'with_statement') {
-                // with open(f) as fh: — as-target is inside with_clause/with_item
-                const text = c.namedChild(0)?.text || '';
-                const m = text.match(/\bas\s+([A-Za-z_][A-Za-z0-9_]*)/);
-                if (m && m[1] === name) return true;
-            }
-            if (_bindsNameInScope(c, name)) return true;
-        }
-        return false;
-    };
-    const PY_COMPREHENSIONS = new Set([
-        'generator_expression', 'list_comprehension', 'set_comprehension', 'dictionary_comprehension',
-    ]);
-    const isShadowedByLocal = (refNode, name) => {
-        for (let p = refNode.parent; p; p = p.parent) {
-            // Comprehension for-clause targets are scoped to the comprehension
-            // itself (PEP 3110-era scoping): `cell_len(line) for line in lines`
-            // binds `line` ONLY inside the comprehension — block-accurate, so
-            // check on the way up rather than function-wide (fix #218).
-            if (PY_COMPREHENSIONS.has(p.type)) {
-                for (let i = 0; i < p.namedChildCount; i++) {
-                    const c = p.namedChild(i);
-                    if (c.type === 'for_in_clause' && _targetBindsName(c.childForFieldName('left'), name)) return true;
-                }
-            }
-            // Lambda params shadow their body the same way (fix #218).
-            if (p.type === 'lambda') {
-                const params = p.childForFieldName('parameters');
-                if (params) for (let i = 0; i < params.namedChildCount; i++) {
-                    const c = params.namedChild(i);
-                    if (c.type === 'identifier' && c.text === name) return true;
-                    if (c.type === 'default_parameter' && c.childForFieldName('name')?.text === name) return true;
-                }
-            }
-            if (p.type === 'function_definition' || p.type === 'async_function_definition') {
-                const params = p.childForFieldName('parameters');
-                if (params) {
-                    for (let i = 0; i < params.namedChildCount; i++) {
-                        const prm = params.namedChild(i);
-                        const prmName = prm.type === 'identifier'
-                            ? prm
-                            : (prm.childForFieldName('name') || prm.namedChild(0));
-                        if (prmName?.type === 'identifier' && prmName.text === name) return true;
-                    }
-                }
-                const body = p.childForFieldName('body');
-                return body ? _bindsNameInScope(body, name) : false;
-            }
-        }
-        return false; // module level — that's a module binding, not a shadow
-    };
+    const isShadowedByLocal = isPythonNameShadowedAt;
 
     traverseTree(tree.rootNode, (node) => {
         // Track module-alias bindings: `import httpx` binds 'httpx' (a module),
@@ -2504,6 +2531,7 @@ function findExportsInCode(code, parser) {
 function findUsagesInCode(code, name, parser, tree) {
     tree = tree || parseTree(parser, code);
     const usages = [];
+    const moduleAliases = pythonModuleAliases(tree);
 
     visitNameNodes(tree, code, name, (node) => {
         // Only look for identifiers with the matching name
@@ -2575,7 +2603,16 @@ function findUsagesInCode(code, name, parser, tree) {
                 // Track receiver for member expressions (obj.name → receiver = 'obj')
                 const object = parent.childForFieldName('object');
                 if (object && object.type === 'identifier') {
-                    usages.push({ line, column, usageType, receiver: object.text });
+                    usages.push({
+                        line,
+                        column,
+                        usageType,
+                        receiver: object.text,
+                        ...(moduleAliases.has(object.text) && { receiverIsModule: true }),
+                        ...(isPythonNameShadowedAt(object, object.text) && {
+                            receiverLocalBinding: true,
+                        }),
+                    });
                     return true;
                 }
                 // Constructed receiver: ColorTriplet(...).normalized is a

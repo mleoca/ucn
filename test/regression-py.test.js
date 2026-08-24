@@ -5457,6 +5457,54 @@ describe('fix #300: plan renames Python __all__ string entries', () => {
     });
 });
 
+describe('fix #301: plan closes Python module-attribute references', () => {
+    it('edits an imported module member in tests without touching foreign or shadowed receivers', () => {
+        const dir = tmp({
+            'pkg/api.py': [
+                'def put(value):',
+                '    return value',
+            ].join('\n') + '\n',
+            'pkg/__init__.py': [
+                'from .api import put',
+                '__all__ = ["put"]',
+            ].join('\n') + '\n',
+            'tests/test_consumer.py': [
+                'import pkg',
+                '',
+                'class Other:',
+                '    def put(self, value):',
+                '        return value',
+                '',
+                'def test_entry_points(other):',
+                '    refs = (pkg.put, other.put)',
+                '    return refs',
+                '',
+                'def test_shadow(pkg):',
+                '    return pkg.put',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'plan', {
+                name: 'pkg/api.py:1:put', renameTo: 'put_req',
+            });
+            assert.ok(result.ok, JSON.stringify(result.error));
+            const changes = result.result.changes || [];
+            const moduleRef = changes.find(change =>
+                change.file === 'tests/test_consumer.py' && change.line === 8);
+            assert.ok(moduleRef,
+                `test-file module reference must be included: ${JSON.stringify(changes)}`);
+            assert.strictEqual(moduleRef.editKind, 'reference');
+            assert.strictEqual(moduleRef.newExpression,
+                'refs = (pkg.put_req, other.put)',
+                'only the module-owned member token may be renamed');
+            assert.ok(!changes.some(change =>
+                change.file === 'tests/test_consumer.py' && change.line === 12),
+            'a parameter shadowing the imported module must block the edit');
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #300: callee twin — scope-correct ancestry + typed-receiver builtin names', () => {
     it('findCallees resolves inherited calls through the scoped local subclass', () => {
         const dir = tmp({
