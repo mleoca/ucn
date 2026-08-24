@@ -83,6 +83,62 @@ function applyRenameToContent(content, lineNumbers, name, newName) {
     return { content: lines.join('\n'), replacedLines, noEffectLines };
 }
 
+/**
+ * Apply the exact expression edits emitted by `plan`.
+ *
+ * A semantic plan can distinguish two same-named calls on one source line;
+ * reducing that plan to a line number and renaming every occurrence destroys
+ * the evidence the outcome instrument is meant to judge. Edits are located
+ * from their reported start line and applied from the end of the file toward
+ * the beginning so earlier offsets remain stable. Multiline expressions are
+ * supported as long as their first token starts on the reported line.
+ */
+function applyPlannedEditsToContent(content, edits) {
+    const lines = content.split('\n');
+    const offsets = [];
+    let offset = 0;
+    for (const line of lines) {
+        offsets.push(offset);
+        offset += line.length + 1;
+    }
+    const located = [];
+    const noEffectEdits = [];
+    for (const edit of edits) {
+        const expression = String(edit.expression || '');
+        const newExpression = String(edit.newExpression || '');
+        const lineIndex = Number(edit.line) - 1;
+        if (!expression || lineIndex < 0 || lineIndex >= offsets.length) {
+            noEffectEdits.push(edit);
+            continue;
+        }
+        const lineStart = offsets[lineIndex];
+        const nextLineStart = lineIndex + 1 < offsets.length
+            ? offsets[lineIndex + 1] : content.length + 1;
+        const start = content.indexOf(expression, lineStart);
+        if (start < lineStart || start >= nextLineStart) {
+            noEffectEdits.push(edit);
+            continue;
+        }
+        located.push({ start, end: start + expression.length, newExpression, edit });
+    }
+    located.sort((a, b) => b.start - a.start);
+    let result = content;
+    let lastStart = Infinity;
+    const appliedEdits = [];
+    for (const item of located) {
+        if (item.end > lastStart) {
+            // Overlapping edits should have been combined by plan. Refuse to
+            // guess an application order and meter the duplicate as no-effect.
+            noEffectEdits.push(item.edit);
+            continue;
+        }
+        result = result.slice(0, item.start) + item.newExpression + result.slice(item.end);
+        lastStart = item.start;
+        appliedEdits.push(item.edit);
+    }
+    return { content: result, appliedEdits, noEffectEdits };
+}
+
 /** Delete a definition's line range (1-based, inclusive). */
 function applyDeleteToContent(content, startLine, endLine) {
     const lines = content.split('\n');
@@ -162,7 +218,13 @@ function armSitesFromPlan(planData, mode) {
         // "verify before renaming" — the scripted agent defers those rather
         // than blindly rewriting the line.
         if (change.needsReview && !change.newExpression) continue;
-        sites.push({ file: change.file, line: change.line, kind: change.editKind });
+        sites.push({
+            file: change.file,
+            line: change.line,
+            kind: change.editKind,
+            ...(change.expression && { expression: change.expression }),
+            ...(change.newExpression && { newExpression: change.newExpression }),
+        });
     }
     const escalationFiles = [];
     const deferredExternal = [];
@@ -599,6 +661,7 @@ module.exports = {
     renameOnLine,
     renameFirstOnLine,
     applyRenameToContent,
+    applyPlannedEditsToContent,
     applyDeleteToContent,
     stripNameFromImportLine,
     armSitesFromPlan,

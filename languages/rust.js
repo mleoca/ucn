@@ -444,6 +444,7 @@ function _processFunction(node, functions, processedRanges, lines, code) {
             const iteratorItemType = extractRustIteratorItemType(node);
             const docstring = extractRustDocstring(lines, startLine);
             const generics = extractGenerics(node);
+            const genericBounds = extractGenericBounds(node);
             const attributes = extractAttributes(node, lines);
             const attributesWithArgs = extractAttributesWithArgs(node, lines);
             const inCfgTest = _isInsideCfgTestModule(node, lines);
@@ -476,6 +477,7 @@ function _processFunction(node, functions, processedRanges, lines, code) {
                 ...(iteratorItemType && { iteratorItemType }),
                 ...(docstring && { docstring }),
                 ...(generics && { generics }),
+                ...(genericBounds && { genericBounds }),
                 ...(attributesWithArgs.length > 0 && { attributesWithArgs })
             });
         }
@@ -1030,6 +1032,39 @@ function extractGenerics(node) {
 }
 
 /**
+ * Compiler-declared Rust type-parameter bounds from both `<T: Trait>` and
+ * `where T: Trait`. Keep only nominal trait heads from AST type nodes;
+ * lifetimes and unparseable shapes add no evidence.
+ */
+function extractGenericBounds(node) {
+    const result = new Map();
+    const record = declaration => {
+        if (!declaration) return;
+        const children = declaration.namedChildren || [];
+        const parameter = children.find(child => child.type === 'type_identifier');
+        const bounds = children.find(child => child.type === 'trait_bounds');
+        if (!parameter || !bounds) return;
+        const names = bounds.namedChildren
+            .map(bound => aliasBaseTypeName(bound))
+            .filter(Boolean);
+        if (names.length === 0) return;
+        if (!result.has(parameter.text)) result.set(parameter.text, new Set());
+        for (const name of names) result.get(parameter.text).add(name);
+    };
+    const typeParameters = node.childForFieldName('type_parameters');
+    for (const child of typeParameters?.namedChildren || []) {
+        if (child.type === 'constrained_type_parameter') record(child);
+    }
+    const whereClause = node.namedChildren.find(child => child.type === 'where_clause');
+    for (const child of whereClause?.namedChildren || []) {
+        if (child.type === 'where_predicate') record(child);
+    }
+    if (result.size === 0) return null;
+    return Object.fromEntries([...result].map(([name, bounds]) =>
+        [name, [...bounds].sort()]));
+}
+
+/**
  * Find all types (structs, enums, traits, impls) in Rust code
  */
 function findClasses(code, parser) {
@@ -1317,6 +1352,7 @@ function extractImplMembers(implNode, codeOrLines, typeName) {
                 if (inCfgTest) modifiers.push('cfg_test_module');
 
                 const memberGenerics = extractGenerics(child);
+                const genericBounds = extractGenericBounds(child);
                 const callbackParamTypes = extractRustCallbackParamTypes(paramsNode);
                 members.push({
                     name: nameNode.text,
@@ -1335,7 +1371,8 @@ function extractImplMembers(implNode, codeOrLines, typeName) {
                     ...(docstring && { docstring }),
                     // Method-level type params (fix #229): generic-param receiver
                     // types inside the method resolve against this declaration.
-                    ...(memberGenerics && { generics: memberGenerics })
+                    ...(memberGenerics && { generics: memberGenerics }),
+                    ...(genericBounds && { genericBounds })
                 });
             }
         }
@@ -1491,8 +1528,48 @@ function extractCallsFromTokenTree(tree, enclosingFunction, calls, getReceiverTy
     isPatternShadow, isFlowInvalidated, context = 'invocation') {
     const contextKind = typeof context === 'string' ? context : context.kind;
     const containerMacro = typeof context === 'object' ? context.containerMacro : undefined;
+    const inheritedTokenTypes = typeof context === 'object' && context.tokenTypes
+        ? context.tokenTypes : new Map();
     const children = [];
     for (let i = 0; i < tree.childCount; i++) children.push(tree.child(i));
+    // Macro arguments are token trees, so a typed closure parameter is not a
+    // normal closure_parameters AST node. Recover only the compiler-explicit
+    // simple/path type shape from AST tokens and pass it into that closure's
+    // body token tree. This keeps the evidence lexical: sibling macro
+    // arguments and token trees before the closure never inherit the name.
+    const closureBodyTypes = new Map();
+    for (let i = 0; i < children.length; i++) {
+        if (children[i].type !== '|') continue;
+        let close = i + 1;
+        while (close < children.length && children[close].type !== '|') close++;
+        if (close >= children.length) break;
+        const bindings = new Map(inheritedTokenTypes);
+        let cursor = i + 1;
+        while (cursor < close) {
+            const nameNode = children[cursor];
+            if (nameNode?.type !== 'identifier' || children[cursor + 1]?.type !== ':') {
+                cursor++;
+                continue;
+            }
+            let end = cursor + 2;
+            while (end < close && children[end].type !== ',') end++;
+            const typeTokens = children.slice(cursor + 2, end).filter(token =>
+                !['&', 'mutable_specifier', 'lifetime'].includes(token.type));
+            const simplePath = typeTokens.length > 0 && typeTokens.every((token, index) =>
+                token.type === 'identifier' ||
+                (token.type === '::' && index > 0 && index < typeTokens.length - 1));
+            if (simplePath) {
+                const identifiers = typeTokens.filter(token => token.type === 'identifier');
+                if (identifiers.length > 0) {
+                    bindings.set(nameNode.text, identifiers[identifiers.length - 1].text);
+                }
+            }
+            cursor = end + 1;
+        }
+        const body = children[close + 1];
+        if (body?.type === 'token_tree') closureBodyTypes.set(body.id, bindings);
+        i = close;
+    }
     let lastProducer = null;
     const macroFields = {
         inMacro: true,
@@ -1502,8 +1579,13 @@ function extractCallsFromTokenTree(tree, enclosingFunction, calls, getReceiverTy
     for (let i = 0; i < children.length; i++) {
         const tok = children[i];
         if (tok.type === 'token_tree') {
+            const tokenTypes = closureBodyTypes.get(tok.id) || inheritedTokenTypes;
             extractCallsFromTokenTree(tok, enclosingFunction, calls, getReceiverType,
-                isPatternShadow, isFlowInvalidated, context);
+                isPatternShadow, isFlowInvalidated, {
+                    kind: contextKind,
+                    ...(containerMacro && { containerMacro }),
+                    tokenTypes,
+                });
             continue;
         }
         // `default` is tokenized as the Rust keyword even in the valid
@@ -1620,8 +1702,9 @@ function extractCallsFromTokenTree(tree, enclosingFunction, calls, getReceiverTy
                 ? ({ string_literal: 'str', raw_string_literal: 'str',
                     char_literal: 'char', boolean_literal: 'bool' })[recvTok.type]
                 : undefined;
-            const receiverType = (receiver && receiver !== 'self' && getReceiverType)
-                ? getReceiverType(receiver, tok) : litType;
+            const receiverType = (receiver && receiver !== 'self')
+                ? (getReceiverType?.(receiver, tok) || inheritedTokenTypes.get(receiver))
+                : litType;
             const receiverPatternShadow = !!(receiver && isPatternShadow?.(tok, receiver));
             const receiverFlowInvalidated = !!(receiver && isFlowInvalidated?.(tok, receiver));
             const iterationSource = rustIterationSourceOf(tok, receiver);

@@ -29,6 +29,38 @@ describe('outcome-policy: identifier rename mechanics', () => {
         assert.deepStrictEqual(result.noEffectLines, [2, 99]);
     });
 
+    it('applies the exact planned expression when one line has two same-named calls', () => {
+        const content = [
+            'func use(r *Router) {',
+            '\tr.PathPrefix("/before").PathPrefix("/after")',
+            '}',
+        ].join('\n');
+        const result = policy.applyPlannedEditsToContent(content, [{
+            file: 'mux.go',
+            line: 2,
+            expression: 'r.PathPrefix("/before").PathPrefix("/after")',
+            newExpression: 'r.PathPrefixV2("/before").PathPrefix("/after")',
+        }]);
+        assert.strictEqual(result.content, [
+            'func use(r *Router) {',
+            '\tr.PathPrefixV2("/before").PathPrefix("/after")',
+            '}',
+        ].join('\n'));
+        assert.strictEqual(result.appliedEdits.length, 1);
+        assert.deepStrictEqual(result.noEffectEdits, []);
+    });
+
+    it('applies multiline planned expressions from their reported start line', () => {
+        const content = 'before\n\toldCall(\n\t\tvalue,\n\t)\nafter';
+        const result = policy.applyPlannedEditsToContent(content, [{
+            line: 2,
+            expression: 'oldCall(\n\t\tvalue,\n\t)',
+            newExpression: 'newCall(\n\t\tvalue,\n\t)',
+        }]);
+        assert.strictEqual(result.content, 'before\n\tnewCall(\n\t\tvalue,\n\t)\nafter');
+        assert.strictEqual(result.appliedEdits.length, 1);
+    });
+
     it('applyDeleteToContent removes the inclusive 1-based range', () => {
         assert.strictEqual(policy.applyDeleteToContent('l1\nl2\nl3\nl4', 2, 3), 'l1\nl4');
     });

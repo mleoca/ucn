@@ -646,9 +646,11 @@ const GO_BUILTINS = new Set([
 /**
  * Variable receiving this call's result (fix #207 return-type flow):
  *   bb := balancer.Get(n)  → { assignedTo: 'bb' }
- *   x, err := pkg.Make()   → { assignedTo: 'x', assignedTuple: true }
- *                            (tuple unpack — the flow map pairs the first
- *                             return element with the first variable)
+ *   x, err := pkg.Make()   → { assignedTo: 'x', assignedTuple: true,
+ *                              assignedTupleTargets: [{name:'x', index:0},
+ *                                                     {name:'err', index:1}] }
+ *                            (tuple unpack — the flow map pairs every named
+ *                             target with its declared return position)
  *   y = q()                → { assignedTo: 'y' } (plain `=` only — `+=` etc.
  *                            don't bind the call's type to the variable)
  *   a, b := g(), h()       → parallel assignment: each call pairs with its
@@ -684,19 +686,24 @@ function goAssignmentTargetOf(callNode) {
         return target?.type === 'identifier' && target.text !== '_'
             ? { assignedTo: target.text } : undefined;
     }
+    if (names.length > 1) {
+        const targets = names
+            .map((item, index) => ({ item, index }))
+            .filter(({ item }) => item.type === 'identifier' && item.text !== '_')
+            .map(({ item, index }) => ({ name: item.text, index }));
+        if (targets.length === 0) return undefined;
+        const [target, ...restTargets] = targets;
+        const rest = restTargets.map(item => item.name);
+        return {
+            assignedTo: target.name,
+            assignedTuple: true,
+            assignedTupleIndex: target.index,
+            assignedTupleTargets: targets,
+            ...(rest.length > 0 && { assignedTupleRest: rest }),
+        };
+    }
     const target = names[0];
     if (target?.type !== 'identifier' || target.text === '_') return undefined;
-    if (names.length > 1) {
-        // All LHS names (fix #220): an EXTERNAL producer decides every tuple
-        // element's type, not just the first — `tmpFile, err := os.CreateTemp`
-        // marks err external-flow too. The TYPED flow keeps pairing only
-        // element 0 with the producer's return tuple (#207).
-        const rest = names.slice(1)
-            .filter(t => t.type === 'identifier' && t.text !== '_')
-            .map(t => t.text);
-        return { assignedTo: target.text, assignedTuple: true,
-            ...(rest.length > 0 && { assignedTupleRest: rest }) };
-    }
     return { assignedTo: target.text };
 }
 
@@ -732,7 +739,10 @@ function findCallsInCode(code, parser, options = {}) {
     };
     // Skip common non-function identifiers when detecting callback arguments
     const GO_SKIP_IDENTS = new Set(['nil', 'true', 'false', 'err', 'ctx', 'context', 'iota']);
-    // Track local closure names per function scope (scopeStartLine -> Set<name>)
+    // Track local closures per function scope. The declared result belongs
+    // to the lexical value (not to a package-level function with the same
+    // name), but it is still compiler-grade assignment-flow evidence.
+    // scopeStartLine -> Map<name, { returnType?: string }>
     const closureScopes = new Map();
     // Track variable -> type mappings per function scope (scopeStartLine -> Map<varName, typeName>)
     const scopeTypes = new Map();
@@ -900,13 +910,13 @@ function findCallsInCode(code, parser, options = {}) {
             : null;
     };
 
-    // Check if current scope has a local closure with the given name
-    const isLocalClosure = (name) => {
+    // Resolve a local closure through the lexical function-scope chain.
+    const getLocalClosure = (name) => {
         for (let i = functionStack.length - 1; i >= 0; i--) {
             const scope = closureScopes.get(functionStack[i].startLine);
-            if (scope?.has(name)) return true;
+            if (scope?.has(name)) return scope.get(name);
         }
-        return false;
+        return null;
     };
 
     // Check if name is a function-typed parameter (e.g., match func(Object) bool)
@@ -1402,52 +1412,66 @@ function findCallsInCode(code, parser, options = {}) {
             }
         }
 
-        // Track local closures: atoi := func(...) { ... } or var handler = func(...) { ... }
+        // Track local closures: atoi := func(...) { ... } or
+        // var handler = func(...) { ... }. Pair each lexical name with the
+        // literal's declared result so an invocation can type its assignment
+        // without pretending it calls a same-named package symbol.
         if (node.type === 'short_var_declaration' || node.type === 'var_declaration') {
-            // Check if a subtree contains a func_literal
-            const hasFunc = (n) => {
+            const firstFuncLiteral = (n) => {
                 if (!n) return false;
-                if (n.type === 'func_literal') return true;
+                if (n.type === 'func_literal') return n;
                 for (let i = 0; i < n.childCount; i++) {
-                    if (hasFunc(n.child(i))) return true;
+                    const found = firstFuncLiteral(n.child(i));
+                    if (found) return found;
                 }
-                return false;
+                return null;
             };
-            let names = [];
-            if (node.type === 'short_var_declaration') {
-                // short_var_declaration checks the whole RHS
-                if (hasFunc(node)) {
-                    const left = node.childForFieldName('left');
-                    if (left) {
-                        names = left.type === 'expression_list'
-                            ? Array.from({ length: left.namedChildCount }, (_, i) => left.namedChild(i))
-                                  .filter(n => n.type === 'identifier').map(n => n.text)
-                            : left.type === 'identifier' ? [left.text] : [];
-                    }
+            const entries = [];
+            const pairNamesWithValues = (left, right) => {
+                if (!left || !right) return;
+                const names = left.type === 'expression_list'
+                    ? left.namedChildren.filter(child => child.type === 'identifier')
+                    : left.type === 'identifier' ? [left] : [];
+                const values = right.type === 'expression_list'
+                    ? right.namedChildren : [right];
+                for (let i = 0; i < names.length; i++) {
+                    const literal = firstFuncLiteral(values[i] ||
+                        (values.length === 1 ? values[0] : null));
+                    if (literal) entries.push({
+                        name: names[i].text,
+                        returnType: extractReturnType(literal),
+                    });
                 }
+            };
+            if (node.type === 'short_var_declaration') {
+                pairNamesWithValues(
+                    node.childForFieldName('left'),
+                    node.childForFieldName('right'));
             } else {
-                // var_declaration: check per-spec so only names with func_literal values are tracked
+                // var_declaration: check per-spec so only names paired with
+                // func_literal values are tracked.
                 // Handle both: var x = func(){} (var_declaration > var_spec)
                 //          and: var (\n x = func(){} \n) (var_declaration > var_spec_list > var_spec)
-                const collectClosureNames = (parent) => {
+                const collectClosureEntries = (parent) => {
                     for (let i = 0; i < parent.namedChildCount; i++) {
                         const child = parent.namedChild(i);
-                        if (child.type === 'var_spec' && hasFunc(child)) {
-                            const nameNode = child.childForFieldName('name');
-                            if (nameNode && nameNode.type === 'identifier') {
-                                names.push(nameNode.text);
-                            }
+                        if (child.type === 'var_spec') {
+                            pairNamesWithValues(
+                                child.childForFieldName('name'),
+                                child.childForFieldName('value'));
                         } else if (child.type === 'var_spec_list') {
-                            collectClosureNames(child);
+                            collectClosureEntries(child);
                         }
                     }
                 };
-                collectClosureNames(node);
+                collectClosureEntries(node);
             }
-            if (names.length > 0 && functionStack.length > 0) {
+            if (entries.length > 0 && functionStack.length > 0) {
                 const scopeKey = functionStack[functionStack.length - 1].startLine;
-                if (!closureScopes.has(scopeKey)) closureScopes.set(scopeKey, new Set());
-                for (const n of names) closureScopes.get(scopeKey).add(n);
+                if (!closureScopes.has(scopeKey)) closureScopes.set(scopeKey, new Map());
+                for (const entry of entries) {
+                    closureScopes.get(scopeKey).set(entry.name, entry);
+                }
             }
         }
 
@@ -1483,8 +1507,42 @@ function findCallsInCode(code, parser, options = {}) {
                 const callName = funcNode.text;
                 // Skip Go built-in function calls
                 if (GO_BUILTINS.has(callName)) return true;
-                // Skip calls to local closures (they shadow package-level functions)
-                if (isLocalClosure(callName)) return true;
+                // Local closures shadow package-level functions. Keep an
+                // internal-only call record when their declared result can
+                // type an assignment; the sentinel name prevents semantic
+                // caller matching against a package symbol of the same name.
+                const localClosure = getLocalClosure(callName);
+                if (localClosure) {
+                    if (assigned && localClosure.returnType) {
+                        calls.push({
+                            name: '<local-closure>',
+                            localCallName: callName,
+                            localValueCall: true,
+                            returnTypeHint: localClosure.returnType,
+                            line: node.startPosition.row + 1,
+                            column: funcNode.startPosition.column,
+                            callStart: node.startIndex,
+                            callEnd: node.endIndex,
+                            isMethod: false,
+                            argCount,
+                            ...(argSpread && { argSpread: true }),
+                            assignedTo: assigned.assignedTo,
+                            ...(assigned.assignedTuple && { assignedTuple: true }),
+                            ...(assigned.assignedTupleIndex != null && {
+                                assignedTupleIndex: assigned.assignedTupleIndex,
+                            }),
+                            ...(assigned.assignedTupleTargets && {
+                                assignedTupleTargets: assigned.assignedTupleTargets,
+                            }),
+                            ...(assigned.assignedTupleRest && {
+                                assignedTupleRest: assigned.assignedTupleRest,
+                            }),
+                            enclosingFunction,
+                            uncertain: false,
+                        });
+                    }
+                    return true;
+                }
                 // Skip calls to function-typed parameters (e.g., match func(Object) bool)
                 // These are local parameter invocations, not calls to global functions
                 if (isFuncTypedParam(callName)) return true;
@@ -1495,12 +1553,20 @@ function findCallsInCode(code, parser, options = {}) {
                     name: callName,
                     line: node.startPosition.row + 1,
                     column: funcNode.startPosition.column,
+                    callStart: node.startIndex,
+                    callEnd: node.endIndex,
                     isMethod: false,
                     argCount,
                     ...(argSpread && { argSpread: true }),
                     ...(assigned && { assignedTo: assigned.assignedTo }),
                     ...(assigned?.assignedTuple && { assignedTuple: true }),
-                        ...(assigned?.assignedTupleRest && { assignedTupleRest: assigned.assignedTupleRest }),
+                    ...(assigned?.assignedTupleIndex != null && {
+                        assignedTupleIndex: assigned.assignedTupleIndex,
+                    }),
+                    ...(assigned?.assignedTupleTargets && {
+                        assignedTupleTargets: assigned.assignedTupleTargets,
+                    }),
+                    ...(assigned?.assignedTupleRest && { assignedTupleRest: assigned.assignedTupleRest }),
                     enclosingFunction,
                     uncertain,
                     ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
@@ -1562,14 +1628,34 @@ function findCallsInCode(code, parser, options = {}) {
                     // declared return (*pflag.FlagSet → external → routed).
                     // Package-qualified producers (os.CreateTemp().Name())
                     // carry the qualifier for strict import-package resolution.
-                    let receiverCall, receiverCallIsMethod, receiverCallReceiver, receiverCallLine;
+                    let receiverCall, receiverCallIsMethod, receiverCallReceiver,
+                        receiverCallLine, receiverCallStart, receiverCallEnd,
+                        receiverCallResultType, receiverCallResultTypeQualifier;
                     if (!receiver && !receiverFieldName && operandNode?.type === 'call_expression') {
                         const prodFunc = operandNode.childForFieldName('function');
+                        receiverCallStart = operandNode.startIndex;
+                        receiverCallEnd = operandNode.endIndex;
                         if (prodFunc?.type === 'identifier') {
                             receiverCall = prodFunc.text;
                             // Producer link (fix #258): plain-call records carry
                             // the call node's start line
                             receiverCallLine = operandNode.startPosition.row + 1;
+                            // Go's builtin new has an exact static result:
+                            // `new(Route)` is `*Route`. The builtin itself is
+                            // intentionally absent from the semantic call
+                            // index, so carry the result type on its consumer.
+                            if (receiverCall === 'new') {
+                                const prodArgs = operandNode.childForFieldName('arguments');
+                                const typeArg = prodArgs?.namedChild(0);
+                                if (typeArg) {
+                                    const authored = typeArg.text.replace(/^\*+/, '').trim();
+                                    const parts = authored.split('.');
+                                    receiverCallResultType = parts.pop();
+                                    if (parts.length > 0) {
+                                        receiverCallResultTypeQualifier = parts.join('.');
+                                    }
+                                }
+                            }
                         } else if (prodFunc?.type === 'selector_expression') {
                             const pf = prodFunc.childForFieldName('field');
                             const po = prodFunc.childForFieldName('operand');
@@ -1597,6 +1683,8 @@ function findCallsInCode(code, parser, options = {}) {
                         // the only parser still using the call node's start.
                         line: fieldNode.startPosition.row + 1,
                         column: fieldNode.startPosition.column,
+                        callStart: node.startIndex,
+                        callEnd: node.endIndex,
                         isMethod: !isPkgCall,
                         receiver,
                         ...(receiverType && { receiverType }),
@@ -1611,10 +1699,22 @@ function findCallsInCode(code, parser, options = {}) {
                         ...(receiverCallIsMethod && { receiverCallIsMethod: true }),
                         ...(receiverCallReceiver && { receiverCallReceiver }),
                         ...(receiverCallLine && { receiverCallLine }),
+                        ...(receiverCallStart != null && { receiverCallStart }),
+                        ...(receiverCallEnd != null && { receiverCallEnd }),
+                        ...(receiverCallResultType && { receiverCallResultType }),
+                        ...(receiverCallResultTypeQualifier && {
+                            receiverCallResultTypeQualifier,
+                        }),
                         argCount,
                         ...(argSpread && { argSpread: true }),
                         ...(assigned && { assignedTo: assigned.assignedTo }),
                         ...(assigned?.assignedTuple && { assignedTuple: true }),
+                        ...(assigned?.assignedTupleIndex != null && {
+                            assignedTupleIndex: assigned.assignedTupleIndex,
+                        }),
+                        ...(assigned?.assignedTupleTargets && {
+                            assignedTupleTargets: assigned.assignedTupleTargets,
+                        }),
                         ...(assigned?.assignedTupleRest && { assignedTupleRest: assigned.assignedTupleRest }),
                         enclosingFunction,
                         uncertain,

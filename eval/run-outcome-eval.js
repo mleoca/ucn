@@ -607,6 +607,7 @@ function applyRenameArm(repoPath, contentByFile, task, proposal, armSites) {
     const newName = proposal.newName;
     const byFile = new Map();
     const defByFile = new Map();
+    const exactByFile = new Map();
     const addSite = (map, file, line) => {
         if (!map.has(file)) map.set(file, new Set());
         map.get(file).add(line);
@@ -618,7 +619,10 @@ function applyRenameArm(repoPath, contentByFile, task, proposal, armSites) {
     // (line granularity is the instrument's design); a line carrying both
     // kinds keeps site semantics.
     for (const site of armSites) {
-        if (site.kind === 'definition') addSite(defByFile, site.file, site.line);
+        if (site.expression && site.newExpression) {
+            if (!exactByFile.has(site.file)) exactByFile.set(site.file, []);
+            exactByFile.get(site.file).push(site);
+        } else if (site.kind === 'definition') addSite(defByFile, site.file, site.line);
         else addSite(byFile, site.file, site.line);
     }
     for (const [file, lineSet] of defByFile) {
@@ -636,11 +640,26 @@ function applyRenameArm(repoPath, contentByFile, task, proposal, armSites) {
         }
     }
 
+    let noEffectEdits = 0;
+    for (const [file, edits] of exactByFile) {
+        let content;
+        try {
+            content = fs.readFileSync(path.join(repoPath, file), 'utf8');
+        } catch (_) {
+            content = contentByFile.get(file);
+        }
+        if (content == null) { noEffectEdits += edits.length; continue; }
+        const result = policy.applyPlannedEditsToContent(content, edits);
+        noEffectEdits += result.noEffectEdits.length;
+        fs.writeFileSync(path.join(repoPath, file), result.content);
+    }
+
     // The def rename is given to every arm: first-occurrence-only on the
     // name line (a def line can repeat the symbol as a param/type — see
     // renameFirstOnLine). When an arm ALSO proposed the def line as a site
     // (one-line recursive functions), site semantics win via the loop.
-    const defProposed = byFile.get(task.relativePath)?.has(task.nameLine);
+    const defProposed = byFile.get(task.relativePath)?.has(task.nameLine) ||
+        exactByFile.get(task.relativePath)?.some(site => site.line === task.nameLine);
     if (!defProposed && contentByFile.has(task.relativePath)) {
         // Read the WORKING TREE, never the pristine snapshot — the
         // definition-site pass above may already have renamed sibling
@@ -661,7 +680,6 @@ function applyRenameArm(repoPath, contentByFile, task, proposal, armSites) {
         fs.writeFileSync(path.join(repoPath, task.relativePath), lines.join('\n'));
     }
 
-    let noEffectEdits = 0;
     for (const [file, lineSet] of byFile) {
         // Read the working tree, not the pristine snapshot — the def rename
         // above may already have touched this file.

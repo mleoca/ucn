@@ -630,7 +630,11 @@ function clearAllCaches() {
 // persisted call-record receiverTypes.
 // v179: Go unnamed interface parameters are retained in paramsStructured;
 // old caches report zero-arity interface methods and break rename closure.
-const CACHE_FORMAT_VERSION = 179;
+// v183: Go calls persist exact spans, builtin-new receiver types, indexed
+// multi-return assignment targets, and lexical-closure result hints for exact
+// chain/tuple flow; Rust macro-token calls retain compiler-declared closure
+// parameter receiver types, and Rust functions retain generic trait bounds.
+const CACHE_FORMAT_VERSION = 183;
 
 /**
  * Save index to cache file

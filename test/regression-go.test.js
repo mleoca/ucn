@@ -6972,3 +6972,68 @@ describe('fix #302: Go implicit interface-slot rename closure', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #303: exact Go multi-return and same-line chain flow', () => {
+    const files = {
+        'go.mod': 'module f303\n\ngo 1.21\n',
+        'use.go': [
+            'package f303',
+            '',
+            'type Route struct{}',
+            'type Router struct{}',
+            '',
+            'func (r *Route) PathPrefix() *Route { return r }',
+            'func (r *Route) Subrouter() *Router { return &Router{} }',
+            'func (r *Router) PathPrefix() *Route { return &Route{} }',
+            'func split(r *Route) (*Route, *Router) { return r, &Router{} }',
+            '',
+            'func use(root *Router) {',
+            '\t_, nested := split(new(Route))',
+            '\tnested.PathPrefix()',
+            '\tnew(Route).PathPrefix()',
+            '\troot.PathPrefix().Subrouter().PathPrefix()',
+            '\tlocalSplit := func(r *Route) (*Route, *Router) { return r, &Router{} }',
+            '\t_, localRouter := localSplit(new(Route))',
+            '\tlocalRouter.PathPrefix()',
+            '}',
+        ].join('\n') + '\n',
+    };
+
+    it('types every tuple position and addresses every same-line chain token', () => {
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const calls = index.getCachedCalls(path.join(dir, 'use.go'));
+            const pathCalls = calls.filter(call => call.name === 'PathPrefix');
+            assert.ok(pathCalls.every(call =>
+                Number.isInteger(call.column) &&
+                Number.isInteger(call.callStart) &&
+                Number.isInteger(call.callEnd)));
+            const newReceiver = pathCalls.find(call => call.line === 14);
+            assert.strictEqual(newReceiver.receiverCallResultType, 'Route');
+            const nestedChain = pathCalls.find(call =>
+                call.line === 15 && call.receiverCall === 'Subrouter');
+            assert.ok(Number.isInteger(nestedChain.receiverCallStart));
+            assert.ok(Number.isInteger(nestedChain.receiverCallEnd));
+
+            const result = execute(index, 'plan', {
+                name: 'use.go:8:PathPrefix', renameTo: 'PathPrefixV2',
+            });
+            assert.ok(result.ok, JSON.stringify(result.error));
+            const changes = result.result.changes || [];
+            assert.ok(changes.some(change => change.line === 13),
+                'the second result of split() types nested as Router');
+            assert.ok(!changes.some(change => change.line === 14),
+                'new(Route) belongs to Route.PathPrefix, not the selected method');
+            const chain = changes.find(change => change.line === 15);
+            assert.strictEqual(
+                chain?.newExpression,
+                'root.PathPrefixV2().Subrouter().PathPrefixV2()',
+                'both compiler-proven Router calls on one line are edited');
+            assert.ok(changes.some(change => change.line === 18),
+                'a local closure declared tuple result types its invocation');
+            assert.ok(!calls.some(call => call.name === 'localSplit'),
+                'the lexical call cannot impersonate a package-level symbol');
+        } finally { rm(dir); }
+    });
+});

@@ -1180,8 +1180,10 @@ function findCallers(index, name, options = {}) {
                             } };
                         foldCtxCache.set(filePath, foldCtx);
                     }
-                    const flowEntry = _foldChainedReceiverType(
-                        index, fileEntry, filePath, call, foldCtx) ||
+                    const flowEntry = _goBuiltinChainedReceiverType(
+                        index, fileEntry, filePath, call) ||
+                        _foldChainedReceiverType(
+                            index, fileEntry, filePath, call, foldCtx) ||
                         _nominalChainedReceiverType(
                             index, call, fileEntry, filePath);
                     if (flowEntry && flowEntry.externalVia) {
@@ -3144,7 +3146,8 @@ function findCallers(index, name, options = {}) {
                         }
                         if (knownType && !BUILTIN_RECEIVER_TYPES.has(knownType) &&
                             _isGenericParamReceiverType(index, filePath, call.line, knownType)) {
-                            knownType = null;
+                            knownType = _genericParamTraitTarget(
+                                index, filePath, call.line, knownType, targetDefs);
                         }
                         if (knownType) {
                             const explicitInterfaceTarget = fileEntry.language === 'csharp' &&
@@ -7263,7 +7266,13 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
         let returnType, fromFile, selfClass, returnedFunctionResult, returnDefinition;
         const builtinCallReturn = !nominal && language === 'python'
             ? _pythonBuiltinCallReturnType(index, fileEntry, call) : null;
-        if (builtinCallReturn) {
+        if (call.localValueCall && call.returnTypeHint) {
+            // Lexical function values are deliberately absent from the
+            // project symbol table, but their declared result remains exact
+            // local compiler evidence (Go: `f := func() (*A, *B)`).
+            returnType = call.returnTypeHint;
+            fromFile = filePath;
+        } else if (builtinCallReturn) {
             returnType = builtinCallReturn;
         } else if (!nominal && language === 'python' && !call.isMethod &&
             !call.receiver && call.name === 'open' && !call.localShadow &&
@@ -7732,11 +7741,63 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
             });
             continue;
         }
+        // Go multi-return assignments have one compiler-declared type per
+        // LHS position. Record every named target, including assignments
+        // whose first position is `_`; treating only element zero left later
+        // receivers permanently ambiguous (`route, router := split(...)`).
+        if (language === 'go' && call.assignedTuple &&
+            Array.isArray(call.assignedTupleTargets) &&
+            call.assignedTupleTargets.length > 0) {
+            const scope = call.enclosingFunction
+                ? `${call.enclosingFunction.startLine}` : '';
+            if (!map) map = new Map();
+            for (const target of call.assignedTupleTargets) {
+                const key = `${scope}:${target.name}`;
+                if (!map.has(key)) map.set(key, []);
+                const base = { line: call.line, start: call.callStart };
+                const parsed = _returnTypeNameNominal(returnType, language, {
+                    tuple: true,
+                    tupleIndex: target.index,
+                    selfClass,
+                    index,
+                    originFile: fromFile || filePath,
+                });
+                if (!parsed) {
+                    const uncertainVia = _rejectedNominalFlowVia(
+                        returnType, language, {
+                            tuple: true,
+                            tupleIndex: target.index,
+                        });
+                    map.get(key).push(uncertainVia
+                        ? { ...base, externalVia: uncertainVia }
+                        : { ...base, invalidated: true });
+                    continue;
+                }
+                if (parsed.qualifier) {
+                    const producerEntry =
+                        index.files.get(fromFile || filePath) || fileEntry;
+                    const qualified = _goQualifiedReceiverType(
+                        index, producerEntry, parsed.qualifier, parsed.name);
+                    if (qualified && qualified.kind !== 'project') {
+                        map.get(key).push({ ...base, externalVia: qualified.via });
+                        continue;
+                    }
+                }
+                const origin = _resolveFlowTypeOrigin(
+                    index, fromFile || filePath, parsed.name, parsed.qualifier);
+                map.get(key).push(origin?.fromFile
+                    ? { ...base, type: parsed.name, fromFile: origin.fromFile }
+                    : { ...base, invalidated: true });
+            }
+            continue;
+        }
+
         let typeName, entryFromFile;
         if (nominal) {
             const parsed = _returnTypeNameNominal(returnType, language, {
                 unwrapped: call.assignedUnwrap,
                 tuple: call.assignedTuple,
+                tupleIndex: call.assignedTupleIndex,
                 selfClass,
                 index,
                 originFile: fromFile || filePath,
@@ -8050,8 +8111,11 @@ function _returnTypeNameNominal(text, language, opts = {}) {
             if (!opts.tuple) return undefined;
             const inner = t.slice(1, -1);
             if (inner.includes('func(') || inner.includes('func (')) return undefined;
-            const first = inner.split(',')[0].trim();
-            const parts = first.split(/\s+/);
+            const position = Number.isInteger(opts.tupleIndex)
+                ? opts.tupleIndex : 0;
+            const item = _splitTopLevelGenericArgs(inner)[position]?.trim();
+            if (!item) return undefined;
+            const parts = item.split(/\s+/);
             t = parts[parts.length - 1]; // named return `n int` → int
         } else if (opts.tuple) {
             return undefined; // v, err := f() needs a multi-return producer
@@ -8142,8 +8206,10 @@ function _rejectedNominalFlowVia(text, language, opts = {}) {
     let raw = text.trim();
     if (language === 'go' && raw.startsWith('(')) {
         if (!opts.tuple) return null;
-        const first = raw.slice(1, -1).split(',')[0]?.trim();
-        raw = first ? first.split(/\s+/).pop() : '';
+        const position = Number.isInteger(opts.tupleIndex)
+            ? opts.tupleIndex : 0;
+        const item = _splitTopLevelGenericArgs(raw.slice(1, -1))[position]?.trim();
+        raw = item ? item.split(/\s+/).pop() : '';
     }
     const norm = _normalizeFieldTypeName(raw, language);
     if (!norm) return null;
@@ -8192,6 +8258,51 @@ function _rustBindingResolvedFiles(index, fileEntry, filePath, binding) {
         }
     }
     return resolvedFiles;
+}
+
+/**
+ * Resolve a Rust `use path::Type as LocalType` alias to the indexed type it
+ * names. Import aliases are value/type names, not Rust `type` declarations,
+ * so they do not appear in the symbol table and cannot use `_pureAliasBase`.
+ * Require every same-local-name binding to resolve to one identical type/file;
+ * a resolver gap or scope collision remains unknown rather than guessed.
+ */
+function _rustImportedTypeIdentity(index, filePath, localName) {
+    const fileEntry = index.files.get(filePath);
+    if (fileEntry?.language !== 'rust') return null;
+    const bindings = (fileEntry.importBindings || []).filter(binding =>
+        (binding.name === localName || binding.alias === localName) &&
+        String(binding.module || '').includes('::'));
+    if (bindings.length === 0) return null;
+    const identities = [];
+    for (const binding of bindings) {
+        const parts = String(binding.module).split('::').filter(Boolean);
+        const original = parts[parts.length - 1];
+        if (!original || original === localName) return null;
+        const definitions = (index.symbols.get(original) || []).filter(definition =>
+            IDENTITY_TYPE_KINDS.has(definition.type) && definition.file);
+        if (definitions.length === 0) return null;
+        const starts = _rustBindingResolvedFiles(
+            index, fileEntry, filePath, binding);
+        if (starts.size === 0) return null;
+        let reachable = definitions.filter(definition => [...starts].some(start =>
+            definition.file === start ||
+            _nameBindingReaches(
+                index, start, original, new Set([definition.file])) === 'yes'));
+        if (reachable.length === 0) {
+            reachable = definitions.filter(definition => [...starts].some(start =>
+                definition.file === start ||
+                _importReaches(index, start, new Set([definition.file]))));
+        }
+        const files = new Set(reachable.map(definition => definition.file));
+        if (files.size !== 1) return null;
+        identities.push({ type: original, fromFile: [...files][0] });
+    }
+    if (new Set(identities.map(identity => identity.type)).size !== 1 ||
+        new Set(identities.map(identity => identity.fromFile)).size !== 1) {
+        return null;
+    }
+    return identities[0];
 }
 
 /**
@@ -9208,6 +9319,30 @@ function _isEnclosingGenericParam(index, filePath, line, typeName) {
         }
     }
     return false;
+}
+
+/**
+ * Generic receivers normally have runtime-unknown ownership. For a trait
+ * declaration pin, an explicit `F: Float` bound is nevertheless exact
+ * compiler evidence that `f.exponent()` invokes Float's method slot (not any
+ * one concrete implementation). Resolve the bound to the pinned trait file;
+ * a same-named external or sibling trait remains unknown.
+ */
+function _genericParamTraitTarget(index, filePath, line, typeName, targetDefs) {
+    const enclosing = index.findEnclosingFunction(filePath, line, true);
+    const bounds = enclosing?.genericBounds?.[typeName];
+    if (!Array.isArray(bounds) || bounds.length === 0) return null;
+    for (const target of targetDefs) {
+        const owner = target.className ||
+            (target.receiver || '').replace(/^[*&]\s*/, '');
+        if (!owner || !bounds.includes(owner)) continue;
+        const ownsTraitDeclaration = (index.symbols.get(owner) || []).some(definition =>
+            definition.type === 'trait' && definition.file === target.file);
+        if (!ownsTraitDeclaration) continue;
+        const origin = _resolveFlowTypeOrigin(index, filePath, owner);
+        if (origin?.fromFile === target.file) return owner;
+    }
+    return null;
 }
 
 /**
@@ -10587,7 +10722,10 @@ function _declaredFieldType(index, rootType, fieldName, language, info, rootName
                 return null;
             }
         }
-        const t = _normalizeFieldTypeName(rawText, language);
+        const localType = _normalizeFieldTypeName(rawText, language);
+        const importedIdentity = language === 'rust' && f.file && localType
+            ? _rustImportedTypeIdentity(index, f.file, localType) : null;
+        const t = importedIdentity?.type || localType;
         if (t) normalized.add(t);
         else return null; // any un-normalizable declaration → no evidence
     }
@@ -10613,8 +10751,13 @@ function _declaredFieldType(index, rootType, fieldName, language, info, rootName
             const qualifier = language === 'java'
                 ? _javaNestedTypeQualifier(rawText) : undefined;
             if (qualifier) namespaces.add(qualifier);
-            const origin = _resolveFlowTypeOrigin(
-                index, field.file, typeName, qualifier);
+            const localType = _normalizeFieldTypeName(rawText, language);
+            const importedIdentity = language === 'rust' && localType
+                ? _rustImportedTypeIdentity(index, field.file, localType) : null;
+            const origin = importedIdentity?.type === typeName
+                ? importedIdentity
+                : _resolveFlowTypeOrigin(
+                    index, field.file, typeName, qualifier);
             if (!origin?.fromFile) {
                 complete = false;
                 break;
@@ -13396,6 +13539,31 @@ function _builtinMethodReturnType(language, receiverType, methodName) {
  * the PRODUCER's scope (_resolveFlowTypeOrigin). External producer packages
  * and reject-set returns stay untyped — no evidence either way.
  */
+function _goBuiltinChainedReceiverType(index, fileEntry, filePath, call) {
+    if (fileEntry?.language !== 'go' || !call.receiverCallResultType) return null;
+    const type = call.receiverCallResultType;
+    const qualifier = call.receiverCallResultTypeQualifier;
+    if (qualifier) {
+        const qualified = _goQualifiedReceiverType(
+            index, fileEntry, qualifier, type);
+        if (!qualified) return null;
+        if (qualified.kind !== 'project') {
+            return {
+                externalVia: qualified.via,
+                externalConcrete: true,
+            };
+        }
+        if (qualified.defs.length === 0 ||
+            new Set(qualified.defs.map(definition => definition.file)).size !== 1) {
+            return null;
+        }
+        return { type, fromFile: qualified.defs[0].file };
+    }
+    const origin = _resolveFlowTypeOrigin(index, filePath, type);
+    if (!origin?.fromFile) return null;
+    return { type, fromFile: origin.fromFile };
+}
+
 function _nominalChainedReceiverType(index, call, fileEntry, filePath) {
     const language = fileEntry.language;
     const defs = (index.symbols.get(call.receiverCall) || [])
@@ -14262,7 +14430,8 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
     // to the one-hop project-wide agreement rule when the receiver stays
     // untyped.
     if (record.isMethod) {
-        let rt = null;
+        let rt = _goBuiltinChainedReceiverType(
+            index, fileEntry, filePath, record);
         if (record.receiverType && !record.receiverIsChainRoot) {
             const origin = nominal
                 ? _resolveFlowTypeOrigin(index, filePath, record.receiverType,

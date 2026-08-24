@@ -2302,6 +2302,100 @@ impl Holder {
     });
 });
 
+describe('fix #304: Rust imported aliases retain declared-field identity', () => {
+    it('resolves `use Type as Alias` to the exact field method owner', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/lib.rs': 'pub mod core;\npub mod wrapper;\n',
+            'src/core.rs': [
+                'pub struct WriterBuilder;',
+                'impl WriterBuilder {',
+                '  pub fn escape(&mut self, _value: u8) {}',
+                '}',
+            ].join('\n'),
+            'src/wrapper.rs': [
+                'use crate::core::WriterBuilder as CoreWriterBuilder;',
+                'pub struct WriterBuilder { builder: CoreWriterBuilder }',
+                'impl WriterBuilder {',
+                '  pub fn escape(&mut self, value: u8) {',
+                '    self.builder.escape(value);',
+                '  }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'plan', {
+                name: 'src/core.rs:3:escape', renameTo: 'escapeV2',
+            });
+            assert.ok(result.ok, JSON.stringify(result.error));
+            assert.ok(result.result.changes.some(change =>
+                change.file === 'src/wrapper.rs' && change.line === 5),
+            `aliased field call must be a proven edit: ${JSON.stringify(result.result)}`);
+            assert.ok(!result.result.changes.some(change =>
+                change.file === 'src/wrapper.rs' && change.line === 4),
+            'the wrapper method definition belongs to a distinct type');
+        } finally { rm(dir); }
+    });
+
+    it('keeps typed closure parameters lexical inside macro token trees', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/lib.rs': [
+                'macro_rules! apply { ($f:expr) => { $f }; }',
+                'pub struct ReaderBuilder;',
+                'impl ReaderBuilder { pub fn escape(&mut self, _value: u8) {} }',
+                'pub struct WriterBuilder;',
+                'impl WriterBuilder { pub fn escape(&mut self, _value: u8) {} }',
+                'pub fn test() {',
+                '  apply!(|b: &mut ReaderBuilder| { b.escape(1); });',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const call = index.getCachedCalls(path.join(dir, 'src/lib.rs'))
+                .find(candidate => candidate.name === 'escape' && candidate.line === 7);
+            assert.strictEqual(call?.receiverType, 'ReaderBuilder');
+            const result = execute(index, 'plan', {
+                name: 'src/lib.rs:3:escape', renameTo: 'escapeV2',
+            });
+            assert.ok(result.ok, JSON.stringify(result.error));
+            assert.ok(result.result.changes.some(change => change.line === 7),
+                `typed macro closure call must be a proven edit: ${JSON.stringify(result.result)}`);
+            assert.ok(!result.result.unverifiedSites?.some(site => site.line === 7));
+        } finally { rm(dir); }
+    });
+
+    it('confirms generic receiver calls against their exact trait bound slot', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/lib.rs': [
+                'pub trait Float { fn exponent(self) -> i32; }',
+                'pub trait Other { fn exponent(self) -> i32; }',
+                'pub fn inline<F: Float>(f: F) -> i32 { f.exponent() }',
+                'pub fn bounded<F>(f: F) -> i32',
+                'where F: Float,',
+                '{ f.exponent() }',
+                'pub fn foreign<F: Other>(f: F) -> i32 { f.exponent() }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'plan', {
+                name: 'src/lib.rs:1:exponent', renameTo: 'exponentV2',
+            });
+            assert.ok(result.ok, JSON.stringify(result.error));
+            const lines = result.result.changes.map(change => change.line);
+            assert.ok(lines.includes(3), 'inline trait bound is exact slot evidence');
+            assert.ok(lines.includes(6), 'where-clause trait bound is exact slot evidence');
+            assert.ok(!lines.includes(7), 'a different trait bound cannot join the slot');
+            assert.ok(!result.result.unverifiedSites?.some(site =>
+                site.line === 3 || site.line === 6));
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #202b: same-class resolution respects the pinned target class (Rust)', () => {
     const FILES = {
         'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\n',
