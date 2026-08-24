@@ -313,6 +313,7 @@ const allSourceTreeBySelected = new WeakMap();
 // name merely to rediscover the same handful of macro definitions. Trees are
 // immutable, so retain the exact AST node set without retaining dead trees.
 const macroDefinitionsByTree = new WeakMap();
+const macroParamEffectsByDefinition = new WeakMap();
 
 function macroDefinitionNodes(tree) {
     const cached = macroDefinitionsByTree.get(tree);
@@ -1682,7 +1683,112 @@ function findStateObjects(code, parser) {
         item => `${item.name}:${item.startLine}`) : primary;
 }
 
-function findMacrosInTree(tree, lines) {
+function collectMacroParameterEffects(nestedTree, parameters) {
+    const effects = [];
+    traverseTree(nestedTree.rootNode, node => {
+        // Token-paste after a global qualifier (`::_##call`) is not C++
+        // until preprocessing. tree-sitter preserves the `#call` token as
+        // a preprocessor node next to an AST global qualified identifier;
+        // that exact shape still proves the substituted callable is
+        // globally qualified.
+        if (node.type === 'preproc_directive' &&
+            node.text.startsWith('#')) {
+            const paramIndex = parameters.indexOf(node.text.slice(1));
+            let globalSibling = false;
+            let container = node.parent;
+            for (let hops = 0; container && hops < 3 && !globalSibling;
+                hops++, container = container.parent) {
+                const stack = [...(container.namedChildren || [])];
+                while (stack.length > 0 && !globalSibling) {
+                    const sibling = stack.pop();
+                    if (sibling === node) continue;
+                    if (sibling.type === 'qualified_identifier' &&
+                        sibling.children?.[0]?.type === '::') {
+                        globalSibling = true;
+                        break;
+                    }
+                    for (const child of sibling.namedChildren || []) {
+                        stack.push(child);
+                    }
+                }
+            }
+            if (paramIndex >= 0 && globalSibling) {
+                effects.push({
+                    paramIndex,
+                    kind: 'qualified',
+                    qualifier: 'global',
+                });
+            }
+            return true;
+        }
+        if (node.type !== 'identifier') return true;
+        const paramIndex = parameters.indexOf(node.text);
+        if (paramIndex < 0) return true;
+        const parent = node.parent;
+        if (parent?.type === 'qualified_identifier' &&
+            parent.childForFieldName('name') === node) {
+            const scope = parent.childForFieldName('scope');
+            effects.push({
+                paramIndex,
+                kind: 'qualified',
+                qualifier: scope?.text || 'global',
+            });
+            return true;
+        }
+        if (parent?.type === 'argument_list' &&
+            parent.parent?.type === 'call_expression') {
+            const wrapper = callIdentity(
+                parent.parent.childForFieldName('function'));
+            if (!wrapper.name || !isMacroToken(wrapper.name)) return true;
+            const args = (parent.namedChildren || [])
+                .filter(child => !child.type.endsWith('comment'));
+            const argIndex = args.findIndex(argument =>
+                argument.startIndex <= node.startIndex &&
+                node.endIndex <= argument.endIndex);
+            if (argIndex >= 0) {
+                effects.push({
+                    paramIndex,
+                    kind: 'forwarded',
+                    macro: wrapper.name,
+                    argIndex,
+                });
+            }
+        }
+        return true;
+    });
+    return effects;
+}
+
+function macroParameterEffects(definitionNode, valueNode, paramsNode, parser) {
+    if (definitionNode && macroParamEffectsByDefinition.has(definitionNode)) {
+        return macroParamEffectsByDefinition.get(definitionNode);
+    }
+    if (!valueNode || !paramsNode || !parser) return [];
+    const parameters = (paramsNode.namedChildren || [])
+        .filter(child => child.type === 'identifier')
+        .map(child => child.text);
+    if (parameters.length === 0) return [];
+    const body = valueNode.text.replace(/\\(?=\r?\n)/g, ' ');
+    // Cheap parse-avoidance only; every semantic decision below comes from
+    // the replacement list's tree. Ordinary value/punctuation macros need no
+    // extra native tree.
+    if (!body.includes('::') &&
+        !/[A-Z_][A-Z0-9_]*\s*\(/.test(body)) return [];
+    const prefix = 'void __ucn_macro_effect__(void) {\n';
+    const synthetic = `${prefix}${body}\n;}`;
+    const nestedTree = safeParse(parser, synthetic, undefined, PARSE_OPTIONS);
+    try {
+        const effects = collectMacroParameterEffects(nestedTree, parameters);
+        if (definitionNode) {
+            macroParamEffectsByDefinition.set(definitionNode, effects);
+        }
+        return effects;
+    } finally {
+        nestedTree.delete?.();
+    }
+}
+
+function findMacrosInTree(tree, lines, parser) {
     const macros = [];
     for (const node of macroDefinitionNodes(tree)) {
         const nameNode = node.childForFieldName('name') ||
@@ -1708,6 +1814,17 @@ function findMacrosInTree(tree, lines) {
                 : undefined,
             modifiers: [],
             functionLike: node.type === 'preproc_function_def',
+            ...(() => {
+                const effects = macroParameterEffects(
+                    node,
+                    node.childForFieldName('value') ||
+                        (node.namedChildren || []).find(child =>
+                            child.type === 'preproc_arg'),
+                    paramsNode,
+                    parser);
+                return effects.length > 0
+                    ? { macroParamEffects: effects } : {};
+            })(),
             docstring: extractJSDocstring(lines, startLine),
         });
     }
@@ -1717,10 +1834,10 @@ function findMacrosInTree(tree, lines) {
 function findMacros(code, parser) {
     const tree = parseTree(parser, code);
     const lines = code.split('\n');
-    const primary = findMacrosInTree(tree, lines);
+    const primary = findMacrosInTree(tree, lines, parser);
     const literal = literalRecoveryTree(parser, code, tree);
     return literal ? mergeExtracted(primary,
-        findMacrosInTree(literal, lines),
+        findMacrosInTree(literal, lines, parser),
         item => `${item.name}:${item.startLine}:${item.functionLike ? 1 : 0}`) : primary;
 }
 
@@ -1813,6 +1930,23 @@ function buildVariableTypes(tree) {
     // block declaration.
     const memberReceiverUses = [];
     const ambiguousDirectInitializers = [];
+    const declaratorStaticType = (type, declarator) => {
+        // The declaration's type node carries only the base type. Preserve
+        // array rank from the AST declarator for overload arguments:
+        // `wchar_t format_str[]; runtime(format_str)` passes a wide-character
+        // array (and decays to wchar_t*), not a scalar wchar_t. Receiver
+        // typing continues to use the base `type`; only static argument shape
+        // consumes this fuller spelling.
+        let arrays = 0;
+        const stack = [declarator];
+        while (stack.length > 0) {
+            const current = stack.pop();
+            if (!current) continue;
+            if (current.type === 'array_declarator') arrays++;
+            for (const child of current.namedChildren || []) stack.push(child);
+        }
+        return arrays > 0 ? `${type}${'[]'.repeat(arrays)}` : type;
+    };
     const addBindings = (node, type, pointeeType, scope, declarators) => {
         for (const declarator of declarators) {
             const identity = declaratorIdentity(declarator);
@@ -1820,6 +1954,7 @@ function buildVariableTypes(tree) {
             bindings.push({
                 name: identity.name,
                 type,
+                staticType: declaratorStaticType(type, declarator),
                 ...(pointeeType && { pointeeType }),
                 declaredAt: node.type === 'parameter_declaration'
                     ? scope.startIndex : declarator.startIndex,
@@ -1917,6 +2052,7 @@ function buildVariableTypes(tree) {
     };
     return {
         get: (name, atNode) => resolveBinding(name, atNode)?.type,
+        getStatic: (name, atNode) => resolveBinding(name, atNode)?.staticType,
         getPointee: (name, atNode) =>
             resolveBinding(name, atNode)?.pointeeType,
         has: (name, atNode) => resolveBinding(name, atNode) !== undefined,
@@ -1987,7 +2123,8 @@ function staticArgumentKind(node, variableTypes) {
     if (node.type === 'true' || node.type === 'false') return 'bool';
     if (node.type === 'null' || node.type === 'nullptr') return 'null';
     if (node.type === 'identifier') {
-        const type = variableTypes?.get(node.text, node);
+        const type = variableTypes?.getStatic(node.text, node) ||
+            variableTypes?.get(node.text, node);
         return type ? `type:${type}` : 'expr';
     }
     if (node.type === 'compound_literal_expression') {
@@ -2238,6 +2375,46 @@ function fieldReceiverPath(node) {
     return { root: base.root, fields: [...base.fields, field.text] };
 }
 
+/** Macro invocations whose argument expression contains this call node. */
+function enclosingMacroArguments(node) {
+    const wrappers = [];
+    let current = node;
+    let hops = 0;
+    while (current?.parent && hops++ < 24) {
+        const argumentsNode = current.parent;
+        const outerCall = argumentsNode?.type === 'argument_list'
+            ? argumentsNode.parent : null;
+        if (outerCall?.type === 'call_expression') {
+            const wrapper = callIdentity(
+                outerCall.childForFieldName('function'));
+            if (wrapper.name && isMacroToken(wrapper.name)) {
+                const args = (argumentsNode.namedChildren || [])
+                    .filter(child => !child.type.endsWith('comment'));
+                const argIndex = args.findIndex(argument =>
+                    argument.startIndex <= node.startIndex &&
+                    node.endIndex <= argument.endIndex);
+                if (argIndex >= 0) {
+                    wrappers.push({ name: wrapper.name, argIndex });
+                }
+            }
+            current = outerCall;
+            continue;
+        }
+        // Once the walk leaves an expression, no outer macro invocation can
+        // contain this call. Stopping here keeps the common non-macro path
+        // constant-depth instead of climbing every call to the translation
+        // unit (material on template-heavy fmt headers).
+        if (/(?:statement|declaration|definition)$/.test(
+            argumentsNode.type) ||
+            argumentsNode.type === 'translation_unit' ||
+            argumentsNode.type === 'init_declarator') {
+            break;
+        }
+        current = current.parent;
+    }
+    return wrappers;
+}
+
 function findCallsInTree(code, parser, _options = {}, existingTree = null,
     includeMacroBodies = true) {
     const tree = existingTree || parseTree(parser, code);
@@ -2317,6 +2494,7 @@ function findCallsInTree(code, parser, _options = {}, existingTree = null,
                 : undefined;
             const assignedTo = assignmentTargetOf(node);
             const compileTimeOnly = compileTimeOnlyContext(node);
+            const macroArguments = enclosingMacroArguments(node);
             calls.push({
                 name: identity.name,
                 line: identity.nameNode?.startPosition.row + 1 || node.startPosition.row + 1,
@@ -2331,6 +2509,7 @@ function findCallsInTree(code, parser, _options = {}, existingTree = null,
                     explicitTemplateCall: true,
                 }),
                 ...(compileTimeOnly && { compileTimeOnly }),
+                ...(macroArguments.length > 0 && { macroArguments }),
                 ...(directReceiverType && { receiverType: directReceiverType }),
                 ...(receiverCall && {
                     receiverCall,
@@ -2510,9 +2689,10 @@ function findMacroBodyCalls(tree, code, parser, onlyName = null) {
         if (onlyName && !valueNode.text.includes(onlyName)) continue;
         const paramsNode = node.childForFieldName('parameters') ||
             (node.namedChildren || []).find(child => child.type === 'preproc_params');
-        const parameters = new Set((paramsNode?.namedChildren || [])
+        const parameterNames = (paramsNode?.namedChildren || [])
             .filter(child => child.type === 'identifier')
-            .map(child => child.text));
+            .map(child => child.text);
+        const parameters = new Set(parameterNames);
         // Replace only the continuation backslash. Keeping the newline and
         // every other byte makes source-line/column and span remapping exact.
         const body = valueNode.text.replace(/\\(?=\r?\n)/g, ' ');
@@ -2526,6 +2706,12 @@ function findMacroBodyCalls(tree, code, parser, onlyName = null) {
         const nestedTree = safeParse(parser, synthetic, undefined, PARSE_OPTIONS);
         let nested;
         try {
+            macroParamEffectsByDefinition.set(
+                node,
+                body.includes('::') ||
+                    /[A-Z_][A-Z0-9_]*\s*\(/.test(body)
+                    ? collectMacroParameterEffects(nestedTree, parameterNames)
+                    : []);
             nested = findCallsInCode(synthetic, parser, {}, nestedTree, false);
         } finally {
             nestedTree.delete?.();
@@ -2761,10 +2947,10 @@ function parse(code, parser, mode, options = {}) {
                     item => `${item.name}:${item.startLine}`)
                 : findStateObjectsInTree(tree, lines),
             macros: literal
-                ? mergeExtracted(findMacrosInTree(tree, lines),
-                    findMacrosInTree(literal, lines),
+                ? mergeExtracted(findMacrosInTree(tree, lines, parser),
+                    findMacrosInTree(literal, lines, parser),
                     item => `${item.name}:${item.startLine}:${item.functionLike ? 1 : 0}`)
-                : findMacrosInTree(tree, lines),
+                : findMacrosInTree(tree, lines, parser),
             imports,
             exports: [
                 ...functions

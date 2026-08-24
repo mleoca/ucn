@@ -640,7 +640,11 @@ function clearAllCaches() {
 // cannot survive an engine upgrade.
 // v185: C# deep member receivers retain their root+field path instead of a
 // false terminal receiverType copied from the root variable (fix #305).
-const CACHE_FORMAT_VERSION = 185;
+// v188: C++ call records retain enclosing macro-argument positions and macro
+// symbols retain AST-derived parameter qualification/forwarding effects, so
+// replacement-list requalification cannot masquerade as lexical calls
+// (fix #306).
+const CACHE_FORMAT_VERSION = 188;
 
 /**
  * Save index to cache file

@@ -444,6 +444,9 @@ class ProjectIndex {
         this._completenessCache = null;
         this._attrTypeCache = null;
         this._computedDispatchBlindspots = null;
+        this._cppVisibleFilesCache?.clear();
+        this._cppTargetVisibilityCache?.clear();
+        this._cppMacroParamOutcomesCache?.clear();
         // Endpoints cache (server routes / client requests / bridges) becomes
         // stale when files change; clear on every rebuild.
         this._endpointsCache = null;
@@ -588,6 +591,13 @@ class ProjectIndex {
             existing.size = stat.size;
             return false;
         }
+
+        // These query caches depend on project symbols and include closure.
+        // A changed file can alter either even before a full rebuild reaches
+        // its graph phase, so no prior call-identity verdict may survive.
+        this._cppVisibleFilesCache?.clear();
+        this._cppTargetVisibilityCache?.clear();
+        this._cppMacroParamOutcomesCache?.clear();
 
         if (existing) {
             this.removeFileSymbols(filePath);

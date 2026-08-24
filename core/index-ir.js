@@ -78,7 +78,7 @@ const OPTIONAL_SYMBOL_FIELDS = Object.freeze([
     'returnedConcreteType', 'returnedConstructors', 'templateDependent',
     'isSpecialization',
     'linkage', 'functionLike', 'callableAlias', 'exportedAlias',
-    'aliasOwner', 'aliasMember',
+    'aliasOwner', 'aliasMember', 'macroParamEffects',
 ]);
 
 function materializeSymbol(fileEntry, item) {

@@ -715,7 +715,7 @@ describe('C++ language support', () => {
             assert.equal(member.callers.length, 0);
             assert.equal(member.unverifiedCallers.length, 0);
             assert.equal(
-                member.meta.account.excluded.byReason['arity-mismatch'].count,
+                member.meta.account.excluded.byReason['macro-requalified'].count,
                 1,
             );
             assert.equal(
@@ -727,7 +727,7 @@ describe('C++ language support', () => {
                 file: 'write.cpp',
                 line: 1,
             });
-            assert.deepEqual(global.callers.map(caller => caller.line), [6]);
+            assert.deepEqual(global.callers.map(caller => caller.line), [5, 6]);
             assert.equal(global.meta.account.conserved, true);
         } finally {
             rm(dir);
@@ -1235,6 +1235,268 @@ describe('C++ language support', () => {
                 2,
             );
             assert.equal(result.meta.account.conserved, true);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('includes caller-local namespace overloads in qualified lookup', () => {
+        const dir = tmp({
+            'include/fmt/core.hpp': [
+                'namespace detail {',
+                'struct buffer {}; struct string_view {}; struct args {}; struct locale {};',
+                'void render(buffer value, string_view text, args values, locale loc);',
+                '}',
+            ].join('\n'),
+            'include/fmt/color.hpp': [
+                '#include "core.hpp"',
+                'namespace detail {',
+                'struct style {};',
+                'void render(buffer value, style colors, string_view text, args values);',
+                'void use(buffer value, style colors, string_view text, args values) {',
+                '  detail::render(value, colors, text, values);',
+                '}',
+                '}',
+            ].join('\n'),
+            'include/fmt/public.hpp': [
+                '#include "core.hpp"',
+                'namespace fmt {',
+                'void render(int out, int loc, int text, int values);',
+                'void use() { fmt::render(1, 2, 3, 4); }',
+                '}',
+            ].join('\n'),
+            'main.cpp': [
+                '#include "fmt/color.hpp"',
+                '#include "fmt/public.hpp"',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = index.context('render', {
+                file: 'include/fmt/core.hpp',
+                line: 3,
+            });
+            assert.equal(result.callers.length, 0,
+                `both calls bind caller-local siblings: ${JSON.stringify(result.callers)}`);
+            assert.equal(result.unverifiedCallers.length, 0,
+                JSON.stringify(result.unverifiedCallers));
+            assert.equal(
+                result.meta.account.excluded.byReason['overload-mismatch'].count,
+                2,
+            );
+            assert.equal(result.meta.account.conserved, true);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('preserves C++ array shape for wide-string overload selection', () => {
+        const dir = tmp({
+            'wide.cpp': [
+                'struct string_view {};',
+                'struct wstring_view {};',
+                'void runtime(string_view value);',
+                'void runtime(wstring_view value);',
+                'void use() {',
+                '  wchar_t format_str[] = { L\'{\', L\'}\', 0 };',
+                '  runtime(format_str);',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const adapter = getLanguageAdapter('cpp');
+            const calls = adapter.findCalls(
+                fs.readFileSync(path.join(dir, 'wide.cpp'), 'utf8'),
+                getParser('cpp'),
+            ).filter(call => call.name === 'runtime');
+            assert.deepEqual(calls.map(call => call.argKinds),
+                [['type:wchar_t[]']]);
+
+            const index = idx(dir);
+            const narrow = index.context('runtime', {
+                file: 'wide.cpp', line: 3,
+            });
+            assert.equal(narrow.callers.length, 0);
+            assert.equal(narrow.unverifiedCallers.length, 0,
+                JSON.stringify(narrow.unverifiedCallers));
+            assert.equal(
+                narrow.meta.account.excluded.byReason['overload-mismatch'].count,
+                1,
+            );
+            const wide = index.context('runtime', {
+                file: 'wide.cpp', line: 4,
+            });
+            assert.deepEqual(wide.callers.map(call => call.line), [7]);
+            assert.equal(wide.meta.account.conserved, true);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('follows macro parameter requalification before assigning call identity', () => {
+        const dir = tmp({
+            'macro.cpp': [
+                '#define SYSTEM_CALL(call) ::_##call',
+                '#define POSIX_CALL(call) SYSTEM_CALL(call)',
+                'struct file {',
+                '  void dup2(int from, int to) {',
+                '    POSIX_CALL(dup2(from, to));',
+                '  }',
+                '};',
+            ].join('\n'),
+        });
+        try {
+            const adapter = getLanguageAdapter('cpp');
+            const parsed = adapter.analyze(
+                fs.readFileSync(path.join(dir, 'macro.cpp'), 'utf8'),
+                getParser('cpp'), path.join(dir, 'macro.cpp'));
+            const call = parsed.calls.find(candidate =>
+                candidate.name === 'dup2');
+            assert.deepEqual(call.macroArguments, [
+                { name: 'POSIX_CALL', argIndex: 0 },
+            ]);
+            const effects = new Map(parsed.symbols
+                .filter(symbol => symbol.kind === 'macro')
+                .map(macro => [
+                macro.name, macro.macroParamEffects,
+                ]));
+            assert.deepEqual(effects.get('SYSTEM_CALL'), [{
+                paramIndex: 0, kind: 'qualified', qualifier: 'global',
+            }]);
+            assert.deepEqual(effects.get('POSIX_CALL'), [{
+                paramIndex: 0, kind: 'forwarded', macro: 'SYSTEM_CALL',
+                argIndex: 0,
+            }]);
+
+            const index = idx(dir);
+            const target = index.context('dup2', {
+                className: 'file', file: 'macro.cpp', line: 4,
+            });
+            assert.equal(target.callers.length, 0);
+            assert.equal(target.unverifiedCallers.length, 0);
+            assert.equal(
+                target.meta.account.excluded.byReason['macro-requalified'].count,
+                1,
+            );
+            assert.equal(target.meta.account.conserved, true);
+
+            const definition = index.symbols.get('dup2').find(symbol =>
+                symbol.startLine === 4);
+            const callees = index.findCallees(definition, {
+                collectAccount: true,
+            });
+            assert.deepEqual(callees.map(callee => callee.name),
+                ['POSIX_CALL']);
+            assert.equal(callees.calleeAccount.excluded.byReason[
+                'macro-requalified'], 1);
+            assert.equal(callees.calleeAccount.conserved, true);
+
+            index.saveCache();
+            const reloaded = new index.constructor(dir);
+            assert.equal(reloaded.loadCache(), true);
+            const cachedTarget = reloaded.context('dup2', {
+                className: 'file', file: 'macro.cpp', line: 4,
+            });
+            assert.equal(cachedTarget.callers.length, 0);
+            assert.equal(cachedTarget.unverifiedCallers.length, 0);
+            assert.equal(cachedTarget.meta.account.excluded.byReason[
+                'macro-requalified'].count, 1);
+            assert.deepEqual(
+                reloaded.symbols.get('POSIX_CALL')[0].macroParamEffects,
+                [{
+                    paramIndex: 0,
+                    kind: 'forwarded',
+                    macro: 'SYSTEM_CALL',
+                    argIndex: 0,
+                }],
+            );
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('routes conditional macro identity disagreement to visible uncertainty', () => {
+        const dir = tmp({
+            'conditional-macro.cpp': [
+                'void dup2(int from, int to);',
+                '#if USE_SYSTEM',
+                '#define ROUTE(call) ::call',
+                '#else',
+                '#define ROUTE(call) call',
+                '#endif',
+                'struct file {',
+                '  void dup2(int from, int to) {',
+                '    ROUTE(dup2(from, to));',
+                '  }',
+                '};',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const global = index.context('dup2', {
+                file: 'conditional-macro.cpp', line: 1,
+            });
+            assert.equal(global.callers.length, 0);
+            assert.deepEqual(global.unverifiedCallers.map(call => ({
+                line: call.line,
+                reason: call.reason,
+            })), [{ line: 9, reason: 'macro-expansion' }]);
+            assert.equal(global.meta.account.conserved, true);
+
+            const member = index.context('dup2', {
+                className: 'file', file: 'conditional-macro.cpp', line: 8,
+            });
+            assert.equal(member.callers.length, 0);
+            assert.deepEqual(member.unverifiedCallers.map(call => ({
+                line: call.line,
+                reason: call.reason,
+            })), [{ line: 9, reason: 'macro-expansion' }]);
+            assert.equal(member.meta.account.conserved, true);
+
+            const definition = index.symbols.get('dup2').find(symbol =>
+                symbol.startLine === 8);
+            const callees = index.findCallees(definition, {
+                collectAccount: true,
+            });
+            assert.deepEqual(callees.unverifiedCallees
+                .filter(call => call.name === 'dup2')
+                .map(call => ({
+                line: call.sites[0],
+                reason: call.reason,
+                })), [{ line: 9, reason: 'macro-expansion' }]);
+            assert.equal(callees.calleeAccount.conserved, true);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('invalidates macro identity outcomes after an incremental rebuild', () => {
+        const before = [
+            '#define ROUTE(call) ::call',
+            'struct file {',
+            '  void dup2(int from, int to) {',
+            '    ROUTE(dup2(from, to));',
+            '  }',
+            '};',
+        ].join('\n');
+        const after = before.replace('::call', 'call');
+        const dir = tmp({ 'incremental.cpp': before });
+        try {
+            const index = idx(dir);
+            const target = () => index.context('dup2', {
+                className: 'file', file: 'incremental.cpp', line: 3,
+            });
+            const qualified = target();
+            assert.equal(qualified.callers.length, 0);
+            assert.equal(qualified.meta.account.excluded.byReason[
+                'macro-requalified'].count, 1);
+
+            fs.writeFileSync(path.join(dir, 'incremental.cpp'), after);
+            index.build(null, { quiet: true, forceRebuild: true });
+            const preserved = target();
+            assert.deepEqual(preserved.callers.map(call => call.line), [4]);
+            assert.equal(preserved.unverifiedCallers.length, 0);
+            assert.equal(preserved.meta.account.conserved, true);
         } finally {
             rm(dir);
         }

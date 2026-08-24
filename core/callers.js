@@ -660,6 +660,35 @@ function findCallers(index, name, options = {}) {
                     continue;
                 }
 
+                if (fileEntry.language === 'cpp' && call.macroArguments) {
+                    const macroDisposition = _cppMacroTargetDisposition(
+                        index, filePath, call,
+                        options.targetDefinitions || definitions);
+                    if (macroDisposition?.kind === 'other') {
+                        recordExcluded(filePath, call.line,
+                            'macro-requalified');
+                        continue;
+                    }
+                    if (macroDisposition?.kind === 'uncertain') {
+                        if (collectAccount) {
+                            routeUnverified(
+                                filePath, fileEntry, call,
+                                'macro-expansion', calledAs, {
+                                    uncertaintyClass: 'compile-time-dispatch',
+                                    dispatchFamily:
+                                        `${call.name} macro expansion`,
+                                });
+                        }
+                        continue;
+                    }
+                    if (macroDisposition?.kind === 'qualified') {
+                        call = macroDisposition.qualifier === 'global'
+                            ? { ...call, globalQualified: true }
+                            : { ...call, isMethod: true, isPathCall: true,
+                                receiver: macroDisposition.qualifier };
+                    }
+                }
+
                 // Static member syntax carries two compiler symbols:
                 // `JValue.Compare(...)` calls Compare and references the
                 // JValue type. Class/type queries promise usages rather than
@@ -5117,7 +5146,7 @@ function findCallees(index, definition, options = {}) {
         };
 
         let siteOrdinal = -1;
-        for (const call of calls) {
+        for (let call of calls) {
             siteOrdinal++;
             const siteId = siteOrdinal;
             // Filter to calls within this function's scope
@@ -5137,6 +5166,30 @@ function findCallees(index, definition, options = {}) {
             if (call.macroParameter) {
                 noteSite(siteId, 'excluded', 'macro-parameter', call);
                 continue;
+            }
+
+            if (language === 'cpp' && call.macroArguments) {
+                const macroDisposition = _cppMacroTargetDisposition(
+                    index, def.file, call, index.symbols.get(call.name) || []);
+                if (macroDisposition?.kind === 'other') {
+                    noteSite(siteId, 'excluded', 'macro-requalified', call);
+                    continue;
+                }
+                if (macroDisposition?.kind === 'uncertain') {
+                    if (collectAccount) {
+                        noteUnverified(siteId, call, 'macro-expansion', {
+                            uncertaintyClass: 'compile-time-dispatch',
+                            dispatchFamily: `${call.name} macro expansion`,
+                        });
+                    }
+                    continue;
+                }
+                if (macroDisposition?.kind === 'qualified') {
+                    call = macroDisposition.qualifier === 'global'
+                        ? { ...call, globalQualified: true }
+                        : { ...call, isMethod: true, isPathCall: true,
+                            receiver: macroDisposition.qualifier };
+                }
             }
 
             // C# extension methods are statically resolved compiler calls,
@@ -12139,6 +12192,7 @@ function _cppTypeCategory(type) {
     const unqualified = original
         .replace(/\b(const|volatile|constexpr|typename|struct|class)\b/g, ' ')
         .replace(/&&|\.\.\.|[&*]/g, ' ')
+        .replace(/\[[^\]]*\]/g, ' ')
         .replace(/\s+/g, ' ')
         .trim();
     const headText = unqualified.split('<')[0].trim();
@@ -12629,14 +12683,140 @@ function _cppQualifiedPathOwnsTarget(index, callerFile, call, targetDefs) {
     return targetDefs.some(definition => {
         if (!definition.file) return false;
         const namespace = String(definition.namespace || '');
-        if (namespace === call.receiver ||
-            namespace.startsWith(`${call.receiver}::`) ||
-            namespace.endsWith(`::${call.receiver}`)) {
-            return true;
+        if (namespace) {
+            // An AST-recorded namespace is stronger than the portable-header
+            // path heuristic. `fmt::vformat_to` cannot name
+            // `detail::vformat_to`; only the exact namespace (or the same
+            // namespace expressed relative to an enclosing scope) owns it.
+            return namespace === call.receiver ||
+                String(call.receiver).endsWith(`::${namespace}`) ||
+                namespace.endsWith(`::${call.receiver}`);
         }
         const relative = path.relative(index.root, definition.file);
         return relative.split(path.sep).includes(namespaceRoot);
     });
+}
+
+function _cppMacroParamOutcomes(index, callerFile, macroName, argIndex,
+    depth = 0, seen = new Set()) {
+    if (!macroName || depth > 8) return new Set(['unknown']);
+    let cache;
+    let cacheKey;
+    if (depth === 0) {
+        if (!index._cppMacroParamOutcomesCache) {
+            Object.defineProperty(index, '_cppMacroParamOutcomesCache', {
+                value: new Map(),
+                configurable: true,
+            });
+        }
+        cache = index._cppMacroParamOutcomesCache;
+        cacheKey = `${callerFile}\0${macroName}\0${argIndex}`;
+        if (cache.has(cacheKey)) return cache.get(cacheKey);
+    }
+    const key = `${macroName}:${argIndex}`;
+    if (seen.has(key)) return new Set(['unknown']);
+    const nextSeen = new Set(seen);
+    nextSeen.add(key);
+    const visible = _cppVisibleFiles(index, callerFile);
+    const definitions = (index.symbols.get(macroName) || []).filter(definition =>
+        definition.type === 'macro' && definition.functionLike !== false &&
+        definition.file && visible.has(definition.file));
+    if (definitions.length === 0) {
+        const result = new Set(['unknown']);
+        if (cache) cache.set(cacheKey, result);
+        return result;
+    }
+    const outcomes = new Set();
+    for (const definition of definitions) {
+        const effects = (definition.macroParamEffects || [])
+            .filter(effect => effect.paramIndex === argIndex);
+        if (effects.length === 0) {
+            outcomes.add('preserve');
+            continue;
+        }
+        for (const effect of effects) {
+            if (effect.kind === 'qualified' && effect.qualifier) {
+                outcomes.add(`qualified:${effect.qualifier}`);
+            } else if (effect.kind === 'forwarded' && effect.macro &&
+                Number.isInteger(effect.argIndex)) {
+                for (const outcome of _cppMacroParamOutcomes(
+                    index, callerFile, effect.macro, effect.argIndex,
+                    depth + 1, nextSeen)) {
+                    outcomes.add(outcome);
+                }
+            } else {
+                outcomes.add('unknown');
+            }
+        }
+    }
+    const result = outcomes.size > 0 ? outcomes : new Set(['unknown']);
+    if (cache) cache.set(cacheKey, result);
+    return result;
+}
+
+function _cppMacroQualifierCanNameTarget(qualifier, targetDefs) {
+    if (!qualifier || !Array.isArray(targetDefs) || targetDefs.length === 0) {
+        return false;
+    }
+    if (qualifier === 'global') {
+        return targetDefs.some(definition =>
+            !definition.className && !definition.receiver && !definition.namespace);
+    }
+    return targetDefs.some(definition => {
+        const owner = definition.className || definition.receiver;
+        const namespace = definition.namespace;
+        return owner === qualifier || namespace === qualifier ||
+            String(owner || '').endsWith(`::${qualifier}`) ||
+            String(namespace || '').endsWith(`::${qualifier}`);
+    });
+}
+
+/**
+ * Whether a macro transforms this source call's argument into a qualified
+ * callable. Replacement-list effects are parser-derived and followed through
+ * forwarding macros; conditional definitions are unioned, so disagreement
+ * routes visible rather than becoming false exclusion evidence.
+ */
+function _cppMacroTargetDisposition(index, callerFile, call, targetDefs) {
+    if (!Array.isArray(call?.macroArguments) ||
+        call.macroArguments.length === 0) return null;
+    let uncertain = false;
+    let qualified = null;
+    let qualifiedAway = false;
+    for (const wrapper of call.macroArguments) {
+        const outcomes = _cppMacroParamOutcomes(
+            index, callerFile, wrapper.name, wrapper.argIndex);
+        const qualifiers = [...outcomes]
+            .filter(outcome => outcome.startsWith('qualified:'))
+            .map(outcome => outcome.slice('qualified:'.length));
+        if (qualifiers.length === 0) continue;
+        const targetMatches = qualifiers.map(qualifier =>
+            _cppMacroQualifierCanNameTarget(qualifier, targetDefs));
+        const canNameTarget = targetMatches.some(Boolean);
+        const allNameTarget = targetMatches.every(Boolean);
+        const hasUnknown = outcomes.has('unknown') || outcomes.has('preserve');
+        if (canNameTarget) {
+            const unique = new Set(qualifiers);
+            if (!hasUnknown && allNameTarget && unique.size === 1) {
+                const qualifier = [...unique][0];
+                if (qualified && qualified !== qualifier) uncertain = true;
+                else qualified = qualifier;
+            } else {
+                // Multiple conditional definitions, a preserve path, or a
+                // mixture of target and non-target qualifiers means the
+                // preprocessor can change identity by build configuration.
+                uncertain = true;
+            }
+            continue;
+        }
+        if (!hasUnknown) qualifiedAway = true;
+        else uncertain = true;
+    }
+    if (uncertain || (qualified && qualifiedAway)) {
+        return { kind: 'uncertain' };
+    }
+    if (qualifiedAway) return { kind: 'other' };
+    return qualified ? { kind: 'qualified', qualifier: qualified } : null;
 }
 
 function _overloadDiscipline(index, call, targetDefs, definitions, callerFile) {
@@ -12665,12 +12845,22 @@ function _overloadDiscipline(index, call, targetDefs, definitions, callerFile) {
         targetDefs.every(d => !d.className && !d.receiver) &&
         _cppTargetVisibleFrom(index, callerFile, targetDefs)) {
         const visible = _cppVisibleFiles(index, callerFile);
-        const callerHostsPin = targetDefs.some(d => d.file === callerFile);
+        const pathCanName = definition => {
+            if (!call.isPathCall || !call.receiver) return true;
+            const namespace = String(definition.namespace || '');
+            // Missing namespace metadata is not negative evidence: namespace
+            // macros (FMT_BEGIN_NAMESPACE and peers) are intentionally opaque
+            // to the portable tree. A recorded namespace, however, must match
+            // the qualifier's exact/relative namespace identity.
+            if (!namespace) return true;
+            return namespace === call.receiver ||
+                String(call.receiver).endsWith(`::${namespace}`) ||
+                namespace.endsWith(`::${call.receiver}`);
+        };
         family = definitions.filter(d =>
             !NON_CALLABLE_TYPES.has(d.type) &&
             !d.className && !d.receiver &&
-            (!call.isPathCall || d.file !== callerFile || callerHostsPin ||
-             pinnedKeys.has(`${d.file}:${d.startLine}`)) &&
+            pathCanName(d) &&
             (visible.has(d.file) ||
              pinnedKeys.has(`${d.file}:${d.startLine}`)));
     } else {
@@ -12738,6 +12928,15 @@ function _overloadDiscipline(index, call, targetDefs, definitions, callerFile) {
                 family.push(d);
             }
         }
+    }
+    if (targetLanguage === 'cpp' && call.isPathCall && family.length > 0 &&
+        !family.some(definition =>
+            pinnedKeys.has(`${definition.file}:${definition.startLine}`))) {
+        // The qualifier selects a modeled namespace family that does not
+        // contain the pin (`fmt::vformat_to` versus
+        // `detail::vformat_to`). This is exact negative identity evidence
+        // even when that family has only one overload.
+        return 'other-overload';
     }
     if (family.length <= 1) return null;
     if (family.every(d => pinnedKeys.has(`${d.file}:${d.startLine}`))) return null;

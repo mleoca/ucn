@@ -55,7 +55,7 @@ function normalizeSymbol(symbol, family, language, kind, owner = null) {
         'returnedConcreteType', 'returnedConstructors', 'templateDependent',
         'isSpecialization',
         'linkage', 'functionLike', 'callableAlias', 'exportedAlias',
-        'aliasOwner', 'aliasMember',
+        'aliasOwner', 'aliasMember', 'macroParamEffects',
     ];
     for (const field of passthrough) {
         if (symbol[field] !== undefined && symbol[field] !== null) {
