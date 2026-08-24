@@ -8,6 +8,7 @@
 const { detectLanguage, getParser, getLanguageAdapter, safeParse, langTraits } = require('../languages');
 const { sameNode } = require('../languages/utils');
 const { escapeRegExp, codeUnitCompare, NON_CALLABLE_TYPES } = require('./shared');
+const { findAccessorReferences } = require('./accessors');
 
 function codeUnitColumnForByteColumn(line, byteColumn) {
     if (!Number.isInteger(byteColumn) || byteColumn < 0) return null;
@@ -2084,6 +2085,7 @@ function plan(index, name, options = {}) {
     let newSignature = currentSignature;
     let operation = null;
     let changes = [];
+    const reviewItems = [];
     let unchangedSites = 0;
 
     if (options.addParam) {
@@ -2361,7 +2363,7 @@ function plan(index, name, options = {}) {
         // tests; the import/reference sweep must not silently hide them via
         // usages()' navigation-oriented default test exclusion.
         const usages = index.usages(name, {
-            codeOnly: true,
+            codeOnly: false,
             includeTests: true,
             internalEvidence: true,
         });
@@ -3166,6 +3168,75 @@ function plan(index, name, options = {}) {
                 }
             }
         }
+
+        // Property/getter/setter renames must cover their normal consumption
+        // form: attribute reads and writes. Reuse impact's receiver-evidence
+        // query so a typed field is edited mechanically and an unresolved
+        // receiver is surfaced for review instead of silently omitted.
+        const accessorReferences = findAccessorReferences(index, name, def, {
+            includeTests: true,
+        });
+        if (accessorReferences) {
+            const confirmedByLine = new Map();
+            for (const ref of accessorReferences.confirmed) {
+                const key = `${ref.absoluteFile}\0${ref.line}`;
+                if (!confirmedByLine.has(key)) confirmedByLine.set(key, []);
+                confirmedByLine.get(key).push(ref);
+            }
+            for (const refs of confirmedByLine.values()) {
+                const ref = refs[0];
+                const columns = refs.map(item => item.column)
+                    .filter(Number.isInteger);
+                const edit = renameIdentifierTokens(index, ref.absoluteFile,
+                    ref.line, name, options.renameTo,
+                    columns.length === refs.length ? columns : null);
+                if (edit.renamed === edit.source) continue;
+                const concrete = {
+                    file: ref.file,
+                    line: ref.line,
+                    expression: edit.source,
+                    suggestion: `Update property access: ${edit.renamed}`,
+                    newExpression: edit.renamed,
+                    editKind: 'reference',
+                };
+                const existing = changes.find(change =>
+                    change.file === ref.file && change.line === ref.line &&
+                    !change.needsReview);
+                if (existing) Object.assign(existing, concrete);
+                else changes.push(concrete);
+            }
+            for (const ref of accessorReferences.unverified) {
+                changes.push({
+                    file: ref.file,
+                    line: ref.line,
+                    expression: ref.expression,
+                    suggestion: `Verify this property access resolves to ${name} on ` +
+                        `${accessorReferences.owner} before renaming`,
+                    needsReview: true,
+                    editKind: 'reference',
+                });
+            }
+        }
+
+        // String/comment occurrences in indexed source can encode guards,
+        // reflection keys, protocol names, snapshots, or documentation. AST
+        // identifier replacement must never rewrite them automatically, but a
+        // complete plan must list them as explicit review work.
+        for (const textRef of usages.filter(usage => usage.usageType === 'text')) {
+            const rel = textRef.relativePath || textRef.file;
+            if (reviewItems.some(item =>
+                item.file === rel && item.line === textRef.line)) continue;
+            reviewItems.push({
+                file: rel,
+                line: textRef.line,
+                expression: (textRef.content || '').trim(),
+                suggestion: `Review comment/string dependency on "${name}"; ` +
+                    'rename manually only if its contract changes',
+                needsReview: true,
+                textDependency: true,
+                editKind: 'text-reference',
+            });
+        }
     }
 
     // Every operation changes the selected declaration. Historically `plan`
@@ -3222,7 +3293,9 @@ function plan(index, name, options = {}) {
         imports: changes.filter(change => change.editKind === 'import').length,
         exports: changes.filter(change => change.editKind === 'export').length,
         references: changes.filter(change => change.editKind === 'reference').length,
-        reviewRequired: changes.filter(change => change.needsReview).length,
+        textReferences: reviewItems.length,
+        reviewRequired: changes.filter(change => change.needsReview).length +
+            reviewItems.length,
     };
 
     return {
@@ -3243,9 +3316,11 @@ function plan(index, name, options = {}) {
             params: newParams.map(p => formatPlanParamName(p)).filter(Boolean)
         },
         totalChanges: changes.length,
-        filesAffected: new Set(changes.map(c => c.file)).size,
+        filesAffected: new Set([...changes, ...reviewItems].map(c => c.file)).size,
         changeSummary,
         changes,
+        reviewItems,
+        totalReviewItems: reviewItems.length,
         ...(unchangedSites > 0 && { unchangedSites }),
         // v4 tiered contract: sites that MAY also need this change but lack
         // binding/receiver evidence — review manually before refactoring.
@@ -3253,6 +3328,13 @@ function plan(index, name, options = {}) {
         unverifiedSites: planUnverified,
         account: planAccount,
         scopeWarning: impactScopeWarning,
+        ...(options.renameTo && {
+            outsideIndexedSource: {
+                scope: 'indexed-source-files',
+                excluded: ['documentation', 'configuration', 'generated files', 'unsupported languages'],
+                action: `Search non-source project files for the exact spelling "${name}" before applying the rename.`,
+            },
+        }),
         ...(resolved.warnings.length > 0 && { warnings: resolved.warnings }),
     };
     } finally { index._endOp(); }

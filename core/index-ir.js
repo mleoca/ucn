@@ -20,6 +20,7 @@ function createImportBindings(imports) {
                 ...(item.line != null && { line: item.line }),
                 ...(rename && { alias: rename.local }),
                 ...(item.defaultLike && { defaultLike: true }),
+                ...(item.deferred && { deferred: true }),
             };
         }));
 }
@@ -46,6 +47,15 @@ function createFileEntryFromIR({
         mtime,
         size,
         imports: imports.map(item => item.module),
+        ...(ir.language === 'python' && {
+            importDetails: imports.map(item => ({
+                module: item.module,
+                names: [...(item.names || [])],
+                ...(item.type && { type: item.type }),
+                ...(item.line != null && { line: item.line }),
+                ...(item.deferred && { deferred: true }),
+            })),
+        }),
         globalImports: imports.filter(item => item.global).map(item => item.module),
         importNames: imports.flatMap(item => item.names || []),
         importBindings: createImportBindings(imports),

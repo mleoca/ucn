@@ -294,6 +294,12 @@ function formatDeadcode(results, options = {}) {
     if (results.computedDispatch?.count > 0) {
         lines.push(`\nWARNING: ${results.computedDispatch.count} computed dispatch call(s) in ${results.computedDispatch.fileCount} file(s). Dead-code results are review candidates; runtime-selected members may not have a named static edge.`);
     }
+    if (results.reflection?.literalCount > 0) {
+        lines.push(`\n${results.reflection.literalCount} literal reflection use(s) name ${results.reflection.names.length} member spelling(s); matching symbols were withheld from deletion candidates.`);
+    }
+    if (results.reflection?.dynamicCount > 0) {
+        lines.push(`\nWARNING: ${results.reflection.dynamicCount} dynamic reflection use(s) have no static member spelling. Dead-code results remain review candidates because runtime-selected members cannot be attributed.`);
+    }
     if (results.coverage?.complete === false) {
         const c = results.coverage;
         const reasonText = Object.entries(c.reasons || {})
@@ -337,6 +343,7 @@ function formatDeadcodeJson(results) {
             ...(results.pythonImplicitExportFiles > 0 && { pythonImplicitExportFiles: results.pythonImplicitExportFiles }),
             ...(results.excludedDynamicDispatch > 0 && { excludedDynamicDispatch: results.excludedDynamicDispatch }),
             ...(results.computedDispatch?.count > 0 && { computedDispatch: results.computedDispatch }),
+            ...(results.reflection?.count > 0 && { reflection: results.reflection }),
             ...(results.coverage?.complete === false && { coverage: results.coverage }),
             symbols: results.map(item => {
                 const handleSym = { ...item, relativePath: item.relativePath || item.file };

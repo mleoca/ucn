@@ -59,6 +59,12 @@ For caller-bearing `show`, `impact`, `trace`, `tests`, and `check` views:
 - `WARNING` identifies unreadable, unparsed, or partially indexed files, and lists unsupported-language occurrence sites (file:line plus the line text) so nothing grep would show is hidden. `usages` and `tests` carry the same disclosure as a note.
 - `FILTERED` means query options hid evidence.
 
+When the selected definition is a property/getter/setter, `impact` adds a
+separate `PROPERTY ACCESS SITES` band. Confirmed reads/writes have receiver
+identity; matching attribute syntax with an unresolved receiver stays
+unverified. These are change dependencies, not fabricated caller edges, so
+the caller `ACCOUNT` remains a call-shaped partition.
+
 An observed-text zero is not semantic zero or safe-delete proof. Numeric evidence values are ordinal ranking weights, not probabilities.
 
 When a plain name selects more than one definition, action-oriented commands
@@ -101,7 +107,7 @@ definition as an implicit repository-wide target.
 
 ## Deletion protocol
 
-Treat `deadcode` as a candidate generator. Before deletion, inspect `usages`, `impact`, `entrypoints`, `api`, and `repo --sections=health --deep`; then corroborate with the compiler/type checker and tests. Computed dispatch such as `handlers[key]()` is a reported blind spot; registry members reached by a modeled computed receiver are withheld. Unknown decorators/annotations and member-assigned event handlers are also withheld by default because they can be the registration itself. All remaining candidates are still review-only. Never delete solely from `deadcode` or an observed-text-zero result.
+Treat `deadcode` as a candidate generator. Before deletion, inspect `usages`, `impact`, `entrypoints`, `api`, and `repo --sections=health --deep`; then corroborate with the compiler/type checker and tests. Computed dispatch such as `handlers[key]()` is a reported blind spot; registry members reached by a modeled computed receiver are withheld. Statically named reflection such as `getattr(obj, "run")` is positive liveness evidence, so every matching member spelling is withheld; recognized dynamic reflection is counted and warned because it cannot be attributed to one member. Unknown decorators/annotations and member-assigned event handlers are also withheld by default because they can be the registration itself. All remaining candidates are still review-only. Never delete solely from `deadcode` or an observed-text-zero result.
 
 `usages` includes comment/string/docstring occurrences in an `OTHER TEXT` section unless
 `--code-only` is set. This is a literal-name inventory, not exact target
@@ -122,8 +128,16 @@ imports/exports, Python `__all__` strings, and module-attribute references.
 Exact token/expression spans keep a foreign same-named occurrence on the same
 line unchanged. Open external interfaces, incomplete ownership, unresolved
 dispatch, or an inexact token route to `needsReview` instead of a synthesized
-edit. Read `changeSummary` and every review item. `plan` previews only: it does
-not modify files, run a compiler, or prove runtime compatibility.
+edit. Comment/string occurrences in indexed source appear in `reviewItems` and
+are never rewritten automatically; the result also tells you to search
+documentation, configuration, generated files, and unsupported languages for
+the old spelling. Read `changeSummary` and every review item. `plan` previews
+only: it does not modify files, run a compiler, or prove runtime compatibility.
+
+For `deps --cycles`, `eager` means every edge executes at module scope.
+`deferred` means at least one Python edge is function-local, so the chain is
+not an unconditional import-time cycle; it remains visible because invoking
+that function during initialization can still matter.
 
 ## Efficient use
 

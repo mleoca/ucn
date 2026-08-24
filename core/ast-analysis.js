@@ -181,6 +181,108 @@ function computedReceiver(callee) {
     return node?.type === 'identifier' ? node.text : null;
 }
 
+const STRING_LITERAL_NODES = new Set([
+    'string', 'string_literal', 'raw_string_literal',
+    'interpreted_string_literal', 'verbatim_string_literal',
+]);
+
+function literalStringValue(node) {
+    if (!node || !STRING_LITERAL_NODES.has(node.type)) return null;
+    const content = (node.namedChildren || []).find(child =>
+        child.type === 'string_content' || child.type === 'interpreted_string_literal_content');
+    if (content) return content.text;
+    const raw = String(node.text || '');
+    const first = raw.search(/["']/);
+    if (first < 0) return null;
+    const quote = raw[first];
+    const triple = raw.slice(first, first + 3) === quote.repeat(3);
+    const width = triple ? 3 : 1;
+    if (!raw.endsWith(quote.repeat(width))) return null;
+    const value = raw.slice(first + width, -width);
+    // Escaped/interpolated member names are not a stable static spelling.
+    if (value.includes('\\') || value.includes('{') || value.includes('$')) return null;
+    return value;
+}
+
+function callShape(node) {
+    if (!['call', 'call_expression', 'invocation_expression',
+        'method_invocation'].includes(node.type)) return null;
+    const callee = node.childForFieldName('function') ||
+        node.childForFieldName('name') || node.namedChild(0);
+    const args = node.childForFieldName('arguments') ||
+        (node.namedChildren || []).find(child =>
+            ['argument_list', 'arguments', 'bracketed_argument_list'].includes(child.type));
+    return callee && args ? { callee, args: args.namedChildren || [] } : null;
+}
+
+/**
+ * Extract recognized reflection operations and classify whether their member
+ * target is a stable literal. Literal targets are positive liveness evidence;
+ * dynamic targets cannot identify one member but must still be disclosed by
+ * deletion-oriented commands.
+ */
+function reflectionSites(content, language) {
+    try {
+        const syntaxHints = {
+            python: ['getattr', 'setattr', 'hasattr', 'delattr'],
+            javascript: ['Reflect.'],
+            typescript: ['Reflect.'],
+            tsx: ['Reflect.'],
+            go: ['MethodByName', 'FieldByName'],
+            java: ['getMethod', 'getDeclaredMethod', 'getField', 'getDeclaredField'],
+            csharp: ['GetMethod', 'GetProperty', 'GetField'],
+        }[language];
+        if (!syntaxHints || !syntaxHints.some(hint => content.includes(hint))) {
+            return [];
+        }
+        const parser = getParser(language);
+        if (!parser) return [];
+        const tree = safeParse(parser, content);
+        const sites = [];
+        walkNamed(tree.rootNode, node => {
+            const call = callShape(node);
+            if (!call) return true;
+            const callee = String(call.callee.text || '');
+            let argIndex = null;
+            let kind = null;
+            if (language === 'python' &&
+                ['getattr', 'setattr', 'hasattr', 'delattr'].includes(callee)) {
+                argIndex = 1;
+                kind = callee;
+            } else if (['javascript', 'typescript', 'tsx'].includes(language) &&
+                /^(?:globalThis\.)?Reflect\.(?:get|set|has|deleteProperty)$/.test(callee)) {
+                argIndex = 1;
+                kind = callee.split('.').pop();
+            } else if (language === 'go' &&
+                /\.(?:MethodByName|FieldByName)$/.test(callee)) {
+                argIndex = 0;
+                kind = callee.split('.').pop();
+            } else if (['java', 'csharp'].includes(language) &&
+                /(?:^|\.)(?:getMethod|getDeclaredMethod|getField|getDeclaredField|GetMethod|GetProperty|GetField)$/.test(callee)) {
+                argIndex = 0;
+                kind = callee.split('.').pop();
+            }
+            if (argIndex == null || !call.args[argIndex]) return true;
+            const name = literalStringValue(call.args[argIndex]);
+            sites.push({
+                ...(name && /^[A-Za-z_$][\w$]*$/.test(name) && { name }),
+                kind,
+                line: node.startPosition.row + 1,
+                expression: node.text,
+                dynamic: !name || !/^[A-Za-z_$][\w$]*$/.test(name),
+            });
+            return true;
+        });
+        return sites;
+    } catch (_) {
+        return [];
+    }
+}
+
+function literalReflectionSites(content, language) {
+    return reflectionSites(content, language).filter(site => !site.dynamic);
+}
+
 /**
  * Find direct computed dispatch calls such as handlers[name](). Literal keys
  * are excluded because they retain a statically visible member name.
@@ -276,4 +378,6 @@ module.exports = {
     computeAstComplexity,
     computedDispatchSites,
     projectComputedDispatch,
+    reflectionSites,
+    literalReflectionSites,
 };

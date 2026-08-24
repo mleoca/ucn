@@ -108,7 +108,8 @@ function createFileIR({
                 }),
             };
             append(inherited,
-                inherited.memberType === 'field' ? 'state' : 'callable',
+                ['field', 'property'].includes(inherited.memberType)
+                    ? 'state' : 'callable',
                 inherited.memberType || (inherited.isConstructor ? 'constructor' : 'method'),
                 type.name);
         }

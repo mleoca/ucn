@@ -9880,6 +9880,31 @@ describe('fix #294: for-of external-producer receivers demote single-owner (JS t
     });
 });
 
+describe('Accessor impact dependencies (JavaScript)', () => {
+    it('proves same-class this.property reads without inventing caller edges', () => {
+        const dir = tmp({
+            'counter.js': [
+                'class Counter {',
+                '    get value() { return this._value; }',
+                '    read() { return this.value; }',
+                '}',
+                'module.exports = { Counter };',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const result = index.impact('value', {
+                file: 'counter.js', line: 2,
+            });
+            assert.equal(result.propertyAccesses.confirmedCount, 1);
+            assert.equal(result.propertyAccesses.unverifiedCount, 0);
+            assert.equal(result.totalCallSites, 0,
+                'a property read is a dependency, not a fabricated call');
+            assert.equal(result.totalDependencySites, 1);
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #295: method-value references with typed receivers (JS twin)', () => {
     it('constructor-typed t.check in general argument position confirms', () => {
         const dir = tmp({

@@ -513,27 +513,18 @@ function conditionalRecoverySources(code) {
 }
 
 function treeStructureScore(tree) {
-    let declarations = 0;
-    let calls = 0;
     const declarationTypes = new Set([
         'function_definition', 'class_specifier', 'struct_specifier',
         'union_specifier', 'enum_specifier', 'type_definition',
     ]);
-    const cursor = tree.walk();
-    let entered = true;
-    while (entered) {
-        const type = cursor.nodeType;
-        if (declarationTypes.has(type)) declarations++;
-        else if (type === 'call_expression') calls++;
-        if (cursor.gotoFirstChild()) continue;
-        while (!cursor.gotoNextSibling()) {
-            if (!cursor.gotoParent()) {
-                entered = false;
-                break;
-            }
-        }
-    }
-    cursor.delete?.();
+    // `descendantsOfType` performs the filtering in tree-sitter's native
+    // cursor. Recovery can score the same large source under as many as 14
+    // bounded preprocessor views; walking every node through the JS bridge
+    // made scoring alone a material part of cold C/C++ build CPU. The native
+    // query returns the exact same node sets and therefore preserves the
+    // recovery ordering contract while avoiding thousands of wrapper calls.
+    const declarations = tree.rootNode.descendantsOfType([...declarationTypes]).length;
+    const calls = tree.rootNode.descendantsOfType('call_expression').length;
     return declarations * 1000 + calls;
 }
 

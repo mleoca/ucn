@@ -786,12 +786,17 @@ function formatImpact(impact, options = {}) {
     // Summary (confirmed + unverified tiers reported separately)
     const impactUnverified = impact.unverifiedSites || [];
     const unverifiedSuffix = impactUnverified.length > 0 ? ` confirmed + ${impactUnverified.length} unverified` : '';
+    if (impact.propertyAccesses) {
+        const pa = impact.propertyAccesses;
+        const uv = pa.unverifiedCount ? ` + ${pa.unverifiedCount} unverified` : '';
+        lines.push(`DEPENDENCY SITES: ${impact.totalDependencySites} confirmed${uv}`);
+    }
     if (impact.shownCallSites !== undefined && impact.shownCallSites < impact.totalCallSites) {
         lines.push(`CALL SITES: ${impact.shownCallSites} shown of ${impact.totalCallSites}${unverifiedSuffix ? ` total${unverifiedSuffix}` : ' total'}`);
     } else {
         lines.push(`CALL SITES: ${impact.totalCallSites}${unverifiedSuffix}`);
     }
-    lines.push(`  Files affected: ${impact.byFile.length}`);
+    lines.push(`  Files affected: ${impact.affectedFiles ?? impact.byFile.length}`);
 
     // Patterns
     // BUG-1: also surface structural classification counts (inLoop / inTry /
@@ -855,6 +860,30 @@ function formatImpact(impact, options = {}) {
         }
     }
     if (impactReach.note && !compact) lines.push(impactReach.note);
+
+    if (impact.propertyAccesses) {
+        const access = impact.propertyAccesses;
+        lines.push(`${compact ? '' : '\n'}PROPERTY ACCESS SITES: ${access.confirmedCount} confirmed` +
+            (access.unverifiedCount ? ` + ${access.unverifiedCount} unverified` : ''));
+        for (const group of access.byFile) {
+            for (const site of group.sites) {
+                const caller = site.callerName ? ` [${site.callerName}]` : '';
+                const expr = site.expression ? `: ${site.expression.replace(/\s+/g, ' ').slice(0, 100)}` : '';
+                lines.push(`  ${group.file}:${site.line}${caller}${expr}`);
+            }
+        }
+        if (access.unverifiedSites.length > 0) {
+            lines.push(`${compact ? '' : '\n'}UNVERIFIED PROPERTY ACCESS CANDIDATES (${access.unverifiedSites.length}) — matching attribute syntax, receiver identity unresolved:`);
+            for (const site of access.unverifiedSites.slice(0, 10)) {
+                const caller = site.callerName ? ` [${site.callerName}]` : '';
+                const expr = site.expression ? `: ${site.expression.replace(/\s+/g, ' ').slice(0, 100)}` : '';
+                lines.push(`  ${site.file}:${site.line}${caller}${expr}`);
+            }
+            if (access.unverifiedSites.length > 10) {
+                lines.push(`  (+${access.unverifiedSites.length - 10} more unverified)`);
+            }
+        }
+    }
 
     // Unverified tier: visible, capped at 10 one-liners
     if (impactUnverified.length > 0) {

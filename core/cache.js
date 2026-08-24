@@ -644,7 +644,11 @@ function clearAllCaches() {
 // symbols retain AST-derived parameter qualification/forwarding effects, so
 // replacement-list requalification cannot masquerade as lexical calls
 // (fix #306).
-const CACHE_FORMAT_VERSION = 188;
+// v189: Python import records retain function-local/deferred scope so cycle
+// reporting can classify import-time vs lazy edges from fresh and cached
+// indexes; C# properties retain property identity instead of masquerading as
+// ordinary fields for accessor impact/refactoring.
+const CACHE_FORMAT_VERSION = 189;
 
 /**
  * Save index to cache file

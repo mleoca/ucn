@@ -1673,6 +1673,39 @@ describe('C# language support', () => {
             call.receiverRootType === 'Controller'));
     });
 
+    it('indexes properties distinctly and reports typed property impact', () => {
+        const dir = tmp({
+            'Fixture.cs': [
+                'class Client {',
+                '  public int Value { get; set; }',
+                '  public int Read() { return this.Value; }',
+                '}',
+                'class Consumer {',
+                '  int Read(Client client) { return client.Value; }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const property = index.symbols.get('Value')[0];
+            assert.equal(property.type, 'property');
+            assert.equal(property.memberType, 'property');
+            const impact = index.impact('Value', {
+                file: 'Fixture.cs', line: 2,
+            });
+            assert.equal(impact.propertyAccesses.confirmedCount, 2,
+                'same-class and parameter-typed reads are proven dependencies');
+            assert.equal(impact.propertyAccesses.unverifiedCount, 0);
+            const source = execute(index, 'source', {
+                name: 'Value', file: 'Fixture.cs', line: 2,
+            });
+            assert.equal(source.ok, true,
+                'stable property handles must round-trip through source');
+            assert.match(source.result.entries[0].code,
+                /public int Value \{ get; set; \}/);
+        } finally { rm(dir); }
+    });
+
     it('preserves C# casts, null-forgiving fields, and nested receiver paths', () => {
         const code = [
             'using System.Collections;',

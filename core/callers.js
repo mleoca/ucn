@@ -10708,7 +10708,7 @@ function _declaredFieldType(index, rootType, fieldName, language, info, rootName
         d.type === 'property' || d.memberType === 'property';
     const fields = defs.filter(d =>
         ((d.type === 'field' || d.memberType === 'field' || d.memberType === 'private field') && d.fieldType) ||
-        (isAccessor(d) && d.returnType));
+        (isAccessor(d) && (d.returnType || d.fieldType)));
     let onType = fields.filter(d => d.className === rootType &&
         (language !== 'csharp' || !rootNamespace ||
             (d.namespace || null) === rootNamespace));
@@ -10767,7 +10767,7 @@ function _declaredFieldType(index, rootType, fieldName, language, info, rootName
     if (onType.length === 0) return null;
     const normalized = new Set();
     for (const f of onType) {
-        const rawText = isAccessor(f) ? f.returnType : f.fieldType;
+        const rawText = isAccessor(f) ? (f.returnType || f.fieldType) : f.fieldType;
         // Qualified declared types resolve through the FIELD-DECLARING file's
         // imports or not at all (fix #268, chi-measured — the #206 identity
         // discipline): `inner http.Handler` is net/http's Handler, never a
@@ -10824,7 +10824,8 @@ function _declaredFieldType(index, rootType, fieldName, language, info, rootName
                 complete = false;
                 break;
             }
-            const rawText = isAccessor(field) ? field.returnType : field.fieldType;
+            const rawText = isAccessor(field)
+                ? (field.returnType || field.fieldType) : field.fieldType;
             const qualifier = language === 'java'
                 ? _javaNestedTypeQualifier(rawText) : undefined;
             if (qualifier) namespaces.add(qualifier);
@@ -10983,10 +10984,14 @@ function _nonCallableFieldMember(index, typeName, name, language) {
         (d.receiver && d.receiver.replace(/^\*/, '') === typeName));
     if (onType.length === 0) return false;
     for (const d of onType) {
-        if (d.type !== 'field' && d.memberType !== 'field' && d.memberType !== 'private field') return false;
-        if (!d.fieldType) return false;
+        const valueMember = d.type === 'field' || d.memberType === 'field' ||
+            d.memberType === 'private field' || d.type === 'property' ||
+            d.memberType === 'property';
+        if (!valueMember) return false;
+        const declaredType = d.fieldType || d.returnType;
+        if (!declaredType) return false;
         if (_callableFieldDef(index, d)) return false;
-        const raw = String(d.fieldType).trim();
+        const raw = String(declaredType).trim();
         if (/^func\b/.test(raw)) return false;
         if (/\bfn\s*\(|\b(?:Fn|FnMut|FnOnce)\s*[(<]/.test(raw)) return false;
         if (langTraits(language)?.typeSystem === 'structural') {
@@ -13455,7 +13460,8 @@ function _declaredFieldInterfaceType(index, rootType, fieldName, language, rootN
     const defs = index.symbols.get(fieldName);
     if (!defs) return null;
     const fields = defs.filter(d =>
-        (d.type === 'field' || d.memberType === 'field') &&
+        (d.type === 'field' || d.memberType === 'field' ||
+         d.type === 'property' || d.memberType === 'property') &&
         d.className === rootType && d.fieldType &&
         (language !== 'csharp' || !rootNamespace ||
             (d.namespace || null) === rootNamespace));

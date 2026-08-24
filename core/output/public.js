@@ -384,6 +384,10 @@ function formatPublicJson(command, result, params = {}, execution = {}) {
         commandMeta.pythonImplicitExportFiles = result.pythonImplicitExportFiles || 0;
         commandMeta.excludedDynamicDispatch = result.excludedDynamicDispatch || 0;
         commandMeta.computedDispatch = result.computedDispatch || { count: 0, names: [] };
+        commandMeta.reflection = result.reflection || {
+            count: 0, literalCount: 0, dynamicCount: 0,
+            fileCount: 0, files: [], names: [],
+        };
         if (result.coverage) commandMeta.coverage = result.coverage;
         if (result.limitInfo) {
             commandMeta.total = result.limitInfo.total;

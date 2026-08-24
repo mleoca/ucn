@@ -18,6 +18,7 @@ const { isTestFile } = require('./discovery');
 const { computeReachability, symbolKey } = require('./entrypoints');
 const { getLanguageAdapter } = require('../languages');
 const { projectComputedDispatch } = require('./ast-analysis');
+const { findAccessorReferences } = require('./accessors');
 
 // JS/TS test framework helpers — calls to these bracket a test case.
 // Used to flag call sites whose enclosing function is an arrow callback
@@ -1235,6 +1236,40 @@ function impact(index, name, options = {}) {
         });
     }
 
+    // Accessors are consumed through reads/writes. They are intentionally a
+    // separate dependency band rather than fake caller edges: the caller
+    // oracle and conservation account remain call-shaped, while impact no
+    // longer hides the normal use form of a property/getter/setter.
+    let propertyAccesses = findAccessorReferences(index, name, def, {
+        includeTests: true,
+        exclude: options.exclude,
+    });
+    if (propertyAccesses) {
+        const accessByFile = new Map();
+        for (const site of propertyAccesses.confirmed) {
+            if (!accessByFile.has(site.file)) accessByFile.set(site.file, []);
+            accessByFile.get(site.file).push(site);
+        }
+        propertyAccesses = {
+            owner: propertyAccesses.owner,
+            confirmedCount: propertyAccesses.confirmed.length,
+            unverifiedCount: propertyAccesses.unverified.length,
+            totalCandidates: propertyAccesses.confirmed.length +
+                propertyAccesses.unverified.length,
+            byFile: [...accessByFile.entries()]
+                .sort((a, b) => codeUnitCompare(a[0], b[0]))
+                .map(([file, sites]) => ({ file, count: sites.length, sites })),
+            unverifiedSites: propertyAccesses.unverified,
+            excluded: {
+                total: propertyAccesses.excluded.length,
+                byReason: propertyAccesses.excluded.reduce((out, site) => {
+                    out[site.reason] = (out[site.reason] || 0) + 1;
+                    return out;
+                }, {}),
+            },
+        };
+    }
+
     // Apply top limit if specified (limits total call sites shown)
     const totalBeforeLimit = filteredSites.length;
     if (options.top && options.top > 0 && filteredSites.length > options.top) {
@@ -1276,6 +1311,12 @@ function impact(index, name, options = {}) {
         }
     }
 
+    const affectedFiles = new Set([
+        ...Array.from(byFile.keys()),
+        ...(propertyAccesses?.byFile || []).map(group => group.file),
+        ...(propertyAccesses?.unverifiedSites || []).map(site => site.file),
+    ]);
+
     return {
         function: name,
         file: def.relativePath,
@@ -1286,6 +1327,11 @@ function impact(index, name, options = {}) {
         totalCallSites: totalBeforeLimit,
         shownCallSites: filteredSites.length,
         unverifiedSites,
+        ...(propertyAccesses && {
+            propertyAccesses,
+            totalDependencySites: totalBeforeLimit + propertyAccesses.confirmedCount,
+            affectedFiles: affectedFiles.size,
+        }),
         account: impactAccount,
         hasEntrypoints: !!impactReachable && impactReachable.size > 0,
         callerHistogram,

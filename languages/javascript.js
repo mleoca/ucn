@@ -3844,7 +3844,7 @@ function findUsagesInCode(code, name, parser, tree) {
                     usageType = 'reference';
                 }
                 // Track receiver for member expressions (obj.name → receiver = 'obj')
-                if (object && object.type === 'identifier') {
+                if (object && ['identifier', 'this', 'super'].includes(object.type)) {
                     usages.push({ line, column, usageType, receiver: object.text });
                     return true;
                 }

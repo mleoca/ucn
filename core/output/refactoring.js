@@ -70,13 +70,16 @@ function formatPlan(plan, options = {}) {
     lines.push(`  Files affected: ${plan.filesAffected}`);
     if (plan.changeSummary) {
         const summary = plan.changeSummary;
-        lines.push(`  Definition ${summary.definitions}, calls ${summary.calls}, references ${summary.references || 0}, imports ${summary.imports}, exports ${summary.exports}; manual review required for ${summary.reviewRequired} of these changes`);
+        lines.push(`  Definition ${summary.definitions}, calls ${summary.calls}, references ${summary.references || 0}, text dependencies ${summary.textReferences || 0}, imports ${summary.imports}, exports ${summary.exports}; manual review items ${summary.reviewRequired}`);
     }
     if (plan.unchangedSites > 0) {
         lines.push(`  ${plan.unchangedSites} existing call site${plan.unchangedSites === 1 ? '' : 's'} require no edit because the new parameter has a default.`);
     }
     if (plan.scopeWarning) {
         lines.push(`  Note: ${plan.scopeWarning.hint}`);
+    }
+    if (plan.outsideIndexedSource) {
+        lines.push(`  Source boundary: ${plan.outsideIndexedSource.action}`);
     }
     lines.push('');
 
@@ -98,6 +101,17 @@ function formatPlan(plan, options = {}) {
             lines.push(`  :${change.line}${kind}${review}`);
             lines.push(`    ${change.expression}`);
             lines.push(`    → ${change.suggestion}`);
+        }
+    }
+
+    if (plan.reviewItems?.length > 0) {
+        lines.push(`\nREVIEW ITEMS (${plan.reviewItems.length}) — source text dependencies are never rewritten automatically:`);
+        for (const item of plan.reviewItems.slice(0, 20)) {
+            lines.push(`  ${item.file}:${item.line}: ${item.expression.replace(/\s+/g, ' ').slice(0, 120)}`);
+            lines.push(`    → ${item.suggestion}`);
+        }
+        if (plan.reviewItems.length > 20) {
+            lines.push(`  (+${plan.reviewItems.length - 20} more review items)`);
         }
     }
 
@@ -139,7 +153,8 @@ function formatPlanJson(plan) {
     // commands still emitting a bare result object).
     return JSON.stringify({
         meta: {
-            complete: (plan.unverifiedCount || 0) === 0,
+            complete: (plan.unverifiedCount || 0) === 0 &&
+                (plan.changeSummary?.reviewRequired || 0) === 0,
             unverified: plan.unverifiedCount || 0,
             ...(plan.account && { account: plan.account }),
             ...(plan.warnings?.length > 0 && { warnings: plan.warnings }),
@@ -153,8 +168,12 @@ function formatPlanJson(plan) {
             before: { signature: plan.before.signature },
             after: { signature: plan.after.signature },
             totalChanges: plan.totalChanges,
+            totalReviewItems: plan.totalReviewItems || 0,
             filesAffected: plan.filesAffected,
             ...(plan.changeSummary && { changeSummary: plan.changeSummary }),
+            ...(plan.outsideIndexedSource && {
+                outsideIndexedSource: plan.outsideIndexedSource,
+            }),
             ...(plan.unchangedSites > 0 && { unchangedSites: plan.unchangedSites }),
             changes: plan.changes.map(c => ({
                 file: c.file,
@@ -167,6 +186,16 @@ function formatPlanJson(plan) {
                 ...(c.isImport && { isImport: true }),
                 ...(c.isExport && { isExport: true }),
                 ...(c.needsReview && { needsReview: true }),
+                ...(c.textDependency && { textDependency: true }),
+            })),
+            reviewItems: (plan.reviewItems || []).map(item => ({
+                file: item.file,
+                line: item.line,
+                expression: item.expression,
+                suggestion: item.suggestion,
+                editKind: item.editKind,
+                needsReview: true,
+                textDependency: true,
             })),
             // v4 tiered contract passthrough
             unverifiedCount: plan.unverifiedCount,

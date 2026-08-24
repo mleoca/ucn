@@ -16,6 +16,7 @@ const { addTestExclusions, pickBestDefinition, parseSymbolHandle, looksLikeHandl
 const { cleanHtmlScriptTags, detectLanguage } = require('./parser');
 const { renderExpandItem } = require('./expand-cache');
 const { CANONICAL_COMMANDS } = require('./registry');
+const { isAccessorDefinition } = require('./accessors');
 
 // ============================================================================
 // HELPERS
@@ -1639,6 +1640,7 @@ const HANDLERS = {
             if (result.excludedDynamicDispatch != null) sliced.excludedDynamicDispatch = result.excludedDynamicDispatch;
             if (result.pythonImplicitExportFiles != null) sliced.pythonImplicitExportFiles = result.pythonImplicitExportFiles;
             if (result.computedDispatch != null) sliced.computedDispatch = result.computedDispatch;
+            if (result.reflection != null) sliced.reflection = result.reflection;
             if (result.coverage != null) sliced.coverage = result.coverage;
             // Truncation must be visible IN the JSON payload, not only in the
             // stderr note (fix #242) — the formatter reads this to emit
@@ -1875,7 +1877,8 @@ const HANDLERS = {
             const actualName = fnSplit ? fnSplit.methodName : fnName;
             const fnClassName = fnSplit ? fnSplit.className : p.className;
             let matches = index.find(actualName, { file: p.file, className: fnClassName, skipCounts: true })
-                .filter(m => m.type === 'function' || m.params !== undefined);
+                .filter(m => m.type === 'function' || m.params !== undefined ||
+                    isAccessorDefinition(m));
 
             // Line pin from a stable handle or explicit line= (fix #249:
             // `fn both.js:5:run` returned the OTHER same-name def — the

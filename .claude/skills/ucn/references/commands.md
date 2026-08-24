@@ -22,17 +22,17 @@ structural or code-only search.
 
 | Command | Purpose |
 |---|---|
-| `impact [handle]` | Show direct symbol impact when given a handle; without one, analyze the Git diff. |
+| `impact [handle]` | Show direct symbol impact when given a handle; accessor targets include receiver-tiered property reads/writes as a separate dependency band. Without a handle, analyze the Git diff. |
 | `tests <handle\|file>` | Find statically linked direct tests. Set `--depth=N` for transitive affected tests. Empty results are not runtime coverage proof. |
 | `check [handle]` | Validate confirmed call-site arity for a symbol; without one, run the composed pre-commit diagnostic. |
-| `plan <handle>` | Preview `--rename-to`, `--add-param`, or `--remove-param` edits. For renames, the proven closure can include overload/signature groups, inheritance/trait/Go-interface slots, exact call/reference tokens, imports/exports, Python `__all__` strings, and module-attribute references. Open ownership or method sets stay `needsReview`; the command never applies or compiles edits. |
+| `plan <handle>` | Preview `--rename-to`, `--add-param`, or `--remove-param` edits. For renames, the proven closure can include overload/signature groups, inheritance/trait/Go-interface slots, accessor reads/writes, exact call/reference tokens, imports/exports, Python `__all__` strings, and module-attribute references. Source comments/strings are explicit `reviewItems`; non-source files get a search handoff. Open ownership or method sets stay `needsReview`; the command never applies or compiles edits. |
 
 ## Repository and architecture
 
 | Command | Purpose |
 |---|---|
 | `repo` | Repository orientation. Select `summary,files,stats,health` with `--sections`; `--deep` includes readiness evidence. Skipped unsupported source is listed with a grep/language-tool handoff. |
-| `deps <file>` | File dependency graph. Use `--direction=imports\|importers\|both`, `--detailed`, or `--cycles`. |
+| `deps <file>` | File dependency graph. Use `--direction=imports\|importers\|both`, `--detailed`, or `--cycles`. Python cycles are classified as eager or function-local/deferred without dropping either kind. |
 | `api [file]` | Static exported/public surface for a project or file. |
 | `entrypoints` | Framework, route, task, test, and runtime entry points. |
 | `endpoints` | Server/client HTTP surface; `--bridge` adds advisory matching. |
@@ -41,7 +41,7 @@ structural or code-only search.
 
 | Command | Purpose |
 |---|---|
-| `deadcode` | Conservative unreferenced-symbol candidates for review. Modeled computed-dispatch members, unknown decorated/annotated callables, and member-assigned event handlers are withheld by default. |
+| `deadcode` | Conservative unreferenced-symbol candidates for review. Statically named reflection targets, modeled computed-dispatch members, unknown decorated/annotated callables, and member-assigned event handlers are withheld by default. Recognized dynamic reflection is counted and warned because it cannot be attributed. |
 | `audit-async` | Potential missing-await sites in JavaScript/TypeScript/Python and C#. MCP spelling: `audit_async`. |
 | `stacktrace <text>` | Advisory stack-frame parsing and source lookup. |
 

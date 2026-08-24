@@ -287,7 +287,7 @@ SIGNATURE CHANGE:
 
 CHANGES NEEDED: 12
   Files affected: 5
-  Definition 1, calls/references 7, imports 4, exports 0; manual review required for 0 of these changes
+  Definition 1, calls 7, references 0, text dependencies 0, imports 4, exports 0; manual review items 0
 
 BY FILE:
 
@@ -306,12 +306,16 @@ For a rename, `plan` closes the change over every relationship the index can
 prove: overload/signature groups, base and override declarations, Rust trait
 slots, Go interface slots and their satisfiers, exact call and value-reference
 tokens, imports/exports, Python `__all__` strings, and module-attribute
-references. It edits exact token or expression spans, so another same-named
-call on the same line is not swept up accidentally.
+references. Accessor renames also follow receiver-proven property reads and
+writes. It edits exact token or expression spans, so another same-named call
+on the same line is not swept up accidentally.
 
 Open external interfaces, incomplete ownership, unresolved dispatch, or an
 inexact token are marked `needsReview` instead of receiving a synthesized
-edit. `plan` previews changes; it does not modify files or replace the
+edit. Comments and strings in indexed source appear as separate review items
+and are never rewritten automatically; documentation, configuration,
+generated files, and unsupported languages get an explicit exact-text search
+handoff. `plan` previews changes; it does not modify files or replace the
 compiler and test suite. Before committing, point the same machinery at your
 Git diff:
 
@@ -408,7 +412,10 @@ Three claims, and every one is re-checked against rust-analyzer in CI: a
 default-audit claim with an oracle-visible reference fails the build. Notice
 what it *didn't* claim: exported API that external code may call,
 framework-registered symbols, and anything whose name appears in files UCN
-couldn't parse. `deadcode` is deliberately a candidate generator. Before
+couldn't parse. A literal reflection target such as `getattr(obj, "run")`
+also withholds matching member names from deletion candidates; recognized
+dynamic reflection is counted and warned because it cannot be attributed.
+`deadcode` is deliberately a candidate generator. Before
 deleting, corroborate with `usages`, `impact`, `api`, and your compiler and
 tests.
 
@@ -425,6 +432,11 @@ ucn api                                # public surface of the project
 ucn entrypoints --type=http            # runtime and framework roots
 ucn endpoints --bridge --unmatched     # server routes with no client, and vice versa
 ```
+
+Cycle output separates eager import-time loops from Python chains containing
+a function-local/deferred edge. Deferred chains stay visible—they are not
+unconditional import-time cycles, but can still fail if invoked while modules
+are initializing.
 
 `endpoints --bridge` matches server routes to client requests across
 languages: Express/Fastify/Koa/NestJS/Next.js, Flask/FastAPI, Spring/JAX-RS,

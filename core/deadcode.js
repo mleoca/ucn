@@ -13,7 +13,7 @@ const { isTestFile } = require('./discovery');
 const { isFrameworkEntrypoint } = require('./entrypoints');
 const { splitParentList } = require('./graph-build');
 const { isOverrideMarked, codeUnitCompare, lineInRanges, maskBlockComments, escapeRegExp } = require('./shared');
-const { projectComputedDispatch } = require('./ast-analysis');
+const { projectComputedDispatch, reflectionSites } = require('./ast-analysis');
 
 const _CLASS_KINDS = ['class', 'struct', 'interface', 'trait', 'record'];
 
@@ -738,6 +738,34 @@ function deadcode(index, options = {}) {
             computedDispatchInfo.files.push(fe.relativePath);
         }
     }
+    const literalReflectionNames = new Set();
+    const reflectionInfo = {
+        count: 0,
+        literalCount: 0,
+        dynamicCount: 0,
+        fileCount: 0,
+        files: [],
+        names: [],
+    };
+    for (const [reflectionFile, fe] of index.files) {
+        if (!index.matchesFilters(fe.relativePath, options)) continue;
+        let sites = [];
+        try {
+            sites = reflectionSites(index._readFile(reflectionFile), fe.language);
+        } catch { /* coverage diagnostics own unreadable-file reporting */ }
+        if (sites.length === 0) continue;
+        reflectionInfo.count += sites.length;
+        reflectionInfo.literalCount += sites.filter(site => !site.dynamic).length;
+        reflectionInfo.dynamicCount += sites.filter(site => site.dynamic).length;
+        reflectionInfo.fileCount++;
+        if (reflectionInfo.files.length < 10) {
+            reflectionInfo.files.push(fe.relativePath);
+        }
+        for (const site of sites) {
+            if (site.name) literalReflectionNames.add(site.name);
+        }
+    }
+    reflectionInfo.names = [...literalReflectionNames].sort(codeUnitCompare);
 
     // Ensure callee index is built (lazy, reused across operations)
     if (!index.calleeIndex) {
@@ -810,8 +838,18 @@ function deadcode(index, options = {}) {
         potentiallyDeadNames = filteredNames;
     }
 
+    // A literal reflection target is a statically named runtime use. We may
+    // not know which same-name member receives it, so conservatively withdraw
+    // every deletion claim for that spelling rather than invent identity.
+    for (const reflectedName of literalReflectionNames) {
+        potentiallyDeadNames.delete(reflectedName);
+    }
+
     const coverage = scanDeadcodeCoverage(index, potentiallyDeadNames);
-    const coverageSuppressedNames = new Set(coverage.matchedNames);
+    const coverageSuppressedNames = new Set([
+        ...coverage.matchedNames,
+        ...literalReflectionNames,
+    ]);
     if (coverage.claimsWithdrawn) {
         // An unreadable file/directory can contain a use of any candidate.
         // Returning no deletion candidates is the only sound verdict.
@@ -1470,6 +1508,7 @@ function deadcode(index, options = {}) {
     results.excludedRuntimeContract = excludedRuntimeContract;
     results.excludedDynamicDispatch = excludedDynamicDispatch;
     results.computedDispatch = computedDispatchInfo;
+    results.reflection = reflectionInfo;
     results.coverage = {
         complete: coverage.complete,
         claimsWithdrawn: coverage.claimsWithdrawn,

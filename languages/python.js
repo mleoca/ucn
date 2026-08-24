@@ -2468,10 +2468,24 @@ function findImportsInCode(code, parser) {
     const imports = [];
     let importAliases = null;  // {original, local}[] — tracks renamed imports
 
+    // Imports nested in a function/lambda do not execute during ordinary
+    // module initialization. Preserve that AST fact so dependency-cycle
+    // reporting can distinguish an eager import loop from a deliberate lazy
+    // edge without deleting either edge from the graph.
+    const isDeferredImport = (node) => {
+        for (let parent = node.parent; parent; parent = parent.parent) {
+            if (parent.type === 'function_definition' || parent.type === 'lambda') {
+                return true;
+            }
+        }
+        return false;
+    };
+
     traverseTreeCached(tree.rootNode, (node) => {
         // import statement: import os, import sys as system
         if (node.type === 'import_statement') {
             const line = node.startPosition.row + 1;
+            const deferred = isDeferredImport(node);
 
             for (let i = 0; i < node.namedChildCount; i++) {
                 const child = node.namedChild(i);
@@ -2487,20 +2501,23 @@ function findImportsInCode(code, parser) {
                             module: parts[0],
                             names: [parts[0]],
                             type: 'import',
-                            line
+                            line,
+                            ...(deferred && { deferred: true })
                         });
                         imports.push({
                             module: child.text,
                             names: [],
                             type: 'import-submodule',
-                            line
+                            line,
+                            ...(deferred && { deferred: true })
                         });
                     } else {
                         imports.push({
                             module: child.text,
                             names: [child.text],
                             type: 'import',
-                            line
+                            line,
+                            ...(deferred && { deferred: true })
                         });
                     }
                 } else if (child.type === 'aliased_import') {
@@ -2512,7 +2529,8 @@ function findImportsInCode(code, parser) {
                             module: nameNode.text,
                             names: [aliasNode ? aliasNode.text : nameNode.text.split('.').pop()],
                             type: 'import',
-                            line
+                            line,
+                            ...(deferred && { deferred: true })
                         });
                         if (aliasNode && aliasNode.text !== nameNode.text) {
                             if (!importAliases) importAliases = [];
@@ -2527,6 +2545,7 @@ function findImportsInCode(code, parser) {
         // from ... import statement
         if (node.type === 'import_from_statement') {
             const line = node.startPosition.row + 1;
+            const deferred = isDeferredImport(node);
             let modulePath = '';
             const names = [];
 
@@ -2559,7 +2578,8 @@ function findImportsInCode(code, parser) {
                     module: modulePath,
                     names,
                     type: isRelative ? 'relative' : 'from',
-                    line
+                    line,
+                    ...(deferred && { deferred: true })
                 });
             }
             return true;
@@ -2574,13 +2594,15 @@ function findImportsInCode(code, parser) {
                 const firstArg = argsNode.namedChild(0);
                 if ((funcName === 'importlib.import_module' || funcName === '__import__') && firstArg) {
                     const line = node.startPosition.row + 1;
+                    const deferred = isDeferredImport(node);
                     const isLiteral = firstArg.type === 'string';
                     imports.push({
                         module: isLiteral ? firstArg.text.replace(/^['"]|['"]$/g, '') : firstArg.text,
                         names: [],
                         type: 'dynamic',
                         line,
-                        dynamic: !isLiteral
+                        dynamic: !isLiteral,
+                        ...(deferred && { deferred: true })
                     });
                 }
             }

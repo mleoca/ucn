@@ -287,6 +287,10 @@ function indexSnapshot(index) {
                 .map(binding => JSON.stringify(Object.fromEntries(
                     Object.entries(binding).sort(([a], [b]) => a.localeCompare(b)))))
                 .sort(),
+            importDetails: (fe.importDetails || [])
+                .map(detail => JSON.stringify(Object.fromEntries(
+                    Object.entries(detail).sort(([a], [b]) => a.localeCompare(b)))))
+                .sort(),
             globalImports: [...(fe.globalImports || [])].sort(),
             importAliases: (fe.importAliases || []).map(a => `${a.original} ${a.local}`).sort(),
             exportDetails: (fe.exportDetails || []).map(e => JSON.stringify(e)).sort(),

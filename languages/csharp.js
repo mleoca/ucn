@@ -293,7 +293,7 @@ function propertyMember(node, lines) {
         endLine,
         indent,
         modifiers: modifiersOf(node),
-        memberType: 'field',
+        memberType: 'property',
         fieldType: typeNode?.text || null,
     };
 }
@@ -1312,6 +1312,7 @@ function findImportsInCode(code, parser) {
 function findUsagesInCode(code, name, parser, existingTree) {
     const tree = existingTree || parseTree(parser, code);
     const usages = [];
+    const variableTypesByScope = buildVariableTypes(tree, parser);
     visitNameNodes(tree, code, name, node => {
         if (!IDENTIFIER_NODES.has(node.type) || node.text !== name) return;
         let usageType = 'reference';
@@ -1320,6 +1321,8 @@ function findUsagesInCode(code, name, parser, existingTree) {
             if ((parent.type === 'method_declaration' ||
                 parent.type === 'constructor_declaration' ||
                 TYPE_DECLARATIONS.has(parent.type) ||
+                parent.type === 'property_declaration' ||
+                parent.type === 'event_declaration' ||
                 parent.type === 'parameter' ||
                 parent.type === 'variable_declarator') &&
                 (sameNode(parent.childForFieldName('name'), node))) {
@@ -1329,6 +1332,28 @@ function findUsagesInCode(code, name, parser, existingTree) {
                 usageType = 'call';
             } else if (parent.type === 'using_directive') {
                 usageType = 'import';
+            }
+            if (parent.type === 'member_access_expression' &&
+                sameNode(parent.childForFieldName('name'), node)) {
+                const receiverNode = parent.childForFieldName('expression') ||
+                    parent.namedChild(0);
+                const receiver = receiverNode?.text;
+                const scopeTypes = variableTypesByScope.get(variableScopeKey(node)) ||
+                    variableTypesByScope.get('global');
+                const declared = receiverNode?.type === 'identifier'
+                    ? normalizeReceiverType(scopeTypes?.get(receiver)) : null;
+                const sameClass = ['this', 'base'].includes(receiver)
+                    ? enclosingClassName(node) : null;
+                usages.push({
+                    line: node.startPosition.row + 1,
+                    column: node.startPosition.column,
+                    usageType,
+                    ...(receiver && { receiver }),
+                    ...((declared?.name || sameClass) && {
+                        receiverType: declared?.name || sameClass,
+                    }),
+                });
+                return true;
             }
         }
         usages.push({

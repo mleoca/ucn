@@ -48,7 +48,8 @@ function imports(index, filePath) {
                     resolved: null,
                     isExternal: false,
                     isDynamic: true,
-                    line
+                    line,
+                    deferred: !!imp.deferred,
                 };
             }
 
@@ -64,7 +65,8 @@ function imports(index, filePath) {
                     resolved: null,
                     isExternal: false,
                     isDynamic: true,
-                    line
+                    line,
+                    deferred: !!imp.deferred,
                 };
             }
 
@@ -94,7 +96,8 @@ function imports(index, filePath) {
                 // is still mechanically dynamic even when the path resolves —
                 // `type: 'dynamic'` with `isDynamic: false` was a contradiction.
                 isDynamic: imp.type === 'dynamic',
-                line
+                line,
+                deferred: !!imp.deferred,
             };
         });
     } catch (e) {
@@ -780,7 +783,37 @@ function circularDeps(index, options = {}) {
             }
         }
 
-        // Convert to relative paths and deduplicate
+        const importEdgeDetails = (fromFile, toFile) => {
+            const entry = index.files.get(fromFile);
+            if (!entry || entry.language !== 'python') return [];
+            const matches = [];
+            for (const detail of entry.importDetails || []) {
+                const specs = [detail.module];
+                const mod = String(detail.module || '');
+                for (const importedName of detail.names || []) {
+                    specs.push(mod.endsWith('.')
+                        ? mod + importedName
+                        : `${mod}.${importedName}`);
+                }
+                const reachesTarget = specs.some(spec => {
+                    const rel = entry.moduleResolved?.[spec];
+                    return rel && path.resolve(index.root, rel) === path.resolve(toFile);
+                });
+                if (!reachesTarget) continue;
+                matches.push({
+                    from: entry.relativePath,
+                    to: index.files.get(toFile)?.relativePath || path.relative(index.root, toFile),
+                    line: detail.line ?? null,
+                    deferred: !!detail.deferred,
+                });
+            }
+            return matches;
+        };
+
+        // Convert to relative paths, classify edge execution, and deduplicate.
+        // A cycle with at least one function-local Python import is still a
+        // structural dependency loop, but not an unconditional import-time
+        // loop. Preserve it as a deferred advisory rather than a false alarm.
         const seen = new Set();
         const uniqueCycles = [];
         for (const cycle of cycles) {
@@ -792,7 +825,37 @@ function circularDeps(index, options = {}) {
             const key = rotated.join('\0');
             if (!seen.has(key)) {
                 seen.add(key);
-                uniqueCycles.push({ files: rotated, length: rotated.length });
+                const rotatedAbs = [...cycle.slice(minIdx), ...cycle.slice(0, minIdx)];
+                const edges = [];
+                for (let edgeIndex = 0; edgeIndex < rotatedAbs.length; edgeIndex++) {
+                    const from = rotatedAbs[edgeIndex];
+                    const to = rotatedAbs[(edgeIndex + 1) % rotatedAbs.length];
+                    const details = importEdgeDetails(from, to);
+                    const deferred = details.length > 0 && details.every(detail => detail.deferred);
+                    edges.push({
+                        from: rotated[edgeIndex],
+                        to: rotated[(edgeIndex + 1) % rotated.length],
+                        deferred,
+                        ...(details.length > 0 && {
+                            lines: [...new Set(details.map(detail => detail.line)
+                                .filter(line => line != null))].sort((a, b) => a - b),
+                        }),
+                    });
+                }
+                const deferredEdges = edges.filter(edge => edge.deferred)
+                    .map(edge => ({
+                        from: edge.from,
+                        to: edge.to,
+                        line: edge.lines?.[0] ?? null,
+                        ...(edge.lines?.length > 1 && { lines: edge.lines }),
+                    }));
+                uniqueCycles.push({
+                    files: rotated,
+                    length: rotated.length,
+                    classification: deferredEdges.length > 0 ? 'deferred' : 'eager',
+                    edges,
+                    deferredEdges,
+                });
             }
         }
 
@@ -810,6 +873,8 @@ function circularDeps(index, options = {}) {
             if (targets && targets.size > 0) filesWithImports++;
         }
 
+        const eagerCycles = result.filter(cycle => cycle.classification !== 'deferred').length;
+        const deferredCycles = result.length - eagerCycles;
         return {
             cycles: result,
             totalFiles: index.files.size,
@@ -818,6 +883,8 @@ function circularDeps(index, options = {}) {
             summary: {
                 totalCycles: result.length,
                 filesInCycles: new Set(result.flatMap(c => c.files)).size,
+                eagerCycles,
+                deferredCycles,
             }
         };
     } finally {

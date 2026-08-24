@@ -56,6 +56,144 @@ describe('Regression: Python class methods in context', () => {
     });
 });
 
+describe('Accessor, reflection, dependency, and refactor safety regressions', () => {
+    it('reports property reads and writes as impact dependencies', () => {
+        const dir = tmp({
+            'model.py': `class HttpClient:
+    @property
+    def last_probe_status(self):
+        return getattr(self._local, "last_probe_status", None)
+
+    @last_probe_status.setter
+    def last_probe_status(self, value):
+        if value != self.last_probe_status:
+            self._local.last_probe_status = value
+
+    def reset(self):
+        self.last_probe_status = None
+`,
+            'consumer.py': `from model import HttpClient
+
+class Fetcher:
+    def __init__(self):
+        self._http = HttpClient()
+
+    def current_error(self):
+        return self._http.last_probe_status, self._http.last_probe_status
+`,
+        });
+        try {
+            const index = idx(dir);
+            const result = index.impact('last_probe_status', {
+                file: 'model.py',
+                line: 3,
+            });
+            assert.ok(result.propertyAccesses, 'accessor impact must expose property accesses');
+            assert.equal(result.propertyAccesses.confirmedCount, 4,
+                'self accesses and both typed instance-field reads are proven dependencies');
+            assert.ok(result.propertyAccesses.byFile.some(group =>
+                group.file === 'consumer.py' && group.sites.some(site => site.line === 8)));
+            assert.match(require('../core/output').formatImpact(result),
+                /PROPERTY ACCESS SITES: 4 confirmed/);
+            const plan = index.plan('last_probe_status', {
+                file: 'model.py',
+                line: 3,
+                renameTo: 'error_kind',
+            });
+            const consumerEdit = plan.changes.find(change =>
+                change.file === 'consumer.py' && change.line === 8);
+            assert.equal((consumerEdit.newExpression.match(/error_kind/g) || []).length, 2,
+                'two proven accesses on one line must both be edited');
+            assert.doesNotMatch(consumerEdit.newExpression, /last_probe_status/);
+            assert.ok(plan.changes.some(change =>
+                change.file === 'model.py' && change.expression.includes('value != self.last_probe_status') &&
+                change.newExpression.includes('value != self.error_kind')),
+            'a recursive accessor use in the getter/setter body is still a real dependency');
+        } finally { rm(dir); }
+    });
+
+    it('treats literal getattr targets as positive dead-code liveness evidence', () => {
+        const dir = tmp({
+            'app.py': `class Handler:
+    def _only_via_getattr(self):
+        return 1
+
+def dispatch(handler):
+    return getattr(handler, "_only_via_getattr")()
+
+def dispatch_dynamic(handler, member_name):
+    return getattr(handler, member_name)()
+`,
+        });
+        try {
+            const index = idx(dir);
+            const result = index.deadcode({ includeExported: true });
+            assert.ok(!result.some(candidate => candidate.name === '_only_via_getattr'),
+                'a literal reflection target must never be proposed for deletion');
+            assert.equal(result.reflection.literalCount, 1);
+            assert.equal(result.reflection.dynamicCount, 1);
+            assert.deepEqual(result.reflection.names, ['_only_via_getattr']);
+            assert.match(require('../core/output').formatDeadcode(result),
+                /WARNING: 1 dynamic reflection use/);
+        } finally { rm(dir); }
+    });
+
+    it('separates function-local deferred cycles from eager import-time cycles', () => {
+        const dir = tmp({
+            'a.py': 'from b import load_b\n\ndef load_a():\n    return 1\n',
+            'b.py': 'def load_b():\n    from a import load_a\n    return load_a()\n',
+            'c.py': 'from d import load_d\n\ndef load_c():\n    return load_d()\n',
+            'd.py': 'from c import load_c\n\ndef load_d():\n    return load_c()\n',
+        });
+        try {
+            const index = idx(dir);
+            const result = index.circularDeps();
+            assert.equal(result.summary.totalCycles, 2);
+            assert.equal(result.summary.deferredCycles, 1);
+            assert.equal(result.summary.eagerCycles, 1);
+            const deferred = result.cycles.find(cycle => cycle.classification === 'deferred');
+            assert.ok(deferred);
+            assert.equal(deferred.deferredEdges.length, 1);
+            assert.equal(deferred.deferredEdges[0].line, 2);
+            const imports = index.imports('b.py');
+            assert.ok(imports.some(item => item.module === 'a' && item.deferred),
+                'file dependency details expose the function-local edge too');
+            const text = require('../core/output').formatCircularDeps(result);
+            assert.match(text, /IMPORT-TIME CYCLES \(1\)/);
+            assert.match(text, /DEFERRED CYCLES \(1\)/);
+        } finally { rm(dir); }
+    });
+
+    it('surfaces source strings and comments as rename-plan review work', () => {
+        const dir = tmp({
+            'scope.py': `def is_within_window(value):
+    return bool(value)
+
+TEXT_GUARDS = [("scope.py", "and is_within_window(", 2)]
+
+def use_it(value):
+    return is_within_window(value)
+`,
+        });
+        try {
+            const index = idx(dir);
+            const result = index.plan('is_within_window', {
+                renameTo: 'is_within_window_v2',
+            });
+            const review = result.reviewItems.find(change =>
+                change.editKind === 'text-reference' && change.line === 4);
+            assert.ok(review, 'the literal guard must be present in the plan');
+            assert.equal(review.needsReview, true);
+            assert.ok(result.changeSummary.reviewRequired >= 1);
+            assert.ok(result.changeSummary.textReferences >= 1);
+            assert.ok(result.outsideIndexedSource, 'plan must disclose its source-file boundary');
+            const json = JSON.parse(require('../core/output').formatPlanJson(result));
+            assert.equal(json.meta.complete, false,
+                'manual review work means the plan is not complete');
+        } finally { rm(dir); }
+    });
+});
+
 describe('v5 ownership evidence: structural module exports', () => {
     it('confirms an exact module-qualified re-export instead of leaving it unverified', () => {
         const dir = tmp({

@@ -21,7 +21,7 @@ function formatImports(imports, filePath) {
     if (internal.length > 0) {
         lines.push('INTERNAL:');
         for (const imp of internal) {
-            lines.push(`  ${imp.module}`);
+            lines.push(`  ${imp.module}${imp.deferred ? ' [function-local/deferred]' : ''}`);
             if (imp.resolved) {
                 lines.push(`    -> ${imp.resolved}${imp.indexed === false
                     ? ' (not indexed; absent from dependency graph)'
@@ -37,7 +37,7 @@ function formatImports(imports, filePath) {
         if (internal.length > 0) lines.push('');
         lines.push('EXTERNAL:');
         for (const imp of external) {
-            lines.push(`  ${imp.module}`);
+            lines.push(`  ${imp.module}${imp.deferred ? ' [function-local/deferred]' : ''}`);
             if (imp.names && imp.names.length > 0) {
                 lines.push(`    ${imp.names.join(', ')}`);
             }
@@ -48,7 +48,7 @@ function formatImports(imports, filePath) {
         if (internal.length > 0 || external.length > 0) lines.push('');
         lines.push('DYNAMIC (unresolved):');
         for (const imp of dynamic) {
-            lines.push(`  ${imp.module || '(variable)'}`);
+            lines.push(`  ${imp.module || '(variable)'}${imp.deferred ? ' [function-local/deferred]' : ''}`);
             if (imp.names && imp.names.length > 0) {
                 lines.push(`    ${imp.names.join(', ')}`);
             }
@@ -77,6 +77,7 @@ function formatImportsJson(imports, filePath) {
             resolved: i.resolved || null,
             indexed: i.resolved ? i.indexed !== false : false,
             isDynamic: !!i.isDynamic,
+            deferred: !!i.deferred,
             line: i.line ?? null
         }))
     }, null, 2);
@@ -426,16 +427,35 @@ function formatCircularDeps(result) {
         return lines.join('\n');
     }
 
-    for (let i = 0; i < result.cycles.length; i++) {
-        const cycle = result.cycles[i];
+    const eager = result.cycles.filter(cycle => cycle.classification !== 'deferred');
+    const deferred = result.cycles.filter(cycle => cycle.classification === 'deferred');
+    let cycleNumber = 0;
+    const renderGroup = (title, group, deferredGroup = false) => {
+        if (group.length === 0) return;
         lines.push('');
-        lines.push(`Cycle ${i + 1} (${cycle.length} files):`);
-        lines.push(`  ${cycle.files.join(' → ')} → ${cycle.files[0]}`);
-    }
+        lines.push(`${title} (${group.length}):`);
+        for (const cycle of group) {
+            cycleNumber++;
+            lines.push('');
+            lines.push(`Cycle ${cycleNumber} (${cycle.length} files):`);
+            lines.push(`  ${cycle.files.join(' → ')} → ${cycle.files[0]}`);
+            if (deferredGroup) {
+                for (const edge of cycle.deferredEdges || []) {
+                    const at = edge.line != null ? `:${edge.line}` : '';
+                    lines.push(`  deferred edge: ${edge.from}${at} → ${edge.to} (function-local import)`);
+                }
+            }
+        }
+    };
+    renderGroup('IMPORT-TIME CYCLES', eager);
+    renderGroup('DEFERRED CYCLES', deferred, true);
 
     lines.push('');
     const { totalCycles, filesInCycles } = result.summary;
     lines.push(`Summary: ${totalCycles} circular dependency chain${totalCycles !== 1 ? 's' : ''} involving ${filesInCycles} file${filesInCycles !== 1 ? 's' : ''} (${scannedCount} files with imports scanned).`);
+    if (deferred.length > 0) {
+        lines.push(`${deferred.length} chain${deferred.length === 1 ? '' : 's'} contain a function-local import; they are not unconditional import-time cycles, but may still matter if invoked during initialization.`);
+    }
 
     return lines.join('\n');
 }
