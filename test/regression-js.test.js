@@ -8046,28 +8046,47 @@ describe('fix #236 (JS): callee-side type-qualified and single-owner confirmatio
         } finally { rm(dir); }
     });
 
-    it('confirms k.run() via the single project-wide owner rule', () => {
+    it('keeps an untyped factory result visible instead of borrowing a single owner', () => {
         const dir = tmp(FILES);
         try {
             const index = idx(dir);
             const def = index.symbols.get('main')[0];
             const acct = index.findCallees(def, { collectAccount: true, includeMethods: true });
-            assert.ok(acct.some(c => c.name === 'run' && c.className === 'Kit' && c.tier === 'confirmed'),
-                `k.run() must confirm via single owner: ${JSON.stringify(acct.map(c => c.name))}`);
-            assert.strictEqual((acct.unverifiedCallees || []).length, 0,
-                `no unverified leftovers: ${JSON.stringify(acct.unverifiedCallees)}`);
+            assert.ok(!acct.some(c => c.name === 'run'),
+                `an unannotated factory cannot prove k's runtime type: ${JSON.stringify(acct)}`);
+            assert.deepEqual((acct.unverifiedCallees || []).map(c => [c.name, c.reason]),
+                [['run', 'possible-dispatch']]);
         } finally { rm(dir); }
     });
 
-    it('trace expands through the statically-resolvable calls', () => {
+    it('trace does not silently promote an untyped factory result', () => {
         const dir = tmp(FILES);
         try {
             const index = idx(dir);
             const r = execute(index, 'trace', { name: 'main' });
             assert.ok(r.ok, `trace failed: ${r.error}`);
             const children = (r.result.tree?.children || []).map(c => c.name);
-            assert.ok(children.includes('make') && children.includes('run'),
-                `trace main must expand make and run: ${JSON.stringify(children)}`);
+            assert.deepEqual(children, ['make']);
+        } finally { rm(dir); }
+    });
+
+    it('confirms and traces a constructor-proven receiver', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': 'class Kit {\n  run() { return 1; }\n}\nmodule.exports = { Kit };',
+            'app.js': 'const { Kit } = require("./lib");\nfunction main() {\n  const k = new Kit();\n  return k.run();\n}\nmodule.exports = { main };',
+        });
+        try {
+            const index = idx(dir);
+            const def = index.symbols.get('main')[0];
+            const acct = index.findCallees(def, { collectAccount: true, includeMethods: true });
+            assert.ok(acct.some(c => c.name === 'run' && c.className === 'Kit' &&
+                c.tier === 'confirmed'), `constructor identity must confirm: ${JSON.stringify(acct)}`);
+            assert.equal((acct.unverifiedCallees || []).length, 0);
+
+            const r = execute(index, 'trace', { name: 'main' });
+            assert.ok(r.ok, `trace failed: ${r.error}`);
+            assert.deepEqual((r.result.tree?.children || []).map(c => c.name), ['Kit', 'run']);
         } finally { rm(dir); }
     });
 

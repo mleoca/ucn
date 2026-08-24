@@ -638,7 +638,9 @@ function clearAllCaches() {
 // inferred from an uppercase name that is value-bound in the lexical scope
 // (fix #304).  Reject v183 calls shards so stale false receiver evidence
 // cannot survive an engine upgrade.
-const CACHE_FORMAT_VERSION = 184;
+// v185: C# deep member receivers retain their root+field path instead of a
+// false terminal receiverType copied from the root variable (fix #305).
+const CACHE_FORMAT_VERSION = 185;
 
 /**
  * Save index to cache file

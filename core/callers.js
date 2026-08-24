@@ -2506,15 +2506,27 @@ function findCallers(index, name, options = {}) {
                                 }
                                 const inherited = _isAncestorOfTargetClass(
                                     index, d.className, [boundDef]);
+                                const derivedApplicableSibling = definitions.some(candidate =>
+                                    candidate !== boundDef &&
+                                    !NON_CALLABLE_TYPES.has(candidate.type) &&
+                                    candidate.className === boundDef.className &&
+                                    candidate.file === boundDef.file &&
+                                    _overloadApplicable(index, call, candidate));
                                 // A derived same-name method hides inherited
                                 // overloads until it proves inapplicable.
                                 // Receiver-blind bindings may therefore be
                                 // overruled only when static argument evidence
                                 // accepts this inherited target and rejects the
-                                // derived declaration.
+                                // ENTIRE derived overload family. Looking only
+                                // at the first bound declaration let an
+                                // inapplicable one-arg sibling expose a hidden
+                                // base method even when another derived sibling
+                                // accepted the call (Newtonsoft's new static
+                                // JArray/JObject/JProperty.Load families).
                                 return inherited &&
                                     _overloadApplicable(index, call, d) &&
-                                    !_overloadApplicable(index, call, boundDef);
+                                    !_overloadApplicable(index, call, boundDef) &&
+                                    !derivedApplicableSibling;
                             })) ||
                             (fileEntry.language === 'cpp' &&
                              !boundDef.className && !boundDef.receiver &&

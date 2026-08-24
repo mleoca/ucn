@@ -1445,6 +1445,85 @@ describe('C# language support', () => {
             ['_items']);
     });
 
+    it('types a local property receiver from the property, not its root object', () => {
+        const dir = tmp({
+            'Fixture.cs': [
+                'namespace Demo;',
+                'abstract class Token { internal abstract bool Same(Token other); }',
+                'class Property : Token {',
+                '  public Token Value { get; set; }',
+                '  internal override bool Same(Token other) => true;',
+                '}',
+                'class Compare {',
+                '  bool Run(Property left, Property right) {',
+                '    return left.Value.Same(right.Value);',
+                '  }',
+                '}',
+            ].join('\n'),
+            'Fixture.csproj': '<Project Sdk="Microsoft.NET.Sdk"></Project>',
+        });
+        try {
+            const index = idx(dir);
+            const target = index.context('Same', {
+                className: 'Property', file: 'Fixture.cs', line: 5,
+            });
+            assert.equal(target.callers.length, 0,
+                `a Token-typed property cannot exactly select the override: ${JSON.stringify(target.callers)}`);
+            assert.deepEqual(target.unverifiedCallers.map(call => [
+                call.line, call.reason, call.dispatchVia,
+            ]), [[9, 'possible-dispatch', 'Token']]);
+            assert.equal(target.meta.account.conserved, true);
+
+            const calls = getLanguageAdapter('csharp').findCalls(
+                fs.readFileSync(path.join(dir, 'Fixture.cs'), 'utf8'),
+                getParser('csharp'));
+            const same = calls.find(call => call.line === 9 && call.name === 'Same');
+            assert.equal(same.receiverType, undefined);
+            assert.equal(same.receiverRoot, 'left');
+            assert.deepEqual(same.receiverFields, ['Value']);
+            assert.equal(same.receiverRootType, 'Property');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('does not expose a hidden base overload through an inapplicable sibling', () => {
+        const dir = tmp({
+            'Fixture.cs': [
+                'namespace Demo;',
+                'class Reader {}',
+                'class Settings {}',
+                'class Token {',
+                '  public static Token Load(Reader reader, Settings? settings) => new Token();',
+                '}',
+                'class ArrayToken : Token {',
+                '  public new static ArrayToken Load(Reader reader) => Load(reader, null);',
+                '  public new static ArrayToken Load(Reader reader, Settings? settings) => new ArrayToken();',
+                '  public static ArrayToken Parse(Reader reader, Settings? settings) => Load(reader, settings);',
+                '}',
+            ].join('\n'),
+            'Fixture.csproj': '<Project Sdk="Microsoft.NET.Sdk"></Project>',
+        });
+        try {
+            const index = idx(dir);
+            const base = index.context('Load', {
+                className: 'Token', file: 'Fixture.cs', line: 5,
+            });
+            assert.equal(base.callers.length, 0,
+                `derived overloads own both calls: ${JSON.stringify(base.callers)}`);
+            assert.equal(base.meta.account.excluded.byReason['other-definition'].count, 2);
+            assert.equal(base.meta.account.conserved, true);
+
+            const derived = index.context('Load', {
+                className: 'ArrayToken', file: 'Fixture.cs', line: 9,
+            });
+            assert.deepEqual(derived.callers.map(call => call.line), [8, 10]);
+            assert.equal(derived.meta.account.conserved, true);
+        } finally {
+            rm(dir);
+        }
+    });
+
     it('uses C# platform field ownership and enclosing-class lookup as exclusions', () => {
         const dir = tmp({
             'Fixture.cs': [

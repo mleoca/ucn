@@ -1155,10 +1155,21 @@ function findCallsInCode(code, parser) {
                 : functionNode?.type === 'conditional_access_expression'
                     ? functionNode.childForFieldName('condition') || functionNode.namedChild(0)
                     : null;
-            const receiverTypeInfo = receiverTypeFromNode(receiverNode, variableTypes) ||
-                normalizeReceiverType(receiverRoot && variableTypes.get(receiverRoot));
-            const receiverType = receiverTypeInfo?.name;
             const unwrappedReceiverNode = unwrapReceiverNode(receiverNode);
+            // A root variable's type is the receiver type only for a direct
+            // `value.Method()` call. For `value.Property.Method()` the static
+            // receiver type is the property's declared type, not `value`'s
+            // type. Preserve that shape as a field path for query-time
+            // declaration walking; collapsing it to the root class falsely
+            // confirms sibling overrides (Newtonsoft JProperty.Value is a
+            // JToken, not a JProperty).
+            const receiverTypeInfo = receiverTypeFromNode(
+                receiverNode, variableTypes) ||
+                (unwrappedReceiverNode?.type === 'identifier'
+                    ? normalizeReceiverType(
+                        receiverRoot && variableTypes.get(receiverRoot))
+                    : null);
+            const receiverType = receiverTypeInfo?.name;
             const receiverCastThis = receiverCastIsThis(receiverNode);
             const receiverIsTypeQualified = !!(identity.isMethod &&
                 unwrappedReceiverNode?.type === 'identifier' &&
