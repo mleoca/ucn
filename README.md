@@ -202,7 +202,7 @@ ACCOUNT, CONTRACT, and WARNING lines survive the cut.
 Don't take the tiers on faith. Release gates re-derive UCN's answers from real
 compilers and language servers on a ten-repository board of pinned production
 codebases, and publishing is blocked unless they pass. The latest full
-release-board run (2026-08-11):
+release-board run (2026-08-24):
 
 | Repository | Pinned commit | Oracle | Caller precision | Caller recall | Callee prec / recall | Command checks |
 |---|---|---|---:|---:|---:|---:|
@@ -213,16 +213,16 @@ release-board run (2026-08-11):
 | [ripgrep](https://github.com/BurntSushi/ripgrep) | [`82313cf9`](https://github.com/BurntSushi/ripgrep/commit/82313cf95849bfe425109ad9506a52154879b1b1) | rust-analyzer | 100% | 100% | 100% / 100% | 100% |
 | [clap](https://github.com/clap-rs/clap) | [`d3e59a9a`](https://github.com/clap-rs/clap/commit/d3e59a9ab214910b9dad02921b7ef42c6400de9b) | rust-analyzer | 100% | 100% | 100% / 100% | 100% |
 | [javapoet](https://github.com/square/javapoet) | [`b9017a95`](https://github.com/square/javapoet/commit/b9017a9503b76e11b4ad4c1a9f050e2d29112cb0) | JDT LS | 100% | 100% | 100% / 100% | 100% |
-| [newtonsoft-json](https://github.com/JamesNK/Newtonsoft.Json) | [`4f73e743`](https://github.com/JamesNK/Newtonsoft.Json/commit/4f73e74372445108d2c1bda37b36e6f5e43402e0) | Roslyn | 99.4% | 100% | 100% / 100% | 100% |
+| [newtonsoft-json](https://github.com/JamesNK/Newtonsoft.Json) | [`4f73e743`](https://github.com/JamesNK/Newtonsoft.Json/commit/4f73e74372445108d2c1bda37b36e6f5e43402e0) | Roslyn | 100% | 100% | 100% / 100% | 100% |
 | [cjson](https://github.com/DaveGamble/cJSON) | [`c859b25d`](https://github.com/DaveGamble/cJSON/commit/c859b25da02955fef659d658b8f324b5cde87be3) | clangd | 100% | 100% | 100% / 100% | 100% |
-| [fmt](https://github.com/fmtlib/fmt) | [`e424e3f2`](https://github.com/fmtlib/fmt/commit/e424e3f2e607da02742f73db84873b8084fc714c) | clangd | 99.6% | 100% | 100% / 100% | 100% |
+| [fmt](https://github.com/fmtlib/fmt) | [`e424e3f2`](https://github.com/fmtlib/fmt/commit/e424e3f2e607da02742f73db84873b8084fc714c) | clangd | 100% | 100% | 100% / 100% | 100% |
 
 On the same run: **zero** in-scope oracle call edges missing from the answer
 (the release gate) on every repository, **zero** false-dead `deadcode` claims
 in the oracle-visible sample, **8,000 / 8,000** cross-command consistency
 comparisons in agreement, **10 / 10** repositories inside the performance
-budget (slowest median cold build 15.4K lines/second by wall time, worst query
-p95 73.8 ms, highest peak RSS 771 MB), and 3,383 automated tests with no
+budget (slowest normalized median cold build 17.4K lines/second by wall time,
+worst query p95 83.0 ms, highest peak RSS 908.5 MB), and 3,609 automated tests with no
 failures or skips. The same gates run in CI (the scheduled
 [Eval workflow](https://github.com/mleoca/ucn/actions/workflows/eval.yml) and
 every release tag), and `npm run trust:gate` reproduces the release board
@@ -302,8 +302,17 @@ cli/index.js (2 changes)
 ... (more changes in core/discovery.js, core/cache.js, core/project.js, test/integration.test.js)
 ```
 
-Anything `plan` can't represent safely is marked `needsReview` instead of
-being silently rewritten. Before committing, point the same machinery at your
+For a rename, `plan` closes the change over every relationship the index can
+prove: overload/signature groups, base and override declarations, Rust trait
+slots, Go interface slots and their satisfiers, exact call and value-reference
+tokens, imports/exports, Python `__all__` strings, and module-attribute
+references. It edits exact token or expression spans, so another same-named
+call on the same line is not swept up accidentally.
+
+Open external interfaces, incomplete ownership, unresolved dispatch, or an
+inexact token are marked `needsReview` instead of receiving a synthesized
+edit. `plan` previews changes; it does not modify files or replace the
+compiler and test suite. Before committing, point the same machinery at your
 Git diff:
 
 ```bash
@@ -521,10 +530,13 @@ evidence.
 - **C** - functions, structs, macros, includes, calls, entry points, API
   analysis.
 - **C++** - C coverage plus classes, methods, constructors, inheritance,
-  namespaces, overloads, templates, typed field receivers.
+  namespaces, overloads, templates, typed field receivers, static array-shape
+  selection, and macro requalification. Conditional macro disagreement stays
+  visible as unverified.
 - **C#** - namespaces, classes/interfaces/records, fields/properties,
-  attributes, overload-aware calls, async flow, top-level programs, .NET stack
-  frames, ASP.NET/HttpClient endpoints.
+  attributes, declared property/field receiver types, overload and hiding
+  discipline, async flow, top-level programs, .NET stack frames, and
+  ASP.NET/HttpClient endpoints.
 - **HTML** - inline JavaScript and `on*` event handlers.
 
 For C and C++, a `compile_commands.json` improves header-language,

@@ -41,7 +41,7 @@ three. The text block is the whole response on every surface.
 
 Persistent indexes live in a per-user, project-keyed cache rather than the analyzed repository. Set `UCN_CACHE_DIR` to override the cache root; CLI `--no-cache` bypasses persistence and `--clear-cache` removes the current project's cache. Legacy `<project>/.ucn-cache` directories are migrated on first use.
 
-Supported source families are JavaScript/TypeScript/TSX, Python, Go, Rust, Java, C, C++, C#, and HTML inline JavaScript/event handlers. C/C++ uses `compile_commands.json` when available to classify headers and resolve include paths. Recoverable preprocessor branches contribute AST-proven source facts, so a single selected configuration does not silently erase definitions or calls; UCN still cannot prove which branch a particular build activates. This is portable AST analysis, not a compiler build; macros, templates, generated code, reflection, and external dependency semantics can remain unverified.
+Supported source families are JavaScript/TypeScript/TSX, Python, Go, Rust, Java, C, C++, C#, and HTML inline JavaScript/event handlers. C/C++ uses `compile_commands.json` when available to classify headers and resolve include paths. Recoverable preprocessor branches contribute AST-proven source facts, so a single selected configuration does not silently erase definitions or calls; disagreeing conditional macro identities stay visible as unverified. C++ resolution uses namespace ownership, static overload shape (including arrays), and macro-parameter requalification. C# resolution uses declared property/field receiver types plus overload and hiding discipline. This is portable AST analysis, not a compiler build; macros, templates, generated code, reflection, and external dependency semantics can remain unverified.
 
 `repo` readiness is task-specific. Its headline is navigation readiness;
 refactor, deletion, semantic recall, and the sampled evidence mix are separate
@@ -114,9 +114,16 @@ rejected, and unsupported advanced syntax should be handed to ripgrep.
 call candidates. Calls proved to belong to another same-name target are
 disclosed separately and excluded from the activity total.
 
-`plan` always includes the selected declaration plus indexed call/import/export
-previews. Read `changeSummary`, and manually review any edit marked
-`needsReview`; the command previews changes but does not apply or compile them.
+For `plan --rename-to`, the selected declaration is only the starting point.
+When the index proves the relationship, the rename unit closes over
+overload/signature groups, base and override declarations, Rust trait slots,
+Go interface slots and their satisfiers, exact call and value-reference tokens,
+imports/exports, Python `__all__` strings, and module-attribute references.
+Exact token/expression spans keep a foreign same-named occurrence on the same
+line unchanged. Open external interfaces, incomplete ownership, unresolved
+dispatch, or an inexact token route to `needsReview` instead of a synthesized
+edit. Read `changeSummary` and every review item. `plan` previews only: it does
+not modify files, run a compiler, or prove runtime compatibility.
 
 ## Efficient use
 

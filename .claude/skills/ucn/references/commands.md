@@ -25,7 +25,7 @@ structural or code-only search.
 | `impact [handle]` | Show direct symbol impact when given a handle; without one, analyze the Git diff. |
 | `tests <handle\|file>` | Find statically linked direct tests. Set `--depth=N` for transitive affected tests. Empty results are not runtime coverage proof. |
 | `check [handle]` | Validate confirmed call-site arity for a symbol; without one, run the composed pre-commit diagnostic. |
-| `plan <handle>` | Preview `--rename-to`, `--add-param`, or `--remove-param` edits, including the selected declaration and indexed call/import/export sites. Review `changeSummary` and `needsReview`. |
+| `plan <handle>` | Preview `--rename-to`, `--add-param`, or `--remove-param` edits. For renames, the proven closure can include overload/signature groups, inheritance/trait/Go-interface slots, exact call/reference tokens, imports/exports, Python `__all__` strings, and module-attribute references. Open ownership or method sets stay `needsReview`; the command never applies or compiles edits. |
 
 ## Repository and architecture
 
@@ -84,4 +84,4 @@ Omit the target for the current project. A target may be a file, directory, or q
 
 ## Language notes
 
-Supported source families are JavaScript/TypeScript/TSX, Python, Go, Rust, Java, C, C++, C#, and HTML inline JavaScript/event handlers. C/C++ consumes `compile_commands.json` when present for header-language and include-path context, and retains AST-proven facts across recoverable preprocessor branches. UCN remains portable AST analysis: it does not run a compiler, preprocessor, Roslyn, or an LSP during normal queries, and it does not assert which conditional branch a build activates.
+Supported source families are JavaScript/TypeScript/TSX, Python, Go, Rust, Java, C, C++, C#, and HTML inline JavaScript/event handlers. C/C++ consumes `compile_commands.json` when present for header-language and include-path context, and retains AST-proven facts across recoverable preprocessor branches. C++ call identity uses namespace ownership, static overload shape (including arrays), and macro requalification; disagreeing conditional macro definitions remain visible as unverified. C# uses declared property/field receiver types and overload/hiding discipline. UCN remains portable AST analysis: it does not run a compiler, preprocessor, Roslyn, or an LSP during normal queries, and it does not assert which conditional branch a build activates.
