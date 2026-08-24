@@ -634,7 +634,11 @@ function clearAllCaches() {
 // multi-return assignment targets, and lexical-closure result hints for exact
 // chain/tuple flow; Rust macro-token calls retain compiler-declared closure
 // parameter receiver types, and Rust functions retain generic trait bounds.
-const CACHE_FORMAT_VERSION = 183;
+// v184: Python constructor-result records no longer retain a receiverType
+// inferred from an uppercase name that is value-bound in the lexical scope
+// (fix #304).  Reject v183 calls shards so stale false receiver evidence
+// cannot survive an engine upgrade.
+const CACHE_FORMAT_VERSION = 184;
 
 /**
  * Save index to cache file

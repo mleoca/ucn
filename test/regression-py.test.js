@@ -3662,7 +3662,7 @@ describe('deadcode: out-of-tree base-class overrides are not dead (fix: #210 ana
 });
 
 describe('fix #236 (Python): callee-side class-qualified and single-owner receivers', () => {
-    it('ClassName.method() through an import binding confirms; instance single-owner confirms', () => {
+    it('confirms class-qualified calls but keeps an untyped result visible', () => {
         const dir = tmp({
             'requirements.txt': '',
             'engine.py': 'class Engine:\n    @classmethod\n    def create(cls):\n        return cls()\n\n    def start(self):\n        return 1\n',
@@ -3674,8 +3674,11 @@ describe('fix #236 (Python): callee-side class-qualified and single-owner receiv
             const acct = index.findCallees(def, { collectAccount: true, includeMethods: true });
             assert.ok(acct.some(c => c.name === 'create' && c.className === 'Engine'),
                 `Engine.create() must confirm: ${JSON.stringify(acct.map(c => c.name))}`);
-            assert.ok(acct.some(c => c.name === 'start' && c.className === 'Engine'),
-                `e.start() must confirm via single owner: ${JSON.stringify(acct.map(c => c.name))}`);
+            assert.ok(!acct.some(c => c.name === 'start'),
+                `unknown result identity must not confirm by single-owner spelling: ${JSON.stringify(acct)}`);
+            assert.ok(acct.unverifiedCallees.some(c =>
+                c.name === 'start' && c.reason === 'possible-dispatch'),
+            `e.start() must remain visible: ${JSON.stringify(acct.unverifiedCallees)}`);
             assert.ok(acct.calleeAccount.conserved);
         } finally { rm(dir); }
     });
@@ -5580,6 +5583,130 @@ describe('fix #300: callee twin — scope-correct ancestry + typed-receiver buil
             assert.ok(!r.some(c => c.name === 'classmethod'),
                 'an UNTYPED receiver must not confirm through the builtin name');
             assert.ok(r.calleeAccount.conserved);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #304: value-shadowed Python constructor names stay unverified', () => {
+    const shadowFixture = {
+        'base.py': [
+            'class C1:',
+            '    def method(self):',
+            '        return "base"',
+        ].join('\n') + '\n',
+        'test_local.py': [
+            'from base import C1',
+            'import attrs',
+            '',
+            'def exact_local_class():',
+            '    class C2(C1):',
+            '        pass',
+            '    value = C2()',
+            '    return value.method()',
+            '',
+            'def transformed_class():',
+            '    class Simple:',
+            '        def method(self):',
+            '            return "simple"',
+            '    C2 = attrs.define()(Simple)',
+            '    value = C2()',
+            '    return value.method()',
+        ].join('\n') + '\n',
+    };
+
+    it('keeps a real local subclass exact without borrowing its name across scopes', () => {
+        const dir = tmp(shadowFixture);
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', { name: 'base.py:2:method' });
+            assert.ok(result.ok, JSON.stringify(result.error));
+            const confirmed = result.result.callers || [];
+            assert.ok(confirmed.some(c =>
+                c.relativePath === 'test_local.py' && c.line === 8),
+            `the real local subclass call must confirm: ${JSON.stringify(confirmed)}`);
+            assert.ok(!confirmed.some(c => c.line === 16),
+                `the decorator-produced class must not borrow C2 identity: ${JSON.stringify(confirmed)}`);
+            const visible = result.result.unverifiedCallers || [];
+            assert.ok(visible.some(c =>
+                c.relativePath === 'test_local.py' && c.line === 16 &&
+                c.reason === 'possible-dispatch'),
+            `the unresolved runtime class stays visible: ${JSON.stringify(visible)}`);
+            assert.strictEqual(result.result.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('applies the same unknown-provenance rule to callee resolution', () => {
+        const dir = tmp(shadowFixture);
+        try {
+            const index = idx(dir);
+            const { findCallees } = require('../core/callers');
+            const transformed = (index.symbols.get('transformed_class') || [])[0];
+            const callees = findCallees(index, transformed, { collectAccount: true });
+            assert.ok(!callees.some(c => c.name === 'method'),
+                `no exact method callee may be invented: ${JSON.stringify(callees)}`);
+            assert.ok(callees.unverifiedCallees.some(c =>
+                c.name === 'method' && c.reason === 'possible-dispatch' &&
+                c.sites.includes(16)),
+            `the method call stays visible: ${JSON.stringify(callees.unverifiedCallees)}`);
+            assert.strictEqual(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('still uses an uppercase local function declared return type', () => {
+        const dir = tmp({
+            'mod.py': [
+                'class Result:',
+                '    def finish(self):',
+                '        return 1',
+                '',
+                'def run():',
+                '    def Factory() -> Result:',
+                '        return Result()',
+                '    value = Factory()',
+                '    return value.finish()',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', { name: 'mod.py:2:finish' });
+            assert.ok(result.ok, JSON.stringify(result.error));
+            assert.ok((result.result.callers || []).some(c => c.line === 9),
+                `declared return flow remains exact: ${JSON.stringify(result.result)}`);
+            assert.strictEqual(result.result.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('does not trust a module-looking qualifier shadowed by a parameter', () => {
+        const dir = tmp({
+            'pkg.py': [
+                'class Widget:',
+                '    def render(self):',
+                '        return "project"',
+            ].join('\n') + '\n',
+            'app.py': [
+                'import pkg',
+                '',
+                'def exact():',
+                '    value = pkg.Widget()',
+                '    return value.render()',
+                '',
+                'def dynamic(pkg):',
+                '    value = pkg.Widget()',
+                '    return value.render()',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', { name: 'pkg.py:2:render' });
+            assert.ok(result.ok, JSON.stringify(result.error));
+            assert.ok((result.result.callers || []).some(c => c.line === 5),
+                `the unshadowed module constructor stays exact: ${JSON.stringify(result.result)}`);
+            assert.ok(!(result.result.callers || []).some(c => c.line === 9),
+                'a parameter-shadowed module name cannot supply type identity');
+            assert.ok((result.result.unverifiedCallers || []).some(c =>
+                c.line === 9 && c.reason === 'possible-dispatch'),
+            `the dynamic qualifier remains visible: ${JSON.stringify(result.result)}`);
+            assert.strictEqual(result.result.meta.account.conserved, true);
         } finally { rm(dir); }
     });
 });

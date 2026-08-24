@@ -5206,6 +5206,18 @@ function findCallees(index, definition, options = {}) {
             const directReceiverFlow = mayNeedDirectReceiverFlow(call)
                 ? _lookupReturnTypeFlow(flowMap(), call)
                 : undefined;
+            // Callee-side twin of the structural caller gate (#222(4)).  A
+            // local receiver whose nearest producer was examined but could
+            // not be typed (`C2 = decorator(Base); value = C2()`) has unknown
+            // runtime identity.  Never let unique project-wide spelling turn
+            // that into an exact callee; keep the site visible and conserved.
+            if (collectAccount && mayNeedDirectReceiverFlow(call) &&
+                !directReceiverFlow && _receiverAssignedUntyped(flowMap(), call)) {
+                noteUnverified(siteId, call, 'possible-dispatch', {
+                    dispatchVia: 'local receiver',
+                });
+                continue;
+            }
 
             // Declared-field receiver hop (fix #231 — callee-side parity
             // with the caller side's #202/#219): `tm.service.Save()` /

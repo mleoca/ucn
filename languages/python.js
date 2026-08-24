@@ -1351,6 +1351,137 @@ function isPythonNameShadowedAt(refNode, name) {
     return false;
 }
 
+/**
+ * Whether an uppercase call target is a local VALUE binding rather than a
+ * class declaration.
+ *
+ * Python permits runtime class factories and decorators to be rebound under
+ * class-shaped names:
+ *
+ *     C2 = attrs.define(...)(Base)
+ *     value = C2()
+ *
+ * The capitalization convention alone cannot type `value` as an indexed
+ * `class C2` from another lexical scope.  Scan the nearest Python scope using
+ * AST bindings and reject constructor-name inference when a parameter,
+ * function, assignment, loop, or with-target owns the name.  A sole local
+ * class declaration is deliberately allowed; its exact declaration is
+ * selected later with the call site's enclosing-function range.
+ */
+function isPythonConstructorValueShadowedAt(refNode, name) {
+    let scope = null;
+    for (let parent = refNode?.parent; parent; parent = parent.parent) {
+        if (PY_COMPREHENSIONS.has(parent.type)) {
+            for (let i = 0; i < parent.namedChildCount; i++) {
+                const clause = parent.namedChild(i);
+                if (clause.type === 'for_in_clause' &&
+                    pythonTargetBindsName(
+                        clause.childForFieldName('left'), name)) return true;
+            }
+        }
+        if (parent.type === 'lambda') {
+            const params = parent.childForFieldName('parameters');
+            if (params) {
+                for (let i = 0; i < params.namedChildCount; i++) {
+                    const param = params.namedChild(i);
+                    const paramName = param.type === 'identifier'
+                        ? param
+                        : (param.childForFieldName('name') || param.namedChild(0));
+                    if (paramName?.type === 'identifier' &&
+                        paramName.text === name) return true;
+                }
+            }
+            scope = parent;
+            break;
+        }
+        if (parent.type === 'function_definition' ||
+            parent.type === 'async_function_definition') {
+            const params = parent.childForFieldName('parameters');
+            if (params) {
+                for (let i = 0; i < params.namedChildCount; i++) {
+                    const param = params.namedChild(i);
+                    const paramName = param.type === 'identifier'
+                        ? param
+                        : (param.childForFieldName('name') || param.namedChild(0));
+                    if (paramName?.type === 'identifier' &&
+                        paramName.text === name) return true;
+                }
+            }
+            scope = parent.childForFieldName('body');
+            break;
+        }
+        if (parent.type === 'class_definition') {
+            scope = parent.childForFieldName('body');
+            break;
+        }
+        if (parent.type === 'module') {
+            scope = parent;
+            break;
+        }
+    }
+    if (!scope) return false;
+
+    let classDeclarations = 0;
+    const stack = [scope];
+    while (stack.length > 0) {
+        const node = stack.pop();
+        if (node !== scope && (node.type === 'function_definition' ||
+            node.type === 'async_function_definition' ||
+            node.type === 'class_definition')) {
+            const declaredName = node.childForFieldName('name')?.text;
+            if (declaredName === name) {
+                if (node.type === 'class_definition') classDeclarations++;
+                else return true;
+            }
+            // The declaration name binds in this scope; its body does not.
+            continue;
+        }
+        if (node.type === 'decorated_definition') {
+            let declaration = null;
+            for (let i = 0; i < node.namedChildCount; i++) {
+                const child = node.namedChild(i);
+                if (child.type === 'function_definition' ||
+                    child.type === 'async_function_definition' ||
+                    child.type === 'class_definition') {
+                    declaration = child;
+                    break;
+                }
+            }
+            if (declaration) {
+                const declaredName = declaration.childForFieldName('name')?.text;
+                if (declaredName === name) {
+                    if (declaration.type === 'class_definition') classDeclarations++;
+                    else return true;
+                }
+                continue;
+            }
+        }
+        if (node.type === 'assignment' ||
+            node.type === 'augmented_assignment' ||
+            node.type === 'named_expression') {
+            if (pythonTargetBindsName(
+                node.childForFieldName('left') || node.childForFieldName('name'),
+                name)) return true;
+        } else if (node.type === 'for_statement' || node.type === 'for_in_clause') {
+            if (pythonTargetBindsName(node.childForFieldName('left'), name)) return true;
+        } else if (node.type === 'with_item') {
+            const value = node.childForFieldName('value') || node.namedChild(0);
+            const target = value?.type === 'as_pattern'
+                ? value.namedChild(value.namedChildCount - 1) : null;
+            if (pythonTargetBindsName(
+                target?.type === 'as_pattern_target' ? target.namedChild(0) : target,
+                name)) return true;
+        }
+        for (let i = node.namedChildCount - 1; i >= 0; i--) {
+            stack.push(node.namedChild(i));
+        }
+    }
+    // Two conditional/repeated local class declarations with the same name
+    // are not one stable identity.  Refuse the heuristic and leave the value
+    // on the visible unverified rail.
+    return classDeclarations > 1;
+}
+
 function pythonModuleAliases(tree) {
     const aliases = new Set();
     traverseTreeCached(tree.rootNode, node => {
@@ -1513,6 +1644,22 @@ function findCallsInCode(code, parser) {
     };
 
     const isShadowedByLocal = isPythonNameShadowedAt;
+    const exactConstructorInfo = funcNode => {
+        const ctor = constructorTypeInfo(funcNode);
+        if (!ctor) return undefined;
+        if (!ctor.qualifier) {
+            return isPythonConstructorValueShadowedAt(funcNode, ctor.type)
+                ? undefined : ctor;
+        }
+        // Attribute calls are constructors only when the receiver is an
+        // unshadowed module alias. `self.Widget()` / `factory.Widget()` and a
+        // parameter shadowing `import pkg` are dynamic attribute dispatch,
+        // not type identity. Previously their qualifier was discarded and
+        // the terminal name could borrow an unrelated project class.
+        const root = ctor.qualifier.split('.')[0];
+        return moduleAliases.has(root) && !isShadowedByLocal(funcNode, root)
+            ? ctor : undefined;
+    };
 
     traverseTree(tree.rootNode, (node) => {
         // Track module-alias bindings: `import httpx` binds 'httpx' (a module),
@@ -1651,12 +1798,14 @@ function findCallsInCode(code, parser) {
                 };
                 recordWithTargets(targetId || target);
                 if (ctx?.type === 'call' && targetId?.type === 'identifier') {
-                    const ctor = constructorTypeInfo(ctx.childForFieldName('function'));
-                    if (ctor) {
-                        localVarTypes.set(targetId.text, ctor.type);
+                    const constructorNode = ctx.childForFieldName('function');
+                    const exactCtor = exactConstructorInfo(constructorNode);
+                    if (exactCtor) {
+                        localVarTypes.set(targetId.text, exactCtor.type);
                         constructedReceiverVars.add(targetId.text);
-                        if (ctor.qualifier && moduleAliases.has(ctor.qualifier.split('.')[0])) {
-                            localVarTypeQualifiers.set(targetId.text, ctor.qualifier);
+                        if (exactCtor.qualifier &&
+                            moduleAliases.has(exactCtor.qualifier.split('.')[0])) {
+                            localVarTypeQualifiers.set(targetId.text, exactCtor.qualifier);
                         } else {
                             localVarTypeQualifiers.delete(targetId.text);
                         }
@@ -1856,12 +2005,14 @@ function findCallsInCode(code, parser) {
                     nonCallableNames.add(left.text);
                     // Infer type from constructor call: x = ClassName(...) or
                     // x = pkg.ClassName(...). Python convention: classes start uppercase
-                    const ctor = constructorTypeInfo(right.childForFieldName('function'));
-                    if (ctor) {
-                        localVarTypes.set(left.text, ctor.type);
+                    const constructorNode = right.childForFieldName('function');
+                    const exactCtor = exactConstructorInfo(constructorNode);
+                    if (exactCtor) {
+                        localVarTypes.set(left.text, exactCtor.type);
                         constructedReceiverVars.add(left.text);
-                        if (ctor.qualifier && moduleAliases.has(ctor.qualifier.split('.')[0])) {
-                            localVarTypeQualifiers.set(left.text, ctor.qualifier);
+                        if (exactCtor.qualifier &&
+                            moduleAliases.has(exactCtor.qualifier.split('.')[0])) {
+                            localVarTypeQualifiers.set(left.text, exactCtor.qualifier);
                         } else {
                             localVarTypeQualifiers.delete(left.text);
                         }
