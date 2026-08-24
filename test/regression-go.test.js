@@ -6883,3 +6883,92 @@ describe('fix #300: range VALUE variables typed from the container element', () 
         } finally { rm(dir); }
     });
 });
+
+describe('fix #302: Go implicit interface-slot rename closure', () => {
+    const files = {
+        'go.mod': 'module f302\n\ngo 1.21\n',
+        'slot.go': [
+            'package f302',
+            '',
+            'type Runner interface {',
+            '\tRun(int) bool',
+            '\tStop()',
+            '}',
+            '',
+            'type A struct{}',
+            'func (A) Run(v int) bool { return v > 0 }',
+            'func (A) Stop() {}',
+            '',
+            'type B struct{}',
+            'func (B) Run(v int) bool { return v > 1 }',
+            'func (B) Stop() {}',
+            '',
+            'type Other struct{}',
+            'func (Other) Run(v int) bool { return v > 2 }',
+            '',
+            'func throughInterface(r Runner) bool { return r.Run(1) }',
+            'func direct(a A, b B, other Other) bool {',
+            '\treturn a.Run(1) || b.Run(1) || other.Run(1)',
+            '}',
+        ].join('\n') + '\n',
+    };
+
+    it('retains unnamed interface parameters as real signature slots', () => {
+        const parsed = parse(files['slot.go'], 'go');
+        const runner = parsed.classes.find(type => type.name === 'Runner');
+        const run = runner?.members.find(member => member.name === 'Run');
+        assert.deepStrictEqual(run?.paramsStructured, [
+            { name: 'int', unnamed: true },
+        ]);
+    });
+
+    it('renames the complete proven slot but not a same-signature non-satisfier', () => {
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'plan', {
+                name: 'slot.go:9:Run', renameTo: 'RunV2',
+            });
+            assert.ok(result.ok, JSON.stringify(result.error));
+            const changes = result.result.changes || [];
+            const changedLines = new Set(changes.map(change => change.line));
+            assert.ok(changedLines.has(4), 'interface declaration joins the slot');
+            assert.ok(changedLines.has(9), 'pinned implementation remains included');
+            assert.ok(changedLines.has(13), 'sibling satisfier joins the slot');
+            assert.ok(changedLines.has(19), 'interface-receiver call is a required edit');
+            assert.ok(changedLines.has(21), 'direct calls to slot members are edited');
+            assert.ok(!changedLines.has(17),
+                'same-signature type missing Stop does not satisfy Runner');
+            const direct = changes.find(change => change.line === 21);
+            assert.ok(direct?.newExpression.includes('a.RunV2(1)'));
+            assert.ok(direct?.newExpression.includes('b.RunV2(1)'));
+            assert.ok(direct?.newExpression.includes('other.Run(1)'),
+                'same-line foreign member must keep its spelling');
+        } finally { rm(dir); }
+    });
+
+    it('abstains when an embedded external interface leaves the method set open', () => {
+        const dir = tmp({
+            'go.mod': 'module f302open\n\ngo 1.21\n',
+            'open.go': [
+                'package f302open',
+                'import "io"',
+                'type Open interface { io.Reader; Run(int) bool }',
+                'type A struct{}',
+                'func (A) Run(v int) bool { return v > 0 }',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'plan', {
+                name: 'open.go:5:Run', renameTo: 'RunV2',
+            });
+            assert.ok(result.ok, JSON.stringify(result.error));
+            assert.deepStrictEqual(
+                (result.result.changes || []).filter(change => change.isDefinition)
+                    .map(change => change.line),
+                [5],
+                'external embedded methods must prevent inferred slot closure');
+        } finally { rm(dir); }
+    });
+});

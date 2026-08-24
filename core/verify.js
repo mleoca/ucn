@@ -816,7 +816,15 @@ function computePlanCallSites(index, name, def) {
         if (fc !== 0) return fc;
         return (a.line || 0) - (b.line || 0);
     });
-    return { sites, unverifiedSites: unverified.map(unverifiedSiteShape), account, groundSet };
+    return {
+        sites,
+        unverifiedSites: unverified.map(unverifiedSiteShape),
+        // Plan-only evidence used to promote calls through a compiler-proven
+        // Go interface slot. Kept out of the public JSON surface.
+        rawUnverified: unverified,
+        account,
+        groundSet,
+    };
 }
 
 /**
@@ -1657,6 +1665,346 @@ const RESERVED_WORDS_BY_LANGUAGE = {
         'while').split(' ')),
 };
 
+/** Split a Go signature list on commas outside nested type syntax. */
+function splitGoSignatureList(raw) {
+    const text = String(raw || '').trim().replace(/^\((.*)\)$/s, '$1');
+    if (!text) return [];
+    const out = [];
+    let start = 0;
+    let round = 0;
+    let square = 0;
+    let curly = 0;
+    for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        if (ch === '(') round++;
+        else if (ch === ')') round = Math.max(0, round - 1);
+        else if (ch === '[') square++;
+        else if (ch === ']') square = Math.max(0, square - 1);
+        else if (ch === '{') curly++;
+        else if (ch === '}') curly = Math.max(0, curly - 1);
+        else if (ch === ',' && round === 0 && square === 0 && curly === 0) {
+            out.push(text.slice(start, i).trim());
+            start = i + 1;
+        }
+    }
+    out.push(text.slice(start).trim());
+    return out.filter(Boolean);
+}
+
+const GO_UNNAMED_TYPE_PREFIX = /^(?:\*|\[|map\[|chan(?:<-)?\s|<-chan\s|func\s*\(|interface\s*\{|struct\s*\{|\.\.\.)/;
+
+/** Turn one raw Go parameter/result declaration into its type spelling. */
+function goDeclarationType(raw) {
+    let value = String(raw || '').trim();
+    if (!value) return null;
+    // Named slots/results: `value T`, `ctx context.Context`. Unnamed type
+    // forms starting with Go type syntax (`chan T`, `func(...)`, `*T`) keep
+    // their whole text. Structured params normally handle grouped names;
+    // this fallback exists for unnamed interface slots and result tuples.
+    if (!GO_UNNAMED_TYPE_PREFIX.test(value)) {
+        const named = value.match(/^[A-Za-z_][A-Za-z0-9_]*\s+(.+)$/s);
+        if (named) value = named[1].trim();
+    }
+    return value.replace(/\s+/g, '');
+}
+
+/** Compiler-shaped Go method fingerprint: parameter types + result types. */
+function goMethodFingerprint(def) {
+    let params;
+    if (Array.isArray(def.paramsStructured) && def.paramsStructured.length > 0) {
+        params = [];
+        for (const param of def.paramsStructured) {
+            const rawType = param.type || (param.unnamed ? param.name : null);
+            const type = goDeclarationType(rawType);
+            if (!type) return null;
+            params.push(type);
+        }
+    } else if (def.params === '' || def.params == null) {
+        params = [];
+    } else {
+        params = splitGoSignatureList(def.params).map(goDeclarationType);
+        if (params.some(type => !type)) return null;
+    }
+    const results = def.returnType
+        ? splitGoSignatureList(def.returnType).map(goDeclarationType)
+        : [];
+    if (results.some(type => !type)) return null;
+    return `${params.join(',')}->${results.join(',')}`;
+}
+
+function goTypeIdentity(name, file) {
+    const pathMod = require('path');
+    return `${pathMod.dirname(file || '')}\0${name}`;
+}
+
+function goTypeDefinition(index, name, fromFile) {
+    const pathMod = require('path');
+    const dir = pathMod.dirname(fromFile || '');
+    const kinds = new Set(['struct', 'type', 'class']);
+    const defs = (index.symbols.get(name) || []).filter(candidate =>
+        candidate.file && pathMod.dirname(candidate.file) === dir &&
+        kinds.has(candidate.type));
+    if (defs.length !== 1 || defs[0].generics) return null;
+    return defs[0];
+}
+
+function goInterfaceMembers(index, interfaceDef) {
+    const out = [];
+    for (const defs of index.symbols.values()) {
+        for (const candidate of defs) {
+            if (candidate.file === interfaceDef.file &&
+                candidate.className === interfaceDef.name &&
+                candidate.type === 'method' &&
+                candidate.startLine >= interfaceDef.startLine &&
+                candidate.startLine <= interfaceDef.endLine) out.push(candidate);
+        }
+    }
+    return out;
+}
+
+/** Authored embedded-type spellings for one Go type declaration. */
+function goEmbeddedTypes(index, typeDef) {
+    const out = [];
+    for (const definitions of index.symbols.values()) {
+        for (const candidate of definitions) {
+            if (candidate.file === typeDef.file &&
+                candidate.className === typeDef.name &&
+                candidate.type === 'field' && candidate.fieldType &&
+                candidate.startLine >= typeDef.startLine &&
+                candidate.startLine <= typeDef.endLine) {
+                out.push(String(candidate.fieldType).trim());
+            }
+        }
+    }
+    return out;
+}
+
+/**
+ * Complete method requirements for one project Go interface. A qualified or
+ * unresolved embedded interface makes the set open, so the caller abstains.
+ */
+function goInterfaceRequirements(index, interfaceDef, memo, visiting = new Set()) {
+    const key = `${interfaceDef.file}\0${interfaceDef.name}`;
+    if (memo.has(key)) return memo.get(key);
+    if (visiting.has(key) || interfaceDef.generics) return null;
+    visiting.add(key);
+    const requirements = new Map();
+    for (const member of goInterfaceMembers(index, interfaceDef)) {
+        const fingerprint = goMethodFingerprint(member);
+        if (!fingerprint) { visiting.delete(key); memo.set(key, null); return null; }
+        const previous = requirements.get(member.name);
+        if (previous && previous.fingerprint !== fingerprint) {
+            visiting.delete(key); memo.set(key, null); return null;
+        }
+        requirements.set(member.name, { fingerprint, defs: [member] });
+    }
+    for (const rawParent of goEmbeddedTypes(index, interfaceDef)) {
+        if (rawParent.includes('.')) {
+            visiting.delete(key); memo.set(key, null); return null;
+        }
+        const parent = (index.symbols.get(rawParent) || []).find(candidate =>
+            candidate.type === 'interface' &&
+            require('path').dirname(candidate.file || '') ===
+                require('path').dirname(interfaceDef.file || ''));
+        if (!parent) { visiting.delete(key); memo.set(key, null); return null; }
+        const inherited = goInterfaceRequirements(index, parent, memo, visiting);
+        if (!inherited) { visiting.delete(key); memo.set(key, null); return null; }
+        for (const [name, requirement] of inherited) {
+            const previous = requirements.get(name);
+            if (previous && previous.fingerprint !== requirement.fingerprint) {
+                visiting.delete(key); memo.set(key, null); return null;
+            }
+            if (!previous) requirements.set(name, requirement);
+        }
+    }
+    visiting.delete(key);
+    const result = requirements.size > 0 ? requirements : null;
+    memo.set(key, result);
+    return result;
+}
+
+/**
+ * Method set for a project Go named type, including promoted embedded methods.
+ * Unknown/external embeddings make the set open and force abstention.
+ */
+function goConcreteMethodSet(index, typeDef, memo, visiting = new Set()) {
+    const key = goTypeIdentity(typeDef.name, typeDef.file);
+    if (memo.has(key)) return memo.get(key);
+    if (visiting.has(key) || typeDef.generics) return null;
+    visiting.add(key);
+    const methods = new Map();
+    const directNames = new Set();
+    const dir = require('path').dirname(typeDef.file || '');
+    for (const [name, defs] of index.symbols) {
+        const owned = defs.filter(candidate =>
+            !NON_CALLABLE_TYPES.has(candidate.type) &&
+            candidate.className === typeDef.name && candidate.file &&
+            require('path').dirname(candidate.file) === dir &&
+            candidate.type !== 'method');
+        for (const method of owned) {
+            const fingerprint = goMethodFingerprint(method);
+            if (!fingerprint) { visiting.delete(key); memo.set(key, null); return null; }
+            const previous = methods.get(name);
+            if (previous && previous.fingerprint !== fingerprint) {
+                visiting.delete(key); memo.set(key, null); return null;
+            }
+            if (!previous) methods.set(name, { fingerprint, defs: [method] });
+            else previous.defs.push(method);
+            directNames.add(name);
+        }
+    }
+    for (const rawParent of goEmbeddedTypes(index, typeDef)) {
+        if (rawParent.includes('.')) {
+            visiting.delete(key); memo.set(key, null); return null;
+        }
+        const parent = goTypeDefinition(index, rawParent.replace(/^\*/, ''), typeDef.file);
+        if (!parent) { visiting.delete(key); memo.set(key, null); return null; }
+        const promoted = goConcreteMethodSet(index, parent, memo, visiting);
+        if (!promoted) { visiting.delete(key); memo.set(key, null); return null; }
+        for (const [name, method] of promoted) {
+            // A direct method shadows a promoted one. Two promoted methods of
+            // the same name are ambiguous in Go; abstain instead of coupling.
+            if (methods.has(name)) {
+                if (directNames.has(name)) continue;
+                visiting.delete(key); memo.set(key, null); return null;
+            }
+            methods.set(name, method);
+        }
+    }
+    visiting.delete(key);
+    memo.set(key, methods);
+    return methods;
+}
+
+function goMethodSetSatisfies(methods, requirements) {
+    if (!methods || !requirements) return false;
+    for (const [name, requirement] of requirements) {
+        if (methods.get(name)?.fingerprint !== requirement.fingerprint) return false;
+    }
+    return true;
+}
+
+function goMethodArityCompatible(def, argCount) {
+    if (!Number.isInteger(argCount)) return true;
+    let params;
+    if (Array.isArray(def.paramsStructured) && def.paramsStructured.length > 0) {
+        params = def.paramsStructured.map(param =>
+            param.type || (param.unnamed ? param.name : null));
+    } else if (def.params === '' || def.params == null) {
+        params = [];
+    } else {
+        params = splitGoSignatureList(def.params);
+    }
+    if (params.some(param => !param)) return true;
+    const variadic = params.length > 0 &&
+        goDeclarationType(params[params.length - 1])?.startsWith('...');
+    return variadic ? argCount >= params.length - 1 : argCount === params.length;
+}
+
+function goSlotCoversMethodAmbiguity(index, name, slot, raw) {
+    if (!slot || raw.reason !== 'method-ambiguous') return false;
+    const candidates = (index.symbols.get(name) || []).filter(definition =>
+        definition.className && !NON_CALLABLE_TYPES.has(definition.type) &&
+        goMethodArityCompatible(definition, raw.argCount));
+    return candidates.length > 0 && candidates.every(definition =>
+        slot.memberIdentity.has(`${require('path').resolve(definition.file)}\0${definition.startLine}`));
+}
+
+/**
+ * Compute the Go method/interface rename component containing the pinned
+ * member. Go satisfaction is implicit, so this is a bipartite fixed point:
+ * concrete types join interfaces whose complete method sets they satisfy,
+ * and every satisfier of a joined interface joins the same compiler slot.
+ */
+function goInterfaceRenameClosure(index, targetDef) {
+    if (!targetDef.className || goMethodFingerprint(targetDef) == null) return null;
+    const pathMod = require('path');
+    const interfaceMemo = new Map();
+    const methodMemo = new Map();
+    const interfaces = [];
+    for (const defs of index.symbols.values()) {
+        for (const candidate of defs) {
+            if (candidate.type !== 'interface') continue;
+            const requirements = goInterfaceRequirements(index, candidate, interfaceMemo);
+            const directTarget = goInterfaceMembers(index, candidate).find(member =>
+                member.name === targetDef.name &&
+                goMethodFingerprint(member) === goMethodFingerprint(targetDef));
+            if (requirements && directTarget) {
+                interfaces.push({
+                    key: `${candidate.file}\0${candidate.name}`,
+                    def: candidate,
+                    requirements,
+                    targetDefs: [directTarget],
+                });
+            }
+        }
+    }
+    if (interfaces.length === 0) return null;
+
+    const concreteByKey = new Map();
+    for (const definition of index.symbols.get(targetDef.name) || []) {
+        if (!definition.className || definition.type === 'method' ||
+            NON_CALLABLE_TYPES.has(definition.type)) continue;
+        const typeDef = goTypeDefinition(index, definition.className, definition.file);
+        if (!typeDef) continue;
+        const key = goTypeIdentity(typeDef.name, typeDef.file);
+        const node = concreteByKey.get(key) || {
+            key, def: typeDef, methods: goConcreteMethodSet(index, typeDef, methodMemo),
+            targetDefs: [],
+        };
+        node.targetDefs.push(definition);
+        concreteByKey.set(key, node);
+    }
+
+    const startInterface = interfaces.find(node =>
+        node.def.file === targetDef.file && node.def.name === targetDef.className);
+    const startConcreteKey = goTypeIdentity(targetDef.className, targetDef.file);
+    if (!startInterface && !concreteByKey.has(startConcreteKey)) return null;
+
+    const joinedInterfaces = new Set(startInterface ? [startInterface.key] : []);
+    const joinedConcrete = new Set(startInterface ? [] : [startConcreteKey]);
+    let changed = true;
+    while (changed) {
+        changed = false;
+        for (const interfaceNode of interfaces) {
+            for (const concrete of concreteByKey.values()) {
+                if (!goMethodSetSatisfies(concrete.methods, interfaceNode.requirements)) continue;
+                if (joinedInterfaces.has(interfaceNode.key) && !joinedConcrete.has(concrete.key)) {
+                    joinedConcrete.add(concrete.key); changed = true;
+                }
+                if (joinedConcrete.has(concrete.key) && !joinedInterfaces.has(interfaceNode.key)) {
+                    joinedInterfaces.add(interfaceNode.key); changed = true;
+                }
+            }
+        }
+    }
+    if (joinedInterfaces.size === 0) return null;
+
+    const memberDefs = [];
+    const interfaceNames = new Set();
+    for (const node of interfaces) {
+        if (!joinedInterfaces.has(node.key)) continue;
+        interfaceNames.add(node.def.name);
+        memberDefs.push(...node.targetDefs);
+    }
+    for (const node of concreteByKey.values()) {
+        if (joinedConcrete.has(node.key)) memberDefs.push(...node.targetDefs);
+    }
+    const seen = new Set();
+    const uniqueMembers = memberDefs.filter(member => {
+        const key = `${pathMod.resolve(member.file)}\0${member.startLine}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
+    return {
+        interfaceNames,
+        memberDefs: uniqueMembers,
+        memberIdentity: new Set(uniqueMembers.map(member =>
+            `${pathMod.resolve(member.file)}\0${member.startLine}`)),
+    };
+}
+
 function plan(index, name, options = {}) {
     index._beginOp();
     try {
@@ -1898,27 +2246,35 @@ function plan(index, name, options = {}) {
         // line appears ONCE however many call records it holds (fix #230 —
         // the non-global regex left the inner call behind and emitted a
         // duplicate entry per record).
+        // Slot closure is discovered after the pin's own caller sweep. Keep a
+        // cumulative per-line record so later member sweeps can add a second
+        // exact token on the SAME line (`a.Run() || b.Run() || other.Run()`)
+        // and update one edit instead of losing it to line-level deduplication.
+        const emittedRenameCalls = new Map();
         const emitRenameCallSites = (siteList) => {
-        const callLines = new Map();
-        for (const site of siteList) {
-            const lineKey = `${site.file}:${site.line}`;
-            const group = callLines.get(lineKey) || {
-                file: site.file,
-                absoluteFile: site.absoluteFile,
-                line: site.line,
-                expression: site.expression,
+        const touched = new Set();
+        for (const incoming of siteList) {
+            const lineKey = `${incoming.file}:${incoming.line}`;
+            const site = emittedRenameCalls.get(lineKey) || {
+                file: incoming.file,
+                absoluteFile: incoming.absoluteFile,
+                line: incoming.line,
+                expression: incoming.expression,
                 columns: [],
                 missingColumn: false,
                 callCount: 0,
-                calledAs: site.calledAs,
+                calledAs: incoming.calledAs,
+                change: null,
             };
-            if (group.calledAs !== site.calledAs) group.calledAs = null;
-            group.callCount++;
-            if (Number.isInteger(site.column)) group.columns.push(site.column);
-            else group.missingColumn = true;
-            callLines.set(lineKey, group);
+            if (site.calledAs !== incoming.calledAs) site.calledAs = null;
+            site.callCount++;
+            if (Number.isInteger(incoming.column)) site.columns.push(incoming.column);
+            else site.missingColumn = true;
+            emittedRenameCalls.set(lineKey, site);
+            touched.add(lineKey);
         }
-        for (const site of callLines.values()) {
+        for (const lineKey of touched) {
+            const site = emittedRenameCalls.get(lineKey);
             // A renamed import preserves its local alias (`old as local` /
             // `{ old: local }`). The caller engine carries the authored name
             // in calledAs; that token must remain unchanged while the import's
@@ -1950,25 +2306,39 @@ function plan(index, name, options = {}) {
                 // required but cannot safely synthesize it. Never fall back
                 // to whole-line regex replacement.
                 if (site.missingColumn) {
-                    changes.push({
+                    const manual = {
                         file: site.file,
                         line: site.line,
                         expression: edit.source,
                         suggestion: `Rename call identifier "${name}" to "${options.renameTo}" manually`,
                         needsReview: true,
                         editKind: 'call',
-                    });
+                    };
+                    if (site.change) {
+                        for (const key of Object.keys(site.change)) delete site.change[key];
+                        Object.assign(site.change, manual);
+                    } else {
+                        site.change = manual;
+                        changes.push(manual);
+                    }
                 }
                 continue;
             }
-            changes.push({
+            const concrete = {
                 file: site.file,
                 line: site.line,
                 expression: edit.source,
                 suggestion: `Rename to: ${newExpression}`,
                 newExpression,
                 editKind: 'call',
-            });
+            };
+            if (site.change) {
+                for (const key of Object.keys(site.change)) delete site.change[key];
+                Object.assign(site.change, concrete);
+            } else {
+                site.change = concrete;
+                changes.push(concrete);
+            }
         }
         };
         emitRenameCallSites(planCallSites);
@@ -2332,6 +2702,42 @@ function plan(index, name, options = {}) {
                 slotMemberDefs.push(override);
             }
 
+            // Go interface slots are implicit (fix #302, mux Match): there is
+            // no implements edge for the hierarchy walk above. Compute the
+            // compiler-shaped satisfaction component from complete project
+            // method sets, then rename every declaration in that component.
+            // Open method sets (external/qualified embeds, generics, unknown
+            // signatures) abstain in goInterfaceRenameClosure — absence is
+            // never treated as proof.
+            const goInterfaceSlot = planLang === 'go'
+                ? goInterfaceRenameClosure(index, def)
+                : null;
+            if (goInterfaceSlot) {
+                for (const member of goInterfaceSlot.memberDefs) {
+                    if (member.file === def.file && member.startLine === def.startLine) continue;
+                    const line = member.nameLine || member.startLine;
+                    const rel = member.relativePath || member.file;
+                    if (!changes.some(change =>
+                        change.file === rel && change.line === line)) {
+                        const edit = renameIdentifierTokens(index, member.file,
+                            line, name, options.renameTo,
+                            null, null, { definitionNameOnly: true });
+                        if (edit.renamed !== edit.source) {
+                            changes.push({
+                                file: rel,
+                                line,
+                                expression: edit.source,
+                                suggestion: `Update Go interface-slot definition: ${edit.renamed}`,
+                                newExpression: edit.renamed,
+                                isDefinition: true,
+                                editKind: 'definition',
+                            });
+                        }
+                    }
+                    slotMemberDefs.push(member);
+                }
+            }
+
             // Rust trait slots (fix #296, serde-as_cast-measured): trait
             // impls carry `traitName` markers, not extends edges — the climb
             // and descendant walk above cannot see them, so renaming a trait
@@ -2464,24 +2870,65 @@ function plan(index, name, options = {}) {
             // band with slot attribution. Bounded — a pathological slot
             // discloses the cut instead of sweeping forever.
             const SLOT_SWEEP_CAP = 25;
-            const seenSiteLines = new Set([
-                ...planCallSites.map(site => `${site.file}:${site.line}`),
-                ...changes.map(change => `${change.file}:${change.line}`),
-            ]);
+            const siteTokenKey = site =>
+                `${site.file}:${site.line}:${Number.isInteger(site.column) ? site.column : '*'}`;
+            const seenSiteTokens = new Set(planCallSites.map(site => siteTokenKey(site)));
             const slotMemberSites = [];
             for (const memberDef of slotMemberDefs.slice(0, SLOT_SWEEP_CAP)) {
                 const memberSweep = computePlanCallSites(index, name, memberDef);
                 for (const site of memberSweep.sites) {
-                    const key = `${site.file}:${site.line}`;
-                    if (seenSiteLines.has(key)) continue;
-                    seenSiteLines.add(key);
+                    const key = siteTokenKey(site);
+                    if (seenSiteTokens.has(key)) continue;
+                    seenSiteTokens.add(key);
                     slotMemberSites.push(site);
+                }
+                // A call through a joined Go interface receiver is bound to
+                // this exact METHOD SLOT even though runtime dispatch cannot
+                // select one concrete body. Promote it for rename purposes
+                // only; caller/context evidence stays honestly unverified.
+                for (const raw of memberSweep.rawUnverified || []) {
+                    const exactInterfaceReceiver = goInterfaceSlot &&
+                        raw.reason === 'possible-dispatch' &&
+                        goInterfaceSlot.interfaceNames.has(raw.dispatchVia);
+                    const closedAmbiguity = goSlotCoversMethodAmbiguity(
+                        index, name, goInterfaceSlot, raw);
+                    if ((!exactInterfaceReceiver && !closedAmbiguity) ||
+                        raw.externalContract) continue;
+                    const relativePath = raw.relativePath ||
+                        index.files.get(raw.file)?.relativePath || raw.file;
+                    const key = siteTokenKey({
+                        file: relativePath, line: raw.line, column: raw.column,
+                    });
+                    if (seenSiteTokens.has(key)) continue;
+                    let content = raw.content || '';
+                    if (!content && raw.file) {
+                        try { content = index._getFileLines(raw.file)[raw.line - 1] || ''; }
+                        catch { /* unreadable is already disclosed by the account */ }
+                    }
+                    const analysis = analyzeCallSite(index, {
+                        file: raw.file,
+                        relativePath,
+                        line: raw.line,
+                        content,
+                        usageType: 'call',
+                        receiver: raw.receiver,
+                    }, name, 0);
+                    seenSiteTokens.add(key);
+                    slotMemberSites.push({
+                        file: relativePath,
+                        absoluteFile: raw.file,
+                        line: raw.line,
+                        ...(Number.isInteger(raw.column) && { column: raw.column }),
+                        expression: content.trim(),
+                        args: analysis.args,
+                        argCount: analysis.argCount,
+                        ...(raw.calledAs && { calledAs: raw.calledAs }),
+                    });
                 }
                 for (const site of memberSweep.unverifiedSites) {
                     if (planUnverified.some(existing =>
                         existing.file === site.file &&
                         existing.line === site.line)) continue;
-                    if (seenSiteLines.has(`${site.file}:${site.line}`)) continue;
                     planUnverified.push({
                         ...site,
                         slotMember: memberDef.className,

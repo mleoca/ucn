@@ -242,6 +242,17 @@ function parseGoParam(param, info) {
         }
         if (names.length > 0) info.name = names[0];
         if (typeNode) info.type = typeNode.text;
+        // Interface method declarations commonly omit parameter names:
+        // `Match(*http.Request, *RouteMatch) bool`. These are still two real
+        // signature slots. Dropping them made verify/plan see zero arguments
+        // and prevented interface-dispatch call sites from joining a rename
+        // slot. Preserve the authored type as the display token while marking
+        // it unnamed so signature consumers can distinguish it from a name.
+        if (names.length === 0 && typeNode) {
+            info.name = typeNode.text;
+            info.unnamed = true;
+            delete info.type;
+        }
         // Store additional names for multi-param declarations (handled by parseStructuredParams)
         if (names.length > 1) {
             info._additionalNames = names.slice(1);

@@ -227,6 +227,11 @@ function _processClass(node, types, processedRanges, lines) {
 
                 const embeddedBases = members
                     .filter(m => m.embedded)
+                    // The inheritance graph is keyed by project type names.
+                    // Keep the historical bare name here so promoted methods
+                    // remain connected; the field symbol separately retains
+                    // the qualified authored type (`io.Reader`) for consumers
+                    // which must distinguish an open external method set.
                     .map(m => m.name);
 
                 types.push({
@@ -1489,6 +1494,7 @@ function findCallsInCode(code, parser, options = {}) {
                 calls.push({
                     name: callName,
                     line: node.startPosition.row + 1,
+                    column: funcNode.startPosition.column,
                     isMethod: false,
                     argCount,
                     ...(argSpread && { argSpread: true }),
@@ -1590,6 +1596,7 @@ function findCallsInCode(code, parser, options = {}) {
                         // set and the oracles key by the name's line; Go was
                         // the only parser still using the call node's start.
                         line: fieldNode.startPosition.row + 1,
+                        column: fieldNode.startPosition.column,
                         isMethod: !isPkgCall,
                         receiver,
                         ...(receiverType && { receiverType }),
@@ -1655,6 +1662,7 @@ function findCallsInCode(code, parser, options = {}) {
                     calls.push({
                         name: typeName,
                         line: node.startPosition.row + 1,
+                        column: (typeNode.childForFieldName?.('name') || typeNode).startPosition.column,
                         isMethod: false,
                         isConstructor: true,
                         ...(typeQualifier && { receiver: typeQualifier }),
@@ -1691,7 +1699,8 @@ function findCallsInCode(code, parser, options = {}) {
                     const enclosingFunction = getCurrentEnclosingFunction();
                     calls.push({
                         name: fieldNode.text,
-                        line: node.startPosition.row + 1,
+                        line: fieldNode.startPosition.row + 1,
+                        column: fieldNode.startPosition.column,
                         isMethod: true,
                         receiver,
                         ...(receiverType && { receiverType }),
@@ -1714,6 +1723,7 @@ function findCallsInCode(code, parser, options = {}) {
                 calls.push({
                     name,
                     line: node.startPosition.row + 1,
+                    column: node.startPosition.column,
                     isMethod: false,
                     isFunctionReference: true,
                     isPotentialCallback: true,
@@ -1759,7 +1769,8 @@ function findCallsInCode(code, parser, options = {}) {
                             const enclosingFunction = getCurrentEnclosingFunction();
                             calls.push({
                                 name: fieldNode.text,
-                                line: rhs.startPosition.row + 1,
+                                line: fieldNode.startPosition.row + 1,
+                                column: fieldNode.startPosition.column,
                                 isMethod: true,
                                 receiver,
                                 ...(receiverType && { receiverType }),
@@ -1779,6 +1790,7 @@ function findCallsInCode(code, parser, options = {}) {
                             calls.push({
                                 name,
                                 line: rhs.startPosition.row + 1,
+                                column: rhs.startPosition.column,
                                 isMethod: false,
                                 isFunctionReference: true,
                                 isPotentialCallback: true,
@@ -1824,6 +1836,7 @@ function findCallsInCode(code, parser, options = {}) {
                     name: fieldNode.text,
                     // #223 name-node convention: the field's own line.
                     line: fieldNode.startPosition.row + 1,
+                    column: fieldNode.startPosition.column,
                     isMethod: true,
                     receiver,
                     ...(receiverType && { receiverType }),
@@ -1879,6 +1892,7 @@ function findCallsInCode(code, parser, options = {}) {
                         calls.push({
                             name,
                             line: valueNode.startPosition.row + 1,
+                            column: valueNode.startPosition.column,
                             isMethod: false,
                             isFunctionReference: true,
                             isPotentialCallback: true,
@@ -1910,7 +1924,8 @@ function findCallsInCode(code, parser, options = {}) {
                         const enclosingFunction = getCurrentEnclosingFunction();
                         calls.push({
                             name: fieldNode.text,
-                            line: valueNode.startPosition.row + 1,
+                            line: fieldNode.startPosition.row + 1,
+                            column: fieldNode.startPosition.column,
                             isMethod: true,
                             receiver,
                             ...(receiverType && { receiverType }),

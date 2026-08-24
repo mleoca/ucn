@@ -628,7 +628,9 @@ function clearAllCaches() {
 // element type (declared fields/params/vars/literals — `for _, route :=
 // range r.routes` types route as Route; fix #300, mux-measured), changing
 // persisted call-record receiverTypes.
-const CACHE_FORMAT_VERSION = 178;
+// v179: Go unnamed interface parameters are retained in paramsStructured;
+// old caches report zero-arity interface methods and break rename closure.
+const CACHE_FORMAT_VERSION = 179;
 
 /**
  * Save index to cache file
