@@ -1013,8 +1013,14 @@ function loadCache(index, cachePath) {
             : (relPath) => rootPrefix + relPath.replace(/\//g, path.sep);
 
         // Loading into a previously-used ProjectIndex replaces its indexed
-        // contents, so no parsed tree from the old state may survive.
+        // contents, so no parsed tree or cross-file derived query answer from
+        // the old state may survive. Usage results are content-hash keyed and
+        // remain safe; these caches are graph/text-universe keyed instead.
         index._clearParsedTreeCache?.();
+        index._groundSetCache = new Map();
+        index._groundSetCacheLines = 0;
+        index._nameBindingReachCache = new Map();
+        index._returnTypeFlowCache = new Map();
 
         // Reconstruct files Map: relative key → absolute key, restore path and relativePath
         // Initialize symbols/bindings arrays (will be populated from top-level symbols)

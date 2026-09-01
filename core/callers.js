@@ -20,6 +20,7 @@ const CONSTRUCTABLE_BINDING_KINDS = new Set([
 const RESERVED_RECEIVER_NAMES = new Set([
     'self', 'cls', 'this', 'super', 'base', 'Self',
 ]);
+const CROSS_OPERATION_FLOW_CACHE_LIMIT = 4096;
 
 /** Set.some() helper — like Array.some() but for Sets */
 function setSome(set, predicate) {
@@ -7255,11 +7256,11 @@ function _typeNameFromReturnAnnotation(text) {
         t = m[2].trim();
     }
     // generic base: Foo[...] / Foo<...> → Foo (the value is a Foo)
-    m = t.match(/^([\w.]+)\s*[[<]/);
+    m = t.match(/^([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*[[<]/);
     if (m) t = m[1];
     // dotted → last segment; validate a bare identifier remains
     const last = t.split('.').pop();
-    return /^[A-Za-z_]\w*$/.test(last) ? last : undefined;
+    return /^[A-Za-z_$][\w$]*$/.test(last) ? last : undefined;
 }
 
 /**
@@ -7300,6 +7301,19 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
     // Map.has() so files without resolvable flow are cheap too.
     const opCache = index._opReturnTypeFlowCache;
     if (opCache?.has(filePath)) return opCache.get(filePath);
+    // Return-flow derives from symbols in OTHER files, so it must never enter
+    // the persisted calls cache. It is nevertheless immutable until the next
+    // ProjectIndex build. Retain a bounded, calls-array-identity-guarded copy
+    // across composed agent queries; build() clears it when any annotation or
+    // import graph could have changed.
+    const persistentCache = index._returnTypeFlowCache;
+    const persistent = persistentCache?.get(filePath);
+    if (persistent?.calls === calls) {
+        persistentCache.delete(filePath);
+        persistentCache.set(filePath, persistent);
+        if (opCache) opCache.set(filePath, persistent.map);
+        return persistent.map;
+    }
     const fileEntry = index.files.get(filePath);
     const language = fileEntry?.language;
     const nominal = langTraits(language)?.typeSystem === 'nominal';
@@ -8118,6 +8132,13 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
             }) });
     }
     if (opCache) opCache.set(filePath, map);
+    if (persistentCache) {
+        persistentCache.delete(filePath);
+        persistentCache.set(filePath, { calls, map });
+        if (persistentCache.size > CROSS_OPERATION_FLOW_CACHE_LIMIT) {
+            persistentCache.delete(persistentCache.keys().next().value);
+        }
+    }
     return map;
 }
 

@@ -370,8 +370,16 @@ describe('perf: cross-operation parsed-tree cache', () => {
                 index._endOp();
             }
             assert.strictEqual(index._parsedTreeCache.size, 1);
+            index._groundSetCache.set('stale-ground', { total: 1 });
+            index._groundSetCacheLines = 1;
+            index._nameBindingReachCache.set('stale-name', 'yes');
+            index._returnTypeFlowCache.set('stale-flow', { calls: [], map: null });
             assert.strictEqual(index.loadCache(), true);
             assert.strictEqual(index._parsedTreeCache.size, 0);
+            assert.strictEqual(index._groundSetCache.size, 0);
+            assert.strictEqual(index._groundSetCacheLines, 0);
+            assert.strictEqual(index._nameBindingReachCache.size, 0);
+            assert.strictEqual(index._returnTypeFlowCache.size, 0);
         } finally {
             rm(dir);
         }
@@ -379,6 +387,47 @@ describe('perf: cross-operation parsed-tree cache', () => {
 });
 
 describe('perf: cross-operation account caches', () => {
+    it('reuses return-type flow and invalidates it on rebuild', () => {
+        const dir = tmp({
+            'package.json': '{"name":"return-flow-cache","type":"module"}',
+            'factory.ts': [
+                'export class Product { run() { return 1; } }',
+                'export function make(): Product { return new Product(); }',
+            ].join('\n'),
+            'app.ts': [
+                'import { make } from "./factory.js";',
+                'const product = make();',
+                'export const value = product.run();',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const target = index.symbols.get('run')[0];
+            const options = { targetDefinitions: [target], collectAccount: true };
+
+            const first = index.findCallers('run', options);
+            const populatedSize = index._returnTypeFlowCache.size;
+            assert.ok(populatedSize > 0,
+                'the first caller query should retain derived per-file flow');
+            const cachedEntries = new Map(index._returnTypeFlowCache);
+
+            const second = index.findCallers('run', options);
+            assert.deepStrictEqual(second, first,
+                'cached return flow must preserve the caller answer');
+            assert.strictEqual(index._returnTypeFlowCache.size, populatedSize);
+            for (const [file, entry] of cachedEntries) {
+                assert.strictEqual(index._returnTypeFlowCache.get(file), entry,
+                    'a later query should reuse the same immutable flow entry');
+            }
+
+            index.build(null, { forceRebuild: true, quiet: true, workers: 0 });
+            assert.strictEqual(index._returnTypeFlowCache.size, 0,
+                'a rebuild must clear flow derived from cross-file annotations');
+        } finally {
+            rm(dir);
+        }
+    });
+
     it('reuses name-level export ownership and invalidates it on rebuild', () => {
         const dir = tmp({
             'package.json': '{"name":"name-ownership-cache","type":"module"}',

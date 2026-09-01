@@ -102,6 +102,10 @@ class ProjectIndex {
         // symbols in sequence; retaining these tri-state barrel verdicts
         // avoids repeating the same bounded graph walks after every command.
         this._nameBindingReachCache = new Map();
+        // Query-derived return flow depends on cross-file annotations and is
+        // deliberately never persisted. It is safe across commands only
+        // until the next build, which resets it below.
+        this._returnTypeFlowCache = new Map();
         this.calleeIndex = null;         // name -> Set<filePath> — inverted call index (built lazily)
     }
 
@@ -401,6 +405,7 @@ class ProjectIndex {
         this._groundSetCache = new Map();
         this._groundSetCacheLines = 0;
         this._nameBindingReachCache = new Map();
+        this._returnTypeFlowCache = new Map();
 
         // A (re)build invalidates any cache-loaded reachability set — the
         // fingerprint guard in computeReachability is content-shaped and

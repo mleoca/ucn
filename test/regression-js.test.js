@@ -7767,6 +7767,39 @@ describe('fix #309: assigned namespace factories follow name-level barrels', () 
     });
 });
 
+describe('fix #310: dollar-prefixed return types enter assignment flow', () => {
+    it('uses a $-named factory result to pin a same-name method call', () => {
+        // Zod-measured: registry() returns `$ZodRegistry<T>`. JavaScript `$`
+        // is a legal identifier character, but the return-flow parser rejected
+        // it and left every `const reg = z.registry(); reg.add()` call visible.
+        const dir = tmp({
+            'package.json': '{"name":"t","type":"module"}',
+            'impl.ts': [
+                'export class $Registry { add() { return "registry"; } }',
+                'export function registry(): $Registry { return new $Registry(); }',
+            ].join('\n'),
+            'relay.ts': 'export { registry } from "./impl.js";',
+            'index.ts': 'export * from "./relay.js";',
+            'decoy.ts': 'export class Bag { add() { return "bag"; } }',
+            'use.ts': [
+                'import * as api from "./index.js";',
+                'const reg = api.registry();',
+                'reg.add();',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', { name: 'impl.ts:1:add' });
+            assert.ok(result.ok);
+            assert.deepStrictEqual(result.result.callers.map(call =>
+                `${call.relativePath}:${call.line}`), ['use.ts:3']);
+            assert.ok(!result.result.unverifiedCallers.some(call =>
+                call.relativePath === 'use.ts'));
+            assert.ok(result.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #291: plain-JS fluent self returns and closure bindings', () => {
     it('folds prototype builder chains only when every value return is this', () => {
         const dir = tmp({
