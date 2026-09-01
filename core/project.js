@@ -97,6 +97,11 @@ class ProjectIndex {
         // The cache is cleared at every build and bounded in account.js.
         this._groundSetCache = new Map();
         this._groundSetCacheLines = 0;
+        // Bounded cross-operation memo for immutable name-level export
+        // ownership. Agent workflows ask show/impact/tests about related
+        // symbols in sequence; retaining these tri-state barrel verdicts
+        // avoids repeating the same bounded graph walks after every command.
+        this._nameBindingReachCache = new Map();
         this.calleeIndex = null;         // name -> Set<filePath> — inverted call index (built lazily)
     }
 
@@ -395,6 +400,7 @@ class ProjectIndex {
         // results remain safe and useful for unchanged files.
         this._groundSetCache = new Map();
         this._groundSetCacheLines = 0;
+        this._nameBindingReachCache = new Map();
 
         // A (re)build invalidates any cache-loaded reachability set — the
         // fingerprint guard in computeReachability is content-shaped and

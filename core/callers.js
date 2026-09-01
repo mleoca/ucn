@@ -7751,6 +7751,19 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
                 const cands = (index.symbols.get(call.name) || [])
                     .filter(d => !NON_CALLABLE_TYPES.has(d.type) && d.returnType && !d.className);
                 let matches = cands.filter(d => d.file === modFile);
+                // A namespace binding owns a NAME through the complete
+                // re-export surface, not merely through one import edge.
+                // Zod's self exports run index -> external -> types; the
+                // one-hop fallback below lost the producer's defining-file
+                // provenance and conflated the v3/v4 types with identical
+                // short names. Reuse the same name-aware ownership proof as
+                // chained producers before retaining the legacy fallback.
+                if (matches.length === 0) {
+                    matches = cands.filter(definition =>
+                        _importedNamespaceMemberOwnership(
+                            index, fileEntry, call,
+                            new Set([definition.file]))?.verdict === 'yes');
+                }
                 if (matches.length === 0) {
                     const hop = index.importGraph.get(modFile);
                     if (hop) matches = cands.filter(d => hop.has(d.file));
@@ -8981,13 +8994,41 @@ function _receiverPackageResolution(index, fileEntry, receiver, targetDefs) {
  * back to the original route through records this chase follows or flags).
  */
 function _nameBindingReaches(index, startAbs, name, targetFiles, maxDepth = 4) {
+    // The same export path is asked once per competing definition and again
+    // by caller/callee projections in a composed command. The graph and file
+    // surfaces are immutable during an operation, so retain the tri-state
+    // verdict beside the existing import-reachability memo. Target identity
+    // is part of the key; no answer can leak between pinned definitions.
+    const opCache = index._opImportReachCache;
+    const targetKey = [...targetFiles].sort(codeUnitCompare).join('\x00');
+    const cacheKey = `name\x00${maxDepth}\x00${startAbs}\x00${name}\x00${targetKey}`;
+    if (opCache?.has(cacheKey)) return opCache.get(cacheKey);
+    const persistentCache = index._nameBindingReachCache;
+    if (persistentCache?.has(cacheKey)) {
+        const value = persistentCache.get(cacheKey);
+        // Map insertion order is the LRU order.
+        persistentCache.delete(cacheKey);
+        persistentCache.set(cacheKey, value);
+        if (opCache) opCache.set(cacheKey, value);
+        return value;
+    }
+    const finish = value => {
+        if (opCache) opCache.set(cacheKey, value);
+        if (persistentCache) {
+            persistentCache.set(cacheKey, value);
+            if (persistentCache.size > 16384) {
+                persistentCache.delete(persistentCache.keys().next().value);
+            }
+        }
+        return value;
+    };
     let unknown = false;
     const visited = new Set();
     let frontier = [[startAbs, name]];
     for (let d = 0; d <= maxDepth && frontier.length > 0; d++) {
         const next = [];
         for (const [abs, attr] of frontier) {
-            if (targetFiles.has(abs)) return 'yes';
+            if (targetFiles.has(abs)) return finish('yes');
             const stateKey = `${abs}\x00${attr}`;
             if (visited.has(stateKey)) continue;
             visited.add(stateKey);
@@ -9017,7 +9058,7 @@ function _nameBindingReaches(index, startAbs, name, targetFiles, maxDepth = 4) {
                     e.defaultLike && e.type === 'module.exports' &&
                     (e.alias || e.name) !== attr);
             if (staticOwner && !competingDynamic) {
-                return 'no';
+                return finish('no');
             }
 
             const enqueue = (module, nextAttr) => {
@@ -9075,7 +9116,7 @@ function _nameBindingReaches(index, startAbs, name, targetFiles, maxDepth = 4) {
         frontier = next;
     }
     if (frontier.length > 0) unknown = true; // depth exhausted with live paths
-    return unknown ? 'unknown' : 'no';
+    return finish(unknown ? 'unknown' : 'no');
 }
 
 /**
@@ -13291,6 +13332,7 @@ function _cppExactOverloadWinner(call, applicable) {
  */
 function _buildTargetTypeSet(index, targetDefs, definitions) {
     const targetTypes = new Set();
+    const targetTypeOrigins = [];
     // Callable-identity closure joins a trait declaration with its impl slot.
     // If any member is a blanket impl over a generic owner, the whole slot is
     // universally quantified: a concrete receiver can satisfy it without
@@ -13305,10 +13347,23 @@ function _buildTargetTypeSet(index, targetDefs, definitions) {
         // falls through to the visible dispatch tier.
         if (td.explicitInterface) {
             const interfaceType = _csharpTypeIdentity(td.explicitInterface);
-            if (interfaceType) targetTypes.add(interfaceType);
+            if (interfaceType) {
+                targetTypes.add(interfaceType);
+                targetTypeOrigins.push({ name: interfaceType, file: td.file });
+            }
         } else {
-            if (td.className) targetTypes.add(td.className);
-            if (td.receiver) targetTypes.add(td.receiver.replace(/^\*/, ''));
+            const owners = [
+                td.className,
+                td.receiver && td.receiver.replace(/^\*/, ''),
+            ].filter(Boolean);
+            for (const owner of owners) {
+                targetTypes.add(owner);
+                const origin = _resolveFlowTypeOrigin(index, td.file, owner);
+                targetTypeOrigins.push({
+                    name: owner,
+                    file: origin?.fromFile || td.file,
+                });
+            }
         }
     }
     if (targetTypes.size > 0) {
@@ -13325,26 +13380,42 @@ function _buildTargetTypeSet(index, targetDefs, definitions) {
         const overloadedSlots = !!langTraits(language)?.hasArityOverloads;
         const targetSignatures = new Set(targetDefs.map(signature)
             .filter(value => value !== null));
-        const queue = [...targetTypes];
+        const queue = targetTypeOrigins.length > 0
+            ? targetTypeOrigins : [...targetTypes].map(name => ({ name }));
         while (queue.length > 0) {
-            const children = index.extendedByGraph?.get(queue.pop());
+            const parent = queue.pop();
+            const children = index.extendedByGraph?.get(parent.name);
             if (!children) continue;
             for (const child of children) {
                 const cName = typeof child === 'string' ? child : child.name;
                 if (!cName || targetTypes.has(cName)) continue;
+                const childFile = typeof child === 'string' ? null : child.file;
+                if (parent.file && childFile) {
+                    // extendedByGraph is keyed by the parent's SHORT name.
+                    // Parallel package versions can therefore share a bucket
+                    // (zod v3/v4 both define ZodType). Admit a child only when
+                    // its written parent resolves back to this exact target
+                    // type origin. An unresolved parent stays conservative;
+                    // a positively foreign origin is never confirmation-grade.
+                    const parentOrigin = _resolveFlowTypeOrigin(
+                        index, childFile, parent.name);
+                    if (parentOrigin?.fromFile &&
+                        parentOrigin.fromFile !== parent.file) continue;
+                }
                 // In overload-capable languages, another same-named overload
                 // on the child does not override the pinned virtual slot.
                 // JsonTextWriter.WriteValue(Guid) must not hide inherited
                 // JsonWriter.WriteValue(Guid?). Only an agreeing parameter
                 // signature blocks the subtype closure.
                 const childDefinitions = definitions.filter(definition =>
-                    definition.className === cName);
+                    definition.className === cName &&
+                    (!childFile || definition.file === childFile));
                 const overrides = childDefinitions.some(definition =>
                         !overloadedSlots ||
                         targetSignatures.has(signature(definition)));
                 if (overrides) continue;
                 targetTypes.add(cName);
-                queue.push(cName);
+                queue.push({ name: cName, file: childFile || parent.file });
             }
         }
     }

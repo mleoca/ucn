@@ -379,6 +379,37 @@ describe('perf: cross-operation parsed-tree cache', () => {
 });
 
 describe('perf: cross-operation account caches', () => {
+    it('reuses name-level export ownership and invalidates it on rebuild', () => {
+        const dir = tmp({
+            'package.json': '{"name":"name-ownership-cache","type":"module"}',
+            'impl.js': 'export function target() { return 1; }',
+            'barrel.js': "export { target } from './impl.js';",
+            'app.js': "import { target } from './barrel.js';\nexport const value = target();",
+        });
+        try {
+            const index = idx(dir);
+            const target = index.symbols.get('target')[0];
+            const options = { targetDefinitions: [target], collectAccount: true };
+
+            const first = index.findCallers('target', options);
+            const populatedSize = index._nameBindingReachCache.size;
+            assert.ok(populatedSize > 0,
+                'the first ownership walk should populate the cross-operation cache');
+
+            const second = index.findCallers('target', options);
+            assert.deepStrictEqual(second, first,
+                'cached ownership must preserve the caller answer');
+            assert.strictEqual(index._nameBindingReachCache.size, populatedSize,
+                'an identical query should reuse existing ownership verdicts');
+
+            index.build(null, { forceRebuild: true, quiet: true, workers: 0 });
+            assert.strictEqual(index._nameBindingReachCache.size, 0,
+                'a rebuild must clear ownership verdicts derived from the old graph');
+        } finally {
+            rm(dir);
+        }
+    });
+
     it('reuses an exact ground set until the index is rebuilt', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',

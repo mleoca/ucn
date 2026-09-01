@@ -7708,6 +7708,65 @@ describe('fix #290: immutable class-member factory aliases preserve return types
     });
 });
 
+describe('fix #309: assigned namespace factories follow name-level barrels', () => {
+    it('pins same-named return types through two re-export hops', () => {
+        // Zod-measured: namespace factories are commonly assigned before a
+        // method call (`const schema = z.string(); schema.safeParseAsync()`).
+        // Chained calls already followed the name-aware export surface, but
+        // assignment flow stopped after one raw import edge and lost v3/v4
+        // type identity when both versions used the same short class name.
+        const dir = tmp({
+            'package.json': '{"name":"t","type":"module"}',
+            'v3/impl.ts': [
+                'export class Schema { execute() { return "v3"; } }',
+                'export class ConcreteSchema extends Schema {}',
+                'export const schema = (): ConcreteSchema => new ConcreteSchema();',
+            ].join('\n'),
+            'v3/relay.ts': 'export * from "./impl.js";',
+            'v3/index.ts': 'export * from "./relay.js";',
+            'v4/impl.ts': [
+                'export class Schema { execute() { return "v4"; } }',
+                'export class ConcreteSchema extends Schema {}',
+                'export const schema = (): ConcreteSchema => new ConcreteSchema();',
+            ].join('\n'),
+            'v4/relay.ts': 'export * from "./impl.js";',
+            'v4/index.ts': 'export * from "./relay.js";',
+            'use.ts': [
+                'import * as v3 from "./v3/index.js";',
+                'import * as v4 from "./v4/index.js";',
+                'const oldSchema = v3.schema();',
+                'const newSchema = v4.schema();',
+                'oldSchema.execute();',
+                'newSchema.execute();',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const v3 = execute(index, 'context', { name: 'v3/impl.ts:1:execute' });
+            assert.ok(v3.ok);
+            assert.deepStrictEqual(v3.result.callers.map(call =>
+                `${call.relativePath}:${call.line}`), ['use.ts:5']);
+            assert.ok(!v3.result.unverifiedCallers.some(call =>
+                call.relativePath === 'use.ts'));
+            assert.strictEqual(
+                v3.result.meta.account.excluded.byReason['receiver-type-mismatch'].count,
+                1);
+            assert.ok(v3.result.meta.account.conserved);
+
+            const v4 = execute(index, 'context', { name: 'v4/impl.ts:1:execute' });
+            assert.ok(v4.ok);
+            assert.deepStrictEqual(v4.result.callers.map(call =>
+                `${call.relativePath}:${call.line}`), ['use.ts:6']);
+            assert.ok(!v4.result.unverifiedCallers.some(call =>
+                call.relativePath === 'use.ts'));
+            assert.strictEqual(
+                v4.result.meta.account.excluded.byReason['receiver-type-mismatch'].count,
+                1);
+            assert.ok(v4.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #291: plain-JS fluent self returns and closure bindings', () => {
     it('folds prototype builder chains only when every value return is this', () => {
         const dir = tmp({
