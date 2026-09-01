@@ -1046,7 +1046,7 @@ class Line:
         assert.ok(!attrs.has('comments'), 'Should skip list primitive');
     });
 
-    it('findInstanceAttributeTypes should not scan non-dataclass classes for field annotations', () => {
+    it('findInstanceAttributeTypes trusts bare contracts but not initialized plain-class fields', () => {
         const Parser = require('tree-sitter');
         const Python = require('tree-sitter-python');
         const parser = new Parser();
@@ -1055,6 +1055,7 @@ class Line:
 
         const code = `
 class RegularClass:
+    helper_contract: Optional[Helper]
     name: str = "default"
     tracker: BracketTracker = None
 
@@ -1066,7 +1067,41 @@ class RegularClass:
         assert.ok(result.has('RegularClass'), 'Should find RegularClass');
         const attrs = result.get('RegularClass');
         assert.strictEqual(attrs.get('helper'), 'Helper', 'Should find Helper from __init__');
+        assert.strictEqual(attrs.get('helper_contract'), 'Helper',
+            'Should unwrap a bare Optional field contract');
         assert.ok(!attrs.has('tracker'), 'Should NOT extract from non-dataclass class annotations');
+    });
+
+    it('findCallers resolves a method through a bare Optional field contract', () => {
+        const dir = tmp({
+            'model.py': [
+                'from typing import Optional',
+                '',
+                'class Color:',
+                '    def downgrade(self):',
+                '        return self',
+                '',
+                'class Decoy:',
+                '    def downgrade(self):',
+                '        return self',
+                '',
+                'class Style:',
+                '    _color: Optional[Color]',
+                '    def make(self):',
+                '        if self._color is not None:',
+                '            return self._color.downgrade()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', {
+                name: 'model.py:4:downgrade',
+            });
+            assert.ok(result.ok, result.error);
+            assert.ok(result.result.callers.some(call => call.line === 15));
+            assert.ok(!result.result.unverifiedCallers.some(call => call.line === 15));
+            assert.ok(result.result.meta.account.conserved);
+        } finally { rm(dir); }
     });
 
     it('findCallees should resolve @dataclass attribute method calls', () => {

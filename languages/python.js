@@ -2954,10 +2954,14 @@ function findInstanceAttributeTypes(code, parser, options = {}) {
             if (!typeNode) continue;
             if (!isDataclass && assign.childForFieldName('right')) continue;
 
-            // Extract type name from annotation
-            const typeIdent = typeNode.type === 'type' ? typeNode.firstChild : typeNode;
-            if (!typeIdent || typeIdent.type !== 'identifier') continue;
-            const typeName = typeIdent.text;
+            // Use the same single-type annotation parser as parameters and
+            // explicit instance fields. This admits compiler-equivalent bare
+            // contracts such as `color: Optional[Color]` and `Color | None`,
+            // while unions with several value types still abstain. Qualified
+            // names need origin metadata that this compact attr map does not
+            // retain, so leave those to declared field symbols.
+            const typeName = typeNameFromAnnotation(typeNode);
+            if (!typeName || typeQualifierFromAnnotation(typeNode)) continue;
 
             // Skip primitives and lowercase types
             if (PRIMITIVE_TYPES.has(typeName)) continue;
