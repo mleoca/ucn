@@ -7437,11 +7437,14 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
             continue;
         }
 
-        // Assigned builder chain (chi-measured):
-        // `hr := RouteHeaders().Route(...)` stores the OUTERMOST method call
-        // as the assignment producer. Fold the chain to its declared result
-        // before composing later `hr.Handler(...)` flow.
-        if (nominal && (call.receiverCall || call.isMacro)) {
+        // Assigned builder chain (chi/zod-measured):
+        // `hr := RouteHeaders().Route(...)` / `const s = z.array().refine(...)`
+        // stores the OUTERMOST method call as the assignment producer. Fold
+        // the chain to its declared result before composing a later receiver.
+        // Macro-result folding remains nominal-only; structural call chains
+        // use the same compiler-annotation and module-ownership rails as the
+        // already-supported immediate chained-receiver path.
+        if (call.receiverCall || (nominal && call.isMacro)) {
             let folded = _typeOfCallResultFold(
                 index, fileEntry, filePath, call, assignedFoldCtx);
             // Rust result aliases are commonly imported under a local name
@@ -10861,8 +10864,15 @@ function _calleeSelectReceiverMethod(index, call, symbols, typeName, language,
          (symbol.receiver && symbol.receiver.replace(/^\*/, '') === owner)));
     let selected = _calleeOverloadSelect(
         index, call, onOwner(typeName), language);
-    if (!selected.match && !selected.ambiguous &&
-        langTraits(language)?.typeSystem === 'nominal') {
+    // Nominal lookup and compiler-typed TS/TSX class values inherit methods
+    // from the nearest recorded base. Structural lookup stays restricted to
+    // TypeScript here: plain JavaScript/Python receivers can be dynamically
+    // reshaped, while a TS return annotation plus a concrete class heritage
+    // edge is compiler-grade method ownership.
+    const followsRecordedClassInheritance =
+        langTraits(language)?.typeSystem === 'nominal' ||
+        language === 'typescript' || language === 'tsx';
+    if (!selected.match && !selected.ambiguous && followsRecordedClassInheritance) {
         const visited = new Set([typeName]);
         const queue = [...(index._getInheritanceParents?.(
             typeName, contextFile) || [])];

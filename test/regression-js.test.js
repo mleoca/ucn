@@ -7878,6 +7878,51 @@ describe('fix #311: overloaded factory aliases preserve concrete flow', () => {
     });
 });
 
+describe('fix #312: assigned structural chains retain their result type', () => {
+    it('pins a later receiver through a module factory and method chain', () => {
+        // Zod-measured: `const schema = z.array(...).superRefine(...)` and
+        // `const tuple = z.tuple(...).refine(...)` store a compiler-typed
+        // builder result before calling an inherited method on it.
+        const dir = tmp({
+            'package.json': '{"name":"t","type":"module"}',
+            'impl.ts': [
+                'export class Schema {',
+                '  refine(): Effects { return new Effects(); }',
+                '  execute() { return "schema"; }',
+                '}',
+                'export class Effects extends Schema {}',
+                'export function schema(): Schema { return new Schema(); }',
+            ].join('\n'),
+            'decoy.ts': 'export class Other { execute() { return "other"; } }',
+            'use.ts': [
+                'import * as api from "./impl.js";',
+                'export function run() {',
+                '  const value = api.schema().refine();',
+                '  return value.execute();',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', { name: 'impl.ts:3:execute' });
+            assert.ok(result.ok);
+            assert.deepStrictEqual(result.result.callers.map(call =>
+                `${call.relativePath}:${call.line}`), ['use.ts:4']);
+            assert.ok(!result.result.unverifiedCallers.some(call =>
+                call.relativePath === 'use.ts'));
+            assert.ok(result.result.meta.account.conserved);
+
+            const run = index.symbols.get('run')[0];
+            const callees = index.findCallees(run, { collectAccount: true });
+            const executeDef = index.symbols.get('execute')
+                .find(symbol => symbol.className === 'Schema');
+            assert.ok(callees.some(callee =>
+                callee.bindingId === executeDef.bindingId),
+            `callee direction should retain the assigned chain: ${JSON.stringify(callees)}`);
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #291: plain-JS fluent self returns and closure bindings', () => {
     it('folds prototype builder chains only when every value return is this', () => {
         const dir = tmp({
