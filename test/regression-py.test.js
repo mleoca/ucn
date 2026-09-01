@@ -1144,6 +1144,62 @@ class Line:
     });
 });
 
+describe('fix #320: Python stable factory field contracts', () => {
+    it('types cross-method fields from exact class factories but rejects local shadows', () => {
+        const dir = tmp({
+            'colors.py': [
+                'class Color:',
+                '    @classmethod',
+                '    def parse(cls, value: str) -> "Color":',
+                '        return cls()',
+                '    def downgrade(self):',
+                '        return self',
+                '',
+                'class Decoy:',
+                '    def downgrade(self):',
+                '        return self',
+            ].join('\n'),
+            'bench.py': [
+                'from colors import Color',
+                '',
+                'class Suite:',
+                '    def setup(self):',
+                '        self.color = Color.parse("red")',
+                '    def time_it(self):',
+                '        return self.color.downgrade()',
+                '',
+                'class Shadowed:',
+                '    def setup(self, Color):',
+                '        self.color = Color.parse("red")',
+                '    def time_it(self):',
+                '        return self.color.downgrade()',
+                '',
+                'class Mutated:',
+                '    def setup(self):',
+                '        self.color = Color.parse("red")',
+                '    def reset(self):',
+                '        self.color = object()',
+                '    def time_it(self):',
+                '        return self.color.downgrade()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', {
+                name: 'colors.py:5:downgrade',
+            });
+            assert.ok(result.ok, result.error);
+            assert.ok(result.result.callers.some(call =>
+                call.relativePath === 'bench.py' && call.line === 7));
+            assert.ok(!result.result.callers.some(call =>
+                call.relativePath === 'bench.py' && call.line === 13));
+            assert.ok(!result.result.callers.some(call =>
+                call.relativePath === 'bench.py' && call.line === 21));
+            assert.ok(result.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+});
+
 describe('Regression: Python self.method() same-class resolution', () => {
     it('findCallees should resolve self.method() to same-class methods', () => {
         const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-selfmethod-'));

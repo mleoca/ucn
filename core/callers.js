@@ -7209,12 +7209,19 @@ function getInstanceAttributeTypes(index, filePath, className) {
             const parser = getParser('python');
             const fileEntry = index.files.get(filePath);
             fileCache = langModule.findInstanceAttributeTypes(content, parser, {
-                resolveBuiltinCallType(moduleName, functionName) {
-                    if (!_pythonBuiltinContractAllowed(index, fileEntry, moduleName)) {
-                        return null;
+                resolveCallType(moduleName, functionName) {
+                    if (_pythonBuiltinContractAllowed(index, fileEntry, moduleName)) {
+                        const builtin = langModule.getBuiltinCallReturnType?.(
+                            moduleName, functionName);
+                        if (builtin) return builtin;
                     }
-                    return langModule.getBuiltinCallReturnType?.(
-                        moduleName, functionName) || null;
+                    const owner = _resolveFlowTypeOrigin(
+                        index, filePath, moduleName);
+                    if (!owner?.fromFile) return null;
+                    const result = _methodReturnOnType(
+                        index, moduleName, owner.fromFile, functionName,
+                        'python', { filePath, consumerAwaited: false });
+                    return result?.fromFile ? result.type : null;
                 },
             });
             index._attrTypeCache.set(filePath, fileCache);

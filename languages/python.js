@@ -3095,12 +3095,17 @@ function findInstanceAttributeTypes(code, parser, options = {}) {
                 const right = assignment.childForFieldName('right');
                 const callable = right?.type === 'call'
                     ? right.childForFieldName('function') : null;
-                const moduleName = callable?.type === 'attribute'
-                    ? callable.childForFieldName('object')?.text : null;
+                const callableReceiver = callable?.type === 'attribute'
+                    ? callable.childForFieldName('object') : null;
+                const moduleName = callableReceiver?.type === 'identifier'
+                    ? callableReceiver.text : null;
                 const functionName = callable?.type === 'attribute'
                     ? callable.childForFieldName('attribute')?.text : null;
-                const runtimeType = moduleName && functionName
-                    ? options.resolveBuiltinCallType?.(moduleName, functionName)
+                const resolveCallType = options.resolveCallType ||
+                    options.resolveBuiltinCallType;
+                const runtimeType = moduleName && functionName &&
+                    !isPythonNameShadowedAt(callable, moduleName)
+                    ? resolveCallType?.(moduleName, functionName)
                     : null;
                 if (!runtimeType) {
                     // None is a harmless uninitialized state; any other
