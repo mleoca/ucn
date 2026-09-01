@@ -464,6 +464,22 @@ function returnsReceiverSelf(node) {
 }
 
 /**
+ * Exact call expression returned by an expression-bodied arrow. This is a
+ * syntax proof, not return-type inference: query-time flow resolves the call
+ * through its ordinary import/receiver ownership rails. Block bodies,
+ * conditionals, and other expressions deliberately stay unmarked.
+ */
+function returnedArrowCallSpan(node) {
+    if (node.type !== 'arrow_function') return null;
+    let body = node.childForFieldName('body');
+    while (body?.type === 'parenthesized_expression' && body.namedChildCount === 1) {
+        body = body.namedChild(0);
+    }
+    if (body?.type !== 'call_expression') return null;
+    return { start: body.startIndex, end: body.endIndex };
+}
+
+/**
  * Process a node for function extraction (single-pass helper)
  * Returns true if node was matched, false otherwise
  */
@@ -634,6 +650,7 @@ function _processFunction(node, functions, processedRanges, lines) {
                         // declaration text, so we double-check the value node directly.
                         const valueIsAsync = valueNode.text.trimStart().startsWith('async ');
                         const isAsync = valueIsAsync || modifiers.includes('async');
+                        const returnedCall = returnedArrowCallSpan(valueNode);
 
                         functions.push({
                             name: nameNode.text,
@@ -648,6 +665,10 @@ function _processFunction(node, functions, processedRanges, lines) {
                             modifiers,
                             ...lexicalOwnerRange(node),
                             ...typeAnno,
+                            ...(returnedCall && {
+                                returnedCallStart: returnedCall.start,
+                                returnedCallEnd: returnedCall.end,
+                            }),
                             ...(generics && { generics }),
                             ...(docstring && { docstring })
                         });

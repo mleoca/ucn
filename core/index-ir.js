@@ -86,6 +86,7 @@ const OPTIONAL_SYMBOL_FIELDS = Object.freeze([
     'lexicalScopeStartLine', 'lexicalScopeEndLine',
     'returnTypeQualifier', 'macroNeverReturns', 'callbackParamTypes', 'iteratorItemType',
     'returnedConcreteType', 'returnedConstructors', 'templateDependent',
+    'returnedCallStart', 'returnedCallEnd',
     'isSpecialization',
     'linkage', 'functionLike', 'callableAlias', 'exportedAlias',
     'aliasOwner', 'aliasMember', 'callableTarget', 'macroParamEffects',

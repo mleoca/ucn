@@ -5278,6 +5278,11 @@ function findCallees(index, definition, options = {}) {
         const foldCtx = () => {
             if (!calleeFoldCtx) {
                 calleeFoldCtx = { memo: new Map(), visiting: new Set(), records: calls,
+                    // A called local arrow factory may be declared outside
+                    // the current callee definition. Keep the narrow records
+                    // set for ordinary producer indexing, but expose the
+                    // already-loaded file records for exact returned spans.
+                    allRecords: allCalls,
                     getFlowMap: () => flowMap() };
             }
             return calleeFoldCtx;
@@ -15035,6 +15040,26 @@ function _typeOfCallResultFold(index, fileEntry, filePath, record, ctx, consumer
     return out;
 }
 
+function _returnedCallRecord(ctx, start, end, current) {
+    if (!ctx.returnedCallIndex) {
+        ctx.returnedCallIndex = new Map();
+        const records = ctx.allRecords || ctx.records || [];
+        for (const candidate of records) {
+            if (candidate.callStart == null || candidate.callEnd == null) continue;
+            const key = `${candidate.callStart}:${candidate.callEnd}`;
+            let group = ctx.returnedCallIndex.get(key);
+            if (!group) {
+                group = [];
+                ctx.returnedCallIndex.set(key, group);
+            }
+            group.push(candidate);
+        }
+    }
+    const matches = (ctx.returnedCallIndex.get(`${start}:${end}`) || [])
+        .filter(candidate => candidate !== current);
+    return matches.length === 1 ? matches[0] : null;
+}
+
 function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, consumerAwaited) {
     const language = fileEntry.language;
     const traits = langTraits(language);
@@ -15382,7 +15407,24 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
         const sameFile = defs.filter(d => d.file === filePath);
         if (sameFile.length === 1) chosen = sameFile[0];
     }
-    if (!chosen || !chosen.returnType) return null;
+    if (!chosen) return null;
+    // An expression-bodied arrow returns its expression by construction.
+    // The parser persists the exact span only when that expression IS a call;
+    // resolve that existing call record through the normal compiler-evidence
+    // rails. Async functions expose the inner value only when the consumer
+    // awaits them; generators are never ordinary value factories (fix #317,
+    // zod-measured local `base = () => z.object(...)` flow).
+    if (!nominal && !chosen.returnType && !chosen.isGenerator &&
+        (!chosen.isAsync || consumerAwaited) &&
+        chosen.returnedCallStart != null && chosen.returnedCallEnd != null) {
+        const returned = _returnedCallRecord(
+            ctx, chosen.returnedCallStart, chosen.returnedCallEnd, record);
+        if (returned) {
+            return _typeOfCallResultFold(
+                index, fileEntry, filePath, returned, ctx, consumerAwaited);
+        }
+    }
+    if (!chosen.returnType) return null;
     if (nominal) {
         if (language === 'cpp') {
             const concrete = _cppAutoReturnConcreteType(index, chosen);

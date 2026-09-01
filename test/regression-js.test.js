@@ -9072,6 +9072,87 @@ describe('fix #316: overload signatures drive structural chain flow', () => {
     });
 });
 
+describe('fix #317: expression-bodied arrow call result flow', () => {
+    it('types a local arrow factory through its exact returned call', () => {
+        // Zod-measured: `const base = () => z.object(...)` has a compiler-
+        // inferred return type, then `base().safeParseAsync()` calls an
+        // inherited method through that value.
+        const dir = tmp({
+            'package.json': '{"name":"t","type":"module"}',
+            'schema.ts': [
+                'export class Schema { run(): string { return "schema"; } }',
+                'export function object(): Schema { return new Schema(); }',
+            ].join('\n'),
+            'decoy.ts': 'export class Decoy { run(): string { return "decoy"; } }',
+            'use.ts': [
+                "import * as api from './schema.js';",
+                'const base = (flag?: boolean) =>',
+                '  api.object();',
+                'export function use() {',
+                '  return base(true).run();',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const base = index.symbols.get('base')[0];
+            assert.ok(Number.isInteger(base.returnedCallStart));
+            assert.ok(base.returnedCallEnd > base.returnedCallStart);
+
+            const result = execute(index, 'context', { name: 'schema.ts:1:run' });
+            assert.ok(result.ok, result.error);
+            assert.deepStrictEqual(result.result.callers.map(call =>
+                `${call.relativePath}:${call.line}`), ['use.ts:5']);
+            assert.ok(!result.result.unverifiedCallers.some(call =>
+                call.relativePath === 'use.ts'));
+            assert.ok(result.result.meta.account.conserved);
+
+            const use = index.symbols.get('use')[0];
+            const callees = index.findCallees(use, { collectAccount: true });
+            assert.ok(callees.some(callee => callee.name === 'run' &&
+                callee.className === 'Schema'));
+            assert.ok(!callees.some(callee => callee.name === 'run' &&
+                callee.className === 'Decoy'));
+        } finally { rm(dir); }
+    });
+
+    it('does not infer block, conditional, or un-awaited async arrow results', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t","type":"module"}',
+            'schema.ts': [
+                'export class Left { finish(): string { return "left"; } }',
+                'export class Right { finish(): string { return "right"; } }',
+                'export function left(): Left { return new Left(); }',
+                'export function right(): Right { return new Right(); }',
+            ].join('\n'),
+            'use.ts': [
+                "import * as api from './schema.js';",
+                'const block = () => { api.left(); };',
+                'const conditional = (flag: boolean) => flag ? api.left() : api.right();',
+                'const asynchronous = async () => api.left();',
+                'block().finish();',
+                'conditional(true).finish();',
+                'asynchronous().finish();',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            for (const name of ['block', 'conditional']) {
+                assert.strictEqual(index.symbols.get(name)[0].returnedCallStart, undefined);
+            }
+            assert.ok(Number.isInteger(index.symbols.get('asynchronous')[0].returnedCallStart),
+                'the exact returned call is retained even though async wrapping blocks un-awaited flow');
+            for (const handle of ['schema.ts:1:finish', 'schema.ts:2:finish']) {
+                const result = execute(index, 'context', { name: handle });
+                assert.ok(result.ok, result.error);
+                assert.ok(!result.result.callers.some(call =>
+                    call.relativePath === 'use.ts'));
+                assert.ok(result.result.meta.account.conserved);
+            }
+        } finally { rm(dir); }
+    });
+});
+
 // ============================================================================
 // fix #262: JS/TS literal ASSIGNMENTS type the variable (#218d parity) —
 // `const lines = []` → Array, so lines.push() routes external/excluded via

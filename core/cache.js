@@ -664,7 +664,10 @@ function clearAllCaches() {
 // compositions for exact module export ownership (fix #314).
 // v196: TS parameter type references no longer mark namespace receiver roots
 // as locally shadowed, changing receiverLocalBinding evidence (fix #315).
-const CACHE_FORMAT_VERSION = 196;
+// v197 (fix #317): JS/TS expression-bodied arrow symbols persist the exact
+// returned call span so query-time flow can resolve compiler-inferred factory
+// results without treating block bodies or arbitrary expressions as returns.
+const CACHE_FORMAT_VERSION = 197;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**
