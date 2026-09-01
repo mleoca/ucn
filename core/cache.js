@@ -667,7 +667,9 @@ function clearAllCaches() {
 // v197 (fix #317): JS/TS expression-bodied arrow symbols persist the exact
 // returned call span so query-time flow can resolve compiler-inferred factory
 // results without treating block bodies or arbitrary expressions as returns.
-const CACHE_FORMAT_VERSION = 197;
+// v198 (fix #318): JS/TS one-return methods persist exact this-field paths for
+// generic declared-field result flow.
+const CACHE_FORMAT_VERSION = 198;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**

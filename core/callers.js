@@ -14464,6 +14464,131 @@ function _chainedReceiverType(index, call, language) {
 
 const _FOLD_TYPE_KINDS = new Set(['class', 'struct', 'enum', 'trait', 'interface', 'record', 'type', 'namespace']);
 
+function _structuralTypeExpression(text) {
+    if (!text || typeof text !== 'string') return null;
+    const source = text.trim();
+    const match = source.match(/^([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)/);
+    if (!match) return null;
+    const qualifiedHead = match[1];
+    const rest = source.slice(qualifiedHead.length).trim();
+    if (!rest) {
+        return { head: qualifiedHead.split('.').pop(), qualifiedHead, args: [], text: source };
+    }
+    if (!rest.startsWith('<') || !rest.endsWith('>')) return null;
+    let depth = 0;
+    for (let i = 0; i < rest.length; i++) {
+        if (rest[i] === '<') depth++;
+        else if (rest[i] === '>') depth--;
+        if (depth === 0 && i !== rest.length - 1) return null;
+        if (depth < 0) return null;
+    }
+    if (depth !== 0) return null;
+    return {
+        head: qualifiedHead.split('.').pop(),
+        qualifiedHead,
+        args: _splitTopLevelGenericArgs(rest.slice(1, -1)).map(arg => arg.trim()),
+        text: source,
+    };
+}
+
+function _structuralGenericParameters(generics) {
+    if (!generics || typeof generics !== 'string') return [];
+    const source = generics.trim();
+    if (!source.startsWith('<') || !source.endsWith('>')) return [];
+    return _splitTopLevelGenericArgs(source.slice(1, -1)).map(part => {
+        const match = part.trim().match(/^([A-Za-z_$][\w$]*)/);
+        return match ? match[1] : null;
+    }).filter(Boolean);
+}
+
+function _substituteStructuralGenerics(text, bindings) {
+    let result = String(text || '').trim();
+    for (const [name, value] of [...bindings].sort((a, b) => b[0].length - a[0].length)) {
+        if (!value || !_structuralTypeExpression(value)) continue;
+        result = result.replace(new RegExp(`\\b${name}\\b`, 'g'), value);
+    }
+    return result;
+}
+
+function _pinnedStructuralTypeDefinition(index, typeName, fromFile) {
+    let defs = (index.symbols.get(typeName) || []).filter(definition =>
+        IDENTITY_TYPE_KINDS.has(definition.type) && definition.file);
+    if (fromFile) {
+        const origin = _resolveFlowTypeOrigin(index, fromFile, typeName);
+        if (!origin?.fromFile) return null;
+        defs = defs.filter(definition => definition.file === origin.fromFile);
+    }
+    return defs.length === 1 ? defs[0] : null;
+}
+
+function _singleStructuralParent(text) {
+    if (!text) return null;
+    let angle = 0, square = 0, paren = 0;
+    for (const ch of String(text)) {
+        if (ch === '<') angle++;
+        else if (ch === '>') angle--;
+        else if (ch === '[') square++;
+        else if (ch === ']') square--;
+        else if (ch === '(') paren++;
+        else if (ch === ')') paren--;
+        else if (ch === ',' && angle === 0 && square === 0 && paren === 0) return null;
+        if (angle < 0 || square < 0 || paren < 0) return null;
+    }
+    return angle === 0 && square === 0 && paren === 0 ? String(text).trim() : null;
+}
+
+function _structuralFieldTypeExpression(
+    index, typeText, fromFile, fieldName, depth = 0
+) {
+    if (depth > 12) return null;
+    const expression = _structuralTypeExpression(typeText);
+    if (!expression) return null;
+    const definition = _pinnedStructuralTypeDefinition(
+        index, expression.head, fromFile);
+    if (!definition) return null;
+    const params = _structuralGenericParameters(definition.generics);
+    const bindings = new Map();
+    for (let i = 0; i < params.length && i < expression.args.length; i++) {
+        if (_structuralTypeExpression(expression.args[i])) {
+            bindings.set(params[i], expression.args[i]);
+        }
+    }
+    const fields = (index.symbols.get(fieldName) || []).filter(field =>
+        field.className === expression.head && field.file === definition.file &&
+        (field.type === 'field' || field.memberType === 'field' ||
+            field.memberType === 'private field') && field.fieldType);
+    if (fields.length > 0) {
+        const resolved = new Set(fields.map(field =>
+            _substituteStructuralGenerics(field.fieldType, bindings)));
+        if (resolved.size !== 1) return null;
+        const text = [...resolved][0];
+        const parsed = _structuralTypeExpression(text);
+        if (!parsed) return null;
+        const origin = _resolveFlowTypeOrigin(index, definition.file, parsed.head);
+        return { text, fromFile: origin?.fromFile || definition.file };
+    }
+    const parent = _singleStructuralParent(definition.extends);
+    if (!parent) return null;
+    const parentText = _substituteStructuralGenerics(parent, bindings);
+    const parsedParent = _structuralTypeExpression(parentText);
+    if (!parsedParent) return null;
+    const parentOrigin = _resolveFlowTypeOrigin(
+        index, definition.file, parsedParent.head);
+    if (!parentOrigin?.fromFile) return null;
+    return _structuralFieldTypeExpression(
+        index, parentText, parentOrigin.fromFile, fieldName, depth + 1);
+}
+
+function _structuralReturnedReceiverType(index, receiverText, fromFile, fieldNames) {
+    let current = { text: receiverText, fromFile };
+    for (const fieldName of fieldNames) {
+        current = _structuralFieldTypeExpression(
+            index, current.text, current.fromFile, fieldName);
+        if (!current) return null;
+    }
+    return current;
+}
+
 /**
  * Resolve method `methodName` on type `typeName` (identity-pinned to
  * `fromFile` when known) and return its resolved return-type head as
@@ -14529,15 +14654,38 @@ function _methodReturnOnType(index, typeName, fromFile, methodName, language, op
     const contracts = owned.some(d => d.isSignature)
         ? owned.filter(d => d.isSignature) : owned;
     if (language === 'python' && !opts.consumerAwaited && contracts.some(d => d.isAsync)) return null;
+    const returnedPaths = contracts.map(definition => definition.returnedReceiverPath);
+    if (contracts.length > 0 && returnedPaths.every(path =>
+        Array.isArray(path) && path.length > 0) &&
+        new Set(returnedPaths.map(path => path.join('\0'))).size === 1) {
+        const receiverText = opts.selfTypeText || selfType;
+        const resolved = _structuralReturnedReceiverType(
+            index, receiverText, fromFile || contracts[0].file, returnedPaths[0]);
+        const parsed = resolved && _structuralTypeExpression(resolved.text);
+        if (!parsed || /^[A-Z][A-Z0-9]?$/.test(parsed.head) ||
+            _STRUCTURAL_FLOW_REJECT.has(parsed.head)) return null;
+        const origin = _resolveFlowTypeOrigin(
+            index, resolved.fromFile || contracts[0].file, parsed.head);
+        if (!origin?.fromFile) return null;
+        return {
+            type: parsed.head,
+            typeText: resolved.text,
+            fromFile: origin.fromFile,
+        };
+    }
     const heads = new Set();
+    const typeTexts = new Set();
     for (const d of contracts) {
         if (!d.returnType) return null;
-        let h = _structuralTypeHead(d.returnType, {
+        const returnText = String(d.returnType).replace(
+            /\b(?:this|Self)\b/g, opts.selfTypeText || selfType);
+        let h = _structuralTypeHead(returnText, {
             unwrapAsync: opts.consumerAwaited, index, language, originFile: d.file,
         });
         if (h === 'this' || h === 'Self') h = selfType;
         if (!h) return null;
         heads.add(h);
+        typeTexts.add(returnText);
         if (heads.size > 1) return null;
     }
     const head = [...heads][0];
@@ -14553,9 +14701,16 @@ function _methodReturnOnType(index, typeName, fromFile, methodName, language, op
             if (origins.size > 1) return null;
         }
         const fromFile = [...origins][0];
-        return { type: head, ...(fromFile && { fromFile }) };
+        return {
+            type: head,
+            ...(typeTexts.size === 1 && { typeText: [...typeTexts][0] }),
+            ...(fromFile && { fromFile }),
+        };
     }
-    return { type: head };
+    return {
+        type: head,
+        ...(typeTexts.size === 1 && { typeText: [...typeTexts][0] }),
+    };
 }
 
 function _rustMacroDefinitions(index, fileEntry, filePath, record) {
@@ -15339,7 +15494,7 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
                 if (builtinReturn) return { type: builtinReturn };
             }
             return _methodReturnOnType(index, rt.type, rt.fromFile, name, language,
-                { filePath, consumerAwaited });
+                { filePath, consumerAwaited, selfTypeText: rt.typeText });
         }
         if (nominal) return null;
         // One-hop agreement (the #207/#219 discipline, one level deeper):
@@ -15534,8 +15689,12 @@ function _foldChainedReceiverType(index, fileEntry, filePath, call, ctx) {
     if (results.some(r => r.externalVia)) return null;
     if (new Set(results.map(r => r.type)).size !== 1) return null;
     const fromFiles = new Set(results.map(r => r.fromFile));
+    const typeTexts = new Set(results.map(r => r.typeText));
     let result = {
         type: results[0].type,
+        ...(typeTexts.size === 1 && results[0].typeText && {
+            typeText: results[0].typeText,
+        }),
         ...(fromFiles.size === 1 && results[0].fromFile && {
             fromFile: results[0].fromFile,
         }),

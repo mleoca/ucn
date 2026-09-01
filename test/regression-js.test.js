@@ -9153,6 +9153,93 @@ describe('fix #317: expression-bodied arrow call result flow', () => {
     });
 });
 
+describe('fix #318: generic this-field return flow', () => {
+    it('substitutes inherited generic field paths through a fluent wrapper', () => {
+        // Zod-measured: ZodDefault<T>.removeDefault() returns
+        // `this._def.innerType`; `_def` is inherited from ZodType<..., Def>
+        // and the subclass supplies Def=ZodDefaultDef<T>.
+        const dir = tmp({
+            'package.json': '{"name":"t","type":"module"}',
+            'schema.ts': [
+                'export interface WrappedDef<T extends Schema> { innerType: T; }',
+                'export class Schema<Def = unknown> {',
+                '  readonly _def!: Def;',
+                '  wrap(): Wrapped<this> { return new Wrapped(this); }',
+                '  finish(): string { return "schema"; }',
+                '}',
+                'export class Wrapped<T extends Schema> extends Schema<WrappedDef<T>> {',
+                '  constructor(value: T) { super(); this._def = { innerType: value }; }',
+                '  unwrap() { return this._def.innerType; }',
+                '}',
+                'export function schema(): Schema { return new Schema(); }',
+            ].join('\n'),
+            'decoy.ts': 'export class Decoy { finish(): string { return "decoy"; } }',
+            'use.ts': [
+                "import { schema } from './schema.js';",
+                'export const value = schema()',
+                '  .wrap()',
+                '  .unwrap()',
+                '  .wrap()',
+                '  .finish();',
+                'export const direct = schema().wrap().unwrap().finish();',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const unwrap = index.symbols.get('unwrap')[0];
+            assert.deepStrictEqual(unwrap.returnedReceiverPath, ['_def', 'innerType']);
+
+            const wrapped = execute(index, 'context', { name: 'schema.ts:4:wrap' });
+            assert.ok(wrapped.ok, wrapped.error);
+            assert.deepStrictEqual(wrapped.result.callers.map(call =>
+                `${call.relativePath}:${call.line}`), ['use.ts:3', 'use.ts:5', 'use.ts:7']);
+            assert.ok(!wrapped.result.unverifiedCallers.some(call =>
+                call.relativePath === 'use.ts'));
+            assert.ok(wrapped.result.meta.account.conserved);
+
+            const finish = execute(index, 'context', { name: 'schema.ts:5:finish' });
+            assert.ok(finish.ok, finish.error);
+            assert.ok(finish.result.callers.some(call =>
+                call.relativePath === 'use.ts' && call.line === 6));
+            assert.ok(finish.result.callers.some(call =>
+                call.relativePath === 'use.ts' && call.line === 7));
+            assert.ok(!finish.result.unverifiedCallers.some(call =>
+                call.relativePath === 'use.ts' && call.line === 7));
+            assert.ok(finish.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('does not infer alternate returns or an unbound generic wrapper', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'schema.ts': [
+                'interface Def<T> { left: T; right: Other; }',
+                'class Schema<D = unknown> { readonly _def!: D; finish() {} }',
+                'class Other { finish() {} }',
+                'class Ambiguous<T extends Schema> extends Schema<Def<T>> {',
+                '  unwrap(flag: boolean) {',
+                '    if (flag) return this._def.left;',
+                '    return this._def.right;',
+                '  }',
+                '}',
+                'declare const raw: Ambiguous;',
+                'raw.unwrap(true).finish();',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.strictEqual(
+                index.symbols.get('unwrap')[0].returnedReceiverPath, undefined);
+            for (const handle of ['schema.ts:2:finish', 'schema.ts:3:finish']) {
+                const result = execute(index, 'context', { name: handle });
+                assert.ok(result.ok, result.error);
+                assert.ok(!result.result.callers.some(call => call.line === 11));
+                assert.ok(result.result.meta.account.conserved);
+            }
+        } finally { rm(dir); }
+    });
+});
+
 // ============================================================================
 // fix #262: JS/TS literal ASSIGNMENTS type the variable (#218d parity) —
 // `const lines = []` → Array, so lines.push() routes external/excluded via

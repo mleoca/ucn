@@ -480,6 +480,39 @@ function returnedArrowCallSpan(node) {
 }
 
 /**
+ * Exact `this.field...` value returned by a one-statement method body. The
+ * deliberately narrow shape proves both that the member path is returned and
+ * that no fallthrough/alternate return widens the compiler-inferred type.
+ */
+function returnedReceiverFieldPath(node) {
+    const body = node.childForFieldName('body');
+    if (!body || body.type !== 'statement_block' || body.namedChildCount !== 1) {
+        return null;
+    }
+    const statement = body.namedChild(0);
+    if (statement?.type !== 'return_statement' || statement.namedChildCount !== 1) {
+        return null;
+    }
+    let value = statement.namedChild(0);
+    while (value?.type === 'parenthesized_expression' && value.namedChildCount === 1) {
+        value = value.namedChild(0);
+    }
+    const fields = [];
+    while (value?.type === 'member_expression') {
+        const property = value.childForFieldName('property');
+        const object = value.childForFieldName('object');
+        if (!property || !object ||
+            !['property_identifier', 'private_property_identifier', 'identifier']
+                .includes(property.type)) {
+            return null;
+        }
+        fields.unshift(property.text);
+        value = object;
+    }
+    return value?.type === 'this' && fields.length > 0 ? fields : null;
+}
+
+/**
  * Process a node for function extraction (single-pass helper)
  * Returns true if node was matched, false otherwise
  */
@@ -1322,6 +1355,8 @@ function extractClassMembers(classNode, codeOrLines) {
                 const isAsync = text.match(/^\s*(?:(?:public|private|protected)\s+)?(?:static\s+)?(?:override\s+)?async\s/) !== null;
                 const returnType = extractReturnType(child) ||
                     (returnsReceiverSelf(child) ? 'this' : null);
+                const returnedReceiverPath = !returnType
+                    ? returnedReceiverFieldPath(child) : null;
                 const docstring = extractJSDocstring(code, startLine);
                 const paramsStructured = parseStructuredParams(paramsNode, 'javascript');
                 const typeAnno = buildTypeAnnotations(paramsStructured, returnType, code, startLine, true);
@@ -1350,6 +1385,7 @@ function extractClassMembers(classNode, codeOrLines) {
                     // (fix #230) — pickBestDefinition prefers the implementation.
                     ...(child.type === 'method_signature' && { isSignature: true }),
                     ...typeAnno,
+                    ...(returnedReceiverPath && { returnedReceiverPath }),
                     ...(docstring && { docstring }),
                     ...(decorators.length > 0 && { decorators }),
                     ...(decoratorsWithArgs.length > 0 && { decoratorsWithArgs })
