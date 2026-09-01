@@ -8085,6 +8085,103 @@ describe('fix #314: ordered namespace-spread composites preserve ownership', () 
     });
 });
 
+describe('fix #315: namespace-exported values retain their declared type', () => {
+    it('pins callers, callees, and result flow through a barrel value', () => {
+        // Zod-measured: `core.globalRegistry.add()` reaches a typed exported
+        // singleton through core/index.ts. A namespace name in a parameter
+        // TYPE annotation is not a runtime shadow of that import.
+        const dir = tmp({
+            'package.json': '{"name":"t","type":"module"}',
+            'registry.ts': [
+                'export class Result { done() { return true; } }',
+                'export class Registry { add(_value?: unknown): Result { return new Result(); } }',
+                'export const globalRegistry: Registry = new Registry();',
+            ].join('\n'),
+            'barrel.ts': 'export * from "./registry.js";',
+            'use.ts': [
+                'import * as api from "./barrel.js";',
+                'export function run() {',
+                '  const value = api.globalRegistry.add();',
+                '  return value.done();',
+                '}',
+                'export function attach(meta: api.Registry) { return api.globalRegistry.add(meta); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const add = execute(index, 'context', { name: 'registry.ts:2:add' });
+            assert.ok(add.ok);
+            assert.deepStrictEqual(add.result.callers.map(call =>
+                `${call.relativePath}:${call.line}`), ['use.ts:3', 'use.ts:6']);
+            assert.ok(!add.result.unverifiedCallers.some(call =>
+                call.relativePath === 'use.ts'));
+
+            const done = execute(index, 'context', { name: 'registry.ts:1:done' });
+            assert.ok(done.ok);
+            assert.deepStrictEqual(done.result.callers.map(call =>
+                `${call.relativePath}:${call.line}`), ['use.ts:4']);
+
+            const run = index.symbols.get('run')[0];
+            const callees = index.findCallees(run, {
+                collectAccount: true,
+                includeMethods: true,
+            });
+            const addDef = index.symbols.get('add')
+                .find(symbol => symbol.className === 'Registry');
+            const doneDef = index.symbols.get('done')
+                .find(symbol => symbol.className === 'Result');
+            assert.ok(callees.some(callee => callee.bindingId === addDef.bindingId));
+            assert.ok(callees.some(callee => callee.bindingId === doneDef.bindingId));
+            assert.ok(callees.calleeAccount.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('refuses conflicting, untyped, and locally shadowed value roots', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t","type":"module"}',
+            'a.ts': [
+                'export class Registry { add() { return "a"; } }',
+                'export const service: Registry = new Registry();',
+            ].join('\n'),
+            'b.ts': [
+                'export class Other { add() { return "b"; } }',
+                'export const service: Other = new Other();',
+            ].join('\n'),
+            'conflict.ts': [
+                'export * from "./a.js";',
+                'export * from "./b.js";',
+            ].join('\n'),
+            'raw.ts': [
+                'import { Registry } from "./a.js";',
+                'declare function make(): Registry;',
+                'export const service = make();',
+            ].join('\n'),
+            'use.ts': [
+                'import * as api from "./conflict.js";',
+                'import * as raw from "./raw.js";',
+                'export function conflict() { return api.service.add(); }',
+                'export function untyped() { return raw.service.add(); }',
+                'export function shadow(api: any) { return api.service.add(); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            for (const target of ['a.ts:1:add', 'b.ts:1:add']) {
+                const result = execute(index, 'context', { name: target });
+                assert.ok(result.ok);
+                assert.ok(!result.result.callers.some(call =>
+                    call.relativePath === 'use.ts' && [3, 4, 5].includes(call.line)));
+                assert.ok(result.result.unverifiedCallers.some(call =>
+                    call.relativePath === 'use.ts' && call.line === 3));
+                assert.ok(result.result.meta.account.conserved);
+            }
+            const original = execute(index, 'context', { name: 'a.ts:1:add' });
+            assert.ok(original.result.unverifiedCallers.some(call => call.line === 4));
+            assert.ok(original.result.unverifiedCallers.some(call => call.line === 5));
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #291: plain-JS fluent self returns and closure bindings', () => {
     it('folds prototype builder chains only when every value return is this', () => {
         const dir = tmp({

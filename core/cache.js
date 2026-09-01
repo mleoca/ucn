@@ -662,7 +662,9 @@ function clearAllCaches() {
 // immutable module/export aliases (fix #313).
 // v195: JS/TS call records retain safe ordered namespace-spread receiver
 // compositions for exact module export ownership (fix #314).
-const CACHE_FORMAT_VERSION = 195;
+// v196: TS parameter type references no longer mark namespace receiver roots
+// as locally shadowed, changing receiverLocalBinding evidence (fix #315).
+const CACHE_FORMAT_VERSION = 196;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**

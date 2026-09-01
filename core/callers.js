@@ -2378,6 +2378,27 @@ function findCallers(index, name, options = {}) {
                         };
                     }
                 }
+                // Structural namespace value hop (fix #315, Zod-measured):
+                // `core.globalRegistry.add()` has a module namespace root and
+                // an exported VALUE whose explicit annotation fixes the
+                // receiver type. Follow exact ESM re-export chains (including
+                // barrels) to that annotation; untyped/conflicting/dynamic
+                // surfaces abstain. This is the value-level counterpart of
+                // the declared class-field hop above.
+                if (!fieldHopType && call.isMethod && !call.receiverType &&
+                    call.receiverField && !resolvedBySameClass &&
+                    langTraits(fileEntry.language)?.typeSystem === 'structural') {
+                    const moduleValueInfo = {};
+                    fieldHopType = _structuralModuleValueFieldType(
+                        index, fileEntry, call, moduleValueInfo);
+                    if (fieldHopType && moduleValueInfo.fromFile &&
+                        !call.receiverTypeFlowFile) {
+                        call = {
+                            ...call,
+                            receiverTypeFlowFile: moduleValueInfo.fromFile,
+                        };
+                    }
+                }
                 if (!resolvedByExtensionMethod && fileEntry.language === 'csharp' &&
                     fieldHopType) {
                     resolvedByExtensionMethod = _csharpExtensionCallMatches(
@@ -5484,6 +5505,12 @@ function findCallees(index, definition, options = {}) {
                         }
                     }
                 }
+                if (!fieldHopType &&
+                    langTraits(language)?.typeSystem === 'structural') {
+                    fieldHopInfo = fieldHopInfo || {};
+                    fieldHopType = _structuralModuleValueFieldType(
+                        index, fileEntry, call, fieldHopInfo);
+                }
             }
 
             if (fieldDispatchType) {
@@ -7463,7 +7490,9 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
         // Macro-result folding remains nominal-only; structural call chains
         // use the same compiler-annotation and module-ownership rails as the
         // already-supported immediate chained-receiver path.
-        if (call.receiverCall || (nominal && call.isMacro)) {
+        if (call.receiverCall ||
+            (!nominal && call.isMethod && call.receiverRoot && call.receiverField) ||
+            (nominal && call.isMacro)) {
             let folded = _typeOfCallResultFold(
                 index, fileEntry, filePath, call, assignedFoldCtx);
             // Rust result aliases are commonly imported under a local name
@@ -9376,6 +9405,122 @@ function _importedNamespaceMemberOwnership(index, fileEntry, call, targetFiles) 
     if (recognized === 0) return null;
     if (recognized !== bindings.length) unknown = true;
     return { verdict: unknown ? 'unknown' : 'no' };
+}
+
+/**
+ * Resolve the compiler-declared type of an exported JS/TS value through an
+ * exact ESM export chain. This is deliberately narrower than ordinary name
+ * ownership: a local value without an explicit annotation, a dynamic/CJS
+ * surface, an unresolved module, or competing exports returns unknown.
+ */
+function _structuralExportedValueType(
+    index, startAbs, exposedName, language, maxDepth = 6, visited = new Set()
+) {
+    if (maxDepth < 0) return { verdict: 'unknown' };
+    const stateKey = `${startAbs}\x00${exposedName}`;
+    if (visited.has(stateKey)) return { verdict: 'unknown' };
+    visited.add(stateKey);
+    const fileEntry = index.files.get(startAbs);
+    if (!fileEntry) return { verdict: 'unknown' };
+    const details = fileEntry.exportDetails || [];
+    if (details.some(item => item.type === 'exports' ||
+        item.type === 'module.exports')) return { verdict: 'unknown' };
+
+    const local = details.filter(item =>
+        !item.source && (item.alias || item.name) === exposedName);
+    if (local.length > 0) {
+        if (local.length !== 1 || !local[0].isVariable ||
+            !local[0].typeAnnotation) return { verdict: 'unknown' };
+        const type = _structuralTypeHead(local[0].typeAnnotation, {
+            index,
+            language,
+            originFile: startAbs,
+        });
+        if (!type || _STRUCTURAL_FLOW_REJECT.has(type) ||
+            (/^[A-Z][A-Z0-9]?$/.test(type) &&
+                !(index.symbols.get(type) || [])
+                    .some(definition => IDENTITY_TYPE_KINDS.has(definition.type)))) {
+            return { verdict: 'unknown' };
+        }
+        const typeDefs = (index.symbols.get(type) || [])
+            .filter(definition => IDENTITY_TYPE_KINDS.has(definition.type));
+        if (typeDefs.length === 0) return { verdict: 'yes', type };
+        const origin = _resolveFlowTypeOrigin(index, startAbs, type);
+        if (!origin?.fromFile) return { verdict: 'unknown' };
+        return { verdict: 'yes', type, fromFile: origin.fromFile };
+    }
+
+    const resolveSource = (item, name) => {
+        const rel = fileEntry.moduleResolved?.[item.source];
+        if (!rel) return { verdict: 'unknown' };
+        return _structuralExportedValueType(
+            index, path.join(index.root, rel), name, language,
+            maxDepth - 1, new Set(visited));
+    };
+    const merge = results => {
+        if (results.some(result => result.verdict === 'unknown')) {
+            return { verdict: 'unknown' };
+        }
+        const matches = results.filter(result => result.verdict === 'yes');
+        if (matches.length === 0) return { verdict: 'no' };
+        const identities = new Set(matches.map(result =>
+            `${result.type}\x00${result.fromFile || ''}`));
+        return identities.size === 1 ? matches[0] : { verdict: 'unknown' };
+    };
+
+    const exact = details.filter(item => item.source &&
+        item.type === 're-export' && (item.alias || item.name) === exposedName);
+    if (exact.length > 0) {
+        return merge(exact.map(item => resolveSource(item, item.name)));
+    }
+    const stars = details.filter(item => item.source &&
+        item.type === 're-export-all' && !item.alias);
+    if (stars.length === 0) return { verdict: 'no' };
+    return merge(stars.map(item => resolveSource(item, exposedName)));
+}
+
+/**
+ * Type a one-hop field receiver rooted at an unshadowed namespace import:
+ * `api.service.run()` where `service` is an explicitly typed exported value.
+ */
+function _structuralModuleValueFieldType(index, fileEntry, call, info = null) {
+    if (!call?.receiverRoot || !call.receiverField || call.receiverLocalBinding) {
+        return null;
+    }
+    const fields = call.receiverFields || [call.receiverField];
+    if (fields.length !== 1) return null;
+    const cache = index._opImportReachCache;
+    const cacheKey = `module-value-type\x00${fileEntry?.path || ''}\x00` +
+        `${call.receiverRoot}\x00${call.receiverField}`;
+    if (cache?.has(cacheKey)) {
+        const cached = cache.get(cacheKey);
+        if (info && cached?.fromFile) info.fromFile = cached.fromFile;
+        return cached?.type || null;
+    }
+    const finish = result => {
+        if (cache) cache.set(cacheKey, result);
+        if (info && result?.fromFile) info.fromFile = result.fromFile;
+        return result?.type || null;
+    };
+    const bindings = (fileEntry?.importBindings || []).filter(binding =>
+        binding.kind === 'namespace' &&
+        (binding.alias || binding.name) === call.receiverRoot);
+    if (bindings.length === 0) return finish(null);
+
+    const results = [];
+    for (const binding of bindings) {
+        const rel = fileEntry.moduleResolved?.[binding.module];
+        if (!rel) return finish(null);
+        const result = _structuralExportedValueType(
+            index, path.join(index.root, rel), call.receiverField,
+            fileEntry.language);
+        if (result.verdict !== 'yes') return finish(null);
+        results.push(result);
+    }
+    const identities = new Set(results.map(result =>
+        `${result.type}\x00${result.fromFile || ''}`));
+    if (identities.size !== 1) return finish(null);
+    return finish(results[0]);
 }
 
 /**
@@ -15117,6 +15262,19 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
                         externalVia: fieldInfo.externalVia,
                         ...(fieldInfo.externalConcrete && {
                             externalConcrete: true,
+                        }),
+                    };
+                }
+            }
+            if (!rt && langTraits(language)?.typeSystem === 'structural') {
+                const moduleValueInfo = {};
+                const moduleValueType = _structuralModuleValueFieldType(
+                    index, fileEntry, record, moduleValueInfo);
+                if (moduleValueType) {
+                    rt = {
+                        type: moduleValueType,
+                        ...(moduleValueInfo.fromFile && {
+                            fromFile: moduleValueInfo.fromFile,
                         }),
                     };
                 }

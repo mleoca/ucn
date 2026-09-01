@@ -2278,6 +2278,16 @@ function findCallsInCode(code, parser) {
 
     const _patternDeclaresName = (pattern, name) => {
         if (!pattern) return false;
+        // TypeScript parameter wrappers contain both the runtime binding
+        // pattern and a type annotation. Only the pattern declares names:
+        // `metadata: registries.GlobalMeta` must not make the namespace
+        // identifier `registries` look like a shadowing parameter.
+        if (pattern.type === 'required_parameter' ||
+            pattern.type === 'optional_parameter') {
+            return _patternDeclaresName(
+                pattern.childForFieldName('pattern') ||
+                pattern.childForFieldName('name'), name);
+        }
         if ((pattern.type === 'identifier' ||
             pattern.type === 'shorthand_property_identifier_pattern') &&
             pattern.text === name) return true;
