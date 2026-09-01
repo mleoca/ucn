@@ -1609,6 +1609,12 @@ function findCallsInCode(code, parser) {
     // rewritten call is then receiver-blind and routes through dispatch tiering.
     const memberAliases = new Map();
     const memberAliasesStack = [];  // function-scoped save/restore, like localVarTypes
+    // Exact class-value aliases: `_Segment = Segment` makes later
+    // `_Segment.line()` dispatch through the imported/local class object.
+    // Keep this separate from callable aliases: receiver evidence must be
+    // scope-local, position-aware, and invalidated by every later write.
+    const classValueAliases = new Map();
+    const classValueAliasesStack = [];
     const moduleAliases = new Set();  // Names bound to MODULES (import httpx / import numpy as np)
     const localVarTypesStack = [];  // Stack for function-scoped save/restore of localVarTypes
     const declaredVarTypesStack = [];
@@ -1706,6 +1712,33 @@ function findCallsInCode(code, parser) {
     };
 
     const isShadowedByLocal = isPythonNameShadowedAt;
+    const isDirectScopeAssignment = assignment => {
+        const statement = assignment?.parent?.type === 'expression_statement'
+            ? assignment.parent : assignment;
+        const parent = statement?.parent;
+        if (parent?.type === 'module') return true;
+        if (parent?.type !== 'block') return false;
+        return ['function_definition', 'async_function_definition']
+            .includes(parent.parent?.type);
+    };
+    const functionParameterBindsName = (functionNode, name) => {
+        const params = functionNode?.childForFieldName('parameters');
+        if (!params) return false;
+        for (let i = 0; i < params.namedChildCount; i++) {
+            const param = params.namedChild(i);
+            let paramName = param.type === 'identifier'
+                ? param
+                : (param.childForFieldName('name') || param.namedChild(0));
+            if (paramName && ['dictionary_splat_pattern', 'list_splat_pattern']
+                .includes(paramName.type)) {
+                paramName = paramName.namedChild(0);
+            }
+            if (paramName?.type === 'identifier' && paramName.text === name) {
+                return true;
+            }
+        }
+        return false;
+    };
     const exactConstructorInfo = funcNode => {
         const ctor = constructorTypeInfo(funcNode);
         if (!ctor) return undefined;
@@ -1774,6 +1807,14 @@ function findCallsInCode(code, parser) {
             constructedReceiverVarsStack.push(new Set(constructedReceiverVars));
             withBindingVarsStack.push(new Set(withBindingVars));
             memberAliasesStack.push(new Map(memberAliases));
+            classValueAliasesStack.push(new Map(classValueAliases));
+            const body = node.childForFieldName('body');
+            for (const name of classValueAliases.keys()) {
+                if ((body && pythonScopeBindsName(body, name)) ||
+                    functionParameterBindsName(node, name)) {
+                    classValueAliases.delete(name);
+                }
+            }
         }
 
         // Track parameter type annotations: def foo(x: Foo) → x is Foo
@@ -1888,6 +1929,7 @@ function findCallsInCode(code, parser) {
             const left = node.childForFieldName('left');
             const right = node.childForFieldName('right');
             if (left?.type === 'identifier') {
+                classValueAliases.delete(left.text);
                 const previousType = localVarTypes.get(left.text);
                 if (previousType && right?.type === 'call') {
                     const rightFunction = right.childForFieldName('function');
@@ -2015,6 +2057,11 @@ function findCallsInCode(code, parser) {
                 }
                 if (right?.type === 'identifier') {
                     aliases.set(left.text, right.text);
+                    const classValue = !typeNode && isDirectScopeAssignment(node)
+                        ? exactConstructorInfo(right) : null;
+                    if (classValue) {
+                        classValueAliases.set(left.text, classValue.type);
+                    }
                 }
                 // Member-access alias (fix #218): append = output.append
                 else if (right?.type === 'attribute') {
@@ -2274,7 +2321,8 @@ function findCallsInCode(code, parser) {
                             comprehensionReceiverType(
                                 objNode, receiver, localIterableTypes,
                                 callableIterableTypes, instanceFieldContracts) ||
-                            localVarTypes.get(receiver))
+                            localVarTypes.get(receiver) ||
+                            classValueAliases.get(receiver))
                             || assignmentRhsReceiverTypes.get(node.id)
                         : (subscriptReceiverType ||
                             (objNode ? PY_LITERAL_RECEIVER_TYPES[objNode.type] : undefined));
@@ -2515,6 +2563,13 @@ function findCallsInCode(code, parser) {
                 if (savedAliases) {
                     memberAliases.clear();
                     for (const [k, v] of savedAliases) memberAliases.set(k, v);
+                }
+                const savedClassValueAliases = classValueAliasesStack.pop();
+                if (savedClassValueAliases) {
+                    classValueAliases.clear();
+                    for (const [k, v] of savedClassValueAliases) {
+                        classValueAliases.set(k, v);
+                    }
                 }
             }
         }

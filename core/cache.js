@@ -669,7 +669,9 @@ function clearAllCaches() {
 // results without treating block bodies or arbitrary expressions as returns.
 // v198 (fix #318): JS/TS one-return methods persist exact this-field paths for
 // generic declared-field result flow.
-const CACHE_FORMAT_VERSION = 198;
+// v199 (fix #321): Python call records persist receiver types derived from
+// exact, scope-local class-value aliases such as `_Segment = Segment`.
+const CACHE_FORMAT_VERSION = 199;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**

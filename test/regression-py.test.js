@@ -1200,6 +1200,71 @@ describe('fix #320: Python stable factory field contracts', () => {
     });
 });
 
+describe('fix #321: Python class-value receiver aliases', () => {
+    it('pins a direct class alias but rejects shadows, branches, and rebinding', () => {
+        const dir = tmp({
+            'segments.py': [
+                'class Segment:',
+                '    @classmethod',
+                '    def line(cls):',
+                '        return cls()',
+                '',
+                'class Console:',
+                '    def line(self):',
+                '        return None',
+            ].join('\n'),
+            'render.py': [
+                'from segments import Segment',
+                '',
+                'def exact():',
+                '    _Segment = Segment',
+                '    return _Segment.line()',
+                '',
+                'def shadowed(Segment):',
+                '    _Segment = Segment',
+                '    return _Segment.line()',
+                '',
+                'def conditional(flag):',
+                '    if flag:',
+                '        _Segment = Segment',
+                '    return _Segment.line()',
+                '',
+                'def rebound():',
+                '    _Segment = Segment',
+                '    _Segment = object()',
+                '    return _Segment.line()',
+            ].join('\n'),
+            'outer.py': [
+                'from segments import Segment',
+                '_Segment = Segment',
+                '',
+                'def inherited():',
+                '    return _Segment.line()',
+                '',
+                'def shadow_before_assignment():',
+                '    _Segment.line()',
+                '    _Segment = object()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', {
+                name: 'segments.py:3:line',
+            });
+            assert.ok(result.ok, result.error);
+            assert.ok(result.result.callers.some(call =>
+                call.relativePath === 'render.py' && call.line === 5));
+            assert.ok(!result.result.callers.some(call =>
+                call.relativePath === 'render.py' && [9, 14, 19].includes(call.line)));
+            assert.ok(result.result.callers.some(call =>
+                call.relativePath === 'outer.py' && call.line === 5));
+            assert.ok(!result.result.callers.some(call =>
+                call.relativePath === 'outer.py' && call.line === 8));
+            assert.ok(result.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+});
+
 describe('Regression: Python self.method() same-class resolution', () => {
     it('findCallees should resolve self.method() to same-class methods', () => {
         const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-selfmethod-'));
