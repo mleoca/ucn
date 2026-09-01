@@ -8998,6 +8998,80 @@ export function other(): number {
     });
 });
 
+describe('fix #316: overload signatures drive structural chain flow', () => {
+    it('uses agreeing public overload returns when the implementation omits its annotation', () => {
+        // Zod-measured: default() exposes two annotated overload signatures,
+        // while its implementation is intentionally unannotated. The public
+        // signatures still type every inherited fluent-chain result.
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'schema.ts': [
+                'export class Schema {',
+                '  wrap(value: string): Wrapped<this>;',
+                '  wrap(value: () => string): Wrapped<this>;',
+                '  wrap(value: any) { return new Wrapped(this); }',
+                '}',
+                'export class Wrapped<T extends Schema> extends Schema {',
+                '  constructor(readonly inner: T) { super(); }',
+                '}',
+                'export class Decoy { wrap(value: any): Decoy { return this; } }',
+                'export function schema(): Schema { return new Schema(); }',
+            ].join('\n'),
+            'use.ts': [
+                "import { schema } from './schema';",
+                'export const value = schema()',
+                '  .wrap("inner")',
+                '  .wrap("outer");',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', { name: 'schema.ts:4:wrap' });
+            assert.ok(result.ok, result.error);
+            assert.deepStrictEqual(result.result.callers.map(call =>
+                `${call.relativePath}:${call.line}`), ['use.ts:3', 'use.ts:4']);
+            assert.ok(!result.result.unverifiedCallers.some(call =>
+                call.relativePath === 'use.ts'),
+            `both fluent hops should be typed: ${JSON.stringify(result.result.unverifiedCallers)}`);
+            assert.ok(result.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('abstains when public overload return heads disagree', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'schema.ts': [
+                'export class Left { finish(): string { return "left"; } }',
+                'export class Right { finish(): string { return "right"; } }',
+                'export class Factory {',
+                '  choose(value: string): Left;',
+                '  choose(value: number): Right;',
+                '  choose(value: unknown) { return value ? new Left() : new Right(); }',
+                '}',
+                'export function factory(): Factory { return new Factory(); }',
+            ].join('\n'),
+            'use.ts': [
+                "import { factory } from './schema';",
+                'declare const input: string | number;',
+                'factory().choose(input).finish();',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            for (const handle of ['schema.ts:1:finish', 'schema.ts:2:finish']) {
+                const result = execute(index, 'context', { name: handle });
+                assert.ok(result.ok, result.error);
+                assert.ok(!result.result.callers.some(call =>
+                    call.relativePath === 'use.ts'),
+                `conflicting return heads must not pick ${handle}`);
+                assert.ok(result.result.unverifiedCallers.some(call =>
+                    call.relativePath === 'use.ts' && call.line === 3));
+                assert.ok(result.result.meta.account.conserved);
+            }
+        } finally { rm(dir); }
+    });
+});
+
 // ============================================================================
 // fix #262: JS/TS literal ASSIGNMENTS type the variable (#218d parity) —
 // `const lines = []` → Array, so lines.push() routes external/excluded via

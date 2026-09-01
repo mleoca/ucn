@@ -14516,9 +14516,16 @@ function _methodReturnOnType(index, typeName, fromFile, methodName, language, op
     // Structural: heads must agree; `this`/`Self` are the receiver's type
     // (checked BEFORE the reject set — with a known owner they ARE identity);
     // un-awaited async producers stay untyped (the value is a coroutine).
-    if (language === 'python' && !opts.consumerAwaited && owned.some(d => d.isAsync)) return null;
+    // TypeScript/Python overload signatures are the public call contract;
+    // their runtime implementation may intentionally omit a return annotation.
+    // Once a compiler-recognized signature group exists, use only those
+    // declarations for result-flow agreement. Conflicting signature heads
+    // still abstain below (fix #316, zod-measured fluent default chains).
+    const contracts = owned.some(d => d.isSignature)
+        ? owned.filter(d => d.isSignature) : owned;
+    if (language === 'python' && !opts.consumerAwaited && contracts.some(d => d.isAsync)) return null;
     const heads = new Set();
-    for (const d of owned) {
+    for (const d of contracts) {
         if (!d.returnType) return null;
         let h = _structuralTypeHead(d.returnType, {
             unwrapAsync: opts.consumerAwaited, index, language, originFile: d.file,
@@ -14534,7 +14541,7 @@ function _methodReturnOnType(index, typeName, fromFile, methodName, language, op
     const returnTypeDefs = (index.symbols.get(head) || []).filter(d => IDENTITY_TYPE_KINDS.has(d.type));
     if (returnTypeDefs.length > 0) {
         const origins = new Set();
-        for (const d of owned) {
+        for (const d of contracts) {
             const origin = _resolveFlowTypeOrigin(index, d.file || opts.filePath, head);
             if (!origin) return null;
             origins.add(origin.fromFile);
