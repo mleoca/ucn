@@ -22,6 +22,14 @@ const RESERVED_RECEIVER_NAMES = new Set([
 ]);
 const CROSS_OPERATION_FLOW_CACHE_LIMIT = 4096;
 
+// `base` is a contextual receiver keyword only in C#. TypeScript and the
+// other supported languages may bind an ordinary local named base; treating
+// it as reserved globally suppresses otherwise exact assignment flow.
+function _isReservedReceiver(language, receiver) {
+    if (receiver === 'base') return language === 'csharp';
+    return RESERVED_RECEIVER_NAMES.has(receiver);
+}
+
 /** Set.some() helper — like Array.some() but for Sets */
 function setSome(set, predicate) {
     for (const item of set) {
@@ -871,7 +879,7 @@ function findCallers(index, name, options = {}) {
                 // type derives from OTHER files' annotations, so it must never be
                 // persisted with this file's calls.
                 if (call.isMethod && call.receiver &&
-                    !RESERVED_RECEIVER_NAMES.has(call.receiver) &&
+                    !_isReservedReceiver(fileEntry.language, call.receiver) &&
                     (!call.receiverType || call.receiverTypeGuessed) &&
                     !call.receiverPatternShadow && !call.receiverFlowInvalidated &&
                     !call.receiverIsChainRoot &&
@@ -2120,7 +2128,8 @@ function findCallers(index, name, options = {}) {
                                 continue;
                             }
                         }
-                    } else if (['self', 'cls', 'this', 'super', 'base'].includes(call.receiver) ||
+                    } else if (['self', 'cls', 'this', 'super'].includes(call.receiver) ||
+                               (call.receiver === 'base' && fileEntry.language === 'csharp') ||
                                (call.receiver === 'Self' && fileEntry.language === 'rust')) {
                         // self/this/super.method() — resolve to same-class or parent method.
                         // Rust `Self::method()` (fix #232) is the path-call same-class form:
@@ -2137,8 +2146,8 @@ function findCallers(index, name, options = {}) {
                             }
                         } else {
                             // For super(), skip same-class — only check parent chain
-                            const parentOnlyReceiver =
-                                call.receiver === 'super' || call.receiver === 'base';
+                            const parentOnlyReceiver = call.receiver === 'super' ||
+                                (call.receiver === 'base' && fileEntry.language === 'csharp');
                             let matchedClass = !parentOnlyReceiver &&
                                 definitions.some(d => d.className === callerSymbol.className)
                                 ? callerSymbol.className : null;
@@ -5221,7 +5230,7 @@ function findCallees(index, definition, options = {}) {
         const mayNeedDirectReceiverFlow = call =>
             call.isMethod && call.receiver && !call.receiverType &&
             !call.receiverPatternShadow &&
-            !RESERVED_RECEIVER_NAMES.has(call.receiver) &&
+            !_isReservedReceiver(language, call.receiver) &&
             !call.isPathCall && !call.receiverIsModule &&
             !call.receiverIsChainRoot;
         // Chained-receiver fold context (fix #268 — the #258 rails, callee
@@ -5404,7 +5413,7 @@ function findCallees(index, definition, options = {}) {
                     hopRoot = localTypes.get(call.receiverRoot);
                 }
                 if (!hopRoot && call.receiverRoot &&
-                    !RESERVED_RECEIVER_NAMES.has(call.receiverRoot)) {
+                    !_isReservedReceiver(language, call.receiverRoot)) {
                     const inferredRoot = _lookupReturnTypeFlow(flowMap(), {
                         ...call,
                         receiver: call.receiverRoot,
@@ -5618,7 +5627,7 @@ function findCallees(index, definition, options = {}) {
             if (call.isMethod && !call.isConstructor && call.receiver &&
                 !call.receiverType && !fieldHopType && !goImportModule &&
                 !call.receiverIsModule && !call.selfAttribute &&
-                !RESERVED_RECEIVER_NAMES.has(call.receiver) &&
+                !_isReservedReceiver(language, call.receiver) &&
                 !(localTypes && localTypes.has(call.receiver))) {
                 typeQual = _calleeTypeQualifiedReceiver(index, def, fileEntry, call, language);
             }
@@ -5659,7 +5668,8 @@ function findCallees(index, definition, options = {}) {
                            (call.receiver === 'Self' && language === 'rust')) {
                     // self.method() / cls.method() / this.method() — resolve to same-class method below
                     // Rust Self::method() resolves same-impl the same way (fix #236, the #232 callee analog)
-                } else if (call.receiver === 'super' || call.receiver === 'base') {
+                } else if (call.receiver === 'super' ||
+                    (call.receiver === 'base' && language === 'csharp')) {
                     // super().method() — resolve to parent class method below
                 } else if (directReceiverFlow?.externalVia) {
                     if (directReceiverFlow.externalConcrete) {
@@ -6021,7 +6031,7 @@ function findCallees(index, definition, options = {}) {
                 }
                 if (collectAccount && call.receiver && !call.receiverIsModule && !call.receiverType &&
                     !call.receiverCall && !call.isPotentialCallback &&
-                    !RESERVED_RECEIVER_NAMES.has(call.receiver)) {
+                    !_isReservedReceiver(language, call.receiver)) {
                     const owners = new Set((index.symbols.get(call.name) || [])
                         .filter(s => !NON_CALLABLE_TYPES.has(s.type))
                         .map(s => s.className || (s.receiver && s.receiver.replace(/^\*/, '')))
@@ -6041,7 +6051,8 @@ function findCallees(index, definition, options = {}) {
             // `super(...)` 'constructor' record were routed external here
             // because __init__/constructor sit in the builtin name sets).
             const selfShaped = call.isMethod &&
-                (['self', 'cls', 'this', 'super', 'base'].includes(call.receiver) ||
+                (['self', 'cls', 'this', 'super'].includes(call.receiver) ||
+                 (call.receiver === 'base' && language === 'csharp') ||
                  (call.receiver === 'Self' && language === 'rust'));
             // Builtin/global names are shadowable. `Request` is a web global,
             // but `const Request = require('./request')` owns `new Request()`
@@ -6126,7 +6137,8 @@ function findCallees(index, definition, options = {}) {
 
             // Collect super().method() calls for parent-class resolution
             if (call.isMethod &&
-                (call.receiver === 'super' || call.receiver === 'base')) {
+                (call.receiver === 'super' ||
+                 (call.receiver === 'base' && language === 'csharp'))) {
                 if (!selfMethodCalls) selfMethodCalls = [];
                 selfMethodCalls.push({ call, siteId });
                 continue;
@@ -6262,7 +6274,7 @@ function findCallees(index, definition, options = {}) {
                 // also named ReadConfig. Otherwise the bare wrapper steals the
                 // exact callee before receiver evidence is considered.
                 const receiverBlindMethodBinding = call.isMethod &&
-                    !RESERVED_RECEIVER_NAMES.has(call.receiver);
+                    !_isReservedReceiver(language, call.receiver);
                 let bindings = receiverBlindMethodBinding ? [] :
                     fileEntry.bindings.filter(b => b.name === call.name);
                 // For Go, also check sibling files in same directory (same
@@ -6797,8 +6809,8 @@ function findCallees(index, definition, options = {}) {
                 }
 
                 // For super().method(), skip same-class — start from parent
-                const parentOnlyReceiver =
-                    call.receiver === 'super' || call.receiver === 'base';
+                const parentOnlyReceiver = call.receiver === 'super' ||
+                    (call.receiver === 'base' && language === 'csharp');
                 const selectOwner = owner => _calleeOverloadSelect(
                     index,
                     call,

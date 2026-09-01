@@ -11,6 +11,24 @@
 const IR_SCHEMA_VERSION = 1;
 const EVIDENCE_TIERS = Object.freeze(['confirmed', 'unverified', 'excluded']);
 
+// Runtime receiver identity for overload-heavy JS/TS member aliases. Generic
+// arguments may differ while the produced value still has one concrete owner
+// (`Factory.create(): Schema<A>` / `Schema<B>`). Transparent/async wrappers
+// are deliberately rejected here: downstream assignment flow unwraps them,
+// so agreement on Promise/Optional alone would not prove the inner receiver.
+function callableAliasReturnHead(returnType) {
+    if (!returnType || typeof returnType !== 'string') return null;
+    const text = returnType.trim();
+    const match = text.match(
+        /^([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*(?:<[\s\S]*>|\[[\s\S]*\])?$/);
+    if (!match) return null;
+    const head = match[1].split('.').pop();
+    if (['Promise', 'Awaitable', 'Optional', 'Annotated', 'Final'].includes(head)) {
+        return null;
+    }
+    return head;
+}
+
 function normalizeSymbol(symbol, family, language, kind, owner = null) {
     let normalizedOwner = owner || symbol.className || null;
     if (!normalizedOwner && symbol.receiver && family === 'callable') {
@@ -123,9 +141,10 @@ function createFileIR({
     // An immutable module-scope member alias has the callable signature of
     // the class member it captures: `const make = Widget.create`. Materialize
     // the local value and each explicit export alias as real function symbols
-    // only when its member is static and every declared return type agrees.
-    // This is compiler-visible identity; mutable aliases and ambiguous
-    // overload returns were rejected by the parser/agreement gate above.
+    // only when its member is static and every declared return type has the
+    // same concrete runtime head. Generic arguments may differ across legal
+    // overloads; a different head remains ambiguous. This is compiler-visible
+    // identity; mutable aliases and ambiguous overload returns stay rejected.
     for (const alias of (parsed.callableAliases || [])) {
         const sources = normalizedSymbols.filter(symbol =>
             symbol.name === alias.member && symbol.owner === alias.owner &&
@@ -135,7 +154,11 @@ function createFileIR({
             symbol.returnType);
         if (sources.length === 0) continue;
         const sourceReturns = new Set(sources.map(source => source.returnType));
-        if (sourceReturns.size !== 1) continue;
+        if (sourceReturns.size !== 1) {
+            const heads = new Set(sources.map(source =>
+                callableAliasReturnHead(source.returnType)));
+            if (heads.has(null) || heads.size !== 1) continue;
+        }
         const source = sources[0];
         const exported = (parsed.exports || []).filter(item =>
             !item.source && item.name === alias.name);

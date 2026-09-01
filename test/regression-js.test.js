@@ -7800,6 +7800,84 @@ describe('fix #310: dollar-prefixed return types enter assignment flow', () => {
     });
 });
 
+describe('fix #311: overloaded factory aliases preserve concrete flow', () => {
+    it('pins a generic overload result stored in a local named base', () => {
+        // Zod-measured: `record` and `function` are immutable aliases of
+        // overload-heavy static factories. Their return annotations differ
+        // only in generic arguments, while every value is the same runtime
+        // schema class. Separately, `base` is an ordinary TypeScript binding,
+        // not the C# contextual receiver keyword.
+        const dir = tmp({
+            'package.json': '{"name":"t","type":"module"}',
+            'impl.ts': [
+                'export class Schema<T> { execute() { return "schema"; } }',
+                'export class Factory {',
+                '  static create(value: string): Schema<string>;',
+                '  static create(value: number): Schema<number>;',
+                '  static create(value: unknown): Schema<unknown> { return new Schema(); }',
+                '}',
+                'const factory = Factory.create;',
+                'export { factory as schema };',
+            ].join('\n'),
+            'decoy.ts': 'export class Other { execute() { return "other"; } }',
+            'use.ts': [
+                'import * as api from "./impl.js";',
+                'export function run() {',
+                '  const base = api.schema("x");',
+                '  return base.execute();',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const alias = (index.symbols.get('schema') || []).find(symbol =>
+                symbol.file.endsWith('impl.ts'));
+            assert.ok(alias?.callableAlias,
+                `overload alias should be indexed: ${JSON.stringify(index.symbols.get('schema'))}`);
+            assert.strictEqual(alias.returnType, 'Schema<string>');
+
+            const result = execute(index, 'context', { name: 'impl.ts:1:execute' });
+            assert.ok(result.ok);
+            assert.deepStrictEqual(result.result.callers.map(call =>
+                `${call.relativePath}:${call.line}`), ['use.ts:4']);
+            assert.ok(!result.result.unverifiedCallers.some(call =>
+                call.relativePath === 'use.ts'));
+            assert.ok(result.result.meta.account.conserved);
+
+            const run = index.symbols.get('run')[0];
+            const callees = index.findCallees(run, { collectAccount: true });
+            assert.ok(callees.some(callee => callee.name === 'execute' &&
+                callee.bindingId === index.symbols.get('execute')
+                    .find(symbol => symbol.className === 'Schema').bindingId),
+            `callee direction should preserve base's flow type: ${JSON.stringify(callees)}`);
+        } finally { rm(dir); }
+    });
+
+    it('keeps overload aliases with different runtime heads unindexed', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t","type":"module"}',
+            'impl.ts': [
+                'class A {}',
+                'class B {}',
+                'class Factory {',
+                '  static create(value: string): A;',
+                '  static create(value: number): B;',
+                '  static create(value: unknown) { return value ? new A() : new B(); }',
+                '}',
+                'const factory = Factory.create;',
+                'export { factory as schema };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.ok(!(index.symbols.get('factory') || [])
+                .some(symbol => symbol.callableAlias));
+            assert.ok(!(index.symbols.get('schema') || [])
+                .some(symbol => symbol.callableAlias));
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #291: plain-JS fluent self returns and closure bindings', () => {
     it('folds prototype builder chains only when every value return is this', () => {
         const dir = tmp({

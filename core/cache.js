@@ -656,7 +656,9 @@ function clearAllCaches() {
 // same-spelled project method cannot gain confirmed identity after reload.
 // v192: JS/TS callback records carry moduleLocalBinding so dynamically
 // produced module values cannot borrow target identity from file imports.
-const CACHE_FORMAT_VERSION = 192;
+// v193: overload-heavy JS/TS class-member aliases materialize when every
+// declared return has one concrete runtime head, changing indexed symbols.
+const CACHE_FORMAT_VERSION = 193;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**
