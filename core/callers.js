@@ -3008,11 +3008,29 @@ function findCallers(index, name, options = {}) {
                 // dynamic CJS surfaces can exceed the modeled ownership);
                 // unresolved-but-project-looking → visible (resolver gap).
                 if ((!bindingId || recvExportedNamespace) && !resolvedBySameClass && call.isMethod &&
-                    (call.receiverIsModule || recvSubmoduleRel || recvExportedNamespace) &&
+                    (call.receiverIsModule || recvSubmoduleRel || recvExportedNamespace ||
+                        call.receiverModuleComposition) &&
                     langTraits(fileEntry.language)?.typeSystem === 'structural') {
-                    const recvBindings = recvExportedNamespace
-                        ? [] : _structuralModuleBindings(fileEntry, call);
                     const tFiles = targetDefinitionFiles;
+                    const compositeOwnership = call.receiverModuleComposition
+                        ? _structuralCompositeModuleOwnership(
+                            index, fileEntry, call, tFiles)
+                        : null;
+                    if (compositeOwnership?.verdict === 'no') {
+                        recordExcluded(filePath, call.line, 'other-definition-import');
+                        continue;
+                    }
+                    if (compositeOwnership?.verdict === 'unknown') {
+                        if (collectAccount) {
+                            routeUnverified(filePath, fileEntry, call,
+                                'no-import-link', calledAs);
+                            continue;
+                        }
+                    }
+                    const recvBindings = recvExportedNamespace
+                        ? [] : (compositeOwnership?.verdict === 'yes'
+                            ? [compositeOwnership.binding]
+                            : _structuralModuleBindings(fileEntry, call));
                     // Same-file targets get NO bypass (fix #294, flask-measured:
                     // `import json as _json; _json.dump(...)` in the file
                     // defining flask's own `dump` confirmed a self-recursive
@@ -6151,7 +6169,8 @@ function findCallees(index, definition, options = {}) {
             // the callee. Follow the module's name-level re-export chain and
             // add only definitions it actually exposes. Unknown CJS/dynamic
             // surfaces stay visible; external modules are external.
-            if (call.isMethod && call.receiverIsModule &&
+            if (call.isMethod && (call.receiverIsModule ||
+                call.receiverModuleComposition) &&
                 langTraits(language)?.typeSystem === 'structural') {
                 const moduleRoute = _calleeStructuralModuleRoute(index, fileEntry, call, language);
                 if (moduleRoute.matches?.length) {
@@ -7743,7 +7762,8 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
                 }
                 continue;
             }
-        } else if (!nominal && call.isMethod && call.receiverIsModule &&
+        } else if (!nominal && call.isMethod &&
+            (call.receiverIsModule || call.receiverModuleComposition) &&
             (call.receiver || call.receiverModuleSpecifier)) {
             // Structural module-qualified producer (fix #209): schema =
             // z.string() — the module alias resolves through the file's
@@ -7751,8 +7771,15 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
             // and the producer's return annotation types the variable.
             // Standalone exports only (className-less): a module attr is
             // never a class method.
-            const binding = _structuralModuleBindings(fileEntry, call)[0];
-            const rel = binding && fileEntry.moduleResolved && fileEntry.moduleResolved[binding.module];
+            const composite = call.receiverModuleComposition
+                ? _structuralCompositeModuleOwnership(index, fileEntry, call)
+                : null;
+            if (composite && composite.verdict !== 'yes') continue;
+            const binding = composite?.binding ||
+                _structuralModuleBindings(fileEntry, call)[0];
+            const rel = composite?.rel ||
+                (binding && fileEntry.moduleResolved &&
+                    fileEntry.moduleResolved[binding.module]);
             if (binding && !rel) {
                 // External module producer (fix #222, httpx-measured — the
                 // #220 Go external-producer rule for structural languages):
@@ -10464,6 +10491,62 @@ function _structuralModuleBindings(fileEntry, call) {
     return (fileEntry?.importBindings || []).filter(b => b.name === call?.receiver);
 }
 
+/**
+ * Resolve an ordinary module-local object composed from namespace spreads:
+ * `const z = { ...schemas, ...checks, iso }`.
+ *
+ * The JS parser records this only for a private, unescaped, unmodified const
+ * object. Walk layers from last to first because later object spreads and
+ * explicit properties override earlier names. A layer may be skipped only
+ * when its complete modeled export surface definitively lacks the requested
+ * name; resolver gaps and dynamic surfaces remain unknown.
+ *
+ * When targetFiles is supplied, verdict answers whether the winning layer
+ * owns that pinned definition. Without targetFiles it returns the winning
+ * module binding for return-flow/callee lookup.
+ */
+function _structuralCompositeModuleOwnership(
+    index, fileEntry, call, targetFiles = null
+) {
+    const layers = call?.receiverModuleComposition;
+    if (!Array.isArray(layers) || layers.length === 0 || !call.name) return null;
+    const nameFiles = new Set((index.symbols.get(call.name) || [])
+        .filter(definition => definition.file &&
+            (!NON_CALLABLE_TYPES.has(definition.type) || definition.type === 'class'))
+        .map(definition => definition.file));
+    if (nameFiles.size === 0) return { verdict: 'unknown' };
+
+    for (let i = layers.length - 1; i >= 0; i--) {
+        const layer = layers[i];
+        if (layer.kind === 'property') {
+            if (layer.name === call.name) return { verdict: 'unknown' };
+            continue;
+        }
+        if (layer.kind !== 'spread' || !layer.receiver) {
+            return { verdict: 'unknown' };
+        }
+        const bindings = (fileEntry?.importBindings || []).filter(binding =>
+            (binding.alias || binding.name) === layer.receiver &&
+            binding.kind === 'namespace');
+        if (bindings.length !== 1) return { verdict: 'unknown' };
+        const binding = bindings[0];
+        const rel = fileEntry.moduleResolved?.[binding.module];
+        if (!rel) return { verdict: 'unknown' };
+        const moduleFile = path.join(index.root, rel);
+        const presence = _nameBindingReaches(
+            index, moduleFile, call.name, nameFiles);
+        if (presence === 'unknown') return { verdict: 'unknown' };
+        if (presence === 'no') continue;
+        if (!targetFiles) {
+            return { verdict: 'yes', binding, rel, moduleFile };
+        }
+        const verdict = _nameBindingReaches(
+            index, moduleFile, call.name, targetFiles);
+        return { verdict, binding, rel, moduleFile };
+    }
+    return { verdict: 'no' };
+}
+
 function _pythonBuiltinContractAllowed(index, fileEntry, moduleName) {
     const module = String(moduleName || '');
     if (!module || module.startsWith('.')) return false;
@@ -10564,7 +10647,12 @@ function _structuralReturnedConstructorFlow(index, definition) {
 }
 
 function _calleeStructuralModuleRoute(index, fileEntry, call, language) {
-    const bindings = _structuralModuleBindings(fileEntry, call);
+    const composite = call.receiverModuleComposition
+        ? _structuralCompositeModuleOwnership(index, fileEntry, call)
+        : null;
+    if (composite && composite.verdict !== 'yes') return { unknown: true };
+    const bindings = composite
+        ? [composite.binding] : _structuralModuleBindings(fileEntry, call);
     if (bindings.length === 0) return { unknown: true };
     return _calleeStructuralBindingRoute(index, fileEntry, call, language, bindings, call.name, false);
 }
@@ -14890,8 +14978,15 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
     if (!nominal && record.isMethod &&
         (record.receiver || record.receiverModuleSpecifier) &&
         (record.receiverIsModule || _isStructuralImportReceiver(fileEntry, record))) {
-        const binding = _structuralModuleBindings(fileEntry, record)[0];
-        const rel = binding && fileEntry.moduleResolved && fileEntry.moduleResolved[binding.module];
+        const composite = record.receiverModuleComposition
+            ? _structuralCompositeModuleOwnership(index, fileEntry, record)
+            : null;
+        if (composite && composite.verdict !== 'yes') return null;
+        const binding = composite?.binding ||
+            _structuralModuleBindings(fileEntry, record)[0];
+        const rel = composite?.rel ||
+            (binding && fileEntry.moduleResolved &&
+                fileEntry.moduleResolved[binding.module]);
         if (binding && !rel) {
             const mod = String(binding.module);
             const firstSeg = mod.split(/[./]/).filter(Boolean)[0];
@@ -15217,7 +15312,8 @@ function _foldChainedReceiverType(index, fileEntry, filePath, call, ctx) {
         // fallback is not allowed to borrow Mocker.number (or another
         // module/version) as its return type. Keep the consumer untyped and
         // visible instead of manufacturing exclusion-grade evidence.
-        if (prods.some(r => r.receiverIsModule || _isStructuralImportReceiver(fileEntry, r))) {
+        if (prods.some(r => r.receiverIsModule || r.receiverModuleComposition ||
+            _isStructuralImportReceiver(fileEntry, r))) {
             return { suppressFallback: true };
         }
         return null;
@@ -15268,6 +15364,7 @@ function _foldChainedReceiverType(index, fileEntry, filePath, call, ctx) {
 // return annotation from an unrelated class. Capitalized named imports remain
 // eligible for class/static-method resolution.
 function _isStructuralImportReceiver(fileEntry, record) {
+    if (record?.receiverModuleComposition) return true;
     if (!record?.receiver || !/^[a-z_$]/.test(record.receiver)) return false;
     return (fileEntry?.importBindings || []).some(b => b.name === record.receiver);
 }

@@ -1929,13 +1929,120 @@ function findCallsInCode(code, parser) {
     const tree = parseTree(parser, code);
     const calls = [];
     const assignedMembers = new Set();
+    const mutatedObjectRoots = new Set();
+    const moduleCompositions = new Map();
+    const unsafeModuleCompositions = new Set();
+    const namespaceAliases = new Set();
+    const accessRoot = (node) => {
+        let current = node;
+        while (current && (current.type === 'member_expression' ||
+            current.type === 'subscript_expression')) {
+            current = current.childForFieldName('object');
+        }
+        return current?.type === 'identifier' ? current.text : undefined;
+    };
     traverseTreeCached(tree.rootNode, node => {
-        if (node.type !== 'assignment_expression' &&
-            node.type !== 'augmented_assignment_expression') return true;
-        const left = node.childForFieldName('left');
-        if (left?.type === 'member_expression') assignedMembers.add(left.text);
+        if (node.type === 'namespace_import') {
+            const identifier = node.namedChild(0);
+            if (identifier?.type === 'identifier') namespaceAliases.add(identifier.text);
+        }
+        if (node.type === 'variable_declarator') {
+            const declaration = node.parent;
+            const nameNode = node.childForFieldName('name');
+            const valueNode = node.childForFieldName('value');
+            if (nameNode?.type === 'identifier' && valueNode?.type === 'object' &&
+                declaration?.type === 'lexical_declaration' &&
+                declaration.child(0)?.text === 'const' && isModuleScope(declaration)) {
+                const layers = [];
+                let spreadCandidates = 0;
+                for (let i = 0; i < valueNode.namedChildCount; i++) {
+                    const item = valueNode.namedChild(i);
+                    if (item.type === 'spread_element') {
+                        const value = item.namedChild(0);
+                        if (value?.type === 'identifier') {
+                            // Namespace imports may legally appear later in
+                            // the module. Resolve candidates after this pass
+                            // has seen the complete import surface.
+                            layers.push({ kind: 'spread-candidate', receiver: value.text });
+                            spreadCandidates++;
+                        } else {
+                            layers.push({ kind: 'unknown' });
+                        }
+                        continue;
+                    }
+                    if (item.type === 'pair') {
+                        const key = item.childForFieldName('key');
+                        const staticKey = key && ['property_identifier', 'identifier', 'string']
+                            .includes(key.type)
+                            ? key.text.replace(/^['"]|['"]$/g, '') : null;
+                        layers.push(staticKey
+                            ? { kind: 'property', name: staticKey }
+                            : { kind: 'unknown' });
+                        continue;
+                    }
+                    if (item.type === 'shorthand_property_identifier' ||
+                        item.type === 'method_definition') {
+                        const name = item.type === 'method_definition'
+                            ? item.childForFieldName('name')?.text : item.text;
+                        layers.push(name
+                            ? { kind: 'property', name }
+                            : { kind: 'unknown' });
+                        continue;
+                    }
+                    layers.push({ kind: 'unknown' });
+                }
+                if (spreadCandidates > 0) moduleCompositions.set(nameNode.text, layers);
+            }
+        }
+        if (node.type === 'assignment_expression' ||
+            node.type === 'augmented_assignment_expression') {
+            const left = node.childForFieldName('left');
+            if (left?.type === 'member_expression') assignedMembers.add(left.text);
+            const root = accessRoot(left);
+            if (root) mutatedObjectRoots.add(root);
+        }
+        // A namespace-spread composite is exact only while the ordinary
+        // object remains private and unmodified. Any use of the object value
+        // itself (export, alias, return, argument, spread, etc.) can expose a
+        // mutation; property reads/calls are the sole accepted uses.
+        if (node.type !== 'identifier' || !moduleCompositions.has(node.text)) return true;
+        const parent = node.parent;
+        if (parent?.type === 'variable_declarator' &&
+            parent.childForFieldName('name')?.id === node.id) return true;
+        if ((parent?.type === 'member_expression' ||
+            parent?.type === 'subscript_expression') &&
+            parent.childForFieldName('object')?.id === node.id) {
+            let access = parent;
+            while ((access.parent?.type === 'member_expression' ||
+                access.parent?.type === 'subscript_expression') &&
+                access.parent.childForFieldName('object')?.id === access.id) {
+                access = access.parent;
+            }
+            const container = access.parent;
+            const assigned = (container?.type === 'assignment_expression' ||
+                container?.type === 'augmented_assignment_expression') &&
+                container.childForFieldName('left')?.id === access.id;
+            const updated = container?.type === 'update_expression';
+            const deleted = container?.type === 'unary_expression' &&
+                container.child(0)?.text === 'delete';
+            if (!assigned && !updated && !deleted) return true;
+        }
+        unsafeModuleCompositions.add(node.text);
         return true;
     });
+    for (const [name, layers] of moduleCompositions) {
+        const normalized = layers.map(layer => layer.kind === 'spread-candidate'
+            ? (namespaceAliases.has(layer.receiver)
+                ? { kind: 'spread', receiver: layer.receiver }
+                : { kind: 'unknown' })
+            : layer);
+        if (normalized.some(layer => layer.kind === 'spread')) {
+            moduleCompositions.set(name, normalized);
+        } else {
+            moduleCompositions.delete(name);
+        }
+    }
+    for (const name of mutatedObjectRoots) unsafeModuleCompositions.add(name);
     const functionStack = [];  // Stack of { name, startLine, endLine }
     // Local aliases with lexical ownership. A flat aliasName→target map leaks
     // block locals into the rest of a module (`let effect = batchedEffect`
@@ -2764,6 +2871,9 @@ function findCallsInCode(code, parser) {
                         const receiverIsModule = !!receiverModuleSpecifier ||
                             (!!receiver && moduleAliases.has(receiver) &&
                                 !localVarTypes.has(receiver));
+                        const receiverModuleComposition = receiver &&
+                            !unsafeModuleCompositions.has(receiver)
+                            ? moduleCompositions.get(receiver) : undefined;
                         const firstArg = getFirstStringArg(node);
                         const argCount = getArgCount(node);
                         let assignedTo = jsAssignmentTargetOf(node);
@@ -2798,6 +2908,9 @@ function findCallsInCode(code, parser) {
                             }),
                             ...(receiverIsModule && { receiverIsModule: true }),
                             ...(receiverModuleSpecifier && { receiverModuleSpecifier }),
+                            ...(receiverModuleComposition && {
+                                receiverModuleComposition,
+                            }),
                             ...(receiver && assignedMembers.has(`${receiver}.${propName}`) && {
                                 receiverMemberAssigned: true,
                             }),

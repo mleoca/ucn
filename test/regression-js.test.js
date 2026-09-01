@@ -7994,6 +7994,97 @@ describe('fix #313: static field forwarding preserves callable aliases', () => {
     });
 });
 
+describe('fix #314: ordered namespace-spread composites preserve ownership', () => {
+    it('pins callers, callees, and result flow through a private composite', () => {
+        // Zod-measured: from-json-schema builds a private local `z` object as
+        // `{ ..._schemas, ..._checks, iso: _iso }` to avoid an import cycle.
+        const dir = tmp({
+            'package.json': '{"name":"t","type":"module"}',
+            'schemas.ts': [
+                'export class Product { execute() { return "product"; } }',
+                'export function make(): Product { return new Product(); }',
+            ].join('\n'),
+            'checks.ts': 'export function check() { return true; }',
+            'use.ts': [
+                'import * as schemas from "./schemas.js";',
+                'import * as checks from "./checks.js";',
+                'const api = { ...schemas, ...checks, meta: checks };',
+                'export function run() {',
+                '  const value = api.make();',
+                '  return value.execute();',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const make = execute(index, 'context', { name: 'schemas.ts:2:make' });
+            assert.ok(make.ok);
+            assert.deepStrictEqual(make.result.callers.map(call =>
+                `${call.relativePath}:${call.line}`), ['use.ts:5']);
+            assert.ok(!make.result.unverifiedCallers.some(call =>
+                call.relativePath === 'use.ts'));
+
+            const method = execute(index, 'context', { name: 'schemas.ts:1:execute' });
+            assert.ok(method.ok);
+            assert.deepStrictEqual(method.result.callers.map(call =>
+                `${call.relativePath}:${call.line}`), ['use.ts:6']);
+
+            const run = index.symbols.get('run')[0];
+            const callees = index.findCallees(run, {
+                collectAccount: true,
+                includeMethods: true,
+            });
+            const makeDef = index.symbols.get('make')
+                .find(symbol => symbol.relativePath === 'schemas.ts');
+            const executeDef = index.symbols.get('execute')
+                .find(symbol => symbol.className === 'Product');
+            assert.ok(callees.some(callee => callee.bindingId === makeDef.bindingId));
+            assert.ok(callees.some(callee => callee.bindingId === executeDef.bindingId));
+        } finally { rm(dir); }
+    });
+
+    it('honors later overrides and refuses escaped or unknown composites', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t","type":"module"}',
+            'schemas.ts': [
+                'export class Product { execute() { return "product"; } }',
+                'export function make(): Product { return new Product(); }',
+            ].join('\n'),
+            'shadow.ts': [
+                'export class Other { execute() { return "other"; } }',
+                'export function make(): Other { return new Other(); }',
+            ].join('\n'),
+            'use.ts': [
+                'import * as schemas from "./schemas.js";',
+                'import * as shadow from "./shadow.js";',
+                'const api = { ...schemas, ...shadow };',
+                'const unknown = {};',
+                'const uncertainApi = { ...schemas, ...unknown };',
+                'const escapedApi = { ...schemas };',
+                'function consume(value: unknown) { return value; }',
+                'consume(escapedApi);',
+                'export function shadowed() { return api.make(); }',
+                'export function uncertain() { return uncertainApi.make(); }',
+                'export function escaped() { return escapedApi.make(); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const original = execute(index, 'context', { name: 'schemas.ts:2:make' });
+            assert.ok(original.ok);
+            assert.ok(!original.result.callers.some(call => call.line === 9));
+            assert.ok(original.result.unverifiedCallers.some(call => call.line === 10));
+            assert.ok(original.result.unverifiedCallers.some(call => call.line === 11));
+            assert.ok(original.result.meta.account.conserved);
+
+            const shadow = execute(index, 'context', { name: 'shadow.ts:2:make' });
+            assert.ok(shadow.ok);
+            assert.ok(shadow.result.callers.some(call => call.line === 9));
+            assert.ok(!shadow.result.unverifiedCallers.some(call => call.line === 9));
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #291: plain-JS fluent self returns and closure bindings', () => {
     it('folds prototype builder chains only when every value return is this', () => {
         const dir = tmp({

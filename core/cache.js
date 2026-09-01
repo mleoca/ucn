@@ -660,7 +660,9 @@ function clearAllCaches() {
 // declared return has one concrete runtime head, changing indexed symbols.
 // v194: JS/TS static fields preserve direct same-file callable forwarding for
 // immutable module/export aliases (fix #313).
-const CACHE_FORMAT_VERSION = 194;
+// v195: JS/TS call records retain safe ordered namespace-spread receiver
+// compositions for exact module export ownership (fix #314).
+const CACHE_FORMAT_VERSION = 195;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**
