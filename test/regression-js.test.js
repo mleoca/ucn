@@ -7923,6 +7923,77 @@ describe('fix #312: assigned structural chains retain their result type', () => 
     });
 });
 
+describe('fix #313: static field forwarding preserves callable aliases', () => {
+    it('pins a const export through a direct same-file factory identifier', () => {
+        // Zod-measured: `static create = createZodEnum`, followed by
+        // `const enumType = ZodEnum.create; export { enumType as enum }`.
+        const dir = tmp({
+            'package.json': '{"name":"t","type":"module"}',
+            'impl.ts': [
+                'export class Schema { execute() { return "schema"; } }',
+                'function createEnum<T>(value: T): EnumSchema<T>;',
+                'function createEnum(value: unknown): EnumSchema<unknown> { return new EnumSchema(); }',
+                'export class EnumSchema<T = unknown> extends Schema {',
+                '  static create = createEnum;',
+                '}',
+                'const enumType = EnumSchema.create;',
+                'export { enumType as enum };',
+            ].join('\n'),
+            'decoy.ts': 'export class Other { execute() { return "other"; } }',
+            'use.ts': [
+                'import * as api from "./impl.js";',
+                'export function run() {',
+                '  const value = api.enum("A");',
+                '  return value.execute();',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const alias = index.symbols.get('enum')
+                .find(symbol => symbol.callableAlias);
+            assert.ok(alias, 'export alias should materialize as callable');
+            assert.strictEqual(alias.returnType, 'EnumSchema<T>');
+            assert.strictEqual(alias.aliasOwner, 'EnumSchema');
+            assert.strictEqual(alias.aliasMember, 'create');
+
+            const result = execute(index, 'context', { name: 'impl.ts:1:execute' });
+            assert.ok(result.ok);
+            assert.deepStrictEqual(result.result.callers.map(call =>
+                `${call.relativePath}:${call.line}`), ['use.ts:4']);
+            assert.ok(!result.result.unverifiedCallers.some(call =>
+                call.relativePath === 'use.ts'));
+            assert.ok(result.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('rejects instance, expression, and conflicting-overload forwards', () => {
+        const dir = tmp({
+            'bad.ts': [
+                'class A {}',
+                'class B {}',
+                'function split(value: string): A;',
+                'function split(value: number): B;',
+                'function split(value: unknown) { return value ? new A() : new B(); }',
+                'class Instance { create = split; }',
+                'class Expression { static create = (split); }',
+                'class Conflict { static create = split; }',
+                'const instance = Instance.create;',
+                'const expression = Expression.create;',
+                'const conflict = Conflict.create;',
+                'export { instance, expression, conflict };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            for (const name of ['instance', 'expression', 'conflict']) {
+                assert.ok(!index.symbols.get(name)?.some(symbol => symbol.callableAlias),
+                    `${name} must remain non-callable without exact forwarding proof`);
+            }
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #291: plain-JS fluent self returns and closure bindings', () => {
     it('folds prototype builder chains only when every value return is this', () => {
         const dir = tmp({

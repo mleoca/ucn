@@ -73,7 +73,7 @@ function normalizeSymbol(symbol, family, language, kind, owner = null) {
         'returnedConcreteType', 'returnedConstructors', 'templateDependent',
         'isSpecialization',
         'linkage', 'functionLike', 'callableAlias', 'exportedAlias',
-        'aliasOwner', 'aliasMember', 'macroParamEffects',
+        'aliasOwner', 'aliasMember', 'callableTarget', 'macroParamEffects',
     ];
     for (const field of passthrough) {
         if (symbol[field] !== undefined && symbol[field] !== null) {
@@ -146,12 +146,32 @@ function createFileIR({
     // overloads; a different head remains ambiguous. This is compiler-visible
     // identity; mutable aliases and ambiguous overload returns stay rejected.
     for (const alias of (parsed.callableAliases || [])) {
-        const sources = normalizedSymbols.filter(symbol =>
+        let sources = normalizedSymbols.filter(symbol =>
             symbol.name === alias.member && symbol.owner === alias.owner &&
             (symbol.params !== undefined || symbol.paramsStructured) &&
             (symbol.modifiers?.includes('static') ||
                 String(symbol.memberType || symbol.kind).startsWith('static')) &&
             symbol.returnType);
+        if (sources.length === 0) {
+            // Static callable forwarding (zod-measured):
+            // `static create = createSchema; const schema = Type.create`.
+            // The parser records only a direct identifier initializer. Pin it
+            // to top-level callables in this file, and require every matching
+            // field declaration to agree before borrowing its signatures.
+            const forwarded = normalizedSymbols.filter(symbol =>
+                symbol.name === alias.member && symbol.owner === alias.owner &&
+                symbol.family === 'state' && symbol.callableTarget &&
+                symbol.modifiers?.includes('static'));
+            const targets = new Set(forwarded.map(symbol => symbol.callableTarget));
+            if (forwarded.length > 0 && targets.size === 1) {
+                const [target] = targets;
+                sources = normalizedSymbols.filter(symbol =>
+                    symbol.name === target && symbol.family === 'callable' &&
+                    !symbol.owner && !symbol.isNested &&
+                    (symbol.params !== undefined || symbol.paramsStructured) &&
+                    symbol.returnType);
+            }
+        }
         if (sources.length === 0) continue;
         const sourceReturns = new Set(sources.map(source => source.returnType));
         if (sourceReturns.size !== 1) {

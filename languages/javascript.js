@@ -1467,6 +1467,14 @@ function extractClassMembers(classNode, codeOrLines) {
                     const fieldTypeNode = child.childForFieldName('type');
                     const fieldType = fieldTypeNode
                         ? fieldTypeNode.text.replace(/^:\s*/, '').trim() : undefined;
+                    // A direct identifier initializer on a static field keeps
+                    // the lexical callable identity available to the IR:
+                    // `static create = createSchema`. Resolution remains
+                    // same-file and overload-disciplined in createFileIR;
+                    // expressions, member accesses, and instance fields do
+                    // not receive this proof marker.
+                    const callableTarget = isStatic && valueNode?.type === 'identifier'
+                        ? valueNode.text : undefined;
                     members.push({
                         name,
                         startLine,
@@ -1474,6 +1482,7 @@ function extractClassMembers(classNode, codeOrLines) {
                         memberType: name.startsWith('#') ? 'private field' : 'field',
                         ...(isStatic && { modifiers: ['static'] }),
                         ...(fieldType && { fieldType }),
+                        ...(callableTarget && { callableTarget }),
                         ...(fieldDecorators.length > 0 && { decorators: fieldDecorators })
                         // Not a method - regular field
                     });

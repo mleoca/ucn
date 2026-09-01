@@ -658,7 +658,9 @@ function clearAllCaches() {
 // produced module values cannot borrow target identity from file imports.
 // v193: overload-heavy JS/TS class-member aliases materialize when every
 // declared return has one concrete runtime head, changing indexed symbols.
-const CACHE_FORMAT_VERSION = 193;
+// v194: JS/TS static fields preserve direct same-file callable forwarding for
+// immutable module/export aliases (fix #313).
+const CACHE_FORMAT_VERSION = 194;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**
