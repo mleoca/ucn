@@ -26,8 +26,9 @@ const CACHE_PRUNE_INTERVAL_MS = 60 * 60 * 1000;
 const CACHE_MAX_PROJECTS = 128;
 const CACHE_MAX_BYTES = 1024 * 1024 * 1024;
 
-function discoveryRulesHash(root) {
-    return crypto.createHash('md5').update(parseGitignore(root).join('\0')).digest('hex');
+function discoveryRulesHash(root, patterns = null) {
+    const rules = patterns || parseGitignore(root);
+    return crypto.createHash('md5').update(rules.join('\0')).digest('hex');
 }
 
 /**
@@ -648,7 +649,93 @@ function clearAllCaches() {
 // reporting can classify import-time vs lazy edges from fresh and cached
 // indexes; C# properties retain property identity instead of masquerading as
 // ordinary fields for accessor impact/refactoring.
-const CACHE_FORMAT_VERSION = 189;
+// v190: members of Rust generic impl owners retain ownerGenerics so blanket
+// impl parameters (`impl<I> Trait for I`) cannot be mistaken for concrete
+// receiver types after a cache round-trip (fix #302).
+// v191: Python call records retain untyped loop-element provenance so a
+// same-spelled project method cannot gain confirmed identity after reload.
+// v192: JS/TS callback records carry moduleLocalBinding so dynamically
+// produced module values cannot borrow target identity from file imports.
+const CACHE_FORMAT_VERSION = 192;
+const USAGE_CACHE_FILE = 'usage-results.json';
+
+/**
+ * Persist the small hot-name usage cache independently of index/call shards.
+ * This keeps one-shot CLI repeats fast without rewriting the whole project
+ * cache after every read-only account query.
+ */
+function saveUsageCache(index, cachePath) {
+    if (!index.usageCacheDirty) return null;
+    const cacheDir = cachePath
+        ? path.dirname(cachePath)
+        : getProjectCacheDir(index.root);
+    fs.mkdirSync(cacheDir, { recursive: true });
+    const entries = [];
+    for (const [key, cached] of index._usageResultCache || []) {
+        const parts = key.split('\0');
+        if (parts.length < 3 || !Array.isArray(cached?.value)) continue;
+        const [filePath, fileHash, name, mode = ''] = parts;
+        const fileEntry = index.files.get(filePath);
+        // Drop removed/changed-file generations rather than carrying dead LRU
+        // weight across incremental builds.
+        if (!fileEntry || fileEntry.hash !== fileHash) continue;
+        entries.push([
+            path.relative(index.root, filePath), fileHash, name, mode,
+            cached.value,
+        ]);
+    }
+    const usageFile = path.join(cacheDir, USAGE_CACHE_FILE);
+    const tmpFile = usageFile + '.tmp';
+    fs.writeFileSync(tmpFile, JSON.stringify({
+        version: CACHE_FORMAT_VERSION,
+        ucnVersion: UCN_VERSION,
+        entries,
+    }));
+    fs.renameSync(tmpFile, usageFile);
+    index.usageCacheDirty = false;
+    return usageFile;
+}
+
+function loadUsageCache(index, cacheFile) {
+    const usageFile = path.join(path.dirname(cacheFile), USAGE_CACHE_FILE);
+    if (!fs.existsSync(usageFile)) return false;
+    try {
+        const payload = JSON.parse(fs.readFileSync(usageFile, 'utf-8'));
+        if (payload.version !== CACHE_FORMAT_VERSION ||
+            payload.ucnVersion !== UCN_VERSION ||
+            !Array.isArray(payload.entries)) return false;
+        const restored = new Map();
+        let weightTotal = 0;
+        for (const entry of payload.entries) {
+            if (!Array.isArray(entry) || entry.length < 5) continue;
+            const [relativePath, fileHash, name, mode, value] = entry;
+            if (typeof relativePath !== 'string' ||
+                typeof fileHash !== 'string' ||
+                typeof name !== 'string' || typeof mode !== 'string' ||
+                !Array.isArray(value)) continue;
+            const filePath = path.resolve(index.root, relativePath);
+            const fileEntry = index.files.get(filePath);
+            if (!fileEntry || fileEntry.hash !== fileHash) continue;
+            const suffix = mode ? `\0${mode}` : '';
+            const key = `${filePath}\0${fileHash}\0${name}${suffix}`;
+            const weight = 64 + value.length * 40;
+            restored.set(key, { value, weight });
+            weightTotal += weight;
+            while (restored.size > 4096 || weightTotal > 16 * 1024 * 1024) {
+                const oldest = restored.entries().next().value;
+                if (!oldest) break;
+                restored.delete(oldest[0]);
+                weightTotal -= oldest[1].weight;
+            }
+        }
+        index._usageResultCache = restored;
+        index._usageResultCacheWeight = weightTotal;
+        index.usageCacheDirty = false;
+        return true;
+    } catch (_) {
+        return false;
+    }
+}
 
 /**
  * Save index to cache file
@@ -1075,6 +1162,8 @@ function loadCache(index, cachePath) {
             index.buildInheritanceGraph();
         }
 
+        loadUsageCache(index, cacheFile);
+
         return true;
     } catch (e) {
         return false;
@@ -1092,9 +1181,17 @@ function isCacheStale(index) {
     if (index._loadedConfigHash && currentConfigHash !== index._loadedConfigHash) {
         return true;
     }
-    if (index._loadedDiscoveryHash &&
-        discoveryRulesHash(index.root) !== index._loadedDiscoveryHash) {
-        return true;
+    // Parse gitignore rules once for both the discovery fingerprint and the
+    // new-file walk below. On a fresh cache these used to run two identical
+    // `git ls-files` subprocesses per one-shot CLI invocation, accounting for
+    // roughly a third of warm-start staleness time on measured repositories.
+    let gitignorePatterns = null;
+    if (index._loadedDiscoveryHash) {
+        gitignorePatterns = parseGitignore(index.root);
+        if (discoveryRulesHash(index.root, gitignorePatterns) !==
+            index._loadedDiscoveryHash) {
+            return true;
+        }
     }
     // Modified/deleted detection (stat sweep) runs UNCONDITIONALLY — agents
     // edit a file and re-query through MCP within seconds, and a stale answer
@@ -1153,7 +1250,7 @@ function isCacheStale(index) {
             });
         },
     };
-    const gitignorePatterns = parseGitignore(index.root);
+    if (!gitignorePatterns) gitignorePatterns = parseGitignore(index.root);
     globOpts.gitignorePatterns = gitignorePatterns;
     globOpts.trackedPaths = gitTrackedPaths(index.root);
     const configExclude = index.config.exclude || [];
@@ -1347,7 +1444,7 @@ function _computeReachabilityFingerprint(index) {
 }
 
 module.exports = {
-    saveCache, loadCache, loadCallsCache, isCacheStale, ensureCallsCacheLoaded,
+    saveCache, saveUsageCache, loadCache, loadCallsCache, isCacheStale, ensureCallsCacheLoaded,
     getUserCacheRoot, getProjectCacheDir, getProjectCachePath,
     getLegacyProjectCacheDir, migrateLegacyProjectCache, clearProjectCache,
     clearAllCaches, pruneUserCache,

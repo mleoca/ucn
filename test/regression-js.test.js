@@ -9776,6 +9776,77 @@ describe('fix #277c: nested destructured arrow params are locals, not callbacks'
     });
 });
 
+describe('fix #308: module callback values keep their lexical identity', () => {
+    it('demotes dynamic module values while preserving exact imported callbacks', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'factory.js': [
+                'function createApplication() {',
+                '  var app = function (req) { return req; };',
+                '  return app;',
+                '}',
+                'module.exports = createApplication;',
+            ].join('\n'),
+            'local.js': [
+                "const createApplication = require('./factory');",
+                'const app = createApplication();',
+                'function mount(register) { register(app); }',
+                'module.exports = app;',
+            ].join('\n'),
+            'consumer.js': [
+                "const app = require('./local');",
+                'function mount(register) { register(app); }',
+            ].join('\n'),
+            'handler.js': [
+                'function handler(value) { return value; }',
+                'module.exports = handler;',
+            ].join('\n'),
+            'direct.js': [
+                "const handler = require('./handler');",
+                'function mount(register) { register(handler); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const target = index.symbols.get('app')
+                .find(definition => definition.file.endsWith('factory.js'));
+            assert.ok(target, 'nested function-valued app is indexed');
+
+            const { getCachedCalls } = require('../core/callers');
+            const localRef = getCachedCalls(index, path.join(dir, 'local.js')).find(call =>
+                call.name === 'app' && call.line === 3 && call.isFunctionReference);
+            assert.strictEqual(localRef?.moduleLocalBinding, true,
+                'parser preserves the module value binding on callback records');
+
+            const callers = index.findCallers('app', {
+                targetDefinitions: [target], collectAccount: true,
+            });
+            assert.ok(!callers.some(call =>
+                ['local.js', 'consumer.js'].includes(call.relativePath)),
+            `dynamic module values cannot confirm the nested pin: ${JSON.stringify(callers)}`);
+            assert.deepStrictEqual(
+                (callers.unverifiedEntries || [])
+                    .filter(call => ['local.js', 'consumer.js'].includes(call.relativePath))
+                    .map(call => `${call.relativePath}:${call.line}:${call.reason}`),
+                [
+                    'consumer.js:2:ambiguous-binding',
+                    'local.js:3:ambiguous-binding',
+                    'local.js:4:ambiguous-binding',
+                ]);
+            const handler = index.symbols.get('handler')[0];
+            const direct = index.findCallers('handler', {
+                targetDefinitions: [handler], collectAccount: true,
+            });
+            assert.ok(direct.some(call =>
+                call.relativePath === 'direct.js' && call.line === 2),
+            `exact default import still confirms: ${JSON.stringify({
+                confirmed: direct,
+                unverified: direct.unverifiedEntries,
+            })}`);
+        } finally { rm(dir); }
+    });
+});
+
 describe('v5 module and lexical ownership regressions', () => {
     it('resolves an inline require namespace call in both graph directions', () => {
         const dir = tmp({

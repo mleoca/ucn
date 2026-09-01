@@ -6262,6 +6262,53 @@ describe('fix #266b: guessed-type mismatch routes visible, never falls to arity 
 });
 
 describe('fix #268: callee-side external identity (Go)', () => {
+    it('external result provenance survives a field hop in both directions', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/m\n\ngo 1.21',
+            'main.go': [
+                'package main',
+                'import "net/http"',
+                'type Writer struct{}',
+                'func (*Writer) Close() error { return nil }', // 4 — unrelated single owner
+                'func viaPackageCall() {',
+                '    resp, _ := http.Get("https://example.com")',
+                '    defer resp.Body.Close()',                 // 7
+                '}',
+                'func viaPackageValue(req *http.Request) {',
+                '    resp, _ := http.DefaultClient.Do(req)',
+                '    defer resp.Body.Close()',                 // 11
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const pin = (index.symbols.get('Close') || [])
+                .find(definition => definition.startLine === 4);
+            const callers = index.findCallers('Close', {
+                targetDefinitions: [pin], collectAccount: true,
+            });
+            assert.ok(!callers.some(c => [7, 11].includes(c.line)),
+                `net/http Body.Close never confirms Writer.Close: ${JSON.stringify(callers)}`);
+            for (const line of [7, 11]) {
+                const visible = callers.unverifiedEntries?.find(c => c.line === line);
+                assert.strictEqual(visible?.reason, 'possible-dispatch');
+                assert.match(visible?.dispatchVia || '', /^http\./);
+            }
+
+            for (const name of ['viaPackageCall', 'viaPackageValue']) {
+                const definition = (index.symbols.get(name) || [])[0];
+                const callees = index.findCallees(definition, {
+                    includeMethods: true, collectAccount: true,
+                });
+                assert.ok(!callees.some(c => c.name === 'Close'),
+                    `${name} must not resolve net/http Body.Close to Writer.Close`);
+                assert.ok(callees.unverifiedCallees?.some(c =>
+                    c.name === 'Close' && c.reason === 'possible-dispatch'));
+                assert.strictEqual(callees.calleeAccount?.conserved, true);
+            }
+        } finally { rm(dir); }
+    });
+
     it('external package qualifier never confirms a same-name project def (context.WithValue)', () => {
         const dir = tmp({
             'go.mod': 'module example.com/m\n\ngo 1.21',

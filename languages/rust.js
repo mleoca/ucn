@@ -820,6 +820,7 @@ function _processClass(node, types, processedRanges, lines, code) {
             typeName: implInfo.typeName,
             members: extractImplMembers(node, lines, implInfo.typeName),
             modifiers: [],
+            ...(implInfo.generics && { generics: implInfo.generics }),
             ...(derefTarget && { derefTarget }),
             ...(docstring && { docstring })
         });

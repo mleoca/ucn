@@ -79,8 +79,24 @@ class ProjectIndex {
         this._opLinesCache = null;       // per-operation split-lines cache (Map<filePath, string[]>, bounded FIFO)
         this._opInnerSymbolRangesCache = null; // per-operation sorted class-method ranges by file
         this._opFlowTypeOriginCache = null; // per-operation annotation type identity results
+        this._opCppTypeCategoryCache = null; // per-operation normalized C++ parameter categories
+        this._opCppPathReceiverTypeCache = null; // per-operation C++ qualified receiver identity
+        this._opDerefPairs = null;      // per-operation Rust Deref identity pairs
+        this._opAliasPairs = null;      // per-operation language type-alias identity pairs
         this._parsedTreeCache = new Map(); // cross-operation LRU: filePath -> immutable tree entry
         this._parsedTreeCacheSourceBytes = 0;
+        // Cross-operation, content-hash-keyed usage classifications. Account
+        // queries often ask several projections for the same hot symbol; the
+        // AST answer is immutable until the file hash changes. Bounded by
+        // both entries and approximate payload size to avoid turning a warm
+        // MCP process into an unbounded repository mirror.
+        this._usageResultCache = new Map();
+        this._usageResultCacheWeight = 0;
+        this.usageCacheDirty = false;
+        // Exact text-ground sets are likewise immutable for one built index.
+        // The cache is cleared at every build and bounded in account.js.
+        this._groundSetCache = new Map();
+        this._groundSetCacheLines = 0;
         this.calleeIndex = null;         // name -> Set<filePath> — inverted call index (built lazily)
     }
 
@@ -120,6 +136,10 @@ class ProjectIndex {
             this._opInnerSymbolRangesCache = new Map();
             this._opFlowTypeOriginCache = new Map();
             this._opImportReachCache = new Map();
+            this._opCppTypeCategoryCache = new Map();
+            this._opCppPathReceiverTypeCache = new Map();
+            this._opDerefPairs = undefined;
+            this._opAliasPairs = undefined;
             this._opDepth = 0;
         }
         this._opDepth++;
@@ -145,6 +165,10 @@ class ProjectIndex {
             this._opInnerSymbolRangesCache = null;
             this._opFlowTypeOriginCache = null;
             this._opImportReachCache = null;
+            this._opCppTypeCategoryCache = null;
+            this._opCppPathReceiverTypeCache = null;
+            this._opDerefPairs = null;
+            this._opAliasPairs = null;
             // Free cached file content from callsCache entries (retained during
             // operation for _readFile caching, not needed between operations)
             for (const entry of this.callsCache.values()) {
@@ -255,13 +279,36 @@ class ProjectIndex {
      * multiple times within one operation (e.g., about() calls both countSymbolUsages and usages).
      * @param {string} filePath - File to scan
      * @param {string} name - Symbol name to find
+     * @param {object} [options]
+     * @param {boolean} [options.skipCallRecovery] - omit usage-only call
+     * recovery when the caller has already classified lines from the call index
      * @returns {Array|null} Array of usage objects or null if parsing failed
      */
-    _getCachedUsages(filePath, name) {
-        const cacheKey = `${filePath}\0${name}`;
+    _getCachedUsages(filePath, name, options = {}) {
+        // Account construction checks the complete calls cache before it asks
+        // the language adapter to classify the remaining name occurrences.
+        // C/C++ can therefore skip its expensive macro replacement-list call
+        // recovery in that mode. Partition both cache layers so a partial
+        // account classification can never poison the full `usages` result.
+        const mode = [
+            options.skipCallRecovery ? 'skip-call-recovery' : '',
+        ].filter(Boolean).join('+');
+        const modeSuffix = mode ? `\0${mode}` : '';
+        const cacheKey = `${filePath}\0${name}${modeSuffix}`;
         if (this._opUsagesCache) {
             const cached = this._opUsagesCache.get(cacheKey);
             if (cached !== undefined) return cached;
+        }
+
+        const fileHash = this.files.get(filePath)?.hash || '';
+        const persistentKey = `${filePath}\0${fileHash}\0${name}${modeSuffix}`;
+        if (this._usageResultCache?.has(persistentKey)) {
+            const cached = this._usageResultCache.get(persistentKey);
+            // Map insertion order is the LRU order.
+            this._usageResultCache.delete(persistentKey);
+            this._usageResultCache.set(persistentKey, cached);
+            if (this._opUsagesCache) this._opUsagesCache.set(cacheKey, cached.value);
+            return cached.value;
         }
 
         // Header language is resolved during indexing from compilation
@@ -292,9 +339,25 @@ class ProjectIndex {
                 !langModule.managesOwnParseTree
                 ? this._getParsedTree(filePath, content, lang)
                 : null;
-            const usages = langModule.findUsagesInCode(content, name, parser, tree);
+            const usages = langModule.findUsagesInCode(
+                content, name, parser, tree, options);
             if (this._opUsagesCache) {
                 this._opUsagesCache.set(cacheKey, usages);
+            }
+            if (Array.isArray(usages) && this._usageResultCache) {
+                const weight = 64 + usages.length * 40;
+                this._usageResultCache.set(persistentKey, { value: usages, weight });
+                this._usageResultCacheWeight += weight;
+                this.usageCacheDirty = true;
+                const maxEntries = 4096;
+                const maxWeight = 16 * 1024 * 1024;
+                while (this._usageResultCache.size > maxEntries ||
+                    this._usageResultCacheWeight > maxWeight) {
+                    const oldest = this._usageResultCache.entries().next().value;
+                    if (!oldest) break;
+                    this._usageResultCache.delete(oldest[0]);
+                    this._usageResultCacheWeight -= oldest[1].weight;
+                }
             }
             return usages;
         } catch (e) {
@@ -326,6 +389,12 @@ class ProjectIndex {
     build(pattern = null, options = {}) {
         const startTime = Date.now();
         const quiet = options.quiet !== false;
+
+        // Build/discovery can add, remove, or reclassify files. Do not retain
+        // a text-universe answer across that boundary. Hash-keyed usage
+        // results remain safe and useful for unchanged files.
+        this._groundSetCache = new Map();
+        this._groundSetCacheLines = 0;
 
         // A (re)build invalidates any cache-loaded reachability set — the
         // fingerprint guard in computeReachability is content-shaped and
@@ -2413,6 +2482,11 @@ class ProjectIndex {
 
     /** Load index from cache file */
     loadCache(cachePath) { return indexCache.loadCache(this, cachePath); }
+
+    /** Persist the bounded, content-hash-keyed usage-query cache. */
+    saveUsageCache(cachePath = undefined) {
+        return indexCache.saveUsageCache(this, cachePath);
+    }
 
     /** Return this project's default per-user cache file path. */
     getCachePath() { return indexCache.getProjectCachePath(this.root); }

@@ -1307,11 +1307,73 @@ const PY_COMPREHENSIONS = new Set([
     'dictionary_comprehension',
 ]);
 
+// Whether this reference is evaluated with `name` bound by an enclosing
+// for/comprehension target. Keep the check lexical: a nested function has its
+// own scope, and the iterable expression of `for x in source(x)` sees the
+// outer x rather than the new loop binding.
+function isPythonIterationBindingAt(refNode, name) {
+    for (let parent = refNode?.parent; parent; parent = parent.parent) {
+        if (parent.type === 'for_statement' &&
+            pythonTargetBindsName(parent.childForFieldName('left'), name)) {
+            const body = parent.childForFieldName('body');
+            if (nodeContains(body, refNode)) return true;
+        }
+        if (PY_COMPREHENSIONS.has(parent.type)) {
+            for (let i = 0; i < parent.namedChildCount; i++) {
+                const clause = parent.namedChild(i);
+                if (clause.type !== 'for_in_clause' ||
+                    !pythonTargetBindsName(
+                        clause.childForFieldName('left'), name)) continue;
+                const iterable = clause.childForFieldName('right');
+                if (!nodeContains(iterable, refNode)) return true;
+            }
+        }
+        if (parent.type === 'function_definition' ||
+            parent.type === 'async_function_definition' ||
+            parent.type === 'lambda') break;
+    }
+    return false;
+}
+
+// Stronger subset used for dispatch tiering: an element drawn from an
+// identifier/attribute iterable has unknown provenance. Direct call
+// producers are handled separately by assignedIter flow: external calls
+// demote there, while a project-internal producer intentionally keeps the
+// measured single-owner rule (#294's counter-probe).
+function isPythonUnprovenIterationBindingAt(refNode, name) {
+    for (let parent = refNode?.parent; parent; parent = parent.parent) {
+        if (parent.type === 'for_statement' &&
+            pythonTargetBindsName(parent.childForFieldName('left'), name)) {
+            const body = parent.childForFieldName('body');
+            if (nodeContains(body, refNode)) {
+                return unwrapTypeNode(parent.childForFieldName('right'))?.type !== 'call';
+            }
+        }
+        if (PY_COMPREHENSIONS.has(parent.type)) {
+            for (let i = 0; i < parent.namedChildCount; i++) {
+                const clause = parent.namedChild(i);
+                if (clause.type !== 'for_in_clause' ||
+                    !pythonTargetBindsName(
+                        clause.childForFieldName('left'), name)) continue;
+                const iterable = clause.childForFieldName('right');
+                if (!nodeContains(iterable, refNode)) {
+                    return unwrapTypeNode(iterable)?.type !== 'call';
+                }
+            }
+        }
+        if (parent.type === 'function_definition' ||
+            parent.type === 'async_function_definition' ||
+            parent.type === 'lambda') break;
+    }
+    return false;
+}
+
 // Python locals are function-scoped: an assignment anywhere in the function
 // shadows an imported module for every reference in that function. Keep this
 // shared between call records and reference records so plan cannot promote a
 // receiver that callers would reject as locally rebound.
 function isPythonNameShadowedAt(refNode, name) {
+    if (isPythonIterationBindingAt(refNode, name)) return true;
     for (let parent = refNode.parent; parent; parent = parent.parent) {
         if (PY_COMPREHENSIONS.has(parent.type)) {
             for (let i = 0; i < parent.namedChildCount; i++) {
@@ -2272,6 +2334,10 @@ function findCallsInCode(code, parser) {
                         ...(receiverIsModule && { receiverIsModule: true }),
                         ...(receiver && objNode?.type === 'identifier' &&
                             isShadowedByLocal(objNode, receiver) && { receiverLocalBinding: true }),
+                        ...(receiver && !receiverType && objNode?.type === 'identifier' &&
+                            isPythonUnprovenIterationBindingAt(objNode, receiver) && {
+                                receiverUntypedIteration: true,
+                            }),
                         ...(receiverPath && {
                             receiverRoot: receiverPath.root,
                             receiverField: receiverPath.fields[receiverPath.fields.length - 1],
@@ -2936,12 +3002,15 @@ function findInstanceAttributeTypes(code, parser, options = {}) {
                         const pName = param.childForFieldName('name') || param.child(0);
                         const pType = param.childForFieldName('type');
                         if (pName && pType) {
-                            const typeIdent = pType.type === 'type' ? pType.firstChild : pType;
-                            if (typeIdent?.type === 'identifier') {
-                                const tn = typeIdent.text;
-                                if (!PRIMITIVE_TYPES.has(tn) && tn[0] >= 'A' && tn[0] <= 'Z') {
-                                    paramTypes.set(pName.text, tn);
-                                }
+                            // Use the shared annotation parser so forward
+                            // references (`"Environment"`), dotted names,
+                            // and Optional/union wrappers participate in the
+                            // same conservative receiver-type contract as
+                            // ordinary parameter calls.
+                            const tn = typeNameFromAnnotation(pType);
+                            if (tn && !PRIMITIVE_TYPES.has(tn) &&
+                                tn[0] >= 'A' && tn[0] <= 'Z') {
+                                paramTypes.set(pName.text, tn);
                             }
                         }
                     }

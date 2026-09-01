@@ -56,6 +56,72 @@ describe('Regression: Python class methods in context', () => {
     });
 });
 
+describe('fix #302: constructor and forward-field callee receivers', () => {
+    const files = {
+        'environment.py': [
+            'class Environment:',
+            '    def getattr(self, value):',
+            '        return value',
+            '',
+            'class SandboxedEnvironment(Environment):',
+            '    def getattr(self, value):',
+            '        return value',
+        ].join('\n') + '\n',
+        'consumer.py': [
+            'from environment import Environment',
+            '',
+            'class EvalContext:',
+            '    def __init__(self, environment: "Environment"):',
+            '        self.environment = environment',
+            '',
+            'def through_field(eval_ctx: EvalContext):',
+            '    return eval_ctx.environment.getattr(1)',
+            '',
+            'def through_constructor():',
+            '    return Environment().getattr(1)',
+        ].join('\n') + '\n',
+    };
+
+    it('keeps a forward-annotated constructor field visible as dispatch', () => {
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const { findCallees } = require('../core/callers');
+            const definition = (index.symbols.get('through_field') || [])[0];
+            const callees = findCallees(index, definition, {
+                collectAccount: true,
+                includeMethods: true,
+            });
+            const edge = (callees.unverifiedCallees || []).find(candidate =>
+                candidate.name === 'getattr');
+            assert.ok(edge, `field call must remain visible: ${JSON.stringify(callees)}`);
+            assert.strictEqual(edge.reason, 'possible-dispatch');
+            assert.strictEqual(edge.dispatchVia, 'Environment');
+            assert.strictEqual(callees.calleeAccount.external.count, 0);
+            assert.strictEqual(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('resolves a direct constructor expression to the exact method callee', () => {
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const { findCallees } = require('../core/callers');
+            const definition = (index.symbols.get('through_constructor') || [])[0];
+            const callees = findCallees(index, definition, {
+                collectAccount: true,
+                includeMethods: true,
+            });
+            const edge = callees.find(candidate =>
+                candidate.name === 'getattr' &&
+                candidate.className === 'Environment');
+            assert.ok(edge, `constructor call must resolve exactly: ${JSON.stringify(callees)}`);
+            assert.deepStrictEqual(edge.sites, [11]);
+            assert.strictEqual(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
 describe('Accessor, reflection, dependency, and refactor safety regressions', () => {
     it('reports property reads and writes as impact dependencies', () => {
         const dir = tmp({
@@ -5845,6 +5911,95 @@ describe('fix #304: value-shadowed Python constructor names stay unverified', ()
                 c.line === 9 && c.reason === 'possible-dispatch'),
             `the dynamic qualifier remains visible: ${JSON.stringify(result.result)}`);
             assert.strictEqual(result.result.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #305: untyped Python loop elements do not borrow a method owner', () => {
+    it('routes a module-level loop element to visible dispatch uncertainty', () => {
+        const dir = tmp({
+            'ansi.py': [
+                'class AnsiDecoder:',
+                '    def decode(self, value):',
+                '        return value',
+            ].join('\n') + '\n',
+            'app.py': [
+                'stream = unknown_stream',
+                'for line in stream:',
+                '    print(line.decode("utf-8"))',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', {
+                name: 'ansi.py:2:decode',
+            });
+            assert.ok(result.ok, JSON.stringify(result.error));
+            assert.ok(!(result.result.callers || []).some(c =>
+                c.relativePath === 'app.py' && c.line === 3),
+            `an unknown loop element cannot confirm by single-owner spelling: ${JSON.stringify(result.result)}`);
+            assert.ok((result.result.unverifiedCallers || []).some(c =>
+                c.relativePath === 'app.py' && c.line === 3 &&
+                c.reason === 'possible-dispatch' &&
+                c.dispatchVia === 'untyped loop element'),
+            `the compiler-possible call must remain visible: ${JSON.stringify(result.result)}`);
+            assert.strictEqual(result.result.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('keeps a declared iterable element type confirmed', () => {
+        const dir = tmp({
+            'mod.py': [
+                'class AnsiDecoder:',
+                '    def decode(self, value):',
+                '        return value',
+                '',
+                'def rows() -> list[AnsiDecoder]:',
+                '    return []',
+                '',
+                'def run():',
+                '    for line in rows():',
+                '        line.decode("utf-8")',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', {
+                name: 'mod.py:2:decode',
+            });
+            assert.ok(result.ok, JSON.stringify(result.error));
+            assert.ok((result.result.callers || []).some(c =>
+                c.line === 10 && c.resolution === 'receiver-hint'),
+            `the declared element identity remains trusted: ${JSON.stringify(result.result)}`);
+            assert.strictEqual(result.result.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('does not invent an exact callee for an untyped loop element', () => {
+        const dir = tmp({
+            'mod.py': [
+                'class AnsiDecoder:',
+                '    def decode(self, value):',
+                '        return value',
+                '',
+                'def run(stream):',
+                '    for line in stream:',
+                '        line.decode("utf-8")',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const { findCallees } = require('../core/callers');
+            const run = (index.symbols.get('run') || [])[0];
+            const callees = findCallees(index, run, { collectAccount: true });
+            assert.ok(!callees.some(callee => callee.name === 'decode'),
+                `the loop element has no exact class identity: ${JSON.stringify(callees)}`);
+            assert.ok(callees.unverifiedCallees.some(callee =>
+                callee.name === 'decode' &&
+                callee.reason === 'possible-dispatch' &&
+                callee.dispatchVia === 'untyped loop element'),
+            `the unresolved callee stays visible: ${JSON.stringify(callees.unverifiedCallees)}`);
+            assert.strictEqual(callees.calleeAccount.conserved, true);
         } finally { rm(dir); }
     });
 });

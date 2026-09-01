@@ -760,6 +760,9 @@ function runProjectCommand(rootDir, command, arg) {
         if (flags.cache && (needsCacheSave || index.callsCacheDirty || index.reachabilityDirty || index.computedDispatchDirty)) {
             try { index.saveCache(); } catch (e) { /* best-effort */ }
         }
+        if (flags.cache && index.usageCacheDirty) {
+            try { index.saveUsageCache(); } catch (e) { /* best-effort */ }
+        }
     }
 }
 

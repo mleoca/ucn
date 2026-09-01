@@ -11,6 +11,7 @@ const fs = require('fs');
 const path = require('path');
 const { tmp, rm, idx } = require('./helpers');
 const { execute } = require('../core/execute');
+const { computeGroundSet } = require('../core/account');
 const { partitionFiles } = require('../core/parallel-build');
 const {
     saveCache, loadCache, isCacheStale, getProjectCacheDir, getProjectCachePath,
@@ -199,6 +200,58 @@ fn main() { Builder::new().step(); }
     });
 });
 
+describe('perf: repeated C++ overload identity caches', () => {
+    it('shares normalized types and project identity pairs within one operation', () => {
+        const dir = tmp({
+            'format.cpp': [
+                'struct Printer {',
+                '  static int format(int value) { return value; }',
+                '  static int format(const char* value) { return value ? 1 : 0; }',
+                '};',
+                'int run() { return Printer::format(1); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const target = index.symbols.get('format')
+                .find(definition => definition.startLine === 2);
+            index._beginOp();
+            try {
+                const first = index.findCallers('format', {
+                    targetDefinitions: [target], collectAccount: true,
+                });
+                const normalizedCount = index._opCppTypeCategoryCache.size;
+                const receiverTypeCount = index._opCppPathReceiverTypeCache.size;
+                const derefPairs = index._opDerefPairs;
+                const aliasPairs = index._opAliasPairs;
+                const second = index.findCallers('format', {
+                    targetDefinitions: [target], collectAccount: true,
+                });
+                assert.ok(normalizedCount > 0,
+                    'C++ parameter categories should be cached');
+                assert.ok(receiverTypeCount > 0,
+                    'qualified C++ receiver identity should be cached');
+                assert.strictEqual(index._opCppTypeCategoryCache.size, normalizedCount,
+                    'identical overload analysis reuses normalized types');
+                assert.strictEqual(index._opCppPathReceiverTypeCache.size, receiverTypeCount,
+                    'identical overload analysis reuses qualified receiver identity');
+                assert.strictEqual(index._opDerefPairs, derefPairs,
+                    'Deref identity scan is shared');
+                assert.strictEqual(index._opAliasPairs, aliasPairs,
+                    'type-alias identity scan is shared');
+                assert.deepStrictEqual(second, first,
+                    'memoized derivations preserve the caller answer');
+            } finally {
+                index._endOp();
+            }
+            assert.strictEqual(index._opCppTypeCategoryCache, null);
+            assert.strictEqual(index._opCppPathReceiverTypeCache, null);
+            assert.strictEqual(index._opDerefPairs, null);
+            assert.strictEqual(index._opAliasPairs, null);
+        } finally { rm(dir); }
+    });
+});
+
 // ── Incremental callee index ──────────────────────────────────────────────────
 
 describe('perf: incremental callee index', () => {
@@ -322,6 +375,129 @@ describe('perf: cross-operation parsed-tree cache', () => {
         } finally {
             rm(dir);
         }
+    });
+});
+
+describe('perf: cross-operation account caches', () => {
+    it('reuses an exact ground set until the index is rebuilt', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'export function target() {}\ntarget();\n',
+        });
+        try {
+            const index = idx(dir);
+            let first;
+            index._beginOp();
+            try {
+                first = computeGroundSet(index, 'target');
+            } finally {
+                index._endOp();
+            }
+            assert.ok(index._groundSetCache.has('target'));
+
+            index._beginOp();
+            try {
+                const second = computeGroundSet(index, 'target');
+                assert.strictEqual(second, first,
+                    'later account projections should reuse the immutable ground set');
+            } finally {
+                index._endOp();
+            }
+
+            fs.appendFileSync(path.join(dir, 'lib.js'), 'target();\n');
+            index.build(null, { forceRebuild: true, quiet: true, workers: 0 });
+            assert.strictEqual(index._groundSetCache.size, 0,
+                'a build changes the text universe and must clear ground results');
+
+            index._beginOp();
+            try {
+                const rebuilt = computeGroundSet(index, 'target');
+                assert.notStrictEqual(rebuilt, first);
+                assert.strictEqual(rebuilt.total, first.total + 1);
+            } finally {
+                index._endOp();
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('reuses AST usage classifications by content hash across operations', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'export function target() {}\ntarget();\n',
+        });
+        try {
+            const index = idx(dir);
+            const filePath = path.join(dir, 'lib.js');
+            let first;
+            index._beginOp();
+            try {
+                first = index._getCachedUsages(filePath, 'target');
+            } finally {
+                index._endOp();
+            }
+            assert.ok(index._usageResultCache.size > 0);
+
+            index._beginOp();
+            try {
+                const second = index._getCachedUsages(filePath, 'target');
+                assert.strictEqual(second, first,
+                    'unchanged content should reuse the immutable AST classification');
+            } finally {
+                index._endOp();
+            }
+
+            fs.appendFileSync(filePath, 'target();\n');
+            index.build(null, { forceRebuild: true, quiet: true, workers: 0 });
+            index._beginOp();
+            try {
+                const rebuilt = index._getCachedUsages(filePath, 'target');
+                assert.notStrictEqual(rebuilt, first,
+                    'a changed content hash must select a new classification');
+                assert.strictEqual(rebuilt.length, first.length + 1);
+            } finally {
+                index._endOp();
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('persists bounded usage classifications without rewriting the index', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'export function target() {}\ntarget();\n',
+        });
+        try {
+            const index = idx(dir);
+            index.saveCache();
+            const indexPath = getProjectCachePath(dir);
+            const indexMtime = fs.statSync(indexPath).mtimeMs;
+            const filePath = path.join(dir, 'lib.js');
+            const first = index._getCachedUsages(filePath, 'target', {
+                skipCallRecovery: true,
+            });
+            assert.strictEqual(index.usageCacheDirty, true);
+            const usagePath = index.saveUsageCache();
+            assert.ok(fs.existsSync(usagePath));
+            assert.strictEqual(fs.statSync(indexPath).mtimeMs, indexMtime,
+                'saving a read-only query result must not rewrite index.json');
+
+            const { ProjectIndex } = require('../core/project');
+            const loaded = new ProjectIndex(dir);
+            assert.strictEqual(loaded.loadCache(), true);
+            assert.ok(loaded._usageResultCache.size > 0);
+            const restored = [...loaded._usageResultCache.values()][0].value;
+            const second = loaded._getCachedUsages(filePath, 'target', {
+                skipCallRecovery: true,
+            });
+            assert.strictEqual(second, restored,
+                'the next process-shaped index should hit the restored entry');
+            assert.deepStrictEqual(second, first);
+            assert.strictEqual(loaded.usageCacheDirty, false,
+                'a restored cache hit does not schedule another write');
+        } finally { rm(dir); }
     });
 });
 
@@ -1279,6 +1455,7 @@ describe('index reliability: parallel build equals sequential build', () => {
         }
         // Shapes whose symbol fields the worker once silently dropped (fix
         // #219 found aliasOf/isAsync/isGenerator/paramTypes/traitName/
+        // ownerGenerics/
         // *WithArgs missing from build-worker's addSymbol): the snapshot
         // guard only catches a drop when the fixture PRODUCES the field.
         spec['rich0.ts'] = [
@@ -1311,6 +1488,9 @@ describe('index reliability: parallel build equals sequential build', () => {
             '}',
             'impl Greet for Greeter {',
             '    fn hello(&self) -> String { String::from("hi") }',
+            '}',
+            'impl<I: ?Sized> Greet for I {',
+            '    fn hello(&self) -> String { String::from("blanket") }',
             '}',
             'pub fn lit() -> usize { "abc".parse().unwrap() }',
             'pub fn chain(g: Greeter) -> usize { g.hello().len() }',
@@ -1365,4 +1545,5 @@ describe('index reliability: parallel build equals sequential build', () => {
                 'parallel and sequential builds must produce identical indexes');
         } finally { rm(dir); }
     });
+
 });

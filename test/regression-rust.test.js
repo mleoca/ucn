@@ -5569,3 +5569,78 @@ describe('fix #300: bare imported name owns the callee (use free::merge_join_by)
         } finally { rm(dir); }
     });
 });
+
+describe('fix #302: blanket impl identity and value re-exports', () => {
+    it('never excludes concrete receivers against a blanket generic impl owner', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "blanket"\nversion = "0.1.0"\n',
+            'src/lib.rs': [
+                'pub trait RefIter {',
+                '    fn par_iter(&self);',
+                '}',
+                '',
+                'impl<I: ?Sized> RefIter for I {',
+                '    fn par_iter(&self) {}',
+                '}',
+                '',
+                'pub fn consume(values: Vec<u32>) {',
+                '    values.par_iter();',
+                '}',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const impl = (index.symbols.get('par_iter') || [])
+                .find(definition => definition.startLine === 6);
+            assert.ok(impl, 'blanket impl method indexed');
+            assert.match(impl.ownerGenerics, /\bI\b/,
+                'impl generic parameters survive the IR boundary');
+
+            const result = execute(index, 'context', {
+                name: 'src/lib.rs:6:par_iter',
+            });
+            assert.ok(result.ok, JSON.stringify(result.error));
+            assert.ok(!(result.result.meta.account.excluded.byReason || {})
+                ['receiver-type-mismatch'],
+            `generic owner cannot exclude Vec: ${JSON.stringify(result.result.meta.account)}`);
+            assert.ok((result.result.unverifiedCallers || []).some(caller =>
+                caller.line === 10),
+            `blanket-impl call remains visible: ${JSON.stringify(result.result)}`);
+            assert.strictEqual(result.result.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('follows a module path through a same-named value re-export', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "exports"\nversion = "0.1.0"\n',
+            'src/lib.rs': [
+                'pub mod api;',
+                'mod inner;',
+                '',
+                'pub fn run() {',
+                '    api::join(|| 1, || 2);',
+                '}',
+            ].join('\n') + '\n',
+            'src/api.rs': 'pub use crate::inner::join;\n',
+            'src/inner.rs': [
+                'pub fn join<A, B>(a: A, b: B) where A: FnOnce(), B: FnOnce() {',
+                '    a();',
+                '    b();',
+                '}',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', {
+                name: 'src/inner.rs:1:join',
+            });
+            assert.ok(result.ok, JSON.stringify(result.error));
+            assert.ok((result.result.callers || []).some(caller =>
+                caller.relativePath === 'src/lib.rs' && caller.line === 5),
+            `api::join must reach the re-exported function: ${JSON.stringify(result.result)}`);
+            assert.ok(!(result.result.meta.account.excluded.byReason || {})
+                ['other-definition']);
+            assert.strictEqual(result.result.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+});

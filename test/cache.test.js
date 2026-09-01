@@ -2408,6 +2408,12 @@ describe('index reliability: cache round-trip and incremental rebuild identity',
             'Fluent.prototype.next = function () { return this }',
             'function outer() { const nested = () => nested(); return nested() }',
         ].join('\n'),
+        'blanket.rs': [
+            'pub trait RefIter { fn par_iter(&self); }',
+            'impl<I: ?Sized> RefIter for I {',
+            '    fn par_iter(&self) {}',
+            '}',
+        ].join('\n'),
     };
 
     it('loadCache reproduces the exact symbol table, file entries, and calls', () => {

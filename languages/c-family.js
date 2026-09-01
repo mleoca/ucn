@@ -2776,7 +2776,7 @@ function findImportsInCode(code, parser) {
     } finally { /* cached with the selected tree */ }
 }
 
-function findUsagesInCode(code, name, parser, existingTree) {
+function findUsagesInCode(code, name, parser, existingTree, options = {}) {
     // Usage is the raw literal-name inventory. The literal C/C++ tree retains
     // identifiers from every preprocessor branch and is sufficient for
     // occurrence kind/line classification; symbol ownership still comes from
@@ -2860,22 +2860,24 @@ function findUsagesInCode(code, name, parser, existingTree) {
     // call extractor reparses those AST-proven regions; surface the resulting
     // call usages here as well so callers/callees, usages, and tests share one
     // semantic fact set.
-    const seenCalls = new Set(usages
-        .filter(usage => usage.usageType === 'call')
-        .map(usage => `${usage.line}:${usage.column ?? ''}`));
-    const macroCalls = findMacroBodyCalls(tree, code, parser, name);
-    for (const call of macroCalls) {
-        if (call.name !== name) continue;
-        const key = `${call.line}:${call.column ?? ''}`;
-        if (seenCalls.has(key)) continue;
-        seenCalls.add(key);
-        addUsage({
-            line: call.line,
-            column: call.column,
-            usageType: 'call',
-            ...(call.receiver && { receiver: call.receiver }),
-            ...(call.macroParameter && { macroParameter: true }),
-        });
+    if (!options.skipCallRecovery) {
+        const seenCalls = new Set(usages
+            .filter(usage => usage.usageType === 'call')
+            .map(usage => `${usage.line}:${usage.column ?? ''}`));
+        const macroCalls = findMacroBodyCalls(tree, code, parser, name);
+        for (const call of macroCalls) {
+            if (call.name !== name) continue;
+            const key = `${call.line}:${call.column ?? ''}`;
+            if (seenCalls.has(key)) continue;
+            seenCalls.add(key);
+            addUsage({
+                line: call.line,
+                column: call.column,
+                usageType: 'call',
+                ...(call.receiver && { receiver: call.receiver }),
+                ...(call.macroParameter && { macroParameter: true }),
+            });
+        }
     }
     return usages;
 }

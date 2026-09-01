@@ -2189,6 +2189,60 @@ function findCallsInCode(code, parser) {
         return false;
     };
 
+    // Bare callback references need to distinguish a module-owned VALUE from
+    // an unbound name. File-level import reachability cannot prove the value's
+    // identity: `const app = express(); use(app)` may live in a file that also
+    // imports the pinned target, but `app` is the factory result rather than a
+    // direct lexical reference to that target. Keep the parser evidence exact
+    // and cheap by collecting only declarations whose lexical owner is the
+    // program/module root (export wrappers included).
+    const moduleValueBindings = new Set();
+    const collectPatternNames = (pattern) => {
+        if (!pattern) return;
+        if (pattern.type === 'identifier' ||
+            pattern.type === 'shorthand_property_identifier_pattern') {
+            moduleValueBindings.add(pattern.text);
+            return;
+        }
+        if (pattern.type === 'pair_pattern' || pattern.type === 'pair') {
+            collectPatternNames(pattern.childForFieldName('value'));
+            return;
+        }
+        if (pattern.type === 'assignment_pattern') {
+            collectPatternNames(
+                pattern.childForFieldName('left') || pattern.childForFieldName('pattern'));
+            return;
+        }
+        for (let i = 0; i < pattern.namedChildCount; i++) {
+            collectPatternNames(pattern.namedChild(i));
+        }
+    };
+    const collectModuleDeclaration = (statement) => {
+        let declaration = statement;
+        if (statement.type === 'export_statement') {
+            declaration = null;
+            for (let i = 0; i < statement.namedChildCount; i++) {
+                const child = statement.namedChild(i);
+                if (child.type === 'lexical_declaration' || child.type === 'variable_declaration') {
+                    declaration = child;
+                    break;
+                }
+            }
+        }
+        if (!declaration ||
+            (declaration.type !== 'lexical_declaration' &&
+                declaration.type !== 'variable_declaration')) return;
+        for (let i = 0; i < declaration.namedChildCount; i++) {
+            const declarator = declaration.namedChild(i);
+            if (declarator.type === 'variable_declarator') {
+                collectPatternNames(declarator.childForFieldName('name'));
+            }
+        }
+    };
+    for (let i = 0; i < tree.rootNode.namedChildCount; i++) {
+        collectModuleDeclaration(tree.rootNode.namedChild(i));
+    }
+
     // fix #203: is a bare-identifier function REFERENCE shadowed by a
     // let/const/var local, for/catch binding, or inner-arrow param in an
     // enclosing lexical scope? Block-accurate, declaration-before-use.
@@ -2240,6 +2294,11 @@ function findCallsInCode(code, parser) {
         }
         return false;
     };
+
+    const bareReferenceBindingFields = (refNode) => ({
+        ...(isShadowedByLocal(refNode, refNode.text) && { localShadow: true }),
+        ...(moduleValueBindings.has(refNode.text) && { moduleLocalBinding: true }),
+    });
 
     const isConditionalReassignment = node => {
         for (let p = node.parent; p && !isFunctionNode(p); p = p.parent) {
@@ -2429,7 +2488,7 @@ function findCallsInCode(code, parser) {
                     isMethod: false,
                     isFunctionReference: true,
                     isPotentialCallback: true,
-                    ...(isShadowedByLocal(right, right.text) && { localShadow: true }),
+                    ...bareReferenceBindingFields(right),
                     enclosingFunction: getCurrentEnclosingFunction(),
                 });
             }
@@ -2787,7 +2846,7 @@ function findCallsInCode(code, parser) {
                                     line: arg.startPosition.row + 1,
                                     isMethod: false,
                                     isFunctionReference: true,
-                                    ...(isShadowedByLocal(arg, arg.text) && { localShadow: true }),
+                                    ...bareReferenceBindingFields(arg),
                                     enclosingFunction
                                 });
                             } else if (arg.type === 'member_expression') {
@@ -2832,7 +2891,7 @@ function findCallsInCode(code, parser) {
                                 isMethod: false,
                                 isFunctionReference: true,
                                 isPotentialCallback: true,
-                                ...(isShadowedByLocal(arg, arg.text) && { localShadow: true }),
+                                ...bareReferenceBindingFields(arg),
                                 enclosingFunction
                             });
                         }
@@ -2873,7 +2932,7 @@ function findCallsInCode(code, parser) {
                                             isMethod: false,
                                             isFunctionReference: true,
                                             isPotentialCallback: true,
-                                            ...(isShadowedByLocal(val, val.text) && { localShadow: true }),
+                                            ...bareReferenceBindingFields(val),
                                             enclosingFunction
                                         });
                                     }
@@ -2977,7 +3036,7 @@ function findCallsInCode(code, parser) {
                         isMethod: false,
                         isFunctionReference: true,
                         isPotentialCallback: true,
-                        ...(isShadowedByLocal(child, child.text) && { localShadow: true }),
+                        ...bareReferenceBindingFields(child),
                         enclosingFunction
                     });
                 } else if (child.type === 'member_expression') {

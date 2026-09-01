@@ -43,7 +43,7 @@ function normalizeSymbol(symbol, family, language, kind, owner = null) {
     };
     const passthrough = [
         'docstring', 'returnedFunctionResult', 'isFunctionVariable', 'paramTypes',
-        'isAsync', 'isGenerator', 'generics', 'genericBounds', 'extends', 'implements', 'indent',
+        'isAsync', 'isGenerator', 'generics', 'ownerGenerics', 'genericBounds', 'extends', 'implements', 'indent',
         'isNested', 'enclosingType', 'isMethod', 'memberType', 'fieldType',
         'aliasOf', 'derefTarget', 'decorators', 'decoratorsWithArgs',
         'annotationsWithArgs', 'attributesWithArgs', 'nameLine', 'traitImpl',
@@ -105,6 +105,9 @@ function createFileIR({
                 ...(type.traitName && {
                     traitImpl: true,
                     traitName: type.traitName,
+                }),
+                ...(type.generics && {
+                    ownerGenerics: type.generics,
                 }),
             };
             append(inherited,

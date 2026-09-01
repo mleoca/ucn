@@ -202,6 +202,14 @@ describe('C language support', () => {
                 caller.relativePath === 'tests/check.c' && caller.line === 6));
             assert.equal(context.meta.account.conserved, true);
 
+            const sourcePath = path.join(dir, 'tests/check.c');
+            const accountUsages = index._getCachedUsages(
+                sourcePath, 'target', { skipCallRecovery: true });
+            assert.ok(Array.isArray(accountUsages));
+            assert.ok([...index._usageResultCache.keys()].some(key =>
+                key.endsWith('\0skip-call-recovery')),
+            'account-mode classifications use an isolated cache partition');
+
             const macro = index.symbols.get('RUN_TARGET')[0];
             const callees = index.findCallees(macro, { collectAccount: true });
             assert.ok(callees.some(callee =>
@@ -222,6 +230,9 @@ describe('C language support', () => {
             assert.ok(usages.result.some(usage =>
                 usage.relativePath === 'tests/check.c' &&
                 usage.line === 4 && usage.usageType === 'call'));
+            assert.ok([...index._usageResultCache.keys()].some(key =>
+                !key.endsWith('\0skip-call-recovery') && key.includes('\0target')),
+            'full usages retains its own macro-complete cache entry');
 
             const tests = execute(index, 'tests', {
                 name: 'target', file: 'tests/check.c', line: 1,

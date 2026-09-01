@@ -36,14 +36,16 @@
  * Ground-set semantics are grep `-n -w`: unit is the (file, line) pair, each
  * line with >= 1 word-boundary match counts once, case-sensitive.
  *
- * Performance: the ground scan is one `includes()`-gated read per project file
- * per caller-command — the same I/O profile as the existing `search`/`usages`
- * commands. Deriving counts from callsCache (zero reads) was rejected because
+ * Performance: the first ground scan is one `includes()`-gated read per project
+ * file — the same I/O profile as the existing `search`/`usages` commands.
+ * Exact results are retained in a small LRU for the lifetime of one built index
+ * so context/about/impact projections of the same symbol do not rescan the
+ * project. Deriving counts from callsCache (zero reads) was rejected because
  * comments/strings/references are not in the calls cache and the contract's
  * ground set is text-defined. AST parsing (the expensive part) is restricted
- * to files containing UNCLAIMED ground lines, via the op-cached
- * `index._getCachedUsages`. No file is read twice in one command because
- * context/about/impact run inside `index._beginOp()`.
+ * to files containing UNCLAIMED ground lines, via the content-hash-keyed
+ * `index._getCachedUsages`. Build invalidation and cache bounds preserve the
+ * same answer without retaining an unbounded repository mirror.
  */
 
 'use strict';
@@ -75,6 +77,12 @@ const UNSUPPORTED_SITE_TEXT_MAX = 160;
  * }}
  */
 function computeGroundSet(index, name) {
+    if (index._groundSetCache?.has(name)) {
+        const cached = index._groundSetCache.get(name);
+        index._groundSetCache.delete(name);
+        index._groundSetCache.set(name, cached);
+        return cached.result;
+    }
     const wordRe = new RegExp('\\b' + escapeRegExp(name) + '\\b');
     const perFile = new Map();
     let total = 0;
@@ -117,7 +125,7 @@ function computeGroundSet(index, name) {
         ? index.discoveryIssues.map(issue => ({ ...issue })) : [];
     unreadableFiles.sort();
 
-    return {
+    const result = {
         total: total + unparsed.lines + unsupported.lines,
         fileCount: fileCount + unparsed.fileCount + unsupported.fileCount,
         perFile,
@@ -126,6 +134,21 @@ function computeGroundSet(index, name) {
         unreadableFiles,
         skippedSources,
     };
+    if (index._groundSetCache) {
+        const weight = result.total + result.fileCount;
+        index._groundSetCache.set(name, { result, weight });
+        index._groundSetCacheLines = (index._groundSetCacheLines || 0) + weight;
+        const maxNames = 64;
+        const maxLines = 100000;
+        while (index._groundSetCache.size > maxNames ||
+            index._groundSetCacheLines > maxLines) {
+            const oldest = index._groundSetCache.entries().next().value;
+            if (!oldest) break;
+            index._groundSetCache.delete(oldest[0]);
+            index._groundSetCacheLines -= oldest[1].weight;
+        }
+    }
+    return result;
 }
 
 /** Scan only files the parser/index could not ingest. */
@@ -300,7 +323,12 @@ function classifyGroundLines(index, name, groundSet, claimedKeys) {
 
         // Remainder: AST usage scan distinguishes import/definition/reference
         // from comment/string/skipped-token lines.
-        const usages = index._getCachedUsages(filePath, name);
+        // Call lines were classified from the complete calls cache above.
+        // Language adapters may skip usage-only call recovery here; notably,
+        // C/C++ avoids reparsing every matching macro replacement list.
+        const usages = index._getCachedUsages(filePath, name, {
+            skipCallRecovery: true,
+        });
         const byLine = new Map();
         if (Array.isArray(usages)) {
             for (const u of usages) {
