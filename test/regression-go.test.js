@@ -6313,6 +6313,76 @@ describe('fix #331: compiler return flow outranks chained New-prefix guesses', (
     });
 });
 
+describe('fix #332: compiler return flow follows Go closure captures', () => {
+    it('types captured receivers without crossing a shadowing closure binding', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/t\n\ngo 1.21\n',
+            'flow.go': [
+                'package t',
+                '',
+                'type Client struct{}',
+                'func (*Client) Run() {}',
+                '',
+                'type Builder struct{}',
+                'func (*Builder) Run() {}',
+                '',
+                'type Other struct{}',
+                'func (*Other) Run() {}',
+                '',
+                'func NewBuilder() *Client { return nil }',
+                'func NewOther() *Other { return nil }',
+                '',
+                'func use() {',
+                '    value := NewBuilder()',
+                '    func() { value.Run() }()',
+                '    func(value *Other) { value.Run() }(nil)',
+                '    func() { value := NewOther(); value.Run() }()',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const calls = index.getCachedCalls(path.join(dir, 'flow.go'))
+                .filter(call => call.name === 'Run');
+            assert.deepStrictEqual(calls.map(call =>
+                call.enclosingFunction.scopeChain), [
+                [15, 17],
+                [18],
+                [19],
+            ], 'only the captured receiver retains its outer lexical scope');
+
+            const cachePath = path.join(dir, '.ucn-cache', 'index.json');
+            saveCache(index, cachePath);
+            const loadedIndex = new ProjectIndex(dir, { quiet: true });
+            assert.ok(loadCache(loadedIndex, cachePath));
+            const loadedCalls = loadedIndex.getCachedCalls(path.join(dir, 'flow.go'))
+                .filter(call => call.name === 'Run');
+            assert.deepStrictEqual(loadedCalls.map(call =>
+                call.enclosingFunction.scopeChain), [
+                [15, 17],
+                [18],
+                [19],
+            ], 'capture scope evidence survives a calls-cache round trip');
+
+            const client = execute(loadedIndex, 'context', {
+                name: 'flow.go:4:Run',
+            });
+            assert.ok(client.ok, client.error);
+            assert.deepStrictEqual(client.result.callers.map(call => call.line), [17],
+                'NewBuilder returns Client, so the captured call belongs to Client.Run');
+            assert.strictEqual(client.result.meta.account.conserved, true);
+
+            const other = execute(loadedIndex, 'context', {
+                name: 'flow.go:10:Run',
+            });
+            assert.ok(other.ok, other.error);
+            assert.deepStrictEqual(other.result.callers.map(call => call.line), [18, 19],
+                'parameter and local shadows stay pinned to their own closure scope');
+            assert.strictEqual(other.result.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #268: callee-side external identity (Go)', () => {
     it('external result provenance survives a field hop in both directions', () => {
         const dir = tmp({

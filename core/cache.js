@@ -682,7 +682,9 @@ function clearAllCaches() {
 // globals even when their functions are declared before the assignment.
 // v204 (fix #328): Python union-alias symbols retain their concrete members
 // so imported annotations can participate in exact conditional narrowing.
-const CACHE_FORMAT_VERSION = 204;
+// v205 (fix #332): Go method-call records retain capture-aware lexical scope
+// chains so return-type flow reaches nested closures without crossing shadows.
+const CACHE_FORMAT_VERSION = 205;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**

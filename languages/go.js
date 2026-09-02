@@ -903,11 +903,24 @@ function findCallsInCode(code, parser, options = {}) {
         return '<anonymous>';
     };
 
-    // Helper to get current enclosing function
-    const getCurrentEnclosingFunction = () => {
-        return functionStack.length > 0
-            ? { ...functionStack[functionStack.length - 1] }
-            : null;
+    // Helper to get current enclosing function. Return-flow assignments are
+    // keyed by function scope, so a captured receiver needs the complete
+    // lexical path back to the scope that binds it. Start at the binding
+    // scope (rather than every outer function) so a parameter/local that
+    // shadows the same name cannot inherit an unrelated outer flow entry.
+    const getCurrentEnclosingFunction = (refNode = null, name = null) => {
+        if (functionStack.length === 0) return null;
+        const allScopes = functionStack.map(scope => scope.startLine);
+        let scopeChain = [allScopes[allScopes.length - 1]];
+        if (refNode && name) {
+            const bindingScope = lexicalBindingScopeStart(refNode, name);
+            const bindingIndex = allScopes.lastIndexOf(bindingScope);
+            if (bindingIndex >= 0) scopeChain = allScopes.slice(bindingIndex);
+        }
+        return {
+            ...functionStack[functionStack.length - 1],
+            scopeChain,
+        };
     };
 
     // Resolve a local closure through the lexical function-scope chain.
@@ -931,17 +944,25 @@ function findCallsInCode(code, parser, options = {}) {
 
     // Look up variable type from scope chain
     const getReceiverType = (varName, refNode) => {
+        const bindingScope = refNode
+            ? lexicalBindingScopeStart(refNode, varName) : null;
         for (let i = functionStack.length - 1; i >= 0; i--) {
-            const typeMap = scopeTypes.get(functionStack[i].startLine);
+            const scopeStart = functionStack[i].startLine;
+            const typeMap = scopeTypes.get(scopeStart);
             if (typeMap?.has(varName)) return typeMap.get(varName);
+            if (bindingScope === scopeStart) return undefined;
         }
         return refNode && isShadowedByLocal(refNode, varName)
             ? undefined : packageTypes.get(varName);
     };
     const getReceiverTypeQualifier = (varName, refNode) => {
+        const bindingScope = refNode
+            ? lexicalBindingScopeStart(refNode, varName) : null;
         for (let i = functionStack.length - 1; i >= 0; i--) {
-            const qualifiers = scopeTypeQualifiers.get(functionStack[i].startLine);
+            const scopeStart = functionStack[i].startLine;
+            const qualifiers = scopeTypeQualifiers.get(scopeStart);
             if (qualifiers?.has(varName)) return qualifiers.get(varName);
+            if (bindingScope === scopeStart) return undefined;
         }
         return refNode && isShadowedByLocal(refNode, varName)
             ? undefined : packageTypeQualifiers.get(varName);
@@ -1102,13 +1123,23 @@ function findCallsInCode(code, parser, options = {}) {
         }
         return false;
     };
-    const isShadowedByLocal = (refNode, name) => {
+    const lexicalBindingScopeStart = (refNode, name) => {
+        const owningFunctionStart = (node) => {
+            for (let current = node; current; current = current.parent) {
+                if (isFunctionNode(current)) {
+                    return current.startPosition.row + 1;
+                }
+            }
+            return null;
+        };
         for (let p = refNode.parent; p; p = p.parent) {
             if (p.type === 'block') {
                 for (let i = 0; i < p.namedChildCount; i++) {
                     const stmt = p.namedChild(i);
                     if (stmt.startIndex >= refNode.startIndex) break; // declaration-before-use
-                    if (_declaresLocal(stmt, name, refNode)) return true;
+                    if (_declaresLocal(stmt, name, refNode)) {
+                        return owningFunctionStart(p);
+                    }
                 }
             } else if (p.type === 'for_statement') {
                 for (let i = 0; i < p.namedChildCount; i++) {
@@ -1118,38 +1149,55 @@ function findCallsInCode(code, parser, options = {}) {
                         if (left) {
                             for (let j = 0; j < left.namedChildCount; j++) {
                                 const id = left.namedChild(j);
-                                if (id.type === 'identifier' && id.text === name) return true;
+                                if (id.type === 'identifier' && id.text === name) {
+                                    return owningFunctionStart(p);
+                                }
                             }
                         }
                     } else if (c.type === 'for_clause') {
-                        if (_declaresLocal(c.childForFieldName('initializer'), name, refNode)) return true;
+                        if (_declaresLocal(c.childForFieldName('initializer'), name, refNode)) {
+                            return owningFunctionStart(p);
+                        }
                     }
                 }
             } else if (p.type === 'if_statement' || p.type === 'expression_switch_statement' ||
                 p.type === 'type_switch_statement') {
-                if (_declaresLocal(p.childForFieldName('initializer'), name, refNode)) return true;
+                if (_declaresLocal(p.childForFieldName('initializer'), name, refNode)) {
+                    return owningFunctionStart(p);
+                }
                 // if/switch initializers are plain named children in some
                 // grammar versions; type switches bind `v := x.(type)`
                 for (let i = 0; i < p.namedChildCount; i++) {
                     const c = p.namedChild(i);
-                    if (c.type === 'short_var_declaration' && _declaresLocal(c, name, refNode)) return true;
+                    if (c.type === 'short_var_declaration' &&
+                        _declaresLocal(c, name, refNode)) {
+                        return owningFunctionStart(p);
+                    }
                     if (p.type === 'type_switch_statement' && c.type === 'expression_list' &&
                         c.nextSibling?.type === ':=') {
                         for (let j = 0; j < c.namedChildCount; j++) {
                             const id = c.namedChild(j);
-                            if (id.type === 'identifier' && id.text === name) return true;
+                            if (id.type === 'identifier' && id.text === name) {
+                                return owningFunctionStart(p);
+                            }
                         }
                     }
                 }
             } else if (p.type === 'func_literal' || p.type === 'function_declaration' ||
                 p.type === 'method_declaration') {
-                if (_paramListDeclares(p.childForFieldName('parameters'), name)) return true;
+                if (_paramListDeclares(p.childForFieldName('parameters'), name)) {
+                    return p.startPosition.row + 1;
+                }
                 if (p.type === 'method_declaration' &&
-                    _paramListDeclares(p.childForFieldName('receiver'), name)) return true;
+                    _paramListDeclares(p.childForFieldName('receiver'), name)) {
+                    return p.startPosition.row + 1;
+                }
             }
         }
-        return false;
+        return null;
     };
+    const isShadowedByLocal = (refNode, name) =>
+        lexicalBindingScopeStart(refNode, name) != null;
 
     traverseTree(tree.rootNode, (node) => {
         // Track function entry
@@ -1597,7 +1645,7 @@ function findCallsInCode(code, parser, options = {}) {
                     // fix #202: one-hop declared-field receivers — h.inner.Run().
                     // receiverRoot/Field/RootType let findCallers hop to the
                     // field's declared struct-field type cross-file.
-                    let receiverRoot, receiverFieldName, receiverRootType,
+                    let receiverRoot, receiverRootNode, receiverFieldName, receiverRootType,
                         receiverRootTypeQualifier, receiverRootTypeGuessed,
                         receiverRootIsModule;
                     if (!receiver && operandNode?.type === 'selector_expression') {
@@ -1605,6 +1653,7 @@ function findCallsInCode(code, parser, options = {}) {
                         const fldNode = operandNode.childForFieldName('field');
                         if (rootNode?.type === 'identifier' && fldNode) {
                             receiverRoot = rootNode.text;
+                            receiverRootNode = rootNode;
                             receiverFieldName = fldNode.text;
                             if (importAliases.has(rootNode.text)) {
                                 // Package-owned value receiver:
@@ -1673,6 +1722,13 @@ function findCallsInCode(code, parser, options = {}) {
                         }
                     }
                     const firstArg = getFirstStringArg(node);
+                    const receiverBindingNode = receiver ? operandNode : receiverRootNode;
+                    const receiverBindingName = receiver || receiverRoot;
+                    const methodEnclosingFunction = !isPkgCall &&
+                        receiverBindingNode && receiverBindingName
+                        ? getCurrentEnclosingFunction(
+                            receiverBindingNode, receiverBindingName)
+                        : enclosingFunction;
                     calls.push({
                         name: fieldNode.text,
                         // Name-node line convention (#201/RUST-2, fix #223):
@@ -1716,7 +1772,7 @@ function findCallsInCode(code, parser, options = {}) {
                             assignedTupleTargets: assigned.assignedTupleTargets,
                         }),
                         ...(assigned?.assignedTupleRest && { assignedTupleRest: assigned.assignedTupleRest }),
-                        enclosingFunction,
+                        enclosingFunction: methodEnclosingFunction,
                         uncertain,
                         ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
                     });
@@ -1796,7 +1852,9 @@ function findCallsInCode(code, parser, options = {}) {
                             receiverTypeQualifier = lit.receiverTypeQualifier;
                         }
                     }
-                    const enclosingFunction = getCurrentEnclosingFunction();
+                    const enclosingFunction = receiver
+                        ? getCurrentEnclosingFunction(operandNode, receiver)
+                        : getCurrentEnclosingFunction();
                     calls.push({
                         name: fieldNode.text,
                         line: fieldNode.startPosition.row + 1,
