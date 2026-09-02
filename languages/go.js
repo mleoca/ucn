@@ -771,6 +771,10 @@ function findCallsInCode(code, parser, options = {}) {
     // types are compiler-true — Go range yields the container's element.
     const scopeContainerTypes = new Map();   // scopeStartLine -> Map<name, typeText>
     const packageContainerTypes = new Map();
+    // Local values bound from an indexed declared field. The file parser may
+    // not own the receiver struct declaration, so preserve its exact root +
+    // field provenance for project-index resolution after all files exist.
+    const scopeIndexedSources = new Map();
     // Track function-typed parameter names per scope (scopeStartLine -> Set<name>)
     const funcParamScopes = new Map();
 
@@ -975,6 +979,17 @@ function findCallsInCode(code, parser, options = {}) {
         }
         return refNode && isShadowedByLocal(refNode, varName)
             ? undefined : packageTypeQualifiers.get(varName);
+    };
+    const getIndexedSource = (varName, refNode) => {
+        const bindingScope = refNode
+            ? lexicalBindingScopeStart(refNode, varName) : null;
+        for (let i = functionStack.length - 1; i >= 0; i--) {
+            const scopeStart = functionStack[i].startLine;
+            const sources = scopeIndexedSources.get(scopeStart);
+            if (sources?.has(varName)) return sources.get(varName);
+            if (bindingScope === scopeStart) return undefined;
+        }
+        return undefined;
     };
     // Compiler-true receiver type from a composite-literal receiver
     // expression (fix #298, websocket-measured — the #220(7) typing-sources
@@ -1237,6 +1252,7 @@ function findCallsInCode(code, parser, options = {}) {
             scopeTypes.set(entry.startLine, typeMap);
             scopeTypeQualifiers.set(entry.startLine, typeQualifierMap);
             scopeContainerTypes.set(entry.startLine, containerMap || new Map());
+            scopeIndexedSources.set(entry.startLine, new Map());
             if (funcParamNames.size > 0) {
                 funcParamScopes.set(entry.startLine, funcParamNames);
             }
@@ -1296,6 +1312,7 @@ function findCallsInCode(code, parser, options = {}) {
                         let typeName = null;
                         let typeQualifier = null;
                         let typeGuessed = false;
+                        let indexedSource = null;
                         // &Type{...} or Type{...}
                         if (val.type === 'composite_literal') {
                             const typeNode = val.childForFieldName('type');
@@ -1372,6 +1389,22 @@ function findCallsInCode(code, parser, options = {}) {
                                 typeName = element.type;
                                 typeQualifier = element.qualifier;
                             }
+                            if (container?.type === 'selector_expression') {
+                                const root = container.childForFieldName('operand');
+                                const field = container.childForFieldName('field');
+                                if (root?.type === 'identifier' && field &&
+                                    !isGuessedType(root.text)) {
+                                    const rootType = getReceiverType(root.text, root);
+                                    if (rootType) {
+                                        indexedSource = {
+                                            rootType,
+                                            rootTypeQualifier:
+                                                getReceiverTypeQualifier(root.text, root) || null,
+                                            field: field.text,
+                                        };
+                                    }
+                                }
+                            }
                         } else if (val.type === 'type_assertion_expression') {
                             // d, ok := dialer.(proxy.ContextDialer) — the
                             // asserted type IS d's static type (fix #298,
@@ -1404,6 +1437,9 @@ function findCallsInCode(code, parser, options = {}) {
                                 gset.delete(names[vi]); // compiler-true retype clears the guess
                             }
                         }
+                        const indexedSources = scopeIndexedSources.get(scopeKey);
+                        if (indexedSource) indexedSources?.set(names[vi], indexedSource);
+                        else indexedSources?.delete(names[vi]);
                     }
                 }
             }
@@ -1656,6 +1692,8 @@ function findCallsInCode(code, parser, options = {}) {
                         ? getReceiverType(receiver, operandNode) : undefined;
                     let receiverTypeQualifier = receiverType
                         ? getReceiverTypeQualifier(receiver, operandNode) : undefined;
+                    const receiverIndexedSource = !isPkgCall && receiver && !receiverType
+                        ? getIndexedSource(receiver, operandNode) : undefined;
                     // Composite-literal receiver (fix #298):
                     // (&Kit{...}).Run(...) — compiler-true type, never guessed.
                     if (!receiver && !receiverType) {
@@ -1769,6 +1807,14 @@ function findCallsInCode(code, parser, options = {}) {
                         ...(receiverType && { receiverType }),
                         ...(receiverTypeQualifier && { receiverTypeQualifier }),
                         ...(receiverType && isGuessedType(receiver) && { receiverTypeGuessed: true }),
+                        ...(receiverIndexedSource && {
+                            receiverIndexRootType: receiverIndexedSource.rootType,
+                            receiverIndexField: receiverIndexedSource.field,
+                            ...(receiverIndexedSource.rootTypeQualifier && {
+                                receiverIndexRootTypeQualifier:
+                                    receiverIndexedSource.rootTypeQualifier,
+                            }),
+                        }),
                         ...(receiverFieldName && { receiverRoot, receiverField: receiverFieldName }),
                         ...(receiverRootIsModule && { receiverRootIsModule: true }),
                         ...(receiverFieldName && receiverRootType && { receiverRootType }),
@@ -2151,6 +2197,7 @@ function findCallsInCode(code, parser, options = {}) {
                     closureScopes.delete(leaving.startLine);
                     scopeTypes.delete(leaving.startLine);
                     scopeGuesses.delete(leaving.startLine);
+                    scopeIndexedSources.delete(leaving.startLine);
                 }
             }
         }

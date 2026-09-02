@@ -6506,6 +6506,83 @@ describe('fix #334: Go indexed container values retain their element type', () =
     });
 });
 
+describe('fix #335: Go indexed receiver flow resolves sibling-file fields', () => {
+    it('defers root-field provenance to caller and callee project queries', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/t\n\ngo 1.21\n',
+            'types.go': [
+                'package t',
+                '',
+                'type Child struct{}',
+                'func (*Child) stop() {}',
+                '',
+                'type Other struct{}',
+                'func (*Other) stop() {}',
+                '',
+                'type Holder struct {',
+                '    children map[string]*Child',
+                '    others []*Other',
+                '}',
+            ].join('\n'),
+            'use.go': [
+                'package t',
+                '',
+                'import foreign "example.net/foreign"',
+                '',
+                'func use(h *Holder, key string, i int) {',
+                '    child, ok := h.children[key]',
+                '    if ok { child.stop() }',
+                '    other := h.others[i]',
+                '    other.stop()',
+                '}',
+                '',
+                'func external(h *foreign.Holder, key string) {',
+                '    child := h.Children[key]',
+                '    child.stop()',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const calls = index.getCachedCalls(path.join(dir, 'use.go'))
+                .filter(call => call.name === 'stop');
+            assert.deepStrictEqual(calls.map(call => ({
+                line: call.line,
+                receiverType: call.receiverType,
+                rootType: call.receiverIndexRootType,
+                field: call.receiverIndexField,
+            })), [
+                { line: 7, receiverType: undefined, rootType: 'Holder', field: 'children' },
+                { line: 9, receiverType: undefined, rootType: 'Holder', field: 'others' },
+                { line: 14, receiverType: undefined, rootType: 'Holder', field: 'Children' },
+            ], 'file-local IR preserves provenance without guessing a sibling field type');
+
+            const child = execute(index, 'context', { name: 'types.go:4:stop' });
+            assert.ok(child.ok, child.error);
+            assert.deepStrictEqual(child.result.callers.map(call => call.line), [7]);
+            assert.strictEqual(child.result.meta.account.conserved, true);
+
+            const other = execute(index, 'context', { name: 'types.go:7:stop' });
+            assert.ok(other.ok, other.error);
+            assert.deepStrictEqual(other.result.callers.map(call => call.line), [9]);
+            assert.strictEqual(other.result.meta.account.conserved, true);
+
+            const use = index.symbols.get('use')[0];
+            const callees = index.findCallees(use, {
+                collectAccount: true,
+                includeMethods: true,
+            });
+            assert.ok(callees.some(callee =>
+                callee.name === 'stop' && callee.className === 'Child' &&
+                callee.sites?.includes(7)), JSON.stringify(callees));
+            assert.ok(callees.some(callee =>
+                callee.name === 'stop' && callee.className === 'Other' &&
+                callee.sites?.includes(9)), JSON.stringify(callees));
+            assert.strictEqual(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #268: callee-side external identity (Go)', () => {
     it('external result provenance survives a field hop in both directions', () => {
         const dir = tmp({

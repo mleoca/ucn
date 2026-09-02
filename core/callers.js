@@ -661,6 +661,26 @@ function findCallers(index, name, options = {}) {
                     continue;
                 }
 
+                if (fileEntry.language === 'go' && call.isMethod &&
+                    !call.receiverType && call.receiverIndexField) {
+                    const indexedType = _goIndexedReceiverType(index, filePath, call);
+                    if (indexedType?.type) {
+                        call = {
+                            ...call,
+                            receiverType: indexedType.type,
+                            ...(indexedType.fromFile && {
+                                receiverTypeFlowFile: indexedType.fromFile,
+                            }),
+                        };
+                    } else if (indexedType?.externalVia) {
+                        call = {
+                            ...call,
+                            receiverExternalFlow: indexedType.externalVia,
+                            receiverExternalConcreteFlow: true,
+                        };
+                    }
+                }
+
                 // A call-shaped identifier in a C/C++ replacement list can
                 // be a macro parameter (`#define APPLY(fn, x) fn(x)`). It is
                 // dynamically supplied by each expansion and therefore is
@@ -5323,6 +5343,25 @@ function findCallees(index, definition, options = {}) {
         for (let call of calls) {
             siteOrdinal++;
             const siteId = siteOrdinal;
+            if (language === 'go' && call.isMethod &&
+                !call.receiverType && call.receiverIndexField) {
+                const indexedType = _goIndexedReceiverType(index, def.file, call);
+                if (indexedType?.type) {
+                    call = {
+                        ...call,
+                        receiverType: indexedType.type,
+                        ...(indexedType.fromFile && {
+                            receiverTypeFlowFile: indexedType.fromFile,
+                        }),
+                    };
+                } else if (indexedType?.externalVia) {
+                    call = {
+                        ...call,
+                        receiverExternalFlow: indexedType.externalVia,
+                        receiverExternalConcreteFlow: true,
+                    };
+                }
+            }
             // Filter to calls within this function's scope
             // Method 1: Direct match via enclosingFunction (fast path for direct calls)
             const isDirectMatch = call.enclosingFunction &&
@@ -11255,6 +11294,94 @@ function _csharpParamsNormalFormApplicable(index, call, definition) {
     const actual = _javaStaticTypeForKind(index, call.argKinds[restIndex]);
     const expected = _overloadTypeIdentity(ps[restIndex]?.type);
     return !!actual && !!expected && actual === expected;
+}
+
+function _goContainerElementType(raw) {
+    const text = String(raw || '').trim();
+    let element = null;
+    const bracketStart = text.startsWith('map[') ? 3 : text.startsWith('[') ? 0 : -1;
+    if (bracketStart >= 0) {
+        let depth = 0;
+        for (let i = bracketStart; i < text.length; i++) {
+            if (text[i] === '[') depth++;
+            else if (text[i] === ']') {
+                depth--;
+                if (depth === 0) {
+                    element = text.slice(i + 1).trim();
+                    break;
+                }
+            }
+        }
+    }
+    if (!element) return null;
+    element = element.replace(/^\*+/, '').trim();
+    const qualified = element.match(/^([A-Za-z_]\w*)\.([A-Za-z_]\w*)$/);
+    if (qualified) {
+        return { qualifier: qualified[1], type: qualified[2] };
+    }
+    return /^[A-Za-z_]\w*$/.test(element)
+        ? { qualifier: null, type: element } : null;
+}
+
+function _goIndexedReceiverType(index, filePath, call) {
+    const rootType = call.receiverIndexRootType;
+    const fieldName = call.receiverIndexField;
+    if (!rootType || !fieldName) return null;
+
+    const rootOrigin = _resolveFlowTypeOrigin(
+        index, filePath, rootType, call.receiverIndexRootTypeQualifier);
+    if (call.receiverIndexRootTypeQualifier && !rootOrigin?.fromFile) {
+        return { externalVia: `${call.receiverIndexRootTypeQualifier}.${rootType}` };
+    }
+
+    let fields = (index.symbols.get(fieldName) || []).filter(definition =>
+        definition.className === rootType && definition.fieldType &&
+        (definition.type === 'field' || definition.memberType === 'field'));
+    if (rootOrigin?.fromFile) {
+        const owned = fields.filter(field => field.file === rootOrigin.fromFile);
+        if (owned.length > 0) fields = owned;
+    }
+    if (fields.length === 0) return null;
+
+    const candidates = new Map();
+    for (const field of fields) {
+        const element = _goContainerElementType(field.fieldType);
+        if (!element) return null;
+        if (element.qualifier) {
+            const origin = field.file && _resolveFlowTypeOrigin(
+                index, field.file, element.type, element.qualifier);
+            if (origin?.fromFile) {
+                candidates.set(`${element.type}\0${origin.fromFile}`, {
+                    type: element.type,
+                    fromFile: origin.fromFile,
+                });
+            } else if (field.file &&
+                _goQualifierNamesImport(index, field.file, element.qualifier)) {
+                candidates.set(`external\0${element.qualifier}.${element.type}`, {
+                    externalVia: `${element.qualifier}.${element.type}`,
+                });
+            } else {
+                return null;
+            }
+            continue;
+        }
+
+        const typeDefs = (index.symbols.get(element.type) || [])
+            .filter(definition => IDENTITY_TYPE_KINDS.has(definition.type));
+        if (typeDefs.length === 0) {
+            if (!BUILTIN_RECEIVER_TYPES.has(element.type)) return null;
+            candidates.set(`builtin\0${element.type}`, { type: element.type });
+            continue;
+        }
+        const origin = field.file && _resolveFlowTypeOrigin(
+            index, field.file, element.type);
+        if (!origin?.fromFile) return null;
+        candidates.set(`${element.type}\0${origin.fromFile}`, {
+            type: element.type,
+            fromFile: origin.fromFile,
+        });
+    }
+    return candidates.size === 1 ? [...candidates.values()][0] : null;
 }
 
 function _declaredFieldType(

@@ -688,7 +688,9 @@ function clearAllCaches() {
 // declaration targets for compiler-return-type receiver flow.
 // v207 (fix #334): Go method-call records retain compiler-exact receiver
 // types for values bound from declared map, slice, and array indexes.
-const CACHE_FORMAT_VERSION = 207;
+// v208 (fix #335): Go indexed-value calls preserve receiver-root/field
+// provenance so sibling-file container declarations resolve query-time.
+const CACHE_FORMAT_VERSION = 208;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**
