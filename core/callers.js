@@ -3002,7 +3002,7 @@ function findCallers(index, name, options = {}) {
                 // only when every target is a class method; standalone-function
                 // and class (constructor) targets keep flowing on import evidence.
                 if ((!bindingId || recvExportedNamespace) && !resolvedBySameClass && call.isMethod &&
-                    (call.receiverIsModule || recvExportedNamespace) &&
+                    (call.receiverIsModule || call.receiverModuleSpecifier || recvExportedNamespace) &&
                     langTraits(fileEntry.language)?.typeSystem === 'structural' &&
                     targetDefs.length > 0 && targetDefs.every(d => d.className)) {
                     isUncertain = true;
@@ -3029,7 +3029,8 @@ function findCallers(index, name, options = {}) {
                 // dynamic CJS surfaces can exceed the modeled ownership);
                 // unresolved-but-project-looking → visible (resolver gap).
                 if ((!bindingId || recvExportedNamespace) && !resolvedBySameClass && call.isMethod &&
-                    (call.receiverIsModule || recvSubmoduleRel || recvExportedNamespace ||
+                    (call.receiverIsModule || call.receiverModuleSpecifier ||
+                        recvSubmoduleRel || recvExportedNamespace ||
                         call.receiverModuleComposition) &&
                     langTraits(fileEntry.language)?.typeSystem === 'structural') {
                     const tFiles = targetDefinitionFiles;
@@ -4584,7 +4585,7 @@ function findCallers(index, name, options = {}) {
                         // root counts only when the resolver PROVED it a
                         // submodule (#224 — a from-import name may be a
                         // plain symbol, never assume).
-                        if (!typeQualifiedReceiver && !knownDispatchType &&
+                        if (!call.moduleOwnedPath && !typeQualifiedReceiver && !knownDispatchType &&
                             call.receiverRoot && !call.receiverRootType &&
                             langTraits(fileEntry.language)?.typeSystem === 'structural') {
                             const rootBinding = (fileEntry.importBindings || []).find(b =>
@@ -6202,7 +6203,7 @@ function findCallees(index, definition, options = {}) {
             // add only definitions it actually exposes. Unknown CJS/dynamic
             // surfaces stay visible; external modules are external.
             if (call.isMethod && (call.receiverIsModule ||
-                call.receiverModuleComposition) &&
+                call.receiverModuleSpecifier || call.receiverModuleComposition) &&
                 langTraits(language)?.typeSystem === 'structural') {
                 const moduleRoute = _calleeStructuralModuleRoute(index, fileEntry, call, language);
                 if (moduleRoute.matches?.length) {
@@ -7823,7 +7824,8 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
                 continue;
             }
         } else if (!nominal && call.isMethod &&
-            (call.receiverIsModule || call.receiverModuleComposition) &&
+            (call.receiverIsModule || call.receiverModuleSpecifier ||
+                call.receiverModuleComposition) &&
             (call.receiver || call.receiverModuleSpecifier)) {
             // Structural module-qualified producer (fix #209): schema =
             // z.string() — the module alias resolves through the file's
@@ -15764,7 +15766,7 @@ function _foldChainedReceiverType(index, fileEntry, filePath, call, ctx) {
 // return annotation from an unrelated class. Capitalized named imports remain
 // eligible for class/static-method resolution.
 function _isStructuralImportReceiver(fileEntry, record) {
-    if (record?.receiverModuleComposition) return true;
+    if (record?.receiverModuleSpecifier || record?.receiverModuleComposition) return true;
     if (!record?.receiver || !/^[a-z_$]/.test(record.receiver)) return false;
     return (fileEntry?.importBindings || []).some(b => b.name === record.receiver);
 }

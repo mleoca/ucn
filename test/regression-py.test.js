@@ -1311,6 +1311,47 @@ describe('fix #322: Python imported class factory result flow', () => {
     });
 });
 
+describe('fix #323: Python dotted module call ownership', () => {
+    it('pins an exact dotted import but rejects another module and a local shadow', () => {
+        const dir = tmp({
+            'pkg/__init__.py': '',
+            'pkg/api.py': [
+                'def auto(*, flag=False):',
+                '    return lambda cls: cls',
+            ].join('\n'),
+            'pkg/other.py': [
+                'def auto():',
+                '    return None',
+            ].join('\n'),
+            'use.py': [
+                'import pkg.api',
+                'import pkg.other',
+                '',
+                '@pkg.api.auto(flag=True)',
+                'class Exact:',
+                '    pass',
+                '',
+                'pkg.other.auto()',
+                '',
+                'def shadowed(pkg):',
+                '    return pkg.api.auto()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', {
+                name: 'pkg/api.py:1:auto',
+            });
+            assert.ok(result.ok, result.error);
+            assert.ok(result.result.callers.some(call =>
+                call.relativePath === 'use.py' && call.line === 4));
+            assert.ok(!result.result.callers.some(call =>
+                call.relativePath === 'use.py' && [8, 11].includes(call.line)));
+            assert.ok(result.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+});
+
 describe('Regression: Python self.method() same-class resolution', () => {
     it('findCallees should resolve self.method() to same-class methods', () => {
         const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-selfmethod-'));

@@ -1616,6 +1616,7 @@ function findCallsInCode(code, parser) {
     const classValueAliases = new Map();
     const classValueAliasesStack = [];
     const moduleAliases = new Set();  // Names bound to MODULES (import httpx / import numpy as np)
+    const moduleImportSpecifiers = new Set(); // Exact dotted imports: import rich.repr
     const localVarTypesStack = [];  // Stack for function-scoped save/restore of localVarTypes
     const declaredVarTypesStack = [];
     const localVarTypeQualifiersStack = [];
@@ -1767,6 +1768,7 @@ function findCallsInCode(code, parser) {
                 if (child.type === 'dotted_name') {
                     const first = child.namedChild(0);
                     if (first?.type === 'identifier') moduleAliases.add(first.text);
+                    moduleImportSpecifiers.add(child.text);
                 } else if (child.type === 'aliased_import') {
                     const alias = child.childForFieldName('alias');
                     if (alias?.type === 'identifier') moduleAliases.add(alias.text);
@@ -2356,6 +2358,13 @@ function findCallsInCode(code, parser) {
                         : undefined;
                     const receiverRootType = receiverPath
                         ? localVarTypes.get(receiverPath.root) : undefined;
+                    const dottedReceiver = receiverPath
+                        ? [receiverPath.root, ...receiverPath.fields].join('.')
+                        : null;
+                    const receiverModuleSpecifier = dottedReceiver &&
+                        moduleImportSpecifiers.has(dottedReceiver) &&
+                        !isShadowedByLocal(objNode, receiverPath.root)
+                        ? dottedReceiver : undefined;
                     // Module receiver (httpx.get()) — unless locally shadowed
                     // by a typed instance binding
                     const receiverIsModule = !!receiver && moduleAliases.has(receiver) &&
@@ -2380,6 +2389,7 @@ function findCallsInCode(code, parser) {
                         ...(receiver && constructedReceiverVars.has(receiver) && { receiverConstructed: true }),
                         ...(receiver && withBindingVars.has(receiver) && { receiverWithBinding: true }),
                         ...(receiverIsModule && { receiverIsModule: true }),
+                        ...(receiverModuleSpecifier && { receiverModuleSpecifier }),
                         ...(receiver && objNode?.type === 'identifier' &&
                             isShadowedByLocal(objNode, receiver) && { receiverLocalBinding: true }),
                         ...(receiver && !receiverType && objNode?.type === 'identifier' &&

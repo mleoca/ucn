@@ -671,7 +671,9 @@ function clearAllCaches() {
 // generic declared-field result flow.
 // v199 (fix #321): Python call records persist receiver types derived from
 // exact, scope-local class-value aliases such as `_Segment = Segment`.
-const CACHE_FORMAT_VERSION = 199;
+// v200 (fix #323): Python dotted module calls persist their exact import
+// specifier (`import rich.repr` → `rich.repr.auto()`).
+const CACHE_FORMAT_VERSION = 200;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**
