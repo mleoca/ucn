@@ -678,7 +678,9 @@ function clearAllCaches() {
 // callable aliases/non-callable bindings no longer leak across functions.
 // v202 (fix #325): Python call records preserve exact typed subscript sources
 // across one local assignment (`item = items[key]; item.method()`).
-const CACHE_FORMAT_VERSION = 202;
+// v203 (fix #326): Python call records type stable, direct module constructor
+// globals even when their functions are declared before the assignment.
+const CACHE_FORMAT_VERSION = 203;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**

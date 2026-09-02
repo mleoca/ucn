@@ -1761,6 +1761,121 @@ function findCallsInCode(code, parser) {
             ? ctor : undefined;
     };
 
+    // A function may legally reference a module global declared later in the
+    // file. The source-order walk cannot see that binding yet, so collect the
+    // narrow compiler-stable subset up front: one direct module assignment to
+    // a bare constructor, with no other module-scope write to the name. Keep
+    // qualified constructors out of this forward pass because their module
+    // import must itself be proven at the assignment position.
+    const moduleBindingCounts = new Map();
+    const forwardModuleConstructorCandidates = new Map();
+    const moduleTargetNames = target => {
+        if (!target) return [];
+        if (target.type === 'identifier') return [target.text];
+        if (!['tuple', 'pattern_list', 'list', 'list_pattern',
+            'tuple_pattern', 'list_splat_pattern',
+            'dictionary_splat_pattern'].includes(target.type)) return [];
+        const names = [];
+        for (let i = 0; i < target.namedChildCount; i++) {
+            names.push(...moduleTargetNames(target.namedChild(i)));
+        }
+        return names;
+    };
+    const isModuleScopeNode = node => {
+        for (let parent = node?.parent; parent; parent = parent.parent) {
+            if (parent.type === 'function_definition' ||
+                parent.type === 'class_definition' ||
+                parent.type === 'lambda') return false;
+        }
+        return true;
+    };
+    const moduleBindingNodeTypes = new Set([
+        'assignment', 'augmented_assignment', 'named_expression',
+        'for_statement', 'function_definition', 'async_function_definition',
+        'class_definition', 'import_statement', 'import_from_statement',
+        'global_statement', 'delete_statement', 'as_pattern',
+    ]);
+    let hasModuleWildcardImport = false;
+    traverseTreeCached(tree.rootNode, node => {
+        if (!moduleBindingNodeTypes.has(node.type)) return true;
+        if (node.type === 'global_statement') {
+            for (let i = 0; i < node.namedChildCount; i++) {
+                const child = node.namedChild(i);
+                if (child.type !== 'identifier') continue;
+                moduleBindingCounts.set(child.text,
+                    (moduleBindingCounts.get(child.text) || 0) + 1);
+            }
+            return true;
+        }
+        if (!isModuleScopeNode(node)) return true;
+        let names = [];
+        if (node.type === 'assignment' ||
+            node.type === 'augmented_assignment' ||
+            node.type === 'named_expression') {
+            names = moduleTargetNames(
+                node.childForFieldName('left') ||
+                node.childForFieldName('name'));
+        } else if (node.type === 'for_statement') {
+            names = moduleTargetNames(node.childForFieldName('left'));
+        } else if (node.type === 'function_definition' ||
+            node.type === 'async_function_definition' ||
+            node.type === 'class_definition') {
+            names = moduleTargetNames(node.childForFieldName('name'));
+        } else if (node.type === 'import_statement') {
+            for (let i = 0; i < node.namedChildCount; i++) {
+                const child = node.namedChild(i);
+                if (child.type === 'aliased_import') {
+                    const alias = child.childForFieldName('alias');
+                    const imported = child.childForFieldName('name');
+                    if (alias) names.push(alias.text);
+                    else if (imported) names.push(imported.text.split('.')[0]);
+                } else if (child.type === 'dotted_name') {
+                    names.push(child.text.split('.')[0]);
+                }
+            }
+        } else if (node.type === 'import_from_statement') {
+            for (let i = 0; i < node.namedChildCount; i++) {
+                const child = node.namedChild(i);
+                if (child.type === 'wildcard_import') {
+                    hasModuleWildcardImport = true;
+                } else if (child.type === 'aliased_import') {
+                    const alias = child.childForFieldName('alias');
+                    const imported = child.childForFieldName('name');
+                    if (alias) names.push(alias.text);
+                    else if (imported) names.push(imported.text.split('.').pop());
+                } else if (i > 0 && child.type === 'dotted_name') {
+                    names.push(child.text.split('.').pop());
+                }
+            }
+        } else if (node.type === 'delete_statement') {
+            for (let i = 0; i < node.namedChildCount; i++) {
+                names.push(...moduleTargetNames(node.namedChild(i)));
+            }
+        } else if (node.type === 'as_pattern') {
+            names = moduleTargetNames(
+                node.childForFieldName('alias')?.namedChild(0));
+        }
+        for (const name of names) {
+            moduleBindingCounts.set(name,
+                (moduleBindingCounts.get(name) || 0) + 1);
+        }
+        if (node.type !== 'assignment' || names.length !== 1) return true;
+        const statement = node.parent?.type === 'expression_statement'
+            ? node.parent : node;
+        if (statement.parent?.type !== 'module') return true;
+        const right = node.childForFieldName('right');
+        if (right?.type !== 'call') return true;
+        const ctor = constructorTypeInfo(right.childForFieldName('function'));
+        if (!ctor || ctor.qualifier ||
+            isPythonConstructorValueShadowedAt(
+                right.childForFieldName('function'), ctor.type)) return true;
+        forwardModuleConstructorCandidates.set(names[0], ctor);
+        return true;
+    });
+    const stableForwardModuleConstructors = new Map(
+        [...forwardModuleConstructorCandidates].filter(([name]) =>
+            !hasModuleWildcardImport && moduleBindingCounts.get(name) === 1));
+
     traverseTree(tree.rootNode, (node) => {
         // Track module-alias bindings: `import httpx` binds 'httpx' (a module),
         // `import numpy as np` binds 'np'. Method calls through these receivers
@@ -1818,6 +1933,14 @@ function findCallsInCode(code, parser) {
             aliasesStack.push(new Map(aliases));
             nonCallableNamesStack.push(new Set(nonCallableNames));
             const body = node.childForFieldName('body');
+            for (const [name, ctor] of stableForwardModuleConstructors) {
+                if (functionParameterBindsName(node, name) ||
+                    (body && pythonScopeBindsName(body, name))) continue;
+                if (!localVarTypes.has(name)) {
+                    localVarTypes.set(name, ctor.type);
+                    constructedReceiverVars.add(name);
+                }
+            }
             for (const name of aliases.keys()) {
                 if ((body && pythonScopeBindsName(body, name)) ||
                     functionParameterBindsName(node, name)) {

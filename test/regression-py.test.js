@@ -1480,6 +1480,71 @@ describe('fix #325: Python assigned indexed receiver flow', () => {
     });
 });
 
+describe('fix #326: Python forward module constructor globals', () => {
+    it('types one stable global but rejects rebinding and local shadowing', () => {
+        const dir = tmp({
+            'model.py': [
+                'class Progress:',
+                '    def update(self):',
+                '        return "progress"',
+                '',
+                'class Other:',
+                '    def update(self):',
+                '        return "other"',
+            ].join('\n'),
+            'use.py': [
+                'from model import Progress, Other',
+                '',
+                'def run():',
+                '    global_progress.update()',
+                '    unstable.update()',
+                '    imported_rebind.update()',
+                '    mutated.update()',
+                '',
+                'def local(global_progress):',
+                '    global_progress.update()',
+                '',
+                'def mutate():',
+                '    global mutated',
+                '    mutated = Other()',
+                '',
+                'global_progress = Progress()',
+                'unstable = Progress()',
+                'unstable = Other()',
+                'imported_rebind = Progress()',
+                'from model import Other as imported_rebind',
+                'mutated = Progress()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', {
+                name: 'model.py:2:update',
+            });
+            assert.ok(result.ok, result.error);
+            assert.ok(result.result.callers.some(call =>
+                call.relativePath === 'use.py' && call.line === 4));
+            assert.ok(!result.result.callers.some(call =>
+                call.relativePath === 'use.py' && [5, 6, 7, 10].includes(call.line)));
+            assert.strictEqual(result.result.meta.account.conserved, true);
+
+            const run = index.symbols.get('run')[0];
+            const callees = index.findCallees(run, {
+                collectAccount: true,
+                includeMethods: true,
+            });
+            assert.ok(callees.some(callee =>
+                callee.relativePath === 'model.py' &&
+                callee.className === 'Progress' &&
+                callee.sites?.includes(4)), JSON.stringify(callees));
+            assert.ok(!callees.some(callee =>
+                callee.sites?.some(site => [5, 6, 7].includes(site))),
+            JSON.stringify(callees));
+            assert.strictEqual(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
 describe('Regression: Python self.method() same-class resolution', () => {
     it('findCallees should resolve self.method() to same-class methods', () => {
         const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-selfmethod-'));
