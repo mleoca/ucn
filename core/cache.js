@@ -676,7 +676,9 @@ function clearAllCaches() {
 // v201 (fix #324): Python method-call records persist simple subscript roots
 // and their local type provenance for `items[key].method()` dispatch; local
 // callable aliases/non-callable bindings no longer leak across functions.
-const CACHE_FORMAT_VERSION = 201;
+// v202 (fix #325): Python call records preserve exact typed subscript sources
+// across one local assignment (`item = items[key]; item.method()`).
+const CACHE_FORMAT_VERSION = 202;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**

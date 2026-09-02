@@ -1598,6 +1598,7 @@ function findCallsInCode(code, parser) {
     const localIterableTypes = new Map(); // iterable binding -> loop-variable types
     const localIterationSources = new Map(); // loop variable -> declared iterable path + tuple index
     const localDictValueTypes = new Map(); // local dict -> exact string-key value types
+    const localSubscriptSources = new Map(); // local value -> exact typed container selected by []
     const localVarStdlibContracts = new Map(); // variable -> stdlib module proving its type flow
     const assignmentRhsReceiverTypes = new Map(); // call-node id -> pre-assignment receiver type
     const constructedReceiverVars = new Set(); // exact constructor-result bindings
@@ -1626,6 +1627,7 @@ function findCallsInCode(code, parser) {
     const localIterableTypesStack = [];
     const localIterationSourcesStack = [];
     const localDictValueTypesStack = [];
+    const localSubscriptSourcesStack = [];
     const localVarStdlibContractsStack = [];
     const constructedReceiverVarsStack = [];
     const withBindingVarsStack = [];
@@ -1807,6 +1809,7 @@ function findCallsInCode(code, parser) {
             localDictValueTypesStack.push(new Map(
                 [...localDictValueTypes].map(([name, values]) =>
                     [name, new Map(values)])));
+            localSubscriptSourcesStack.push(new Map(localSubscriptSources));
             localVarStdlibContractsStack.push(new Map(localVarStdlibContracts));
             constructedReceiverVarsStack.push(new Set(constructedReceiverVars));
             withBindingVarsStack.push(new Set(withBindingVars));
@@ -1825,6 +1828,12 @@ function findCallsInCode(code, parser) {
                 if ((body && pythonScopeBindsName(body, name)) ||
                     functionParameterBindsName(node, name)) {
                     nonCallableNames.delete(name);
+                }
+            }
+            for (const name of localSubscriptSources.keys()) {
+                if ((body && pythonScopeBindsName(body, name)) ||
+                    functionParameterBindsName(node, name)) {
+                    localSubscriptSources.delete(name);
                 }
             }
             for (const name of classValueAliases.keys()) {
@@ -1948,6 +1957,7 @@ function findCallsInCode(code, parser) {
             const right = node.childForFieldName('right');
             if (left?.type === 'identifier') {
                 classValueAliases.delete(left.text);
+                localSubscriptSources.delete(left.text);
                 const previousType = localVarTypes.get(left.text);
                 if (previousType && right?.type === 'call') {
                     const rightFunction = right.childForFieldName('function');
@@ -2064,6 +2074,20 @@ function findCallsInCode(code, parser) {
                     }
                     if (valueTypes.size > 0) {
                         localDictValueTypes.set(left.text, valueTypes);
+                    }
+                }
+                if (!typeNode && right?.type === 'subscript') {
+                    const base = right.childForFieldName('value');
+                    if (base?.type === 'identifier' && base.text !== left.text) {
+                        const rootType = localVarTypes.get(base.text);
+                        if (rootType) {
+                            localSubscriptSources.set(left.text, {
+                                root: base.text,
+                                rootType,
+                                rootTypeQualifier:
+                                    localVarTypeQualifiers.get(base.text),
+                            });
+                        }
                     }
                 }
                 const roundTripSource = pickleRoundTripSource(right);
@@ -2342,6 +2366,15 @@ function findCallsInCode(code, parser) {
                             }
                         }
                     }
+                    if (!receiverSubscriptRoot && receiver) {
+                        const source = localSubscriptSources.get(receiver);
+                        if (source) {
+                            receiverSubscriptRoot = source.root;
+                            receiverSubscriptRootType = source.rootType;
+                            receiverSubscriptRootTypeQualifier =
+                                source.rootTypeQualifier;
+                        }
+                    }
                     const receiverType = receiver
                         ? (narrowedReceiverType(
                             objNode, receiver, localVarUnionTypes.get(receiver)) ||
@@ -2586,6 +2619,13 @@ function findCallsInCode(code, parser) {
                     localDictValueTypes.clear();
                     for (const [name, values] of savedDictValueTypes) {
                         localDictValueTypes.set(name, values);
+                    }
+                }
+                const savedSubscriptSources = localSubscriptSourcesStack.pop();
+                if (savedSubscriptSources) {
+                    localSubscriptSources.clear();
+                    for (const [name, source] of savedSubscriptSources) {
+                        localSubscriptSources.set(name, source);
                     }
                 }
                 const savedStdlibContracts = localVarStdlibContractsStack.pop();

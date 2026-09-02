@@ -1423,6 +1423,63 @@ describe('fix #324: Python indexed receiver return contracts', () => {
     });
 });
 
+describe('fix #325: Python assigned indexed receiver flow', () => {
+    it('carries exact indexed value identity until the next assignment', () => {
+        const dir = tmp({
+            'model.py': [
+                'class Item:',
+                '    def touch(self):',
+                '        return "item"',
+                '',
+                'class Box:',
+                '    def __getitem__(self, key: str) -> Item:',
+                '        return Item()',
+                '',
+                'class Other:',
+                '    def touch(self):',
+                '        return "other"',
+            ].join('\n'),
+            'use.py': [
+                'from model import Box, Other',
+                '',
+                'def run():',
+                '    box = Box()',
+                '    item = box["x"]',
+                '    item.touch()',
+                '    item = Other()',
+                '    item.touch()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', {
+                name: 'model.py:2:touch',
+            });
+            assert.ok(result.ok, result.error);
+            assert.ok(result.result.callers.some(call =>
+                call.relativePath === 'use.py' && call.line === 6));
+            assert.ok(!result.result.callers.some(call =>
+                call.relativePath === 'use.py' && call.line === 8));
+            assert.strictEqual(result.result.meta.account.conserved, true);
+
+            const run = index.symbols.get('run')[0];
+            const callees = index.findCallees(run, {
+                collectAccount: true,
+                includeMethods: true,
+            });
+            assert.ok(callees.some(callee =>
+                callee.relativePath === 'model.py' &&
+                callee.className === 'Item' &&
+                callee.sites?.includes(6)), JSON.stringify(callees));
+            assert.ok(callees.some(callee =>
+                callee.relativePath === 'model.py' &&
+                callee.className === 'Other' &&
+                callee.sites?.includes(8)), JSON.stringify(callees));
+            assert.strictEqual(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
 describe('Regression: Python self.method() same-class resolution', () => {
     it('findCallees should resolve self.method() to same-class methods', () => {
         const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-selfmethod-'));
