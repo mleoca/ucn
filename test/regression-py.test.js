@@ -1265,6 +1265,52 @@ describe('fix #321: Python class-value receiver aliases', () => {
     });
 });
 
+describe('fix #322: Python imported class factory result flow', () => {
+    it('types an exact classmethod result but rejects a locally shadowed class value', () => {
+        const dir = tmp({
+            'text.py': [
+                'class Text:',
+                '    @classmethod',
+                '    def from_markup(cls, value: str) -> "Text":',
+                '        return cls()',
+                '    def expand_tabs(self):',
+                '        return None',
+            ].join('\n'),
+            'decoy.py': [
+                'class Text:',
+                '    @classmethod',
+                '    def from_markup(cls, value: str) -> "Text":',
+                '        return cls()',
+                '    def expand_tabs(self):',
+                '        return None',
+            ].join('\n'),
+            'render.py': [
+                'from text import Text',
+                '',
+                'def exact(markup: str):',
+                '    value = Text.from_markup(markup)',
+                '    return value.expand_tabs()',
+                '',
+                'def shadowed(Text, markup: str):',
+                '    value = Text.from_markup(markup)',
+                '    return value.expand_tabs()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', {
+                name: 'text.py:5:expand_tabs',
+            });
+            assert.ok(result.ok, result.error);
+            assert.ok(result.result.callers.some(call =>
+                call.relativePath === 'render.py' && call.line === 5));
+            assert.ok(!result.result.callers.some(call =>
+                call.relativePath === 'render.py' && call.line === 9));
+            assert.ok(result.result.meta.account.conserved);
+        } finally { rm(dir); }
+    });
+});
+
 describe('Regression: Python self.method() same-class resolution', () => {
     it('findCallees should resolve self.method() to same-class methods', () => {
         const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-selfmethod-'));

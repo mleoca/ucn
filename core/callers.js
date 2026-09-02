@@ -7622,6 +7622,25 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
                         index._getInheritanceParents?.(owner, filePath) || []))];
                 }
             }
+        } else if (!nominal && language === 'python' && call.isMethod &&
+            call.receiver && !call.receiverLocalBinding &&
+            !call.receiverIsModule && !call.receiverModuleComposition) {
+            // Exact imported class factory: `text = Text.from_markup(...)`.
+            // The parser intentionally does not label every capitalized
+            // receiver as an instance type. Pin the value to an indexed type
+            // in the caller's import scope first, then reuse the method
+            // contract agreement discipline to type the assigned result.
+            const owner = _resolveFlowTypeOrigin(index, filePath, call.receiver);
+            const resolved = owner?.fromFile
+                ? _methodReturnOnType(
+                    index, call.receiver, owner.fromFile, call.name,
+                    language, { filePath, consumerAwaited: false })
+                : null;
+            if (resolved?.type) {
+                returnType = resolved.type;
+                fromFile = resolved.fromFile;
+                selfClass = call.receiver;
+            }
         } else if (call.isMethod && call.receiver &&
             !['self', 'this', 'cls'].includes(call.receiver) &&
             _lookupReturnTypeFlow(map, call)) {
@@ -14620,8 +14639,16 @@ function _methodReturnOnType(index, typeName, fromFile, methodName, language, op
     const typeDefs = (index.symbols.get(typeName) || []).filter(d => _FOLD_TYPE_KINDS.has(d.type));
     if (typeDefs.length > 1 && owned.length > 0) {
         if (!fromFile) return null;
-        const dir = path.dirname(fromFile);
-        owned = owned.filter(d => d.file === fromFile || (d.file && path.dirname(d.file) === dir));
+        if (nominal) {
+            const dir = path.dirname(fromFile);
+            owned = owned.filter(d => d.file === fromFile ||
+                (d.file && path.dirname(d.file) === dir));
+        } else {
+            // Structural sibling modules are distinct identities. Directory
+            // co-location is package evidence for Go/Rust/Java impl layouts,
+            // but never merges two Python/JS/TS classes with the same name.
+            owned = owned.filter(d => d.file === fromFile);
+        }
     }
     if (owned.length === 0) {
         // Inheritance walk: resolve on a declared ancestor; Self/this still
