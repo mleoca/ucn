@@ -653,6 +653,8 @@ const GO_BUILTINS = new Set([
  *                             target with its declared return position)
  *   y = q()                → { assignedTo: 'y' } (plain `=` only — `+=` etc.
  *                            don't bind the call's type to the variable)
+ *   var z = q()            → { assignedTo: 'z' } (`var` declarations use
+ *                            repeated AST `name` fields plus a `value` list)
  *   a, b := g(), h()       → parallel assignment: each call pairs with its
  *                            own LHS position, single-value semantics
  * Identifier targets only; blank (`_`) targets return undefined.
@@ -669,18 +671,25 @@ function goAssignmentTargetOf(callNode) {
         }
         n = p; p = n.parent;
     }
-    if (!p || (p.type !== 'short_var_declaration' && p.type !== 'assignment_statement')) return undefined;
+    if (!p || (p.type !== 'short_var_declaration' &&
+        p.type !== 'assignment_statement' && p.type !== 'var_spec')) return undefined;
     if (p.type === 'assignment_statement') {
         const op = p.childForFieldName('operator');
         if (op && op.text !== '=') return undefined;
     }
-    const right = p.childForFieldName('right');
+    const isVarSpec = p.type === 'var_spec';
+    const right = p.childForFieldName(isVarSpec ? 'value' : 'right');
     if (!right || right.id !== n.id) return undefined;
-    const left = p.childForFieldName('left');
-    if (!left) return undefined;
-    const names = left.type === 'expression_list'
-        ? Array.from({ length: left.namedChildCount }, (_, i) => left.namedChild(i))
-        : [left];
+    const left = isVarSpec ? null : p.childForFieldName('left');
+    if (!isVarSpec && !left) return undefined;
+    const names = isVarSpec
+        ? Array.from({ length: p.childCount }, (_, i) => ({
+            child: p.child(i),
+            field: p.fieldNameForChild(i),
+        })).filter(({ field }) => field === 'name').map(({ child }) => child)
+        : left.type === 'expression_list'
+            ? Array.from({ length: left.namedChildCount }, (_, i) => left.namedChild(i))
+            : [left];
     if (rhsCount > 1) {
         const target = names[rhsIndex];
         return target?.type === 'identifier' && target.text !== '_'

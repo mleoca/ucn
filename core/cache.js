@@ -684,7 +684,9 @@ function clearAllCaches() {
 // so imported annotations can participate in exact conditional narrowing.
 // v205 (fix #332): Go method-call records retain capture-aware lexical scope
 // chains so return-type flow reaches nested closures without crossing shadows.
-const CACHE_FORMAT_VERSION = 205;
+// v206 (fix #333): Go calls assigned in `var` declarations retain their
+// declaration targets for compiler-return-type receiver flow.
+const CACHE_FORMAT_VERSION = 206;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**

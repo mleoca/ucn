@@ -6383,6 +6383,75 @@ describe('fix #332: compiler return flow follows Go closure captures', () => {
     });
 });
 
+describe('fix #333: compiler return flow follows Go var declarations', () => {
+    it('pairs factory calls with single, parallel, and tuple var targets', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/t\n\ngo 1.21\n',
+            'flow.go': [
+                'package t',
+                '',
+                'type Router struct{}',
+                'func (*Router) Use() {}',
+                'func (*Router) Get() {}',
+                '',
+                'type Other struct{}',
+                'func (*Other) Use() {}',
+                'func (*Other) Get() {}',
+                '',
+                'func NewRouter() *Router { return nil }',
+                'func NewOther() *Other { return nil }',
+                'func pair() (*Router, *Other) { return nil, nil }',
+                '',
+                'func use() {',
+                '    var r = NewRouter()',
+                '    r.Use()',
+                '    var a, b = NewRouter(), NewOther()',
+                '    a.Get()',
+                '    b.Get()',
+                '    var x, y = pair()',
+                '    x.Use()',
+                '    y.Use()',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const calls = index.getCachedCalls(path.join(dir, 'flow.go'));
+            assert.strictEqual(calls.find(call =>
+                call.name === 'NewRouter' && call.line === 16)?.assignedTo, 'r');
+            assert.strictEqual(calls.find(call =>
+                call.name === 'NewRouter' && call.line === 18)?.assignedTo, 'a');
+            assert.strictEqual(calls.find(call =>
+                call.name === 'NewOther' && call.line === 18)?.assignedTo, 'b');
+            const pairCall = calls.find(call => call.name === 'pair');
+            assert.strictEqual(pairCall?.assignedTo, 'x');
+            assert.strictEqual(pairCall?.assignedTuple, true);
+            assert.deepStrictEqual(pairCall?.assignedTupleTargets, [
+                { name: 'x', index: 0 },
+                { name: 'y', index: 1 },
+            ]);
+
+            const routerUse = execute(index, 'context', { name: 'flow.go:4:Use' });
+            assert.ok(routerUse.ok, routerUse.error);
+            assert.deepStrictEqual(routerUse.result.callers.map(call => call.line), [17, 22]);
+            assert.strictEqual(routerUse.result.meta.account.conserved, true);
+
+            const otherUse = execute(index, 'context', { name: 'flow.go:8:Use' });
+            assert.ok(otherUse.ok, otherUse.error);
+            assert.deepStrictEqual(otherUse.result.callers.map(call => call.line), [23]);
+            assert.strictEqual(otherUse.result.meta.account.conserved, true);
+
+            const routerGet = execute(index, 'context', { name: 'flow.go:5:Get' });
+            assert.ok(routerGet.ok, routerGet.error);
+            assert.deepStrictEqual(routerGet.result.callers.map(call => call.line), [19]);
+
+            const otherGet = execute(index, 'context', { name: 'flow.go:9:Get' });
+            assert.ok(otherGet.ok, otherGet.error);
+            assert.deepStrictEqual(otherGet.result.callers.map(call => call.line), [20]);
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #268: callee-side external identity (Go)', () => {
     it('external result provenance survives a field hop in both directions', () => {
         const dir = tmp({
