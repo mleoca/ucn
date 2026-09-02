@@ -1588,7 +1588,9 @@ function findCallsInCode(code, parser) {
     });
     const functionStack = [];  // Stack of { name, startLine, endLine }
     const aliases = new Map();  // Track local aliases: aliasName -> originalName
+    const aliasesStack = [];
     const nonCallableNames = new Set();  // Track names assigned non-callable values
+    const nonCallableNamesStack = [];
     const localVarTypes = new Map();  // Track local variable types: varName -> typeName (for receiverType inference)
     const declaredVarTypes = new Map(); // Compiler-checked annotations survive later assignments
     const localVarTypeQualifiers = new Map(); // varName -> imported module alias that owns the inferred type
@@ -1810,7 +1812,21 @@ function findCallsInCode(code, parser) {
             withBindingVarsStack.push(new Set(withBindingVars));
             memberAliasesStack.push(new Map(memberAliases));
             classValueAliasesStack.push(new Map(classValueAliases));
+            aliasesStack.push(new Map(aliases));
+            nonCallableNamesStack.push(new Set(nonCallableNames));
             const body = node.childForFieldName('body');
+            for (const name of aliases.keys()) {
+                if ((body && pythonScopeBindsName(body, name)) ||
+                    functionParameterBindsName(node, name)) {
+                    aliases.delete(name);
+                }
+            }
+            for (const name of nonCallableNames) {
+                if ((body && pythonScopeBindsName(body, name)) ||
+                    functionParameterBindsName(node, name)) {
+                    nonCallableNames.delete(name);
+                }
+            }
             for (const name of classValueAliases.keys()) {
                 if ((body && pythonScopeBindsName(body, name)) ||
                     functionParameterBindsName(node, name)) {
@@ -2308,13 +2324,22 @@ function findCallsInCode(code, parser) {
                     // Literal receivers carry their builtin type: {}.get() can
                     // never be a project class method
                     let subscriptReceiverType;
+                    let receiverSubscriptRoot;
+                    let receiverSubscriptRootType;
+                    let receiverSubscriptRootTypeQualifier;
                     if (objNode?.type === 'subscript') {
                         const base = objNode.childForFieldName('value');
                         const key = literalStringValue(
                             objNode.childForFieldName('subscript'));
-                        if (base?.type === 'identifier' && key != null) {
-                            subscriptReceiverType =
-                                localDictValueTypes.get(base.text)?.get(key);
+                        if (base?.type === 'identifier') {
+                            receiverSubscriptRoot = base.text;
+                            receiverSubscriptRootType = localVarTypes.get(base.text);
+                            receiverSubscriptRootTypeQualifier =
+                                localVarTypeQualifiers.get(base.text);
+                            if (key != null) {
+                                subscriptReceiverType =
+                                    localDictValueTypes.get(base.text)?.get(key);
+                            }
                         }
                     }
                     const receiverType = receiver
@@ -2390,6 +2415,13 @@ function findCallsInCode(code, parser) {
                         ...(receiver && withBindingVars.has(receiver) && { receiverWithBinding: true }),
                         ...(receiverIsModule && { receiverIsModule: true }),
                         ...(receiverModuleSpecifier && { receiverModuleSpecifier }),
+                        ...(receiverSubscriptRoot && { receiverSubscriptRoot }),
+                        ...(receiverSubscriptRootType && {
+                            receiverSubscriptRootType,
+                        }),
+                        ...(receiverSubscriptRootTypeQualifier && {
+                            receiverSubscriptRootTypeQualifier,
+                        }),
                         ...(receiver && objNode?.type === 'identifier' &&
                             isShadowedByLocal(objNode, receiver) && { receiverLocalBinding: true }),
                         ...(receiver && !receiverType && objNode?.type === 'identifier' &&
@@ -2579,6 +2611,18 @@ function findCallsInCode(code, parser) {
                     classValueAliases.clear();
                     for (const [k, v] of savedClassValueAliases) {
                         classValueAliases.set(k, v);
+                    }
+                }
+                const savedCallableAliases = aliasesStack.pop();
+                if (savedCallableAliases) {
+                    aliases.clear();
+                    for (const [k, v] of savedCallableAliases) aliases.set(k, v);
+                }
+                const savedNonCallableNames = nonCallableNamesStack.pop();
+                if (savedNonCallableNames) {
+                    nonCallableNames.clear();
+                    for (const name of savedNonCallableNames) {
+                        nonCallableNames.add(name);
                     }
                 }
             }

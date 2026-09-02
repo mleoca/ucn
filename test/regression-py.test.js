@@ -1352,6 +1352,77 @@ describe('fix #323: Python dotted module call ownership', () => {
     });
 });
 
+describe('fix #324: Python indexed receiver return contracts', () => {
+    it('resolves caller and callee identity through an exact __getitem__ owner', () => {
+        const dir = tmp({
+            'boxes.py': [
+                'class Item:',
+                '    def touch(self):',
+                '        return "box"',
+                '',
+                'class Box:',
+                '    def __getitem__(self, key: str) -> Item:',
+                '        return Item()',
+            ].join('\n'),
+            'duplicate.py': [
+                'class Item:',
+                '    def touch(self):',
+                '        return "duplicate"',
+            ].join('\n'),
+            'foreign.py': [
+                'class ForeignItem:',
+                '    def touch(self):',
+                '        return "foreign"',
+                '',
+                'class ForeignBox:',
+                '    def __getitem__(self, key: str) -> ForeignItem:',
+                '        return ForeignItem()',
+            ].join('\n'),
+            'use.py': [
+                'from boxes import Box',
+                'from foreign import ForeignBox',
+                '',
+                'def earlier(source):',
+                '    box = source',
+                '    return box',
+                '',
+                'def run():',
+                '    box = Box()',
+                '    box["yes"].touch()',
+                '    foreign = ForeignBox()',
+                '    foreign["no"].touch()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', {
+                name: 'boxes.py:2:touch',
+            });
+            assert.ok(result.ok, result.error);
+            assert.ok(result.result.callers.some(call =>
+                call.relativePath === 'use.py' && call.line === 10));
+            assert.ok(!result.result.callers.some(call =>
+                call.relativePath === 'use.py' && call.line === 12));
+            assert.strictEqual(result.result.meta.account.conserved, true);
+
+            const run = index.symbols.get('run')[0];
+            const callees = index.findCallees(run, {
+                collectAccount: true,
+                includeMethods: true,
+            });
+            assert.ok(callees.some(callee =>
+                callee.relativePath === 'boxes.py' &&
+                callee.sites?.includes(10)), JSON.stringify(callees));
+            assert.ok(callees.some(callee =>
+                callee.relativePath === 'foreign.py' &&
+                callee.sites?.includes(12)), JSON.stringify(callees));
+            assert.ok(!callees.some(callee =>
+                callee.relativePath === 'duplicate.py'), JSON.stringify(callees));
+            assert.strictEqual(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
 describe('Regression: Python self.method() same-class resolution', () => {
     it('findCallees should resolve self.method() to same-class methods', () => {
         const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-selfmethod-'));

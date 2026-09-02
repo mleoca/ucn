@@ -595,6 +595,7 @@ function findCallers(index, name, options = {}) {
     const localTypeCache = new Map(); // `${filePath}:${startLine}` -> localTypes Map or null
     const returnFlowCache = new Map(); // filePath -> return-type-flow map (see _buildReturnTypeFlowMap)
     const foldCtxCache = new Map(); // filePath -> chained-receiver fold context (fix #258)
+    const pythonIndexedReceiverCache = new Map();
 
     // Use inverted callee index to skip files that don't contain calls to this name
     let calleeFiles = index.getCalleeFiles(name);
@@ -923,6 +924,34 @@ function findCallers(index, name, options = {}) {
                             receiverTypeGuessed: undefined,
                             receiverFlowInvalidated: false,
                             ...(flowEntry.fromFile && { receiverTypeFlowFile: flowEntry.fromFile }) };
+                    }
+                }
+
+                // Python indexed receivers (fix #324): `layout["body"].update()`
+                // dispatch through the container's compiler-visible
+                // `__getitem__` return contract. The parser retains only a
+                // simple identifier root; query time pins that root's type to
+                // an exact project definition before trusting the contract.
+                // External, unresolved, and ambiguous containers abstain.
+                if (fileEntry.language === 'python' && call.isMethod &&
+                    !call.receiverType && call.receiverSubscriptRoot) {
+                    const indexedType = _pythonIndexedReceiverType(
+                        index, filePath, call, () => {
+                            let flowMap = returnFlowCache.get(filePath);
+                            if (flowMap === undefined) {
+                                flowMap = _buildReturnTypeFlowMap(index, filePath, calls);
+                                returnFlowCache.set(filePath, flowMap);
+                            }
+                            return flowMap;
+                        }, pythonIndexedReceiverCache);
+                    if (indexedType?.type) {
+                        call = {
+                            ...call,
+                            receiverType: indexedType.type,
+                            ...(indexedType.fromFile && {
+                                receiverTypeFlowFile: indexedType.fromFile,
+                            }),
+                        };
                     }
                 }
                 // Python loop/comprehension bindings can inherit item types
@@ -5253,6 +5282,7 @@ function findCallees(index, definition, options = {}) {
         // Return-type flow map (lazy — only built if a single-owner
         // resolution needs the external-producer/typed-receiver defeater).
         let _flowMap;
+        const pythonIndexedReceiverCache = new Map();
         const flowMap = () => {
             if (_flowMap === undefined) {
                 if (queryProfile) {
@@ -5405,6 +5435,25 @@ function findCallees(index, definition, options = {}) {
                 if (!localTarget) {
                     noteSite(siteId, 'excluded', 'local-shadow', call);
                     continue;
+                }
+            }
+
+            // Python indexed receivers share the caller-side #324 contract:
+            // only an exact project container type plus its declared
+            // `__getitem__` return type may identify the selected value.
+            if (language === 'python' && call.isMethod &&
+                !call.receiverType && call.receiverSubscriptRoot) {
+                const indexedType = _pythonIndexedReceiverType(
+                    index, def.file, call, flowMap,
+                    pythonIndexedReceiverCache);
+                if (indexedType?.type) {
+                    call = {
+                        ...call,
+                        receiverType: indexedType.type,
+                        ...(indexedType.fromFile && {
+                            receiverTypeFlowFile: indexedType.fromFile,
+                        }),
+                    };
                 }
             }
 
@@ -5851,7 +5900,8 @@ function findCallees(index, definition, options = {}) {
                     const isCallableRT = (s) => !NON_CALLABLE_TYPES.has(s.type) ||
                         (s.type === 'field' && s.fieldType && /^func\b/.test(s.fieldType));
                     // Same-class overload selection by static call shape (fix #268)
-                    const receiverOriginFile = directReceiverFlow?.fromFile ||
+                    const receiverOriginFile = call.receiverTypeFlowFile ||
+                        directReceiverFlow?.fromFile ||
                         fieldHopInfo?.fromFile ||
                         (call.receiverType
                             ? _resolveFlowTypeOrigin(
@@ -5865,7 +5915,8 @@ function findCallees(index, definition, options = {}) {
                          (symbol.file &&
                           path.dirname(symbol.file) === qualifiedType.dir)) &&
                         (!receiverOriginFile || !symbol.file ||
-                         ((language === 'java' || language === 'csharp')
+                         ((langTraits(language)?.typeSystem === 'structural' ||
+                           language === 'java' || language === 'csharp')
                              ? symbol.file === receiverOriginFile
                              : path.dirname(symbol.file) ===
                                 path.dirname(receiverOriginFile)));
@@ -14432,6 +14483,50 @@ function _nominalChainedReceiverType(index, call, fileEntry, filePath) {
     const origin = _resolveFlowTypeOrigin(index, producer.file || filePath, parsed.name, parsed.qualifier);
     if (!origin) return null;
     return { type: parsed.name, ...(origin.fromFile && { fromFile: origin.fromFile }) };
+}
+
+/**
+ * Type a Python subscript expression used as a method receiver from the
+ * indexed container's declared `__getitem__` return contract.
+ *
+ * The root must resolve to an exact project type definition. This prevents a
+ * globally unique project `__getitem__` (or a same-named local class) from
+ * lending identity to an external or ambiguous container. The returned value
+ * then follows the same origin-pinned structural return rails as an ordinary
+ * method call.
+ */
+function _pythonIndexedReceiverType(
+    index, filePath, call, getFlowMap, cache = null
+) {
+    if (!call?.receiverSubscriptRoot) return null;
+    let rootType = call.receiverSubscriptRootType;
+    let rootFromFile;
+    if (!rootType && typeof getFlowMap === 'function') {
+        const flow = _lookupReturnTypeFlow(getFlowMap(), {
+            ...call,
+            receiver: call.receiverSubscriptRoot,
+        });
+        if (flow?.type) {
+            rootType = flow.type;
+            rootFromFile = flow.fromFile;
+        }
+    }
+    if (!rootType) return null;
+
+    const origin = _resolveFlowTypeOrigin(
+        index, rootFromFile || filePath, rootType,
+        call.receiverSubscriptRootTypeQualifier);
+    if (!origin?.fromFile) return null;
+
+    const key = `${origin.fromFile}\0${rootType}`;
+    if (cache?.has(key)) return cache.get(key);
+    const result = _methodReturnOnType(
+        index, rootType, origin.fromFile, '__getitem__', 'python', {
+            filePath,
+            selfType: rootType,
+        });
+    if (cache) cache.set(key, result || null);
+    return result;
 }
 
 function _chainedReceiverType(index, call, language) {

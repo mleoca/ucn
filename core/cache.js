@@ -673,7 +673,10 @@ function clearAllCaches() {
 // exact, scope-local class-value aliases such as `_Segment = Segment`.
 // v200 (fix #323): Python dotted module calls persist their exact import
 // specifier (`import rich.repr` → `rich.repr.auto()`).
-const CACHE_FORMAT_VERSION = 200;
+// v201 (fix #324): Python method-call records persist simple subscript roots
+// and their local type provenance for `items[key].method()` dispatch; local
+// callable aliases/non-callable bindings no longer leak across functions.
+const CACHE_FORMAT_VERSION = 201;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**
