@@ -1683,6 +1683,51 @@ describe('fix #328: Python union-narrowed field result flow', () => {
     });
 });
 
+describe('fix #329: Python private-class constructor flow', () => {
+    it('types direct and qualified private constructors without trusting shadows', () => {
+        const dir = tmp({
+            'model.py': [
+                'class _ClassBuilder:',
+                '    def make_unhashable(self):',
+                '        return "builder"',
+                '',
+                'class Other:',
+                '    def make_unhashable(self):',
+                '        return "other"',
+            ].join('\n'),
+            'use.py': [
+                'import model',
+                'from model import _ClassBuilder',
+                '',
+                'def direct():',
+                '    builder = _ClassBuilder()',
+                '    builder.make_unhashable()',
+                '',
+                'def qualified():',
+                '    builder = model._ClassBuilder()',
+                '    builder.make_unhashable()',
+                '',
+                'def shadowed(_ClassBuilder):',
+                '    builder = _ClassBuilder()',
+                '    builder.make_unhashable()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', {
+                name: 'model.py:2:make_unhashable',
+            });
+            assert.ok(result.ok, result.error);
+            assert.deepStrictEqual(result.result.callers
+                .filter(call => call.relativePath === 'use.py')
+                .map(call => call.line), [6, 10]);
+            assert.ok(!result.result.callers.some(call =>
+                call.relativePath === 'use.py' && call.line === 14));
+            assert.strictEqual(result.result.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
 describe('Regression: Python self.method() same-class resolution', () => {
     it('findCallees should resolve self.method() to same-class methods', () => {
         const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-selfmethod-'));

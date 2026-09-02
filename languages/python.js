@@ -1142,18 +1142,21 @@ function contextTargetOf(callNode) {
  * pkg.ClassName(...).  Preserve the qualifier: dropping `threading` from
  * `threading.Thread()` turns an external class into an unqualified project
  * type name and can falsely confirm `thread.join()` against Project.join.
- * Uppercase-first remains a Python class-naming heuristic, so callers use the
- * qualifier as routing/provenance evidence rather than a hidden hard claim.
+ * PascalCase after optional privacy underscores remains a Python class-naming
+ * heuristic, so callers use the qualifier as routing/provenance evidence
+ * rather than a hidden hard claim. Private classes such as `_ClassBuilder`
+ * are ordinary constructor values and must retain their type identity.
  */
 function constructorTypeInfo(funcNode) {
     if (!funcNode) return undefined;
     if (funcNode.type === 'identifier') {
-        return /^[A-Z]/.test(funcNode.text) ? { type: funcNode.text } : undefined;
+        return /^_*[A-Z]/.test(funcNode.text)
+            ? { type: funcNode.text } : undefined;
     }
     if (funcNode.type === 'attribute') {
         const attr = funcNode.childForFieldName('attribute');
         const object = funcNode.childForFieldName('object');
-        return attr && /^[A-Z]/.test(attr.text)
+        return attr && /^_*[A-Z]/.test(attr.text)
             ? { type: attr.text, qualifier: object?.text || undefined }
             : undefined;
     }
