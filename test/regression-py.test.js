@@ -1606,6 +1606,83 @@ describe('fix #327: Python lifecycle field constructor flow', () => {
     });
 });
 
+describe('fix #328: Python union-narrowed field result flow', () => {
+    it('types a conditional field and its copied local but rejects an ambiguous alias', () => {
+        const dir = tmp({
+            'model.py': [
+                'class Text:',
+                '    @classmethod',
+                '    def parse(cls, value: str) -> "Text":',
+                '        return cls()',
+                '',
+                '    def copy(self) -> "Text":',
+                '        return Text()',
+                '',
+                '    def append(self):',
+                '        return "message"',
+                '',
+                'class Other:',
+                '    def copy(self) -> "Other":',
+                '        return Other()',
+                '',
+                '    def append(self):',
+                '        return "other"',
+                '',
+                'from typing import Union',
+                'TextType = Union["Text", str]',
+                'AmbiguousType = Union["Text", Other, str]',
+            ].join('\n'),
+            'use.py': [
+                'from model import Text, TextType, AmbiguousType',
+                '',
+                'class Prompt:',
+                '    def __init__(self, prompt: TextType):',
+                '        self.prompt = Text.parse(prompt) if isinstance(prompt, str) else prompt',
+                '',
+                '    def run(self):',
+                '        value = self.prompt.copy()',
+                '        value.append()',
+                '',
+                'class AmbiguousPrompt:',
+                '    def __init__(self, prompt: AmbiguousType):',
+                '        self.prompt = Text.parse(prompt) if isinstance(prompt, str) else prompt',
+                '',
+                '    def run(self):',
+                '        value = self.prompt.copy()',
+                '        value.append()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const alias = index.symbols.get('TextType')[0];
+            assert.deepStrictEqual(alias.aliasMembers, ['Text', 'str']);
+
+            const result = execute(index, 'context', {
+                name: 'model.py:9:append',
+            });
+            assert.ok(result.ok, result.error);
+            assert.ok(result.result.callers.some(call =>
+                call.relativePath === 'use.py' && call.line === 9));
+            assert.ok(!result.result.callers.some(call =>
+                call.relativePath === 'use.py' && call.line === 17));
+            assert.strictEqual(result.result.meta.account.conserved, true);
+
+            const run = index.symbols.get('run').find(definition =>
+                definition.className === 'Prompt');
+            const callees = index.findCallees(run, {
+                collectAccount: true,
+                includeMethods: true,
+            });
+            assert.ok(callees.some(callee =>
+                callee.relativePath === 'model.py' &&
+                callee.className === 'Text' &&
+                callee.name === 'append' &&
+                callee.sites?.includes(9)), JSON.stringify(callees));
+            assert.strictEqual(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
 describe('Regression: Python self.method() same-class resolution', () => {
     it('findCallees should resolve self.method() to same-class methods', () => {
         const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-selfmethod-'));

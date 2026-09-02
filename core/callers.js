@@ -7261,6 +7261,20 @@ function getInstanceAttributeTypes(index, filePath, className) {
             const parser = getParser('python');
             const fileEntry = index.files.get(filePath);
             fileCache = langModule.findInstanceAttributeTypes(content, parser, {
+                resolveTypeAliasMembers(typeName) {
+                    const owner = _resolveFlowTypeOrigin(
+                        index, filePath, typeName);
+                    if (!owner?.fromFile) return null;
+                    const definitions = (index.symbols.get(typeName) || [])
+                        .filter(definition => definition.file === owner.fromFile &&
+                            definition.type === 'type' &&
+                            Array.isArray(definition.aliasMembers));
+                    if (definitions.length === 0) return null;
+                    const identities = new Set(definitions.map(definition =>
+                        definition.aliasMembers.join('\0')));
+                    return identities.size === 1
+                        ? [...definitions[0].aliasMembers] : null;
+                },
                 resolveCallType(moduleName, functionName) {
                     if (_pythonBuiltinContractAllowed(index, fileEntry, moduleName)) {
                         const builtin = langModule.getBuiltinCallReturnType?.(
@@ -11242,7 +11256,9 @@ function _csharpParamsNormalFormApplicable(index, call, definition) {
     return !!actual && !!expected && actual === expected;
 }
 
-function _declaredFieldType(index, rootType, fieldName, language, info, rootNamespace) {
+function _declaredFieldType(
+    index, rootType, fieldName, language, info = null, rootNamespace = undefined
+) {
     const defs = index.symbols.get(fieldName) || [];
     if (defs.length === 0 && language !== 'python') return null;
     // 'private field' (JS #-fields, fix #219): equally compiler-true, and
@@ -11346,7 +11362,10 @@ function _declaredFieldType(index, rootType, fieldName, language, info, rootName
                 return null;
             }
         }
-        const localType = _normalizeFieldTypeName(rawText, language);
+        const localType = _normalizeFieldTypeName(rawText, language, {
+            index,
+            originFile: f.file,
+        });
         const importedIdentity = language === 'rust' && f.file && localType
             ? _rustImportedTypeIdentity(index, f.file, localType) : null;
         const t = importedIdentity?.type || localType;
@@ -11376,7 +11395,10 @@ function _declaredFieldType(index, rootType, fieldName, language, info, rootName
             const qualifier = language === 'java'
                 ? _javaNestedTypeQualifier(rawText) : undefined;
             if (qualifier) namespaces.add(qualifier);
-            const localType = _normalizeFieldTypeName(rawText, language);
+            const localType = _normalizeFieldTypeName(rawText, language, {
+                index,
+                originFile: field.file,
+            });
             const importedIdentity = language === 'rust' && localType
                 ? _rustImportedTypeIdentity(index, field.file, localType) : null;
             const origin = importedIdentity?.type === typeName
@@ -14203,7 +14225,7 @@ function _javaNestedTypeQualifier(raw) {
  *   go:   `*ignore.Ig` → Ig; slices/maps/chans/funcs → null
  *   java: `java.util.List<Foo>` → List; arrays → null
  */
-function _normalizeFieldTypeName(raw, language) {
+function _normalizeFieldTypeName(raw, language, options = {}) {
     let t = String(raw).trim();
     if (language === 'rust') {
         let prev;
@@ -14242,7 +14264,7 @@ function _normalizeFieldTypeName(raw, language) {
     if (langTraits(language)?.typeSystem === 'structural') {
         // JS/TS/Python (fix #219): compiler-true annotation heads, value-
         // position semantics — a field declared Promise<X> HOLDS a Promise.
-        return _structuralTypeHead(t, { language });
+        return _structuralTypeHead(t, { language, ...options });
     }
     return null;
 }
@@ -15508,7 +15530,8 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
         return { type: head, ...(fromFile && { fromFile }) };
     }
     // self/this/cls receiver: resolve through the enclosing class (+ walk).
-    if (record.isMethod && ['self', 'this', 'cls'].includes(record.receiver)) {
+    if (record.isMethod && !record.receiverField &&
+        ['self', 'this', 'cls'].includes(record.receiver)) {
         const enclosing = index.findEnclosingFunction(filePath, record.line, true);
         let cls = enclosing && enclosing.className;
         let ctxFile = filePath;
@@ -15547,6 +15570,12 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
         if (!rt && record.receiverField && record.receiverRoot) {
             let rootType = record.receiverRootType;
             let rootFromFile;
+            if (!rootType && language === 'python' &&
+                ['self', 'cls'].includes(record.receiverRoot)) {
+                rootType = index.findEnclosingFunction(
+                    filePath, record.line, true)?.className;
+                if (rootType) rootFromFile = filePath;
+            }
             if (!rootType) {
                 const flowMap = ctx.getFlowMap();
                 const rootFlow = flowMap && _lookupReturnTypeFlow(flowMap, {

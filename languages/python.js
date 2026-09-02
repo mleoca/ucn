@@ -408,6 +408,24 @@ function pythonAliasBase(node) {
     return base ? (PY_ALIAS_RUNTIME_TYPES.get(base) || base) : null;
 }
 
+function pythonAliasMembers(node) {
+    const current = unwrapTypeNode(node);
+    if (!current) return [];
+    if (current.type === 'binary_operator' && current.text.includes('|')) {
+        return [...new Set([
+            ...pythonAliasMembers(current.namedChild(0)),
+            ...pythonAliasMembers(current.namedChild(1)),
+        ])];
+    }
+    if (current.type === 'subscript' || current.type === 'generic_type') {
+        const parts = genericTypeParts(current);
+        if (!parts || !['Union', 'Optional'].includes(parts.base)) return [];
+        return [...new Set(parts.args.flatMap(pythonAliasMembers))];
+    }
+    const name = typeNameFromExpr(current);
+    return name && name !== 'None' ? [name] : [];
+}
+
 /**
  * Python type aliases: PEP 695 `type X = int`, annotated
  * `X: TypeAlias = ...`, and module-scope static aliases such as
@@ -448,6 +466,7 @@ function _processTypeAlias(node, classes, processedRanges, lines) {
     processedRanges.add(rangeKey);
     const { startLine, endLine } = nodeToLocation(node, lines);
     const aliasOf = pythonAliasBase(valueNode);
+    const aliasMembers = pythonAliasMembers(valueNode);
     classes.push({
         name,
         type: 'type',
@@ -456,6 +475,7 @@ function _processTypeAlias(node, classes, processedRanges, lines) {
         methods: [],
         members: [],
         ...(aliasOf && { aliasOf }),
+        ...(aliasMembers.length > 1 && { aliasMembers }),
     });
     return true;
 }
@@ -3172,6 +3192,50 @@ function findInstanceAttributeTypes(code, parser, options = {}) {
     const explicitContracts = explicitInstanceFieldContracts(tree, parser);
 
     const PRIMITIVE_TYPES = new Set(['int', 'float', 'str', 'bool', 'bytes', 'list', 'dict', 'set', 'tuple', 'None', 'Any', 'object']);
+    const conditionalFieldType = (node, parameterAlternatives) => {
+        let current = node;
+        while (current?.type === 'parenthesized_expression' &&
+            current.namedChildCount === 1) {
+            current = current.namedChild(0);
+        }
+        if (current?.type !== 'conditional_expression' ||
+            current.namedChildCount < 3) return null;
+        const consequence = current.namedChild(0);
+        const condition = current.namedChild(1);
+        const alternative = current.namedChild(2);
+        const parameterBranches = [consequence, alternative]
+            .map((branch, index) => branch?.type === 'identifier' &&
+                parameterAlternatives.has(branch.text)
+                ? { index, name: branch.text } : null)
+            .filter(Boolean);
+        if (parameterBranches.length !== 1) return null;
+        const parameterBranch = parameterBranches[0];
+        const positiveTypes = isinstanceTypes(condition, parameterBranch.name);
+        if (positiveTypes.length === 0) return null;
+        const declaredTypes = parameterAlternatives.get(parameterBranch.name);
+        const narrowedTypes = parameterBranch.index === 0
+            ? declaredTypes.filter(type => positiveTypes.includes(type))
+            : declaredTypes.filter(type => !positiveTypes.includes(type));
+        if (narrowedTypes.length !== 1) return null;
+
+        const valueBranch = parameterBranch.index === 0
+            ? alternative : consequence;
+        if (valueBranch?.type !== 'call') return null;
+        const callable = valueBranch.childForFieldName('function');
+        let valueType = null;
+        if (callable?.type === 'identifier' && /^[A-Z]/.test(callable.text) &&
+            !isPythonConstructorValueShadowedAt(callable, callable.text)) {
+            valueType = callable.text;
+        } else if (callable?.type === 'attribute') {
+            const owner = callable.childForFieldName('object');
+            const method = callable.childForFieldName('attribute');
+            if (owner?.type === 'identifier' && method?.type === 'identifier' &&
+                !isPythonNameShadowedAt(callable, owner.text)) {
+                valueType = options.resolveCallType?.(owner.text, method.text);
+            }
+        }
+        return valueType === narrowedTypes[0] ? valueType : null;
+    };
 
     traverseTreeCached(tree.rootNode, (node) => {
         if (node.type !== 'class_definition') return true;
@@ -3269,6 +3333,7 @@ function findInstanceAttributeTypes(code, parser, options = {}) {
             // Build parameter type map from __init__ annotations
             // e.g. def __init__(self, market: MarketDataFetcher = None) → {market: MarketDataFetcher}
             const paramTypes = new Map();
+            const paramAlternatives = new Map();
             const params = child.childForFieldName('parameters');
             if (params) {
                 for (let p = 0; p < params.childCount; p++) {
@@ -3284,6 +3349,16 @@ function findInstanceAttributeTypes(code, parser, options = {}) {
                             // same conservative receiver-type contract as
                             // ordinary parameter calls.
                             const tn = typeNameFromAnnotation(pType);
+                            const directAlternatives = typeNamesFromAnnotation(pType);
+                            const aliasAlternatives = directAlternatives.length === 1
+                                ? options.resolveTypeAliasMembers?.(
+                                    directAlternatives[0])
+                                : null;
+                            const alternatives = aliasAlternatives?.length > 1
+                                ? aliasAlternatives : directAlternatives;
+                            if (alternatives.length > 1) {
+                                paramAlternatives.set(pName.text, alternatives);
+                            }
                             if (tn && !PRIMITIVE_TYPES.has(tn) &&
                                 tn[0] >= 'A' && tn[0] <= 'Z') {
                                 paramTypes.set(pName.text, tn);
@@ -3312,7 +3387,8 @@ function findInstanceAttributeTypes(code, parser, options = {}) {
                 const rhs = assign.childForFieldName('right');
                 if (!rhs) return true;
 
-                const typeName = extractConstructorName(rhs);
+                const typeName = conditionalFieldType(rhs, paramAlternatives) ||
+                    extractConstructorName(rhs);
                 if (typeName) {
                     attrTypes.set(attrName, typeName);
                 } else if (rhs.type === 'call') {

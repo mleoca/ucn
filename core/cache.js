@@ -680,7 +680,9 @@ function clearAllCaches() {
 // across one local assignment (`item = items[key]; item.method()`).
 // v203 (fix #326): Python call records type stable, direct module constructor
 // globals even when their functions are declared before the assignment.
-const CACHE_FORMAT_VERSION = 203;
+// v204 (fix #328): Python union-alias symbols retain their concrete members
+// so imported annotations can participate in exact conditional narrowing.
+const CACHE_FORMAT_VERSION = 204;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**
