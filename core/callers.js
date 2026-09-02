@@ -7651,7 +7651,8 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
         } else if (callableFlow?.returnedFunctionResult) {
             returnType = callableFlow.returnedFunctionResult;
             fromFile = callableFlow.fromFile;
-        } else if (call.isMethod && call.receiverType) {
+        } else if (call.isMethod && call.receiverType &&
+            !call.receiverTypeGuessed) {
             const defs = index.symbols.get(call.name) || [];
             if (nominal) {
                 const matches = defs.filter(d => d.className === call.receiverType && d.returnType);

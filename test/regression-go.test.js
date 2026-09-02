@@ -6261,6 +6261,58 @@ describe('fix #266b: guessed-type mismatch routes visible, never falls to arity 
     });
 });
 
+describe('fix #331: compiler return flow outranks chained New-prefix guesses', () => {
+    it('types a method result through the producer receiver compiler contract', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/t\n\ngo 1.21\n',
+            'flow.go': [
+                'package t',
+                '',
+                'type Viper struct{}',
+                'func (*Viper) Sub() *Viper { return nil }',
+                'func (*Viper) Get(string) any { return nil }',
+                '',
+                'type WithOptions struct{}',
+                'func (*WithOptions) Get(string) any { return nil }',
+                '',
+                'func NewWithOptions() *Viper { return nil }',
+                '',
+                'func use() {',
+                '    v := NewWithOptions()',
+                '    subv := v.Sub()',
+                '    _ = subv.Get("key")',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', {
+                name: 'flow.go:5:Get',
+            });
+            assert.ok(result.ok, result.error);
+            assert.ok(result.result.callers.some(call => call.line === 15),
+                JSON.stringify(result.result));
+            assert.strictEqual(result.result.meta.account.conserved, true);
+
+            const foreign = execute(index, 'context', {
+                name: 'flow.go:8:Get',
+            });
+            assert.ok(foreign.ok, foreign.error);
+            assert.ok(!foreign.result.callers.some(call => call.line === 15));
+
+            const use = index.symbols.get('use')[0];
+            const callees = index.findCallees(use, {
+                collectAccount: true,
+                includeMethods: true,
+            });
+            assert.ok(callees.some(callee =>
+                callee.className === 'Viper' && callee.name === 'Get' &&
+                callee.sites?.includes(15)), JSON.stringify(callees));
+            assert.strictEqual(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #268: callee-side external identity (Go)', () => {
     it('external result provenance survives a field hop in both directions', () => {
         const dir = tmp({
