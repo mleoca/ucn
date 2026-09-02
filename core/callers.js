@@ -8561,7 +8561,6 @@ function _returnTypeNameNominal(text, language, opts = {}) {
         if (t.startsWith('(')) {
             if (!opts.tuple) return undefined;
             const inner = t.slice(1, -1);
-            if (inner.includes('func(') || inner.includes('func (')) return undefined;
             const position = Number.isInteger(opts.tupleIndex)
                 ? opts.tupleIndex : 0;
             const item = _splitTopLevelGenericArgs(inner)[position]?.trim();

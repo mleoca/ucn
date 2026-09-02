@@ -6583,6 +6583,61 @@ describe('fix #335: Go indexed receiver flow resolves sibling-file fields', () =
     });
 });
 
+describe('fix #336: Go tuple flow isolates function-valued return slots', () => {
+    it('types concrete positions when a sibling return position is a function', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/t\n\ngo 1.21\n',
+            'flow.go': [
+                'package t',
+                '',
+                'type Client struct{}',
+                'func (*Client) Run() {}',
+                '',
+                'type Other struct{}',
+                'func (*Other) Run() {}',
+                '',
+                'func setup() (*Client, *Other, func()) {',
+                '    return nil, nil, func() {}',
+                '}',
+                '',
+                'func use() {',
+                '    client, other, cleanup := setup()',
+                '    client.Run()',
+                '    other.Run()',
+                '    func() { client.Run() }()',
+                '    cleanup()',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+
+            const client = execute(index, 'context', { name: 'flow.go:4:Run' });
+            assert.ok(client.ok, client.error);
+            assert.deepStrictEqual(client.result.callers.map(call => call.line), [15, 17]);
+            assert.strictEqual(client.result.meta.account.conserved, true);
+
+            const other = execute(index, 'context', { name: 'flow.go:7:Run' });
+            assert.ok(other.ok, other.error);
+            assert.deepStrictEqual(other.result.callers.map(call => call.line), [16]);
+            assert.strictEqual(other.result.meta.account.conserved, true);
+
+            const use = index.symbols.get('use')[0];
+            const callees = index.findCallees(use, {
+                collectAccount: true,
+                includeMethods: true,
+            });
+            assert.ok(callees.some(callee =>
+                callee.name === 'Run' && callee.className === 'Client' &&
+                callee.sites?.includes(15)), JSON.stringify(callees));
+            assert.ok(callees.some(callee =>
+                callee.name === 'Run' && callee.className === 'Other' &&
+                callee.sites?.includes(16)), JSON.stringify(callees));
+            assert.strictEqual(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #268: callee-side external identity (Go)', () => {
     it('external result provenance survives a field hop in both directions', () => {
         const dir = tmp({
