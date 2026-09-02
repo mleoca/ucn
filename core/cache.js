@@ -686,7 +686,9 @@ function clearAllCaches() {
 // chains so return-type flow reaches nested closures without crossing shadows.
 // v206 (fix #333): Go calls assigned in `var` declarations retain their
 // declaration targets for compiler-return-type receiver flow.
-const CACHE_FORMAT_VERSION = 206;
+// v207 (fix #334): Go method-call records retain compiler-exact receiver
+// types for values bound from declared map, slice, and array indexes.
+const CACHE_FORMAT_VERSION = 207;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**

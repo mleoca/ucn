@@ -6452,6 +6452,60 @@ describe('fix #333: compiler return flow follows Go var declarations', () => {
     });
 });
 
+describe('fix #334: Go indexed container values retain their element type', () => {
+    it('types map comma-ok and direct map/slice index bindings', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/t\n\ngo 1.21\n',
+            'flow.go': [
+                'package t',
+                '',
+                'type Child struct{}',
+                'func (*Child) stop() {}',
+                '',
+                'type Other struct{}',
+                'func (*Other) stop() {}',
+                '',
+                'type Holder struct {',
+                '    children map[string]*Child',
+                '    others []*Other',
+                '}',
+                '',
+                'func use(h *Holder, key string, i int) {',
+                '    current, ok := h.children[key]',
+                '    if ok { current.stop() }',
+                '    child := h.children[key]',
+                '    child.stop()',
+                '    other := h.others[i]',
+                '    other.stop()',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const calls = index.getCachedCalls(path.join(dir, 'flow.go'))
+                .filter(call => call.name === 'stop');
+            assert.deepStrictEqual(calls.map(call => ({
+                line: call.line,
+                receiverType: call.receiverType,
+            })), [
+                { line: 16, receiverType: 'Child' },
+                { line: 18, receiverType: 'Child' },
+                { line: 20, receiverType: 'Other' },
+            ]);
+
+            const child = execute(index, 'context', { name: 'flow.go:4:stop' });
+            assert.ok(child.ok, child.error);
+            assert.deepStrictEqual(child.result.callers.map(call => call.line), [16, 18]);
+            assert.strictEqual(child.result.meta.account.conserved, true);
+
+            const other = execute(index, 'context', { name: 'flow.go:7:stop' });
+            assert.ok(other.ok, other.error);
+            assert.deepStrictEqual(other.result.callers.map(call => call.line), [20]);
+            assert.strictEqual(other.result.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #268: callee-side external identity (Go)', () => {
     it('external result provenance survives a field hop in both directions', () => {
         const dir = tmp({

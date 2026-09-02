@@ -1082,6 +1082,22 @@ function findCallsInCode(code, parser, options = {}) {
         }
         return structFieldsCache;
     };
+    const containerTypeOf = (node) => {
+        if (node?.type === 'selector_expression') {
+            const operand = node.childForFieldName('operand');
+            const field = node.childForFieldName('field');
+            if (operand?.type === 'identifier' && field &&
+                !isGuessedType(operand.text)) {
+                const rootType = getReceiverType(operand.text, operand);
+                if (rootType) {
+                    return getStructFields().get(rootType)?.get(field.text) || null;
+                }
+            }
+        } else if (node?.type === 'identifier') {
+            return lookupContainerType(node.text);
+        }
+        return null;
+    };
 
     // fix #203 (Go): is a bare-identifier function REFERENCE shadowed by an
     // enclosing func-literal/function parameter, method receiver, range/init
@@ -1243,21 +1259,7 @@ function findCallsInCode(code, parser, options = {}) {
             const valueVar = vars.length === 2 && vars[1].type === 'identifier' &&
                 vars[1].text !== '_' ? vars[1].text : null;
             if (valueVar && right) {
-                let containerText = null;
-                if (right.type === 'selector_expression') {
-                    const operand = right.childForFieldName('operand');
-                    const fieldN = right.childForFieldName('field');
-                    if (operand?.type === 'identifier' && fieldN &&
-                        !isGuessedType(operand.text)) {
-                        const rootType = getReceiverType(operand.text, operand);
-                        if (rootType) {
-                            containerText = getStructFields().get(rootType)?.get(fieldN.text) || null;
-                        }
-                    }
-                } else if (right.type === 'identifier') {
-                    containerText = lookupContainerType(right.text);
-                }
-                const el = containerElementType(containerText);
+                const el = containerElementType(containerTypeOf(right));
                 if (el) {
                     const scopeKey = functionStack[functionStack.length - 1].startLine;
                     const typeMap = scopeTypes.get(scopeKey);
@@ -1357,6 +1359,18 @@ function findCallsInCode(code, parser, options = {}) {
                                         }
                                     }
                                 }
+                            }
+                        } else if (val.type === 'index_expression') {
+                            // child, ok := holder.children[key] — map lookup
+                            // and slice/array indexing yield the container's
+                            // declared element type. In a comma-ok lookup the
+                            // first LHS receives the value; the existing
+                            // single-RHS pairing already selects that target.
+                            const container = val.childForFieldName('operand');
+                            const element = containerElementType(containerTypeOf(container));
+                            if (element) {
+                                typeName = element.type;
+                                typeQualifier = element.qualifier;
                             }
                         } else if (val.type === 'type_assertion_expression') {
                             // d, ok := dialer.(proxy.ContextDialer) — the
