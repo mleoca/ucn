@@ -3369,16 +3369,21 @@ function findInstanceAttributeTypes(code, parser, options = {}) {
                     ? right.childForFieldName('function') : null;
                 const callableReceiver = callable?.type === 'attribute'
                     ? callable.childForFieldName('object') : null;
+                const directConstructor = callable?.type === 'identifier' &&
+                    /^[A-Z]/.test(callable.text) &&
+                    !isPythonConstructorValueShadowedAt(callable, callable.text)
+                    ? callable.text : null;
                 const moduleName = callableReceiver?.type === 'identifier'
                     ? callableReceiver.text : null;
                 const functionName = callable?.type === 'attribute'
                     ? callable.childForFieldName('attribute')?.text : null;
                 const resolveCallType = options.resolveCallType ||
                     options.resolveBuiltinCallType;
-                const runtimeType = moduleName && functionName &&
-                    !isPythonNameShadowedAt(callable, moduleName)
-                    ? resolveCallType?.(moduleName, functionName)
-                    : null;
+                const runtimeType = directConstructor ||
+                    (moduleName && functionName &&
+                        !isPythonNameShadowedAt(callable, moduleName)
+                        ? resolveCallType?.(moduleName, functionName)
+                        : null);
                 if (!runtimeType) {
                     // None is a harmless uninitialized state; any other
                     // unknown write could replace the field with a project

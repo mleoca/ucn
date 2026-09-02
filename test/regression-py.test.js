@@ -1545,6 +1545,67 @@ describe('fix #326: Python forward module constructor globals', () => {
     });
 });
 
+describe('fix #327: Python lifecycle field constructor flow', () => {
+    it('types a stable field across methods but rejects dynamic and shadowed writes', () => {
+        const dir = tmp({
+            'model.py': [
+                'class Item:',
+                '    def touch(self):',
+                '        return "item"',
+            ].join('\n'),
+            'use.py': [
+                'from model import Item',
+                '',
+                'class Holder:',
+                '    def prepare(self):',
+                '        self.item = Item()',
+                '',
+                '    def run(self):',
+                '        return self.item.touch()',
+                '',
+                'class Unstable:',
+                '    def prepare(self, factory):',
+                '        self.item = Item()',
+                '        self.item = factory()',
+                '',
+                '    def run(self):',
+                '        return self.item.touch()',
+                '',
+                'class Shadowed:',
+                '    def prepare(self, Item):',
+                '        self.item = Item()',
+                '',
+                '    def run(self):',
+                '        return self.item.touch()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', {
+                name: 'model.py:2:touch',
+            });
+            assert.ok(result.ok, result.error);
+            assert.ok(result.result.callers.some(call =>
+                call.relativePath === 'use.py' && call.line === 8));
+            assert.ok(!result.result.callers.some(call =>
+                call.relativePath === 'use.py' && [16, 23].includes(call.line)));
+            assert.strictEqual(result.result.meta.account.conserved, true);
+
+            const run = index.symbols.get('run').find(definition =>
+                definition.className === 'Holder');
+            const callees = index.findCallees(run, {
+                collectAccount: true,
+                includeMethods: true,
+            });
+            assert.ok(callees.some(callee =>
+                callee.relativePath === 'model.py' &&
+                callee.className === 'Item' &&
+                callee.sites?.includes(8)), JSON.stringify(callees));
+            assert.strictEqual(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
 describe('Regression: Python self.method() same-class resolution', () => {
     it('findCallees should resolve self.method() to same-class methods', () => {
         const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-selfmethod-'));
