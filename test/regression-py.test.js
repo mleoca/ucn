@@ -1728,6 +1728,78 @@ describe('fix #329: Python private-class constructor flow', () => {
     });
 });
 
+describe('fix #330: Python nullable branch-join narrowing', () => {
+    it('types a complete constructor-or-none join only inside its non-null guard', () => {
+        const dir = tmp({
+            'model.py': [
+                'class Converter:',
+                '    def global_name(self):',
+                '        return "converter"',
+                '',
+                'class Other:',
+                '    def global_name(self):',
+                '        return "other"',
+            ].join('\n'),
+            'use.py': [
+                'from model import Converter',
+                '',
+                'def build(attribute):',
+                '    if attribute.converter is not None and not isinstance(attribute.converter, Converter):',
+                '        converter = Converter(attribute.converter)',
+                '    else:',
+                '        converter = attribute.converter',
+                '    if converter is not None:',
+                '        converter.global_name()',
+                '    converter.global_name()',
+                '',
+                'def incomplete(attribute, flag):',
+                '    if attribute.converter is not None and not isinstance(attribute.converter, Converter) and flag:',
+                '        converter = Converter(attribute.converter)',
+                '    else:',
+                '        converter = attribute.converter',
+                '    if converter is not None:',
+                '        converter.global_name()',
+                '',
+                'def guarded_elif(attribute, flag):',
+                '    if attribute.converter is not None and not isinstance(attribute.converter, Converter):',
+                '        converter = Converter(attribute.converter)',
+                '    else:',
+                '        converter = attribute.converter',
+                '    if flag:',
+                '        pass',
+                '    elif converter is not None:',
+                '        converter.global_name()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', {
+                name: 'model.py:2:global_name',
+            });
+            assert.ok(result.ok, result.error);
+            assert.ok(result.result.callers.some(call =>
+                call.relativePath === 'use.py' && call.line === 9));
+            assert.ok(result.result.callers.some(call =>
+                call.relativePath === 'use.py' && call.line === 28));
+            assert.ok(!result.result.callers.some(call =>
+                call.relativePath === 'use.py' && [10, 18].includes(call.line)));
+            assert.strictEqual(result.result.meta.account.conserved, true);
+
+            const build = index.symbols.get('build')[0];
+            const callees = index.findCallees(build, {
+                collectAccount: true,
+                includeMethods: true,
+            });
+            assert.ok(callees.some(callee =>
+                callee.relativePath === 'model.py' &&
+                callee.className === 'Converter' &&
+                callee.name === 'global_name' &&
+                callee.sites?.includes(9)), JSON.stringify(callees));
+            assert.strictEqual(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
 describe('Regression: Python self.method() same-class resolution', () => {
     it('findCallees should resolve self.method() to same-class methods', () => {
         const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-selfmethod-'));

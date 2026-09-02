@@ -989,8 +989,30 @@ function isinstanceTypes(condition, receiverName) {
 function narrowedReceiverType(refNode, receiverName, declaredUnion) {
     for (let current = refNode; current?.parent; current = current.parent) {
         const parent = current.parent;
-        if (parent.type === 'if_statement') {
+        if (parent.type === 'if_statement' || parent.type === 'elif_clause') {
             const condition = parent.childForFieldName('condition');
+            const noneIdentity = condition?.type === 'comparison_operator' &&
+                condition.namedChildCount === 2 &&
+                condition.children.find(child =>
+                    child.type === 'is' || child.type === 'is not');
+            const noneIndex = noneIdentity
+                ? [condition.namedChild(0), condition.namedChild(1)]
+                    .findIndex(child => child?.type === 'none')
+                : -1;
+            const compared = noneIndex >= 0
+                ? condition.namedChild(1 - noneIndex) : null;
+            if (compared?.type === 'identifier' &&
+                compared.text === receiverName && declaredUnion?.length) {
+                const remaining = declaredUnion.filter(type => type !== 'None');
+                const consequence = parent.childForFieldName('consequence');
+                const alternative = parent.childForFieldName('alternative');
+                const inNonNullBranch = noneIdentity.type === 'is not'
+                    ? nodeContains(consequence, refNode)
+                    : nodeContains(alternative, refNode);
+                if (inNonNullBranch && remaining.length === 1) {
+                    return remaining[0];
+                }
+            }
             const positive = isinstanceTypes(condition, receiverName);
             if (positive.length === 0) continue;
             const consequence = parent.childForFieldName('consequence');
@@ -1617,7 +1639,10 @@ function findCallsInCode(code, parser) {
     const localVarTypes = new Map();  // Track local variable types: varName -> typeName (for receiverType inference)
     const declaredVarTypes = new Map(); // Compiler-checked annotations survive later assignments
     const localVarTypeQualifiers = new Map(); // varName -> imported module alias that owns the inferred type
-    const localVarUnionTypes = new Map(); // varName -> concrete PEP 604 alternatives
+    // varName -> concrete union alternatives. `None` is retained only for a
+    // complete constructor/nullable branch join so a later identity guard can
+    // narrow it without typing unguarded calls.
+    const localVarUnionTypes = new Map();
     const localIterableTypes = new Map(); // iterable binding -> loop-variable types
     const localIterationSources = new Map(); // loop variable -> declared iterable path + tuple index
     const localDictValueTypes = new Map(); // local dict -> exact string-key value types
@@ -1782,6 +1807,79 @@ function findCallsInCode(code, parser) {
         const root = ctor.qualifier.split('.')[0];
         return moduleAliases.has(root) && !isShadowedByLocal(funcNode, root)
             ? ctor : undefined;
+    };
+    // Compiler-stable two-branch join (#330):
+    //   if value is not None and not isinstance(value, T): out = T(value)
+    //   else: out = value
+    // The result is T | None. Require one direct assignment per branch and
+    // exactly the two proving conjuncts; extra control flow must abstain.
+    const nullableBranchJoinType = (assignment, targetName, source) => {
+        if (!assignment || !source ||
+            !['identifier', 'attribute'].includes(source.type)) return null;
+        const block = assignment.parent?.parent;
+        const elseClause = block?.parent;
+        const statement = elseClause?.parent;
+        if (block?.type !== 'block' || block.namedChildCount !== 1 ||
+            elseClause?.type !== 'else_clause' ||
+            statement?.type !== 'if_statement') return null;
+
+        const directAssignment = branch => {
+            if (branch?.type !== 'block' || branch.namedChildCount !== 1) {
+                return null;
+            }
+            const expression = branch.namedChild(0);
+            const candidate = expression?.type === 'expression_statement'
+                ? expression.namedChild(0) : null;
+            return candidate?.type === 'assignment' &&
+                candidate.childForFieldName('left')?.type === 'identifier' &&
+                candidate.childForFieldName('left').text === targetName
+                ? candidate.childForFieldName('right') : null;
+        };
+        const alternative = elseClause.childForFieldName('body') ||
+            elseClause.namedChild(0);
+        const alternativeRhs = directAssignment(alternative);
+        if (alternativeRhs?.id !== source.id) return null;
+
+        const condition = statement.childForFieldName('condition');
+        const andTerms = node => {
+            const isAnd = node?.type === 'boolean_operator' &&
+                node.children.some(child => child.type === 'and');
+            return isAnd
+                ? node.namedChildren.flatMap(andTerms)
+                : (node ? [node] : []);
+        };
+        const terms = andTerms(condition);
+        if (terms.length !== 2) return null;
+        const sameSource = node => node?.type === source.type &&
+            node.text === source.text;
+        const nonNull = terms.find(term => {
+            if (term.type !== 'comparison_operator' ||
+                !term.children.some(child => child.type === 'is not') ||
+                term.namedChildCount !== 2) return false;
+            const parts = [term.namedChild(0), term.namedChild(1)];
+            return parts.some(part => part?.type === 'none') &&
+                parts.some(sameSource);
+        });
+        const negativeIsinstance = terms.find(term =>
+            term.type === 'not_operator' &&
+            term.namedChild(0)?.type === 'call');
+        if (!nonNull || !negativeIsinstance) return null;
+        const check = negativeIsinstance.namedChild(0);
+        if (check.childForFieldName('function')?.type !== 'identifier' ||
+            check.childForFieldName('function').text !== 'isinstance') return null;
+        const args = check.childForFieldName('arguments');
+        if (!args || args.namedChildCount !== 2 ||
+            !sameSource(args.namedChild(0))) return null;
+        const narrowedType = typeNameFromExpr(args.namedChild(1));
+        if (!narrowedType) return null;
+
+        const consequence = statement.childForFieldName('consequence');
+        const consequenceRhs = directAssignment(consequence);
+        if (consequenceRhs?.type !== 'call') return null;
+        const constructor = exactConstructorInfo(
+            consequenceRhs.childForFieldName('function'));
+        return constructor?.type === narrowedType
+            ? [narrowedType, 'None'] : null;
     };
 
     // A function may legally reference a module global declared later in the
@@ -2115,6 +2213,8 @@ function findCallsInCode(code, parser) {
                 }
                 // Track type annotation: x: Foo = ... → x is Foo
                 const typeNode = node.childForFieldName('type');
+                const branchJoinUnion = !typeNode
+                    ? nullableBranchJoinType(node, left.text, right) : null;
                 if (typeNode) {
                     const typeName = typeNameFromAnnotation(typeNode);
                     const unionTypes = typeNamesFromAnnotation(typeNode);
@@ -2143,6 +2243,9 @@ function findCallsInCode(code, parser) {
                     localIterationSources.delete(left.text);
                     localDictValueTypes.delete(left.text);
                     localVarStdlibContracts.delete(left.text);
+                    if (branchJoinUnion) {
+                        localVarUnionTypes.set(left.text, branchJoinUnion);
+                    }
                     // Python assignments remain constrained by a variable or
                     // parameter annotation. Constructor/literal inference is
                     // nearest-assignment only, but a declared contract is
