@@ -7146,7 +7146,7 @@ describe('fix #341: grep-shaped --lines and code-only --raw output', () => {
             // unverified record that must still carry its source text
             // (lines implies --all).
             const show = runCli(dir, 'show', ['svc.py:2:invoke'], ['--lines']);
-            assert.match(show, /^svc\.py:14:    return r\.invoke\(None\)\t# unverified: method-ambiguous/m, show);
+            assert.match(show, /^svc\.py:14:return r\.invoke\(None\)\t# unverified: method-ambiguous/m, show);
             const structural = runCli(dir, 'search', [], ['--type=call', '--receiver=o', '--lines']);
             assert.match(structural, /^app\.js:3:o\.helper\t# call$/m, structural);
         } finally { rm(dir); }

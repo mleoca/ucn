@@ -21,8 +21,10 @@ const LINES_COMMANDS = new Set(['find', 'usages', 'search', 'show', 'impact']);
 
 function record(pathLike, line, text, tag) {
     // One record per line is the contract: a multi-line signature or a
-    // wrapped call expression folds onto one line.
-    const body = String(text == null ? '' : text).replace(/\s*\n\s*/g, ' ').replace(/\s+$/, '');
+    // wrapped call expression folds onto one line, and the source line's
+    // indentation is dropped (a locate result needs the text, `--raw` has
+    // the layout).
+    const body = String(text == null ? '' : text).replace(/\s*\n\s*/g, ' ').trim();
     return `${pathLike}:${line == null ? 0 : line}:${body}${tag ? `\t# ${tag}` : ''}`;
 }
 
