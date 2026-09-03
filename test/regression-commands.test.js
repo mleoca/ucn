@@ -7117,6 +7117,56 @@ describe('fix #341: grep-shaped --lines and code-only --raw output', () => {
         } finally { rm(dir); }
     });
 
+    it('--lines folds multi-line signatures, lists every record with text, and shapes structural search', () => {
+        const dir = tmp({
+            ...files,
+            'svc.py': [
+                'class Runner:',
+                '    def invoke(',
+                '        self,',
+                '        cli,',
+                '        args=None,',
+                '    ):',
+                '        return cli(args)',
+                '',
+                'class Other:',
+                '    def invoke(self, cli, args=None):',
+                '        return None',
+                '',
+                'def use(r):',
+                '    return r.invoke(None)',
+            ].join('\n'),
+        });
+        try {
+            const find = runCli(dir, 'find', ['invoke'], ['--lines']);
+            const records = find.split('\n').filter(Boolean);
+            assert.equal(records.length, 2, find);
+            assert.match(find, /^svc\.py:2:Runner\.invoke\(self, cli, args=None\)\t# method$/m, find);
+            // `r.invoke(None)` has an untyped receiver and two owners: an
+            // unverified record that must still carry its source text
+            // (lines implies --all).
+            const show = runCli(dir, 'show', ['svc.py:2:invoke'], ['--lines']);
+            assert.match(show, /^svc\.py:14:    return r\.invoke\(None\)\t# unverified: method-ambiguous/m, show);
+            const structural = runCli(dir, 'search', [], ['--type=call', '--receiver=o', '--lines']);
+            assert.match(structural, /^app\.js:3:o\.helper\t# call$/m, structural);
+        } finally { rm(dir); }
+    });
+
+    it('--raw keeps stdout pristine and sends the same-name note to stderr', () => {
+        const dir = tmp({
+            ...files,
+            'other.js': 'function helper(y) {\n  return y * 2;\n}\nmodule.exports = { helper };',
+        });
+        try {
+            const { spawnSync } = require('child_process');
+            const run = spawnSync('node', [path.join(__dirname, '..', 'cli', 'index.js'), dir, 'source', 'helper', '--raw'],
+                { encoding: 'utf-8' });
+            assert.equal(run.status, 0, run.stderr);
+            assert.match(run.stdout, /^function helper\([xy]\) \{\n  return [^\n]+;\n\}\n$/, run.stdout);
+            assert.match(run.stderr, /^# Found 2 definitions for "helper"/, run.stderr);
+        } finally { rm(dir); }
+    });
+
     it('--raw prints the code and nothing else, with one trailing newline', () => {
         const dir = tmp(files);
         try {

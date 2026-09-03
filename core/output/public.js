@@ -276,7 +276,12 @@ function formatRepo(result, params = {}, hints = presentationHints()) {
 
 function formatPublicText(command, result, params = {}, execution = {}) {
     // Grep-shaped and raw modes (fix #341): the agent-in-a-shell surface.
-    if (params.raw && command === 'source') return formatPublicRaw(result);
+    if (params.raw && command === 'source') {
+        return formatPublicRaw(result, {
+            ...execution,
+            note: execution.note ? formatSurfaceMessage(execution.note, execution.surface) : undefined,
+        });
+    }
     if (params.lines && LINES_COMMANDS.has(command)) {
         const shaped = formatPublicLines(command, result, params, {
             ...execution,

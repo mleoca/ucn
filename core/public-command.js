@@ -17,6 +17,8 @@ function parseSourceTarget(arg, params) {
 }
 
 /** Build normalized execute() params from the shared CLI-style positional arg. */
+const LINES_ALL_COMMANDS = new Set(['find', 'usages', 'search', 'show', 'impact']);
+
 function buildPublicParams(command, arg, params = {}) {
     const clean = { ...params };
     if (clean.top === 0 && params.topRaw == null) delete clean.top;
@@ -27,6 +29,10 @@ function buildPublicParams(command, arg, params = {}) {
         'depthRaw', 'contextRaw', 'workersRaw',
         '_fileFromFileMode']) delete clean[key];
 
+    // --lines is a listing surface (fix #341): every record must carry its
+    // source text, and text mode's "+N more — use --all" page cap would leave
+    // the rest of the band with empty content. Listing implies --all.
+    if (clean.lines && LINES_ALL_COMMANDS.has(command)) clean.all = true;
     if (NAME_COMMANDS.has(command)) return { ...clean, name: arg || clean.name };
     switch (command) {
         case 'search': return { ...clean, term: arg || clean.term };

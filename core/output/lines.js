@@ -20,14 +20,19 @@ const { formatAccountLines, formatCalleeAccountLine } = require('./analysis');
 const LINES_COMMANDS = new Set(['find', 'usages', 'search', 'show', 'impact']);
 
 function record(pathLike, line, text, tag) {
-    const body = String(text == null ? '' : text).replace(/\s+$/, '');
+    // One record per line is the contract: a multi-line signature or a
+    // wrapped call expression folds onto one line.
+    const body = String(text == null ? '' : text).replace(/\s*\n\s*/g, ' ').replace(/\s+$/, '');
     return `${pathLike}:${line == null ? 0 : line}:${body}${tag ? `\t# ${tag}` : ''}`;
 }
 
 function signatureOf(symbol) {
     const owner = symbol.className ? `${symbol.className}.` : '';
     const callable = CALLABLE_SYMBOL_KINDS.has(symbol.type) || symbol.params != null;
-    return callable ? `${owner}${symbol.name}(${symbol.params || ''})` : `${owner}${symbol.name}`;
+    // A multi-line parameter list folds onto one line and drops the trailing
+    // comma the source may carry before its closing paren.
+    const params = String(symbol.params || '').replace(/\s*\n\s*/g, ' ').replace(/,\s*$/, '');
+    return callable ? `${owner}${symbol.name}(${params})` : `${owner}${symbol.name}`;
 }
 
 function pathOf(entry) {
@@ -75,6 +80,19 @@ function usagesRecords(result) {
 function searchRecords(result) {
     const out = [];
     const notes = [];
+    // Structural search (--type=...) returns { meta, results: [{file, line,
+    // name, kind, receiver, params?}] }; text search returns file groups.
+    if (result && !Array.isArray(result) && Array.isArray(result.results)) {
+        for (const item of result.results) {
+            const text = item.params != null ? `${item.name}(${item.params})` : item.name;
+            out.push(record(item.file, item.line, text, item.kind || item.type));
+        }
+        const meta = result.meta;
+        if (meta && meta.totalMatched > meta.shown) {
+            notes.push(`# ${meta.totalMatched - meta.shown} more match(es) (--limit=N / --all)`);
+        }
+        return { records: out, notes };
+    }
     for (const item of Array.isArray(result) ? result : []) {
         if (Array.isArray(item.matches)) {
             for (const match of item.matches) out.push(record(item.file, match.line, match.content));
@@ -178,14 +196,21 @@ function formatPublicLines(command, result, params = {}, execution = {}) {
 /**
  * Render a `source` result as the code text alone.
  */
-function formatPublicRaw(result) {
-    if (!result) return '';
-    if (Array.isArray(result.lines)) return result.lines.join('\n');
-    if (Array.isArray(result.entries)) {
-        return result.entries.map(entry => entry.code == null ? '' : String(entry.code)).join('\n\n');
+function formatPublicRaw(result, execution = {}) {
+    let code = '';
+    if (result && Array.isArray(result.lines)) code = result.lines.join('\n');
+    else if (result && Array.isArray(result.entries)) {
+        code = result.entries.map(entry => entry.code == null ? '' : String(entry.code)).join('\n\n');
+    } else if (result && typeof result.code === 'string') code = result.code;
+    // A note (the same-name disambiguation, a hidden-section warning) must
+    // not vanish in raw mode. Code lines are never reinterpreted, so it
+    // cannot ride inside the text: the CLI prints `execution.note` to stderr
+    // itself (see emitCliText); the single-block surfaces get it appended as
+    // one trailing `# ` line after the code.
+    if (execution.note && execution.surface !== 'cli') {
+        return `${code.replace(/\n$/, '')}\n# ${execution.note}`;
     }
-    if (typeof result.code === 'string') return result.code;
-    return '';
+    return code;
 }
 
 module.exports = { LINES_COMMANDS, formatPublicLines, formatPublicRaw };

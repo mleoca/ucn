@@ -118,9 +118,12 @@ ucn source src/server.js:40-80 --raw
 
 Records go to stdout; the `ACCOUNT` / `CONTRACT` lines, notes, and the
 same-name disambiguation go to stderr prefixed `# ` (MCP keeps them in the one
-text block). Nothing to list prints nothing and exits 1, grep's contract.
-Use `grep` for literals, messages, configuration, and unsupported languages;
-use `ucn ... --lines` when the question is a symbol, a caller, or a
+text block, and `--raw` appends its note as one trailing `# ` line there).
+`--lines` lists the whole band (it implies `--all`), so pipe through
+`grep -v '# unverified'` for the confirmed tier or `cut -d: -f1 | sort | uniq -c`
+for callers per file. Nothing to list prints nothing and exits 1, grep's
+contract. Use `grep` for literals, messages, configuration, and unsupported
+languages; use `ucn ... --lines` when the question is a symbol, a caller, or a
 definition, and `--raw` when the next step is an edit.
 
 ## Breaking-change protocol

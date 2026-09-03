@@ -478,7 +478,7 @@ function formatCliText(command, result, params, execution, displayFlags) {
  * notes) on stderr, exit 1 when nothing matched — grep's own contract.
  * --raw: the text verbatim with exactly one trailing newline.
  */
-function emitCliText(text, params, json) {
+function emitCliText(text, params, json, note) {
     if (!json && params?.lines) {
         const records = [];
         const comments = [];
@@ -494,6 +494,9 @@ function emitCliText(text, params, json) {
     if (!json && params?.raw) {
         const body = String(text);
         process.stdout.write(body.endsWith('\n') ? body : body + '\n');
+        // Code lines are never reinterpreted (a Python comment starts with
+        // "# " too), so the note travels on its own channel.
+        if (note) process.stderr.write(`# ${formatSurfaceMessage(note, 'cli')}\n`);
         return;
     }
     console.log(text);
@@ -703,7 +706,7 @@ function runFileCommand(filePath, command, arg) {
         ? output.formatPublicJson(canonical, result, params, {
             ...execution, surface: 'cli',
         })
-        : formatCliText(canonical, result, params, execution, scopedFlags), params, flags.json);
+        : formatCliText(canonical, result, params, execution, scopedFlags), params, flags.json, execution.note);
 }
 
 // ============================================================================
@@ -776,7 +779,7 @@ function runProjectCommand(rootDir, command, arg) {
             ...publicExecution, surface: 'cli',
         })
         : formatCliText(canonical, publicExecution.result, publicParams, publicExecution, flags),
-    publicParams, flags.json);
+    publicParams, flags.json, publicExecution.note);
     // A gate that could not run (check outside git / bad base ref) must not
     // exit 0 — CI gating on the exit code would read "could not run" as "passed".
     process.exitCode = Math.max(process.exitCode || 0,
@@ -836,7 +839,7 @@ function runGlobCommand(pattern, command, arg) {
             ...publicExecution, surface: 'cli',
         })
         : formatCliText(canonical, publicExecution.result, publicParams, publicExecution, flags),
-    publicParams, flags.json);
+    publicParams, flags.json, publicExecution.note);
     process.exitCode = Math.max(process.exitCode || 0,
         resultExitCode(canonical, publicExecution.result));
 }
