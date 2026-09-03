@@ -99,6 +99,30 @@ definition as an implicit repository-wide target.
 | Generate review candidates | `ucn deadcode`; `ucn audit-async` |
 | Resolve runtime frames | `ucn stacktrace <text>` |
 
+## In a shell, next to grep
+
+`ucn` is a Bash tool as much as an MCP tool. Two flags make it compose like
+`grep -n` so a shell-first agent can keep its reflexes and still get symbol
+answers:
+
+```bash
+ucn find handleRequest --lines            # path:line:signature   # kind
+ucn show handleRequest --lines            # callers as path:line:text; unverified ones end in "\t# unverified: <reason>"
+ucn show handleRequest --lines --sections=callees
+ucn usages handleRequest --lines          # every literal-name line; non-call kinds tagged "# import" / "# definition"
+ucn search 'retry(' --lines               # grep -n output, code-aware scope
+ucn impact handleRequest --lines
+ucn source handleRequest --raw            # the code and nothing else, ready for an exact-string edit
+ucn source src/server.js:40-80 --raw
+```
+
+Records go to stdout; the `ACCOUNT` / `CONTRACT` lines, notes, and the
+same-name disambiguation go to stderr prefixed `# ` (MCP keeps them in the one
+text block). Nothing to list prints nothing and exits 1, grep's contract.
+Use `grep` for literals, messages, configuration, and unsupported languages;
+use `ucn ... --lines` when the question is a symbol, a caller, or a
+definition, and `--raw` when the next step is an edit.
+
 ## Breaking-change protocol
 
 1. Pin the exact definition with `find`.

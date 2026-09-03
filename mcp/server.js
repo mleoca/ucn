@@ -280,6 +280,8 @@ const INPUT_SHAPE = {
     functions: booleanParam('repo stats: include per-function line counts sorted by size.'),
     hot: booleanParam('repo stats: include the top N most-called functions.'),
     diverse: booleanParam('show example: return representatives from distinct argument shapes.'),
+    lines: booleanParam('find/usages/search/show/impact: one path:line:text record per line (grep -n shape); non-confirmed records carry a trailing "# tag"; accounting and notes follow as "# " lines.'),
+    raw: booleanParam('source: return only the code text, no header or line-number gutter.'),
     git: booleanParam('show summary: attach last-modified, author, and recent-change metadata.'),
     add_param: stringParam('Parameter name to add (plan command)'),
     remove_param: stringParam('Parameter name to remove (plan command)'),

@@ -892,3 +892,29 @@ describe('fix #284: truncated MCP responses keep the payload in the text block',
         }
     });
 });
+
+describe('fix #341: lines and raw over MCP', () => {
+    it('lines=true returns grep-shaped records with "# " accounting; raw=true returns code only', async () => {
+        const dir = tmp({
+            'package.json': '{"name":"fx341mcp"}',
+            'lib.js': 'function helper(x) {\n  return x + 1;\n}\nmodule.exports = { helper };',
+            'app.js': 'const { helper } = require("./lib");\nfunction main() { return helper(1); }\nmodule.exports = { main };',
+        });
+        const client = new McpClient();
+        try {
+            await client.start();
+            await client.initialize();
+            const lines = await client.callTool({ command: 'show', project_dir: dir, name: 'helper', lines: true });
+            assert.equal(lines.isError, false, lines.text);
+            assert.match(lines.text, /^app\.js:2:.*helper\(1\)/m);
+            assert.match(lines.text, /^# ACCOUNT: "helper"/m);
+            assert.ok(!/RELATIONSHIPS/.test(lines.text));
+            const raw = await client.callTool({ command: 'source', project_dir: dir, name: 'helper', raw: true });
+            assert.equal(raw.isError, false, raw.text);
+            assert.equal(raw.text.trim(), 'function helper(x) {\n  return x + 1;\n}');
+        } finally {
+            client.stop();
+            rm(dir);
+        }
+    });
+});

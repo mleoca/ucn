@@ -133,13 +133,13 @@ const FLAG_APPLICABILITY = {
     // Understand one symbol. `sections` is a comma-separated projection:
     // summary, callers, callees, source, dependencies, tests, types, example,
     // related. Caller-bearing projections always preserve ACCOUNT/CONTRACT.
-    show:         ['name', 'file', 'exclude', 'className', 'line', 'sections', 'includeMethods', 'includeTests', 'top', 'all', 'withTypes', 'minConfidence', 'showConfidence', 'unreachableOnly', 'compact', 'git', 'diverse'],
-    find:         ['name', 'file', 'exclude', 'className', 'includeTests', 'limit', 'exact', 'in', 'compact', 'type', 'withSource'],
-    usages:       ['name', 'file', 'exclude', 'className', 'includeTests', 'limit', 'codeOnly', 'context', 'in', 'compact', 'all'],
-    search:       ['term', 'file', 'exclude', 'includeTests', 'top', 'limit', 'codeOnly', 'caseSensitive', 'context', 'regex', 'in', 'type', 'param', 'receiver', 'returns', 'decorator', 'exported', 'unused'],
-    source:       ['name', 'file', 'className', 'line', 'range', 'all', 'maxLines'],
+    show:         ['name', 'file', 'exclude', 'className', 'line', 'sections', 'includeMethods', 'includeTests', 'top', 'all', 'withTypes', 'minConfidence', 'showConfidence', 'unreachableOnly', 'compact', 'git', 'diverse', 'lines'],
+    find:         ['name', 'file', 'exclude', 'className', 'includeTests', 'limit', 'exact', 'in', 'compact', 'type', 'withSource', 'lines'],
+    usages:       ['name', 'file', 'exclude', 'className', 'includeTests', 'limit', 'codeOnly', 'context', 'in', 'compact', 'all', 'lines'],
+    search:       ['term', 'file', 'exclude', 'includeTests', 'top', 'limit', 'codeOnly', 'caseSensitive', 'context', 'regex', 'in', 'type', 'param', 'receiver', 'returns', 'decorator', 'exported', 'unused', 'lines'],
+    source:       ['name', 'file', 'className', 'line', 'range', 'all', 'maxLines', 'raw'],
     trace:        ['name', 'file', 'exclude', 'className', 'line', 'direction', 'to', 'includeMethods', 'depth', 'all', 'expandUnverified'],
-    impact:       ['name', 'file', 'exclude', 'className', 'line', 'includeMethods', 'top', 'unreachableOnly', 'compact', 'base', 'staged', 'limit', 'all'],
+    impact:       ['name', 'file', 'exclude', 'className', 'line', 'includeMethods', 'top', 'unreachableOnly', 'compact', 'base', 'staged', 'limit', 'all', 'lines'],
     tests:        ['name', 'file', 'exclude', 'className', 'line', 'callsOnly', 'depth', 'includeMethods', 'all'],
     deps:         ['file', 'exclude', 'depth', 'direction', 'all', 'detailed', 'cycles'],
     api:          ['file', 'in', 'limit'],
@@ -308,6 +308,7 @@ function formatSurfaceMessage(message, surface = 'cli') {
         'expandUnverified', 'withSource', 'all', 'compact', 'exact',
         'regex', 'exported', 'unused', 'staged', 'detailed', 'functions',
         'hot', 'deep', 'cycles', 'bridge', 'unmatched', 'diverse', 'git',
+        'raw', 'lines',
     ]);
     if (surface === 'mcp') {
         rendered = rendered.replace(/--([a-z][a-z0-9-]*)(?:=([^\s,.)]+))?/g,

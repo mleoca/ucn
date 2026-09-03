@@ -11,6 +11,7 @@
 const { COMMAND_CONTRACTS } = require('../command-contracts');
 const { COMMAND_TRUST_MATRIX } = require('../trust-matrix');
 const { toCliName, toMcpName, formatSurfaceMessage } = require('../registry');
+const { LINES_COMMANDS, formatPublicLines, formatPublicRaw } = require('./lines');
 
 const legacy = {
     ...require('./analysis'),
@@ -274,6 +275,15 @@ function formatRepo(result, params = {}, hints = presentationHints()) {
 }
 
 function formatPublicText(command, result, params = {}, execution = {}) {
+    // Grep-shaped and raw modes (fix #341): the agent-in-a-shell surface.
+    if (params.raw && command === 'source') return formatPublicRaw(result);
+    if (params.lines && LINES_COMMANDS.has(command)) {
+        const shaped = formatPublicLines(command, result, params, {
+            ...execution,
+            note: execution.note ? formatSurfaceMessage(execution.note, execution.surface) : undefined,
+        });
+        if (shaped != null) return shaped;
+    }
     const hints = presentationHints(execution.surface);
     if (result?.scopeWarning?.hint) {
         result.scopeWarning = {

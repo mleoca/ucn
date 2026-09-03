@@ -45,6 +45,12 @@ It's deliberately lightweight:
   without building the project.
 - **No config** - point it at a directory and ask.
 
+It also sits next to grep instead of replacing it: `--lines` prints
+`path:line:text` records the way `grep -n` does (accounting goes to stderr as
+`# ` lines, nothing found exits 1) and `source --raw` prints code and nothing
+else, so a shell pipeline or an agent's exact-string edit can consume it
+directly.
+
 And it's built for auditable trust. grep hands you raw matches to sift
 yourself; UCN separates proven edges from possible ones, explains every
 exclusion, and reconciles every occurrence of the name it searched. It never

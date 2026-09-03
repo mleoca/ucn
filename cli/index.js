@@ -315,6 +315,8 @@ function parseFlags(tokens) {
         functions: tokens.includes('--functions') || undefined,
         hot: tokens.includes('--hot') || undefined,
         diverse: tokens.includes('--diverse') || undefined,
+        raw: tokens.includes('--raw') || undefined,
+        lines: tokens.includes('--lines') || undefined,
         git: tokens.includes('--git') || undefined,
         className: getValueFlag('--class-name'),
         // Explicit line pin (fix #249: our own disambiguation notes advertise
@@ -456,6 +458,11 @@ function formatCliText(command, result, params, execution, displayFlags) {
         ...execution,
         surface: 'cli',
     });
+    // --lines / --raw are pipe surfaces: records are compact, a truncated
+    // function body is worse than a long one, and an empty answer must stay
+    // empty (grep prints nothing and exits 1). Only an explicit --max-chars
+    // budgets them.
+    if ((params?.lines || params?.raw) && !displayFlags?.maxChars) return text;
     return applyOutputBudget(text, {
         command,
         maxChars: displayFlags?.maxChars,
@@ -463,6 +470,33 @@ function formatCliText(command, result, params, execution, displayFlags) {
         surface: 'cli',
         params,
     }).text;
+}
+
+/**
+ * Print a formatted answer the way the mode asks for it (fix #341).
+ * --lines: `path:line:text` records on stdout, `# ` comment lines (ACCOUNT,
+ * notes) on stderr, exit 1 when nothing matched — grep's own contract.
+ * --raw: the text verbatim with exactly one trailing newline.
+ */
+function emitCliText(text, params, json) {
+    if (!json && params?.lines) {
+        const records = [];
+        const comments = [];
+        for (const line of String(text).split('\n')) {
+            if (line === '') continue;
+            (line.startsWith('# ') ? comments : records).push(line);
+        }
+        if (records.length > 0) process.stdout.write(records.join('\n') + '\n');
+        if (comments.length > 0) process.stderr.write(comments.join('\n') + '\n');
+        if (records.length === 0) process.exitCode = Math.max(process.exitCode || 0, 1);
+        return;
+    }
+    if (!json && params?.raw) {
+        const body = String(text);
+        process.stdout.write(body.endsWith('\n') ? body : body + '\n');
+        return;
+    }
+    console.log(text);
 }
 
 // ============================================================================
@@ -665,11 +699,11 @@ function runFileCommand(filePath, command, arg) {
     const execution = execute(index, canonical, params);
     const { ok, result, error } = execution;
     if (!ok) fail(formatSurfaceMessage(error, 'cli'));
-    console.log(flags.json
+    emitCliText(flags.json
         ? output.formatPublicJson(canonical, result, params, {
             ...execution, surface: 'cli',
         })
-        : formatCliText(canonical, result, params, execution, scopedFlags));
+        : formatCliText(canonical, result, params, execution, scopedFlags), params, flags.json);
 }
 
 // ============================================================================
@@ -737,11 +771,12 @@ function runProjectCommand(rootDir, command, arg) {
     if (!publicExecution.ok) {
         fail(formatSurfaceMessage(publicExecution.error, 'cli'));
     }
-    console.log(flags.json
+    emitCliText(flags.json
         ? output.formatPublicJson(canonical, publicExecution.result, publicParams, {
             ...publicExecution, surface: 'cli',
         })
-        : formatCliText(canonical, publicExecution.result, publicParams, publicExecution, flags));
+        : formatCliText(canonical, publicExecution.result, publicParams, publicExecution, flags),
+    publicParams, flags.json);
     // A gate that could not run (check outside git / bad base ref) must not
     // exit 0 — CI gating on the exit code would read "could not run" as "passed".
     process.exitCode = Math.max(process.exitCode || 0,
@@ -796,11 +831,12 @@ function runGlobCommand(pattern, command, arg) {
     if (!publicExecution.ok) {
         fail(formatSurfaceMessage(publicExecution.error, 'cli'));
     }
-    console.log(flags.json
+    emitCliText(flags.json
         ? output.formatPublicJson(canonical, publicExecution.result, publicParams, {
             ...publicExecution, surface: 'cli',
         })
-        : formatCliText(canonical, publicExecution.result, publicParams, publicExecution, flags));
+        : formatCliText(canonical, publicExecution.result, publicParams, publicExecution, flags),
+    publicParams, flags.json);
     process.exitCode = Math.max(process.exitCode || 0,
         resultExitCode(canonical, publicExecution.result));
 }
@@ -860,6 +896,11 @@ Common flags:
   --range=N-M (source with --file=PATH)
   --base=REF --staged --no-cache --clear-cache [--all] --max-files=N --workers=N
   --max-chars=N (text output; default 10K targeted / 3K broad, ceiling 100K)
+  --lines  find/usages/search/show/impact: grep -n shape, one path:line:text
+           record per line (tags after a tab: # unverified: <reason>, # import,
+           # callee); accounting and notes go to stderr as "# " lines; exit 1
+           when nothing matched.
+  --raw    source: the code only, no header or line-number gutter.
   Cache: per-user by default; set UCN_CACHE_DIR to override the cache root.
 
 Accepted flags by command:

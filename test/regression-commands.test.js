@@ -7055,3 +7055,77 @@ describe('fix #339: cycle enumeration is complete and order-independent', () => 
         } finally { rm(dir); }
     });
 });
+
+describe('fix #341: grep-shaped --lines and code-only --raw output', () => {
+    const files = {
+        'package.json': '{"name":"fx341"}',
+        'lib.js': [
+            'class Store { get(k) { return this.m.get(k); } }',
+            'function helper(x) {',
+            '  return x + 1;',
+            '}',
+            'module.exports = { helper, Store };',
+        ].join('\n'),
+        'app.js': [
+            'const { helper } = require("./lib");',
+            'function main() { return helper(1) + helper(2); }',
+            'function other(o) { return o.helper(3); } // untyped receiver, not a confirmed caller',
+            'module.exports = { main, other };',
+        ].join('\n'),
+    };
+
+    it('--lines prints path:line:text records on stdout and "# " accounting on stderr', () => {
+        const dir = tmp(files);
+        try {
+            const { spawnSync } = require('child_process');
+            const run = spawnSync('node', [path.join(__dirname, '..', 'cli', 'index.js'), dir, 'show', 'helper', '--lines'],
+                { encoding: 'utf-8' });
+            assert.equal(run.status, 0, run.stderr);
+            const out = run.stdout;
+            const records = out.split('\n').filter(l => l);
+            const comments = run.stderr.split('\n').filter(l => l);
+            assert.ok(records.every(l => /^[^:]+:\d+:/.test(l)), `grep -n shape expected on stdout: ${out}`);
+            assert.ok(comments.every(l => l.startsWith('# ')), `only "# " lines on stderr: ${run.stderr}`);
+            assert.ok(records.some(l => l.startsWith('app.js:2:') && !l.includes('\t#')), 'confirmed callers carry no tag');
+            assert.ok(records.some(l => l.startsWith('app.js:3:') && /\t# unverified: /.test(l)),
+                `unverified sites keep the prefix and add a tab tag: ${out}`);
+            assert.ok(comments.some(l => l.startsWith('# ACCOUNT: "helper"')), 'accounting travels as # lines');
+            assert.ok(!/SUMMARY|RELATIONSHIPS|═/.test(out), 'no prose blocks in lines mode');
+            const find = runCli(dir, 'find', ['helper'], ['--lines']);
+            assert.match(find, /^lib\.js:2:helper\(x\)\t# function$/m);
+            const usages = runCli(dir, 'usages', ['helper'], ['--lines']);
+            assert.match(usages, /^app\.js:1:.*\t# import$/m);
+            assert.match(usages, /^lib\.js:2:function helper\(x\) \{\t# definition$/m);
+            const search = runCli(dir, 'search', ['helper('], ['--lines']);
+            assert.match(search, /^app\.js:2:.*helper\(1\)/m);
+            const impact = runCli(dir, 'impact', ['helper'], ['--lines']);
+            assert.match(impact, /^app\.js:2:/m);
+        } finally { rm(dir); }
+    });
+
+    it('--lines with nothing to list prints nothing and exits 1, like grep', () => {
+        const dir = tmp(files);
+        try {
+            const { execFileSync } = require('child_process');
+            let status = 0; let stdout = '';
+            try {
+                stdout = execFileSync('node', [path.join(__dirname, '..', 'cli', 'index.js'), dir, 'find', 'zzzNope', '--lines'],
+                    { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] });
+            } catch (e) { status = e.status; stdout = e.stdout || ''; }
+            assert.equal(status, 1);
+            assert.equal(stdout, '');
+        } finally { rm(dir); }
+    });
+
+    it('--raw prints the code and nothing else, with one trailing newline', () => {
+        const dir = tmp(files);
+        try {
+            const raw = runCli(dir, 'source', ['helper'], ['--raw']);
+            assert.equal(raw, 'function helper(x) {\n  return x + 1;\n}\n');
+            const range = runCli(dir, 'source', ['lib.js:2-3'], ['--raw']);
+            assert.equal(range, 'function helper(x) {\n  return x + 1;\n');
+            const cls = runCli(dir, 'source', ['Store'], ['--raw']);
+            assert.ok(cls.startsWith('class Store {'), cls);
+        } finally { rm(dir); }
+    });
+});
