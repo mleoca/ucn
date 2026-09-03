@@ -120,13 +120,17 @@ function callerRecords(context) {
     return out;
 }
 
-function showRecords(result) {
+function showRecords(result, params = {}) {
     const out = [];
     const notes = [];
     const context = result && result.context;
-    const selected = new Set(result && result.sections || []);
+    // Only an EXPLICIT --sections selects the band: the resolved defaults
+    // (summary, callers, callees) would mix callee records into a caller
+    // listing and skew `cut -d: -f1 | sort | uniq -c`.
+    const explicit = String(params.sections || '').split(',').map(s => s.trim()).filter(Boolean);
+    const selected = new Set(explicit.length > 0 ? explicit : ['callers']);
     if (context) {
-        if (selected.size === 0 || selected.has('callers')) out.push(...callerRecords(context));
+        if (selected.has('callers')) out.push(...callerRecords(context));
         if (selected.has('callees')) {
             for (const callee of context.callees || []) {
                 const count = callee.callCount > 1 ? ` x${callee.callCount}` : '';
@@ -184,7 +188,7 @@ function formatPublicLines(command, result, params = {}, execution = {}) {
         case 'find': shaped = findRecords(result); break;
         case 'usages': shaped = usagesRecords(result); break;
         case 'search': shaped = searchRecords(result); break;
-        case 'show': shaped = showRecords(result); break;
+        case 'show': shaped = showRecords(result, params); break;
         case 'impact': shaped = impactRecords(result); break;
         default: return null;
     }

@@ -59,9 +59,37 @@ compilers and language servers (ts-morph, Pyright, gopls, rust-analyzer,
 JDT LS, Roslyn, clangd) on pinned production repositories. See
 [Answers you can trust](#answers-you-can-trust).
 
-<img src="https://raw.githubusercontent.com/mleoca/ucn/main/assets/demo.svg" alt="ucn show on ripgrep: signature, 123 confirmed callers with evidence types, and the ACCOUNT line reconciling all 136 occurrences of the name" width="100%">
+Here it is on [ripgrep](https://github.com/BurntSushi/ripgrep), in a shell,
+answering "who calls `Searcher::search_reader`?" without opening a file:
 
-<sub>Real output: one `ucn show` on [ripgrep](https://github.com/BurntSushi/ripgrep) - signature, 123 proven callers with their evidence, and an account of every occurrence of the name. No files opened.</sub>
+```text
+$ ucn find search_reader --lines
+crates/searcher/src/searcher/mod.rs:727:Searcher.search_reader(&mut self, matcher: M, read_from: R, write_to: S)	# method
+crates/core/search.rs:362:SearchWorker.search_reader(&mut self, path: &Path, rdr: &mut R)	# method
+crates/core/search.rs:416:search_reader(matcher: M, searcher: &mut grep::searcher::Searcher, printer: &mut Printer<W>, path: &Path, mut rdr: R)	# function
+crates/searcher/src/testutil.rs:693:TesterConfig.search_reader(&self, haystack: &str)	# method
+
+$ ucn show crates/searcher/src/searcher/mod.rs:727:search_reader --lines | cut -d: -f1 | sort | uniq -c | sort -rn | head -4
+# ACCOUNT: "search_reader" occurs on 136 lines in 8 files: 123 confirmed, 1 unverified, 6 non-call (0 import, 4 definition, 0 reference, 2 other-text), 6 other-target, 0 unaccounted
+# CONTRACT: literal-name text partition complete; semantic completeness is not claimed (aliases, indirect calls, generated code, and runtime dispatch may exist).
+  89 crates/printer/src/standard.rs
+  18 crates/printer/src/summary.rs
+   7 crates/printer/src/json.rs
+   3 crates/searcher/src/searcher/glue.rs
+
+$ ucn show crates/searcher/src/searcher/mod.rs:727:search_reader --lines 2>/dev/null | grep '# unverified'
+crates/searcher/src/testutil.rs:696:        let result = searcher.search_reader(	# unverified: method-ambiguous
+
+$ ucn source crates/searcher/src/searcher/mod.rs:727:search_reader --raw | head -6
+    pub fn search_reader<M, R, S>(
+        &mut self,
+        matcher: M,
+        read_from: R,
+        write_to: S,
+    ) -> Result<(), S::Error>
+```
+
+<sub>Real output at ripgrep `82313cf9`. Four definitions of the name, the one you meant pinned by handle, its 123 proven callers tallied per file (`cut`, `sort`, `uniq` do the rest), the account of all 136 occurrences on stderr, the single unproven site named with its reason, and the code itself, paste-ready.</sub>
 
 ## Start here
 
