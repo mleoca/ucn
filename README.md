@@ -63,14 +63,14 @@ Here it is on [ripgrep](https://github.com/BurntSushi/ripgrep): who calls
 `alloc_error`, and what is it?
 
 ```text
-$ ucn show crates/searcher/src/line_buffer.rs:37:alloc_error --lines
+$ ucn show alloc_error --lines
 crates/searcher/src/line_buffer.rs:512:return Err(alloc_error(self.config.capacity + limit));
 crates/searcher/src/searcher/mod.rs:996:return Err(S::Error::error_io(alloc_error(heap_limit)));
 crates/searcher/src/searcher/mod.rs:1021:return Err(S::Error::error_io(alloc_error(heap_limit)));
 # ACCOUNT: "alloc_error" occurs on 5 lines in 2 files: 3 confirmed, 0 unverified, 2 non-call (1 import, 1 definition, 0 reference, 0 other-text), 0 other-target, 0 unaccounted
 # CONTRACT: literal-name text partition complete; semantic completeness is not claimed (aliases, indirect calls, generated code, and runtime dispatch may exist).
 
-$ ucn source crates/searcher/src/line_buffer.rs:37:alloc_error --raw
+$ ucn source alloc_error --raw
 pub(crate) fn alloc_error(limit: usize) -> io::Error {
     let msg = format!("configured allocation limit ({}) exceeded", limit);
     io::Error::new(io::ErrorKind::Other, msg)
