@@ -2371,6 +2371,40 @@ function findCallsInCode(code, parser) {
         }
         return false;
     };
+    // fix #337: a declarator initialized from require()/import() is an
+    // IMPORT binding — the module's own name reaching this scope — not a
+    // local shadow. `function build() { const { Foo } = require('./lib');
+    // new Foo() }` resolves through import ownership exactly like the
+    // top-level require the walk already exempts as the module binding
+    // itself. Unwraps `await import()`, parens, and `require('./x').Foo`.
+    const _isImportBindingInitializer = (value) => {
+        let v = value;
+        for (;;) {
+            if (!v) return false;
+            if (v.type === 'await_expression' || v.type === 'parenthesized_expression') {
+                v = v.namedChild(0);
+                continue;
+            }
+            if (v.type === 'member_expression' || v.type === 'subscript_expression') {
+                v = v.childForFieldName('object');
+                continue;
+            }
+            break;
+        }
+        if (v.type !== 'call_expression') return false;
+        const fn = v.childForFieldName('function');
+        return !!fn && (fn.type === 'import' || (fn.type === 'identifier' && fn.text === 'require'));
+    };
+    const _declaresLocalShadow = (declNode, name) => {
+        for (let i = 0; i < declNode.namedChildCount; i++) {
+            const d = declNode.namedChild(i);
+            if (d.type !== 'variable_declarator') continue;
+            if (!_patternDeclaresName(d.childForFieldName('name'), name)) continue;
+            if (_isImportBindingInitializer(d.childForFieldName('value'))) continue;
+            return true;
+        }
+        return false;
+    };
 
     // Bare callback references need to distinguish a module-owned VALUE from
     // an unbound name. File-level import reachability cannot prove the value's
@@ -2447,7 +2481,7 @@ function findCallsInCode(code, parser) {
                         stmt.childForFieldName('name')?.text === name) return true;
                     if (stmt.startIndex >= refNode.startIndex) continue; // declaration-before-use
                     if ((stmt.type === 'lexical_declaration' || stmt.type === 'variable_declaration') &&
-                        _declaresName(stmt, name)) return true;
+                        _declaresLocalShadow(stmt, name)) return true;
                 }
             } else if (p.type === 'for_statement') {
                 const init = p.childForFieldName('initializer');
@@ -3438,6 +3472,89 @@ function findImportsInCode(code, parser) {
     const imports = [];
     let importAliases = null;  // {original, local}[] — tracks renamed imports
 
+    // fix #338: classify edges that do not execute during module
+    // initialization so dependency-cycle reporting can separate an eager
+    // import-time loop from a deliberate lazy one. `require()`/`import()`
+    // nested in any function body (incl. `() => require('./x')` thunks) runs
+    // only when that function is called; TS `import type` / `export type`
+    // re-exports and all-`type` specifier lists are erased at compile time.
+    const FUNCTION_LIKE = new Set(['function_declaration', 'function_expression', 'arrow_function',
+        'method_definition', 'generator_function_declaration', 'generator_function', 'function']);
+    const importDeferral = (node) => {
+        for (let p = node.parent; p; p = p.parent) {
+            if (FUNCTION_LIKE.has(p.type)) return 'function-local';
+        }
+        return null;
+    };
+    // Static composition of `__dirname`-rooted require paths (fix #337b).
+    // Returns a relative specifier ('./x' / '../x') or null when any piece is
+    // not a string literal.
+    const unquote = (n) => (n.type === 'string' ? n.text.slice(1, -1) : null);
+    const staticDirnamePath = (arg) => {
+        let parts = null;
+        if (arg.type === 'call_expression') {
+            const fn = arg.childForFieldName('function');
+            const fnName = fn?.type === 'member_expression'
+                ? fn.childForFieldName('property')?.text
+                : (fn?.type === 'identifier' ? fn.text : null);
+            if (fnName !== 'join' && fnName !== 'resolve') return null;
+            const args = arg.childForFieldName('arguments');
+            if (!args || args.namedChildCount < 2) return null;
+            if (args.namedChild(0).type !== 'identifier' || args.namedChild(0).text !== '__dirname') return null;
+            parts = [];
+            for (let i = 1; i < args.namedChildCount; i++) {
+                const piece = unquote(args.namedChild(i));
+                if (piece == null || piece.startsWith('/')) return null;
+                parts.push(piece);
+            }
+        } else if (arg.type === 'binary_expression') {
+            const operands = [];
+            const flatten = (n) => {
+                if (n.type === 'binary_expression' && n.childForFieldName('operator')?.text === '+') {
+                    flatten(n.childForFieldName('left'));
+                    flatten(n.childForFieldName('right'));
+                } else operands.push(n);
+            };
+            flatten(arg);
+            if (operands.length < 2 || operands[0].type !== 'identifier' || operands[0].text !== '__dirname') return null;
+            let tail = '';
+            for (let i = 1; i < operands.length; i++) {
+                const piece = unquote(operands[i]);
+                if (piece == null) return null;
+                tail += piece;
+            }
+            if (!tail.startsWith('/')) return null;
+            parts = [tail.slice(1)];
+        } else if (arg.type === 'template_string') {
+            let tail = '';
+            let sawDirname = false;
+            for (let i = 0; i < arg.childCount; i++) {
+                const c = arg.child(i);
+                if (c.type === 'template_substitution') {
+                    if (sawDirname || c.namedChildCount !== 1 || c.namedChild(0).text !== '__dirname') return null;
+                    sawDirname = true;
+                } else if (c.type === 'string_fragment') {
+                    if (!sawDirname) return null;
+                    tail += c.text;
+                }
+            }
+            if (!sawDirname || !tail.startsWith('/')) return null;
+            parts = [tail.slice(1)];
+        }
+        if (!parts || parts.length === 0) return null;
+        const joined = parts.join('/').replace(/\\/g, '/');
+        if (!joined || joined.includes('${')) return null;
+        const normalized = require('path').posix.normalize(joined);
+        if (normalized.startsWith('/') || normalized === '.') return null;
+        return normalized.startsWith('.') ? normalized : `./${normalized}`;
+    };
+    const hasTypeKeyword = (node) => {
+        for (let i = 0; i < node.childCount; i++) {
+            if (node.child(i).type === 'type') return true;
+        }
+        return false;
+    };
+
     traverseTreeCached(tree.rootNode, (node) => {
         // ES6 import statements
         if (node.type === 'import_statement') {
@@ -3446,6 +3563,9 @@ function findImportsInCode(code, parser) {
             const names = [];
             const esmRenames = [];
             let importType = 'named';
+            let typeOnly = hasTypeKeyword(node);
+            let specifierCount = 0;
+            let typeSpecifierCount = 0;
 
             // Find the module path (string node)
             for (let i = 0; i < node.namedChildCount; i++) {
@@ -3485,6 +3605,8 @@ function findImportsInCode(code, parser) {
                                 if (specifier.type === 'import_specifier') {
                                     const nameNode = specifier.namedChild(0);
                                     const aliasNode = specifier.namedChild(1);
+                                    specifierCount++;
+                                    if (hasTypeKeyword(specifier)) typeSpecifierCount++;
                                     if (nameNode) names.push(nameNode.text);
                                     // Track renamed imports: import { X as Y }
                                     if (nameNode && aliasNode && aliasNode.text !== nameNode.text) {
@@ -3511,8 +3633,13 @@ function findImportsInCode(code, parser) {
                     // Side-effect import: import 'x'
                     importType = 'side-effect';
                 }
+                if (!typeOnly && specifierCount > 0 && typeSpecifierCount === specifierCount &&
+                    importType === 'named') {
+                    typeOnly = true;
+                }
                 imports.push({ module: modulePath, names, type: importType, line,
-                    ...(esmRenames.length > 0 && { renames: esmRenames }) });
+                    ...(esmRenames.length > 0 && { renames: esmRenames }),
+                    ...(typeOnly && { deferred: true, deferredReason: 'type-only' }) });
             }
             return true;
         }
@@ -3544,7 +3671,8 @@ function findImportsInCode(code, parser) {
                 const line = node.startPosition.row + 1;
                 const isStarReExport = node.text.includes('export *');
                 const importType = isStarReExport ? 'namespace' : 'named';
-                imports.push({ module: source, names, type: importType, line, isReExport: true });
+                imports.push({ module: source, names, type: importType, line, isReExport: true,
+                    ...(hasTypeKeyword(node) && { deferred: true, deferredReason: 'type-only' }) });
             }
             return true;
         }
@@ -3562,8 +3690,17 @@ function findImportsInCode(code, parser) {
                     let modulePath;
                     let dynamic = false;
 
+                    const composedPath = firstArg ? staticDirnamePath(firstArg) : null;
                     if (firstArg && firstArg.type === 'string') {
                         modulePath = firstArg.text.slice(1, -1);
+                    } else if (composedPath) {
+                        // fix #337b: `require(path.join(__dirname, '..', 'x'))`,
+                        // `require(__dirname + '/x')`, `require(\`${__dirname}/x\`)`
+                        // compose to an exact relative specifier — the CJS
+                        // test-suite idiom that used to be an unresolvable
+                        // dynamic module (excluding every constructor call it
+                        // bound as other-definition-import).
+                        modulePath = composedPath;
                     } else {
                         dynamic = true;
                         modulePath = firstArg ? firstArg.text : null;
@@ -3605,7 +3742,9 @@ function findImportsInCode(code, parser) {
                     }
 
                     if (modulePath) {
+                        const deferral = importDeferral(node);
                         imports.push({ module: modulePath, names, type: 'require', line, dynamic,
+                            ...(deferral && { deferred: true, deferredReason: deferral }),
                             ...(defaultLike && { defaultLike: true }),
                             // Per-import rename pairing (fix #269): the flat
                             // importAliases list loses WHICH module a renamed
@@ -3623,11 +3762,15 @@ function findImportsInCode(code, parser) {
                 if (argsNode && argsNode.namedChildCount > 0) {
                     const firstArg = argsNode.namedChild(0);
                     const line = node.startPosition.row + 1;
+                    const deferral = importDeferral(node);
+                    const deferredFields = deferral ? { deferred: true, deferredReason: deferral } : {};
                     if (firstArg && firstArg.type === 'string') {
                         const modulePath = firstArg.text.slice(1, -1);
-                        imports.push({ module: modulePath, names: [], type: 'dynamic', line, dynamic: false });
+                        imports.push({ module: modulePath, names: [], type: 'dynamic', line, dynamic: false,
+                            ...deferredFields });
                     } else if (firstArg) {
-                        imports.push({ module: firstArg.text, names: [], type: 'dynamic', line, dynamic: true });
+                        imports.push({ module: firstArg.text, names: [], type: 'dynamic', line, dynamic: true,
+                            ...deferredFields });
                     }
                 }
             }

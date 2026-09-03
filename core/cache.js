@@ -690,7 +690,10 @@ function clearAllCaches() {
 // types for values bound from declared map, slice, and array indexes.
 // v208 (fix #335): Go indexed-value calls preserve receiver-root/field
 // provenance so sibling-file container declarations resolve query-time.
-const CACHE_FORMAT_VERSION = 208;
+// v210 (fixes #337-#339): importDetails persisted for every language (was Python-only),
+// require(path.join(__dirname, ...)) composes to a static relative specifier,
+// and import records carry deferredReason (function-local / type-checking / type-only).
+const CACHE_FORMAT_VERSION = 210;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**

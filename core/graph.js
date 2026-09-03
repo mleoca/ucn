@@ -50,6 +50,7 @@ function imports(index, filePath) {
                     isDynamic: true,
                     line,
                     deferred: !!imp.deferred,
+                    ...(imp.deferredReason && { deferredReason: imp.deferredReason }),
                 };
             }
 
@@ -67,6 +68,7 @@ function imports(index, filePath) {
                     isDynamic: true,
                     line,
                     deferred: !!imp.deferred,
+                    ...(imp.deferredReason && { deferredReason: imp.deferredReason }),
                 };
             }
 
@@ -98,6 +100,7 @@ function imports(index, filePath) {
                 isDynamic: imp.type === 'dynamic',
                 line,
                 deferred: !!imp.deferred,
+                    ...(imp.deferredReason && { deferredReason: imp.deferredReason }),
             };
         });
     } catch (e) {
@@ -735,16 +738,14 @@ function graph(index, filePath, options = {}) {
  * @param {object} options - { file, exclude }
  * @returns {object} - { cycles, totalFiles, summary }
  */
+const DEFAULT_CYCLE_LIMIT = 500;
+const MAX_ENUMERATED_COMPONENT = 2000;
+
 function circularDeps(index, options = {}) {
     index._beginOp();
     try {
         const exclude = options.exclude || [];
         const fileFilter = options.file || null;
-
-        const WHITE = 0, GRAY = 1, BLACK = 2;
-        const color = new Map();
-        const cycles = [];
-        const stack = [];
 
         const shouldSkip = (file) => {
             if (!index.files.has(file)) return true;
@@ -755,37 +756,125 @@ function circularDeps(index, options = {}) {
             return false;
         };
 
-        const dfs = (file) => {
-            color.set(file, GRAY);
-            stack.push(file);
-
-            const neighbors = index.importGraph.get(file) || new Set();
-
-            for (const neighbor of neighbors) {
-                if (neighbor === file) continue;  // Skip self-imports (not a cycle)
-                if (shouldSkip(neighbor)) continue;
-                const nc = color.get(neighbor) || WHITE;
-                if (nc === GRAY) {
-                    const idx = stack.indexOf(neighbor);
-                    cycles.push(stack.slice(idx));
-                } else if (nc === WHITE) {
-                    dfs(neighbor);
+        // Complete, order-independent enumeration (fix #339). The previous
+        // 3-color DFS reported only back-edge cycles: a cycle closing through
+        // an already-finished node was never emitted, so the answer depended
+        // on traversal order (click: 10 cycles in canonical order, 20 with
+        // reversed neighbor order, 4 shared). Tarjan strongly connected
+        // components + Johnson's elementary-circuit search over a canonically
+        // sorted adjacency — the same cycles for every build history — capped
+        // and disclosed (`summary.truncated`) so a dense tangle cannot explode.
+        const nodes = [...index.files.keys()].filter(f => !shouldSkip(f)).sort(codeUnitCompare);
+        const nodeIndex = new Map(nodes.map((f, i) => [f, i]));
+        const adj = nodes.map(f => {
+            const out = new Set();
+            for (const n of index.importGraph.get(f) || []) {
+                const j = nodeIndex.get(n);
+                if (j != null && n !== f) out.add(j);  // self-imports are not cycles
+            }
+            return [...out].sort((a, b) => a - b);
+        });
+        const components = [];
+        {
+            let counter = 0;
+            const idxOf = new Array(nodes.length).fill(-1);
+            const low = new Array(nodes.length).fill(0);
+            const onStack = new Array(nodes.length).fill(false);
+            const tarjanStack = [];
+            for (let root = 0; root < nodes.length; root++) {
+                if (idxOf[root] !== -1) continue;
+                idxOf[root] = low[root] = counter++;
+                tarjanStack.push(root); onStack[root] = true;
+                const work = [[root, 0]];
+                while (work.length > 0) {
+                    const frame = work[work.length - 1];
+                    const v = frame[0];
+                    if (frame[1] < adj[v].length) {
+                        const w = adj[v][frame[1]++];
+                        if (idxOf[w] === -1) {
+                            idxOf[w] = low[w] = counter++;
+                            tarjanStack.push(w); onStack[w] = true;
+                            work.push([w, 0]);
+                        } else if (onStack[w]) {
+                            low[v] = Math.min(low[v], idxOf[w]);
+                        }
+                    } else {
+                        work.pop();
+                        if (work.length > 0) {
+                            const u = work[work.length - 1][0];
+                            low[u] = Math.min(low[u], low[v]);
+                        }
+                        if (low[v] === idxOf[v]) {
+                            const comp = [];
+                            let w;
+                            do { w = tarjanStack.pop(); onStack[w] = false; comp.push(w); } while (w !== v);
+                            components.push(comp.sort((a, b) => a - b));
+                        }
+                    }
                 }
             }
-
-            stack.pop();
-            color.set(file, BLACK);
-        };
-
-        for (const file of index.files.keys()) {
-            if ((color.get(file) || WHITE) === WHITE && !shouldSkip(file)) {
-                dfs(file);
+        }
+        const cycleLimit = Number.isInteger(options.maxCycles) && options.maxCycles > 0
+            ? options.maxCycles : DEFAULT_CYCLE_LIMIT;
+        const cycles = [];
+        let truncated = false;
+        const cyclicComponents = components.filter(c => c.length >= 2).sort((a, b) => a[0] - b[0]);
+        for (const comp of cyclicComponents) {
+            if (truncated) break;
+            if (comp.length > MAX_ENUMERATED_COMPONENT) { truncated = true; continue; }
+            const inComp = new Set(comp);
+            for (const s of comp) {
+                if (truncated) break;
+                const allowed = (v) => v >= s && inComp.has(v);
+                const blocked = new Map();
+                const blockedBy = new Map();
+                const trail = [];
+                const unblock = (u) => {
+                    blocked.set(u, false);
+                    const set = blockedBy.get(u);
+                    if (!set) return;
+                    blockedBy.set(u, new Set());
+                    for (const w of set) if (blocked.get(w)) unblock(w);
+                };
+                const circuit = (v) => {
+                    let found = false;
+                    trail.push(v);
+                    blocked.set(v, true);
+                    for (const w of adj[v]) {
+                        if (!allowed(w)) continue;
+                        if (w === s) {
+                            cycles.push(trail.map(i => nodes[i]));
+                            found = true;
+                            if (cycles.length >= cycleLimit) { truncated = true; break; }
+                        } else if (!blocked.get(w)) {
+                            if (circuit(w)) found = true;
+                            if (truncated) break;
+                        }
+                    }
+                    if (found) {
+                        unblock(v);
+                    } else {
+                        for (const w of adj[v]) {
+                            if (!allowed(w)) continue;
+                            if (!blockedBy.has(w)) blockedBy.set(w, new Set());
+                            blockedBy.get(w).add(v);
+                        }
+                    }
+                    trail.pop();
+                    return found;
+                };
+                circuit(s);
             }
         }
+        const componentSummaries = cyclicComponents.map(comp => ({
+            files: comp.map(i => index.files.get(nodes[i])?.relativePath || path.relative(index.root, nodes[i]))
+                .sort(codeUnitCompare),
+            size: comp.length,
+        }));
 
         const importEdgeDetails = (fromFile, toFile) => {
             const entry = index.files.get(fromFile);
-            if (!entry || entry.language !== 'python') return [];
+            if (!entry) return [];
             const matches = [];
             for (const detail of entry.importDetails || []) {
                 const specs = [detail.module];
@@ -805,6 +894,7 @@ function circularDeps(index, options = {}) {
                     to: index.files.get(toFile)?.relativePath || path.relative(index.root, toFile),
                     line: detail.line ?? null,
                     deferred: !!detail.deferred,
+                    ...(detail.deferredReason && { deferredReason: detail.deferredReason }),
                 });
             }
             return matches;
@@ -832,10 +922,14 @@ function circularDeps(index, options = {}) {
                     const to = rotatedAbs[(edgeIndex + 1) % rotatedAbs.length];
                     const details = importEdgeDetails(from, to);
                     const deferred = details.length > 0 && details.every(detail => detail.deferred);
+                    const deferredReasons = deferred
+                        ? [...new Set(details.map(detail => detail.deferredReason).filter(Boolean))].sort()
+                        : [];
                     edges.push({
                         from: rotated[edgeIndex],
                         to: rotated[(edgeIndex + 1) % rotated.length],
                         deferred,
+                        ...(deferredReasons.length > 0 && { deferredReasons }),
                         ...(details.length > 0 && {
                             lines: [...new Set(details.map(detail => detail.line)
                                 .filter(line => line != null))].sort((a, b) => a - b),
@@ -847,6 +941,7 @@ function circularDeps(index, options = {}) {
                         from: edge.from,
                         to: edge.to,
                         line: edge.lines?.[0] ?? null,
+                        ...(edge.deferredReasons && { reasons: edge.deferredReasons }),
                         ...(edge.lines?.length > 1 && { lines: edge.lines }),
                     }));
                 uniqueCycles.push({
@@ -865,7 +960,7 @@ function circularDeps(index, options = {}) {
             result = uniqueCycles.filter(c => c.files.some(f => f.includes(fileFilter)));
         }
 
-        result.sort((a, b) => a.length - b.length || codeUnitCompare(a.files[0], b.files[0]));
+        result.sort((a, b) => a.length - b.length || codeUnitCompare(a.files.join('\0'), b.files.join('\0')));
 
         // Count files that participate in import graph (have edges)
         let filesWithImports = 0;
@@ -875,8 +970,23 @@ function circularDeps(index, options = {}) {
 
         const eagerCycles = result.filter(cycle => cycle.classification !== 'deferred').length;
         const deferredCycles = result.length - eagerCycles;
+        const groupOf = new Map();
+        componentSummaries.forEach((group, i) => { for (const f of group.files) groupOf.set(f, i); });
+        for (const group of componentSummaries) { group.eagerCycles = 0; group.deferredCycles = 0; }
+        for (const cycle of result) {
+            const group = componentSummaries[groupOf.get(cycle.files[0])];
+            if (!group) continue;
+            if (cycle.classification === 'deferred') group.deferredCycles++;
+            else group.eagerCycles++;
+        }
+        const cycleGroups = fileFilter
+            ? componentSummaries.filter(c => c.files.some(f => f.includes(fileFilter)))
+            : componentSummaries;
         return {
             cycles: result,
+            // Strongly connected groups: every file in a group sits on at
+            // least one cycle with every other member — the refactor unit.
+            components: cycleGroups,
             totalFiles: index.files.size,
             filesWithImports,
             fileFilter: fileFilter || undefined,
@@ -885,6 +995,8 @@ function circularDeps(index, options = {}) {
                 filesInCycles: new Set(result.flatMap(c => c.files)).size,
                 eagerCycles,
                 deferredCycles,
+                componentCount: cycleGroups.length,
+                ...(truncated && { truncated: true, cycleLimit }),
             }
         };
     } finally {

@@ -135,9 +135,15 @@ the old spelling. Read `changeSummary` and every review item. `plan` previews
 only: it does not modify files, run a compiler, or prove runtime compatibility.
 
 For `deps --cycles`, `eager` means every edge executes at module scope.
-`deferred` means at least one Python edge is function-local, so the chain is
-not an unconditional import-time cycle; it remains visible because invoking
-that function during initialization can still matter.
+`deferred` means at least one edge does not: a function-local import (Python
+`def`/`lambda` bodies; JS/TS `require()`/`import()` inside any function,
+including `() => require()` thunks), a Python `if TYPE_CHECKING:` import, or a
+TypeScript type-only import. Each deferred edge names its reason. A deferred
+chain is not an unconditional import-time cycle; function-local chains stay
+visible because invoking that function during initialization can still matter.
+Cycles are enumerated completely and independently of build history (capped at
+500 with a disclosed truncation); `CYCLE GROUPS` lists each strongly connected
+file set, the unit a refactor has to break.
 
 ## Efficient use
 

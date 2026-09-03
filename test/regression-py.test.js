@@ -6694,3 +6694,29 @@ describe('fix #305: untyped Python loop elements do not borrow a method owner', 
         } finally { rm(dir); }
     });
 });
+
+describe('fix #338: TYPE_CHECKING-guarded imports are deferred edges', () => {
+    it('classifies if TYPE_CHECKING consequence imports as deferred; else/not branches stay eager', () => {
+        const dir = tmp({
+            'a.py': 'import typing as t\nif t.TYPE_CHECKING:\n    from b import B\n\nclass A:\n    pass\n',
+            'b.py': 'from a import A\n\nclass B(A):\n    pass\n',
+            'c.py': 'from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    pass\nelse:\n    from d import D\nc_val = 1\n',
+            'd.py': 'from c import c_val\nD = 1\n',
+            'e.py': 'from typing import TYPE_CHECKING\nif not TYPE_CHECKING:\n    from f import F\nE = 1\n',
+            'f.py': 'from e import E\nF = 1\n',
+        });
+        try {
+            const index = idx(dir);
+            const result = index.circularDeps();
+            const cyc = (x, y) => result.cycles.find(c => c.files.includes(x) && c.files.includes(y));
+            assert.ok(cyc('a.py', 'b.py') && cyc('c.py', 'd.py') && cyc('e.py', 'f.py'), JSON.stringify(result.cycles));
+            assert.equal(cyc('a.py', 'b.py').classification, 'deferred');
+            assert.deepEqual(cyc('a.py', 'b.py').deferredEdges[0].reasons, ['type-checking']);
+            assert.equal(cyc('c.py', 'd.py').classification, 'eager', 'the else: branch executes at runtime');
+            assert.equal(cyc('e.py', 'f.py').classification, 'eager', 'if not TYPE_CHECKING executes at runtime');
+            assert.ok(index.imports('a.py').some(i => i.module === 'b' && i.deferredReason === 'type-checking'));
+            assert.match(require('../core/output').formatCircularDeps(result),
+                /TYPE_CHECKING-only import, never executed at runtime/);
+        } finally { rm(dir); }
+    });
+});

@@ -7022,3 +7022,36 @@ describe('fix #300: plan export-pass symbol identity + def-line name-only rename
         } finally { rm(dir); }
     });
 });
+
+describe('fix #339: cycle enumeration is complete and order-independent', () => {
+    it('reports every elementary cycle regardless of import-graph iteration order', () => {
+        // a→b→a, a→c→b→a, b→d→b: three elementary cycles. The old back-edge
+        // DFS never emitted a→c→b→a once b had finished before c was explored.
+        const dir = tmp({
+            'package.json': '{"name":"fx339"}',
+            'a.js': 'require("./b"); require("./c");',
+            'b.js': 'require("./a"); require("./d");',
+            'c.js': 'require("./b");',
+            'd.js': 'require("./b");',
+        });
+        try {
+            const index = idx(dir);
+            const key = r => r.cycles.map(c => c.files.join('>')).sort();
+            const canonical = key(index.circularDeps());
+            assert.deepEqual(canonical, ['a.js>b.js', 'a.js>c.js>b.js', 'b.js>d.js']);
+            for (const [k, v] of index.importGraph) index.importGraph.set(k, new Set([...v].reverse()));
+            index.files = new Map([...index.files].reverse());
+            assert.deepEqual(key(index.circularDeps()), canonical, 'iteration order must not change the answer');
+            const result = index.circularDeps();
+            assert.deepEqual(result.components,
+                [{ files: ['a.js', 'b.js', 'c.js', 'd.js'], size: 4, eagerCycles: 3, deferredCycles: 0 }]);
+            assert.equal(result.summary.componentCount, 1);
+            assert.equal(result.summary.truncated, undefined);
+            const capped = index.circularDeps({ maxCycles: 2 });
+            assert.equal(capped.cycles.length, 2);
+            assert.equal(capped.summary.truncated, true);
+            assert.match(require('../core/output').formatCircularDeps(capped), /Enumeration stopped at 2/);
+            assert.match(require('../core/output').formatCircularDeps(result), /CYCLE GROUPS \(1\)/);
+        } finally { rm(dir); }
+    });
+});

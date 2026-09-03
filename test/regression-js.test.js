@@ -10761,3 +10761,122 @@ describe('fix #295: method-value references with typed receivers (JS twin)', () 
         } finally { rm(dir); }
     });
 });
+
+describe('fix #337: function-scoped require bindings are imports, not shadows', () => {
+    it('confirms new Foo() after a function-local destructured require; non-import locals still shadow', () => {
+        const dir = tmp({
+            'package.json': '{"name":"fx337"}',
+            'lib.js': [
+                'class Foo { constructor(n) { this.n = n; } }',
+                'function helper() { return 1; }',
+                'module.exports = { Foo, helper };',
+            ].join('\n'),
+            'scoped.js': [
+                'function build() {',
+                '  const { Foo, helper } = require("./lib");',
+                '  const f = new Foo(2);',
+                '  return helper() + f.n;',
+                '}',
+                'function shadowed() {',
+                '  const Foo = makeFoo();',
+                '  return new Foo(3);',
+                '}',
+                'function makeFoo() { return class {}; }',
+                'module.exports = { build, shadowed };',
+            ].join('\n'),
+            'other.js': 'class Foo {}\nmodule.exports = { Foo };',
+            'foreign.js': [
+                'function use() {',
+                '  const { Foo } = require("./other");',
+                '  return new Foo(4);',
+                '}',
+                'module.exports = { use };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const target = index.symbols.get('Foo').find(d => d.relativePath === 'lib.js');
+            const callers = index.findCallers('Foo', {
+                targetDefinitions: [target], collectAccount: true, includeMethods: true,
+            });
+            const at = (file, line) => callers.some(c =>
+                String(c.relativePath || c.file).endsWith(file) && c.line === line);
+            assert.ok(at('scoped.js', 3),
+                `function-local require binding must confirm the constructor call: ${JSON.stringify(callers)}`);
+            assert.ok(!at('scoped.js', 8), 'a non-import local still shadows the class');
+            assert.ok(callers.accountRaw.excludedEntries.some(e => e.line === 8 && e.reason === 'local-shadow'),
+                JSON.stringify(callers.accountRaw.excludedEntries));
+            assert.ok(!at('foreign.js', 3), 'a function-local require of ANOTHER module never confirms the pin');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #337b: dynamic require specifiers are resolver gaps; __dirname paths compose statically', () => {
+    it('resolves require(path.join(__dirname, ...)) and never judges require(name) external', () => {
+        const dir = tmp({
+            'package.json': '{"name":"fx337b"}',
+            'core/cache.js': 'class Cache { constructor() { this.m = new Map(); } }\nmodule.exports = { Cache };',
+            'test/cache.test.js': [
+                'const path = require("path");',
+                'describe("Cache", () => {',
+                '  const { Cache } = require(path.join(__dirname, "..", "core", "cache"));',
+                '  it("x", () => { const c = new Cache(); return c; });',
+                '});',
+                'function dyn(name) {',
+                '  const { Cache } = require(name);',
+                '  return new Cache();',
+                '}',
+                'module.exports = { dyn };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const imports = index.imports('test/cache.test.js');
+            assert.ok(imports.some(i => i.module === '../core/cache'),
+                `composed __dirname specifier expected: ${JSON.stringify(imports.map(i => i.module))}`);
+            const target = index.symbols.get('Cache')[0];
+            const callers = index.findCallers('Cache', {
+                targetDefinitions: [target], collectAccount: true, includeMethods: true, includeTests: true,
+            });
+            assert.ok(callers.some(c => c.line === 4),
+                `composed __dirname require must confirm: ${JSON.stringify(callers)}`);
+            assert.ok(!callers.accountRaw.excludedEntries.some(e => e.line === 8),
+                `a dynamic require(name) binding is a resolver gap, never other-definition-import: ${JSON.stringify(callers.accountRaw.excludedEntries)}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #338: JS/TS deferred import edges classify cycles', () => {
+    it('function-local require, lazy thunks, and type-only imports are deferred; mixed specifiers stay eager', () => {
+        const dir = tmp({
+            'package.json': '{"name":"fx338"}',
+            'a.js': 'const b = require("./b");\nmodule.exports = { a: () => b.b() };',
+            'b.js': 'module.exports = { b: () => require("./a").a(), lazy: { load: () => require("./a") } };',
+            'c.js': 'const d = require("./d");\nmodule.exports = { c: d };',
+            'd.js': 'const c = require("./c");\nmodule.exports = { d: c };',
+            'e.ts': 'import type { F } from "./f";\nexport const e: F | null = null;',
+            'f.ts': 'import { e } from "./e";\nexport type F = typeof e;',
+            'g.ts': 'import { type H, hval } from "./h";\nexport const g: H = hval;',
+            'h.ts': 'import { g } from "./g";\nexport type H = number;\nexport const hval: H = 1;\nexport const gg = g;',
+        });
+        try {
+            const index = idx(dir);
+            const result = index.circularDeps();
+            const cyc = (x, y) => result.cycles.find(c => c.files.includes(x) && c.files.includes(y));
+            assert.ok(cyc('a.js', 'b.js') && cyc('c.js', 'd.js') && cyc('e.ts', 'f.ts') && cyc('g.ts', 'h.ts'),
+                JSON.stringify(result.cycles));
+            assert.equal(cyc('a.js', 'b.js').classification, 'deferred');
+            assert.deepEqual(cyc('a.js', 'b.js').deferredEdges.map(e => e.reasons), [['function-local']]);
+            assert.equal(cyc('c.js', 'd.js').classification, 'eager');
+            assert.equal(cyc('e.ts', 'f.ts').classification, 'deferred');
+            assert.deepEqual(cyc('e.ts', 'f.ts').deferredEdges[0].reasons, ['type-only']);
+            assert.equal(cyc('g.ts', 'h.ts').classification, 'eager', 'a mixed value+type import still executes');
+            const text = require('../core/output').formatCircularDeps(result);
+            assert.match(text, /type-only import, erased at compile time/);
+            assert.match(text, /IMPORT-TIME CYCLES \(2\)/);
+            assert.match(text, /DEFERRED CYCLES \(2\)/);
+            assert.ok(index.imports('b.js').filter(i => i.module === './a')
+                .every(i => i.deferred && i.deferredReason === 'function-local'));
+        } finally { rm(dir); }
+    });
+});

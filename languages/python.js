@@ -2936,20 +2936,38 @@ function findImportsInCode(code, parser) {
     // module initialization. Preserve that AST fact so dependency-cycle
     // reporting can distinguish an eager import loop from a deliberate lazy
     // edge without deleting either edge from the graph.
-    const isDeferredImport = (node) => {
-        for (let parent = node.parent; parent; parent = parent.parent) {
-            if (parent.type === 'function_definition' || parent.type === 'lambda') {
-                return true;
-            }
+    // fix #338: `if TYPE_CHECKING:` (bare, `t.TYPE_CHECKING`,
+    // `typing.TYPE_CHECKING`) consequence blocks never execute at runtime —
+    // the import exists for the type checker only. Only the consequence
+    // branch is guarded: `else:` and `if not TYPE_CHECKING:` bodies DO run.
+    const isTypeCheckingGuard = (condition) => {
+        if (!condition) return false;
+        if (condition.type === 'identifier') return condition.text === 'TYPE_CHECKING';
+        if (condition.type === 'attribute') {
+            return condition.childForFieldName('attribute')?.text === 'TYPE_CHECKING';
         }
         return false;
+    };
+    const importDeferral = (node) => {
+        for (let parent = node.parent; parent; parent = parent.parent) {
+            if (parent.type === 'function_definition' || parent.type === 'lambda') {
+                return 'function-local';
+            }
+            if (parent.type === 'block' && parent.parent &&
+                (parent.parent.type === 'if_statement' || parent.parent.type === 'elif_clause') &&
+                sameNode(parent.parent.childForFieldName('consequence'), parent) &&
+                isTypeCheckingGuard(parent.parent.childForFieldName('condition'))) {
+                return 'type-checking';
+            }
+        }
+        return null;
     };
 
     traverseTreeCached(tree.rootNode, (node) => {
         // import statement: import os, import sys as system
         if (node.type === 'import_statement') {
             const line = node.startPosition.row + 1;
-            const deferred = isDeferredImport(node);
+            const deferral = importDeferral(node);
 
             for (let i = 0; i < node.namedChildCount; i++) {
                 const child = node.namedChild(i);
@@ -2966,14 +2984,14 @@ function findImportsInCode(code, parser) {
                             names: [parts[0]],
                             type: 'import',
                             line,
-                            ...(deferred && { deferred: true })
+                            ...(deferral && { deferred: true, deferredReason: deferral })
                         });
                         imports.push({
                             module: child.text,
                             names: [],
                             type: 'import-submodule',
                             line,
-                            ...(deferred && { deferred: true })
+                            ...(deferral && { deferred: true, deferredReason: deferral })
                         });
                     } else {
                         imports.push({
@@ -2981,7 +2999,7 @@ function findImportsInCode(code, parser) {
                             names: [child.text],
                             type: 'import',
                             line,
-                            ...(deferred && { deferred: true })
+                            ...(deferral && { deferred: true, deferredReason: deferral })
                         });
                     }
                 } else if (child.type === 'aliased_import') {
@@ -2994,7 +3012,7 @@ function findImportsInCode(code, parser) {
                             names: [aliasNode ? aliasNode.text : nameNode.text.split('.').pop()],
                             type: 'import',
                             line,
-                            ...(deferred && { deferred: true })
+                            ...(deferral && { deferred: true, deferredReason: deferral })
                         });
                         if (aliasNode && aliasNode.text !== nameNode.text) {
                             if (!importAliases) importAliases = [];
@@ -3009,7 +3027,7 @@ function findImportsInCode(code, parser) {
         // from ... import statement
         if (node.type === 'import_from_statement') {
             const line = node.startPosition.row + 1;
-            const deferred = isDeferredImport(node);
+            const deferral = importDeferral(node);
             let modulePath = '';
             const names = [];
 
@@ -3043,7 +3061,7 @@ function findImportsInCode(code, parser) {
                     names,
                     type: isRelative ? 'relative' : 'from',
                     line,
-                    ...(deferred && { deferred: true })
+                    ...(deferral && { deferred: true, deferredReason: deferral })
                 });
             }
             return true;
@@ -3058,7 +3076,7 @@ function findImportsInCode(code, parser) {
                 const firstArg = argsNode.namedChild(0);
                 if ((funcName === 'importlib.import_module' || funcName === '__import__') && firstArg) {
                     const line = node.startPosition.row + 1;
-                    const deferred = isDeferredImport(node);
+                    const deferral = importDeferral(node);
                     const isLiteral = firstArg.type === 'string';
                     imports.push({
                         module: isLiteral ? firstArg.text.replace(/^['"]|['"]$/g, '') : firstArg.text,
@@ -3066,7 +3084,7 @@ function findImportsInCode(code, parser) {
                         type: 'dynamic',
                         line,
                         dynamic: !isLiteral,
-                        ...(deferred && { deferred: true })
+                        ...(deferral && { deferred: true, deferredReason: deferral })
                     });
                 }
             }

@@ -1157,12 +1157,8 @@ function findCallers(index, name, options = {}) {
                                 receiverTypeFlowFile: path.join(index.root, project.rel),
                             };
                         } else {
-                            const projectish = bindings.some(b => {
-                                const mod = String(b.module || '');
-                                const first = mod.split(/[./]/).filter(Boolean)[0];
-                                return mod.startsWith('.') ||
-                                    (first && _projectTopLevelNames(index).has(first));
-                            });
+                            const projectish = bindings.some(b =>
+                                _unresolvedModuleIsGap(index, b.module, b));
                             const via = `${bindings[0].module}.${bindings[0].name}`;
                             if (BUILTIN_RECEIVER_TYPES.has(call.receiverType)) {
                                 // Stable stdlib runtime classes (StringIO,
@@ -1657,10 +1653,7 @@ function findCallers(index, name, options = {}) {
                         for (const binding of cbNameBindings) {
                             const rel = fileEntry.moduleResolved?.[binding.module];
                             if (!rel) {
-                                const mod = String(binding.module || '');
-                                const firstSeg = mod.split(/[./]/).filter(Boolean)[0];
-                                if (mod.startsWith('.') ||
-                                    (firstSeg && _projectTopLevelNames(index).has(firstSeg))) {
+                                if (_unresolvedModuleIsGap(index, binding.module, binding)) {
                                     cbBindingUnknown = true;
                                 }
                                 continue;
@@ -2851,10 +2844,7 @@ function findCallers(index, name, options = {}) {
                                 // relative (project-internal by construction)
                                 // or its first segment names a project path
                                 // (resolution gap, not externality evidence)
-                                const mod = String(b.module);
-                                const firstSeg = mod.split(/[./]/).filter(Boolean)[0];
-                                if (mod.startsWith('.') ||
-                                    (firstSeg && _projectTopLevelNames(index).has(firstSeg))) {
+                                if (_unresolvedModuleIsGap(index, b.module, b)) {
                                     undetermined = true;
                                 }
                                 continue;
@@ -3129,10 +3119,7 @@ function findCallers(index, name, options = {}) {
                             const rel = recvSubmoduleRel ||
                                 (fileEntry.moduleResolved && fileEntry.moduleResolved[b.module]);
                             if (!rel) {
-                                const mod = String(b.module);
-                                const firstSeg = mod.split(/[./]/).filter(Boolean)[0];
-                                if (mod.startsWith('.') ||
-                                    (firstSeg && _projectTopLevelNames(index).has(firstSeg))) {
+                                if (_unresolvedModuleIsGap(index, b.module, b)) {
                                     projectish = true;
                                     undetermined = true;
                                 }
@@ -7956,10 +7943,7 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
                 // project `info`) is not identity evidence. Same externality
                 // test as #209 module ownership: relative or project-ish
                 // modules are resolver gaps, never externality evidence.
-                const mod = String(binding.module);
-                const firstSeg = mod.split(/[./]/).filter(Boolean)[0];
-                if (!mod.startsWith('.') &&
-                    !(firstSeg && _projectTopLevelNames(index).has(firstSeg))) {
+                if (!_unresolvedModuleIsGap(index, binding.module, binding)) {
                     const scope = call.enclosingFunction ? `${call.enclosingFunction.startLine}` : '';
                     if (!map) map = new Map();
                     const key = `${scope}:${call.assignedTo}`;
@@ -9103,9 +9087,7 @@ function _structuralQualifiedReceiverOrigin(index, fileEntry, qualifier, typeNam
                 fromFile: path.join(index.root, rel),
             };
         }
-        const first = moduleName.split(/[./]/).filter(Boolean)[0];
-        if (moduleName.startsWith('.') ||
-            (first && _projectTopLevelNames(index).has(first))) {
+        if (_unresolvedModuleIsGap(index, moduleName)) {
             projectish = true;
         }
     }
@@ -9296,10 +9278,7 @@ function _nameBindingReaches(index, startAbs, name, targetFiles, maxDepth = 4) {
                     // Unresolved: relative or project-ish → resolver gap, not
                     // a terminal; clearly external → that path pins outside
                     // the project (dead end, consistent with #209c).
-                    const mod = String(module);
-                    const firstSeg = mod.split(/[./]/).filter(Boolean)[0];
-                    if (mod.startsWith('.') ||
-                        (firstSeg && _projectTopLevelNames(index).has(firstSeg))) unknown = true;
+                    if (_unresolvedModuleIsGap(index, module)) unknown = true;
                     return;
                 }
                 next.push([path.join(index.root, rel), nextAttr]);
@@ -9858,6 +9837,25 @@ function _projectTopLevelNames(index) {
     }
     index._projectTopLevelNames = names;
     return names;
+}
+
+/**
+ * Is an UNRESOLVED module specifier a resolver gap rather than externality
+ * evidence? (fix #337b) Relative specifiers and first segments naming a
+ * project top-level path were already gaps (#209); a NON-LITERAL specifier —
+ * `require(path.join(__dirname, ...))`, `require(name)`, template paths — is
+ * one too: the parser records the expression text as the module, which can
+ * never match a package name, so judging it external excluded true callers as
+ * `other-definition-import`. Statically composable `__dirname` paths are
+ * resolved parser-side; whatever stays dynamic must route 'unknown'.
+ */
+function _unresolvedModuleIsGap(index, module, binding) {
+    const mod = String(module || '');
+    if (binding && binding.dynamic) return true;
+    if (mod.startsWith('.')) return true;
+    if (/[()$`{}+\s]/.test(mod)) return true;
+    const firstSeg = mod.split(/[./]/).filter(Boolean)[0];
+    return !!(firstSeg && _projectTopLevelNames(index).has(firstSeg));
 }
 
 const IDENTITY_TYPE_KINDS = new Set(['class', 'struct', 'interface', 'trait', 'enum']);
@@ -10740,10 +10738,9 @@ function _goQualifierNamesImport(index, fieldFile, qualifier) {
 function _iterExternalProducerVia(index, fileEntry, call) {
     if (!fileEntry || langTraits(fileEntry.language)?.typeSystem === 'nominal') return null;
     const externalModule = (mod) => {
-        if (!mod || mod.startsWith('.')) return false;
+        if (!mod) return false;
         if (fileEntry.moduleResolved?.[mod]) return false;
-        const firstSeg = mod.split(/[./]/).filter(Boolean)[0];
-        return !(firstSeg && _projectTopLevelNames(index).has(firstSeg));
+        return !_unresolvedModuleIsGap(index, mod);
     };
     if (call.isMethod && call.receiverIsModule && call.receiver) {
         const binding = _structuralModuleBindings(fileEntry, call)[0];
@@ -10831,10 +10828,9 @@ function _structuralCompositeModuleOwnership(
 
 function _pythonBuiltinContractAllowed(index, fileEntry, moduleName) {
     const module = String(moduleName || '');
-    if (!module || module.startsWith('.')) return false;
+    if (!module) return false;
     if (fileEntry.moduleResolved?.[module]) return false;
-    const first = module.split('.')[0];
-    return !first || !_projectTopLevelNames(index).has(first);
+    return !_unresolvedModuleIsGap(index, module);
 }
 
 function _structuralImportedReceiverType(index, fileEntry, receiver) {
@@ -10957,10 +10953,7 @@ function _calleeStructuralBindingRoute(index, fileEntry, call, language, binding
     for (const binding of bindings) {
         const rel = fileEntry.moduleResolved && fileEntry.moduleResolved[binding.module];
         if (!rel) {
-            const mod = String(binding.module || '');
-            const firstSeg = mod.split(/[./]/).filter(Boolean)[0];
-            if (mod.startsWith('.') ||
-                (firstSeg && _projectTopLevelNames(index).has(firstSeg))) {
+            if (_unresolvedModuleIsGap(index, binding.module, binding)) {
                 sawProjectish = true;
                 sawUnknown = true;
             }
@@ -11008,10 +11001,7 @@ function _calleeExportDefinitions(index, startAbs, exposedName, language, call, 
             const enqueue = (module, nextAttr) => {
                 const rel = fe.moduleResolved && fe.moduleResolved[module];
                 if (!rel) {
-                    const mod = String(module || '');
-                    const firstSeg = mod.split(/[./]/).filter(Boolean)[0];
-                    if (mod.startsWith('.') ||
-                        (firstSeg && _projectTopLevelNames(index).has(firstSeg))) unknown = true;
+                    if (_unresolvedModuleIsGap(index, module)) unknown = true;
                     return;
                 }
                 next.push([path.join(index.root, rel), nextAttr]);
@@ -15600,10 +15590,7 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
             (binding && fileEntry.moduleResolved &&
                 fileEntry.moduleResolved[binding.module]);
         if (binding && !rel) {
-            const mod = String(binding.module);
-            const firstSeg = mod.split(/[./]/).filter(Boolean)[0];
-            if (!mod.startsWith('.') &&
-                !(firstSeg && _projectTopLevelNames(index).has(firstSeg))) {
+            if (!_unresolvedModuleIsGap(index, binding.module, binding)) {
                 return {
                     externalVia: `${record.receiver}.${name}`,
                     ...(/^[A-Z]/.test(name) && { externalConcrete: true }),
@@ -16129,4 +16116,4 @@ function findCallbackUsages(index, name) {
     return usages;
 }
 
-module.exports = { getCachedCalls, findCallers, findCallees, getInstanceAttributeTypes, findCallbackUsages, _nameBindingReaches, _moduleAttributeBindingReaches, _declaredFieldType, _projectTopLevelNames, _callArityCompatible, _closeCallableIdentityGroup, _overloadDiscipline, _overloadApplicable };
+module.exports = { _unresolvedModuleIsGap, getCachedCalls, findCallers, findCallees, getInstanceAttributeTypes, findCallbackUsages, _nameBindingReaches, _moduleAttributeBindingReaches, _declaredFieldType, _projectTopLevelNames, _callArityCompatible, _closeCallableIdentityGroup, _overloadDiscipline, _overloadApplicable };

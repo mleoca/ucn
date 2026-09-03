@@ -21,6 +21,7 @@ function createImportBindings(imports) {
                 ...(rename && { alias: rename.local }),
                 ...(item.defaultLike && { defaultLike: true }),
                 ...(item.deferred && { deferred: true }),
+                ...(item.dynamic && { dynamic: true }),
             };
         }));
 }
@@ -47,15 +48,17 @@ function createFileEntryFromIR({
         mtime,
         size,
         imports: imports.map(item => item.module),
-        ...(ir.language === 'python' && {
-            importDetails: imports.map(item => ({
-                module: item.module,
-                names: [...(item.names || [])],
-                ...(item.type && { type: item.type }),
-                ...(item.line != null && { line: item.line }),
-                ...(item.deferred && { deferred: true }),
-            })),
-        }),
+        // Per-import detail records (fix #307, Python-only then; un-gated in
+        // fix #338 so JS/TS function-local require()/import() and type-only
+        // imports classify cycle edges the same way).
+        importDetails: imports.map(item => ({
+            module: item.module,
+            names: [...(item.names || [])],
+            ...(item.type && { type: item.type }),
+            ...(item.line != null && { line: item.line }),
+            ...(item.deferred && { deferred: true }),
+            ...(item.deferredReason && { deferredReason: item.deferredReason }),
+        })),
         globalImports: imports.filter(item => item.global).map(item => item.module),
         importNames: imports.flatMap(item => item.names || []),
         importBindings: createImportBindings(imports),

@@ -433,10 +433,14 @@ ucn entrypoints --type=http            # runtime and framework roots
 ucn endpoints --bridge --unmatched     # server routes with no client, and vice versa
 ```
 
-Cycle output separates eager import-time loops from Python chains containing
-a function-local/deferred edge. Deferred chains stay visible—they are not
-unconditional import-time cycles, but can still fail if invoked while modules
-are initializing.
+Cycle output separates eager import-time loops from chains that close only
+through a deferred edge: a function-local import (Python or JS/TS, including
+`() => require()` thunks), a Python `if TYPE_CHECKING:` import, or a TypeScript
+type-only import, each labeled with its reason. Deferred chains stay visible—they
+are not unconditional import-time cycles, but function-local ones can still
+fail if invoked while modules are initializing. Enumeration is complete and
+independent of build history, and `CYCLE GROUPS` lists each strongly connected
+file set.
 
 `endpoints --bridge` matches server routes to client requests across
 languages: Express/Fastify/Koa/NestJS/Next.js, Flask/FastAPI, Spring/JAX-RS,

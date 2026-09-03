@@ -21,7 +21,7 @@ function formatImports(imports, filePath) {
     if (internal.length > 0) {
         lines.push('INTERNAL:');
         for (const imp of internal) {
-            lines.push(`  ${imp.module}${imp.deferred ? ' [function-local/deferred]' : ''}`);
+            lines.push(`  ${imp.module}${deferredImportLabel(imp)}`);
             if (imp.resolved) {
                 lines.push(`    -> ${imp.resolved}${imp.indexed === false
                     ? ' (not indexed; absent from dependency graph)'
@@ -37,7 +37,7 @@ function formatImports(imports, filePath) {
         if (internal.length > 0) lines.push('');
         lines.push('EXTERNAL:');
         for (const imp of external) {
-            lines.push(`  ${imp.module}${imp.deferred ? ' [function-local/deferred]' : ''}`);
+            lines.push(`  ${imp.module}${deferredImportLabel(imp)}`);
             if (imp.names && imp.names.length > 0) {
                 lines.push(`    ${imp.names.join(', ')}`);
             }
@@ -48,7 +48,7 @@ function formatImports(imports, filePath) {
         if (internal.length > 0 || external.length > 0) lines.push('');
         lines.push('DYNAMIC (unresolved):');
         for (const imp of dynamic) {
-            lines.push(`  ${imp.module || '(variable)'}${imp.deferred ? ' [function-local/deferred]' : ''}`);
+            lines.push(`  ${imp.module || '(variable)'}${deferredImportLabel(imp)}`);
             if (imp.names && imp.names.length > 0) {
                 lines.push(`    ${imp.names.join(', ')}`);
             }
@@ -407,6 +407,22 @@ function formatGraphJson(graph) {
     return JSON.stringify(result, null, 2);
 }
 
+// fix #338: deferred-edge vocabulary shared by deps and cycle output.
+const DEFERRED_REASON_LABELS = {
+    'function-local': 'function-local import',
+    'type-checking': 'TYPE_CHECKING-only import, never executed at runtime',
+    'type-only': 'type-only import, erased at compile time',
+};
+function deferredReasonLabel(reason) {
+    return DEFERRED_REASON_LABELS[reason] || 'deferred import';
+}
+const EAGER_CYCLE_DISPLAY_LIMIT = 25;
+const DEFERRED_CYCLE_DISPLAY_LIMIT = 10;
+function deferredImportLabel(imp) {
+    if (!imp.deferred) return '';
+    return imp.deferredReason ? ` [deferred: ${imp.deferredReason}]` : ' [deferred]';
+}
+
 function formatCircularDeps(result) {
     if (!result) return 'No results.';
     const lines = [];
@@ -429,12 +445,32 @@ function formatCircularDeps(result) {
 
     const eager = result.cycles.filter(cycle => cycle.classification !== 'deferred');
     const deferred = result.cycles.filter(cycle => cycle.classification === 'deferred');
-    let cycleNumber = 0;
-    const renderGroup = (title, group, deferredGroup = false) => {
-        if (group.length === 0) return;
+
+    // Groups first: a strongly connected file set is the unit a refactor has
+    // to break, and a 14-file tangle can hold hundreds of elementary cycles.
+    const groups = result.components || [];
+    if (groups.length > 0) {
         lines.push('');
-        lines.push(`${title} (${group.length}):`);
-        for (const cycle of group) {
+        lines.push(`CYCLE GROUPS (${groups.length}) — every member reaches every other member:`);
+        for (const group of groups) {
+            const counts = [];
+            if (group.eagerCycles != null) counts.push(`${group.eagerCycles} import-time`);
+            if (group.deferredCycles != null) counts.push(`${group.deferredCycles} deferred`);
+            const suffix = counts.length > 0 ? `  [${counts.join(', ')}]` : '';
+            lines.push(`  ${group.size} files: ${group.files.join(', ')}${suffix}`);
+        }
+    }
+
+    let cycleNumber = 0;
+    const renderGroup = (title, group, deferredGroup, displayLimit) => {
+        if (group.length === 0) return;
+        const shown = group.slice(0, displayLimit);
+        lines.push('');
+        const heading = shown.length < group.length
+            ? `${title} (${group.length}, showing ${shown.length} shortest):`
+            : `${title} (${group.length}):`;
+        lines.push(heading);
+        for (const cycle of shown) {
             cycleNumber++;
             lines.push('');
             lines.push(`Cycle ${cycleNumber} (${cycle.length} files):`);
@@ -442,19 +478,26 @@ function formatCircularDeps(result) {
             if (deferredGroup) {
                 for (const edge of cycle.deferredEdges || []) {
                     const at = edge.line != null ? `:${edge.line}` : '';
-                    lines.push(`  deferred edge: ${edge.from}${at} → ${edge.to} (function-local import)`);
+                    const why = (edge.reasons || []).map(deferredReasonLabel).join('; ') || 'function-local import';
+                    lines.push(`  deferred edge: ${edge.from}${at} → ${edge.to} (${why})`);
                 }
             }
         }
+        if (shown.length < group.length) {
+            lines.push(`  ... and ${group.length - shown.length} more (use --json for the full list)`);
+        }
     };
-    renderGroup('IMPORT-TIME CYCLES', eager);
-    renderGroup('DEFERRED CYCLES', deferred, true);
+    renderGroup('IMPORT-TIME CYCLES', eager, false, EAGER_CYCLE_DISPLAY_LIMIT);
+    renderGroup('DEFERRED CYCLES', deferred, true, DEFERRED_CYCLE_DISPLAY_LIMIT);
 
     lines.push('');
     const { totalCycles, filesInCycles } = result.summary;
     lines.push(`Summary: ${totalCycles} circular dependency chain${totalCycles !== 1 ? 's' : ''} involving ${filesInCycles} file${filesInCycles !== 1 ? 's' : ''} (${scannedCount} files with imports scanned).`);
+    if (result.summary.truncated) {
+        lines.push(`Enumeration stopped at ${result.summary.cycleLimit} elementary cycles; the CYCLE GROUPS list is complete, the cycle list is not.`);
+    }
     if (deferred.length > 0) {
-        lines.push(`${deferred.length} chain${deferred.length === 1 ? '' : 's'} contain a function-local import; they are not unconditional import-time cycles, but may still matter if invoked during initialization.`);
+        lines.push(`${deferred.length} chain${deferred.length === 1 ? '' : 's'} close only through deferred edges (function-local, TYPE_CHECKING-only, or type-only imports); they are not unconditional import-time cycles, but a function-local edge may still matter if invoked during initialization.`);
     }
 
     return lines.join('\n');
