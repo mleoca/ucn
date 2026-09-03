@@ -133,39 +133,125 @@ function getStats(index, options = {}) {
         // decide which definitions are capable of entering the requested top
         // N. Exact pinned caller resolution is then run only until no unseen
         // candidate can beat the current Nth result.
-        const rawUpperByName = new Map();
+        // A record whose receiver is provably EXTERNAL (fix #340) cannot
+        // confirm a project definition — the engine routes such calls
+        // external-package / possible-dispatch, never confirmed — so it leaves
+        // the bound. `t.Fatalf(...)` (receiverType T, qualifier `testing`)
+        // used to hand every project `Fatalf`/`Fatal`/`Errorf`/`String` a
+        // four-digit upper bound, so the early stop never fired and grpc-go's
+        // `repo` refined 1375 candidates. Resolution is the engine's own
+        // module physics: an import naming the qualifier that resolves to a
+        // project file keeps the record; a resolver gap keeps it; only an
+        // import that is non-relative, non-project, and unresolved drops it.
+        const { _unresolvedModuleIsGap } = require('./callers');
+        const externalQualifierMemo = new Map(); // filePath + qualifier -> boolean
+        const receiverProvablyExternal = (filePath, fileEntry, c) => {
+            if (!c.isMethod || !fileEntry) return false;
+            const qualifier = c.receiverTypeQualifier ||
+                (c.receiverIsModule && c.receiver) || null;
+            if (!qualifier || typeof qualifier !== 'string') return false;
+            const key = filePath + '\u0000' + qualifier;
+            const memo = externalQualifierMemo.get(key);
+            if (memo !== undefined) return memo;
+            const head = qualifier.split('.')[0];
+            const modules = new Set();
+            for (const binding of fileEntry.importBindings || []) {
+                if (binding.name === head || binding.alias === head) modules.add(binding.module);
+            }
+            for (const mod of fileEntry.imports || []) {
+                const text = String(mod || '');
+                if (text === head || text.split('/').pop() === head ||
+                    text.split('.').pop() === head) modules.add(text);
+            }
+            let verdict = false;
+            if (modules.size > 0) {
+                verdict = true;
+                for (const mod of modules) {
+                    if (fileEntry.moduleResolved?.[mod] || _unresolvedModuleIsGap(index, mod)) {
+                        verdict = false;
+                        break;
+                    }
+                }
+            }
+            externalQualifierMemo.set(key, verdict);
+            return verdict;
+        };
+        // Per-DEFINITION bound (fix #340). A record with a trusted parser
+        // receiver type can confirm only that type's own same-name method,
+        // or an inherited/promoted one when that type defines none itself —
+        // so it is charged to that class alone (or to every definition when
+        // the class is not a definer). Untyped and convention-guessed
+        // receivers (#266: never exclusion evidence) stay charged to every
+        // definition. grpc-go: `String` has 278 same-name methods and `Close`
+        // 146; under the per-NAME bound every one of them inherited the whole
+        // name's ceiling and had to be refined.
+        const normalizeTypeName = (text) => String(text || '')
+            .replace(/^[*&\s]+/, '').replace(/[<[(].*$/, '').split('.').pop() || null;
+        const untypedByName = new Map(); // name -> records with no trusted receiver type
+        const typedByName = new Map();   // name -> Map<className, records typed to it>
+        const chargeRecord = (name, c) => {
+            const typed = c.isMethod && c.receiverType && !c.receiverTypeGuessed
+                ? normalizeTypeName(c.receiverType) : null;
+            if (typed) {
+                let byClass = typedByName.get(name);
+                if (!byClass) { byClass = new Map(); typedByName.set(name, byClass); }
+                byClass.set(typed, (byClass.get(typed) || 0) + 1);
+            } else {
+                untypedByName.set(name, (untypedByName.get(name) || 0) + 1);
+            }
+        };
         for (const [filePath, entry] of index.callsCache) {
             if (!scopedPaths.has(filePath)) continue;
-            if (index.files.get(filePath)?.isBundled) continue;
+            const fileEntry = index.files.get(filePath);
+            if (fileEntry?.isBundled) continue;
             if (!entry || !Array.isArray(entry.calls)) continue;
             const seenInFile = new Set();
             for (const c of entry.calls) {
                 if (!c || !c.name) continue;
+                if (receiverProvablyExternal(filePath, fileEntry, c)) continue;
                 const key = `${c.name}::${c.line || 0}`;
                 if (!seenInFile.has(key)) {
                     seenInFile.add(key);
-                    rawUpperByName.set(c.name, (rawUpperByName.get(c.name) || 0) + 1);
+                    chargeRecord(c.name, c);
                 }
                 if (c.resolvedName && c.resolvedName !== c.name) {
                     const rkey = `${c.resolvedName}::${c.line || 0}`;
                     if (!seenInFile.has(rkey)) {
                         seenInFile.add(rkey);
-                        rawUpperByName.set(c.resolvedName,
-                            (rawUpperByName.get(c.resolvedName) || 0) + 1);
+                        chargeRecord(c.resolvedName, c);
                     }
                 }
             }
         }
+        const ownerOf = (symbol) => normalizeTypeName(symbol.className || symbol.receiver || '');
 
         const candidates = [];
         const seenDefinitions = new Set();
         for (const [name, symbols] of index.symbols) {
-            const upper = rawUpperByName.get(name) || 0;
-            if (upper === 0) continue;
+            const untyped = untypedByName.get(name) || 0;
+            const typedByClass = typedByName.get(name);
+            if (untyped === 0 && !typedByClass) continue;
             const callable = symbols.filter(symbol =>
                 FUNCTION_TYPES.has(symbol.type) &&
                 matchesReportingScope(index, symbol.relativePath, options));
+            const definers = new Set(callable.map(ownerOf).filter(Boolean));
             for (const symbol of callable) {
+                let upper = untyped;
+                if (typedByClass) {
+                    const owner = ownerOf(symbol);
+                    for (const [cls, count] of typedByClass) {
+                        if (cls === owner || !definers.has(cls)) upper += count;
+                    }
+                }
+                if (upper === 0) continue;
+                // Fair share of the name's ceiling: a name shared by 278
+                // methods cannot make all 278 hot, so a definition's likely
+                // count is nearer upper/definers than upper. Ordering by the
+                // share puts the genuinely hot definitions first; the early
+                // stop below still uses the exact remaining ceiling, so the
+                // exact answer is unchanged and only a bounded refinement
+                // (`maxRefine`) benefits from the order.
+                const share = upper / Math.max(1, callable.length);
                 if (index.files.get(symbol.file)?.isBundled) continue;
                 if (options.productionCallsOnly && require('./shared').isTestPath(symbol.relativePath)) continue;
                 const identity = `${symbol.file}:${symbol.startLine}:${name}:` +
@@ -183,21 +269,39 @@ function getStats(index, options = {}) {
                         index.importGraph.get(symbol.file)?.has(candidate.file)))) {
                     continue;
                 }
-                candidates.push({ name, symbol, upper });
+                candidates.push({ name, symbol, upper, share });
             }
         }
+        const maxRefine = Number.isInteger(options.maxRefine) && options.maxRefine > 0
+            ? options.maxRefine : Infinity;
+        // Exact mode walks the ceilings in descending order so the early stop
+        // fires as soon as possible; a bounded refinement walks fair shares so
+        // the budget lands on the definitions most likely to be hot.
         candidates.sort((a, b) =>
+            (maxRefine !== Infinity ? (b.share - a.share) : 0) ||
             (b.upper - a.upper) ||
             codeUnitCompare(a.symbol.relativePath, b.symbol.relativePath) ||
             (a.symbol.startLine || 0) - (b.symbol.startLine || 0));
+        // Suffix maximum of the exact ceilings: once no unseen candidate can
+        // beat the current Nth result, the answer is exact regardless of order.
+        const remainingUpper = new Array(candidates.length + 1).fill(-1);
+        for (let i = candidates.length - 1; i >= 0; i--) {
+            remainingUpper[i] = Math.max(candidates[i].upper, remainingUpper[i + 1]);
+        }
 
         const hotList = [];
         const { findCallers } = require('./callers');
         const scopedCallerQuery = !!(options.file || options.in ||
             (options.exclude && options.exclude.length > 0));
         let refined = 0;
+        let budgetExhausted = false;
+        // One operation scope for the whole refinement loop (fix #340): the
+        // per-file derivations findCallers builds are shared across candidates.
+        if (top > 0) index._beginOp();
+        try {
         if (top > 0) {
             for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex++) {
+                if (refined >= maxRefine) { budgetExhausted = true; break; }
                 const { name, symbol } = candidates[candidateIndex];
                 const exact = findCallers(index, name, {
                     targetDefinitions: [symbol],
@@ -229,11 +333,11 @@ function getStats(index, options = {}) {
                     (a.startLine || 0) - (b.startLine || 0));
                 if (hotList.length >= top) {
                     const threshold = hotList[top - 1].callCount;
-                    const nextUpper = candidates[candidateIndex + 1]?.upper ?? -1;
-                    if (nextUpper < threshold) break;
+                    if (remainingUpper[candidateIndex + 1] < threshold) break;
                 }
             }
         }
+        } finally { if (top > 0) index._endOp(); }
 
         // Stable order: callCount desc, then (relativePath, startLine) asc.
         hotList.sort((a, b) =>
@@ -248,6 +352,7 @@ function getStats(index, options = {}) {
             totalKind: refined === candidates.length ? 'confirmed' : 'raw-call-candidates',
             refined,
             items: hotList.slice(0, top),
+            ...(budgetExhausted && { budgetExhausted: true, maxRefine }),
             note: refined === candidates.length
                 ? 'Counts are confirmed caller-engine edges pinned to each displayed definition; unverified dispatch is excluded.'
                 : `Displayed counts are exact confirmed caller-engine edges; ${candidates.length} raw candidates were bounded and ${refined} required exact refinement.`,
@@ -805,6 +910,12 @@ function computeEvidenceProfile(index, { sampleSize, matchInFilter }) {
  * trust verdict. Composes existing engine reads; counts and pointers only
  * (no caller claims, so no account — the toc/stats category).
  */
+// Orientation refines at most this many HOT candidates exactly (fix #340).
+// grpc-go (1037 files): exact refinement walks 1089 candidates in ~20s; 400
+// in fair-share order reproduces the exact top 8 in under 5s. When the budget
+// binds, the header says so and points at the exact command.
+const ORIENT_HOT_REFINE_BUDGET = 400;
+
 function orient(index, options = {}) {
     const top = options.top || 8;
     const scope = {
@@ -827,6 +938,8 @@ function orient(index, options = {}) {
         // actually contains production files. In an all-test repository it
         // would erase the raw ranking that orient promises as its fallback.
         productionCallsOnly: options.includeTests !== true && hasProductionFiles,
+        maxRefine: Number.isInteger(options.hotRefineBudget) && options.hotRefineBudget > 0
+            ? options.hotRefineBudget : ORIENT_HOT_REFINE_BUDGET,
     });
     const health = doctor(index, scope);
 
@@ -908,6 +1021,9 @@ function orient(index, options = {}) {
             total: stats.hot?.total ?? 0,
             totalKind: stats.hot?.totalKind || 'confirmed',
             refined: stats.hot?.refined ?? 0,
+            ...(stats.hot?.budgetExhausted && {
+                budgetExhausted: true, maxRefine: stats.hot.maxRefine,
+            }),
             top,
             production,
             items: hotItems,

@@ -486,7 +486,10 @@ function formatOrient(result, options = {}) {
         const population = result.hot.totalKind === 'raw-call-candidates'
             ? `${result.hot.total} raw candidates`
             : result.hot.total;
-        lines.push(`HOT (most-called ${scope}, top ${result.hot.items.length} of ${population}):`);
+        const budgetNote = result.hot.budgetExhausted
+            ? `; refinement budget ${result.hot.maxRefine} reached — ranking approximate, exact list: ucn repo --sections=stats --hot`
+            : '';
+        lines.push(`HOT (most-called ${scope}, top ${result.hot.items.length} of ${population}${budgetNote}):`);
         for (const h of result.hot.items) {
             const label = h.className ? `${h.className}.${h.name}` : h.name;
             lines.push(`  ${label} — ${h.callCount} call(s) · ${h.file}:${h.line}`);

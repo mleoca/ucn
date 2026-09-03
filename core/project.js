@@ -149,6 +149,7 @@ class ProjectIndex {
             this._opCppPathReceiverTypeCache = new Map();
             this._opDerefPairs = undefined;
             this._opAliasPairs = undefined;
+            this._opFindCallersCaches = null; // fix #340: findCallers per-file derivations
             this._opDepth = 0;
         }
         this._opDepth++;
@@ -178,6 +179,7 @@ class ProjectIndex {
             this._opCppPathReceiverTypeCache = null;
             this._opDerefPairs = null;
             this._opAliasPairs = null;
+            this._opFindCallersCaches = null;
             // Free cached file content from callsCache entries (retained during
             // operation for _readFile caching, not needed between operations)
             for (const entry of this.callsCache.values()) {

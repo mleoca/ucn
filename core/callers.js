@@ -592,10 +592,22 @@ function findCallers(index, name, options = {}) {
     // completion. Phase 2 still only enriches the first `maxResults` items —
     // file reads stay bounded, but the candidate count reflects the true total.
     const needsTotal = !!options.needsTotal;
-    const localTypeCache = new Map(); // `${filePath}:${startLine}` -> localTypes Map or null
-    const returnFlowCache = new Map(); // filePath -> return-type-flow map (see _buildReturnTypeFlowMap)
-    const foldCtxCache = new Map(); // filePath -> chained-receiver fold context (fix #258)
-    const pythonIndexedReceiverCache = new Map();
+    // Per-file query-time derivations that depend only on a file's immutable
+    // call records — never on the pinned target — so they live for the whole
+    // OPERATION, not one findCallers call (fix #340): stats --hot / repo run
+    // findCallers for hundreds of candidates over the same files, and
+    // rebuilding fold contexts (producer index, flow maps) and typed-local
+    // maps per candidate made grpc-go's `repo` cost 40s (1375 calls).
+    if (!index._opFindCallersCaches) {
+        index._opFindCallersCaches = {
+            localTypeCache: new Map(), // `${filePath}:${startLine}` -> localTypes Map or null
+            returnFlowCache: new Map(), // filePath -> return-type-flow map (see _buildReturnTypeFlowMap)
+            foldCtxCache: new Map(), // filePath -> chained-receiver fold context (fix #258)
+            pythonIndexedReceiverCache: new Map(),
+        };
+    }
+    const { localTypeCache, returnFlowCache, foldCtxCache, pythonIndexedReceiverCache } =
+        index._opFindCallersCaches;
 
     // Use inverted callee index to skip files that don't contain calls to this name
     let calleeFiles = index.getCalleeFiles(name);

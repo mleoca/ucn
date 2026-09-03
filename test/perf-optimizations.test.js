@@ -1627,3 +1627,99 @@ describe('index reliability: parallel build equals sequential build', () => {
     });
 
 });
+
+describe('fix #340: stats --hot bounds candidates per definition, not per name', () => {
+    it('refines only the definitions whose receiver-typed records can confirm them', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/hot\n\ngo 1.21\n',
+            'pkg/a.go': [
+                'package pkg',
+                '',
+                'type Svc struct{}',
+                '',
+                'func (s *Svc) Close() error { return nil }',
+                '',
+                'type Other struct{}',
+                '',
+                'func (o *Other) Close() error { return nil }',
+                '',
+                'func Run() {}',
+            ].join('\n'),
+            'pkg/b.go': [
+                'package pkg',
+                '',
+                'func useSvc() {',
+                '\ts := &Svc{}',
+                '\ts.Close()',
+                '\ts.Close()',
+                '\ts.Close()',
+                '\tRun()',
+                '}',
+                '',
+                'func useOther() {',
+                '\to := &Other{}',
+                '\to.Close()',
+                '}',
+            ].join('\n'),
+            'pkg/c_test.go': [
+                'package pkg',
+                '',
+                'import "testing"',
+                '',
+                'func TestX(t *testing.T) {',
+                '\tt.Fatalf("x")',
+                '\tt.Fatalf("y")',
+                '\tt.Fatalf("z")',
+                '\tRun()',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const stats = index.getStats({ hot: true, top: 1 });
+            assert.equal(stats.hot.items[0].name, 'Svc.Close', JSON.stringify(stats.hot));
+            assert.equal(stats.hot.items[0].callCount, 3);
+            // Per-name bounds gave Other.Close the same 4-record ceiling as
+            // Svc.Close, so it had to be refined before the early stop could
+            // fire; the per-definition bound (typed `s.Close()` records belong
+            // to Svc) lets the loop stop after the first exact refinement.
+            assert.equal(stats.hot.refined, 1, JSON.stringify(stats.hot));
+            // External receivers (`t.Fatalf` on testing.T) never enter a bound.
+            assert.ok(!stats.hot.items.some(i => i.name.endsWith('Fatalf')));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #340: orientation refines HOT within a disclosed budget', () => {
+    it('marks the ranking approximate and points at the exact command when the budget binds', () => {
+        const dir = tmp({
+            'package.json': '{"name":"hotbudget"}',
+            'lib.js': [
+                'function alpha() { return 1; }',
+                'function beta() { return 2; }',
+                'function gamma() { return 3; }',
+                'module.exports = { alpha, beta, gamma };',
+            ].join('\n'),
+            'app.js': [
+                'const { alpha, beta, gamma } = require("./lib");',
+                'function run() { alpha(); alpha(); beta(); gamma(); return alpha() + beta(); }',
+                'module.exports = { run };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const { orient } = require('../core/reporting');
+            const exact = orient(index, {});
+            assert.equal(exact.hot.budgetExhausted, undefined);
+            assert.equal(exact.hot.items[0].name, 'alpha');
+            const bounded = orient(index, { hotRefineBudget: 1 });
+            assert.equal(bounded.hot.budgetExhausted, true);
+            assert.equal(bounded.hot.maxRefine, 1);
+            assert.equal(bounded.hot.refined, 1);
+            const text = require('../core/output').formatOrient(bounded);
+            assert.match(text, /refinement budget 1 reached — ranking approximate, exact list: ucn repo --sections=stats --hot/);
+            const exactText = require('../core/output').formatOrient(exact);
+            assert.ok(!/refinement budget/.test(exactText), 'an exact orientation carries no budget note');
+        } finally { rm(dir); }
+    });
+});

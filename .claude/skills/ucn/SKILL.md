@@ -43,6 +43,10 @@ Persistent indexes live in a per-user, project-keyed cache rather than the analy
 
 Supported source families are JavaScript/TypeScript/TSX, Python, Go, Rust, Java, C, C++, C#, and HTML inline JavaScript/event handlers. C/C++ uses `compile_commands.json` when available to classify headers and resolve include paths. Recoverable preprocessor branches contribute AST-proven source facts, so a single selected configuration does not silently erase definitions or calls; disagreeing conditional macro identities stay visible as unverified. C++ resolution uses namespace ownership, static overload shape (including arrays), and macro-parameter requalification. C# resolution uses declared property/field receiver types plus overload and hiding discipline. This is portable AST analysis, not a compiler build; macros, templates, generated code, reflection, and external dependency semantics can remain unverified.
 
+`repo` refines its HOT list exactly for up to 400 candidate definitions per
+run; when a large repository exhausts that budget the HOT header says so and
+the ranking is approximate. `repo --sections=stats --hot` is always exact.
+
 `repo` readiness is task-specific. Its headline is navigation readiness;
 refactor, deletion, semantic recall, and the sampled evidence mix are separate
 dimensions. The confirmed/unverified percentage is a classification profile,
