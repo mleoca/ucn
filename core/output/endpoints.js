@@ -26,7 +26,7 @@ function formatEndpoints(result, options = {}) {
     const showBridge = options.bridge;
 
     if (!showBridge) {
-        return formatRoutesAndRequests(routes, requests, meta, options, result.advisory);
+        return formatRoutesAndRequests(routes, requests, meta, options, result.advisory, result);
     }
     return formatBridges(bridges, unmatchedRoutes, unmatchedRequests, meta, options, result.advisory);
 }
@@ -48,7 +48,20 @@ function uniqueMatchPercent(bridges, totalRequests) {
     return Math.min(100, Math.max(0, pct));
 }
 
-function formatRoutesAndRequests(routes, requests, meta, options, advisory = null) {
+function formatUncertainRequests(result, options) {
+    const list = result?.uncertainRequests || [];
+    if (list.length === 0) return [];
+    const lines = [];
+    lines.push(`Possible client requests (${list.length}) — request-shaped call with a path literal, receiver not recognized as an HTTP client:`);
+    const cap = options.all ? Infinity : 10;
+    for (const r of list.slice(0, cap)) {
+        lines.push(`  ${r.file}:${r.line} ${r.receiver}.${r.method}(${JSON.stringify(r.path)}) in ${r.callerName}`);
+    }
+    if (list.length > cap) lines.push(`  (+${list.length - cap} more — use --all)`);
+    return lines;
+}
+
+function formatRoutesAndRequests(routes, requests, meta, options, advisory = null, result = null) {
     const lines = [];
     const showServer = !options.clientOnly;
     const showClient = !options.serverOnly;
@@ -109,6 +122,10 @@ function formatRoutesAndRequests(routes, requests, meta, options, advisory = nul
         }
     }
 
+    if (showClient) {
+        const uncertain = formatUncertainRequests(result, options);
+        if (uncertain.length > 0) lines.push('', ...uncertain);
+    }
     const routeAdvisory = advisoryLine(advisory);
     if (routeAdvisory) lines.push('', routeAdvisory);
     return lines.join('\n').trimEnd();
@@ -230,6 +247,10 @@ function formatEndpointsJson(result, options = {}) {
         data: {
             routes: routes.map(trimRoute),
             requests: requests.map(trimReq),
+            uncertainRequests: (result.uncertainRequests || []).map(r => ({
+                receiver: r.receiver, method: r.method, path: r.path,
+                file: r.file, line: r.line, callerName: r.callerName, reason: r.reason,
+            })),
             // In unmatched-only mode, the matched bridges array is suppressed
             // — consumers that want both should not pass --unmatched.
             bridges: unmatchedOnly ? [] : bridges.map(trimBridge),

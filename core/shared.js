@@ -118,6 +118,18 @@ function addTestExclusions(exclude) {
 /**
  * Escape special regex characters
  */
+/**
+ * Whole-identifier match for a symbol name. `\b` is ASCII-only in JS, so
+ * `hit` matched inside `hitΔ` while every compiler and ripgrep treat Δ as an
+ * identifier character. Letters, digits, `_` and `$` on either side break a
+ * match; anything else (punctuation, whitespace, line edges) is a boundary.
+ */
+function literalNameRegex(name, flags = '') {
+    return new RegExp(
+        `(?<![\\p{L}\\p{N}_$])${escapeRegExp(name)}(?![\\p{L}\\p{N}_$])`,
+        flags.includes('u') ? flags : flags + 'u');
+}
+
 function escapeRegExp(text) {
     return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -463,7 +475,7 @@ function maskBlockComments(content, language) {
     return out.join('');
 }
 
-module.exports = {
+module.exports = { literalNameRegex,
     pickBestDefinition,
     addTestExclusions,
     escapeRegExp,

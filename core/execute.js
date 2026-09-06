@@ -1836,6 +1836,7 @@ const HANDLERS = {
         result.meta = {
             totalRoutes: result.routes.length,
             totalRequests: result.requests.length,
+            uncertainRequests: (result.uncertainRequests || []).length,
             totalBridges: result.bridges.length,
             unmatchedRoutes: result.unmatchedRoutes.length,
             unmatchedRequests: result.unmatchedRequests.length,

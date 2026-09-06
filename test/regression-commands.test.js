@@ -7518,3 +7518,126 @@ describe('fix #347: hub-friendly tests output and explicit endpoints client disc
         }
     });
 });
+
+describe('fix #348: Python aliased imports of same-name siblings pair by module', () => {
+    it('each definition confirms only the site whose alias binds it', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname="fx"',
+            'scripts/__init__.py': '',
+            'scripts/backfill.py': 'def main():\n    return 1\n',
+            'scripts/validate.py': 'def main():\n    return 2\n',
+            'scripts/driver.py': [
+                'from scripts.backfill import main as backfill_main',
+                'from scripts.validate import main as validate_main',
+                '',
+                'def run():',
+                '    backfill_main()',
+                '    validate_main()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const b = execute(index, 'show', { name: 'main', file: 'scripts/backfill.py', sections: 'callers' });
+            const v = execute(index, 'show', { name: 'main', file: 'scripts/validate.py', sections: 'callers' });
+            assert.ok(b.ok && v.ok);
+            assert.deepStrictEqual(b.result.context.callers.map(c => c.line), [5], JSON.stringify(b.result.context.callers));
+            assert.deepStrictEqual(v.result.context.callers.map(c => c.line), [6], JSON.stringify(v.result.context.callers));
+            const entry = index.files.get(path.join(dir, 'scripts/driver.py'));
+            assert.deepStrictEqual(entry.importBindings.map(x => x.alias), ['backfill_main', 'validate_main']);
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #349: endpoints recognizes Python client receivers by evidence and lists the rest', () => {
+    it('pytest fixtures that construct a client type receivers; unrecognized receivers are visible', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname="fx"',
+            'app.py': 'from fastapi import FastAPI\napp = FastAPI()\n@app.get("/items")\ndef items():\n    return []\n',
+            'tests/test_api.py': [
+                'import pytest',
+                'from fastapi.testclient import TestClient',
+                'from app import app',
+                '',
+                '@pytest.fixture',
+                'def tc():',
+                '    with TestClient(app) as c:',
+                '        yield c',
+                '',
+                '@pytest.fixture',
+                'def seeded_client():',
+                '    return TestClient(app)',
+                '',
+                'def test_items(tc, seeded_client):',
+                '    tc.get("/items")',
+                '    seeded_client.post("/items")',
+                '    other.get("/items")',
+                '    cache.get("key")',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'endpoints', {});
+            assert.ok(r.ok, JSON.stringify(r));
+            const reqs = r.result.requests.map(x => `${x.line}:${x.method}:${x.framework}`);
+            assert.deepStrictEqual(reqs, ['15:GET:pytest-client-fixture', '16:POST:pytest-client-fixture']);
+            const unc = r.result.uncertainRequests;
+            assert.deepStrictEqual(unc.map(u => `${u.file}:${u.line}:${u.receiver}`), ['tests/test_api.py:17:other'],
+                'route decorator lines and non-path keys never enter the band');
+            assert.strictEqual(r.result.meta.uncertainRequests, 1);
+            const text = output.formatEndpoints(r.result, {});
+            assert.match(text, /Possible client requests \(1\)/);
+            assert.match(text, /other\.get\("\/items"\) in test_items/);
+            const json = JSON.parse(runCli(dir, 'endpoints', [], ['--json']));
+            assert.strictEqual(json.meta.uncertainRequests, 1);
+            assert.strictEqual(json.data.uncertainRequests[0].reason, 'receiver-unrecognized');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #350: usages lists non-code text lines the ACCOUNT counts', () => {
+    it('JSX children and HTML markup render as other-text records', () => {
+        const dir = tmp({
+            'package.json': '{"name":"fx"}',
+            'lib.ts': 'export function score() { return 1; }\n',
+            'view.tsx': 'import { score } from "./lib";\nexport const V = () => (\n  <div>\n    dir-score%\n    {score()}\n  </div>\n);\n',
+            'page.html': '<div data-x="score">score here</div>\n<script>score();</script>\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'usages', { name: 'score' });
+            assert.ok(r.ok);
+            const text = r.result.filter(u => u.usageType === 'text').map(u => `${u.relativePath}:${u.line}:${u.textKind}`);
+            assert.deepStrictEqual(text, ['page.html:1:markup-or-text', 'view.tsx:4:markup-or-text']);
+            const imp = execute(index, 'impact', { name: 'score' });
+            const account = imp.result.account;
+            const listed = r.result.filter(u => !u.isDefinition).length + 1;
+            assert.strictEqual(listed, account.groundTotal, 'usages lists every line the ACCOUNT counts');
+            const code = execute(index, 'usages', { name: 'score', codeOnly: true });
+            assert.ok(!code.result.some(u => u.usageType === 'text'), '--code-only keeps text out');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #351: identifier boundaries are Unicode-aware', () => {
+    it('hit does not match inside hitΔ in the ACCOUNT, usages, or deadcode scan', () => {
+        const dir = tmp({
+            'package.json': '{"name":"fx"}',
+            'a.ts': 'export function hit() { return 1; }\nexport const hitΔ = 2;\nexport const use = hit() + hitΔ;\nexport const lone = hitΔ;\n',
+        });
+        try {
+            const index = idx(dir);
+            const imp = execute(index, 'impact', { name: 'hit' });
+            assert.strictEqual(imp.result.account.groundTotal, 2, JSON.stringify(imp.result.account));
+            const u = execute(index, 'usages', { name: 'hit' });
+            assert.ok(!u.result.some(x => x.line === 4), 'line 4 holds only hitΔ');
+        } finally {
+            rm(dir);
+        }
+    });
+});

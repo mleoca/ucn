@@ -8,7 +8,7 @@
 'use strict';
 
 const path = require('path');
-const { escapeRegExp, codeUnitCompare, inlineTestRanges, lineInRanges, classDispatchNames, CALLABLE_SYMBOL_KINDS } = require('./shared');
+const { escapeRegExp, codeUnitCompare, inlineTestRanges, lineInRanges, classDispatchNames, CALLABLE_SYMBOL_KINDS, literalNameRegex } = require('./shared');
 const { isTestFile } = require('./discovery');
 const { detectLanguage, getParser, getLanguageAdapter, langTraits } = require('../languages');
 const { getCachedCalls } = require('./callers');
@@ -49,11 +49,6 @@ function matchesSubstring(text, pattern, caseSensitive) {
     return text.toLowerCase().includes(pattern.toLowerCase());
 }
 
-function literalNameRegex(name) {
-    return new RegExp(
-        `(?<![A-Za-z0-9_$])${escapeRegExp(name)}(?![A-Za-z0-9_$])`,
-    );
-}
 
 /**
  * Complete the AST-classified usage inventory with literal-name lines that
@@ -82,14 +77,21 @@ function appendTextComplements(index, {
         const lineNum = idx + 1;
         const commentOrString = index.isCommentOrStringAtPosition(
             content, lineNum, match.index, filePath);
-        if (!commentOrString) continue;
+        // A literal match that no AST identifier record claimed and that is
+        // not inside a comment or string is non-code text: JSX children,
+        // HTML markup and attributes, regex bodies. The ACCOUNT counts these
+        // lines as other-text; the escape hatch must list them too. A line
+        // the AST scan classified and then deliberately dropped (Rust enum
+        // variants against a struct pin, #234) is code, not text: skip it.
+        if (!commentOrString &&
+            index.isIdentifierAtPosition(content, lineNum, match.index, filePath)) continue;
         const usage = {
             file: filePath,
             relativePath: fileEntry.relativePath,
             line: lineNum,
             content: line,
             usageType: 'text',
-            textKind: 'comment-or-string',
+            textKind: commentOrString ? 'comment-or-string' : 'markup-or-text',
             isDefinition: false,
         };
         if (context > 0) {
@@ -397,7 +399,7 @@ function usages(index, name, options = {}) {
             }
 
             // Fallback to regex-based detection
-            const regex = new RegExp('\\b' + escapeRegExp(name) + '\\b');
+            const regex = literalNameRegex(name);
             lines.forEach((line, idx) => {
                 const lineNum = idx + 1;
 

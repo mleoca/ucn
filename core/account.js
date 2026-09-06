@@ -52,7 +52,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { escapeRegExp, codeUnitCompare } = require('./shared');
+const { codeUnitCompare, literalNameRegex } = require('./shared');
 
 // Unsupported-language site listings are capped so a Rails-sized repo cannot
 // flood the account object; the counts always cover the full set.
@@ -83,7 +83,7 @@ function computeGroundSet(index, name) {
         index._groundSetCache.set(name, cached);
         return cached.result;
     }
-    const wordRe = new RegExp('\\b' + escapeRegExp(name) + '\\b');
+    const wordRe = literalNameRegex(name);
     const perFile = new Map();
     let total = 0;
     let fileCount = 0;
@@ -158,7 +158,7 @@ function scanFailedFiles(index, name) {
     if (!index.failedFiles || index.failedFiles.size === 0) {
         return { unparsed, unreadableFiles };
     }
-    const wordRe = new RegExp('\\b' + escapeRegExp(name) + '\\b');
+    const wordRe = literalNameRegex(name);
     for (const failedPath of index.failedFiles) {
         if (index.files.has(failedPath)) continue;
         let content;
@@ -204,7 +204,7 @@ function scanUnsupportedFiles(index, name, opts = {}) {
     if (!Array.isArray(index.unsupportedFiles) || index.unsupportedFiles.length === 0) {
         return unsupported;
     }
-    const wordRe = new RegExp('\\b' + escapeRegExp(name) + '\\b');
+    const wordRe = literalNameRegex(name);
     const languageCounts = new Map();
     for (const skipped of index.unsupportedFiles) {
         const absPath = path.join(index.root, skipped.relativePath);

@@ -697,7 +697,9 @@ function clearAllCaches() {
 // default/type imports and inline type re-exports preserve execution timing.
 // Python TYPE_CHECKING guards require typing ownership and no rebinding.
 // v212 (fix #342): extendsGraph/extendedByGraph no longer persisted (rebuilt on load).
-const CACHE_FORMAT_VERSION = 212;
+// v213 (fix #348): Python from-import records carry per-name `renames` so
+// import bindings pair each alias with its own module.
+const CACHE_FORMAT_VERSION = 213;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**

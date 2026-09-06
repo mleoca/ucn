@@ -17,7 +17,7 @@ const { detectLanguage, getParser, getLanguageAdapter, safeParse, langTraits, PA
 const { validateFileIR } = require('./ir');
 const { createFileEntryFromIR, populateFileEntryFromIR } = require('./index-ir');
 const { getTokenTypeAtPosition } = require('../languages/utils');
-const { escapeRegExp, NON_CALLABLE_TYPES, codeUnitCompare } = require('./shared');
+const { escapeRegExp, NON_CALLABLE_TYPES, codeUnitCompare, literalNameRegex } = require('./shared');
 const stacktrace = require('./stacktrace');
 const indexCache = require('./cache');
 const deadcodeModule = require('./deadcode');
@@ -1523,7 +1523,7 @@ class ProjectIndex {
 
         // Detailed path: full AST-based counting (original algorithm)
         // Note: no 'g' flag - we only need to test for presence per line
-        const regex = new RegExp('\\b' + escapeRegExp(name) + '\\b');
+        const regex = literalNameRegex(name);
 
         // Get files that could reference this symbol:
         // 1. The file where it's defined
@@ -1938,6 +1938,25 @@ class ProjectIndex {
             return 'reference'; // Default if not found
         } catch (e) {
             return null;
+        }
+    }
+
+    /**
+     * True when the AST node at (line, column) is an identifier token — code
+     * the usage scan saw (and may have deliberately dropped), as opposed to
+     * JSX children, HTML markup, or other non-code text (fix #350).
+     */
+    isIdentifierAtPosition(content, lineNum, column, filePath) {
+        const language = detectLanguage(filePath, this.root);
+        if (!language) return false;
+        try {
+            const tree = this._getParsedTree(filePath, content, language) ||
+                safeParse(getParser(language), content);
+            if (!tree) return false;
+            const node = tree.rootNode.descendantForPosition({ row: lineNum - 1, column });
+            return !!node && /identifier|^name$|^word$/.test(node.type);
+        } catch (e) {
+            return false;
         }
     }
 

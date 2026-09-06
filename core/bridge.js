@@ -1066,11 +1066,60 @@ function extractNextjsRoutes(index) {
  * Detect HTTP client requests across the project.
  * Cached on `index._endpointsCache.clientRequests`.
  */
+// Python HTTP client types whose instances are receivers of request calls.
+// A receiver typed to one of these (with-binding, constructor assignment) or
+// bound to a pytest fixture that constructs one is a client by evidence, not
+// by name (fix #349: 145 of 625 real `tc.get("/api/...")` sites on one repo
+// were invisible because the receiver was not literally named `client`).
+const PY_CLIENT_TYPES = new Set([
+    'TestClient', 'Client', 'AsyncClient', 'Session', 'FlaskClient',
+    'ClientSession', 'AsyncSession', 'HTTPConnection', 'HTTPSConnection',
+]);
+const PY_CLIENT_FACTORIES = new Set(['test_client', 'Session', 'Client', 'AsyncClient']);
+const PY_REQUEST_METHODS = /^(get|post|put|delete|patch|options|head|request)$/;
+
+function _pythonClientFixtures(index) {
+    if (index._endpointsCache?.pyClientFixtures) return index._endpointsCache.pyClientFixtures;
+    const fixtures = new Set();
+    for (const [filePath, fileEntry] of index.files) {
+        if (fileEntry.language !== 'python') continue;
+        const fixtureDefs = (fileEntry.symbols || []).filter(s =>
+            (s.decorators || []).some(d => /(^|\.)fixture$/.test(String(d))));
+        if (fixtureDefs.length === 0) continue;
+        const calls = getCachedCalls(index, filePath) || [];
+        for (const def of fixtureDefs) {
+            const constructsClient = calls.some(c =>
+                c.enclosingFunction?.name === def.name &&
+                c.enclosingFunction?.startLine === def.startLine &&
+                (PY_CLIENT_TYPES.has(c.name) || (c.isMethod && PY_CLIENT_FACTORIES.has(c.name))));
+            if (constructsClient) fixtures.add(def.name);
+        }
+    }
+    if (!index._endpointsCache) index._endpointsCache = {};
+    index._endpointsCache.pyClientFixtures = fixtures;
+    return fixtures;
+}
+
+function _pythonClientReceiver(index, fileEntry, call, fixtures) {
+    if (!call.isMethod || !call.receiver || !PY_REQUEST_METHODS.test(call.name)) return null;
+    if (call.receiverType && PY_CLIENT_TYPES.has(String(call.receiverType).split('.').pop())) {
+        return 'python-client';
+    }
+    if (fixtures.size === 0 || !fixtures.has(call.receiver)) return null;
+    const fn = call.enclosingFunction;
+    if (!fn) return null;
+    const sym = (fileEntry.symbols || []).find(s => s.name === fn.name && s.startLine === fn.startLine);
+    const params = String(sym?.params || '').split(',').map(p => p.trim().split(/[:=]/)[0].trim());
+    return params.includes(call.receiver) ? 'pytest-client-fixture' : null;
+}
+
 function extractClientRequests(index) {
     if (index._endpointsCache && index._endpointsCache.clientRequests) {
         return index._endpointsCache.clientRequests;
     }
     const requests = [];
+    const uncertain = [];
+    const pyFixtures = _pythonClientFixtures(index);
 
     for (const [filePath, fileEntry] of index.files) {
         const lang = fileEntry.language;
@@ -1079,8 +1128,30 @@ function extractClientRequests(index) {
 
         for (const call of calls) {
             if (!call.firstStringArg) continue;
-            const r = matchClientRequest(call, lang, calls);
-            if (!r) continue;
+            let r = matchClientRequest(call, lang, calls);
+            if (!r && lang === 'python') {
+                const framework = _pythonClientReceiver(index, fileEntry, call, pyFixtures);
+                if (framework) {
+                    r = { method: call.name.toUpperCase() === 'REQUEST' ? 'ALL' : call.name.toUpperCase(),
+                        framework, methodInferred: call.name === 'request' };
+                }
+            }
+            if (!r) {
+                // Visible uncertainty: request-shaped call on an unrecognized
+                // receiver with a path-shaped literal. Listed, never counted.
+                const conf = CLIENT_PATTERNS[lang];
+                const pathShaped = call.firstStringArg.startsWith('/') || call.firstStringArg.includes('://');
+                if (conf && call.isMethod && call.receiver && pathShaped &&
+                    conf.receivers.some(p => p.methodPattern.test(call.name))) {
+                    uncertain.push({
+                        receiver: call.receiver, method: call.name, path: call.firstStringArg,
+                        file: fileEntry.relativePath || filePath, absoluteFile: filePath, line: call.line,
+                        callerName: call.enclosingFunction?.name || '<top-level>',
+                        reason: 'receiver-unrecognized',
+                    });
+                }
+                continue;
+            }
 
             // Python's common `session.get("key")` / `s.get("key")`
             // dictionary and ORM idioms are not HTTP requests.  Without
@@ -1114,6 +1185,9 @@ function extractClientRequests(index) {
     }
 
     // Stable sort
+    uncertain.sort((a, b) => a.file !== b.file ? codeUnitCompare(a.file, b.file) : a.line - b.line);
+    if (!index._endpointsCache) index._endpointsCache = {};
+    index._endpointsCache.uncertainRequests = uncertain;
     requests.sort((a, b) => {
         if (a.file !== b.file) return codeUnitCompare(a.file, b.file);
         if (a.line !== b.line) return a.line - b.line;
@@ -1418,6 +1492,13 @@ function endpoints(index, options = {}) {
 
     let routes = opts.clientOnly ? [] : extractServerRoutes(index);
     let requests = (opts.serverOnly ? [] : extractClientRequests(index));
+    let uncertainRequests = opts.serverOnly ? [] : (index._endpointsCache?.uncertainRequests || []);
+    if (uncertainRequests.length > 0) {
+        // A server route registration (`@app.get("/x")`, `router.get("/x", h)`)
+        // is request-shaped too; the route inventory already owns those lines.
+        const routeLines = new Set(extractServerRoutes(index).map(r => `${r.absoluteFile}:${r.line}`));
+        uncertainRequests = uncertainRequests.filter(r => !routeLines.has(`${r.absoluteFile}:${r.line}`));
+    }
 
     // Apply filters
     if (opts.method) {
@@ -1427,6 +1508,10 @@ function endpoints(index, options = {}) {
     if (opts.prefix) {
         routes = routes.filter(r => r.path.startsWith(opts.prefix) || r.normalizedPath.startsWith(opts.prefix));
         requests = requests.filter(r => r.path.startsWith(opts.prefix) || r.normalizedPath.startsWith(opts.prefix));
+        uncertainRequests = uncertainRequests.filter(r => r.path.startsWith(opts.prefix));
+    }
+    if (opts.method) {
+        uncertainRequests = uncertainRequests.filter(r => r.method.toUpperCase() === opts.method || r.method === 'request');
     }
 
     let bridges = opts.bridge ? bridgeEndpoints(index) : [];
@@ -1472,12 +1557,14 @@ function endpoints(index, options = {}) {
             : 'incomplete-endpoint-inventory',
         routes,
         requests,
+        uncertainRequests,
         bridges,
         unmatchedRoutes,
         unmatchedRequests,
         meta: {
             totalRoutes: routes.length,
             totalRequests: requests.length,
+            uncertainRequests: uncertainRequests.length,
             totalBridges: bridges.length,
             unmatchedRoutes: unmatchedRoutes.length,
             unmatchedRequests: unmatchedRequests.length,

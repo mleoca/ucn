@@ -3140,6 +3140,7 @@ function findImportsInCode(code, parser) {
             const deferral = importDeferral(node);
             let modulePath = '';
             const names = [];
+            const renames = [];
 
             for (let i = 0; i < node.namedChildCount; i++) {
                 const child = node.namedChild(i);
@@ -3158,6 +3159,7 @@ function findImportsInCode(code, parser) {
                     if (nameNode && aliasNode && aliasNode.text !== nameNode.text) {
                         if (!importAliases) importAliases = [];
                         importAliases.push({ original: nameNode.text, local: aliasNode.text });
+                        renames.push({ original: nameNode.text, local: aliasNode.text });
                     }
                 } else if (child.type === 'wildcard_import') {
                     names.push('*');
@@ -3171,6 +3173,7 @@ function findImportsInCode(code, parser) {
                     names,
                     type: isRelative ? 'relative' : 'from',
                     line,
+                    ...(renames.length > 0 && { renames }),
                     ...(deferral && { deferred: true, deferredReason: deferral })
                 });
             }

@@ -2802,7 +2802,9 @@ function findCallers(index, name, options = {}) {
                     // source name from DIFFERENT modules — the record's local
                     // alias (call.name) picks its own binding; source-name
                     // matching alone over-follows into the other module.
-                    if (call.resolvedName && nameBindings.some(b => b.alias)) {
+                    // Python records carry the alias as `calledAs` rather
+                    // than resolvedName; both name the paired binding.
+                    if ((call.resolvedName || calledAs) && nameBindings.some(b => b.alias)) {
                         const paired = nameBindings.filter(b => b.alias === call.name);
                         if (paired.length > 0) nameBindings = paired;
                     }

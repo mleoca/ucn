@@ -157,9 +157,17 @@ definition, and `--raw` when the next step is an edit.
 
 Treat `deadcode` as a candidate generator. Before deletion, inspect `usages`, `impact`, `entrypoints`, `api`, and `repo --sections=health --deep`; then corroborate with the compiler/type checker and tests. Computed dispatch such as `handlers[key]()` is a reported blind spot; registry members reached by a modeled computed receiver are withheld. Statically named reflection such as `getattr(obj, "run")` is positive liveness evidence, so every matching member spelling is withheld; recognized dynamic reflection is counted and warned because it cannot be attributed to one member. Unknown decorators/annotations and member-assigned event handlers are also withheld by default because they can be the registration itself. All remaining candidates are still review-only. Never delete solely from `deadcode` or an observed-text-zero result.
 
-`usages` includes comment/string/docstring occurrences in an `OTHER TEXT` section unless
-`--code-only` is set. This is a literal-name inventory, not exact target
-binding. `search` treats its term literally by default; pass `--regex` only
+`usages` includes comment/string/docstring occurrences and non-code text
+(JSX children, HTML markup and attributes) in an `OTHER TEXT` section unless
+`--code-only` is set, so it lists every line the `ACCOUNT` counts. This is a
+literal-name inventory, not exact target binding. Identifier boundaries are
+Unicode-aware: `hit` never matches inside `hitΔ`.
+
+`endpoints` recognizes client receivers by evidence (a receiver typed to an
+HTTP client class, or bound to a pytest fixture that constructs one), not only
+by name. Request-shaped calls with a path literal on an unrecognized receiver
+are listed under `Possible client requests` (JSON `uncertainRequests`),
+counted in `meta`, never in the inventory. `search` treats its term literally by default; pass `--regex` only
 when regular-expression semantics are intended. Ordinary regex patterns run
 through an RE2-compatible linear-time engine; unsafe nested repetition is
 rejected, and unsupported advanced syntax should be handed to ripgrep.
