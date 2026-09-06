@@ -532,6 +532,14 @@ function formatReverseTraceJson(result) {
 /**
  * Format affected-tests command output - text
  */
+// fix #347: a hub symbol at depth 2 links hundreds of names per test file;
+// the list is the answer only for leaves. Cap at 8 unless --all.
+function linkList(names, options) {
+    const MAX_LINKS = options?.all ? Infinity : 8;
+    if (!Array.isArray(names) || names.length <= MAX_LINKS) return (names || []).join(', ');
+    return `${names.slice(0, MAX_LINKS).join(', ')}, +${names.length - MAX_LINKS} more`;
+}
+
 function formatAffectedTests(result, options = {}) {
     if (!result) return 'Function not found.';
 
@@ -553,7 +561,7 @@ function formatAffectedTests(result, options = {}) {
         lines.push(`Test files to run (${summary.totalTestFiles}):`);
         lines.push('');
         for (const tf of displayFiles) {
-            lines.push(`  ${tf.file} (links: ${tf.linkedFunctions.join(', ')})`);
+            lines.push(`  ${tf.file} (links: ${linkList(tf.linkedFunctions, options)})`);
             // Show up to 5 key matches per file
             const keyMatches = tf.matches
                 .filter(m => m.matchType === 'call' || m.matchType === 'test-case')
@@ -581,7 +589,7 @@ function formatAffectedTests(result, options = {}) {
             lines.push(`  Additional test files (${pat.length}):`);
             const MAX_POSSIBLE = options.all ? Infinity : 10;
             for (const tf of pat.slice(0, MAX_POSSIBLE)) {
-                lines.push(`    ${tf.file} (links: ${tf.linkedFunctions.join(', ')})`);
+                lines.push(`    ${tf.file} (links: ${linkList(tf.linkedFunctions, options)})`);
             }
             if (pat.length > MAX_POSSIBLE) {
                 lines.push(`    ... ${pat.length - MAX_POSSIBLE} more (${options.allHint || 'use --all'})`);

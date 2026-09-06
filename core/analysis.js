@@ -980,6 +980,113 @@ function related(index, name, options = {}) {
  * @param {object} options - { file, className, exclude, top }
  * @returns {object|null}
  */
+// Kinds whose dependents are annotation/reference sites rather than calls.
+// Classes and structs stay out: `new X()` / `X{}` are call-shaped and already
+// flow through the caller sweep.
+const TYPE_REFERENCE_KINDS = new Set(['type', 'interface', 'enum', 'trait', 'record']);
+
+/**
+ * fix #345: tiered annotation-site band for a type-kind definition.
+ * Confirmed needs identity evidence: same file as the definition, or an
+ * import binding of the name in the referencing file that reaches the
+ * definition's file (the #215/#217 scope discipline). Anything else is
+ * VISIBLE unverified with a reason. A same-name definition elsewhere is
+ * excluded as other-target. Spelling alone never confirms.
+ */
+function findTypeReferences(index, name, def, options = {}) {
+    if (!def || !TYPE_REFERENCE_KINDS.has(def.type)) return null;
+    const { usages } = require('./search');
+    const { _importReaches, _sameNominalPackageDir } = require('./callers');
+    const records = usages(index, name, {
+        includeTests: true, codeOnly: true, exclude: options.exclude,
+    });
+    const targetFiles = new Set([def.file]);
+    const sameNameDefs = (index.symbols.get(name) || []).filter(d => d !== def);
+    const confirmed = [];
+    const unverified = [];
+    const excluded = [];
+    for (const u of (Array.isArray(records) ? records : records?.usages || [])) {
+        if (u.isDefinition || u.usageType !== 'reference') continue;
+        const site = {
+            file: u.relativePath, line: u.line,
+            expression: (u.content || '').trim(),
+        };
+        // A same-name type defined in the referencing file owns that file's
+        // bare references (the #215 scope rule): excluded, never confirmed.
+        if (u.file !== def.file && sameNameDefs.some(d => d.file === u.file && TYPE_REFERENCE_KINDS.has(d.type))) {
+            excluded.push({ ...site, reason: 'other-definition' });
+            continue;
+        }
+        if (sameNameDefs.some(d => d.file === u.file && (d.nameLine || d.startLine) === u.line)) {
+            excluded.push({ ...site, reason: 'other-definition' });
+            continue;
+        }
+        if (u.file === def.file) {
+            confirmed.push({ ...site, evidence: 'same-file' });
+            continue;
+        }
+        const fileEntry = index.files.get(u.file);
+        // Directory-scoped packages (Go) and Java packages see sibling files'
+        // types without an import; a same-name def in another package would
+        // have been excluded above only if it shared the line, so require the
+        // pinned def to be the package's own.
+        const packageScoped = fileEntry && (
+            (langTraits(fileEntry.language).packageScope === 'directory' &&
+                path.dirname(u.file) === path.dirname(def.file)) ||
+            (fileEntry.language === 'java' &&
+                _sameNominalPackageDir(path.dirname(def.file), path.dirname(u.file), 'java')));
+        if (packageScoped) {
+            const foreign = sameNameDefs.some(d => TYPE_REFERENCE_KINDS.has(d.type) &&
+                path.dirname(d.file) === path.dirname(u.file));
+            if (foreign) unverified.push({ ...site, reason: 'same-package-ambiguous' });
+            else confirmed.push({ ...site, evidence: 'package-scope' });
+            continue;
+        }
+        const bindings = (fileEntry?.importBindings || []).filter(b =>
+            b.name === name || b.alias === name);
+        if (bindings.length > 0) {
+            const reaches = bindings.some(b => {
+                const rel = fileEntry.moduleResolved && fileEntry.moduleResolved[b.module];
+                return rel && _importReaches(index, path.join(index.root, rel), targetFiles);
+            });
+            if (reaches) { confirmed.push({ ...site, evidence: 'import' }); continue; }
+            const otherProject = bindings.some(b =>
+                fileEntry.moduleResolved && fileEntry.moduleResolved[b.module]);
+            if (otherProject) { excluded.push({ ...site, reason: 'other-definition-import' }); continue; }
+            unverified.push({ ...site, reason: 'import-unresolved' });
+            continue;
+        }
+        if (fileEntry?.importNames?.includes('*')) {
+            unverified.push({ ...site, reason: 'star-import' });
+            continue;
+        }
+        unverified.push({ ...site, reason: 'no-import-link' });
+    }
+    if (confirmed.length === 0 && unverified.length === 0 && excluded.length === 0) {
+        return { owner: def.type, confirmedCount: 0, unverifiedCount: 0, totalCandidates: 0,
+            byFile: [], unverifiedSites: [], excluded: { total: 0, byReason: {} } };
+    }
+    const bySite = (a, b) => a.file !== b.file ? codeUnitCompare(a.file, b.file) : a.line - b.line;
+    confirmed.sort(bySite); unverified.sort(bySite);
+    const byFile = new Map();
+    for (const site of confirmed) {
+        if (!byFile.has(site.file)) byFile.set(site.file, []);
+        byFile.get(site.file).push(site);
+    }
+    return {
+        owner: def.type,
+        confirmedCount: confirmed.length,
+        unverifiedCount: unverified.length,
+        totalCandidates: confirmed.length + unverified.length,
+        byFile: [...byFile.entries()].map(([file, sites]) => ({ file, count: sites.length, sites })),
+        unverifiedSites: unverified,
+        excluded: {
+            total: excluded.length,
+            byReason: excluded.reduce((out, s) => { out[s.reason] = (out[s.reason] || 0) + 1; return out; }, {}),
+        },
+    };
+}
+
 function impact(index, name, options = {}) {
     index._beginOp();
     try {
@@ -1270,6 +1377,13 @@ function impact(index, name, options = {}) {
         };
     }
 
+    // fix #345: a type/interface/enum/trait is consumed through annotations,
+    // not calls. Those sites were counted in the ACCOUNT as references and
+    // listed nowhere, so the headline said 0 for a type with dozens of
+    // dependents. Same design as the accessor band: a separate band, never
+    // fake caller edges (the caller oracle and the account stay call-shaped).
+    let typeReferences = findTypeReferences(index, name, def, options);
+
     // Apply top limit if specified (limits total call sites shown)
     const totalBeforeLimit = filteredSites.length;
     if (options.top && options.top > 0 && filteredSites.length > options.top) {
@@ -1315,6 +1429,8 @@ function impact(index, name, options = {}) {
         ...Array.from(byFile.keys()),
         ...(propertyAccesses?.byFile || []).map(group => group.file),
         ...(propertyAccesses?.unverifiedSites || []).map(site => site.file),
+        ...(typeReferences?.byFile || []).map(group => group.file),
+        ...(typeReferences?.unverifiedSites || []).map(site => site.file),
     ]);
 
     return {
@@ -1330,6 +1446,11 @@ function impact(index, name, options = {}) {
         ...(propertyAccesses && {
             propertyAccesses,
             totalDependencySites: totalBeforeLimit + propertyAccesses.confirmedCount,
+            affectedFiles: affectedFiles.size,
+        }),
+        ...(typeReferences && {
+            typeReferences,
+            totalDependencySites: totalBeforeLimit + typeReferences.confirmedCount,
             affectedFiles: affectedFiles.size,
         }),
         account: impactAccount,
@@ -1876,19 +1997,6 @@ function diffImpact(index, options = {}) {
         }
     }
 
-    if (!diffText || !diffText.trim()) {
-        return {
-            base: staged ? '(staged)' : base,
-            changedPaths: 0,
-            nonSourcePaths: 0,
-            functions: [],
-            moduleLevelChanges: [],
-            newFunctions: [],
-            deletedFunctions: [],
-            summary: { modifiedFunctions: 0, deletedFunctions: 0, newFunctions: 0, totalCallSites: 0, unverifiedCallSites: 0, affectedFiles: 0 }
-        };
-    }
-
     // Diff paths are git-root-relative. Resolve to index.root for file lookup.
     // Normalize both through realpath to handle macOS /var → /private/var symlinks.
     let realGitRoot, realProjectRoot;
@@ -1906,6 +2014,58 @@ function diffImpact(index, options = {}) {
         if (projectPrefix && !c.relativePath.startsWith(projectPrefix + '/')) continue;
         const localRel = projectPrefix ? c.relativePath.slice(projectPrefix.length + 1) : c.relativePath;
         changes.push({ ...c, gitRelativePath: c.relativePath, filePath: path.join(index.root, localRel), relativePath: localRel });
+    }
+
+    // fix #346: untracked files are new work too. `git diff <base>` only
+    // sees tracked paths, so a session's brand-new modules were invisible to
+    // the pre-commit gate until `git add -N` — a silent pass on exactly the
+    // code that has never been checked. Indexed, gitignore-respecting
+    // untracked source files join the working-tree diff as whole-file
+    // additions (staged mode keeps its index-only meaning).
+    let untrackedPaths = 0;
+    if (!staged) {
+        const lsArgs = ['ls-files', '--others', '--exclude-standard', '-z'];
+        if (file) lsArgs.push('--', file);
+        let untrackedText = '';
+        try {
+            untrackedText = execFileSync('git', lsArgs, {
+                cwd: index.root, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024,
+                stdio: ['ignore', 'pipe', 'ignore'],
+            });
+        } catch (_) { untrackedText = ''; }
+        const known = new Set(changes.map(c => c.relativePath));
+        for (const localRel of untrackedText.split('\0').filter(Boolean).sort(codeUnitCompare)) {
+            if (known.has(localRel)) continue;
+            const filePath = path.join(index.root, localRel);
+            const fileEntry = index.files.get(filePath);
+            if (!fileEntry || !detectLanguage(filePath)) continue;
+            let lineCount = fileEntry.lines;
+            if (!Number.isFinite(lineCount)) {
+                try { lineCount = fs.readFileSync(filePath, 'utf-8').split('\n').length; } catch (_) { continue; }
+            }
+            const addedLines = [];
+            for (let i = 1; i <= lineCount; i++) addedLines.push(i);
+            untrackedPaths++;
+            changes.push({
+                filePath, relativePath: localRel,
+                gitRelativePath: projectPrefix ? `${projectPrefix}/${localRel}` : localRel,
+                addedLines, deletedLines: [], untracked: true,
+            });
+        }
+    }
+
+    if (changes.length === 0) {
+        return {
+            base: staged ? '(staged)' : base,
+            changedPaths: 0,
+            nonSourcePaths: 0,
+            untrackedPaths: 0,
+            functions: [],
+            moduleLevelChanges: [],
+            newFunctions: [],
+            deletedFunctions: [],
+            summary: { modifiedFunctions: 0, deletedFunctions: 0, newFunctions: 0, totalCallSites: 0, unverifiedCallSites: 0, affectedFiles: 0 }
+        };
     }
 
     const functions = [];
@@ -2111,7 +2271,10 @@ function diffImpact(index, options = {}) {
             const { symbol, addedLines } = data;
             const identityKey = `${symbol.name}\0${symbol.className || ''}`;
             let isNew;
-            if (oldSymbolIdentities !== null) {
+            if (change.untracked) {
+                // fix #346: nothing in an untracked file existed at the base.
+                isNew = true;
+            } else if (oldSymbolIdentities !== null) {
                 isNew = !oldSymbolIdentities.has(identityKey);
             } else {
                 // Fallback: 80% of body lines added and no deletions hit this symbol.
@@ -2291,6 +2454,7 @@ function diffImpact(index, options = {}) {
         base: staged ? '(staged)' : base,
         changedPaths: changes.length,
         nonSourcePaths,
+        untrackedPaths,
         functions,
         moduleLevelChanges,
         newFunctions,

@@ -69,6 +69,16 @@ identity; matching attribute syntax with an unresolved receiver stays
 unverified. These are change dependencies, not fabricated caller edges, so
 the caller `ACCOUNT` remains a call-shaped partition.
 
+When the selected definition is a type, interface, enum, trait, or record,
+`impact` adds a `TYPE REFERENCE SITES` band: annotation and reference sites
+confirmed by an import link to the definition's file (or package scope in
+Go/Java), the rest visible as unverified with a reason. `DEPENDENCY SITES`
+counts them; `CALL SITES` stays call-shaped.
+
+Target-less `impact` and `check` diff the working tree against `HEAD` AND
+include untracked, non-ignored source files as whole-file additions, so new
+modules are checked before `git add`. `--staged` keeps its index-only meaning.
+
 An observed-text zero is not semantic zero or safe-delete proof. Numeric evidence values are ordinal ranking weights, not probabilities.
 
 When a plain name selects more than one definition, action-oriented commands

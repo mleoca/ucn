@@ -1317,34 +1317,59 @@ function pythonTargetBindsName(left, name) {
     return false;
 }
 
+// One walk per scope body collects every name it binds at this scope level
+// (declarations, assignment targets, for/with targets; nested def/class bodies
+// are separate scopes, lambdas too). Memoized per tree by native node id: the
+// caller loop asks the same body about many names, and a per-name walk made
+// the Python build cost functions x tracked names x body size (measured 10s of
+// a 60s sequential build on a 20MB Python repo).
+const scopeBoundNamesByTree = new WeakMap();
+function pythonScopeBoundNames(scopeNode) {
+    let byId = scopeBoundNamesByTree.get(scopeNode.tree);
+    if (!byId) { byId = new Map(); scopeBoundNamesByTree.set(scopeNode.tree, byId); }
+    const cached = byId.get(scopeNode.id);
+    if (cached) return cached;
+    const names = new Set();
+    const addTarget = (left) => {
+        if (!left) return;
+        if (left.type === 'identifier') names.add(left.text);
+        else if (left.type === 'pattern_list' || left.type === 'tuple_pattern') {
+            for (const item of left.namedChildren) {
+                if (item.type === 'identifier') names.add(item.text);
+            }
+        }
+    };
+    const walk = (node) => {
+        for (const child of node.namedChildren) {
+            if (child.type === 'function_definition' ||
+                child.type === 'async_function_definition' ||
+                child.type === 'class_definition') {
+                const declared = child.childForFieldName('name')?.text;
+                if (declared) names.add(declared);
+                continue;
+            }
+            if (child.type === 'lambda') continue;
+            if (child.type === 'assignment' ||
+                child.type === 'augmented_assignment' ||
+                child.type === 'named_expression') {
+                addTarget(child.childForFieldName('left') || child.childForFieldName('name'));
+            } else if (child.type === 'for_statement') {
+                addTarget(child.childForFieldName('left'));
+            } else if (child.type === 'with_statement') {
+                const text = child.namedChild(0)?.text || '';
+                const match = text.match(/\bas\s+([A-Za-z_][A-Za-z0-9_]*)/);
+                if (match) names.add(match[1]);
+            }
+            walk(child);
+        }
+    };
+    walk(scopeNode);
+    byId.set(scopeNode.id, names);
+    return names;
+}
+
 function pythonScopeBindsName(scopeNode, name) {
-    for (let i = 0; i < scopeNode.namedChildCount; i++) {
-        const child = scopeNode.namedChild(i);
-        if (child.type === 'function_definition' ||
-            child.type === 'async_function_definition' ||
-            child.type === 'class_definition') {
-            // The nested body is a separate scope, but the declaration name
-            // binds in this scope.
-            if (child.childForFieldName('name')?.text === name) return true;
-            continue;
-        }
-        if (child.type === 'lambda') continue;
-        if (child.type === 'assignment' ||
-            child.type === 'augmented_assignment' ||
-            child.type === 'named_expression') {
-            if (pythonTargetBindsName(
-                child.childForFieldName('left') || child.childForFieldName('name'),
-                name)) return true;
-        } else if (child.type === 'for_statement') {
-            if (pythonTargetBindsName(child.childForFieldName('left'), name)) return true;
-        } else if (child.type === 'with_statement') {
-            const text = child.namedChild(0)?.text || '';
-            const match = text.match(/\bas\s+([A-Za-z_][A-Za-z0-9_]*)/);
-            if (match && match[1] === name) return true;
-        }
-        if (pythonScopeBindsName(child, name)) return true;
-    }
-    return false;
+    return pythonScopeBoundNames(scopeNode).has(name);
 }
 
 const PY_COMPREHENSIONS = new Set([

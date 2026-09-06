@@ -786,8 +786,8 @@ function formatImpact(impact, options = {}) {
     // Summary (confirmed + unverified tiers reported separately)
     const impactUnverified = impact.unverifiedSites || [];
     const unverifiedSuffix = impactUnverified.length > 0 ? ` confirmed + ${impactUnverified.length} unverified` : '';
-    if (impact.propertyAccesses) {
-        const pa = impact.propertyAccesses;
+    if (impact.propertyAccesses || impact.typeReferences) {
+        const pa = impact.propertyAccesses || impact.typeReferences;
         const uv = pa.unverifiedCount ? ` + ${pa.unverifiedCount} unverified` : '';
         lines.push(`DEPENDENCY SITES: ${impact.totalDependencySites} confirmed${uv}`);
     }
@@ -882,6 +882,34 @@ function formatImpact(impact, options = {}) {
             if (access.unverifiedSites.length > 10) {
                 lines.push(`  (+${access.unverifiedSites.length - 10} more unverified)`);
             }
+        }
+    }
+
+    // fix #345: annotation sites of a type-kind definition, tiered like the
+    // accessor band. The headline no longer says 0 for a type with dependents.
+    if (impact.typeReferences) {
+        const refs = impact.typeReferences;
+        lines.push(`${compact ? '' : '\n'}TYPE REFERENCE SITES: ${refs.confirmedCount} confirmed` +
+            (refs.unverifiedCount ? ` + ${refs.unverifiedCount} unverified` : '') +
+            (refs.excluded?.total ? ` (${refs.excluded.total} other-target)` : ''));
+        for (const group of refs.byFile) {
+            for (const site of group.sites) {
+                const expr = site.expression ? `: ${site.expression.replace(/\s+/g, ' ').slice(0, 100)}` : '';
+                lines.push(`  ${group.file}:${site.line}${expr}`);
+            }
+        }
+        if (refs.unverifiedSites.length > 0) {
+            lines.push(`${compact ? '' : '\n'}UNVERIFIED TYPE REFERENCE CANDIDATES (${refs.unverifiedSites.length}) — name matches, no import link to this definition:`);
+            for (const site of refs.unverifiedSites.slice(0, 10)) {
+                const expr = site.expression ? `: ${site.expression.replace(/\s+/g, ' ').slice(0, 100)}` : '';
+                lines.push(`  ${site.file}:${site.line}${expr} (${site.reason})`);
+            }
+            if (refs.unverifiedSites.length > 10) {
+                lines.push(`  (+${refs.unverifiedSites.length - 10} more unverified)`);
+            }
+        }
+        if (refs.confirmedCount === 0 && refs.unverifiedCount === 0) {
+            lines.push('  (no annotation sites outside the definition)');
         }
     }
 

@@ -215,6 +215,10 @@ function formatDiffImpact(result, options = {}) {
     if (result.nonSourcePaths > 0) {
         lines.push(`Note: ${result.nonSourcePaths} changed path(s) outside supported source files not analyzed.`);
     }
+    // fix #346: untracked source files join the working-tree diff.
+    if (result.untrackedPaths > 0) {
+        lines.push(`Note: ${result.untrackedPaths} untracked source file(s) included as whole-file additions.`);
+    }
     lines.push('');
 
     // Modified functions

@@ -184,6 +184,7 @@ function impactRecords(result) {
         const summary = result.summary || {};
         notes.push(`# Diff: ${summary.modifiedFunctions || 0} modified, ${summary.newFunctions || 0} new, ${summary.deletedFunctions || 0} deleted functions; ${(result.moduleLevelChanges || []).length} file(s) with module-level changes.`);
         if (result.nonSourcePaths) notes.push(`# ${result.nonSourcePaths} changed path(s) outside supported source files not analyzed.`);
+        if (result.untrackedPaths) notes.push(`# ${result.untrackedPaths} untracked source file(s) included as whole-file additions.`);
         return { records: [...new Set(out)], notes };
     }
     for (const group of result.byFile || []) {
@@ -206,6 +207,18 @@ function impactRecords(result) {
             out.push(record(pathOf(access), access.line, access.expression, `${unverifiedTag(access)}; property-access`));
         }
         notes.push(`# PROPERTY ACCESS SITES: ${accesses.confirmedCount} confirmed, ${accesses.unverifiedCount} unverified, ${accesses.excluded?.total || 0} other-target (separate from caller ACCOUNT).`);
+    }
+    if (result.typeReferences) {
+        const refs = result.typeReferences;
+        for (const group of refs.byFile || []) {
+            for (const site of group.sites || []) {
+                out.push(record(group.file, site.line, site.expression, 'type-reference'));
+            }
+        }
+        for (const site of refs.unverifiedSites || []) {
+            out.push(record(pathOf(site), site.line, site.expression, `unverified: ${site.reason}; type-reference`));
+        }
+        notes.push(`# TYPE REFERENCE SITES: ${refs.confirmedCount} confirmed, ${refs.unverifiedCount} unverified, ${refs.excluded?.total || 0} other-target (separate from caller ACCOUNT).`);
     }
     notes.push(...accountComments(result.account));
     for (const warning of result.warnings || []) notes.push(...commentLines(warning.message));

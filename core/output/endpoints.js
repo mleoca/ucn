@@ -84,7 +84,7 @@ function formatRoutesAndRequests(routes, requests, meta, options, advisory = nul
 
     if (showClient) {
         if (requests.length === 0) {
-            if (showServer) lines.push('No client requests detected.');
+            if (showServer) lines.push('Client Requests: 0 — no static route literal found in any indexed file (wrapped or dynamically built request paths are invisible to this scan).');
         } else {
             if (showServer) lines.push('');
             lines.push(`Client Requests: ${requests.length}`);

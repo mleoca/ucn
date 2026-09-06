@@ -7342,3 +7342,179 @@ describe('fix #343: a bare name resolves to the callable when a field shares it'
         }
     });
 });
+
+describe('fix #344: Python scope-bound names are collected once per body', () => {
+    it('keeps shadow discipline: a name bound anywhere in the body shadows the module alias', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname="fx"',
+            'lib.py': 'class Kit:\n    def run(self):\n        return 1\n',
+            'app.py': [
+                'from lib import Kit',
+                'kit = Kit()',
+                'def a():',
+                '    return kit.run()',
+                'def b():',
+                '    if True:',
+                '        kit = object()',
+                '    return kit.run()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'show', { name: 'run', className: 'Kit', sections: 'callers' });
+            assert.ok(r.ok, JSON.stringify(r));
+            const ctx = r.result.context;
+            const confirmed = ctx.callers.map(c => c.callerName);
+            assert.deepStrictEqual(confirmed, ['a'], `the nested-block rebinding in b must be seen: ${confirmed}`);
+            assert.ok((ctx.unverifiedCallers || []).some(c => c.callerName === 'b'), 'b stays visible, not confirmed');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #345: impact on a type-kind definition renders a type-reference band', () => {
+    it('TS type: annotation sites confirm through import links; headline counts them', () => {
+        const dir = tmp({
+            'package.json': '{"name":"fx"}',
+            'sig.ts': 'export type Signal = { name: string };\n',
+            'use.ts': "import { Signal } from './sig';\nexport function scale(s: Signal): Signal { return s; }\n",
+            'loose.ts': 'export const pick = (xs: Signal[]) => xs[0];\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'impact', { name: 'Signal' });
+            assert.ok(r.ok, JSON.stringify(r));
+            const refs = r.result.typeReferences;
+            assert.ok(refs, 'type band present');
+            assert.strictEqual(refs.confirmedCount, 1);
+            assert.strictEqual(refs.byFile[0].file, 'use.ts');
+            assert.strictEqual(refs.unverifiedCount, 1, 'no-import-link site stays visible');
+            assert.strictEqual(refs.unverifiedSites[0].reason, 'no-import-link');
+            assert.strictEqual(r.result.totalDependencySites, 1);
+            assert.strictEqual(r.result.totalCallSites, 0);
+            const text = output.formatImpact(r.result);
+            assert.match(text, /DEPENDENCY SITES: 1 confirmed \+ 1 unverified/);
+            assert.match(text, /TYPE REFERENCE SITES: 1 confirmed \+ 1 unverified/);
+            const lines = runCli(dir, 'impact', ['Signal'], ['--lines']);
+            assert.match(lines, /^use\.ts:2:.*\t# type-reference$/m);
+            assert.match(lines, /^loose\.ts:1:.*\t# unverified: no-import-link; type-reference$/m);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('a same-name type in another file is other-target, and a function pin has no band', () => {
+        const dir = tmp({
+            'package.json': '{"name":"fx"}',
+            'a.ts': 'export interface Box { w: number }\n',
+            'b.ts': 'export interface Box { h: number }\nexport function fit(b: Box): Box { return b; }\n',
+            'c.ts': "import { Box } from './a';\nexport function area(b: Box) { return b.w; }\n",
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'impact', { name: 'Box', file: 'a.ts' });
+            assert.ok(r.ok, JSON.stringify(r));
+            const refs = r.result.typeReferences;
+            assert.strictEqual(refs.confirmedCount, 1, 'c.ts imports a.ts');
+            assert.strictEqual(refs.byFile[0].file, 'c.ts');
+            assert.strictEqual(refs.excluded.byReason['other-definition'], 1, 'b.ts:2 binds b.ts\'s own Box');
+            assert.strictEqual(refs.unverifiedCount, 0);
+            const fn = execute(index, 'impact', { name: 'fit' });
+            assert.ok(fn.ok && !fn.result.typeReferences, 'callable pins keep the call-shaped answer');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('Go package scope and Python aliases confirm without an import binding', () => {
+        const goDir = tmp({
+            'go.mod': 'module m\n',
+            'types.go': 'package m\n\ntype Runner interface { Run() }\n',
+            'use.go': 'package m\n\nfunc use(r Runner) Runner { return r }\n',
+        });
+        const pyDir = tmp({
+            'pyproject.toml': '[project]\nname="fx"',
+            'types.py': 'from typing import TypeAlias\nUserId: TypeAlias = int\n',
+            'svc.py': 'from types import UserId\n\ndef load(uid: UserId) -> UserId:\n    return uid\n',
+        });
+        try {
+            const g = execute(idx(goDir), 'impact', { name: 'Runner' });
+            assert.ok(g.ok && g.result.typeReferences, JSON.stringify(g));
+            assert.strictEqual(g.result.typeReferences.confirmedCount, 1);
+            assert.strictEqual(g.result.typeReferences.byFile[0].sites[0].evidence, 'package-scope');
+            const p = execute(idx(pyDir), 'impact', { name: 'UserId' });
+            assert.ok(p.ok && p.result.typeReferences, JSON.stringify(p));
+            assert.strictEqual(p.result.typeReferences.confirmedCount, 1);
+        } finally {
+            rm(goDir); rm(pyDir);
+        }
+    });
+});
+
+describe('fix #346: target-less impact/check include untracked source files', () => {
+    const { execFileSync } = require('child_process');
+    const git = (dir, args) => execFileSync('git', args, { cwd: dir, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] });
+    it('an untracked module counts as ADDED without git add -N; staged mode stays index-only', () => {
+        const dir = tmp({
+            'package.json': '{"name":"fx"}',
+            'lib.js': 'function base(a) { return a; }\nmodule.exports = { base };\n',
+        });
+        try {
+            git(dir, ['init', '-q']);
+            git(dir, ['-c', 'user.email=a@b', '-c', 'user.name=x', 'add', '-A']);
+            git(dir, ['-c', 'user.email=a@b', '-c', 'user.name=x', 'commit', '-qm', 'init']);
+            fs.writeFileSync(path.join(dir, 'new.js'), "const { base } = require('./lib');\nfunction fresh(x) { return base(x); }\nmodule.exports = { fresh };\n");
+            fs.writeFileSync(path.join(dir, 'notes.md'), '# untracked doc\n');
+            const index = idx(dir);
+            const r = execute(index, 'impact', {});
+            assert.ok(r.ok, JSON.stringify(r));
+            assert.strictEqual(r.result.untrackedPaths, 1, 'only the supported source file joins');
+            assert.deepStrictEqual(r.result.newFunctions.map(f => f.name), ['fresh']);
+            assert.strictEqual(r.result.functions.length, 0, 'nothing in an untracked file is MODIFIED');
+            assert.match(output.formatDiffImpact(r.result), /1 untracked source file\(s\) included/);
+            const chk = execute(index, 'check', {});
+            assert.ok(chk.ok && !chk.result.empty, JSON.stringify(chk.result));
+            const staged = execute(index, 'impact', { staged: true });
+            assert.ok(staged.ok);
+            assert.strictEqual(staged.result.changedPaths, 0, 'staged mode does not read the working tree');
+            // A gitignored source file never joins.
+            fs.writeFileSync(path.join(dir, '.gitignore'), 'gen.js\n');
+            fs.writeFileSync(path.join(dir, 'gen.js'), 'function gen() {}\nmodule.exports = { gen };\n');
+            const r2 = execute(idx(dir), 'impact', {});
+            assert.ok(!r2.result.newFunctions.some(f => f.name === 'gen'), 'gitignored files stay out');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #347: hub-friendly tests output and explicit endpoints client disclosure', () => {
+    it('affected-tests caps the links list at 8 names unless --all', () => {
+        const { formatAffectedTests } = require('../core/output/tracing');
+        const names = Array.from({ length: 12 }, (_, i) => `fn${i}`);
+        const result = {
+            root: 'hub', file: 'a.js', line: 1, depth: 2,
+            summary: { totalAffected: 12, totalTestFiles: 1 },
+            testFiles: [{ file: 'test/a.test.js', linkedFunctions: names, matches: [] }],
+        };
+        const text = formatAffectedTests(result, {});
+        assert.match(text, /links: fn0, fn1, fn2, fn3, fn4, fn5, fn6, fn7, \+4 more\)/);
+        assert.match(formatAffectedTests(result, { all: true }), /fn11\)/);
+    });
+
+    it('endpoints says why the client side is empty instead of staying silent', () => {
+        const dir = tmp({
+            'package.json': '{"name":"fx"}',
+            'server.js': "const express = require('express');\nconst app = express();\napp.get('/x', (req, res) => res.send(1));\n",
+            'client.js': "const fetchApi = (p) => fetch(base + p);\nfetchApi('/x');\n",
+        });
+        try {
+            const out = runCli(dir, 'endpoints', [], []);
+            assert.match(out, /Client Requests: 0 — no static route literal found/);
+            assert.doesNotMatch(out, /No client requests detected/);
+        } finally {
+            rm(dir);
+        }
+    });
+});

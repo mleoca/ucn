@@ -88,9 +88,9 @@ function check(index, options = {}) {
         const nonSourcePaths = dr?.nonSourcePaths || 0;
         let reason = 'no changes detected';
         if (changedPaths > 0 && nonSourcePaths === changedPaths) {
-            reason = `${changedPaths} changed path(s), all outside supported source files`;
+            reason = `${changedPaths} changed path(s), all outside supported source files; untracked source files are included`;
         } else if (changedPaths > 0) {
-            reason = 'no callable-symbol changes in the diff';
+            reason = 'no callable-symbol changes in the diff or untracked source files';
         }
         return {
             base: options.base || 'HEAD',

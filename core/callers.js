@@ -16128,4 +16128,4 @@ function findCallbackUsages(index, name) {
     return usages;
 }
 
-module.exports = { _unresolvedModuleIsGap, getCachedCalls, findCallers, findCallees, getInstanceAttributeTypes, findCallbackUsages, _nameBindingReaches, _moduleAttributeBindingReaches, _declaredFieldType, _projectTopLevelNames, _callArityCompatible, _closeCallableIdentityGroup, _overloadDiscipline, _overloadApplicable };
+module.exports = { _unresolvedModuleIsGap, _importReaches, _sameNominalPackageDir, getCachedCalls, findCallers, findCallees, getInstanceAttributeTypes, findCallbackUsages, _nameBindingReaches, _moduleAttributeBindingReaches, _declaredFieldType, _projectTopLevelNames, _callArityCompatible, _closeCallableIdentityGroup, _overloadDiscipline, _overloadApplicable };
