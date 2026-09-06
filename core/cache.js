@@ -693,7 +693,11 @@ function clearAllCaches() {
 // v210 (fixes #337-#339): importDetails persisted for every language (was Python-only),
 // require(path.join(__dirname, ...)) composes to a static relative specifier,
 // and import records carry deferredReason (function-local / type-checking / type-only).
-const CACHE_FORMAT_VERSION = 210;
+// v211: path-utility composition requires unshadowed binding evidence; mixed
+// default/type imports and inline type re-exports preserve execution timing.
+// Python TYPE_CHECKING guards require typing ownership and no rebinding.
+// v212 (fix #342): extendsGraph/extendedByGraph no longer persisted (rebuilt on load).
+const CACHE_FORMAT_VERSION = 212;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**
@@ -904,9 +908,13 @@ function saveCache(index, cachePath) {
         symbols: strippedSymbols,
         importGraph: relGraph(index.importGraph),
         exportGraph: relGraph(index.exportGraph),
-        // extendsGraph/extendedByGraph use class names as keys (not file paths)
-        extendsGraph: Array.from(index.extendsGraph.entries()),
-        extendedByGraph: Array.from(index.extendedByGraph.entries()),
+        // extendsGraph/extendedByGraph are NOT persisted (fix #342): their
+        // entries carry absolute file paths in the build-time spelling, and
+        // the cache key is realpath-normalized — a root reached through a
+        // symlink (/var → /private/var on macOS) loaded a graph whose files
+        // matched nothing, so an overriding Go embed read as a non-overriding
+        // subclass and confirmed two false callers. loadCache rebuilds both
+        // from the rehydrated symbols (8ms on 1037 files).
         failedFiles: index.failedFiles
             ? Array.from(index.failedFiles).map(f => path.relative(root, f))
             : [],
@@ -1119,13 +1127,8 @@ function loadCache(index, cachePath) {
         index.buildTime = cacheData.buildTime;
 
         // Restore optional graphs if present
-        // extendsGraph/extendedByGraph use class names as keys (not file paths)
-        if (Array.isArray(cacheData.extendsGraph)) {
-            index.extendsGraph = new Map(cacheData.extendsGraph);
-        }
-        if (Array.isArray(cacheData.extendedByGraph)) {
-            index.extendedByGraph = new Map(cacheData.extendedByGraph);
-        }
+        // extendsGraph/extendedByGraph are derived below from the rehydrated
+        // symbols (fix #342) — never read from the payload.
 
         // Prepare lazy calls cache loading — load manifest but defer shard parsing.
         // Shards are loaded on first getCachedCalls access via ensureCallsCacheLoaded().
@@ -1197,13 +1200,16 @@ function loadCache(index, cachePath) {
             }
         }
 
-        // Only rebuild graphs if config changed (e.g., aliases modified)
+        // Only rebuild the import graph if config changed (e.g., aliases
+        // modified); it is persisted with relative paths. The inheritance
+        // graph is always derived from the rehydrated symbols (fix #342) so
+        // its file paths agree with index.root whatever spelling built it.
         const currentConfigHash = crypto.createHash('md5')
             .update(JSON.stringify(index.config || {})).digest('hex');
         if (currentConfigHash !== cacheData.configHash) {
             index.buildImportGraph();
-            index.buildInheritanceGraph();
         }
+        index.buildInheritanceGraph();
 
         loadUsageCache(index, cacheFile);
 

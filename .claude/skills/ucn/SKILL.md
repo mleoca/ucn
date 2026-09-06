@@ -119,10 +119,17 @@ ucn source src/server.js:40-80 --raw
 Records go to stdout; the `ACCOUNT` / `CONTRACT` lines, notes, and the
 same-name disambiguation go to stderr prefixed `# ` (MCP keeps them in the one
 text block, and `--raw` appends its note as one trailing `# ` line there).
-`--lines` lists the whole band (it implies `--all`), so pipe through
+`--lines` lists the whole band without default row/character caps, so pipe through
 `grep -v '# unverified'` for the confirmed tier or `cut -d: -f1 | sort | uniq -c`
 for callers per file. Nothing to list prints nothing and exits 1, grep's
-contract. Use `grep` for literals, messages, configuration, and unsupported
+contract; errors exit 2. Explicit `--top`/`--limit` still apply and disclose
+omissions. `show --lines` accepts only callers/callees sections; target-less
+`impact --lines` lists Git-diff callers with per-target accounting. Closing a
+pipe with `head` is supported. `source --raw` extracts full large classes too;
+`--max-lines` truncation is disclosed on stderr. An explicit `--max-chars`
+fails before stdout if the complete shell output exceeds it. Unusual path
+characters (backslash/tab/CR/LF) are escaped; use JSON for exact filenames.
+`trace` and `tests` scripting uses `--json`. Use `grep` for literals, messages, configuration, and unsupported
 languages; use `ucn ... --lines` when the question is a symbol, a caller, or a
 definition, and `--raw` when the next step is an edit.
 
@@ -173,7 +180,9 @@ TypeScript type-only import. Each deferred edge names its reason. A deferred
 chain is not an unconditional import-time cycle; function-local chains stay
 visible because invoking that function during initialization can still matter.
 Cycles are enumerated completely and independently of build history (capped at
-500 with a disclosed truncation); `CYCLE GROUPS` lists each strongly connected
+500 with a disclosed truncation; groups above 2000 files skip enumeration);
+`CYCLE GROUPS` and the files-in-cycles count remain complete even when the
+enumerated cycle counts are lower bounds. `CYCLE GROUPS` lists each strongly connected
 file set, the unit a refactor has to break.
 
 ## Efficient use

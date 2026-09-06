@@ -1629,6 +1629,18 @@ describe('index reliability: parallel build equals sequential build', () => {
 });
 
 describe('fix #340: stats --hot bounds candidates per definition, not per name', () => {
+    it('retains distinct typed receiver calls sharing one source line', () => {
+        const dir = tmp({ 'lib.ts': [
+            'class A { run() {} }',
+            'class B { run() {} }',
+            'function calls(a: A, b: B) { a.run(); b.run(); }',
+        ].join('\n') });
+        try {
+            const index = idx(dir);
+            const hot = index.getStats({ hot: true, top: 20 }).hot;
+            assert.deepEqual(hot.items.map(item => [item.name, item.callCount]), [['A.run', 1], ['B.run', 1]]);
+        } finally { rm(dir); }
+    });
     it('refines only the definitions whose receiver-typed records can confirm them', () => {
         const dir = tmp({
             'go.mod': 'module example.com/hot\n\ngo 1.21\n',

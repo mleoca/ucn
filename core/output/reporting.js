@@ -1,6 +1,7 @@
 /**
  * core/output/reporting.js - Stats/TOC/deadcode/entrypoints formatters
  */
+const path = require('path');
 
 const {
     lineRange,
@@ -457,7 +458,10 @@ function formatEntrypointsJson(results) {
  */
 function formatOrient(result, options = {}) {
     const lines = [];
-    lines.push(`PROJECT ORIENTATION — ${result.root}${result.scope ? ` (scoped to ${result.scope})` : ''}`);
+    // The title names the project (fix #343); the absolute root is the
+    // caller's own argument and `--sections=stats` prints it in full.
+    const projectName = path.basename(String(result.root || '')) || String(result.root || '');
+    lines.push(`PROJECT ORIENTATION — ${projectName}${result.scope ? ` (scoped to ${result.scope})` : ''}`);
     lines.push('═'.repeat(60));
 
     // Size + language mix (percent by symbols, largest first)

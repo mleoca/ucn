@@ -1,0 +1,542 @@
+{
+ "symbol": "file_name",
+ "pin": "crates/ignore/src/pathutil.rs:113",
+ "repo": "ripgrep",
+ "commit": "82313cf9",
+ "groundTotal": 29,
+ "fileCount": 6,
+ "account": {
+  "confirmed": 4,
+  "unverified": 1,
+  "otherTarget": 7,
+  "definitions": 8,
+  "imports": 2,
+  "references": 2,
+  "otherText": 5
+ },
+ "accountLine": "ACCOUNT: \"file_name\" occurs on 29 lines in 6 files: 4 confirmed, 1 unverified, 17 non-call (2 import, 8 definition, 2 reference, 5 other-text), 7 other-target, 0 unaccounted",
+ "rows": [
+  {
+   "file": "crates/globset/src/lib.rs",
+   "line": 133,
+   "text": "pathutil::{file_name, file_name_ext, normalize_path},",
+   "verdict": "import",
+   "tag": "import",
+   "kinds": [
+    "import"
+   ],
+   "evidence": {
+    "kind": "edge",
+    "from": "glib",
+    "to": "gpathutil"
+   }
+  },
+  {
+   "file": "crates/globset/src/lib.rs",
+   "line": 635,
+   "text": "let basename = file_name(&path).unwrap_or(Cow::Borrowed(B(\"\")));",
+   "verdict": "unverified",
+   "tag": "name only",
+   "kinds": [
+    "call"
+   ],
+   "evidence": {
+    "kind": "unresolved",
+    "from": "glib",
+    "via": "gpathutil"
+   }
+  },
+  {
+   "file": "crates/globset/src/pathutil.rs",
+   "line": 8,
+   "text": "/// file_name will return `None`.",
+   "verdict": "other-text",
+   "tag": "comment",
+   "kinds": [
+    "text"
+   ],
+   "evidence": {
+    "kind": "tick",
+    "from": "gpathutil"
+   }
+  },
+  {
+   "file": "crates/globset/src/pathutil.rs",
+   "line": 96,
+   "text": "($name:ident, $file_name:expr, $ext:expr) => {",
+   "verdict": "other-text",
+   "tag": "macro text",
+   "kinds": [],
+   "evidence": {
+    "kind": "tick",
+    "from": "gpathutil"
+   }
+  },
+  {
+   "file": "crates/globset/src/pathutil.rs",
+   "line": 99,
+   "text": "let bs = Vec::from($file_name);",
+   "verdict": "other-text",
+   "tag": "macro text",
+   "kinds": [],
+   "evidence": {
+    "kind": "tick",
+    "from": "gpathutil"
+   }
+  },
+  {
+   "file": "crates/globset/src/pathutil.rs",
+   "line": 9,
+   "text": "pub(crate) fn file_name<'a>(path: &Cow<'a, [u8]>) -> Option<Cow<'a, [u8]>> {",
+   "verdict": "definition",
+   "tag": "definition",
+   "kinds": [
+    "definition"
+   ],
+   "evidence": {
+    "kind": "def",
+    "from": "gpathutil",
+    "target": "gfn"
+   }
+  },
+  {
+   "file": "crates/ignore/src/dir.rs",
+   "line": 795,
+   "text": "file_name: S,",
+   "verdict": "definition",
+   "tag": "definition",
+   "kinds": [
+    "definition"
+   ],
+   "evidence": {
+    "kind": "tick",
+    "from": "dir",
+    "note": "parameter"
+   }
+  },
+  {
+   "file": "crates/ignore/src/dir.rs",
+   "line": 797,
+   "text": "self.custom_ignore_filenames.push(file_name.as_ref().to_os_string());",
+   "verdict": "reference",
+   "tag": "reference",
+   "kinds": [
+    "reference"
+   ],
+   "evidence": {
+    "kind": "tick",
+    "from": "dir"
+   }
+  },
+  {
+   "file": "crates/ignore/src/pathutil.rs",
+   "line": 111,
+   "text": "/// file_name will return None.",
+   "verdict": "other-text",
+   "tag": "comment",
+   "kinds": [
+    "text"
+   ],
+   "evidence": {
+    "kind": "tick",
+    "from": "pathutil"
+   }
+  },
+  {
+   "file": "crates/ignore/src/pathutil.rs",
+   "line": 113,
+   "text": "pub(crate) fn file_name<'a, P: AsRef<Path> + ?Sized>(",
+   "verdict": "definition",
+   "tag": "definition",
+   "kinds": [
+    "definition"
+   ],
+   "evidence": {
+    "kind": "def",
+    "from": "pathutil",
+    "target": "pin",
+    "twin": false
+   }
+  },
+  {
+   "file": "crates/ignore/src/pathutil.rs",
+   "line": 136,
+   "text": "/// file_name will return None.",
+   "verdict": "other-text",
+   "tag": "comment",
+   "kinds": [
+    "text"
+   ],
+   "evidence": {
+    "kind": "tick",
+    "from": "pathutil"
+   }
+  },
+  {
+   "file": "crates/ignore/src/pathutil.rs",
+   "line": 138,
+   "text": "pub(crate) fn file_name<'a, P: AsRef<Path> + ?Sized>(",
+   "verdict": "definition",
+   "tag": "definition",
+   "kinds": [
+    "definition"
+   ],
+   "evidence": {
+    "kind": "def",
+    "from": "pathutil",
+    "target": "pin",
+    "twin": true
+   }
+  },
+  {
+   "file": "crates/ignore/src/pathutil.rs",
+   "line": 141,
+   "text": "path.as_ref().file_name()",
+   "verdict": "other-target",
+   "tag": "method kind mismatch",
+   "kinds": [
+    "call"
+   ],
+   "evidence": {
+    "kind": "owner",
+    "from": "pathutil",
+    "target": "methods"
+   }
+  },
+  {
+   "file": "crates/ignore/src/pathutil.rs",
+   "line": 14,
+   "text": "if let Some(name) = file_name(dent.path()) {",
+   "verdict": "confirmed",
+   "tag": "exact binding",
+   "kinds": [
+    "call"
+   ],
+   "evidence": {
+    "kind": "binding",
+    "from": "pathutil",
+    "target": "pin"
+   }
+  },
+  {
+   "file": "crates/ignore/src/pathutil.rs",
+   "line": 40,
+   "text": "if let Some(name) = file_name(dent.path()) {",
+   "verdict": "confirmed",
+   "tag": "exact binding",
+   "kinds": [
+    "call"
+   ],
+   "evidence": {
+    "kind": "binding",
+    "from": "pathutil",
+    "target": "pin"
+   }
+  },
+  {
+   "file": "crates/ignore/src/pathutil.rs",
+   "line": 52,
+   "text": "if let Some(name) = file_name(dent.path()) {",
+   "verdict": "confirmed",
+   "tag": "exact binding",
+   "kinds": [
+    "call"
+   ],
+   "evidence": {
+    "kind": "binding",
+    "from": "pathutil",
+    "target": "pin"
+   }
+  },
+  {
+   "file": "crates/ignore/src/types.rs",
+   "line": 273,
+   "text": "let name = match file_name(path.as_ref()) {",
+   "verdict": "confirmed",
+   "tag": "scope match",
+   "kinds": [
+    "call"
+   ],
+   "evidence": {
+    "kind": "import",
+    "from": "types",
+    "via": "pathutil",
+    "target": "pin"
+   }
+  },
+  {
+   "file": "crates/ignore/src/types.rs",
+   "line": 94,
+   "text": "use crate::{Error, Match, default_types::DEFAULT_TYPES, pathutil::file_name};",
+   "verdict": "import",
+   "tag": "import",
+   "kinds": [
+    "import"
+   ],
+   "evidence": {
+    "kind": "edge",
+    "from": "types",
+    "to": "pathutil"
+   }
+  },
+  {
+   "file": "crates/ignore/src/walk.rs",
+   "line": 197,
+   "text": "fn file_name(&self) -> &OsStr {",
+   "verdict": "definition",
+   "tag": "definition",
+   "kinds": [
+    "definition"
+   ],
+   "evidence": {
+    "kind": "def",
+    "from": "walk",
+    "target": "methods"
+   }
+  },
+  {
+   "file": "crates/ignore/src/walk.rs",
+   "line": 201,
+   "text": "Walkdir(ref x) => x.file_name(),",
+   "verdict": "other-target",
+   "tag": "method kind mismatch",
+   "kinds": [
+    "call"
+   ],
+   "evidence": {
+    "kind": "owner",
+    "from": "walk",
+    "target": "methods"
+   }
+  },
+  {
+   "file": "crates/ignore/src/walk.rs",
+   "line": 202,
+   "text": "Raw(ref x) => x.file_name(),",
+   "verdict": "other-target",
+   "tag": "method kind mismatch",
+   "kinds": [
+    "call"
+   ],
+   "evidence": {
+    "kind": "owner",
+    "from": "walk",
+    "target": "methods"
+   }
+  },
+  {
+   "file": "crates/ignore/src/walk.rs",
+   "line": 2490,
+   "text": ".filter_entry(|entry| entry.file_name() != OsStr::new(\"a\")),",
+   "verdict": "other-target",
+   "tag": "method kind mismatch",
+   "kinds": [
+    "call"
+   ],
+   "evidence": {
+    "kind": "owner",
+    "from": "walk",
+    "target": "methods"
+   }
+  },
+  {
+   "file": "crates/ignore/src/walk.rs",
+   "line": 309,
+   "text": "fn file_name(&self) -> &OsStr {",
+   "verdict": "definition",
+   "tag": "definition",
+   "kinds": [
+    "definition"
+   ],
+   "evidence": {
+    "kind": "def",
+    "from": "walk",
+    "target": "methods"
+   }
+  },
+  {
+   "file": "crates/ignore/src/walk.rs",
+   "line": 310,
+   "text": "self.path.file_name().unwrap_or_else(|| self.path.as_os_str())",
+   "verdict": "other-target",
+   "tag": "method kind mismatch",
+   "kinds": [
+    "call"
+   ],
+   "evidence": {
+    "kind": "owner",
+    "from": "walk",
+    "target": "methods"
+   }
+  },
+  {
+   "file": "crates/ignore/src/walk.rs",
+   "line": 590,
+   "text": "cmp(a.file_name(), b.file_name())",
+   "verdict": "other-target",
+   "tag": "method kind mismatch",
+   "kinds": [
+    "call"
+   ],
+   "evidence": {
+    "kind": "owner",
+    "from": "walk",
+    "target": "methods"
+   }
+  },
+  {
+   "file": "crates/ignore/src/walk.rs",
+   "line": 749,
+   "text": "file_name: S,",
+   "verdict": "definition",
+   "tag": "definition",
+   "kinds": [
+    "definition"
+   ],
+   "evidence": {
+    "kind": "tick",
+    "from": "walk",
+    "note": "parameter"
+   }
+  },
+  {
+   "file": "crates/ignore/src/walk.rs",
+   "line": 751,
+   "text": "self.ig_builder.add_custom_ignore_filename(file_name);",
+   "verdict": "reference",
+   "tag": "reference",
+   "kinds": [
+    "reference"
+   ],
+   "evidence": {
+    "kind": "tick",
+    "from": "walk"
+   }
+  },
+  {
+   "file": "crates/ignore/src/walk.rs",
+   "line": 75,
+   "text": "pub fn file_name(&self) -> &OsStr {",
+   "verdict": "definition",
+   "tag": "definition",
+   "kinds": [
+    "definition"
+   ],
+   "evidence": {
+    "kind": "def",
+    "from": "walk",
+    "target": "methods"
+   }
+  },
+  {
+   "file": "crates/ignore/src/walk.rs",
+   "line": 76,
+   "text": "self.dent.file_name()",
+   "verdict": "other-target",
+   "tag": "method kind mismatch",
+   "kinds": [
+    "call"
+   ],
+   "evidence": {
+    "kind": "owner",
+    "from": "walk",
+    "target": "methods"
+   }
+  }
+ ],
+ "files": [
+  {
+   "id": "ilib",
+   "label": "ignore/lib.rs",
+   "note": "crate root"
+  },
+  {
+   "id": "types",
+   "label": "ignore/types.rs"
+  },
+  {
+   "id": "pathutil",
+   "label": "ignore/pathutil.rs"
+  },
+  {
+   "id": "dir",
+   "label": "ignore/dir.rs"
+  },
+  {
+   "id": "walk",
+   "label": "ignore/walk.rs"
+  },
+  {
+   "id": "glib",
+   "label": "globset/lib.rs"
+  },
+  {
+   "id": "gpathutil",
+   "label": "globset/pathutil.rs"
+  }
+ ],
+ "edges": [
+  {
+   "from": "ilib",
+   "to": "types"
+  },
+  {
+   "from": "ilib",
+   "to": "pathutil"
+  },
+  {
+   "from": "ilib",
+   "to": "dir"
+  },
+  {
+   "from": "ilib",
+   "to": "walk"
+  },
+  {
+   "from": "types",
+   "to": "pathutil"
+  },
+  {
+   "from": "types",
+   "to": "glib"
+  },
+  {
+   "from": "dir",
+   "to": "pathutil"
+  },
+  {
+   "from": "walk",
+   "to": "pathutil"
+  },
+  {
+   "from": "pathutil",
+   "to": "walk"
+  },
+  {
+   "from": "glib",
+   "to": "gpathutil"
+  }
+ ],
+ "owners": {
+  "pin": {
+   "file": "pathutil",
+   "label": "fn file_name",
+   "line": 113,
+   "twin": 138
+  },
+  "gfn": {
+   "file": "gpathutil",
+   "label": "fn file_name",
+   "line": 9
+  },
+  "methods": {
+   "file": "walk",
+   "label": ".file_name() methods",
+   "list": [
+    "DirEntry.file_name",
+    "DirEntryInner.file_name",
+    "DirEntryRaw.file_name"
+   ]
+  }
+ }
+}

@@ -464,6 +464,14 @@ const PUBLIC_COMMAND_SET = new Set(CANONICAL_COMMANDS);
  * glob, file, and programmatic callers receive the same answer.
  */
 function validatePublicParams(command, p) {
+    if (p.raw && command !== 'source') return '--raw is supported only by source.';
+    if (p.lines && !['find', 'usages', 'search', 'show', 'impact'].includes(command)) {
+        return '--lines is supported by find, usages, search, show, and impact.';
+    }
+    if (p.lines && command === 'show' && p.sections) {
+        const parsed = parseSections(p.sections, ['callers'], new Set(['callers', 'callees']), 'show --lines');
+        if (parsed.error) return parsed.error;
+    }
     const hasName = typeof p.name === 'string' && p.name.trim() !== '';
     const gitScope = p.staged || (typeof p.base === 'string' && p.base.trim() !== '');
     if ((command === 'impact' || command === 'check') && hasName && gitScope) {
@@ -569,7 +577,7 @@ const HANDLERS = {
         } : query;
         const parsed = parseSections(
             p.sections,
-            ['summary', 'callers', 'callees'],
+            p.lines ? ['callers'] : ['summary', 'callers', 'callees'],
             SHOW_SECTIONS,
             'show',
         );
@@ -693,6 +701,8 @@ const HANDLERS = {
         const notes = [
             ...(resolved.warnings || []).map(warning => warning.message),
             response.note,
+            ...(p.raw ? (response.result.entries || []).filter(entry => entry.truncated)
+                .map(entry => `Source truncated: ${entry.match.relativePath}:${entry.match.startLine}; showing ${entry.shownLines || entry.maxLines} of ${entry.totalLines} lines (--max-lines).`) : []),
         ].filter(Boolean);
         return notes.length > 0
             ? { ...response, note: combineNotes(notes) }
@@ -1174,6 +1184,9 @@ const HANDLERS = {
             file: p.file,
             className: p.className,
             exact: p.exact || false,
+            // A shell definition listing renders no activity counts. Avoid a
+            // full pinned caller query for every definition in a wildcard.
+            skipCounts: !!p.lines,
             exclude,
             in: p.in,
         });
@@ -1430,7 +1443,7 @@ const HANDLERS = {
                 exclude,
                 in: p.in,
                 file: p.file,
-                top: topVal || 50,
+                top: topVal || (p.lines ? undefined : 50),
             });
             if (result.meta.error) return { ok: false, error: result.meta.error };
             const unsupported = (!p.regex && (p.term || p.name))
@@ -1456,7 +1469,7 @@ const HANDLERS = {
         // default at 500 and retain total/truncated metadata for controlled
         // expansion with an explicit top/limit.
         const topVal = num(p.top, undefined) || num(p.limit, undefined);
-        const effectiveLimit = topVal || 500;
+        const effectiveLimit = topVal || (p.lines ? undefined : 500);
         const result = index.search(p.term, {
             codeOnly: p.codeOnly || false,
             context: num(p.context, 0),
@@ -2014,9 +2027,12 @@ const HANDLERS = {
 
         if (matches.length > 1 && p.all) {
             for (const m of matches) {
-                const code = readAndExtract(m);
+                const fullCode = readAndExtract(m);
                 const totalLines = m.endLine - m.startLine + 1;
-                entries.push({ match: m, code, totalLines, summaryMode: false, truncated: false });
+                const truncated = !!maxLines && totalLines > maxLines;
+                const code = truncated ? fullCode.split('\n').slice(0, maxLines).join('\n') : fullCode;
+                entries.push({ match: m, code, totalLines, summaryMode: false, truncated,
+                    ...(truncated && { maxLines }) });
             }
             return { ok: true, result: { entries }, note: notes.length ? notes.map(n => 'Note: ' + n).join('\n') : undefined };
         }
@@ -2035,7 +2051,7 @@ const HANDLERS = {
         const totalLines = match.endLine - match.startLine + 1;
 
         // Large class summary mode (>200 lines, no maxLines)
-        if (totalLines > 200 && !maxLines) {
+        if (totalLines > 200 && !maxLines && !p.raw) {
             const methods = index.findMethodsForType(match.name, match);
             entries.push({ match, code: null, methods, totalLines, summaryMode: true, truncated: false });
             return { ok: true, result: { entries }, note: notes.length ? notes.map(n => 'Note: ' + n).join('\n') : undefined };
@@ -2457,6 +2473,8 @@ function execute(index, command, params = {}) {
     // logged params object; a frozen object silently no-oped the
     // normalizers and returned wrong not-found answers).
     params = { ...params };
+    // Listing completeness belongs to execution, including direct API calls.
+    if (params.lines) params.all = true;
     try {
         if (PUBLIC_COMMAND_SET.has(command)) {
             const validationError = validatePublicParams(command, params);

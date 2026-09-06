@@ -3486,18 +3486,73 @@ function findImportsInCode(code, parser) {
         }
         return null;
     };
+    // Static path folding is positive identity evidence. A method merely
+    // named join/resolve need not be Node's path utility. Keep an ambiguous
+    // or shadowed binding dynamic rather than inventing a module edge.
+    let pathBindings = null;
+    const isPathModuleCall = node => {
+        if (node?.type !== 'call_expression') return false;
+        const fn = node.childForFieldName('function');
+        const args = node.childForFieldName('arguments');
+        const arg = args?.namedChild(0);
+        return fn?.type === 'identifier' && fn.text === 'require' &&
+            args.namedChildCount === 1 && arg?.type === 'string' &&
+            ['path', 'node:path'].includes(arg.text.slice(1, -1));
+    };
+    const collectPathBindings = () => {
+        if (pathBindings) return;
+        pathBindings = new Map();
+        const add = (pattern, value) => {
+            if (!pattern) return;
+            traverseTree(pattern, id => {
+                if (id.type === 'identifier' || id.type === 'shorthand_property_identifier_pattern') {
+                    const entries = pathBindings.get(id.text) || [];
+                    entries.push({ pattern, value });
+                    pathBindings.set(id.text, entries);
+                }
+                return true;
+            });
+        };
+        // File-wide ambiguity is deliberately conservative, including writes
+        // and parameters in unrelated scopes. This rare syntax needs proof,
+        // while ordinary literal require specifiers keep their existing path.
+        traverseTree(tree.rootNode, n => {
+            if (n.type === 'variable_declarator') add(n.childForFieldName('name'), n.childForFieldName('value'));
+            else if (n.type === 'formal_parameters' || n.type === 'import_clause') add(n, null);
+            else if (n.type === 'assignment_expression' || n.type === 'augmented_assignment_expression') add(n.childForFieldName('left'), null);
+            else if (n.type === 'update_expression') add(n.childForFieldName('argument'), null);
+            else if (n.type === 'class_declaration' || n.type === 'class') add(n.childForFieldName('name'), null);
+            else if (n.type === 'catch_clause') add(n.childForFieldName('parameter'), null);
+            else if (FUNCTION_LIKE.has(n.type)) {
+                add(n.childForFieldName('name'), null);
+                add(n.childForFieldName('parameter'), null); // unparenthesized arrow
+            }
+            return true;
+        });
+    };
+    const isPathUtility = fn => {
+        if (pathBindings.has('require')) return false;
+        if (fn?.type !== 'member_expression' ||
+            !['join', 'resolve'].includes(fn.childForFieldName('property')?.text)) return false;
+        const object = fn.childForFieldName('object');
+        if (isPathModuleCall(object)) return true;
+        if (object?.type !== 'identifier') return false;
+        const bindings = pathBindings.get(object.text) || [];
+        return bindings.length === 1 && bindings[0].pattern.type === 'identifier' &&
+            isPathModuleCall(bindings[0].value);
+    };
     // Static composition of `__dirname`-rooted require paths (fix #337b).
     // Returns a relative specifier ('./x' / '../x') or null when any piece is
     // not a string literal.
-    const unquote = (n) => (n.type === 'string' ? n.text.slice(1, -1) : null);
+    const unquote = (n) => (n.type === 'string' &&
+        !n.namedChildren.some(child => child.type === 'escape_sequence') ? n.text.slice(1, -1) : null);
     const staticDirnamePath = (arg) => {
+        collectPathBindings();
+        if (pathBindings.has('__dirname') || pathBindings.has('require')) return null;
         let parts = null;
         if (arg.type === 'call_expression') {
             const fn = arg.childForFieldName('function');
-            const fnName = fn?.type === 'member_expression'
-                ? fn.childForFieldName('property')?.text
-                : (fn?.type === 'identifier' ? fn.text : null);
-            if (fnName !== 'join' && fnName !== 'resolve') return null;
+            if (!isPathUtility(fn)) return null;
             const args = arg.childForFieldName('arguments');
             if (!args || args.namedChildCount < 2) return null;
             if (args.namedChild(0).type !== 'identifier' || args.namedChild(0).text !== '__dirname') return null;
@@ -3536,7 +3591,7 @@ function findImportsInCode(code, parser) {
                 } else if (c.type === 'string_fragment') {
                     if (!sawDirname) return null;
                     tail += c.text;
-                }
+                } else if (c.type !== '`') return null;
             }
             if (!sawDirname || !tail.startsWith('/')) return null;
             parts = [tail.slice(1)];
@@ -3566,6 +3621,7 @@ function findImportsInCode(code, parser) {
             let typeOnly = hasTypeKeyword(node);
             let specifierCount = 0;
             let typeSpecifierCount = 0;
+            let hasValueBinding = false;
 
             // Find the module path (string node)
             for (let i = 0; i < node.namedChildCount; i++) {
@@ -3586,7 +3642,8 @@ function findImportsInCode(code, parser) {
                         if (c.type === 'string') src = c.text.slice(1, -1);
                     }
                     if (src) {
-                        imports.push({ module: src, names: alias ? [alias] : [], type: 'require', line });
+                        imports.push({ module: src, names: alias ? [alias] : [], type: 'require', line,
+                            ...(typeOnly && { deferred: true, deferredReason: 'type-only' }) });
                     }
                     return true;
                 }
@@ -3598,6 +3655,7 @@ function findImportsInCode(code, parser) {
                             // Default import: import foo from 'x'
                             names.push(clauseChild.text);
                             importType = 'default';
+                            hasValueBinding = true;
                         } else if (clauseChild.type === 'named_imports') {
                             // Named imports: import { a, b } from 'x'
                             for (let k = 0; k < clauseChild.namedChildCount; k++) {
@@ -3623,6 +3681,7 @@ function findImportsInCode(code, parser) {
                                           clauseChild.namedChild(0);
                             if (nsName) names.push(nsName.text);
                             importType = 'namespace';
+                            hasValueBinding = true;
                         }
                     }
                 }
@@ -3634,7 +3693,7 @@ function findImportsInCode(code, parser) {
                     importType = 'side-effect';
                 }
                 if (!typeOnly && specifierCount > 0 && typeSpecifierCount === specifierCount &&
-                    importType === 'named') {
+                    importType === 'named' && !hasValueBinding) {
                     typeOnly = true;
                 }
                 imports.push({ module: modulePath, names, type: importType, line,
@@ -3649,6 +3708,8 @@ function findImportsInCode(code, parser) {
         if (node.type === 'export_statement') {
             let source = null;
             const names = [];
+            let specifierCount = 0;
+            let typeSpecifierCount = 0;
 
             // Find the source module (string node with 'from')
             for (let i = 0; i < node.namedChildCount; i++) {
@@ -3660,6 +3721,8 @@ function findImportsInCode(code, parser) {
                     for (let j = 0; j < child.namedChildCount; j++) {
                         const specifier = child.namedChild(j);
                         if (specifier.type === 'export_specifier') {
+                            specifierCount++;
+                            if (hasTypeKeyword(specifier)) typeSpecifierCount++;
                             const nameNode = specifier.namedChild(0);
                             if (nameNode) names.push(nameNode.text);
                         }
@@ -3672,7 +3735,8 @@ function findImportsInCode(code, parser) {
                 const isStarReExport = node.text.includes('export *');
                 const importType = isStarReExport ? 'namespace' : 'named';
                 imports.push({ module: source, names, type: importType, line, isReExport: true,
-                    ...(hasTypeKeyword(node) && { deferred: true, deferredReason: 'type-only' }) });
+                    ...((hasTypeKeyword(node) || (specifierCount > 0 && specifierCount === typeSpecifierCount)) &&
+                        { deferred: true, deferredReason: 'type-only' }) });
             }
             return true;
         }
@@ -3690,7 +3754,7 @@ function findImportsInCode(code, parser) {
                     let modulePath;
                     let dynamic = false;
 
-                    const composedPath = firstArg ? staticDirnamePath(firstArg) : null;
+                    const composedPath = firstArg && firstArg.type !== 'string' ? staticDirnamePath(firstArg) : null;
                     if (firstArg && firstArg.type === 'string') {
                         modulePath = firstArg.text.slice(1, -1);
                     } else if (composedPath) {

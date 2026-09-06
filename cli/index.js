@@ -30,6 +30,16 @@ const { buildPublicParams, isPublicCommand } = require('../core/public-command')
 const { execute } = require('../core/execute');
 const { applyOutputBudget, MAX_OUTPUT_CHARS } = require('../core/output-budget');
 const { clearAllCaches } = require('../core/cache');
+const { commentLines } = require('../core/output/lines');
+
+// A downstream consumer such as head may finish before our write drains.
+// Handle the pipe closure without an unhandled Node error or bypassing cache
+// cleanup. Other write failures are real command errors.
+process.stdout.on('error', error => {
+    if (error.code === 'EPIPE') return;
+    process.stderr.write(`Error writing stdout: ${error.message}\n`);
+    process.exitCode = 2;
+});
 
 let activeCanonicalCommand = null;
 
@@ -398,7 +408,7 @@ if (unknownFlags.length > 0) {
     emitCliError(
         `Unknown flag(s): ${unknownFlags.join(', ')}. Use --help to see available flags.`,
     );
-    process.exit(1);
+    process.exit(flags.lines || flags.raw ? 2 : 1);
 }
 
 // Validate numeric flag values up front so bad input fails before we build
@@ -409,7 +419,7 @@ try {
 } catch (e) {
     if (e instanceof FlagValidationError) {
         emitCliError(e.message);
-        process.exit(1);
+        process.exit(flags.lines || flags.raw ? 2 : 1);
     }
     throw e;
 }
@@ -460,9 +470,14 @@ function formatCliText(command, result, params, execution, displayFlags) {
     });
     // --lines / --raw are pipe surfaces: records are compact, a truncated
     // function body is worse than a long one, and an empty answer must stay
-    // empty (grep prints nothing and exits 1). Only an explicit --max-chars
-    // budgets them.
-    if ((params?.lines || params?.raw) && !displayFlags?.maxChars) return text;
+    // empty (grep prints nothing and exits 1). An explicit --max-chars acts
+    // as a fail-before-output guard, never a lossy source/record truncation.
+    if (params?.lines || params?.raw) {
+        if (displayFlags?.maxChars && text.length > displayFlags.maxChars) {
+            fail(`Output exceeds --max-chars=${displayFlags.maxChars}; shell output cannot be truncated. Narrow the query, use --limit/--max-lines, or omit --max-chars.`);
+        }
+        return text;
+    }
     return applyOutputBudget(text, {
         command,
         maxChars: displayFlags?.maxChars,
@@ -496,7 +511,7 @@ function emitCliText(text, params, json, note) {
         process.stdout.write(body.endsWith('\n') ? body : body + '\n');
         // Code lines are never reinterpreted (a Python comment starts with
         // "# " too), so the note travels on its own channel.
-        if (note) process.stderr.write(`# ${formatSurfaceMessage(note, 'cli')}\n`);
+        if (note) process.stderr.write(commentLines(formatSurfaceMessage(note, 'cli')).join('\n') + '\n');
         return;
     }
     console.log(text);
@@ -592,7 +607,7 @@ function main() {
         if (!(e instanceof CommandError)) {
             emitCliError(`Error: ${e.message}`);
         }
-        process.exitCode = 1;
+        process.exitCode = flags.lines || flags.raw ? 2 : 1;
     }
 }
 
@@ -788,7 +803,7 @@ function runProjectCommand(rootDir, command, arg) {
         if (!(e instanceof CommandError)) {
             emitCliError(`Error: ${e.message}`);
         }
-        process.exitCode = 1;
+        process.exitCode = flags.lines || flags.raw ? 2 : 1;
     } finally {
         // Save cache after command execution so callsCache populated
         // by findCallers/findCallees gets persisted to disk.
@@ -902,8 +917,10 @@ Common flags:
   --lines  find/usages/search/show/impact: grep -n shape, one path:line:text
            record per line (tags after a tab: # unverified: <reason>, # import,
            # callee); accounting and notes go to stderr as "# " lines; exit 1
-           when nothing matched.
-  --raw    source: the code only, no header or line-number gutter.
+           when nothing matched; exit 2 on errors. No default result cap.
+           show defaults to callers; --sections=callers,callees selects bands.
+  --raw    source: full code, no header or gutter (including large classes).
+           Shell modes fail before output if an explicit --max-chars is exceeded.
   Cache: per-user by default; set UCN_CACHE_DIR to override the cache root.
 
 Accepted flags by command:

@@ -7024,6 +7024,45 @@ describe('fix #300: plan export-pass symbol identity + def-line name-only rename
 });
 
 describe('fix #339: cycle enumeration is complete and order-independent', () => {
+    const graphFixture = sizes => {
+        const index = {
+            root: '/virtual', files: new Map(), importGraph: new Map(),
+            _beginOp() {}, _endOp() {},
+        };
+        for (let group = 0; group < sizes.length; group++) {
+            const names = Array.from({ length: sizes[group] }, (_, i) => `/virtual/${group}-${String(i).padStart(5, '0')}.js`);
+            names.forEach((name, i) => {
+                index.files.set(name, { relativePath: name.slice('/virtual/'.length) });
+                index.importGraph.set(name, new Set([names[(i + 1) % names.length]]));
+            });
+        }
+        return index;
+    };
+
+    it('does not claim truncation for exactly the requested number of cycles', () => {
+        const { circularDeps } = require('../core/graph');
+        const result = circularDeps(graphFixture([2]), { maxCycles: 1 });
+        assert.equal(result.cycles.length, 1);
+        assert.equal(result.summary.truncated, undefined);
+        const clipped = circularDeps(graphFixture([2, 2]), { maxCycles: 1 });
+        assert.equal(clipped.summary.truncated, true);
+        assert.equal(clipped.summary.filesInCycles, 4, 'group membership is complete even when enumeration stops');
+    });
+
+    it('discloses an oversized cycle group and still enumerates later small groups', () => {
+        const { circularDeps } = require('../core/graph');
+        const result = circularDeps(graphFixture([2001, 2]));
+        assert.equal(result.components.length, 2);
+        assert.equal(result.cycles.length, 1);
+        assert.equal(result.summary.filesInCycles, 2003);
+        assert.deepEqual(result.summary.truncationReasons, ['component-size']);
+        const text = output.formatCircularDeps(result);
+        assert.match(text, /skipped groups larger than 2000/);
+        assert.doesNotMatch(text, /No circular dependencies|stopped at 500/);
+        const onlyLarge = output.formatCircularDeps(circularDeps(graphFixture([2001])));
+        assert.match(onlyLarge, /CYCLE GROUPS/);
+        assert.doesNotMatch(onlyLarge, /No circular dependencies/);
+    });
     it('reports every elementary cycle regardless of import-graph iteration order', () => {
         // a→b→a, a→c→b→a, b→d→b: three elementary cycles. The old back-edge
         // DFS never emitted a→c→b→a once b had finished before c was explored.
@@ -7177,5 +7216,129 @@ describe('fix #341: grep-shaped --lines and code-only --raw output', () => {
             const cls = runCli(dir, 'source', ['Store'], ['--raw']);
             assert.ok(cls.startsWith('class Store {'), cls);
         } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// fix #343: bare-name resolution prefers the callable over a same-named field;
+// orientation title names the project
+// ============================================================================
+
+describe('fix #343: a bare name resolves to the callable when a field shares it', () => {
+    it('Rust builder idiom: the setter outranks the struct field (ripgrep heap_limit)', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "fx"\nversion = "0.1.0"\n',
+            'src/lib.rs': [
+                'pub struct Config {',
+                '    limit: usize,',
+                '}',
+                '',
+                'impl Config {',
+                '    pub fn limit(&mut self, n: usize) -> &mut Config {',
+                '        self.limit = n;',
+                '        self',
+                '    }',
+                '}',
+                '',
+                'pub fn configure() -> Config {',
+                '    let mut c = Config { limit: 0 };',
+                '    c.limit(3);',
+                '    c',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const { def } = index.resolveSymbol('limit');
+            assert.strictEqual(def.type, 'method', 'the method wins the bare-name pick');
+            assert.strictEqual(def.startLine, 6);
+            const res = execute(index, 'impact', { name: 'limit' });
+            assert.ok(res.ok, JSON.stringify(res));
+            const text = output.formatImpact(res.result);
+            assert.match(text, /src\/lib\.rs:6\b/, text);
+            assert.match(text, /CALL SITES: 1\b/, text);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('Java: a one-line getter still outranks the field it reads', () => {
+        const dir = tmp({
+            'pom.xml': '<project/>',
+            'src/main/java/app/Config.java': [
+                'package app;',
+                'public class Config {',
+                '    private int limit;',
+                '    public int limit() { return limit; }',
+                '}',
+            ].join('\n'),
+            'src/main/java/app/Main.java': [
+                'package app;',
+                'public class Main {',
+                '    static int read(Config c) { return c.limit(); }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const { def } = index.resolveSymbol('limit');
+            assert.strictEqual(def.type, 'method', `picked ${def.type} at line ${def.startLine}`);
+            assert.strictEqual(def.startLine, 4);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('HOT ranking skips inline #[cfg(test)] helpers and their calls (ripgrep TempDir.path)', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "fx"\nversion = "0.1.0"\n',
+            'src/lib.rs': [
+                'pub fn work() -> u32 { 1 }',
+                'pub fn run() -> u32 { work() }',
+                '',
+                '#[cfg(test)]',
+                'mod tests {',
+                '    use super::*;',
+                '    fn helper() -> u32 { 2 }',
+                '    #[test]',
+                '    fn t1() { assert_eq!(helper(), 2); assert_eq!(helper(), 2); assert_eq!(helper(), 2); }',
+                '    #[test]',
+                '    fn t2() { assert_eq!(helper(), 2); assert_eq!(work(), 1); }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            // Orientation ranks PRODUCTION calls; `--sections=stats --hot`
+            // deliberately counts every call and is untouched.
+            const { orient } = require('../core/reporting');
+            const items = orient(index, {}).hot.items;
+            const names = items.map(i => i.name);
+            assert.ok(!names.includes('helper'), `inline test helper must not rank: ${names}`);
+            const work = items.find(i => i.name === 'work');
+            assert.ok(work, `work must rank: ${names}`);
+            assert.strictEqual(work.callCount, 1, 'the call from the inline test module does not count as production');
+            const all = execute(index, 'repo', { sections: 'stats', hot: true, top: 5 });
+            assert.ok(all.ok);
+            const allNames = (all.result.stats?.hot || all.result.hot).items.map(i => i.name);
+            assert.ok(allNames.includes('helper'), `stats --hot keeps counting every call: ${allNames}`);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('repo orientation title names the project, not the absolute root', () => {
+        const dir = tmp({
+            'package.json': '{"name":"fx"}',
+            'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+            'app.js': 'const { helper } = require("./lib");\nfunction main() { return helper(); }\nmain();',
+        });
+        try {
+            const out = runCli(dir, 'repo', [], []);
+            const first = out.split('\n')[0];
+            assert.strictEqual(first, `PROJECT ORIENTATION — ${path.basename(dir)}`, first);
+        } finally {
+            rm(dir);
+        }
     });
 });

@@ -2598,6 +2598,65 @@ describe('fix #227: canonical index order and no stale-calls resurrection', () =
     });
 });
 
+describe('fix #342: inheritance graph is derived on load, never persisted with a path spelling', () => {
+    it('a cache built through a symlinked root answers identically when loaded through the real path', () => {
+        const real = fs.realpathSync(tmp({
+            'go.mod': 'module example.com/embed\n\ngo 1.21\n',
+            'lib/lib.go': [
+                'package lib',
+                '',
+                'type Base struct{}',
+                '',
+                'func (b *Base) Close() {}',
+                '',
+                'type Sub struct{ Base }',
+                '',
+                'func (s *Sub) Close() {}',
+            ].join('\n'),
+            'lib/use.go': [
+                'package lib',
+                '',
+                'func useBase() { b := &Base{}; b.Close() }',
+                '',
+                'func useSub() { s := &Sub{}; s.Close() }',
+            ].join('\n'),
+        }));
+        const link = real + '-link';
+        fs.symlinkSync(real, link);
+        const pin = index => index.symbols.get('Close').find(d => d.relativePath === 'lib/lib.go' && d.startLine === 5);
+        const confirmedLines = index => index.findCallers('Close', {
+            targetDefinitions: [pin(index)], collectAccount: true, includeMethods: true, includeTests: true,
+        }).filter(c => c.tier !== 'unverified').map(c => c.line).sort();
+        try {
+            // Build and save through the SYMLINK spelling of the root.
+            const viaLink = new ProjectIndex(link, { quiet: true });
+            viaLink.build(null, { quiet: true });
+            viaLink.saveCache();
+            const expected = confirmedLines(viaLink);
+            assert.deepStrictEqual(expected, [3], 'Base.Close has one caller; Sub overrides Close');
+
+            // Both spellings share one cache directory (the key is realpath-normalized).
+            assert.strictEqual(getProjectCacheDir(link), getProjectCacheDir(real));
+
+            // Load through the REAL spelling: every inheritance-graph file must
+            // sit under index.root, and the override must still exclude s.Close().
+            const viaReal = new ProjectIndex(real, { quiet: true });
+            assert.ok(viaReal.loadCache(), 'cache loads under the other spelling');
+            for (const entries of viaReal.extendsGraph.values()) {
+                for (const entry of entries) {
+                    assert.ok(entry.file.startsWith(real + path.sep), `graph file under index.root: ${entry.file}`);
+                }
+            }
+            assert.deepStrictEqual(confirmedLines(viaReal), expected,
+                'a loaded index must not confirm the overriding embed as a Base.Close caller');
+        } finally {
+            clearProjectCache(real);
+            try { fs.unlinkSync(link); } catch { /* already gone */ }
+            rm(real);
+        }
+    });
+});
+
 describe('fix #249: relocated project cache stays portable', () => {
     it('a cache copied to a new project identity rehydrates every path under the NEW root', () => {
         const { computeReachability } = require('../core/entrypoints');

@@ -2940,11 +2940,96 @@ function findImportsInCode(code, parser) {
     // `typing.TYPE_CHECKING`) consequence blocks never execute at runtime —
     // the import exists for the type checker only. Only the consequence
     // branch is guarded: `else:` and `if not TYPE_CHECKING:` bodies DO run.
-    const isTypeCheckingGuard = (condition) => {
+    let typingBindings = null;
+    let typingWildcard = false;
+    const isNestedScope = node => {
+        for (let p = node.parent; p; p = p.parent) {
+            if (p.type === 'function_definition' || p.type === 'class_definition' || p.type === 'lambda') return true;
+        }
+        return false;
+    };
+    // Which local names prove a runtime-false guard, and where. A guard at
+    // module level reads the module binding: only module-level rebindings
+    // (assignments, loops, def/class names, walrus, `as` targets) and a
+    // second import of the same name can disturb it — a function parameter
+    // or a nested import lives in its own scope. A guard INSIDE a function
+    // can additionally be shadowed by that function's locals, so nested
+    // rebindings poison nested guards (conservative: any nested scope, not
+    // just the enclosing one). Same-spelled user flags/attributes can be
+    // true; only a unique `typing` binding proves the guard false.
+    const typingBindingKind = (name, guardNested) => {
+        if (!typingBindings) {
+            typingBindings = new Map();
+            const entry = local => {
+                let e = typingBindings.get(local);
+                if (!e) { e = { kind: null, imports: 0, moduleShadow: false, nestedShadow: false }; typingBindings.set(local, e); }
+                return e;
+            };
+            const shadow = (pattern, nested) => {
+                if (!pattern) return;
+                traverseTree(pattern, child => {
+                    if (child.type === 'identifier') {
+                        const e = entry(child.text);
+                        if (nested) e.nestedShadow = true; else e.moduleShadow = true;
+                    }
+                    return true;
+                });
+            };
+            traverseTree(tree.rootNode, n => {
+                const nested = isNestedScope(n);
+                if (n.type === 'import_statement' || n.type === 'import_from_statement') {
+                    if (n.namedChildren.some(item => item.type === 'wildcard_import')) typingWildcard = true;
+                    const moduleNode = n.childForFieldName('module_name');
+                    for (const item of n.namedChildren) {
+                        if (moduleNode && sameNode(moduleNode, item)) continue;
+                        const imported = item.type === 'aliased_import' ? item.childForFieldName('name')?.text : item.text;
+                        const local = item.type === 'aliased_import' ? item.childForFieldName('alias')?.text : imported?.split('.')[0];
+                        if (!local) continue;
+                        const e = entry(local);
+                        if (nested) { e.nestedShadow = true; continue; }
+                        const kind = n.type === 'import_statement'
+                            ? (imported === 'typing' ? 'module' : null)
+                            : (moduleNode?.text === 'typing' && imported === 'TYPE_CHECKING' ? 'flag' : null);
+                        e.imports++;
+                        e.kind = e.imports === 1 ? kind : null;
+                    }
+                } else if (n.type === 'assignment' || n.type === 'augmented_assignment' || n.type === 'for_statement' || n.type === 'for_in_clause') {
+                    shadow(n.childForFieldName('left'), nested);
+                } else if (n.type === 'parameters' || n.type === 'lambda_parameters') {
+                    // Parameter NAMES rebind; annotations (`x: t.Any`) and
+                    // default values are expressions that READ the outer
+                    // binding. Walking the whole subtree treated every
+                    // `t.`-annotated parameter as a rebinding of `t` and
+                    // reverted click's TYPE_CHECKING guards to eager.
+                    for (const param of n.namedChildren) {
+                        if (param.type === 'default_parameter' || param.type === 'typed_default_parameter') {
+                            shadow(param.childForFieldName('name'), true);
+                        } else if (param.type === 'typed_parameter') {
+                            shadow(param.namedChild(0), true);
+                        } else if (param.type !== 'keyword_separator' && param.type !== 'positional_separator') {
+                            shadow(param, true);
+                        }
+                    }
+                } else if (n.type === 'named_expression') shadow(n.childForFieldName('name'), nested);
+                else if (n.type === 'function_definition' || n.type === 'class_definition') shadow(n.childForFieldName('name'), nested);
+                else if (n.type === 'as_pattern') shadow(n.childForFieldName('alias'), nested);
+                return true;
+            });
+        }
+        if (typingWildcard) return null;
+        const e = typingBindings.get(name);
+        if (!e || e.imports !== 1 || e.moduleShadow) return null;
+        if (guardNested && e.nestedShadow) return null;
+        return e.kind;
+    };
+    const isTypeCheckingGuard = (condition, guardNested = true) => {
         if (!condition) return false;
-        if (condition.type === 'identifier') return condition.text === 'TYPE_CHECKING';
+        if (condition.type === 'parenthesized_expression') return isTypeCheckingGuard(condition.namedChild(0), guardNested);
+        if (condition.type === 'identifier') return typingBindingKind(condition.text, guardNested) === 'flag';
         if (condition.type === 'attribute') {
-            return condition.childForFieldName('attribute')?.text === 'TYPE_CHECKING';
+            const object = condition.childForFieldName('object');
+            return condition.childForFieldName('attribute')?.text === 'TYPE_CHECKING' &&
+                object?.type === 'identifier' && typingBindingKind(object.text, guardNested) === 'module';
         }
         return false;
     };
@@ -2956,7 +3041,7 @@ function findImportsInCode(code, parser) {
             if (parent.type === 'block' && parent.parent &&
                 (parent.parent.type === 'if_statement' || parent.parent.type === 'elif_clause') &&
                 sameNode(parent.parent.childForFieldName('consequence'), parent) &&
-                isTypeCheckingGuard(parent.parent.childForFieldName('condition'))) {
+                isTypeCheckingGuard(parent.parent.childForFieldName('condition'), isNestedScope(parent.parent))) {
                 return 'type-checking';
             }
         }

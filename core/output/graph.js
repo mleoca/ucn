@@ -436,7 +436,7 @@ function formatCircularDeps(result) {
 
     const scannedCount = result.filesWithImports != null ? result.filesWithImports : result.totalFiles;
 
-    if (result.cycles.length === 0) {
+    if (result.cycles.length === 0 && !(result.components || []).length && !result.summary?.truncated) {
         lines.push('');
         lines.push('No circular dependencies found.');
         lines.push(`Scanned ${scannedCount} files with import relationships.`);
@@ -456,7 +456,7 @@ function formatCircularDeps(result) {
             const counts = [];
             if (group.eagerCycles != null) counts.push(`${group.eagerCycles} import-time`);
             if (group.deferredCycles != null) counts.push(`${group.deferredCycles} deferred`);
-            const suffix = counts.length > 0 ? `  [${counts.join(', ')}]` : '';
+            const suffix = counts.length > 0 ? `  [${counts.join(', ')}${result.summary.truncated ? '; enumerated counts only' : ''}]` : '';
             lines.push(`  ${group.size} files: ${group.files.join(', ')}${suffix}`);
         }
     }
@@ -494,7 +494,13 @@ function formatCircularDeps(result) {
     const { totalCycles, filesInCycles } = result.summary;
     lines.push(`Summary: ${totalCycles} circular dependency chain${totalCycles !== 1 ? 's' : ''} involving ${filesInCycles} file${filesInCycles !== 1 ? 's' : ''} (${scannedCount} files with imports scanned).`);
     if (result.summary.truncated) {
-        lines.push(`Enumeration stopped at ${result.summary.cycleLimit} elementary cycles; the CYCLE GROUPS list is complete, the cycle list is not.`);
+        if (result.summary.truncationReasons?.includes('component-size')) {
+            lines.push(`Cycle enumeration skipped groups larger than ${result.summary.maxComponentSize} files.`);
+        }
+        if (!result.summary.truncationReasons || result.summary.truncationReasons.includes('cycle-limit')) {
+            lines.push(`Enumeration stopped at ${result.summary.cycleLimit} elementary cycles.`);
+        }
+        lines.push('The CYCLE GROUPS list and files-in-cycles count are complete; enumerated cycle counts are lower bounds.');
     }
     if (deferred.length > 0) {
         lines.push(`${deferred.length} chain${deferred.length === 1 ? '' : 's'} close only through deferred edges (function-local, TYPE_CHECKING-only, or type-only imports); they are not unconditional import-time cycles, but a function-local edge may still matter if invoked during initialization.`);

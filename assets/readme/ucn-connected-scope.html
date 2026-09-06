@@ -1,0 +1,161 @@
+<div id="ucn-scope">
+  <div class="us-heading"><h2>UCN</h2><span class="text-muted">A symbol. Its reach.</span><span class="us-state text-small" data-state>Explore</span></div>
+  <svg class="us-network" role="img" aria-labelledby="us-title us-description">
+    <title id="us-title">Explore connected code, reuse the index, refresh after an edit</title>
+    <desc id="us-description">An illustrative graph expands from one selected symbol through three hops. Circles represent functions, diamonds types, squares modules, and triangles tests. Dashed connections end at unverified findings. A second query reuses the existing index. An edited module and its symbols refresh, then relationships are checked again. Animation timing is schematic.</desc>
+    <g data-links></g><g data-trails></g><g data-nodes></g><g data-labels></g>
+  </svg>
+  <div class="us-legend text-small" aria-label="Node types">
+    <span><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="4" class="us-function"/></svg>Functions</span>
+    <span><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2 14 8 8 14 2 8Z" class="us-type"/></svg>Types</span>
+    <span><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="3" y="3" width="10" height="10" rx="1" class="us-module"/></svg>Modules</span>
+    <span><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2 14 13 2 13Z" class="us-test"/></svg>Tests</span>
+    <span><svg viewBox="0 0 22 16" aria-hidden="true"><path d="M0 8H14" class="us-uncertain-line"/><circle cx="17" cy="8" r="3" class="us-unknown"/></svg>Unverified</span>
+  </div>
+  <div class="us-footer"><span data-caption aria-live="polite">Follow relationships across files.</span><button class="btn btn-ghost" type="button" data-play>Pause</button></div>
+  <div class="text-small text-muted">Conceptual graph · schematic timing</div>
+</div>
+<style>
+#ucn-scope {color:var(--foreground);}
+#ucn-scope .us-heading {display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;}
+#ucn-scope h2 {margin:0;}
+#ucn-scope .us-state {margin-left:auto;}
+#ucn-scope .us-network {display:block;width:100%;height:274px;overflow:visible;}
+#ucn-scope .us-legend {display:flex;gap:8px 17px;flex-wrap:wrap;align-items:center;}
+#ucn-scope .us-legend span {display:inline-flex;gap:5px;align-items:center;}
+#ucn-scope .us-legend svg {width:16px;height:16px;overflow:visible;}
+#ucn-scope .us-footer {display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:46px;}
+#ucn-scope .us-function {fill:var(--viz-series-1);}
+#ucn-scope .us-type {fill:var(--viz-series-2);}
+#ucn-scope .us-module {fill:var(--viz-series-3);}
+#ucn-scope .us-test {fill:var(--viz-series-4);}
+#ucn-scope .us-unknown {fill:var(--background);stroke:var(--viz-series-5);stroke-width:1.5;}
+#ucn-scope .us-link {fill:none;stroke:var(--border);stroke-width:1.2;}
+#ucn-scope .us-uncertain-line {fill:none;stroke:var(--viz-series-5);stroke-width:1.2;stroke-dasharray:3 4;}
+#ucn-scope .us-wave {fill:none;stroke:var(--viz-series-1);stroke-width:1.6;}
+#ucn-scope .us-label {fill:var(--foreground);font-size:12px;paint-order:stroke;stroke:var(--background);stroke-width:5px;stroke-linejoin:round;}
+#ucn-scope .us-center-label {fill:var(--foreground);font-weight:500;paint-order:stroke;stroke:var(--background);stroke-width:5px;}
+#ucn-scope .us-halo {fill:var(--viz-series-1);}
+#ucn-scope .us-change {fill:none;stroke:var(--viz-series-3);stroke-width:2;}
+@media(max-width:460px){#ucn-scope .us-network{height:270px;}#ucn-scope .us-heading{gap:8px;}#ucn-scope .us-footer{align-items:flex-start;}#ucn-scope [data-caption]{padding-top:10px;}}
+</style>
+<script>
+(() => {
+  const root=document.getElementById('ucn-scope'),svg=root.querySelector('.us-network');
+  const ns='http://www.w3.org/2000/svg',reduced=matchMedia('(prefers-reduced-motion: reduce)');
+  const nodes=[],edges=[],labels=[];
+  const clamp=v=>Math.max(0,Math.min(1,v)),ease=v=>1-(1-v)**3;
+  function make(tag,attrs,parent){const e=document.createElementNS(ns,tag);for(const[k,v]of Object.entries(attrs))e.setAttribute(k,v);parent.appendChild(e);return e;}
+  function node(parent,angle,radius,kind,depth,group){
+    const n={id:nodes.length,parent,angle,radius,kind,depth,group};nodes.push(n);
+    if(parent!==null)edges.push({a:parent,b:n.id,unknown:kind==='unknown'});
+    return n.id;
+  }
+  node(null,0,0,'function',0,-1);
+  const branches=[
+    {angle:-155,label:'Callers',kind:'function'},
+    {angle:-95,label:'Imports',kind:'module'},
+    {angle:-35,label:'Types',kind:'type'},
+    {angle:25,label:'Callees',kind:'function'},
+    {angle:85,label:'Tests',kind:'test'},
+    {angle:145,label:'References',kind:'function'}
+  ];
+  const first=[];
+  branches.forEach((b,g)=>{
+    const p=node(0,b.angle,.29,b.kind,1,g);first.push(p);
+    [-13,13].forEach((offset,j)=>{
+      const uncertain=g===3&&j===1;
+      const q=node(p,b.angle+offset,.60,uncertain?'unknown':b.kind,2,g);
+      if(!uncertain)[-6,6].forEach((spread,k)=>node(q,b.angle+offset+spread,.91,(g===0&&k===0)?'test':(g===2&&k===1)?'function':b.kind,3,g));
+    });
+  });
+  // Shared dependencies and references make this a graph, not six isolated trees.
+  edges.push({a:4,b:9},{a:11,b:17},{a:18,b:23},{a:33,b:39});
+  function distances(start){
+    const d=new Map([[start,0]]),queue=[start];
+    while(queue.length){const a=queue.shift();if(d.get(a)>=3||nodes[a].kind==='unknown')continue;
+      for(const e of edges){const b=e.a===a?e.b:e.b===a?e.a:null;if(b===null||d.has(b))continue;d.set(b,d.get(a)+1);queue.push(b);}
+    }return d;
+  }
+  const warmRoot=first[0],warmDistances=distances(warmRoot),editGroup=1;
+  edges.forEach(e=>{
+    e.path=make('path',{class:e.unknown?'us-uncertain-line':'us-link'},root.querySelector('[data-links]'));
+    e.wave=make('path',{class:e.unknown?'us-uncertain-line':'us-wave',pathLength:1},root.querySelector('[data-trails]'));
+  });
+  nodes.forEach(n=>{
+    n.g=make('g',{},root.querySelector('[data-nodes]'));
+    n.halo=make('circle',{r:14,class:'us-halo',opacity:0},n.g);
+    const c='us-'+n.kind;
+    if(n.kind==='module')n.mark=make('rect',{x:-4,y:-4,width:8,height:8,rx:1,class:c},n.g);
+    else if(n.kind==='type')n.mark=make('path',{d:'M0 -5 5 0 0 5 -5 0Z',class:c},n.g);
+    else if(n.kind==='test')n.mark=make('path',{d:'M0 -5 5 4 -5 4Z',class:c},n.g);
+    else n.mark=make('circle',{r:n.id===0?7:3.8,class:c},n.g);
+    n.editRing=make('circle',{r:9,class:'us-change',opacity:0},n.g);
+  });
+  branches.forEach(b=>{const l=make('text',{class:'us-label','text-anchor':'middle'},root.querySelector('[data-labels]'));l.textContent=b.label;labels.push(l);});
+  const centerLabel=make('text',{class:'us-center-label','text-anchor':'middle'},root.querySelector('[data-labels]'));centerLabel.textContent='symbol';
+  const frontierLabel=make('text',{class:'us-label','text-anchor':'start'},root.querySelector('[data-labels]'));frontierLabel.textContent='?';
+  const button=root.querySelector('[data-play]');
+  let width=0,height=0,t=reduced.matches?6800:0,running=!reduced.matches,raf=null,last=null,stage=-1;
+  function position(){
+    width=svg.getBoundingClientRect().width;height=svg.getBoundingClientRect().height;
+    svg.setAttribute('viewBox',`0 0 ${width} ${height}`);
+    const rx=Math.max(90,width/2-45),ry=height/2-33,cx=width/2,cy=height/2;
+    nodes.forEach(n=>{const a=n.angle*Math.PI/180;n.x=cx+Math.cos(a)*rx*n.radius;n.y=cy+Math.sin(a)*ry*n.radius;});
+    branches.forEach((b,i)=>{const a=b.angle*Math.PI/180;labels[i].setAttribute('x',cx+Math.cos(a)*rx*1.04);labels[i].setAttribute('y',cy+Math.sin(a)*ry*1.13+(Math.sin(a)>0?12:-5));});
+    draw();
+  }
+  function draw(){
+    const warm=t>=2600&&t<4200,editing=t>=4200,selected=warm?warmRoot:0;
+    const warmTime=t-2600,editTime=t-4200;
+    nodes.forEach(n=>{
+      const delay=n.depth*190+(n.group<0?0:n.group*32);
+      const u=n.id===0?1:ease(clamp((t-180-delay)/370));
+      const p=n.parent===null?n:nodes[n.parent];
+      n.px=n.id===0?n.x:p.x+(n.x-p.x)*u;n.py=n.id===0?n.y:p.y+(n.y-p.y)*u;
+      n.g.setAttribute('transform',`translate(${n.px},${n.py})`);
+      const depth=warmDistances.get(n.id),reached=depth!==undefined&&warmTime>depth*70;
+      const alpha=u*(warm?(reached?1:.18):1);
+      n.g.setAttribute('opacity',alpha);
+      const flash=editing&&n.group===editGroup?Math.max(0,1-(editTime%500)/500)*(editTime<1050?1:0):0;
+      n.editRing.setAttribute('opacity',flash);n.editRing.setAttribute('r',7+flash*5);
+      n.halo.setAttribute('opacity',n.id===selected?.13:warm&&reached?.07:0);
+      if(n.id===0)n.mark.setAttribute('r',selected===0?7:4);
+    });
+    edges.forEach(e=>{
+      const a=nodes[e.a],b=nodes[e.b];
+      const bend=(e.b%2?1:-1)*7;
+      const d=`M${a.px} ${a.py} Q${(a.px+b.px)/2+bend} ${(a.py+b.py)/2-bend} ${b.px} ${b.py}`;
+      e.path.setAttribute('d',d);e.wave.setAttribute('d',d);
+      const start=Math.max(a.depth,b.depth)*190+Math.max(a.group,b.group)*32+180;
+      const visible=clamp((t-start)/250);
+      const wa=warmDistances.get(e.a),wb=warmDistances.get(e.b);
+      const inWarm=wa!==undefined&&wb!==undefined;
+      e.path.setAttribute('opacity',visible*(warm?(inWarm?.9:.12):.8));
+      let progress=(t-start)/400;
+      if(warm)progress=inWarm?(warmTime-Math.min(wa,wb)*70)/220:2;
+      if(editing)progress=(editTime-(e.a===first[editGroup]||a.group===editGroup?150:850))/430;
+      const pulse=progress>0&&progress<1;
+      e.wave.setAttribute('opacity',pulse?Math.sin(progress*Math.PI)*.8:0);
+      e.wave.setAttribute('stroke-dasharray','.16 1');e.wave.setAttribute('stroke-dashoffset',-clamp(progress));
+    });
+    labels.forEach((l,i)=>l.setAttribute('opacity',clamp((t-480-i*32)/400)*(warm&&i!==0?.45:1)));
+    const target=nodes[selected];centerLabel.setAttribute('x',target.px);centerLabel.setAttribute('y',target.py+25);centerLabel.textContent=warm?'next symbol':'symbol';
+    const unknown=nodes.find(n=>n.kind==='unknown');frontierLabel.setAttribute('x',unknown.px+9);frontierLabel.setAttribute('y',unknown.py+4);frontierLabel.setAttribute('opacity',clamp((t-1000)/300));
+    const phase=t<650?0:t<1400?1:t<2600?2:t<4200?3:t<5300?4:t<6200?5:6;
+    if(stage!==phase){stage=phase;root.querySelector('[data-state]').textContent=['Explore','Three hops','Resolved scope','Index reused','File changed','Refresh','Ready'][phase];root.querySelector('[data-caption]').textContent=['Follow relationships across files.','Calls, references, imports, types, tests.','Unverified edges stay at the frontier.','Next query · reuse the existing index.','Reparse the changed file.','Refresh derived relationships.','Connected evidence, ready for the next query.'][phase];}
+  }
+  function tick(now){
+    if(!running){raf=null;return;}
+    if(last!==null)t+=Math.min(80,now-last);
+    last=now;
+    if(reduced.matches&&t>=6800){t=6800;draw();running=false;raf=null;button.textContent='Replay';return;}
+    // Hold the completed graph before the next automatic exploration.
+    if(t>=8500)t%=8500;
+    draw();raf=requestAnimationFrame(tick);
+  }
+  button.addEventListener('click',()=>{if(running){running=false;cancelAnimationFrame(raf);raf=null;last=null;button.textContent='Play';}else{if(t>=6800)t=0;running=true;last=null;button.textContent='Pause';raf=requestAnimationFrame(tick);}});
+  reduced.addEventListener('change',()=>{if(reduced.matches){running=false;cancelAnimationFrame(raf);raf=null;t=6800;draw();button.textContent='Replay';}});
+  new ResizeObserver(position).observe(svg);position();if(running)raf=requestAnimationFrame(tick);else button.textContent='Replay';
+})();
+</script>

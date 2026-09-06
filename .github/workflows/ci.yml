@@ -29,10 +29,18 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Install clangd 18 (C/C++ oracle test)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clangd-18
+          sudo ln -sf /usr/bin/clangd-18 /usr/local/bin/clangd
+          clangd --version
+
       - name: Run lint
         run: npm run lint
 
       - name: Run tests
+        shell: bash
         run: npm test 2>&1 | tee test-output.txt
 
       - name: Update test count badge

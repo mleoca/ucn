@@ -32,7 +32,7 @@ structural or code-only search.
 | Command | Purpose |
 |---|---|
 | `repo` | Repository orientation. Select `summary,files,stats,health` with `--sections`; `--deep` includes readiness evidence. Skipped unsupported source is listed with a grep/language-tool handoff. |
-| `deps <file>` | File dependency graph. Use `--direction=imports\|importers\|both`, `--detailed`, or `--cycles`. Python cycles are classified as eager or function-local/deferred without dropping either kind. |
+| `deps <file>` | File dependency graph. Use `--direction=imports\|importers\|both`, `--detailed`, or `--cycles`. Cycles distinguish eager edges from function-local, Python typing-guarded, and TypeScript type-only edges. Complete cycle groups remain visible when enumeration is capped. |
 | `api [file]` | Static exported/public surface for a project or file. |
 | `entrypoints` | Framework, route, task, test, and runtime entry points. |
 | `endpoints` | Server/client HTTP surface; `--bridge` adds advisory matching. |
@@ -65,6 +65,8 @@ Symbol-listing commands emit handles such as `src/api.ts:42:handler`. Pass the f
 | `--compact` / `--no-compact` | Select token-efficient or full semantic output. |
 | `--range=N-M` | Extract an explicit line range with `source --file=<path>`. |
 | `--json` | Emit the stable CLI `{ meta, data }` envelope; `meta.contract` carries the truth boundary, decision safety, and next actions. |
+| `--lines` | `find/usages/search/show/impact`: uncapped `path:line:text` listings, with tier tags after a tab. `show` accepts callers/callees sections; default callers. Accounting and notes go to stderr. Exit 0 for records, 1 for none, 2 for errors. Explicit row limits disclose omissions. |
+| `--raw` | `source`: code only, including full large classes. Notes and explicit `--max-lines` truncation travel on stderr. In CLI shell modes, exceeding an explicit `--max-chars` fails before stdout instead of truncating it. |
 | `--expand-unverified` | Follow possible caller edges while preserving their unverified status. |
 | `--base=<ref>` / `--staged` | Scope Git-diff `impact` or target-less `check`. |
 | `--no-cache` / `--clear-cache` | Bypass or clear the current project's per-user cache. Set `UCN_CACHE_DIR` to override its root. |

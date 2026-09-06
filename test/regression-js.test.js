@@ -10812,6 +10812,25 @@ describe('fix #337: function-scoped require bindings are imports, not shadows', 
 });
 
 describe('fix #337b: dynamic require specifiers are resolver gaps; __dirname paths compose statically', () => {
+    it('does not fold lookalike path utilities, shadowed dirname, or escaped template fragments', () => {
+        const { getParser } = require('../languages');
+        const { findImportsInCode } = require('../languages/javascript');
+        const parser = getParser('javascript');
+        for (const code of [
+            'function join() { return "./other"; } const x = require(join(__dirname, "lib"));',
+            'const util = { join() { return "./other"; } }; const x = require(util.join(__dirname, "lib"));',
+            'const path = require("path"); function load(path) { return require(path.join(__dirname, "lib")); }',
+            'const path = require("path"); function load(__dirname) { return require(path.join(__dirname, "lib")); }',
+            'const path = require("path"); { class path { static join() {} } const x = require(path.join(__dirname, "lib")); }',
+            'const x = require(`${__dirname}/li\\u0062`);',
+        ]) {
+            const imports = findImportsInCode(code, parser);
+            assert.ok(imports.some(imp => imp.dynamic), JSON.stringify({ code, imports }));
+            assert.ok(!imports.some(imp => imp.module === './lib'), code);
+        }
+        const proven = findImportsInCode('const x = require(require("node:path").join(__dirname, "lib"));', parser);
+        assert.ok(proven.some(imp => imp.module === './lib' && !imp.dynamic));
+    });
     it('resolves require(path.join(__dirname, ...)) and never judges require(name) external', () => {
         const dir = tmp({
             'package.json': '{"name":"fx337b"}',
@@ -10847,6 +10866,20 @@ describe('fix #337b: dynamic require specifiers are resolver gaps; __dirname pat
 });
 
 describe('fix #338: JS/TS deferred import edges classify cycles', () => {
+    it('keeps default value imports eager and recognizes inline type exports and import-equals', () => {
+        const dir = tmp({
+            'a.ts': 'import Value, { type Shape } from "./b";\nexport default Value; export type A = string;',
+            'b.ts': 'import type { A } from "./a";\nexport default class Value {}\nexport type Shape = A;',
+            'c.ts': 'export { type Shape } from "./b";',
+            'd.ts': 'import type B = require("./b");',
+        });
+        try {
+            const index = idx(dir);
+            assert.equal(index.imports('a.ts')[0].deferred, false);
+            assert.equal(index.imports('c.ts')[0].deferredReason, 'type-only');
+            assert.equal(index.imports('d.ts')[0].deferredReason, 'type-only');
+        } finally { rm(dir); }
+    });
     it('function-local require, lazy thunks, and type-only imports are deferred; mixed specifiers stay eager', () => {
         const dir = tmp({
             'package.json': '{"name":"fx338"}',

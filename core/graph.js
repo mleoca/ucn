@@ -13,6 +13,16 @@ const { extractImports, resolveImport } = require('./imports');
 const { langTraits } = require('../languages');
 const { isTestFile } = require('./discovery');
 
+function importDeferralFields(imp, fileEntry) {
+    // A project-local typing module can expose a true TYPE_CHECKING flag.
+    // Parser spelling evidence alone cannot prove that guard runtime-false.
+    if (imp.deferredReason === 'type-checking' && fileEntry.moduleResolved?.typing) {
+        return { deferred: false };
+    }
+    return { deferred: !!imp.deferred,
+        ...(imp.deferredReason && { deferredReason: imp.deferredReason }) };
+}
+
 /**
  * Resolve imports in a file
  * @param {object} index - ProjectIndex instance
@@ -49,8 +59,7 @@ function imports(index, filePath) {
                     isExternal: false,
                     isDynamic: true,
                     line,
-                    deferred: !!imp.deferred,
-                    ...(imp.deferredReason && { deferredReason: imp.deferredReason }),
+                    ...importDeferralFields(imp, fileEntry),
                 };
             }
 
@@ -67,8 +76,7 @@ function imports(index, filePath) {
                     isExternal: false,
                     isDynamic: true,
                     line,
-                    deferred: !!imp.deferred,
-                    ...(imp.deferredReason && { deferredReason: imp.deferredReason }),
+                    ...importDeferralFields(imp, fileEntry),
                 };
             }
 
@@ -99,8 +107,7 @@ function imports(index, filePath) {
                 // `type: 'dynamic'` with `isDynamic: false` was a contradiction.
                 isDynamic: imp.type === 'dynamic',
                 line,
-                deferred: !!imp.deferred,
-                    ...(imp.deferredReason && { deferredReason: imp.deferredReason }),
+                ...importDeferralFields(imp, fileEntry),
             };
         });
     } catch (e) {
@@ -818,13 +825,19 @@ function circularDeps(index, options = {}) {
             ? options.maxCycles : DEFAULT_CYCLE_LIMIT;
         const cycles = [];
         let truncated = false;
+        let limitReached = false;
+        const truncationReasons = new Set();
         const cyclicComponents = components.filter(c => c.length >= 2).sort((a, b) => a[0] - b[0]);
         for (const comp of cyclicComponents) {
-            if (truncated) break;
-            if (comp.length > MAX_ENUMERATED_COMPONENT) { truncated = true; continue; }
+            if (limitReached) break;
+            if (comp.length > MAX_ENUMERATED_COMPONENT) {
+                truncated = true;
+                truncationReasons.add('component-size');
+                continue;
+            }
             const inComp = new Set(comp);
             for (const s of comp) {
-                if (truncated) break;
+                if (limitReached) break;
                 const allowed = (v) => v >= s && inComp.has(v);
                 const blocked = new Map();
                 const blockedBy = new Map();
@@ -843,12 +856,18 @@ function circularDeps(index, options = {}) {
                     for (const w of adj[v]) {
                         if (!allowed(w)) continue;
                         if (w === s) {
+                            // Probe one extra cycle to distinguish a full list
+                            // of exactly N from a genuinely truncated list.
+                            if (cycles.length === cycleLimit) {
+                                truncated = limitReached = true;
+                                truncationReasons.add('cycle-limit');
+                                break;
+                            }
                             cycles.push(trail.map(i => nodes[i]));
                             found = true;
-                            if (cycles.length >= cycleLimit) { truncated = true; break; }
                         } else if (!blocked.get(w)) {
                             if (circuit(w)) found = true;
-                            if (truncated) break;
+                            if (limitReached) break;
                         }
                     }
                     if (found) {
@@ -893,8 +912,7 @@ function circularDeps(index, options = {}) {
                     from: entry.relativePath,
                     to: index.files.get(toFile)?.relativePath || path.relative(index.root, toFile),
                     line: detail.line ?? null,
-                    deferred: !!detail.deferred,
-                    ...(detail.deferredReason && { deferredReason: detail.deferredReason }),
+                    ...importDeferralFields(detail, entry),
                 });
             }
             return matches;
@@ -992,11 +1010,13 @@ function circularDeps(index, options = {}) {
             fileFilter: fileFilter || undefined,
             summary: {
                 totalCycles: result.length,
-                filesInCycles: new Set(result.flatMap(c => c.files)).size,
+                filesInCycles: new Set(cycleGroups.flatMap(c => c.files)).size,
                 eagerCycles,
                 deferredCycles,
                 componentCount: cycleGroups.length,
-                ...(truncated && { truncated: true, cycleLimit }),
+                ...(truncated && { truncated: true, cycleLimit,
+                    maxComponentSize: MAX_ENUMERATED_COMPONENT,
+                    truncationReasons: [...truncationReasons] }),
             }
         };
     } finally {

@@ -1,0 +1,782 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>UCN</title>
+<style>
+:root{--bg:#181818;--fg:#ffffff;--muted:#a0a0a0;--dim:#5c5c5c;--border:#343434;--edge:#3a3a3a;
+--confirmed:#83c3ff;--unverified:#aa91ef;--other-target:#f59a56;--definition:#74d58b;--import:#f08fc0;--reference:#d6d6d6;--other-text:#6a6a6a;--ok:#74d58b}
+html,body{margin:0;background:var(--bg)}
+#stage{position:relative;width:736px;height:470px;overflow:hidden;background:var(--bg);color:var(--fg);
+font-family:-apple-system,"SF Pro Text","Helvetica Neue",Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}
+.mono{font-family:"SF Mono",Menlo,Consolas,"Liberation Mono",monospace}
+.abs{position:absolute;white-space:nowrap}
+#brand{left:16px;top:12px;font-size:20px;font-weight:600;letter-spacing:.2px}
+#state{right:16px;top:16px;font-size:12px;color:var(--muted);text-align:right}
+#cmd{left:16px;top:44px;font-size:12px}
+#cmd .p{color:var(--muted)} #cmd .cur{display:inline-block;width:7px;height:12px;background:var(--fg);vertical-align:-2px;margin-left:1px}
+.row{position:absolute;left:12px;width:364px;height:12px;line-height:12px;font-size:10.5px;opacity:0;white-space:nowrap}
+.row .bg{position:absolute;left:0;top:0;right:0;bottom:0;border-radius:2px;opacity:0}
+.row .mark{position:absolute;left:4px;top:1px;width:3px;height:10px;border-radius:1px;opacity:0}
+.row .path{position:absolute;left:12px;width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted)}
+.row .code{position:absolute;left:146px;width:112px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dim)}
+.row .tg{position:absolute;right:2px;width:104px;text-align:right;font-size:9px;opacity:0;white-space:nowrap}
+#graph{position:absolute;left:384px;top:62px;width:340px;height:332px;overflow:visible}
+#graph text{font-family:-apple-system,"SF Pro Text","Helvetica Neue",Helvetica,Arial,sans-serif}
+#graph .mono{font-family:"SF Mono",Menlo,Consolas,monospace}
+#acc1,#acc2{left:16px;font-size:10px;color:var(--fg)} #acc1{top:424px} #acc2{top:438px}
+#seam{position:absolute;left:0;top:0;width:100%;height:100%;background:var(--bg);pointer-events:none;opacity:0}
+</style>
+<div id="stage">
+  <div id="brand" class="abs">UCN</div>
+  <div id="state" class="abs mono"></div>
+  <div id="cmd" class="abs mono"><span class="p">$ </span><span class="t"></span><span class="cur"></span></div>
+  <div id="rows"></div>
+  <svg id="graph" viewBox="0 0 340 332" xmlns="http://www.w3.org/2000/svg"></svg>
+  <div id="acc1" class="abs mono"></div>
+  <div id="acc2" class="abs mono"></div>
+  <div id="seam"></div>
+</div>
+<script id="data" type="application/json">{
+ "symbol": "file_name",
+ "pin": "crates/ignore/src/pathutil.rs:113",
+ "repo": "ripgrep",
+ "commit": "82313cf9",
+ "groundTotal": 29,
+ "fileCount": 6,
+ "account": {
+  "confirmed": 4,
+  "unverified": 1,
+  "otherTarget": 7,
+  "definitions": 8,
+  "imports": 2,
+  "references": 2,
+  "otherText": 5
+ },
+ "accountLine": "ACCOUNT: \"file_name\" occurs on 29 lines in 6 files: 4 confirmed, 1 unverified, 17 non-call (2 import, 8 definition, 2 reference, 5 other-text), 7 other-target, 0 unaccounted",
+ "rows": [
+  {
+   "file": "crates/globset/src/lib.rs",
+   "line": 133,
+   "text": "pathutil::{file_name, file_name_ext, normalize_path},",
+   "verdict": "import",
+   "tag": "import",
+   "kinds": [
+    "import"
+   ],
+   "evidence": {
+    "kind": "edge",
+    "from": "glib",
+    "to": "gpathutil"
+   }
+  },
+  {
+   "file": "crates/globset/src/lib.rs",
+   "line": 635,
+   "text": "let basename = file_name(&path).unwrap_or(Cow::Borrowed(B(\"\")));",
+   "verdict": "unverified",
+   "tag": "name only",
+   "kinds": [
+    "call"
+   ],
+   "evidence": {
+    "kind": "unresolved",
+    "from": "glib",
+    "via": "gpathutil"
+   }
+  },
+  {
+   "file": "crates/globset/src/pathutil.rs",
+   "line": 8,
+   "text": "/// file_name will return `None`.",
+   "verdict": "other-text",
+   "tag": "comment",
+   "kinds": [
+    "text"
+   ],
+   "evidence": {
+    "kind": "tick",
+    "from": "gpathutil"
+   }
+  },
+  {
+   "file": "crates/globset/src/pathutil.rs",
+   "line": 96,
+   "text": "($name:ident, $file_name:expr, $ext:expr) => {",
+   "verdict": "other-text",
+   "tag": "macro text",
+   "kinds": [],
+   "evidence": {
+    "kind": "tick",
+    "from": "gpathutil"
+   }
+  },
+  {
+   "file": "crates/globset/src/pathutil.rs",
+   "line": 99,
+   "text": "let bs = Vec::from($file_name);",
+   "verdict": "other-text",
+   "tag": "macro text",
+   "kinds": [],
+   "evidence": {
+    "kind": "tick",
+    "from": "gpathutil"
+   }
+  },
+  {
+   "file": "crates/globset/src/pathutil.rs",
+   "line": 9,
+   "text": "pub(crate) fn file_name<'a>(path: &Cow<'a, [u8]>) -> Option<Cow<'a, [u8]>> {",
+   "verdict": "definition",
+   "tag": "definition",
+   "kinds": [
+    "definition"
+   ],
+   "evidence": {
+    "kind": "def",
+    "from": "gpathutil",
+    "target": "gfn"
+   }
+  },
+  {
+   "file": "crates/ignore/src/dir.rs",
+   "line": 795,
+   "text": "file_name: S,",
+   "verdict": "definition",
+   "tag": "definition",
+   "kinds": [
+    "definition"
+   ],
+   "evidence": {
+    "kind": "tick",
+    "from": "dir",
+    "note": "parameter"
+   }
+  },
+  {
+   "file": "crates/ignore/src/dir.rs",
+   "line": 797,
+   "text": "self.custom_ignore_filenames.push(file_name.as_ref().to_os_string());",
+   "verdict": "reference",
+   "tag": "reference",
+   "kinds": [
+    "reference"
+   ],
+   "evidence": {
+    "kind": "tick",
+    "from": "dir"
+   }
+  },
+  {
+   "file": "crates/ignore/src/pathutil.rs",
+   "line": 111,
+   "text": "/// file_name will return None.",
+   "verdict": "other-text",
+   "tag": "comment",
+   "kinds": [
+    "text"
+   ],
+   "evidence": {
+    "kind": "tick",
+    "from": "pathutil"
+   }
+  },
+  {
+   "file": "crates/ignore/src/pathutil.rs",
+   "line": 113,
+   "text": "pub(crate) fn file_name<'a, P: AsRef<Path> + ?Sized>(",
+   "verdict": "definition",
+   "tag": "definition",
+   "kinds": [
+    "definition"
+   ],
+   "evidence": {
+    "kind": "def",
+    "from": "pathutil",
+    "target": "pin",
+    "twin": false
+   }
+  },
+  {
+   "file": "crates/ignore/src/pathutil.rs",
+   "line": 136,
+   "text": "/// file_name will return None.",
+   "verdict": "other-text",
+   "tag": "comment",
+   "kinds": [
+    "text"
+   ],
+   "evidence": {
+    "kind": "tick",
+    "from": "pathutil"
+   }
+  },
+  {
+   "file": "crates/ignore/src/pathutil.rs",
+   "line": 138,
+   "text": "pub(crate) fn file_name<'a, P: AsRef<Path> + ?Sized>(",
+   "verdict": "definition",
+   "tag": "definition",
+   "kinds": [
+    "definition"
+   ],
+   "evidence": {
+    "kind": "def",
+    "from": "pathutil",
+    "target": "pin",
+    "twin": true
+   }
+  },
+  {
+   "file": "crates/ignore/src/pathutil.rs",
+   "line": 141,
+   "text": "path.as_ref().file_name()",
+   "verdict": "other-target",
+   "tag": "method kind mismatch",
+   "kinds": [
+    "call"
+   ],
+   "evidence": {
+    "kind": "owner",
+    "from": "pathutil",
+    "target": "methods"
+   }
+  },
+  {
+   "file": "crates/ignore/src/pathutil.rs",
+   "line": 14,
+   "text": "if let Some(name) = file_name(dent.path()) {",
+   "verdict": "confirmed",
+   "tag": "exact binding",
+   "kinds": [
+    "call"
+   ],
+   "evidence": {
+    "kind": "binding",
+    "from": "pathutil",
+    "target": "pin"
+   }
+  },
+  {
+   "file": "crates/ignore/src/pathutil.rs",
+   "line": 40,
+   "text": "if let Some(name) = file_name(dent.path()) {",
+   "verdict": "confirmed",
+   "tag": "exact binding",
+   "kinds": [
+    "call"
+   ],
+   "evidence": {
+    "kind": "binding",
+    "from": "pathutil",
+    "target": "pin"
+   }
+  },
+  {
+   "file": "crates/ignore/src/pathutil.rs",
+   "line": 52,
+   "text": "if let Some(name) = file_name(dent.path()) {",
+   "verdict": "confirmed",
+   "tag": "exact binding",
+   "kinds": [
+    "call"
+   ],
+   "evidence": {
+    "kind": "binding",
+    "from": "pathutil",
+    "target": "pin"
+   }
+  },
+  {
+   "file": "crates/ignore/src/types.rs",
+   "line": 273,
+   "text": "let name = match file_name(path.as_ref()) {",
+   "verdict": "confirmed",
+   "tag": "scope match",
+   "kinds": [
+    "call"
+   ],
+   "evidence": {
+    "kind": "import",
+    "from": "types",
+    "via": "pathutil",
+    "target": "pin"
+   }
+  },
+  {
+   "file": "crates/ignore/src/types.rs",
+   "line": 94,
+   "text": "use crate::{Error, Match, default_types::DEFAULT_TYPES, pathutil::file_name};",
+   "verdict": "import",
+   "tag": "import",
+   "kinds": [
+    "import"
+   ],
+   "evidence": {
+    "kind": "edge",
+    "from": "types",
+    "to": "pathutil"
+   }
+  },
+  {
+   "file": "crates/ignore/src/walk.rs",
+   "line": 197,
+   "text": "fn file_name(&self) -> &OsStr {",
+   "verdict": "definition",
+   "tag": "definition",
+   "kinds": [
+    "definition"
+   ],
+   "evidence": {
+    "kind": "def",
+    "from": "walk",
+    "target": "methods"
+   }
+  },
+  {
+   "file": "crates/ignore/src/walk.rs",
+   "line": 201,
+   "text": "Walkdir(ref x) => x.file_name(),",
+   "verdict": "other-target",
+   "tag": "method kind mismatch",
+   "kinds": [
+    "call"
+   ],
+   "evidence": {
+    "kind": "owner",
+    "from": "walk",
+    "target": "methods"
+   }
+  },
+  {
+   "file": "crates/ignore/src/walk.rs",
+   "line": 202,
+   "text": "Raw(ref x) => x.file_name(),",
+   "verdict": "other-target",
+   "tag": "method kind mismatch",
+   "kinds": [
+    "call"
+   ],
+   "evidence": {
+    "kind": "owner",
+    "from": "walk",
+    "target": "methods"
+   }
+  },
+  {
+   "file": "crates/ignore/src/walk.rs",
+   "line": 2490,
+   "text": ".filter_entry(|entry| entry.file_name() != OsStr::new(\"a\")),",
+   "verdict": "other-target",
+   "tag": "method kind mismatch",
+   "kinds": [
+    "call"
+   ],
+   "evidence": {
+    "kind": "owner",
+    "from": "walk",
+    "target": "methods"
+   }
+  },
+  {
+   "file": "crates/ignore/src/walk.rs",
+   "line": 309,
+   "text": "fn file_name(&self) -> &OsStr {",
+   "verdict": "definition",
+   "tag": "definition",
+   "kinds": [
+    "definition"
+   ],
+   "evidence": {
+    "kind": "def",
+    "from": "walk",
+    "target": "methods"
+   }
+  },
+  {
+   "file": "crates/ignore/src/walk.rs",
+   "line": 310,
+   "text": "self.path.file_name().unwrap_or_else(|| self.path.as_os_str())",
+   "verdict": "other-target",
+   "tag": "method kind mismatch",
+   "kinds": [
+    "call"
+   ],
+   "evidence": {
+    "kind": "owner",
+    "from": "walk",
+    "target": "methods"
+   }
+  },
+  {
+   "file": "crates/ignore/src/walk.rs",
+   "line": 590,
+   "text": "cmp(a.file_name(), b.file_name())",
+   "verdict": "other-target",
+   "tag": "method kind mismatch",
+   "kinds": [
+    "call"
+   ],
+   "evidence": {
+    "kind": "owner",
+    "from": "walk",
+    "target": "methods"
+   }
+  },
+  {
+   "file": "crates/ignore/src/walk.rs",
+   "line": 749,
+   "text": "file_name: S,",
+   "verdict": "definition",
+   "tag": "definition",
+   "kinds": [
+    "definition"
+   ],
+   "evidence": {
+    "kind": "tick",
+    "from": "walk",
+    "note": "parameter"
+   }
+  },
+  {
+   "file": "crates/ignore/src/walk.rs",
+   "line": 751,
+   "text": "self.ig_builder.add_custom_ignore_filename(file_name);",
+   "verdict": "reference",
+   "tag": "reference",
+   "kinds": [
+    "reference"
+   ],
+   "evidence": {
+    "kind": "tick",
+    "from": "walk"
+   }
+  },
+  {
+   "file": "crates/ignore/src/walk.rs",
+   "line": 75,
+   "text": "pub fn file_name(&self) -> &OsStr {",
+   "verdict": "definition",
+   "tag": "definition",
+   "kinds": [
+    "definition"
+   ],
+   "evidence": {
+    "kind": "def",
+    "from": "walk",
+    "target": "methods"
+   }
+  },
+  {
+   "file": "crates/ignore/src/walk.rs",
+   "line": 76,
+   "text": "self.dent.file_name()",
+   "verdict": "other-target",
+   "tag": "method kind mismatch",
+   "kinds": [
+    "call"
+   ],
+   "evidence": {
+    "kind": "owner",
+    "from": "walk",
+    "target": "methods"
+   }
+  }
+ ],
+ "files": [
+  {
+   "id": "ilib",
+   "label": "ignore/lib.rs",
+   "note": "crate root"
+  },
+  {
+   "id": "types",
+   "label": "ignore/types.rs"
+  },
+  {
+   "id": "pathutil",
+   "label": "ignore/pathutil.rs"
+  },
+  {
+   "id": "dir",
+   "label": "ignore/dir.rs"
+  },
+  {
+   "id": "walk",
+   "label": "ignore/walk.rs"
+  },
+  {
+   "id": "glib",
+   "label": "globset/lib.rs"
+  },
+  {
+   "id": "gpathutil",
+   "label": "globset/pathutil.rs"
+  }
+ ],
+ "edges": [
+  {
+   "from": "ilib",
+   "to": "types"
+  },
+  {
+   "from": "ilib",
+   "to": "pathutil"
+  },
+  {
+   "from": "ilib",
+   "to": "dir"
+  },
+  {
+   "from": "ilib",
+   "to": "walk"
+  },
+  {
+   "from": "types",
+   "to": "pathutil"
+  },
+  {
+   "from": "types",
+   "to": "glib"
+  },
+  {
+   "from": "dir",
+   "to": "pathutil"
+  },
+  {
+   "from": "walk",
+   "to": "pathutil"
+  },
+  {
+   "from": "pathutil",
+   "to": "walk"
+  },
+  {
+   "from": "glib",
+   "to": "gpathutil"
+  }
+ ],
+ "owners": {
+  "pin": {
+   "file": "pathutil",
+   "label": "fn file_name",
+   "line": 113,
+   "twin": 138
+  },
+  "gfn": {
+   "file": "gpathutil",
+   "label": "fn file_name",
+   "line": 9
+  },
+  "methods": {
+   "file": "walk",
+   "label": ".file_name() methods",
+   "list": [
+    "DirEntry.file_name",
+    "DirEntryInner.file_name",
+    "DirEntryRaw.file_name"
+   ]
+  }
+ }
+}</script>
+<script>
+(() => {
+const DATA = JSON.parse(document.getElementById('data').textContent);
+const NS = 'http://www.w3.org/2000/svg';
+const css = v => getComputedStyle(document.documentElement).getPropertyValue('--' + v).trim();
+const COLOR = { confirmed: css('confirmed'), unverified: css('unverified'), 'other-target': css('other-target'), definition: css('definition'), import: css('import'), reference: css('reference'), 'other-text': css('other-text') };
+const rows = DATA.rows.slice().sort((a, b) => a.file < b.file ? -1 : a.file > b.file ? 1 : a.line - b.line);
+const counts = {}; for (const r of rows) counts[r.verdict] = (counts[r.verdict] || 0) + 1;
+
+// ---- timeline ----
+const CMD = `ucn impact ${DATA.symbol}`;
+const T_CMD = 0.15, CMD_STEP = 0.035;
+const T_OCCURRENCES = 1.0, OCCURRENCE_STEP = 0.028;
+const T_ADJ = 2.2, STEP = 0.13, FLY = 0.5;
+const T_ACC = T_ADJ + (rows.length - 1) * STEP + FLY + 0.35;
+const ACC_STEP = 0.006;
+const [ACC1, ACC2] = (l => { const i = l.indexOf('unverified,') + 'unverified,'.length; return [l.slice(0, i), l.slice(i).trim()]; })(DATA.accountLine);
+const T_OK = T_ACC + (ACC1.length + ACC2.length) * ACC_STEP + 0.35;
+const T_END = T_OK + 2.6;
+window.__duration = T_END; window.__stillTime = T_OK + 0.8;
+const clamp = v => Math.max(0, Math.min(1, v));
+const easeOut = v => 1 - Math.pow(1 - v, 3);
+const easeInOut = v => v < .5 ? 4 * v * v * v : 1 - Math.pow(-2 * v + 2, 3) / 2;
+const ramp = (t, t0, d) => clamp((t - t0) / d);
+
+// ---- rows ----
+const ROW0 = 70, LH = 12;
+const rowsEl = document.getElementById('rows');
+const R = rows.map((r, i) => {
+  const el = document.createElement('div'); el.className = 'row mono'; el.style.top = (ROW0 + i * LH) + 'px';
+  el.innerHTML = `<div class="bg"></div><div class="mark"></div><div class="path"></div><div class="code"></div><div class="tg"></div>`;
+  el.querySelector('.path').textContent = r.file.replace(/^crates\//, '').replace(/\/src\//, '/') + ':' + r.line;
+  el.querySelector('.code').textContent = r.text;
+  el.querySelector('.tg').textContent = r.tag;
+  const c = COLOR[r.verdict];
+  el.querySelector('.bg').style.background = c; el.querySelector('.mark').style.background = c; el.querySelector('.tg').style.color = c;
+  rowsEl.appendChild(el);
+  return { el, bg: el.querySelector('.bg'), mark: el.querySelector('.mark'), path: el.querySelector('.path'), code: el.querySelector('.code'), tg: el.querySelector('.tg'), r, t: T_ADJ + i * STEP, i };
+});
+
+// ---- graph geometry (panel coords) ----
+const N = {
+  pathutil: { x: 92, y: 100, w: 170, h: 62, big: true }, walk: { x: 92, y: 196, w: 170, h: 62, big: true }, gpathutil: { x: 92, y: 290, w: 170, h: 40, big: true },
+  ilib: { x: 262, y: 22, w: 118, h: 26 }, types: { x: 262, y: 92, w: 118, h: 26 }, dir: { x: 262, y: 178, w: 118, h: 26 }, glib: { x: 262, y: 270, w: 118, h: 26 },
+};
+for (const f of DATA.files) N[f.id].label = f.label, N[f.id].note = f.note;
+const SUB = { // sub-nodes inside big nodes
+  pin: { node: 'pathutil', y: 98, label: `★ fn file_name  :113`, line: '', color: COLOR.confirmed },
+  twin: { node: 'pathutil', y: 122, label: 'cfg twin  :138', line: '', color: COLOR.definition, small: true },
+  methods: { node: 'walk', y: 194, label: '.file_name() methods ×' + DATA.owners.methods.list.length, line: '', color: COLOR['other-target'], list: DATA.owners.methods.list.map(s => s.replace('.file_name', '')).join(' · ') },
+  gfn: { node: 'gpathutil', y: 298, label: 'fn file_name  :' + DATA.owners.gfn.line, line: '', color: COLOR.definition },
+};
+const svg = document.getElementById('graph');
+const mk = (tag, attrs, parent = svg) => { const e = document.createElementNS(NS, tag); for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v); parent.appendChild(e); return e; };
+const defs = mk('defs', {});
+const marker = mk('marker', { id: 'arr', viewBox: '0 0 8 8', refX: 7, refY: 4, markerWidth: 6, markerHeight: 6, orient: 'auto' }, defs);
+mk('path', { d: 'M0 0 L8 4 L0 8 Z', fill: '#4a4a4a' }, marker);
+const gGroups = mk('g', {}), gEdges = mk('g', {}), gNodes = mk('g', {}), gTicks = mk('g', {}), gEv = mk('g', {}), gBadges = mk('g', {});
+// crate groups
+const group = (x, y, w, h, label) => { mk('rect', { x, y, width: w, height: h, rx: 8, fill: 'none', stroke: '#2a2a2a', 'stroke-dasharray': '3 4' }, gGroups); const t = mk('text', { x: x + 8, y: y + 11, 'font-size': 9, fill: '#5c5c5c' }, gGroups); t.textContent = label; };
+group(2, 2, 334, 236, 'crate ignore'); group(2, 246, 334, 74, 'crate globset');
+// nodes
+for (const [id, n] of Object.entries(N)) {
+  n.rect = mk('rect', { x: n.x - n.w / 2, y: n.y - n.h / 2, width: n.w, height: n.h, rx: 5, fill: '#1f1f1f', stroke: css('border'), 'stroke-width': 1 }, gNodes);
+  const t = mk('text', { x: n.x - n.w / 2 + 8, y: n.y - n.h / 2 + 13, 'font-size': 9.5, fill: '#e6e6e6' }, gNodes); t.textContent = n.label;
+  if (n.note) { const s = mk('text', { x: n.x + n.w / 2 - 6, y: n.y - n.h / 2 + 13, 'font-size': 8, fill: '#5c5c5c', 'text-anchor': 'end' }, gNodes); s.textContent = n.note; }
+  n.ticks = 0;
+}
+for (const [id, s] of Object.entries(SUB)) {
+  const n = N[s.node]; const x0 = n.x - n.w / 2 + 7, w = n.w - 14;
+  if (!s.small) s.rect = mk('rect', { x: x0, y: s.y - 8, width: w, height: 16, rx: 3, fill: s.color, 'fill-opacity': 0.09, stroke: s.color, 'stroke-opacity': 0.35 }, gNodes);
+  const t = mk('text', { x: x0 + 6, y: s.y + 3.5, 'font-size': s.small ? 8.5 : 9, fill: s.small ? '#8a8a8a' : s.color, class: 'mono' }, gNodes); t.textContent = s.label;
+  if (s.line) { const l = mk('text', { x: x0 + w - 6, y: s.y + 3.5, 'font-size': 8.5, fill: '#8a8a8a', 'text-anchor': 'end', class: 'mono' }, gNodes); l.textContent = s.line; }
+  if (s.list) { const l = mk('text', { x: x0 + 6, y: s.y + 20, 'font-size': 8, fill: '#8a8a8a', class: 'mono' }, gNodes); l.textContent = s.list; }
+  s.text = t;
+}
+// edges: border-to-border quadratic curves
+function border(n, toward) { const dx = toward.x - n.x, dy = toward.y - n.y; const k = Math.max(Math.abs(dx) / (n.w / 2), Math.abs(dy) / (n.h / 2)) || 1; return { x: n.x + dx / k, y: n.y + dy / k }; }
+function edgeGeom(a, b, bow = 14) {
+  const A = border(N[a], N[b]), B = border(N[b], N[a]);
+  const mx = (A.x + B.x) / 2, my = (A.y + B.y) / 2, dx = B.x - A.x, dy = B.y - A.y, L = Math.hypot(dx, dy) || 1;
+  const cx = mx - dy / L * bow, cy = my + dx / L * bow;
+  return { A, B, C: { x: cx, y: cy }, d: `M${A.x} ${A.y} Q${cx} ${cy} ${B.x} ${B.y}` };
+}
+const E = {};
+for (const e of DATA.edges) { const g = edgeGeom(e.from, e.to); E[e.from + '>' + e.to] = g; g.el = mk('path', { d: g.d, fill: 'none', stroke: css('edge'), 'stroke-width': 1, 'marker-end': 'url(#arr)' }, gEdges); }
+const qpt = (A, C, B, u) => ({ x: (1 - u) * (1 - u) * A.x + 2 * (1 - u) * u * C.x + u * u * B.x, y: (1 - u) * (1 - u) * A.y + 2 * (1 - u) * u * C.y + u * u * B.y });
+
+// evidence paths per row
+const PANEL = { left: 384, top: 62 };
+function evidencePath(x) {
+  const ev = x.r.evidence, from = N[ev.from];
+  const p0 = { x: 376 - PANEL.left, y: ROW0 + x.i * LH + 6 - PANEL.top };
+  const entry = { x: from.x - from.w / 2, y: from.y };
+  let d = `M${p0.x} ${p0.y} C${p0.x + 26} ${p0.y} ${entry.x - 30} ${entry.y} ${entry.x} ${entry.y}`;
+  let stop = null;
+  if (ev.kind === 'import' || ev.kind === 'edge' || ev.kind === 'unresolved') {
+    const g = E[ev.from + '>' + (ev.via || ev.to)];
+    if (ev.kind === 'unresolved') { const u = 0.62; const P = qpt(g.A, g.C, g.B, u); const Cm = { x: (1 - u) * g.A.x + u * g.C.x, y: (1 - u) * g.A.y + u * g.C.y }; d += ` L${g.A.x} ${g.A.y} Q${Cm.x} ${Cm.y} ${P.x} ${P.y}`; stop = P; }
+    else d += ` L${g.A.x} ${g.A.y} Q${g.C.x} ${g.C.y} ${g.B.x} ${g.B.y}`;
+  } else if (ev.kind === 'owner' && ev.from !== SUB.methods.node) {
+    const g = E[ev.from + '>' + SUB.methods.node]; d += ` L${g.A.x} ${g.A.y} Q${g.C.x} ${g.C.y} ${g.B.x} ${g.B.y}`;
+  }
+  const target = ev.kind === 'binding' || ev.kind === 'import' ? 'pin' : ev.kind === 'owner' ? 'methods' : ev.kind === 'def' ? (ev.twin ? 'twin' : ev.target) : null;
+  if (target) { const s = SUB[target], n = N[s.node]; const tx = n.x - n.w / 2 + 7, ty = s.y; d += ` L${tx} ${ty}`; }
+  return { d, stop, target };
+}
+const EV = R.map(x => {
+  const { d, stop, target } = evidencePath(x);
+  const col = COLOR[x.r.verdict];
+  const trail = mk('path', { d, fill: 'none', stroke: col, 'stroke-width': 1.5, 'stroke-linecap': 'round', opacity: 0, 'stroke-dasharray': x.r.verdict === 'unverified' ? '3 3' : 'none' }, gEv);
+  const dot = mk('circle', { r: 3, fill: col, opacity: 0 }, gEv);
+  const L = trail.getTotalLength();
+  return { trail, dot, L, stop, target, col, x };
+});
+// badges
+const badge = (x, y, col) => { const g = mk('g', { opacity: 0 }, gBadges); mk('circle', { cx: x, cy: y, r: 8, fill: col }, g); const t = mk('text', { x, y: y + 3.5, 'font-size': 10, 'font-weight': 600, fill: '#181818', 'text-anchor': 'middle', class: 'mono' }, g); return { g, t }; };
+const pinBadge = badge(N.pathutil.x + N.pathutil.w / 2 - 16, SUB.pin.y, COLOR.confirmed);
+const methBadge = badge(N.walk.x + N.walk.w / 2 - 16, SUB.methods.y, COLOR['other-target']);
+const unrStop = EV.find(e => e.x.r.verdict === 'unverified').stop;
+const unrBadge = (() => { const g = mk('g', { opacity: 0 }, gBadges); mk('circle', { cx: unrStop.x, cy: unrStop.y, r: 7, fill: '#181818', stroke: COLOR.unverified, 'stroke-width': 1.5, 'stroke-dasharray': '2 2' }, g); const t = mk('text', { x: unrStop.x, y: unrStop.y + 3.5, 'font-size': 10, fill: COLOR.unverified, 'text-anchor': 'middle', 'font-weight': 600 }, g); t.textContent = '?'; const l = mk('text', { x: unrStop.x - 11, y: unrStop.y + 3.5, 'font-size': 8.5, fill: COLOR.unverified, 'text-anchor': 'end', class: 'mono' }, g); l.textContent = 'name only'; return { g }; })();
+// ticks (non-call rows that only touch a file)
+const tickDots = R.map(x => { const ev = x.r.evidence; if (ev.kind !== 'tick') return null; const n = N[ev.from]; const k = n.ticks++; const c = mk('circle', { cx: n.x + n.w / 2 - 10 - k * 9, cy: n.y - n.h / 2 + 9, r: 2.5, fill: ev.note ? COLOR.definition : COLOR[x.r.verdict], opacity: 0 }, gTicks); return c; });
+// non-call tally
+const tally = mk('text', { x: 6, y: 330, 'font-size': 9.5, fill: '#8a8a8a', class: 'mono' });
+const tallyHead = mk('text', { x: 6, y: 2, 'font-size': 0 }); // placeholder
+
+const stateEl = document.getElementById('state'), cmdT = document.querySelector('#cmd .t'), cur = document.querySelector('#cmd .cur');
+const acc1 = document.getElementById('acc1'), acc2 = document.getElementById('acc2'), seam = document.getElementById('seam');
+const mix = (a, b, p) => { const h = s => [1, 3, 5].map(i => parseInt(s.slice(i, i + 2), 16)); const A = h(a), B = h(b); return `rgb(${A.map((v, i) => Math.round(v + (B[i] - v) * p)).join(',')})`; };
+const escapeHtml = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+
+window.__render = function (t) {
+  const typed = t < T_CMD ? 0 : Math.min(CMD.length, Math.floor((t - T_CMD) / CMD_STEP));
+  cmdT.textContent = CMD.slice(0, typed);
+  cur.style.opacity = (t < T_ADJ && (typed < CMD.length || Math.floor(t * 2.2) % 2 === 0)) ? 1 : 0;
+  const landed = R.filter(x => t >= x.t + FLY).length;
+  let s = '', col = 'var(--muted)', glow = 'none';
+  if (t >= T_OK) { s = 'CONSERVED ✓'; col = 'var(--ok)'; glow = '0 0 12px rgba(116,213,139,.55)'; }
+  else if (t >= T_ACC) s = 'reconciling';
+  else if (t >= T_ADJ) s = `consulting the index ${landed}/${rows.length}`;
+  else if (t >= T_OCCURRENCES) s = `${DATA.symbol} · ${Math.min(rows.length, Math.floor((t - T_OCCURRENCES) / OCCURRENCE_STEP) + 1)} matching lines`;
+  stateEl.textContent = s; stateEl.style.color = col; stateEl.style.textShadow = glow; stateEl.style.fontWeight = t >= T_OK ? '600' : '400';
+
+  const nodeFlash = {}; const subFlash = {}; let pinN = 0, methN = 0, unrN = 0; const nonCall = { definition: 0, import: 0, reference: 0, 'other-text': 0 };
+  R.forEach((x, i) => {
+    const a = easeOut(ramp(t, T_OCCURRENCES + i * OCCURRENCE_STEP, 0.16));
+    x.el.style.opacity = a; x.el.style.transform = `translateX(${(1 - a) * -8}px)`;
+    const p = ramp(t, x.t, 0.18);
+    x.mark.style.opacity = easeOut(ramp(t, x.t, 0.12));
+    x.bg.style.opacity = p > 0 ? 0.14 * (1 - easeInOut(ramp(t, x.t + 0.05, 0.6))) : 0;
+    x.path.style.color = p > 0 ? mix('#a0a0a0', '#ffffff', p) : '';
+    x.code.style.color = p > 0 ? mix('#5c5c5c', '#e6e6e6', p) : '';
+    x.tg.style.opacity = easeOut(ramp(t, x.t + 0.05, 0.25));
+    const ev = EV[i], f = ramp(t, x.t + 0.03, FLY - 0.03);
+    if (f <= 0) { ev.trail.style.opacity = 0; ev.dot.style.opacity = 0; }
+    else {
+      const e = easeInOut(f), len = ev.L * e;
+      ev.trail.setAttribute('stroke-dasharray', x.r.verdict === 'unverified' ? '3 3' : `${ev.L}`);
+      if (x.r.verdict !== 'unverified') ev.trail.setAttribute('stroke-dashoffset', ev.L - len);
+      else ev.trail.style.clipPath = ''; // dashed trail reveals with opacity only
+      const fade = f >= 1 ? 1 - easeOut(ramp(t, x.t + FLY, 0.5)) : 1;
+      ev.trail.style.opacity = (x.r.verdict === 'unverified' && f < 1 ? f : 1) * fade * (x.r.verdict === 'other-text' || x.r.verdict === 'reference' ? 0.6 : 0.9);
+      const P = ev.trail.getPointAtLength(len);
+      ev.dot.setAttribute('cx', P.x); ev.dot.setAttribute('cy', P.y);
+      const pop = f >= 1 ? ramp(t, x.t + FLY, 0.3) : 0;
+      ev.dot.setAttribute('r', f >= 1 ? 3 + 4 * pop : 3);
+      ev.dot.style.opacity = f >= 1 ? 1 - pop : 1;
+      if (f >= 1) {
+        const fl = 1 - easeOut(ramp(t, x.t + FLY, 0.7));
+        nodeFlash[x.r.evidence.from] = Math.max(nodeFlash[x.r.evidence.from] || 0, fl);
+        if (ev.target) subFlash[ev.target] = Math.max(subFlash[ev.target] || 0, fl);
+        if (x.r.evidence.kind === 'import' || x.r.evidence.kind === 'edge') { const g = E[x.r.evidence.from + '>' + (x.r.evidence.via || x.r.evidence.to)]; g.flash = Math.max(g.flash || 0, fl); g.flashCol = ev.col; }
+        if (x.r.verdict === 'confirmed') pinN++; else if (x.r.verdict === 'other-target') methN++; else if (x.r.verdict === 'unverified') unrN++; else nonCall[x.r.verdict]++;
+        if (tickDots[i]) tickDots[i].style.opacity = 1;
+      } else if (tickDots[i]) tickDots[i].style.opacity = 0;
+    }
+  });
+  for (const [id, n] of Object.entries(N)) { const fl = nodeFlash[id] || 0; n.rect.setAttribute('stroke', fl > 0 ? '#ffffff' : css('border')); n.rect.setAttribute('stroke-opacity', fl > 0 ? 0.25 + 0.75 * fl : 1); }
+  for (const [id, s] of Object.entries(SUB)) { const fl = subFlash[id] || 0; if (s.rect) { s.rect.setAttribute('fill-opacity', 0.09 + 0.35 * fl); s.rect.setAttribute('stroke-opacity', 0.35 + 0.65 * fl); } s.text.setAttribute('fill', s.small ? mix('#8a8a8a', '#74d58b', fl) : s.color); }
+  for (const g of Object.values(E)) { const fl = g.flash || 0; g.el.setAttribute('stroke', fl > 0 ? g.flashCol : css('edge')); g.el.setAttribute('stroke-width', 1 + 1.2 * fl); g.el.setAttribute('stroke-opacity', 1); g.flash = 0; }
+  pinBadge.t.textContent = pinN; pinBadge.g.setAttribute('opacity', pinN > 0 ? 1 : 0);
+  methBadge.t.textContent = methN; methBadge.g.setAttribute('opacity', methN > 0 ? 1 : 0);
+  unrBadge.g.setAttribute('opacity', unrN > 0 ? 1 : 0);
+  const nc = nonCall.definition + nonCall.import + nonCall.reference + nonCall['other-text'];
+  tally.textContent = `non-call ${nc}: definition ${nonCall.definition} · import ${nonCall.import} · reference ${nonCall.reference} · text ${nonCall['other-text']}`;
+  tally.setAttribute('opacity', t >= T_ADJ ? 1 : 0);
+
+  const chars = t < T_ACC ? 0 : Math.floor((t - T_ACC) / ACC_STEP);
+  acc1.textContent = ACC1.slice(0, chars);
+  const s2 = ACC2.slice(0, Math.max(0, chars - ACC1.length)); const k = s2.lastIndexOf('0 unaccounted');
+  if (k >= 0 && t >= T_OK) acc2.innerHTML = escapeHtml(s2.slice(0, k)) + `<span style="color:var(--ok);font-weight:600">${escapeHtml(s2.slice(k))}</span>`; else acc2.textContent = s2;
+  seam.style.opacity = Math.max(1 - ramp(t, 0, 0.12), ramp(t, T_END - 0.15, 0.15));
+};
+
+if (!window.__headless) {
+  if (matchMedia('(prefers-reduced-motion: reduce)').matches) window.__render(window.__stillTime);
+  else { let paused = false, base = performance.now(), frozen = 0;
+    document.getElementById('stage').addEventListener('click', () => { if (paused) base = performance.now() - frozen * 1000; else frozen = ((performance.now() - base) / 1000) % T_END; paused = !paused; });
+    (function loop() { if (!paused) window.__render(((performance.now() - base) / 1000) % T_END); requestAnimationFrame(loop); })(); }
+}
+})();
+</script>

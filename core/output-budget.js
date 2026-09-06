@@ -33,18 +33,21 @@ function preservedContractMetadata(fullText, visibleText, options = {}) {
         // one physical line. Preserve the actionable test-scope contract as
         // its own sentence so a later parse-failure note cannot make the
         // whole metadata item too large for a small transport budget.
-        const firstSentenceEnd = /^\s*\d+ test-file usage\(s\) hidden\b/.test(rawLine)
+        const firstSentenceEnd = /^\s*(?:# )?\d+ test-file usage\(s\) hidden\b/.test(rawLine)
             ? rawLine.indexOf('. ')
             : -1;
         const contractLine = firstSentenceEnd >= 0
             ? rawLine.slice(0, firstSentenceEnd + 1)
             : rawLine;
-        if (!CONTRACT_LINE_RE.test(contractLine)) continue;
+        // Shell-shaped MCP/interactive results prefix disclosures with '# '.
+        // Match their contents but retain the prefix in the preserved text.
+        const evidenceLine = contractLine.replace(/^\s*# /, '').trim();
+        if (!CONTRACT_LINE_RE.test(evidenceLine)) continue;
         const line = contractLine.trim();
         if (!line || visible.has(line)) continue;
-        const priority = /^(?:ACCOUNT|CONTRACT|WARNING|FILTERED|CALLEE ACCOUNT|TREE ACCOUNT):/.test(line)
+        const priority = /^(?:ACCOUNT|CONTRACT|WARNING|FILTERED|CALLEE ACCOUNT|TREE ACCOUNT):/.test(evidenceLine)
             ? 0
-            : /^\d+ test-file usage\(s\) hidden\b/.test(line) ? 1 : 2;
+            : /^\d+ test-file usage\(s\) hidden\b/.test(evidenceLine) ? 1 : 2;
         candidates.push({ line, priority, sourceIndex });
     }
 

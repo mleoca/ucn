@@ -894,6 +894,23 @@ describe('fix #284: truncated MCP responses keep the payload in the text block',
 });
 
 describe('fix #341: lines and raw over MCP', () => {
+    it('preserves shell-prefixed accounting under the MCP transport budget', async () => {
+        const dir = tmp({
+            'lib.js': 'function helper() {}\n' + 'helper();\n'.repeat(150),
+        });
+        const client = new McpClient();
+        try {
+            await client.start();
+            await client.initialize();
+            const result = await client.callTool({ command: 'show', project_dir: dir,
+                name: 'helper', lines: true, max_chars: 2200 });
+            assert.equal(result.isError, false, result.text);
+            assert.ok(result.text.length <= 2200);
+            assert.match(result.text, /OUTPUT TRUNCATED/);
+            assert.match(result.text, /^# ACCOUNT:/m);
+            assert.match(result.text, /^# CONTRACT:/m);
+        } finally { client.stop(); rm(dir); }
+    });
     it('lines=true returns grep-shaped records with "# " accounting; raw=true returns code only', async () => {
         const dir = tmp({
             'package.json': '{"name":"fx341mcp"}',

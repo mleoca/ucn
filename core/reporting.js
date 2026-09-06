@@ -200,6 +200,25 @@ function getStats(index, options = {}) {
                 untypedByName.set(name, (untypedByName.get(name) || 0) + 1);
             }
         };
+        // Fix #343: symbols and call sites inside inline test modules
+        // (`#[cfg(test)] mod tests` / `#[test]` fns, fix #244's ranges) are
+        // test code even though their FILE is production — ripgrep's
+        // `TempDir.path` (197 calls, all from tests) ranked second among
+        // "production functions". Under productionCallsOnly they leave the
+        // candidate set, the exact count, AND the upper bound (a bound that
+        // still counted them stopped the early exit from firing, so the
+        // orientation fell back to its approximate refinement budget).
+        const { inlineTestRanges, lineInRanges } = require('./shared');
+        const inlineTestRangesByFile = new Map();
+        const inInlineTest = (file, line) => {
+            if (!file || !line) return false;
+            let ranges = inlineTestRangesByFile.get(file);
+            if (!ranges) {
+                ranges = inlineTestRanges(index.files.get(file) || {});
+                inlineTestRangesByFile.set(file, ranges);
+            }
+            return ranges.length > 0 && lineInRanges(line, ranges);
+        };
         for (const [filePath, entry] of index.callsCache) {
             if (!scopedPaths.has(filePath)) continue;
             const fileEntry = index.files.get(filePath);
@@ -209,13 +228,20 @@ function getStats(index, options = {}) {
             for (const c of entry.calls) {
                 if (!c || !c.name) continue;
                 if (receiverProvablyExternal(filePath, fileEntry, c)) continue;
-                const key = `${c.name}::${c.line || 0}`;
+                if (options.productionCallsOnly && inInlineTest(filePath, c.line)) continue;
+                // Distinct receiver types on one line can confirm DIFFERENT
+                // definitions. Dedup within a type bucket, never across them.
+                // Mixed typed/untyped buckets may overcount, which is safe for
+                // an upper bound; dropping a bucket can erase a true HOT item.
+                const bucket = c.isMethod && c.receiverType && !c.receiverTypeGuessed
+                    ? normalizeTypeName(c.receiverType) : '';
+                const key = `${c.name}::${c.line || 0}::${bucket}`;
                 if (!seenInFile.has(key)) {
                     seenInFile.add(key);
                     chargeRecord(c.name, c);
                 }
                 if (c.resolvedName && c.resolvedName !== c.name) {
-                    const rkey = `${c.resolvedName}::${c.line || 0}`;
+                    const rkey = `${c.resolvedName}::${c.line || 0}::${bucket}`;
                     if (!seenInFile.has(rkey)) {
                         seenInFile.add(rkey);
                         chargeRecord(c.resolvedName, c);
@@ -253,7 +279,9 @@ function getStats(index, options = {}) {
                 // (`maxRefine`) benefits from the order.
                 const share = upper / Math.max(1, callable.length);
                 if (index.files.get(symbol.file)?.isBundled) continue;
-                if (options.productionCallsOnly && require('./shared').isTestPath(symbol.relativePath)) continue;
+                if (options.productionCallsOnly &&
+                    (require('./shared').isTestPath(symbol.relativePath) ||
+                        inInlineTest(symbol.file, symbol.startLine))) continue;
                 const identity = `${symbol.file}:${symbol.startLine}:${name}:` +
                     `${symbol.className || symbol.receiver || ''}:${symbol.params || ''}`;
                 if (seenDefinitions.has(identity)) continue;
@@ -314,7 +342,8 @@ function getStats(index, options = {}) {
                     (!scopedCallerQuery || scopedPaths.has(caller.file)) &&
                     !index.files.get(caller.file)?.isBundled &&
                     (!options.productionCallsOnly ||
-                        !require('./shared').isTestPath(caller.relativePath || caller.file))).length;
+                        (!require('./shared').isTestPath(caller.relativePath || caller.file) &&
+                            !inInlineTest(caller.file, caller.line)))).length;
                 if (count > 0) {
                     const owner = symbol.className ||
                         (symbol.receiver || '').replace(/^\*/, '');

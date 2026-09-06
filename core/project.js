@@ -1251,7 +1251,7 @@ class ProjectIndex {
         const typeOrder = new Set([
             'class', 'struct', 'interface', 'type', 'impl', 'enum', 'record',
         ]);
-        const { isTestPath } = require('./shared');
+        const { isTestPath, CALLABLE_SYMBOL_KINDS } = require('./shared');
         const scored = definitions.map(d => {
             let score = 0;
             const rp = d.relativePath || '';
@@ -1282,10 +1282,21 @@ class ProjectIndex {
             // Deprioritize type-only overload signatures (TypeScript function_signature)
             if (d.isSignature) score -= 200;
             // Prefer larger function bodies (implementation over overload signature)
-            // Only for functions/methods — not for class-level types (struct vs impl)
+            // Only for functions — not for class-level types (struct vs impl).
+            // Same-named METHODS keep tying here on purpose: widening this to
+            // every callable kind reshuffled method-vs-method picks project-wide
+            // (httpx `send`), which is not the fix #343 defect.
             if (d.startLine && d.endLine && d.type === 'function') {
                 score += Math.min(d.endLine - d.startLine, 100);
             }
+            // Fix #343: a bare name denotes the CALLABLE when a field shares it.
+            // A Rust/Go/Java method used to tie with a same-named field (the
+            // builder idiom: `heap_limit` field + `heap_limit(&mut self)` setter)
+            // and lose on file order, so `impact heap_limit` answered 0 call
+            // sites against the field while the setter had 10 confirmed callers.
+            // Callable kinds tie among themselves as before; only the
+            // callable-vs-field tie is decided (a zero-line Java getter too).
+            if (CALLABLE_SYMBOL_KINDS.has(d.type)) score += 25;
             // Prefer shallower paths (fewer directory levels = more central to project)
             // Max bonus 50 for root-level files, decreasing with depth
             const depth = (rp.match(/\//g) || []).length;

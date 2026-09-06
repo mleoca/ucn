@@ -6696,6 +6696,37 @@ describe('fix #305: untyped Python loop elements do not borrow a method owner', 
 });
 
 describe('fix #338: TYPE_CHECKING-guarded imports are deferred edges', () => {
+    it('does not treat a project-local typing module as the standard library', () => {
+        const dir = tmp({
+            'typing.py': 'TYPE_CHECKING = True',
+            'a.py': 'from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    import b',
+            'b.py': 'import a',
+        });
+        try {
+            const index = idx(dir);
+            assert.equal(index.imports('a.py').find(imp => imp.module === 'b').deferred, false);
+            assert.equal(index.circularDeps().cycles[0].classification, 'eager');
+        } finally { rm(dir); }
+    });
+    it('requires typing binding identity, supports aliases, and rejects rebound lookalikes', () => {
+        const dir = tmp({
+            'a.py': 'TYPE_CHECKING = True\nif TYPE_CHECKING:\n    import target',
+            'b.py': 'import flags\nif flags.TYPE_CHECKING:\n    import target',
+            'c.py': 'from typing import TYPE_CHECKING as TC\nif (TC):\n    import target',
+            'd.py': 'from typing import TYPE_CHECKING\nTYPE_CHECKING = True\nif TYPE_CHECKING:\n    import target',
+            'e.py': 'import typing as t\nt.TYPE_CHECKING = True\nif t.TYPE_CHECKING:\n    import target',
+            'f.py': 'from typing import TYPE_CHECKING\nfrom flags import *\nif TYPE_CHECKING:\n    import target',
+            'g.py': 'from typing import TYPE_CHECKING\n(TYPE_CHECKING := True)\nif TYPE_CHECKING:\n    import target',
+            'target.py': 'value = 1',
+        });
+        try {
+            const index = idx(dir);
+            for (const file of ['a.py', 'b.py', 'd.py', 'e.py', 'f.py', 'g.py']) {
+                assert.equal(index.imports(file).find(imp => imp.module === 'target').deferred, false, file);
+            }
+            assert.equal(index.imports('c.py').find(imp => imp.module === 'target').deferredReason, 'type-checking');
+        } finally { rm(dir); }
+    });
     it('classifies if TYPE_CHECKING consequence imports as deferred; else/not branches stay eager', () => {
         const dir = tmp({
             'a.py': 'import typing as t\nif t.TYPE_CHECKING:\n    from b import B\n\nclass A:\n    pass\n',

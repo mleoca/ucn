@@ -11,6 +11,8 @@ plugins/
 .github/
 demo/
 docs/
+assets/readme/
+/README*proposal*.md
 eval/
 test/
 server.json

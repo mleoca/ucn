@@ -15,17 +15,25 @@
 'use strict';
 
 const { CALLABLE_SYMBOL_KINDS } = require('../shared');
+const { formatSurfaceMessage } = require('../registry');
 const { formatAccountLines, formatCalleeAccountLine } = require('./analysis');
 
 const LINES_COMMANDS = new Set(['find', 'usages', 'search', 'show', 'impact']);
 
-function record(pathLike, line, text, tag) {
+function record(pathLike, line, text, tag = '') {
     // One record per line is the contract: a multi-line signature or a
     // wrapped call expression folds onto one line, and the source line's
     // indentation is dropped (a locate result needs the text, `--raw` has
     // the layout).
     const body = String(text == null ? '' : text).replace(/\s*\n\s*/g, ' ').trim();
-    return `${pathLike}:${line == null ? 0 : line}:${body}${tag ? `\t# ${tag}` : ''}`;
+    // Keep unusual filenames from becoming notes or extra physical records.
+    let file = String(pathLike).replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t');
+    if (file.startsWith('# ')) file = './' + file;
+    return `${file}:${line == null ? 0 : line}:${body}${tag ? `\t# ${tag}` : ''}`;
+}
+
+function commentLines(text) {
+    return String(text || '').split(/\r?\n/).filter(Boolean).map(line => `# ${line}`);
 }
 
 function signatureOf(symbol) {
@@ -107,6 +115,9 @@ function searchRecords(result) {
     if (meta && meta.filesSkipped > 0) {
         notes.push(`# ${meta.filesSkipped} test file(s) hidden by default (--include-tests)`);
     }
+    if (meta && meta.truncatedMatches > 0) {
+        notes.push(`# ${meta.truncatedMatches} more match(es) omitted by --top/--limit`);
+    }
     return { records: out, notes };
 }
 
@@ -129,7 +140,8 @@ function showRecords(result, params = {}) {
     // Only an EXPLICIT --sections selects the band: the resolved defaults
     // (summary, callers, callees) would mix callee records into a caller
     // listing and skew `cut -d: -f1 | sort | uniq -c`.
-    const explicit = String(params.sections || '').split(',').map(s => s.trim()).filter(Boolean);
+    const explicit = (Array.isArray(params.sections) ? params.sections : String(params.sections || '').split(','))
+        .map(s => String(s).trim().toLowerCase()).filter(Boolean);
     const selected = new Set(explicit.length > 0 ? explicit : ['callers']);
     if (context) {
         if (selected.has('callers')) out.push(...callerRecords(context));
@@ -140,7 +152,7 @@ function showRecords(result, params = {}) {
             }
             for (const callee of context.unverifiedCallees || []) {
                 for (const site of callee.sites || []) {
-                    out.push(record(pathOf(context), site, callee.name, `callee ${unverifiedTag(callee)}`));
+                    out.push(record(pathOf(context), site, callee.name, `${unverifiedTag(callee)}; callee`));
                 }
             }
         }
@@ -159,6 +171,21 @@ function impactRecords(result) {
     const out = [];
     const notes = [];
     if (!result) return { records: out, notes };
+    if (Array.isArray(result.functions)) {
+        for (const fn of result.functions) {
+            out.push(...callerRecords(fn));
+            notes.push(...accountComments(fn.account));
+        }
+        for (const fn of result.deletedFunctions || []) {
+            for (const site of fn.remainingCallSites || []) {
+                out.push(record(pathOf(site), site.line, site.content, 'unverified: deleted-target-name-match'));
+            }
+        }
+        const summary = result.summary || {};
+        notes.push(`# Diff: ${summary.modifiedFunctions || 0} modified, ${summary.newFunctions || 0} new, ${summary.deletedFunctions || 0} deleted functions; ${(result.moduleLevelChanges || []).length} file(s) with module-level changes.`);
+        if (result.nonSourcePaths) notes.push(`# ${result.nonSourcePaths} changed path(s) outside supported source files not analyzed.`);
+        return { records: [...new Set(out)], notes };
+    }
     for (const group of result.byFile || []) {
         for (const site of group.sites || []) {
             const tag = site.tier && site.tier !== 'confirmed' ? unverifiedTag(site) : '';
@@ -169,14 +196,23 @@ function impactRecords(result) {
         out.push(record(pathOf(site), site.line, site.content || site.expression, unverifiedTag(site)));
     }
     if (result.propertyAccesses) {
-        for (const access of result.propertyAccesses.confirmed || []) {
-            out.push(record(pathOf(access), access.line, access.content, 'property-access'));
+        const accesses = result.propertyAccesses;
+        for (const group of accesses.byFile || []) {
+            for (const access of group.sites || []) {
+                out.push(record(group.file, access.line, access.expression, 'property-access'));
+            }
         }
-        for (const access of result.propertyAccesses.unverified || []) {
-            out.push(record(pathOf(access), access.line, access.content, `property-access ${unverifiedTag(access)}`));
+        for (const access of accesses.unverifiedSites || []) {
+            out.push(record(pathOf(access), access.line, access.expression, `${unverifiedTag(access)}; property-access`));
         }
+        notes.push(`# PROPERTY ACCESS SITES: ${accesses.confirmedCount} confirmed, ${accesses.unverifiedCount} unverified, ${accesses.excluded?.total || 0} other-target (separate from caller ACCOUNT).`);
     }
     notes.push(...accountComments(result.account));
+    for (const warning of result.warnings || []) notes.push(...commentLines(warning.message));
+    if (result.scopeWarning?.hint) notes.push(...commentLines(result.scopeWarning.hint));
+    if (result.shownCallSites < result.totalCallSites) {
+        notes.push(`# ${result.totalCallSites - result.shownCallSites} more call site(s) omitted by --top/--limit`);
+    }
     return { records: out, notes };
 }
 
@@ -195,8 +231,9 @@ function formatPublicLines(command, result, params = {}, execution = {}) {
         default: return null;
     }
     const lines = [...shaped.records, ...shaped.notes];
-    if (execution.note) lines.push(`# ${execution.note}`);
-    return lines.join('\n');
+    if (execution.note) lines.push(...commentLines(execution.note));
+    return lines.map(line => line.startsWith('# ')
+        ? commentLines(formatSurfaceMessage(line.slice(2), execution.surface)).join('\n') : line).join('\n');
 }
 
 /**
@@ -214,9 +251,9 @@ function formatPublicRaw(result, execution = {}) {
     // itself (see emitCliText); the single-block surfaces get it appended as
     // one trailing `# ` line after the code.
     if (execution.note && execution.surface !== 'cli') {
-        return `${code.replace(/\n$/, '')}\n# ${execution.note}`;
+        return `${code.replace(/\n$/, '')}\n${commentLines(execution.note).join('\n')}`;
     }
     return code;
 }
 
-module.exports = { LINES_COMMANDS, formatPublicLines, formatPublicRaw };
+module.exports = { LINES_COMMANDS, formatPublicLines, formatPublicRaw, commentLines };
