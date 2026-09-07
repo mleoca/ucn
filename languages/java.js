@@ -1502,14 +1502,34 @@ function findCallsInCode(code, parser) {
                     const valueNode = receiverNode.childForFieldName('value');
                     if (valueNode?.type === 'identifier') castReceiverName = valueNode.text;
                 }
-                const receiver = castReceiverName ||
+                let receiver = castReceiverName ||
                     ((receiverNode?.type === 'identifier' || receiverNode?.type === 'this')
                         ? receiverNode.text : undefined);
+                // fix #353: `beta.Helper.widget()` — a lowercase dotted root
+                // under a capitalized member is a PACKAGE-qualified type
+                // (Java packages are lowercase by convention, types
+                // capitalized); the receiver is the type and the package is
+                // its qualifier, so same-name static methods in two packages
+                // resolve by the qualifier that is right there in the call.
+                let packageQualifier;
+                if (!receiver && receiverNode?.type === 'field_access') {
+                    const rootNode = receiverNode.childForFieldName('object');
+                    const fldNode = receiverNode.childForFieldName('field');
+                    const rootText = rootNode?.text || '';
+                    const rootHead = rootText.split('.')[0];
+                    if (fldNode?.type === 'identifier' && /^[A-Z]/.test(fldNode.text) &&
+                        /^[a-z_][\w]*(\.[a-z_][\w]*)*$/.test(rootText) &&
+                        !getReceiverType(rootHead) && !isDeclaredLocal(rootHead) &&
+                        !hasEnclosingField(node, rootHead)) {
+                        receiver = fldNode.text;
+                        packageQualifier = rootText;
+                    }
+                }
                 const receiverType = castReceiverType ||
                     ((receiver && receiver !== 'this') ? getReceiverType(receiver) : undefined);
-                const receiverTypeQualifier = !castReceiverType && receiver
-                    ? getReceiverTypeQualifier(receiver) : undefined;
-                const receiverIsTypeQualified = !!(receiverNode?.type === 'identifier' &&
+                const receiverTypeQualifier = packageQualifier ||
+                    (!castReceiverType && receiver ? getReceiverTypeQualifier(receiver) : undefined);
+                const receiverIsTypeQualified = !!((receiverNode?.type === 'identifier' || packageQualifier) &&
                     receiver && /^[A-Z]/.test(receiver) && !receiverType &&
                     !isDeclaredLocal(receiver) && !hasEnclosingField(node, receiver));
                 // fix #202: one-hop declared-field receivers —

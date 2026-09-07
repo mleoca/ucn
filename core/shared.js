@@ -126,7 +126,7 @@ function addTestExclusions(exclude) {
  */
 function literalNameRegex(name, flags = '') {
     return new RegExp(
-        `(?<![\\p{L}\\p{N}_$])${escapeRegExp(name)}(?![\\p{L}\\p{N}_$])`,
+        `(?<![\\p{L}\\p{N}_])${escapeRegExp(name)}(?![\\p{L}\\p{N}_])`,
         flags.includes('u') ? flags : flags + 'u');
 }
 

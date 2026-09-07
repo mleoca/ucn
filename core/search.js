@@ -84,7 +84,7 @@ function appendTextComplements(index, {
         // the AST scan classified and then deliberately dropped (Rust enum
         // variants against a struct pin, #234) is code, not text: skip it.
         if (!commentOrString &&
-            index.isIdentifierAtPosition(content, lineNum, match.index, filePath)) continue;
+            index.isIdentifierAtPosition(content, lineNum, match.index, filePath, name)) continue;
         const usage = {
             file: filePath,
             relativePath: fileEntry.relativePath,

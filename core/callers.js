@@ -10,7 +10,8 @@ const path = require('path');
 const crypto = require('crypto');
 const { detectLanguage, getParser, getLanguageAdapter, langTraits } = require('../languages');
 const { isTestFile } = require('./discovery');
-const { NON_CALLABLE_TYPES, isOverrideMarked, codeUnitCompare, isTestPath } = require('./shared');
+const { NON_CALLABLE_TYPES, isOverrideMarked, codeUnitCompare, isTestPath, CALLABLE_SYMBOL_KINDS } = require('./shared');
+const { _resolveJavaPackageImport } = require('./graph-build');
 const { scoreEdge, tierForResolution, TIER } = require('./confidence');
 const { findGoModule, resolveRustImport } = require('./imports');
 
@@ -634,6 +635,17 @@ function findCallers(index, name, options = {}) {
                 langTraits(fileEntry.language)?.typeSystem === 'structural';
 
             for (let call of calls) {
+                // fix #353: C# `Beta.Helper.Widget()` — the parser records a
+                // field hop rooted at `this` (Beta is no local). When the
+                // prefix names a project NAMESPACE that declares the last
+                // segment as a type, the receiver is that type, namespace-
+                // qualified; the hop shape would only ever fail the field
+                // walk and route method-ambiguous.
+                if (fileEntry.language === 'csharp') {
+                    const rewritten = _csharpNamespaceQualifiedReceiver(index, call,
+                        index.findEnclosingFunction(filePath, call.line, true));
+                    if (rewritten) call = rewritten;
+                }
                 // Skip if not matching our target name (also check alias resolution)
                 let calledAs = null; // surface name when matched via an import/export rename
                 const typeQualifierReference = targetIsTypeQuery &&
@@ -2808,6 +2820,16 @@ function findCallers(index, name, options = {}) {
                         const paired = nameBindings.filter(b => b.alias === call.name);
                         if (paired.length > 0) nameBindings = paired;
                     }
+                    // Scope-granular import bindings (fix #352): a
+                    // function-local `from x import name` binds the name for
+                    // ITS function only. Three such imports in one file used
+                    // to make three file-level bindings, so a bare call in any
+                    // of the functions scope-matched every pin (investment
+                    // run_validation: 6 defs, each claiming the others'
+                    // sites). The nearest enclosing binder owns the name; a
+                    // binding inside a function that does not enclose the
+                    // call is out of scope (#215 discipline, line-granular).
+                    nameBindings = _scopeImportBindings(fileEntry, nameBindings, call.line);
                     const tFiles = new Set(targetDefs.map(d => d.file).filter(Boolean));
                     // fix #215 (rich-measured: 225 builtin `print(...)` calls
                     // confirmed against rich's def via file-level import edges):
@@ -4075,12 +4097,17 @@ function findCallers(index, name, options = {}) {
                     if (call.isPathCall && receiverName) {
                         receiverName = String(receiverName).split('::').pop();
                     }
+                    let aliasResolvedFile = null;
                     if (receiverName && !tTypes.has(receiverName)) {
                         for (const im of (fileEntry.importBindings || [])) {
                             if (im.name !== receiverName) continue;
-                            const orig = String(im.module || '').split('::').pop();
+                            // fix #353: C# `using BH = Beta.Helper` (and Java
+                            // dotted paths) split on `.`; Rust paths on `::`.
+                            const orig = String(im.module || '').split(/::|\./).pop();
                             if (orig && orig !== receiverName && tTypes.has(orig)) {
                                 receiverName = orig;
+                                const rel = fileEntry.moduleResolved && fileEntry.moduleResolved[im.module];
+                                if (rel) aliasResolvedFile = path.join(index.root, rel);
                                 break;
                             }
                         }
@@ -4108,7 +4135,14 @@ function findCallers(index, name, options = {}) {
                     // name fallback above handles multi-definition names; this
                     // covers single-definition targets that skip it.
                     if (typeQualifiedReceiver) {
-                        const identity = _resolveReceiverTypeIdentity(index, filePath, receiverName, targetDefs2, call.line);
+                        // fix #353: an alias binding that RESOLVED to a file is
+                        // the type's identity (`using BH = Beta.Helper`); a
+                        // parser-recorded qualifier (`beta.Helper`, `Beta.Helper`)
+                        // is a namespace/package hint for the resolver.
+                        const identity = aliasResolvedFile
+                            ? (targetDefs2.some(d => d.file === aliasResolvedFile) ? 'target' : 'other')
+                            : _resolveReceiverTypeIdentity(index, filePath, receiverName, targetDefs2, call.line,
+                                call.receiverIsTypeQualified ? call.receiverTypeQualifier : undefined);
                         if (identity === 'other') {
                             recordExcluded(filePath, call.line, 'path-type-mismatch');
                             continue;
@@ -5344,6 +5378,12 @@ function findCallees(index, definition, options = {}) {
         for (let call of calls) {
             siteOrdinal++;
             const siteId = siteOrdinal;
+            if (language === 'csharp') {
+                // fix #353: `Beta.Helper.Widget()` — namespace-qualified type
+                // receiver (see the findCallers twin).
+                const rewritten = _csharpNamespaceQualifiedReceiver(index, call, def);
+                if (rewritten) call = rewritten;
+            }
             if (language === 'go' && call.isMethod &&
                 !call.receiverType && call.receiverIndexField) {
                 const indexedType = _goIndexedReceiverType(index, def.file, call);
@@ -9854,6 +9894,42 @@ function _projectTopLevelNames(index) {
 }
 
 /**
+ * Fix #352: restrict import bindings of a name to those in scope at a call
+ * line. A binding whose import line sits inside a function body is local to
+ * that function (Python function-body imports, JS function-scoped require);
+ * the innermost enclosing binder wins, bindings in non-enclosing functions
+ * are dropped, module-level bindings survive only when no enclosing function
+ * binds the name. Bindings without a line (older records) are kept as-is.
+ */
+function _scopeImportBindings(fileEntry, bindings, callLine) {
+    if (!bindings || bindings.length < 2 || callLine == null) return bindings;
+    if (!bindings.some(b => b.line != null && b.deferred)) return bindings;
+    const scopes = (fileEntry.symbols || []).filter(s =>
+        s.startLine != null && s.endLine != null && s.endLine > s.startLine &&
+        CALLABLE_SYMBOL_KINDS.has(s.type));
+    const innermost = line => {
+        let best = null;
+        for (const s of scopes) {
+            if (line < s.startLine || line > s.endLine) continue;
+            if (!best || (s.endLine - s.startLine) < (best.endLine - best.startLine)) best = s;
+        }
+        return best;
+    };
+    const local = [];
+    const moduleLevel = [];
+    for (const b of bindings) {
+        if (b.line == null) { moduleLevel.push(b); continue; }
+        const scope = innermost(b.line);
+        if (!scope) { moduleLevel.push(b); continue; }
+        if (callLine < scope.startLine || callLine > scope.endLine) continue;
+        local.push({ b, size: scope.endLine - scope.startLine });
+    }
+    if (local.length === 0) return moduleLevel;
+    const nearest = Math.min(...local.map(l => l.size));
+    return local.filter(l => l.size === nearest).map(l => l.b);
+}
+
+/**
  * Is an UNRESOLVED module specifier a resolver gap rather than externality
  * evidence? (fix #337b) Relative specifiers and first segments naming a
  * project top-level path were already gaps (#209); a NON-LITERAL specifier —
@@ -9981,6 +10057,32 @@ function _isGenericParamReceiverType(index, filePath, line, typeName) {
 }
 
 /**
+ * fix #353: C# namespace-qualified type receivers. `Beta.Helper.Widget()` is
+ * recorded by the parser as a this-rooted field hop (Beta is not a local);
+ * when the dotted prefix names a project namespace (exactly, or relative to
+ * the call's own namespace) that declares the last segment as a type, the
+ * call is a type-qualified static call on that type. Returns a rewritten
+ * record or null (unknown prefixes keep the parser's shape).
+ */
+function _csharpNamespaceQualifiedReceiver(index, call, enclosing) {
+    if (!call.isMethod || call.receiverType || !Array.isArray(call.receiverFields) ||
+        call.receiverFields.length < 2 || call.receiverRoot !== 'this') return null;
+    const typeName = call.receiverFields[call.receiverFields.length - 1];
+    if (!/^[A-Z]/.test(typeName)) return null;
+    const prefix = call.receiverFields.slice(0, -1).join('.');
+    const typeDefs = (index.symbols.get(typeName) || []).filter(d =>
+        IDENTITY_TYPE_KINDS.has(d.type) && d.namespace);
+    if (typeDefs.length === 0) return null;
+    const enclosingNs = enclosing?.namespace || null;
+    const candidates = enclosingNs ? [prefix, `${enclosingNs}.${prefix}`] : [prefix];
+    const ns = candidates.find(c => typeDefs.some(d => d.namespace === c));
+    if (!ns) return null;
+    const { receiverRoot, receiverField, receiverFields, receiverRootType, receiverRootNamespace, ...rest } = call;
+    void receiverRoot; void receiverField; void receiverFields; void receiverRootType; void receiverRootNamespace;
+    return { ...rest, receiver: typeName, receiverIsTypeQualified: true, receiverTypeQualifier: ns };
+}
+
+/**
  * Java same-package check across Maven/Gradle source roots (fix #246):
  * src/main/java/<pkg> and src/test/java/<pkg> hold the SAME package —
  * javac compiles both source sets onto one classpath, so a test file sees
@@ -10018,6 +10120,16 @@ function _resolveReceiverTypeIdentity(index, filePath, knownType, targetDefs, li
         // The qualifier is syntactically a nested owner but the project index
         // cannot resolve it. That is not exclusion evidence.
         return 'unknown';
+    }
+    if (language === 'java' && namespaceHint && /^[a-z_]/.test(namespaceHint)) {
+        // fix #353: a lowercase dotted qualifier is a PACKAGE
+        // (`beta.Helper.widget()`); the package + type name resolve to one
+        // file exactly like an import of `beta.Helper` would. Unresolvable
+        // packages (external, resolver gap) are never exclusion evidence.
+        const resolved = _resolveJavaPackageImport(index, `${namespaceHint}.${knownType}`, null);
+        if (!resolved) return 'unknown';
+        return targetDefs.some(d => d.className === knownType && d.file === resolved)
+            ? 'target' : 'other';
     }
     if (language === 'java' && line == null) {
         // Return-flow annotations are interpreted in the PRODUCER definition's
@@ -10965,6 +11077,23 @@ function _calleeStructuralBindingRoute(index, fileEntry, call, language, binding
     let sawProjectish = false;
     let sawUnknown = false;
     for (const binding of bindings) {
+        // fix #353 (Rust): `use alpha::widget as renamed; renamed()` — the
+        // binding's module is the ITEM path; the item is its last segment
+        // and the owning module file resolves through the Rust resolver.
+        if (language === 'rust') {
+            const segs = String(binding.module || '').split('::').filter(Boolean);
+            const item = segs[segs.length - 1];
+            const owners = _rustBindingResolvedFiles(index, fileEntry, fileEntry.path, binding);
+            if (item && owners.size > 0) {
+                sawProjectish = true;
+                for (const moduleFile of owners) {
+                    const routed = _calleeExportDefinitions(index, moduleFile, item, language, call, {});
+                    for (const d of routed.matches) matches.set(`${d.file}:${d.startLine}`, d);
+                    if (routed.unknown) sawUnknown = true;
+                }
+                continue;
+            }
+        }
         const rel = fileEntry.moduleResolved && fileEntry.moduleResolved[binding.module];
         if (!rel) {
             if (_unresolvedModuleIsGap(index, binding.module, binding)) {
@@ -11723,6 +11852,42 @@ function _nonCallableFieldMember(index, typeName, name, language) {
  * an unbound capitalized receiver may be a parameter or local.
  */
 /**
+ * fix #353: resolve the files that OWN a type-qualified static receiver from
+ * the qualifier in the call (Java package / C# namespace), the file's alias
+ * or name import binding of the receiver, or the caller's own namespace.
+ * Returns a Set of absolute files, or null when nothing pins the owner.
+ */
+function _qualifiedStaticOwnerFiles(index, fileEntry, call, typeName, language, def) {
+    const files = new Set();
+    const typeDefs = (index.symbols.get(typeName) || []).filter(d =>
+        IDENTITY_TYPE_KINDS.has(d.type) && d.file);
+    const qual = call.receiverIsTypeQualified ? call.receiverTypeQualifier : null;
+    if (qual) {
+        if (language === 'java' && /^[a-z_]/.test(qual)) {
+            const resolved = _resolveJavaPackageImport(index, `${qual}.${typeName}`, null);
+            if (resolved) files.add(resolved);
+            return files.size > 0 ? files : null;
+        }
+        if (language === 'csharp') {
+            const enclosingNs = def?.namespace || null;
+            const candidates = enclosingNs ? [qual, `${enclosingNs}.${qual}`] : [qual];
+            for (const d of typeDefs) {
+                if (candidates.includes(d.namespace)) files.add(d.file);
+            }
+            return files.size > 0 ? files : null;
+        }
+    }
+    for (const b of (fileEntry?.importBindings || [])) {
+        const bindsReceiver = b.name === call.receiver || b.alias === call.receiver ||
+            (b.name === typeName && !b.alias);
+        if (!bindsReceiver) continue;
+        const rel = fileEntry.moduleResolved && fileEntry.moduleResolved[b.module];
+        if (rel) files.add(path.join(index.root, rel));
+    }
+    return files.size > 0 ? files : null;
+}
+
+/**
  * Namespace/module-container resolution (fix #254, W8 BUG-4 — verify's
  * BUG-BX rule brought into the engine, range-based): `Utils.slug()` where a
  * `namespace Utils` block CONTAINS a definition of `slug` is a qualified
@@ -11835,7 +12000,8 @@ function _calleeTypeQualifiedReceiver(index, def, fileEntry, call, language) {
     if (typeDefs.length === 0) {
         for (const im of (fileEntry?.importBindings || [])) {
             if (im.name !== receiver) continue;
-            const orig = String(im.module || '').split('::').pop();
+            // fix #353: C# `using BH = Beta.Helper` splits on `.`
+            const orig = String(im.module || '').split(/::|\./).pop();
             if (orig && orig !== receiver && typeKindsOf(orig).length > 0) {
                 receiver = orig;
                 typeDefs = typeKindsOf(orig);
@@ -11877,9 +12043,30 @@ function _calleeTypeQualifiedReceiver(index, def, fileEntry, call, language) {
             _normalizedAliasBase(index, d)));
         if (bases.size === 1) candidateTypes.push(bases.values().next().value);
     }
-    const symbols = index.symbols.get(call.name) || [];
+    const allSymbols = index.symbols.get(call.name) || [];
     const isCallable = (s) => !NON_CALLABLE_TYPES.has(s.type) ||
         (s.type === 'field' && s.fieldType && /^func\b/.test(s.fieldType));
+    // fix #353: the qualifier that is right there in the call owns the type —
+    // `beta.Helper.widget()` (package), `Beta.Helper.Widget()` (namespace),
+    // `using BH = Beta.Helper; BH.Widget()` (alias binding), `import
+    // beta.Helper;` (name binding). Same-name types in other packages/
+    // namespaces leave the candidate set BEFORE member-group construction
+    // (the group dedupes identical signatures, so the first same-name type
+    // used to swallow the second). An unresolvable qualifier keeps them all.
+    const ownerFiles = (language === 'java' || language === 'csharp')
+        ? _qualifiedStaticOwnerFiles(index, fileEntry, call, receiver, language, def)
+        : null;
+    // A package qualifier the resolver cannot place (`org.external.Helper`)
+    // over a project type of the same name: unpinnable — visible, never
+    // confirmed by first-definition selection (#206 discipline).
+    if (language === 'java' && call.receiverIsTypeQualified &&
+        call.receiverTypeQualifier && /^[a-z_]/.test(call.receiverTypeQualifier) &&
+        !ownerFiles) {
+        return { unverified: 'method-ambiguous' };
+    }
+    const symbols = ownerFiles
+        ? allSymbols.filter(s => !candidateTypes.includes(s.className) || ownerFiles.has(s.file))
+        : allSymbols;
     if (language === 'java' || language === 'csharp') {
         // Class-qualified Java/C# calls see the compiler member group on the
         // qualifier. The helper handles inherited slots and C# name hiding.

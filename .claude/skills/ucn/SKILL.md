@@ -161,7 +161,15 @@ Treat `deadcode` as a candidate generator. Before deletion, inspect `usages`, `i
 (JSX children, HTML markup and attributes) in an `OTHER TEXT` section unless
 `--code-only` is set, so it lists every line the `ACCOUNT` counts. This is a
 literal-name inventory, not exact target binding. Identifier boundaries are
-Unicode-aware: `hit` never matches inside `hitΔ`.
+Unicode-aware and match `grep -w`: `hit` never matches inside `hitΔ`, while
+`$` is a boundary (`buy${...}`, `$fail`, `ws$close()` all count).
+
+Aliased and qualified calls resolve in every language: Rust `use m::f as g; g()`
+is a caller of `f` (listed as a beyond-text caller, since the line holds no
+target token); Java `pkg.Type.method()` and C# `Ns.Type.Method()` /
+`using T = Ns.Type; T.Method()` pick the type the qualifier names when several
+same-name types exist. A qualifier the resolver cannot place stays visible as
+`method-ambiguous`, never confirmed by first-definition order.
 
 `endpoints` recognizes client receivers by evidence (a receiver typed to an
 HTTP client class, or bound to a pytest fixture that constructs one), not only

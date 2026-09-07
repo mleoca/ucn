@@ -7641,3 +7641,156 @@ describe('fix #351: identifier boundaries are Unicode-aware', () => {
         }
     });
 });
+
+describe('fix #352: $-adjacent ground set, scope-granular function-local imports, hyphenated JSX attributes', () => {
+    it('counts names adjacent to $ like grep -w (template literals, shell vars, ws$name)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'a.js': [
+                'function token() { return 1; }',
+                'const s = `count token${1} end`;',
+                'const t = ws$token();',
+                'module.exports = { token };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const res = execute(index, 'impact', { name: 'token' });
+            assert.ok(res.ok, JSON.stringify(res));
+            // grep -w counts 4 lines; the #351 regex excluded `$` neighbours
+            assert.strictEqual(res.result.account.groundTotal, 4);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('binds a function-local Python import to its own function only', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'a.py': 'def run_validation():\n    return 1\n',
+            'b.py': 'def run_validation():\n    return 2\n',
+            'tasks.py': [
+                'def task_a():',
+                '    from a import run_validation',
+                '    return run_validation()',
+                '',
+                'def task_b():',
+                '    from b import run_validation',
+                '    return run_validation()',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const a = execute(index, 'show', { name: 'a.py:1:run_validation' });
+            const b = execute(index, 'show', { name: 'b.py:1:run_validation' });
+            const lines = r => (r.result.context.callers || []).map(c => c.line).sort();
+            assert.deepStrictEqual(lines(a), [3]);
+            assert.deepStrictEqual(lines(b), [7]);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('lists hyphenated JSX attribute lines that the ACCOUNT counts as other-text', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'App.tsx': [
+                'export function cell() { return 1; }',
+                'export const Grid = () => <div data-cell-state="on">{cell()}</div>;',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const usages = execute(index, 'usages', { name: 'cell' });
+            assert.ok(usages.ok);
+            const lines = usages.result.map(u => u.line);
+            assert.ok(lines.includes(2), 'line 2 listed: ' + JSON.stringify(usages.result.usages));
+            const account = execute(index, 'impact', { name: 'cell' }).result.account;
+            assert.strictEqual(new Set(lines).size, account.groundTotal);
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #353: Rust aliased calls, Java package-qualified and C# namespace-qualified static receivers', () => {
+    const callerLines = r => (r.result.context.callers || []).map(c => `${c.file.split('/').pop()}:${c.line}`).sort();
+    const unverifiedLines = r => (r.result.context.unverifiedCallers || []).map(c => `${c.file.split('/').pop()}:${c.line}`).sort();
+    const calleeNames = r => (r.result.context.callees || []).map(c => `${c.file.split('/').pop()}:${c.name}`).sort();
+
+    it('Rust: `use alpha::widget as renamed; renamed()` is a caller and a callee', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "ra"\nversion = "0.1.0"\n',
+            'src/lib.rs': 'pub mod alpha;\nuse alpha::unique_widget_name as renamed;\npub fn call_it() -> &\'static str { renamed() }\n',
+            'src/alpha.rs': 'pub fn unique_widget_name() -> &\'static str { "w" }\n',
+        });
+        try {
+            const index = idx(dir);
+            const up = execute(index, 'show', { name: 'unique_widget_name' });
+            assert.deepStrictEqual(callerLines(up), ['lib.rs:3']);
+            const down = execute(index, 'show', { name: 'call_it', sections: 'callees' });
+            assert.deepStrictEqual(calleeNames(down), ['alpha.rs:unique_widget_name']);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('Java: beta.Helper.widget() resolves by package; unresolvable package stays visible', () => {
+        const dir = tmp({
+            'alpha/Helper.java': 'package alpha;\npublic class Helper { public static String widget() { return "a"; } }\n',
+            'beta/Helper.java': 'package beta;\npublic class Helper { public static String widget() { return "b"; } }\n',
+            'Main.java': [
+                'import beta.Helper;',
+                'public class Main {',
+                '  static String go() { return beta.Helper.widget(); }',
+                '  static String goAlpha() { return alpha.Helper.widget(); }',
+                '  static String viaImport() { return Helper.widget(); }',
+                '  static String ext() { return org.external.Helper.widget(); }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const beta = execute(index, 'show', { name: 'beta/Helper.java:2:widget' });
+            assert.deepStrictEqual(callerLines(beta), ['Main.java:3', 'Main.java:5']);
+            assert.deepStrictEqual(unverifiedLines(beta), ['Main.java:6']);
+            const alpha = execute(index, 'show', { name: 'alpha/Helper.java:2:widget' });
+            assert.deepStrictEqual(callerLines(alpha), ['Main.java:4']);
+            assert.deepStrictEqual(unverifiedLines(alpha), ['Main.java:6']);
+            const down = execute(index, 'show', { name: 'Main.java:3:go', sections: 'callees' });
+            assert.deepStrictEqual(calleeNames(down), ['Helper.java:widget']);
+            assert.strictEqual(down.result.context.callees[0].file, path.join(dir, 'beta/Helper.java'));
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('C#: Beta.Helper.Widget() and `using BH = Beta.Helper; BH.Widget()` resolve by namespace, both directions', () => {
+        const dir = tmp({
+            'A.cs': 'namespace Alpha { public static class Helper { public static string Widget() => "a"; } }\n',
+            'B.cs': 'namespace Beta { public static class Helper { public static string Widget() => "b"; } }\n',
+            'M.cs': [
+                'using BH = Beta.Helper;',
+                'public static class M {',
+                '  public static string Go() => Beta.Helper.Widget();',
+                '  public static string GoAlias() => BH.Widget();',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const beta = execute(index, 'show', { name: 'B.cs:1:Widget' });
+            assert.deepStrictEqual(callerLines(beta), ['M.cs:3', 'M.cs:4']);
+            const alpha = execute(index, 'show', { name: 'A.cs:1:Widget' });
+            assert.deepStrictEqual(callerLines(alpha), []);
+            assert.deepStrictEqual(unverifiedLines(alpha), []);
+            for (const fn of ['M.cs:3:Go', 'M.cs:4:GoAlias']) {
+                const down = execute(index, 'show', { name: fn, sections: 'callees' });
+                assert.deepStrictEqual(calleeNames(down), ['B.cs:Widget'], fn);
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+});

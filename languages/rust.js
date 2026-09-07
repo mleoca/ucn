@@ -3152,6 +3152,14 @@ function findImportsInCode(code, parser) {
             if (pathNode && aliasNode) {
                 addLeaf(joinUsePath(prefix, pathNode.text), aliasNode.text,
                     'use', false, line);
+                // fix #353: `use alpha::widget as renamed; renamed()` — the
+                // alias pairing feeds findCallers' import-rename surface
+                // (calledAs), exactly like Python/JS `import x as y`.
+                const original = String(pathNode.text).split('::').pop();
+                if (original && original !== aliasNode.text && original !== 'self') {
+                    if (!imports.aliases) imports.aliases = [];
+                    imports.aliases.push({ original, local: aliasNode.text });
+                }
             }
             return;
         }

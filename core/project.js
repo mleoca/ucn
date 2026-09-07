@@ -1946,7 +1946,7 @@ class ProjectIndex {
      * the usage scan saw (and may have deliberately dropped), as opposed to
      * JSX children, HTML markup, or other non-code text (fix #350).
      */
-    isIdentifierAtPosition(content, lineNum, column, filePath) {
+    isIdentifierAtPosition(content, lineNum, column, filePath, name) {
         const language = detectLanguage(filePath, this.root);
         if (!language) return false;
         try {
@@ -1954,7 +1954,12 @@ class ProjectIndex {
                 safeParse(getParser(language), content);
             if (!tree) return false;
             const node = tree.rootNode.descendantForPosition({ row: lineNum - 1, column });
-            return !!node && /identifier|^name$|^word$/.test(node.type);
+            if (!node || !/identifier|^name$|^word$/.test(node.type)) return false;
+            // fix #352: the identifier node must BE the name — a hyphenated JSX
+            // attribute (`data-cell-state`) is one property_identifier whose
+            // text merely contains `cell`; the ACCOUNT counts that line as
+            // other-text, so usages must list it (the #350 equality).
+            return node.text === name;
         } catch (e) {
             return false;
         }
