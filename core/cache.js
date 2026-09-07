@@ -256,6 +256,14 @@ function pruneUserCache({ force = false, now = Date.now() } = {}) {
             root = data.root || null;
             touched = Math.max(touched, Number(data.timestamp) || 0);
         } catch (_) { /* malformed/incomplete cache expires below */ }
+        // fix #354: a project whose FIRST build is in progress has no
+        // index.json yet, only a live build.lock — another process's prune
+        // must not delete the lock (or the dir) out from under the builder.
+        const lockPath = path.join(dir, BUILD_LOCK_FILE);
+        if (!root && fs.existsSync(lockPath) && !_lockIsStale(lockPath)) {
+            entries.push({ dir, touched: now, bytes: null });
+            continue;
+        }
         if (!root || !fs.existsSync(root) || now - touched > CACHE_TTL_MS) {
             try {
                 fs.rmSync(dir, { recursive: true, force: true });
@@ -1494,7 +1502,101 @@ function _computeReachabilityFingerprint(index) {
     return `${fileCount}:${symbolCount}:${sample}`;
 }
 
+const BUILD_LOCK_FILE = 'build.lock';
+const BUILD_LOCK_STALE_MS = 15 * 60 * 1000;
+const BUILD_LOCK_WAIT_MS = 15 * 60 * 1000;
+const BUILD_LOCK_POLL_MS = 150;
+
+function _sleepSync(ms) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function _pidAlive(pid) {
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+    try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+}
+
+function _readLock(lockPath) {
+    try { return JSON.parse(fs.readFileSync(lockPath, 'utf8')); } catch (_) { return null; }
+}
+
+function _lockIsStale(lockPath) {
+    const info = _readLock(lockPath);
+    if (!info) {
+        // Unreadable or half-written: judge by mtime alone
+        try { return Date.now() - fs.statSync(lockPath).mtimeMs > BUILD_LOCK_STALE_MS; } catch (_) { return true; }
+    }
+    if (info.pid && !_pidAlive(info.pid)) return true;
+    return Date.now() - (info.startedAt || 0) > BUILD_LOCK_STALE_MS;
+}
+
+/**
+ * Cross-process build lock (fix #354): N concurrent cold-cache invocations
+ * used to rebuild the whole index N times at once (6 processes on a 474k-line
+ * repo: 9s each alone, 363s each together — the stampede fires after every
+ * version bump, because the bump invalidates every cache). One process takes
+ * the lock and builds; the others wait, then load the cache it saved. A lock
+ * whose holder is dead, or older than 15 minutes, is broken. Waiters give up
+ * after 15 minutes and build themselves (a wedged holder must never make the
+ * tool hang forever).
+ *
+ * @returns {{ built: boolean, waited: boolean }}
+ */
+function buildWithLock(index, buildOpts = {}, options = {}) {
+    const cacheDir = getProjectCacheDir(index.root);
+    const lockPath = path.join(cacheDir, BUILD_LOCK_FILE);
+    fs.mkdirSync(cacheDir, { recursive: true });
+    const deadline = Date.now() + BUILD_LOCK_WAIT_MS;
+    let announced = false;
+    for (;;) {
+        let fd = null;
+        try {
+            fd = fs.openSync(lockPath, 'wx');
+        } catch (e) {
+            if (e.code !== 'EEXIST') throw e;
+        }
+        if (fd !== null) {
+            try {
+                fs.writeSync(fd, JSON.stringify({ pid: process.pid, startedAt: Date.now() }));
+                fs.closeSync(fd);
+                index.build(null, buildOpts);
+                if (options.save !== false) {
+                    try { saveCache(index); } catch (_) { /* best-effort */ }
+                }
+                return { built: true, waited: announced };
+            } finally {
+                try { fs.unlinkSync(lockPath); } catch (_) { /* already gone */ }
+            }
+        }
+        if (_lockIsStale(lockPath)) {
+            try { fs.unlinkSync(lockPath); } catch (_) { /* raced */ }
+            continue;
+        }
+        if (Date.now() > deadline) {
+            index.build(null, buildOpts);
+            if (options.save !== false) {
+                try { saveCache(index); } catch (_) { /* best-effort */ }
+            }
+            return { built: true, waited: true };
+        }
+        if (!announced) {
+            announced = true;
+            if (typeof options.onWait === 'function') options.onWait(_readLock(lockPath));
+        }
+        _sleepSync(BUILD_LOCK_POLL_MS);
+        if (!fs.existsSync(lockPath)) {
+            // The holder finished: its cache is the answer unless it is
+            // already stale again (or it never saved one)
+            if (options.reload !== false && loadCache(index) && !isCacheStale(index)) {
+                return { built: false, waited: true };
+            }
+            // fall through: take the lock ourselves
+        }
+    }
+}
+
 module.exports = {
+    buildWithLock,
     saveCache, saveUsageCache, loadCache, loadCallsCache, isCacheStale, ensureCallsCacheLoaded,
     getUserCacheRoot, getProjectCacheDir, getProjectCachePath,
     getLegacyProjectCacheDir, migrateLegacyProjectCache, clearProjectCache,

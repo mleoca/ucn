@@ -2529,6 +2529,15 @@ class ProjectIndex {
     saveCache(cachePath) { return indexCache.saveCache(this, cachePath); }
 
     /** Load index from cache file */
+    /**
+     * Build under the cross-process build lock (fix #354) and save the cache.
+     * Returns { built, waited }; when another process built meanwhile and its
+     * cache is fresh, that cache is loaded instead of rebuilding.
+     */
+    buildCached(buildOpts = {}, options = {}) {
+        return indexCache.buildWithLock(this, buildOpts, options);
+    }
+
     loadCache(cachePath) { return indexCache.loadCache(this, cachePath); }
 
     /** Persist the bounded, content-hash-keyed usage-query cache. */

@@ -2763,3 +2763,119 @@ describe('fix: standalone --clear-cache clears the cwd project cache', () => {
         }
     });
 });
+
+describe('fix #354: cross-process build lock', () => {
+    const { buildWithLock, getProjectCacheDir } = require('../core/cache');
+    const { ProjectIndex } = require('../core/project');
+    const fs = require('fs');
+    const path = require('path');
+    const { execFileSync, spawn } = require('child_process');
+    const files = {
+        'package.json': '{"name":"lock-fixture"}',
+        'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+        'app.js': 'const { helper } = require("./lib");\nfunction main() { helper(); }\nmodule.exports = { main };',
+    };
+
+    it('builds, saves, and removes the lock', () => {
+        const dir = tmp(files);
+        try {
+            const index = new ProjectIndex(dir, { quiet: true });
+            const out = buildWithLock(index, { quiet: true });
+            assert.deepStrictEqual(out, { built: true, waited: false });
+            assert.ok(!fs.existsSync(path.join(getProjectCacheDir(dir), 'build.lock')));
+            const fresh = new ProjectIndex(dir, { quiet: true });
+            assert.ok(fresh.loadCache(), 'cache was saved under the lock');
+            assert.ok(fresh.symbols.has('helper'));
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('breaks a lock whose holder is dead', () => {
+        const dir = tmp(files);
+        try {
+            const cacheDir = getProjectCacheDir(dir);
+            fs.mkdirSync(cacheDir, { recursive: true });
+            // pid 2^22-1 is above the macOS/Linux default pid ceiling — never alive
+            fs.writeFileSync(path.join(cacheDir, 'build.lock'),
+                JSON.stringify({ pid: 4194303, startedAt: Date.now() }));
+            const index = new ProjectIndex(dir, { quiet: true });
+            const out = buildWithLock(index, { quiet: true });
+            assert.strictEqual(out.built, true);
+            assert.ok(!fs.existsSync(path.join(cacheDir, 'build.lock')));
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('waits for a live holder and loads the cache it saved instead of rebuilding', async () => {
+        const dir = tmp(files);
+        // Own cache root: other test files wipe/prune the shared suite root
+        // concurrently, which would delete the holder's live lock mid-test.
+        const savedRoot = process.env.UCN_CACHE_DIR;
+        const ownRoot = fs.mkdtempSync(path.join(require('os').tmpdir(), 'ucn-lock-'));
+        process.env.UCN_CACHE_DIR = ownRoot;
+        try {
+            const cacheDir = getProjectCacheDir(dir);
+            fs.mkdirSync(cacheDir, { recursive: true });
+            // Holder: takes the lock, builds + saves after a delay, releases.
+            const holderScript = `
+                const fs = require('fs'); const path = require('path');
+                const { ProjectIndex } = require(${JSON.stringify(path.join(__dirname, '..', 'core', 'project.js'))});
+                const lock = ${JSON.stringify(path.join(cacheDir, 'build.lock'))};
+                fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, startedAt: Date.now() }));
+                console.log('LOCKED');
+                // Hold the lock until the parent says it is about to wait on
+                // it (a fixed timer expires early under suite load), then a
+                // little longer so the parent observably waits.
+                const go = ${JSON.stringify(path.join(cacheDir, 'go'))};
+                const tick = () => {
+                    if (!fs.existsSync(go)) return setTimeout(tick, 25);
+                    setTimeout(() => {
+                        const index = new ProjectIndex(${JSON.stringify(dir)}, { quiet: true });
+                        index.build(null, { quiet: true }); index.saveCache();
+                        fs.unlinkSync(lock);
+                    }, 600);
+                };
+                tick();
+            `;
+            const holder = spawn(process.execPath, ['-e', holderScript], {
+                stdio: ['ignore', 'pipe', 'inherit'], env: { ...process.env, UCN_CACHE_DIR: ownRoot },
+            });
+            await new Promise(resolve => holder.stdout.on('data', d => { if (String(d).includes('LOCKED')) resolve(); }));
+            const index = new ProjectIndex(dir, { quiet: true });
+            let waited = false;
+            fs.writeFileSync(path.join(cacheDir, 'go'), '1');
+            const out = buildWithLock(index, { quiet: true }, { onWait: () => { waited = true; } });
+            assert.strictEqual(waited, true, 'onWait fired');
+            assert.deepStrictEqual(out, { built: false, waited: true });
+            assert.ok(index.symbols.has('helper'), 'loaded the holder\'s cache');
+            await new Promise(resolve => holder.on('exit', resolve));
+        } finally {
+            process.env.UCN_CACHE_DIR = savedRoot;
+            fs.rmSync(ownRoot, { recursive: true, force: true });
+            rm(dir);
+        }
+    });
+
+    it('CLI: concurrent cold-cache invocations share one build', async () => {
+        const dir = tmp(files);
+        try {
+            fs.rmSync(getProjectCacheDir(dir), { recursive: true, force: true });
+            const cli = path.join(__dirname, '..', 'cli', 'index.js');
+            const runs = [1, 2, 3].map(() => new Promise((resolve, reject) => {
+                const p = spawn(process.execPath, [cli, dir, 'find', 'helper'], { stdio: ['ignore', 'pipe', 'pipe'] });
+                let out = ''; let err = '';
+                p.stdout.on('data', d => { out += d; }); p.stderr.on('data', d => { err += d; });
+                p.on('exit', code => code === 0 ? resolve({ out, err }) : reject(new Error(err)));
+            }));
+            const results = await Promise.all(runs);
+            for (const r of results) assert.ok(r.out.includes('helper'), r.out);
+            assert.ok(!fs.existsSync(path.join(getProjectCacheDir(dir), 'build.lock')));
+            const single = execFileSync(process.execPath, [cli, dir, 'find', 'helper'], { encoding: 'utf8' });
+            assert.ok(single.includes('helper'));
+        } finally {
+            rm(dir);
+        }
+    });
+});

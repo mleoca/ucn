@@ -766,8 +766,18 @@ function runProjectCommand(rootDir, command, arg) {
     // If cache was loaded but stale, force rebuild to avoid duplicates
     let needsCacheSave = false;
     if (!usedCache) {
-        index.build(null, { quiet: flags.quiet, forceRebuild: cacheWasLoaded, followSymlinks: flags.followSymlinks, maxFiles: flags.maxFiles, workers: flags.workers });
-        needsCacheSave = flags.cache;
+        const buildOpts = { quiet: flags.quiet, forceRebuild: cacheWasLoaded, followSymlinks: flags.followSymlinks, maxFiles: flags.maxFiles, workers: flags.workers };
+        if (flags.cache && !flags.maxFiles) {
+            // Cross-process build lock (fix #354): concurrent cold-cache
+            // invocations share one build instead of each rebuilding.
+            index.buildCached(buildOpts, {
+                onWait: () => { if (!flags.quiet) console.error('Waiting for another ucn process building the index...'); },
+            });
+            needsCacheSave = false; // buildCached saved (or loaded the other process's cache)
+        } else {
+            index.build(null, buildOpts);
+            needsCacheSave = flags.cache;
+        }
     }
 
     try {
@@ -986,13 +996,10 @@ function runInteractive(rootDir) {
     if (flags.cache) {
         const loaded = !flags.clearCache && index.loadCache();
         iCacheFresh = loaded && !index.isCacheStale();
-        if (!iCacheFresh && loaded) {
-            index.build(null, { quiet: true, forceRebuild: true, workers: flags.workers });
-        } else if (!iCacheFresh) {
-            index.build(null, { quiet: true, workers: flags.workers });
-        }
         if (!iCacheFresh) {
-            try { index.saveCache(); } catch (_) { /* best-effort */ }
+            index.buildCached({ quiet: true, forceRebuild: !!loaded, workers: flags.workers }, {
+                onWait: () => console.log('Waiting for another ucn process building the index...'),
+            });
         }
     } else {
         index.build(null, { quiet: true, workers: flags.workers });
@@ -1113,15 +1120,19 @@ Flags can be added per-command: show myFunc --sections=source,callers
             // appeared in neighbouring answers (UCN5-044).
             if (index.isCacheStale()) {
                 console.log('Source changed; rebuilding index...');
-                index.build(null, {
+                const rebuildOpts = {
                     quiet: true,
                     forceRebuild: true,
                     followSymlinks: flags.followSymlinks,
                     maxFiles: flags.maxFiles,
                     workers: flags.workers,
-                });
-                if (flags.cache) {
-                    try { index.saveCache(); } catch (_) { /* best-effort */ }
+                };
+                if (flags.cache && !flags.maxFiles) {
+                    index.buildCached(rebuildOpts, {
+                        onWait: () => console.log('Waiting for another ucn process building the index...'),
+                    });
+                } else {
+                    index.build(null, rebuildOpts);
                 }
                 console.log(`Index ready: ${index.files.size} files, ${index.symbols.size} unique symbol names`);
             }

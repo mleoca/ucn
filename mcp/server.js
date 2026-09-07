@@ -71,8 +71,13 @@ function getIndex(projectDir, options) {
         // Disk cache is fresh (skip when maxFiles is set — cached index may have different file count)
     } else {
         buildOpts.forceRebuild = !!loaded;
-        index.build(null, buildOpts);
-        if (!maxFiles) index.saveCache(); // Don't pollute disk cache with partial indexes
+        if (maxFiles) {
+            index.build(null, buildOpts); // Don't pollute disk cache with partial indexes
+        } else {
+            // Cross-process build lock (fix #354): a CLI or another MCP
+            // server building the same repo at the same moment shares one build
+            index.buildCached(buildOpts);
+        }
     }
 
     // LRU eviction
