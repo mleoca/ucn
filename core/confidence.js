@@ -8,12 +8,15 @@
 
 'use strict';
 
+const { createProvenance, validateConfirmation } = require('./provenance');
+
 // Resolution types ordered from most to least confident
 const RESOLUTION = {
     EXACT_BINDING:    'exact-binding',
     SAME_CLASS:       'same-class',
     RECEIVER_HINT:    'receiver-hint',
     SCOPE_MATCH:      'scope-match',
+    SINGLE_OWNER:     'single-owner',
     POSSIBLE_DISPATCH: 'possible-dispatch',
     NAME_ONLY:        'name-only',
     METHOD_AMBIGUOUS: 'method-ambiguous',
@@ -27,6 +30,7 @@ const SCORES = {
     [RESOLUTION.SAME_CLASS]:       0.92,
     [RESOLUTION.RECEIVER_HINT]:    0.80,
     [RESOLUTION.SCOPE_MATCH]:      0.65,
+    [RESOLUTION.SINGLE_OWNER]:     0.35,
     [RESOLUTION.POSSIBLE_DISPATCH]: 0.50,
     [RESOLUTION.NAME_ONLY]:        0.40,
     [RESOLUTION.METHOD_AMBIGUOUS]: 0.35,
@@ -46,6 +50,7 @@ const RESOLUTION_TIER = {
     // scope-match is only assigned with import/receiver/callback evidence
     // (see scoreEdge below) — that satisfies the contract's evidence clause.
     [RESOLUTION.SCOPE_MATCH]:   TIER.CONFIRMED,
+    [RESOLUTION.SINGLE_OWNER]: TIER.UNVERIFIED,
     // Nominal dispatch tiering: a call that CAN reach the target through
     // virtual dispatch (interface/supertype-typed receiver) or whose untyped
     // receiver faces multiple same-name owners is evidence a call happens —
@@ -61,7 +66,7 @@ function tierForResolution(resolution) {
     return RESOLUTION_TIER[resolution] || TIER.UNVERIFIED;
 }
 
-function scored(resolution, reasons) {
+function scored(resolution, reasons, evidence) {
     const evidenceScore = SCORES[resolution];
     return {
         confidence: evidenceScore,
@@ -69,6 +74,7 @@ function scored(resolution, reasons) {
         scoreKind: 'ordinal-evidence-not-probability',
         resolution,
         evidence: reasons,
+        provenance: createProvenance(evidence || {}, resolution),
     };
 }
 
@@ -95,38 +101,44 @@ function scoreEdge(evidence) {
     // (without this, a known mismatch would score receiver-hint 0.80).
     if (evidence.typeMismatch) {
         reasons.push('receiver type mismatch');
-        return scored(RESOLUTION.UNCERTAIN, reasons);
+        return scored(RESOLUTION.UNCERTAIN, reasons, evidence);
     }
 
     // Nominal dispatch tiering (contract surface only — callers.js sets these
     // flags exclusively under collectAccount, so legacy paths never see them).
     if (evidence.possibleDispatch) {
         reasons.push('interface/supertype dispatch');
-        return scored(RESOLUTION.POSSIBLE_DISPATCH, reasons);
+        return scored(RESOLUTION.POSSIBLE_DISPATCH, reasons, evidence);
     }
     if (evidence.methodAmbiguous) {
         reasons.push('untyped receiver, multiple same-name definitions');
-        return scored(RESOLUTION.METHOD_AMBIGUOUS, reasons);
+        return scored(RESOLUTION.METHOD_AMBIGUOUS, reasons, evidence);
     }
 
     // Exact binding match (highest confidence)
     if (evidence.hasBindingId) {
         reasons.push('binding-id match');
         if (evidence.hasImportEvidence) reasons.push('import-verified');
-        return scored(RESOLUTION.EXACT_BINDING, reasons);
+        return scored(RESOLUTION.EXACT_BINDING, reasons, evidence);
     }
 
     // Same-class resolution (self/this/super/cls)
     if (evidence.resolvedBySameClass) {
         reasons.push('same-class method');
         if (evidence.hasInheritanceChain) reasons.push('via inheritance');
-        return scored(RESOLUTION.SAME_CLASS, reasons);
+        return scored(RESOLUTION.SAME_CLASS, reasons, evidence);
     }
 
     // Receiver hint narrowed to specific type
     if (evidence.resolvedByReceiverHint || evidence.hasReceiverType) {
         reasons.push(evidence.hasReceiverType ? 'parser receiver-type' : 'local type inference');
-        return scored(RESOLUTION.RECEIVER_HINT, reasons);
+        return scored(RESOLUTION.RECEIVER_HINT, reasons, evidence);
+    }
+
+    if (evidence.hasSingleOwnerEvidence && !evidence.typeQualifiedReceiver &&
+        !evidence.moduleOwnedPath) {
+        reasons.push('single project owner, receiver identity unresolved');
+        return scored(RESOLUTION.SINGLE_OWNER, reasons, evidence);
     }
 
     // Function reference (callback / passed-as-argument). Argument position is
@@ -137,31 +149,30 @@ function scoreEdge(evidence) {
         reasons.push('function reference');
         if (evidence.hasImportEvidence || evidence.hasSamePackageEvidence) {
             reasons.push(evidence.hasImportEvidence ? 'import-supported' : 'same package/module');
-            return scored(RESOLUTION.SCOPE_MATCH, reasons);
+            return scored(RESOLUTION.SCOPE_MATCH, reasons, evidence);
         }
         reasons.push('no import evidence');
-        return scored(RESOLUTION.NAME_ONLY, reasons);
+        return scored(RESOLUTION.NAME_ONLY, reasons, evidence);
     }
 
     // Scope/import-supported match
     if (evidence.hasImportEvidence || evidence.hasReceiverEvidence ||
-        evidence.hasSamePackageEvidence || evidence.hasSingleOwnerEvidence) {
+        evidence.hasSamePackageEvidence) {
         if (evidence.hasImportEvidence) reasons.push('import-supported');
         if (evidence.hasReceiverEvidence) reasons.push('receiver binding in scope');
         if (evidence.hasSamePackageEvidence) reasons.push('same package/module');
-        if (evidence.hasSingleOwnerEvidence) reasons.push('single project method owner');
-        return scored(RESOLUTION.SCOPE_MATCH, reasons);
+        return scored(RESOLUTION.SCOPE_MATCH, reasons, evidence);
     }
 
     // Uncertain
     if (evidence.isUncertain) {
         reasons.push('ambiguous resolution');
-        return scored(RESOLUTION.UNCERTAIN, reasons);
+        return scored(RESOLUTION.UNCERTAIN, reasons, evidence);
     }
 
     // Name-only match (no additional evidence)
     reasons.push('name match only');
-    return scored(RESOLUTION.NAME_ONLY, reasons);
+    return scored(RESOLUTION.NAME_ONLY, reasons, evidence);
 }
 
 /**
@@ -192,4 +203,5 @@ module.exports = {
     tierForResolution,
     scoreEdge,
     filterByConfidence,
+    validateConfirmation,
 };

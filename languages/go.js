@@ -5,6 +5,9 @@
  * struct/interface types, and const/var declarations.
  */
 
+const { ReceiverTypeMap, typeOrigin } = require('./type-evidence');
+
+
 const {
     traverseTree,
     traverseTreeCached,
@@ -761,7 +764,7 @@ function findCallsInCode(code, parser, options = {}) {
     // unless a lexical declaration shadows the name (`var v *Viper`;
     // `func Set(...) { v.Set(...) }`). They are stored separately so local
     // scope restoration cannot erase them.
-    const packageTypes = new Map();
+    const packageTypes = new ReceiverTypeMap();
     const packageTypeQualifiers = new Map();
     // Names whose scope type is a New*-prefix GUESS (fix #266) — per scope
     const scopeGuesses = new Map();
@@ -835,7 +838,7 @@ function findCallsInCode(code, parser, options = {}) {
     // Also returns funcParamNames: parameter names with function types (func(...) ...)
     // so calls to them can be skipped (they're local parameter calls, not global function calls).
     const buildScopeTypeMap = (node) => {
-        const typeMap = new Map();
+        const typeMap = new ReceiverTypeMap();
         const typeQualifierMap = new Map();
         const funcParamNames = new Set();
         const containerMap = new Map();
@@ -851,7 +854,7 @@ function findCallsInCode(code, parser, options = {}) {
                         const typeNode = param.childForFieldName('type');
                         const typeName = extractTypeName(typeNode);
                         if (nameNode && typeName) {
-                            typeMap.set(nameNode.text, typeName);
+                            typeMap.set(nameNode.text, typeName, 'annotation', param);
                             const qualifier = extractTypeQualifier(typeNode);
                             if (qualifier) typeQualifierMap.set(nameNode.text, qualifier);
                         }
@@ -888,7 +891,7 @@ function findCallsInCode(code, parser, options = {}) {
                         if (typeName) {
                             const qualifier = extractTypeQualifier(typeNode);
                             for (const nn of nameNodes) {
-                                typeMap.set(nn.text, typeName);
+                                typeMap.set(nn.text, typeName, 'annotation', node);
                                 if (qualifier) typeQualifierMap.set(nn.text, qualifier);
                             }
                         }
@@ -956,17 +959,17 @@ function findCallsInCode(code, parser, options = {}) {
     };
 
     // Look up variable type from scope chain
-    const getReceiverType = (varName, refNode) => {
+    const getReceiverType = (varName, refNode, evidence = false) => {
         const bindingScope = refNode
             ? lexicalBindingScopeStart(refNode, varName) : null;
         for (let i = functionStack.length - 1; i >= 0; i--) {
             const scopeStart = functionStack[i].startLine;
             const typeMap = scopeTypes.get(scopeStart);
-            if (typeMap?.has(varName)) return typeMap.get(varName);
+            if (typeMap?.has(varName)) return evidence ? typeMap.fields(varName) : typeMap.get(varName);
             if (bindingScope === scopeStart) return undefined;
         }
         return refNode && isShadowedByLocal(refNode, varName)
-            ? undefined : packageTypes.get(varName);
+            ? undefined : (evidence ? packageTypes.fields(varName) : packageTypes.get(varName));
     };
     const getReceiverTypeQualifier = (varName, refNode) => {
         const bindingScope = refNode
@@ -1280,7 +1283,7 @@ function findCallsInCode(code, parser, options = {}) {
                     const scopeKey = functionStack[functionStack.length - 1].startLine;
                     const typeMap = scopeTypes.get(scopeKey);
                     if (typeMap) {
-                        typeMap.set(valueVar, el.type);
+                        typeMap.set(valueVar, el.type, 'flow', node);
                         const qualifiers = scopeTypeQualifiers.get(scopeKey);
                         if (el.qualifier) qualifiers?.set(valueVar, el.qualifier);
                         else qualifiers?.delete(valueVar);
@@ -1425,7 +1428,7 @@ function findCallsInCode(code, parser, options = {}) {
                             }
                         }
                         if (typeName) {
-                            typeMap.set(names[vi], typeName);
+                            typeMap.set(names[vi], typeName, typeGuessed ? 'guess' : val.type === 'type_assertion_expression' ? 'type-assertion' : ['composite_literal', 'unary_expression'].includes(val.type) ? 'constructor' : ['identifier', 'index_expression'].includes(val.type) ? 'flow' : 'unknown', val);
                             const qualifiers = scopeTypeQualifiers.get(scopeKey);
                             if (typeQualifier) qualifiers?.set(names[vi], typeQualifier);
                             else qualifiers?.delete(names[vi]);
@@ -1688,6 +1691,7 @@ function findCallsInCode(code, parser, options = {}) {
                     // Distinguish pkg.Func() (package-qualified) from obj.Method()
                     // If receiver is a known import alias, this is a package call, not a method call
                     const isPkgCall = receiver && importAliases.has(receiver);
+                    let receiverTypeEvidence;
                     let receiverType = (!isPkgCall && receiver)
                         ? getReceiverType(receiver, operandNode) : undefined;
                     let receiverTypeQualifier = receiverType
@@ -1700,6 +1704,7 @@ function findCallsInCode(code, parser, options = {}) {
                         const lit = literalReceiverInfo(operandNode);
                         if (lit) {
                             receiverType = lit.receiverType;
+                            receiverTypeEvidence = typeOrigin('constructor', operandNode);
                             receiverTypeQualifier = lit.receiverTypeQualifier;
                         }
                     }
@@ -1804,7 +1809,7 @@ function findCallsInCode(code, parser, options = {}) {
                         callEnd: node.endIndex,
                         isMethod: !isPkgCall,
                         receiver,
-                        ...(receiverType && { receiverType }),
+                        ...(receiverType && { receiverType, ...(receiverTypeEvidence ? { receiverTypeSource: 'constructor', receiverTypeEvidence } : getReceiverType(receiver, node, true) || { receiverTypeSource: 'unknown' }) }),
                         ...(receiverTypeQualifier && { receiverTypeQualifier }),
                         ...(receiverType && isGuessedType(receiver) && { receiverTypeGuessed: true }),
                         ...(receiverIndexedSource && {
@@ -1908,6 +1913,7 @@ function findCallsInCode(code, parser, options = {}) {
                 const operandNode = node.childForFieldName('operand');
                 if (fieldNode && operandNode) {
                     const receiver = operandNode.type === 'identifier' ? operandNode.text : undefined;
+                    let receiverTypeEvidence;
                     let receiverType = receiver
                         ? getReceiverType(receiver, operandNode) : undefined;
                     let receiverTypeQualifier = receiverType
@@ -1918,6 +1924,7 @@ function findCallsInCode(code, parser, options = {}) {
                         const lit = literalReceiverInfo(operandNode);
                         if (lit) {
                             receiverType = lit.receiverType;
+                            receiverTypeEvidence = typeOrigin('constructor', operandNode);
                             receiverTypeQualifier = lit.receiverTypeQualifier;
                         }
                     }
@@ -1930,7 +1937,7 @@ function findCallsInCode(code, parser, options = {}) {
                         column: fieldNode.startPosition.column,
                         isMethod: true,
                         receiver,
-                        ...(receiverType && { receiverType }),
+                        ...(receiverType && { receiverType, ...(receiverTypeEvidence ? { receiverTypeSource: 'constructor', receiverTypeEvidence } : getReceiverType(receiver, node, true) || { receiverTypeSource: 'unknown' }) }),
                         ...(receiverTypeQualifier && { receiverTypeQualifier }),
                         ...(receiverType && receiver && isGuessedType(receiver) && { receiverTypeGuessed: true }),
                         enclosingFunction,
@@ -1981,6 +1988,7 @@ function findCallsInCode(code, parser, options = {}) {
                         const operandNode = rhs.childForFieldName('operand');
                         if (fieldNode && operandNode) {
                             const receiver = operandNode.type === 'identifier' ? operandNode.text : undefined;
+                            let receiverTypeEvidence;
                             let receiverType = receiver
                                 ? getReceiverType(receiver, operandNode) : undefined;
                             let receiverTypeQualifier = receiverType
@@ -1990,6 +1998,7 @@ function findCallsInCode(code, parser, options = {}) {
                                 const lit = literalReceiverInfo(operandNode);
                                 if (lit) {
                                     receiverType = lit.receiverType;
+                                    receiverTypeEvidence = typeOrigin('constructor', operandNode);
                                     receiverTypeQualifier = lit.receiverTypeQualifier;
                                 }
                             }
@@ -2000,7 +2009,7 @@ function findCallsInCode(code, parser, options = {}) {
                                 column: fieldNode.startPosition.column,
                                 isMethod: true,
                                 receiver,
-                                ...(receiverType && { receiverType }),
+                                ...(receiverType && { receiverType, ...(receiverTypeEvidence ? { receiverTypeSource: 'constructor', receiverTypeEvidence } : getReceiverType(receiver, node, true) || { receiverTypeSource: 'unknown' }) }),
                                 ...(receiverTypeQualifier && { receiverTypeQualifier }),
                                 ...(receiverType && receiver && isGuessedType(receiver) && { receiverTypeGuessed: true }),
                                 enclosingFunction,
@@ -2048,6 +2057,7 @@ function findCallsInCode(code, parser, options = {}) {
                 const operandNode = val.childForFieldName('operand');
                 if (!fieldNode || !operandNode) continue;
                 const receiver = operandNode.type === 'identifier' ? operandNode.text : undefined;
+                let receiverTypeEvidence;
                 let receiverType = receiver
                     ? getReceiverType(receiver, operandNode) : undefined;
                 let receiverTypeQualifier = receiverType
@@ -2056,6 +2066,7 @@ function findCallsInCode(code, parser, options = {}) {
                     const lit = literalReceiverInfo(operandNode);
                     if (lit) {
                         receiverType = lit.receiverType;
+                        receiverTypeEvidence = typeOrigin('constructor', operandNode);
                         receiverTypeQualifier = lit.receiverTypeQualifier;
                     }
                 }
@@ -2066,7 +2077,7 @@ function findCallsInCode(code, parser, options = {}) {
                     column: fieldNode.startPosition.column,
                     isMethod: true,
                     receiver,
-                    ...(receiverType && { receiverType }),
+                    ...(receiverType && { receiverType, ...(receiverTypeEvidence ? { receiverTypeSource: 'constructor', receiverTypeEvidence } : getReceiverType(receiver, node, true) || { receiverTypeSource: 'unknown' }) }),
                     ...(receiverTypeQualifier && { receiverTypeQualifier }),
                     ...(receiverType && receiver && isGuessedType(receiver) && { receiverTypeGuessed: true }),
                     enclosingFunction: getCurrentEnclosingFunction(),
@@ -2136,6 +2147,7 @@ function findCallsInCode(code, parser, options = {}) {
                     const operandNode = valueNode.childForFieldName('operand');
                     if (fieldNode && operandNode) {
                         const receiver = operandNode.type === 'identifier' ? operandNode.text : undefined;
+                        let receiverTypeEvidence;
                         let receiverType = receiver
                             ? getReceiverType(receiver, operandNode) : undefined;
                         let receiverTypeQualifier = receiverType
@@ -2145,6 +2157,7 @@ function findCallsInCode(code, parser, options = {}) {
                             const lit = literalReceiverInfo(operandNode);
                             if (lit) {
                                 receiverType = lit.receiverType;
+                                receiverTypeEvidence = typeOrigin('constructor', operandNode);
                                 receiverTypeQualifier = lit.receiverTypeQualifier;
                             }
                         }
@@ -2155,7 +2168,7 @@ function findCallsInCode(code, parser, options = {}) {
                             column: fieldNode.startPosition.column,
                             isMethod: true,
                             receiver,
-                            ...(receiverType && { receiverType }),
+                            ...(receiverType && { receiverType, ...(receiverTypeEvidence ? { receiverTypeSource: 'constructor', receiverTypeEvidence } : getReceiverType(receiver, node, true) || { receiverTypeSource: 'unknown' }) }),
                             ...(receiverTypeQualifier && { receiverTypeQualifier }),
                             ...(receiverType && receiver && isGuessedType(receiver) && { receiverTypeGuessed: true }),
                             enclosingFunction,

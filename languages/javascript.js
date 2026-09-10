@@ -5,6 +5,9 @@
  * interfaces, type aliases, enums, and state objects.
  */
 
+const { ReceiverTypeMap, typeOrigin } = require('./type-evidence');
+
+
 const {
     traverseTree,
     traverseTreeCached,
@@ -2107,7 +2110,7 @@ function findCallsInCode(code, parser) {
     // false external edges and caller/callee disagreement.
     const aliases = new Map();  // aliasName -> [{ target, declarationIndex, scopeStart, scopeEnd }]
     const nonCallableNames = new Set();  // Track names assigned non-callable values
-    const localVarTypes = new Map();  // Track local variable types: varName -> typeName (for receiverType inference)
+    const localVarTypes = new ReceiverTypeMap();  // Track local variable types: varName -> typeName (for receiverType inference)
     const localVarTypeQualifiers = new Map(); // qualifier provenance for new ns.Type()
     // Names whose type came from a DECLARED annotation (TS `x: Foo` / typed
     // params). The compiler enforces assignability for these, so reassignment
@@ -2549,7 +2552,7 @@ function findCallsInCode(code, parser) {
                 endLine: node.endPosition.row + 1
             });
             // Save localVarTypes so inner declarations don't leak to sibling functions
-            localVarTypesStack.push(new Map(localVarTypes));
+            localVarTypesStack.push(new ReceiverTypeMap(localVarTypes));
             localVarTypeQualifiersStack.push(new Map(localVarTypeQualifiers));
             declaredTypeVarsStack.push(new Set(declaredTypeVars));
         }
@@ -2603,7 +2606,7 @@ function findCallsInCode(code, parser) {
                 // Infer type: const x = new Foo() / new pkg.Foo() → x is Foo
                 const ctorName = jsConstructorTypeName(initNode.childForFieldName('constructor'));
                 if (ctorName) {
-                    localVarTypes.set(nameNode.text, ctorName);
+                    localVarTypes.set(nameNode.text, ctorName, 'constructor', initNode);
                     const qualifier = jsConstructorTypeQualifier(
                         initNode.childForFieldName('constructor'));
                     if (qualifier) localVarTypeQualifiers.set(nameNode.text, qualifier);
@@ -2619,7 +2622,7 @@ function findCallsInCode(code, parser) {
                         ? typeNode.namedChild(0) : typeNode;
                     const typeName = tsTypeName(typeId);
                     if (typeName) {
-                        localVarTypes.set(nameNode.text, typeName);
+                        localVarTypes.set(nameNode.text, typeName, 'annotation', typeNode);
                         declaredTypeVars.add(nameNode.text);
                         const annotationQualifier = tsTypeQualifier(typeId);
                         if (annotationQualifier) {
@@ -2632,7 +2635,7 @@ function findCallsInCode(code, parser) {
                     // Literal declaration types the variable (fix #262):
                     // `const lines = []` → Array. Annotation, when present,
                     // wins (the branch above).
-                    localVarTypes.set(nameNode.text, JS_LITERAL_ASSIGN_TYPES[initNode.type]);
+                    localVarTypes.set(nameNode.text, JS_LITERAL_ASSIGN_TYPES[initNode.type], 'literal', initNode);
                 }
             }
         }
@@ -2645,7 +2648,7 @@ function findCallsInCode(code, parser) {
                 const inner = typeNode.type === 'type_annotation' ? typeNode.namedChild(0) : typeNode;
                 const typeName = tsTypeName(inner);
                 if (typeName) {
-                    localVarTypes.set(pat.text, typeName);
+                    localVarTypes.set(pat.text, typeName, 'annotation', node);
                     declaredTypeVars.add(pat.text);
                     const annotationQualifier = tsTypeQualifier(inner);
                     if (annotationQualifier) {
@@ -2666,7 +2669,7 @@ function findCallsInCode(code, parser) {
                     nonCallableNames.add(left.text);
                     const ctorName = jsConstructorTypeName(right.childForFieldName('constructor'));
                     if (ctorName && !isConditionalReassignment(node)) {
-                        localVarTypes.set(left.text, ctorName);
+                        localVarTypes.set(left.text, ctorName, 'constructor', right);
                         const qualifier = jsConstructorTypeQualifier(
                             right.childForFieldName('constructor'));
                         if (qualifier) localVarTypeQualifiers.set(left.text, qualifier);
@@ -2678,7 +2681,7 @@ function findCallsInCode(code, parser) {
                 } else if (right && JS_LITERAL_ASSIGN_TYPES[right.type]) {
                     // Literal reassignment re-types the variable (fix #262)
                     if (!declaredTypeVars.has(left.text)) {
-                        localVarTypes.set(left.text, JS_LITERAL_ASSIGN_TYPES[right.type]);
+                        localVarTypes.set(left.text, JS_LITERAL_ASSIGN_TYPES[right.type], 'literal', right);
                         localVarTypeQualifiers.delete(left.text);
                     }
                 } else if (localVarTypes.has(left.text) && !declaredTypeVars.has(left.text)) {
@@ -2861,7 +2864,11 @@ function findCallsInCode(code, parser) {
                                     isMethod: true,
                                     boundCall: true,
                                     receiver: boundReceiver,
-                                    ...(boundReceiverType && { receiverType: boundReceiverType }),
+                                    ...(boundReceiverType && { receiverType: boundReceiverType,
+                                        ...(prototypeOwner ? {
+                                            receiverTypeSource: 'type-qualified',
+                                            receiverTypeEvidence: typeOrigin('type-qualified', innerObj),
+                                        } : localVarTypes.fields(innerObj?.text, boundReceiverType)) }),
                                     ...(innerObj?.type === 'identifier' &&
                                         localVarTypeQualifiers.has(innerObj.text) && {
                                             receiverTypeQualifier: localVarTypeQualifiers.get(innerObj.text),
@@ -3001,7 +3008,12 @@ function findCallsInCode(code, parser) {
                             callEnd: node.endIndex,
                             isMethod: true,
                             receiver,
-                            ...(receiverType && { receiverType }),
+                            ...(receiverType && { receiverType,
+                                ...(receiver ? localVarTypes.fields(receiver, receiverType) : {
+                                    receiverTypeSource: constructedReceiverType ? 'constructor' : 'literal',
+                                    receiverTypeEvidence: typeOrigin(constructedReceiverType ? 'constructor' : 'literal', objNode),
+                                }),
+                            }),
                             ...((constructedReceiverQualifier ||
                                 (receiver && localVarTypeQualifiers.get(receiver))) && {
                                 receiverTypeQualifier: constructedReceiverQualifier ||
@@ -3087,7 +3099,7 @@ function findCallsInCode(code, parser) {
                                         line: arg.startPosition.row + 1,
                                         isMethod: true,
                                         receiver: hofRecv,
-                                        ...(hofRecvType && { receiverType: hofRecvType }),
+                                        ...(hofRecvType && { receiverType: hofRecvType, ...localVarTypes.fields(hofRecv, hofRecvType) }),
                                         isFunctionReference: true,
                                         enclosingFunction
                                     });
@@ -3135,7 +3147,7 @@ function findCallsInCode(code, parser) {
                                     line: arg.startPosition.row + 1,
                                     isMethod: true,
                                     receiver: mvObj.text,
-                                    ...(mvType && { receiverType: mvType }),
+                                    ...(mvType && { receiverType: mvType, ...localVarTypes.fields(mvObj.text, mvType) }),
                                     isFunctionReference: true,
                                     enclosingFunction
                                 });
@@ -3290,8 +3302,7 @@ function findCallsInCode(code, parser) {
                 // Restore localVarTypes to pre-function state
                 const saved = localVarTypesStack.pop();
                 if (saved) {
-                    localVarTypes.clear();
-                    for (const [k, v] of saved) localVarTypes.set(k, v);
+                    localVarTypes.restore(saved);
                 }
                 const savedQualifiers = localVarTypeQualifiersStack.pop();
                 if (savedQualifiers) {

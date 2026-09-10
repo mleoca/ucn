@@ -1548,6 +1548,7 @@ describe('index reliability: parallel build equals sequential build', () => {
             '}',
             'export function typedFn(a: string, b: number): boolean { return !!a && b > 0; }',
             'const HANDLERS = { run: () => typedFn("x", 1) };',
+            'export function evidence(b: BaseT) { const c = new BaseT(); b.load("a"); c.load("c"); }',
         ].join('\n');
         spec['rich1.py'] = [
             'from flask import Flask',
@@ -1621,6 +1622,10 @@ describe('index reliability: parallel build equals sequential build', () => {
             seq.build(null, { quiet: true, workers: 0 });
             const par = new ProjectIndex(dir);
             par.build(null, { quiet: true, workers: 2 });
+            const sourceKinds = new Set(par.getCachedCalls(path.join(dir, 'rich0.ts'))
+                .filter(call => call.name === 'load').map(call => call.receiverTypeSource));
+            assert.deepStrictEqual(sourceKinds, new Set(['annotation', 'constructor']),
+                'the parity fixture must actually produce both receiver origins');
             assert.strictEqual(indexSnapshot(par), indexSnapshot(seq),
                 'parallel and sequential builds must produce identical indexes');
         } finally { rm(dir); }

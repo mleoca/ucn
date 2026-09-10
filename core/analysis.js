@@ -1158,6 +1158,8 @@ function impact(index, name, options = {}) {
                 evidenceScore: c.evidenceScore,
                 scoreKind: c.scoreKind,
                 resolution: c.resolution,
+                ...(c.provenance && { provenance: c.provenance }),
+                ...(c.siteProvenance && { siteProvenance: c.siteProvenance }),
                 ...(c.tier && { tier: c.tier }),
                 ...analysis
             });
@@ -1190,6 +1192,8 @@ function impact(index, name, options = {}) {
             evidenceScore: c.evidenceScore,
             scoreKind: c.scoreKind,
             resolution: c.resolution,
+            ...(c.provenance && { provenance: c.provenance }),
+            ...(c.siteProvenance && { siteProvenance: c.siteProvenance }),
             tier: c.tier,
         }));
         // findCallers already applied binding, receiver, module ownership, and
@@ -1241,6 +1245,8 @@ function impact(index, name, options = {}) {
                 evidenceScore: call.evidenceScore,
                 scoreKind: call.scoreKind,
                 resolution: call.resolution,
+                ...(call.provenance && { provenance: call.provenance }),
+                ...(call.siteProvenance && { siteProvenance: call.siteProvenance }),
                 ...(call.tier && { tier: call.tier }),
                 ...analysis
             });
@@ -1262,6 +1268,8 @@ function impact(index, name, options = {}) {
             evidenceScore: u.evidenceScore,
             scoreKind: u.scoreKind,
             resolution: u.resolution,
+            ...(u.provenance && { provenance: u.provenance }),
+            ...(u.siteProvenance && { siteProvenance: u.siteProvenance }),
             tier: 'unverified',
             ...(u.reason && { reason: u.reason }),
             ...(u.dispatchVia && { dispatchVia: u.dispatchVia }),
@@ -1711,6 +1719,8 @@ function about(index, name, options = {}) {
             evidenceScore: c.evidenceScore,
             scoreKind: c.scoreKind,
             resolution: c.resolution,
+            ...(c.provenance && { provenance: c.provenance }),
+            ...(c.siteProvenance && { siteProvenance: c.siteProvenance }),
             reachable: c.reachable,
         }));
 
@@ -1735,6 +1745,8 @@ function about(index, name, options = {}) {
                 evidenceScore: c.evidenceScore,
                 scoreKind: c.scoreKind,
                 resolution: c.resolution,
+                ...(c.provenance && { provenance: c.provenance }),
+                ...(c.siteProvenance && { siteProvenance: c.siteProvenance }),
                 ...(c.reason && { reason: c.reason }),
                 ...(c.dispatchVia && { dispatchVia: c.dispatchVia }),
                 ...(c.dispatchCandidates != null && { dispatchCandidates: c.dispatchCandidates }),
@@ -1786,6 +1798,8 @@ function about(index, name, options = {}) {
             evidenceScore: c.evidenceScore,
             scoreKind: c.scoreKind,
             resolution: c.resolution,
+            ...(c.provenance && { provenance: c.provenance }),
+            ...(c.siteProvenance && { siteProvenance: c.siteProvenance }),
             reachable: c.reachable,
             ...(c.returnType && { returnType: c.returnType }),
             ...(c.paramTypes && { paramTypes: c.paramTypes }),
@@ -2392,6 +2406,8 @@ function diffImpact(index, options = {}) {
                     evidenceScore: c.evidenceScore,
                     scoreKind: c.scoreKind,
                     resolution: c.resolution,
+                    ...(c.provenance && { provenance: c.provenance }),
+                    ...(c.siteProvenance && { siteProvenance: c.siteProvenance }),
                     ...(c.tier && { tier: c.tier }),
                 })),
                 unverifiedCallers: unverified.map(u => ({
@@ -2404,6 +2420,8 @@ function diffImpact(index, options = {}) {
                     evidenceScore: u.evidenceScore,
                     scoreKind: u.scoreKind,
                     resolution: u.resolution,
+                    ...(u.provenance && { provenance: u.provenance }),
+                    ...(u.siteProvenance && { siteProvenance: u.siteProvenance }),
                     tier: 'unverified',
                     ...(u.reason && { reason: u.reason }),
                     ...(u.dispatchVia && { dispatchVia: u.dispatchVia }),

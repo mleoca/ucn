@@ -5645,7 +5645,7 @@ describe('fix #209: structural dispatch tiering (JS/TS)', () => {
         } finally { rm(dir); }
     });
 
-    it('single-owner method name keeps confirming on scope evidence', () => {
+    it('single-owner method name stays visible despite the owner import (#355)', () => {
         const dir = tmp({
             'package.json': '{"name":"t"}',
             'lib.ts': [
@@ -5666,8 +5666,8 @@ describe('fix #209: structural dispatch tiering (JS/TS)', () => {
             const r = execute(index, 'context', { name: 'lib.ts:2:decodeFrames' });
             assert.ok(r.ok);
             const confirmed = (r.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
-            assert.ok(confirmed.includes('app.ts:4'),
-                `single project-wide owner stays confirmed (#204 rule): ${confirmed}`);
+            assert.ok(!confirmed.includes('app.ts:4'));
+            assert.strictEqual(r.result.unverifiedCallers.find(c => c.relativePath === 'app.ts' && c.line === 4)?.reason, 'single-owner');
         } finally { rm(dir); }
     });
 
@@ -5986,13 +5986,13 @@ export function drive(o) {
         } finally { rm(dir); }
     });
 
-    it('un-marked single-owner methods keep confirming (control)', () => {
+    it('un-marked single-owner methods remain visible without receiver evidence (#355)', () => {
         const dir = tmp(FILES);
         try {
             const index = idx(dir);
             const res = contract(index, 'mine.ts:5:plain');
-            assert.ok(res.confirmed.includes('user.ts:5'),
-                `plain has no override marker — import evidence stays sufficient: ${res.confirmed} / ${JSON.stringify(res.unverified)}`);
+            assert.ok(!res.confirmed.includes('user.ts:5'));
+            assert.strictEqual(res.unverified.find(c => c.key === 'user.ts:5')?.reason, 'single-owner');
             assert.strictEqual(res.conserved, true);
         } finally { rm(dir); }
     });
@@ -6687,13 +6687,13 @@ describe('fix #219: function-typed fields are callable owners (TS)', () => {
         } finally { rm(dir); }
     });
 
-    it('plain-typed interface properties do NOT add owners (single method owner still confirms)', () => {
+    it('plain-typed interface properties do not add owners or prove a receiver (#355)', () => {
         const dir = tmp(FILES);
         try {
             const index = idx(dir);
             const ctx = contextOf(index, 'types.ts:3:describe');
-            assert.ok(ctx.confirmed.includes('types.ts:15'),
-                `single-owner rule unchanged for non-callable properties: ${ctx.confirmed}`);
+            assert.ok(!ctx.confirmed.includes('types.ts:15'));
+            assert.ok(ctx.unverified.includes('types.ts:15'));
         } finally { rm(dir); }
     });
 });
@@ -9578,7 +9578,7 @@ describe('fix #265: fresh-arm caller physics (zustand/hono families)', () => {
         } finally { rm(dir); }
     });
 
-    it('counter: non-universal single-owner method names still confirm', () => {
+    it('ordinary single-owner names still need receiver evidence (#355)', () => {
         const dir = tmp({
             'package.json': '{"name":"t"}',
             'kit.js': [
@@ -9593,8 +9593,8 @@ describe('fix #265: fresh-arm caller physics (zustand/hono families)', () => {
             const index = idx(dir);
             const def = pinned(index, 'runIt', 'kit.js', 2);
             const res = callersFor(index, 'runIt', def);
-            assert.ok(res.some(c => c.line === 4),
-                'single-owner rule intact for ordinary names');
+            assert.ok(!res.some(c => c.line === 4));
+            assert.strictEqual(res.unverifiedEntries.find(c => c.line === 4)?.reason, 'single-owner');
         } finally { rm(dir); }
     });
 });
@@ -10297,7 +10297,7 @@ describe('fix #275: exact callable exports and renamed callee ownership', () => 
         } finally { rm(dir); }
     });
 
-    it('keeps branch-typed and dynamically-qualified receivers unverified; pristine-param bind keeps #221 confirmation', () => {
+    it('keeps branch-typed, dynamically-qualified, and untyped bound receivers visible (#355)', () => {
         const dir = tmp({
             'package.json': '{"name":"t"}',
             'lib.js': [
@@ -10336,18 +10336,12 @@ describe('fix #275: exact callable exports and renamed callee ownership', () => 
                     c.reason === 'possible-dispatch'),
                 `${className}.${name} must stay visible: ${JSON.stringify(callers.unverifiedEntries)}`);
             };
-            // `schema.validate.bind(schema)` on a pristine parameter keeps
-            // the measured #204/#221 physics: single project-wide owner +
-            // usage-style bind site stays CONFIRMED (calledAs 'bound').
-            // Demotion requires unknown-provenance evidence — an untypeable
-            // assignment (tombstone), external flow, or a dynamic qualifier
-            // like the two shapes below — never parameter-ness alone.
+            // Binding a method to an untyped parameter preserves receiver uncertainty.
             const bound = index.findCallers('validate', {
                 targetDefinitions: [target('validate', 'Hooks')], collectAccount: true,
             });
-            assert.ok(bound.some(c => c.relativePath === 'app.js' && c.line === 3 &&
-                c.calledAs === 'bound'),
-            `bind site keeps #221 confirmation: ${JSON.stringify(bound)}`);
+            assert.ok(!bound.some(c => c.relativePath === 'app.js' && c.line === 3));
+            assert.strictEqual(bound.unverifiedEntries.find(c => c.relativePath === 'app.js' && c.line === 3)?.reason, 'single-owner');
             assertVisibleOnly('toString', 'ContentType', 7);
             assertVisibleOnly('send', 'Reply', 11);
         } finally { rm(dir); }

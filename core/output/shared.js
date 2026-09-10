@@ -342,6 +342,9 @@ function formatGitLine(git) {
  */
 function unverifiedReasonLabel(entry) {
     if (!entry || !entry.reason) return '';
+    if (entry.reason === 'provenance-incomplete' && entry.provenance?.diagnostic) {
+        return `${entry.reason}: ${entry.provenance.diagnostic}`;
+    }
     if (entry.reason === 'possible-dispatch' && entry.externalContract) {
         // External contract (fix #210): the candidate set is open — any
         // external subtype of the contract — so no implementation count.

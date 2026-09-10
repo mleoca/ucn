@@ -139,6 +139,12 @@ const LANG_FIXTURES = {
     },
 };
 
+// The generators are shared with native fixture validation and later rule
+// matrices; each language uses valid syntax for its own uncertainty shapes.
+for (const [language, shapes] of Object.entries(require('./helpers/evidence-fixtures').RECEIVER_SHAPES)) {
+    Object.assign(LANG_FIXTURES[language], shapes);
+}
+
 // ── Test suites ────────────────────────────────────────────────────────────
 
 describe('Cross-language: trait consistency', () => {
@@ -716,6 +722,68 @@ describe('Cross-language: direct-call runtime boundaries', () => {
                 e.file.endsWith('client.js') && e.line === 2 &&
                 e.reason === 'language-boundary'),
             `cross-runtime text hit is explained: ${JSON.stringify(callers.accountRaw?.excludedEntries)}`);
+        } finally { rm(dir); }
+    });
+});
+
+
+describe('fix #355: reusable three-band receiver contract', () => {
+    forEachLanguage((language, _traits, extension) => {
+        if (language === 'c') return; // C's function-pointer shape is tested below.
+        it(`${language}: exact target, different target, unresolved receiver`, () => {
+            const shapes = LANG_FIXTURES[language];
+            assert.ok(shapes?.classWithMethod, `${language}: missing receiver fixture`);
+            const source = [shapes.prelude || '', shapes.classWithMethod('Local'),
+                shapes.classWithMethod('Other'), shapes.untypedOrExternalReceiverCall(),
+                shapes.annotatedReceiverCall(), shapes.constructorReceiverCall(),
+                shapes.unrelatedTypedReceiverCall()].join('\n');
+            const file = `fixture${extension}`;
+            const dir = tmp({ [file]: source });
+            try {
+                const index = idx(dir);
+                const target = index.symbols.get('as_posix').find(d => d.className === 'Local');
+                const result = index.context('as_posix', { file, line: target.startLine });
+                assert.ok(result.callers.some(c => c.callerName === 'declared'));
+                assert.ok(result.callers.some(c => c.callerName === 'constructed' &&
+                    c.provenance.rule === 'constructor-typed' && c.provenance.validation === 'establishes-target'));
+                assert.ok(!result.callers.some(c => ['different', 'unresolved'].includes(c.callerName)));
+                assert.ok(result.unverifiedCallers.some(c => c.callerName === 'unresolved'));
+                assert.ok(!result.unverifiedCallers.some(c => c.callerName === 'different'));
+                const other = result.meta.account.excluded.evidence.find(e =>
+                    e.provenance.facts.receiverType === 'Other');
+                assert.ok(other, 'different receiver needs inspectable exclusion evidence');
+                assert.equal(other.provenance.validation, 'establishes-other');
+                assert.equal(result.meta.account.conserved, true);
+                for (const name of ['declared', 'constructed', 'different']) {
+                    const callees = index.findCallees(index.symbols.get(name)[0], {
+                        includeMethods: true, collectAccount: true,
+                    });
+                    const edge = callees.find(c => c.name === 'as_posix');
+                    assert.ok(edge, `${name}: typed callee missing`);
+                    assert.equal(edge.className, name === 'different' ? 'Other' : 'Local');
+                    assert.equal(edge.siteProvenance[0].provenance.validation, 'establishes-target');
+                }
+            } finally { rm(dir); }
+        });
+    });
+
+    it('C: a struct function-pointer member is not a same-named function binding', () => {
+        const dir = tmp({
+            'fixture.c': 'static int as_posix(void) { return 1; }\nstruct Operations { int (*as_posix)(void); };\nint declared(void) { return as_posix(); }\nint unresolved(struct Operations value) { return value.as_posix(); }\n',
+            'other.c': 'static int as_posix(void) { return 2; }\nint different(void) { return as_posix(); }\n',
+        });
+        try {
+            const index = idx(dir);
+            const result = index.context('as_posix', { file: 'fixture.c', line: 1 });
+            assert.ok(result.callers.some(c => c.callerName === 'declared'));
+            assert.ok(!result.callers.some(c => c.callerName === 'unresolved'));
+            assert.ok(result.unverifiedCallers.some(c => c.callerName === 'unresolved'));
+            assert.ok(!result.callers.some(c => c.callerName === 'different'));
+            assert.ok(result.meta.account.excluded.total > 0);
+            assert.equal(result.meta.account.conserved, true);
+            const callees = index.findCallees(index.symbols.get('unresolved')[0], { collectAccount: true, includeMethods: true });
+            assert.ok(callees.unverifiedCallees.some(c => c.name === 'as_posix' && c.reason === 'callable-field'));
+            assert.equal(callees.calleeAccount.conserved, true);
         } finally { rm(dir); }
     });
 });

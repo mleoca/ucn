@@ -8,6 +8,9 @@
  * source fallback.
  */
 
+const { typeOrigin } = require('./type-evidence');
+
+
 const {
     traverseTree,
     traverseTreeCached,
@@ -1946,6 +1949,10 @@ function buildVariableTypes(tree) {
                 name: identity.name,
                 type,
                 staticType: declaratorStaticType(type, declarator),
+                origin: typeOrigin(node.type === 'declaration' &&
+                    (declarator.type === 'identifier' ||
+                     declarator.childForFieldName('value')?.type === 'new_expression')
+                    ? 'constructor' : 'annotation', declarator),
                 ...(pointeeType && { pointeeType }),
                 declaredAt: node.type === 'parameter_declaration'
                     ? scope.startIndex : declarator.startIndex,
@@ -2044,6 +2051,12 @@ function buildVariableTypes(tree) {
     return {
         get: (name, atNode) => resolveBinding(name, atNode)?.type,
         getStatic: (name, atNode) => resolveBinding(name, atNode)?.staticType,
+        evidence: (name, atNode) => {
+            const binding = resolveBinding(name, atNode);
+            return { receiverTypeSource: binding?.origin?.source || 'unknown',
+                ...(binding && { receiverTypeEvidence: { ...binding.origin, name, type: binding.type } }),
+            };
+        },
         getPointee: (name, atNode) =>
             resolveBinding(name, atNode)?.pointeeType,
         has: (name, atNode) => resolveBinding(name, atNode) !== undefined,
@@ -2501,7 +2514,7 @@ function findCallsInTree(code, parser, _options = {}, existingTree = null,
                 }),
                 ...(compileTimeOnly && { compileTimeOnly }),
                 ...(macroArguments.length > 0 && { macroArguments }),
-                ...(directReceiverType && { receiverType: directReceiverType }),
+                ...(directReceiverType && { receiverType: directReceiverType, ...variableTypes.evidence(receiverRoot, node) }),
                 ...(receiverCall && {
                     receiverCall,
                     receiverIsChainRoot: true,

@@ -707,7 +707,8 @@ function clearAllCaches() {
 // v212 (fix #342): extendsGraph/extendedByGraph no longer persisted (rebuilt on load).
 // v213 (fix #348): Python from-import records carry per-name `renames` so
 // import bindings pair each alias with its own module.
-const CACHE_FORMAT_VERSION = 214;
+// v215: receiver-type provenance records the originating AST fact (#355).
+const CACHE_FORMAT_VERSION = 216;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**

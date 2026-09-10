@@ -463,7 +463,11 @@ function buildAccount(index, name, parts) {
         confirmed,
         unverified,
         nonCall,
-        excluded: { total: excludedTotal, byReason: excludedByReason },
+        excluded: { total: excludedTotal, byReason: excludedByReason,
+            ...(excludedEntries.some(e => e.provenance) && { evidence: excludedEntries
+                .filter(e => e.provenance).map(e => ({ file: relPath(index, e.file),
+                    line: e.line, reason: e.reason, provenance: e.provenance })) }),
+        },
         unparsed: groundSet.unparsed,
         unsupported,
         unreadableFiles: groundSet.unreadableFiles,

@@ -12,6 +12,7 @@ const { COMMAND_CONTRACTS } = require('../command-contracts');
 const { COMMAND_TRUST_MATRIX } = require('../trust-matrix');
 const { toCliName, toMcpName, formatSurfaceMessage } = require('../registry');
 const { LINES_COMMANDS, formatPublicLines, formatPublicRaw } = require('./lines');
+const { provenanceReplacer } = require('./provenance');
 
 const legacy = {
     ...require('./analysis'),
@@ -44,7 +45,7 @@ function canonicalJsonValue(value) {
     if (!value || typeof value !== 'object') return value;
     const canonical = {};
     for (const key of Object.keys(value).sort()) {
-        canonical[key] = canonicalJsonValue(value[key]);
+        canonical[key] = canonicalJsonValue(provenanceReplacer(key, value[key]));
     }
     return canonical;
 }

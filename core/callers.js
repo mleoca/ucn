@@ -12,7 +12,10 @@ const { detectLanguage, getParser, getLanguageAdapter, langTraits } = require('.
 const { isTestFile } = require('./discovery');
 const { NON_CALLABLE_TYPES, isOverrideMarked, codeUnitCompare, isTestPath, CALLABLE_SYMBOL_KINDS } = require('./shared');
 const { _resolveJavaPackageImport } = require('./graph-build');
-const { scoreEdge, tierForResolution, TIER } = require('./confidence');
+const { scoreEdge, tierForResolution, TIER, validateConfirmation } = require('./confidence');
+const { summarizeProvenance, declarationIdentity, sameDeclaration } = require('./provenance');
+const { confirmationFacts, occurrenceIdentity } = require('./provenance-facts');
+const { BUILTIN_RECEIVER_TYPES, isProvenanceBuiltinReceiver } = require('./receiver-types');
 const { findGoModule, resolveRustImport } = require('./imports');
 
 const CONSTRUCTABLE_BINDING_KINDS = new Set([
@@ -22,6 +25,45 @@ const RESERVED_RECEIVER_NAMES = new Set([
     'self', 'cls', 'this', 'super', 'base', 'Self',
 ]);
 const CROSS_OPERATION_FLOW_CACHE_LIMIT = 4096;
+
+function _confirmationFacts(index, file, call, targets, options = {}) {
+    return confirmationFacts(index, file, call, targets, {
+        ...options,
+        selectOverload: selectProvenanceOverload,
+        typeHead: name => _structuralTypeHead(name, { index, language: index.files.get(file)?.language }),
+        resolveType(name, context, line, qualified) {
+            const language = index.files.get(context)?.language;
+            const parts = name.split(name.includes('::') ? '::' : '.');
+            if (parts.length > 1) {
+                const simple = parts.pop();
+                const qualifier = parts.join(language === 'cpp' ? '::' : '.');
+                const named = (index.symbols.get(simple) || []).filter(d =>
+                    IDENTITY_TYPE_KINDS.has(d.type) && d.namespace === qualifier &&
+                    (d.file === context || index.importGraph.get(context)?.has(d.file)));
+                if (named.length === 1) return named[0];
+            }
+            if (language === 'java' || language === 'csharp') {
+                const definitions = (index.symbols.get(name) || []).filter(d => IDENTITY_TYPE_KINDS.has(d.type));
+                const selected = definitions.filter(d => _resolveReceiverTypeIdentity(
+                    index, context, name, [{ ...d, className: name }], line, qualified) === 'target');
+                if (selected.length === 1) return selected[0];
+            }
+            if (language === 'java' && qualified) {
+                const nested = (index.symbols.get(name) || []).filter(d =>
+                    IDENTITY_TYPE_KINDS.has(d.type) && d.enclosingType === qualified);
+                if (nested.length === 1) return nested[0];
+            }
+            const origin = _resolveFlowTypeOrigin(index, context, name, qualified);
+            if (!origin?.fromFile) return null;
+            const definitions = (index.symbols.get(name) || []).filter(d =>
+                (IDENTITY_TYPE_KINDS.has(d.type) || (d.type === 'type' && d.aliasOf)) &&
+                d.file === origin.fromFile &&
+                (!d.lexicalScopeStartLine || (line != null &&
+                    line >= d.lexicalScopeStartLine && line <= d.lexicalScopeEndLine)));
+            return definitions.length === 1 ? definitions[0] : null;
+        },
+    });
+}
 
 // `base` is a contextual receiver keyword only in C#. TypeScript and the
 // other supported languages may bind an ordinary local named base; treating
@@ -290,8 +332,9 @@ function findCallers(index, name, options = {}) {
     // lookup); the rest stay as shadow-style records. Display caps are handled
     // by formatters — this only bounds file reads.
     const unverifiedEnrichLimit = options.unverifiedEnrichLimit ?? 10;
-    const recordExcluded = (filePath, line, reason) => {
-        if (accountRaw) accountRaw.excludedEntries.push({ file: filePath, line, reason });
+    const recordExcluded = (filePath, line, reason, provenance) => {
+        if (accountRaw) accountRaw.excludedEntries.push({ file: filePath, line, reason,
+            ...(provenance && { provenance }) });
     };
 
     const definitions = index.symbols.get(name) || [];
@@ -556,7 +599,7 @@ function findCallers(index, name, options = {}) {
     // unverified-tier entry (tiered caller contract: shown in its own
     // section, never silently hidden). Does NOT count toward pendingCount —
     // totals describe the confirmed answer.
-    const routeUnverified = (filePath, fileEntry, call, reason, calledAs, meta) => {
+    const routeUnverified = (filePath, fileEntry, call, reason, calledAs, meta, facts) => {
         if (!collectAccount) return; // non-account paths (trace/blast/verify) keep the plain drop
         const compilerSelectsOverload = cppOverloadDispatchTarget &&
             (reason === 'overload-ambiguous' || reason === 'ambiguous-binding' ||
@@ -582,10 +625,27 @@ function findCallers(index, name, options = {}) {
             _tier: TIER.UNVERIFIED, _reason: reason, _meta: meta,
             // Dispatch-tiered routes carry their own resolution so JSON output
             // distinguishes "possible virtual dispatch" from a bare uncertain.
-            _evidence: reason === 'possible-dispatch' ? { possibleDispatch: true }
+            _evidence: { ...(reason === 'single-owner' ? { hasSingleOwnerEvidence: true }
+                : reason === 'possible-dispatch' ? { possibleDispatch: true }
                 : reason === 'method-ambiguous' ? { methodAmbiguous: true }
-                : { isUncertain: true },
+                : { isUncertain: true }), ...(facts && { facts }) },
         });
+    };
+    const excludeReceiver = (filePath, fileEntry, call, calledAs, receiverOptions = {}) => {
+        const targets = options.targetDefinitions || definitions;
+        const facts = _confirmationFacts(index, filePath, call, targets, receiverOptions);
+        if ((BUILTIN_RECEIVER_TYPES.has(facts.receiverType) ||
+            (fileEntry.language === 'rust' && ['Option', 'Result', 'Vec'].includes(facts.receiverType))) &&
+            (facts.receiverTypeSource === 'literal' || !facts.receiverTypeDeclaration)) {
+            facts.builtinReceiver = { type: facts.receiverType, language: fileEntry.language };
+        }
+        const provenance = scoreEdge({ hasReceiverType: true, facts }).provenance;
+        const checked = validateConfirmation(provenance, facts.targets);
+        if (checked.verdict === 'establishes-other' || checked.verdict === 'unsupported') {
+            recordExcluded(filePath, call.line, 'receiver-type-mismatch', provenance);
+        } else {
+            routeUnverified(filePath, fileEntry, call, 'provenance-incomplete', calledAs, undefined, facts);
+        }
     };
     const maxResults = options.maxResults;
     // BUG-H1: when consumers (like `about`) need an accurate truncation header
@@ -692,6 +752,8 @@ function findCallers(index, name, options = {}) {
                         call = {
                             ...call,
                             receiverType: indexedType.type,
+                            receiverTypeSource: 'flow',
+                            receiverTypeEvidence: { source: 'flow', ...indexedType },
                             ...(indexedType.fromFile && {
                                 receiverTypeFlowFile: indexedType.fromFile,
                             }),
@@ -965,6 +1027,8 @@ function findCallers(index, name, options = {}) {
                         // annotation says *DefaultCodecRegistry; the guess
                         // excluded all three true RegisterCodec callers).
                         call = { ...call, receiverType: flowEntry.type,
+                            receiverTypeSource: 'flow',
+                            receiverTypeEvidence: { source: 'flow', ...flowEntry },
                             receiverTypeGuessed: undefined,
                             receiverFlowInvalidated: false,
                             ...(flowEntry.fromFile && { receiverTypeFlowFile: flowEntry.fromFile }) };
@@ -992,6 +1056,8 @@ function findCallers(index, name, options = {}) {
                         call = {
                             ...call,
                             receiverType: indexedType.type,
+                            receiverTypeSource: 'flow',
+                            receiverTypeEvidence: { source: 'flow', ...indexedType },
                             ...(indexedType.fromFile && {
                                 receiverTypeFlowFile: indexedType.fromFile,
                             }),
@@ -1028,7 +1094,9 @@ function findCallers(index, name, options = {}) {
                         const items = _pythonDeclaredIterablePathItems(
                             index, rootType, call.receiverIterationFields);
                         const item = items?.[call.receiverIterationIndex || 0];
-                        if (item) call = { ...call, receiverType: item };
+                        if (item) call = { ...call, receiverType: item,
+                            receiverTypeSource: 'flow',
+                            receiverTypeEvidence: { source: 'flow', type: item, iteration: call.receiver } };
                     }
                 }
 
@@ -1038,6 +1106,8 @@ function findCallers(index, name, options = {}) {
                         index, fileEntry, call.receiver);
                     if (importedType) {
                         call = { ...call, receiverType: importedType.type,
+                            receiverTypeSource: 'flow',
+                            receiverTypeEvidence: { source: 'flow', ...importedType },
                             receiverTypeFlowFile: importedType.fromFile };
                     }
                 }
@@ -1082,6 +1152,9 @@ function findCallers(index, name, options = {}) {
                         call = {
                             ...call,
                             receiverType: returnInfo.type.replace(/\[\]$/, '').split('.').pop(),
+                            receiverTypeSource: 'flow',
+                            receiverTypeEvidence: { source: 'flow', ...returnInfo,
+                                producerPath: call.receiverCallTypePath },
                             ...(returnInfo.fromFile && {
                                 receiverTypeFlowFile: returnInfo.fromFile,
                             }),
@@ -1122,6 +1195,8 @@ function findCallers(index, name, options = {}) {
                         call = {
                             ...call,
                             receiverType: patternType.type,
+                            receiverTypeSource: 'flow',
+                            receiverTypeEvidence: { source: 'flow', ...patternType },
                             ...(patternType.fromFile && {
                                 receiverTypeFlowFile: patternType.fromFile,
                             }),
@@ -1250,6 +1325,8 @@ function findCallers(index, name, options = {}) {
                             receiverTypePlatform: true };
                     } else if (folded && folded.type) {
                         call = { ...call, receiverType: folded.type,
+                            receiverTypeSource: 'flow',
+                            receiverTypeEvidence: { source: 'flow', ...folded },
                             ...(folded.fromFile && { receiverTypeFlowFile: folded.fromFile }) };
                     } else if (folded && folded.externalVia) {
                         call = {
@@ -1262,6 +1339,8 @@ function findCallers(index, name, options = {}) {
                     } else if (!folded?.suppressFallback) {
                         const chainedType = _chainedReceiverType(index, call, fileEntry.language);
                         if (chainedType) call = { ...call, receiverType: chainedType.type,
+                            receiverTypeSource: 'flow',
+                            receiverTypeEvidence: { source: 'flow', ...chainedType },
                             ...(chainedType.fromFile && { receiverTypeFlowFile: chainedType.fromFile }) };
                     }
                 } else if (call.isMethod && (!call.receiver || call.receiverIsChainRoot) &&
@@ -1303,6 +1382,8 @@ function findCallers(index, name, options = {}) {
                         };
                     } else if (flowEntry) {
                         call = { ...call, receiverType: flowEntry.type,
+                            receiverTypeSource: 'flow',
+                            receiverTypeEvidence: { source: 'flow', ...flowEntry },
                             ...(flowEntry.fromFile && { receiverTypeFlowFile: flowEntry.fromFile }) };
                     }
                 }
@@ -1359,6 +1440,8 @@ function findCallers(index, name, options = {}) {
                         call = {
                             ...call,
                             receiverType: items[0].type,
+                            receiverTypeSource: 'flow',
+                            receiverTypeEvidence: { source: 'flow', alternatives: items },
                             receiverTypeFlowFile: items[0].fromFile,
                         };
                     }
@@ -1393,6 +1476,8 @@ function findCallers(index, name, options = {}) {
                         call = {
                             ...call,
                             receiverType: closureType.type,
+                            receiverTypeSource: 'flow',
+                            receiverTypeEvidence: { source: 'flow', ...closureType },
                             receiverTypeFlowFile: closureType.fromFile,
                         };
                     }
@@ -1590,7 +1675,7 @@ function findCallers(index, name, options = {}) {
                                             dispatchCandidates: countDispatchCandidates(call.receiverType),
                                         });
                                     } else {
-                                        recordExcluded(filePath, call.line, 'receiver-type-mismatch');
+                                        excludeReceiver(filePath, fileEntry, call, calledAs);
                                     }
                                 }
                                 continue;
@@ -1619,9 +1704,9 @@ function findCallers(index, name, options = {}) {
                             const cbTypedMatch = call.receiverType && cbTypes.has(call.receiverType);
                             const cbAllTypeTargets = cbTargetDefs.length > 0 &&
                                 cbTargetDefs.every(d => IDENTITY_TYPE_KINDS.has(d.type));
-                            if (!cbTypeQualified && !cbTypedMatch &&
-                                (methodOwnerKeys().size > 1 || cbAllTypeTargets)) {
-                                routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs,
+                            if (!cbTypeQualified && !cbTypedMatch) {
+                                routeUnverified(filePath, fileEntry, call,
+                                    methodOwnerKeys().size === 1 && !cbAllTypeTargets ? 'single-owner' : 'method-ambiguous', calledAs,
                                     { dispatchCandidates: methodOwnerKeys().size });
                                 continue;
                             }
@@ -2005,6 +2090,7 @@ function findCallers(index, name, options = {}) {
                 // resolution, but its evidence grade is receiver-hint, not
                 // same-class (the receiver is the field's class).
                 let resolvedByTypedAttribute = false;
+                let resolvedReceiverFacts = {};
                 // Receiver/path type known to mismatch the target: such an edge can
                 // never tier as confirmed even when legacy includeUncertain keeps it
                 // visible (scoreEdge checks hasReceiverType before isUncertain, so
@@ -2053,6 +2139,9 @@ function findCallers(index, name, options = {}) {
                         index, fileEntry, call.receiver);
                     if (staticFieldType) {
                         call = { ...call, receiverType: staticFieldType,
+                            receiverTypeSource: 'field',
+                            receiverTypeEvidence: { source: 'field', field: call.receiver,
+                                type: staticFieldType, imports: fileEntry.importBindings },
                             receiverIsTypeQualified: false };
                     }
                 }
@@ -2160,6 +2249,11 @@ function findCallers(index, name, options = {}) {
                                 if (compatibleTypes.has(targetClass)) {
                                     resolvedBySameClass = true;
                                     resolvedByTypedAttribute = true;
+                                    resolvedReceiverFacts = {
+                                        receiverType: targetClass, receiverTypeSource: 'field',
+                                        receiverOrigin: { source: 'field', rootType: callerSymbol.className,
+                                            field: call.selfAttribute, scope: declarationIdentity(callerSymbol) },
+                                    };
                                 } else if (_isAncestorOfTargetClass(index, targetClass, tDefs)) {
                                     // A field declared as a strict ancestor can
                                     // dynamically hold the pinned override.
@@ -2172,7 +2266,11 @@ function findCallers(index, name, options = {}) {
                                     // type is exact negative evidence. Earlier
                                     // code discarded this field contract and
                                     // emitted method-no-evidence.
-                                    recordExcluded(filePath, call.line, 'receiver-type-mismatch');
+                                    excludeReceiver(filePath, fileEntry, call, calledAs, {
+                                        receiverType: targetClass, receiverTypeSource: 'field',
+                                        receiverOrigin: { source: 'field', rootType: callerSymbol?.className,
+                                            field: call.selfAttribute },
+                                    });
                                     continue;
                                 } else if (options.collectAccount || !options.includeMethods) {
                                     routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
@@ -3036,6 +3134,13 @@ function findCallers(index, name, options = {}) {
                         continue;
                     }
                     const targetHasClass = targetDefs.some(d => d.className);
+                    if (call.isMethod && !targetHasClass && fileEntry.language === 'c') {
+                        // C member calls invoke function-pointer fields. The
+                        // pointer can hold the pinned free function; member
+                        // syntax alone is neither binding nor exclusion proof.
+                        routeUnverified(filePath, fileEntry, call, 'callable-field', calledAs);
+                        continue;
+                    }
                     if (call.isMethod && !targetHasClass) {
                         // Method call but target is a standalone function — skip
                         recordExcluded(filePath, call.line, 'method-kind-mismatch');
@@ -3227,7 +3332,7 @@ function findCallers(index, name, options = {}) {
                     isUncertain = true;
                     typeMismatch = true;
                     if (collectAccount) {
-                        recordExcluded(filePath, call.line, 'receiver-type-mismatch');
+                        excludeReceiver(filePath, fileEntry, call, calledAs);
                         continue;
                     }
                     if (!options.includeUncertain) {
@@ -3303,13 +3408,21 @@ function findCallers(index, name, options = {}) {
                     isUncertain = true;
                     typeMismatch = true;
                     if (collectAccount) {
-                        recordExcluded(filePath, call.line, 'receiver-type-mismatch');
+                        excludeReceiver(filePath, fileEntry, call, calledAs);
                         continue;
                     }
                     if (!options.includeUncertain) {
                         if (stats) stats.uncertain = (stats.uncertain || 0) + 1;
                         continue;
                     }
+                }
+
+                // C# dynamic is an unresolved runtime receiver, never a
+                // concrete foreign type that can disprove a project edge.
+                if (fileEntry.language === 'csharp' && call.receiverType === 'dynamic') {
+                    routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs,
+                        { dispatchVia: 'dynamic' });
+                    continue;
                 }
 
                 // Receiver-class disambiguation:
@@ -3571,7 +3684,8 @@ function findCallers(index, name, options = {}) {
                                     // Not evidence against — visible possible-dispatch.
                                     // Go struct embedding binds statically and stays
                                     // excluded.
-                                    if (_dispatchCapableSupertype(index, fileEntry.language, knownType, targetDefs, definitions)) {
+                                    if (_dispatchCapableSupertype(index, fileEntry.language, knownType, targetDefs, definitions) ||
+                                        (!knownTypeHasProjectIdentity && externalContractTarget()?.via === knownType)) {
                                         const externalContract = externalContractTarget();
                                         routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
                                             dispatchVia: knownType,
@@ -3582,7 +3696,11 @@ function findCallers(index, name, options = {}) {
                                         });
                                         continue;
                                     }
-                                    recordExcluded(filePath, call.line, 'receiver-type-mismatch');
+                                    excludeReceiver(filePath, fileEntry, call, calledAs, fieldHopType && !call.receiverType ? {
+                                        receiverType: fieldHopType, receiverTypeSource: 'field',
+                                        receiverOrigin: { source: 'field', root: call.receiverRoot,
+                                            rootType: call.receiverRootType, field: call.receiverField },
+                                    } : {});
                                     continue;
                                 }
                                 if (!options.includeUncertain) {
@@ -3695,7 +3813,7 @@ function findCallers(index, name, options = {}) {
                                 isUncertain = true;
                                 typeMismatch = true;
                                 if (collectAccount) {
-                                    recordExcluded(filePath, call.line, 'receiver-type-mismatch');
+                                    excludeReceiver(filePath, fileEntry, call, calledAs);
                                     continue;
                                 }
                                 if (!options.includeUncertain) {
@@ -3736,6 +3854,10 @@ function findCallers(index, name, options = {}) {
                                 }
                                 inferredMatch = true;
                                 nominalInferredMatch = true;
+                                resolvedReceiverFacts = {
+                                    receiverType: typeReceiver, receiverTypeSource: 'type-qualified',
+                                    receiverOrigin: { source: 'type-qualified', site: occurrenceIdentity(fileEntry.relativePath, call) },
+                                };
                             }
                             // Still no type — fall back to receiver name matching when
                             // multiple defs exist. A field-declared interface/trait type
@@ -4154,6 +4276,13 @@ function findCallers(index, name, options = {}) {
                             continue;
                         }
                     }
+                    if (typeQualifiedReceiver) {
+                        resolvedReceiverFacts = {
+                            receiverType: receiverName, receiverTypeSource: 'type-qualified',
+                            receiverOrigin: { source: 'type-qualified', site: occurrenceIdentity(fileEntry.relativePath, call) },
+                            ...(aliasResolvedFile && { originFile: aliasResolvedFile }),
+                        };
+                    }
                     if (!typeQualifiedReceiver) {
                         // External-producer receiver (fix #220): the variable
                         // was assigned from a call into an external package
@@ -4344,6 +4473,15 @@ function findCallers(index, name, options = {}) {
                                 }
                             }
                         }
+                        // Module ownership is evidence for an exported item,
+                        // not for a method nested inside that module's type.
+                        // A same-named free function and method can share the
+                        // target file (itertools::peek_nth vs PeekNth::peek_nth).
+                        if (call.moduleOwnedPath && fileEntry.language === 'rust' &&
+                            targetDefs2.every(d => d.className || d.receiver)) {
+                            routeUnverified(filePath, fileEntry, call, 'provenance-incomplete', calledAs);
+                            continue;
+                        }
                         const knownDispatchType = call.receiverType || fieldHopType || fieldDispatchType;
                         // Module-owned qualified calls (fix #260b) are resolved
                         // by OWNERSHIP — the dispatch-ambiguity routing below is
@@ -4373,8 +4511,11 @@ function findCallers(index, name, options = {}) {
                             });
                             continue;
                         }
-                        if (!call.moduleOwnedPath && !knownDispatchType && methodOwnerKeys().size > 1) {
-                            routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs, {
+                        if (!call.moduleOwnedPath && !knownDispatchType) {
+                            const contract = externalContractTarget();
+                            routeUnverified(filePath, fileEntry, call,
+                                contract ? 'possible-dispatch' : methodOwnerKeys().size === 1 ? 'single-owner' : 'method-ambiguous', calledAs, {
+                                ...(contract && { dispatchVia: contract.via, externalContract: true }),
                                 dispatchCandidates: methodOwnerKeys().size,
                             });
                             continue;
@@ -4566,8 +4707,8 @@ function findCallers(index, name, options = {}) {
                 // in a file that imports _decoders.py is bytes.decode, not
                 // ContentDecoder.decode. An untyped-receiver method call
                 // confirms only via binding, same-class, a validated receiver
-                // type, a type-qualified receiver (Class.method static style),
-                // or a single project-wide owner. Multi-owner name matches
+                // type or a type-qualified receiver (Class.method static style).
+                // Single-owner and multi-owner name matches
                 // route VISIBLE method-ambiguous — never dropped. Same for a
                 // bare call against pure method targets (a bare name cannot
                 // denote a method in JS/TS/Python — only a rebound alias can,
@@ -4583,7 +4724,11 @@ function findCallers(index, name, options = {}) {
                     if (call.isMethod && !call.receiverIsModule &&
                         !recvSubmoduleRel && !call.moduleOwnedPath) {
                         const tTypes = dispatchTargetTypes(targetDefs2);
-                        const typeQualifiedReceiver = !!(call.receiver && tTypes.has(call.receiver));
+                        let typeQualifiedReceiver = !!(call.receiver && tTypes.has(call.receiver));
+                        if (typeQualifiedReceiver) resolvedReceiverFacts = {
+                            receiverType: call.receiver, receiverTypeSource: 'type-qualified',
+                            receiverOrigin: { source: 'type-qualified', site: occurrenceIdentity(fileEntry.relativePath, call) },
+                        };
                         const knownDispatchType = call.receiverType ||
                             fieldHopType || fieldDispatchType;
                         // A compiler/parser-known receiver type that is not a
@@ -4758,6 +4903,8 @@ function findCallers(index, name, options = {}) {
                                 });
                                 continue;
                             }
+                            typeQualifiedReceiver = true;
+                            call = { ...call, moduleOwnedPath: true };
                         }
                         // External-contract single owner (fix #210): same
                         // physics as the nominal gate above — an override
@@ -4787,7 +4934,7 @@ function findCallers(index, name, options = {}) {
                             });
                             continue;
                         }
-                        if (!typeQualifiedReceiver && methodOwnerKeys().size > 1) {
+                        if (!typeQualifiedReceiver) {
                             const knownDispatchType = call.receiverType || fieldHopType || fieldDispatchType;
                             if (knownDispatchType) {
                                 // Known-but-unvalidated type (supertype of the
@@ -4801,7 +4948,7 @@ function findCallers(index, name, options = {}) {
                                     dispatchCandidates: countDispatchCandidates(knownDispatchType),
                                 });
                             } else {
-                                routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs, {
+                                routeUnverified(filePath, fileEntry, call, methodOwnerKeys().size === 1 ? 'single-owner' : 'method-ambiguous', calledAs, {
                                     dispatchCandidates: methodOwnerKeys().size,
                                 });
                             }
@@ -4876,6 +5023,17 @@ function findCallers(index, name, options = {}) {
                     }
                 }
 
+                if (!collectAccount && call.isMethod && !call.isConstructor &&
+                    !resolvedBySameClass && !receiverTypeValidated && !nominalInferredMatch &&
+                    !resolvedByExtensionMethod && !call.moduleOwnedPath &&
+                    !call.receiverIsModule && !recvSubmoduleRel) {
+                    const qualified = _calleeTypeQualifiedReceiver(index,
+                        { ...callerSymbol, file: filePath }, fileEntry, call, fileEntry.language);
+                    const exact = qualified?.match && targetDefs.some(target =>
+                        target.file === qualified.match.file && target.startLine === qualified.match.startLine);
+                    if (!exact) continue;
+                }
+
                 if (!pendingByFile.has(filePath)) pendingByFile.set(filePath, []);
                 pendingByFile.get(filePath).push({
                     call, fileEntry, callerSymbol,
@@ -4891,6 +5049,19 @@ function findCallers(index, name, options = {}) {
                     receiverType: call.receiverType,
                     calledAs,
                     _evidence: {
+                        facts: _confirmationFacts(index, filePath, call, targetDefs, {
+                            bindingId,
+                            ...resolvedReceiverFacts,
+                            sameClass: !!resolvedBySameClass && !resolvedByTypedAttribute,
+                            ...(fieldHopType && !call.receiverType && {
+                                receiverType: fieldHopType, receiverTypeSource: 'field',
+                                receiverOrigin: { source: 'field', root: call.receiverRoot,
+                                    rootType: call.receiverRootType, field: call.receiverField },
+                            }),
+                        }),
+                        typeQualifiedReceiver: resolvedReceiverFacts.receiverTypeSource === 'type-qualified',
+                        moduleOwnedPath: !!call.moduleOwnedPath,
+                        extensionMethod: !!resolvedByExtensionMethod,
                         hasBindingId: !!bindingId,
                         resolvedBySameClass: !!resolvedBySameClass && !resolvedByTypedAttribute,
                         hasSamePackageEvidence,
@@ -4912,8 +5083,8 @@ function findCallers(index, name, options = {}) {
                         // The dispatch gates above have already rejected
                         // external contracts, universal methods, wrong arity,
                         // unresolved producer flow, and multi-owner names.
-                        // What remains with exactly one project owner is
-                        // positive project-scope identity evidence.
+                        // Owner count describes unresolved candidates. It
+                        // never establishes the identity of a value receiver (#355).
                         hasSingleOwnerEvidence: !!(collectAccount && call.isMethod &&
                             !call.inMacroDefinition && !call.isMacro &&
                             !call.receiverType && !fieldHopType &&
@@ -4967,14 +5138,43 @@ function findCallers(index, name, options = {}) {
         for (const { call, fileEntry, callerSymbol, isMethod, isFunctionReference,
             isTypeReference, receiver, receiverType, calledAs, _evidence, _tier,
             _reason, _meta } of pending) {
-            const scored = scoreEdge(_evidence || {});
+            const evidence = {
+                ...(_evidence || {}),
+                ...(_reason && { reason: _reason }),
+                facts: _evidence?.facts || _confirmationFacts(index, filePath,
+                    call, options.targetDefinitions || definitions, {
+                        sameClass: _evidence?.resolvedBySameClass,
+                    }),
+            };
+            let scored = scoreEdge(evidence);
+            let routedTier = _tier;
+            let routedReason = _reason;
+            const migrated = isMethod && !call.isConstructor && !evidence.resolvedBySameClass &&
+                !evidence.typeQualifiedReceiver && !evidence.moduleOwnedPath && !evidence.extensionMethod &&
+                (evidence.hasReceiverType || evidence.resolvedByReceiverHint || evidence.hasSingleOwnerEvidence);
+            if (!_tier && migrated && collectAccount) {
+                const checked = validateConfirmation(scored.provenance, evidence.facts.targets);
+                if (checked.verdict === 'establishes-other') {
+                    recordExcluded(filePath, call.line, 'receiver-target-different', scored.provenance);
+                    continue;
+                }
+                if (checked.verdict !== 'establishes-target' && checked.verdict !== 'unsupported') {
+                    if (!collectAccount) continue;
+                    routedTier = TIER.UNVERIFIED;
+                    routedReason = evidence.hasSingleOwnerEvidence && !evidence.hasReceiverType
+                        ? 'single-owner' : 'provenance-incomplete';
+                    const ranking = scoreEdge({ isUncertain: true,
+                        hasSingleOwnerEvidence: routedReason === 'single-owner' });
+                    scored = { ...ranking, provenance: scored.provenance };
+                }
+            }
             // Family B contract field (fix #221): a bind/call/apply site reaches
             // the target through Function.prototype indirection, not direct call
             // syntax — label the edge calledAs:'bound'. Rename aliases keep their
             // surface name (they describe the same slot and are rarer). Label
             // only, computed at edge construction: routing logic never sees it.
             const edgeCalledAs = calledAs || (call.boundCall ? 'bound' : undefined);
-            if (_tier) {
+            if (routedTier) {
                 // Routed unverified entry — never competes with the main
                 // answer for maxResults/enrichLimit slots.
                 const base = {
@@ -4986,8 +5186,9 @@ function findCallers(index, name, options = {}) {
                     evidenceScore: scored.evidenceScore,
                     scoreKind: scored.scoreKind,
                     resolution: scored.resolution,
-                    tier: _tier,
-                    reason: _reason,
+                    ...(collectAccount && { provenance: scored.provenance }),
+                    tier: routedTier,
+                    reason: routedReason,
                     ...(_meta || {}),
                     isMethod: call.isMethod || false,
                     ...(isFunctionReference && { isFunctionReference: true }),
@@ -5036,6 +5237,7 @@ function findCallers(index, name, options = {}) {
                     evidenceScore: scored.evidenceScore,
                     scoreKind: scored.scoreKind,
                     resolution: scored.resolution,
+                    ...(collectAccount && { provenance: scored.provenance }),
                     ...(tier && { tier }),
                     isMethod: call.isMethod || false,
                     ...(isFunctionReference && { isFunctionReference: true }),
@@ -5074,6 +5276,7 @@ function findCallers(index, name, options = {}) {
                 evidenceScore: scored.evidenceScore,
                 scoreKind: scored.scoreKind,
                 resolution: scored.resolution,
+                    ...(collectAccount && { provenance: scored.provenance }),
                 ...(tier && { tier }),
             });
             enrichedCount++;
@@ -5211,6 +5414,30 @@ function findCallees(index, definition, options = {}) {
             : [];
 
         const callees = new Map();  // key -> { name, bindingId, count }
+        const siteEvidence = new Map();
+        const provenanceForSite = (siteId, target, reason) => {
+            const record = siteEvidence.get(siteId) || { call: calls[siteId], evidence: {} };
+            const call = record.call;
+            const evidence = { ...record.evidence, ...(reason && { reason }) };
+            evidence.facts = _confirmationFacts(index, def.file, call,
+                target ? [target] : (index.symbols.get(call.name) || []), record.options);
+            // A bindingId synthesized by receiver resolution is not a
+            // lexical binding of the method token. Rank the actual site facts.
+            if (call.isMethod && !call.receiverIsModule && !call.moduleOwnedPath &&
+                !evidence.typeQualifiedReceiver && !evidence.extensionMethod) evidence.hasBindingId = false;
+            if (!call.isMethod && target && !evidence.hasBindingId) {
+                evidence.hasImportEvidence = (index.symbols.get(call.name) || []).length === 1 ||
+                    target.file === def.file || index.importGraph.get(def.file)?.has(target.file);
+            }
+            const scored = scoreEdge(evidence);
+            return {
+                ...occurrenceIdentity(fileEntry?.relativePath || def.file, call, siteId),
+                ...(target && { targetDef: declarationIdentity(target) }),
+                confidence: scored.confidence, evidenceScore: scored.evidenceScore,
+                resolution: scored.resolution, scoreKind: scored.scoreKind,
+                provenance: scored.provenance,
+            };
+        };
         let selfAttrCalls = null;   // collected for Python self.attr.method() resolution
         let selfMethodCalls = null; // collected for Python self.method() resolution
 
@@ -5259,7 +5486,7 @@ function findCallees(index, definition, options = {}) {
         };
         // Retain an uncertain/unresolved call as a visible unverified callee
         // entry (aggregated by name+reason) and claim its site.
-        const noteUnverified = (siteId, call, reason, meta = {}) => {
+        const noteUnverified = (siteId, call, reason, meta = {}, siteProof) => {
             if (!collectAccount || claimedSiteIds.has(siteId)) return;
             noteSite(siteId, 'unverified', reason, call);
             const key = `${call.name}|${reason}|${meta.dispatchVia || ''}`;
@@ -5272,6 +5499,13 @@ function findCallees(index, definition, options = {}) {
             }
             entry.callCount++;
             entry.sites.push(call.line);
+            if (!entry.siteProvenance) entry.siteProvenance = [];
+            const unverifiedScore = scoreEdge({ isUncertain: true, reason });
+            entry.siteProvenance.push({ ...(siteProof || provenanceForSite(siteId, null, reason)),
+                tier: TIER.UNVERIFIED, reason,
+                confidence: unverifiedScore.confidence, evidenceScore: unverifiedScore.evidenceScore,
+                resolution: reason, scoreKind: unverifiedScore.scoreKind });
+            entry.provenance = summarizeProvenance(entry.siteProvenance);
         };
         // A statically selected base implementation is not the only runtime
         // target in languages with virtual/structural dispatch. If a project
@@ -5353,7 +5587,8 @@ function findCallees(index, definition, options = {}) {
         // already carry stronger identity and must not trigger a whole-file
         // flow build merely because their parser record lacks receiverType.
         const mayNeedDirectReceiverFlow = call =>
-            call.isMethod && call.receiver && !call.receiverType &&
+            call.isMethod && call.receiver && (!call.receiverType ||
+                call.receiverTypeGuessed || call.receiverTypeSource === 'guess') &&
             !call.receiverPatternShadow &&
             !_isReservedReceiver(language, call.receiver) &&
             !call.isPathCall && !call.receiverIsModule &&
@@ -5378,6 +5613,14 @@ function findCallees(index, definition, options = {}) {
         for (let call of calls) {
             siteOrdinal++;
             const siteId = siteOrdinal;
+            siteEvidence.set(siteId, {
+                call,
+                evidence: {
+                    hasReceiverType: !!call.receiverType,
+                    resolvedBySameClass: !!call.receiver && _isReservedReceiver(language, call.receiver),
+                },
+                options: { sameClass: !!call.receiver && _isReservedReceiver(language, call.receiver) },
+            });
             if (language === 'csharp') {
                 // fix #353: `Beta.Helper.Widget()` — namespace-qualified type
                 // receiver (see the findCallers twin).
@@ -5391,6 +5634,8 @@ function findCallees(index, definition, options = {}) {
                     call = {
                         ...call,
                         receiverType: indexedType.type,
+                            receiverTypeSource: 'flow',
+                            receiverTypeEvidence: { source: 'flow', ...indexedType },
                         ...(indexedType.fromFile && {
                             receiverTypeFlowFile: indexedType.fromFile,
                         }),
@@ -5416,6 +5661,17 @@ function findCallees(index, definition, options = {}) {
 
             if (!isDirectMatch && !isNestedCallback) continue;
             if (calleeAccount) calleeAccount.totalSites++;
+
+            if (language === 'c' && call.isMethod) {
+                noteUnverified(siteId, call, 'callable-field');
+                continue;
+            }
+
+            if (language === 'csharp' && call.receiverType === 'dynamic') {
+                if (_calleeZeroCandidateName(index, call)) noteSite(siteId, 'external', null, call);
+                else noteUnverified(siteId, call, 'possible-dispatch', { dispatchVia: 'dynamic' });
+                continue;
+            }
 
             if (call.macroParameter) {
                 noteSite(siteId, 'excluded', 'macro-parameter', call);
@@ -5460,6 +5716,7 @@ function findCallees(index, definition, options = {}) {
                     const selected = _calleeOverloadSelect(
                         index, call, extensions, language);
                     if (selected.match) {
+                        if (collectAccount) siteEvidence.get(siteId).evidence.extensionMethod = true;
                         const match = selected.match;
                         const key = match.bindingId ||
                             `${match.file}:${match.startLine}:${call.name}`;
@@ -5530,6 +5787,8 @@ function findCallees(index, definition, options = {}) {
                     call = {
                         ...call,
                         receiverType: indexedType.type,
+                            receiverTypeSource: 'flow',
+                            receiverTypeEvidence: { source: 'flow', ...indexedType },
                         ...(indexedType.fromFile && {
                             receiverTypeFlowFile: indexedType.fromFile,
                         }),
@@ -5648,6 +5907,22 @@ function findCallees(index, definition, options = {}) {
                 }
             }
 
+            if (collectAccount) {
+                const record = siteEvidence.get(siteId);
+                record.call = call;
+                if (directReceiverFlow?.type || fieldHopType) {
+                    const source = directReceiverFlow?.type ? 'flow' : 'field';
+                    record.evidence.hasReceiverType = true;
+                    Object.assign(record.options, {
+                        receiverType: directReceiverFlow?.type || fieldHopType,
+                        receiverTypeSource: source,
+                        originFile: directReceiverFlow?.fromFile || fieldHopInfo?.fromFile,
+                        receiverOrigin: { source, ...(directReceiverFlow || fieldHopInfo || {}),
+                            field: call.receiverField, rootType: call.receiverRootType },
+                    });
+                }
+            }
+
             if (fieldDispatchType) {
                 noteUnverified(siteId, call, 'possible-dispatch', {
                     dispatchVia: fieldDispatchType,
@@ -5667,6 +5942,7 @@ function findCallees(index, definition, options = {}) {
                     const selected = _calleeOverloadSelect(
                         index, extensionCall, extensions, language);
                     if (selected.match) {
+                        if (collectAccount) siteEvidence.get(siteId).evidence.extensionMethod = true;
                         const match = selected.match;
                         const key = match.bindingId ||
                             `${match.file}:${match.startLine}:${call.name}`;
@@ -5810,6 +6086,7 @@ function findCallees(index, definition, options = {}) {
                 !_isReservedReceiver(language, call.receiver) &&
                 !(localTypes && localTypes.has(call.receiver))) {
                 typeQual = _calleeTypeQualifiedReceiver(index, def, fileEntry, call, language);
+                if (typeQual) siteEvidence.get(siteId).evidence.typeQualifiedReceiver = true;
             }
 
             // Package-qualified NON-method records (fix #268, chi-measured):
@@ -6103,6 +6380,12 @@ function findCallees(index, definition, options = {}) {
                         chained = _nominalChainedReceiverType(index, call, fileEntry, def.file);
                     }
                     if (chained?.type) {
+                        const record = siteEvidence.get(siteId);
+                        record.evidence.hasReceiverType = true;
+                        Object.assign(record.options, {
+                            receiverType: chained.type, receiverTypeSource: 'flow',
+                            receiverOrigin: { source: 'flow', ...chained }, originFile: chained.fromFile,
+                        });
                         const symbols = index.symbols.get(call.name);
                         const isCallableCh = (s) => !NON_CALLABLE_TYPES.has(s.type) ||
                             (s.type === 'field' && s.fieldType && /^func\b/.test(s.fieldType));
@@ -6849,21 +7132,28 @@ function findCallees(index, definition, options = {}) {
                 if (bound && routeVirtualOverride(siteId, call, def.className, bound)) continue;
             }
 
-            // Single project-wide owner (fix #236 — the caller side's
-            // #204/#209 rule on the callee side): an untyped-receiver method
-            // call whose name has exactly ONE owner type resolves to that
-            // owner's method — `k.run()` where only Kit defines run. Without
-            // it, trace trees stopped expanding at statically-resolvable
-            // calls the caller direction confirms.
+            // Receiver evidence for the former single-owner fallback (#355).
+            // A name with one owner still needs an independent typed lookup;
+            // unresolved values remain visible in the contract.
             if (isUncertain && call.isMethod && call.receiver && !bindingResolved) {
                 const fm = mayNeedDirectReceiverFlow(call) ? flowMap() : null;
                 const flowEntry = fm ? _lookupReturnTypeFlow(fm, call) : undefined;
                 const owner = _calleeSingleOwnerMatch(index, def, fileEntry, call, effectiveName, language, flowEntry);
                 if (owner) {
+                    siteEvidence.get(siteId).evidence.hasSingleOwnerEvidence = true;
                     isUncertain = false;
                     bindingResolved = owner.bindingId;
                     calleeKey = owner.bindingId ||
                         `${owner.className || (owner.receiver || '').replace(/^\*/, '')}.${effectiveName}`;
+                } else if (!call.receiverType && !flowEntry?.type && !fieldHopType &&
+                    !call.receiverExternalFlow && !call.receiverQualifiedFlow) {
+                    const owners = new Set((index.symbols.get(effectiveName) || [])
+                        .filter(d => !NON_CALLABLE_TYPES.has(d.type) && (d.className || d.receiver))
+                        .map(d => `${d.file}:${d.className || d.receiver}`));
+                    if (owners.size === 1) {
+                        uncertainReason = 'single-owner';
+                        siteEvidence.get(siteId).evidence.hasSingleOwnerEvidence = true;
+                    }
                 }
             }
 
@@ -6891,6 +7181,59 @@ function findCallees(index, definition, options = {}) {
                 }
             }
 
+            // Legacy callers receive no uncertainty band. Drop an untyped
+            // value receiver even if a same-file or unique-name lookup picked
+            // a method; only actual receiver/module/type evidence survives.
+            if (!collectAccount && call.isMethod && !call.receiverType &&
+                !directReceiverFlow?.type && !fieldHopType &&
+                !localTypes?.has(call.receiver) &&
+                !siteEvidence.get(siteId).evidence.resolvedBySameClass &&
+                !siteEvidence.get(siteId).evidence.typeQualifiedReceiver &&
+                !call.receiverIsModule && !call.receiverModuleSpecifier &&
+                !call.receiverModuleComposition && !call.moduleOwnedPath &&
+                !call.isConstructor) continue;
+
+            if (collectAccount) {
+                const record = siteEvidence.get(siteId);
+                record.call = call;
+                if (bindingResolved && !record.evidence.hasSingleOwnerEvidence) {
+                    record.evidence.hasBindingId = true;
+                    record.options.bindingId = bindingResolved;
+                }
+            }
+            if (collectAccount) {
+                const record = siteEvidence.get(siteId);
+                const valueReceiver = call.isMethod && !call.isConstructor &&
+                    !call.receiverIsModule && !call.receiverModuleSpecifier &&
+                    !call.receiverModuleComposition && !call.moduleOwnedPath &&
+                    !record.evidence.typeQualifiedReceiver && !record.evidence.extensionMethod &&
+                    !record.evidence.resolvedBySameClass;
+                if (valueReceiver) {
+                    // Resolve and classify THIS occurrence before its grouping
+                    // key is chosen. A sibling site cannot lend its receiver
+                    // evidence or overload identity to this one.
+                    const proof = provenanceForSite(siteId, null);
+                    const facts = proof.provenance.facts;
+                    const checked = validateConfirmation(proof.provenance, facts.targets);
+                    const selected = checked.verdict === 'establishes-target' &&
+                        (index.symbols.get(effectiveName) || []).find(candidate =>
+                            sameDeclaration(declarationIdentity(candidate), facts.lookup?.selected));
+                    const reportOnly = checked.verdict === 'unsupported' && record.evidence.hasReceiverType;
+                    if (!selected && !reportOnly) {
+                        const reason = !record.evidence.hasReceiverType && facts.ownerCount === 1
+                            ? 'single-owner' : 'provenance-incomplete';
+                        if (reason === 'single-owner') proof.provenance = scoreEdge({
+                            hasSingleOwnerEvidence: true, facts,
+                        }).provenance;
+                        noteUnverified(siteId, call, reason, {}, proof);
+                        continue;
+                    }
+                    if (selected) {
+                        bindingResolved = selected.bindingId;
+                        calleeKey = selected.bindingId || `${selected.file}:${selected.startLine}:${selected.name}`;
+                    }
+                }
+            }
             const existing = callees.get(calleeKey);
             if (existing) {
                 existing.count += 1;
@@ -7254,24 +7597,61 @@ function findCallees(index, definition, options = {}) {
                     }
                 }
 
-                const calleeScored = scoreEdge({
+                let calleeScored = scoreEdge({
                     hasBindingId: !!bindingId,
                     hasImportEvidence: !!bindingId || resolutionSymbols.length === 1 ||
                         (callee.file === def.file) || callerImportSet.has(callee.file),
                     isUncertain: false, // uncertain callees already filtered above
                 });
+                const siteProvenance = collectAccount ? siteIds.map(siteId => ({
+                    ...provenanceForSite(siteId, callee), tier: TIER.CONFIRMED,
+                })).sort((a, b) => a.siteId - b.siteId).filter(site => {
+                    const record = siteEvidence.get(site.siteId);
+                    const valueReceiver = record.call.isMethod &&
+                        !record.call.receiverIsModule && !record.call.receiverModuleSpecifier &&
+                        !record.call.receiverModuleComposition && !record.evidence.typeQualifiedReceiver;
+                    const untypedValue = valueReceiver && !record.evidence.hasReceiverType &&
+                        !record.evidence.resolvedBySameClass;
+                    if (untypedValue && site.provenance.facts.ownerCount === 1) {
+                        record.evidence.hasSingleOwnerEvidence = true;
+                    }
+                    const migrated = valueReceiver && !record.call.isConstructor &&
+                        !record.evidence.resolvedBySameClass && !record.evidence.extensionMethod &&
+                        (record.evidence.hasReceiverType || record.evidence.hasSingleOwnerEvidence || untypedValue);
+                    if (!migrated) return true;
+                    const checked = validateConfirmation(site.provenance, [declarationIdentity(callee)]);
+                    if (checked.verdict === 'establishes-target' ||
+                        (checked.verdict === 'unsupported' && record.evidence.hasReceiverType)) return true;
+                    if (checked.verdict === 'establishes-other') {
+                        noteSite(site.siteId, 'excluded', 'receiver-target-different', record.call);
+                        (calleeAccount.excluded.evidence ||= []).push(site);
+                    } else {
+                        const reason = record.evidence.hasSingleOwnerEvidence && !record.evidence.hasReceiverType
+                            ? 'single-owner' : 'provenance-incomplete';
+                        if (reason === 'single-owner') site.provenance = scoreEdge({
+                            hasSingleOwnerEvidence: true, facts: site.provenance.facts,
+                        }).provenance;
+                        noteUnverified(site.siteId, record.call, reason, {}, site);
+                    }
+                    return false;
+                }) : null;
+                if (collectAccount && siteProvenance.length === 0) continue;
+                if (collectAccount) calleeScored = siteProvenance.reduce((weakest, site) =>
+                    site.evidenceScore < weakest.evidenceScore ? site : weakest);
                 claimSites('confirmed', null);
                 result.push({
                     ...callee,
-                    callCount: count,
-                    weight: index.calculateWeight(count),
+                    callCount: collectAccount ? siteProvenance.length : count,
+                    weight: index.calculateWeight(collectAccount ? siteProvenance.length : count),
                     confidence: calleeScored.confidence,
                     evidenceScore: calleeScored.evidenceScore,
                     scoreKind: calleeScored.scoreKind,
                     resolution: calleeScored.resolution,
                     ...(collectAccount && {
                         tier: TIER.CONFIRMED,
-                        sites: [...sites].sort((a, b) => a - b),
+                        provenance: summarizeProvenance(siteProvenance),
+                        siteProvenance,
+                        sites: siteProvenance.map(site => site.line).sort((a, b) => a - b),
                         ...(isFunctionReference && { functionReference: true }),
                     }),
                 });
@@ -9052,22 +9432,7 @@ const JS_GLOBAL_RECEIVERS = new Set([
     'crypto', 'performance', 'history', 'location', 'screen',
 ]);
 
-const BUILTIN_RECEIVER_TYPES = new Set([
-    'dict', 'list', 'set', 'tuple', 'str', 'int', 'float', 'bool', 'bytes', 'frozenset',
-    'Mapping', 'MutableMapping', 'Sequence', 'MutableSequence',
-    'Collection', 'Iterable', 'Iterator', 'KeysView', 'ValuesView', 'ItemsView',
-    'IO', 'TextIO', 'BinaryIO', 'StringIO', 'BytesIO',
-    'ZlibCompress', 'ZlibDecompress',
-    'AsyncEvent',
-    'Generator', 'AsyncGenerator', 'ContextManager', 'AsyncContextManager',
-    'Array', 'String', 'Object', 'RegExp', 'Number', 'Boolean', 'Map', 'Set', 'Promise',
-    'WeakMap', 'WeakSet',
-    'string', 'number', 'boolean', 'bigint', 'symbol',
-    'object', 'dynamic', 'decimal', 'byte', 'sbyte', 'char',
-    'short', 'ushort', 'uint', 'long', 'ulong', 'double',
-    'List', 'Dictionary', 'HashSet', 'Queue', 'Stack',
-    'Task', 'ValueTask', 'IEnumerable', 'ICollection', 'IList',
-]);
+
 
 // Universal-contract method names (fix #265, hono-measured: 183 untyped
 // `x.toString()` calls confirmed against JSXNode.toString via the single-
@@ -11127,6 +11492,7 @@ function _calleeExportDefinitions(index, startAbs, exposedName, language, call, 
     let unknown = false;
     let frontier = [[startAbs, exposedName]];
     const shapeMatches = d =>
+        (language !== 'rust' || !(d.className || d.receiver)) &&
         (!NON_CALLABLE_TYPES.has(d.type) ||
             (call.isConstructor && d.type === 'class') ||
             (langTraits(language)?.classesCallableWithoutNew && d.type === 'class')) &&
@@ -11262,6 +11628,19 @@ function _calleeGoPackageMatch(index, call, importModule) {
         }
     }
     return bestMatch;
+}
+
+function selectProvenanceOverload(index, call, candidates, language) {
+    const remaining = new Set(candidates);
+    const slots = [];
+    for (const definition of candidates) {
+        if (!remaining.has(definition)) continue;
+        const group = _closeCallableIdentityGroup(index, [definition], candidates);
+        const representative = group.find(d => !d.isSignature && !d.isDeclaration) || definition;
+        slots.push(representative);
+        for (const member of group) remaining.delete(member);
+    }
+    return _calleeOverloadSelect(index, call, slots, language);
 }
 
 function _calleeOverloadSelect(index, call, matches, language) {
@@ -12309,7 +12688,14 @@ function _calleeSingleOwnerMatch(index, def, fileEntry, call, name, language, fl
     if (matchFe && callerFe &&
         (isTestFile(matchFe.relativePath, matchFe.language) || isTestPath(matchFe.relativePath)) &&
         !(isTestFile(callerFe.relativePath, callerFe.language) || isTestPath(callerFe.relativePath))) return null;
-    return match;
+    const facts = _confirmationFacts(index, def.file, call, [match], {
+        ...(flowEntry?.type && !call.receiverType && {
+            receiverType: flowEntry.type, receiverTypeSource: 'flow',
+            receiverOrigin: { source: 'flow', ...flowEntry }, originFile: flowEntry.fromFile,
+        }),
+    });
+    return validateConfirmation({ facts }, facts.targets).verdict === 'establishes-target'
+        ? match : null;
 }
 
 const _CSHARP_TYPE_ALIASES = new Map([
@@ -16317,4 +16703,4 @@ function findCallbackUsages(index, name) {
     return usages;
 }
 
-module.exports = { _unresolvedModuleIsGap, _importReaches, _sameNominalPackageDir, getCachedCalls, findCallers, findCallees, getInstanceAttributeTypes, findCallbackUsages, _nameBindingReaches, _moduleAttributeBindingReaches, _declaredFieldType, _projectTopLevelNames, _callArityCompatible, _closeCallableIdentityGroup, _overloadDiscipline, _overloadApplicable };
+module.exports = { isProvenanceBuiltinReceiver, provenanceParameterIdentity: _overloadTypeIdentity, selectProvenanceOverload, _unresolvedModuleIsGap, _importReaches, _sameNominalPackageDir, getCachedCalls, findCallers, findCallees, getInstanceAttributeTypes, findCallbackUsages, _nameBindingReaches, _moduleAttributeBindingReaches, _declaredFieldType, _projectTopLevelNames, _callArityCompatible, _closeCallableIdentityGroup, _overloadDiscipline, _overloadApplicable };

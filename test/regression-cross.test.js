@@ -2251,7 +2251,7 @@ func main() {
         }
     });
 
-    it('includes untyped method calls when includeUncertain is true', () => {
+    it('keeps untyped method calls visible in the callee contract (#355)', () => {
         const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-f002e-'));
         try {
             fs.writeFileSync(path.join(tmpDir, 'package.json'), '{}');
@@ -2263,14 +2263,15 @@ func main() {
             const index = new ProjectIndex(tmpDir);
             index.build(null, { quiet: true });
 
-            // With includeUncertain, the method call should appear
+            // The contract keeps this candidate visible without inventing a binding.
             const callees = index.findCallees(
                 { name: 'getIndex', file: path.join(tmpDir, 'app.js'), startLine: 1, endLine: 1 },
-                { includeMethods: true, includeUncertain: true }
+                { includeMethods: true, collectAccount: true }
             );
             const calleeNames = [...callees.values()].map(c => c.name);
-            assert.ok(calleeNames.includes('get'),
-                'with includeUncertain, m.get() should appear as uncertain callee');
+            assert.ok(!calleeNames.includes('get'));
+            assert.ok(callees.unverifiedCallees.some(c => c.name === 'get'));
+            assert.strictEqual(callees.calleeAccount.conserved, true);
         } finally {
             fs.rmSync(tmpDir, { recursive: true, force: true });
         }

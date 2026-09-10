@@ -1161,10 +1161,10 @@ describe('Confidence Scoring', () => {
             assert.strictEqual(result.resolution, RESOLUTION.SCOPE_MATCH);
         });
 
-        it('scores one eligible project method owner as scope evidence', () => {
+        it('scores a single project owner as unverified without receiver evidence', () => {
             const result = scoreEdge({ hasSingleOwnerEvidence: true });
-            assert.strictEqual(result.resolution, RESOLUTION.SCOPE_MATCH);
-            assert.ok(result.evidence.includes('single project method owner'));
+            assert.strictEqual(result.resolution, RESOLUTION.SINGLE_OWNER);
+            assert.strictEqual(require('../core/confidence').tierForResolution(result.resolution), 'unverified');
         });
 
         it('scores uncertain lowest', () => {
@@ -1420,7 +1420,7 @@ describe('Confidence Scoring', () => {
             } finally { rm(dir); }
         });
 
-        it('JS method call with no receiver evidence scores uncertain (0.25)', () => {
+        it('JS method calls without receiver evidence drop in legacy mode and stay visible in the contract (#355)', () => {
             const dir = tmp({
                 'package.json': '{"name":"test"}',
                 'lib.js': 'class Foo { get() { return 1; } }\nmodule.exports = { Foo };',
@@ -1429,9 +1429,10 @@ describe('Confidence Scoring', () => {
             try {
                 const index = idx(dir);
                 const callers = index.findCallers('get', { includeUncertain: true, includeMethods: true });
-                assert.ok(callers.length > 0);
-                assert.strictEqual(callers[0].resolution, 'uncertain');
-                assert.strictEqual(callers[0].confidence, 0.25);
+                assert.strictEqual(callers.length, 0);
+                const contract = index.findCallers('get', { collectAccount: true, includeMethods: true });
+                assert.strictEqual(contract.length, 0);
+                assert.ok(contract.unverifiedEntries.some(c => c.relativePath === 'app.js' && c.line === 2));
             } finally { rm(dir); }
         });
 

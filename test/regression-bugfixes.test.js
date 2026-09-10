@@ -2258,7 +2258,7 @@ describe('fix #157: impact/verify className filter uses parameter type annotatio
 });
 
 describe('fix #159: unique method heuristic for className filtering', () => {
-    it('impact includes untyped param calls when method is unique to target class', () => {
+    it('impact retains untyped single-owner calls as unverified (#355)', () => {
         const dir = tmp({
             'requirements.txt': '',
             'tracker.py': 'class SourceTracker:\n    def record(self, data):\n        pass\n',
@@ -2269,11 +2269,11 @@ describe('fix #159: unique method heuristic for className filtering', () => {
             const impact = index.impact('record', { className: 'SourceTracker' });
             assert.ok(impact, 'impact should return results');
             const allSites = impact.byFile.flatMap(f => f.sites);
-            // Both calls should be included: direct constructor + untyped param (unique method)
+            // Constructor evidence confirms; the untyped parameter remains visible.
             assert.ok(allSites.some(c => c.expression && c.expression.includes('t.record')),
                 'should find direct constructor-based call');
-            assert.ok(allSites.some(c => c.expression && c.expression.includes('tracker.record')),
-                'should find untyped param call via unique method heuristic');
+            assert.ok(!allSites.some(c => c.expression && c.expression.includes('tracker.record')));
+            assert.ok(impact.unverifiedSites.some(c => c.expression?.includes('tracker.record') && c.reason === 'single-owner'));
         } finally {
             rm(dir);
         }

@@ -587,6 +587,9 @@ function enclosingClassName(node) {
 }
 
 /** Whether a bare identifier is a field/property/event of the enclosing type. */
+
+const { ReceiverTypeMap, typeOrigin } = require('./type-evidence');
+
 function enclosingTypeDeclaresMember(node, memberName) {
     let typeNode = null;
     for (let parent = node?.parent; parent; parent = parent.parent) {
@@ -648,10 +651,10 @@ function variableScopeKey(node) {
 }
 
 function buildVariableTypes(tree, parser) {
-    const byScope = new Map([['global', new Map()]]);
+    const byScope = new Map([['global', new ReceiverTypeMap()]]);
     const conflictsByScope = new Map([['global', new Set()]]);
     const scopeStack = [];
-    const setType = (scope, name, type) => {
+    const setType = (scope, name, type, source = 'unknown', node = null) => {
         if (!name || !type) return;
         if (!conflictsByScope.has(scope)) conflictsByScope.set(scope, new Set());
         const conflicts = conflictsByScope.get(scope);
@@ -663,14 +666,14 @@ function buildVariableTypes(tree, parser) {
             conflicts.add(name);
             return;
         }
-        types.set(name, type);
+        types.set(name, type, source, node);
     };
     traverseTree(tree.rootNode, node => {
         if (CALLABLE_SCOPE_NODES.has(node.type) &&
             !isControlFlowLocalArtifact(node)) {
             const key = node.startPosition.row + 1;
             scopeStack.push(key);
-            if (!byScope.has(key)) byScope.set(key, new Map());
+            if (!byScope.has(key)) byScope.set(key, new ReceiverTypeMap());
             if (!conflictsByScope.has(key)) conflictsByScope.set(key, new Set());
         }
         const currentKey = scopeStack[scopeStack.length - 1] || 'global';
@@ -694,7 +697,7 @@ function buildVariableTypes(tree, parser) {
                     const type =
                         recoveredNode.childForFieldName('type')?.text ||
                         recoveredNode.namedChild(0)?.text;
-                    setType(currentKey, name, type);
+                    setType(currentKey, name, type, 'annotation', node);
                     return true;
                 });
             }
@@ -711,14 +714,14 @@ function buildVariableTypes(tree, parser) {
             if (artifactParameter) return true;
             const name = node.childForFieldName('name')?.text;
             const type = node.childForFieldName('type')?.text;
-            setType(currentKey, name, type);
+            setType(currentKey, name, type, 'annotation', node);
         } else if (node.type === 'declaration_pattern' ||
             node.type === 'declaration_expression') {
             const name = node.childForFieldName('name')?.text ||
                 node.namedChildren.at(-1)?.text;
             const type = node.childForFieldName('type')?.text ||
                 node.namedChild(0)?.text;
-            setType(currentKey, name, type);
+            setType(currentKey, name, type, 'annotation', node);
         } else if (node.type === 'variable_declaration') {
             // Class fields have their own declared-field receiver path; do not
             // leak them into the top-level-program local scope.
@@ -747,7 +750,7 @@ function buildVariableTypes(tree, parser) {
                 const dynamicType = value?.type === 'object_creation_expression'
                     ? value.childForFieldName('type')?.text : null;
                 const type = dynamicType || (typeNode?.text !== 'var' ? typeNode?.text : null);
-                setType(currentKey, name, type);
+                setType(currentKey, name, type, dynamicType ? 'constructor' : 'annotation', value || typeNode);
             }
         }
         return true;
@@ -1206,12 +1209,19 @@ function findCallsInCode(code, parser) {
                 }
             }
             calls.push({
+                callSite: typeOrigin('call', identity.nameNode || node),
                 name: identity.name,
                 line: identity.nameNode?.startPosition.row + 1 || node.startPosition.row + 1,
                 isMethod: identity.isMethod,
                 ...(identity.receiver && { receiver: identity.receiver }),
                 ...(receiverIsTypeQualified && { receiverIsTypeQualified: true }),
-                ...(receiverType && { receiverType }),
+                ...(receiverType && { receiverType, ...(unwrappedReceiverNode?.type === 'cast_expression' ? {
+                    receiverTypeSource: 'cast', receiverTypeEvidence: typeOrigin('cast', unwrappedReceiverNode),
+                } : unwrappedReceiverNode?.type === 'object_creation_expression' ? {
+                    receiverTypeSource: 'constructor', receiverTypeEvidence: typeOrigin('constructor', unwrappedReceiverNode),
+                } : literalReceiverType(unwrappedReceiverNode) ? {
+                    receiverTypeSource: 'literal', receiverTypeEvidence: typeOrigin('literal', unwrappedReceiverNode),
+                } : variableTypes.fields(identity.receiver)) }),
                 ...(receiverCastThis && { receiverCastThis: true }),
                 ...(receiverType && receiverTypeInfo.namespace && {
                     receiverTypeNamespace: receiverTypeInfo.namespace,
@@ -1255,6 +1265,7 @@ function findCallsInCode(code, parser) {
                 }
                 if (!callbackName) continue;
                 calls.push({
+                    callSite: typeOrigin('call', value),
                     name: callbackName,
                     line: value.startPosition.row + 1,
                     isMethod: !!callbackReceiver,
@@ -1274,6 +1285,7 @@ function findCallsInCode(code, parser) {
             const raw = typeNode.text.replace(/<.*>$/, '');
             const name = raw.split('.').pop();
             calls.push({
+                callSite: typeOrigin('call', typeNode),
                 name,
                 line: typeNode.startPosition.row + 1,
                 isMethod: false,

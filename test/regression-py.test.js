@@ -3880,13 +3880,13 @@ def drive(o):
         } finally { rm(dir); }
     });
 
-    it('un-marked single-owner methods keep confirming (control)', () => {
+    it('un-marked single-owner methods remain visible without receiver evidence (#355)', () => {
         const dir = tmp(FILES);
         try {
             const index = idx(dir);
             const res = contract(index, 'mine.py:10:plain');
-            assert.ok(res.confirmed.includes('user.py:6'),
-                `plain has no override marker — import evidence stays sufficient: ${res.confirmed} / ${JSON.stringify(res.unverified)}`);
+            assert.ok(!res.confirmed.includes('user.py:6'));
+            assert.strictEqual(res.unverified.find(c => c.key === 'user.py:6')?.reason, 'single-owner');
             assert.strictEqual(res.conserved, true);
         } finally { rm(dir); }
     });
@@ -5948,7 +5948,7 @@ describe('fix #294: for-loop external-producer receivers demote single-owner', (
         } finally { rm(dir); }
     });
 
-    it('a project-internal loop producer keeps single-owner confirmation (counter-probe)', () => {
+    it('an unannotated project loop producer does not prove its element type (#355)', () => {
         const dir = tmp({
             'pyproject.toml': '[project]\nname = "pkg"\n',
             'pkg/__init__.py': '',
@@ -5968,8 +5968,9 @@ describe('fix #294: for-loop external-producer receivers demote single-owner', (
             const r = execute(index, 'context', { name: 'decode', file: 'pkg/codec.py' });
             assert.ok(r.ok);
             const confirmed = r.result.callers || [];
-            assert.ok(confirmed.some(c => c.line === 7),
-                `project loop producer keeps #204 single-owner physics: ${JSON.stringify(r.result.meta.account)}`);
+            assert.ok(!confirmed.some(c => c.line === 7));
+            assert.strictEqual(r.result.unverifiedCallers.find(c => c.line === 7)?.reason, 'single-owner');
+            assert.strictEqual(r.result.meta.account.conserved, true);
         } finally { rm(dir); }
     });
 });
@@ -6015,9 +6016,9 @@ describe('fix #294: module-rooted dotted receivers demote single-owner', () => {
         } finally { rm(dir); }
     });
 
-    it('a from-import SYMBOL root keeps normal physics (counter-probe, #224 discipline)', () => {
+    it('an imported value does not prove its nested attribute receiver (#355)', () => {
         // `from .globals import current_app` binds a value, not a module —
-        // current_app.json.load() keeps single-owner confirmation.
+        // current_app.json.load() still needs evidence of the json attribute type.
         const dir = tmp({
             'pyproject.toml': '[project]\nname = "pkg"\n',
             'pkg/__init__.py': '',
@@ -6036,8 +6037,9 @@ describe('fix #294: module-rooted dotted receivers demote single-owner', () => {
             const r = execute(index, 'context', { name: 'load', file: 'pkg/provider.py' });
             assert.ok(r.ok);
             const confirmed = r.result.callers || [];
-            assert.ok(confirmed.some(c => c.line === 5),
-                `symbol-rooted attr chain keeps single-owner confirm: ${JSON.stringify(r.result.meta.account)}`);
+            assert.ok(!confirmed.some(c => c.line === 5));
+            assert.strictEqual(r.result.unverifiedCallers.find(c => c.line === 5)?.reason, 'single-owner');
+            assert.strictEqual(r.result.meta.account.conserved, true);
         } finally { rm(dir); }
     });
 });

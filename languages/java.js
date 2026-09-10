@@ -5,6 +5,9 @@
  * declarations, and static final constants.
  */
 
+const { ReceiverTypeMap, typeOrigin } = require('./type-evidence');
+
+
 const {
     traverseTree,
     traverseTreeCached,
@@ -1029,7 +1032,7 @@ function findCallsInCode(code, parser) {
 
     // Build type map from method/constructor parameters
     const buildScopeTypeMap = (node) => {
-        const typeMap = new Map();
+        const typeMap = new ReceiverTypeMap();
         const rawTypeMap = new Map();
         const qualifierMap = new Map();
         const paramsNode = node.childForFieldName('parameters');
@@ -1041,7 +1044,7 @@ function findCallsInCode(code, parser) {
                     const typeNode = param.childForFieldName('type');
                     const typeName = extractTypeName(typeNode);
                     if (nameNode && typeName) {
-                        typeMap.set(nameNode.text, typeName);
+                        typeMap.set(nameNode.text, typeName, 'annotation', typeNode);
                         rawTypeMap.set(nameNode.text, typeNode.text);
                         const qualifier = extractTypeQualifier(typeNode);
                         if (qualifier) qualifierMap.set(nameNode.text, qualifier);
@@ -1076,10 +1079,10 @@ function findCallsInCode(code, parser) {
     };
 
     // Look up variable type from scope chain
-    const getReceiverType = (varName) => {
+    const getReceiverType = (varName, evidence = false) => {
         for (let i = functionStack.length - 1; i >= 0; i--) {
             const typeMap = scopeTypes.get(functionStack[i].startLine);
-            if (typeMap?.has(varName)) return typeMap.get(varName);
+            if (typeMap?.has(varName)) return evidence ? typeMap.fields(varName) : typeMap.get(varName);
         }
         return undefined;
     };
@@ -1476,7 +1479,7 @@ function findCallsInCode(code, parser) {
                     rawHad: rawTypeMap?.has(nameNode.text),
                     rawPrevious: rawTypeMap?.get(nameNode.text),
                 });
-                typeMap.set(nameNode.text, typeName);
+                typeMap.set(nameNode.text, typeName, 'annotation', typeNode);
                 rawTypeMap?.set(nameNode.text, typeNode.text);
                 const qualifierMap = scopeTypeQualifiers.get(scopeKey);
                 if (typeQualifier) qualifierMap?.set(nameNode.text, typeQualifier);
@@ -1525,7 +1528,9 @@ function findCallsInCode(code, parser) {
                         packageQualifier = rootText;
                     }
                 }
-                const receiverType = castReceiverType ||
+                const inlineConstructorType = receiverNode?.type === 'object_creation_expression'
+                    ? extractTypeName(receiverNode.childForFieldName('type')) : undefined;
+                const receiverType = castReceiverType || inlineConstructorType ||
                     ((receiver && receiver !== 'this') ? getReceiverType(receiver) : undefined);
                 const receiverTypeQualifier = packageQualifier ||
                     (!castReceiverType && receiver ? getReceiverTypeQualifier(receiver) : undefined);
@@ -1597,6 +1602,7 @@ function findCallsInCode(code, parser) {
                         : `chain:${receiverPath.owner}#${receiverPath.methods.join('#')}`)
                     : null;
                 calls.push({
+                    callSite: typeOrigin('call', nameNode),
                     name: nameNode.text,
                     // Multi-line chains (builder.x()\n.y()) must report each
                     // method's OWN name line, not the chain-start line — the
@@ -1604,7 +1610,10 @@ function findCallsInCode(code, parser) {
                     line: nameNode.startPosition.row + 1,
                     isMethod: !!objNode,
                     receiver,
-                    ...(receiverType && { receiverType }),
+                    ...(receiverType && { receiverType, ...(getReceiverType(receiver, true) ||
+                        (castReceiverType ? { receiverTypeSource: 'cast', receiverTypeEvidence: typeOrigin('cast', objNode) } :
+                            inlineConstructorType ? { receiverTypeSource: 'constructor', receiverTypeEvidence: typeOrigin('constructor', receiverNode) } :
+                            { receiverTypeSource: 'unknown' })) }),
                     ...(receiverTypeQualifier && { receiverTypeQualifier }),
                     ...(receiverIsTypeQualified && { receiverIsTypeQualified: true }),
                     ...(castReceiverType && { receiverTypeCast: true }),
@@ -1656,6 +1665,7 @@ function findCallsInCode(code, parser) {
                 const enclosingFunction = getCurrentEnclosingFunction();
                 const ctorArgs = getCallArgs(node);
                 calls.push({
+                    callSite: typeOrigin('call', node),
                     name: targetClass,
                     line: node.startPosition.row + 1,
                     isMethod: false,
@@ -1686,6 +1696,7 @@ function findCallsInCode(code, parser) {
             if (enumName) {
                 const ctorArgs = getCallArgs(node);
                 calls.push({
+                    callSite: typeOrigin('call', node),
                     name: enumName,
                     line: node.startPosition.row + 1,
                     isMethod: false,
@@ -1725,6 +1736,7 @@ function findCallsInCode(code, parser) {
                 const enclosingFunction = getCurrentEnclosingFunction();
                 const ctorArgs = getCallArgs(node);
                 calls.push({
+                    callSite: typeOrigin('call', typeNode),
                     name: typeName,
                     line: node.startPosition.row + 1,
                     isMethod: false,
@@ -1747,11 +1759,12 @@ function findCallsInCode(code, parser) {
                 const receiverType = (receiver && receiver !== 'this') ? getReceiverType(receiver) : undefined;
                 const enclosingFunction = getCurrentEnclosingFunction();
                 calls.push({
+                    callSite: typeOrigin('call', nameNode),
                     name: nameNode.text,
                     line: node.startPosition.row + 1,
                     isMethod: !!receiver,
                     receiver,
-                    ...(receiverType && { receiverType }),
+                    ...(receiverType && { receiverType, ...(getReceiverType(receiver, true) || { receiverTypeSource: 'unknown' }) }),
                     isFunctionReference: true,
                     isPotentialCallback: true,
                     enclosingFunction
@@ -1788,7 +1801,7 @@ function findCallsInCode(code, parser) {
                     if (nameNode && typeName) {
                         const scopeKey = functionStack[functionStack.length - 1].startLine;
                         const typeMap = scopeTypes.get(scopeKey);
-                        if (typeMap) typeMap.set(nameNode.text, typeName);
+                        if (typeMap) typeMap.set(nameNode.text, typeName, valueNode?.type === 'object_creation_expression' ? 'constructor' : 'annotation', valueNode || declTypeNode);
                         const rawTypeMap = scopeRawTypes.get(scopeKey);
                         const rawType = valueNode?.type === 'object_creation_expression'
                             ? valueNode.childForFieldName('type')?.text
@@ -1822,7 +1835,7 @@ function findCallsInCode(code, parser) {
             if (resNameNode && typeName) {
                 const scopeKey = functionStack[functionStack.length - 1].startLine;
                 const typeMap = scopeTypes.get(scopeKey);
-                if (typeMap) typeMap.set(resNameNode.text, typeName);
+                if (typeMap) typeMap.set(resNameNode.text, typeName, 'with-binding', node);
                 const rawTypeMap = scopeRawTypes.get(scopeKey);
                 const rawType = resValueNode?.type === 'object_creation_expression'
                     ? resValueNode.childForFieldName('type')?.text

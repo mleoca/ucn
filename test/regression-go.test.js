@@ -4523,13 +4523,14 @@ func getThing() interface{} { return nil }
         } finally { rm(dir); }
     });
 
-    it('untyped receiver with a UNIQUE project-wide owner stays confirmed', () => {
+    it('untyped receiver with a unique project owner stays visible (#355)', () => {
         const dir = tmp(FILES);
         try {
             const index = idx(dir);
             const res = callersOf(index, 'types.go:7:Unique');
-            assert.ok(res.confirmed.includes('caller.go:10'),
-                `x.Unique() — only Filter defines Unique — stays confirmed: ${res.confirmed}`);
+            assert.ok(!res.confirmed.includes('caller.go:10'));
+            assert.strictEqual(res.unverified.find(c => c.key === 'caller.go:10')?.reason, 'single-owner');
+            assert.strictEqual(res.conserved, true);
         } finally { rm(dir); }
     });
 
@@ -5074,7 +5075,7 @@ func Run() {
         } finally { rm(dir); }
     });
 
-    it('legacy (non-account) callers keep all method-call edges — no flow exclusions', () => {
+    it('legacy does not confirm receivers without its own type evidence (#355)', () => {
         const dir = tmp(FILES);
         try {
             const index = idx(dir);
@@ -5082,7 +5083,7 @@ func Run() {
             const legacy = findCallers(index, 'Build', { file: 'balancer/base.go' });
             const lines = (legacy.callers || legacy).map(c => `${path.basename(c.file)}:${c.line}`);
             for (const l of ['app.go:7', 'app.go:10', 'app.go:12']) {
-                assert.ok(lines.includes(l), `legacy keeps ${l}: ${lines}`);
+                assert.ok(!lines.includes(l), `legacy must not guess ${l}: ${lines}`);
             }
         } finally { rm(dir); }
     });

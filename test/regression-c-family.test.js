@@ -1733,7 +1733,13 @@ describe('C# language support', () => {
         ].join('\n');
         const calls = getLanguageAdapter('csharp').findCalls(
             code, getParser('csharp'));
-        assert.deepEqual(calls.find(call => call.line === 6), {
+        const castCall = calls.find(call => call.line === 6);
+        assert.equal(castCall.receiverTypeSource, 'cast');
+        assert.equal(castCall.receiverTypeEvidence.nodeType, 'cast_expression');
+        const { receiverTypeSource, receiverTypeEvidence, callSite, ...shape } = castCall;
+        assert.equal(code.slice(callSite.start, callSite.end), 'CopyTo');
+        assert.equal(callSite.column, 19);
+        assert.deepEqual(shape, {
             name: 'CopyTo',
             line: 6,
             isMethod: true,

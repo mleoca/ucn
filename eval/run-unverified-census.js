@@ -29,7 +29,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const REPORTS_DIR = path.join(__dirname, 'reports');
+const REPORTS_DIR = process.env.UCN_EVAL_REPORTS_DIR || path.join(__dirname, 'reports');
 const REPORT_RE = /^oracle-eval-(.+)-(\d{4}-\d{2}-\d{2})((?:-[a-z0-9]+)*)\.json$/;
 
 function codeUnitCompare(a, b) {
@@ -76,6 +76,7 @@ function loadReport(entry) {
 function censusRepo(entry, report) {
     const summary = report.summary || {};
     const reasons = summary.unverifiedReasons || {};
+    const confirmedRules = summary.confirmedRules || null;
     const burden = summary.reviewBurden || {};
     const perSymbol = Array.isArray(report.perSymbol) ? report.perSymbol : [];
 
@@ -119,6 +120,7 @@ function censusRepo(entry, report) {
         runtimeDispatchGroups: burden.runtimeDispatchGroups || 0,
         zeroActionableUnverifiedTargetRate: burden.zeroActionableUnverifiedTargetRate ?? null,
         reasons: reasonRows,
+        confirmedRules,
         topSymbols,
     };
 }

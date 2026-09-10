@@ -39,6 +39,8 @@ docs/
 # tracked, but new local runs must not leak into commits or release tarballs.
 eval/reports/*.json
 eval/reports/*.md
+eval/reports/baseline-355/
+eval/reports/post-355/
 
 # Compiler-oracle helper build products
 eval/oracles/roslyn-helper/bin/

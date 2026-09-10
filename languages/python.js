@@ -5,6 +5,9 @@
  * class definitions, and state objects (constants).
  */
 
+const { ReceiverTypeMap, typeOrigin } = require('./type-evidence');
+
+
 const {
     traverseTree,
     traverseTreeCached,
@@ -1661,7 +1664,7 @@ function findCallsInCode(code, parser) {
     const aliasesStack = [];
     const nonCallableNames = new Set();  // Track names assigned non-callable values
     const nonCallableNamesStack = [];
-    const localVarTypes = new Map();  // Track local variable types: varName -> typeName (for receiverType inference)
+    const localVarTypes = new ReceiverTypeMap();  // Track local variable types: varName -> typeName (for receiverType inference)
     const declaredVarTypes = new Map(); // Compiler-checked annotations survive later assignments
     const localVarTypeQualifiers = new Map(); // varName -> imported module alias that owns the inferred type
     // varName -> concrete union alternatives. `None` is retained only for a
@@ -1689,7 +1692,7 @@ function findCallsInCode(code, parser) {
     // `_Segment.line()` dispatch through the imported/local class object.
     // Keep this separate from callable aliases: receiver evidence must be
     // scope-local, position-aware, and invalidated by every later write.
-    const classValueAliases = new Map();
+    const classValueAliases = new ReceiverTypeMap();
     const classValueAliasesStack = [];
     const moduleAliases = new Set();  // Names bound to MODULES (import httpx / import numpy as np)
     const moduleImportSpecifiers = new Set(); // Exact dotted imports: import rich.repr
@@ -2061,7 +2064,7 @@ function findCallsInCode(code, parser) {
                 ...(generatorSendType && { generatorSendType }),
             });
             // Save localVarTypes so inner declarations don't leak to sibling functions
-            localVarTypesStack.push(new Map(localVarTypes));
+            localVarTypesStack.push(new ReceiverTypeMap(localVarTypes));
             declaredVarTypesStack.push(new Map(declaredVarTypes));
             localVarTypeQualifiersStack.push(new Map(localVarTypeQualifiers));
             localVarUnionTypesStack.push(new Map(localVarUnionTypes));
@@ -2075,7 +2078,7 @@ function findCallsInCode(code, parser) {
             constructedReceiverVarsStack.push(new Set(constructedReceiverVars));
             withBindingVarsStack.push(new Set(withBindingVars));
             memberAliasesStack.push(new Map(memberAliases));
-            classValueAliasesStack.push(new Map(classValueAliases));
+            classValueAliasesStack.push(new ReceiverTypeMap(classValueAliases));
             aliasesStack.push(new Map(aliases));
             nonCallableNamesStack.push(new Set(nonCallableNames));
             const body = node.childForFieldName('body');
@@ -2083,7 +2086,7 @@ function findCallsInCode(code, parser) {
                 if (functionParameterBindsName(node, name) ||
                     (body && pythonScopeBindsName(body, name))) continue;
                 if (!localVarTypes.has(name)) {
-                    localVarTypes.set(name, ctor.type);
+                    localVarTypes.set(name, ctor.type, 'constructor');
                     constructedReceiverVars.add(name);
                 }
             }
@@ -2131,7 +2134,7 @@ function findCallsInCode(code, parser) {
                     ? 'dict'
                     : (parameterPattern?.type === 'list_splat_pattern' ? 'tuple' : typeName);
                 if (receiverType && !['self', 'cls'].includes(nameNode.text)) {
-                    localVarTypes.set(nameNode.text, receiverType);
+                    localVarTypes.set(nameNode.text, receiverType, 'annotation', typeNode);
                     declaredVarTypes.set(nameNode.text, receiverType);
                     // The annotation's module qualifier is identity (fix
                     // #286e) — splat params got a builtin type, no qualifier.
@@ -2165,10 +2168,10 @@ function findCallsInCode(code, parser) {
                 const names = patternIdentifiers(left);
                 if (names.length === itemTypes.length) {
                     for (let i = 0; i < names.length; i++) {
-                        if (itemTypes[i]) localVarTypes.set(names[i], itemTypes[i]);
+                        if (itemTypes[i]) localVarTypes.set(names[i], itemTypes[i], 'flow', node);
                     }
                 } else if (names.length === 1 && itemTypes.length === 1) {
-                    localVarTypes.set(names[0], itemTypes[0]);
+                    localVarTypes.set(names[0], itemTypes[0], 'flow', node);
                 }
             } else {
                 const source = iterableAttributeSource(right, localVarTypes);
@@ -2200,7 +2203,7 @@ function findCallsInCode(code, parser) {
                     const constructorNode = ctx.childForFieldName('function');
                     const exactCtor = exactConstructorInfo(constructorNode);
                     if (exactCtor) {
-                        localVarTypes.set(targetId.text, exactCtor.type);
+                        localVarTypes.set(targetId.text, exactCtor.type, 'constructor', node);
                         constructedReceiverVars.add(targetId.text);
                         if (exactCtor.qualifier &&
                             moduleAliases.has(exactCtor.qualifier.split('.')[0])) {
@@ -2214,7 +2217,7 @@ function findCallsInCode(code, parser) {
                         // Builtin open() is its own context value and always
                         // yields an IO object. The exact text/binary subtype
                         // is irrelevant for method-owner exclusion.
-                        localVarTypes.set(targetId.text, 'IO');
+                        localVarTypes.set(targetId.text, 'IO', 'with-binding', node);
                     }
                 }
             }
@@ -2245,7 +2248,7 @@ function findCallsInCode(code, parser) {
                     const unionTypes = typeNamesFromAnnotation(typeNode);
                     const itemTypes = iterableBindingTypes(typeNode);
                     if (typeName) {
-                        localVarTypes.set(left.text, typeName);
+                        localVarTypes.set(left.text, typeName, 'constructor', right);
                         declaredVarTypes.set(left.text, typeName);
                     }
                     if (unionTypes.length > 1) localVarUnionTypes.set(left.text, unionTypes);
@@ -2277,7 +2280,7 @@ function findCallsInCode(code, parser) {
                     // valid for every subsequent assignment in type-correct
                     // code (`boundary: bytes | None; boundary = make()`).
                     const declaredType = declaredVarTypes.get(left.text);
-                    if (declaredType) localVarTypes.set(left.text, declaredType);
+                    if (declaredType) localVarTypes.set(left.text, declaredType, 'annotation', node);
                 } else {
                     // An annotation is the authoritative type source; a
                     // previous constructor qualifier must not survive it —
@@ -2318,13 +2321,13 @@ function findCallsInCode(code, parser) {
                     if (selfBranch && literalType &&
                         (previousType === literalType ||
                             compatible[previousType]?.has(literalType))) {
-                        localVarTypes.set(left.text, previousType);
+                        localVarTypes.set(left.text, previousType, 'flow', node);
                     }
                 }
                 if (!typeNode && right?.type === 'yield') {
                     const sendType = functionStack[
                         functionStack.length - 1]?.generatorSendType;
-                    if (sendType) localVarTypes.set(left.text, sendType);
+                    if (sendType) localVarTypes.set(left.text, sendType, 'flow', node);
                 }
                 // Literal assignment types the variable (fix #218):
                 // ansi_bytes = b"…" → bytes; out = [] → list. Compiler-true,
@@ -2332,7 +2335,7 @@ function findCallsInCode(code, parser) {
                 if (!typeNode && right && PY_LITERAL_RECEIVER_TYPES[right.type]) {
                     let litType = PY_LITERAL_RECEIVER_TYPES[right.type];
                     if (litType === 'str' && /^[rRuU]*[bB]/.test(right.text)) litType = 'bytes';
-                    localVarTypes.set(left.text, litType);
+                    localVarTypes.set(left.text, litType, 'literal', right);
                 }
                 if (right?.type === 'dictionary') {
                     const valueTypes = new Map();
@@ -2368,7 +2371,7 @@ function findCallsInCode(code, parser) {
                 const roundTripType = roundTripSource
                     ? localVarTypes.get(roundTripSource) : null;
                 if (roundTripType && moduleAliases.has('pickle')) {
-                    localVarTypes.set(left.text, roundTripType);
+                    localVarTypes.set(left.text, roundTripType, 'flow', node);
                     localVarStdlibContracts.set(left.text, 'pickle');
                 }
                 if (right?.type === 'identifier') {
@@ -2376,7 +2379,7 @@ function findCallsInCode(code, parser) {
                     const classValue = !typeNode && isDirectScopeAssignment(node)
                         ? exactConstructorInfo(right) : null;
                     if (classValue) {
-                        classValueAliases.set(left.text, classValue.type);
+                        classValueAliases.set(left.text, classValue.type, 'type-qualified', node);
                     }
                 }
                 // Member-access alias (fix #218): append = output.append
@@ -2433,7 +2436,7 @@ function findCallsInCode(code, parser) {
                     const constructorNode = right.childForFieldName('function');
                     const exactCtor = exactConstructorInfo(constructorNode);
                     if (exactCtor) {
-                        localVarTypes.set(left.text, exactCtor.type);
+                        localVarTypes.set(left.text, exactCtor.type, 'constructor', node);
                         constructedReceiverVars.add(left.text);
                         if (exactCtor.qualifier &&
                             moduleAliases.has(exactCtor.qualifier.split('.')[0])) {
@@ -2513,12 +2516,13 @@ function findCallsInCode(code, parser) {
                     const recvIsModule = !!memberAlias.receiver && moduleAliases.has(memberAlias.receiver) &&
                         !localVarTypes.has(memberAlias.receiver);
                     calls.push({
+                        callSite: typeOrigin('call', funcNode),
                         name: memberAlias.attr,
                         line: node.startPosition.row + 1,
                         isMethod: true,
                         aliasCall: true,
                         ...(memberAlias.receiver && { receiver: memberAlias.receiver }),
-                        ...(recvType && { receiverType: recvType }),
+                        ...(recvType && { receiverType: recvType, ...localVarTypes.fields(memberAlias.receiver, recvType) }),
                         ...(recvIsModule && { receiverIsModule: true }),
                         ...(assignedTo && { assignedTo }),
                         ...assignedIterFields,
@@ -2533,6 +2537,7 @@ function findCallsInCode(code, parser) {
                     const resolvedName = aliases.get(funcNode.text);
                     const firstArg = getFirstStringArg(node);
                     calls.push({
+                        callSite: typeOrigin('call', funcNode),
                         name: funcNode.text,
                         ...(resolvedName && { resolvedName }),
                         line: node.startPosition.row + 1,
@@ -2649,12 +2654,12 @@ function findCallsInCode(code, parser) {
                                 source.rootTypeQualifier;
                         }
                     }
+                    const narrowedType = receiver && narrowedReceiverType(
+                        objNode, receiver, localVarUnionTypes.get(receiver));
+                    const comprehensionType = receiver && comprehensionReceiverType(
+                        objNode, receiver, localIterableTypes, callableIterableTypes, instanceFieldContracts);
                     const receiverType = receiver
-                        ? (narrowedReceiverType(
-                            objNode, receiver, localVarUnionTypes.get(receiver)) ||
-                            comprehensionReceiverType(
-                                objNode, receiver, localIterableTypes,
-                                callableIterableTypes, instanceFieldContracts) ||
+                        ? (narrowedType || comprehensionType ||
                             localVarTypes.get(receiver) ||
                             classValueAliases.get(receiver))
                             || assignmentRhsReceiverTypes.get(node.id)
@@ -2705,6 +2710,7 @@ function findCallsInCode(code, parser) {
                     const capabilityGuard = receiverCapabilityGuard(
                         node, objNode, attrNode.text);
                     calls.push({
+                        callSite: typeOrigin('call', attrNode),
                         name: attrNode.text,
                         // Multi-line chains (obj.x()\n.y()) must report each
                         // method's OWN name line, not the chain-start line —
@@ -2712,7 +2718,19 @@ function findCallsInCode(code, parser) {
                         line: attrNode.startPosition.row + 1,
                         isMethod: true,
                         receiver,
-                        ...(receiverType && { receiverType }),
+                        ...(receiverType && { receiverType,
+                            ...(narrowedType || comprehensionType ? {
+                                receiverTypeSource: 'flow', receiverTypeEvidence: {
+                                    ...typeOrigin('flow', objNode),
+                                    union: localVarUnionTypes.get(receiver),
+                                    ...(comprehensionType && { type: comprehensionType, comprehension: true }),
+                                },
+                            } : receiver && classValueAliases.get(receiver) === receiverType ?
+                                classValueAliases.fields(receiver) :
+                                receiver ? localVarTypes.fields(receiver, receiverType) : {
+                                    receiverTypeSource: 'literal', receiverTypeEvidence: typeOrigin('literal', objNode),
+                                }),
+                        }),
                         ...(receiver && localVarStdlibContracts.has(receiver) && {
                             receiverTypeStdlibModule:
                                 localVarStdlibContracts.get(receiver),
@@ -2817,7 +2835,7 @@ function findCallsInCode(code, parser) {
                                 line: mvAttr.startPosition.row + 1,
                                 isMethod: true,
                                 receiver: mvObj.text,
-                                ...(mvType && { receiverType: mvType }),
+                                ...(mvType && { receiverType: mvType, ...localVarTypes.fields(mvObj.text, mvType) }),
                                 isFunctionReference: true,
                                 enclosingFunction
                             });
@@ -2858,8 +2876,7 @@ function findCallsInCode(code, parser) {
                 // Restore localVarTypes to pre-function state
                 const saved = localVarTypesStack.pop();
                 if (saved) {
-                    localVarTypes.clear();
-                    for (const [k, v] of saved) localVarTypes.set(k, v);
+                    localVarTypes.restore(saved);
                 }
                 const savedDeclared = declaredVarTypesStack.pop();
                 if (savedDeclared) {
@@ -2924,7 +2941,7 @@ function findCallsInCode(code, parser) {
                 if (savedClassValueAliases) {
                     classValueAliases.clear();
                     for (const [k, v] of savedClassValueAliases) {
-                        classValueAliases.set(k, v);
+                        classValueAliases.set(k, v, savedClassValueAliases.origins.get(k));
                     }
                 }
                 const savedCallableAliases = aliasesStack.pop();

@@ -51,6 +51,9 @@ const { ProjectIndex } = require('../core/project');
 const { getCachedCalls } = require('../core/callers');
 const { execute } = require('../core/execute');
 const output = require('../core/output');
+const { dedupeOccurrences, addRuleStat, finishRuleStats, ruleTable } = require('./provenance-report');
+const { createRunManifest, population, saveManifest, referencePopulation,
+    deferredReferenceShown } = require('./run-manifest');
 const {
     PROOF_COMMANDS,
     createCommandProofSummary,
@@ -88,6 +91,10 @@ const { roslynOracle } = require('./oracles/roslyn-oracle');
 const { clangdOracle } = require('./oracles/clangd-oracle');
 
 const args = process.argv.slice(2);
+const manifestPath = readArgValue(args, '--manifest');
+const replayPath = readArgValue(args, '--replay-manifest');
+const replayManifest = replayPath ? JSON.parse(fs.readFileSync(replayPath, 'utf8')) : null;
+let runManifest = null;
 const releaseOnly = args.includes('--release');
 const repoFilter = readArgValue(args, '--repo'); // name, or comma-separated names
 const repoFilterSet = repoFilter ? new Set(repoFilter.split(',').map(s => s.trim())) : null;
@@ -298,6 +305,7 @@ async function evaluateRepo(repo, oracle) {
     const perBucket = Math.ceil(sampleSize / REF_BUCKETS.length);
     const buckets = new Map(REF_BUCKETS.map(b => [b.name, []]));
     const refCache = new Map();
+    const replayRepo = replayManifest?.repos.find(r => r.name === repo.name);
     for (const sym of candidates) {
         if ([...buckets.values()].every(list => list.length >= perBucket)) break;
         let refs;
@@ -312,7 +320,21 @@ async function evaluateRepo(repo, oracle) {
         refCache.set(sym, refs);
         list.push(sym);
     }
-    const sampled = [...buckets.values()].flat().slice(0, sampleSize);
+    const sampled = replayRepo ? replayRepo.sampledTargets.map(target => {
+        const matches = allSymbols.filter(s => s.file === target.file && s.line === target.line &&
+            s.name === target.name && s.kind === target.kind);
+        if (matches.length !== 1) throw new Error(`Replay target missing or ambiguous: ${JSON.stringify(target)}`);
+        return matches[0];
+    }) : [...buckets.values()].flat().slice(0, sampleSize);
+    if (replayRepo) for (const sym of sampled) {
+        if (!refCache.has(sym)) throw new Error(`Replay sampling population changed: ${sym.file}:${sym.line}:${sym.name}`);
+    }
+    if (runManifest) {
+        runManifest.repos.find(r => r.name === repo.name).sampledTargets = sampled.map(s => ({
+            file: s.file, line: s.line, name: s.name, kind: s.kind,
+        }));
+        saveManifest(manifestPath, runManifest);
+    }
     process.stdout.write(`  sampled ${sampled.length} symbols (buckets: ${[...buckets].map(([n, l]) => `${n}:${l.length}`).join(' ')})\n`);
     if (oracle.comprehensiveReferences) {
         process.stdout.write(
@@ -350,6 +372,12 @@ async function evaluateRepo(repo, oracle) {
         conserved: 0, evaluated: 0,
     };
     const byKind = new Map(SYMBOL_KINDS.map(k => [k, emptyKindTotals()]));
+    const confirmedRuleStats = {};
+    const calleeConfirmedRuleStats = {};
+    const calleeFalseConfirmationSamples = [];
+    const calleeAbstentionSamples = [];
+    const falseConfirmationSamples = [];
+    const abstentionSamples = [];
     const confirmedFalsePositiveSamples = [];
     const confirmedUnscoredSamples = [];
     const unverifiedUnscoredSamples = [];
@@ -454,6 +482,12 @@ async function evaluateRepo(repo, oracle) {
             // a "call" on the declaration line is the declaration itself in some
             // ts-morph shapes — exclude self-lines
             .filter(r => !(r.file === sym.file && r.line === sym.line)), true);
+        const oracleReferencePopulation = referencePopulation(rawOracleCalls);
+        const replayOracle = replayRepo?.oraclePopulations?.find(s =>
+            s.file === sym.file && s.line === sym.line && s.name === sym.name && s.kind === sym.kind);
+        if (replayRepo?.oraclePopulations && !replayOracle) {
+            throw new Error(`Replay oracle population missing: ${sym.file}:${sym.line}:${sym.name}`);
+        }
 
         const sameNameDefs = index.symbols.get(sym.name) || [];
         const targetDef = sameNameDefs.find(d =>
@@ -751,12 +785,15 @@ async function evaluateRepo(repo, oracle) {
         // direct call syntax — reference oracles classify those sites as
         // reference-kind, so they verify against ANY oracle ref (family B
         // decision 2026-06-12; the #218f class-kind precedent).
-        const confirmed = dedupe((json.data.callers || json.data.usages || []).map(c => ({
+        const confirmedOccurrences = dedupeOccurrences((json.data.callers || json.data.usages || []).map(c => ({
             file: c.file, line: c.line,
-            ...(Number.isInteger(c.column) && { column: c.column }),
+            column: c.column ?? c.provenance?.facts?.site?.column,
             ...(c.calledAs && c.calledAs !== 'bound' && { calledAs: c.calledAs }),
             usageStyle: c.calledAs === 'bound' || !!c.functionReference,
+            resolution: c.resolution, tier: c.tier, provenance: c.provenance,
+            target: { file: sym.file, startLine: sym.line, name: sym.name, kind: sym.kind },
         })));
+        const confirmed = dedupe(confirmedOccurrences);
         const unverified = dedupe((json.data.unverifiedCallers || []).map(c => ({
             file: c.file, line: c.line,
             ...(Number.isInteger(c.column) && { column: c.column }),
@@ -775,6 +812,8 @@ async function evaluateRepo(repo, oracle) {
 
         const confirmedKeys = new Set(confirmed.map(c => key(c.file, c.line)));
         const unverifiedKeys = new Set(unverified.map(c => key(c.file, c.line)));
+        const shownKeys = new Set([...confirmedKeys, ...unverifiedKeys]);
+        const deferredShown = [];
         // Deferred adjudication for oracle-unresolved references (fix #286d):
         // edges the engine SHOWS need no lookup — they stay in the universe
         // untouched (the dayjs lesson: plain-JS repos are mostly unresolved).
@@ -791,8 +830,8 @@ async function evaluateRepo(repo, oracle) {
                 delete oc._pendingUnresolved;
                 const stashedStatus = oc._definitionStatus;
                 delete oc._definitionStatus;
-                const k = key(oc.file, oc.line);
-                if (confirmedKeys.has(k) || unverifiedKeys.has(k)) {
+                if (deferredReferenceShown(oc, shownKeys, replayOracle)) {
+                    deferredShown.push(key(oc.file, oc.line));
                     kept.push(oc);
                     continue;
                 }
@@ -910,6 +949,16 @@ async function evaluateRepo(repo, oracle) {
             }
             return { hit: false, scorable: true, definitionValidated: false };
         };
+        const symbolRuleStats = {};
+        const symbolCalleeRuleStats = {};
+        for (const candidate of confirmedOccurrences) {
+            const verdict = await edgeMatchesTarget(candidate);
+            addRuleStat(symbolRuleStats, candidate.provenance?.rule, verdict, candidate.provenance);
+            addRuleStat(confirmedRuleStats, candidate.provenance?.rule, verdict, candidate.provenance);
+            const sample = { ...candidate, verdict, symbol: sym.name };
+            if (!verdict.scorable) abstentionSamples.push(sample);
+            else if (!verdict.hit) falseConfirmationSamples.push(sample);
+        }
         const confirmedVerdicts = [];
         for (const c of confirmed) {
             const verdict = await edgeMatchesTarget(c);
@@ -1104,6 +1153,20 @@ async function evaluateRepo(repo, oracle) {
                     seenPrecisionDefs.add(dKey);
                     for (const e of ucnCallees) {
                         if (!isExactCalleeTargetEdge(e)) continue;
+                        const occurrences = dedupeOccurrences((e.siteProvenance || []).map(site => ({
+                            file: oc.file, line: site.line, column: site.column,
+                            target: site.targetDef, provenance: site.provenance,
+                            resolution: site.resolution, tier: site.tier,
+                            usageStyle: !!e.functionReference,
+                        })));
+                        for (const candidate of occurrences) {
+                            const verdict = await edgeMatchesTarget(candidate);
+                            addRuleStat(symbolCalleeRuleStats, candidate.provenance?.rule, verdict, candidate.provenance);
+                            addRuleStat(calleeConfirmedRuleStats, candidate.provenance?.rule, verdict, candidate.provenance);
+                            const sample = { ...candidate, verdict, symbol: sym.name, enclosing: encl.name };
+                            if (!verdict.scorable) calleeAbstentionSamples.push(sample);
+                            else if (!verdict.hit) calleeFalseConfirmationSamples.push(sample);
+                        }
                         for (const siteLine of e.sites || []) {
                             const verdict = await edgeMatchesTarget({
                                 file: oc.file,
@@ -1123,6 +1186,7 @@ async function evaluateRepo(repo, oracle) {
                                     symbol: sym.name, target: `${sym.file}:${sym.line}`,
                                     edge: k, enclosing: encl.name,
                                     text: lineText(index.root, oc.file, siteLine),
+                                    siteProvenance: e.siteProvenance?.filter(site => site.line === siteLine),
                                 });
                             }
                         }
@@ -1291,8 +1355,11 @@ async function evaluateRepo(repo, oracle) {
                 `${site.dispatchCandidates ?? ''}`));
         perSymbol.push({
             name: sym.name, file: sym.file, line: sym.line, kind: sym.kind,
+            oracleReplay: { references: oracleReferencePopulation, deferredShown: deferredShown.sort() },
             oracleCalls: oracleCalls.length,
             confirmed: confirmed.length, confirmedHits, confirmedUnscored,
+            confirmedRules: finishRuleStats(symbolRuleStats),
+            calleeConfirmedRules: finishRuleStats(symbolCalleeRuleStats),
             unverified: unverified.length, unverifiedHits, unverifiedUnscored,
             actionableUnverified: actionableUnverified.length,
             actionableUnverifiedHits,
@@ -1443,6 +1510,13 @@ async function evaluateRepo(repo, oracle) {
         tier1Precision,
         confirmedFalsePositiveSamples,
         confirmedUnscoredSamples,
+        language: repo.language,
+        confirmedRules: finishRuleStats(confirmedRuleStats),
+        calleeConfirmedRules: finishRuleStats(calleeConfirmedRuleStats),
+        calleeFalseConfirmationSamples,
+        calleeAbstentionSamples,
+        falseConfirmationSamples,
+        abstentionSamples,
         unverifiedPrecision,
         unverifiedEdges: totals.unverifiedEdges,
         unverifiedScoredEdges,
@@ -1648,7 +1722,11 @@ async function main() {
     if (freshCount && releaseOnly) {
         throw new Error('--release and --fresh cannot be combined');
     }
-    const baseRepos = freshCount
+    if (replayManifest && (replayManifest.options.sampleSeed !== sampleSeed ||
+        replayManifest.options.sampleSize !== sampleSize)) {
+        throw new Error('Replay requires the manifest sample size and seed');
+    }
+    const baseRepos = replayManifest ? replayManifest.repos : freshCount
         ? selectFreshRepos(freshCount)
         : (releaseOnly ? RELEASE_REPOS : REPOS);
     const oracleRepos = baseRepos.filter(r =>
@@ -1658,11 +1736,20 @@ async function main() {
         console.error(`No matching repos for oracle languages${repoFilter ? ` and --repo ${repoFilter}` : ''}.`);
         process.exit(1);
     }
-    if (freshCount) {
+    if (freshCount && !replayManifest) {
         for (const repo of oracleRepos) resolveFreshCommit(repo);
         process.stdout.write(`Fresh-repo arm: ${oracleRepos.map(r => `${r.name}@${r.commit.slice(0, 8)}`).join(', ')}\n`);
     }
 
+    if (manifestPath) {
+        runManifest = createRunManifest(path.join(__dirname, '..'), oracleRepos, {
+            sampleSize, sampleSeed, freshCount, releaseOnly, minPrecision,
+            maxUnscoredRatio, reviewBudgets, args,
+            oracles: oracleRepos.map(repo => ({ repo: repo.name,
+                name: ORACLES.find(o => o.languages.includes(repo.language)).name })),
+        });
+        saveManifest(manifestPath, runManifest);
+    }
     fs.mkdirSync(REPORTS_DIR, { recursive: true });
     const date = new Date().toISOString().slice(0, 10);
     const results = [];
@@ -1672,7 +1759,28 @@ async function main() {
         const oracle = ORACLES.find(o => o.languages.includes(repo.language));
         try {
             const result = await evaluateRepo(repo, oracle);
-            result.schemaVersion = 4;
+            result.schemaVersion = 5;
+            const eligiblePopulation = population(result);
+            const oraclePopulations = result.perSymbol.map(s => ({
+                file: s.file, line: s.line, name: s.name, kind: s.kind, ...s.oracleReplay,
+            }));
+            if (runManifest) {
+                runManifest.repos.find(r => r.name === repo.name).population = eligiblePopulation;
+                runManifest.repos.find(r => r.name === repo.name).oraclePopulations = oraclePopulations;
+                saveManifest(manifestPath, runManifest);
+            }
+            const priorPopulation = replayManifest?.repos.find(r => r.name === repo.name)?.population;
+            const priorOraclePopulation = replayManifest?.repos.find(r => r.name === repo.name)?.oraclePopulations;
+            if (priorOraclePopulation && JSON.stringify(priorOraclePopulation) !== JSON.stringify(oraclePopulations)) {
+                result.summary.oracleReferencesChanged = true;
+                process.stdout.write(`  ⚠ POPULATION GATE FAILURE: ${repo.name} oracle reference identities changed\n`);
+                gateFailed = true;
+            }
+            if (priorPopulation && JSON.stringify(priorPopulation) !== JSON.stringify(eligiblePopulation)) {
+                result.summary.populationChanged = true;
+                process.stdout.write(`  ⚠ POPULATION GATE FAILURE: ${repo.name} eligible oracle populations changed\n`);
+                gateFailed = true;
+            }
             result.generatedAt = new Date().toISOString();
             result.reviewBudgets = reviewBudgets;
             results.push(result);
@@ -1918,6 +2026,8 @@ async function main() {
         lines.push(`| ${s.repo} | ${s.definitionValidatedConfirmed} | ${s.definitionValidatedUnverified} | ${s.definitionValidatedOracleCalls} | ${s.oracleBroadReferenceEdges} | ${s.definitionUnresolvedReferenceEdges} | **${s.definitionLookupErrors}** | ${s.configurationGatedUnscored} | ${s.calleeUnscoredSites} | **${s.sourceStatusErrors}** |`);
     }
     lines.push('');
+    lines.push(...ruleTable(rollupResults));
+    lines.push(...ruleTable(rollupResults, 'calleeConfirmedRules', 'Callee confirmed tier'));
     const mdPath = path.join(REPORTS_DIR, `oracle-eval-rollup-${date}${seedSuffix}.md`);
     fs.writeFileSync(mdPath, lines.join('\n'));
     process.stdout.write(`\nwrote ${path.relative(process.cwd(), rollupJsonPath)}\n`);

@@ -1300,7 +1300,7 @@ fn main() {}
 });
 
 describe('fix #167: Rust method references detected as callbacks', () => {
-    it('detects obj.method passed as argument as callback reference', () => {
+    it('retains an unresolved method-value expression without a confirmed callee (#355)', () => {
         const dir = tmp({
             'main.rs': `struct Handler;
 impl Handler {
@@ -1319,7 +1319,10 @@ fn main() {
             const callees = index.findCallees(mainDef);
             const calleeNames = callees.map(c => c.name);
             assert.ok(calleeNames.includes('execute'), 'should find execute as callee');
-            assert.ok(calleeNames.includes('process'), 'should find process as callback callee');
+            assert.ok(!calleeNames.includes('process'), 'an untyped method value cannot manufacture a callee binding');
+            const contract = index.findCallees(mainDef, { collectAccount: true, includeMethods: true });
+            assert.ok(contract.unverifiedCallees.some(c => c.name === 'process'));
+            assert.strictEqual(contract.calleeAccount.conserved, true);
         } finally {
             rm(dir);
         }
@@ -2246,6 +2249,7 @@ impl Holder {
         const json = JSON.parse(output.formatContextJson(r.result));
         return {
             confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(c => ({ key: `${c.file}:${c.line}`, reason: c.reason })),
             excluded: json.meta.account?.excluded,
             conserved: json.meta.account?.conserved,
         };
@@ -2296,8 +2300,10 @@ impl Holder {
         try {
             const index = idx(dir);
             const concrete = callersOf(index, 'user.rs:18:is_switch');
-            assert.ok(concrete.confirmed.includes('user.rs:22'),
-                `self.flag.is_switch() through Box<dyn Flag> stays a possible edge: ${concrete.confirmed}`);
+            assert.ok(!concrete.confirmed.includes('user.rs:22'));
+            assert.ok(concrete.unverified.some(c => c.key === 'user.rs:22'),
+                'dynamic trait dispatch remains visible without confirming a concrete implementation');
+            assert.strictEqual(concrete.conserved, true);
         } finally { rm(dir); }
     });
 });

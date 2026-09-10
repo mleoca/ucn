@@ -5,6 +5,9 @@
  * modules, macros, and const/static declarations.
  */
 
+const { ReceiverTypeMap, typeOrigin } = require('./type-evidence');
+
+
 const {
     traverseTree,
     traverseTreeCached,
@@ -1530,7 +1533,7 @@ function extractCallsFromTokenTree(tree, enclosingFunction, calls, getReceiverTy
     const contextKind = typeof context === 'string' ? context : context.kind;
     const containerMacro = typeof context === 'object' ? context.containerMacro : undefined;
     const inheritedTokenTypes = typeof context === 'object' && context.tokenTypes
-        ? context.tokenTypes : new Map();
+        ? context.tokenTypes : new ReceiverTypeMap();
     const children = [];
     for (let i = 0; i < tree.childCount; i++) children.push(tree.child(i));
     // Macro arguments are token trees, so a typed closure parameter is not a
@@ -1544,7 +1547,7 @@ function extractCallsFromTokenTree(tree, enclosingFunction, calls, getReceiverTy
         let close = i + 1;
         while (close < children.length && children[close].type !== '|') close++;
         if (close >= children.length) break;
-        const bindings = new Map(inheritedTokenTypes);
+        const bindings = new ReceiverTypeMap(inheritedTokenTypes);
         let cursor = i + 1;
         while (cursor < close) {
             const nameNode = children[cursor];
@@ -1562,7 +1565,7 @@ function extractCallsFromTokenTree(tree, enclosingFunction, calls, getReceiverTy
             if (simplePath) {
                 const identifiers = typeTokens.filter(token => token.type === 'identifier');
                 if (identifiers.length > 0) {
-                    bindings.set(nameNode.text, identifiers[identifiers.length - 1].text);
+                    bindings.set(nameNode.text, identifiers[identifiers.length - 1].text, 'annotation', nameNode);
                 }
             }
             cursor = end + 1;
@@ -1719,7 +1722,7 @@ function extractCallsFromTokenTree(tree, enclosingFunction, calls, getReceiverTy
                 isMethod: true,
                 receiver: receiverField ? undefined : receiver,
                 ...(receiverField && { receiverRoot, receiverField }),
-                ...(receiverType && { receiverType }),
+                ...(receiverType && { receiverType, ...(getReceiverType?.(receiver, tok, true) || inheritedTokenTypes.fields(receiver, receiverType)) }),
                 ...(receiverPatternShadow && { receiverPatternShadow: true }),
                 ...(receiverFlowInvalidated && { receiverFlowInvalidated: true }),
                 ...(iterationSource || {}),
@@ -2120,7 +2123,7 @@ function findCallsInCode(code, parser) {
 
     // Build type map from function parameters (including self receiver for impl methods)
     const buildScopeTypeMap = (node) => {
-        const typeMap = new Map();
+        const typeMap = new ReceiverTypeMap();
         typeMap.qualifiers = new Map();
         typeMap.iteratorItems = new Map();
         typeMap.annotationTexts = new Map();
@@ -2154,7 +2157,7 @@ function findCallsInCode(code, parser) {
                         // Pattern can be identifier or _
                         const name = patternNode.type === 'identifier' ? patternNode.text : null;
                         if (name) {
-                            typeMap.set(name, typeName);
+                            typeMap.set(name, typeName, 'annotation', param);
                             typeMap.annotationTexts.set(name, typeNode.text);
                             if (qualifier) typeMap.qualifiers.set(name, qualifier);
                             if (iteratorItem) typeMap.iteratorItems.set(name, iteratorItem);
@@ -2253,13 +2256,13 @@ function findCallsInCode(code, parser) {
         !!flowEventAt(node, varName)?.invalidated;
 
     // Look up variable type from scope chain
-    const getReceiverType = (varName, atNode) => {
+    const getReceiverType = (varName, atNode, evidence = false) => {
         if (atNode && patternShadowsAt(atNode, varName)) return undefined;
         const flow = flowEventAt(atNode, varName);
-        if (flow?.type) return flow.type;
+        if (flow?.type) return evidence ? { receiverTypeSource: 'flow', receiverTypeEvidence: { ...typeOrigin('flow', atNode), ...flow } } : flow.type;
         for (let i = functionStack.length - 1; i >= 0; i--) {
             const typeMap = scopeTypes.get(functionStack[i].startLine);
-            if (typeMap?.has(varName)) return typeMap.get(varName);
+            if (typeMap?.has(varName)) return evidence ? typeMap.fields(varName) : typeMap.get(varName);
             if (typeMap?.boundNames?.has(varName)) return undefined;
         }
         return undefined;
@@ -2761,7 +2764,7 @@ function findCallsInCode(code, parser) {
                         callEnd: node.endIndex,
                         isMethod: true,
                         receiver,
-                        ...(receiverType && { receiverType }),
+                        ...(receiverType && { receiverType, ...(getReceiverType(receiver, node, true) || { receiverTypeSource: 'unknown' }) }),
                         ...(receiverTypeQualifier && { receiverTypeQualifier }),
                         ...(receiverIteratorItemType && { receiverIteratorItemType }),
                         ...(receiverPatternShadow && { receiverPatternShadow: true }),
@@ -2987,7 +2990,7 @@ function findCallsInCode(code, parser) {
                         line: fieldNode.startPosition.row + 1,
                         isMethod: true,
                         receiver,
-                        ...(receiverType && { receiverType }),
+                        ...(receiverType && { receiverType, ...(getReceiverType(receiver, node, true) || { receiverTypeSource: 'unknown' }) }),
                         ...(receiverPatternShadow && { receiverPatternShadow: true }),
                         ...(receiverFlowInvalidated && { receiverFlowInvalidated: true }),
                         isFunctionReference: true,
@@ -3061,7 +3064,7 @@ function findCallsInCode(code, parser) {
                         }
                     }
                     if (typeName) {
-                        typeMap.set(varName, typeName);
+                        typeMap.set(varName, typeName, typeAnnotation ? 'annotation' : valueNode?.type === 'call_expression' ? 'guess' : 'constructor', typeAnnotation || valueNode);
                         if (typeQualifier) typeMap.qualifiers.set(varName, typeQualifier);
                     }
                 }

@@ -220,3 +220,25 @@ file set, the unit a refactor has to break.
 - Use `search` or ordinary repository search for text, filenames, configuration, and unsupported syntax.
 
 Read [references/commands.md](references/commands.md) for all public commands and flags. Read [references/trust-contract.md](references/trust-contract.md) before building automation that gates changes on UCN output.
+
+
+### Inspect confirmation provenance
+
+Caller and callee JSON carries compact `provenance`: `rule`, contributing `rules`
+when there is more than one, `validation`, and the receiver's source and origin
+line when recorded. Incomplete proofs include a `diagnostic`, also shown in text.
+Callees retain compact `siteProvenance` for each distinct occurrence; their summary
+uses the weakest confirmed site's rule. Exclusions expose counts by rule and
+validation under `account.excluded.evidenceSummary`. Full declaration, import,
+and member-lookup facts remain on engine results and in oracle reports.
+
+A lone project owner of a method name does not identify an untyped receiver.
+Such candidates stay unverified with `single-owner`; importing the class does not
+change that. `provenance-incomplete` means the available facts cannot establish
+this declaration. Inspect the site and diagnostic before editing it. Neither
+reason is permission to discard a possible caller. `validation: unsupported`
+means the witness collector does not yet cover that path (for example a wildcard
+re-export or an external inherited member). Its existing classification is kept
+in report-only mode; it is not a validated proof. Missing or inconsistent facts
+on a supported lookup still route unverified. Full rule migration is tracked as
+#356. Ordinal evidence weights are not probabilities.

@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const { langTraits } = require('../../languages');
 const { dynamicImportsNote, formatGitLine, unverifiedReasonLabel } = require('./shared');
+const { provenanceReplacer } = require('./provenance');
 
 /**
  * One short sentence (~80 chars) of a docstring, suitable for inline display
@@ -40,7 +41,7 @@ function reachabilityDisplay(items, hasEntrypoints, label) {
 }
 
 // Display order for resolution labels in evidence aggregates (most → least confident)
-const RESOLUTION_ORDER = ['exact-binding', 'same-class', 'receiver-hint', 'scope-match', 'name-only', 'uncertain'];
+const RESOLUTION_ORDER = ['exact-binding', 'same-class', 'receiver-hint', 'scope-match', 'single-owner', 'name-only', 'uncertain'];
 
 /**
  * One aggregate evidence line per tier section, replacing per-edge confidence
@@ -51,8 +52,9 @@ function formatEvidenceLine(items) {
     if (!items || items.length === 0) return null;
     const counts = new Map();
     for (const it of items) {
-        if (!it.resolution) continue;
-        counts.set(it.resolution, (counts.get(it.resolution) || 0) + 1);
+        const rule = it.provenance?.rule || it.resolution;
+        if (!rule) continue;
+        counts.set(rule, (counts.get(rule) || 0) + 1);
     }
     if (counts.size === 0) return null;
     if (counts.size === 1) {
@@ -266,6 +268,8 @@ function formatContextJson(context) {
                     ...(c.evidenceScore !== undefined && { evidenceScore: c.evidenceScore }),
                     ...(c.scoreKind && { scoreKind: c.scoreKind }),
                     ...(c.resolution && { resolution: c.resolution }),
+                    ...(c.provenance && { provenance: c.provenance }),
+                    ...(c.siteProvenance && { siteProvenance: c.siteProvenance }),
                     ...(c.tier && { tier: c.tier })
                 })),
                 unverifiedCallers: (context.unverifiedCallers || []).map(c => ({
@@ -281,6 +285,8 @@ function formatContextJson(context) {
                     ...(c.evidenceScore !== undefined && { evidenceScore: c.evidenceScore }),
                     ...(c.scoreKind && { scoreKind: c.scoreKind }),
                     ...(c.resolution && { resolution: c.resolution }),
+                    ...(c.provenance && { provenance: c.provenance }),
+                    ...(c.siteProvenance && { siteProvenance: c.siteProvenance }),
                     ...(c.reason && { reason: c.reason }),
                     ...(c.dispatchVia && { dispatchVia: c.dispatchVia }),
                     ...(c.dispatchCandidates != null && { dispatchCandidates: c.dispatchCandidates }),
@@ -295,7 +301,7 @@ function formatContextJson(context) {
                 }),
                 ...(context.warnings && { warnings: context.warnings })
             }
-        });
+        }, provenanceReplacer);
     }
 
     // Standard function/method context
@@ -321,6 +327,8 @@ function formatContextJson(context) {
                 ...(c.calledAs && { calledAs: c.calledAs }),
                 ...(c.isFunctionReference && { functionReference: true }),
                 ...(c.confidence != null && { confidence: c.confidence, resolution: c.resolution }),
+                ...(c.provenance && { provenance: c.provenance }),
+                ...(c.siteProvenance && { siteProvenance: c.siteProvenance }),
                 ...(c.evidenceScore != null && { evidenceScore: c.evidenceScore }),
                 ...(c.scoreKind && { scoreKind: c.scoreKind }),
                 ...(c.tier && { tier: c.tier }),
@@ -335,6 +343,8 @@ function formatContextJson(context) {
                 ...(c.calledAs && { calledAs: c.calledAs }),
                 ...(c.isFunctionReference && { functionReference: true }),
                 ...(c.confidence != null && { confidence: c.confidence, resolution: c.resolution }),
+                ...(c.provenance && { provenance: c.provenance }),
+                ...(c.siteProvenance && { siteProvenance: c.siteProvenance }),
                 ...(c.evidenceScore != null && { evidenceScore: c.evidenceScore }),
                 ...(c.scoreKind && { scoreKind: c.scoreKind }),
                 tier: 'unverified',
@@ -358,6 +368,8 @@ function formatContextJson(context) {
                 params: c.params,  // FULL params
                 weight: c.weight || 'normal',  // Dependency weight: core, setup, utility
                 ...(c.confidence != null && { confidence: c.confidence, resolution: c.resolution }),
+                ...(c.provenance && { provenance: c.provenance }),
+                ...(c.siteProvenance && { siteProvenance: c.siteProvenance }),
                 ...(c.evidenceScore != null && { evidenceScore: c.evidenceScore }),
                 ...(c.scoreKind && { scoreKind: c.scoreKind }),
                 ...(c.tier && { tier: c.tier }),
@@ -370,7 +382,7 @@ function formatContextJson(context) {
             unverifiedCallees: context.unverifiedCallees || [],
             ...(context.warnings && { warnings: context.warnings })
         }
-    });
+    }, provenanceReplacer);
 }
 
 /**
@@ -456,7 +468,7 @@ function formatContext(ctx, options = {}) {
             for (const u of typeUnverified) {
                 if (shown >= cap) break;
                 const callerName = u.callerName ? ` [${u.callerName}]` : '';
-                const reason = u.reason ? ` (${u.reason})` : '';
+                const reason = u.reason ? ` (${unverifiedReasonLabel(u)})` : '';
                 const expr = u.content ? `: ${u.content.trim().replace(/\s+/g, ' ').slice(0, 100)}` : '';
                 lines.push(`  [${itemNum}] ${u.relativePath}:${u.line}${callerName}${expr}${reason}`);
                 expandable.push({
@@ -943,7 +955,7 @@ function formatImpactJson(impact) {
     if (!impact) {
         return JSON.stringify({ found: false, error: 'Function not found' }, null, 2);
     }
-    return JSON.stringify(impact, null, 2);
+    return JSON.stringify(impact, provenanceReplacer, 2);
 }
 
 /** Format about command output - text. The "tell me everything" output for AI agents. */
@@ -1215,7 +1227,7 @@ function formatAboutJson(about) {
     if (!about) {
         return JSON.stringify({ found: false, error: 'Symbol not found' }, null, 2);
     }
-    return JSON.stringify(about, null, 2);
+    return JSON.stringify(about, provenanceReplacer, 2);
 }
 
 module.exports = {

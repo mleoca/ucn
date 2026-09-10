@@ -2520,13 +2520,13 @@ describe('fix #210: external-contract methods (Java)', () => {
         } finally { rm(dir); }
     });
 
-    it('un-marked single-owner methods keep confirming (control)', () => {
+    it('un-marked single-owner methods remain visible without receiver evidence (#355)', () => {
         const dir = tmp(FILES);
         try {
             const index = idx(dir);
             const res = contract(index, 'LazyNum.java:4:ownMethod');
-            assert.ok(res.confirmed.includes('Caller.java:4'),
-                `ownMethod has no override marker — unique ownership stays evidence: ${res.confirmed}`);
+            assert.ok(!res.confirmed.includes('Caller.java:4'));
+            assert.strictEqual(res.unverified.find(c => c.key === 'Caller.java:4')?.reason, 'single-owner');
             assert.strictEqual(res.conserved, true);
         } finally { rm(dir); }
     });
@@ -2558,14 +2558,14 @@ describe('fix #210: external-contract methods (Java)', () => {
         } finally { rm(dir); }
     });
 
-    it('legacy (non-account) caller resolution is unchanged', () => {
+    it('legacy drops unsupported receivers and retains typed callers (#355)', () => {
         const dir = tmp(FILES);
         try {
             const index = idx(dir);
             const { findCallers } = require('../core/callers');
             const legacy = findCallers(index, 'intValue', {});
-            assert.ok(legacy.some(c => (c.relativePath || c.file).includes('Caller.java') && c.line === 3),
-                `legacy keeps the edge (drop-vs-route asymmetry): ${JSON.stringify(legacy.map(c => `${c.relativePath || c.file}:${c.line}`))}`);
+            assert.ok(!legacy.some(c => (c.relativePath || c.file).includes('Caller.java') && c.line === 3));
+            assert.ok(legacy.some(c => c.relativePath === 'Typed.java' && c.line === 4));
         } finally { rm(dir); }
     });
 });
@@ -2672,15 +2672,15 @@ describe('fix #212: Object-typed receivers route possible-dispatch, never exclud
         } finally { rm(dir); }
     });
 
-    it('unrelated concrete project receivers still exclude (control)', () => {
+    it('a receiver with no modeled member cannot prove a different target (#355)', () => {
         const dir = tmp(FILES);
         try {
             const index = idx(dir);
             const res = contract(index, 'src/Num.java:2:size');
             assert.ok(!res.confirmed.includes('src/Show.java:5'),
                 'x is typed Other — not a Num caller');
-            assert.ok(!res.unverified.some(u => u.key === 'src/Show.java:5'),
-                `Other defines no size and is unrelated to Num — stays excluded: ${JSON.stringify(res.unverified)}`);
+            assert.strictEqual(res.unverified.find(u => u.key === 'src/Show.java:5')?.reason, 'provenance-incomplete');
+            assert.strictEqual(res.conserved, true);
         } finally { rm(dir); }
     });
 });

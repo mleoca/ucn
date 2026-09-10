@@ -9,6 +9,7 @@ const { detectLanguage, getParser, getLanguageAdapter, safeParse, langTraits } =
 const { sameNode } = require('../languages/utils');
 const { escapeRegExp, codeUnitCompare, NON_CALLABLE_TYPES } = require('./shared');
 const { findAccessorReferences } = require('./accessors');
+const { validateCallMismatch, declarationIdentity } = require('./provenance');
 
 function codeUnitColumnForByteColumn(line, byteColumn) {
     if (!Number.isInteger(byteColumn) || byteColumn < 0) return null;
@@ -1340,7 +1341,10 @@ function verify(index, name, options = {}) {
 
     // Convert caller results to usage-like objects for analyzeCallSite.
     // Carry callerFile/callerStartLine through so we can compute inTestCase.
-    const calls = callerResults.map(c => ({
+    const invalidFamilyCalls = sweepUnverified.filter(c =>
+        validateCallMismatch(c.provenance, declarationIdentity(def)));
+    const calls = [...callerResults, ...invalidFamilyCalls].map(c => ({
+        invalidOverload: invalidFamilyCalls.includes(c),
         file: c.file,
         relativePath: c.relativePath,
         line: c.line,
@@ -1448,12 +1452,12 @@ function verify(index, name, options = {}) {
         const countOk = hasRest
             ? argCount >= minArgs
             : (argCount >= minArgs && argCount <= expectedParamCount);
-        if (!countOk) {
+        if (!countOk || call.invalidOverload) {
             mismatches.push({
                 file: call.relativePath,
                 line: call.line,
                 expression: call.content.trim(),
-                expected: hasRest
+                expected: call.invalidOverload && countOk ? 'a compatible overload signature' : hasRest
                     ? `at least ${minArgs} arg(s)`
                     : (minArgs === expectedParamCount
                         ? `${expectedParamCount} arg(s)`
