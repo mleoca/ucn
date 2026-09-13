@@ -17,6 +17,8 @@ const { summarizeProvenance, declarationIdentity, sameDeclaration } = require('.
 const { confirmationFacts, occurrenceIdentity } = require('./provenance-facts');
 const { BUILTIN_RECEIVER_TYPES, isProvenanceBuiltinReceiver } = require('./receiver-types');
 const { findGoModule, resolveRustImport } = require('./imports');
+const { rustWrapperContract, validateRustWrapperContract } = require('./rust-result-flow');
+const { pythonFixtureReceiver, pythonFixtureType } = require('./python-fixture-flow');
 
 const CONSTRUCTABLE_BINDING_KINDS = new Set([
     'class', 'struct', 'record', 'enum', 'function',
@@ -730,6 +732,21 @@ function findCallers(index, name, options = {}) {
                     calledAs = call.name;
                 }
 
+                const standardWrapper = fileEntry.language === 'rust'
+                    ? _rustStandardWrapperMethod(index, filePath, call, calls) : null;
+                if (standardWrapper) {
+                    const facts = { language: 'rust', site: occurrenceIdentity(fileEntry.relativePath, call),
+                        targets: (options.targetDefinitions || definitions).map(declarationIdentity), standardWrapper };
+                    const checked = validateConfirmation({ facts }, facts.targets);
+                    if (checked.verdict === 'establishes-other') {
+                        recordExcluded(filePath, call.line, 'standard-wrapper-method', {
+                            rule: 'rust-standard-wrapper', rules: ['rust-standard-wrapper'], facts,
+                            validation: checked.verdict, diagnostic: 'standard-wrapper-method',
+                        });
+                        continue;
+                    }
+                }
+
                 // A direct static call cannot cross an unrelated runtime
                 // language boundary. A Python `service.get` is not a possible
                 // target of JavaScript `map.get()`, nor can a Java method be
@@ -987,7 +1004,7 @@ function findCallers(index, name, options = {}) {
                 // persisted with this file's calls.
                 if (call.isMethod && call.receiver &&
                     !_isReservedReceiver(fileEntry.language, call.receiver) &&
-                    (!call.receiverType || call.receiverTypeGuessed) &&
+                    (!call.receiverType || call.receiverTypeGuessed || call.receiverTypeSource === 'guess') &&
                     !call.receiverPatternShadow && !call.receiverFlowInvalidated &&
                     !call.receiverIsChainRoot &&
                     (langTraits(fileEntry.language)?.typeSystem === 'structural' ||
@@ -1016,7 +1033,7 @@ function findCallers(index, name, options = {}) {
                                 receiverExternalConcreteFlow: true,
                             }),
                         };
-                        if (call.receiverTypeGuessed) {
+                        if (call.receiverTypeGuessed || call.receiverTypeSource === 'guess') {
                             call = { ...call, receiverType: undefined, receiverTypeGuessed: undefined };
                         }
                     } else if (flowEntry) {
@@ -1032,6 +1049,22 @@ function findCallers(index, name, options = {}) {
                             receiverTypeGuessed: undefined,
                             receiverFlowInvalidated: false,
                             ...(flowEntry.fromFile && { receiverTypeFlowFile: flowEntry.fromFile }) };
+                    }
+                }
+
+                if (fileEntry.language === 'python' && call.isMethod && !call.receiverType) {
+                    const fixture = _pythonFixtureReceiverType(index, filePath, call);
+                    if (fixture) call = { ...call, receiverType: fixture.type,
+                        receiverTypeSource: 'fixture', receiverTypeEvidence: { source: 'fixture', ...fixture },
+                        ...(fixture.fromFile && { receiverTypeFlowFile: fixture.fromFile }) };
+                    const external = !fixture && _pythonExternalFieldFlow(index, filePath, call);
+                    if (external) {
+                        call = { ...call, receiverTypeSource: 'flow',
+                            receiverTypeEvidence: { source: 'flow', externalFactory: external.proof } };
+                        routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs,
+                            { dispatchVia: external.via, externalContract: true },
+                            _confirmationFacts(index, filePath, call, options.targetDefinitions || definitions));
+                        continue;
                     }
                 }
 
@@ -1186,7 +1219,7 @@ function findCallers(index, name, options = {}) {
                 // exact indexed variant and positional payload before method
                 // dispatch; external qualified payloads remain external
                 // provenance, never borrowed project identity.
-                if (collectAccount && fileEntry.language === 'rust' &&
+                if ((collectAccount || call.receiverPatternSourceCallStart != null) && fileEntry.language === 'rust' &&
                     call.isMethod && !call.receiverType &&
                     call.receiverPatternVariant) {
                     const patternType = _rustPatternReceiverType(
@@ -1321,7 +1354,9 @@ function findCallers(index, name, options = {}) {
                     const builtinChained = _pythonBuiltinChainedReceiverType(
                         index, fileEntry, call, foldCtx);
                     if (builtinChained) {
-                        call = { ...call, receiverType: builtinChained,
+                        call = { ...call, receiverType: builtinChained.type,
+                            receiverTypeSource: 'flow',
+                            receiverTypeEvidence: { source: 'flow', ...builtinChained },
                             receiverTypePlatform: true };
                     } else if (folded && folded.type) {
                         call = { ...call, receiverType: folded.type,
@@ -1394,7 +1429,7 @@ function findCallers(index, name, options = {}) {
                 // analysis resolves the source owner and its declared
                 // `Iterator<Item = T>` contract. Item-preserving std adapters
                 // such as rev/filter/take recurse to that same declaration.
-                if (collectAccount && fileEntry.language === 'rust' &&
+                if (fileEntry.language === 'rust' &&
                     call.isMethod && call.receiver && !call.receiverType &&
                     (call.receiverIterationCall || call.receiverIterationVariable)) {
                     let foldCtx = foldCtxCache.get(filePath);
@@ -1410,39 +1445,14 @@ function findCallers(index, name, options = {}) {
                             } };
                         foldCtxCache.set(filePath, foldCtx);
                     }
-                    let items = [];
-                    if (call.receiverIterationVariable) {
-                        const flow = _lookupReturnTypeFlow(foldCtx.getFlowMap(), {
-                            ...call,
-                            receiver: call.receiverIterationVariable,
-                        });
-                        if (flow?.iteratorItemType) {
-                            items = [{
-                                type: flow.iteratorItemType,
-                                fromFile: flow.iteratorItemFromFile,
-                            }];
-                        }
-                    } else {
-                        const sources = _chainedProducerRecords(foldCtx, {
-                            receiverCall: call.receiverIterationCall,
-                            receiverCallIsMethod: call.receiverIterationCallIsMethod,
-                            receiverCallLine: call.receiverIterationCallLine,
-                            receiverCallStart: call.receiverIterationCallStart,
-                            receiverCallEnd: call.receiverIterationCallEnd,
-                        });
-                        items = sources.map(source => _rustIteratorOutputItemType(
-                            index, fileEntry, filePath, source, foldCtx));
-                    }
-                    if (items.length > 0 && items.every(Boolean) &&
-                        new Set(items.map(item => item.type)).size === 1 &&
-                        new Set(items.map(item => item.fromFile)).size === 1 &&
-                        items[0].fromFile) {
+                    const item = _rustIterationReceiverType(index, fileEntry, filePath, call, foldCtx);
+                    if (item) {
                         call = {
                             ...call,
-                            receiverType: items[0].type,
+                            receiverType: item.type,
                             receiverTypeSource: 'flow',
-                            receiverTypeEvidence: { source: 'flow', alternatives: items },
-                            receiverTypeFlowFile: items[0].fromFile,
+                            receiverTypeEvidence: { source: 'flow', ...item },
+                            receiverTypeFlowFile: item.fromFile,
                         };
                     }
                 }
@@ -2252,7 +2262,8 @@ function findCallers(index, name, options = {}) {
                                     resolvedReceiverFacts = {
                                         receiverType: targetClass, receiverTypeSource: 'field',
                                         receiverOrigin: { source: 'field', rootType: callerSymbol.className,
-                                            field: call.selfAttribute, scope: declarationIdentity(callerSymbol) },
+                                            field: call.selfAttribute, scope: declarationIdentity(callerSymbol),
+                                            ...attrTypes?.origins?.get(call.selfAttribute) },
                                     };
                                 } else if (_isAncestorOfTargetClass(index, targetClass, tDefs)) {
                                     // A field declared as a strict ancestor can
@@ -2269,7 +2280,7 @@ function findCallers(index, name, options = {}) {
                                     excludeReceiver(filePath, fileEntry, call, calledAs, {
                                         receiverType: targetClass, receiverTypeSource: 'field',
                                         receiverOrigin: { source: 'field', rootType: callerSymbol?.className,
-                                            field: call.selfAttribute },
+                                            field: call.selfAttribute, ...attrTypes?.origins?.get(call.selfAttribute) },
                                     });
                                     continue;
                                 } else if (options.collectAccount || !options.includeMethods) {
@@ -2449,7 +2460,9 @@ function findCallers(index, name, options = {}) {
                     const builtinFieldType = _pythonBuiltinFieldPathType(
                         index, fileEntry, call.receiverRoot, call.receiverFields);
                     if (builtinFieldType) {
-                        call = { ...call, receiverType: builtinFieldType,
+                        call = { ...call, receiverType: builtinFieldType.type,
+                            receiverTypeSource: 'field',
+                            receiverTypeEvidence: { source: 'field', ...builtinFieldType },
                             receiverTypePlatform: true };
                     }
                 }
@@ -5662,6 +5675,44 @@ function findCallees(index, definition, options = {}) {
             if (!isDirectMatch && !isNestedCallback) continue;
             if (calleeAccount) calleeAccount.totalSites++;
 
+            if (language === 'python' && call.isMethod && !call.receiverType) {
+                const fixture = _pythonFixtureReceiverType(index, def.file, call);
+                if (fixture) call = { ...call, receiverType: fixture.type,
+                    receiverTypeSource: 'fixture', receiverTypeEvidence: { source: 'fixture', ...fixture },
+                    ...(fixture.fromFile && { receiverTypeFlowFile: fixture.fromFile }) };
+                const external = !fixture && _pythonExternalFieldFlow(index, def.file, call);
+                if (external) {
+                    call = { ...call, receiverTypeSource: 'flow',
+                        receiverTypeEvidence: { source: 'flow', externalFactory: external.proof } };
+                    const targets = (index.symbols.get(call.name) || []).filter(d => !NON_CALLABLE_TYPES.has(d.type));
+                    const facts = _confirmationFacts(index, def.file, call, targets);
+                    const provenance = scoreEdge({ possibleDispatch: true, facts }).provenance;
+                    noteUnverified(siteId, call, 'possible-dispatch', { dispatchVia: external.via, externalContract: true },
+                        { ...occurrenceIdentity(fileEntry.relativePath, call, siteId), provenance });
+                    continue;
+                }
+            }
+
+            if (language === 'rust' && _rustStandardWrapperMethod(index, def.file, call, allCalls)) {
+                noteSite(siteId, 'external', 'standard-wrapper-method', call);
+                continue;
+            }
+            if (language === 'rust' && call.isMethod && !call.receiverType &&
+                call.receiverPatternVariant && (collectAccount || call.receiverPatternSourceCallStart != null)) {
+                const item = _rustPatternReceiverType(index, fileEntry, def.file, call, foldCtx());
+                if (item?.type) call = { ...call, receiverType: item.type,
+                    receiverTypeSource: 'flow', receiverTypeEvidence: { source: 'flow', ...item },
+                    receiverTypeFlowFile: item.fromFile };
+            }
+            if (language === 'rust' && call.isMethod &&
+                call.receiver && !call.receiverType &&
+                (call.receiverIterationCall || call.receiverIterationVariable)) {
+                const item = _rustIterationReceiverType(index, fileEntry, def.file, call, foldCtx());
+                if (item) call = { ...call, receiverType: item.type,
+                    receiverTypeSource: 'flow', receiverTypeEvidence: { source: 'flow', ...item },
+                    receiverTypeFlowFile: item.fromFile };
+            }
+
             if (language === 'c' && call.isMethod) {
                 noteUnverified(siteId, call, 'callable-field');
                 continue;
@@ -6231,7 +6282,7 @@ function findCallees(index, definition, options = {}) {
                         }
                         continue;
                     }
-                    const typeName = call.receiverType || directReceiverFlow?.type || fieldHopType;
+                    const typeName = directReceiverFlow?.type || call.receiverType || fieldHopType;
                     const symbols = index.symbols.get(call.name);
                     const qualifiedType = language === 'go' && call.receiverType
                         ? _goQualifiedReceiverType(index, fileEntry,
@@ -6257,8 +6308,8 @@ function findCallees(index, definition, options = {}) {
                     const isCallableRT = (s) => !NON_CALLABLE_TYPES.has(s.type) ||
                         (s.type === 'field' && s.fieldType && /^func\b/.test(s.fieldType));
                     // Same-class overload selection by static call shape (fix #268)
-                    const receiverOriginFile = call.receiverTypeFlowFile ||
-                        directReceiverFlow?.fromFile ||
+                    const receiverOriginFile = directReceiverFlow?.fromFile ||
+                        call.receiverTypeFlowFile ||
                         fieldHopInfo?.fromFile ||
                         (call.receiverType
                             ? _resolveFlowTypeOrigin(
@@ -7749,6 +7800,28 @@ function getInstanceAttributeTypes(index, filePath, className) {
                         'python', { filePath, consumerAwaited: false });
                     return result?.fromFile ? result.type : null;
                 },
+                resolveImportedCallType(name) {
+                    const bindings = (fileEntry.importBindings || []).filter(binding =>
+                        (binding.alias || binding.name) === name);
+                    if (bindings.length !== 1 || (fileEntry.moduleAssignedNames || []).includes(name) ||
+                        (index.symbols.get(name) || []).some(d => d.file === filePath)) return null;
+                    const binding = bindings[0];
+                    if (!_pythonBuiltinContractAllowed(index, fileEntry, binding.module)) return null;
+                    const type = langModule.getBuiltinCallReturnType?.(binding.module, binding.name);
+                    return type ? { type, binding: { ...binding }, externalModule: binding.module } : null;
+                },
+                resolveExternalFactory(parts) {
+                    const name = parts[0];
+                    const bindings = (fileEntry.importBindings || []).filter(binding => (binding.alias || binding.name) === name);
+                    if (bindings.length !== 1 || (fileEntry.moduleAssignedNames || []).includes(name) ||
+                        (index.symbols.get(name) || []).some(d => d.file === filePath)) return null;
+                    const binding = bindings[0];
+                    if (!_pythonBuiltinContractAllowed(index, fileEntry, binding.module)) return null;
+                    const importedFunction = ['from', 'relative'].includes(binding.kind);
+                    if (parts.length !== (importedFunction ? 1 : 2)) return null;
+                    return { module: binding.module, producer: importedFunction ? binding.name : parts[1],
+                        binding: { ...binding }, projectDeclarations: [], projectBindings: [], resolvedModule: null };
+                },
             });
             index._attrTypeCache.set(filePath, fileCache);
         } catch {
@@ -7996,6 +8069,30 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
                 candidate.callStart === call.receiverCallStart &&
                 candidate.callEnd === call.receiverCallEnd);
 
+        // A separate unwrap/expect assignment consumes the payload of the
+        // receiver's declared standard wrapper. Its spelling alone is not a
+        // contract: project-defined Result/Option classes remain ordinary
+        // method producers. Reassignments are checked by the same nearest-
+        // assignment lookup used for every other flow receiver.
+        if (language === 'rust' && call.isMethod && call.receiver &&
+            !call.receiverPatternShadow && !call.receiverFlowInvalidated &&
+            ((call.name === 'unwrap' && call.argCount === 0) ||
+                (call.name === 'expect' && call.argCount === 1))) {
+            const receiverFlow = _lookupReturnTypeFlow(map, call);
+            const contract = receiverFlow?.rustWrapper;
+            if (contract?.type && validateRustWrapperContract(contract)) {
+                const scope = call.enclosingFunction ? `${call.enclosingFunction.startLine}` : '';
+                const key = `${scope}:${call.assignedTo}`;
+                if (!map.has(key)) map.set(key, []);
+                map.get(key).push({ line: call.line, start: call.callStart,
+                    type: contract.type, fromFile: contract.fromFile,
+                    wrapperUnwrap: { method: call.name,
+                        producer: { line: receiverFlow.line, start: receiverFlow.start,
+                            type: receiverFlow.type, fromFile: receiverFlow.fromFile }, contract } });
+                continue;
+            }
+        }
+
         // Rust's `collect::<Vec<Item>>()` turbofish fixes the concrete result
         // and its item type at the call site. Preserve the item identity even
         // though the outer collection is a standard-library type with no
@@ -8072,7 +8169,7 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
                     ? resolved[0]
                     : null;
             }
-            if (folded?.type || folded?.externalVia) {
+            if (folded?.type || folded?.externalVia || folded?.rustWrapper) {
                 const scope = call.enclosingFunction
                     ? `${call.enclosingFunction.startLine}` : '';
                 const key = `${scope}:${call.assignedTo}`;
@@ -8081,12 +8178,15 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
                 map.get(key).push({ line: call.line, start: call.callStart,
                     ...(folded.type && { type: folded.type }),
                     ...(folded.fromFile && { fromFile: folded.fromFile }),
+                    ...(folded.rustWrapper && { rustWrapper: folded.rustWrapper }),
+                    ...(folded.rustReturnDeclaration && { rustReturnDeclaration: folded.rustReturnDeclaration }),
+                    ...(folded.moduleProducer && { moduleProducer: folded.moduleProducer }),
                     ...(folded.externalVia && { externalVia: folded.externalVia }),
                     ...(folded.externalConcrete && { externalConcrete: true }) });
                 continue;
             }
         }
-        let returnType, fromFile, selfClass, returnedFunctionResult, returnDefinition;
+        let returnType, fromFile, selfClass, returnedFunctionResult, returnDefinition, moduleProducer;
         const builtinCallReturn = !nominal && language === 'python'
             ? _pythonBuiltinCallReturnType(index, fileEntry, call) : null;
         if (call.localValueCall && call.returnTypeHint) {
@@ -8112,10 +8212,14 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
             returnType = callableFlow.returnedFunctionResult;
             fromFile = callableFlow.fromFile;
         } else if (call.isMethod && call.receiverType &&
-            !call.receiverTypeGuessed) {
+            !call.receiverTypeGuessed && call.receiverTypeSource !== 'guess') {
             const defs = index.symbols.get(call.name) || [];
             if (nominal) {
-                const matches = defs.filter(d => d.className === call.receiverType && d.returnType);
+                const rustOwner = language === 'rust'
+                    ? _rustFlowReceiverOrigin(index, filePath, call.receiverType, call.receiverTypeQualifier)
+                    : null;
+                const matches = defs.filter(d => d.className === call.receiverType && d.returnType &&
+                    (language !== 'rust' || rustOwner?.fromFile));
                 if (matches.length > 0 && new Set(matches.map(d => d.returnType)).size === 1) {
                     returnType = matches[0].returnType;
                     fromFile = matches[0].file;
@@ -8226,6 +8330,15 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
                 cls = next;
             }
         } else if (nominal && call.isMethod && call.isPathCall && call.receiver) {
+            if (language === 'rust') {
+                const producer = _rustModuleProducer(index, fileEntry, filePath, call);
+                if (producer) {
+                    returnDefinition = producer.definition;
+                    returnType = returnDefinition.returnType;
+                    fromFile = returnDefinition.file;
+                    moduleProducer = producer.facts;
+                }
+            }
             if (language === 'cpp') {
                 // C++ value-initialization through a qualified type name:
                 // `auto p = fmt::pipe()`. The portable tree-sitter AST uses
@@ -8707,6 +8820,18 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
             }
             const origin = _resolveFlowTypeOrigin(index, fromFile || filePath, parsed.name, parsed.qualifier);
             if (!origin) {
+                const wrapper = language === 'rust' && !call.assignedUnwrap &&
+                    _rustReturnWrapper(index, returnType, fromFile || filePath, selfClass,
+                        returnDefinition, [], true);
+                if (wrapper && validateRustWrapperContract(wrapper, true)) {
+                    const scope = call.enclosingFunction ? `${call.enclosingFunction.startLine}` : '';
+                    const key = `${scope}:${call.assignedTo}`;
+                    if (!map) map = new Map();
+                    if (!map.has(key)) map.set(key, []);
+                    map.get(key).push({ line: call.line, start: call.callStart,
+                        rustWrapper: wrapper, rustReturnDeclaration: _rustReturnDeclaration(returnDefinition) });
+                    continue;
+                }
                 // A project producer can return a package-qualified external
                 // Go type (`DefaultLogger(...) http.Handler`). That still
                 // gives compiler-grade provenance: the assigned receiver is
@@ -8753,6 +8878,12 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
         if (!map.has(key)) map.set(key, []);
         map.get(key).push({ line: call.line, start: call.callStart, type: typeName,
             ...(entryFromFile && { fromFile: entryFromFile }),
+            ...(moduleProducer && { moduleProducer }),
+            ...(language === 'rust' && returnDefinition && { rustReturnDeclaration: _rustReturnDeclaration(returnDefinition) }),
+            ...(language === 'rust' && !call.assignedUnwrap && {
+                rustWrapper: _rustReturnWrapper(index, returnType, fromFile || filePath,
+                    selfClass, returnDefinition),
+            }),
             ...(iteratorItemType && {
                 iteratorItemType,
                 iteratorItemFromFile,
@@ -8860,7 +8991,15 @@ function _lookupReturnTypeFlow(map, call) {
         for (const e of entries) {
             if (precedesCall(e) && laterThan(e, best)) best = e;
         }
-        if (best) return best.invalidated ? undefined : best;
+        if (best) {
+            const binding = call.receiverTypeEvidence?.aliasBinding;
+            // A non-call copy/rebinding is absent from the producer map.
+            // Its newer AST declaration must still invalidate an older
+            // factory payload with the same local variable name.
+            if (binding?.target === call.receiver && Number.isInteger(binding.assignment?.start) &&
+                (best.start == null || binding.assignment.start > best.start)) return undefined;
+            return best.invalidated ? undefined : best;
+        }
     }
     return undefined;
 }
@@ -8933,6 +9072,59 @@ function _splitTopLevelGenericArgs(s) {
     }
     out.push(cur);
     return out;
+}
+
+function _rustReturnWrapper(index, text, file, selfClass, producer, projection = [], allowUnknownPayload = false) {
+    if (!text || !file || !producer) return null;
+    const contract = rustWrapperContract(index, text, file, {
+        projection,
+        allowUnknownPayload,
+        parseType: value => _returnTypeNameNominal(value, 'rust', { selfClass }),
+        resolveType: (context, name, qualifier) => _resolveFlowTypeOrigin(index, context, name, qualifier),
+    });
+    return contract && { ...contract, producer: { ...declarationIdentity(producer), returnType: producer.returnType } };
+}
+
+function _rustReturnDeclaration(definition) {
+    return { ...declarationIdentity(definition), file: definition.file,
+        relativePath: definition.relativePath, returnType: definition.returnType };
+}
+
+function _rustStandardWrapperMethod(index, file, call, calls) {
+    if (!call.isMethod || !call.receiver || call.isPathCall ||
+        call.receiverPatternShadow || call.receiverFlowInvalidated ||
+        !['unwrap', 'expect'].includes(call.name)) return null;
+    const flow = _lookupReturnTypeFlow(_buildReturnTypeFlowMap(index, file, calls), call);
+    const contract = flow?.rustWrapper;
+    if (contract && validateRustWrapperContract(contract, true)) {
+        return { method: call.name, receiver: call.receiver, callKind: 'method',
+            producer: { line: flow.line, start: flow.start }, contract };
+    }
+    // Ownership of a standard wrapper does not require knowing its payload:
+    // `value: Result<T, E>` still uses Result's inherent unwrap. This negative
+    // proof never types T or attributes its later methods to a project class.
+    const type = call.receiverType;
+    if (!['Result', 'Option'].includes(type) || call.receiverTypeSource !== 'annotation' ||
+        call.receiverTypeEvidence?.source !== 'annotation' ||
+        _isGenericParamReceiverType(index, file, call.line, type)) return null;
+    const entry = index.files.get(file);
+    const module = type === 'Result' ? 'result' : 'option';
+    const standardPaths = [`std::${module}::${type}`, `core::${module}::${type}`];
+    const qualifier = call.receiverTypeQualifier;
+    const local = (index.symbols.get(type) || []).filter(d => d.file === file &&
+        (IDENTITY_TYPE_KINDS.has(d.type) || d.type === 'type'));
+    const bindings = (entry.importBindings || []).filter(b => (b.alias || b.name) === type);
+    if (qualifier ? !standardPaths.includes(`${qualifier}::${type}`)
+        : local.length || bindings.some(b => !standardPaths.includes(b.module))) return null;
+    if ((entry.importBindings || []).some(b => b.name === '*' || b.module?.endsWith('::*'))) return null;
+    const root = qualifier?.split('::')[0] || bindings[0]?.module.split('::')[0];
+    if (root && ((index.symbols.get(root) || []).some(d => d.file === file) ||
+        (entry.importBindings || []).some(b => (b.alias || b.name) === root))) return null;
+    return { method: call.name, receiver: call.receiver, callKind: 'method',
+        annotationReceiver: { type, origin: call.receiverTypeEvidence,
+            qualifier: qualifier || null, localDeclarations: local.map(declarationIdentity),
+            bindings, wildcardImports: [], rootDeclarations: [], rootBindings: [],
+            genericParameter: false } };
 }
 
 function _splitTopLevelDelimiter(s, delimiter) {
@@ -9039,10 +9231,11 @@ function _returnTypeNameNominal(text, language, opts = {}) {
     if (language === 'go') {
         const qm = t.replace(/^\*+/, '').match(/^([A-Za-z_]\w*)\.([A-Za-z_]\w*)$/);
         if (qm) qualifier = qm[1];
-    } else if (language === 'cpp') {
-        const stripped = t
-            .replace(/\b(const|volatile|class|struct|typename)\b/g, '')
-            .replace(/[*&]+/g, '').trim();
+    } else if (language === 'cpp' || language === 'rust') {
+        const stripped = language === 'rust'
+            ? t.replace(/^&(?:\s*'\w+)?\s*/, '').replace(/^mut\s+/, '').trim()
+            : t.replace(/\b(const|volatile|class|struct|typename)\b/g, '')
+                .replace(/[*&]+/g, '').trim();
         const genericStart = stripped.indexOf('<');
         const head = genericStart >= 0
             ? stripped.slice(0, genericStart).trim() : stripped;
@@ -9187,6 +9380,35 @@ function _rustImportedTypeIdentity(index, filePath, localName) {
  *    trusted (a use/import of an external type can shadow it invisibly)
  *  - no project type def at all: external name — safe, can't conflate
  */
+function _rustFlowReceiverOrigin(index, file, name, qualifier) {
+    const entry = index.files.get(file);
+    // An annotation names a type in this module's scope. A same-directory
+    // project Result/Option declaration does not shadow the standard prelude
+    // of another module, nor does an unrelated imported file bind its names.
+    const local = (index.symbols.get(name) || []).some(d => d.file === file &&
+        (IDENTITY_TYPE_KINDS.has(d.type) || (d.type === 'type' && d.aliasOf)));
+    const bound = (entry?.importBindings || []).some(b => (b.alias || b.name) === name);
+    if (!qualifier && !local && !bound) return null;
+    return _resolveFlowTypeOrigin(index, file, name, qualifier);
+}
+
+function _rustSameNameAliasOrigin(index, definition, seen = new Set()) {
+    if (!definition || seen.has(definition) || seen.size >= 8) return null;
+    seen.add(definition);
+    if (definition.type !== 'type') return { fromFile: definition.file };
+    if (!definition.aliasTypeText) return null;
+    const parsed = _returnTypeNameNominal(definition.aliasTypeText, 'rust');
+    if (parsed?.name !== definition.name || !parsed.qualifier) return null;
+    const relative = index.files.get(definition.file)?.moduleResolved?.[parsed.qualifier];
+    const resolved = relative ? path.resolve(index.root, relative)
+        : resolveRustImport(`${parsed.qualifier}::${parsed.name}`, definition.file, index.root) ||
+            resolveRustImport(parsed.qualifier, definition.file, index.root);
+    if (!resolved) return null;
+    const targets = (index.symbols.get(parsed.name) || []).filter(d =>
+        IDENTITY_TYPE_KINDS.has(d.type) && d.file === resolved);
+    return targets.length === 1 ? _rustSameNameAliasOrigin(index, targets[0], seen) : null;
+}
+
 function _resolveFlowTypeOrigin(index, producerFile, typeName, qualifier = undefined) {
     const opCache = index._opFlowTypeOriginCache;
     const cacheKey = `${producerFile}\x00${typeName}\x00${qualifier || ''}`;
@@ -9243,6 +9465,13 @@ function _resolveFlowTypeOrigin(index, producerFile, typeName, qualifier = undef
             const resolved = resolveRustImport(
                 `${qualifier}::${typeName}`, producerFile, index.root);
             if (resolved) {
+                const local = typeDefs.filter(d => d.file === resolved);
+                if (local.length === 1) {
+                    const direct = local[0].type === 'type' && local[0].aliasOf === typeName
+                        ? _rustSameNameAliasOrigin(index, local[0])
+                        : { fromFile: local[0].file };
+                    if (direct) return finish(direct);
+                }
                 const reachable = typeDefs.filter(d =>
                     d.file === resolved ||
                     _importReaches(index, resolved, new Set([d.file])));
@@ -11324,6 +11553,60 @@ function _pythonBuiltinContractAllowed(index, fileEntry, moduleName) {
     return !_unresolvedModuleIsGap(index, module);
 }
 
+function _pythonExternalFieldFlow(index, file, call) {
+    const field = call.receiverRoot === 'self' && (!call.receiverFields || call.receiverFields.length === 1)
+        ? call.receiverField : call.receiver?.startsWith('self.') && call.receiver.split('.').length === 2
+        ? call.receiver.slice(5) : null;
+    if (!field || call.receiverFlowInvalidated) return null;
+    const enclosing = index.findEnclosingFunction(file, call.line, true);
+    if (!enclosing?.className) return null;
+    const owner = (index.symbols.get(enclosing.className) || []).filter(d => d.file === file && d.type === 'class');
+    if (owner.length !== 1) return null;
+    const flow = getInstanceAttributeTypes(index, file, enclosing.className)?.externalFlows?.get(field);
+    if (!flow) return null;
+    const producer = flow.assignments[0];
+    return { via: `${producer.module}.${producer.producer}${'()'.repeat(producer.depth)}`,
+        proof: { ...flow, owner: declarationIdentity(owner[0]), enclosing: declarationIdentity(enclosing) } };
+}
+
+function _pythonFixtureReceiverType(index, file, call) {
+    const resolveType = (context, name, qualifier) => {
+        const root = qualifier || name, entry = index.files.get(context);
+        if ((entry.moduleAssignedNames || []).includes(root) ||
+            (entry.importBindings || []).filter(b => (b.alias || b.name) === root).length > 1 ||
+            (qualifier && (index.symbols.get(root) || []).some(d => d.file === context))) return null;
+        return pythonFixtureType(index, context, qualifier ? `${qualifier}.${name}` : name,
+            d => IDENTITY_TYPE_KINDS.has(d.type));
+    };
+    return pythonFixtureReceiver(index, file, call, {
+        resolveType,
+        externalModule: (context, module) => _pythonBuiltinContractAllowed(index, index.files.get(context), module),
+        field(type, context, field) {
+            const owner = resolveType(context, type)?.declaration;
+            if (!owner) return null;
+            const members = (index.symbols.get(field) || []).filter(d => d.className === type && d.file === owner.file &&
+                ['property', 'getter', 'field'].includes(d.type));
+            if (members.length !== 1) return null;
+            const member = members[0], text = member.returnType || member.fieldType;
+            const result = _structuralTypeExpression(text);
+            if (!result || result.args.length) return null;
+            const qualifier = result.qualifiedHead.includes('.')
+                ? result.qualifiedHead.slice(0, result.qualifiedHead.lastIndexOf('.')) : undefined;
+            const next = resolveType(member.file, result.head, qualifier);
+            const builtin = !qualifier && !next && isProvenanceBuiltinReceiver(result.head, 'python') &&
+                !(index.files.get(member.file).importBindings || []).some(b => (b.alias || b.name) === result.head) &&
+                !(index.files.get(member.file).moduleAssignedNames || []).includes(result.head) &&
+                !(index.symbols.get(result.head) || []).some(d => d.file === member.file);
+            if (!next && !builtin) return null;
+            return { type: result.head, fromFile: next?.declaration.file,
+                fact: { owner: declarationIdentity(owner), member: declarationIdentity(member), annotation: text,
+                    result: next ? declarationIdentity(next.declaration) : { builtin: result.head, language: 'python' },
+                    ...(builtin && { builtinShadowDeclarations: [], builtinShadowBindings: [] }),
+                    importChain: next?.chain || [] } };
+        },
+    });
+}
+
 function _structuralImportedReceiverType(index, fileEntry, receiver) {
     const bindings = (fileEntry.importBindings || []).filter(binding =>
         binding.name === receiver || binding.alias === receiver);
@@ -11346,7 +11629,7 @@ function _structuralImportedReceiverType(index, fileEntry, receiver) {
     return { type: receiver, fromFile: definition.file };
 }
 
-function _pythonBuiltinCallReturnType(index, fileEntry, call) {
+function _pythonBuiltinCallReturnType(index, fileEntry, call, evidence = null) {
     if (fileEntry?.language !== 'python') return null;
     const adapter = getLanguageAdapter('python');
     if (typeof adapter?.getBuiltinCallReturnType !== 'function') return null;
@@ -11363,7 +11646,10 @@ function _pythonBuiltinCallReturnType(index, fileEntry, call) {
     for (const binding of bindings) {
         if (!_pythonBuiltinContractAllowed(index, fileEntry, binding.module)) continue;
         const type = adapter.getBuiltinCallReturnType(binding.module, call.name);
-        if (type) types.add(type);
+        if (type) {
+            types.add(type);
+            if (evidence) (evidence.bindings ||= []).push({ ...binding, returnType: type });
+        }
     }
     return types.size === 1 ? [...types][0] : null;
 }
@@ -11375,21 +11661,30 @@ function _pythonBuiltinFieldPathType(index, fileEntry, root, fields) {
     const bindings = (fileEntry.importBindings || []).filter(binding =>
         binding.name === root || binding.alias === root);
     const types = new Set();
+    const contracts = [];
     for (const binding of bindings) {
         if (!_pythonBuiltinContractAllowed(index, fileEntry, binding.module)) continue;
         const type = adapter.getBuiltinFieldType(binding.module, fields[0]);
-        if (type) types.add(type);
+        if (type) {
+            types.add(type);
+            contracts.push({ ...binding, field: fields[0], type });
+        }
     }
-    return types.size === 1 ? [...types][0] : null;
+    return types.size === 1 ? { type: [...types][0], root, fields, bindings: contracts } : null;
 }
 
 function _pythonBuiltinChainedReceiverType(index, fileEntry, call, foldCtx) {
     if (fileEntry?.language !== 'python') return null;
     const producers = _chainedProducerRecords(foldCtx, call);
     if (producers.length === 0) return null;
-    const types = producers.map(producer =>
-        _pythonBuiltinCallReturnType(index, fileEntry, producer));
-    return types.every(Boolean) && new Set(types).size === 1 ? types[0] : null;
+    const witnesses = producers.map(producer => {
+        const evidence = { name: producer.name, line: producer.line, site: producer.callSite };
+        const type = _pythonBuiltinCallReturnType(index, fileEntry, producer, evidence);
+        return { type, ...evidence };
+    });
+    const types = witnesses.map(witness => witness.type);
+    return types.every(Boolean) && new Set(types).size === 1
+        ? { type: types[0], producers: witnesses } : null;
 }
 
 /**
@@ -11959,6 +12254,7 @@ function _declaredFieldType(
                     className: rootType,
                     fieldType,
                     file: owner.file,
+                    ...(attrs.origins?.get(fieldName) && { fieldOrigin: attrs.origins.get(fieldName) }),
                 });
             }
             if (complete && inferred.length > 0) {
@@ -12021,6 +12317,7 @@ function _declaredFieldType(
     const aliasBase = _pureAliasBase(index, typeName);
     if (aliasBase) typeName = aliasBase;
     if (info) {
+        if (onType.length === 1 && onType[0].fieldOrigin) Object.assign(info, onType[0].fieldOrigin);
         const origins = new Set();
         const namespaces = new Set();
         let complete = true;
@@ -15497,8 +15794,18 @@ function _methodReturnOnType(index, typeName, fromFile, methodName, language, op
         const parsed = _returnTypeNameNominal(def.returnType, language, { selfClass: selfType });
         if (!parsed) return null;
         const origin = _resolveFlowTypeOrigin(index, def.file || opts.filePath, parsed.name, parsed.qualifier);
-        if (!origin) return null;
-        return { type: parsed.name, ...(origin.fromFile && { fromFile: origin.fromFile }) };
+        const wrappers = language === 'rust' ? owned.map(candidate =>
+            _rustReturnWrapper(index, candidate.returnType, candidate.file || opts.filePath,
+                selfType, candidate, [], true)) : [];
+        // Identical annotation text in different impl files can bind different
+        // aliases. Every possible producer must agree on the payload identity.
+        const rustWrapper = wrappers.length && wrappers.every(wrapper => wrapper &&
+            wrapper.kind === wrappers[0].kind && wrapper.type === wrappers[0].type &&
+            wrapper.fromFile === wrappers[0].fromFile) ? wrappers[0] : null;
+        if (!origin && !rustWrapper) return null;
+        return { ...(origin && { type: parsed.name }), ...(origin?.fromFile && { fromFile: origin.fromFile }),
+            ...(language === 'rust' && owned.length === 1 && { rustReturnDeclaration: _rustReturnDeclaration(def) }),
+            ...(rustWrapper && { rustWrapper }) };
     }
     // Structural: heads must agree; `this`/`Self` are the receiver's type
     // (checked BEFORE the reject set — with a known owner they ARE identity);
@@ -15652,7 +15959,72 @@ function _rustPathIsKnownExternal(index, fileEntry, filePath, receiver, name) {
         `${segments.join('::')}::${name}`, filePath, index.root);
 }
 
-function _rustPatternReceiverType(index, fileEntry, filePath, record) {
+/** A qualified free function belongs to its exact module, never an impl
+ * whose type or method happens to share either path component. Re-exports
+ * and inline modules abstain until their complete item path is available.
+ */
+function _rustModuleProducer(index, fileEntry, filePath, call) {
+    if (!call.isPathCall || !call.receiver || call.receiverType || call.localShadow) return null;
+    const parts = call.receiver.split('::');
+    const root = parts[0];
+    const bindings = (fileEntry.importBindings || []).filter(b => (b.alias || b.name) === root);
+    const locals = (index.symbols.get(root) || []).filter(d => d.file === filePath);
+    if (locals.some(d => d.type !== 'module') || bindings.length > 1) return null;
+    const binding = bindings[0];
+    const specifier = binding ? [binding.module, ...parts.slice(1)].join('::') : call.receiver;
+    const terminal = specifier.split('::').at(-1);
+    if (!terminal || ['Self', 'self', 'super', 'crate'].includes(terminal)) return null;
+    const relative = fileEntry.moduleResolved?.[specifier];
+    const destination = relative ? path.resolve(index.root, relative)
+        : resolveRustImport(specifier, filePath, index.root);
+    if (!destination || !index.files.has(destination) || destination === filePath) return null;
+    const base = path.basename(destination, '.rs');
+    if ((base === 'mod' ? path.basename(path.dirname(destination)) : base) !== terminal) return null;
+    const candidates = (index.symbols.get(call.name) || []).filter(d => d.file === destination &&
+        !NON_CALLABLE_TYPES.has(d.type) && !d.className && !d.receiver && !d.namespace);
+    if (candidates.length !== 1 || !candidates[0].returnType) return null;
+    const definition = candidates[0];
+    if ((index.files.get(destination).symbols || []).some(d => d.type === 'module' &&
+        d.startLine < definition.startLine && d.endLine >= definition.endLine)) return null;
+    return { definition, facts: {
+        call: { file: fileEntry.relativePath, line: call.line, start: call.callStart,
+            end: call.callEnd, receiver: call.receiver, name: call.name },
+        binding: binding || null, module: { specifier, file: path.relative(index.root, destination) },
+        declaration: { ...declarationIdentity(definition), returnType: definition.returnType },
+    } };
+}
+
+function _rustPatternReceiverType(index, fileEntry, filePath, record, ctx) {
+    if (['Some', 'Ok'].includes(record.receiverPatternVariant) && !record.receiverPatternOwner &&
+        (record.receiverPatternIndex || 0) === 0 &&
+        (record.receiverPatternSourceCallStart != null || record.receiverPatternSourceVariable)) {
+        if (!ctx) {
+            const records = index.getCachedCalls(filePath);
+            ctx = { records, memo: new Map(), visiting: new Set(),
+                getFlowMap: () => _buildReturnTypeFlowMap(index, filePath, records) };
+        }
+        const shadow = (index.symbols.get(record.receiverPatternVariant) || []).some(d => d.file === filePath) ||
+            (fileEntry.importBindings || []).some(b => (b.alias || b.name) === record.receiverPatternVariant || b.name === '*');
+        const sources = record.receiverPatternSourceVariable
+            ? [_lookupReturnTypeFlow(ctx.getFlowMap(), { ...record, receiver: record.receiverPatternSourceVariable,
+                receiverPatternShadow: false })]
+            : ctx.records.filter(source => source.callStart === record.receiverPatternSourceCallStart &&
+                source.callEnd === record.receiverPatternSourceCallEnd).map(source =>
+                _typeOfCallResultFold(index, fileEntry, filePath, source, ctx));
+        const producer = sources.length === 1 && sources[0]?.rustReturnDeclaration;
+        const contract = !shadow && producer && _rustReturnWrapper(index, producer.returnType, producer.file,
+            producer.className, producer, record.receiverPatternProjection || []);
+        if (contract && validateRustWrapperContract(contract) &&
+            contract.kind === (record.receiverPatternVariant === 'Some' ? 'Option' : 'Result')) {
+            return { type: contract.type, fromFile: contract.fromFile,
+                wrapperPattern: { variant: record.receiverPatternVariant, contract,
+                    source: { start: record.receiverPatternSourceCallStart, end: record.receiverPatternSourceCallEnd,
+                        variable: record.receiverPatternSourceVariable }, shadowDeclarations: [], shadowBindings: [] } };
+        }
+        // A tuple payload cannot be treated as its outer type by the older
+        // whole-payload path below.
+        if (record.receiverPatternProjection?.length) return null;
+    }
     let variants = (index.symbols.get(record.receiverPatternVariant) || [])
         .filter(definition => definition.type === 'variant');
     if (record.receiverPatternOwner) {
@@ -15742,7 +16114,15 @@ const _RUST_ITERATOR_ITEM_CALLBACKS = new Set([
 ]);
 
 function _rustRecordReceiverType(index, fileEntry, filePath, record, ctx) {
-    if (record.receiverType && !record.receiverIsChainRoot) {
+    if (record.receiver === 'self') {
+        const enclosing = index.findEnclosingFunction(filePath, record.line, true);
+        if (enclosing?.className) {
+            const origin = _resolveFlowTypeOrigin(index, filePath, enclosing.className);
+            if (origin?.fromFile) return { type: enclosing.className, fromFile: origin.fromFile };
+        }
+    }
+    if (record.receiverType && !record.receiverIsChainRoot &&
+        !record.receiverTypeGuessed && record.receiverTypeSource !== 'guess') {
         const origin = _resolveFlowTypeOrigin(
             index, filePath, record.receiverType, record.receiverTypeQualifier);
         if (origin?.fromFile) {
@@ -15769,8 +16149,12 @@ function _rustRecordReceiverType(index, fileEntry, filePath, record, ctx) {
     }
     if (record.receiverPatternVariant) {
         const pattern = _rustPatternReceiverType(
-            index, fileEntry, filePath, record);
+            index, fileEntry, filePath, record, ctx);
         if (pattern) return pattern;
+    }
+    if (record.enclosingFunction?.closureParameterNames?.includes(record.receiver)) {
+        const parameter = _rustClosureReceiverType(index, fileEntry, filePath, record, ctx);
+        if (parameter) return parameter;
     }
     if (record.receiver && !record.receiverIsChainRoot &&
         !record.receiverPatternShadow) {
@@ -15870,6 +16254,35 @@ const _RUST_ITERATOR_ITEM_PRESERVING = new Set([
     'by_ref', 'cycle', 'filter', 'fuse', 'inspect', 'peekable', 'rev',
     'skip', 'skip_while', 'step_by', 'take', 'take_while',
 ]);
+
+function _rustIterationReceiverType(index, fileEntry, filePath, call, ctx) {
+    let items = [];
+    let producers = [];
+    if (call.receiverIterationVariable) {
+        const flow = _lookupReturnTypeFlow(ctx.getFlowMap(), {
+            ...call, receiver: call.receiverIterationVariable,
+        });
+        if (flow?.iteratorItemType) {
+            items = [{ type: flow.iteratorItemType, fromFile: flow.iteratorItemFromFile }];
+            producers = [{ ...flow }];
+        }
+    } else {
+        const sources = _chainedProducerRecords(ctx, {
+            receiverCall: call.receiverIterationCall,
+            receiverCallIsMethod: call.receiverIterationCallIsMethod,
+            receiverCallLine: call.receiverIterationCallLine,
+            receiverCallStart: call.receiverIterationCallStart,
+            receiverCallEnd: call.receiverIterationCallEnd,
+        });
+        items = sources.map(source => _rustIteratorOutputItemType(index, fileEntry, filePath, source, ctx));
+        producers = sources.map(source => ({ name: source.name,
+            site: occurrenceIdentity(fileEntry.relativePath, source) }));
+    }
+    if (!items.length || items.some(item => !item?.fromFile) ||
+        new Set(items.map(item => item.type)).size !== 1 ||
+        new Set(items.map(item => item.fromFile)).size !== 1) return null;
+    return { ...items[0], alternatives: items, producers };
+}
 
 function _rustIteratorOutputItemType(index, fileEntry, filePath, source, ctx, visiting = new Set()) {
     if (!source || visiting.has(source)) return null;
@@ -16117,6 +16530,16 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
                 externalConcrete: true,
             };
         }
+        const module = language === 'rust' ? _rustModuleProducer(index, fileEntry, filePath, record) : null;
+        if (module) {
+            const producer = module.definition;
+            const parsed = _returnTypeNameNominal(producer.returnType, language);
+            const origin = parsed && _resolveFlowTypeOrigin(index, producer.file, parsed.name, parsed.qualifier);
+            if (!origin) return null;
+            return { type: parsed.name, fromFile: origin.fromFile, moduleProducer: module.facts,
+                rustReturnDeclaration: _rustReturnDeclaration(producer),
+                rustWrapper: _rustReturnWrapper(index, producer.returnType, producer.file, null, producer) };
+        }
         const segs = String(record.receiver).split('::');
         let seg = segs.pop();
         if (seg === 'Self') {
@@ -16258,11 +16681,15 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
     if (record.isMethod) {
         let rt = _goBuiltinChainedReceiverType(
             index, fileEntry, filePath, record);
-        if (record.receiverType && !record.receiverIsChainRoot) {
-            const origin = nominal
+        if (record.receiverType && !record.receiverIsChainRoot &&
+            !record.receiverTypeGuessed && record.receiverTypeSource !== 'guess') {
+            const origin = language === 'rust'
+                ? _rustFlowReceiverOrigin(index, filePath, record.receiverType, record.receiverTypeQualifier)
+                : nominal
                 ? _resolveFlowTypeOrigin(index, filePath, record.receiverType,
                     record.receiverTypeQualifier)
                 : null;
+            if (language === 'rust' && !origin?.fromFile) return null;
             rt = {
                 type: record.receiverType,
                 ...(origin?.fromFile && { fromFile: origin.fromFile }),
@@ -16459,7 +16886,8 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
         if (!parsed) return null;
         const origin = _resolveFlowTypeOrigin(index, chosen.file || filePath, parsed.name, parsed.qualifier);
         if (!origin) return null;
-        return { type: parsed.name, ...(origin.fromFile && { fromFile: origin.fromFile }) };
+        return { type: parsed.name, ...(origin.fromFile && { fromFile: origin.fromFile }),
+            ...(language === 'rust' && chosen.file === filePath && { rustReturnDeclaration: _rustReturnDeclaration(chosen) }) };
     }
     if (language === 'python' && !consumerAwaited && chosen.isAsync) return null;
     let head = _structuralTypeHead(chosen.returnType, {
@@ -16553,6 +16981,9 @@ function _foldChainedReceiverType(index, fileEntry, filePath, call, ctx) {
     const typeTexts = new Set(results.map(r => r.typeText));
     let result = {
         type: results[0].type,
+        ...(results.length === 1 && results[0].moduleProducer && {
+            moduleProducer: results[0].moduleProducer,
+        }),
         ...(typeTexts.size === 1 && results[0].typeText && {
             typeText: results[0].typeText,
         }),

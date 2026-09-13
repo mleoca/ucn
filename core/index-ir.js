@@ -81,7 +81,7 @@ const OPTIONAL_SYMBOL_FIELDS = Object.freeze([
     'returnedFunctionResult', 'isFunctionVariable', 'paramTypes', 'isAsync',
     'isGenerator', 'generics', 'ownerGenerics', 'genericBounds', 'extends', 'implements', 'indent', 'isNested',
     'enclosingType', 'isMethod', 'receiver', 'memberType', 'fieldType',
-    'aliasOf', 'aliasMembers', 'derefTarget', 'decorators', 'decoratorsWithArgs',
+    'aliasOf', 'aliasMembers', 'aliasTypeText', 'aliasTypeParameters', 'aliasTypeDefaults', 'derefTarget', 'decorators', 'decoratorsWithArgs',
     'annotationsWithArgs', 'attributesWithArgs', 'nameLine', 'traitImpl',
     'traitName', 'isSignature', 'memberAssigned', 'assignedReceiver', 'bodyScopedName',
     'registryMember', 'registryContainer', 'namespace',

@@ -66,14 +66,13 @@ function captureOverload(index, call, candidates, language, select) {
     const reads = {};
     try {
         const result = select(factIndex(reads, index), call, candidates, language);
-        if (!result.match && result.ambiguous) return null;
         return { call: encode(call), candidates: encode(candidates), language, reads,
             selected: declarationIdentity(result.match),
-            outcome: result.match ? 'selected' : 'no-fit' };
+            outcome: result.match ? 'selected' : result.ambiguous ? 'ambiguous' : 'no-fit' };
     } catch { return null; }
 }
 
-function validateOverload(witness, members, selected, invalidCall = false) {
+function validateOverload(witness, members, selected, invalidCall = false, ambiguous = false) {
     if (!witness || !Array.isArray(witness.candidates)) return false;
     const candidates = decode(witness.candidates);
     if (candidates.length !== members.length || candidates.some(candidate =>
@@ -83,6 +82,7 @@ function validateOverload(witness, members, selected, invalidCall = false) {
         // The selector only sees the data-only replay facade above.
         const select = require('./callers').selectProvenanceOverload;
         const result = select(factIndex(witness.reads), decode(witness.call), candidates, witness.language);
+        if (ambiguous) return !result.match && result.ambiguous === true;
         return invalidCall ? !result.match && !result.ambiguous :
             !!result.match && sameDeclaration(declarationIdentity(result.match), selected);
     } catch { return false; }

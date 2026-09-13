@@ -7,6 +7,7 @@ const TYPE_SOURCE_RULES = Object.freeze({
     flow: 'return-flow', field: 'field-hop', literal: 'literal-receiver',
     'with-binding': 'with-binding', cast: 'receiver-cast',
     'type-assertion': 'receiver-type-assertion', guess: 'receiver-guess',
+    fixture: 'pytest-fixture',
     unknown: 'receiver-type', 'type-qualified': 'type-qualified',
 });
 
@@ -45,6 +46,12 @@ function sameDeclaration(left, right) {
     return key !== null && key === identityKey(right);
 }
 
+function propertyReadMember(members) {
+    const readers = members.filter(member => ['getter', 'property'].includes(member.kind));
+    return readers.length === 1 && members.every(member =>
+        ['getter', 'property', 'setter'].includes(member.kind)) ? readers[0] : null;
+}
+
 /**
  * Check a data-only witness, never infer a negative from a failed proof.
  * `establishes-other` requires its own complete lookup/binding witness.
@@ -59,6 +66,152 @@ function validateConfirmation(provenance, target, invalidCall = false) {
         ? { verdict: 'establishes-target' }
         : { verdict: 'establishes-other', declaration };
     if (!targets.length || targets.some(t => !identityKey(t))) return incomplete('missing-target-identity');
+    if (facts.receiverOrigin?.externalFactory) {
+        const factory = facts.receiverOrigin.externalFactory;
+        const empty = value => Array.isArray(value) && !value.length;
+        const span = origin => Number.isInteger(origin?.start) && Number.isInteger(origin?.end) && origin.end > origin.start;
+        if (facts.language !== 'python' || facts.receiverTypeSource !== 'flow' ||
+            !identityKey(factory.owner) || !identityKey(factory.enclosing) ||
+            factory.owner.file !== facts.site?.file || factory.enclosing.file !== factory.owner.file ||
+            factory.enclosing.className !== factory.owner.name || !factory.field ||
+            facts.site.line < factory.enclosing.startLine || facts.site.line > factory.enclosing.endLine ||
+            facts.receiverPath?.length !== 2 || facts.receiverPath[0] !== 'self' || facts.receiverPath[1] !== factory.field ||
+            !Array.isArray(factory.assignments) || !factory.assignments.length) return incomplete('missing-external-field-flow');
+        for (const write of factory.assignments) {
+            const binding = write.binding, imported = ['from', 'relative'].includes(binding?.kind);
+            if (!binding || !write.module || write.module !== binding.module || !write.producer ||
+                !Array.isArray(write.path) || (binding.alias || binding.name) !== write.path[0] ||
+                write.path.length !== (imported ? 1 : 2) || write.producer !== (imported ? binding.name : write.path[1]) ||
+                !Number.isInteger(write.depth) || write.depth < 1 || write.depth > 3 ||
+                !span(write.assignment) || write.assignment.nodeType !== 'assignment' ||
+                write.assignment.line < factory.owner.startLine || write.assignment.line > factory.owner.endLine ||
+                !span(write.expression) || write.expression.nodeType !== 'call' ||
+                !empty(write.projectDeclarations) || !empty(write.projectBindings) || write.resolvedModule !== null) {
+                return incomplete('invalid-external-factory-binding');
+            }
+        }
+        if (new Set(factory.assignments.map(w => `${w.module}.${w.producer}:${w.depth}`)).size !== 1) {
+            return inconsistent('conflicting-external-field-producers');
+        }
+        // Source ownership establishes runtime uncertainty, never a concrete
+        // project target or an exclusion: an external factory may return one.
+        return { verdict: 'establishes-dispatch' };
+    }
+    if (facts.receiverTypeSource === 'fixture' &&
+        !require('./python-fixture-flow').validatePythonFixtureBinding(facts.receiverOrigin?.fixtureBinding, facts)) {
+        return incomplete('invalid-pytest-fixture-binding');
+    }
+    if (facts.receiverOrigin?.aliasBinding) {
+        const binding = facts.receiverOrigin.aliasBinding;
+        if (facts.language !== 'rust' || binding.type !== facts.receiverType || binding.origin?.type !== binding.type ||
+            !binding.variable || !['copy', 'borrow', 'reassignment'].includes(binding.kind) ||
+            !['annotation', 'constructor', 'flow'].includes(binding.origin?.source) ||
+            (binding.referenceAnnotation && (binding.origin.source !== 'annotation' ||
+                !binding.referenceAnnotation.trim().startsWith('&'))) ||
+            !Number.isInteger(binding.assignment?.start) || !Number.isInteger(binding.assignment?.end)) {
+            return incomplete('invalid-copied-receiver-binding');
+        }
+    }
+    if (facts.receiverOrigin?.assignments) {
+        const assignments = facts.receiverOrigin.assignments;
+        if (facts.language !== 'python' || !Array.isArray(assignments) || !assignments.length) {
+            return incomplete('invalid-field-assignments');
+        }
+        const literals = { dictionary: 'dict', dictionary_comprehension: 'dict', list: 'list',
+            list_comprehension: 'list', set: 'set', set_comprehension: 'set', tuple: 'tuple' };
+        for (const write of assignments) {
+            if (write.type !== facts.receiverType || !Number.isInteger(write.assignment?.start) ||
+                !Number.isInteger(write.assignment?.end) || !Number.isInteger(write.expression?.start) ||
+                !Number.isInteger(write.expression?.end)) return incomplete('invalid-field-assignment-origin');
+            if (write.literal) {
+                if (write.expression.nodeType !== write.literal || literals[write.literal] !== write.type) {
+                    return inconsistent('field-literal-contract-mismatch');
+                }
+            } else {
+                const call = write.importedCall;
+                const binding = call?.binding;
+                if (!binding || call.externalModule !== binding.module || write.expression.nodeType !== 'call' ||
+                    call.type !== write.type || require('../languages/python').getBuiltinCallReturnType(
+                        binding.module, binding.name) !== write.type) return inconsistent('field-call-contract-mismatch');
+            }
+        }
+    }
+    if (facts.receiverOrigin?.moduleProducer) {
+        const producer = facts.receiverOrigin.moduleProducer;
+        const call = producer.call, declaration = producer.declaration;
+        if (facts.language !== 'rust' || !call?.receiver || !call.name || !call.file ||
+            !Number.isInteger(call.start) || !Number.isInteger(call.end) ||
+            !identityKey(declaration) || declaration.className || !declaration.returnType ||
+            declaration.name !== call.name || declaration.file !== producer.module?.file) {
+            return incomplete('invalid-module-producer-declaration');
+        }
+        const segments = call.receiver.split('::');
+        const binding = producer.binding;
+        if (binding && (binding.alias || binding.name) !== segments[0]) {
+            return inconsistent('module-producer-binding-mismatch');
+        }
+        const specifier = binding ? [binding.module, ...segments.slice(1)].join('::') : call.receiver;
+        const fileParts = producer.module.file.split('/');
+        const base = fileParts.pop().replace(/\.rs$/, '');
+        if (specifier !== producer.module.specifier ||
+            specifier.split('::').at(-1) !== (base === 'mod' ? fileParts.pop() : base)) {
+            return inconsistent('module-producer-path-mismatch');
+        }
+    }
+    if (facts.standardWrapper) {
+        const wrapper = facts.standardWrapper;
+        if (facts.language !== 'rust' || wrapper.callKind !== 'method' || !wrapper.receiver ||
+            !['unwrap', 'expect'].includes(wrapper.method)) {
+            return incomplete('invalid-standard-wrapper-contract');
+        }
+        let kind;
+        if (wrapper.contract) {
+            if (!require('./rust-result-flow').validateRustWrapperContract(wrapper.contract, true)) {
+                return incomplete('invalid-standard-wrapper-contract');
+            }
+            kind = wrapper.contract.kind;
+        } else {
+            const annotation = wrapper.annotationReceiver;
+            const empty = value => Array.isArray(value) && !value.length;
+            if (!annotation || !['Result', 'Option'].includes(annotation.type) ||
+                annotation.origin?.source !== 'annotation' || annotation.genericParameter !== false ||
+                !empty(annotation.wildcardImports) || !empty(annotation.rootDeclarations) || !empty(annotation.rootBindings) ||
+                !Array.isArray(annotation.bindings)) return incomplete('invalid-standard-wrapper-annotation');
+            const module = annotation.type === 'Result' ? 'result' : 'option';
+            const paths = [`std::${module}::${annotation.type}`, `core::${module}::${annotation.type}`];
+            if (annotation.qualifier ? !paths.includes(`${annotation.qualifier}::${annotation.type}`)
+                : !empty(annotation.localDeclarations) || annotation.bindings.some(b =>
+                    (b.alias || b.name) !== annotation.type || !paths.includes(b.module))) {
+                return incomplete('shadowed-standard-wrapper-annotation');
+            }
+            kind = annotation.type;
+        }
+        return { verdict: 'establishes-other', declaration: {
+            builtin: kind, method: wrapper.method, language: 'rust',
+        } };
+    }
+    if (facts.receiverOrigin?.wrapperUnwrap || facts.receiverOrigin?.wrapperPattern) {
+        const pattern = facts.receiverOrigin.wrapperPattern;
+        const unwrap = pattern || facts.receiverOrigin.wrapperUnwrap;
+        const validProjection = pattern
+            ? ['Some', 'Ok'].includes(pattern.variant) &&
+                pattern.contract?.kind === (pattern.variant === 'Some' ? 'Option' : 'Result') &&
+                Array.isArray(pattern.shadowDeclarations) && !pattern.shadowDeclarations.length &&
+                Array.isArray(pattern.shadowBindings) && !pattern.shadowBindings.length &&
+                (pattern.source?.variable || (Number.isInteger(pattern.source?.start) &&
+                    Number.isInteger(pattern.source?.end) && pattern.source.end > pattern.source.start))
+            : ['unwrap', 'expect'].includes(unwrap.method);
+        if (facts.language !== 'rust' || !validProjection ||
+            !require('./rust-result-flow').validateRustWrapperContract(unwrap.contract)) {
+            return incomplete('invalid-wrapper-unwrapping-contract');
+        }
+        if (facts.receiverOrigin.type !== unwrap.contract.type ||
+            facts.receiverTypeFlowFile !== unwrap.contract.payload.declaration.file ||
+            !sameDeclaration(unwrap.contract.payload.declaration,
+                facts.receiverTypeDeclaration || facts.receiverResolvedIn)) {
+            return inconsistent('wrapper-payload-identity-mismatch');
+        }
+    }
     if (facts.builtinReceiver) {
         if (!require('./receiver-types').isProvenanceBuiltinReceiver(facts.receiverType, facts.language) ||
             facts.builtinReceiver.type !== facts.receiverType ||
@@ -105,6 +258,10 @@ function validateConfirmation(provenance, target, invalidCall = false) {
         const overload = facts.lookup.overload;
         const group = overload && require('./provenance-overload').overloadMemberGroup(steps);
         if (overload && !group) return incomplete('missing-overload-declarations');
+        if (overload && !group.some(member => sameDeclaration(declarationIdentity(member), selected))) {
+            return inconsistent('selected-member-outside-overload-group');
+        }
+        const ambiguousOverload = overload?.outcome === 'ambiguous';
         for (let i = 0; i < steps.length; i++) {
             const step = steps[i];
             if (!identityKey(step.owner) || !Array.isArray(step.members) || !Array.isArray(step.parents)) {
@@ -123,13 +280,15 @@ function validateConfirmation(provenance, target, invalidCall = false) {
                     return inconsistent('unproven-inheritance-hop');
                 }
             } else if (!overload && (named.length !== 1 || !sameDeclaration(named[0], selected))) {
-                if (!require('./provenance-overload').validateOverload(step.overload, named, selected)) {
+                const propertyRead = facts.valueReference && step.propertyRead &&
+                    sameDeclaration(propertyReadMember(named), selected);
+                if (!propertyRead && !require('./provenance-overload').validateOverload(step.overload, named, selected)) {
                     return incomplete('ambiguous-or-missing-member');
                 }
             }
         }
         if (overload && !require('./provenance-overload').validateOverload(
-            overload, group.map(declarationIdentity), selected, invalidCall)) {
+            overload, group.map(declarationIdentity), selected, invalidCall, ambiguousOverload)) {
             return incomplete(overload.outcome === 'no-fit' ? 'no-applicable-overload' : 'ambiguous-or-missing-member');
         }
         if (facts.receiverTypeSource === 'guess' || facts.receiverTypeSource === 'unknown') {
@@ -140,6 +299,16 @@ function validateConfirmation(provenance, target, invalidCall = false) {
         }
         if (facts.receiverOrigin.source !== facts.receiverTypeSource) {
             return inconsistent('receiver-source-mismatch');
+        }
+        if (ambiguousOverload) {
+            // Every overload is known, but the argument shape cannot choose
+            // one. This proves no particular target. It can still establish
+            // that an unrelated target is outside the entire member group.
+            const declarations = group.map(declarationIdentity);
+            if (targets.some(target => declarations.some(member => sameDeclaration(target, member)))) {
+                return incomplete('ambiguous-or-missing-member');
+            }
+            return { verdict: 'establishes-other', declarations };
         }
         return verdictFor(selected);
     }
@@ -157,6 +326,23 @@ function validateConfirmation(provenance, target, invalidCall = false) {
             const hop = chain[i];
             if (!hop.localName || !hop.importedName || !hop.fromFile || !hop.toFile) {
                 return incomplete('missing-import-name-hop');
+            }
+            if (hop.wildcards) {
+                const sources = hop.wildcards;
+                if (!Array.isArray(sources) || !sources.length || sources.some(source =>
+                    !source.file || source.binding?.name !== '*' || !source.binding.topLevel || !source.binding.module ||
+                    !Number.isInteger(source.binding.origin?.start) || source.exports?.name !== '__all__' ||
+                    !Number.isInteger(source.exports.origin?.start) || !Array.isArray(source.exports.literals) ||
+                    !Array.isArray(source.exports.otherReferences) || source.exports.otherReferences.length ||
+                    source.exports.literals.some(literal => typeof literal.value !== 'string' ||
+                        literal.origin?.nodeType !== 'string' || !Number.isInteger(literal.origin.start)))) {
+                    return incomplete('missing-wildcard-export-list');
+                }
+                const selected = sources.filter(source => source.exports.literals.some(literal => literal.value === hop.importedName));
+                if (selected.length !== 1 || selected[0].file !== hop.toFile ||
+                    selected[0].binding.module !== hop.module || hop.localName !== hop.importedName) {
+                    return inconsistent('wildcard-export-owner-mismatch');
+                }
             }
             if (i > 0 && (chain[i - 1].toFile !== hop.fromFile ||
                 chain[i - 1].importedName !== hop.localName)) {
@@ -232,6 +418,6 @@ function summarizeProvenance(sites) {
 }
 
 module.exports = {
-    TYPE_SOURCE_RULES, declarationIdentity, identityKey, sameDeclaration,
+    TYPE_SOURCE_RULES, declarationIdentity, identityKey, sameDeclaration, propertyReadMember,
     validateConfirmation, validateCallMismatch, createProvenance, summarizeProvenance,
 };

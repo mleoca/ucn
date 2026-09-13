@@ -708,7 +708,9 @@ function clearAllCaches() {
 // v213 (fix #348): Python from-import records carry per-name `renames` so
 // import bindings pair each alias with its own module.
 // v215: receiver-type provenance records the originating AST fact (#355).
-const CACHE_FORMAT_VERSION = 216;
+// v224 (#355 recovery): Go declaration origins; Rust aliases, wrapper patterns,
+// copied bindings and qualified macro receivers; TS indexed array evidence.
+const CACHE_FORMAT_VERSION = 224;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**

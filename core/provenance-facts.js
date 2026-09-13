@@ -3,7 +3,7 @@
 const path = require('path');
 const { langTraits } = require('../languages');
 const { NON_CALLABLE_TYPES } = require('./shared');
-const { declarationIdentity, identityKey } = require('./provenance');
+const { declarationIdentity, identityKey, propertyReadMember } = require('./provenance');
 const { captureOverload, overloadMemberGroup } = require('./provenance-overload');
 const { splitParentList } = require('./graph-build');
 
@@ -113,12 +113,18 @@ function confirmationFacts(index, file, call, targets, options = {}) {
         receiverType: options.receiverType || call.receiverType || null,
         receiverTypeSource: options.receiverTypeSource || call.receiverTypeSource || 'unknown',
         receiverOrigin: options.receiverOrigin || call.receiverTypeEvidence || null,
+        ...(call.isFunctionReference && { valueReference: true }),
         ownerCount: new Set((index.symbols.get(call.name) || [])
             .filter(d => !NON_CALLABLE_TYPES.has(d.type) && ownerName(d))
             .map(d => `${d.file}\0${ownerName(d)}\0${d.namespace || ''}`)).size,
-        ...(call.receiverTypeFlowFile && { receiverTypeFlowFile: path.relative(index.root, call.receiverTypeFlowFile) }),
+        ...((options.originFile || call.receiverTypeFlowFile) && {
+            receiverTypeFlowFile: path.relative(index.root, options.originFile || call.receiverTypeFlowFile),
+        }),
         ...(call.moduleOwnedPath && { moduleOwnedPath: true }),
     };
+    if (facts.receiverTypeSource === 'fixture' || facts.receiverOrigin?.externalFactory) facts.receiverPath = call.receiverRoot
+        ? [call.receiverRoot, ...(call.receiverFields || [call.receiverField])]
+        : [call.receiver];
     const methodReceiver = call.isMethod && !call.moduleOwnedPath;
     // Method-name bindings cannot establish the identity of a value receiver.
     if (options.bindingId && !methodReceiver) {
@@ -178,7 +184,12 @@ function confirmationFacts(index, file, call, targets, options = {}) {
     };
     const qualifier = call.receiverTypeNamespace || call.receiverTypeQualifier;
     if (qualifier) facts.receiverTypeQualifier = qualifier;
-    let resolved = resolveType(type, originFile, originFile === file ? call.line : undefined, qualifier);
+    // A parser annotation's qualifier belongs to the consuming file. The
+    // already-pinned declaration file may be another crate/module, where
+    // replaying `crate::Type` or an import alias would change its meaning.
+    const receiverContext = qualifier && facts.receiverTypeSource === 'annotation' ? file : originFile;
+    let resolved = resolveType(type, receiverContext, receiverContext === file ? call.line : undefined, qualifier);
+    if (resolved && receiverContext !== originFile && resolved.declaration.file !== originFile) resolved = null;
     if (!resolved && language === 'rust') {
         const enclosing = index.findEnclosingFunction(file, call.line, true);
         const bounds = enclosing?.genericBounds?.[type];
@@ -239,6 +250,9 @@ function confirmationFacts(index, file, call, targets, options = {}) {
         }
         const step = { owner: identity, members: members.map(declarationIdentity), parents: parents.map(declarationIdentity),
             ...(derefTarget && { derefTarget }) };
+        const getter = facts.valueReference && propertyReadMember(step.members);
+        if (getter) return { receiver: declarationIdentity(resolved.declaration),
+            steps: [...steps, { ...step, propertyRead: true }], selected: getter };
         if (language === 'java' || language === 'csharp') {
             step.memberDefinitions = members;
             const chain = [...steps, step];

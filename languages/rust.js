@@ -919,6 +919,14 @@ function _processClass(node, types, processedRanges, lines, code) {
                 members: [],
                 modifiers: visibility ? [visibility] : [],
                 ...(aliasOf && { aliasOf }),
+                aliasTypeText: node.childForFieldName('type')?.text,
+                aliasTypeParameters: (node.childForFieldName('type_parameters')?.namedChildren || [])
+                    .map(parameter => parameter.type === 'type_identifier' ? parameter.text
+                        : parameter.childForFieldName('name')?.text ||
+                            parameter.namedChildren.find(child => child.type === 'type_identifier')?.text)
+                    .map(name => name || null),
+                aliasTypeDefaults: (node.childForFieldName('type_parameters')?.namedChildren || [])
+                    .map(parameter => parameter.childForFieldName('default_type')?.text || null),
                 ...(docstring && { docstring })
             });
         }
@@ -1528,6 +1536,51 @@ function _tokenTreeCallArgsAfter(children, nameIndex) {
     return args?.type === 'token_tree' && args.text.startsWith('(') ? args : null;
 }
 
+// Extract the base type name from a Rust type node (strips &, &mut, Box<>, etc.)
+function extractTypeName(typeNode) {
+    if (!typeNode) return null;
+    if (typeNode.type === 'type_identifier' ||
+        typeNode.type === 'primitive_type') {
+        return typeNode.text;
+    }
+    if (typeNode.type === 'reference_type') {
+        // &Filter or &mut Filter -> Filter
+        for (let i = 0; i < typeNode.namedChildCount; i++) {
+            const r = extractTypeName(typeNode.namedChild(i));
+            if (r) return r;
+        }
+    }
+    if (typeNode.type === 'abstract_type' || typeNode.type === 'dynamic_type') {
+        for (let i = 0; i < typeNode.namedChildCount; i++) {
+            const r = extractTypeName(typeNode.namedChild(i));
+            if (r) return r;
+        }
+    }
+    if (typeNode.type === 'generic_type') {
+        // Box<Filter> -> Filter (or get the outer type)
+        return extractTypeName(typeNode.namedChild(0));
+    }
+    if (typeNode.type === 'scoped_type_identifier') {
+        // module::Type -> Type
+        const nameNode = typeNode.childForFieldName('name');
+        return nameNode?.text || null;
+    }
+    return null;
+}
+
+
+// Shared by ordinary AST calls and macro token-tree calls. Both carry the
+// same self-field owner identity; a field spelling is never a local receiver.
+function findEnclosingImplType(node) {
+    for (let parent = node.parent; parent; parent = parent.parent) {
+        if (parent.type === 'impl_item') {
+            const type = parent.childForFieldName('type');
+            return (type && extractTypeName(type)) || undefined;
+        }
+    }
+    return undefined;
+}
+
 function extractCallsFromTokenTree(tree, enclosingFunction, calls, getReceiverType,
     isPatternShadow, isFlowInvalidated, context = 'invocation') {
     const contextKind = typeof context === 'string' ? context : context.kind;
@@ -1706,12 +1759,15 @@ function extractCallsFromTokenTree(tree, enclosingFunction, calls, getReceiverTy
                 ? ({ string_literal: 'str', raw_string_literal: 'str',
                     char_literal: 'char', boolean_literal: 'bool' })[recvTok.type]
                 : undefined;
-            const receiverType = (receiver && receiver !== 'self')
+            const receiverRootType = receiverRoot === 'self'
+                ? findEnclosingImplType(tok) : getReceiverType?.(receiverRoot, tok);
+            const receiverType = receiverField ? undefined : (receiver && receiver !== 'self')
                 ? (getReceiverType?.(receiver, tok) || inheritedTokenTypes.get(receiver))
                 : litType;
             const receiverPatternShadow = !!(receiver && isPatternShadow?.(tok, receiver));
             const receiverFlowInvalidated = !!(receiver && isFlowInvalidated?.(tok, receiver));
             const iterationSource = rustIterationSourceOf(tok, receiver);
+            const patternSource = rustPatternBindingOf(tok, receiver);
             const producer = !receiver && lastProducer &&
                 lastProducer.callEnd === recvTok?.endIndex ? lastProducer : null;
             const record = {
@@ -1722,10 +1778,12 @@ function extractCallsFromTokenTree(tree, enclosingFunction, calls, getReceiverTy
                 isMethod: true,
                 receiver: receiverField ? undefined : receiver,
                 ...(receiverField && { receiverRoot, receiverField }),
+                ...(receiverRootType && { receiverRootType }),
                 ...(receiverType && { receiverType, ...(getReceiverType?.(receiver, tok, true) || inheritedTokenTypes.fields(receiver, receiverType)) }),
                 ...(receiverPatternShadow && { receiverPatternShadow: true }),
                 ...(receiverFlowInvalidated && { receiverFlowInvalidated: true }),
                 ...(iterationSource || {}),
+                ...(patternSource || {}),
                 ...(producer && {
                     receiverCall: producer.name,
                     ...(producer.isMethod && { receiverCallIsMethod: true }),
@@ -1951,26 +2009,13 @@ function rustPatternBindingOf(node, receiver) {
         return identifiers.length === 1 ? identifiers[0] : null;
     };
 
-    for (let ancestor = node.parent; ancestor; ancestor = ancestor.parent) {
-        if (ancestor.type === 'function_item') break;
-        if (ancestor.type === 'closure_expression') {
-            const params = ancestor.childForFieldName('parameters');
-            if (params && patternContainsIdentifier(params, receiver)) break;
-            continue; // captured binding from an outer match arm
-        }
-        if (ancestor.type !== 'match_arm') continue;
-        let matchExpression = ancestor.parent;
-        while (matchExpression && matchExpression.type !== 'match_expression' &&
-            matchExpression.type !== 'function_item') {
-            matchExpression = matchExpression.parent;
-        }
-        const matchValue = matchExpression?.type === 'match_expression'
-            ? matchExpression.childForFieldName('value')
-            : null;
+    const readPattern = (root, matchValue) => {
         const source = matchValue?.type === 'identifier'
             ? { receiverPatternSourceVariable: matchValue.text }
+            : matchValue?.type === 'call_expression'
+            ? { receiverPatternSourceCallStart: matchValue.startIndex,
+                receiverPatternSourceCallEnd: matchValue.endIndex }
             : {};
-        const root = ancestor.childForFieldName('pattern');
         const pending = root ? [root] : [];
         while (pending.length > 0) {
             const pattern = pending.pop();
@@ -1979,7 +2024,19 @@ function rustPatternBindingOf(node, receiver) {
                 const positional = pattern.namedChildren
                     .filter(child => !typeNode || child.id !== typeNode.id);
                 for (let i = 0; i < positional.length; i++) {
-                    if (directBindingName(positional[i]) !== receiver) continue;
+                    const tupleProjection = (part, steps = []) => {
+                        if (directBindingName(part) === receiver) return steps;
+                        if (part.type !== 'tuple_pattern') return null;
+                        // Unnamed `_` nodes still occupy a tuple position.
+                        const elements = part.children.filter(child => !['(', ')', ','].includes(child.type));
+                        for (const [position, child] of elements.entries()) {
+                            const found = tupleProjection(child, [...steps, position]);
+                            if (found) return found;
+                        }
+                        return null;
+                    };
+                    const projection = tupleProjection(positional[i]);
+                    if (!projection) continue;
                     const pathText = typeNode?.text;
                     if (!pathText) return null;
                     const segments = pathText.split('::').filter(Boolean);
@@ -1988,6 +2045,7 @@ function rustPatternBindingOf(node, receiver) {
                     return {
                         receiverPatternVariant: variant,
                         receiverPatternIndex: i,
+                        ...(projection.length && { receiverPatternProjection: projection }),
                         ...source,
                         ...(segments.length > 0 && {
                             receiverPatternOwner: segments.join('::'),
@@ -2000,6 +2058,49 @@ function rustPatternBindingOf(node, receiver) {
             }
         }
         return null;
+    };
+
+    for (let ancestor = node.parent; ancestor; ancestor = ancestor.parent) {
+        if (ancestor.type === 'function_item') break;
+        if (ancestor.type === 'block') {
+            for (const child of [...ancestor.namedChildren].reverse()) {
+                if (child.endIndex > node.startIndex) continue;
+                const declaration = child.type === 'expression_statement' ? child.namedChild(0) : child;
+                const pattern = declaration?.type === 'let_declaration'
+                    ? declaration.childForFieldName('pattern')
+                    : declaration?.type === 'assignment_expression'
+                    ? declaration.childForFieldName('left') : null;
+                if (patternContainsIdentifier(pattern, receiver)) {
+                    return declaration.type === 'let_declaration' && declaration.childForFieldName('alternative')
+                        ? readPattern(pattern, declaration.childForFieldName('value')) : null;
+                }
+            }
+        }
+        if (ancestor.type === 'for_expression' &&
+            patternContainsIdentifier(ancestor.childForFieldName('pattern'), receiver)) return null;
+        if (ancestor.type === 'closure_expression') {
+            const params = ancestor.childForFieldName('parameters');
+            if (params && patternContainsIdentifier(params, receiver)) break;
+            continue; // captured binding from an outer match arm
+        }
+        let matchValue, root;
+        if (ancestor.type === 'match_arm') {
+            let matchExpression = ancestor.parent;
+            while (matchExpression && matchExpression.type !== 'match_expression' &&
+                matchExpression.type !== 'function_item') matchExpression = matchExpression.parent;
+            matchValue = matchExpression?.type === 'match_expression'
+                ? matchExpression.childForFieldName('value') : null;
+            root = ancestor.childForFieldName('pattern');
+        } else if (['if_expression', 'while_expression'].includes(ancestor.type)) {
+            const body = ancestor.childForFieldName(ancestor.type === 'if_expression' ? 'consequence' : 'body');
+            const condition = ancestor.childForFieldName('condition');
+            if (!body || node.startIndex < body.startIndex || node.endIndex > body.endIndex ||
+                condition?.type !== 'let_condition') continue;
+            matchValue = condition.childForFieldName('value');
+            root = condition.childForFieldName('pattern');
+        } else continue;
+        if (!patternContainsIdentifier(root, receiver)) continue;
+        return readPattern(root, matchValue);
     }
     return null;
 }
@@ -2068,38 +2169,6 @@ function findCallsInCode(code, parser) {
     // Helper to check if a node creates a function scope
     const isFunctionNode = (node) => {
         return ['function_item', 'closure_expression'].includes(node.type);
-    };
-
-    // Extract the base type name from a Rust type node (strips &, &mut, Box<>, etc.)
-    const extractTypeName = (typeNode) => {
-        if (!typeNode) return null;
-        if (typeNode.type === 'type_identifier' ||
-            typeNode.type === 'primitive_type') {
-            return typeNode.text;
-        }
-        if (typeNode.type === 'reference_type') {
-            // &Filter or &mut Filter -> Filter
-            for (let i = 0; i < typeNode.namedChildCount; i++) {
-                const r = extractTypeName(typeNode.namedChild(i));
-                if (r) return r;
-            }
-        }
-        if (typeNode.type === 'abstract_type' || typeNode.type === 'dynamic_type') {
-            for (let i = 0; i < typeNode.namedChildCount; i++) {
-                const r = extractTypeName(typeNode.namedChild(i));
-                if (r) return r;
-            }
-        }
-        if (typeNode.type === 'generic_type') {
-            // Box<Filter> -> Filter (or get the outer type)
-            return extractTypeName(typeNode.namedChild(0));
-        }
-        if (typeNode.type === 'scoped_type_identifier') {
-            // module::Type -> Type
-            const nameNode = typeNode.childForFieldName('name');
-            return nameNode?.text || null;
-        }
-        return null;
     };
 
     const extractTypeQualifier = (typeNode) => {
@@ -2259,10 +2328,18 @@ function findCallsInCode(code, parser) {
     const getReceiverType = (varName, atNode, evidence = false) => {
         if (atNode && patternShadowsAt(atNode, varName)) return undefined;
         const flow = flowEventAt(atNode, varName);
-        if (flow?.type) return evidence ? { receiverTypeSource: 'flow', receiverTypeEvidence: { ...typeOrigin('flow', atNode), ...flow } } : flow.type;
+        if (flow?.type) {
+            const { until, ...origin } = flow;
+            return evidence ? { receiverTypeSource: 'flow',
+                receiverTypeEvidence: { ...typeOrigin('flow', atNode), ...origin,
+                    ...(Number.isFinite(until) && { until }) },
+                ...(flow.qualifier && { receiverTypeQualifier: flow.qualifier }) } : flow.type;
+        }
         for (let i = functionStack.length - 1; i >= 0; i--) {
             const typeMap = scopeTypes.get(functionStack[i].startLine);
-            if (typeMap?.has(varName)) return evidence ? typeMap.fields(varName) : typeMap.get(varName);
+            if (typeMap?.has(varName)) return evidence ? { ...typeMap.fields(varName),
+                ...(typeMap.qualifiers?.has(varName) && { receiverTypeQualifier: typeMap.qualifiers.get(varName) }) }
+                : typeMap.get(varName);
             if (typeMap?.boundNames?.has(varName)) return undefined;
         }
         return undefined;
@@ -2366,15 +2443,31 @@ function findCallsInCode(code, parser) {
         };
     };
 
-    // Walk up to the enclosing impl block's target type (impl<T> Foo<T> → Foo).
-    const findEnclosingImplType = (n) => {
-        for (let p = n.parent; p; p = p.parent) {
-            if (p.type === 'impl_item') {
-                const t = p.childForFieldName('type');
-                return (t && extractTypeName(t)) || undefined;
-            }
+    const copiedBindingType = (value, assignment, retainedName = null) => {
+        let expression = value;
+        while (expression && ['reference_expression', 'parenthesized_expression'].includes(expression.type)) {
+            expression = expression.childForFieldName('value') || expression.namedChildren.at(-1);
         }
-        return undefined;
+        const dereferenced = !retainedName && expression?.type === 'unary_expression' && expression.child(0)?.text === '*';
+        if (dereferenced) expression = expression.namedChild(0);
+        const name = retainedName || (expression?.type === 'identifier' ? expression.text : null);
+        if (!name) return null;
+        const type = getReceiverType(name, assignment);
+        const facts = type && getReceiverType(name, assignment, true);
+        if (!facts?.receiverTypeEvidence || ['unknown', 'guess'].includes(facts.receiverTypeSource)) return null;
+        const annotation = dereferenced && getReceiverAnnotationText(name, assignment);
+        // Deref on a custom owner can change the type. Only an actual
+        // reference annotation proves the built-in `&*reference` reborrow.
+        if (dereferenced && (facts.receiverTypeSource !== 'annotation' || !annotation?.trim().startsWith('&'))) return null;
+        const qualifier = getReceiverTypeQualifier(name, assignment);
+        return { type, ...(qualifier && { qualifier }), aliasBinding: {
+            variable: name, target: assignment.childForFieldName(
+                assignment.type === 'let_declaration' ? 'pattern' : 'left')?.text,
+            type, origin: facts.receiverTypeEvidence,
+            assignment: typeOrigin('flow', assignment),
+            ...(dereferenced && { referenceAnnotation: annotation }),
+            kind: retainedName ? 'reassignment' : value.type === 'identifier' ? 'copy' : 'borrow',
+        } };
     };
 
     const closureContractSource = (node) => {
@@ -2498,7 +2591,11 @@ function findCallsInCode(code, parser) {
                         at: node.endIndex,
                         until,
                         ...(() => {
-                            const inferred = matchBindingType(value, node);
+                            // Rust assignment preserves a variable's static
+                            // type; a fresh `let` may shadow it with another.
+                            const inferred = copiedBindingType(value, node,
+                                node.type === 'assignment_expression' ? pattern.text : null) ||
+                                matchBindingType(value, node);
                             return inferred
                                 ? { invalidated: false, ...inferred }
                                 : { invalidated: !valueHasFlowProducer(value) };

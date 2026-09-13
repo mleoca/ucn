@@ -1901,6 +1901,23 @@ function tsTypeName(node) {
     }
 }
 
+function tsArrayElement(node) {
+    if (!node) return null;
+    if (['type_annotation', 'parenthesized_type', 'readonly_type'].includes(node.type)) {
+        return tsArrayElement(node.namedChild(0));
+    }
+    if (node.type === 'union_type') {
+        const present = node.namedChildren.filter(child =>
+            !(child.type === 'literal_type' && ['null', 'undefined'].includes(child.text)));
+        return present.length === 1 ? tsArrayElement(present[0]) : null;
+    }
+    if (node.type !== 'array_type') return null;
+    const item = node.namedChild(0);
+    if (!['type_identifier', 'nested_type_identifier', 'generic_type', 'predefined_type'].includes(item?.type)) return null;
+    const type = tsTypeName(item);
+    return type ? { type, qualifier: tsTypeQualifier(item), node: item } : null;
+}
+
 /**
  * Variable receiving this call's result: `const x = foo()` / `x = await foo()`
  * → 'x'. Identifier targets only. Compared by node id — tree-sitter wrapper
@@ -1993,6 +2010,7 @@ function findCallsInCode(code, parser) {
     const moduleCompositions = new Map();
     const unsafeModuleCompositions = new Set();
     const namespaceAliases = new Set();
+    const arrayAnnotationNames = new Set();
     const accessRoot = (node) => {
         let current = node;
         while (current && (current.type === 'member_expression' ||
@@ -2002,6 +2020,12 @@ function findCallsInCode(code, parser) {
         return current?.type === 'identifier' ? current.text : undefined;
     };
     traverseTreeCached(tree.rootNode, node => {
+        if (['variable_declarator', 'required_parameter', 'optional_parameter'].includes(node.type)) {
+            const name = node.childForFieldName('name') || node.childForFieldName('pattern');
+            if (name?.type === 'identifier' && tsArrayElement(node.childForFieldName('type'))) {
+                arrayAnnotationNames.add(name.text);
+            }
+        }
         if (node.type === 'namespace_import') {
             const identifier = node.namedChild(0);
             if (identifier?.type === 'identifier') namespaceAliases.add(identifier.text);
@@ -2362,6 +2386,79 @@ function findCallsInCode(code, parser) {
             if (_patternDeclaresName(pattern.namedChild(i), name)) return true;
         }
         return false;
+    };
+
+    // Resolve the actual lexical declaration for an indexed receiver. Keep
+    // untyped bindings too: a shadow must stop an outer annotation from
+    // leaking into a nested function or block. This lookup is cached per
+    // spelling and used only for bracket receivers, not every ordinary call.
+    const indexedBindings = new Map();
+    const indexedBinding = (name, site) => {
+        if (!indexedBindings.has(name)) {
+            const records = [];
+            const add = (pattern, declaration, scope) => {
+                if (!scope || !_patternDeclaresName(pattern, name)) return;
+                records.push({ declaration, scope, type: pattern?.type === 'identifier'
+                    ? declaration.childForFieldName('type') : null });
+            };
+            traverseTree(tree.rootNode, current => {
+                if (current.type === 'variable_declarator') {
+                    add(current.childForFieldName('name'), current, aliasScope(current));
+                } else if (isFunctionNode(current)) {
+                    const parameters = current.childForFieldName('parameters');
+                    for (const parameter of parameters?.namedChildren || []) {
+                        const pattern = parameter.childForFieldName('pattern') ||
+                            parameter.childForFieldName('name') || parameter;
+                        add(pattern, parameter, current);
+                    }
+                    const lone = current.childForFieldName('parameter');
+                    if (lone) add(lone, lone, current);
+                    const fnName = current.childForFieldName('name');
+                    if (fnName?.text === name) add(fnName, current,
+                        current.type === 'function_declaration' ? current.parent : current);
+                } else if (current.type === 'catch_clause') {
+                    add(current.childForFieldName('parameter'), current, current);
+                }
+                return true;
+            });
+            indexedBindings.set(name, records);
+        }
+        const matches = indexedBindings.get(name).filter(record =>
+            record.scope.startIndex <= site.startIndex && record.scope.endIndex >= site.endIndex)
+            .sort((a, b) => (a.scope.endIndex - a.scope.startIndex) - (b.scope.endIndex - b.scope.startIndex));
+        const nearest = matches[0];
+        if (!nearest || nearest.declaration.startIndex > site.startIndex ||
+            (matches[1] && matches[1].scope.id === nearest.scope.id)) return null;
+        return nearest;
+    };
+    const indexedArrayReceiver = object => {
+        if (object?.type !== 'subscript_expression') return null;
+        const root = object.childForFieldName('object');
+        const offset = object.childForFieldName('index');
+        if (root?.type !== 'identifier' || !arrayAnnotationNames.has(root.text) || !offset) return null;
+        let numeric = offset.type === 'number';
+        if (offset.type === 'identifier') {
+            const indexBinding = indexedBinding(offset.text, object);
+            const annotation = indexBinding?.type?.namedChild(0);
+            numeric = annotation?.type === 'predefined_type' && annotation.text === 'number';
+            if (!annotation && indexBinding?.declaration.childForFieldName('value')?.type === 'number') {
+                numeric = localVarTypes.get(offset.text) === 'Number';
+            }
+        }
+        if (!numeric) return null;
+        const binding = indexedBinding(root.text, object);
+        const element = tsArrayElement(binding?.type);
+        if (element && !element.qualifier) {
+            for (let scope = binding.declaration.parent; scope; scope = scope.parent) {
+                const parameters = scope.childForFieldName('type_parameters');
+                if (parameters?.namedChildren.some(parameter =>
+                    (parameter.childForFieldName('name')?.text || parameter.text) === element.type)) return null;
+            }
+        }
+        return element && { ...element,
+            evidence: { ...typeOrigin('annotation', binding.type), projection: 'array-element',
+                container: root.text, elementType: element.node.text,
+                index: { start: offset.startIndex, end: offset.endIndex, nodeType: offset.type } } };
     };
 
     // fix #203: does a declaration node declare `name` (including nested destructuring)?
@@ -2969,10 +3066,11 @@ function findCallsInCode(code, parser) {
                         const constructedReceiverQualifier = objNode?.type === 'new_expression'
                             ? jsConstructorTypeQualifier(objNode.childForFieldName('constructor'))
                             : undefined;
-                        const receiverType = receiver
+                        const indexedReceiver = indexedArrayReceiver(objNode);
+                        const receiverType = indexedReceiver?.type || (receiver
                             ? localVarTypes.get(receiver)
                             : (constructedReceiverType ||
-                                (objNode ? JS_LITERAL_RECEIVER_TYPES[objNode.type] : undefined));
+                                (objNode ? JS_LITERAL_RECEIVER_TYPES[objNode.type] : undefined)));
                         // Module receiver (ns.helper()) — unless locally shadowed
                         // by a typed instance binding
                         const receiverModuleSpecifier = jsLiteralRequireModule(objNode);
@@ -3009,14 +3107,16 @@ function findCallsInCode(code, parser) {
                             isMethod: true,
                             receiver,
                             ...(receiverType && { receiverType,
-                                ...(receiver ? localVarTypes.fields(receiver, receiverType) : {
+                                ...(indexedReceiver ? { receiverTypeSource: 'annotation',
+                                    receiverTypeEvidence: indexedReceiver.evidence }
+                                    : receiver ? localVarTypes.fields(receiver, receiverType) : {
                                     receiverTypeSource: constructedReceiverType ? 'constructor' : 'literal',
                                     receiverTypeEvidence: typeOrigin(constructedReceiverType ? 'constructor' : 'literal', objNode),
                                 }),
                             }),
-                            ...((constructedReceiverQualifier ||
+                            ...((indexedReceiver?.qualifier || constructedReceiverQualifier ||
                                 (receiver && localVarTypeQualifiers.get(receiver))) && {
-                                receiverTypeQualifier: constructedReceiverQualifier ||
+                                receiverTypeQualifier: indexedReceiver?.qualifier || constructedReceiverQualifier ||
                                     localVarTypeQualifiers.get(receiver),
                             }),
                             ...(receiverIsModule && { receiverIsModule: true }),

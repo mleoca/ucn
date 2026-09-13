@@ -26,6 +26,8 @@ const OPTIONAL_HELPERS = Object.freeze([
     'findTestCallRanges',
     'getBuiltinCallReturnType',
     'getBuiltinFieldType',
+    'findPytestFunctions',
+    'findPythonModuleEvidence',
     'isPlatformConcreteCall',
     'isPlatformConcreteType',
 ]);

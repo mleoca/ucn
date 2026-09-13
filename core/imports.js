@@ -446,18 +446,32 @@ function rustModuleOwnFile(dir, fromFile) {
  * @param {string[]} segments - Path segments to resolve
  * @returns {string|null}
  */
+function rustPathHasExactCase(base, file) {
+    // Rust names remain case-sensitive on case-insensitive filesystems.
+    // Check directory entries, rather than realpath, so legitimate symlinked
+    // modules keep their declared spelling and remain resolvable.
+    let current = base;
+    try {
+        for (const part of path.relative(base, file).split(path.sep)) {
+            if (!fs.readdirSync(current).includes(part)) return false;
+            current = path.join(current, part);
+        }
+        return true;
+    } catch { return false; }
+}
+
 function resolveRustModulePath(dir, segments) {
     // Try progressively shorter paths (items at the end may be types, not modules)
     for (let len = segments.length; len >= 1; len--) {
         const modPath = path.join(dir, ...segments.slice(0, len));
         // Try <path>.rs
         const rsFile = modPath + '.rs';
-        if (fs.existsSync(rsFile) && fs.statSync(rsFile).isFile()) {
+        if (fs.existsSync(rsFile) && fs.statSync(rsFile).isFile() && rustPathHasExactCase(dir, rsFile)) {
             return rsFile;
         }
         // Try <path>/mod.rs
         const modFile = path.join(modPath, 'mod.rs');
-        if (fs.existsSync(modFile) && fs.statSync(modFile).isFile()) {
+        if (fs.existsSync(modFile) && fs.statSync(modFile).isFile() && rustPathHasExactCase(dir, modFile)) {
             return modFile;
         }
     }
@@ -600,11 +614,11 @@ function resolveRustImport(importPath, fromFile, projectRoot) {
     if (!importPath.includes('::')) {
         // For mod declarations: <dir>/<name>.rs or <dir>/<name>/mod.rs
         const rsFile = path.join(fromDir, importPath + '.rs');
-        if (fs.existsSync(rsFile) && fs.statSync(rsFile).isFile()) {
+        if (fs.existsSync(rsFile) && fs.statSync(rsFile).isFile() && rustPathHasExactCase(fromDir, rsFile)) {
             return rsFile;
         }
         const modFile = path.join(fromDir, importPath, 'mod.rs');
-        if (fs.existsSync(modFile) && fs.statSync(modFile).isFile()) {
+        if (fs.existsSync(modFile) && fs.statSync(modFile).isFile() && rustPathHasExactCase(fromDir, modFile)) {
             return modFile;
         }
     }

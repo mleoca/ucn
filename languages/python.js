@@ -1676,7 +1676,7 @@ function findCallsInCode(code, parser) {
     const localDictValueTypes = new Map(); // local dict -> exact string-key value types
     const localSubscriptSources = new Map(); // local value -> exact typed container selected by []
     const localVarStdlibContracts = new Map(); // variable -> stdlib module proving its type flow
-    const assignmentRhsReceiverTypes = new Map(); // call-node id -> pre-assignment receiver type
+    const assignmentRhsReceiverTypes = new Map(); // call-node id -> pre-assignment type and origin
     const constructedReceiverVars = new Set(); // exact constructor-result bindings
     const withBindingVars = new Set(); // names produced by a context-manager as-target
     // Member-access aliases (fix #218): `append = output.append` makes a later
@@ -2236,7 +2236,8 @@ function findCallsInCode(code, parser) {
                     if (rightFunction?.type === 'attribute' &&
                         rightFunction.childForFieldName('object')?.type === 'identifier' &&
                         rightFunction.childForFieldName('object').text === left.text) {
-                        assignmentRhsReceiverTypes.set(right.id, previousType);
+                        assignmentRhsReceiverTypes.set(right.id, { type: previousType,
+                            ...localVarTypes.fields(left.text, previousType) });
                     }
                 }
                 // Track type annotation: x: Foo = ... → x is Foo
@@ -2658,11 +2659,12 @@ function findCallsInCode(code, parser) {
                         objNode, receiver, localVarUnionTypes.get(receiver));
                     const comprehensionType = receiver && comprehensionReceiverType(
                         objNode, receiver, localIterableTypes, callableIterableTypes, instanceFieldContracts);
+                    const rhsReceiver = assignmentRhsReceiverTypes.get(node.id);
                     const receiverType = receiver
                         ? (narrowedType || comprehensionType ||
                             localVarTypes.get(receiver) ||
                             classValueAliases.get(receiver))
-                            || assignmentRhsReceiverTypes.get(node.id)
+                            || rhsReceiver?.type
                         : (subscriptReceiverType ||
                             (objNode ? PY_LITERAL_RECEIVER_TYPES[objNode.type] : undefined));
                     let iterationSource = receiver
@@ -2727,6 +2729,9 @@ function findCallsInCode(code, parser) {
                                 },
                             } : receiver && classValueAliases.get(receiver) === receiverType ?
                                 classValueAliases.fields(receiver) :
+                                receiver && !localVarTypes.has(receiver) && rhsReceiver?.type === receiverType
+                                    ? { receiverTypeSource: rhsReceiver.receiverTypeSource,
+                                        receiverTypeEvidence: rhsReceiver.receiverTypeEvidence } :
                                 receiver ? localVarTypes.fields(receiver, receiverType) : {
                                     receiverTypeSource: 'literal', receiverTypeEvidence: typeOrigin('literal', objNode),
                                 }),
@@ -3502,6 +3507,10 @@ function findInstanceAttributeTypes(code, parser, options = {}) {
         if (!body) return false;
 
         const attrTypes = new Map();
+        const attrOrigins = new Map();
+        Object.defineProperty(attrTypes, 'origins', { value: attrOrigins });
+        const externalFlows = new Map();
+        Object.defineProperty(attrTypes, 'externalFlows', { value: externalFlows });
         for (const [field, contract] of explicitContracts.get(className) || []) {
             if (contract.type) attrTypes.set(field, contract.type);
         }
@@ -3674,6 +3683,8 @@ function findInstanceAttributeTypes(code, parser, options = {}) {
         // old constructor-name heuristic to arbitrary methods. Unknown or
         // conflicting assignments leave the field untyped.
         const runtimeFieldTypes = new Map();
+        const runtimeFieldWrites = new Map();
+        const externalFieldWrites = new Map();
         const invalidRuntimeFields = new Set();
         for (let i = 0; i < body.namedChildCount; i++) {
             let member = body.namedChild(i);
@@ -3688,12 +3699,18 @@ function findInstanceAttributeTypes(code, parser, options = {}) {
             traverseTree(memberBody, stmt => {
                 if (stmt.type !== 'expression_statement') return true;
                 const assignment = stmt.firstChild;
-                if (assignment?.type !== 'assignment') return true;
+                if (!['assignment', 'augmented_assignment'].includes(assignment?.type)) return true;
                 const left = assignment.childForFieldName('left');
                 const field = left?.type === 'attribute' &&
                     left.childForFieldName('object')?.text === 'self'
                     ? left.childForFieldName('attribute')?.text : null;
                 if (!field) return true;
+                let enclosing = assignment.parent;
+                while (enclosing && !['function_definition', 'lambda', 'class_definition'].includes(enclosing.type)) enclosing = enclosing.parent;
+                if (assignment.type !== 'assignment' || enclosing !== member) {
+                    invalidRuntimeFields.add(field);
+                    return true;
+                }
                 const right = assignment.childForFieldName('right');
                 const callable = right?.type === 'call'
                     ? right.childForFieldName('function') : null;
@@ -3709,11 +3726,35 @@ function findInstanceAttributeTypes(code, parser, options = {}) {
                     ? callable.childForFieldName('attribute')?.text : null;
                 const resolveCallType = options.resolveCallType ||
                     options.resolveBuiltinCallType;
-                const runtimeType = directConstructor ||
+                const literalType = right && ['dictionary', 'dictionary_comprehension', 'list',
+                    'list_comprehension', 'set', 'set_comprehension', 'tuple'].includes(right.type)
+                    ? PY_LITERAL_RECEIVER_TYPES[right.type] : null;
+                const importedCall = callable?.type === 'identifier' &&
+                    !isPythonNameShadowedAt(callable, callable.text)
+                    ? options.resolveImportedCallType?.(callable.text) : null;
+                const runtimeType = literalType || importedCall?.type || directConstructor ||
                     (moduleName && functionName &&
                         !isPythonNameShadowedAt(callable, moduleName)
                         ? resolveCallType?.(moduleName, functionName)
                         : null);
+                let producer = right, depth = 0;
+                while (producer?.type === 'call') {
+                    depth++;
+                    producer = producer.childForFieldName('function');
+                }
+                const factoryPath = producer?.type === 'attribute' &&
+                    producer.childForFieldName('object')?.type === 'identifier'
+                    ? [producer.childForFieldName('object').text, producer.childForFieldName('attribute')?.text]
+                    : producer?.type === 'identifier' ? [producer.text] : null;
+                const externalFactory = !runtimeType && depth > 0 && depth <= 3 && factoryPath?.every(Boolean) &&
+                    !isPythonNameShadowedAt(producer, factoryPath[0])
+                    ? options.resolveExternalFactory?.(factoryPath) : null;
+                if (externalFactory) {
+                    if (!externalFieldWrites.has(field)) externalFieldWrites.set(field, []);
+                    externalFieldWrites.get(field).push({ ...externalFactory, path: factoryPath, depth,
+                        assignment: typeOrigin('field', assignment), expression: typeOrigin('field', right) });
+                    return true;
+                }
                 if (!runtimeType) {
                     // None is a harmless uninitialized state; any other
                     // unknown write could replace the field with a project
@@ -3723,18 +3764,32 @@ function findInstanceAttributeTypes(code, parser, options = {}) {
                 }
                 if (!runtimeFieldTypes.has(field)) runtimeFieldTypes.set(field, new Set());
                 runtimeFieldTypes.get(field).add(runtimeType);
+                if (!runtimeFieldWrites.has(field)) runtimeFieldWrites.set(field, []);
+                runtimeFieldWrites.get(field).push({ type: runtimeType,
+                    assignment: typeOrigin('field', assignment), expression: typeOrigin('field', right),
+                    ...(literalType ? { literal: right.type } : importedCall ? { importedCall } : { legacy: true }) });
                 return true;
             });
+        }
+        for (const [field, assignments] of externalFieldWrites) {
+            if (!invalidRuntimeFields.has(field) && !runtimeFieldTypes.has(field) && !attrTypes.has(field) &&
+                new Set(assignments.map(write => `${write.module}.${write.producer}:${write.depth}`)).size === 1) {
+                externalFlows.set(field, { field, assignments });
+            }
         }
         for (const [field, types] of runtimeFieldTypes) {
             if (invalidRuntimeFields.has(field) || types.size !== 1) continue;
             const type = [...types][0];
             if (!attrTypes.has(field) || attrTypes.get(field) === type) {
                 attrTypes.set(field, type);
+                const assignments = runtimeFieldWrites.get(field);
+                if (assignments.every(write => !write.legacy)) {
+                    attrOrigins.set(field, { assignments });
+                }
             }
         }
 
-        if (attrTypes.size > 0) {
+        if (attrTypes.size > 0 || externalFlows.size > 0) {
             result.set(className, attrTypes);
         }
 
@@ -3833,6 +3888,98 @@ function isEntryPoint(symbol) {
     return getEntryPointKind(symbol) !== null;
 }
 
+/** Module-level pytest declarations. Decorator ownership is resolved by the
+ * index; a decorator merely spelled `fixture` is not sufficient evidence.
+ */
+function findPythonModuleEvidence(code, parser) {
+    const tree = parseTree(parser, code), references = [], wildcards = [];
+    traverseTree(tree.rootNode, node => {
+        if (node.type === 'identifier' && node.text === '__all__') references.push(node);
+        if (node.type === 'import_from_statement' && node.namedChildren.some(child => child.type === 'wildcard_import')) {
+            const module = node.childForFieldName('module_name');
+            wildcards.push({ name: '*', module: module?.text, origin: typeOrigin('import', node),
+                topLevel: node.parent?.type === 'module' });
+        }
+        return true;
+    });
+    let exports = null;
+    if (references.length === 1) {
+        const name = references[0], assignment = name.parent, value = assignment.childForFieldName('right');
+        if (assignment.type === 'assignment' && assignment.childForFieldName('left') === name &&
+            assignment.parent?.parent?.type === 'module' && ['list', 'tuple'].includes(value?.type)) {
+            const literals = value.namedChildren.map(item => {
+                const content = item.type === 'string' && item.namedChildren.find(child => child.type === 'string_content');
+                return content && item.namedChildren.every(child => ['string_start', 'string_content', 'string_end'].includes(child.type))
+                    ? { value: content.text, origin: typeOrigin('literal', item) } : null;
+            });
+            if (literals.every(Boolean)) exports = { name: '__all__', origin: typeOrigin('assignment', assignment),
+                literals, otherReferences: [] };
+        }
+    }
+    return { exports, wildcards };
+}
+
+function findPytestFunctions(code, parser) {
+    const tree = parseTree(parser, code);
+    const pathOf = node => {
+        if (node?.type === 'identifier') return [node.text];
+        if (node?.type !== 'attribute') return null;
+        const root = pathOf(node.childForFieldName('object'));
+        const member = node.childForFieldName('attribute');
+        return root && member ? [...root, member.text] : null;
+    };
+    const out = [];
+    for (const outer of tree.rootNode.namedChildren) {
+        const node = outer.type === 'decorated_definition' ? outer.childForFieldName('definition') : outer;
+        if (node?.type !== 'function_definition') continue;
+        const body = node.childForFieldName('body');
+        const params = node.childForFieldName('parameters');
+        const decorators = outer.type === 'decorated_definition'
+            ? outer.namedChildren.filter(child => child.type === 'decorator').map(decorator => {
+                const expression = decorator.namedChild(0);
+                const callable = expression?.type === 'call' ? expression.childForFieldName('function') : expression;
+                let alias, dynamicName = false;
+                for (const argument of expression?.childForFieldName('arguments')?.namedChildren || []) {
+                    if (argument.type !== 'keyword_argument' || argument.childForFieldName('name')?.text !== 'name') continue;
+                    const value = argument.childForFieldName('value');
+                    const content = value?.type === 'string' && value.namedChildren.find(child => child.type === 'string_content');
+                    if (content && value.namedChildren.every(child => ['string_start', 'string_content', 'string_end'].includes(child.type))) alias = content.text;
+                    else dynamicName = true;
+                }
+                return { path: pathOf(callable), alias, dynamicName, origin: typeOrigin('fixture', decorator) };
+            }) : [];
+        let yields = false;
+        traverseTree(body, child => {
+            if (child.type === 'function_definition' || child.type === 'lambda' || child.type === 'class_definition') return false;
+            if (child.type === 'yield') yields = true;
+            return true;
+        });
+        const annotation = node.childForFieldName('return_type');
+        let value = annotation?.namedChild(0);
+        let container;
+        if (yields) {
+            if (value?.type === 'subscript') {
+                container = pathOf(value.childForFieldName('value'));
+                value = value.childForFieldName('subscript');
+            } else if (value?.type === 'generic_type') {
+                container = pathOf(value.namedChild(0));
+                value = value.namedChildren.find(child => child.type === 'type_parameter')?.namedChild(0)?.namedChild(0);
+            } else value = null;
+        }
+        const valuePath = pathOf(value);
+        out.push({ name: node.childForFieldName('name')?.text,
+            startLine: outer.startPosition.row + 1, endLine: outer.endPosition.row + 1,
+            async: node.children.some(child => child.type === 'async'), decorators, yields,
+            parameters: (params?.namedChildren || []).filter(param => param.type === 'identifier')
+                .map(param => ({ name: param.text, origin: typeOrigin('fixture', param),
+                    unchanged: !pythonScopeBindsName(body, param.text) })),
+            returnType: annotation?.text, valuePath, container,
+            returnOrigin: annotation ? typeOrigin('annotation', annotation) : null,
+        });
+    }
+    return out;
+}
+
 // Stable CPython/stdlib runtime contracts. These are intentionally small and
 // language-owned: callers must still prove that the import is external (not a
 // project module with the same name) before using them as exclusion evidence.
@@ -3843,6 +3990,7 @@ const PY_BUILTIN_CALL_RETURNS = Object.freeze({
     'json.dumps': 'str',
     'os.urandom': 'bytes',
     'urllib.request.getproxies': 'dict',
+    'urllib.parse.parse_qs': 'dict',
     'zlib.compressobj': 'ZlibCompress',
     'zlib.decompressobj': 'ZlibDecompress',
 });
@@ -3860,6 +4008,7 @@ function getBuiltinFieldType(moduleName, fieldName) {
 }
 
 module.exports = {
+    findPythonModuleEvidence,
     findFunctions,
     findClasses,
     findStateObjects,
@@ -3870,6 +4019,7 @@ module.exports = {
     findInstanceAttributeTypes,
     getBuiltinCallReturnType,
     getBuiltinFieldType,
+    findPytestFunctions,
     isEntryPoint,
     getEntryPointKind,
     parse

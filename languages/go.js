@@ -1242,6 +1242,82 @@ function findCallsInCode(code, parser, options = {}) {
     const isShadowedByLocal = (refNode, name) =>
         lexicalBindingScopeStart(refNode, name) != null;
 
+    // Go package declarations are in scope throughout the file, including
+    // function bodies preceding the declaration. Locals still enter in order.
+    const recordVarDeclaration = (node, scopeKey) => {
+        const varTypeMap = scopeKey == null ? packageTypes : scopeTypes.get(scopeKey);
+        const varQualifierMap = scopeKey == null
+            ? packageTypeQualifiers : scopeTypeQualifiers.get(scopeKey);
+        if (varTypeMap) {
+            const varContainerMap = scopeKey == null
+                ? packageContainerTypes : scopeContainerTypes.get(scopeKey);
+            const recordSpec = (spec) => {
+                if (spec.type !== 'var_spec') return;
+                const declaredType = spec.childForFieldName('type');
+                // Container-typed declaration (fix #300): `var routes
+                // []*Route` feeds range-element typing.
+                if (declaredType && CONTAINER_TYPE_NODES.has(declaredType.type) &&
+                    varContainerMap) {
+                    for (let j = 0; j < spec.namedChildCount; j++) {
+                        const id = spec.namedChild(j);
+                        if (id.type === 'identifier') {
+                            varContainerMap.set(id.text, declaredType.text);
+                        }
+                    }
+                    return;
+                }
+                let typeName = extractTypeName(spec.childForFieldName('type'));
+                let qualifier = typeName
+                    ? extractTypeQualifier(spec.childForFieldName('type')) : null;
+                let origin = declaredType;
+                let source = 'annotation';
+                if (!typeName) {
+                    // var cstDialer = Dialer{...} — the initializer's
+                    // composite-literal type IS the variable's type
+                    // (fix #298, websocket-measured: `d := cstDialer`
+                    // copies then call DialContext). Single-value specs
+                    // only; multi-value pairing stays untyped.
+                    const valueNode = spec.childForFieldName('value');
+                    let init = valueNode?.type === 'expression_list' &&
+                        valueNode.namedChildCount === 1
+                        ? valueNode.namedChild(0) : null;
+                    if (init?.type === 'unary_expression') {
+                        init = init.namedChildCount > 0 ? init.namedChild(0) : null;
+                    }
+                    if (init?.type === 'composite_literal') {
+                        const tn = init.childForFieldName('type');
+                        typeName = extractTypeName(tn);
+                        qualifier = extractTypeQualifier(tn);
+                        origin = init;
+                        source = 'constructor';
+                    }
+                    if (!typeName) return;
+                }
+                for (let j = 0; j < spec.namedChildCount; j++) {
+                    const id = spec.namedChild(j);
+                    if (id.type === 'identifier') {
+                        varTypeMap.set(id.text, typeName, source, origin);
+                        if (qualifier) varQualifierMap?.set(id.text, qualifier);
+                        else varQualifierMap?.delete(id.text);
+                        if (scopeKey != null) {
+                            scopeGuesses.get(scopeKey)?.delete(id.text);
+                        }
+                    }
+                }
+            };
+            for (let i = 0; i < node.namedChildCount; i++) {
+                const c = node.namedChild(i);
+                if (c.type === 'var_spec') recordSpec(c);
+                else if (c.type === 'var_spec_list') {
+                    for (let j = 0; j < c.namedChildCount; j++) recordSpec(c.namedChild(j));
+                }
+            }
+        }
+    };
+    for (const declaration of tree.rootNode.namedChildren) {
+        if (declaration.type === 'var_declaration') recordVarDeclaration(declaration, null);
+    }
+
     traverseTree(tree.rootNode, (node) => {
         // Track function entry
         if (isFunctionNode(node)) {
@@ -1448,78 +1524,8 @@ function findCallsInCode(code, parser, options = {}) {
             }
         }
 
-        // Explicitly typed var declarations: `var buf bytes.Buffer`,
-        // `var sb strings.Builder` (fix #220, cobra-measured — sb.String()
-        // on an untyped receiver fell to single-owner confirmation). Same
-        // semantics as parameter annotations: the declared type is the
-        // receiver's compile-time type.
-        if (node.type === 'var_declaration') {
-            const scopeKey = functionStack.length > 0
-                ? functionStack[functionStack.length - 1].startLine : null;
-            const varTypeMap = scopeKey == null ? packageTypes : scopeTypes.get(scopeKey);
-            const varQualifierMap = scopeKey == null
-                ? packageTypeQualifiers : scopeTypeQualifiers.get(scopeKey);
-            if (varTypeMap) {
-                const varContainerMap = scopeKey == null
-                    ? packageContainerTypes : scopeContainerTypes.get(scopeKey);
-                const recordSpec = (spec) => {
-                    if (spec.type !== 'var_spec') return;
-                    const declaredType = spec.childForFieldName('type');
-                    // Container-typed declaration (fix #300): `var routes
-                    // []*Route` feeds range-element typing.
-                    if (declaredType && CONTAINER_TYPE_NODES.has(declaredType.type) &&
-                        varContainerMap) {
-                        for (let j = 0; j < spec.namedChildCount; j++) {
-                            const id = spec.namedChild(j);
-                            if (id.type === 'identifier') {
-                                varContainerMap.set(id.text, declaredType.text);
-                            }
-                        }
-                        return;
-                    }
-                    let typeName = extractTypeName(spec.childForFieldName('type'));
-                    let qualifier = typeName
-                        ? extractTypeQualifier(spec.childForFieldName('type')) : null;
-                    if (!typeName) {
-                        // var cstDialer = Dialer{...} — the initializer's
-                        // composite-literal type IS the variable's type
-                        // (fix #298, websocket-measured: `d := cstDialer`
-                        // copies then call DialContext). Single-value specs
-                        // only; multi-value pairing stays untyped.
-                        const valueNode = spec.childForFieldName('value');
-                        let init = valueNode?.type === 'expression_list' &&
-                            valueNode.namedChildCount === 1
-                            ? valueNode.namedChild(0) : null;
-                        if (init?.type === 'unary_expression') {
-                            init = init.namedChildCount > 0 ? init.namedChild(0) : null;
-                        }
-                        if (init?.type === 'composite_literal') {
-                            const tn = init.childForFieldName('type');
-                            typeName = extractTypeName(tn);
-                            qualifier = extractTypeQualifier(tn);
-                        }
-                        if (!typeName) return;
-                    }
-                    for (let j = 0; j < spec.namedChildCount; j++) {
-                        const id = spec.namedChild(j);
-                        if (id.type === 'identifier') {
-                            varTypeMap.set(id.text, typeName);
-                            if (qualifier) varQualifierMap?.set(id.text, qualifier);
-                            else varQualifierMap?.delete(id.text);
-                            if (scopeKey != null) {
-                                scopeGuesses.get(scopeKey)?.delete(id.text);
-                            }
-                        }
-                    }
-                };
-                for (let i = 0; i < node.namedChildCount; i++) {
-                    const c = node.namedChild(i);
-                    if (c.type === 'var_spec') recordSpec(c);
-                    else if (c.type === 'var_spec_list') {
-                        for (let j = 0; j < c.namedChildCount; j++) recordSpec(c.namedChild(j));
-                    }
-                }
-            }
+        if (node.type === 'var_declaration' && functionStack.length > 0) {
+            recordVarDeclaration(node, functionStack.at(-1).startLine);
         }
 
         // Track local closures: atoi := func(...) { ... } or

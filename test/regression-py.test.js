@@ -846,7 +846,8 @@ class OtherClass:
         assert.strictEqual(rg.get('scanner'), 'MarketScanner');
         assert.strictEqual(rg.has('name'), false, 'Should skip string literals');
         assert.strictEqual(rg.has('count'), false, 'Should skip number literals');
-        assert.strictEqual(rg.has('items'), false, 'Should skip list literals');
+        assert.strictEqual(rg.get('items'), 'list', 'A list literal fixes the builtin receiver type');
+        assert.strictEqual(rg.origins.get('items').assignments[0].literal, 'list');
 
         // OtherClass
         const oc = result.get('OtherClass');
