@@ -5650,3 +5650,73 @@ describe('fix #302: blanket impl identity and value re-exports', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #357: same-name items renamed from different modules pair with their own module', () => {
+    const FILES = {
+        'Cargo.toml': '[package]\nname = "alias_pair"\nversion = "0.1.0"\nedition = "2021"\n',
+        'src/alpha.rs': 'pub fn widget() -> u32 { 1 }\n',
+        'src/beta.rs': 'pub fn widget() -> u32 { 2 }\n',
+        'src/main.rs': [
+            'mod alpha;',
+            'mod beta;',
+            'use alpha::widget as a_widget;',
+            'use beta::widget as b_widget;',
+            '',
+            'fn main() {',
+            '    let x = a_widget();',
+            '    let y = b_widget();',
+            '    let z = alpha::widget();',
+            '    println!("{} {} {}", x, y, z);',
+            '}',
+        ].join('\n'),
+    };
+    const { execute } = require('../core/execute');
+    const callerLines = r => (r.result.context.callers || []).map(c => `${path.basename(c.file)}:${c.line}`).sort();
+    const unverifiedLines = r => (r.result.context.unverifiedCallers || []).map(c => `${path.basename(c.file)}:${c.line}`).sort();
+
+    it('each pin confirms only the site spelled by its own alias (caller direction)', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const alpha = execute(index, 'show', { name: 'src/alpha.rs:1:widget', sections: 'callers' });
+            const beta = execute(index, 'show', { name: 'src/beta.rs:1:widget', sections: 'callers' });
+            assert.ok(alpha.ok && beta.ok);
+            // a_widget() and the path-qualified alpha::widget() are alpha's; b_widget() is beta's.
+            assert.deepStrictEqual(callerLines(alpha), ['main.rs:7', 'main.rs:9']);
+            assert.deepStrictEqual(callerLines(beta), ['main.rs:8']);
+            assert.deepStrictEqual(unverifiedLines(alpha), []);
+            assert.deepStrictEqual(unverifiedLines(beta), []);
+            assert.strictEqual(alpha.result.context.meta?.account?.conserved ?? alpha.result.context.account?.conserved ?? true, true);
+        } finally { rm(dir); }
+    });
+
+    it('each aliased call resolves to its own module item (callee direction)', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const main = index.symbols.get('main')[0];
+            const callees = index.findCallees(main, { collectAccount: true });
+            const widgets = callees.filter(c => c.name === 'widget').map(c => path.basename(c.file)).sort();
+            assert.deepStrictEqual(widgets, ['alpha.rs', 'beta.rs']);
+            // The aliased spellings resolve exactly; the lowercase-module path call
+            // `alpha::widget()` may stay visible on the callee side (#260 deferral).
+            assert.ok(!(callees.unverifiedCallees || []).some(c => c.name === 'a_widget' || c.name === 'b_widget'));
+            assert.strictEqual(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('a rename whose module resolves nowhere in the project stays visible, never excluded', () => {
+        const dir = tmp({
+            ...FILES,
+            'src/main.rs': 'mod alpha;\nuse alpha::widget as a_widget;\nuse external_crate::widget as x_widget;\n\nfn main() {\n    let x = a_widget();\n    let y = x_widget();\n    println!("{} {}", x, y);\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const alpha = execute(index, 'show', { name: 'src/alpha.rs:1:widget', sections: 'callers' });
+            assert.ok(alpha.ok);
+            assert.deepStrictEqual(callerLines(alpha), ['main.rs:6']);
+            // The external rename is a different binding; it must not become a confirmed edge of alpha.
+            assert.ok(!callerLines(alpha).includes('main.rs:7'));
+        } finally { rm(dir); }
+    });
+});

@@ -12,9 +12,14 @@ function createImportBindings(imports) {
     return imports.flatMap(item => (item.names || [])
         .filter(name => name && name !== '*' && name !== '_' && name !== '.')
         .map(name => {
-            const rename = (item.renames || []).find(candidate => candidate.original === name);
+            // A rename may be recorded under its original name (Python
+            // `from m import a as b` lists 'a') or under its local alias
+            // (Rust `use m::a as b` lists 'b', fix #357); both yield the
+            // binding {name: original, alias: local}.
+            const rename = (item.renames || []).find(candidate =>
+                candidate.original === name || candidate.local === name);
             return {
-                name,
+                name: rename ? rename.original : name,
                 module: item.module,
                 ...(item.type && { kind: item.type }),
                 ...(item.line != null && { line: item.line }),

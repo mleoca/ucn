@@ -710,7 +710,8 @@ function clearAllCaches() {
 // v215: receiver-type provenance records the originating AST fact (#355).
 // v224 (#355 recovery): Go declaration origins; Rust aliases, wrapper patterns,
 // copied bindings and qualified macro receivers; TS indexed array evidence.
-const CACHE_FORMAT_VERSION = 224;
+// v225 (fix #357): Rust `use path::name as local` bindings record the original name with a paired `renames` alias.
+const CACHE_FORMAT_VERSION = 225;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**

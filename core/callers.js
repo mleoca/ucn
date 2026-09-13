@@ -2885,6 +2885,42 @@ function findCallers(index, name, options = {}) {
                 // modules must not exclude: a binding to an unresolved module
                 // whose first segment matches a project directory routes
                 // visible instead.
+                // Rust item renames are name-level ownership (fix #357): a
+                // bare call spelled by a `use path::name as local` alias
+                // denotes exactly the item that binding resolves to. Two
+                // renames of one source name from different modules
+                // (`use alpha::widget as a; use beta::widget as b`) used to
+                // fall through to file-level import evidence, which BOTH
+                // modules satisfy, so each pin confirmed both sites. The
+                // paired binding decides: resolves into a target file →
+                // confirmable; resolves to another project file → excluded
+                // other-definition-import; unresolvable → visible (a resolver
+                // gap is never exclusion evidence).
+                if (calledAs && !call.isMethod && !call.receiver &&
+                    fileEntry.language === 'rust' && call.name === calledAs) {
+                    const paired = (fileEntry.importBindings || []).filter(b =>
+                        b.alias === call.name);
+                    if (paired.length > 0) {
+                        const tFiles = new Set(targetDefs.map(d => d.file).filter(Boolean));
+                        let verdict = 'unknown';
+                        for (const b of paired) {
+                            const resolved = _rustBindingResolvedFiles(index, fileEntry, filePath, b);
+                            if (resolved.size === 0) { verdict = 'unknown'; break; }
+                            const hit = [...resolved].some(f => tFiles.has(f));
+                            if (hit) { verdict = 'target'; break; }
+                            verdict = 'other';
+                        }
+                        if (verdict === 'other') {
+                            recordExcluded(filePath, call.line, 'other-definition-import');
+                            continue;
+                        }
+                        if (verdict === 'unknown' && collectAccount) {
+                            routeUnverified(filePath, fileEntry, call, 'no-import-link', calledAs);
+                            continue;
+                        }
+                    }
+                }
+
                 if (!bindingId && !call.isMethod &&
                     langTraits(fileEntry.language)?.typeSystem === 'structural' &&
                     (fileEntry.importBindings || []).length > 0) {
@@ -4235,7 +4271,9 @@ function findCallers(index, name, options = {}) {
                     let aliasResolvedFile = null;
                     if (receiverName && !tTypes.has(receiverName)) {
                         for (const im of (fileEntry.importBindings || [])) {
-                            if (im.name !== receiverName) continue;
+                            // fix #357: Rust rename bindings carry the local
+                            // name as `alias` (the original is `name`).
+                            if ((im.alias || im.name) !== receiverName) continue;
                             // fix #353: C# `using BH = Beta.Helper` (and Java
                             // dotted paths) split on `.`; Rust paths on `::`.
                             const orig = String(im.module || '').split(/::|\./).pop();
@@ -11722,11 +11760,21 @@ function _calleeStructuralModuleRoute(index, fileEntry, call, language) {
 }
 
 function _calleeStructuralImportedNameRoute(index, fileEntry, call, language) {
-    const lookupName = call.resolvedName || call.name;
+    let lookupName = call.resolvedName || call.name;
     let bindings = (fileEntry?.importBindings || []).filter(b => b.name === lookupName);
     if (call.resolvedName && bindings.some(b => b.alias)) {
         const paired = bindings.filter(b => b.alias === call.name);
         if (paired.length > 0) bindings = paired;
+    }
+    // fix #357: a call spelled by a rename's LOCAL alias (Rust `use m::a as
+    // b; b()`) pairs with exactly the binding carrying that alias, and the
+    // exported item is the binding's ORIGINAL name.
+    if (bindings.length === 0) {
+        const aliased = (fileEntry?.importBindings || []).filter(b => b.alias === call.name);
+        if (aliased.length > 0 && new Set(aliased.map(b => b.name)).size === 1) {
+            bindings = aliased;
+            lookupName = aliased[0].name;
+        }
     }
     if (bindings.length === 0) return null;
     return _calleeStructuralBindingRoute(index, fileEntry, call, language, bindings, lookupName, true);

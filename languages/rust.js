@@ -3221,7 +3221,7 @@ function findImportsInCode(code, parser) {
         const right = String(suffix || '').replace(/^::/, '');
         return left && right ? `${left}::${right}` : left || right;
     };
-    const addLeaf = (module, localName, type = 'use', dynamic = false, line) => {
+    const addLeaf = (module, localName, type = 'use', dynamic = false, line, rename = null) => {
         if (!module || !localName) return;
         imports.push({
             module,
@@ -3229,6 +3229,7 @@ function findImportsInCode(code, parser) {
             type,
             dynamic,
             line,
+            ...(rename && { renames: [rename] }),
         });
     };
     const collectUseTree = (node, prefix, line) => {
@@ -3250,13 +3251,20 @@ function findImportsInCode(code, parser) {
             const pathNode = node.namedChild(0);
             const aliasNode = node.childForFieldName('alias') || node.namedChild(1);
             if (pathNode && aliasNode) {
-                addLeaf(joinUsePath(prefix, pathNode.text), aliasNode.text,
-                    'use', false, line);
                 // fix #353: `use alpha::widget as renamed; renamed()` — the
                 // alias pairing feeds findCallers' import-rename surface
                 // (calledAs), exactly like Python/JS `import x as y`.
+                // fix #357: `renames` pairs the alias with ITS record so
+                // createImportBindings emits {name: original, alias: local}
+                // (the #348 Python shape); two renames of one source name
+                // from different modules each pair with their own module
+                // instead of both bindings matching both calls. `names`
+                // keeps the local spelling (parser contract, imports command).
                 const original = String(pathNode.text).split('::').pop();
-                if (original && original !== aliasNode.text && original !== 'self') {
+                const renamed = original && original !== aliasNode.text && original !== 'self';
+                addLeaf(joinUsePath(prefix, pathNode.text), aliasNode.text,
+                    'use', false, line, renamed ? { original, local: aliasNode.text } : null);
+                if (renamed) {
                     if (!imports.aliases) imports.aliases = [];
                     imports.aliases.push({ original, local: aliasNode.text });
                 }
