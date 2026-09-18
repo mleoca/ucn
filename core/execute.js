@@ -1314,8 +1314,10 @@ const HANDLERS = {
             const hidden = unfiltered.length - result.length;
             if (hidden > 0) notes.push(`${hidden} test-file usage(s) hidden by default — pass --include-tests to include them.`);
         }
-        // Apply limit to total usages (result is a flat array)
-        const limit = listingLimit(p);
+        // Apply limit to total usages (result is a flat array). usages is the
+        // escape-hatch listing (fix #284): only an EXPLICIT limit caps it; the
+        // release command-surface gate reads every oracle reference from it.
+        const limit = num(p.limit, undefined);
         let limited = result;
         if (limit && limit > 0 && Array.isArray(result) && result.length > limit) {
             notes.push(limitNote(limit, result.length));

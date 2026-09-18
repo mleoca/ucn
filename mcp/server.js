@@ -305,7 +305,7 @@ const INPUT_SHAPE = {
     top_level: booleanParam('repo files: show only top-level functions.'),
     class_name: stringParam('Class name to scope method analysis (e.g. "MarketDataFetcher" for close)'),
     line: integerParam('Definition line pin. Resolves the symbol defined at this exact line (the middle component of a file:line:name handle). Disambiguates same-file same-name definitions.', { exclusiveMinimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
-    limit: integerParam('Max results to return (default: 500; structural search: 50; lines: uncapped). Caps find, usages, search, deadcode, api, and repo files. Must be a positive integer.', { exclusiveMinimum: 0, maximum: 1000000 }),
+    limit: integerParam('Max results to return (default: 500; structural search: 50; usages and lines: uncapped). Caps find, usages, search, deadcode, api, and repo files. Must be a positive integer.', { exclusiveMinimum: 0, maximum: 1000000 }),
     max_files: integerParam('Max files to index (default: 10000). Use for very large codebases. Must be a positive integer.', { exclusiveMinimum: 0, maximum: 10000000 }),
     max_chars: integerParam('Max output chars before truncation. Broad sweep commands (repo, entrypoints, endpoints, deadcode, deps, check, audit_async) default to 3K; all other commands default to 10K. Maximum: 100K. all=true lifts formatter caps but keeps the 100K transport ceiling.', { exclusiveMinimum: 0, maximum: 100000 }),
     type: stringParam('Symbol type filter for structural search: function, class, call, method, type, state, field, constant, macro. Triggers index-based search.'),

@@ -218,9 +218,9 @@ empty results and exit 1 for command errors (`meta.ok: false` plus `error`).
 Target-less `check` exits 1 when `TRUST` is `BLOCKED`, 0 for other completed
 checks, and 2 if it could not run.
 
-Outside `--lines`, `find`, `usages`, text `search`, `deadcode`, `api`, and
+Outside `--lines`, `find`, text `search`, `deadcode`, `api`, and
 `repo --sections=files` default to a maximum of 500 results. Use `--limit=N`
-to request more. Broad `find` queries select candidates by approximate usage
+to request more; `usages` lists every site unless a limit is given. Broad `find` queries select candidates by approximate usage
 totals before calculating definition-pinned caller activity, and disclose
 that selection when limited.
 

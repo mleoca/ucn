@@ -54,7 +54,7 @@ describe('5.3.6 audit regressions', () => {
         } finally { rm(dir); }
     });
 
-    it('F2: shared defaults cap find, usages, api, deadcode and repo files with totals', () => {
+    it('F2: shared defaults cap find, api, deadcode and repo files with totals; usages stays uncapped', () => {
         const files = Object.fromEntries(Array.from({ length: 510 }, (_, i) => [
             `src/f${String(i).padStart(3, '0')}.js`, `export function listed${i}() {}\n// inventoryToken\n`,
         ]));
@@ -63,7 +63,6 @@ describe('5.3.6 audit regressions', () => {
             const index = idx(dir);
             const cases = [
                 ['find', { name: 'listed' }],
-                ['usages', { name: 'inventoryToken' }],
                 ['api', {}],
                 ['deadcode', { includeExported: true }],
             ];
@@ -77,18 +76,16 @@ describe('5.3.6 audit regressions', () => {
                 assert.match(response.note, /Showing 500 of 510/);
                 assert.equal(execute(index, command, { ...params, limit: 505 }).result.length, 505);
             }
-            for (const command of ['find', 'usages']) {
-                const params = command === 'find' ? { name: 'listed' } : { name: 'inventoryToken' };
-                assert.equal(execute(index, command, { ...params, lines: true }).result.length, 510);
-            }
+            assert.equal(execute(index, 'find', { name: 'listed', lines: true }).result.length, 510);
+            assert.equal(execute(index, 'usages', { name: 'inventoryToken' }).result.length, 510);
+            assert.equal(execute(index, 'usages', { name: 'inventoryToken', lines: true }).result.length, 510);
             const repo = execute(index, 'repo', { sections: 'files' });
             assert.equal(repo.result.files.files.length, 500);
             assert.equal(repo.result.files.totals.files, 510);
             assert.equal(repo.result.files.hiddenFiles, 10);
             assert.equal(execute(index, 'repo', { sections: 'files', limit: 505 }).result.files.files.length, 505);
             assert.equal(execute(index, 'repo', { sections: 'files', all: true }).result.files.files.length, 510);
-            assert.equal(execute(index, 'usages', { name: 'inventoryToken', all: true }).result.length, 510);
-            assert.equal(execute(index, 'usages', { name: 'inventoryToken', all: true, limit: 5 }).result.length, 5);
+            assert.equal(execute(index, 'usages', { name: 'inventoryToken', limit: 5 }).result.length, 5);
         } finally { rm(dir); }
     });
 

@@ -58,7 +58,7 @@ Symbol-listing commands emit handles such as `src/api.ts:42:handler`. Pass the f
 | `--class-name=<name>` | Scope a member when no handle is available. |
 | `--in=<directory>` | Limit query scope to a directory. |
 | `--exclude=<patterns>` | Exclude matching paths. |
-| `--limit=N` | Default maximum of 500 results for `find`, `usages`, text `search`, `deadcode`, `api`, and `repo` files; structural `search` defaults to 50. Explicit limits override these caps; `--lines` is uncapped by default. |
+| `--limit=N` | Default maximum of 500 results for `find`, text `search`, `deadcode`, `api`, and `repo` files; structural `search` defaults to 50. Explicit limits override these caps; `usages` and `--lines` are uncapped by default. |
 | `--include-bundled` | Include `*.min.js` and `*.bundle.js` in discovery, respecting user exclusions and bypassing the shared cache. By default these and `*.map` are disclosed as skipped sources and completeness is partial. Source maps remain unindexed. MCP: `include_bundled=true`. |
 | `--depth=N` | Set trace/dependency/test traversal depth. |
 | `--direction=<value>` | Select trace or dependency direction. |

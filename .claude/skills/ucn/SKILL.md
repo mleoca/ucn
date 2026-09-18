@@ -197,10 +197,10 @@ call candidates. Calls proved to belong to another same-name target are
 disclosed separately and excluded from the activity total.
 Broad queries rank candidates by inexpensive approximate usage totals before
 applying the row limit; only returned definitions receive caller adjudication.
-The selection note discloses that approximation. `find`, `usages`, text
-`search`, `deadcode`, `api`, and `repo --sections=files` default to at most 500
-results (structural `search`: 50). Use an explicit `--limit=N` to request more;
-`--lines` has no default row cap.
+The selection note discloses that approximation. `find`, text `search`,
+`deadcode`, `api`, and `repo --sections=files` default to at most 500 results
+(structural `search`: 50). Use an explicit `--limit=N` to request more;
+`usages` and `--lines` have no default row cap.
 
 For `plan --rename-to`, the selected declaration is only the starting point.
 When the index proves the relationship, the rename unit closes over
