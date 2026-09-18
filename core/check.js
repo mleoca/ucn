@@ -73,6 +73,11 @@ function check(index, options = {}) {
     const modified = (dr && Array.isArray(dr.functions)) ? dr.functions : [];
     const added    = (dr && Array.isArray(dr.newFunctions)) ? dr.newFunctions : [];
     const deleted  = (dr && Array.isArray(dr.deletedFunctions)) ? dr.deletedFunctions : [];
+    const pathCounts = {
+        changedPaths: dr?.changedPaths || 0,
+        nonSourcePaths: dr?.nonSourcePaths || 0,
+        untrackedPaths: dr?.untrackedPaths || 0,
+    };
 
     const allChanged = [
         ...modified.map(f => ({ ...f, _kind: 'modified' })),
@@ -99,6 +104,7 @@ function check(index, options = {}) {
             status: 'clean',
             empty: true,
             reason,
+            ...pathCounts,
         };
     }
 
@@ -293,6 +299,7 @@ function check(index, options = {}) {
         staged: !!options.staged,
         ok: true,
         status: 'checked',
+        ...pathCounts,
         changed: items,
         totalChanged: allChanged.length + deleted.length,
         truncated: !!(limit && allChanged.length > limit),

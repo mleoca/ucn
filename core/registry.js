@@ -114,6 +114,7 @@ const PARAM_MAP = {
     max_files:         'maxFiles',
     max_chars:         'maxChars',
     follow_symlinks:   'followSymlinks',
+    include_bundled:   'includeBundled',
     unreachable_only:  'unreachableOnly',
     server_only:       'serverOnly',
     client_only:       'clientOnly',
@@ -303,7 +304,7 @@ function formatSurfaceMessage(message, surface = 'cli') {
     const booleanParams = new Set([
         'includeTests', 'excludeTests', 'includeMethods', 'withTypes',
         'codeOnly', 'caseSensitive', 'includeExported', 'includeDecorated',
-        'showConfidence', 'callsOnly', 'topLevel', 'followSymlinks',
+        'showConfidence', 'callsOnly', 'topLevel', 'followSymlinks', 'includeBundled',
         'unreachableOnly', 'serverOnly', 'clientOnly', 'hideUncertain',
         'expandUnverified', 'withSource', 'all', 'compact', 'exact',
         'regex', 'exported', 'unused', 'staged', 'detailed', 'functions',
@@ -314,7 +315,7 @@ function formatSurfaceMessage(message, surface = 'cli') {
         rendered = rendered.replace(/--([a-z][a-z0-9-]*)(?:=([^\s,.)]+))?/g,
             (whole, flag, rawValue) => {
                 const camel = flag.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
-                if (!knownParams.has(camel) && !['maxChars', 'maxFiles'].includes(camel)) {
+                if (!knownParams.has(camel) && !['maxChars', 'maxFiles', 'includeBundled'].includes(camel)) {
                     return whole;
                 }
                 const snake = REVERSE_PARAM_MAP[camel] || camel;
@@ -365,7 +366,7 @@ const CLI_GLOBAL_FLAGS = Object.freeze([
     '--help', '-h', '--version', '-v', '--mcp',
     '--json', '--verbose', '--no-quiet', '--quiet',
     '--interactive', '-i',
-    '--no-cache', '--clear-cache', '--no-follow-symlinks',
+    '--no-cache', '--clear-cache', '--no-follow-symlinks', '--include-bundled',
     '--max-files', '--max-chars', '--workers',
 ]);
 
@@ -408,7 +409,7 @@ function getCliAcceptedFlags() {
  * One line per command: `show: file, exclude, class_name, ...`
  */
 function generateMcpParamSection() {
-    const lines = ['', 'ACCEPTED FLAGS PER COMMAND (max_chars, max_files, follow_symlinks always accepted; flags not listed below are ignored):'];
+    const lines = ['', 'ACCEPTED FLAGS PER COMMAND (max_chars, max_files, follow_symlinks, include_bundled always accepted; flags not listed below are ignored):'];
     for (const cmd of CANONICAL_COMMANDS) {
         const flags = FLAG_APPLICABILITY[cmd];
         if (!flags || flags.length === 0) continue;

@@ -45,6 +45,7 @@ function getIndex(projectDir, options) {
     }
     const maxFiles = options && options.maxFiles;
     const followSymlinks = options && options.followSymlinks;
+    const includeBundled = options?.includeBundled === true;
     const absDir = path.resolve(projectDir);
     if (!fs.existsSync(absDir) || !fs.statSync(absDir).isDirectory()) {
         throw new Error(`Project directory not found: ${absDir}`);
@@ -54,7 +55,7 @@ function getIndex(projectDir, options) {
 
     // Always check staleness — MCP is used in iterative agent loops where
     // files change between requests, so a throttle causes stale results.
-    if (cached && !maxFiles) {
+    if (cached && !maxFiles && !includeBundled) {
         if (!cached.index.isCacheStale()) {
             cached.checkedAt = Date.now();
             return cached.index;
@@ -66,12 +67,13 @@ function getIndex(projectDir, options) {
     const buildOpts = { quiet: true, forceRebuild: false };
     if (maxFiles) buildOpts.maxFiles = maxFiles;
     if (followSymlinks === false) buildOpts.followSymlinks = false;
-    const loaded = index.loadCache();
-    if (loaded && !maxFiles && !index.isCacheStale()) {
+    buildOpts.includeBundled = includeBundled;
+    const loaded = !includeBundled && index.loadCache();
+    if (loaded && !index.includeBundled && !maxFiles && !index.isCacheStale()) {
         // Disk cache is fresh (skip when maxFiles is set — cached index may have different file count)
     } else {
         buildOpts.forceRebuild = !!loaded;
-        if (maxFiles) {
+        if (maxFiles || includeBundled) {
             index.build(null, buildOpts); // Don't pollute disk cache with partial indexes
         } else {
             // Cross-process build lock (fix #354): a CLI or another MCP
@@ -96,7 +98,7 @@ function getIndex(projectDir, options) {
     }
 
     // Don't cache partial indexes (maxFiles) — they'd serve wrong results for full queries
-    if (!maxFiles) {
+    if (!maxFiles && !includeBundled) {
         indexCache.set(root, { index, checkedAt: Date.now() });
     }
     return index;
@@ -303,7 +305,7 @@ const INPUT_SHAPE = {
     top_level: booleanParam('repo files: show only top-level functions.'),
     class_name: stringParam('Class name to scope method analysis (e.g. "MarketDataFetcher" for close)'),
     line: integerParam('Definition line pin. Resolves the symbol defined at this exact line (the middle component of a file:line:name handle). Disambiguates same-file same-name definitions.', { exclusiveMinimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
-    limit: integerParam('Max results to return (default: 500). Caps find, usages, search, deadcode, api, and repo files. Must be a positive integer.', { exclusiveMinimum: 0, maximum: 1000000 }),
+    limit: integerParam('Max results to return (default: 500; structural search: 50; lines: uncapped). Caps find, usages, search, deadcode, api, and repo files. Must be a positive integer.', { exclusiveMinimum: 0, maximum: 1000000 }),
     max_files: integerParam('Max files to index (default: 10000). Use for very large codebases. Must be a positive integer.', { exclusiveMinimum: 0, maximum: 10000000 }),
     max_chars: integerParam('Max output chars before truncation. Broad sweep commands (repo, entrypoints, endpoints, deadcode, deps, check, audit_async) default to 3K; all other commands default to 10K. Maximum: 100K. all=true lifts formatter caps but keeps the 100K transport ceiling.', { exclusiveMinimum: 0, maximum: 100000 }),
     type: stringParam('Symbol type filter for structural search: function, class, call, method, type, state, field, constant, macro. Triggers index-based search.'),
@@ -315,6 +317,7 @@ const INPUT_SHAPE = {
     unused: booleanParam('Only symbols with zero callers (structural search).'),
     framework: stringParam('Filter entrypoints by framework (e.g. "express", "spring", "flask"). Comma-separated for multiple.'),
     follow_symlinks: booleanParam('Follow symlinks during file discovery (default: true)'),
+    include_bundled: booleanParam('Index *.min.js and *.bundle.js files (default: false). Source maps remain disclosed but unindexed. Bypasses the shared cache.'),
     bridge: booleanParam('Match server routes to client requests (endpoints command).'),
     server_only: booleanParam('Only list server routes (endpoints command).'),
     client_only: booleanParam('Only list client requests (endpoints command).'),
@@ -400,7 +403,7 @@ server.registerTool(
         if (applicable) {
             // Truly global options — apply to all commands (build/display control).
             // Command-specific params (name, term, stack, range, etc.) are in FLAG_APPLICABILITY.
-            const coreParams = new Set(['maxChars', 'maxFiles', 'followSymlinks']);
+            const coreParams = new Set(['maxChars', 'maxFiles', 'followSymlinks', 'includeBundled']);
             for (const key of Object.keys(ep)) {
                 if (coreParams.has(key)) continue;
                 if (!applicable.includes(key) && ep[key] !== undefined &&
@@ -512,7 +515,8 @@ server.registerTool(
             // so we save here to avoid re-parsing all files on every MCP session.
             // MED-1: also persist when reachability was computed in-process so
             // long-lived MCP servers carry the BFS result forward to disk.
-            if (index && (index.callsCacheDirty || index.reachabilityDirty || index.computedDispatchDirty)) {
+            if (index && !ep.includeBundled && !ep.maxFiles &&
+                (index.callsCacheDirty || index.reachabilityDirty || index.computedDispatchDirty)) {
                 try { index.saveCache(); } catch (_) { /* best-effort */ }
                 index.callsCacheDirty = false;
             }

@@ -52,15 +52,14 @@ const DEFAULT_IGNORES = [
     '.pytest_cache',
     '.mypy_cache',
 
-    // Bundled/minified
-    '*.min.js',
-    '*.bundle.js',
-    '*.map',
-
     // System
     '.DS_Store',
     '.ucn-cache'
 ];
+
+// These can contain user code: disclose their exclusion, unlike dependency
+// and VCS directories. Source maps are data and cannot be parsed as code.
+const BUNDLED_PATTERNS = ['*.min.js', '*.bundle.js', '*.map'];
 
 // Conditional ignores - only ignore when marker file exists in same directory
 // Maps directory name -> array of marker files that indicate it's a vendor dir
@@ -340,6 +339,7 @@ function expandGlob(pattern, options = {}) {
         maxDepth,
         maxFileSize,
         followSymlinks,
+        includeBundled: options.includeBundled === true,
         // Anchored gitignore patterns ('/name') apply only to entries directly
         // under the project root — the .gitignore's own directory (fix #226).
         anchorRoot: root,
@@ -530,6 +530,16 @@ function walkDir(dir, options, depth = 0, visited = new Set()) {
                 walkDir(fullPath, options, depth + 1, visited);
             }
         } else if (isFile) {
+            if (shouldIgnore(entry.name, BUNDLED_PATTERNS) &&
+                (!options.includeBundled || entry.name.endsWith('.map'))) {
+                options.onDiscoveryIssue?.({
+                    path: fullPath, kind: 'file', reason: 'bundled',
+                    detail: entry.name.endsWith('.map')
+                        ? 'source maps are not supported source files'
+                        : 'bundled/minified filename; use --include-bundled to index',
+                });
+                continue;
+            }
             if (options.filePattern.test(entry.name)) {
                 let size;
                 try { size = fs.statSync(fullPath).size; } catch (e) {

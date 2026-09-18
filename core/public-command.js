@@ -22,7 +22,7 @@ function buildPublicParams(command, arg, params = {}) {
     if (clean.top === 0 && params.topRaw == null) delete clean.top;
     if (clean.maxLines == null) delete clean.maxLines;
     // Surface-only values never belong in execute params.
-    for (const key of ['json', 'quiet', 'cache', 'clearCache', 'followSymlinks', 'interactive',
+    for (const key of ['json', 'quiet', 'cache', 'clearCache', 'followSymlinks', 'includeBundled', 'interactive',
         'topRaw', 'limitRaw', 'maxFilesRaw', 'maxLinesRaw', 'maxChars', 'maxCharsRaw',
         'depthRaw', 'contextRaw', 'workersRaw',
         '_fileFromFileMode']) delete clean[key];

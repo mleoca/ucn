@@ -58,6 +58,8 @@ Symbol-listing commands emit handles such as `src/api.ts:42:handler`. Pass the f
 | `--class-name=<name>` | Scope a member when no handle is available. |
 | `--in=<directory>` | Limit query scope to a directory. |
 | `--exclude=<patterns>` | Exclude matching paths. |
+| `--limit=N` | Default maximum of 500 results for `find`, `usages`, text `search`, `deadcode`, `api`, and `repo` files; structural `search` defaults to 50. Explicit limits override these caps; `--lines` is uncapped by default. |
+| `--include-bundled` | Include `*.min.js` and `*.bundle.js` in discovery, respecting user exclusions and bypassing the shared cache. By default these and `*.map` are disclosed as skipped sources and completeness is partial. Source maps remain unindexed. MCP: `include_bundled=true`. |
 | `--depth=N` | Set trace/dependency/test traversal depth. |
 | `--direction=<value>` | Select trace or dependency direction. |
 | `--all` | Lift result and formatter caps where supported. It is recommended only for commands that accept it. |
@@ -83,6 +85,13 @@ ucn [target] <command> [argument] [flags]
 ```
 
 Omit the target for the current project. A target may be a file, directory, or quoted glob such as `"src/**/*.py"`.
+
+Ordinary text and shell command errors exit 2. JSON command errors retain
+exit 1 with `meta.ok: false` and an `error` field; successful empty JSON
+results exit 0. Target-less `check` exits 1 for `TRUST: BLOCKED`, 0 for other
+completed checks, and 2 when the check could not run. Working-tree `impact`
+and `check` count untracked documentation/configuration in their non-source
+path note; `--staged` excludes all untracked paths.
 
 ## Language notes
 

@@ -292,6 +292,11 @@ function num(val, fallback) {
     return isNaN(n) ? fallback : n;
 }
 
+/** Shared listing bound; shell listings remain uncapped unless requested. */
+function listingLimit(p) {
+    return num(p.limit, undefined) || (p.lines || p.all ? undefined : 500);
+}
+
 /**
  * Apply limit to an array result.
  * Returns { items, total, limited } where limited is true if truncated.
@@ -771,7 +776,7 @@ const HANDLERS = {
             ...p,
             // repo's public limit caps the file result set. Direct toc's
             // legacy symbol-list cap is intentionally not composed here.
-            top: p.top || p.limit,
+            top: p.top || listingLimit(p),
             limit: undefined,
         });
         if (!failure && selected.has('stats')) failure = collect('stats', 'stats', p);
@@ -1147,10 +1152,13 @@ const HANDLERS = {
                 if (!p.withSource && Array.isArray(response.result)) {
                     response.result = response.result.map(({ code, ...item }) => item);
                 }
-                const limit = num(p.limit, undefined);
+                const limit = listingLimit(p);
                 if (limit && limit > 0 && Array.isArray(response.result)) {
                     const { items, total, limited } = applyLimit(response.result, limit);
                     response.result = items;
+                    Object.defineProperty(items, 'findInfo', {
+                        value: { total, shown: items.length }, enumerable: false,
+                    });
                     if (limited) {
                         const note = limitNote(limit, total);
                         response.note = response.note ? `${response.note}\n${note}` : note;
@@ -1184,9 +1192,9 @@ const HANDLERS = {
             file: p.file,
             className: p.className,
             exact: p.exact || false,
-            // A shell definition listing renders no activity counts. Avoid a
-            // full pinned caller query for every definition in a wildcard.
-            skipCounts: !!p.lines,
+            // Filter and bound the inventory before resolving any callers.
+            // Shell listings do not need the activity pass at all.
+            skipCounts: true,
             exclude,
             in: p.in,
         });
@@ -1203,9 +1211,6 @@ const HANDLERS = {
             };
             const kinds = kindGroups[p.type] || new Set([p.type]);
             result = result.filter(item => kinds.has(item.type));
-        }
-        if (p.withSource) {
-            result = result.map(item => ({ ...item, code: readAndExtract(item) }));
         }
         const fullFindCount = result.length;
         const nameWideDefinitionCounts = Object.fromEntries(
@@ -1234,11 +1239,21 @@ const HANDLERS = {
             }
         }
         // Apply limit
-        const limit = num(p.limit, undefined);
-        if (limit && limit > 0) {
-            const { items, total, limited } = applyLimit(result, limit);
-            if (limited) notes.push(limitNote(limit, total));
-            result = items;
+        const limit = listingLimit(p);
+        if (!p.lines) {
+            index._beginOp();
+            try {
+                result = index._applyFindFilters(result, { limit });
+            } finally { index._endOp(); }
+        } else {
+            result = applyLimit(result, limit).items;
+        }
+        if (result.length < fullFindCount) {
+            notes.push(limitNote(result.length, fullFindCount));
+            if (!p.lines) notes.push('Selection ranked by approximate usage totals; returned activity counts use definition-pinned caller evidence.');
+        }
+        if (p.withSource) {
+            result = result.map(item => ({ ...item, code: readAndExtract(item) }));
         }
         Object.defineProperty(result, 'findInfo', {
             value: {
@@ -1300,11 +1315,15 @@ const HANDLERS = {
             if (hidden > 0) notes.push(`${hidden} test-file usage(s) hidden by default — pass --include-tests to include them.`);
         }
         // Apply limit to total usages (result is a flat array)
-        const limit = num(p.limit, undefined);
+        const limit = listingLimit(p);
         let limited = result;
         if (limit && limit > 0 && Array.isArray(result) && result.length > limit) {
             notes.push(limitNote(limit, result.length));
             limited = result.slice(0, limit);
+            Object.defineProperty(limited, 'limitInfo', {
+                value: { total: result.length, shown: limited.length },
+                enumerable: false,
+            });
             // Summary counts describe the FULL result set — the limit applies
             // to listed entries only (fix #237: the header claimed '0 calls'
             // for a called function whenever the definition filled the limit).
@@ -1640,7 +1659,7 @@ const HANDLERS = {
             file: p.file,
         });
         // Apply limit to dead code results (result is an array with custom properties)
-        const limit = num(p.limit, undefined);
+        const limit = listingLimit(p);
         let note;
         if (limit && limit > 0 && Array.isArray(result) && result.length > limit) {
             note = limitNote(limit, result.length);
@@ -2331,7 +2350,7 @@ const HANDLERS = {
             if (fileErr) return { ok: false, error: fileErr };
         }
         // Apply limit to api results (api returns an array)
-        const limit = num(p.limit, undefined);
+        const limit = listingLimit(p);
         let note;
         if (limit && limit > 0 && Array.isArray(result)) {
             const { items, total, limited } = applyLimit(result, limit);
@@ -2494,7 +2513,18 @@ function execute(index, command, params = {}) {
                 }
             }
         }
-        return handler(index, params);
+        const response = handler(index, params);
+        const bundled = (index.discoveryIssues || []).filter(issue => issue.reason === 'bundled');
+        if (bundled.length > 0) {
+            const files = bundled.slice(0, 5).map(issue => issue.relativePath).join(', ');
+            const note = `UCN skipped ${bundled.length} bundled/minified or source-map file(s): ${files}` +
+                (bundled.length > 5 ? ', ...' : '') +
+                '. This is not a repository-wide semantic zero; use --include-bundled for JavaScript bundles ' +
+                '(source maps remain unindexed), or grep/ripgrep to inspect skipped files.';
+            if (response.ok) response.note = combineNotes([response.note, note]);
+            else response.error = `${response.error}\n${note}`;
+        }
+        return response;
     } catch (e) {
         return { ok: false, error: e.message };
     }

@@ -1519,8 +1519,8 @@ describe('UCN v5 prerelease audit regressions', () => {
                 'function greet(name, punctuation){return name+punctuation;}\nmodule.exports={greet};');
             assert.equal(cli(['check']).status, 1);
             assert.equal(cli(['check', 'greet']).status, 1);
-            assert.equal(cli(['plan', 'greet', '--rename-to=class']).status, 1);
-            assert.equal(cli(['plan', 'greet', '--remove-param=missing']).status, 1);
+            assert.equal(cli(['plan', 'greet', '--rename-to=class']).status, 2);
+            assert.equal(cli(['plan', 'greet', '--remove-param=missing']).status, 2);
         } finally { rm(dir); }
     });
 

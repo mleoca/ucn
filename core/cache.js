@@ -711,7 +711,8 @@ function clearAllCaches() {
 // v224 (#355 recovery): Go declaration origins; Rust aliases, wrapper patterns,
 // copied bindings and qualified macro receivers; TS indexed array evidence.
 // v225 (fix #357): Rust `use path::name as local` bindings record the original name with a paired `renames` alias.
-const CACHE_FORMAT_VERSION = 225;
+// v226: bundled/minified filename exclusions are disclosed in discoveryIssues.
+const CACHE_FORMAT_VERSION = 226;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**
@@ -935,6 +936,7 @@ function saveCache(index, cachePath) {
         unsupportedFiles: Array.isArray(index.unsupportedFiles)
             ? index.unsupportedFiles
             : [],
+        includeBundled: index.includeBundled === true,
         discoveryIssues: Array.isArray(index.discoveryIssues)
             ? index.discoveryIssues
             : [],
@@ -1164,6 +1166,7 @@ function loadCache(index, cachePath) {
         index.unsupportedFiles = Array.isArray(cacheData.unsupportedFiles)
             ? cacheData.unsupportedFiles
             : [];
+        index.includeBundled = cacheData.includeBundled === true;
         index.discoveryIssues = Array.isArray(cacheData.discoveryIssues)
             ? cacheData.discoveryIssues
             : [];
@@ -1302,8 +1305,13 @@ function isCacheStale(index) {
     // Only reached when all cached files are unchanged.
     const pattern = detectProjectPattern(index.root);
     const currentUnsupported = [];
+    const currentBundled = [];
     const globOpts = {
         root: index.root,
+        includeBundled: index.includeBundled === true,
+        onDiscoveryIssue: issue => {
+            if (issue.reason === 'bundled') currentBundled.push(path.relative(index.root, issue.path));
+        },
         onSkippedFile: (filePath) => {
             const kind = classifyUnsupportedSourceFile(filePath);
             if (!kind) return;
@@ -1321,6 +1329,11 @@ function isCacheStale(index) {
         globOpts.ignores = [...DEFAULT_IGNORES, ...configExclude];
     }
     const currentFiles = expandGlob(pattern, globOpts);
+    const cachedBundled = (index.discoveryIssues || [])
+        .filter(issue => issue.reason === 'bundled').map(issue => issue.relativePath).sort();
+    currentBundled.sort();
+    if (cachedBundled.length !== currentBundled.length ||
+        cachedBundled.some((value, i) => value !== currentBundled[i])) return true;
     const cachedPaths = new Set(index.files.keys());
     const currentPaths = new Set(currentFiles);
 

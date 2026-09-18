@@ -10,13 +10,17 @@ function formatCheck(result) {
         // The gate could not run — never render this like a clean tree.
         return `Pre-commit Check (${result.base}${result.staged ? ', staged' : ''})\n${'═'.repeat(60)}\nCHECK DID NOT RUN [${result.status || 'diff-failed'}] — ${result.error || 'git diff failed'}\nThis is not a pass. Fix the git context (run inside a git repository with a valid base ref) and rerun.`;
     }
+    const pathNotes = [];
+    if (result.nonSourcePaths > 0) pathNotes.push(`Note: ${result.nonSourcePaths} changed path(s) outside supported source files not analyzed.`);
+    if (result.untrackedPaths > 0) pathNotes.push(`Note: ${result.untrackedPaths} untracked source file(s) included as whole-file additions.`);
     if (result.empty) {
-        return `Pre-commit Check (${result.base}${result.staged ? ', staged' : ''})\n${'═'.repeat(60)}\nNo changes to analyze${result.reason ? ` (${result.reason})` : ''}.`;
+        return [`Pre-commit Check (${result.base}${result.staged ? ', staged' : ''})\n${'═'.repeat(60)}\nNo changes to analyze${result.reason ? ` (${result.reason})` : ''}.`, ...pathNotes].join('\n');
     }
 
     const lines = [];
     lines.push(`Pre-commit Check vs ${result.base}${result.staged ? ' (staged)' : ''}`);
     lines.push('═'.repeat(60));
+    lines.push(...pathNotes);
     if (result.trust) {
         lines.push(`TRUST: ${result.trust.status} — UCN evidence is not semantic proof; compiler and tests are required`);
         const trustDetails = [];

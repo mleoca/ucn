@@ -372,6 +372,11 @@ function formatPublicText(command, result, params = {}, execution = {}) {
 function formatPublicJson(command, result, params = {}, execution = {}) {
     let commandMeta = {};
     let data = result;
+    if (Array.isArray(result) && result.limitInfo) {
+        commandMeta.total = result.limitInfo.total;
+        commandMeta.shown = result.limitInfo.shown;
+        commandMeta.truncated = result.limitInfo.shown < result.limitInfo.total;
+    }
 
     // Ambiguous bare-name resolution is a surface-level trust decision. Keep
     // it in the common envelope even for array results (notably `tests`, whose

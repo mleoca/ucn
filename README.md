@@ -213,6 +213,23 @@ and a shell-mode character budget fails before writing partial output.
 `source --raw` extracts complete functions and classes unless an explicit
 line limit is requested; any resulting truncation is reported on stderr.
 
+Ordinary text-mode command errors also exit 2. JSON keeps exit 0 for successful
+empty results and exit 1 for command errors (`meta.ok: false` plus `error`).
+Target-less `check` exits 1 when `TRUST` is `BLOCKED`, 0 for other completed
+checks, and 2 if it could not run.
+
+Outside `--lines`, `find`, `usages`, text `search`, `deadcode`, `api`, and
+`repo --sections=files` default to a maximum of 500 results. Use `--limit=N`
+to request more. Broad `find` queries select candidates by approximate usage
+totals before calculating definition-pinned caller activity, and disclose
+that selection when limited.
+
+Files named `*.min.js`, `*.bundle.js`, and `*.map` are reported as skipped
+sources and make completeness partial. `--include-bundled` (MCP
+`include_bundled=true`) indexes the JavaScript bundles while respecting user
+exclusions; it bypasses the shared cache. Source maps remain disclosed but
+unindexed.
+
 ## AI setup
 
 One tool, 18 commands, compact source-linked answers that keep their trust

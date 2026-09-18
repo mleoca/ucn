@@ -41,6 +41,12 @@ three. The text block is the whole response on every surface.
 
 Persistent indexes live in a per-user, project-keyed cache rather than the analyzed repository. Set `UCN_CACHE_DIR` to override the cache root; CLI `--no-cache` bypasses persistence and `--clear-cache` removes the current project's cache. Legacy `<project>/.ucn-cache` directories are migrated on first use. Concurrent invocations on a cold cache share one build: the first process takes a build lock, the others wait for its cache (`Waiting for another ucn process building the index...` on stderr) instead of rebuilding; a lock left by a dead process is broken automatically.
 
+Files named `*.min.js`, `*.bundle.js`, and `*.map` are disclosed as skipped
+bundled sources; they make observed-text completeness partial. Pass
+`--include-bundled` (MCP `include_bundled=true`) to index the JavaScript files.
+This option bypasses the shared cache and still respects user exclusions.
+Source maps remain disclosed but unindexed; inspect them with text tools.
+
 Supported source families are JavaScript/TypeScript/TSX, Python, Go, Rust, Java, C, C++, C#, and HTML inline JavaScript/event handlers. C/C++ uses `compile_commands.json` when available to classify headers and resolve include paths. Recoverable preprocessor branches contribute AST-proven source facts, so a single selected configuration does not silently erase definitions or calls; disagreeing conditional macro identities stay visible as unverified. C++ resolution uses namespace ownership, static overload shape (including arrays), and macro-parameter requalification. C# resolution uses declared property/field receiver types plus overload and hiding discipline. This is portable AST analysis, not a compiler build; macros, templates, generated code, reflection, and external dependency semantics can remain unverified.
 
 `repo` refines its HOT list exactly for up to 400 candidate definitions per
@@ -78,6 +84,7 @@ counts them; `CALL SITES` stays call-shaped.
 Target-less `impact` and `check` diff the working tree against `HEAD` AND
 include untracked, non-ignored source files as whole-file additions, so new
 modules are checked before `git add`. `--staged` keeps its index-only meaning.
+The changed-path note also counts untracked documentation and configuration.
 
 An observed-text zero is not semantic zero or safe-delete proof. Numeric evidence values are ordinal ranking weights, not probabilities.
 
@@ -143,6 +150,11 @@ characters (backslash/tab/CR/LF) are escaped; use JSON for exact filenames.
 languages; use `ucn ... --lines` when the question is a symbol, a caller, or a
 definition, and `--raw` when the next step is an edit.
 
+Command errors exit 2 in ordinary text mode as well. CLI JSON preserves its
+own contract: successful empty results exit 0; command errors exit 1 with
+`meta.ok: false` and an `error` field. A target-less `check` exits 1 when
+`TRUST` is `BLOCKED`, 0 otherwise; a check that could not run exits 2.
+
 ## Breaking-change protocol
 
 1. Pin the exact definition with `find`.
@@ -183,6 +195,12 @@ rejected, and unsupported advanced syntax should be handed to ripgrep.
 `find` activity counts are definition-pinned: confirmed plus visible unverified
 call candidates. Calls proved to belong to another same-name target are
 disclosed separately and excluded from the activity total.
+Broad queries rank candidates by inexpensive approximate usage totals before
+applying the row limit; only returned definitions receive caller adjudication.
+The selection note discloses that approximation. `find`, `usages`, text
+`search`, `deadcode`, `api`, and `repo --sections=files` default to at most 500
+results (structural `search`: 50). Use an explicit `--limit=N` to request more;
+`--lines` has no default row cap.
 
 For `plan --rename-to`, the selected declaration is only the starting point.
 When the index proves the relationship, the rename unit closes over

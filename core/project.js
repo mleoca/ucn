@@ -424,6 +424,7 @@ class ProjectIndex {
         const implicitProjectDiscovery = !Array.isArray(pattern) && !pattern;
         this.unsupportedFiles = [];
         this.discoveryIssues = [];
+        this.includeBundled = options.includeBundled === true;
         const discoveryIssueKeys = new Set();
         const recordDiscoveryIssue = (issue) => {
             const rel = path.relative(this.root, issue.path || this.root) || '.';
@@ -450,7 +451,8 @@ class ProjectIndex {
                 maxFiles: options.maxFiles || this.config.maxFiles || 50000,
                 maxDepth: options.maxDepth ?? this.config.maxDepth,
                 maxFileSize: options.maxFileSize ?? this.config.maxFileSize,
-                followSymlinks: options.followSymlinks
+                followSymlinks: options.followSymlinks,
+                includeBundled: this.includeBundled,
             };
 
             // Merge .gitignore and .ucn.json exclude into file discovery

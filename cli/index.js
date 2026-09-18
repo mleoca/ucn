@@ -48,7 +48,7 @@ let activeCanonicalCommand = null;
 class CommandError extends Error { constructor() { super(); } }
 
 // Thrown by validateNumericFlags when a numeric flag has a bad value.
-// The CLI top-level catches this, prints the message, and exits 1. Interactive
+// The CLI top-level catches this, prints the message, and exits 2 (JSON: 1). Interactive
 // mode catches it inside its REPL try/catch and continues the session.
 class FlagValidationError extends Error {
     constructor(msg) { super(msg); this.name = 'FlagValidationError'; }
@@ -363,6 +363,7 @@ function parseFlags(tokens) {
         hideUncertain: tokens.includes('--hide-uncertain') || tokens.includes('--no-uncertain') || undefined,
         stack: getValueFlag('--stack'),
         workersRaw: getValueFlag('--workers'),
+        includeBundled: tokens.includes('--include-bundled') || undefined,
         workers: (() => {
             const v = getValueFlag('--workers');
             if (v === null) return undefined;
@@ -376,7 +377,7 @@ function parseFlags(tokens) {
 const flags = parseFlags(args);
 flags.json = args.includes('--json');
 flags.quiet = !args.includes('--verbose') && !args.includes('--no-quiet');
-flags.cache = !args.includes('--no-cache');
+flags.cache = !args.includes('--no-cache') && !flags.includeBundled;
 flags.clearCache = args.includes('--clear-cache');
 flags.interactive = args.includes('--interactive') || args.includes('-i');
 flags.followSymlinks = !args.includes('--no-follow-symlinks');
@@ -408,7 +409,7 @@ if (unknownFlags.length > 0) {
     emitCliError(
         `Unknown flag(s): ${unknownFlags.join(', ')}. Use --help to see available flags.`,
     );
-    process.exit(flags.lines || flags.raw ? 2 : 1);
+    process.exit(flags.json ? 1 : 2);
 }
 
 // Validate numeric flag values up front so bad input fails before we build
@@ -419,7 +420,7 @@ try {
 } catch (e) {
     if (e instanceof FlagValidationError) {
         emitCliError(e.message);
-        process.exit(flags.lines || flags.raw ? 2 : 1);
+        process.exit(flags.json ? 1 : 2);
     }
     throw e;
 }
@@ -607,7 +608,7 @@ function main() {
         if (!(e instanceof CommandError)) {
             emitCliError(`Error: ${e.message}`);
         }
-        process.exitCode = flags.lines || flags.raw ? 2 : 1;
+        process.exitCode = flags.json ? 1 : 2;
     }
 }
 
@@ -625,7 +626,7 @@ function printTieredNoOpNotes(canonical, flags, print) {
 }
 
 const GLOBAL_FLAG_KEYS = new Set([
-    'json', 'quiet', 'cache', 'clearCache', 'followSymlinks', 'maxFiles',
+    'json', 'quiet', 'cache', 'clearCache', 'followSymlinks', 'includeBundled', 'maxFiles',
     'verbose', 'interactive', '_fileFromFileMode', 'topRaw',
     'limitRaw', 'maxFilesRaw', 'maxLinesRaw', 'depthRaw', 'contextRaw',
     'workers', 'workersRaw', 'lineRaw', 'maxChars', 'maxCharsRaw', 'minConfidenceRaw',
@@ -752,7 +753,7 @@ function runProjectCommand(rootDir, command, arg) {
     if (flags.cache && !flags.clearCache) {
         const loaded = index.loadCache();
         cacheWasLoaded = !!loaded;
-        if (loaded && !flags.maxFiles) {
+        if (loaded && !index.includeBundled && !flags.maxFiles) {
             if (!index.isCacheStale()) {
                 usedCache = true;
                 if (!flags.quiet) {
@@ -766,7 +767,7 @@ function runProjectCommand(rootDir, command, arg) {
     // If cache was loaded but stale, force rebuild to avoid duplicates
     let needsCacheSave = false;
     if (!usedCache) {
-        const buildOpts = { quiet: flags.quiet, forceRebuild: cacheWasLoaded, followSymlinks: flags.followSymlinks, maxFiles: flags.maxFiles, workers: flags.workers };
+        const buildOpts = { quiet: flags.quiet, forceRebuild: cacheWasLoaded, followSymlinks: flags.followSymlinks, includeBundled: flags.includeBundled, maxFiles: flags.maxFiles, workers: flags.workers };
         if (flags.cache && !flags.maxFiles) {
             // Cross-process build lock (fix #354): concurrent cold-cache
             // invocations share one build instead of each rebuilding.
@@ -813,7 +814,7 @@ function runProjectCommand(rootDir, command, arg) {
         if (!(e instanceof CommandError)) {
             emitCliError(`Error: ${e.message}`);
         }
-        process.exitCode = flags.lines || flags.raw ? 2 : 1;
+        process.exitCode = flags.json ? 1 : 2;
     } finally {
         // Save cache after command execution so callsCache populated
         // by findCallers/findCallees gets persisted to disk.
@@ -834,7 +835,11 @@ function runProjectCommand(rootDir, command, arg) {
 // ============================================================================
 
 function runGlobCommand(pattern, command, arg) {
-    const files = expandGlob(pattern);
+    const discoveryIssues = [];
+    const files = expandGlob(pattern, {
+        includeBundled: flags.includeBundled,
+        onDiscoveryIssue: issue => discoveryIssues.push(issue),
+    });
 
     if (files.length === 0) {
         fail(`No files match pattern: ${pattern}`, command);
@@ -849,6 +854,9 @@ function runGlobCommand(pattern, command, arg) {
     const rootDir = findProjectRoot(path.dirname(files[0]));
     const index = new ProjectIndex(rootDir);
     index.build(files, { quiet: true });
+    index.discoveryIssues.push(...discoveryIssues.map(issue => ({
+        ...issue, relativePath: path.relative(index.root, issue.path), path: undefined,
+    })));
 
     if (!isPublicCommand(canonical)) {
         fail(unknownCommandMessage(command));
@@ -938,14 +946,14 @@ ${perCommandFlags}
 
 Global/build/output flags:
   --help -h --version -v --mcp --json --verbose --no-quiet --quiet
-  --interactive -i --no-cache --clear-cache --no-follow-symlinks
+  --interactive -i --no-cache --clear-cache --no-follow-symlinks --include-bundled
   --max-files=N --max-chars=N --workers=N
   --clear-cache --all clears every bounded per-user UCN project cache.
 
 Exit codes:
   0  Command completed successfully; check found no blocking issues.
-  1  Findings, unsafe changes, validation failures, or invalid user input.
-  2  Command could not run (operational/environment failure).
+  1  Empty --lines listing, blocking check findings, or JSON command error.
+  2  Text/shell command error, or a check that could not run.
 
 Boolean aliases:
   --no-include-methods --no-regex --show-confidence --hide-confidence
@@ -995,14 +1003,14 @@ function runInteractive(rootDir) {
     let iCacheFresh;
     if (flags.cache) {
         const loaded = !flags.clearCache && index.loadCache();
-        iCacheFresh = loaded && !index.isCacheStale();
+        iCacheFresh = loaded && !index.includeBundled && !index.isCacheStale();
         if (!iCacheFresh) {
             index.buildCached({ quiet: true, forceRebuild: !!loaded, workers: flags.workers }, {
                 onWait: () => console.log('Waiting for another ucn process building the index...'),
             });
         }
     } else {
-        index.build(null, { quiet: true, workers: flags.workers });
+        index.build(null, { quiet: true, workers: flags.workers, includeBundled: flags.includeBundled });
     }
     console.log(`Index ready: ${index.files.size} files, ${index.symbols.size} unique symbol names`);
     console.log('Type commands (e.g., "find parseFile", "show main", "repo")');
@@ -1118,16 +1126,18 @@ Flags can be added per-command: show myFunc --sections=source,callers
             // refreshes individual call records lazily; without this matching
             // rebuild a newly added definition was invisible while its calls
             // appeared in neighbouring answers (UCN5-044).
-            if (index.isCacheStale()) {
+            const includeBundled = !!(iflags.includeBundled || flags.includeBundled);
+            if (!!index.includeBundled !== includeBundled || index.isCacheStale()) {
                 console.log('Source changed; rebuilding index...');
                 const rebuildOpts = {
                     quiet: true,
                     forceRebuild: true,
                     followSymlinks: flags.followSymlinks,
+                    includeBundled,
                     maxFiles: flags.maxFiles,
                     workers: flags.workers,
                 };
-                if (flags.cache && !flags.maxFiles) {
+                if (flags.cache && !flags.maxFiles && !includeBundled) {
                     index.buildCached(rebuildOpts, {
                         onWait: () => console.log('Waiting for another ucn process building the index...'),
                     });

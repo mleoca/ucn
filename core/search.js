@@ -204,9 +204,19 @@ function _applyFindFilters(index, matches, options) {
         return filtered;
     }
 
-    // Add per-symbol usage counts for disambiguation
-    const withCounts = filtered.map(m => {
-        const counts = index.countSymbolUsages(m);
+    // Rank cheaply before adjudicating callers. A broad inventory must never
+    // pay for pinned caller resolution on rows the caller will not receive.
+    const ranked = filtered.map(symbol => ({
+        symbol, counts: index.countSymbolUsages(symbol),
+    }));
+    if (options.limit > 0 && ranked.length > options.limit) {
+        ranked.sort((a, b) => b.counts.total - a.counts.total ||
+            codeUnitCompare(a.symbol.relativePath || '', b.symbol.relativePath || '') ||
+            a.symbol.startLine - b.symbol.startLine ||
+            codeUnitCompare(a.symbol.name, b.symbol.name));
+    }
+    const survivors = options.limit > 0 ? ranked.slice(0, options.limit) : ranked;
+    const withCounts = survivors.map(({ symbol: m, counts }) => {
         // The fast count supplies cheap definition/import totals, but its
         // name-only call bucket cannot distinguish json.dumps from a project
         // dumps, or one class's save from another's. The public `find`

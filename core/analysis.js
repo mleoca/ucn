@@ -2052,7 +2052,14 @@ function diffImpact(index, options = {}) {
             if (known.has(localRel)) continue;
             const filePath = path.join(index.root, localRel);
             const fileEntry = index.files.get(filePath);
-            if (!fileEntry || !detectLanguage(filePath)) continue;
+            if (!fileEntry || !detectLanguage(filePath)) {
+                changes.push({
+                    filePath, relativePath: localRel,
+                    gitRelativePath: projectPrefix ? `${projectPrefix}/${localRel}` : localRel,
+                    addedLines: [], deletedLines: [], untracked: true,
+                });
+                continue;
+            }
             let lineCount = fileEntry.lines;
             if (!Number.isFinite(lineCount)) {
                 try { lineCount = fs.readFileSync(filePath, 'utf-8').split('\n').length; } catch (_) { continue; }
@@ -2096,7 +2103,10 @@ function diffImpact(index, options = {}) {
 
     for (const change of changes) {
         const lang = detectLanguage(change.filePath);
-        if (!lang) { nonSourcePaths++; continue; }
+        if (!lang || (change.untracked && !index.files.has(change.filePath))) {
+            nonSourcePaths++;
+            continue;
+        }
 
         const fileEntry = index.files.get(change.filePath);
 
