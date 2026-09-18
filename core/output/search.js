@@ -87,6 +87,10 @@ function formatSearchJson(results, term) {
 /**
  * Format structural search results (index-based queries)
  */
+function unusedSearchNote(flag = '--unused') {
+    return `${flag} lists callable symbols with no resolved call edge; it does not assess type/field/reference liveness and is not safe-delete proof. Confirm with deadcode and usages.`;
+}
+
 function formatStructuralSearch(result, options = {}) {
     const { results, meta } = result;
     const lines = [];
@@ -106,7 +110,7 @@ function formatStructuralSearch(result, options = {}) {
     lines.push(`Structural search: ${queryStr}`);
     lines.push('═'.repeat(60));
     if (meta.query.unused) {
-        lines.push(`NOTE: ${options.unusedFlag || '--unused'} lists callable symbols with no resolved call edge; it does not assess type/field/reference liveness and is not safe-delete proof. Confirm with deadcode and usages.`);
+        lines.push(`NOTE: ${unusedSearchNote(options.unusedFlag)}`);
         lines.push('');
     }
 
@@ -447,6 +451,7 @@ function formatTestsJson(tests, name) {
 }
 
 module.exports = {
+    unusedSearchNote,
     formatSearch,
     formatSearchJson,
     formatStructuralSearch,

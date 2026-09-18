@@ -10,6 +10,7 @@ const { ReceiverTypeMap, typeOrigin } = require('./type-evidence');
 
 const {
     traverseTree,
+    nodeTextWithoutComments,
     traverseTreeCached,
     nodeToLocation,
     extractParams,
@@ -34,7 +35,7 @@ function parseTree(parser, code) {
 function extractReturnType(node) {
     const returnTypeNode = node.childForFieldName('return_type');
     if (returnTypeNode) {
-        let text = returnTypeNode.text.trim();
+        let text = nodeTextWithoutComments(returnTypeNode).trim();
         if (text.startsWith(':')) {
             text = text.slice(1).trim();
         }

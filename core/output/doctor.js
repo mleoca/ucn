@@ -33,7 +33,7 @@ function formatDoctor(result, options = {}) {
     // Cache state
     if (result.cache) {
         const state = result.cache.fresh === true ? 'fresh' : result.cache.fresh === false ? 'stale' : 'unknown';
-        const buildHint = result.cache.buildMs ? `, ${result.cache.buildMs}ms build` : '';
+        const buildHint = result.cache.buildMs ? `, ${result.cache.buildMs}ms last index build (excludes cache I/O and query execution)` : '';
         lines.push(`Cache: ${state}${buildHint}`);
     }
     if (result.commandTrust) {

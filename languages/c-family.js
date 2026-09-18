@@ -13,6 +13,7 @@ const { typeOrigin } = require('./type-evidence');
 
 const {
     traverseTree,
+    nodeTextWithoutComments,
     traverseTreeCached,
     nodeToLocation,
     extractJSDocstring,
@@ -989,7 +990,7 @@ function paramTypeText(param, identity) {
     const defaultValue = param.childForFieldName('default_value');
     const end = defaultValue ? defaultValue.startIndex : param.endIndex;
     if (identity.nameNode.startIndex < base || identity.nameNode.endIndex > end) return null;
-    const text = param.text.slice(0, end - base);
+    const text = nodeTextWithoutComments(param).slice(0, end - base);
     const typeText = (text.slice(0, identity.nameNode.startIndex - base) +
         text.slice(identity.nameNode.endIndex - base))
         .replace(/\s+/g, ' ')
@@ -1014,10 +1015,10 @@ function structuredParams(paramsNode) {
         // their type text alone — the type must not double as both name and
         // annotation, and `void *` must not collapse into the `(void)` form.
         const info = {
-            name: identity.name || param.text.replace(/\s+/g, ' ').trim(),
+            name: identity.name || nodeTextWithoutComments(param).replace(/\s+/g, ' ').trim(),
         };
         if (typeNode && identity.name) {
-            info.type = paramTypeText(param, identity) || typeNode.text;
+            info.type = paramTypeText(param, identity) || nodeTextWithoutComments(typeNode);
         }
         if (param.type === 'optional_parameter_declaration') info.optional = true;
         let declaratorCursor = declarator;
@@ -1164,7 +1165,7 @@ function returnTypeOf(node) {
             const descriptor = (current.namedChildren || []).find(child =>
                 child.type === 'type_descriptor') || current.namedChild(0);
             const type = descriptor?.childForFieldName('type') || descriptor;
-            return type?.text || null;
+            return nodeTextWithoutComments(type) || null;
         }
         for (const child of current.namedChildren || []) {
             const found = findTrailing(child);
@@ -1193,7 +1194,7 @@ function returnTypeOf(node) {
         current = current.childForFieldName('declarator') ||
             (current.namedChildren || []).find(child => child.type.endsWith('_declarator'));
     }
-    return stars > 0 ? `${typeNode.text} ${'*'.repeat(stars)}` : typeNode.text;
+    return stars > 0 ? `${nodeTextWithoutComments(typeNode)} ${'*'.repeat(stars)}` : nodeTextWithoutComments(typeNode);
 }
 
 function memberFromNode(node, className, access, lines, mode) {
@@ -1209,7 +1210,7 @@ function memberFromNode(node, className, access, lines, mode) {
     if (isConstructor && identity.name.startsWith('~')) modifiers.push('destructor');
     return {
         name: identity.name,
-        params: paramsNode ? paramsNode.text.replace(/^\(|\)$/g, '').trim() : '...',
+        params: paramsNode ? nodeTextWithoutComments(paramsNode).replace(/^\(|\)$/g, '').trim() : '...',
         paramsStructured: structuredParams(paramsNode),
         returnType: isConstructor ? null :
             (identity.conversionType || returnTypeOf(node)),
@@ -1510,7 +1511,7 @@ function findFunctionsInTree(code, tree, mode, sourceLines = null) {
             : null;
         functions.push({
             name: identity.name,
-            params: paramsNode ? paramsNode.text.replace(/^\(|\)$/g, '').trim() : '...',
+            params: paramsNode ? nodeTextWithoutComments(paramsNode).replace(/^\(|\)$/g, '').trim() : '...',
             paramsStructured: structuredParams(paramsNode),
             returnType: isConstructor ? null :
                 (identity.conversionType || returnTypeOf(node)),
@@ -1800,7 +1801,7 @@ function findMacrosInTree(tree, lines, parser) {
             startLine,
             endLine,
             indent,
-            params: paramsNode ? paramsNode.text.replace(/^\(|\)$/g, '').trim() : undefined,
+            params: paramsNode ? nodeTextWithoutComments(paramsNode).replace(/^\(|\)$/g, '').trim() : undefined,
             paramsStructured: paramsNode
                 ? (paramsNode.namedChildren || [])
                     .filter(child => child.type === 'identifier')

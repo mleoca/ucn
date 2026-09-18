@@ -883,7 +883,10 @@ function structuralSearch(index, options = {}) {
                         // expression position — never "unused" (the deadcode
                         // twin of the bodyScopedName audit skip).
                         if (def.bodyScopedName) continue;
-                        index.buildCalleeIndex();
+                        // buildCalleeIndex rebuilds the whole project. Reuse
+                        // the eagerly built (or cache-loaded) index, including
+                        // across every candidate in this operation.
+                        if (!index.calleeIndex) index.buildCalleeIndex();
                         // A name whose every call site is its own recursion
                         // has zero callers (fix #253c — the deadcode
                         // carve-out, applied here). Class-kind names are

@@ -125,7 +125,7 @@ function formatStats(stats, options = {}) {
         lines.push(`Files: ${stats.files}`);
     }
     lines.push(`Symbols: ${stats.symbols}`);
-    lines.push(`Build time: ${stats.buildTime}ms`);
+    lines.push(`Last index build: ${stats.buildTime}ms (excludes cache I/O and query execution; reused from cache)`);
 
     lines.push('\nBy Language:');
     for (const [lang, info] of Object.entries(stats.byLanguage)) {

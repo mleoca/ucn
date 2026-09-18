@@ -143,7 +143,7 @@ const FLAG_APPLICABILITY = {
     impact:       ['name', 'file', 'exclude', 'className', 'line', 'includeMethods', 'top', 'unreachableOnly', 'compact', 'base', 'staged', 'limit', 'all', 'lines'],
     tests:        ['name', 'file', 'exclude', 'className', 'line', 'callsOnly', 'depth', 'includeMethods', 'all'],
     deps:         ['file', 'exclude', 'depth', 'direction', 'all', 'detailed', 'cycles'],
-    api:          ['file', 'in', 'limit'],
+    api:          ['file', 'in', 'limit', 'includeTests'],
     check:        ['name', 'file', 'className', 'line', 'includeMethods', 'base', 'staged', 'limit'],
     plan:         ['name', 'file', 'className', 'line', 'addParam', 'removeParam', 'renameTo', 'defaultValue'],
     repo:         ['file', 'exclude', 'top', 'limit', 'all', 'detailed', 'topLevel', 'in', 'functions', 'hot', 'deep', 'sections'],

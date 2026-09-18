@@ -10,6 +10,7 @@ const { ReceiverTypeMap, typeOrigin } = require('./type-evidence');
 
 const {
     traverseTree,
+    nodeTextWithoutComments,
     traverseTreeCached,
     nodeToLocation,
     parseStructuredParams,
@@ -128,7 +129,7 @@ function declarationTrees(code, parser) {
 function extractReturnType(node) {
     const returnTypeNode = node.childForFieldName('return_type');
     if (returnTypeNode) {
-        let text = returnTypeNode.text.trim();
+        let text = nodeTextWithoutComments(returnTypeNode).trim();
         if (text.startsWith('->')) {
             text = text.slice(2).trim();
         }
@@ -198,7 +199,7 @@ function extractRustParams(paramsNode) {
     // unknown signatures in JSON output (fix #238; the shared
     // utils.extractParams already had this fix).
     if (!paramsNode) return '...';
-    const text = paramsNode.text;
+    const text = nodeTextWithoutComments(paramsNode);
     return text.replace(/^\(|\)$/g, '').trim();
 }
 

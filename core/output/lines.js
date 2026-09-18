@@ -29,7 +29,8 @@ function record(pathLike, line, text, tag = '') {
     // Keep unusual filenames from becoming notes or extra physical records.
     let file = String(pathLike).replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t');
     if (file.startsWith('# ')) file = './' + file;
-    return `${file}:${line == null ? 0 : line}:${body}${tag ? `\t# ${tag}` : ''}`;
+    const tagText = String(tag || '').replace(/\s+/g, ' ').trim();
+    return `${file}:${line == null ? 0 : line}:${body}${tagText ? `\t# ${tagText}` : ''}`;
 }
 
 function commentLines(text) {
@@ -95,9 +96,14 @@ function searchRecords(result) {
     if (result && !Array.isArray(result) && Array.isArray(result.results)) {
         for (const item of result.results) {
             const text = item.params != null ? `${item.name}(${item.params})` : item.name;
-            out.push(record(item.file, item.line, text, item.kind || item.type));
+            const decorators = (item.decorators || []).map(d => `@${String(d).replace(/^@/, '')}`).join(', ');
+            const tag = [item.kind || item.type, decorators].filter(Boolean).join('; ');
+            out.push(record(item.file, item.line, text, tag));
         }
         const meta = result.meta;
+        if (meta?.query?.unused) {
+            notes.push(...commentLines(require('./search').unusedSearchNote()));
+        }
         if (meta && meta.totalMatched > meta.shown) {
             notes.push(`# ${meta.totalMatched - meta.shown} more match(es) (--limit=N / --all)`);
         }

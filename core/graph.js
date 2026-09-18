@@ -564,6 +564,8 @@ function api(index, filePath, options = {}) {
     const results = [];
     let scopedFiles = 0;
     let pythonImplicitFiles = 0;
+    let excludedTestFiles = 0;
+    let explicitFile = false;
 
     let fileIterator;
     if (filePath) {
@@ -573,6 +575,7 @@ function api(index, filePath, options = {}) {
             const fileEntry = index.files.get(resolved);
             if (!fileEntry) return { error: 'file-not-found', filePath };
             fileIterator = [[resolved, fileEntry]];
+            explicitFile = true;
         } else {
             // Fall back to pattern filter (substring match on relative path)
             const matches = [];
@@ -596,7 +599,8 @@ function api(index, filePath, options = {}) {
         }
 
         // Skip test files by default (test classes aren't part of public API)
-        if (!options.includeTests && isTestFile(fileEntry.relativePath, fileEntry.language)) {
+        if (!explicitFile && !options.includeTests && isTestFile(fileEntry.relativePath, fileEntry.language)) {
+            excludedTestFiles++;
             continue;
         }
         scopedFiles++;
@@ -612,7 +616,7 @@ function api(index, filePath, options = {}) {
     results.sort((a, b) => codeUnitCompare(a.file, b.file) ||
         (a.startLine - b.startLine) || codeUnitCompare(a.name, b.name));
     Object.defineProperty(results, 'apiInfo', {
-        value: { scopedFiles, pythonImplicitFiles },
+        value: { scopedFiles, pythonImplicitFiles, excludedTestFiles },
         enumerable: false, writable: true, configurable: true,
     });
     return results;

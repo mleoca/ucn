@@ -10,6 +10,7 @@ const { ReceiverTypeMap, typeOrigin } = require('./type-evidence');
 
 const {
     traverseTree,
+    nodeTextWithoutComments,
     traverseTreeCached,
     nodeToLocation,
     parseStructuredParams,
@@ -29,7 +30,7 @@ function parseTree(parser, code) {
 function extractReturnType(node) {
     const resultNode = node.childForFieldName('result');
     if (resultNode) {
-        return resultNode.text.trim() || null;
+        return nodeTextWithoutComments(resultNode).trim() || null;
     }
     return null;
 }
@@ -39,7 +40,7 @@ function extractReturnedFunctionResult(node) {
     const resultNode = node.childForFieldName('result');
     if (resultNode?.type !== 'function_type') return null;
     const innerResult = resultNode.childForFieldName('result');
-    return innerResult?.text.trim() || null;
+    return nodeTextWithoutComments(innerResult).trim() || null;
 }
 
 /**
@@ -51,7 +52,7 @@ function extractGoParams(paramsNode) {
     // unknown signatures in JSON output (fix #238; the shared
     // utils.extractParams already had this fix).
     if (!paramsNode) return '...';
-    const text = paramsNode.text;
+    const text = nodeTextWithoutComments(paramsNode);
     return text.replace(/^\(|\)$/g, '').trim();
 }
 
@@ -115,7 +116,7 @@ function _processFunction(node, functions, processedRanges, lines) {
                 indent,
                 modifiers: isExported ? ['export'] : [],
                 isFunctionVariable: true,
-                ...(resultNode?.text.trim() && { returnType: resultNode.text.trim() }),
+                ...(resultNode && { returnType: nodeTextWithoutComments(resultNode).trim() || null }),
             });
         }
         return true;
@@ -491,11 +492,11 @@ function extractInterfaceMembers(interfaceNode, codeOrLines) {
                 } else if (sub.type === 'parameter_list') {
                     hasParams = true;
                     if (!paramsText) {
-                        paramsText = sub.text.slice(1, -1); // strip parens
+                        paramsText = nodeTextWithoutComments(sub).slice(1, -1); // strip parens
                         paramsNode = sub;
                     } else {
                         // Second parameter_list is the return type tuple
-                        returnType = sub.text;
+                        returnType = nodeTextWithoutComments(sub);
                     }
                 }
             }
@@ -514,7 +515,7 @@ function extractInterfaceMembers(interfaceNode, codeOrLines) {
                 for (let j = 0; j < child.namedChildCount; j++) {
                     const sub = child.namedChild(j);
                     if (returnTypeNodes.has(sub.type) && sub.text !== nameText) {
-                        returnType = sub.text;
+                        returnType = nodeTextWithoutComments(sub);
                     }
                 }
             }

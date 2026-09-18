@@ -54,9 +54,30 @@ function extractParams(paramsNode) {
     // functions that actually take zero arguments. Empty → '' so callers can
     // render `main()` cleanly.
     if (!paramsNode) return '...';
-    const text = paramsNode.text;
+    const text = nodeTextWithoutComments(paramsNode);
     const stripped = text.replace(/^\(|\)$/g, '').trim();
     return stripped;  // '' for empty params, '...' only when paramsNode missing
+}
+
+/**
+ * Signature text without AST comment nodes. Keep source offsets/line breaks
+ * intact for declarator slicing, and preserve strings (including forward
+ * annotations and defaults containing comment-like text) verbatim.
+ */
+function nodeTextWithoutComments(node) {
+    if (!node) return '';
+    const text = node.text;
+    const parts = [];
+    let offset = 0;
+    traverseTree(node, child => {
+        if (child.type !== 'comment' && !child.type.endsWith('_comment')) return true;
+        const start = child.startIndex - node.startIndex;
+        const end = child.endIndex - node.startIndex;
+        parts.push(text.slice(offset, start), text.slice(start, end).replace(/[^\r\n]/g, ' '));
+        offset = end;
+        return false;
+    });
+    return parts.length ? parts.join('') + text.slice(offset) : text;
 }
 
 /**
@@ -140,7 +161,7 @@ function parseStructuredParams(paramsNode, language) {
 
 function parseJSParam(param, info) {
     if (param.type === 'identifier') {
-        info.name = param.text;
+        info.name = nodeTextWithoutComments(param);
     } else if (param.type === 'required_parameter' || param.type === 'optional_parameter') {
         const patternNode = param.childForFieldName('pattern');
         const typeNode = param.childForFieldName('type');
@@ -148,18 +169,18 @@ function parseJSParam(param, info) {
             // Check if pattern is a rest_pattern (e.g., ...args inside required_parameter)
             if (patternNode.type === 'rest_pattern') {
                 const innerName = patternNode.namedChild(0);
-                info.name = innerName ? innerName.text : patternNode.text.replace(/^\.\.\./, '');
+                info.name = innerName ? nodeTextWithoutComments(innerName) : nodeTextWithoutComments(patternNode).replace(/^\.\.\./, '');
                 info.rest = true;
             } else {
-                info.name = patternNode.text;
+                info.name = nodeTextWithoutComments(patternNode);
             }
         }
-        if (typeNode) info.type = typeNode.text.replace(/^:\s*/, '');
+        if (typeNode) info.type = nodeTextWithoutComments(typeNode).replace(/^:\s*/, '');
         if (param.type === 'optional_parameter') info.optional = true;
         // Check for default value (e.g., priority: number = 1)
         const valueNode = param.childForFieldName('value');
         if (valueNode) {
-            info.default = valueNode.text;
+            info.default = nodeTextWithoutComments(valueNode);
             info.optional = true;
         } else if (!info.rest) {
             // Also check for bare number/string/etc. children as defaults.
@@ -170,14 +191,14 @@ function parseJSParam(param, info) {
             // wrecking expectedArgs.min and the signature display).
             const NON_DEFAULT_PARAM_CHILDREN = new Set([
                 'identifier', 'type_annotation', 'rest_pattern',
-                'accessibility_modifier', 'override_modifier', 'readonly', 'decorator',
+                'accessibility_modifier', 'override_modifier', 'readonly', 'decorator', 'comment',
             ]);
             for (let i = 0; i < param.namedChildCount; i++) {
                 const child = param.namedChild(i);
                 if (child !== patternNode && child !== (typeNode && typeNode.parent === param ? typeNode : null) &&
                     !NON_DEFAULT_PARAM_CHILDREN.has(child.type)) {
                     // This is likely a default value node
-                    info.default = child.text;
+                    info.default = nodeTextWithoutComments(child);
                     info.optional = true;
                     break;
                 }
@@ -186,27 +207,27 @@ function parseJSParam(param, info) {
     } else if (param.type === 'rest_parameter' || param.type === 'rest_pattern') {
         // rest_parameter = TypeScript, rest_pattern = JavaScript
         const patternNode = param.childForFieldName('pattern') || param.namedChild(0);
-        if (patternNode) info.name = patternNode.text;
+        if (patternNode) info.name = nodeTextWithoutComments(patternNode);
         info.rest = true;
     } else if (param.type === 'assignment_pattern') {
         const leftNode = param.childForFieldName('left');
         const rightNode = param.childForFieldName('right');
-        if (leftNode) info.name = leftNode.text;
-        if (rightNode) info.default = rightNode.text;
+        if (leftNode) info.name = nodeTextWithoutComments(leftNode);
+        if (rightNode) info.default = nodeTextWithoutComments(rightNode);
     } else if (param.type === 'object_pattern' || param.type === 'array_pattern') {
         // Destructured params: { name, value } or [a, b]
-        info.name = param.text;
+        info.name = nodeTextWithoutComments(param);
     }
 }
 
 function parsePythonParam(param, info) {
     if (param.type === 'identifier') {
-        info.name = param.text;
+        info.name = nodeTextWithoutComments(param);
     } else if (param.type === 'typed_parameter') {
         const nameNode = param.namedChild(0);
         const typeNode = param.childForFieldName('type');
-        if (nameNode) info.name = nameNode.text;
-        if (typeNode) info.type = typeNode.text;
+        if (nameNode) info.name = nodeTextWithoutComments(nameNode);
+        if (typeNode) info.type = nodeTextWithoutComments(typeNode);
         // Python wraps annotated splats in typed_parameter, with the actual
         // `*args` / `**kwargs` node as its first named child. Treating those
         // as ordinary required parameters makes every short call look broken.
@@ -218,12 +239,12 @@ function parsePythonParam(param, info) {
         const nameNode = param.childForFieldName('name');
         const valueNode = param.childForFieldName('value');
         const typeNode = param.childForFieldName('type');
-        if (nameNode) info.name = nameNode.text;
-        if (valueNode) info.default = valueNode.text;
-        if (typeNode) info.type = typeNode.text;
+        if (nameNode) info.name = nodeTextWithoutComments(nameNode);
+        if (valueNode) info.default = nodeTextWithoutComments(valueNode);
+        if (typeNode) info.type = nodeTextWithoutComments(typeNode);
         info.optional = true;
     } else if (param.type === 'list_splat_pattern' || param.type === 'dictionary_splat_pattern') {
-        info.name = param.text;
+        info.name = nodeTextWithoutComments(param);
         info.rest = true;
     }
 }
@@ -237,11 +258,11 @@ function parseGoParam(param, info) {
         for (let i = 0; i < param.namedChildCount; i++) {
             const child = param.namedChild(i);
             if (child && child.type === 'identifier') {
-                names.push(child.text);
+                names.push(nodeTextWithoutComments(child));
             }
         }
         if (names.length > 0) info.name = names[0];
-        if (typeNode) info.type = typeNode.text;
+        if (typeNode) info.type = nodeTextWithoutComments(typeNode);
         // Interface method declarations commonly omit parameter names:
         // `Match(*http.Request, *RouteMatch) bool`. These are still two real
         // signature slots. Dropping them made verify/plan see zero arguments
@@ -249,7 +270,7 @@ function parseGoParam(param, info) {
         // slot. Preserve the authored type as the display token while marking
         // it unnamed so signature consumers can distinguish it from a name.
         if (names.length === 0 && typeNode) {
-            info.name = typeNode.text;
+            info.name = nodeTextWithoutComments(typeNode);
             info.unnamed = true;
             delete info.type;
         }
@@ -261,9 +282,9 @@ function parseGoParam(param, info) {
         // Go variadic: `args ...int`
         const nameNode = param.childForFieldName('name');
         const typeNode = param.childForFieldName('type');
-        if (nameNode) info.name = nameNode.text;
+        if (nameNode) info.name = nodeTextWithoutComments(nameNode);
         else info.name = '...';
-        if (typeNode) info.type = '...' + typeNode.text;
+        if (typeNode) info.type = '...' + nodeTextWithoutComments(typeNode);
         info.rest = true;
     }
 }
@@ -272,10 +293,10 @@ function parseRustParam(param, info) {
     if (param.type === 'parameter') {
         const patternNode = param.childForFieldName('pattern');
         const typeNode = param.childForFieldName('type');
-        if (patternNode) info.name = patternNode.text;
-        if (typeNode) info.type = typeNode.text;
+        if (patternNode) info.name = nodeTextWithoutComments(patternNode);
+        if (typeNode) info.type = nodeTextWithoutComments(typeNode);
     } else if (param.type === 'self_parameter') {
-        info.name = param.text;
+        info.name = nodeTextWithoutComments(param);
     }
 }
 
@@ -294,8 +315,8 @@ function parseJavaParam(param, info) {
                 }
             }
         }
-        if (nameNode) info.name = nameNode.text;
-        if (typeNode) info.type = typeNode.text;
+        if (nameNode) info.name = nodeTextWithoutComments(nameNode);
+        if (typeNode) info.type = nodeTextWithoutComments(typeNode);
         if (param.type === 'spread_parameter') info.rest = true;
     }
 }
@@ -1051,6 +1072,7 @@ function sameNode(a, b) {
 }
 
 module.exports = {
+    nodeTextWithoutComments,
     sameNode,
     traverseTree,
     traverseTreeCached,

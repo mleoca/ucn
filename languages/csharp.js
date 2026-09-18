@@ -2,6 +2,7 @@
 
 const {
     traverseTree,
+    nodeTextWithoutComments,
     traverseTreeCached,
     nodeToLocation,
     extractJSDocstring,
@@ -127,7 +128,7 @@ function structuredParams(paramsNode) {
         if (nameNode) {
             recoveredParams.push({
                 name: nameNode.text,
-                ...(typeNode && { type: typeNode.text }),
+                ...(typeNode && { type: nodeTextWithoutComments(typeNode) }),
                 rest: true,
             });
         }
@@ -138,14 +139,14 @@ function structuredParams(paramsNode) {
         const typeNode = param.childForFieldName('type');
         if (!nameNode) continue;
         const info = { name: nameNode.text };
-        if (typeNode) info.type = typeNode.text;
+        if (typeNode) info.type = nodeTextWithoutComments(typeNode);
         if (modifiersOf(param).includes('this')) info.extensionReceiver = true;
         if (param.type === 'parameter_array') info.rest = true;
         const value = param.childForFieldName('value') ||
             param.namedChildren.find(child => child !== nameNode && child !== typeNode &&
-                !['attribute_list', 'modifier'].includes(child.type));
+                !['attribute_list', 'modifier', 'comment'].includes(child.type));
         if (value) {
-            info.default = value.text;
+            info.default = nodeTextWithoutComments(value);
             info.optional = true;
         }
         params.push(info);
@@ -208,9 +209,9 @@ function memberFromNode(node, className, lines) {
     const paramsStructured = structuredParams(paramsNode);
     return {
         name,
-        params: paramsNode ? paramsNode.text.replace(/^\(|\)$/g, '').trim() : '...',
+        params: paramsNode ? nodeTextWithoutComments(paramsNode).replace(/^\(|\)$/g, '').trim() : '...',
         paramsStructured,
-        returnType: isConstructor ? null : returnNode?.text || null,
+        returnType: isConstructor ? null : nodeTextWithoutComments(returnNode).trim() || null,
         startLine,
         endLine,
         indent,
@@ -263,9 +264,9 @@ function indexerMember(node, className, lines) {
     const { startLine, endLine, indent } = nodeToLocation(node, lines);
     return {
         name: 'this[]',
-        params: paramsNode ? paramsNode.text.replace(/^\[|\]$/g, '').trim() : '...',
+        params: paramsNode ? nodeTextWithoutComments(paramsNode).replace(/^\[|\]$/g, '').trim() : '...',
         paramsStructured: structuredParams(paramsNode),
-        returnType: typeNode?.text || null,
+        returnType: nodeTextWithoutComments(typeNode).trim() || null,
         startLine,
         endLine,
         indent,
@@ -495,9 +496,9 @@ function findFunctions(code, parser) {
         const modifiers = modifiersOf(node);
         functions.push({
             name: nameNode.text,
-            params: paramsNode ? paramsNode.text.replace(/^\(|\)$/g, '').trim() : '...',
+            params: paramsNode ? nodeTextWithoutComments(paramsNode).replace(/^\(|\)$/g, '').trim() : '...',
             paramsStructured: structuredParams(paramsNode),
-            returnType: returnNode?.text || null,
+            returnType: nodeTextWithoutComments(returnNode).trim() || null,
             startLine,
             endLine,
             indent,

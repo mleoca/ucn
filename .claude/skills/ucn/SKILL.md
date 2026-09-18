@@ -126,7 +126,7 @@ answers:
 ucn find handleRequest --lines            # path:line:signature   # kind
 ucn show handleRequest --lines            # callers as path:line:text; unverified ones end in "\t# unverified: <reason>"
 ucn show handleRequest --lines --sections=callees
-ucn usages handleRequest --lines          # every literal-name line; non-call kinds tagged "# import" / "# definition"
+ucn usages handleRequest --lines          # every literal-name occurrence; non-call kinds tagged "# import" / "# definition"
 ucn search 'retry(' --lines               # grep -n output, code-aware scope
 ucn impact handleRequest --lines
 ucn source handleRequest --raw            # the code and nothing else, ready for an exact-string edit
@@ -136,6 +136,12 @@ ucn source src/server.js:40-80 --raw
 Records go to stdout; the `ACCOUNT` / `CONTRACT` lines, notes, and the
 same-name disambiguation go to stderr prefixed `# ` (MCP keeps them in the one
 text block, and `--raw` appends its note as one trailing `# ` line there).
+`usages` emits one record per occurrence, so a source line may repeat; deduplicate
+`path:line` values for line counts. Definition handles start at decorators when
+present, while usages point at token lines (`nameLine` identifies the declaration
+token when it differs from `startLine`). Structural `search --unused` keeps its
+safety note and decorator tags in shell output; runtime registrations can appear
+and zero call edges do not prove a symbol is safe to delete.
 `--lines` lists the whole band without default row/character caps, so pipe through
 `grep -v '# unverified'` for the confirmed tier or `cut -d: -f1 | sort | uniq -c`
 for callers per file. Nothing to list prints nothing and exits 1, grep's

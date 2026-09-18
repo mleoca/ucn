@@ -33,7 +33,7 @@ structural or code-only search.
 |---|---|
 | `repo` | Repository orientation. Select `summary,files,stats,health` with `--sections`; `--deep` includes readiness evidence. Skipped unsupported source is listed with a grep/language-tool handoff. |
 | `deps <file>` | File dependency graph. Use `--direction=imports\|importers\|both`, `--detailed`, or `--cycles`. Cycles distinguish eager edges from function-local, Python typing-guarded, and TypeScript type-only edges. Complete cycle groups remain visible when enumeration is capped. |
-| `api [file]` | Static exported/public surface for a project or file. |
+| `api [file]` | Static exported/public surface for a project or file. An exact file includes tests; broader scans exclude tests with a count. Use `--include-tests` to include them. |
 | `entrypoints` | Framework, route, task, test, and runtime entry points. |
 | `endpoints` | Server/client HTTP surface; `--bridge` adds advisory matching. |
 
@@ -48,6 +48,14 @@ structural or code-only search.
 ## Stable symbol identity
 
 Symbol-listing commands emit handles such as `src/api.ts:42:handler`. Pass the full handle to symbol commands. `path:line` also works. Handles prevent same-named definitions from being silently combined.
+
+Definition handles and source spans start at the first decorator or annotation when present; literal usages point at the actual token line. Use a symbol's `nameLine` (when present, otherwise `startLine`) to compare declaration tokens with usages.
+
+Structural `search --param` matches parameter names, types, and defaults; `--returns` matches return annotations. Both exclude AST comments and preserve string contents. `--unused` lists callable symbols without call edges, not safe-delete candidates; decorated runtime registrations may still appear. Its safety note and decorator tags are retained in `--lines` output. Use `deadcode` and `usages` before deletion.
+
+`repo` summary/stats `buildTime` is the duration of the last index build (discovery, parsing, and graphs), retained in the cache. It excludes cache loading/saving and query execution, so it is not command wall time; `buildTimeNote` states this boundary.
+
+`--lines` writes one record per output line. `usages` records occurrences, so multiple tokens on the same source line can produce repeated `path:line` values. Deduplicate those values when counting source lines.
 
 ## Common flags
 

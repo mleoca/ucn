@@ -424,6 +424,9 @@ function formatPublicJson(command, result, params = {}, execution = {}) {
         if (result.meta.truncatedMatches > 0) commandMeta.truncated = true;
         if (result.unsupportedMatches) commandMeta.unsupportedMatches = result.unsupportedMatches;
     }
+    if (command === 'api' && result?.apiInfo) {
+        commandMeta.apiInfo = result.apiInfo;
+    }
     if (command === 'entrypoints' && result?.filterInfo) {
         commandMeta.hiddenTestEntrypoints = result.filterInfo.hiddenTests;
         commandMeta.testsIncluded = result.filterInfo.testsIncluded;

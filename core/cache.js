@@ -712,7 +712,8 @@ function clearAllCaches() {
 // copied bindings and qualified macro receivers; TS indexed array evidence.
 // v225 (fix #357): Rust `use path::name as local` bindings record the original name with a paired `renames` alias.
 // v226: bundled/minified filename exclusions are disclosed in discoveryIssues.
-const CACHE_FORMAT_VERSION = 226;
+// v227: signature parameter/return text excludes AST comments in every language.
+const CACHE_FORMAT_VERSION = 227;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**

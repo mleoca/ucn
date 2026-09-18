@@ -10,6 +10,7 @@ const { ReceiverTypeMap, typeOrigin } = require('./type-evidence');
 
 const {
     traverseTree,
+    nodeTextWithoutComments,
     traverseTreeCached,
     nodeToLocation,
     parseStructuredParams,
@@ -32,7 +33,7 @@ function extractJavaParams(paramsNode) {
     // unknown signatures in JSON output (fix #241; go/rust got this in #238,
     // the shared utils.extractParams already had it).
     if (!paramsNode) return '...';
-    const text = paramsNode.text;
+    const text = nodeTextWithoutComments(paramsNode);
     let params = text.replace(/^\(|\)$/g, '').trim();
     return params;
 }
@@ -201,7 +202,7 @@ function stripJavaString(text) {
 function extractReturnType(node) {
     const typeNode = node.childForFieldName('type');
     if (typeNode) {
-        return typeNode.text;
+        return nodeTextWithoutComments(typeNode);
     }
     return null;
 }

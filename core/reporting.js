@@ -48,6 +48,7 @@ function getStats(index, options = {}) {
         files: scopedFiles.length,
         symbols: totalSymbols,  // Total symbol count, not unique names
         buildTime: index.buildTime,
+        buildTimeNote: 'Last index build, including discovery and graphs; excludes cache I/O and query execution. Reused when loading a cached index.',
         byLanguage: {},
         byType: {},
         ...(index.truncated && { truncated: index.truncated })
@@ -1044,6 +1045,7 @@ function orient(index, options = {}) {
         files: stats.files,
         symbols: stats.symbols,
         buildTime: stats.buildTime,
+        buildTimeNote: stats.buildTimeNote,
         byLanguage: stats.byLanguage,
         dirs,
         hot: {

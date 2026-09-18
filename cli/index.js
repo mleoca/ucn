@@ -917,7 +917,8 @@ Commands:
   deps <file>                     File graph; --direction=imports|importers|both
     --detailed                     Include import declarations
   deps --cycles                   Report circular dependencies (no file target)
-  api [file]                      Project or file public API
+  api [file]                      Project or file public API (exact files include tests;
+                                  broader scans exclude tests unless --include-tests)
   check [symbol]                  Signature check; without symbol, precommit check
   plan <symbol>                   Preview rename or parameter edits
   entrypoints                     Runtime and framework entry points
@@ -933,7 +934,8 @@ Common flags:
   --base=REF --staged --no-cache --clear-cache [--all] --max-files=N --workers=N
   --max-chars=N (text output; default 10K targeted / 3K broad, ceiling 100K)
   --lines  find/usages/search/show/impact: grep -n shape, one path:line:text
-           record per line (tags after a tab: # unverified: <reason>, # import,
+           record per output line; usages may repeat a source line per occurrence
+           (tags after a tab: # unverified: <reason>, # import,
            # callee); accounting and notes go to stderr as "# " lines; exit 1
            when nothing matched; exit 2 on errors. No default result cap.
            show defaults to callers; --sections=callers,callees selects bands.

@@ -2330,7 +2330,7 @@ const HANDLERS = {
     },
 
     api: (index, p) => {
-        if (p.file) {
+        if (p.file && typeof index.resolveFilePathForQuery(p.file) !== 'string') {
             const fileErr = checkFilePatternMatch(index, p.file);
             if (fileErr) return { ok: false, error: fileErr };
         }
@@ -2346,7 +2346,7 @@ const HANDLERS = {
                 return { ok: false, error: `No files matched the 'in' directory filter '${p.in}'.` };
             }
         }
-        let result = index.api(p.file, { in: p.in });
+        let result = index.api(p.file, { in: p.in, includeTests: p.includeTests });
         if (p.file) {
             const fileErr = checkFileError(result, p.file, index);
             if (fileErr) return { ok: false, error: fileErr };
@@ -2373,6 +2373,10 @@ const HANDLERS = {
                 });
             }
             result = items;
+        }
+        if (result.apiInfo?.excludedTestFiles > 0) {
+            const excluded = `${result.apiInfo.excludedTestFiles} test file(s) excluded from API; use --include-tests to include them, or name an exact file.`;
+            note = note ? `${note}\n${excluded}` : excluded;
         }
         return { ok: true, result, note };
     },
