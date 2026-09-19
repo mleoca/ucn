@@ -522,7 +522,10 @@ function formatAuditAsync(result) {
         lines.push(`${file} (${fileIssues.length})`);
         for (const issue of fileIssues) {
             const caller = issue.callerName ? ` [${issue.callerName}]` : '';
-            lines.push(`  :${issue.line}${caller}  ${issue.calleeName}() — async, not awaited`);
+            const detail = issue.reason === 'stored-promise-used-as-value'
+                ? `${issue.variable} used as a resolved value; promise from ${issue.calleeName}() at line ${issue.originLine}`
+                : `${issue.calleeName}() — async, not awaited`;
+            lines.push(`  :${issue.line}${caller}  ${detail}`);
         }
     }
     return lines.join('\n');

@@ -291,6 +291,22 @@ function _javaConstructorDisposition(index, filePath, fileEntry, call, targetDef
     return 'unknown';
 }
 
+// A structural member passed as a value is not invocation syntax. Keep it
+// in the callback model only when a project member can actually be callable;
+// an unrelated standalone function's spelling is not such evidence. Module
+// members remain eligible because modules can export standalone functions.
+function isDataMemberReference(fileEntry, call, definitions) {
+    if (!call.isFunctionReference || !call.isMethod || call.receiverIsModule ||
+        call.receiverModuleSpecifier || langTraits(fileEntry?.language)?.typeSystem !== 'structural') return false;
+    if (_structuralModuleBindings(fileEntry, call).length > 0) return false;
+    return !definitions.some(def => !NON_CALLABLE_TYPES.has(def.type) &&
+        // A typed Python descriptor read really invokes its getter; retain
+        // that existing proof path. An untyped property spelling belongs to
+        // the separate property-access inventory, never the call band.
+        (!require('./accessors').isAccessorDefinition(def) || call.receiverType) &&
+        (def.className || def.receiver));
+}
+
 /**
  * Find all call sites that invoke the named symbol.
  *
@@ -697,6 +713,7 @@ function findCallers(index, name, options = {}) {
                 langTraits(fileEntry.language)?.typeSystem === 'structural';
 
             for (let call of calls) {
+                if (isDataMemberReference(fileEntry, call, options.targetDefinitions || definitions)) continue;
                 // fix #353: C# `Beta.Helper.Widget()` — the parser records a
                 // field hop rooted at `this` (Beta is no local). When the
                 // prefix names a project NAMESPACE that declares the last
@@ -5444,7 +5461,8 @@ function findCallees(index, definition, options = {}) {
         // to this definition's source range. Nested closures deliberately
         // remain in the slice and retain the existing inner-symbol rules.
         const calls = _callsInDefinitionRange(index, def.file, allCalls,
-            def.startLine, def.endLine);
+            def.startLine, def.endLine).filter(call => !isDataMemberReference(
+                index.files.get(def.file), call, index.symbols.get(call.name) || []));
         // The reachability walk uses the legacy (non-accounting) path and most
         // entry/test symbols contain no calls. Avoid constructing receiver,
         // overload, and flow machinery for an empty source range. Contract
@@ -5545,7 +5563,8 @@ function findCallees(index, definition, options = {}) {
             if (!entry) {
                 const defs = index.symbols.get(call.name) || [];
                 const owners = defs.filter(s => !NON_CALLABLE_TYPES.has(s.type)).length;
-                entry = { name: call.name, reason, callCount: 0, sites: [], ownerCount: owners, ...meta };
+                entry = { name: call.name, reason, callCount: 0, sites: [], ownerCount: owners,
+                    ...(call.isFunctionReference && { functionReference: true }), ...meta };
                 unverifiedCallees.set(key, entry);
             }
             entry.callCount++;

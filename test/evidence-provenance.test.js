@@ -433,7 +433,8 @@ def unknown(item): consume(item.value)
             assert.deepEqual(callers.map(c => c.callerName), ['typed']);
             assert.equal(callers[0].provenance.validation, 'establishes-target');
             assert.equal(callers[0].provenance.facts.lookup.steps.at(-1).propertyRead, true);
-            assert.ok(callers.unverifiedEntries.some(c => c.callerName === 'unknown'));
+            assert.ok(!callers.unverifiedEntries.some(c => c.callerName === 'unknown'),
+                'an untyped property value belongs to the property-access inventory, not the caller band');
             assert.ok(callers.accountRaw.excludedEntries.some(c => c.line === 12));
             const facts = structuredClone(callers[0].provenance.facts);
             delete facts.valueReference;

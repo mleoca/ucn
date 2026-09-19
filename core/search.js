@@ -727,6 +727,7 @@ function structuralSearch(index, options = {}) {
         // Auto-infer type: --receiver implies type=call
         const type = options.type || (receiver ? 'call' : undefined);
         const results = [];
+        const skippedTestFiles = new Set();
 
         // Validate type if provided
         if (type && !STRUCTURAL_TYPES.has(type)) {
@@ -753,7 +754,13 @@ function structuralSearch(index, options = {}) {
                 if (!rp.includes(options.file) && !rp.endsWith(options.file)) return false;
             }
             if ((options.exclude && options.exclude.length > 0) || options.in) {
-                if (!index.matchesFilters(fileEntry.relativePath, { exclude: options.exclude, in: options.in })) return false;
+                if (!index.matchesFilters(fileEntry.relativePath, { in: options.in })) return false;
+                if (!index.matchesFilters(fileEntry.relativePath, { exclude: options.exclude })) {
+                    if (options.testExclude && !index.matchesFilters(fileEntry.relativePath, { exclude: options.testExclude })) {
+                        skippedTestFiles.add(fileEntry.relativePath);
+                    }
+                    return false;
+                }
             }
             return true;
         };
@@ -978,6 +985,7 @@ function structuralSearch(index, options = {}) {
                 }).filter(([, v]) => v !== undefined && v !== null)),
                 totalMatched: total,
                 shown: results.length,
+                filesSkipped: skippedTestFiles.size,
                 ...(unused && {
                     unusedScope: 'callable-symbols-only',
                     unusedSafety: 'candidate-only; use deadcode before deletion',

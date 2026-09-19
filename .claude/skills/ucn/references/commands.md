@@ -57,6 +57,12 @@ Structural `search --param` matches parameter names, types, and defaults; `--ret
 
 `--lines` writes one record per output line. `usages` records occurrences, so multiple tokens on the same source line can produce repeated `path:line` values. Deduplicate those values when counting source lines.
 
+Public JSON source paths (`file`, caller files, dependency roots and edges) are project-relative, with the absolute base in `meta.pathBase`. Project roots and external paths remain absolute. Indexed absolute handles are accepted as well as relative handles.
+
+Default test exclusions follow language conventions. Python `spec.py` and `*_spec.py` are included; `test_*.py`, `*_test.py`, and test directories are excluded. Structural search reports hidden test-file counts, including on empty results. `--include-tests` disables these defaults; explicit `--exclude` patterns still apply.
+
+`audit-async` checks recognized async producers, including captured JS/TS/HTML promises used as resolved values in the same lexical scope. Promise returns and handlers are valid; alias flow and unknown receivers require compiler/type-checker review.
+
 ## Common flags
 
 | Flag | Meaning |

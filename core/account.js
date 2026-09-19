@@ -301,6 +301,10 @@ function classifyGroundLines(index, name, groundSet, claimedKeys) {
         const callLines = new Set();
         if (Array.isArray(cachedCalls)) {
             for (const c of cachedCalls) {
+                // Unclaimed callback/type references have no invocation
+                // syntax. Let the usage AST classify them as references;
+                // merely entering the candidate cache is not a call fact.
+                if (c.isFunctionReference || c.isTypeReference) continue;
                 if (c.name === name || c.resolvedName === name ||
                     (c.resolvedNames && c.resolvedNames.includes(name))) {
                     callLines.add(c.line);

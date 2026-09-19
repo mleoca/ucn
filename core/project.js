@@ -1105,6 +1105,11 @@ class ProjectIndex {
             const lowerPath = filePath.toLowerCase();
             for (const pattern of filters.exclude) {
                 const lowerPattern = pattern.toLowerCase();
+                if (lowerPattern === 'test files') {
+                    const rp = path.isAbsolute(filePath) ? path.relative(this.root, filePath) : filePath;
+                    if (require('./shared').isTestPath(rp)) return false;
+                    continue;
+                }
                 let regex = this._excludeRegexCache?.get(lowerPattern);
                 if (!regex) {
                     const escaped = lowerPattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');

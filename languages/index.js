@@ -144,6 +144,7 @@ const LANGUAGES = {
         traits: {
             ...STRUCTURAL_TRAITS,
             selfParam: ['this'],
+            storedPromises: true,
             testFileCandidates: (base, ext) => [`${base}.test${ext}`, `${base}.spec${ext}`, `${base}.test.ts`, `${base}.test.js`, `${base}.spec.ts`, `${base}.spec.js`],
             testDirs: ['__tests__'],
         },
@@ -157,6 +158,7 @@ const LANGUAGES = {
         traits: {
             ...STRUCTURAL_TRAITS,
             selfParam: ['this'],
+            storedPromises: true,
             testFileCandidates: (base, ext) => [`${base}.test${ext}`, `${base}.spec${ext}`, `${base}.test.ts`, `${base}.test.js`, `${base}.spec.ts`, `${base}.spec.js`],
             testDirs: ['__tests__'],
         },
@@ -170,6 +172,7 @@ const LANGUAGES = {
         traits: {
             ...STRUCTURAL_TRAITS,
             selfParam: ['this'],
+            storedPromises: true,
             testFileCandidates: (base, ext) => [`${base}.test${ext}`, `${base}.spec${ext}`, `${base}.test.ts`, `${base}.test.js`, `${base}.spec.ts`, `${base}.spec.js`],
             testDirs: ['__tests__'],
         },
@@ -324,6 +327,7 @@ const LANGUAGES = {
         traits: {
             ...STRUCTURAL_TRAITS,
             selfParam: ['this'],
+            storedPromises: true,
             testFileCandidates: (base, ext) => [`${base}.test${ext}`, `${base}.spec${ext}`],
         },
     }

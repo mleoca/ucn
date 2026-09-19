@@ -2805,7 +2805,14 @@ function findCallsInCode(code, parser) {
             const argsNode = node.childForFieldName('arguments');
             if (argsNode) {
                 for (let i = 0; i < argsNode.namedChildCount; i++) {
-                    const arg = argsNode.namedChild(i);
+                    const rawArg = argsNode.namedChild(i);
+                    const arg = rawArg.type === 'keyword_argument'
+                        ? rawArg.childForFieldName('value') : rawArg;
+                    if (!arg) continue;
+                    // Bare keyword values already belong to the reference
+                    // inventory/rename path; only extend the member-value
+                    // callback model to match its positional counterpart.
+                    if (rawArg.type === 'keyword_argument' && arg.type !== 'attribute') continue;
                     if (arg.type === 'identifier' && !PYTHON_SKIP.has(arg.text) && !nonCallableNames.has(arg.text)) {
                         calls.push({
                             name: arg.text,

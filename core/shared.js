@@ -50,15 +50,22 @@ function codeUnitCompare(a, b) {
  * Path-based test heuristic — matches the same patterns as `find`'s exclusion
  * logic so that `about` and `find` agree on which files are de-emphasized.
  *
- * Triggers when any of `test|tests|spec|__tests__|__mocks__|fixture|mock`
- * appears as a path segment (with word boundaries on both sides).
+ * Uses language-specific filename conventions plus `test|tests|__tests__|__mocks__|fixture|mock`
+ * as path segments (with word boundaries on both sides). `spec` is a test
+ * marker only for languages whose test-file conventions include it.
  *
  * Complement to `isTestFile` (filename pattern check) — together they catch
  * both `foo.test.js` (filename) AND `test/agent-benchmark.js` (directory).
  */
 function isTestPath(rp) {
     if (!rp) return false;
-    return /(^|[/._-])(test|tests|spec|__tests__|__mocks__|fixture|mock)s?([/._-]|$)/i.test(rp);
+    const language = detectLanguage(rp);
+    const { langTraits } = require('../languages');
+    const specConvention = langTraits(language)?.testFileCandidates?.('sample', '')
+        .some(candidate => candidate.includes('.spec'));
+    return isTestFile(rp, language) ||
+        /(^|[/._-])(test|tests|__tests__|__mocks__|fixture|mock)s?([/._-]|$)/i.test(rp) ||
+        (!!specConvention && /(^|[/._-])specs?([/._-]|$)/i.test(rp));
 }
 
 /**
@@ -109,7 +116,9 @@ function pickBestDefinition(matches, opts = {}) {
  * Returns a new array with test patterns appended (deduplicating).
  */
 function addTestExclusions(exclude) {
-    const testPatterns = ['test', 'spec', '__tests__', '__mocks__', 'fixture', 'mock'];
+    // Keep automatic test classification distinct from explicit substring
+    // exclusions: --exclude=spec deliberately excludes Python specs too.
+    const testPatterns = ['test files'];
     const existing = new Set((exclude || []).map(e => e.toLowerCase()));
     const additions = testPatterns.filter(p => !existing.has(p));
     return [...(exclude || []), ...additions];

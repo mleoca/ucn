@@ -2656,6 +2656,78 @@ const _ASYNCIO_CONSUMER_FNS = new Set([
     'gather', 'create_task', 'ensure_future', 'wait', 'as_completed',
 ]);
 
+// Follow a captured JS promise within its lexical scope, looking only for
+// operations that require its resolved value. Passing/returning/awaiting the
+// promise and its own methods are valid. Reassignment stops the inference;
+// nested functions and shadowing blocks cannot borrow the outer binding.
+function storedPromiseMisuse(call, functionNodes) {
+    const { sameNode } = require('../languages/utils');
+    let value = call;
+    while (value.parent?.type === 'parenthesized_expression') value = value.parent;
+    const assignment = value.parent;
+    if (!assignment || !['variable_declarator', 'assignment_expression'].includes(assignment.type)) return null;
+    const binding = assignment.childForFieldName(assignment.type === 'variable_declarator' ? 'name' : 'left');
+    if (binding?.type !== 'identifier') return null;
+    let scope = assignment.parent;
+    while (scope && scope.type !== 'statement_block' && !functionNodes.has(scope.type)) scope = scope.parent;
+    if (!scope) return null;
+    const name = binding.text;
+    const promiseMembers = new Set(['then', 'catch', 'finally', 'constructor',
+        'toString', 'toLocaleString', 'valueOf', 'hasOwnProperty', 'isPrototypeOf', 'propertyIsEnumerable']);
+    let stopped = false;
+    let misuse = null;
+    const namesBinding = node => !!node && ((['identifier', 'shorthand_property_identifier_pattern'].includes(node.type) && node.text === name) ||
+        node.namedChildren.some(namesBinding));
+    const shadows = block => (block.namedChildren || []).some(statement =>
+        ['lexical_declaration', 'variable_declaration'].includes(statement.type) &&
+        statement.namedChildren.some(decl => namesBinding(decl.childForFieldName('name'))));
+    const visit = node => {
+        if (stopped || misuse || node.endIndex <= call.endIndex) return;
+        if (functionNodes.has(node.type)) return;
+        if (!sameNode(node, scope) && node.type === 'statement_block' && shadows(node)) return;
+        if (node.type === 'catch_clause' && namesBinding(node.childForFieldName('parameter'))) return;
+        if (node.type === 'for_statement' && shadows(node)) return;
+        if (node.type === 'for_in_statement' && namesBinding(node.childForFieldName('left'))) {
+            // A declared loop variable shadows; an undeclared one overwrites
+            // the promise, so later uses cannot inherit its earlier type.
+            if (!node.children.some(child => ['let', 'const'].includes(child.type))) stopped = true;
+            return;
+        }
+        if (node.type === 'assignment_expression' && !sameNode(node, assignment) && node.childForFieldName('left')?.text === name) {
+            const right = node.childForFieldName('right');
+            if (right) visit(right);
+            stopped = true;
+            return;
+        }
+        if (node.type === 'identifier' && node.text === name && node.startIndex >= call.endIndex) {
+            let use = node;
+            while (use.parent?.type === 'parenthesized_expression') use = use.parent;
+            const parent = use.parent;
+            if (parent?.type === 'member_expression' && sameNode(parent.childForFieldName('object'), use)) {
+                const property = parent.childForFieldName('property');
+                if (property && !promiseMembers.has(property.text)) misuse = node;
+            } else if (parent?.type === 'subscript_expression' && sameNode(parent.childForFieldName('object'), use)) {
+                misuse = node;
+            } else if (parent?.type === 'binary_expression') {
+                const operator = parent.childForFieldName('operator')?.text;
+                if (['+', '-', '*', '/', '%', '**', '<', '>', '<=', '>=', '|', '&', '^', '<<', '>>', '>>>'].includes(operator)) misuse = node;
+            } else if (parent?.type === 'unary_expression' && ['+', '-', '~'].includes(parent.childForFieldName('operator')?.text)) {
+                misuse = node;
+            } else if (parent && ['update_expression', 'augmented_assignment_expression'].includes(parent.type)) {
+                misuse = node;
+            } else if (parent && ['if_statement', 'while_statement', 'do_statement', 'ternary_expression'].includes(parent.type) &&
+                sameNode(parent.childForFieldName('condition'), use)) {
+                misuse = node;
+            }
+        }
+        for (const child of node.namedChildren || []) visit(child);
+    };
+    // A function root's body is the scan scope, never its parameters.
+    visit(scope.type === 'statement_block' ? scope : scope.childForFieldName('body') || scope);
+    return misuse ? { line: misuse.startPosition.row + 1, variable: name,
+        originLine: call.startPosition.row + 1, reason: 'stored-promise-used-as-value' } : null;
+}
+
 /**
  * Run an async/await audit across the project.
  *
@@ -3012,6 +3084,10 @@ function auditAsync(index, options = {}) {
                                         let current = node.parent;
                                         let awaitDepth = 0;
                                         while (current && awaitDepth++ < 5) {
+                                            if (current.type === 'parenthesized_expression') {
+                                                current = current.parent;
+                                                continue;
+                                            }
                                             if (current.type === 'await_expression' ||
                                                 current.type === 'await') {
                                                 awaited = true;
@@ -3034,12 +3110,15 @@ function auditAsync(index, options = {}) {
                                             }
                                             break;
                                         }
-                                        if (!awaited && !isFireAndForget(node, language)) {
+                                        const storedMisuse = !awaited && langTraits(language)?.storedPromises
+                                            ? storedPromiseMisuse(node, FN_NODE_TYPES) : null;
+                                        if (storedMisuse || (!awaited && !isFireAndForget(node, language))) {
                                             issues.push({
                                                 file: fileEntry.relativePath || filePath,
                                                 line,
                                                 callerName: enclosing.name,
                                                 calleeName,
+                                                ...(storedMisuse || {}),
                                             });
                                         }
                                     }

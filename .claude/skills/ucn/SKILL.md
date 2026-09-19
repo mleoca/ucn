@@ -143,8 +143,10 @@ token when it differs from `startLine`). Structural `search --unused` keeps its
 safety note and decorator tags in shell output; runtime registrations can appear
 and zero call edges do not prove a symbol is safe to delete.
 `--lines` lists the whole band without default row/character caps, so pipe through
-`grep -v '# unverified'` for the confirmed tier or `cut -d: -f1 | sort | uniq -c`
-for callers per file. Nothing to list prints nothing and exits 1, grep's
+`grep -v '# unverified'` for the confirmed tier. To count distinct source lines
+per file, use `cut -d: -f1,2 | sort -u | cut -d: -f1 | sort | uniq -c`;
+counting raw usage records can count a source line more than once.
+Nothing to list prints nothing and exits 1, grep's
 contract; errors exit 2. Explicit `--top`/`--limit` still apply and disclose
 omissions. `show --lines` accepts only callers/callees sections; target-less
 `impact --lines` lists Git-diff callers with per-target accounting. Closing a
@@ -207,6 +209,30 @@ The selection note discloses that approximation. `find`, text `search`,
 `deadcode`, `api`, and `repo --sections=files` default to at most 500 results
 (structural `search`: 50). Use an explicit `--limit=N` to request more;
 `usages` and `--lines` have no default row cap.
+
+Automatic test filtering follows the language's conventions: Python `spec.py`
+and `chart_spec.py` are production paths; `test_*.py`, `*_test.py`, and test
+directories remain test paths. Structural search discloses hidden test files,
+including empty results; `--include-tests` gives the full indexed inventory.
+Explicit `--exclude=spec` still means the requested path exclusion.
+
+Public JSON source `file` fields are relative to `meta.pathBase` (the absolute
+project root). Dependency edge paths use the same base. Both absolute and
+relative indexed-file handles are accepted. Definition handles retain their
+decorator span; use `nameLine` for the name token rather than joining usages
+to a handle's start line.
+
+Callable references passed to another function remain visible when a project
+method or function could be their target. An ordinary attribute read with no
+callable member candidate stays a non-call reference in ACCOUNT and `usages`.
+The caller model includes callback dependencies; it does not prove that the
+receiving function invokes every passed callable.
+
+`audit-async` checks recognized async producers. In JS/TS/HTML it also checks
+captured promises used in arithmetic, conditions, or resolved-value member
+access within the same lexical scope. Awaiting, returning, promise handlers,
+reassignment, and shadowed bindings are distinguished. It is a bounded AST
+audit, not a compiler-wide proof that every missing await has been found.
 
 For `plan --rename-to`, the selected declaration is only the starting point.
 When the index proves the relationship, the rename unit closes over

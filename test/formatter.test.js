@@ -1110,7 +1110,7 @@ describe('New Formatter Coverage', () => {
                 meta: { complete: true, skipped: 0, dynamicImports: 0, uncertain: 2, includeMethods: false }
             };
             const { text, expandable } = output.formatContext(ctx);
-            assert.ok(text.includes('CALLERS — UNVERIFIED (2) — call syntax, no binding/receiver evidence:'),
+            assert.ok(text.includes('CALLERS — UNVERIFIED (2) — call or callable-reference syntax, no binding/receiver evidence:'),
                 'Should render unverified tier header');
             assert.ok(text.includes('svc.js:4 [run]: m.fn() (method-no-evidence)'), 'Entry shows expression and reason');
             assert.ok(text.includes('(ambiguous-binding)'), 'Second entry shows its reason');

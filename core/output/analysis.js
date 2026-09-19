@@ -205,7 +205,7 @@ function formatCalleeAccountLine(acct) {
 function unverifiedCalleeLines(entries, compact) {
     if (!entries || entries.length === 0) return [];
     const lines = [];
-    lines.push(`${compact ? '' : '\n'}CALLEES — UNVERIFIED (${entries.length}) — call syntax, receiver/binding unresolved:`);
+    lines.push(`${compact ? '' : '\n'}CALLEES — UNVERIFIED (${entries.length}) — call or callable-reference syntax, receiver/binding unresolved:`);
     for (const u of entries) {
         const owners = u.ownerCount > 1 ? ` (${u.ownerCount} owners)` : '';
         const sites = u.sites && u.sites.length > 0 ? ` L${u.sites.join(',L')}` : '';
@@ -461,7 +461,7 @@ function formatContext(ctx, options = {}) {
 
         const typeUnverified = ctx.unverifiedCallers || [];
         if (typeUnverified.length > 0) {
-            lines.push(`\nCALLERS — UNVERIFIED (${typeUnverified.length}) — call syntax, no binding/receiver evidence:`);
+            lines.push(`\nCALLERS — UNVERIFIED (${typeUnverified.length}) — call or callable-reference syntax, no binding/receiver evidence:`);
             formatAmbiguityCandidates(lines, ctx.ambiguityCandidates);
             const cap = 10;
             let shown = 0;
@@ -688,7 +688,7 @@ function formatContext(ctx, options = {}) {
     // Actionable ambiguity: call syntax without enough identity evidence.
     // Always visible and capped at 10 one-liners unless --all.
     if (actionableUnverified.length > 0) {
-        lines.push(`${compact ? '' : '\n'}CALLERS — UNVERIFIED (${actionableUnverified.length}) — call syntax, no binding/receiver evidence:`);
+        lines.push(`${compact ? '' : '\n'}CALLERS — UNVERIFIED (${actionableUnverified.length}) — call or callable-reference syntax, no binding/receiver evidence:`);
         formatAmbiguityCandidates(lines, ctx.ambiguityCandidates);
         const cap = (ctx.meta && ctx.meta.all) ? Infinity : 10;
         let shown = 0;
@@ -927,7 +927,7 @@ function formatImpact(impact, options = {}) {
 
     // Unverified tier: visible, capped at 10 one-liners
     if (impactUnverified.length > 0) {
-        lines.push(`${compact ? '' : '\n'}UNVERIFIED CALL SITES (${impactUnverified.length}) — call syntax, no binding/receiver evidence:`);
+        lines.push(`${compact ? '' : '\n'}UNVERIFIED CALL SITES (${impactUnverified.length}) — call or callable-reference syntax, no binding/receiver evidence:`);
         const cap = 10;
         for (const site of impactUnverified.slice(0, cap)) {
             const caller = site.callerName ? ` [${site.callerName}]` : '';
@@ -1085,7 +1085,7 @@ function formatAbout(about, options = {}) {
     const aboutUnverified = about.callers.unverified;
     if (aboutUnverified && aboutUnverified.total > 0) {
         lines.push('');
-        lines.push(`CALLERS — UNVERIFIED (${aboutUnverified.total}) — call syntax, no binding/receiver evidence:`);
+        lines.push(`CALLERS — UNVERIFIED (${aboutUnverified.total}) — call or callable-reference syntax, no binding/receiver evidence:`);
         for (const u of aboutUnverified.top) {
             const caller = u.callerName ? ` [${u.callerName}]` : '';
             const reason = u.reason ? ` (${unverifiedReasonLabel(u)})` : '';

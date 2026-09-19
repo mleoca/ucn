@@ -713,7 +713,8 @@ function clearAllCaches() {
 // v225 (fix #357): Rust `use path::name as local` bindings record the original name with a paired `renames` alias.
 // v226: bundled/minified filename exclusions are disclosed in discoveryIssues.
 // v227: signature parameter/return text excludes AST comments in every language.
-const CACHE_FORMAT_VERSION = 227;
+// v228: Python keyword arguments retain the same callable-reference facts as positional arguments.
+const CACHE_FORMAT_VERSION = 228;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**

@@ -40,12 +40,20 @@ function appendNote(text, note) {
 }
 
 /** Canonicalize object keys so JSON bytes do not depend on index provenance. */
-function canonicalJsonValue(value) {
-    if (Array.isArray(value)) return value.map(canonicalJsonValue);
+function canonicalJsonValue(value, root, field = undefined) {
+    if (Array.isArray(value)) return value.map(item => canonicalJsonValue(item, root, field));
+    if (root && typeof value === 'string' &&
+        ['file', 'filePath', 'callerFile', 'definitionFile', 'resolved', 'path', 'targetFile', 'from', 'to', 'root', 'files'].includes(field)) {
+        const path = require('path');
+        if (path.isAbsolute(value)) {
+            const relative = path.relative(root, value);
+            if (relative && relative !== '..' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative)) return relative;
+        }
+    }
     if (!value || typeof value !== 'object') return value;
     const canonical = {};
     for (const key of Object.keys(value).sort()) {
-        canonical[key] = canonicalJsonValue(provenanceReplacer(key, value[key]));
+        canonical[key] = canonicalJsonValue(provenanceReplacer(key, value[key]), root, key);
     }
     return canonical;
 }
@@ -474,12 +482,13 @@ function formatPublicJson(command, result, params = {}, execution = {}) {
             ...(data && data.ok === false && { ok: false }),
             ...(modeOf(command, result) && { mode: modeOf(command, result) }),
             contract: contractMeta(command),
+            ...(execution.projectRoot && { pathBase: execution.projectRoot }),
             ...commandMeta,
             ...(execution.note && { note: execution.note }),
         },
         data,
     };
-    return JSON.stringify(canonicalJsonValue(envelope), null, 2);
+    return JSON.stringify(canonicalJsonValue(envelope, execution.projectRoot), null, 2);
 }
 
 module.exports = {

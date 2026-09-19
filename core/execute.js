@@ -1462,6 +1462,7 @@ const HANDLERS = {
                 unused: p.unused || false,
                 caseSensitive: p.caseSensitive || false,
                 exclude,
+                testExclude: p.includeTests ? undefined : ['test files'],
                 in: p.in,
                 file: p.file,
                 top: topVal || (p.lines ? undefined : 50),
@@ -1470,13 +1471,15 @@ const HANDLERS = {
             const unsupported = (!p.regex && (p.term || p.name))
                 ? require('./account').scanUnsupportedFiles(index, p.term || p.name)
                 : null;
-            let note;
+            let note = result.meta.filesSkipped > 0
+                ? `${result.meta.filesSkipped} test file(s) hidden by default (--include-tests).`
+                : undefined;
             if (unsupported?.lines > 0) {
                 Object.defineProperty(result, 'unsupportedMatches', {
                     value: unsupported,
                     enumerable: false, writable: true, configurable: true,
                 });
-                note = `${unsupported.lines} matching line(s) in ${unsupported.fileCount} unsupported-language file(s) were not structurally analyzed; verify with grep/ripgrep.`;
+                note = combineNotes([note, `${unsupported.lines} matching line(s) in ${unsupported.fileCount} unsupported-language file(s) were not structurally analyzed; verify with grep/ripgrep.`]);
             }
             return { ok: true, result, structural: true, note };
         }
@@ -2506,6 +2509,18 @@ function execute(index, command, params = {}) {
             const validationError = validatePublicParams(command, params);
             if (validationError) return { ok: false, error: validationError };
         }
+        // Public JSON paths and pasted stack frames may be absolute. Resolve
+        // only indexed files, then use the same relative scope as our handles.
+        const relativeIndexedFile = file => {
+            if (!file || !path.isAbsolute(file)) return file;
+            const resolved = index.resolveFilePathForQuery(file);
+            return typeof resolved === 'string' ? index.files.get(resolved).relativePath : file;
+        };
+        if (params.file) params.file = relativeIndexedFile(params.file);
+        const absoluteHandle = params.name && parseSymbolHandle(params.name);
+        if (absoluteHandle && path.isAbsolute(absoluteHandle.file)) {
+            params.name = relativeIndexedFile(absoluteHandle.file) + params.name.slice(absoluteHandle.file.length);
+        }
         // Resolve name-less handles (e.g. `lib.js:42`) via index lookup before dispatch.
         // Handles WITH a name suffix are handled later by applyClassMethodSyntax.
         if (params && params.name && looksLikeHandle(params.name)) {
@@ -2520,6 +2535,7 @@ function execute(index, command, params = {}) {
             }
         }
         const response = handler(index, params);
+        response.projectRoot = index.root;
         const bundled = (index.discoveryIssues || []).filter(issue => issue.reason === 'bundled');
         if (bundled.length > 0) {
             const files = bundled.slice(0, 5).map(issue => issue.relativePath).join(', ');

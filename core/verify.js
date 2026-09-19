@@ -808,6 +808,8 @@ function computePlanCallSites(index, name, def) {
             expression: (call.content || '').trim(),
             args: analysis.args,
             argCount: analysis.argCount,
+            ...(analysis.keywordArgNames && { keywordArgNames: analysis.keywordArgNames }),
+            ...(analysis.positionalCount != null && { positionalCount: analysis.positionalCount }),
             ...(c.calledAs && { calledAs: c.calledAs }),
         });
     }
@@ -2158,7 +2160,10 @@ function plan(index, name, options = {}) {
             } else if (options.defaultValue) {
                 suggestion = `Add argument: ${options.defaultValue} (no default parameter values in ${planFileEntry?.language || 'this language'})`;
             } else {
-                suggestion = `Add argument: ${options.addParam}`;
+                const keywordCall = langTraits(planLang)?.keywordArguments && site.keywordArgNames?.length > 0;
+                suggestion = keywordCall
+                    ? `Add keyword argument: ${options.addParam}=${options.addParam} (replace the right-hand value with the intended expression; keep existing keyword arguments)`
+                    : `Add argument: ${options.addParam}`;
             }
             changes.push({
                 file: site.file,
