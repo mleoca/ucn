@@ -293,6 +293,8 @@ describe('5.4.0 independent audit regressions', () => {
                 assert.ok(result.text.length + trailingChars <= limit, `${limit}: ${result.text.length}`);
                 assert.equal(result.requestedLimit, limit);
                 if (limit >= 500) assert.match(result.text, /ACCOUNT: accounted/);
+                const empty = applyOutputBudget('', { command: 'repo', maxChars: limit, trailingChars });
+                assert.ok(empty.text.length + trailingChars <= limit);
             }
         }
         const dir = tmp({ 'lib.js': Array.from({ length: 30 }, (_, i) => `function unused${i}() { return ${i}; }`).join('\n') });
@@ -304,6 +306,48 @@ describe('5.4.0 independent audit regressions', () => {
                     assert.ok(result.stdout.length <= limit, `${command}: ${result.stdout.length} > ${limit}`);
                 }
             }
+        } finally { rm(dir); }
+    });
+
+    it('F4: MCP counts ignored-parameter notes and contract metadata inside character budgets', async () => {
+        const dir = tmp({ 'lib.js': Array.from({ length: 100 }, (_, i) =>
+            `function unused${i}() { return ${i}; }`).join('\n') });
+        const client = new McpClient();
+        try {
+            await client.start(); await client.initialize();
+            for (const limit of [80, 120, 500, 1200]) {
+                for (const command of ['repo', 'deadcode']) {
+                    const response = await client.callTool({
+                        command, project_dir: dir, max_chars: limit, framework: 'express',
+                    });
+                    assert.equal(response.isError, false);
+                    assert.ok(response.text.length <= limit, `${command}: ${response.text.length} > ${limit}`);
+                    if (limit >= 120) assert.match(response.text, /Note: framework ignored/);
+                }
+            }
+            // Unicode decoration occupies several UTF-8 bytes per character.
+            // Byte counts are not a measurement of --max-chars compliance.
+            const unicode = applyOutputBudget('═'.repeat(3000), { command: 'repo', maxChars: 500 });
+            assert.ok(unicode.text.length <= 500);
+            assert.ok(Buffer.byteLength(unicode.text) > 500);
+        } finally { client.stop(); rm(dir); }
+    });
+
+    it('decorated handles retain the whole declaration and disclose the usage token line', () => {
+        const dir = tmp({ 'app.py': 'def deco(fn): return fn\n@deco\n@deco\ndef worker(): return 1\nworker()\n' });
+        try {
+            const result = JSON.parse(cli(dir, 'find', 'worker', '--json').stdout).data[0];
+            assert.equal(result.handle, 'app.py:2:worker');
+            assert.equal(result.nameLine, 4);
+            const found = cli(dir, 'find', 'worker');
+            assert.match(found.stdout, /name token at app.py:4/);
+            const shell = cli(dir, 'find', 'worker', '--lines');
+            assert.match(shell.stdout, /^app.py:2:worker/);
+            assert.match(shell.stderr, /name token at line 4/);
+            const usages = cli(dir, 'usages', 'worker', '--lines');
+            assert.match(usages.stdout, /^app.py:4:.*# definition/m);
+            const source = cli(dir, 'source', result.handle, '--raw');
+            assert.match(source.stdout, /^@deco\n@deco\ndef worker/);
         } finally { rm(dir); }
     });
 

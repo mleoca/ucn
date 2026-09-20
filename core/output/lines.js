@@ -64,14 +64,20 @@ function accountComments(account) {
 
 function findRecords(result) {
     const out = [];
+    const notes = [];
     if (Array.isArray(result)) {
-        for (const symbol of result) out.push(record(pathOf(symbol), symbol.startLine, signatureOf(symbol), symbol.type));
+        for (const symbol of result) {
+            out.push(record(pathOf(symbol), symbol.startLine, signatureOf(symbol), symbol.type));
+            if (symbol.nameLine && symbol.nameLine !== symbol.startLine) {
+                notes.push(`# ${record(pathOf(symbol), symbol.startLine, symbol.name)} starts at the declaration; name token at line ${symbol.nameLine} (usages reports the token line).`);
+            }
+        }
     } else if (result && Array.isArray(result.types)) {
         for (const type of result.types) {
             out.push(record(pathOf(type), type.startLine ?? type.line, type.name, type.type || type.kind));
         }
     }
-    return { records: out, notes: [] };
+    return { records: out, notes };
 }
 
 function usagesRecords(result) {

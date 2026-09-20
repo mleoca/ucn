@@ -204,18 +204,18 @@ function formatDiffImpact(result, options = {}) {
 
     const s = result.summary || {};
     const parts = [];
-    if (s.modifiedFunctions > 0) parts.push(`${s.modifiedFunctions} modified`);
-    if (s.deletedFunctions > 0) parts.push(`${s.deletedFunctions} deleted`);
-    if (s.newFunctions > 0) parts.push(`${s.newFunctions} new`);
-    if (s.modifiedSymbols || s.newSymbols || s.deletedSymbols) {
-        parts.push(`${s.modifiedSymbols || 0} modified, ${s.newSymbols || 0} new, ${s.deletedSymbols || 0} deleted non-callable declarations`);
+    for (const [label, suffix] of [['Functions', 'Functions'], ['Declarations', 'Symbols']]) {
+        const counts = ['modified', 'new', 'deleted']
+            .filter(kind => s[kind + suffix] > 0)
+            .map(kind => `${s[kind + suffix]} ${kind}`);
+        if (counts.length) parts.push(`${label}: ${counts.join(', ')}`);
     }
     parts.push(`${s.totalCallSites || 0} call sites across ${s.affectedFiles || 0} files`);
     if (s.unverifiedCallSites > 0) parts.push(`${s.unverifiedCallSites} unverified`);
     if (s.totalDependencySites || s.unverifiedDependencySites) {
         parts.push(`${s.totalDependencySites || 0} confirmed + ${s.unverifiedDependencySites || 0} unverified non-call dependency sites across ${s.dependencyFiles || 0} files`);
     }
-    lines.push(parts.join(', '));
+    lines.push(parts.join('; '));
     // fix #283: changed paths outside supported source are invisible to the
     // symbol analysis — disclose instead of silently narrowing the diff.
     if (result.nonSourcePaths > 0) {

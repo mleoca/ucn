@@ -158,10 +158,13 @@ function formatFindDetailed(symbols, query, options = {}) {
         const confStr = confidence.level !== 'high' ? ` [${confidence.level}]` : '';
         const handle = formatSymbolHandle(s);
         const loc = handle || (s.relativePath + ':' + s.startLine);
+        const nameLocation = s.nameLine && s.nameLine !== s.startLine
+            ? `name token at ${s.relativePath || s.file}:${s.nameLine}` : '';
 
         if (compact) {
             // One line per result: "<handle>  <sig>  <usages?>  <doc snippet?>"
             const parts = [`${loc}  ${sig}${confStr}`];
+            if (nameLocation) parts.push(`[${nameLocation}]`);
             if (s.usageCounts !== undefined && s.usageCounts.total > 0) {
                 const scope = sameNameDefinitionCounts.get(s.name) > 1 ? ' name-wide' : '';
                 const label = s.usageCounts.complete === false
@@ -186,6 +189,7 @@ function formatFindDetailed(symbols, query, options = {}) {
         }
 
         lines.push(`${loc}  ${sig}${confStr}`);
+        if (nameLocation) lines.push(`  ${nameLocation} (handle starts at declaration line ${s.startLine})`);
         if (s.docstring) {
             const snip = firstSentenceShort(s.docstring);
             if (snip) lines.push(`  "${snip}"`);

@@ -15,7 +15,7 @@ const BROAD_COMMANDS = new Set([
     ...[...BROAD_CANONICAL].map(toMcpName),
 ]);
 
-const CONTRACT_LINE_RE = /^\s*(?:(?:Summary|ACCOUNT|CONTRACT|WARNING|FILTERED|CALLEE ACCOUNT|TREE ACCOUNT):|\d+ test-file usage\(s\) hidden\b|(?:Note:\s*)?Found \d+ (?:definitions|fuzzy matches)\b)/;
+const CONTRACT_LINE_RE = /^\s*(?:(?:Summary|ACCOUNT|CONTRACT|WARNING|FILTERED|CALLEE ACCOUNT|TREE ACCOUNT|Note):|\d+ test-file usage\(s\) hidden\b|Found \d+ (?:definitions|fuzzy matches)\b)/;
 const MAX_PRESERVED_CONTRACT_LINES = 24;
 const MAX_PRESERVED_CONTRACT_CHARS = 8000;
 
@@ -134,23 +134,23 @@ function applyOutputBudget(text, {
     params = {},
     trailingChars = 0,
 } = {}) {
-    if (!text) {
-        return {
-            text: '(no output)',
-            truncated: false,
-            fullChars: 0,
-            requestedLimit: maxChars || null,
-            contractMetadata: [],
-            contractMetadataComplete: true,
-        };
-    }
-
     const defaultLimit = BROAD_COMMANDS.has(command)
         ? BROAD_OUTPUT_CHARS
         : DEFAULT_OUTPUT_CHARS;
     const requested = maxChars || (all ? MAX_OUTPUT_CHARS : defaultLimit);
     const hardLimit = Math.min(requested, MAX_OUTPUT_CHARS);
     const limit = Math.max(0, hardLimit - trailingChars);
+    if (!text) {
+        return {
+            text: '(no output)'.slice(0, limit),
+            truncated: '(no output)'.length > limit,
+            fullChars: 0,
+            requestedLimit: hardLimit,
+            contractMetadata: [],
+            contractMetadataComplete: true,
+        };
+    }
+
     if (text.length <= limit) {
         return {
             text,
@@ -196,10 +196,21 @@ function applyOutputBudget(text, {
     // can consume most of the transport. Trust/account lines take precedence
     // over body detail and are appended directly after a compact notice.
     if (compactBudget) {
-        const metadataCapacity = Math.max(0, limit - notice.length - 1);
-        const candidate = preservedContractMetadata(text, '', {
-            maxChars: metadataCapacity,
+        let candidate = preservedContractMetadata(text, '', {
+            maxChars: Math.max(0, limit - notice.length - 1),
         });
+        if (candidate.omitted > 0) {
+            // Spend less on generic guidance when that lets a complete scope
+            // or parameter warning survive even a tiny transport ceiling.
+            const shorterNotice = `... OUTPUT TRUNCATED. Raise ${raiseHint}.`;
+            const shorterCandidate = preservedContractMetadata(text, '', {
+                maxChars: Math.max(0, limit - shorterNotice.length - 1),
+            });
+            if (shorterNotice.length < notice.length && shorterCandidate.lines.length > candidate.lines.length) {
+                notice = shorterNotice;
+                candidate = shorterCandidate;
+            }
+        }
         const candidateText = candidate.lines.join('\n');
         const separatorChars = candidateText ? 2 : 1;
         const bodyBudget = Math.max(0,

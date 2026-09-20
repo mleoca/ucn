@@ -4405,6 +4405,7 @@ describe('MCP per-command param validation: stripping note', () => {
             // depth is inapplicable to repo; max_chars=120 forces truncation
             const result = await client.callTool({ command: 'repo', project_dir: dir, depth: 3, max_chars: 120 });
             assert.ok(!result.isError, 'should not be an error');
+            assert.ok(result.text.length <= 120, 'the stripping note is inside the character budget');
             assert.ok(result.text.includes('depth'), 'stripping note should survive truncation');
             assert.ok(result.text.includes('not applicable to repo'), 'should mention the command');
         } finally {
