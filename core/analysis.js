@@ -17,7 +17,7 @@ const { NON_CALLABLE_TYPES, addTestExclusions, countTextBlindspots,
 const { isTestFile } = require('./discovery');
 const { computeReachability, symbolKey } = require('./entrypoints');
 const { getLanguageAdapter } = require('../languages');
-const { projectComputedDispatch } = require('./ast-analysis');
+const { projectComputedDispatch, declarationSnapshots } = require('./ast-analysis');
 const { findAccessorReferences } = require('./accessors');
 
 // JS/TS test framework helpers — calls to these bracket a test case.
@@ -2149,6 +2149,7 @@ function diffImpact(index, options = {}) {
         let oldSymbolIdentities = null; // null = unknown (file untracked or git failed)
         let oldCallables = null;        // old symbols WITH ranges — deleted lines are old-file coordinates
         let oldParsed = null;
+        let oldLines = null;
         if (change.deletedLines.length > 0 || change.addedLines.length > 0) {
             const ref = staged ? 'HEAD' : base;
             try {
@@ -2159,6 +2160,7 @@ function diffImpact(index, options = {}) {
                 const fileLang = detectLanguage(change.filePath);
                 if (fileLang) {
                     oldParsed = parse(oldContent, fileLang);
+                    oldLines = oldContent.split('\n');
                     oldSymbolIdentities = new Set();
                     oldCallables = extractCallableSymbols(oldParsed);
                     for (const oldFn of oldCallables) {
@@ -2170,10 +2172,13 @@ function diffImpact(index, options = {}) {
             }
         }
 
-        collectNonCallableChanges(index, change, oldParsed, fileEntry.symbols, symbolChanges);
+        collectNonCallableChanges(index, change, oldParsed, fileEntry.symbols, symbolChanges, oldLines);
 
         for (const line of change.addedLines) {
-            const symbol = index.findEnclosingFunction(change.filePath, line, true);
+            // Arrow fields are indexed as fields but their bodies still need
+            // callable impact once declaration-only changes are separated out.
+            const symbol = index.findEnclosingFunction(change.filePath, line, true) ||
+                fileEntry.symbols.find(s => isDiffCallable(s) && s.startLine <= line && s.endLine >= line);
             if (symbol) {
                 const key = `${symbol.name}:${symbol.startLine}`;
                 if (!affectedSymbols.has(key)) {
@@ -2200,7 +2205,7 @@ function diffImpact(index, options = {}) {
         // still exists to its CURRENT definition for modification attribution.
         const currentByIdentity = new Map();
         for (const s of fileEntry.symbols) {
-            if (NON_CALLABLE_TYPES.has(s.type)) continue;
+            if (!isDiffCallable(s)) continue;
             const k = `${s.name}\0${s.className || ''}`;
             if (!currentByIdentity.has(k)) currentByIdentity.set(k, []);
             currentByIdentity.get(k).push(s);
@@ -2256,7 +2261,7 @@ function diffImpact(index, options = {}) {
                 let bestExact = false;
                 let bestRange = Infinity;
                 for (const symbol of fileEntry.symbols) {
-                    if (NON_CALLABLE_TYPES.has(symbol.type)) continue;
+                    if (!isDiffCallable(symbol)) continue;
                     const exact = line >= symbol.startLine && line <= symbol.endLine;
                     const tolerant = line >= symbol.startLine - 2 && line <= symbol.endLine + 2;
                     if (!exact && !tolerant) continue;
@@ -2331,7 +2336,7 @@ function diffImpact(index, options = {}) {
         if (change.deletedLines.length > 0 && oldCallables !== null) {
             const currentCounts = new Map();
             for (const s of fileEntry.symbols) {
-                if (NON_CALLABLE_TYPES.has(s.type)) continue;
+                if (!isDiffCallable(s)) continue;
                 const key = `${s.name}\0${s.className || ''}`;
                 currentCounts.set(key, (currentCounts.get(key) || 0) + 1);
             }
@@ -2531,7 +2536,7 @@ function diffImpact(index, options = {}) {
 
 // Non-callable declarations have change dependencies too. Keep them separate
 // from functions so type references never inflate call-site accounting.
-function collectNonCallableChanges(index, change, oldParsed, currentSymbols, output) {
+function collectNonCallableChanges(index, change, oldParsed, currentSymbols, output, oldLines = null) {
     const nonCallable = s => NON_CALLABLE_TYPES.has(s.type) || s.type === 'record';
     const oldSymbols = [];
     for (const cls of oldParsed?.classes || []) {
@@ -2550,13 +2555,27 @@ function collectNonCallableChanges(index, change, oldParsed, currentSymbols, out
         before.get(key).push(s);
     }
     const touches = (s, lines) => lines.some(line => line >= s.startLine && line <= (s.endLine || s.startLine));
-    const append = (symbol, kind, old = null) => {
+    const language = detectLanguage(change.filePath);
+    let currentSnapshots = new Map();
+    let oldSnapshots = new Map();
+    // Unsupported/recovered declaration shapes retain conservative range
+    // reporting. Never turn a failed AST projection into a clean diff.
+    try {
+        if (currentSymbols.some(nonCallable)) currentSnapshots = declarationSnapshots(
+            index._getFileLines(change.filePath).join('\n'), language, currentSymbols.filter(nonCallable));
+    } catch (_) { /* fall back to symbol ranges */ }
+    try {
+        if (oldLines) oldSnapshots = declarationSnapshots(oldLines.join('\n'), language, oldSymbols.filter(nonCallable));
+    } catch (_) { /* fall back to symbol ranges */ }
+    const declarationLines = (s, lines, snapshot) => lines.filter(line =>
+        touches(s, [line]) && (!snapshot || snapshot.lines.has(line)));
+    const append = (symbol, kind, old = null, lines = null) => {
         const item = {
             name: symbol.name, type: symbol.type, className: symbol.className,
             filePath: change.filePath, relativePath: change.relativePath,
             startLine: symbol.startLine, endLine: symbol.endLine,
-            addedLines: kind === 'deletedSymbols' ? [] : change.addedLines.filter(line => touches(symbol, [line])),
-            deletedLines: old ? change.deletedLines.filter(line => touches(old, [line])) : [],
+            addedLines: kind === 'deletedSymbols' ? [] : lines.added,
+            deletedLines: kind === 'deletedSymbols' ? change.deletedLines.filter(line => touches(old, [line])) : lines.deleted,
         };
         if (kind === 'deletedSymbols') {
             // The old identity no longer exists. Name occurrences are review
@@ -2575,10 +2594,17 @@ function collectNonCallableChanges(index, change, oldParsed, currentSymbols, out
     };
     for (const symbol of currentSymbols.filter(nonCallable)) {
         const old = before.get(identity(symbol))?.shift();
-        if (touches(symbol, change.addedLines) || (old && touches(old, change.deletedLines))) {
+        const currentSnapshot = currentSnapshots.get(symbol);
+        const oldSnapshot = oldSnapshots.get(old);
+        if (old && currentSnapshot && oldSnapshot && currentSnapshot.signature === oldSnapshot.signature) continue;
+        const lines = {
+            added: declarationLines(symbol, change.addedLines, currentSnapshot),
+            deleted: old ? declarationLines(old, change.deletedLines, oldSnapshot) : [],
+        };
+        if (lines.added.length > 0 || lines.deleted.length > 0) {
             // When the base cannot be read, do not invent a new declaration.
             append(symbol, old || (!oldParsed && !change.untracked && !change.isNew)
-                ? 'symbols' : 'newSymbols', old);
+                ? 'symbols' : 'newSymbols', old, lines);
         }
     }
     for (const group of before.values()) {
@@ -2591,6 +2617,11 @@ function collectNonCallableChanges(index, change, oldParsed, currentSymbols, out
 // ========================================================================
 // STANDALONE HELPERS (used by diffImpact and parseDiff)
 // ========================================================================
+
+function isDiffCallable(symbol) {
+    const type = symbol.type || symbol.memberType || 'method';
+    return !NON_CALLABLE_TYPES.has(type) || (type === 'field' && symbol.isMethod);
+}
 
 /**
  * Extract all callable symbols (functions + class methods) from a parse result,
@@ -2614,7 +2645,7 @@ function extractCallableSymbols(parsed) {
     for (const cls of parsed.classes) {
         if (cls.members) {
             for (const m of cls.members) {
-                if (NON_CALLABLE_TYPES.has(m.memberType || 'method')) continue;
+                if (!isDiffCallable(m)) continue;
                 symbols.push({ name: m.name, className: cls.name, startLine: m.startLine, endLine: m.endLine });
             }
         }

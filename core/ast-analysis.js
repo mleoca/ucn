@@ -28,6 +28,101 @@ const CALLABLE_NODES = new Set([
     'operator_declaration', 'conversion_operator_declaration',
 ]);
 
+const DECLARATION_NODES = {
+    class: new Set(['class_declaration', 'abstract_class_declaration', 'class_definition', 'class_specifier', 'class']),
+    struct: new Set(['struct_item', 'struct_specifier', 'struct_declaration', 'type_spec']),
+    interface: new Set(['interface_declaration', 'type_spec']),
+    type: new Set(['type_alias_declaration', 'type_definition', 'type_spec', 'type_alias', 'type_item', 'associated_type']),
+    enum: new Set(['enum_declaration', 'enum_item', 'enum_specifier']),
+    trait: new Set(['trait_item']),
+    impl: new Set(['impl_item']),
+    record: new Set(['record_declaration']),
+    field: new Set(['field_definition', 'public_field_definition', 'property_signature', 'field_declaration', 'variable_declarator']),
+    state: new Set(['variable_declarator', 'assignment', 'init_declarator', 'const_item', 'static_item', 'const_spec', 'var_spec']),
+};
+const FUNCTION_EXPRESSIONS = new Set([
+    'function_expression', 'generator_function', 'arrow_function', 'lambda',
+    'func_literal', 'closure_expression', 'lambda_expression', 'anonymous_method_expression',
+]);
+const COMMENT_NODES = new Set(['comment', 'line_comment', 'block_comment']);
+
+/**
+ * Compare declarations by AST tokens, not lines: a class header and its first
+ * method can share a line. Concrete methods belong to the callable diff;
+ * bodyless signatures, fields (including unindexed Python assignments), and
+ * nested types belong to the declaration. Function-valued fields retain their
+ * signature but not their executable body. Nothing here is persisted in the
+ * index, so old and current source use the same projection without a cache bump.
+ * Missing AST mappings return no snapshot; callers keep conservative reporting.
+ */
+function declarationSnapshots(content, language, symbols) {
+    const snapshots = new Map();
+    if (content == null || symbols.length === 0) return snapshots;
+    const parser = getParser(language);
+    if (!parser) return snapshots;
+    const root = safeParse(parser, content).rootNode;
+    const wantedKinds = new Set(symbols.flatMap(s => [...(DECLARATION_NODES[s.type] || [])]));
+    const candidates = new Map();
+    walkNamed(root, node => {
+        if (!wantedKinds.has(node.type)) return;
+        if (!candidates.has(node.type)) candidates.set(node.type, []);
+        candidates.get(node.type).push(node);
+    });
+    const hasName = (node, name) => {
+        if (!node) return false;
+        if (node.text === name) return true;
+        return hasName(node.childForFieldName('name') || node.childForFieldName('declarator') ||
+            (node.type === 'generic_type' && node.childForFieldName('type')), name);
+    };
+    for (const symbol of symbols) {
+        const kinds = DECLARATION_NODES[symbol.type];
+        if (!kinds) continue;
+        let declaration = null;
+        for (const kind of kinds) {
+            for (const node of candidates.get(kind) || []) {
+                if (node.startPosition.row + 1 < symbol.startLine ||
+                    node.endPosition.row + 1 > (symbol.endLine || symbol.startLine)) continue;
+                const name = node.childForFieldName('name') || node.childForFieldName('declarator') ||
+                    node.childForFieldName('left') || (symbol.type === 'impl' && node.childForFieldName('type'));
+                if (!hasName(name, symbol.typeName || symbol.name)) continue;
+                if (!declaration || node.endIndex - node.startIndex > declaration.endIndex - declaration.startIndex) {
+                    declaration = node;
+                }
+            }
+        }
+        if (!declaration || declaration.hasError) continue;
+        // Export modifiers and Python decorators live outside the declaration.
+        while (['export_statement', 'decorated_definition'].includes(declaration.parent?.type) &&
+            declaration.parent.startPosition.row + 1 >= symbol.startLine) declaration = declaration.parent;
+        const tokens = [];
+        const lines = new Set();
+        const visit = node => {
+            if (COMMENT_NODES.has(node.type) || node.type === 'pass_statement') return;
+            if (node.type === 'decorated_definition' &&
+                CALLABLE_NODES.has(node.childForFieldName('definition')?.type)) return;
+            // Class docstrings are documentation, not fields or inheritance.
+            if (language === 'python' && node.type === 'expression_statement' &&
+                node.namedChildCount === 1 && ['string', 'concatenated_string'].includes(node.namedChild(0).type)) return;
+            const body = CALLABLE_NODES.has(node.type) ? node.childForFieldName('body') : null;
+            if (body && !FUNCTION_EXPRESSIONS.has(node.type)) return;
+            if (node.childCount === 0) {
+                // Empty anonymous semicolons between members are separators.
+                if (node.type === ';' && ['class_body', 'interface_body', 'declaration_list'].includes(node.parent?.type)) return;
+                tokens.push([node.type, node.text]);
+                for (let line = node.startPosition.row + 1; line <= node.endPosition.row + 1; line++) lines.add(line);
+                return;
+            }
+            for (const child of node.children) {
+                if (body && child.id === body.id) continue;
+                visit(child);
+            }
+        };
+        visit(declaration);
+        snapshots.set(symbol, { signature: JSON.stringify(tokens), lines });
+    }
+    return snapshots;
+}
+
 const BRANCH_NODES = new Set([
     'if_statement', 'if_expression', 'elif_clause',
     'for_statement', 'for_in_statement', 'for_expression',
@@ -375,6 +470,7 @@ function projectComputedDispatch(index) {
 }
 
 module.exports = {
+    declarationSnapshots,
     computeAstComplexity,
     computedDispatchSites,
     projectComputedDispatch,

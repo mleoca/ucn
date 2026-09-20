@@ -73,6 +73,175 @@ describe('5.4.0 independent audit regressions', () => {
         } finally { rm(dir); }
     });
 
+    it('F1: member-body edits inside a container are member changes, never declaration changes', () => {
+        const dir = tmp({
+            'svc.py': 'class Svc:\n    def run(self, x):\n        return x\n\n    def stop(self):\n        return 0\n',
+            'app.py': 'from svc import Svc\nprint(Svc().run(1))\n',
+            'kit.ts': 'export class Kit {\n  count = 0;\n  bump() {\n    return this.count;\n  }\n}\n',
+        });
+        try {
+            baseline(dir);
+            // A body edit and a new method both sit inside callable ranges.
+            fs.writeFileSync(dir + '/svc.py', 'class Svc:\n    def run(self, x):\n        y = x + 1\n        return y\n\n    def stop(self):\n        return 0\n\n    def extra(self):\n        return 1\n');
+            fs.writeFileSync(dir + '/kit.ts', 'export class Kit {\n  count = 0;\n  bump() {\n    this.count += 1;\n    return this.count;\n  }\n}\n');
+            let result = execute(idx(dir), 'impact', {}).result;
+            assert.deepEqual(result.symbols, []);
+            assert.deepEqual(result.newSymbols, []);
+            assert.deepEqual(result.deletedSymbols, []);
+            assert.ok(result.functions.some(f => f.name === 'run'));
+            assert.ok(result.newFunctions.some(f => f.name === 'extra'));
+            let checked = execute(idx(dir), 'check', {}).result;
+            assert.notEqual(checked.trust.status, 'BLOCKED');
+            assert.equal(checked.trust.unvalidatedDeclarations, 0);
+            assert.ok(!checked.actions.some(a => a.kind === 'declaration_change'));
+            // Deleting a whole method removes lines inside the OLD callable range only.
+            fs.writeFileSync(dir + '/svc.py', 'class Svc:\n    def run(self, x):\n        y = x + 1\n        return y\n\n    def extra(self):\n        return 1\n');
+            result = execute(idx(dir), 'impact', {}).result;
+            assert.deepEqual(result.symbols, []);
+            assert.ok(result.deletedFunctions.some(f => f.name === 'stop'));
+            checked = execute(idx(dir), 'check', {}).result;
+            assert.equal(checked.trust.unvalidatedDeclarations, 0);
+            assert.ok(!checked.actions.some(a => a.kind === 'declaration_change'));
+            // A header/base-list edit is the declaration's own change.
+            fs.writeFileSync(dir + '/svc.py', 'class Svc(dict):\n    def run(self, x):\n        y = x + 1\n        return y\n\n    def extra(self):\n        return 1\n');
+            result = execute(idx(dir), 'impact', {}).result;
+            assert.deepEqual(result.symbols.map(s => s.name), ['Svc']);
+            assert.deepEqual(result.symbols[0].addedLines, [1]);
+            checked = execute(idx(dir), 'check', {}).result;
+            assert.equal(checked.trust.status, 'BLOCKED');
+        } finally { rm(dir); }
+    });
+
+    it('F1: dataclass fields after methods remain declarations, including staged and deleted fields', () => {
+        const before = 'from dataclasses import dataclass\n@dataclass\nclass Svc:\n    def run(self):\n        return 1\n    value: int = 1\n\nsvc = Svc()\n';
+        const dir = tmp({ 'svc.py': before });
+        try {
+            baseline(dir);
+            // Removing the default makes the unchanged Svc() call invalid.
+            fs.writeFileSync(dir + '/svc.py', before.replace('value: int = 1', 'value: int'));
+            let result = execute(idx(dir), 'impact', {}).result;
+            assert.deepEqual(result.symbols.map(s => s.name), ['Svc']);
+            assert.deepEqual(result.symbols[0].addedLines, [6]);
+            assert.deepEqual(result.symbols[0].deletedLines, [6]);
+            assert.equal(cli(dir, 'check').status, 1);
+            git(dir, 'add', '.');
+            assert.equal(cli(dir, 'check', '--staged').status, 1);
+            fs.writeFileSync(dir + '/svc.py', before.replace('    value: int = 1\n', ''));
+            result = execute(idx(dir), 'impact', {}).result;
+            assert.deepEqual(result.symbols.map(s => s.name), ['Svc']);
+            assert.deepEqual(result.symbols[0].addedLines, []);
+            assert.deepEqual(result.symbols[0].deletedLines, [6]);
+        } finally { rm(dir); }
+    });
+
+    it('F1: a superclass change shares the first method line without disappearing', () => {
+        for (const [file, before] of [
+            ['svc.ts', 'class Base { inherited() {} }\nclass Other {}\nexport class Svc extends Base { run() { return 1; }\n}\nnew Svc().inherited();\n'],
+            ['Svc.java', 'class Base {}\nclass Other {}\nclass Svc extends Base { int run() { return 1; }\n}\n'],
+        ]) {
+            const dir = tmp({ [file]: before });
+            try {
+                baseline(dir);
+                fs.writeFileSync(dir + '/' + file, before.replace('extends Base', 'extends Other'));
+                const result = execute(idx(dir), 'impact', {}).result;
+                assert.deepEqual(result.symbols.map(s => s.name), ['Svc'], file);
+                assert.deepEqual(result.symbols[0].addedLines, [3]);
+                assert.deepEqual(result.symbols[0].deletedLines, [3]);
+                const checked = cli(dir, 'check', '--json');
+                assert.equal(checked.status, 1, file);
+                assert.equal(JSON.parse(checked.stdout).data.trust.status, 'BLOCKED');
+            } finally { rm(dir); }
+        }
+    });
+
+    it('F1: required interface and trait members change the containing contract', () => {
+        for (const [file, before, member] of [
+            ['api.ts', 'export interface API {\n  run(): void;\n}\nconst api: API = { run() {} };\n', '  stop(): void;\n'],
+            ['API.java', 'interface API {\n  void run();\n}\n', '  void stop();\n'],
+            ['api.rs', 'trait API {\n  fn run(&self);\n}\n', '  fn stop(&self);\n'],
+            ['api.go', 'package api\ntype API interface {\n  Run()\n}\n', '  Stop()\n'],
+            ['API.cs', 'interface API {\n  void Run();\n}\n', '  void Stop();\n'],
+        ]) {
+            const dir = tmp({ [file]: before });
+            try {
+                baseline(dir);
+                fs.writeFileSync(dir + '/' + file, before.replace('\n}', '\n' + member + '}'));
+                let result = execute(idx(dir), 'impact', {}).result;
+                assert.ok(result.symbols.some(s => s.name === 'API'), file);
+                assert.equal(cli(dir, 'check').status, 1, file);
+                // Removing a required member also changes the type contract.
+                git(dir, 'add', '.');
+                git(dir, '-c', 'user.name=Test', '-c', 'user.email=test@example.test', 'commit', '-qm', 'added member');
+                fs.writeFileSync(dir + '/' + file, before);
+                result = execute(idx(dir), 'impact', {}).result;
+                assert.ok(result.symbols.some(s => s.name === 'API'), file);
+                assert.equal(cli(dir, 'check').status, 1, file);
+            } finally { rm(dir); }
+        }
+    });
+
+    it('F1: single-line method bodies never change their container declaration', () => {
+        for (const [file, before] of [
+            ['svc.ts', 'export class Svc { run() { return 1; } }\n'],
+            ['Svc.java', 'class Svc { int run() { return 1; } }\n'],
+            ['svc.rs', 'struct Svc;\nimpl Svc { fn run(&self) -> i32 { 1 } }\n'],
+            ['svc.cpp', 'class Svc { public: int run() { return 1; } };\n'],
+            ['Svc.cs', 'class Svc { int Run() { return 1; } }\n'],
+        ]) {
+            const dir = tmp({ [file]: before });
+            try {
+                baseline(dir);
+                fs.writeFileSync(dir + '/' + file, before.replace('1', '2'));
+                const result = execute(idx(dir), 'impact', {}).result;
+                assert.deepEqual(result.symbols, [], file);
+                assert.equal(result.functions.length, 1, file);
+                assert.equal(cli(dir, 'check').status, 0, file);
+            } finally { rm(dir); }
+        }
+    });
+
+    it('F1: callable field bodies retain callable impact while signatures remain declarations', () => {
+        for (const before of [
+            'export class Svc {\n  run = (x: number): number => {\n    return x + 1;\n  };\n}\n',
+            'export class Svc { run = (x: number): number => x + 1; }\n',
+        ]) {
+            const dir = tmp({ 'svc.ts': before });
+            try {
+                baseline(dir);
+                fs.writeFileSync(dir + '/svc.ts', before.replace('x + 1', 'x + 2'));
+                let result = execute(idx(dir), 'impact', {}).result;
+                assert.deepEqual(result.symbols, []);
+                assert.deepEqual(result.functions.map(s => s.name), ['run']);
+                assert.deepEqual(result.newFunctions, []);
+                assert.deepEqual(result.deletedFunctions, []);
+                assert.equal(cli(dir, 'check').status, 0);
+                fs.writeFileSync(dir + '/svc.ts', before.replace('x: number', 'x: number, y: number'));
+                result = execute(idx(dir), 'impact', {}).result;
+                assert.deepEqual(result.symbols.map(s => s.name).sort(), ['Svc', 'run']);
+                assert.equal(cli(dir, 'check').status, 1);
+            } finally { rm(dir); }
+        }
+    });
+
+    it('F1: comments and docstrings are ignored but nested fields and decorators remain visible', () => {
+        const before = '@dataclass\nclass Svc:\n    """Documentation."""\n    # Header comment\n    def run(self):\n        return 1\n    # Member comment\n    class Nested:\n        value: int = 1\n';
+        const dir = tmp({ 'svc.py': 'from dataclasses import dataclass\n' + before });
+        try {
+            baseline(dir);
+            fs.writeFileSync(dir + '/svc.py', 'from dataclasses import dataclass\n' + before
+                .replace('Documentation.', 'New documentation.').replace('Header comment', 'New header comment')
+                .replace('Member comment', 'New member comment'));
+            assert.deepEqual(execute(idx(dir), 'impact', {}).result.symbols, []);
+            fs.writeFileSync(dir + '/svc.py', 'from dataclasses import dataclass\n' + before.replace('value: int', 'value: str'));
+            let result = execute(idx(dir), 'impact', {}).result;
+            assert.ok(result.symbols.some(s => s.name === 'Svc'));
+            assert.ok(result.symbols.some(s => s.name === 'Nested'));
+            fs.writeFileSync(dir + '/svc.py', 'from dataclasses import dataclass\n' + before.replace('@dataclass', '@dataclass(frozen=True)'));
+            result = execute(idx(dir), 'impact', {}).result;
+            assert.deepEqual(result.symbols.map(s => s.name), ['Svc']);
+        } finally { rm(dir); }
+    });
+
     it('F2: aliases use their own arguments, including mixed and nested calls on one line', () => {
         const dir = tmp({
             'core.py': 'def compute(a, b=2, *, scale=1): return a+b\nhandler = compute\ndef use(): return handler() + compute(1) + handler(2)\ndef nested(): return handler(handler())\n',
