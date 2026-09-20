@@ -485,6 +485,7 @@ function formatCliText(command, result, params, execution, displayFlags) {
         all: !!displayFlags?.all,
         surface: 'cli',
         params,
+        trailingChars: 1, // emitCliText appends the terminal newline.
     }).text;
 }
 

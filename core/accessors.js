@@ -2,6 +2,48 @@
 
 const path = require('path');
 const { codeUnitCompare } = require('./shared');
+const { getParser, safeParse } = require('../languages');
+
+function inheritedAccessor(index, enclosing, name, definition) {
+    let owner = enclosing?.className;
+    let file = enclosing?.file;
+    const seen = new Set();
+    while (owner && file && !seen.has(`${file}\0${owner}`)) {
+        seen.add(`${file}\0${owner}`);
+        if (owner === ownerName(definition) && file === definition.file) return true;
+        // An override owns this spelling. Multiple inheritance and duplicate
+        // declarations need richer lookup evidence, so keep them unverified.
+        if ((index.symbols.get(name) || []).some(d => d.className === owner && d.file === file)) return false;
+        const definitions = (index.symbols.get(owner) || []).filter(d => d.file === file && ['class', 'struct'].includes(d.type));
+        if (definitions.length !== 1) return false;
+        const parents = index._getInheritanceParentsAt(owner, file, definitions[0].startLine) || [];
+        if (parents.length !== 1) return false;
+        const parentName = bareTypeName(parents[0]);
+        const candidates = (index.symbols.get(parentName) || []).filter(d => ['class', 'struct'].includes(d.type));
+        const local = candidates.filter(d => d.file === file);
+        const imported = candidates.filter(d => index.importGraph.get(file)?.has(d.file));
+        const targets = local.length ? local : imported;
+        if (targets.length !== 1) return false;
+        owner = targets[0].name;
+        file = targets[0].file;
+    }
+    return false;
+}
+
+function accessKind(tree, usage) {
+    if (!tree || !Number.isInteger(usage.column)) return 'access';
+    let node = tree.rootNode.descendantForPosition({ row: usage.line - 1, column: usage.column });
+    if (['attribute', 'member_expression', 'member_access_expression'].includes(node.parent?.type)) node = node.parent;
+    const parent = node.parent;
+    if (parent?.type === 'update_expression' || parent?.type === 'delete_statement') return parent.type === 'update_expression' ? 'read/write' : 'delete';
+    if (['assignment', 'assignment_expression', 'augmented_assignment', 'augmented_assignment_expression'].includes(parent?.type)) {
+        const left = parent.childForFieldName('left');
+        if (left && left.startIndex === node.startIndex && left.endIndex === node.endIndex) {
+            return parent.type.startsWith('augmented') ? 'read/write' : 'write';
+        }
+    }
+    return 'read';
+}
 
 // Descriptors/properties are consumed through reads and writes, not only
 // call syntax. Keep this vocabulary shared by impact and refactoring so the
@@ -87,11 +129,14 @@ function findAccessorReferences(index, name, definition, options = {}) {
             occurrences = index._getCachedUsages(file, name);
         } catch { continue; }
         if (!occurrences) continue;
+        const parser = getParser(entry.language);
+        const tree = parser ? safeParse(parser, content) : null;
         const lines = content.split('\n');
         for (const usage of occurrences) {
             if (usage.usageType !== 'reference') continue;
             refs.push({
                 ...usage,
+                accessKind: accessKind(tree, usage),
                 file,
                 relativePath: entry.relativePath,
                 content: lines[usage.line - 1] || '',
@@ -106,6 +151,7 @@ function findAccessorReferences(index, name, definition, options = {}) {
             absoluteFile: ref.file,
             line: ref.line,
             expression: (ref.content || '').trim(),
+            accessKind: ref.accessKind,
             ...(Number.isInteger(ref.column) && { column: ref.column }),
             ...(ref.receiver && { receiver: ref.receiver }),
         };
@@ -122,7 +168,8 @@ function findAccessorReferences(index, name, definition, options = {}) {
         const enclosing = index.findEnclosingFunction(ref.file, ref.line, true);
         const receiver = ref.receiver || null;
         if (receiver && ['self', 'cls', 'this'].includes(receiver) &&
-            enclosing?.className === owner && enclosing.file === definition.file) {
+            ((enclosing?.className === owner && enclosing.file === definition.file) ||
+                inheritedAccessor(index, enclosing, name, definition))) {
             confirmed.push({
                 ...shaped,
                 callerName: enclosing.name,

@@ -1181,6 +1181,7 @@ function impact(index, name, options = {}) {
         // Convert findCallers results to the format expected by analyzeCallSite
         const calls = callerResults.map(c => ({
             file: c.file,
+            calledAs: c.calledAs,
             relativePath: c.relativePath,
             line: c.line,
             content: c.content,
@@ -2085,6 +2086,7 @@ function diffImpact(index, options = {}) {
             moduleLevelChanges: [],
             newFunctions: [],
             deletedFunctions: [],
+            symbols: [], newSymbols: [], deletedSymbols: [],
             summary: { modifiedFunctions: 0, deletedFunctions: 0, newFunctions: 0, totalCallSites: 0, unverifiedCallSites: 0, affectedFiles: 0 }
         };
     }
@@ -2093,6 +2095,7 @@ function diffImpact(index, options = {}) {
     const moduleLevelChanges = [];
     const newFunctions = [];
     const deletedFunctions = [];
+    const symbolChanges = { symbols: [], newSymbols: [], deletedSymbols: [] };
     const callerFileSet = new Set();
     let totalCallSites = 0;
     let totalUnverifiedSites = 0;
@@ -2120,6 +2123,7 @@ function diffImpact(index, options = {}) {
                         { cwd: index.root, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }
                     );
                     const oldParsed = parse(oldContent, lang);
+                    collectNonCallableChanges(index, change, oldParsed, [], symbolChanges);
                     for (const oldFn of extractCallableSymbols(oldParsed)) {
                         deletedFunctions.push({
                             name: oldFn.name,
@@ -2144,6 +2148,7 @@ function diffImpact(index, options = {}) {
         // The identity key is `name\0className` (matches deletion-detection below).
         let oldSymbolIdentities = null; // null = unknown (file untracked or git failed)
         let oldCallables = null;        // old symbols WITH ranges — deleted lines are old-file coordinates
+        let oldParsed = null;
         if (change.deletedLines.length > 0 || change.addedLines.length > 0) {
             const ref = staged ? 'HEAD' : base;
             try {
@@ -2153,7 +2158,7 @@ function diffImpact(index, options = {}) {
                 );
                 const fileLang = detectLanguage(change.filePath);
                 if (fileLang) {
-                    const oldParsed = parse(oldContent, fileLang);
+                    oldParsed = parse(oldContent, fileLang);
                     oldSymbolIdentities = new Set();
                     oldCallables = extractCallableSymbols(oldParsed);
                     for (const oldFn of oldCallables) {
@@ -2164,6 +2169,8 @@ function diffImpact(index, options = {}) {
                 // File didn't exist in base, or git error — leave null (unknown).
             }
         }
+
+        collectNonCallableChanges(index, change, oldParsed, fileEntry.symbols, symbolChanges);
 
         for (const line of change.addedLines) {
             const symbol = index.findEnclosingFunction(change.filePath, line, true);
@@ -2478,6 +2485,22 @@ function diffImpact(index, options = {}) {
         }
     }
 
+    const dependencyFiles = new Set();
+    let totalDependencySites = 0;
+    let unverifiedDependencySites = 0;
+    for (const symbol of [...symbolChanges.symbols, ...symbolChanges.newSymbols]) {
+        const evidence = symbol.impact;
+        if (!evidence) continue;
+        totalCallSites += evidence.totalCallSites || 0;
+        totalUnverifiedSites += evidence.unverifiedSites?.length || 0;
+        for (const group of evidence.byFile || []) callerFileSet.add(path.resolve(index.root, group.file));
+        const refs = evidence.typeReferences || evidence.propertyAccesses;
+        totalDependencySites += refs?.confirmedCount || 0;
+        unverifiedDependencySites += refs?.unverifiedCount || 0;
+        for (const group of refs?.byFile || []) dependencyFiles.add(group.file);
+        for (const site of refs?.unverifiedSites || []) dependencyFiles.add(site.file);
+    }
+
     return {
         base: staged ? '(staged)' : base,
         changedPaths: changes.length,
@@ -2487,16 +2510,82 @@ function diffImpact(index, options = {}) {
         moduleLevelChanges,
         newFunctions,
         deletedFunctions,
+        ...symbolChanges,
         summary: {
             modifiedFunctions: functions.length,
             deletedFunctions: deletedFunctions.length,
             newFunctions: newFunctions.length,
+            modifiedSymbols: symbolChanges.symbols.length,
+            newSymbols: symbolChanges.newSymbols.length,
+            deletedSymbols: symbolChanges.deletedSymbols.length,
+            totalDependencySites,
+            unverifiedDependencySites,
+            dependencyFiles: dependencyFiles.size,
             totalCallSites,
             unverifiedCallSites: totalUnverifiedSites,
             affectedFiles: callerFileSet.size
         }
     };
     } finally { index._endOp(); }
+}
+
+// Non-callable declarations have change dependencies too. Keep them separate
+// from functions so type references never inflate call-site accounting.
+function collectNonCallableChanges(index, change, oldParsed, currentSymbols, output) {
+    const nonCallable = s => NON_CALLABLE_TYPES.has(s.type) || s.type === 'record';
+    const oldSymbols = [];
+    for (const cls of oldParsed?.classes || []) {
+        oldSymbols.push(cls);
+        for (const member of cls.members || []) {
+            const symbol = { ...member, type: member.memberType, className: cls.name };
+            if (nonCallable(symbol)) oldSymbols.push(symbol);
+        }
+    }
+    oldSymbols.push(...(oldParsed?.stateObjects || []).map(s => ({ ...s, type: 'state' })));
+    const identity = s => `${s.type}\0${s.className || ''}\0${s.name}`;
+    const before = new Map();
+    for (const s of oldSymbols.filter(nonCallable)) {
+        const key = identity(s);
+        if (!before.has(key)) before.set(key, []);
+        before.get(key).push(s);
+    }
+    const touches = (s, lines) => lines.some(line => line >= s.startLine && line <= (s.endLine || s.startLine));
+    const append = (symbol, kind, old = null) => {
+        const item = {
+            name: symbol.name, type: symbol.type, className: symbol.className,
+            filePath: change.filePath, relativePath: change.relativePath,
+            startLine: symbol.startLine, endLine: symbol.endLine,
+            addedLines: kind === 'deletedSymbols' ? [] : change.addedLines.filter(line => touches(symbol, [line])),
+            deletedLines: old ? change.deletedLines.filter(line => touches(old, [line])) : [],
+        };
+        if (kind === 'deletedSymbols') {
+            // The old identity no longer exists. Name occurrences are review
+            // candidates, not proven references to the removed declaration.
+            item.remainingReferences = index.usages(symbol.name, { includeTests: true, codeOnly: true })
+                .filter(u => !u.isDefinition).map(u => ({
+                    file: u.relativePath, line: u.line, expression: u.content,
+                    reason: 'deleted-target-name-match', tier: 'unverified',
+                }));
+        } else {
+            item.impact = impact(index, symbol.name, {
+                file: change.relativePath, line: symbol.startLine, className: symbol.className,
+            });
+        }
+        output[kind].push(item);
+    };
+    for (const symbol of currentSymbols.filter(nonCallable)) {
+        const old = before.get(identity(symbol))?.shift();
+        if (touches(symbol, change.addedLines) || (old && touches(old, change.deletedLines))) {
+            // When the base cannot be read, do not invent a new declaration.
+            append(symbol, old || (!oldParsed && !change.untracked && !change.isNew)
+                ? 'symbols' : 'newSymbols', old);
+        }
+    }
+    for (const group of before.values()) {
+        for (const old of group) {
+            if (touches(old, change.deletedLines)) append(old, 'deletedSymbols', old);
+        }
+    }
 }
 
 // ========================================================================
@@ -2556,8 +2645,10 @@ function parseDiff(diffText, root) {
     const changes = [];
     let currentFile = null;
     let pendingOldPath = null; // Track --- a/ path for deleted files
+    let pendingNewFile = false;
 
     for (const line of diffText.split('\n')) {
+        if (line === '--- /dev/null') pendingNewFile = true;
         // Track old file path from --- header for deleted-file detection
         // Handles both unquoted (--- a/path) and quoted (--- "a/path") formats
         const oldMatch = line.match(/^--- (?:"a\/((?:[^"\\]|\\.)*)"|a\/(.+?))\s*$/);
@@ -2587,8 +2678,10 @@ function parseDiff(diffText, root) {
                 relativePath,
                 addedLines: [],
                 deletedLines: [],
+                ...(pendingNewFile && { isNew: true }),
                 ...(isDevNull && { isDeleted: true })
             };
+            pendingNewFile = false;
             changes.push(currentFile);
             continue;
         }
@@ -2896,7 +2989,7 @@ function auditAsync(index, options = {}) {
                     }
                 }
             }
-            if (asyncFns.length === 0) return;
+            if (asyncFns.length === 0 && language !== 'python') return;
 
             // Re-parse file to find awaited-vs-not call sites. We use a fresh
             // parse rather than tree cache because we want to walk every
@@ -2965,6 +3058,12 @@ function auditAsync(index, options = {}) {
             // immediate enclosing fn-node is async (so callbacks inside an
             // async fn aren't misclassified as async themselves).
             function nearestAsyncEnclosing(callNode) {
+                // Python creates a dormant coroutine even in a synchronous
+                // scope. A discarded expression never runs; returning or
+                // passing it to an event-loop consumer remains intentional.
+                let expression = callNode;
+                while (expression.parent?.type === 'parenthesized_expression') expression = expression.parent;
+                const discardedPython = language === 'python' && expression.parent?.type === 'expression_statement';
                 let cur = callNode.parent;
                 while (cur) {
                     if (FN_NODE_TYPES.has(cur.type)) {
@@ -2981,11 +3080,16 @@ function auditAsync(index, options = {}) {
                                 endLine: cur.endPosition.row + 1,
                             };
                         }
+                        if (discardedPython) return {
+                            name: cur.childForFieldName('name')?.text || '<anonymous>',
+                            startLine: cur.startPosition.row + 1,
+                            endLine: cur.endPosition.row + 1,
+                        };
                         return null; // Inner non-async fn — stop, don't leak into outer scope.
                     }
                     cur = cur.parent;
                 }
-                return null;
+                return discardedPython ? { name: '<module>' } : null;
             }
 
             function visit(node) {

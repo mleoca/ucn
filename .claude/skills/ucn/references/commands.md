@@ -35,7 +35,7 @@ structural or code-only search.
 | `deps <file>` | File dependency graph. Use `--direction=imports\|importers\|both`, `--detailed`, or `--cycles`. Cycles distinguish eager edges from function-local, Python typing-guarded, and TypeScript type-only edges. Complete cycle groups remain visible when enumeration is capped. |
 | `api [file]` | Static exported/public surface for a project or file. An exact file includes tests; broader scans exclude tests with a count. Use `--include-tests` to include them. |
 | `entrypoints` | Framework, route, task, test, and runtime entry points. |
-| `endpoints` | Server/client HTTP surface; `--bridge` adds advisory matching. |
+| `endpoints` | Server/client HTTP surface; `--bridge` adds advisory matching. Test sites carry `[test]`; `--exclude-tests` removes them and `--in=DIR` scopes the inventory. |
 
 ## Focused audits and runtime evidence
 
@@ -55,13 +55,13 @@ Structural `search --param` matches parameter names, types, and defaults; `--ret
 
 `repo` summary/stats `buildTime` is the duration of the last index build (discovery, parsing, and graphs), retained in the cache. It excludes cache loading/saving and query execution, so it is not command wall time; `buildTimeNote` states this boundary.
 
-`--lines` writes one record per output line. `usages` records occurrences, so multiple tokens on the same source line can produce repeated `path:line` values. Deduplicate those values when counting source lines.
+`--lines` writes one record per output line. `usages --lines` groups occurrences by source line and tags their kinds and counts. JSON retains individual occurrence records.
 
 Public JSON source paths (`file`, caller files, dependency roots and edges) are project-relative, with the absolute base in `meta.pathBase`. Project roots and external paths remain absolute. Indexed absolute handles are accepted as well as relative handles.
 
 Default test exclusions follow language conventions. Python `spec.py` and `*_spec.py` are included; `test_*.py`, `*_test.py`, and test directories are excluded. Structural search reports hidden test-file counts, including on empty results. `--include-tests` disables these defaults; explicit `--exclude` patterns still apply.
 
-`audit-async` checks recognized async producers, including captured JS/TS/HTML promises used as resolved values in the same lexical scope. Promise returns and handlers are valid; alias flow and unknown receivers require compiler/type-checker review.
+`audit-async` checks recognized async producers, including Python coroutine calls discarded in synchronous functions or module scope and captured JS/TS/HTML promises used as resolved values in the same lexical scope. Promise returns and handlers are valid; alias flow and unknown receivers require compiler/type-checker review.
 
 ## Common flags
 

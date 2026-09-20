@@ -864,7 +864,7 @@ describe('UCN v5 prerelease audit regressions', () => {
             assert.ok(result.excludedExported >= 3);
             assert.equal(result.pythonImplicitExportFiles, 2);
             const text = output.formatDeadcode(result);
-            assert.match(text, /Java serialization callback/);
+            assert.match(text, /runtime callback/);
             assert.match(text, /Python public-surface rule active/);
             assert.match(output.formatDeadcodeJson(result), /pythonImplicitExportFiles/);
         } finally { rm(dir); }

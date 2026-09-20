@@ -77,9 +77,20 @@ function findRecords(result) {
 function usagesRecords(result) {
     const out = [];
     const notes = [];
+    const byLine = new Map();
     for (const usage of Array.isArray(result) ? result : []) {
         const kind = usage.isDefinition ? 'definition' : (usage.usageType || 'reference');
-        out.push(record(pathOf(usage), usage.line, usage.content, kind === 'call' ? '' : kind));
+        const key = `${pathOf(usage)}\0${usage.line}`;
+        if (!byLine.has(key)) byLine.set(key, { usage, kinds: new Set(), count: 0 });
+        const row = byLine.get(key);
+        row.kinds.add(kind);
+        row.count++;
+    }
+    for (const { usage, kinds, count } of byLine.values()) {
+        const tags = [...kinds].filter(kind => kind !== 'call');
+        if (kinds.has('call') && tags.length) tags.unshift('call');
+        if (count > 1) tags.push(`${count} occurrences`);
+        out.push(record(pathOf(usage), usage.line, usage.content, tags.join('; ')));
     }
     const counts = result && result.summaryCounts;
     if (counts && counts.hiddenTestUsages > 0) {
@@ -187,6 +198,17 @@ function impactRecords(result) {
                 out.push(record(pathOf(site), site.line, site.content, 'unverified: deleted-target-name-match'));
             }
         }
+        for (const symbol of [...(result.symbols || []), ...(result.newSymbols || []), ...(result.deletedSymbols || [])]) {
+            out.push(record(symbol.relativePath, symbol.startLine, symbol.name, `${symbol.type} declaration change`));
+            if (symbol.impact) {
+                const nested = impactRecords(symbol.impact);
+                out.push(...nested.records);
+                notes.push(...nested.notes);
+            }
+            for (const site of symbol.remainingReferences || []) {
+                out.push(record(site.file, site.line, site.expression, 'unverified: deleted-target-name-match'));
+            }
+        }
         const summary = result.summary || {};
         notes.push(`# Diff: ${summary.modifiedFunctions || 0} modified, ${summary.newFunctions || 0} new, ${summary.deletedFunctions || 0} deleted functions; ${(result.moduleLevelChanges || []).length} file(s) with module-level changes.`);
         if (result.nonSourcePaths) notes.push(`# ${result.nonSourcePaths} changed path(s) outside supported source files not analyzed.`);
@@ -206,11 +228,11 @@ function impactRecords(result) {
         const accesses = result.propertyAccesses;
         for (const group of accesses.byFile || []) {
             for (const access of group.sites || []) {
-                out.push(record(group.file, access.line, access.expression, 'property-access'));
+                out.push(record(group.file, access.line, access.expression, `property-access: ${access.accessKind || 'access'}${Number.isInteger(access.column) ? `, column ${access.column + 1}` : ''}`));
             }
         }
         for (const access of accesses.unverifiedSites || []) {
-            out.push(record(pathOf(access), access.line, access.expression, `${unverifiedTag(access)}; property-access`));
+            out.push(record(pathOf(access), access.line, access.expression, `${unverifiedTag(access)}; property-access: ${access.accessKind || 'access'}${Number.isInteger(access.column) ? `, column ${access.column + 1}` : ''}`));
         }
         notes.push(`# PROPERTY ACCESS SITES: ${accesses.confirmedCount} confirmed, ${accesses.unverifiedCount} unverified, ${accesses.excluded?.total || 0} other-target (separate from caller ACCOUNT).`);
     }

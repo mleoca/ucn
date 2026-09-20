@@ -55,7 +55,7 @@ function formatUncertainRequests(result, options) {
     lines.push(`Possible client requests (${list.length}) — request-shaped call with a path literal, receiver not recognized as an HTTP client:`);
     const cap = options.all ? Infinity : 10;
     for (const r of list.slice(0, cap)) {
-        lines.push(`  ${r.file}:${r.line} ${r.receiver}.${r.method}(${JSON.stringify(r.path)}) in ${r.callerName}`);
+        lines.push(`  ${r.file}:${r.line} ${r.receiver}.${r.method}(${JSON.stringify(r.path)}) in ${r.callerName}${r.isTest ? ' [test]' : ''}`);
     }
     if (list.length > cap) lines.push(`  (+${list.length - cap} more — use --all)`);
     return lines;
@@ -88,7 +88,7 @@ function formatRoutesAndRequests(routes, requests, meta, options, advisory = nul
                 for (const r of list) {
                     const handler = r.handler || '<anonymous>';
                     const fw = r.framework ? `[${r.framework}]` : '';
-                    lines.push(`  ${pad(r.method, 7)} ${pad(r.path, 40)} → ${handler} ${fw} :${r.line}`);
+                    lines.push(`  ${pad(r.method, 7)} ${pad(r.path, 40)} → ${handler} ${fw}${r.isTest ? ' [test]' : ''} :${r.line}`);
                 }
                 lines.push('');
             }
@@ -115,7 +115,7 @@ function formatRoutesAndRequests(routes, requests, meta, options, advisory = nul
                     const inferred = r.methodInferred ? '?' : '';
                     const interp = r.interp ? ' (interp)' : '';
                     const fw = r.framework ? `[${r.framework}]` : '';
-                    lines.push(`  ${pad(r.method + inferred, 7)} ${pad(r.path + interp, 40)} from ${r.callerName} ${fw} :${r.line}`);
+                    lines.push(`  ${pad(r.method + inferred, 7)} ${pad(r.path + interp, 40)} from ${r.callerName} ${fw}${r.isTest ? ' [test]' : ''} :${r.line}`);
                 }
                 lines.push('');
             }
@@ -166,12 +166,12 @@ function formatBridges(bridges, unmatchedRoutes, unmatchedRequests, meta, option
 
         lines.push(`Matched (${sorted.length} routes):`);
         for (const { route, clients } of sorted) {
-            lines.push(`  ${pad(route.method, 7)} ${route.path}  [${route.framework}]  ${route.file}:${route.line}`);
+            lines.push(`  ${pad(route.method, 7)} ${route.path}  [${route.framework}]${route.isTest ? ' [test]' : ''}  ${route.file}:${route.line}`);
             for (const b of clients) {
                 const conf = b.confidence.toFixed(2);
                 const tier = b.matchType.toUpperCase();
                 const inf = b.methodInferred ? ' method?' : '';
-                lines.push(`    ↔ ${pad(b.request.method + inf, 9)} ${pad(b.request.path, 30)}  ${tier} (${conf})  from ${b.request.callerName}  ${b.request.file}:${b.request.line}`);
+                lines.push(`    ↔ ${pad(b.request.method + inf, 9)} ${pad(b.request.path, 30)}  ${tier} (${conf})  from ${b.request.callerName}${b.request.isTest ? ' [test]' : ''}  ${b.request.file}:${b.request.line}`);
             }
             lines.push('');
         }
@@ -180,7 +180,7 @@ function formatBridges(bridges, unmatchedRoutes, unmatchedRequests, meta, option
     if (unmatchedRoutes.length > 0) {
         lines.push(`Unmatched server routes (${unmatchedRoutes.length}):`);
         for (const r of unmatchedRoutes) {
-            lines.push(`  ${pad(r.method, 7)} ${pad(r.path, 40)} → ${r.handler}  [${r.framework}]  ${r.file}:${r.line}`);
+            lines.push(`  ${pad(r.method, 7)} ${pad(r.path, 40)} → ${r.handler}  [${r.framework}]${r.isTest ? ' [test]' : ''}  ${r.file}:${r.line}`);
         }
         lines.push('');
     }
@@ -190,7 +190,7 @@ function formatBridges(bridges, unmatchedRoutes, unmatchedRequests, meta, option
         for (const r of unmatchedRequests) {
             const inferred = r.methodInferred ? '?' : '';
             const interp = r.interp ? ' (interp)' : '';
-            lines.push(`  ${pad(r.method + inferred, 7)} ${pad(r.path + interp, 40)} from ${r.callerName}  [${r.framework}]  ${r.file}:${r.line}`);
+            lines.push(`  ${pad(r.method + inferred, 7)} ${pad(r.path + interp, 40)} from ${r.callerName}  [${r.framework}]${r.isTest ? ' [test]' : ''}  ${r.file}:${r.line}`);
         }
     }
 
@@ -213,6 +213,7 @@ function formatEndpointsJson(result, options = {}) {
         file: r.file,
         line: r.line,
         framework: r.framework,
+        isTest: !!r.isTest,
         ...(r.classPrefix && { classPrefix: r.classPrefix }),
     });
     const trimReq = (r) => ({
@@ -225,6 +226,7 @@ function formatEndpointsJson(result, options = {}) {
         callerName: r.callerName,
         ...(r.callerStartLine && { callerStartLine: r.callerStartLine }),
         framework: r.framework,
+        isTest: !!r.isTest,
         ...(r.methodInferred && { methodInferred: true }),
     });
     const trimBridge = (b) => ({
@@ -250,6 +252,7 @@ function formatEndpointsJson(result, options = {}) {
             uncertainRequests: (result.uncertainRequests || []).map(r => ({
                 receiver: r.receiver, method: r.method, path: r.path,
                 file: r.file, line: r.line, callerName: r.callerName, reason: r.reason,
+                isTest: !!r.isTest,
             })),
             // In unmatched-only mode, the matched bridges array is suppressed
             // — consumers that want both should not pass --unmatched.

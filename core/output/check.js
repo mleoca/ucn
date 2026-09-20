@@ -29,15 +29,17 @@ function formatCheck(result) {
         if (result.trust.signatureMismatches) trustDetails.push(`${result.trust.signatureMismatches} signature mismatch(es)`);
         if (result.trust.filteredEdges) trustDetails.push(`${result.trust.filteredEdges} filtered edge(s)`);
         if (result.trust.usageReviewSymbols) trustDetails.push(`${result.trust.usageReviewSymbols} symbol(s) need usages review`);
+        if (result.trust.unvalidatedDeclarations) trustDetails.push(`${result.trust.unvalidatedDeclarations} declaration change(s) need toolchain validation`);
         if (trustDetails.length > 0) lines.push(`  ${trustDetails.join(' · ')}`);
     }
 
     // Changed functions section
     const items = result.changed || [];
+    const noun = items.some(it => it.symbolType) ? 'symbol' : 'function';
     if (result.truncated) {
-        lines.push(`Changed: ${items.length} of ${result.totalChanged} functions`);
+        lines.push(`Changed: ${items.length} of ${result.totalChanged} ${noun}s`);
     } else {
-        lines.push(`Changed: ${items.length} function${items.length === 1 ? '' : 's'}`);
+        lines.push(`Changed: ${items.length} ${noun}${items.length === 1 ? '' : 's'}`);
     }
     if (items.length === 0) {
         lines.push('  (none — only non-function changes)');
@@ -47,6 +49,7 @@ function formatCheck(result) {
             if (it.kind && it.kind !== 'changed') tags.push(it.kind.toUpperCase());
             if (it.signatureMismatches > 0) tags.push(`SIG-DRIFT(${it.signatureMismatches})`);
             if (it.orphan) tags.push('ORPHAN');
+            if (it.symbolType) tags.push(it.symbolType);
             if (it.account && !it.account.textComplete) tags.push('ACCOUNT-INCOMPLETE');
             const tagStr = tags.length ? ' [' + tags.join(', ') + ']' : '';
             let callers = it.callerCount != null ? `${it.callerCount} caller${it.callerCount === 1 ? '' : 's'}` : '';
@@ -54,6 +57,7 @@ function formatCheck(result) {
                 callers += ` (+${it.unverifiedCallerCount} unverified)`;
             }
             lines.push(`  ${it.name} (${it.file}:${it.line})${tagStr}  ${callers}`);
+            if (it.symbolType) lines.push(`    Dependencies: ${it.dependencyCount || 0} confirmed, ${it.unverifiedDependencyCount || 0} unverified`);
             if (it.mismatches && it.mismatches.length > 0) {
                 for (const m of it.mismatches.slice(0, 3)) {
                     const where = m.file ? ` at ${m.file}:${m.line}` : '';

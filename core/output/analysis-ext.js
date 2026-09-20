@@ -207,8 +207,14 @@ function formatDiffImpact(result, options = {}) {
     if (s.modifiedFunctions > 0) parts.push(`${s.modifiedFunctions} modified`);
     if (s.deletedFunctions > 0) parts.push(`${s.deletedFunctions} deleted`);
     if (s.newFunctions > 0) parts.push(`${s.newFunctions} new`);
+    if (s.modifiedSymbols || s.newSymbols || s.deletedSymbols) {
+        parts.push(`${s.modifiedSymbols || 0} modified, ${s.newSymbols || 0} new, ${s.deletedSymbols || 0} deleted non-callable declarations`);
+    }
     parts.push(`${s.totalCallSites || 0} call sites across ${s.affectedFiles || 0} files`);
     if (s.unverifiedCallSites > 0) parts.push(`${s.unverifiedCallSites} unverified`);
+    if (s.totalDependencySites || s.unverifiedDependencySites) {
+        parts.push(`${s.totalDependencySites || 0} confirmed + ${s.unverifiedDependencySites || 0} unverified non-call dependency sites across ${s.dependencyFiles || 0} files`);
+    }
     lines.push(parts.join(', '));
     // fix #283: changed paths outside supported source are invisible to the
     // symbol analysis — disclose instead of silently narrowing the diff.
@@ -229,10 +235,10 @@ function formatDiffImpact(result, options = {}) {
             lines.push(`  ${fn.relativePath}:${fn.startLine}`);
             lines.push(`  ${fn.signature}`);
             if (fn.addedLines.length > 0) {
-                lines.push(`  Lines added: ${formatLineRanges(fn.addedLines)}`);
+                lines.push(`  Added at lines: ${formatLineRanges(fn.addedLines)}`);
             }
             if (fn.deletedLines.length > 0) {
-                lines.push(`  Lines deleted: ${formatLineRanges(fn.deletedLines)}`);
+                lines.push(`  Deleted at old lines: ${formatLineRanges(fn.deletedLines)}`);
             }
 
             if (fn.callers.length > 0) {
@@ -298,6 +304,24 @@ function formatDiffImpact(result, options = {}) {
                 if (remaining.length > 10) {
                     lines.push(`    ... and ${remaining.length - 10} more`);
                 }
+            }
+        }
+    }
+
+    for (const [key, title] of [['symbols', 'MODIFIED'], ['newSymbols', 'NEW'], ['deletedSymbols', 'DELETED']]) {
+        if (!result[key]?.length) continue;
+        lines.push(`\n${title} DECLARATIONS:`);
+        for (const symbol of result[key]) {
+            lines.push(`  ${symbol.type} ${symbol.name} — ${symbol.relativePath}:${symbol.startLine}`);
+            if (symbol.impact) {
+                lines.push(require('./analysis').formatImpact(symbol.impact, { compact: true }));
+            } else {
+                const refs = symbol.remainingReferences || [];
+                lines.push(`  Remaining name references: ${refs.length} unverified (deleted target)`);
+                for (const site of refs.slice(0, MAX_CALLERS_PER_FN)) {
+                    lines.push(`    ${site.file}:${site.line}: ${site.expression}`);
+                }
+                if (refs.length > MAX_CALLERS_PER_FN) lines.push(`    (+${refs.length - MAX_CALLERS_PER_FN} more)`);
             }
         }
     }

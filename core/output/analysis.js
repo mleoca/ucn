@@ -837,8 +837,10 @@ function formatImpact(impact, options = {}) {
     }
 
     // By file (confirmed tier)
-    if (!compact) lines.push('');
-    lines.push('BY FILE:');
+    if (impact.byFile.length > 0) {
+        if (!compact) lines.push('');
+        lines.push('BY FILE:');
+    }
 
     // Evidence aggregate over ALL sites (replaces per-edge confidence lines)
     const allSites = impact.byFile.flatMap(g => g.sites);
@@ -881,7 +883,7 @@ function formatImpact(impact, options = {}) {
             for (const site of group.sites) {
                 const caller = site.callerName ? ` [${site.callerName}]` : '';
                 const expr = site.expression ? `: ${site.expression.replace(/\s+/g, ' ').slice(0, 100)}` : '';
-                lines.push(`  ${group.file}:${site.line}${caller}${expr}`);
+                lines.push(`  ${group.file}:${site.line}${caller} [${site.accessKind || 'access'}${Number.isInteger(site.column) ? `, column ${site.column + 1}` : ''}]${expr}`);
             }
         }
         if (access.unverifiedSites.length > 0) {
@@ -889,7 +891,7 @@ function formatImpact(impact, options = {}) {
             for (const site of access.unverifiedSites.slice(0, 10)) {
                 const caller = site.callerName ? ` [${site.callerName}]` : '';
                 const expr = site.expression ? `: ${site.expression.replace(/\s+/g, ' ').slice(0, 100)}` : '';
-                lines.push(`  ${site.file}:${site.line}${caller}${expr}`);
+                lines.push(`  ${site.file}:${site.line}${caller} [${site.accessKind || 'access'}${Number.isInteger(site.column) ? `, column ${site.column + 1}` : ''}]${expr}`);
             }
             if (access.unverifiedSites.length > 10) {
                 lines.push(`  (+${access.unverifiedSites.length - 10} more unverified)`);

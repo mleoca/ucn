@@ -73,6 +73,11 @@ function check(index, options = {}) {
     const modified = (dr && Array.isArray(dr.functions)) ? dr.functions : [];
     const added    = (dr && Array.isArray(dr.newFunctions)) ? dr.newFunctions : [];
     const deleted  = (dr && Array.isArray(dr.deletedFunctions)) ? dr.deletedFunctions : [];
+    const declarations = [
+        ...(dr?.symbols || []).map(s => ({ ...s, _kind: 'modified', _nonCallable: true })),
+        ...(dr?.newSymbols || []).map(s => ({ ...s, _kind: 'added', _nonCallable: true })),
+        ...(dr?.deletedSymbols || []).map(s => ({ ...s, _kind: 'deleted', _nonCallable: true })),
+    ];
     const pathCounts = {
         changedPaths: dr?.changedPaths || 0,
         nonSourcePaths: dr?.nonSourcePaths || 0,
@@ -82,9 +87,10 @@ function check(index, options = {}) {
     const allChanged = [
         ...modified.map(f => ({ ...f, _kind: 'modified' })),
         ...added.map(f => ({ ...f, _kind: 'added' })),
+        ...declarations,
     ];
 
-    if (!dr || (modified.length === 0 && added.length === 0 && deleted.length === 0)) {
+    if (!dr || (allChanged.length === 0 && deleted.length === 0)) {
         // fix #283: say what the diff actually contained. "no changes
         // detected" with three changed files reads as a false negative in a
         // pre-commit hook — the truth is the changes are outside what the
@@ -95,7 +101,7 @@ function check(index, options = {}) {
         if (changedPaths > 0 && nonSourcePaths === changedPaths) {
             reason = `${changedPaths} changed path(s), all outside supported source files; untracked source files are included`;
         } else if (changedPaths > 0) {
-            reason = 'no callable-symbol changes in the diff or untracked source files';
+            reason = 'no indexed-symbol changes in the diff or untracked source files';
         }
         return {
             base: options.base || 'HEAD',
@@ -116,9 +122,23 @@ function check(index, options = {}) {
     // For each changed function, run verify and gather caller summary
     for (const fn of changed) {
         const filePath = fn.relativePath || fn.file || '';
+        if (fn._nonCallable) {
+            const dependency = fn.impact?.typeReferences || fn.impact?.propertyAccesses;
+            items.push({
+                name: fn.name, file: filePath, line: fn.startLine, kind: fn._kind,
+                symbolType: fn.type, requiresToolchainValidation: true,
+                callerCount: fn.impact?.totalCallSites || 0,
+                unverifiedCallerCount: fn.impact?.unverifiedSites?.length || 0,
+                dependencyCount: dependency?.confirmedCount || 0,
+                unverifiedDependencyCount: (dependency?.unverifiedCount || 0) + (fn.remainingReferences?.length || 0),
+                signatureMismatches: 0,
+                account: summarizeAccount(fn.impact?.account),
+            });
+            continue;
+        }
         let verifyResult;
         try {
-            verifyResult = index.verify(fn.name, { file: filePath });
+            verifyResult = index.verify(fn.name, { file: filePath, line: fn.startLine });
         } catch (e) {
             verifyResult = null;
         }
@@ -225,6 +245,13 @@ function check(index, options = {}) {
     // Action items
     const actions = [];
     for (const it of items) {
+        if (it.requiresToolchainValidation) {
+            actions.push({
+                severity: it.kind === 'added' ? 'warn' : 'error',
+                kind: 'declaration_change',
+                message: `${it.name}: ${it.kind} ${it.symbolType}; shape/inheritance compatibility is not checked by arity analysis — review dependency sites and run the compiler/type checker and tests`,
+            });
+        }
         if (!it.account || !it.account.textComplete) {
             actions.push({
                 severity: 'error',
@@ -272,7 +299,7 @@ function check(index, options = {}) {
         actions.push({
             severity: 'error',
             kind: 'truncated_change_set',
-            message: `${allChanged.length - limit} changed function(s) were not checked; rerun without --limit`,
+            message: `${allChanged.length - limit} changed symbol(s) were not checked; rerun without --limit`,
         });
     }
     if (testFiles.length > 0) {
@@ -289,9 +316,10 @@ function check(index, options = {}) {
     const signatureMismatches = items.reduce((sum, it) => sum + (it.signatureMismatches || 0), 0);
     const filteredEdges = items.reduce((sum, it) => sum + (it.account ? it.account.filtered || 0 : 0), 0);
     const usageReviewSymbols = items.filter(it => it.account && it.account.requiresUsageReview).length;
+    const unvalidatedDeclarations = items.filter(it => it.requiresToolchainValidation && it.kind !== 'added').length;
     const reviewRequired = incompleteAccounts > 0 || unverifiedCallSites > 0 ||
         signatureMismatches > 0 || filteredEdges > 0 || usageReviewSymbols > 0 ||
-        actions.some(a => a.kind === 'orphan_new') ||
+        actions.some(a => a.kind === 'orphan_new' || a.kind === 'declaration_change') ||
         !!(limit && allChanged.length > limit);
 
     return {
@@ -308,7 +336,7 @@ function check(index, options = {}) {
         totalTests: testCount,
         actions,
         trust: {
-            status: incompleteAccounts > 0 || signatureMismatches > 0
+            status: incompleteAccounts > 0 || signatureMismatches > 0 || unvalidatedDeclarations > 0
                 ? 'BLOCKED'
                 : reviewRequired ? 'REVIEW_REQUIRED' : 'READY_FOR_TOOLCHAIN',
             accountsChecked: items.filter(it => it.account && it.account.available).length,
@@ -317,6 +345,7 @@ function check(index, options = {}) {
             signatureMismatches,
             filteredEdges,
             usageReviewSymbols,
+            unvalidatedDeclarations,
             semanticComplete: false,
             safeToDelete: false,
             requiresCompilerAndTests: true,

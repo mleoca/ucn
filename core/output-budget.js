@@ -132,6 +132,7 @@ function applyOutputBudget(text, {
     all = false,
     surface = 'cli',
     params = {},
+    trailingChars = 0,
 } = {}) {
     if (!text) {
         return {
@@ -148,13 +149,14 @@ function applyOutputBudget(text, {
         ? BROAD_OUTPUT_CHARS
         : DEFAULT_OUTPUT_CHARS;
     const requested = maxChars || (all ? MAX_OUTPUT_CHARS : defaultLimit);
-    const limit = Math.min(requested, MAX_OUTPUT_CHARS);
+    const hardLimit = Math.min(requested, MAX_OUTPUT_CHARS);
+    const limit = Math.max(0, hardLimit - trailingChars);
     if (text.length <= limit) {
         return {
             text,
             truncated: false,
             fullChars: text.length,
-            requestedLimit: limit,
+            requestedLimit: hardLimit,
             contractMetadata: [],
             contractMetadataComplete: true,
         };
@@ -178,8 +180,8 @@ function applyOutputBudget(text, {
         ? `Raise ${raiseHint}.`
         : `Narrow with ${compactScope || raiseHint}; raise ${raiseHint}.`;
     let notice = compactBudget
-        ? `... OUTPUT TRUNCATED (${text.length}→${limit}). ${compactGuidance}`
-        : `... OUTPUT TRUNCATED: ${text.length} chars total; hard limit ${limit}. ` +
+        ? `... OUTPUT TRUNCATED (${text.length}→${hardLimit}). ${compactGuidance}`
+        : `... OUTPUT TRUNCATED: ${text.length} chars total; hard limit ${hardLimit}. ` +
             `${narrowingHint(command, surface, params)} ${allHint}`;
     if (compactBudget && notice.length > limit) {
         const emergency = supportsAll
@@ -225,7 +227,7 @@ function applyOutputBudget(text, {
             text: pieces.join('\n').slice(0, limit),
             truncated: true,
             fullChars: text.length,
-            requestedLimit: limit,
+            requestedLimit: hardLimit,
             contractMetadata: contractMetadata.lines,
             contractMetadataComplete: contractMetadata.complete,
         };
@@ -283,7 +285,7 @@ function applyOutputBudget(text, {
         text: rendered,
         truncated: true,
         fullChars: text.length,
-        requestedLimit: limit,
+        requestedLimit: hardLimit,
         contractMetadata: contractMetadata.lines,
         contractMetadataComplete: contractMetadata.complete,
     };

@@ -1637,8 +1637,8 @@ describe('New Formatter Coverage', () => {
             // Modified
             assert.ok(text.includes('MODIFIED FUNCTIONS:'), 'Should have modified section');
             assert.ok(text.includes('processData'), 'Should show modified function name');
-            assert.ok(text.includes('Lines added:'), 'Should show added lines');
-            assert.ok(text.includes('Lines deleted:'), 'Should show deleted lines');
+            assert.ok(text.includes('Added at lines:'), 'Should show added line locations');
+            assert.ok(text.includes('Deleted at old lines:'), 'Should show deleted line locations');
             assert.ok(text.includes('Callers (1):'), 'Should show callers');
             assert.ok(text.includes('src/main.js:20'), 'Should show caller location');
 

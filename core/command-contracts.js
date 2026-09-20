@@ -301,7 +301,7 @@ const COMMAND_CONTRACTS = Object.freeze({
             { name: 'bridge', when: '`bridge=true`.', answer: 'Exact/parameterized route-request matches plus unmatched sides.' },
             { name: 'unmatched', when: '`unmatched=true`.', answer: 'Only unmatched supported boundaries.' },
         ],
-        defaults: ['Framework-specific static extraction.', 'Interpolated-path uncertainty remains visible unless hidden explicitly.'],
+        defaults: ['Framework-specific static extraction.', 'Test routes/requests are labeled; excludeTests=true hides them and in scopes a directory.', 'Interpolated-path uncertainty remains visible unless hidden explicitly.'],
         truth: 'Findings are static matches for supported framework call/decorator shapes; bridge confidence is match quality, not runtime probability.',
         nonGoals: ['Network discovery.', 'Frameworks not represented by an endpoint adapter.'],
         invalidCombinations: ['`serverOnly` and `clientOnly` cannot both describe a useful result.'],

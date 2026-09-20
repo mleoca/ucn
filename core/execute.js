@@ -1796,6 +1796,8 @@ const HANDLERS = {
             method: normMethod,
             prefix: p.prefix || null,
             showUncertain: !p.hideUncertain,
+            in: p.in,
+            excludeTests: !!p.excludeTests,
         });
         if (p.framework != null && String(p.framework).trim() !== '') {
             const framework = String(p.framework).trim().toLowerCase();
@@ -1859,6 +1861,7 @@ const HANDLERS = {
         // Recompute meta after filtering
         result.meta = {
             totalRoutes: result.routes.length,
+            testRoutes: result.routes.filter(r => r.isTest).length,
             totalRequests: result.requests.length,
             uncertainRequests: (result.uncertainRequests || []).length,
             totalBridges: result.bridges.length,
@@ -2286,7 +2289,7 @@ const HANDLERS = {
         const limit = num(p.limit, undefined);
         let note;
         if (limit && limit > 0 && result) {
-            const groups = ['functions', 'moduleLevelChanges', 'newFunctions', 'deletedFunctions'];
+            const groups = ['functions', 'symbols', 'newSymbols', 'deletedSymbols', 'moduleLevelChanges', 'newFunctions', 'deletedFunctions'];
             const total = groups.reduce((sum, key) => sum + (result[key]?.length || 0), 0);
             if (total > limit) {
                 let remaining = limit;

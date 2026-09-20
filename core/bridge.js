@@ -26,7 +26,7 @@
 'use strict';
 
 const fs = require('fs');
-const { codeUnitCompare } = require('./shared');
+const { codeUnitCompare, isTestPath } = require('./shared');
 const path = require('path');
 const { getCachedCalls } = require('./callers');
 const { getParser, safeParse } = require('../languages');
@@ -1490,9 +1490,12 @@ function endpoints(index, options = {}) {
         showUncertain: options.showUncertain !== false,
     };
 
-    let routes = opts.clientOnly ? [] : extractServerRoutes(index);
-    let requests = (opts.serverOnly ? [] : extractClientRequests(index));
-    let uncertainRequests = opts.serverOnly ? [] : (index._endpointsCache?.uncertainRequests || []);
+    const label = r => ({ ...r, isTest: isTestPath(r.file) });
+    const inScope = r => index.matchesFilters(r.file, { in: options.in }) &&
+        !(options.excludeTests && r.isTest);
+    let routes = (opts.clientOnly ? [] : extractServerRoutes(index)).map(label).filter(inScope);
+    let requests = (opts.serverOnly ? [] : extractClientRequests(index)).map(label).filter(inScope);
+    let uncertainRequests = (opts.serverOnly ? [] : (index._endpointsCache?.uncertainRequests || [])).map(label).filter(inScope);
     if (uncertainRequests.length > 0) {
         // A server route registration (`@app.get("/x")`, `router.get("/x", h)`)
         // is request-shaped too; the route inventory already owns those lines.
@@ -1514,12 +1517,14 @@ function endpoints(index, options = {}) {
         uncertainRequests = uncertainRequests.filter(r => r.method.toUpperCase() === opts.method || r.method === 'request');
     }
 
-    let bridges = opts.bridge ? bridgeEndpoints(index) : [];
+    let bridges = opts.bridge ? bridgeEndpoints(index).map(b => ({
+        ...b, route: label(b.route), request: label(b.request),
+    })) : [];
     if (!opts.showUncertain) {
         bridges = bridges.filter(b => b.matchType !== 'uncertain');
     }
     // If user filtered routes/requests, also constrain bridges
-    if (opts.method || opts.prefix) {
+    if (opts.method || opts.prefix || options.in || options.excludeTests) {
         const routeKeys = new Set(routes.map(r => `${r.absoluteFile}:${r.line}:${r.method}:${r.path}`));
         const reqKeys = new Set(requests.map(r => `${r.absoluteFile}:${r.line}:${r.method}:${r.path}`));
         bridges = bridges.filter(b =>

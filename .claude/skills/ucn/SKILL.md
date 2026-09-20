@@ -73,7 +73,9 @@ When the selected definition is a property/getter/setter, `impact` adds a
 separate `PROPERTY ACCESS SITES` band. Confirmed reads/writes have receiver
 identity; matching attribute syntax with an unresolved receiver stays
 unverified. These are change dependencies, not fabricated caller edges, so
-the caller `ACCOUNT` remains a call-shaped partition.
+the caller `ACCOUNT` remains a call-shaped partition. Reads and writes include
+access kind and token column; getter/setter handles describe the same property.
+Unambiguous inherited properties share that owner evidence.
 
 When the selected definition is a type, interface, enum, trait, or record,
 `impact` adds a `TYPE REFERENCE SITES` band: annotation and reference sites
@@ -85,6 +87,10 @@ Target-less `impact` and `check` diff the working tree against `HEAD` AND
 include untracked, non-ignored source files as whole-file additions, so new
 modules are checked before `git add`. `--staged` keeps its index-only meaning.
 The changed-path note also counts untracked documentation and configuration.
+Classes, interfaces, types, and fields appear in separate declaration bands
+with their dependency sites. Modified/deleted declarations block `check` until
+reviewed with the language toolchain: arity checks cannot validate shape or
+inheritance compatibility.
 
 An observed-text zero is not semantic zero or safe-delete proof. Numeric evidence values are ordinal ranking weights, not probabilities.
 
@@ -136,8 +142,9 @@ ucn source src/server.js:40-80 --raw
 Records go to stdout; the `ACCOUNT` / `CONTRACT` lines, notes, and the
 same-name disambiguation go to stderr prefixed `# ` (MCP keeps them in the one
 text block, and `--raw` appends its note as one trailing `# ` line there).
-`usages` emits one record per occurrence, so a source line may repeat; deduplicate
-`path:line` values for line counts. Definition handles start at decorators when
+`usages --lines` emits one record per source line, combining occurrence kinds
+and disclosing repeated occurrences (including JSX open/close tags). JSON keeps
+the individual occurrence records. Definition handles start at decorators when
 present, while usages point at token lines (`nameLine` identifies the declaration
 token when it differs from `startLine`). Structural `search --unused` keeps its
 safety note and decorator tags in shell output; runtime registrations can appear
@@ -145,7 +152,7 @@ and zero call edges do not prove a symbol is safe to delete.
 `--lines` lists the whole band without default row/character caps, so pipe through
 `grep -v '# unverified'` for the confirmed tier. To count distinct source lines
 per file, use `cut -d: -f1,2 | sort -u | cut -d: -f1 | sort | uniq -c`;
-counting raw usage records can count a source line more than once.
+JSON usage records can count a source line more than once.
 Nothing to list prints nothing and exits 1, grep's
 contract; errors exit 2. Explicit `--top`/`--limit` still apply and disclose
 omissions. `show --lines` accepts only callers/callees sections; target-less
@@ -190,6 +197,9 @@ target token); Java `pkg.Type.method()` and C# `Ns.Type.Method()` /
 `using T = Ns.Type; T.Method()` pick the type the qualifier names when several
 same-name types exist. A qualifier the resolver cannot place stays visible as
 `method-ambiguous`, never confirmed by first-definition order.
+
+`endpoints` labels test routes and requests with `[test]` (JSON `isTest`).
+Use `--exclude-tests` for a production inventory or `--in=api/` for a directory.
 
 `endpoints` recognizes client receivers by evidence (a receiver typed to an
 HTTP client class, or bound to a pytest fixture that constructs one), not only

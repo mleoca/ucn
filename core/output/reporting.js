@@ -284,7 +284,7 @@ function formatDeadcode(results, options = {}) {
         lines.push(`\n${extHint}`);
     }
     if (results.excludedRuntimeContract > 0) {
-        lines.push(`\n${results.excludedRuntimeContract} Java serialization callback(s) hidden (JVM runtime contract, not dead).`);
+        lines.push(`\n${results.excludedRuntimeContract} runtime callback(s) hidden (language/runtime registrations, not dead).`);
     }
     if (results.pythonImplicitExportFiles > 0) {
         lines.push(`\nPython public-surface rule active in ${results.pythonImplicitExportFiles} file(s) without __all__: top-level non-underscore names are treated as externally reachable.`);

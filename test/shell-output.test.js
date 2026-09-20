@@ -28,7 +28,7 @@ describe('release shell contracts', () => {
         try {
             const result = run(dir, 'impact', 'value', '--lines');
             assert.equal(result.status, 0, result.stderr);
-            assert.match(result.stdout, /^lib.ts:2:.*\t# unverified: .*; property-access$/m);
+            assert.match(result.stdout, /^lib.ts:2:.*\t# unverified: .*; property-access: read, column \d+$/m);
             assert.match(result.stderr, /^# PROPERTY ACCESS SITES: 0 confirmed, 1 unverified/m);
         } finally { rm(dir); }
     });

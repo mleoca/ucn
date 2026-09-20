@@ -247,14 +247,26 @@ function classifyCallContext(callNode, language) {
 /**
  * Find a call expression node at the target line matching funcName
  */
-function findCallNode(node, callTypes, targetRow, funcName, occurrence = 0) {
+function findCallNode(node, callTypes, targetRow, funcName, occurrence = 0, site = null) {
     // Several same-name calls can share one line (`greet("a") + greet("b")`,
     // f-strings) — fix #231: callers pass the site's per-line ordinal so each
     // record is arg-checked against ITS OWN node, not the line's first.
     // Records and this walk are both pre-order, so ordinals align; an
     // out-of-range ordinal falls back to the first match (never worse than
     // the pre-fix behavior when a parse shape hides a node).
-    const matches = _collectCallNodes(node, callTypes, targetRow, funcName, occurrence + 1);
+    const matches = _collectCallNodes(node, callTypes, targetRow, funcName, site ? Infinity : occurrence + 1);
+    if (Number.isInteger(site?.start)) {
+        // The resolver already identified the callee token. Preserve that
+        // identity through argument extraction, including aliases and several
+        // calls on one line (some of which may target another declaration).
+        const exact = matches.filter(candidate => {
+            const callee = candidate.childForFieldName('function') ||
+                candidate.childForFieldName('name') ||
+                candidate.childForFieldName('constructor') || candidate.childForFieldName('type');
+            return callee && callee.startIndex <= site.start && callee.endIndex >= site.end;
+        });
+        if (exact.length === 1) return exact[0];
+    }
     return matches[occurrence] || matches[0] || null;
 }
 
@@ -795,8 +807,10 @@ function computePlanCallSites(index, name, def) {
             content: c.content,
             usageType: 'call',
             receiver: c.receiver,
+            calledAs: c.calledAs,
+            callSite: c.provenance?.facts?.site,
         };
-        const siteKey = `${c.file}:${c.line}`;
+        const siteKey = `${c.file}:${c.line}:${c.calledAs || name}`;
         const occurrence = planLineSeen.get(siteKey) || 0;
         planLineSeen.set(siteKey, occurrence + 1);
         const analysis = analyzeCallSite(index, call, name, occurrence);
@@ -898,7 +912,9 @@ function analyzeCallSite(index, call, funcName, occurrence = 0) {
         const targetRow = call.line - 1; // tree-sitter is 0-indexed
 
         // Find the call expression at the target line matching funcName
-        const callNode = findCallNode(tree.rootNode, callTypes, targetRow, funcName, occurrence);
+        const spelling = call.calledAs && call.calledAs !== 'bound' ? call.calledAs : funcName;
+        const callNode = findCallNode(tree.rootNode, callTypes, targetRow, spelling, occurrence,
+            call.callSite || call.provenance?.facts?.site);
         if (!callNode) return { args: null, argCount: 0 };
 
         // Check if this is a method call (obj.func()) vs a direct call (func())
@@ -1353,6 +1369,8 @@ function verify(index, name, options = {}) {
         content: c.content,
         usageType: 'call',
         receiver: c.receiver,
+        calledAs: c.calledAs,
+        callSite: c.provenance?.facts?.site,
         // Preserve receiver identity through the usage-shaped adapter. Go
         // permits a local value to have the same spelling as its type; only
         // a type-qualified call is a method expression with an explicit
@@ -1394,7 +1412,7 @@ function verify(index, name, options = {}) {
 
     const verifyLineSeen = new Map(); // 'file:line' -> per-line ordinal (fix #231)
     for (const call of calls) {
-        const siteKey = `${call.file}:${call.line}`;
+        const siteKey = `${call.file}:${call.line}:${call.calledAs || name}`;
         const occurrence = verifyLineSeen.get(siteKey) || 0;
         verifyLineSeen.set(siteKey, occurrence + 1);
         const analysis = analyzeCallSite(index, call, name, occurrence);
