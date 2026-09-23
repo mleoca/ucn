@@ -828,7 +828,7 @@ function computePlanCallSites(index, name, def) {
         });
     }
     clearTreeCache(index);
-    // Stable ordering (matches CLAUDE.md rule #11): files alphabetical, sites by line ascending.
+    // Stable ordering contract: files alphabetical, sites by line ascending.
     sites.sort((a, b) => {
         const fc = codeUnitCompare(String(a.file), String(b.file));
         if (fc !== 0) return fc;

@@ -9,6 +9,8 @@ AGENTS.md
 # Claude local/runtime files — keep only the tracked skill
 .claude/*
 !.claude/skills/
+.claude/skills/ucn-engine-ledger/
+.claude/skills/ucn-dev-workflows/
 
 # MCP registry tokens
 .mcpregistry_*

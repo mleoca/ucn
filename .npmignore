@@ -3,6 +3,8 @@ AGENTS.md
 CLAUDE.md
 .claude/*
 !.claude/skills/
+.claude/skills/ucn-engine-ledger/
+.claude/skills/ucn-dev-workflows/
 .claude-plugin/
 .agents/
 plugins/
