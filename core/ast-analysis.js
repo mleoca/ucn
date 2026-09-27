@@ -8,7 +8,7 @@
  * with stable tree-sitter facts.
  */
 
-const { getParser, safeParse } = require('../languages');
+const { getParser, safeParse, langTraits } = require('../languages');
 
 const CALLABLE_NODES = new Set([
     // JavaScript / TypeScript
@@ -167,9 +167,13 @@ function isDefaultBranch(node) {
 function findCallableForRange(root, startLine, endLine) {
     const candidates = [];
     walkNamed(root, node => {
-        if (!CALLABLE_NODES.has(node.type)) return true;
         const start = node.startPosition.row + 1;
         const end = node.endPosition.row + 1;
+        // A subtree lies within its root's rows: one disjoint from the
+        // range holds no candidate (fix #365 - the walk used to visit every
+        // node of the file for each measured callable).
+        if (end < startLine || start > endLine) return false;
+        if (!CALLABLE_NODES.has(node.type)) return true;
         if (start < startLine || end > endLine) return true;
         candidates.push({
             node,
@@ -193,10 +197,8 @@ function findCallableForRange(root, startLine, endLine) {
  * indexed callable. Formatting, comments, strings, optional chaining, and
  * nullish coalescing cannot affect these values.
  */
-function computeAstComplexity(content, language, {
-    startLine = 1,
-    endLine = startLine,
-} = {}) {
+function computeAstComplexity(content, language, options = {}) {
+    const { startLine = 1, endLine = startLine } = options;
     const lineCount = Math.max(0, endLine - startLine + 1);
     try {
         const parser = getParser(language);
@@ -208,7 +210,7 @@ function computeAstComplexity(content, language, {
                 measuredBy: 'unavailable-no-parser',
             };
         }
-        const tree = safeParse(parser, content);
+        const tree = options.tree || safeParse(parser, content);
         const callable = findCallableForRange(tree.rootNode, startLine, endLine);
         if (!callable) {
             return {
@@ -276,99 +278,22 @@ function computedReceiver(callee) {
     return node?.type === 'identifier' ? node.text : null;
 }
 
-const STRING_LITERAL_NODES = new Set([
-    'string', 'string_literal', 'raw_string_literal',
-    'interpreted_string_literal', 'verbatim_string_literal',
-]);
-
-function literalStringValue(node) {
-    if (!node || !STRING_LITERAL_NODES.has(node.type)) return null;
-    const content = (node.namedChildren || []).find(child =>
-        child.type === 'string_content' || child.type === 'interpreted_string_literal_content');
-    if (content) return content.text;
-    const raw = String(node.text || '');
-    const first = raw.search(/["']/);
-    if (first < 0) return null;
-    const quote = raw[first];
-    const triple = raw.slice(first, first + 3) === quote.repeat(3);
-    const width = triple ? 3 : 1;
-    if (!raw.endsWith(quote.repeat(width))) return null;
-    const value = raw.slice(first + width, -width);
-    // Escaped/interpolated member names are not a stable static spelling.
-    if (value.includes('\\') || value.includes('{') || value.includes('$')) return null;
-    return value;
-}
-
-function callShape(node) {
-    if (!['call', 'call_expression', 'invocation_expression',
-        'method_invocation'].includes(node.type)) return null;
-    const callee = node.childForFieldName('function') ||
-        node.childForFieldName('name') || node.namedChild(0);
-    const args = node.childForFieldName('arguments') ||
-        (node.namedChildren || []).find(child =>
-            ['argument_list', 'arguments', 'bracketed_argument_list'].includes(child.type));
-    return callee && args ? { callee, args: args.namedChildren || [] } : null;
-}
-
 /**
- * Extract recognized reflection operations and classify whether their member
- * target is a stable literal. Literal targets are positive liveness evidence;
- * dynamic targets cannot identify one member but must still be disclosed by
- * deletion-oriented commands.
+ * Extract recognized reflection operations and classify their member target:
+ * a stable literal (`name`), literal fragments around a runtime part
+ * (`patterns`, fix #363), or dynamic. Literal targets and specific patterns
+ * are positive liveness evidence; dynamic targets cannot identify a member
+ * but must still be disclosed by deletion-oriented commands.
  */
-function reflectionSites(content, language) {
+function reflectionSites(content, language, tree = null) {
     try {
-        const syntaxHints = {
-            python: ['getattr', 'setattr', 'hasattr', 'delattr'],
-            javascript: ['Reflect.'],
-            typescript: ['Reflect.'],
-            tsx: ['Reflect.'],
-            go: ['MethodByName', 'FieldByName'],
-            java: ['getMethod', 'getDeclaredMethod', 'getField', 'getDeclaredField'],
-            csharp: ['GetMethod', 'GetProperty', 'GetField'],
-        }[language];
-        if (!syntaxHints || !syntaxHints.some(hint => content.includes(hint))) {
-            return [];
+        if (!langTraits(language)?.reflectionApi) return [];
+        if (!tree) {
+            const parser = getParser(language);
+            if (!parser) return [];
+            tree = safeParse(parser, content);
         }
-        const parser = getParser(language);
-        if (!parser) return [];
-        const tree = safeParse(parser, content);
-        const sites = [];
-        walkNamed(tree.rootNode, node => {
-            const call = callShape(node);
-            if (!call) return true;
-            const callee = String(call.callee.text || '');
-            let argIndex = null;
-            let kind = null;
-            if (language === 'python' &&
-                ['getattr', 'setattr', 'hasattr', 'delattr'].includes(callee)) {
-                argIndex = 1;
-                kind = callee;
-            } else if (['javascript', 'typescript', 'tsx'].includes(language) &&
-                /^(?:globalThis\.)?Reflect\.(?:get|set|has|deleteProperty)$/.test(callee)) {
-                argIndex = 1;
-                kind = callee.split('.').pop();
-            } else if (language === 'go' &&
-                /\.(?:MethodByName|FieldByName)$/.test(callee)) {
-                argIndex = 0;
-                kind = callee.split('.').pop();
-            } else if (['java', 'csharp'].includes(language) &&
-                /(?:^|\.)(?:getMethod|getDeclaredMethod|getField|getDeclaredField|GetMethod|GetProperty|GetField)$/.test(callee)) {
-                argIndex = 0;
-                kind = callee.split('.').pop();
-            }
-            if (argIndex == null || !call.args[argIndex]) return true;
-            const name = literalStringValue(call.args[argIndex]);
-            sites.push({
-                ...(name && /^[A-Za-z_$][\w$]*$/.test(name) && { name }),
-                kind,
-                line: node.startPosition.row + 1,
-                expression: node.text,
-                dynamic: !name || !/^[A-Za-z_$][\w$]*$/.test(name),
-            });
-            return true;
-        });
-        return sites;
+        return require('./reflection').reflectionSitesInTree(tree, language, content);
     } catch (_) {
         return [];
     }
@@ -382,11 +307,19 @@ function literalReflectionSites(content, language) {
  * Find direct computed dispatch calls such as handlers[name](). Literal keys
  * are excluded because they retain a statically visible member name.
  */
-function computedDispatchSites(content, language) {
+const CALL_NODE_TYPES = new Set(['call_expression', 'call', 'invocation_expression']);
+const BINDING_NODE_TYPES = new Set(['variable_declarator', 'assignment_expression', 'assignment']);
+const COMPUTED_INDEX_NODE_TYPES = [
+    'subscript_expression', 'index_expression', 'subscript', 'element_access_expression',
+];
+
+function computedDispatchSites(content, language, tree = null) {
     try {
-        const parser = getParser(language);
-        if (!parser) return [];
-        const tree = safeParse(parser, content);
+        if (!tree) {
+            const parser = getParser(language);
+            if (!parser) return [];
+            tree = safeParse(parser, content);
+        }
         const sites = [];
         const seen = new Set();
         const selectedByLocal = new Map();
@@ -410,35 +343,45 @@ function computedDispatchSites(content, language) {
                 expression: expression || node.text,
             });
         };
-        walkNamed(tree.rootNode, node => {
-            let callee = null;
-            if (node.type === 'call_expression' || node.type === 'call' ||
-                node.type === 'invocation_expression') {
-                callee = node.childForFieldName('function');
+        // Every site's callee (or bound value) is an index expression, so
+        // the native query starts from those (fix #365: the named-node walk
+        // touched every node of every file). A callee is its call's first
+        // child, so index-expression order is the calls' document order.
+        const sameRange = (a, b) => !!a && !!b &&
+            a.startIndex === b.startIndex && a.endIndex === b.endIndex && a.type === b.type;
+        for (const indexExpr of tree.rootNode.descendantsOfType(COMPUTED_INDEX_NODE_TYPES)) {
+            if (!indexExpr.isNamed) continue;
+            const node = indexExpr.parent;
+            if (!node || !node.isNamed) continue;
+            if (CALL_NODE_TYPES.has(node.type)) {
+                const callee = node.childForFieldName('function');
+                if (sameRange(callee, indexExpr)) record(node, callee);
+                continue;
             }
-            record(node, callee);
-
-            if (callee?.type === 'identifier') {
-                calledLocals.add(`${scopeKey(node)}\0${callee.text}`);
-            }
-
             // Two-step dispatch: `const h = handlers[key]; h()`. Record the
             // dynamic access only when its bound local is actually invoked in
             // the same callable scope. Ordinary indexing (`xs[i]`) is a value
             // read and says nothing about runtime-selected call targets.
-            if (node.type === 'variable_declarator' ||
-                node.type === 'assignment_expression' ||
-                node.type === 'assignment') {
+            if (BINDING_NODE_TYPES.has(node.type)) {
                 const left = node.childForFieldName('name') ||
                     node.childForFieldName('left');
                 const right = node.childForFieldName('value') ||
                     node.childForFieldName('right');
-                if (left?.type === 'identifier' && indexNodeForComputedCallee(right)) {
+                if (sameRange(right, indexExpr) && left?.type === 'identifier' &&
+                    indexNodeForComputedCallee(right)) {
                     selectedByLocal.set(`${scopeKey(node)}\0${left.text}`, { node, right });
                 }
             }
-            return true;
-        });
+        }
+        if (selectedByLocal.size > 0) {
+            for (const node of tree.rootNode.descendantsOfType([...CALL_NODE_TYPES])) {
+                if (!node.isNamed) continue;
+                const callee = node.childForFieldName('function');
+                if (callee?.type === 'identifier') {
+                    calledLocals.add(`${scopeKey(node)}\0${callee.text}`);
+                }
+            }
+        }
         for (const [key, selection] of selectedByLocal) {
             if (calledLocals.has(key)) record(selection.node, selection.right);
         }
@@ -469,11 +412,27 @@ function projectComputedDispatch(index) {
     return byFile;
 }
 
+/**
+ * Project reflection inventory (fix #363): per-file sites are extracted at
+ * index time from the file's own parse (fileEntry.reflectionSites), so this
+ * is a view, never a re-parse.
+ */
+function projectReflectionSites(index) {
+    const byFile = new Map();
+    for (const [filePath, fileEntry] of index.files) {
+        if (Array.isArray(fileEntry.reflectionSites) && fileEntry.reflectionSites.length > 0) {
+            byFile.set(filePath, fileEntry.reflectionSites);
+        }
+    }
+    return byFile;
+}
+
 module.exports = {
     declarationSnapshots,
     computeAstComplexity,
     computedDispatchSites,
     projectComputedDispatch,
+    projectReflectionSites,
     reflectionSites,
     literalReflectionSites,
 };

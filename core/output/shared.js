@@ -358,11 +358,25 @@ function unverifiedReasonLabel(entry) {
             ? `possible-dispatch via ${entry.dispatchVia} — 1 of ${n} implementations`
             : `possible-dispatch via ${entry.dispatchVia}`;
     }
+    if (entry.reason === 'macro-generated-scope' && entry.dispatchVia) {
+        // A macro-wrapped body whose argument names a class (fix #396).
+        return `macro-generated-scope via ${entry.dispatchVia}`;
+    }
     if (entry.reason === 'method-ambiguous' && entry.dispatchCandidates > 1) {
         return `method-ambiguous — ${entry.dispatchCandidates} dispatch owners`;
     }
     if (entry.reason === 'overload-ambiguous' && entry.dispatchCandidates > 1) {
         return `overload-ambiguous — 1 of ${entry.dispatchCandidates} applicable overloads`;
+    }
+    if (entry.reason === 'reflection-pattern' && entry.reflectionPattern) {
+        // Member name built at runtime from literal fragments (fix #363).
+        return entry.reflectionScope === 'module-namespace'
+            ? `reflection-pattern \`${entry.reflectionPattern}\` in this module's namespace`
+            : `reflection-pattern \`${entry.reflectionPattern}\``;
+    }
+    if (entry.macroExpansion) {
+        // Call target produced by a macro invocation on this line (fix #362).
+        return `${entry.reason}, via macro ${entry.macroExpansion.macro}`;
     }
     return entry.reason;
 }

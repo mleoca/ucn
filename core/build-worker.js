@@ -3,12 +3,17 @@
 /**
  * core/build-worker.js - Worker thread for parallel index building
  *
- * Receives a chunk of file paths, parses each file, extracts symbols and calls,
- * then sends results back to the main thread via MessagePort.
+ * Claims files from a shared queue, parses each file, extracts symbols and
+ * calls, then sends results back to the main thread via MessagePort.
  * Mirrors the indexFile() logic in project.js.
  */
 
-const { workerData } = require('worker_threads');
+// Reuse V8 code caches across processes (Node >= 22.1; fix #365): compiling
+// the engine's modules is a fixed cost of every command. Node validates each
+// entry against the source, and NODE_DISABLE_COMPILE_CACHE turns it off.
+try { require('module').enableCompileCache?.(); } catch (_) { /* optional */ }
+
+const { workerData, receiveMessageOnPort } = require('worker_threads');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -16,7 +21,42 @@ const { detectLanguage, getParser, getLanguageAdapter } = require('../languages'
 const { validateFileIR } = require('./ir');
 const { createFileEntryFromIR, populateFileEntryFromIR } = require('./index-ir');
 
-const { files, rootDir, existingHashes, signal, workerIndex, port } = workerData;
+const { files, rootDir, existingHashes, signal, workerIndex, queueIndex, port, control, dictionarySignal } = workerData;
+const { contextFor } = require('./external-macros');
+// The main thread computes the macro dictionary while the workers parse
+// (fix #396) and posts it before raising the signal. A file waits for it
+// only when its recovery consults it.
+let macroDictionary = workerData.macroDictionary || null;
+let dictionaryPending = !!dictionarySignal;
+function awaitDictionary() {
+    if (dictionaryPending) {
+        Atomics.wait(new Int32Array(dictionarySignal), 0, 0);
+        macroDictionary = receiveMessageOnPort(port)?.message?.macroDictionary || null;
+        dictionaryPending = false;
+    }
+    return macroDictionary;
+}
+const EMPTY_MACROS = new Map();
+function externalMacrosFor(language) {
+    if (!dictionaryPending) return macroDictionary ? contextFor(macroDictionary, language) : null;
+    if (!getLanguageAdapter(language)?.traits?.textualIncludes) return null;
+    let resolved;
+    const resolve = () => {
+        if (resolved === undefined) {
+            const dictionary = awaitDictionary();
+            resolved = dictionary ? contextFor(dictionary, language) : null;
+        }
+        return resolved;
+    };
+    // Every build's files share one dictionary, so one key serves this
+    // worker's tree cache.
+    return {
+        key: 'build',
+        consulted: new Set(),
+        get objectBodies() { return resolve()?.objectBodies || EMPTY_MACROS; },
+        get functionMacros() { return resolve()?.functionMacros || EMPTY_MACROS; },
+    };
+}
 const signalArray = new Int32Array(signal);
 
 function processFile(filePath) {
@@ -43,7 +83,9 @@ function processFile(filePath) {
     // by both worker and sequential builds.
     const adapter = getLanguageAdapter(language);
     const parser = getParser(language);
-    const ir = adapter.analyze(content, parser, filePath);
+    // C/C++: the project macro dictionary (fix #396), as indexFile reads it.
+    const externalMacros = externalMacrosFor(language);
+    const ir = adapter.analyze(content, parser, filePath, externalMacros ? { externalMacros } : undefined);
     const irFailures = validateFileIR(ir);
     if (irFailures.length > 0) {
         throw new Error(`Invalid ${language} IR: ${irFailures.join('; ')}`);
@@ -101,23 +143,45 @@ function processFile(filePath) {
 }
 
 // Process all files
+(async () => {
 try {
-    const results = [];
-    for (const filePath of files) {
+    for (;;) {
+        const next = Atomics.add(signalArray, queueIndex, 1);
+        if (next >= files.length) break;
+        const filePath = files[next];
+        let result;
         try {
-            results.push(processFile(filePath));
+            result = processFile(filePath);
         } catch (e) {
-            results.push({ filePath, error: e.message });
+            result = { filePath, error: e.message };
         }
+        port.postMessage([result]);
+        // Yield between files so native-tree finalizers of the previous
+        // file's garbage run while the build continues (fix #365): a worker
+        // that never returns to its event loop keeps every tree it parsed
+        // alive until it exits, and with no idle workers the peaks coincide.
+        await new Promise(resolve => setImmediate(resolve));
     }
-
-    port.postMessage(results);
-    port.close();
+    // The dictionary message is consumed before any later job on the port.
+    awaitDictionary();
     Atomics.store(signalArray, workerIndex, 1);
     Atomics.notify(signalArray, workerIndex);
 } catch (e) {
-    // Worker-level error — signal completion with empty results
+    // Worker-level error: signal completion (2 = not reusable).
     try { port.postMessage([]); port.close(); } catch (_) { /* ignore */ }
-    Atomics.store(signalArray, workerIndex, 1);
+    Atomics.store(signalArray, workerIndex, 2);
     Atomics.notify(signalArray, workerIndex);
+    return;
 }
+// A worker kept for the build's next phase (fix #388) waits for its job:
+// Rust macro expansion, run with this thread's already optimized parser.
+if (control) {
+    const controlArray = new Int32Array(control);
+    Atomics.wait(controlArray, workerIndex, 0);
+    if (Atomics.load(controlArray, workerIndex) === 2) {
+        const job = receiveMessageOnPort(port)?.message;
+        if (job) require('./rust-macro-expansion').runExpansionQueue(job, port);
+    }
+}
+try { port.close(); } catch (_) { /* closed */ }
+})();

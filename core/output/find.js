@@ -11,6 +11,9 @@ const {
 
 const { formatSymbolHandle } = require('../shared');
 
+// Detailed text rows shown by default; the rest are counted.
+const DEFAULT_DISPLAY_LIMIT = 5;
+
 /**
  * Trim a docstring to a single short sentence (max 80 chars) for inline display.
  */
@@ -112,7 +115,6 @@ function formatFindDetailed(symbols, query, options = {}) {
     // Surfaces pass validated NUMBERS; the string comparisons below made
     // --depth 0/2 dead code everywhere (fix #250). Normalize once.
     const depth = options.depth != null ? String(options.depth) : undefined;
-    const DEFAULT_LIMIT = 5;
 
     if (symbols.length === 0) {
         return `No symbols found for "${query}"`;
@@ -129,7 +131,10 @@ function formatFindDetailed(symbols, query, options = {}) {
     for (const [name, count] of Object.entries(symbols.findInfo?.nameWideDefinitionCounts || {})) {
         sameNameDefinitionCounts.set(name, count);
     }
-    const limit = all ? symbols.length : (top > 0 ? top : DEFAULT_LIMIT);
+    // Text shows the top N detailed results (default 5; --limit=N raises
+    // both the returned set and the display, --all lifts both) and counts
+    // the rest; JSON carries every returned result (up to 500 by default).
+    const limit = all ? symbols.length : (top > 0 ? top : DEFAULT_DISPLAY_LIMIT);
     const showing = Math.min(limit, symbols.length);
     const total = symbols.findInfo?.total ?? symbols.length;
     const hidden = Math.max(0, total - showing);

@@ -16,6 +16,7 @@ const { saveCache, loadCache, CACHE_FORMAT_VERSION } = require('../core/cache');
 const { parseStackTrace } = require('../core/stacktrace');
 const { tmp, rm, idx, FIXTURES_PATH } = require('./helpers');
 const { execute } = require('../core/execute');
+const output = require('../core/output');
 const { detectEntrypoints } = require('../core/entrypoints');
 
 const os = require('os');
@@ -7459,6 +7460,775 @@ describe('fix #303: exact Go multi-return and same-line chain flow', () => {
                 'a local closure declared tuple result types its invocation');
             assert.ok(!calls.some(call => call.name === 'localSplit'),
                 'the lexical call cannot impersonate a package-level symbol');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #360: Go contract membership in plan --rename-to', () => {
+    const files = {
+        'go.mod': 'module f360\n\ngo 1.21\n',
+        'fs.go': [
+            'package f360',
+            '',
+            'import (',
+            '\t"io"',
+            '\t"os"',
+            ')',
+            '',
+            'type File interface {',
+            '\tio.Closer',
+            '\tName() string',
+            '}',
+            '',
+            'type Fs interface {',
+            '\tOpen(name string) (File, error)',
+            '\tRename(a, b string) error',
+            '}',
+            '',
+            'type Base struct {',
+            '\tpath string',
+            '\tsource Fs',
+            '}',
+            '',
+            'func (b *Base) Rename(a, c string) error         { return nil }',
+            'func (b *Base) Open(name string) (File, error)   { return nil, nil }',
+            '',
+            'func NewBase() Fs { return &Base{} }',
+            '',
+            'type info struct{}',
+            '',
+            'func (i *info) Name() string { return "" }',
+            'func (i *info) Size() int64  { return 0 }',
+            '',
+            'func Stat() (os.FileInfo, error) { return &info{}, nil }',
+            '',
+            'type osFile struct{}',
+            '',
+            'func OpenOS(p string) (File, error) {',
+            '\tf, err := os.Open(p)',
+            '\treturn f, err',
+            '}',
+            '',
+            'func use(f Fs) { f.Rename("a", "b") }',
+        ].join('\n') + '\n',
+        'sub/sub.go': [
+            'package sub',
+            '',
+            'import root "f360"',
+            '',
+            'type Other struct{}',
+            '',
+            'func (o *Other) Rename(a, b string) error          { return nil }',
+            'func (o *Other) Open(name string) (root.File, error) { return nil, nil }',
+            '',
+            'func New() root.Fs { return &Other{} }',
+        ].join('\n') + '\n',
+    };
+    const planOf = (index, name) => {
+        const result = execute(index, 'plan', { name, renameTo: 'Moved' });
+        assert.ok(result.ok, JSON.stringify(result.error));
+        return result.result;
+    };
+    const defLines = plan => plan.changes.filter(change => change.isDefinition)
+        .map(change => `${change.file}:${change.line}`).sort();
+
+    it('named struct fields do not open a method set; implementer and interface pins close the same slot across packages', () => {
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const fromImpl = planOf(index, 'fs.go:23:Rename');
+            const fromIface = planOf(index, 'fs.go:15:Rename');
+            const fromOther = planOf(index, 'sub/sub.go:7:Rename');
+            const expected = ['fs.go:15', 'fs.go:23', 'sub/sub.go:7'];
+            assert.deepStrictEqual(defLines(fromImpl), expected, JSON.stringify(fromImpl.changes));
+            assert.deepStrictEqual(defLines(fromIface), expected);
+            assert.deepStrictEqual(defLines(fromOther), expected,
+                'root.File and File are one type across packages');
+            assert.ok(fromImpl.changes.some(change => change.line === 42 &&
+                change.newExpression?.includes('f.Moved(')), 'interface-receiver call edited');
+        } finally { rm(dir); }
+    });
+
+    it('a type converted to an external interface is a contract site, reported where Go reports it', () => {
+        const dir = tmp(files);
+        try {
+            const plan = planOf(idx(dir), 'fs.go:30:Name');
+            const item = plan.reviewItems.find(entry => entry.contractDependency && entry.line === 33);
+            assert.ok(item, JSON.stringify(plan.reviewItems));
+            assert.match(item.suggestion, /external interface os\.FileInfo/);
+            const definition = plan.changes.find(change => change.line === 30);
+            assert.ok(definition.needsReview && definition.newExpression,
+                'the edit stays, marked for review');
+        } finally { rm(dir); }
+    });
+
+    it('a value from an external package used as a project interface blocks silent completion', () => {
+        const dir = tmp(files);
+        try {
+            const plan = planOf(idx(dir), 'fs.go:10:Name');
+            const item = plan.reviewItems.find(entry => entry.contractDependency && entry.line === 39);
+            assert.ok(item, `os.Open value returned as File: ${JSON.stringify(plan.reviewItems)}`);
+            assert.strictEqual(item.reviewReason, 'go-external-satisfier');
+        } finally { rm(dir); }
+    });
+
+    it('build-constrained variants of one interface are renamed together', () => {
+        const dir = tmp({
+            'go.mod': 'module f360b\n\ngo 1.21\n',
+            'a.go': '//go:build !alt\n\npackage f360b\n\ntype Binder interface {\n\tBind(v any) error\n}\n',
+            'a_alt.go': '//go:build alt\n\npackage f360b\n\ntype Binder interface {\n\tBind(v any) error\n}\n',
+            'impl.go': 'package f360b\n\ntype J struct{}\n\nfunc (J) Bind(v any) error { return nil }\n\nvar _ Binder = J{}\n',
+        });
+        try {
+            const plan = planOf(idx(dir), 'a.go:6:Bind');
+            assert.deepStrictEqual(defLines(plan), ['a.go:6', 'a_alt.go:6', 'impl.go:5']);
+        } finally { rm(dir); }
+    });
+
+    it('a local binding shadows a same-named import in a method call', () => {
+        const dir = tmp({
+            'go.mod': 'module f360c\n\ngo 1.21\n',
+            'm.go': 'package f360c\n\ntype Fs interface{ Chown(n string) error }\ntype Mem struct{}\n\nfunc (m *Mem) Chown(n string) error { return nil }\nfunc NewMem() Fs { return &Mem{} }\n',
+            'm_test.go': 'package f360c\n\nimport (\n\t"io/fs"\n\t"testing"\n)\n\nvar _ fs.FileMode\n\nfunc TestX(t *testing.T) {\n\tfs := NewMem()\n\t_ = fs.Chown("x")\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'impact', { name: 'm.go:3:Chown' });
+            assert.ok(result.ok, JSON.stringify(result.error));
+            const excluded = result.result.meta?.account?.excluded?.byReason || {};
+            assert.ok(!excluded['method-kind-mismatch'],
+                `fs.Chown on the local is a method call: ${JSON.stringify(excluded)}`);
+            const { getCachedCalls } = require('../core/callers');
+            const record = (getCachedCalls(index, path.join(dir, 'm_test.go')) || [])
+                .find(call => call.name === 'Chown');
+            assert.strictEqual(record?.isMethod, true, JSON.stringify(record));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #378: Go generic instantiations, type aliases, composite literals, package function values', () => {
+    const output = require('../core/output');
+    const { getCachedCalls } = require('../core/callers');
+    const relationsOf = (index, handle) => {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, `context ${handle} failed: ${r.error}`);
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: [...new Set((json.data.callers || []).map(c => `${c.file}:${c.line}`))].sort(),
+            unverified: (json.data.unverifiedCallers || []).map(c => `${c.file}:${c.line}`).sort(),
+            callees: (json.data.callees || []).map(c => `${c.name}@${c.file}:${c.startLine ?? c.line}`).sort(),
+            account: json.meta.account,
+        };
+    };
+    const planOf = (index, name) => {
+        const result = execute(index, 'plan', { name, renameTo: 'Moved' });
+        assert.ok(result.ok, JSON.stringify(result.error));
+        return result.result;
+    };
+    const edits = plan => plan.changes.filter(change => !change.needsReview)
+        .map(change => `${change.file}:${change.line}`).sort();
+
+    it('explicit instantiation calls f[T](x), f[A, B](x), pkg.F[T](x) and instantiated values are callers', () => {
+        const dir = tmp({
+            'go.mod': 'module g378\n\ngo 1.22\n',
+            'box/box.go': [
+                'package box',
+                '',
+                'type Box[T any] struct{ V T }',
+                '',
+                'func (b *Box[T]) Get() T { return b.V }',
+                '',
+                'func (b *Box[T]) Twice() T { b.Get(); return b.Get() }',
+                '',
+                'func Make[T any](v T) *Box[T] { return &Box[T]{V: v} }',
+                '',
+                'func Pair[A, B any](a A, b B) A { return a }',
+            ].join('\n') + '\n',
+            'main.go': [
+                'package main',
+                '',
+                'import "g378/box"',
+                '',
+                'func id[T any](x T) T { return x }',
+                '',
+                'func two[A, B any](a A, b B) A { return a }',
+                '',
+                'func main() {',
+                '\t_ = id[int](3)',
+                '\t_ = two[int, string](1, "a")',
+                '\tb := box.Make[int](4)',
+                '\t_ = b.Get()',
+                '\t_ = box.Pair[int, string](1, "x")',
+                '\tf := id[string]',
+                '\tfs := []func(int) int{id[int]}',
+                '\t_, _ = f, fs',
+                '\tk := 0',
+                '\tid := []func(int) int{}',
+                '\t_ = id[k](1)',
+                '\tvar held box.Box[int]',
+                '\t_ = held.Get()',
+                '}',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const id = relationsOf(index, 'main.go:5:id');
+            assert.deepStrictEqual(id.confirmed, ['main.go:10', 'main.go:15', 'main.go:16'],
+                'the call and both instantiated values; the local slice index is not a caller');
+            assert.strictEqual(id.account.conserved, true);
+            assert.deepStrictEqual(relationsOf(index, 'main.go:7:two').confirmed, ['main.go:11']);
+            assert.deepStrictEqual(relationsOf(index, 'box/box.go:9:Make').confirmed, ['main.go:12']);
+            assert.deepStrictEqual(relationsOf(index, 'box/box.go:11:Pair').confirmed, ['main.go:14']);
+            // Generic receivers, return flow through the instantiated producer,
+            // and annotations spelled with type arguments type the receiver.
+            assert.deepStrictEqual(relationsOf(index, 'box/box.go:5:Get').confirmed,
+                ['box/box.go:7', 'main.go:13', 'main.go:22']);
+            assert.ok(relationsOf(index, 'main.go:9:main').callees.includes('id@main.go:5'));
+            const usages = execute(index, 'usages', { name: 'id' });
+            assert.ok(usages.ok);
+            const plan = planOf(index, 'main.go:5:id');
+            assert.deepStrictEqual(edits(plan), ['main.go:10', 'main.go:15', 'main.go:16', 'main.go:5']);
+            assert.ok(!plan.changes.some(change => change.line === 20), 'the local slice stays');
+        } finally { rm(dir); }
+    });
+
+    it('a type-argument list in a type position is a type reference, a generic literal constructs', () => {
+        const dir = tmp({
+            'go.mod': 'module g378b\n\ngo 1.22\n',
+            'a.go': 'package g378b\n\ntype Box[T any] struct{ V T }\n\nfunc Use(b Box[int]) Box[int] {\n\treturn Box[int]{V: b.V}\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const calls = getCachedCalls(index, path.join(dir, 'a.go')) || [];
+            const box = calls.filter(call => call.name === 'Box');
+            assert.deepStrictEqual(box.map(call => [call.line, !!call.isConstructor]), [[6, true]],
+                JSON.stringify(box));
+        } finally { rm(dir); }
+    });
+
+    it('receivers typed through a type alias (generic, grouped, qualified) belong to the aliased type', () => {
+        const dir = tmp({
+            'go.mod': 'module g378c\n\ngo 1.22\n',
+            'base/base.go': 'package base\n\ntype Plain struct{}\n\nfunc (p *Plain) Do() {}\n',
+            'a.go': [
+                'package g378c',
+                '',
+                'import (',
+                '\t"context"',
+                '',
+                '\t"g378c/base"',
+                ')',
+                '',
+                'type Base[T any] struct{ v T }',
+                '',
+                'func (b *Base[T]) Set(v T) { b.v = v }',
+                '',
+                'type (',
+                '\tIntBase = Base[int]',
+                '\tStrBase = Base[string]',
+                ')',
+                '',
+                'type Other struct{}',
+                '',
+                'func (o *Other) Set(v int) {}',
+                '',
+                'type PlainAlias = base.Plain',
+                '',
+                'type Ctx = context.Context',
+                '',
+                'type Context struct{}',
+                '',
+                'func (c *Context) Done() {}',
+                '',
+                'func Wait(c Ctx) { <-c.Done() }',
+            ].join('\n') + '\n',
+            'a_test.go': [
+                'package g378c',
+                '',
+                'import "testing"',
+                '',
+                'func TestX(t *testing.T) {',
+                '\tf := &IntBase{}',
+                '\tf.Set(2)',
+                '\tvar s StrBase',
+                '\ts.Set("x")',
+                '\tp := &PlainAlias{}',
+                '\tp.Do()',
+                '\to := &Other{}',
+                '\to.Set(1)',
+                '}',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const set = relationsOf(index, 'a.go:11:Set');
+            assert.deepStrictEqual(set.confirmed, ['a_test.go:7', 'a_test.go:9']);
+            assert.deepStrictEqual(relationsOf(index, 'a.go:20:Set').confirmed, ['a_test.go:13']);
+            assert.deepStrictEqual(relationsOf(index, 'base/base.go:5:Do').confirmed, ['a_test.go:11']);
+            assert.ok(relationsOf(index, 'a_test.go:5:TestX').callees.includes('Set@a.go:11'),
+                'callee side resolves the alias too');
+            // An alias of an EXTERNAL type is not a same-named project type.
+            const done = relationsOf(index, 'a.go:28:Done');
+            assert.ok(!done.confirmed.includes('a.go:30'), JSON.stringify(done));
+        } finally { rm(dir); }
+    });
+
+    it('a composite literal is a construction, never a call of a same-named method (both views agree)', () => {
+        const dir = tmp({
+            'go.mod': 'module g378d\n\ngo 1.22\n',
+            'a.go': 'package g378d\n\ntype Route struct{ Path string }\ntype Router interface {\n\tAdd(r Route) error\n\tRoute(p string) string\n}\ntype R struct{}\n\nfunc (r *R) Route(p string) string { return p }\nfunc (r *R) Add(rt Route) error { return nil }\nfunc NewR() Router { return &R{} }\n',
+            'a_test.go': 'package g378d\n\nimport "testing"\n\nfunc TestX(t *testing.T) {\n\trouter := NewR()\n\t_ = router.Add(Route{Path: "/"})\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const callees = relationsOf(index, 'a_test.go:5:TestX').callees;
+            assert.ok(callees.includes('Route@a.go:3'), JSON.stringify(callees));
+            assert.ok(!callees.includes('Route@a.go:10'), JSON.stringify(callees));
+            assert.deepStrictEqual(relationsOf(index, 'a.go:10:Route').confirmed, []);
+            const struct = execute(index, 'context', { name: 'a.go:3:Route' });
+            assert.deepStrictEqual(struct.result.callers.map(c => `${c.relativePath}:${c.line}`),
+                ['a_test.go:7']);
+        } finally { rm(dir); }
+    });
+
+    it('a type declared in a function body is visible only in its block', () => {
+        const dir = tmp({
+            'go.mod': 'module g378f\n\ngo 1.22\n',
+            'a.go': 'package g378f\n\ntype testCase struct{ in string }\n',
+            'b.go': [
+                'package g378f',
+                '',
+                'func cases() []testCase {',
+                '\treturn []testCase{testCase{"a"}}',
+                '}',
+                '',
+                'func bench() {',
+                '\ttype testCase struct{ name string }',
+                '\t_ = testCase{"b"}',
+                '}',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const pkg = execute(index, 'context', { name: 'a.go:3:testCase' });
+            assert.deepStrictEqual(pkg.result.callers.map(c => `${c.relativePath}:${c.line}`), ['b.go:4']);
+            const local = execute(index, 'context', { name: 'b.go:8:testCase' });
+            assert.deepStrictEqual(local.result.callers.map(c => `${c.relativePath}:${c.line}`), ['b.go:9']);
+            assert.ok(relationsOf(index, 'b.go:3:cases').callees.includes('testCase@a.go:3'));
+        } finally { rm(dir); }
+    });
+
+    it('a package-qualified function value from the external test package is an exact reference', () => {
+        const dir = tmp({
+            'go.mod': 'module g378e\n\ngo 1.22\n',
+            'conv/conv.go': 'package conv\n\nfunc ToBool(i any) bool { return i != nil }\n\ntype T struct{}\n\nfunc (T) Name() string { return "" }\n',
+            'conv/conv_test.go': [
+                'package conv_test',
+                '',
+                'import (',
+                '\t"testing"',
+                '',
+                '\t"g378e/conv"',
+                ')',
+                '',
+                'func run(t *testing.T, f func(any) bool) {}',
+                '',
+                'func TestBool(t *testing.T) {',
+                '\trun(t, conv.ToBool)',
+                '\tvar g = conv.ToBool',
+                '\t_ = g',
+                '\tcases := map[string]func(any) bool{"b": conv.ToBool}',
+                '\t_ = cases',
+                '}',
+                '',
+                'func pick() func(any) bool { return conv.ToBool }',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const rel = relationsOf(index, 'conv/conv.go:3:ToBool');
+            assert.deepStrictEqual(rel.confirmed,
+                ['conv/conv_test.go:12', 'conv/conv_test.go:13', 'conv/conv_test.go:15', 'conv/conv_test.go:19']);
+            assert.deepStrictEqual(rel.unverified, []);
+            const plan = planOf(index, 'conv/conv.go:3:ToBool');
+            assert.deepStrictEqual(edits(plan),
+                ['conv/conv.go:3', 'conv/conv_test.go:12', 'conv/conv_test.go:13', 'conv/conv_test.go:15', 'conv/conv_test.go:19']);
+            const record = (getCachedCalls(index, path.join(dir, 'conv', 'conv_test.go')) || [])
+                .find(call => call.name === 'ToBool' && call.line === 12);
+            assert.strictEqual(record?.isMethod, false, JSON.stringify(record));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #383: plan renames Go examples bound by name; repeated contract findings are stated once', () => {
+    const planRename = (index, handle, renameTo) => {
+        const r = execute(index, 'plan', { name: handle, renameTo });
+        assert.ok(r.ok, JSON.stringify(r.error));
+        return r.result;
+    };
+    const exampleEdits = result => result.changes.filter(c => c.editKind === 'example')
+        .map(c => `${c.file}:${c.line} ${c.newExpression}`);
+
+    const files = {
+        'go.mod': 'module example.com/binder\n',
+        'binder.go': [
+            'package binder',
+            'type ValueBinder struct{ errs []error }',
+            'func (b *ValueBinder) BindErrors() []error { return b.errs }',
+            'type Wrapped struct{ *ValueBinder }',
+            'func Bind() *ValueBinder { return &ValueBinder{} }',
+        ].join('\n'),
+        // External test package: vet looks the identifier up in the package
+        // the file imports.
+        'binder_external_test.go': [
+            'package binder_test',
+            'import (',
+            '\t"fmt"',
+            '\t"example.com/binder"',
+            ')',
+            'func ExampleValueBinder_BindErrors() {',
+            '\tfmt.Println(binder.Bind().BindErrors())',
+            '}',
+            'func ExampleValueBinder_BindErrors_second() {',
+            '\tfmt.Println(binder.Bind().BindErrors())',
+            '}',
+            'func ExampleWrapped_BindErrors() {}',
+            'func ExampleBind() {}',
+            'func ExampleBind_suffix() {}',
+            'func ExampleValueBinder_bindErrors() {}',
+            'func Example_BindErrors() {}',
+        ].join('\n'),
+        // A different package with its own ValueBinder: its examples name
+        // its own type.
+        'other/other.go': [
+            'package other',
+            'type ValueBinder struct{}',
+            'func (ValueBinder) BindErrors() []error { return nil }',
+        ].join('\n'),
+        'other/other_test.go': [
+            'package other',
+            'func ExampleValueBinder_BindErrors() {}',
+        ].join('\n'),
+    };
+
+    it('renaming a method renames Example<Type>_<Method>[_suffix] of its type and of types it is promoted to', () => {
+        const dir = tmp(files);
+        try {
+            const r = planRename(idx(dir), 'binder.go:3:BindErrors', 'Errs');
+            assert.deepStrictEqual(exampleEdits(r), [
+                'binder_external_test.go:6 func ExampleValueBinder_Errs() {',
+                'binder_external_test.go:9 func ExampleValueBinder_Errs_second() {',
+                'binder_external_test.go:12 func ExampleWrapped_Errs() {}',
+            ]);
+            assert.strictEqual(r.changeSummary.examples, 3);
+            const text = output.formatPlan(r);
+            assert.match(text, /examples 3/);
+            assert.match(text, /\[example\]/);
+        } finally { rm(dir); }
+    });
+
+    it('renaming a type or function renames the examples whose identifier names it', () => {
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(exampleEdits(planRename(index, 'binder.go:5:Bind', 'Make')), [
+                'binder_external_test.go:13 func ExampleMake() {}',
+                'binder_external_test.go:14 func ExampleMake_suffix() {}',
+            ]);
+            assert.deepStrictEqual(exampleEdits(planRename(index, 'binder.go:2:ValueBinder', 'VB')), [
+                'binder_external_test.go:6 func ExampleVB_BindErrors() {',
+                'binder_external_test.go:9 func ExampleVB_BindErrors_second() {',
+                'binder_external_test.go:15 func ExampleVB_bindErrors() {}',
+            ]);
+        } finally { rm(dir); }
+    });
+
+    it('other languages bind no test function by name', () => {
+        const { langTraits } = require('../languages');
+        for (const lang of ['javascript', 'typescript', 'python', 'rust', 'java', 'csharp', 'c', 'cpp']) {
+            assert.strictEqual(langTraits(lang).nameBoundTestFunctions, null, lang);
+        }
+        assert.strictEqual(langTraits('go').nameBoundTestFunctions.kind, 'go-example');
+    });
+
+    it('a contract finding repeated at many satisfaction sites is stated once with its sites', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/flags\n',
+            'flags.go': [
+                'package flags',
+                'import "fmt"',
+                'type Flag interface { fmt.Stringer; Name() string }',
+                'type BoolFlag struct{ name string }',
+                'func (f *BoolFlag) String() string { return f.name }',
+                'func (f *BoolFlag) Name() string { return f.name }',
+                'func All() []Flag {',
+                '\treturn []Flag{',
+                '\t\t&BoolFlag{name: "a"},',
+                '\t\t&BoolFlag{name: "b"},',
+                '\t\t&BoolFlag{name: "c"},',
+                '\t}',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const r = planRename(idx(dir), 'flags.go:5:String', 'Str');
+            const contractItems = r.reviewItems.filter(item => item.contractDependency);
+            assert.ok(contractItems.length >= 3, JSON.stringify(contractItems));
+            const text = output.formatPlan(r);
+            const message = contractItems[0].suggestion;
+            // The finding appears once, with its site count; every site stays listed.
+            assert.strictEqual(text.split(message).length - 1, 1, text);
+            assert.match(text, new RegExp(`\\(${contractItems.length} sites\\):`));
+            for (const item of contractItems) assert.ok(text.includes(`${item.file}:${item.line}:`), text);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #384: values flowing into out-of-project positions make Go plan renames review items', () => {
+    const planOf = (index, handle, renameTo = 'Moved') => {
+        const [file, line, name] = handle.split(':');
+        const result = execute(index, 'plan', { name, file, line: Number(line), renameTo });
+        assert.ok(result.ok, result.error);
+        return result.result;
+    };
+    const files = {
+        'go.mod': 'module f384\n\ngo 1.21\n',
+        'cats.go': [
+            'package f384',
+            '',
+            'import (',
+            '\t"net/http"',
+            '\t"sort"',
+            ')',
+            '',
+            'type cats []string',
+            '',
+            'func (c *cats) Len() int           { return len(*c) }',
+            'func (c *cats) Less(i, j int) bool { return (*c)[i] < (*c)[j] }',
+            'func (c *cats) Swap(i, j int)      { (*c)[i], (*c)[j] = (*c)[j], (*c)[i] }',
+            'func (c *cats) grow()              { *c = append(*c, "") }',
+            '',
+            'type holder struct{ list any }',
+            '',
+            'func sortAll(h *holder) {',
+            '\tsort.Sort(h.list.(*cats))',
+            '\tvar local cats',
+            '\tsort.Sort(&local)',
+            '\tsort.Sort((h.list.(*cats)))',
+            '}',
+            '',
+            'type handler struct{}',
+            '',
+            'func (handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {}',
+            '',
+            'func serve(srv *http.Server) *http.Server {',
+            '\tsrv.Handler = handler{}',
+            '\treturn &http.Server{Handler: handler{}}',
+            '}',
+        ].join('\n'),
+    };
+
+    it('a type assertion, an address of a typed local and a parenthesized value passed to sort.Sort are review sites of an exported method', () => {
+        const dir = tmp(files);
+        try {
+            const plan = planOf(idx(dir), 'cats.go:12:Swap');
+            const sites = plan.reviewItems.filter(item => item.contractDependency &&
+                item.reviewReason === 'go-external-position').map(item => item.line).sort((a, b) => a - b);
+            assert.deepStrictEqual(sites, [18, 20, 21], JSON.stringify(plan.reviewItems));
+            assert.match(plan.reviewItems.find(item => item.line === 18).suggestion,
+                /passed to sort\.Sort \(argument 1\)/);
+            const definition = plan.changes.find(change => change.line === 12);
+            assert.ok(definition.needsReview, 'the definition edit is marked for review');
+        } finally { rm(dir); }
+    });
+
+    it('an unexported method cannot satisfy an out-of-project interface: no review', () => {
+        const dir = tmp(files);
+        try {
+            const plan = planOf(idx(dir), 'cats.go:13:grow', 'expand');
+            assert.ok(!(plan.reviewItems || []).some(item => item.contractDependency),
+                JSON.stringify(plan.reviewItems));
+        } finally { rm(dir); }
+    });
+
+    it('a field of an out-of-project struct, assigned or set in a composite literal, is a review site', () => {
+        const dir = tmp(files);
+        try {
+            const plan = planOf(idx(dir), 'cats.go:26:ServeHTTP');
+            const sites = plan.reviewItems.filter(item => item.contractDependency)
+                .map(item => `${item.line}:${item.reviewReason}`).sort();
+            assert.deepStrictEqual(sites, ['29:go-external-position', '30:go-external-position'],
+                JSON.stringify(plan.reviewItems));
+            assert.match(plan.reviewItems.find(item => item.line === 29).suggestion,
+                /assigned to field http\.Server\.Handler/);
+        } finally { rm(dir); }
+    });
+
+    it('an asserted value passed to a project interface parameter joins the rename closure', () => {
+        const dir = tmp({
+            'go.mod': 'module f384b\n\ngo 1.21\n',
+            'a.go': [
+                'package f384b',
+                '',
+                'import "io"',
+                '',
+                '// The embedded io.Closer leaves the requirement set open:',
+                '// only conversion evidence proves job is used as a Runner.',
+                'type Runner interface {',
+                '\tio.Closer',
+                '\tRun()',
+                '}',
+                '',
+                'type job struct{}',
+                '',
+                'func (*job) Close() error { return nil }',
+                'func (*job) Run() {}',
+                '',
+                'func start(r Runner) { r.Run() }',
+                '',
+                'func kick(v any) { start(v.(*job)) }',
+            ].join('\n'),
+        });
+        try {
+            const plan = planOf(idx(dir), 'a.go:9:Run');
+            const defs = plan.changes.filter(change => change.isDefinition).map(change => change.line).sort((a, b) => a - b);
+            assert.deepStrictEqual(defs, [9, 15], JSON.stringify(plan.changes));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #386: renaming a type edits every reference to it', () => {
+    const { applyRenamePlan } = require('./helpers');
+    const { execute } = require('../core/execute');
+    const files = {
+        'go.mod': 'module example.com/m\n\ngo 1.21\n',
+        'pkg/widget.go': [
+            'package pkg',
+            '',
+            'type Base struct{}',
+            '',
+            'type Widget struct {',
+            '\tBase',
+            '\tnext *Widget',
+            '}',
+            '',
+            'type Shape interface{ Area() int }',
+            '',
+            'func NewWidget() *Widget { return &Widget{} }',
+            '',
+            'func (w *Widget) Area() int { return 1 }',
+            '',
+            'func (w Widget) Copy(other Widget) Widget {',
+            '\tvar s Shape = &w',
+            '\tif v, ok := s.(*Widget); ok {',
+            '\t\treturn *v',
+            '\t}',
+            '\treturn Widget{next: nil}',
+            '}',
+            '',
+            'type Holder struct {',
+            '\t*Widget',
+            '\tn int',
+            '}',
+            '',
+            'func use(h Holder) int { return h.Widget.Area() + h.Area() }',
+            '',
+            'func lit() Holder { return Holder{Widget: &Widget{}} }',
+            '',
+            'type (',
+            '\tWidgetList []Widget',
+            '\tAlias      = Widget',
+            ')',
+        ].join('\n'),
+        'pkg/sub/sub.go': [
+            'package sub',
+            '',
+            'import (',
+            '\t"example.com/m/pkg"',
+            '\tp2 "example.com/m/pkg"',
+            ')',
+            '',
+            'type Widget struct{}',
+            '',
+            'func Make() *pkg.Widget { var w pkg.Widget; _ = Widget{}; return &w }',
+            '',
+            'func Make2() p2.Widget { return p2.Widget{} }',
+            '',
+            'type Wrap struct {',
+            '\tpkg.Widget',
+            '}',
+            '',
+            'func W(x Wrap) { _ = x.Widget }',
+        ].join('\n'),
+    };
+
+    it('Go: type positions, composite literals, qualified types and embedded fields with their selectors and keys', () => {
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: 'Widget', file: 'pkg/widget.go', renameTo: 'Gadget' });
+            assert.ok(r.ok, r.error);
+            const { contents, reviews } = applyRenamePlan(dir, r.result);
+            assert.deepStrictEqual(reviews, []);
+            assert.strictEqual(contents['pkg/widget.go'], files['pkg/widget.go'].replace(/\bWidget\b/g, 'Gadget'),
+                'the embedded field is named after the type: h.Widget and Holder{Widget: ..} follow it');
+            assert.strictEqual(contents['pkg/sub/sub.go'], files['pkg/sub/sub.go']
+                .replace(/pkg\.Widget/g, 'pkg.Gadget').replace(/p2\.Widget/g, 'p2.Gadget')
+                .replace('x.Widget', 'x.Gadget'), 'package sub keeps its own Widget');
+        } finally { rm(dir); }
+    });
+
+    it('Go: a type declared in a grouped declaration is renamed on its own line', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/m\n\ngo 1.21\n',
+            'a.go': 'package a\n\ntype (\n\tFirst struct{}\n\tSecond = First\n)\n\nfunc f(s Second) First { return First(s) }\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: 'Second', file: 'a.go', renameTo: 'Other' });
+            assert.ok(r.ok, r.error);
+            const { contents, reviews } = applyRenamePlan(dir, r.result);
+            assert.deepStrictEqual(reviews, []);
+            assert.strictEqual(contents['a.go'],
+                'package a\n\ntype (\n\tFirst struct{}\n\tOther = First\n)\n\nfunc f(s Other) First { return First(s) }\n');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #392: function references resolve by Go block scoping', () => {
+    it('edits package-level references inside functions, skips shadowing locals, reviews keyed fields', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/f392\n\ngo 1.21\n',
+            'main.go': [
+                'package main',                                   // 1
+                '',                                               // 2
+                'func helper(x int) int { return x + 1 }',        // 3
+                '',                                               // 4
+                'type S struct{ helper int }',                    // 5
+                '',                                               // 6
+                'func use() int {',                               // 7
+                '\tg := []func(int) int{helper, helper}',         // 8
+                '\tif helper := 2; helper > 0 { _ = helper }',    // 9
+                '\t_ = S{helper: 1}',                             // 10
+                '\treturn g[0](1)',                               // 11
+                '}',                                              // 12
+                '',                                               // 13
+                'func shadow() int {',                            // 14
+                '\thelper := func(x int) int { return x }',       // 15
+                '\th := helper',                                  // 16
+                '\treturn h(1)',                                  // 17
+                '}',                                              // 18
+                '',                                               // 19
+                'func main() { use(); shadow() }',                // 20
+            ].join('\n') + '\n',
+        });
+        try {
+            const r = execute(idx(dir), 'plan', { name: 'helper', file: 'main.go', line: 3, renameTo: 'NEW' });
+            assert.ok(r.ok, r.error);
+            const byLine = new Map(r.result.changes.map(c => [c.line, c]));
+            assert.strictEqual(byLine.get(8).newExpression, 'g := []func(int) int{NEW, NEW}');
+            assert.ok(!byLine.has(9) && !byLine.has(16), 'a local binding of the name is not the function');
+            assert.ok(byLine.get(10)?.needsReview, 'a keyed element names a field or a map key');
         } finally { rm(dir); }
     });
 });

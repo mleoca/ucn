@@ -6,6 +6,7 @@
  */
 
 const { ReceiverTypeMap, typeOrigin } = require('./type-evidence');
+const { referenceScope, scopeFields } = require('./lexical-scope');
 
 
 const {
@@ -17,6 +18,8 @@ const {
     extractGoDocstring,
     visitNameNodes,
     sameNode,
+    parseErrorRegions,
+    cachedNodeRange,
 } = require('./utils');
 const { PARSE_OPTIONS, safeParse } = require('./index');
 
@@ -197,8 +200,135 @@ function _processFunction(node, functions, processedRanges, lines) {
  * Process a node for type/class extraction (single-pass helper)
  * Returns true if node was matched, false otherwise
  */
+const goBindingFactsByTree = new WeakMap();
+
+/**
+ * Declarations and assignments of each name inside one top-level function
+ * or method, nested func literals included (fix #381). A one-hop alias needs
+ * exactly one declaration and no assignment of the name.
+ */
+function goBindingFacts(fnNode) {
+    let byId = goBindingFactsByTree.get(fnNode.tree);
+    if (!byId) { byId = new Map(); goBindingFactsByTree.set(fnNode.tree, byId); }
+    let facts = byId.get(fnNode.id);
+    if (facts) return facts;
+    facts = { declared: new Map(), assigned: new Set() };
+    const declare = node => {
+        if (node?.type === 'identifier') {
+            facts.declared.set(node.text, (facts.declared.get(node.text) || 0) + 1);
+        } else if (node?.type === 'expression_list') {
+            for (const child of node.namedChildren) declare(child);
+        }
+    };
+    const record = (child) => {
+        if (child.type === 'parameter_declaration' || child.type === 'variadic_parameter_declaration' ||
+            child.type === 'var_spec' || child.type === 'const_spec') {
+            for (const name of child.childrenForFieldName('name')) declare(name);
+        } else if (child.type === 'short_var_declaration' || child.type === 'range_clause' ||
+            child.type === 'receive_statement') {
+            if (child.type !== 'receive_statement' || child.text.includes(':=')) {
+                declare(child.childForFieldName('left'));
+            }
+        } else if (child.type === 'type_switch_statement') {
+            declare(child.childForFieldName('alias'));
+        } else if (child.type === 'assignment_statement') {
+            const left = child.childForFieldName('left');
+            for (const target of left?.type === 'expression_list' ? left.namedChildren : [left]) {
+                if (target?.type === 'identifier') facts.assigned.add(target.text);
+            }
+        } else if (child.type === 'inc_statement' || child.type === 'dec_statement') {
+            const target = child.namedChild(0);
+            if (target?.type === 'identifier') facts.assigned.add(target.text);
+        } else if (child.type === 'unary_expression' && child.child(0)?.type === '&') {
+            // `&c` may be written through; not a stable alias.
+            const target = child.namedChild(0);
+            if (target?.type === 'identifier') facts.assigned.add(target.text);
+        }
+    };
+    // Every named descendant, from the flat node list when one is cached
+    // (fix #388); the facts are counts and sets, so visit order is free.
+    const range = cachedNodeRange(fnNode);
+    if (range) {
+        const { nodes, subtreeEnds, index } = range;
+        for (let i = index + 1, end = subtreeEnds[index]; i < end; i++) record(nodes[i]);
+    } else {
+        const walk = (node) => {
+            for (const child of node.namedChildren) {
+                record(child);
+                walk(child);
+            }
+        };
+        walk(fnNode);
+    }
+    byId.set(fnNode.id, facts);
+    return facts;
+}
+
+function goOuterFunction(node) {
+    let outer = null;
+    for (let parent = node?.parent; parent; parent = parent.parent) {
+        if (parent.type === 'function_declaration' || parent.type === 'method_declaration') outer = parent;
+    }
+    return outer;
+}
+
+/**
+ * The selector `c` stands for after `c := s.config` (fix #381): one
+ * declaration of `c` in the function, never assigned, the root never
+ * reassigned, and the use inside the declaring block after the declaration.
+ */
+function goFieldAliasOf(identNode) {
+    const fnNode = goOuterFunction(identNode);
+    if (!fnNode) return null;
+    const name = identNode.text;
+    const facts = goBindingFacts(fnNode);
+    if (facts.declared.get(name) !== 1 || facts.assigned.has(name)) return null;
+    // The declaring statement is the nearest preceding short declaration in
+    // an enclosing block.
+    for (let block = identNode.parent; block && block.id !== fnNode.id; block = block.parent) {
+        if (block.type !== 'block' && block.type !== 'statement_list') continue;
+        for (const stmt of block.namedChildren) {
+            if (stmt.startIndex >= identNode.startIndex) break;
+            if (stmt.type !== 'short_var_declaration') continue;
+            const left = stmt.childForFieldName('left');
+            const right = stmt.childForFieldName('right');
+            const lefts = left?.type === 'expression_list' ? left.namedChildren : [left];
+            const rights = right?.type === 'expression_list' ? right.namedChildren : [right];
+            const index = lefts.findIndex(n => n?.type === 'identifier' && n.text === name);
+            if (index < 0) continue;
+            if (lefts.length !== rights.length) return null;
+            const value = rights[index];
+            if (value?.type !== 'selector_expression') return null;
+            const root = value.childForFieldName('operand');
+            if (root?.type !== 'identifier' || root.text === name ||
+                facts.assigned.has(root.text) || (facts.declared.get(root.text) || 0) > 1) return null;
+            return value;
+        }
+    }
+    return null;
+}
+
+/**
+ * A type declared inside a function body is in scope from its declaration to
+ * the end of the enclosing block (fix #378): `type testCase struct{...}` in one
+ * test function never names the package-level testCase used elsewhere.
+ */
+function goLocalTypeScope(node) {
+    for (let parent = node.parent; parent; parent = parent.parent) {
+        if (parent.type === 'source_file') return null;
+        if (parent.type === 'block') {
+            return {
+                lexicalScopeStartLine: node.startPosition.row + 1,
+                lexicalScopeEndLine: parent.endPosition.row + 1,
+            };
+        }
+    }
+    return null;
+}
+
 function _processClass(node, types, processedRanges, lines) {
     if (node.type !== 'type_declaration') return false;
+    const localScope = goLocalTypeScope(node);
 
     const rangeKey = `${node.startIndex}-${node.endIndex}`;
     if (processedRanges.has(rangeKey)) return false;
@@ -238,16 +368,21 @@ function _processClass(node, types, processedRanges, lines) {
                     // which must distinguish an open external method set.
                     .map(m => m.name);
 
+                // A spec of a grouped `type ( ... )` declaration names its
+                // type on its own line (fix #386).
+                const nameLine = nameNode.startPosition.row + 1;
                 types.push({
                     name,
                     startLine,
                     endLine,
+                    ...(nameLine !== startLine && { nameLine }),
                     type: typeKind,
                     members,
                     modifiers: isExported ? ['export'] : [],
                     ...(docstring && { docstring }),
                     ...(typeParams && { generics: typeParams }),
-                    ...(embeddedBases.length > 0 && { extends: embeddedBases.join(', ') })
+                    ...(embeddedBases.length > 0 && { extends: embeddedBases.join(', ') }),
+                    ...localScope,
                 });
             }
         } else if (spec.type === 'type_alias') {
@@ -258,18 +393,31 @@ function _processClass(node, types, processedRanges, lines) {
             const nameNode = spec.childForFieldName('name');
             const typeNode = spec.childForFieldName('type');
             if (nameNode && typeNode) {
-                const aliasOf = typeNode.type === 'type_identifier' ? typeNode.text
-                    : typeNode.type === 'qualified_type' ? typeNode.childForFieldName('name')?.text
+                // `type IntFlag = FlagBase[int, ...]` instantiates a generic
+                // base: the alias is that instantiation, whose method set is
+                // the base's (fix #378).
+                const aliased = typeNode.type === 'generic_type'
+                    ? typeNode.childForFieldName('type') : typeNode;
+                const aliasOf = aliased?.type === 'type_identifier' ? aliased.text
+                    : aliased?.type === 'qualified_type' ? aliased.childForFieldName('name')?.text
                     : null;
+                // `type X = pkg.Base` is pkg's Base, never a same-named
+                // type of another package (fix #378).
+                const aliasQualifier = aliased?.type === 'qualified_type'
+                    ? aliased.childForFieldName('package')?.text : null;
                 const { startLine, endLine } = nodeToLocation(node, lines);
+                const nameLine = nameNode.startPosition.row + 1;
                 types.push({
                     name: nameNode.text,
                     startLine,
                     endLine,
+                    ...(nameLine !== startLine && { nameLine }),
                     type: 'type',
                     members: [],
                     modifiers: /^[A-Z]/.test(nameNode.text) ? ['export'] : [],
                     ...(aliasOf && { aliasOf }),
+                    ...(aliasOf && aliasQualifier && { aliasQualifier }),
+                    ...localScope,
                 });
             }
         }
@@ -600,6 +748,501 @@ function findStateObjects(code, parser) {
 }
 
 /**
+ * Interface-conversion evidence (fix #360): every site where a value of a
+ * named CONCRETE type flows into a slot whose declared type is spelled
+ * differently. In compiling Go the slot type is then an interface the
+ * concrete type satisfies (or an alias of it), so the record is compiler
+ * evidence that renaming a method of the concrete type can break
+ * satisfaction of that interface - including interfaces outside the project
+ * (`return &pseudoRoot{}` as `os.FileInfo`, `var _ IRouter = (*Engine)(nil)`).
+ *
+ * Concrete values: `T{}`, `&T{}`, `(*T)(nil)`, `new(T)`, identifiers bound in
+ * the same function from those shapes or declared with a named type
+ * (parameters, receivers, `var x T`), and one-hop field selectors on such
+ * identifiers (resolved at query time from the declared field type). Slots:
+ * function results by position, typed `var` specs, assignments to typed
+ * locals, `[]I{...}` / `map[K]I{...}` / `[N]I{...}` elements, `append` onto a
+ * typed slice local, keyed struct-literal fields and call arguments (the last
+ * two are resolved against the project definitions at query time). Only the
+ * spelled shapes are recorded; nothing is inferred from names.
+ */
+const GO_BUILTIN_TYPE_NAMES = new Set([
+    'bool', 'byte', 'complex64', 'complex128', 'error', 'float32', 'float64',
+    'int', 'int8', 'int16', 'int32', 'int64', 'rune', 'string', 'uint',
+    'uint8', 'uint16', 'uint32', 'uint64', 'uintptr', 'any',
+]);
+
+const CONVERSION_FUNCTIONS = ['function_declaration', 'method_declaration', 'func_literal'];
+const BODY_SHAPES = new Set([...CONVERSION_FUNCTIONS,
+    'short_var_declaration', 'assignment_statement', 'var_spec',
+    'return_statement', 'composite_literal', 'call_expression']);
+
+function extractTypeConversions(tree) {
+    const out = [];
+    // Qualifiers of standard-library imports (no '.' in the first path
+    // element): their types are never project types, so their values are
+    // no evidence about project interfaces (fix #384).
+    const stdQualifiers = new Set();
+    // Package qualifiers the file imports (fix #384): a call through one may
+    // reach a function outside the project.
+    const importQualifiers = new Set();
+    // Import declarations are top-level: read them without a tree walk.
+    const importSpecs = [];
+    for (let i = 0; i < tree.rootNode.namedChildCount; i++) {
+        const declaration = tree.rootNode.namedChild(i);
+        if (declaration.type !== 'import_declaration') continue;
+        for (const child of declaration.namedChildren) {
+            if (child.type === 'import_spec') importSpecs.push(child);
+            else if (child.type === 'import_spec_list') {
+                for (const spec of child.namedChildren) if (spec.type === 'import_spec') importSpecs.push(spec);
+            }
+        }
+    }
+    for (const spec of importSpecs) {
+        const importPath = (spec.childForFieldName('path')?.text || '').replace(/^["`]|["`]$/g, '');
+        if (!importPath) continue;
+        const alias = spec.childForFieldName('name')?.text;
+        const segments = importPath.split('/');
+        const last = segments[segments.length - 1];
+        // `example.com/mod/v2` imports package `mod`; `gopkg.in/yaml.v3` `yaml`.
+        const conventional = /^v\d+$/.test(last) && segments.length > 1
+            ? segments[segments.length - 2] : last.replace(/\.v\d+$/, '');
+        const qualifier = alias || conventional;
+        if (!qualifier || qualifier === '_' || qualifier === '.') continue;
+        importQualifiers.add(qualifier);
+        if (!segments[0].includes('.')) stdQualifiers.add(qualifier);
+    }
+    const stdTyped = (type) => {
+        const dot = String(type || '').indexOf('.');
+        return dot > 0 && stdQualifiers.has(type.slice(0, dot));
+    };
+    const typeText = (node) => node ? nodeTextWithoutComments(node).replace(/\s+/g, '') : null;
+    const namedTypeOf = (node) => {
+        if (!node) return null;
+        if (node.type === 'pointer_type') return namedTypeOf(node.namedChild(0));
+        if (node.type === 'type_identifier' || node.type === 'qualified_type') return typeText(node);
+        if (node.type === 'generic_type') return namedTypeOf(node.childForFieldName('type'));
+        return null;
+    };
+    // `(*T)(nil)` parses as parenthesized(unary * identifier|selector).
+    const derefTypeOf = (node) => {
+        if (!node || node.type !== 'unary_expression') return null;
+        const operand = node.childForFieldName('operand');
+        const op = node.child(0);
+        if (!op || op.type !== '*' || !operand) return null;
+        if (operand.type === 'identifier') return operand.text;
+        if (operand.type === 'selector_expression' &&
+            operand.childForFieldName('operand')?.type === 'identifier') {
+            return `${operand.childForFieldName('operand').text}.${operand.childForFieldName('field').text}`;
+        }
+        return null;
+    };
+    const constructedTypeOf = (expr) => {
+        if (!expr) return null;
+        if (expr.type === 'parenthesized_expression' && expr.namedChildCount === 1) {
+            return constructedTypeOf(expr.namedChild(0));
+        }
+        if (expr.type === 'composite_literal') return namedTypeOf(expr.childForFieldName('type'));
+        if (expr.type === 'unary_expression' && expr.child(0)?.type === '&') {
+            return constructedTypeOf(expr.childForFieldName('operand'));
+        }
+        if (expr.type === 'call_expression') {
+            const fn = expr.childForFieldName('function');
+            const args = expr.childForFieldName('arguments');
+            if (fn?.type === 'parenthesized_expression' && fn.namedChildCount === 1) {
+                return derefTypeOf(fn.namedChild(0));
+            }
+            if (fn?.type === 'identifier' && fn.text === 'new' && args?.namedChildCount === 1) {
+                return namedTypeOf(args.namedChild(0));
+            }
+        }
+        return null;
+    };
+    const funcTypes = new Set(['function_declaration', 'method_declaration', 'func_literal']);
+    const paramBindings = (list, locals, declared) => {
+        if (!list) return;
+        for (let i = 0; i < list.namedChildCount; i++) {
+            const decl = list.namedChild(i);
+            if (decl.type !== 'parameter_declaration' &&
+                decl.type !== 'variadic_parameter_declaration') continue;
+            const type = decl.childForFieldName('type');
+            const named = decl.type === 'parameter_declaration' ? namedTypeOf(type) : null;
+            for (let j = 0; j < decl.namedChildCount; j++) {
+                const child = decl.namedChild(j);
+                if (child.type !== 'identifier' || child.text === '_') continue;
+                if (named) locals.set(child.text, { type: named });
+                else locals.delete(child.text);
+                if (type) declared.set(child.text, typeText(type));
+            }
+        }
+    };
+    const resultSlots = (fn) => {
+        const result = fn.childForFieldName('result');
+        if (!result) return [];
+        if (result.type !== 'parameter_list') return [typeText(result)];
+        const slots = [];
+        for (let i = 0; i < result.namedChildCount; i++) {
+            const decl = result.namedChild(i);
+            if (decl.type !== 'parameter_declaration') continue;
+            const type = typeText(decl.childForFieldName('type'));
+            let names = 0;
+            for (let j = 0; j < decl.namedChildCount; j++) {
+                if (decl.namedChild(j).type === 'identifier') names++;
+            }
+            for (let k = 0; k < Math.max(1, names); k++) slots.push(type);
+        }
+        return slots;
+    };
+    const elementSlotOf = (typeNode) => {
+        if (!typeNode) return null;
+        if (typeNode.type === 'slice_type' || typeNode.type === 'array_type') {
+            return typeText(typeNode.childForFieldName('element'));
+        }
+        if (typeNode.type === 'map_type') return typeText(typeNode.childForFieldName('value'));
+        return null;
+    };
+    // The callee a call expression names, for query-time result typing.
+    const callShapeOf = (expr, locals) => {
+        if (expr?.type !== 'call_expression') return null;
+        const fnNode = expr.childForFieldName('function');
+        if (fnNode?.type === 'identifier') return { callee: fnNode.text };
+        if (fnNode?.type === 'selector_expression') {
+            const operand = fnNode.childForFieldName('operand');
+            const field = fnNode.childForFieldName('field');
+            if (field && operand?.type === 'identifier') {
+                const bound = locals.get(operand.text);
+                return {
+                    callee: field.text,
+                    receiver: operand.text,
+                    ...(bound?.type && { receiverType: bound.type }),
+                };
+            }
+        }
+        return null;
+    };
+    const valueOf = (value, locals) => {
+        const constructed = constructedTypeOf(value);
+        if (constructed) return { concrete: constructed, constructed: true };
+        // Value forms that keep a named type in this model (fix #384):
+        // parentheses, `&x` and `*p` of a local, and a type assertion
+        // `x.(T)` / `x.(*T)`, whose value has the asserted type.
+        let expr = value;
+        for (;;) {
+            if (expr?.type === 'parenthesized_expression' && expr.namedChildCount === 1) {
+                expr = expr.namedChild(0);
+            } else if (expr?.type === 'unary_expression' &&
+                (expr.child(0)?.type === '&' || expr.child(0)?.type === '*') &&
+                expr.childForFieldName('operand')?.type === 'identifier') {
+                expr = expr.childForFieldName('operand');
+            } else {
+                break;
+            }
+        }
+        if (expr?.type === 'type_assertion_expression') {
+            const asserted = namedTypeOf(expr.childForFieldName('type'));
+            return asserted ? { concrete: asserted, asserted: true } : null;
+        }
+        if (expr?.type === 'identifier') {
+            const bound = locals.get(expr.text);
+            if (bound?.type) return { concrete: bound.type, constructed: !!bound.constructed };
+            if (bound?.call) return { concreteCall: bound.call };
+            return null;
+        }
+        if (expr?.type === 'selector_expression') {
+            const operand = expr.childForFieldName('operand');
+            const field = expr.childForFieldName('field');
+            const bound = operand?.type === 'identifier' ? locals.get(operand.text) : null;
+            if (bound?.type && field) {
+                return { concreteField: { owner: bound.type, field: field.text } };
+            }
+        }
+        // A call's single declared result (`return mem.NewFileHandle(f)`),
+        // resolved against the callee's definition at query time.
+        const call = callShapeOf(expr, locals);
+        if (call) return { concreteCall: call };
+        return null;
+    };
+    const emit = (expr, value, slot) => {
+        if (!value) return;
+        const bare = (t) => String(t || '').replace(/^\*/, '');
+        if (slot.slot && value.concrete && bare(slot.slot) === bare(value.concrete)) return;
+        // Derived values (call results, field reads) are only evidence when
+        // the slot is a named non-builtin type an interface could be:
+        // `return f()` into `error`/`string`/`*T` slots is not a conversion
+        // UCN needs, and recording every one would bloat the index.
+        if ((value.concreteCall || value.concreteField) && slot.slot &&
+            (!/^[A-Za-z_]\w*(\.[A-Za-z_]\w*)?$/.test(slot.slot) ||
+             GO_BUILTIN_TYPE_NAMES.has(slot.slot))) return;
+        out.push({
+            line: expr.startPosition.row + 1,
+            column: expr.startPosition.column,
+            ...(value.concrete && { concrete: value.concrete }),
+            ...(value.concreteField && { concreteField: value.concreteField }),
+            ...(value.concreteCall && { concreteCall: value.concreteCall }),
+            ...slot,
+        });
+    };
+    // The walk acts only on these shapes and passes through every other node
+    // (fix #365: a recursive named-child walk over every node of every file
+    // dominated Go indexing). One native query yields them in document
+    // order; a frame stack replays the recursive walk's scoping exactly:
+    // function scopes copy the enclosing locals at their position, an
+    // assignment visits only its right-hand values and binds its targets
+    // after them, a function-level `var` spec visits only its values and
+    // binds (and emits) after them, and a function without a body, its
+    // parameter list, and every assignment target are never visited.
+    const shapes = tree.rootNode.descendantsOfType([...BODY_SHAPES]);
+    const frames = []; // { end, fn?, locals, declared, results, allowed?, post? }
+    const fnFrame = () => {
+        for (let k = frames.length - 1; k >= 0; k--) if (frames[k].fn) return frames[k];
+        return null;
+    };
+    const openFunction = (fn, outer) => {
+        const locals = new Map(outer ? outer.locals : undefined);
+        const declared = new Map(outer ? outer.declared : undefined);
+        paramBindings(fn.childForFieldName('receiver'), locals, declared);
+        paramBindings(fn.childForFieldName('parameters'), locals, declared);
+        const results = resultSlots(fn);
+        const body = fn.childForFieldName('body');
+        if (!body) return false;
+        frames.push({ fn: true, end: fn.endIndex, locals, declared, results,
+            allowed: [[body.startIndex, body.endIndex]] });
+        return true;
+    };
+    const assignmentPost = (node, lhs, rhs, locals, declared) => () => {
+        if (lhs.length === rhs.length) {
+            for (let i = 0; i < lhs.length; i++) {
+                if (lhs[i].type !== 'identifier' || lhs[i].text === '_') continue;
+                if (node.type === 'assignment_statement' && declared.has(lhs[i].text)) continue;
+                const constructed = constructedTypeOf(rhs[i]);
+                const call = constructed ? null : callShapeOf(rhs[i], locals);
+                if (constructed) locals.set(lhs[i].text, { type: constructed, constructed: true });
+                else if (call) locals.set(lhs[i].text, { call: { ...call, index: 0 } });
+                else locals.delete(lhs[i].text);
+                if (node.type === 'short_var_declaration') declared.delete(lhs[i].text);
+            }
+        } else {
+            // `f, err := os.Create(name)`: each target is one result
+            // position of the call.
+            const call = rhs.length === 1 ? callShapeOf(rhs[0], locals) : null;
+            for (let i = 0; i < lhs.length; i++) {
+                const target = lhs[i];
+                if (target.type !== 'identifier') continue;
+                if (node.type === 'assignment_statement' && declared.has(target.text)) continue;
+                if (call && target.text !== '_') locals.set(target.text, { call: { ...call, index: i } });
+                else locals.delete(target.text);
+                if (node.type === 'short_var_declaration') declared.delete(target.text);
+            }
+        }
+    };
+    const varSpecPost = (node, type, names, values, locals, declared) => () => {
+        for (let i = 0; i < names.length; i++) {
+            if (type) {
+                if (values[i]) emit(values[i], valueOf(values[i], locals), { slot: typeText(type), kind: 'var' });
+                const named = namedTypeOf(type);
+                if (names[i].text !== '_') {
+                    declared.set(names[i].text, typeText(type));
+                    if (named) locals.set(names[i].text, { type: named });
+                    else locals.delete(names[i].text);
+                }
+            } else if (names[i].text !== '_') {
+                const constructed = constructedTypeOf(values[i]);
+                if (constructed) locals.set(names[i].text, { type: constructed, constructed: true });
+                else locals.delete(names[i].text);
+                declared.delete(names[i].text);
+            }
+        }
+    };
+    const closeFramesBefore = (offset) => {
+        while (frames.length > 0 && frames[frames.length - 1].end <= offset) {
+            const frame = frames.pop();
+            if (frame.post) frame.post();
+        }
+    };
+    const actInFunction = (node, scope) => {
+        const { locals, declared, results } = scope;
+        if (node.type === 'short_var_declaration' || node.type === 'assignment_statement') {
+            const left = node.childForFieldName('left');
+            const right = node.childForFieldName('right');
+            const lhs = left ? left.namedChildren : [];
+            const rhs = right ? right.namedChildren : [];
+            if (node.type === 'assignment_statement' && lhs.length === rhs.length) {
+                for (let i = 0; i < lhs.length; i++) {
+                    const target = lhs[i];
+                    if (target.type === 'selector_expression') {
+                        // `srv.Handler = h`: the field of the operand's
+                        // declared named type (fix #384).
+                        const operand = target.childForFieldName('operand');
+                        const field = target.childForFieldName('field');
+                        const ownerType = operand?.type === 'identifier'
+                            ? declared.get(operand.text) : null;
+                        const value = field && ownerType &&
+                            /^\*?[A-Za-z_]\w*(\.[A-Za-z_]\w*)?$/.test(ownerType)
+                            ? valueOf(rhs[i], locals) : null;
+                        if (value?.concrete) {
+                            emit(rhs[i], value, {
+                                fieldSlot: { owner: ownerType.replace(/^\*/, ''), field: field.text },
+                                kind: 'field',
+                            });
+                        }
+                        continue;
+                    }
+                    if (target.type !== 'identifier') continue;
+                    const slotType = declared.get(target.text);
+                    if (slotType) emit(rhs[i], valueOf(rhs[i], locals), { slot: slotType, kind: 'assign' });
+                }
+            }
+            frames.push({ end: node.endIndex, allowed: rhs.map(child => [child.startIndex, child.endIndex]),
+                post: assignmentPost(node, lhs, rhs, locals, declared) });
+            return;
+        }
+        if (node.type === 'var_spec') {
+            const type = node.childForFieldName('type');
+            const value = node.childForFieldName('value');
+            const names = [];
+            for (let i = 0; i < node.namedChildCount; i++) {
+                const child = node.namedChild(i);
+                if (child.type === 'identifier') names.push(child);
+            }
+            const values = value ? value.namedChildren : [];
+            frames.push({ end: node.endIndex, allowed: values.map(child => [child.startIndex, child.endIndex]),
+                post: varSpecPost(node, type, names, values, locals, declared) });
+            return;
+        }
+        if (node.type === 'return_statement') {
+            const list = node.namedChildCount > 0 ? node.namedChild(0) : null;
+            const values = list?.type === 'expression_list' ? list.namedChildren : (list ? [list] : []);
+            if (values.length === results.length) {
+                for (let i = 0; i < values.length; i++) {
+                    if (results[i]) emit(values[i], valueOf(values[i], locals), { slot: results[i], kind: 'return' });
+                }
+            }
+            return;
+        }
+        if (node.type === 'composite_literal') {
+            const typeNode = node.childForFieldName('type');
+            const element = elementSlotOf(typeNode);
+            const structType = element ? null : namedTypeOf(typeNode);
+            const bodyNode = node.childForFieldName('body');
+            for (let i = 0; bodyNode && i < bodyNode.namedChildCount; i++) {
+                const item = bodyNode.namedChild(i);
+                let valueNode = item;
+                let key = null;
+                if (item.type === 'keyed_element') {
+                    key = item.namedChild(0)?.namedChild(0) || null;
+                    valueNode = item.namedChild(item.namedChildCount - 1);
+                }
+                if (valueNode?.type === 'literal_element') valueNode = valueNode.namedChild(0);
+                if (!valueNode) continue;
+                if (element) {
+                    emit(valueNode, valueOf(valueNode, locals), { slot: element, kind: 'element' });
+                } else if (structType && key?.type === 'identifier') {
+                    emit(valueNode, valueOf(valueNode, locals), {
+                        fieldSlot: { owner: structType, field: key.text }, kind: 'field',
+                    });
+                }
+            }
+            return;
+        }
+        if (node.type === 'call_expression') {
+            const fnNode = node.childForFieldName('function');
+            const args = node.childForFieldName('arguments');
+            const argList = args ? args.namedChildren : [];
+            if (fnNode?.type === 'identifier' && fnNode.text === 'append' && argList.length >= 2 &&
+                argList[0].type === 'identifier') {
+                const sliceType = declared.get(argList[0].text) || '';
+                const element = sliceType.startsWith('[]') ? sliceType.slice(2) : null;
+                if (element) {
+                    for (const arg of argList.slice(1)) {
+                        emit(arg, valueOf(arg, locals), { slot: element, kind: 'element' });
+                    }
+                }
+            } else if (fnNode && (fnNode.type === 'identifier' || fnNode.type === 'selector_expression')) {
+                let callee;
+                let receiver = null;
+                let receiverType = null;
+                // A callee that may live outside the project: a function
+                // qualified by an imported package (fix #384).
+                let mayBeOutside = false;
+                if (fnNode.type === 'identifier') {
+                    callee = fnNode.text;
+                } else {
+                    callee = fnNode.childForFieldName('field')?.text || null;
+                    const operand = fnNode.childForFieldName('operand');
+                    if (operand?.type === 'identifier') {
+                        receiver = operand.text;
+                        receiverType = locals.get(operand.text)?.type || null;
+                        mayBeOutside = importQualifiers.has(operand.text) &&
+                            !declared.has(operand.text) && !locals.has(operand.text);
+                    }
+                }
+                for (let i = 0; callee && i < argList.length; i++) {
+                    const value = valueOf(argList[i], locals);
+                    // Arguments: construction-shaped or asserted values; a
+                    // typed local only toward a callee that may live outside
+                    // the project (fix #384: a concrete value passed to an
+                    // out-of-project parameter may be converted to an
+                    // interface UCN cannot see). A local passed along to a
+                    // project callee is usually already the parameter's own
+                    // (interface) type.
+                    if (!value?.concrete || GO_BUILTIN_TYPE_NAMES.has(value.concrete)) continue;
+                    if (!value.constructed && !value.asserted &&
+                        (!mayBeOutside || stdTyped(value.concrete))) continue;
+                    emit(argList[i], value, {
+                        argSlot: {
+                            callee,
+                            argIndex: i,
+                            ...(receiver && { receiver }),
+                            ...(receiverType && { receiverType }),
+                        },
+                        kind: 'argument',
+                    });
+                }
+            }
+        }
+    };
+    const actAtTop = (node) => {
+        if (node.type !== 'var_spec') return;
+        const type = node.childForFieldName('type');
+        const value = node.childForFieldName('value');
+        if (type && value) {
+            for (const child of value.namedChildren) {
+                const constructed = constructedTypeOf(child);
+                if (constructed) {
+                    emit(child, { concrete: constructed, constructed: true },
+                        { slot: typeText(type), kind: 'var' });
+                }
+            }
+        }
+    };
+    const starts = shapes.map(node => node.startIndex);
+    for (let k = 0; k < shapes.length; k++) {
+        const node = shapes[k];
+        const start = starts[k];
+        closeFramesBefore(start);
+        const inner = frames[frames.length - 1];
+        let end = -1;
+        const skipSubtree = () => {
+            if (end < 0) end = node.endIndex;
+            while (k + 1 < shapes.length && starts[k + 1] < end) k++;
+        };
+        if (inner && inner.allowed) {
+            end = node.endIndex;
+            if (!inner.allowed.some(([a, b]) => start >= a && end <= b)) { skipSubtree(); continue; }
+        }
+        const scope = fnFrame();
+        if (funcTypes.has(node.type)) {
+            if (!openFunction(node, scope)) skipSubtree();
+            continue;
+        }
+        if (scope) actInFunction(node, scope);
+        else actAtTop(node);
+    }
+    closeFramesBefore(Infinity);
+    return out;
+}
+
+/**
  * Parse a Go file completely
  */
 function parse(code, parser) {
@@ -622,13 +1265,29 @@ function parse(code, parser) {
     classes.sort((a, b) => a.startLine - b.startLine);
     stateObjects.sort((a, b) => a.startLine - b.startLine);
 
+    // The package clause (fix #383): an external test package
+    // (`package x_test`) shares its directory with package x but not its
+    // scope.
+    let packageName = null;
+    for (let i = 0; i < tree.rootNode.namedChildCount; i++) {
+        const child = tree.rootNode.namedChild(i);
+        if (child.type !== 'package_clause') continue;
+        for (let j = 0; j < child.namedChildCount; j++) {
+            const id = child.namedChild(j);
+            if (id.type === 'package_identifier' || id.type === 'identifier') { packageName = id.text; break; }
+        }
+        break;
+    }
+
     return {
         language: 'go',
         totalLines: lines.length,
         functions,
         classes,
         stateObjects,
-        ...(tree.rootNode.hasError && { parseRecovery: true }),
+        ...(packageName && { packageName }),
+        ...(tree.rootNode.hasError && { parseRecovery: true, parseErrorRegions: parseErrorRegions(tree.rootNode) }),
+        typeConversions: extractTypeConversions(tree),
         imports: [],
         exports: []
     };
@@ -663,6 +1322,22 @@ const GO_BUILTINS = new Set([
  *                            own LHS position, single-value semantics
  * Identifier targets only; blank (`_`) targets return undefined.
  */
+// Value positions of an instantiated generic function value (fix #378).
+const GENERIC_VALUE_PARENTS = new Set(['argument_list', 'literal_element', 'expression_list']);
+
+// An expression_list holding VALUES: the right side of `=` / `:=`, a var
+// spec's values, or a return list (never an assignment's left side).
+function isValueExpressionList(list) {
+    const owner = list.parent;
+    if (!owner) return false;
+    if (owner.type === 'return_statement') return true;
+    if (owner.type === 'var_spec') return sameNode(owner.childForFieldName('value'), list);
+    if (owner.type === 'short_var_declaration' || owner.type === 'assignment_statement') {
+        return sameNode(owner.childForFieldName('right'), list);
+    }
+    return false;
+}
+
 function goAssignmentTargetOf(callNode) {
     let n = callNode;
     let p = n.parent;
@@ -750,6 +1425,114 @@ function findCallsInCode(code, parser, options = {}) {
         }
         return null;
     };
+    // fix #383: the arguments of a route registration (`r.GET("/x", h, mw)`)
+    // after its path: each argument's name, '<anonymous>' for a function
+    // literal, the callee's name for a call, null for any other expression.
+    // The router decides which one is the handler (gin: the last; echo: the
+    // first, middleware follow it).
+    const GO_ROUTE_VERBS = /^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|CONNECT|TRACE|Any|Handle|HandleFunc|Get|Post|Put|Delete|Patch|Head|Options|Connect|Trace|All|Match|Add)$/;
+    const goArgName = (arg) => {
+        if (arg.type === 'identifier') return arg.text;
+        if (arg.type === 'selector_expression') return arg.childForFieldName('field')?.text || null;
+        if (arg.type === 'func_literal') return '<anonymous>';
+        if (arg.type === 'call_expression') {
+            const fn = arg.childForFieldName('function');
+            if (fn?.type === 'identifier') return fn.text;
+            if (fn?.type === 'selector_expression') return fn.childForFieldName('field')?.text || null;
+        }
+        return null;
+    };
+    const getHandlerArgs = (callNode, skip = 1) => {
+        const argsNode = callNode.childForFieldName('arguments');
+        if (!argsNode) return null;
+        const out = [];
+        let seen = 0;
+        for (let i = 0; i < argsNode.namedChildCount; i++) {
+            const arg = argsNode.namedChild(i);
+            if (arg.type.endsWith('comment')) continue;
+            if (seen++ < skip) continue;
+            out.push(goArgName(arg));
+        }
+        return out.length > 0 ? out : null;
+    };
+    // An HTTP method expression: "GET" or http.MethodGet.
+    const goHttpMethodOf = (node) => {
+        if (!node) return null;
+        const lit = _extractStringArg(node);
+        if (lit && !lit.interp && /^[A-Z]+$/.test(lit.value || '')) return lit.value;
+        if (node.type === 'selector_expression') {
+            const field = node.childForFieldName('field')?.text || '';
+            if (/^Method[A-Z][a-z]+$/.test(field)) return field.slice('Method'.length).toUpperCase();
+        }
+        return null;
+    };
+    // fix #383: a registration that takes the method first
+    // (`r.Handle(http.MethodGet, "/x", h)`, `e.Add("GET", "/x", h)`,
+    // `e.Match([]string{"GET", "POST"}, "/x", h)`): its methods and path.
+    const getMethodFirstRoute = (callNode) => {
+        const argsNode = callNode.childForFieldName('arguments');
+        if (!argsNode) return null;
+        const args = [];
+        for (let i = 0; i < argsNode.namedChildCount; i++) {
+            const arg = argsNode.namedChild(i);
+            if (!arg.type.endsWith('comment')) args.push(arg);
+        }
+        if (args.length < 2) return null;
+        let methods = null;
+        const single = goHttpMethodOf(args[0]);
+        if (single) methods = [single];
+        else if (args[0].type === 'composite_literal') {
+            const body = args[0].childForFieldName('body');
+            const items = [];
+            for (let i = 0; body && i < body.namedChildCount; i++) {
+                const element = body.namedChild(i);
+                const value = element.type === 'literal_element' || element.type === 'element'
+                    ? element.namedChild(0) : element;
+                const method = goHttpMethodOf(value);
+                if (!method) return null;
+                items.push(method);
+            }
+            if (items.length > 0) methods = items;
+        }
+        if (!methods) return null;
+        const pathLit = _extractStringArg(args[1]);
+        if (!pathLit || !pathLit.value) return null;
+        return { methods, path: pathLit.value, ...(pathLit.interp && { interp: true }) };
+    };
+    // fix #383: `http.NewRequest(method, url, body)` and
+    // `NewRequestWithContext(ctx, method, url, body)`: the request's method
+    // (a string or an `http.MethodX` constant) and URL are not the first
+    // argument.
+    const getRequestTarget = (callNode, name) => {
+        const argsNode = callNode.childForFieldName('arguments');
+        if (!argsNode) return null;
+        const args = [];
+        for (let i = 0; i < argsNode.namedChildCount; i++) {
+            const arg = argsNode.namedChild(i);
+            if (!arg.type.endsWith('comment')) args.push(arg);
+        }
+        const offset = name === 'NewRequestWithContext' ? 1 : 0;
+        const methodNode = args[offset];
+        const urlNode = args[offset + 1];
+        if (!methodNode || !urlNode) return null;
+        let method = null;
+        const m = _extractStringArg(methodNode);
+        if (m && !m.interp && m.value) method = m.value.toUpperCase();
+        else if (methodNode.type === 'selector_expression') {
+            const field = methodNode.childForFieldName('field')?.text || '';
+            if (/^Method[A-Z][a-z]+$/.test(field)) method = field.slice('Method'.length).toUpperCase();
+        }
+        let url = null;
+        if (urlNode.type === 'call_expression') {
+            const inner = urlNode.childForFieldName('function');
+            if (inner?.type === 'selector_expression' && inner.childForFieldName('operand')?.text === 'fmt' &&
+                inner.childForFieldName('field')?.text === 'Sprintf') url = _extractSprintfPrefix(urlNode);
+        } else {
+            url = _extractStringArg(urlNode);
+        }
+        if (!url || !url.value) return null;
+        return { url: url.value, ...(url.interp && { interp: true }), ...(method && { method }) };
+    };
     // Skip common non-function identifiers when detecting callback arguments
     const GO_SKIP_IDENTS = new Set(['nil', 'true', 'false', 'err', 'ctx', 'context', 'iota']);
     // Track local closures per function scope. The declared result belongs
@@ -813,6 +1596,11 @@ function findCallsInCode(code, parser, options = {}) {
             const tn = typeNode.childForFieldName('name');
             if (tn) return tn.text;
         }
+        // Box[T] / pkg.Box[T] -> Box: an instantiation has the generic
+        // type's method set (fix #378).
+        if (typeNode.type === 'generic_type') {
+            return extractTypeName(typeNode.childForFieldName('type'));
+        }
         return null;
     };
 
@@ -831,6 +1619,9 @@ function findCallsInCode(code, parser, options = {}) {
         if (typeNode.type === 'qualified_type') {
             const pkg = typeNode.childForFieldName('package') || typeNode.namedChild(0);
             return pkg?.text || null;
+        }
+        if (typeNode.type === 'generic_type') {
+            return extractTypeQualifier(typeNode.childForFieldName('type'));
         }
         return null;
     };
@@ -930,7 +1721,7 @@ function findCallsInCode(code, parser, options = {}) {
         const allScopes = functionStack.map(scope => scope.startLine);
         let scopeChain = [allScopes[allScopes.length - 1]];
         if (refNode && name) {
-            const bindingScope = lexicalBindingScopeStart(refNode, name);
+            const bindingScope = bindingScopeOf(refNode, name);
             const bindingIndex = allScopes.lastIndexOf(bindingScope);
             if (bindingIndex >= 0) scopeChain = allScopes.slice(bindingIndex);
         }
@@ -962,7 +1753,7 @@ function findCallsInCode(code, parser, options = {}) {
     // Look up variable type from scope chain
     const getReceiverType = (varName, refNode, evidence = false) => {
         const bindingScope = refNode
-            ? lexicalBindingScopeStart(refNode, varName) : null;
+            ? bindingScopeOf(refNode, varName) : null;
         for (let i = functionStack.length - 1; i >= 0; i--) {
             const scopeStart = functionStack[i].startLine;
             const typeMap = scopeTypes.get(scopeStart);
@@ -974,7 +1765,7 @@ function findCallsInCode(code, parser, options = {}) {
     };
     const getReceiverTypeQualifier = (varName, refNode) => {
         const bindingScope = refNode
-            ? lexicalBindingScopeStart(refNode, varName) : null;
+            ? bindingScopeOf(refNode, varName) : null;
         for (let i = functionStack.length - 1; i >= 0; i--) {
             const scopeStart = functionStack[i].startLine;
             const qualifiers = scopeTypeQualifiers.get(scopeStart);
@@ -986,7 +1777,7 @@ function findCallsInCode(code, parser, options = {}) {
     };
     const getIndexedSource = (varName, refNode) => {
         const bindingScope = refNode
-            ? lexicalBindingScopeStart(refNode, varName) : null;
+            ? bindingScopeOf(refNode, varName) : null;
         for (let i = functionStack.length - 1; i >= 0; i--) {
             const scopeStart = functionStack[i].startLine;
             const sources = scopeIndexedSources.get(scopeStart);
@@ -1240,8 +2031,39 @@ function findCallsInCode(code, parser, options = {}) {
         }
         return null;
     };
-    const isShadowedByLocal = (refNode, name) =>
-        lexicalBindingScopeStart(refNode, name) != null;
+    // Names the file binds locally anywhere (a superset of every binding
+    // form lexicalBindingScopeStart recognizes), from one native query: a
+    // package qualifier no local ever spells cannot be shadowed, so the
+    // per-reference upward scope scan is skipped (fix #365).
+    let localBindingNames = null;
+    const locallyBound = (name) => {
+        if (!localBindingNames) {
+            localBindingNames = new Set();
+            const collect = (node) => {
+                for (const child of node.namedChildren) {
+                    if (child.type === 'identifier') localBindingNames.add(child.text);
+                }
+            };
+            for (const node of tree.rootNode.descendantsOfType([
+                'short_var_declaration', 'range_clause', 'type_switch_statement',
+                'var_spec', 'parameter_declaration', 'variadic_parameter_declaration',
+            ])) {
+                collect(node);
+                for (const child of node.namedChildren) {
+                    if (child.type === 'expression_list') collect(child);
+                }
+            }
+        }
+        return localBindingNames.has(name);
+    };
+    const bindingScopeOf = (refNode, name) =>
+        (locallyBound(name) ? lexicalBindingScopeStart(refNode, name) : null);
+    const isShadowedByLocal = (refNode, name) => bindingScopeOf(refNode, name) != null;
+    // An identifier operand naming an import that no local binding shadows
+    // is a package qualifier: `pkg.Name` then denotes a package-level
+    // symbol (function, type, var or const), never a member of a value.
+    const isPackageQualifier = (operandNode, receiver) => !!(receiver &&
+        importAliases.has(receiver) && !isShadowedByLocal(operandNode, receiver));
 
     // Go package declarations are in scope throughout the file, including
     // function bodies preceding the declaration. Locals still enter in order.
@@ -1592,6 +2414,67 @@ function findCallsInCode(code, parser, options = {}) {
             }
         }
 
+        // Explicit generic instantiation calls (fix #378): tree-sitter-go
+        // parses `f[T](x)` and `pkg.F[T](x)` (one or more type arguments on
+        // a callee it cannot tell from a type) as a type_conversion_expression
+        // over a generic_type; only a multi-argument `f[A, B](x)` with a bare
+        // callee comes out as a call_expression. Both are calls of the named
+        // function (or conversions to the named generic type, recorded like
+        // `T(x)`). The same syntax indexes a local slice or map of funcs
+        // (`handlers[i](x)`) or a field (`s.m[k](x)`): a locally bound or
+        // function-typed-parameter base, or a qualifier that is not an
+        // import, is an index expression and emits nothing.
+        if (node.type === 'type_conversion_expression') {
+            const typeNode = node.childForFieldName('type');
+            const base = typeNode?.type === 'generic_type'
+                ? typeNode.childForFieldName('type') : null;
+            let callName = null;
+            let pkgReceiver;
+            let nameNode = null;
+            if (base?.type === 'type_identifier') {
+                const name = base.text;
+                if (!GO_BUILTINS.has(name) && !getLocalClosure(name) &&
+                    !isFuncTypedParam(name) && !isShadowedByLocal(base, name)) {
+                    callName = name;
+                    nameNode = base;
+                }
+            } else if (base?.type === 'qualified_type') {
+                const pkgNode = base.childForFieldName('package');
+                const fieldNode = base.childForFieldName('name');
+                if (pkgNode && fieldNode && importAliases.has(pkgNode.text) &&
+                    !isShadowedByLocal(pkgNode, pkgNode.text)) {
+                    callName = fieldNode.text;
+                    pkgReceiver = pkgNode.text;
+                    nameNode = fieldNode;
+                }
+            }
+            if (callName) {
+                const operand = node.childForFieldName('operand');
+                const assigned = goAssignmentTargetOf(node);
+                calls.push({
+                    name: callName,
+                    line: nameNode.startPosition.row + 1,
+                    column: nameNode.startPosition.column,
+                    callStart: node.startIndex,
+                    callEnd: node.endIndex,
+                    isMethod: false,
+                    ...(pkgReceiver && { receiver: pkgReceiver }),
+                    argCount: operand ? 1 : 0,
+                    ...(assigned && { assignedTo: assigned.assignedTo }),
+                    ...(assigned?.assignedTuple && { assignedTuple: true }),
+                    ...(assigned?.assignedTupleIndex != null && {
+                        assignedTupleIndex: assigned.assignedTupleIndex,
+                    }),
+                    ...(assigned?.assignedTupleTargets && {
+                        assignedTupleTargets: assigned.assignedTupleTargets,
+                    }),
+                    ...(assigned?.assignedTupleRest && { assignedTupleRest: assigned.assignedTupleRest }),
+                    enclosingFunction: getCurrentEnclosingFunction(),
+                    uncertain: false,
+                });
+            }
+        }
+
         // Handle function calls: foo(), pkg.Foo(), obj.Method()
         if (node.type === 'call_expression') {
             const funcNode = node.childForFieldName('function');
@@ -1691,13 +2574,25 @@ function findCallsInCode(code, parser, options = {}) {
             } else if (funcNode.type === 'selector_expression') {
                 // Method or package call: obj.Method() or pkg.Func()
                 const fieldNode = funcNode.childForFieldName('field');
-                const operandNode = funcNode.childForFieldName('operand');
+                let operandNode = funcNode.childForFieldName('operand');
+                // fix #381: `c.Load()` after `c := s.config` receives like
+                // `s.config.Load()`.
+                if (operandNode?.type === 'identifier' && !importAliases.has(operandNode.text) &&
+                    !getReceiverType(operandNode.text, operandNode)) {
+                    const aliased = goFieldAliasOf(operandNode);
+                    if (aliased) operandNode = aliased;
+                }
 
                 if (fieldNode) {
                     const receiver = operandNode?.type === 'identifier' ? operandNode.text : undefined;
                     // Distinguish pkg.Func() (package-qualified) from obj.Method()
                     // If receiver is a known import alias, this is a package call, not a method call
-                    const isPkgCall = receiver && importAliases.has(receiver);
+                    // A local binding shadows a same-named import inside its
+                    // scope (`fs := NewMemMapFs(); fs.Chown(...)` in a file
+                    // importing "io/fs"): that call is a METHOD call on the
+                    // local, never the package function (fix #360).
+                    const isPkgCall = receiver && importAliases.has(receiver) &&
+                        !isShadowedByLocal(operandNode, receiver);
                     let receiverTypeEvidence;
                     let receiverType = (!isPkgCall && receiver)
                         ? getReceiverType(receiver, operandNode) : undefined;
@@ -1728,7 +2623,8 @@ function findCallsInCode(code, parser, options = {}) {
                             receiverRoot = rootNode.text;
                             receiverRootNode = rootNode;
                             receiverFieldName = fldNode.text;
-                            if (importAliases.has(rootNode.text)) {
+                            if (importAliases.has(rootNode.text) &&
+                                !isShadowedByLocal(rootNode, rootNode.text)) {
                                 // Package-owned value receiver:
                                 // io.Discard.Write(...). The package qualifier
                                 // is identity evidence even though the value's
@@ -1786,7 +2682,8 @@ function findCallsInCode(code, parser, options = {}) {
                                 // Selector records report the FIELD's own line
                                 // (fix #223 name-node convention)
                                 receiverCallLine = pf.startPosition.row + 1;
-                                if (po?.type === 'identifier' && importAliases.has(po.text)) {
+                                if (po?.type === 'identifier' && importAliases.has(po.text) &&
+                                    !isShadowedByLocal(po, po.text)) {
                                     receiverCallReceiver = po.text;
                                 } else {
                                     receiverCallIsMethod = true;
@@ -1795,6 +2692,12 @@ function findCallsInCode(code, parser, options = {}) {
                         }
                     }
                     const firstArg = getFirstStringArg(node);
+                    const methodFirstRoute = !firstArg && GO_ROUTE_VERBS.test(fieldNode.text) && argCount >= 2
+                        ? getMethodFirstRoute(node) : null;
+                    const handlerArgs = (firstArg || methodFirstRoute) && GO_ROUTE_VERBS.test(fieldNode.text) && argCount >= 2
+                        ? getHandlerArgs(node, methodFirstRoute ? 2 : 1) : null;
+                    const requestTarget = fieldNode.text === 'NewRequest' || fieldNode.text === 'NewRequestWithContext'
+                        ? getRequestTarget(node, fieldNode.text) : null;
                     const receiverBindingNode = receiver ? operandNode : receiverRootNode;
                     const receiverBindingName = receiver || receiverRoot;
                     const methodEnclosingFunction = !isPkgCall &&
@@ -1855,7 +2758,10 @@ function findCallsInCode(code, parser, options = {}) {
                         ...(assigned?.assignedTupleRest && { assignedTupleRest: assigned.assignedTupleRest }),
                         enclosingFunction: methodEnclosingFunction,
                         uncertain,
-                        ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
+                        ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp }),
+                        ...(handlerArgs && { handlerArgs }),
+                        ...(methodFirstRoute && { methodFirstRoute }),
+                        ...(requestTarget && { requestTarget })
                     });
                 }
             }
@@ -1877,7 +2783,10 @@ function findCallsInCode(code, parser, options = {}) {
             // `Outer{ field: Inner{...} }`. Both the outer and inner are real
             // constructors, so we DO emit each, but we must not emit the same
             // node twice. Tree-sitter visits each node once, so this is fine.
-            const typeNode = node.childForFieldName('type');
+            const literalType = node.childForFieldName('type');
+            // Box[int]{...} constructs the generic type Box (fix #378).
+            const typeNode = literalType?.type === 'generic_type'
+                ? literalType.childForFieldName('type') : literalType;
             if (typeNode) {
                 let typeName = null;
                 let typeQualifier = null;
@@ -1920,6 +2829,9 @@ function findCallsInCode(code, parser, options = {}) {
                 const operandNode = node.childForFieldName('operand');
                 if (fieldNode && operandNode) {
                     const receiver = operandNode.type === 'identifier' ? operandNode.text : undefined;
+                    // `pkg.Func` as a value is a package-qualified function
+                    // reference, never a method value (fix #378).
+                    const pkgValue = isPackageQualifier(operandNode, receiver);
                     let receiverTypeEvidence;
                     let receiverType = receiver
                         ? getReceiverType(receiver, operandNode) : undefined;
@@ -1942,7 +2854,8 @@ function findCallsInCode(code, parser, options = {}) {
                         name: fieldNode.text,
                         line: fieldNode.startPosition.row + 1,
                         column: fieldNode.startPosition.column,
-                        isMethod: true,
+                        isMethod: !pkgValue,
+                        ...(pkgValue && { isFunctionReference: true }),
                         receiver,
                         ...(receiverType && { receiverType, ...(receiverTypeEvidence ? { receiverTypeSource: 'constructor', receiverTypeEvidence } : getReceiverType(receiver, node, true) || { receiverTypeSource: 'unknown' }) }),
                         ...(receiverTypeQualifier && { receiverTypeQualifier }),
@@ -1950,6 +2863,51 @@ function findCallsInCode(code, parser, options = {}) {
                         enclosingFunction,
                         isPotentialCallback: true,
                         uncertain: false
+                    });
+                }
+            }
+        }
+
+        // Instantiated generic function VALUES (fix #378): `id[int]` /
+        // `pkg.F[int]` in a value position (argument, right-hand side,
+        // return value, literal element) reference the generic function.
+        // The same syntax indexes a slice or map: a locally bound operand is
+        // an index, and a package-level non-function never matches a
+        // function pin (Go forbids a same-package var and func of one name).
+        if (node.type === 'index_expression' && GENERIC_VALUE_PARENTS.has(node.parent?.type) &&
+            (node.parent.type !== 'expression_list' || isValueExpressionList(node.parent))) {
+            const operandNode = node.childForFieldName('operand');
+            if (operandNode?.type === 'identifier') {
+                const name = operandNode.text;
+                if (!GO_SKIP_IDENTS.has(name) && !GO_BUILTINS.has(name) &&
+                    !importAliases.has(name) && !isShadowedByLocal(operandNode, name) &&
+                    !isFuncTypedParam(name) && !getLocalClosure(name)) {
+                    calls.push({
+                        name,
+                        line: operandNode.startPosition.row + 1,
+                        column: operandNode.startPosition.column,
+                        isMethod: false,
+                        isFunctionReference: true,
+                        isPotentialCallback: true,
+                        enclosingFunction: getCurrentEnclosingFunction(),
+                        uncertain: false,
+                    });
+                }
+            } else if (operandNode?.type === 'selector_expression') {
+                const qualifier = operandNode.childForFieldName('operand');
+                const fieldNode = operandNode.childForFieldName('field');
+                const receiver = qualifier?.type === 'identifier' ? qualifier.text : undefined;
+                if (fieldNode && isPackageQualifier(qualifier, receiver)) {
+                    calls.push({
+                        name: fieldNode.text,
+                        line: fieldNode.startPosition.row + 1,
+                        column: fieldNode.startPosition.column,
+                        isMethod: false,
+                        receiver,
+                        isFunctionReference: true,
+                        isPotentialCallback: true,
+                        enclosingFunction: getCurrentEnclosingFunction(),
+                        uncertain: false,
                     });
                 }
             }
@@ -1980,11 +2938,14 @@ function findCallsInCode(code, parser, options = {}) {
         // Pattern 2: sched.SchedulePod = schedulePod (field = function reference)
         // Pattern 3: var handler = processEvent (short variable = function reference)
         // The RHS is a function reference (not a call — no parentheses)
-        if (node.type === 'assignment_statement' || node.type === 'short_var_declaration') {
+        // `var handler = processEvent` / `var f = pkg.F` values too (fix #378).
+        if (node.type === 'assignment_statement' || node.type === 'short_var_declaration' ||
+            node.type === 'var_spec') {
             // Skip blank identifier assignments: _ = x (used to suppress unused warnings)
-            const left = node.childForFieldName('left');
+            const isVarSpec = node.type === 'var_spec';
+            const left = node.childForFieldName(isVarSpec ? 'name' : 'left');
             const isBlankAssign = left && left.text.trim() === '_';
-            const right = isBlankAssign ? null : node.childForFieldName('right');
+            const right = isBlankAssign ? null : node.childForFieldName(isVarSpec ? 'value' : 'right');
             if (right) {
                 // Walk through the expression list (could be multiple assignments)
                 const rhsNodes = right.type === 'expression_list' ? right.namedChildren : [right];
@@ -1995,6 +2956,9 @@ function findCallsInCode(code, parser, options = {}) {
                         const operandNode = rhs.childForFieldName('operand');
                         if (fieldNode && operandNode) {
                             const receiver = operandNode.type === 'identifier' ? operandNode.text : undefined;
+                            // `pkg.Func` as a value is a package-qualified function
+                            // reference, never a method value (fix #378).
+                            const pkgValue = isPackageQualifier(operandNode, receiver);
                             let receiverTypeEvidence;
                             let receiverType = receiver
                                 ? getReceiverType(receiver, operandNode) : undefined;
@@ -2014,7 +2978,8 @@ function findCallsInCode(code, parser, options = {}) {
                                 name: fieldNode.text,
                                 line: fieldNode.startPosition.row + 1,
                                 column: fieldNode.startPosition.column,
-                                isMethod: true,
+                                isMethod: !pkgValue,
+                                ...(pkgValue && { isFunctionReference: true }),
                                 receiver,
                                 ...(receiverType && { receiverType, ...(receiverTypeEvidence ? { receiverTypeSource: 'constructor', receiverTypeEvidence } : getReceiverType(receiver, node, true) || { receiverTypeSource: 'unknown' }) }),
                                 ...(receiverTypeQualifier && { receiverTypeQualifier }),
@@ -2064,6 +3029,9 @@ function findCallsInCode(code, parser, options = {}) {
                 const operandNode = val.childForFieldName('operand');
                 if (!fieldNode || !operandNode) continue;
                 const receiver = operandNode.type === 'identifier' ? operandNode.text : undefined;
+                // `pkg.Func` as a value is a package-qualified function
+                // reference, never a method value (fix #378).
+                const pkgValue = isPackageQualifier(operandNode, receiver);
                 let receiverTypeEvidence;
                 let receiverType = receiver
                     ? getReceiverType(receiver, operandNode) : undefined;
@@ -2082,7 +3050,8 @@ function findCallsInCode(code, parser, options = {}) {
                     // #223 name-node convention: the field's own line.
                     line: fieldNode.startPosition.row + 1,
                     column: fieldNode.startPosition.column,
-                    isMethod: true,
+                    isMethod: !pkgValue,
+                    ...(pkgValue && { isFunctionReference: true }),
                     receiver,
                     ...(receiverType && { receiverType, ...(receiverTypeEvidence ? { receiverTypeSource: 'constructor', receiverTypeEvidence } : getReceiverType(receiver, node, true) || { receiverTypeSource: 'unknown' }) }),
                     ...(receiverTypeQualifier && { receiverTypeQualifier }),
@@ -2154,6 +3123,9 @@ function findCallsInCode(code, parser, options = {}) {
                     const operandNode = valueNode.childForFieldName('operand');
                     if (fieldNode && operandNode) {
                         const receiver = operandNode.type === 'identifier' ? operandNode.text : undefined;
+                        // `pkg.Func` as a value is a package-qualified function
+                        // reference, never a method value (fix #378).
+                        const pkgValue = isPackageQualifier(operandNode, receiver);
                         let receiverTypeEvidence;
                         let receiverType = receiver
                             ? getReceiverType(receiver, operandNode) : undefined;
@@ -2173,7 +3145,8 @@ function findCallsInCode(code, parser, options = {}) {
                             name: fieldNode.text,
                             line: fieldNode.startPosition.row + 1,
                             column: fieldNode.startPosition.column,
-                            isMethod: true,
+                            isMethod: !pkgValue,
+                            ...(pkgValue && { isFunctionReference: true }),
                             receiver,
                             ...(receiverType && { receiverType, ...(receiverTypeEvidence ? { receiverTypeSource: 'constructor', receiverTypeEvidence } : getReceiverType(receiver, node, true) || { receiverTypeSource: 'unknown' }) }),
                             ...(receiverTypeQualifier && { receiverTypeQualifier }),
@@ -2393,9 +3366,35 @@ function findExportsInCode(code, parser) {
  * @param {object} [tree] - Pre-parsed tree (per-operation cache); parsed here when absent
  * @returns {Array<{line: number, column: number, usageType: string}>}
  */
-function findUsagesInCode(code, name, parser, tree) {
+/**
+ * The callee name node of an explicit generic instantiation call:
+ * `f[T](x)` (type_identifier under generic_type) or `pkg.F[T](x)` (the name
+ * of a qualified_type under generic_type), the generic_type being the `type`
+ * of a type_conversion_expression (fix #378), or of a composite literal
+ * (`Box[int]{...}`, a construction like `Box{...}`).
+ */
+function isGenericInstantiationCallee(node) {
+    let base = node.parent;
+    if (base?.type === 'qualified_type') {
+        if (!sameNode(base.childForFieldName('name'), node)) return false;
+    } else {
+        base = node;
+    }
+    const generic = base.parent;
+    if (generic?.type !== 'generic_type' ||
+        !sameNode(generic.childForFieldName('type'), base)) return false;
+    const conversion = generic.parent;
+    // `Box[int]{...}` constructs like `Box{...}`.
+    return (conversion?.type === 'type_conversion_expression' ||
+        conversion?.type === 'composite_literal') &&
+        sameNode(conversion.childForFieldName('type'), generic);
+}
+
+function findUsagesInCode(code, name, parser, tree, options = {}) {
     tree = tree || parseTree(parser, code);
     const usages = [];
+    // Lexical scope verdicts (fix #392) only for refactoring internals.
+    const scopeMemo = options.lexicalScopes ? new Map() : null;
 
     visitNameNodes(tree, code, name, (node) => {
         // Look for identifier, field_identifier (method names in selector expressions),
@@ -2462,6 +3461,11 @@ function findUsagesInCode(code, name, parser, tree) {
                      sameNode(parent.childForFieldName('name'), node)) {
                 usageType = 'definition';
             }
+            // Generic instantiation call: `f[T](x)` / `pkg.F[T](x)` parse as a
+            // type_conversion_expression over generic_type (fix #378).
+            else if (isGenericInstantiationCallee(node)) {
+                usageType = 'call';
+            }
             // Composite literal: Type{} — type_identifier is the type of composite_literal
             else if (parent.type === 'composite_literal' &&
                      sameNode(parent.childForFieldName('type'), node)) {
@@ -2484,7 +3488,10 @@ function findUsagesInCode(code, name, parser, tree) {
             }
         }
 
-        usages.push({ line, column, usageType });
+        // Where a bare reference resolves (fix #392).
+        const scope = scopeMemo && usageType === 'reference'
+            ? scopeFields(referenceScope(node, 'go', scopeMemo)) : null;
+        usages.push({ line, column, usageType, ...scope });
         return true;
     });
 

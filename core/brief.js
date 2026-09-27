@@ -123,6 +123,7 @@ function brief(index, name, options = {}) {
             ...(def.decorators && def.decorators.length && { decorators: def.decorators }),
             ...(def.docstring && { docstring: firstSentence(def.docstring) }),
             ...(def.className && { className: def.className }),
+            ...(def.macroExpansion && { macroExpansion: def.macroExpansion }),
             ...(def.isAsync && { isAsync: true }),
             ...(def.isGenerator && { isGenerator: true }),
         };
@@ -186,9 +187,14 @@ function brief(index, name, options = {}) {
         const fileImports = collectImportNames(fileEntry);
 
         const sideEffects = classifySideEffects(bodyText, language, fileImports);
+        // The operation's shared tree when one is active (fix #365); the
+        // file's indexed hash pins it to this content.
+        const indexedTree = fileEntry && typeof index._getParsedTree === 'function'
+            ? index._getParsedTree(filePath, fileContent, language) : null;
         const complexity = computeAstComplexity(fileContent, language, {
             startLine: def.startLine || 1,
             endLine: def.endLine || def.startLine || 1,
+            ...(indexedTree && { tree: indexedTree }),
         });
 
         return {

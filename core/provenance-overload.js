@@ -30,8 +30,21 @@ function factIndex(reads, live) {
         if (!Object.hasOwn(reads, key)) throw new Error(`Missing overload fact: ${key}`);
         return decode(reads[key]);
     };
+    // A map-like read answers with one object per key, as the live index's
+    // Map.get does (fix #388: decoding the same file entry again for every
+    // read dominated warm `find` on Java projects).
+    const mapReads = new Map();
+    const readMapValue = (key, compute) => {
+        if (mapReads.has(key)) return mapReads.get(key);
+        const value = read(key, compute);
+        mapReads.set(key, value);
+        return value;
+    };
     return new Proxy({}, {
         get(_, property) {
+            // Callers skip their per-operation memos on this facade: every
+            // read must be recorded for the replay (fix #396).
+            if (property === 'isProvenanceFactIndex') return true;
             if (local.has(property)) return local.get(property);
             if (String(property).includes('Cache')) {
                 const cache = new Map(); local.set(property, cache); return cache;
@@ -39,7 +52,7 @@ function factIndex(reads, live) {
             if (['symbols', 'files', 'importGraph', 'extendsGraph', 'extendedByGraph'].includes(property)) {
                 return {
                     get(key) {
-                        return read(`${property}.get:${JSON.stringify(key)}`, () => {
+                        return readMapValue(`${property}.get:${JSON.stringify(key)}`, () => {
                             const value = live[property]?.get(key);
                             if (property !== 'files' || !value) return value;
                             return { language: value.language, relativePath: value.relativePath,
@@ -62,11 +75,25 @@ function factIndex(reads, live) {
     });
 }
 
+// Index definitions are immutable records: one encoding each (fix #396:
+// every excluded receiver site of a many-overload name encoded the whole
+// candidate set again). The encoding is read-only witness data.
+const ENCODED_DEFINITIONS = new WeakMap();
+function encodeDefinition(definition) {
+    if (!definition || typeof definition !== 'object') return encode(definition);
+    let encoded = ENCODED_DEFINITIONS.get(definition);
+    if (!encoded) {
+        encoded = encode(definition);
+        ENCODED_DEFINITIONS.set(definition, encoded);
+    }
+    return encoded;
+}
+
 function captureOverload(index, call, candidates, language, select) {
     const reads = {};
     try {
         const result = select(factIndex(reads, index), call, candidates, language);
-        return { call: encode(call), candidates: encode(candidates), language, reads,
+        return { call: encode(call), candidates: candidates.map(encodeDefinition), language, reads,
             selected: declarationIdentity(result.match),
             outcome: result.match ? 'selected' : result.ambiguous ? 'ambiguous' : 'no-fit' };
     } catch { return null; }
@@ -115,4 +142,4 @@ function overloadMemberGroup(steps) {
     return group;
 }
 
-module.exports = { captureOverload, validateOverload, overloadMemberGroup };
+module.exports = { captureOverload, validateOverload, overloadMemberGroup, factIndex };

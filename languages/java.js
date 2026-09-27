@@ -17,6 +17,7 @@ const {
     extractJavaDocstring,
     visitNameNodes,
     sameNode,
+    parseErrorRegions,
 } = require('./utils');
 const { PARSE_OPTIONS, safeParse } = require('./index');
 
@@ -330,20 +331,53 @@ function findFunctions(code, parser) {
     return functions;
 }
 
+const JAVA_LOCAL_SCOPE_BODIES = new Set(['block', 'constructor_body', 'lambda_expression', 'switch_block']);
+
+/**
+ * Lexical scope of a local type (fix #381): a class, record, enum or
+ * interface declared inside a block is visible from its declaration to the
+ * end of that block, never as a member of the enclosing type.
+ */
+function javaLocalTypeScope(node) {
+    for (let p = node.parent; p; p = p.parent) {
+        if (p.type === 'class_body' || p.type === 'interface_body' || p.type === 'enum_body' ||
+            p.type === 'enum_body_declarations' || p.type === 'program') return {};
+        if (JAVA_LOCAL_SCOPE_BODIES.has(p.type)) {
+            return {
+                lexicalScopeStartLine: node.startPosition.row + 1,
+                lexicalScopeEndLine: p.endPosition.row + 1,
+            };
+        }
+    }
+    return {};
+}
+
 /**
  * Process a node for class/interface/enum/record extraction (single-pass helper)
  * Returns true if node was matched, false otherwise
  */
-function _processClass(node, classes, processedRanges, lines, code) {
-    const enclosingTypeName = current => {
-        for (let p = current.parent; p; p = p.parent) {
-            if (p.type === 'class_declaration' || p.type === 'interface_declaration' ||
-                p.type === 'enum_declaration' || p.type === 'record_declaration') {
-                return p.childForFieldName('name')?.text || null;
-            }
+function enclosingTypeName(current) {
+    for (let p = current.parent; p; p = p.parent) {
+        // A local class (declared in a method, constructor, initializer
+        // or lambda body) is not a member of the enclosing type (fix #381).
+        if (JAVA_LOCAL_SCOPE_BODIES.has(p.type)) return null;
+        if (JAVA_TYPE_DECLARATIONS.has(p.type)) {
+            return p.childForFieldName('name')?.text || null;
         }
-        return null;
-    };
+    }
+    return null;
+}
+
+const JAVA_TYPE_DECLARATIONS = new Set([
+    'class_declaration', 'interface_declaration', 'enum_declaration', 'record_declaration',
+    'annotation_type_declaration',
+]);
+
+function _processClass(node, classes, processedRanges, lines, code) {
+    // Only type declarations are processed below: every other node returns
+    // before any ancestor climb (fix #388).
+    if (!JAVA_TYPE_DECLARATIONS.has(node.type)) return false;
+    const localScope = javaLocalTypeScope(node);
     // Class declarations
     if (node.type === 'class_declaration') {
         const rangeKey = `${node.startIndex}-${node.endIndex}`;
@@ -371,9 +405,12 @@ function _processClass(node, classes, processedRanges, lines, code) {
                 name: nameNode.text,
                 startLine,
                 endLine,
+                // The name's own line when annotations precede it (fix #389).
+                ...(nameNode.startPosition.row + 1 !== startLine && { nameLine: nameNode.startPosition.row + 1 }),
                 type: 'class',
                 members,
                 modifiers,
+                ...localScope,
                 ...(isNested && { isNested: true }),
                 ...(enclosingType && { enclosingType }),
                 ...(docstring && { docstring }),
@@ -387,8 +424,11 @@ function _processClass(node, classes, processedRanges, lines, code) {
         return true;
     }
 
-    // Interface declarations
-    if (node.type === 'interface_declaration') {
+    // Interface declarations. An annotation type (`@interface`) is an
+    // interface whose elements are its methods (JLS 9.6), so it is indexed
+    // as one (fix #389) with `annotationType` set.
+    if (node.type === 'interface_declaration' || node.type === 'annotation_type_declaration') {
+        const annotationType = node.type === 'annotation_type_declaration';
         const rangeKey = `${node.startIndex}-${node.endIndex}`;
         if (processedRanges.has(rangeKey)) return true;
         processedRanges.add(rangeKey);
@@ -401,15 +441,19 @@ function _processClass(node, classes, processedRanges, lines, code) {
             const annotationsWithArgs = extractAnnotationsWithArgs(node);
             const docstring = extractJavaDocstring(lines, startLine);
             const generics = extractGenerics(node);
-            const extendsInfo = extractInterfaceExtends(node);
+            const extendsInfo = annotationType ? [] : extractInterfaceExtends(node);
 
             classes.push({
                 name: nameNode.text,
                 startLine,
                 endLine,
+                // The name's own line when annotations precede it (fix #389).
+                ...(nameNode.startPosition.row + 1 !== startLine && { nameLine: nameNode.startPosition.row + 1 }),
                 type: 'interface',
                 members: extractClassMembers(node, lines),
                 modifiers,
+                ...(annotationType && { annotationType: true }),
+                ...localScope,
                 ...(enclosingTypeName(node) && { enclosingType: enclosingTypeName(node) }),
                 ...(docstring && { docstring }),
                 ...(generics && { generics }),
@@ -434,18 +478,25 @@ function _processClass(node, classes, processedRanges, lines, code) {
             const annotations = extractAnnotations(node);
             const annotationsWithArgs = extractAnnotationsWithArgs(node);
             const docstring = extractJavaDocstring(lines, startLine);
+            // An enum implements its interfaces like a class (fix #392): the
+            // rename closure and dispatch reach its members through them.
+            const implementsInfo = extractImplements(node);
 
             classes.push({
                 name: nameNode.text,
                 startLine,
                 endLine,
+                // The name's own line when annotations precede it (fix #389).
+                ...(nameNode.startPosition.row + 1 !== startLine && { nameLine: nameNode.startPosition.row + 1 }),
                 type: 'enum',
                 members: extractEnumConstants(node, lines),
                 modifiers,
+                ...localScope,
                 ...(enclosingTypeName(node) && { enclosingType: enclosingTypeName(node) }),
                 ...(docstring && { docstring }),
                 ...(annotations.length > 0 && { annotations }),
-                ...(annotationsWithArgs.length > 0 && { annotationsWithArgs })
+                ...(annotationsWithArgs.length > 0 && { annotationsWithArgs }),
+                ...(implementsInfo.length > 0 && { implements: implementsInfo })
             });
         }
         return true;
@@ -495,9 +546,12 @@ function _processClass(node, classes, processedRanges, lines, code) {
                 name: nameNode.text,
                 startLine,
                 endLine,
+                // The name's own line when annotations precede it (fix #389).
+                ...(nameNode.startPosition.row + 1 !== startLine && { nameLine: nameNode.startPosition.row + 1 }),
                 type: 'record',
                 members,
                 modifiers,
+                ...localScope,
                 ...(enclosingTypeName(node) && { enclosingType: enclosingTypeName(node) }),
                 ...(docstring && { docstring }),
                 ...(generics && { generics }),
@@ -559,13 +613,15 @@ function extractImplements(classNode) {
         const interfaces = [];
         for (let i = 0; i < interfacesNode.namedChildCount; i++) {
             const iface = interfacesNode.namedChild(i);
-            if (iface.type === 'type_identifier' || iface.type === 'generic_type') {
+            if (iface.type === 'type_identifier' || iface.type === 'generic_type' ||
+                iface.type === 'scoped_type_identifier') {
                 interfaces.push(iface.text);
             } else if (iface.type === 'type_list') {
                 // Records and some class declarations wrap interfaces in a type_list
                 for (let j = 0; j < iface.namedChildCount; j++) {
                     const inner = iface.namedChild(j);
-                    if (inner.type === 'type_identifier' || inner.type === 'generic_type') {
+                    if (inner.type === 'type_identifier' || inner.type === 'generic_type' ||
+                        inner.type === 'scoped_type_identifier') {
                         interfaces.push(inner.text);
                     }
                 }
@@ -646,6 +702,12 @@ function extractEnumConstants(enumNode, codeOrLines) {
                             const { startLine, endLine } = nodeToLocation(member, code);
                             const modifiers = extractModifiers(member);
                             const returnType = extractReturnType(member);
+                            // The name's own line and annotations, as for class
+                            // methods (fix #392: an `@Override` line above the
+                            // method left its rename on the annotation line).
+                            const nameLine = nameNode.startPosition.row + 1;
+                            const annotationsWithArgs = extractAnnotationsWithArgs(member);
+                            const memberGenerics = extractGenerics(member);
                             constants.push({
                                 name: nameNode.text,
                                 params: extractJavaParams(paramsNode),
@@ -655,7 +717,10 @@ function extractEnumConstants(enumNode, codeOrLines) {
                                 memberType: modifiers.includes('static') ? 'static' : 'method',
                                 modifiers,
                                 isMethod: true,
-                                ...(returnType && { returnType })
+                                ...(returnType && { returnType }),
+                                ...(annotationsWithArgs.length > 0 && { annotationsWithArgs }),
+                                ...(nameLine !== startLine && { nameLine }),
+                                ...(memberGenerics && { generics: memberGenerics })
                             });
                         }
                     } else if (member.type === 'constructor_declaration') {
@@ -690,12 +755,15 @@ function extractEnumConstants(enumNode, codeOrLines) {
 /**
  * Extract class members (methods, constructors)
  */
+const JAVA_ELEMENT_ILLEGAL_MODIFIERS = new Set(['default', 'static', 'final', 'private', 'protected',
+    'synchronized', 'native']);
+
 function extractClassMembers(classNode, codeOrLines) {
     const code = codeOrLines;
     const members = [];
     const bodyNode = classNode.childForFieldName('body');
     if (!bodyNode) return members;
-    const isInterface = bodyNode.type === 'interface_body';
+    const isInterface = bodyNode.type === 'interface_body' || bodyNode.type === 'annotation_type_body';
 
     for (let i = 0; i < bodyNode.namedChildCount; i++) {
         const child = bodyNode.namedChild(i);
@@ -748,6 +816,38 @@ function extractClassMembers(classNode, codeOrLines) {
             }
         }
 
+        // Annotation type elements (fix #389): abstract, implicitly public
+        // methods of the annotation interface; a `default` value makes the
+        // element optional at use sites, never a body.
+        if (child.type === 'annotation_type_element_declaration') {
+            const nameNode = child.childForFieldName('name');
+            if (nameNode) {
+                const { startLine, endLine } = nodeToLocation(child, code);
+                // Elements take no keyword modifiers besides public/abstract;
+                // `default` here introduces the default value.
+                const modifiers = extractModifiers(child).filter(modifier =>
+                    !JAVA_ELEMENT_ILLEGAL_MODIFIERS.has(modifier));
+                if (!modifiers.includes('public')) modifiers.push('public');
+                if (!modifiers.includes('abstract')) modifiers.push('abstract');
+                const returnType = extractReturnType(child);
+                const docstring = extractJavaDocstring(code, startLine);
+                const nameLine = nameNode.startPosition.row + 1;
+                members.push({
+                    name: nameNode.text,
+                    params: '',
+                    paramsStructured: [],
+                    startLine,
+                    endLine,
+                    memberType: 'abstract',
+                    modifiers,
+                    isMethod: true,
+                    ...(returnType && { returnType }),
+                    ...(docstring && { docstring }),
+                    ...(nameLine !== startLine && { nameLine }),
+                });
+            }
+        }
+
         // Constructor declarations: intentionally NOT emitted as separate class
         // members. The class itself is the symbol; `new Foo(...)` calls resolve
         // to the class via `isConstructor: true` on the call. Emitting the
@@ -758,7 +858,10 @@ function extractClassMembers(classNode, codeOrLines) {
 
         // Field declarations: declared types drive receiver disambiguation
         // (fix #202) — Rust/Go already emit field members with fieldType.
-        if (child.type === 'field_declaration') {
+        // Interface and annotation type constants (`constant_declaration`,
+        // implicitly public static final; fix #389) are fields like class
+        // fields.
+        if (child.type === 'field_declaration' || child.type === 'constant_declaration') {
             const typeNode = child.childForFieldName('type');
             const fieldTypeText = typeNode ? typeNode.text : null;
             // Visibility travels with the member (fix #251 — public
@@ -766,16 +869,25 @@ function extractClassMembers(classNode, codeOrLines) {
             // the member had no modifiers for the #240 discipline to read;
             // the #241 Rust-field twin).
             const fieldModifiers = extractModifiers(child);
+            if (child.type === 'constant_declaration') {
+                for (const implicit of ['public', 'static', 'final']) {
+                    if (!fieldModifiers.includes(implicit)) fieldModifiers.push(implicit);
+                }
+            }
             for (let j = 0; j < child.namedChildCount; j++) {
                 const decl = child.namedChild(j);
                 if (decl.type === 'variable_declarator') {
                     const nameNode = decl.childForFieldName('name');
                     if (nameNode && fieldTypeText) {
                         const { startLine, endLine } = nodeToLocation(child, code);
+                        // fix #390: an annotation on its own line starts the
+                        // declaration; the name's line is where edits go.
+                        const nameLine = nameNode.startPosition.row + 1;
                         members.push({
                             name: nameNode.text,
                             startLine,
                             endLine,
+                            ...(nameLine !== startLine && { nameLine }),
                             memberType: 'field',
                             ...(fieldModifiers.length > 0 && { modifiers: fieldModifiers }),
                             fieldType: fieldTypeText
@@ -880,10 +992,53 @@ function parse(code, parser) {
         functions,
         classes,
         stateObjects,
-        ...(tree.rootNode.hasError && { parseRecovery: true }),
+        ...(tree.rootNode.hasError && { parseRecovery: true, parseErrorRegions: parseErrorRegions(tree.rootNode) }),
         imports: [],
         exports: []
     };
+}
+
+/**
+ * Call records for annotation element sites (fix #389): an
+ * `element_value_pair` key names the element method of the annotation type
+ * (`@Marker(priority = 2)`); a single-argument list without a key sets the
+ * element `value` (`@Marker("x")`) with no name token (`implicitName`).
+ */
+function javaAnnotationElementSites(node, calls, enclosingFunctionOf) {
+    const annotation = node.type === 'element_value_pair' ? node.parent?.parent : node.parent;
+    if (annotation?.type !== 'annotation') return;
+    const typeNode = annotation.childForFieldName('name');
+    const typeName = typeNode?.type === 'scoped_identifier'
+        ? typeNode.childForFieldName('name')?.text : typeNode?.text;
+    if (!typeName) return;
+    const typeQualifier = typeNode.type === 'scoped_identifier'
+        ? typeNode.childForFieldName('scope')?.text : null;
+    let nameNode = null;
+    let argument = null;
+    if (node.type === 'element_value_pair') {
+        nameNode = node.childForFieldName('key');
+        if (nameNode?.type !== 'identifier') return;
+    } else {
+        const args = node.namedChildren.filter(child => !child.type.includes('comment'));
+        if (args.length !== 1 || args[0].type === 'element_value_pair') return;
+        argument = args[0];
+    }
+    calls.push({
+        callSite: typeOrigin('call', nameNode || typeNode),
+        name: nameNode ? nameNode.text : 'value',
+        line: (nameNode || argument).startPosition.row + 1,
+        // Where `value = ` goes when the element is renamed.
+        ...(argument && { argColumn: argument.startPosition.column }),
+        isMethod: true,
+        receiverType: typeName,
+        receiverTypeSource: 'annotation',
+        receiverTypeEvidence: typeOrigin('annotation', typeNode),
+        ...(typeQualifier && { receiverTypeQualifier: typeQualifier }),
+        annotationElement: true,
+        ...(!nameNode && { implicitName: true }),
+        argCount: 0,
+        enclosingFunction: enclosingFunctionOf(),
+    });
 }
 
 /**
@@ -948,7 +1103,7 @@ function findCallsInCode(code, parser) {
     };
     const JAVA_TYPE_DECLARATIONS = new Set([
         'class_declaration', 'interface_declaration',
-        'enum_declaration', 'record_declaration',
+        'enum_declaration', 'record_declaration', 'annotation_type_declaration',
     ]);
 
     // Extract type name from a Java type node (strips generics, qualified names)
@@ -1017,6 +1172,19 @@ function findCallsInCode(code, parser) {
         }
         return lexicalNestedTypeOwner(typeNode, extractTypeName(typeNode));
     };
+    // A fully qualified type spelling `a.b.Node` names package `a.b` (fix
+    // #394): Java has no relative package names, so the written prefix is
+    // the whole package. Recorded where no nested owner qualifies the type.
+    const extractTypePackage = (typeNode) => {
+        if (!typeNode) return null;
+        const text = String(typeNode.text || '').replace(/<.*$/s, '').replace(/(?:\[\s*\]\s*)+$/, '').trim();
+        const parts = text.split('.').map(part => part.trim());
+        if (parts.length < 2) return null;
+        const prefix = parts.slice(0, -1);
+        return prefix.every(part => /^[a-z_][A-Za-z0-9_$]*$/.test(part)) ? prefix.join('.') : null;
+    };
+    const extractReceiverTypeQualifier = (typeNode) =>
+        extractTypeQualifier(typeNode) || extractTypePackage(typeNode);
     const qualifyTypeName = (text) => {
         const raw = String(text || '').trim()
             .replace(/^\?\s+extends\s+/, '')
@@ -1031,7 +1199,78 @@ function findCallsInCode(code, parser) {
         return base;
     };
 
+    // The base type of the anonymous class whose body holds `node`, when the
+    // nearest class body is an anonymous one (`new StrBuilder() { .. }`):
+    // `super` there names that type (fix #394).
+    const anonymousSuperType = (node) => {
+        for (let p = node.parent; p; p = p.parent) {
+            if (p.type === 'class_body') {
+                const owner = p.parent;
+                return owner?.type === 'object_creation_expression'
+                    ? extractTypeName(owner.childForFieldName('type')) || null : null;
+            }
+            if (JAVA_TYPE_DECLARATIONS.has(p.type)) return null;
+        }
+        return null;
+    };
+
+    // A written type as an argument kind type: qualified element type plus
+    // its array dimensions (fix #394; `Map<K, V[]>[]` keeps one).
+    const arrayArgType = (text) => {
+        const raw = String(text || '').trim();
+        let outer = '';
+        let depth = 0;
+        for (const ch of raw) {
+            if (ch === '<') depth++;
+            else if (ch === '>') depth--;
+            else if (depth === 0) outer += ch;
+        }
+        const trailing = outer.match(/(?:\[\s*\]\s*)+$/);
+        const dims = trailing ? (trailing[0].match(/\[/g) || []).length : 0;
+        const element = qualifyTypeName(raw.replace(/(?:\[\s*\]\s*)+$/, ''));
+        return element ? element + '[]'.repeat(dims) : null;
+    };
+
     // Build type map from method/constructor parameters
+    // One-hop `var` aliases (fix #381): `var c = this.config; c.load()`
+    // receives through `this.config`; `var c = cfg;` carries cfg's type.
+    // name -> { node, scopeStart } for effectively-final locals only.
+    const localFieldAliases = new Map();
+    const assignedNamesByFn = new Map();
+    const reassignedIn = (fnNode, name) => {
+        let names = assignedNamesByFn.get(fnNode.id);
+        if (!names) {
+            names = new Set();
+            const walk = (n) => {
+                for (const c of n.namedChildren) {
+                    if (c.type === 'assignment_expression') {
+                        const left = c.childForFieldName('left');
+                        if (left?.type === 'identifier') names.add(left.text);
+                    } else if (c.type === 'update_expression') {
+                        const target = c.namedChildren.find(x => x.type === 'identifier');
+                        if (target) names.add(target.text);
+                    }
+                    walk(c);
+                }
+            };
+            walk(fnNode);
+            assignedNamesByFn.set(fnNode.id, names);
+        }
+        return names.has(name);
+    };
+    const enclosingFunctionNode = (n) => {
+        for (let p = n.parent; p; p = p.parent) if (isFunctionNode(p)) return p;
+        return null;
+    };
+
+    // Array dimensions written on a declarator (`int x[]`, `String a[]`).
+    const declaratorDims = (node) => {
+        let dims = '';
+        for (const child of node?.namedChildren || []) {
+            if (child.type === 'dimensions') dims += '[]'.repeat((child.text.match(/\[/g) || []).length);
+        }
+        return dims;
+    };
     const buildScopeTypeMap = (node) => {
         const typeMap = new ReceiverTypeMap();
         const rawTypeMap = new Map();
@@ -1046,8 +1285,9 @@ function findCallsInCode(code, parser) {
                     const typeName = extractTypeName(typeNode);
                     if (nameNode && typeName) {
                         typeMap.set(nameNode.text, typeName, 'annotation', typeNode);
-                        rawTypeMap.set(nameNode.text, typeNode.text);
-                        const qualifier = extractTypeQualifier(typeNode);
+                        // `String a[]` is a String[] (fix #394).
+                        rawTypeMap.set(nameNode.text, typeNode.text + declaratorDims(param));
+                        const qualifier = extractReceiverTypeQualifier(typeNode);
                         if (qualifier) qualifierMap.set(nameNode.text, qualifier);
                     }
                 }
@@ -1084,6 +1324,13 @@ function findCallsInCode(code, parser) {
         for (let i = functionStack.length - 1; i >= 0; i--) {
             const typeMap = scopeTypes.get(functionStack[i].startLine);
             if (typeMap?.has(varName)) return evidence ? typeMap.fields(varName) : typeMap.get(varName);
+        }
+        return undefined;
+    };
+    const getReceiverTypeOrigin = (varName) => {
+        for (let i = functionStack.length - 1; i >= 0; i--) {
+            const typeMap = scopeTypes.get(functionStack[i].startLine);
+            if (typeMap?.has(varName)) return typeMap.origins.get(varName);
         }
         return undefined;
     };
@@ -1194,7 +1441,7 @@ function findCallsInCode(code, parser) {
         }
         return false;
     };
-    const enclosingFieldTypeNode = (n, name) => {
+    const enclosingFieldDeclaration = (n, name) => {
         for (let p = n.parent; p; p = p.parent) {
             if (!JAVA_TYPE_DECLARATIONS.has(p.type)) continue;
             const body = p.childForFieldName('body');
@@ -1206,7 +1453,8 @@ function findCallsInCode(code, parser) {
                     const decl = child.namedChild(j);
                     if (decl.type === 'variable_declarator' &&
                         decl.childForFieldName('name')?.text === name) {
-                        return child.childForFieldName('type') || null;
+                        const type = child.childForFieldName('type');
+                        return type ? { type, dims: declaratorDims(decl) } : null;
                     }
                 }
             }
@@ -1280,24 +1528,38 @@ function findCallsInCode(code, parser) {
                 const tn = arg.childForFieldName('type');
                 return tn ? `new:${qualifyTypeName(tn.text)}` : 'expr';
             }
+            case 'array_creation_expression': {
+                // `new String[3][]`, `new String[]{..}`: an array of that
+                // many dimensions (fix #394).
+                const tn = arg.childForFieldName('type');
+                let dims = 0;
+                for (const child of arg.namedChildren) {
+                    if (child.type === 'dimensions_expr') dims++;
+                    else if (child.type === 'dimensions') dims += (child.text.match(/\[/g) || []).length;
+                }
+                const element = tn && qualifyTypeName(tn.text);
+                return element && dims > 0 ? `new:${element}${'[]'.repeat(dims)}` : 'expr';
+            }
             case 'cast_expression': {
                 const tn = arg.childForFieldName('type');
-                return tn ? `cast:${qualifyTypeName(tn.text)}` : 'expr';
+                const type = tn && arrayArgType(tn.text);
+                return type ? `cast:${type}` : 'expr';
             }
             case 'class_literal': {
                 const tn = arg.namedChild(0);
                 return tn ? `class:${bareTypeName(tn.text)}` : 'class:Object';
             }
             case 'identifier': {
-                const fieldType = !isDeclaredLocal(arg.text)
-                    ? enclosingFieldTypeNode(arg, arg.text) : null;
+                const field = !isDeclaredLocal(arg.text)
+                    ? enclosingFieldDeclaration(arg, arg.text) : null;
                 const typeName = getReceiverType(arg.text) ||
-                    extractTypeName(fieldType);
+                    extractTypeName(field?.type);
                 const rawType = getReceiverRawType(arg.text) ||
-                    fieldType?.text;
-                return typeName
-                    ? `type:${qualifyTypeName(rawType || typeName)}`
-                    : 'expr';
+                    (field ? field.type.text + field.dims : null);
+                // Array dimensions stay on the kind (fix #394): a String[]
+                // never binds a String parameter, a String never an Object[].
+                const type = typeName ? arrayArgType(rawType || typeName) : null;
+                return type ? `type:${type}` : 'expr';
             }
             case 'field_access': {
                 // A class-qualified static field has a compiler-visible
@@ -1414,8 +1676,9 @@ function findCallsInCode(code, parser) {
                 if (!arrayNode) return 'expr';
                 if (arrayNode.type === 'identifier') {
                     const rawType = getReceiverRawType(arrayNode.text);
-                    if (rawType?.endsWith('[]')) {
-                        return `type:${qualifyTypeName(rawType.slice(0, -2))}`;
+                    if (rawType?.trim().endsWith(']')) {
+                        const type = arrayArgType(rawType.trim().replace(/\[\s*\]$/, ''));
+                        if (type) return `type:${type}`;
                     }
                 }
                 const containerKind = argKindOf(arrayNode);
@@ -1423,8 +1686,27 @@ function findCallsInCode(code, parser) {
             }
             case 'parenthesized_expression':
                 return arg.namedChildCount === 1 ? argKindOf(arg.namedChild(0)) : 'expr';
-            case 'lambda_expression':
+            case 'lambda_expression': {
+                // Its parameter count selects among functional-interface
+                // overloads (fix #391).
+                const params = arg.childForFieldName('parameters');
+                if (!params) return 'lambda';
+                if (params.type === 'identifier') return 'lambda:1';
+                return `lambda:${params.namedChildren.filter(child =>
+                    child.type === 'identifier' || child.type === 'formal_parameter' ||
+                    child.type === 'spread_parameter').length}`;
+            }
             case 'method_reference': return 'lambda';
+            case 'binary_expression': {
+                // String concatenation (JLS 15.18.1): `+` with a String
+                // operand is a String (fix #390, `addStatement("a" + "b")`
+                // selects the String overload, never addStatement(CodeBlock)).
+                if (arg.childForFieldName('operator')?.text !== '+') return 'expr';
+                const left = arg.childForFieldName('left');
+                const right = arg.childForFieldName('right');
+                return (left && argKindOf(left) === 'string') ||
+                    (right && argKindOf(right) === 'string') ? 'string' : 'expr';
+            }
             case 'unary_expression':
                 // -1, -2.5 — numeric literal kinds survive negation
                 return arg.namedChildCount === 1 ? argKindOf(arg.namedChild(0)) : 'expr';
@@ -1466,7 +1748,7 @@ function findCallsInCode(code, parser) {
             const typeNode = node.childForFieldName('type');
             const nameNode = node.childForFieldName('name');
             const typeName = extractTypeName(typeNode);
-            const typeQualifier = extractTypeQualifier(typeNode);
+            const typeQualifier = extractReceiverTypeQualifier(typeNode);
             const scopeKey = functionStack[functionStack.length - 1].startLine;
             const typeMap = scopeTypes.get(scopeKey);
             if (nameNode && typeName && typeMap) {
@@ -1491,7 +1773,15 @@ function findCallsInCode(code, parser) {
         // Handle method invocations: foo(), obj.foo(), this.foo()
         if (node.type === 'method_invocation') {
             const nameNode = node.childForFieldName('name');
-            const objNode = node.childForFieldName('object');
+            let objNode = node.childForFieldName('object');
+            // fix #381: `c.load()` after `var c = this.config` receives like
+            // `this.config.load()` (same function, effectively final).
+            if (objNode?.type === 'identifier' && localFieldAliases.has(objNode.text) &&
+                !getReceiverType(objNode.text) &&
+                localFieldAliases.get(objNode.text).scopeStart ===
+                    functionStack[functionStack.length - 1]?.startLine) {
+                objNode = localFieldAliases.get(objNode.text).node;
+            }
 
             if (nameNode) {
                 const enclosingFunction = getCurrentEnclosingFunction();
@@ -1506,8 +1796,10 @@ function findCallsInCode(code, parser) {
                     const valueNode = receiverNode.childForFieldName('value');
                     if (valueNode?.type === 'identifier') castReceiverName = valueNode.text;
                 }
+                // `super.m()` names the direct superclass's member (fix #394).
                 let receiver = castReceiverName ||
-                    ((receiverNode?.type === 'identifier' || receiverNode?.type === 'this')
+                    ((receiverNode?.type === 'identifier' || receiverNode?.type === 'this' ||
+                        receiverNode?.type === 'super')
                         ? receiverNode.text : undefined);
                 // fix #353: `beta.Helper.widget()` — a lowercase dotted root
                 // under a capitalized member is a PACKAGE-qualified type
@@ -1531,9 +1823,28 @@ function findCallsInCode(code, parser) {
                 }
                 const inlineConstructorType = receiverNode?.type === 'object_creation_expression'
                     ? extractTypeName(receiverNode.childForFieldName('type')) : undefined;
-                const receiverType = castReceiverType || inlineConstructorType ||
+                // Declared array element (fix #359): `items[0].m()` with
+                // `Conv[] items` dispatches on Conv. One dimension only; a
+                // multi-dimensional access that yields an array abstains.
+                let arrayElementType;
+                let arrayElementQualifier;
+                if (!receiver && receiverNode?.type === 'array_access') {
+                    const arrayNode = receiverNode.childForFieldName('array');
+                    const rawType = arrayNode?.type === 'identifier'
+                        ? getReceiverRawType(arrayNode.text)?.trim() : undefined;
+                    if (rawType && rawType.endsWith('[]')) {
+                        const elementText = rawType.slice(0, -2).trim();
+                        if (elementText && !elementText.includes('[') &&
+                            !elementText.includes('<')) {
+                            const parts = elementText.split('.');
+                            arrayElementType = parts.pop();
+                            if (parts.length > 0) arrayElementQualifier = parts.join('.');
+                        }
+                    }
+                }
+                const receiverType = castReceiverType || inlineConstructorType || arrayElementType ||
                     ((receiver && receiver !== 'this') ? getReceiverType(receiver) : undefined);
-                const receiverTypeQualifier = packageQualifier ||
+                const receiverTypeQualifier = packageQualifier || arrayElementQualifier ||
                     (!castReceiverType && receiver ? getReceiverTypeQualifier(receiver) : undefined);
                 const receiverIsTypeQualified = !!((receiverNode?.type === 'identifier' || packageQualifier) &&
                     receiver && /^[A-Z]/.test(receiver) && !receiverType &&
@@ -1564,8 +1875,11 @@ function findCallsInCode(code, parser) {
                                     receiverRoot = rootNode.text;
                                     receiverFieldName = fldNode.text;
                                     receiverRootType = rootType;
-                                    receiverRootNamespace =
-                                        getReceiverTypeQualifier(rootNode.text);
+                                    // A nested owner only: the root's package
+                                    // does not qualify the field's type.
+                                    const rootQualifier = getReceiverTypeQualifier(rootNode.text);
+                                    receiverRootNamespace = /^[A-Z]/.test(rootQualifier || '')
+                                        ? rootQualifier : undefined;
                                 }
                             }
                         }
@@ -1614,9 +1928,11 @@ function findCallsInCode(code, parser) {
                     ...(receiverType && { receiverType, ...(getReceiverType(receiver, true) ||
                         (castReceiverType ? { receiverTypeSource: 'cast', receiverTypeEvidence: typeOrigin('cast', objNode) } :
                             inlineConstructorType ? { receiverTypeSource: 'constructor', receiverTypeEvidence: typeOrigin('constructor', receiverNode) } :
+                            arrayElementType ? { receiverTypeSource: 'annotation', receiverTypeEvidence: typeOrigin('annotation', receiverNode) } :
                             { receiverTypeSource: 'unknown' })) }),
                     ...(receiverTypeQualifier && { receiverTypeQualifier }),
                     ...(receiverIsTypeQualified && { receiverIsTypeQualified: true }),
+                    ...(receiver === 'super' && anonymousSuperType(node) && { receiverSuperType: anonymousSuperType(node) }),
                     ...(castReceiverType && { receiverTypeCast: true }),
                     ...(receiverFieldName && { receiverRoot, receiverField: receiverFieldName }),
                     ...(receiverFieldName && receiverRootType && { receiverRootType }),
@@ -1629,6 +1945,10 @@ function findCallsInCode(code, parser) {
                     ...(receiverCallTypePath && { receiverCallTypePath }),
                     argCount: callArgs.argCount,
                     ...(callArgs.argKinds && { argKinds: callArgs.argKinds }),
+                    // `obj.<T>m()`: explicit method type arguments (fix #391).
+                    ...(node.childForFieldName('type_arguments') && {
+                        methodTypeArgs: node.childForFieldName('type_arguments').namedChildCount,
+                    }),
                     ...(assignedTo && { assignedTo }),
                     enclosingFunction,
                     ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
@@ -1751,13 +2071,26 @@ function findCallsInCode(code, parser) {
             return true;
         }
 
+        // Annotation element sites (fix #389): `@Marker(priority = 2)` and
+        // the single-element shorthand `@Marker("x")`.
+        if (node.type === 'element_value_pair' || node.type === 'annotation_argument_list') {
+            javaAnnotationElementSites(node, calls, getCurrentEnclosingFunction);
+            if (node.type === 'element_value_pair') return true;
+        }
+
         // Detect method references passed as arguments: this::worker, obj::method
         if (node.type === 'method_reference') {
             const nameNode = node.namedChild(node.namedChildCount - 1);
             const objNode = node.namedChild(0);
             if (nameNode && nameNode.type === 'identifier') {
-                const receiver = objNode ? (objNode.type === 'identifier' || objNode.type === 'this' ? objNode.text : undefined) : undefined;
-                const receiverType = (receiver && receiver !== 'this') ? getReceiverType(receiver) : undefined;
+                // `obj::m`, `this::m`, `super::m` (fix #395: `super::m` was a
+                // bare name) and qualified `a.b::m` all reference a method.
+                const receiver = objNode && !sameNode(objNode, nameNode)
+                    ? (['identifier', 'this', 'super'].includes(objNode.type) ? objNode.text
+                        : objNode.text.replace(/\s+/g, '') || undefined)
+                    : undefined;
+                const receiverType = (receiver && receiver !== 'this' && receiver !== 'super' &&
+                    objNode.type === 'identifier') ? getReceiverType(receiver) : undefined;
                 const enclosingFunction = getCurrentEnclosingFunction();
                 calls.push({
                     callSite: typeOrigin('call', nameNode),
@@ -1783,30 +2116,65 @@ function findCallsInCode(code, parser) {
             const declaredType = declTypeNode && declTypeNode.text !== 'var'
                 ? extractTypeName(declTypeNode) : null;
             const declaredTypeQualifier = declTypeNode && declTypeNode.text !== 'var'
-                ? extractTypeQualifier(declTypeNode) : null;
+                ? extractReceiverTypeQualifier(declTypeNode) : null;
             for (let i = 0; i < node.namedChildCount; i++) {
                 const child = node.namedChild(i);
                 if (child.type === 'variable_declarator') {
                     const nameNode = child.childForFieldName('name');
                     const valueNode = child.childForFieldName('value');
-                    // new Type() is the DYNAMIC type — more precise than the
-                    // declared static type (Foo f = new Bar() dispatches to Bar)
-                    let typeName = valueNode?.type === 'object_creation_expression'
+                    // The declared type is the receiver's static type: `Shape s
+                    // = new Circle(); s.area()` binds Shape.area and reaches
+                    // Circle.area by dispatch (fix #394). `var` takes the
+                    // constructed type; a declaration of the constructed
+                    // type itself keeps the exact constructor evidence.
+                    const constructedType = valueNode?.type === 'object_creation_expression'
                         ? extractTypeName(valueNode.childForFieldName('type'))
                         : null;
-                    let typeQualifier = valueNode?.type === 'object_creation_expression'
-                        ? extractTypeQualifier(valueNode.childForFieldName('type'))
+                    const constructedQualifier = valueNode?.type === 'object_creation_expression'
+                        ? extractReceiverTypeQualifier(valueNode.childForFieldName('type'))
                         : null;
-                    if (!typeName) typeName = declaredType;
-                    if (!typeQualifier) typeQualifier = declaredTypeQualifier;
+                    const constructorTyped = !!constructedType &&
+                        (!declaredType || (constructedType === declaredType &&
+                            (constructedQualifier || null) === (declaredTypeQualifier || null)));
+                    let typeName = declaredType || constructedType;
+                    let typeQualifier = declaredType ? declaredTypeQualifier : constructedQualifier;
+                    // fix #381: an effectively-final `var` alias.
+                    if (nameNode) localFieldAliases.delete(nameNode.text);
+                    const fnNode = !typeName && nameNode && valueNode && declTypeNode?.text === 'var'
+                        ? enclosingFunctionNode(node) : null;
+                    if (fnNode && valueNode.text !== nameNode.text && !reassignedIn(fnNode, nameNode.text)) {
+                        const scopeKey = functionStack[functionStack.length - 1].startLine;
+                        if (valueNode.type === 'identifier' && getReceiverType(valueNode.text)) {
+                            scopeTypes.get(scopeKey)?.set(nameNode.text, getReceiverType(valueNode.text),
+                                getReceiverTypeOrigin(valueNode.text) || 'flow');
+                            const qualifier = getReceiverTypeQualifier(valueNode.text);
+                            if (qualifier) scopeTypeQualifiers.get(scopeKey)?.set(nameNode.text, qualifier);
+                            const raw = getReceiverRawType(valueNode.text);
+                            if (raw) scopeRawTypes.get(scopeKey)?.set(nameNode.text, raw);
+                        } else if ((valueNode.type === 'field_access' &&
+                                valueNode.childForFieldName('object')?.type === 'this' &&
+                                valueNode.childForFieldName('field')?.type === 'identifier') ||
+                            (valueNode.type === 'identifier' && !isDeclaredLocal(valueNode.text) &&
+                                hasEnclosingField(node, valueNode.text))) {
+                            localFieldAliases.set(nameNode.text, { node: valueNode, scopeStart: scopeKey });
+                        }
+                    }
                     if (nameNode && typeName) {
                         const scopeKey = functionStack[functionStack.length - 1].startLine;
                         const typeMap = scopeTypes.get(scopeKey);
-                        if (typeMap) typeMap.set(nameNode.text, typeName, valueNode?.type === 'object_creation_expression' ? 'constructor' : 'annotation', valueNode || declTypeNode);
+                        // A local never reassigned holds exactly the constructed
+                        // value: dispatch reaches that type's member, never an
+                        // unrelated implementation of the declared type.
+                        const fnOfLocal = constructedType && !constructorTyped ? enclosingFunctionNode(node) : null;
+                        const origin = fnOfLocal && !reassignedIn(fnOfLocal, nameNode.text)
+                            ? { ...typeOrigin('annotation', declTypeNode), constructedType } : null;
+                        if (typeMap) typeMap.set(nameNode.text, typeName,
+                            origin || (constructorTyped ? 'constructor' : 'annotation'),
+                            constructorTyped ? valueNode : declTypeNode);
                         const rawTypeMap = scopeRawTypes.get(scopeKey);
-                        const rawType = valueNode?.type === 'object_creation_expression'
+                        const rawType = constructorTyped
                             ? valueNode.childForFieldName('type')?.text
-                            : declTypeNode?.text;
+                            : declTypeNode?.text && declTypeNode.text + declaratorDims(child);
                         if (rawType) rawTypeMap?.set(nameNode.text, rawType);
                         const qualifierMap = scopeTypeQualifiers.get(scopeKey);
                         if (typeQualifier) qualifierMap?.set(nameNode.text, typeQualifier);
@@ -1827,11 +2195,11 @@ function findCallsInCode(code, parser) {
                 ? extractTypeName(resValueNode.childForFieldName('type'))
                 : null;
             let typeQualifier = resValueNode?.type === 'object_creation_expression'
-                ? extractTypeQualifier(resValueNode.childForFieldName('type'))
+                ? extractReceiverTypeQualifier(resValueNode.childForFieldName('type'))
                 : null;
             if (!typeName && resTypeNode && resTypeNode.text !== 'var') {
                 typeName = extractTypeName(resTypeNode);
-                typeQualifier = extractTypeQualifier(resTypeNode);
+                typeQualifier = extractReceiverTypeQualifier(resTypeNode);
             }
             if (resNameNode && typeName) {
                 const scopeKey = functionStack[functionStack.length - 1].startLine;
@@ -1958,8 +2326,9 @@ function findExportsInCode(code, parser) {
             return false; // Don't descend into class body
         }
 
-        // Public interfaces
-        if (node.type === 'interface_declaration' && isPublic(node)) {
+        // Public interfaces (annotation types are interfaces, fix #389)
+        if ((node.type === 'interface_declaration' || node.type === 'annotation_type_declaration') &&
+            isPublic(node)) {
             const nameNode = node.childForFieldName('name');
             if (nameNode) {
                 exports.push({
@@ -2063,8 +2432,10 @@ function findUsagesInCode(code, name, parser, tree) {
                      sameNode(parent.childForFieldName('name'), node)) {
                 usageType = 'definition';
             }
-            // Definition: interface name
-            else if (parent.type === 'interface_declaration' &&
+            // Definition: interface / annotation type / annotation element name
+            else if ((parent.type === 'interface_declaration' ||
+                      parent.type === 'annotation_type_declaration' ||
+                      parent.type === 'annotation_type_element_declaration') &&
                      sameNode(parent.childForFieldName('name'), node)) {
                 usageType = 'definition';
             }

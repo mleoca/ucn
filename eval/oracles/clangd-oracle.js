@@ -148,7 +148,8 @@ const clangdOracle = {
                     entry.location?.range || entry.range;
                 const semanticName = documentSymbolName(entry.name);
                 const compilerArtifact = isAnonymousRecordSymbol(entry) ||
-                    isRedundantRecordTypedef(entry, namedRecords);
+                    isRedundantRecordTypedef(entry, namedRecords) ||
+                    isUnexpandedMacroFunction(handle, absFile, entry, containers);
                 if (mappedKind && range && !compilerArtifact) {
                     const line = range.start.line + 1;
                     const name = sourceIdentifier(
@@ -680,6 +681,7 @@ async function definitionsAt(handle, absFile, line, column) {
             ? {
                 file: path.relative(handle.root, definitionAbs),
                 line: definitionLine,
+                column: normalized.range.start.character,
             }
             : {
                 file: definitionAbs,
@@ -831,8 +833,18 @@ async function addCompilerResolvedCallOccurrences(handle, {
         // for this name, that non-callable internal landing plus a direct-call
         // AST is still exact identity. Never use this recovery for a real
         // overload set or when clangd names another indexed callable.
+        // A landing on a declaration of the SAME name that is no known
+        // callable (a data member `array_index` initialized by
+        // `array_index(array_index_)` in a member-initializer list) is that
+        // other entity, never a fallback landing for the callable.
+        const declaresName = definition => {
+            if (definition.column == null) return false;
+            const text = sourceLine(handle, path.join(handle.root, definition.file), definition.line) || '';
+            return text.slice(definition.column, definition.column + name.length) === name &&
+                !/[A-Za-z0-9_]/.test(text[definition.column + name.length] || '');
+        };
         return uniqueCallableIdentity && internal.every(definition =>
-            !knownCallableLocations.has(definitionKey(definition)));
+            !knownCallableLocations.has(definitionKey(definition)) && !declaresName(definition));
     };
 
     const macroByFile = new Map();
@@ -984,6 +996,39 @@ async function addCompilerResolvedCallOccurrences(handle, {
     }
 }
 
+const SOURCE_CALL_KEYWORDS = new Set([
+    'return', 'else', 'case', 'do', 'throw', 'co_return', 'co_await', 'co_yield',
+    'sizeof', 'new', 'delete', 'typeid', 'decltype', 'goto', 'not', 'and', 'or',
+]);
+
+/**
+ * A C++ "function" with no return type at namespace scope is invalid C++:
+ * clangd reports one when a test-framework macro whose header is not
+ * available (`TEST_CASE_METHOD(Fixture, "name") { ... }` without Catch2) is
+ * parsed as an implicit-int definition. It is not a source declaration of
+ * that name, so it is never sampled.
+ */
+function isUnexpandedMacroFunction(handle, absFile, entry, containers) {
+    if (!/\.(?:cc|cpp|cxx|hh|hpp|hxx)$/i.test(absFile) || containers.length > 0) return false;
+    if (oracleKind(entry.kind) !== 'function') return false;
+    const range = entry.selectionRange || entry.range;
+    if (!range) return false;
+    const lines = handle.source.get(canonical(absFile)) ||
+        fs.readFileSync(absFile, 'utf8').split('\n');
+    const text = lines[range.start.line] || '';
+    if (text.slice(0, range.start.character).trim() !== '') return false;
+    if (text[range.start.character + String(entry.name).length] !== '(' &&
+        !text.slice(range.start.character).match(/^\w+\s*\(/)) return false;
+    for (let index = range.start.line - 1; index >= 0; index--) {
+        const previous = lines[index].trim();
+        if (!previous || previous.startsWith('//') || previous.startsWith('#') ||
+            previous.startsWith('*') || previous.startsWith('/*')) continue;
+        // `static int\nname(...)`: the return type sits on the line above.
+        return !/[\w*&>:]$/.test(previous);
+    }
+    return true;
+}
+
 function sourceCallInfo(handle, absFile, line, column, name) {
     const canonicalFile = canonical(absFile);
     if (!handle.source.has(canonicalFile)) {
@@ -999,6 +1044,18 @@ function sourceCallInfo(handle, absFile, line, column, name) {
     }
     const source = lines.join('\n');
     if (!isSourceCodePosition(handle, canonicalFile, line, column)) {
+        return { isCall: false };
+    }
+    // A function declarator is not a call: `void *f(void *p, int n) {` or
+    // `int f(int);` whose text before the name is only declaration
+    // specifiers and a type. clangd answers definition queries for names in
+    // inactive preprocessor branches by name, so a declaration of another
+    // configuration's definition (hiredis alloc.c `#ifdef _WIN32`) reached
+    // this fallback as a "call".
+    const prefix = (lines[line - 1] || '').slice(0, column);
+    const declarationPrefix = prefix.match(
+        /^\s*(?:(?:static|inline|extern|const|volatile|unsigned|signed|struct|enum|union|constexpr|virtual)\s+)*([A-Za-z_]\w*)(?:\s*[*&]+\s*|\s+)$/);
+    if (declarationPrefix && !SOURCE_CALL_KEYWORDS.has(declarationPrefix[1])) {
         return { isCall: false };
     }
     let cursor = (offsets[line - 1] || 0) + column + name.length;

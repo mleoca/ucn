@@ -2863,6 +2863,8 @@ describe('fix #274: findCallers fails loudly on semantic engine defects', () => 
             assert.ok(entry, 'sanity: caller file indexed');
             entry.bindings = {
                 filter() { throw new Error('semantic boom'); },
+                some() { throw new Error('semantic boom'); },
+                [Symbol.iterator]() { throw new Error('semantic boom'); },
             };
 
             assert.throws(
@@ -2963,6 +2965,192 @@ describe('fix #275: CommonJS spread-barrel namespace calls', () => {
             assert.ok(profile.enrichmentMs >= 0);
             assert.ok(profile.totalMs >= profile.candidateScanMs);
         } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// fix #382: discovery at scale. The git listing is complete whatever its size
+// (a 1MB output cap emptied the tracked set, silently dropping tracked files
+// that match a .gitignore rule); a failing git is disclosed; .gitignore rules
+// are compiled once and matched with git's own semantics.
+// ============================================================================
+describe('fix #382: discovery keeps tracked files and discloses git failures', () => {
+    const { execFileSync } = require('child_process');
+    const gitAvailable = () => {
+        try { execFileSync('git', ['--version'], { stdio: 'ignore' }); return true; } catch { return false; }
+    };
+    const git = (dir, args, input) => execFileSync('git', ['-C', dir, ...args], {
+        input, maxBuffer: Infinity, stdio: ['pipe', 'pipe', 'ignore'],
+    });
+
+    it('a tracked file matching .gitignore survives a git listing larger than 1MB', () => {
+        if (!gitAvailable()) return;
+        const dir = tmp({
+            '.gitignore': 'generated/\n',
+            'src/lib.py': 'def target(a):\n    return a + 1\n',
+            'generated/keep.py': 'from src.lib import target\ndef caller():\n    return target(1)\n',
+            'generated/scratch.py': 'def untracked_generated():\n    return 2\n',
+        });
+        try {
+            git(dir, ['init', '-q']);
+            git(dir, ['add', '-f', '.gitignore', 'src/lib.py', 'generated/keep.py']);
+            // ~1.3MB of index entries: `ls-files --cached` lists the index,
+            // so the bulk needs no files on disk.
+            const blob = git(dir, ['hash-object', '-w', '--stdin'], '').toString().trim();
+            const long = 'd'.repeat(200);
+            const lines = [];
+            for (let i = 0; i < 6000; i++) lines.push(`100644 ${blob}\tbulk/${long}/${i}.txt`);
+            git(dir, ['update-index', '--index-info'], lines.join('\n') + '\n');
+            const listingBytes = git(dir, ['ls-files', '-z']).length;
+            assert.ok(listingBytes > 1024 * 1024, `fixture listing must exceed 1MB (${listingBytes})`);
+
+            const index = idx(dir);
+            const rels = [...index.files.values()].map(fe => fe.relativePath).sort();
+            assert.deepEqual(rels, ['generated/keep.py', 'src/lib.py'],
+                'the tracked file stays; the untracked one under the ignored directory does not');
+            assert.ok(!index.discoveryIssues.some(issue => issue.reason === 'git-listing-failed'));
+            const context = index.context('target', { file: 'src/lib.py' });
+            assert.deepEqual(context.callers.map(call => call.relativePath), ['generated/keep.py']);
+            index._lastFreshAt = 0;
+            assert.equal(index.isCacheStale(), false, 'the staleness walk sees the same file set');
+        } finally { rm(dir); }
+    });
+
+    it('a failing git listing is disclosed, never a silent file-set change', () => {
+        const dir = tmp({
+            '.gitignore': 'build\n',
+            'src/lib.py': 'def target(a):\n    return a\n',
+            'src/app.py': 'from src.lib import target\ndef run():\n    return target(1)\n',
+        });
+        try {
+            fs.mkdirSync(path.join(dir, '.git')); // not a repository: git ls-files fails
+            const index = idx(dir);
+            const issue = index.discoveryIssues.find(i => i.reason === 'git-listing-failed');
+            assert.ok(issue, JSON.stringify(index.discoveryIssues));
+            assert.equal(issue.relativePath, '.');
+            assert.match(issue.detail, /tracked files that match \.gitignore rules could not be identified/);
+            assert.equal(execute(index, 'doctor', {}).result.trust, 'PARTIAL');
+            const account = index.context('target', { file: 'src/lib.py' }).meta.account;
+            assert.equal(account.contract.textComplete, false, 'the completeness claim is withdrawn');
+            assert.ok(account.skippedSources.some(s => s.reason === 'git-listing-failed'));
+        } finally { rm(dir); }
+    });
+
+    it('matches git check-ignore on anchoring, dir-only, negation, nested scopes and wildmatch', () => {
+        if (!gitAvailable()) return;
+        const { IgnoreRules } = require('../core/ignore-rules');
+        const files = {
+            '.gitignore': [
+                '/root-only', 'build/', '*.log', '!keep.log', 'docs/**/tmp', 'a**/b',
+                '[a/b]x', 'gen/*', '!gen/keep', 'deep/', '!deep/re.py', 'sp\\ ace ', '\\#hash',
+                'CR\r', '[[:digit:]]*.py', '[!a-c]z.py', 'x?z.py', 'dir/**', '**/any', 'w\\*',
+            ].join('\n') + '\n',
+            'pkg/.gitignore': 'local.py\n/anchored.py\n*.tmp.py\n!important.tmp.py\n',
+        };
+        const paths = [
+            'root-only', 'sub/root-only', 'build', 'sub/build', 'buildfile', 'x.log', 'keep.log',
+            'docs/tmp', 'docs/a/b/tmp', 'ab', 'a/b', 'ax/y/b', 'ay', 'bx', 'b/x', 'gen/drop.py',
+            'gen/keep', 'deep/re.py', 'deep/other.py', 'sp ace', '#hash', 'CR', '1st.py',
+            'az.py', 'dz.py', 'xyz.py', 'x/z.py', 'dir/in.py', 'dir', 'q/any', 'any', 'w*', 'wx',
+            'pkg/local.py', 'pkg/sub/local.py', 'pkg/anchored.py', 'pkg/sub/anchored.py',
+            'pkg/a.tmp.py', 'pkg/important.tmp.py', 'other/local.py',
+        ];
+        const dirs = new Set(['build', 'sub/build', 'dir', 'deep']);
+        const dir = tmp(files);
+        try {
+            git(dir, ['init', '-q']);
+            fs.writeFileSync(path.join(dir, '.git', 'info', 'exclude'), '');
+            for (const rel of paths) {
+                const full = path.join(dir, rel);
+                if (dirs.has(rel)) fs.mkdirSync(full, { recursive: true });
+                else {
+                    fs.mkdirSync(path.dirname(full), { recursive: true });
+                    fs.writeFileSync(full, 'x');
+                }
+            }
+            let out = '';
+            try {
+                out = execFileSync('git', ['-C', dir, '-c', 'core.ignorecase=false',
+                    '-c', 'core.excludesFile=/dev/null', 'check-ignore', '--no-index',
+                    '--stdin', '-z', '-v', '-n'], { input: paths.join('\0') + '\0' }).toString();
+            } catch (e) { out = e.stdout.toString(); }
+            const parts = out.split('\0');
+            const expected = new Map();
+            for (let i = 0; i + 3 < parts.length; i += 4) {
+                expected.set(parts[i + 3], parts[i] !== '' && !parts[i + 2].startsWith('!'));
+            }
+            const rules = new IgnoreRules([
+                { base: '', content: files['.gitignore'] },
+                { base: 'pkg', content: files['pkg/.gitignore'] },
+            ]);
+            const mismatches = paths.filter(rel =>
+                rules.isIgnored(rel, dirs.has(rel)) !== expected.get(rel));
+            assert.deepEqual(mismatches, [], 'every verdict equals git check-ignore');
+            // Spot-check the semantics the old flattened patterns got wrong.
+            assert.equal(expected.get('ab'), true, 'git matches a**/b after its literal prefix');
+            assert.equal(expected.get('bx'), true, 'a bracket holding "/" is still one path segment');
+            assert.equal(expected.get('buildfile'), false);
+            assert.equal(expected.get('deep/re.py'), true, 'no re-include below an excluded directory');
+        } finally { rm(dir); }
+    });
+
+    it('the discovered file set equals git\'s view, including tracked files under excluded directories', () => {
+        if (!gitAvailable()) return;
+        const { expandGlob, parseGitignore, gitListing, gitTrackedPaths, detectProjectPattern } =
+            require('../core/discovery');
+        const dir = tmp({
+            '.gitignore': 'out/\n*.gen.js\n!keep.gen.js\nlib/**/fixtures\n/top.js\ncache/*\n!cache/live.js\n',
+            'src/.gitignore': 'private/\n',
+            'src/a.js': 'a', 'src/private/p.js': 'p', 'src/x.gen.js': 'x', 'src/keep.gen.js': 'k',
+            'out/tracked.js': 't', 'out/untracked.js': 'u', 'out/deeper/tracked2.js': 't2',
+            'out/deeper/untracked2.js': 'u2', 'lib/fixtures/f.js': 'f', 'lib/a/fixtures/g.js': 'g',
+            'lib/ok.js': 'o', 'top.js': 'top', 'sub/top.js': 'sub', 'cache/drop.js': 'd',
+            'cache/live.js': 'l',
+        });
+        try {
+            git(dir, ['init', '-q']);
+            fs.writeFileSync(path.join(dir, '.git', 'info', 'exclude'), '');
+            git(dir, ['add', '-f', 'out/tracked.js', 'out/deeper/tracked2.js']);
+            const listing = gitListing(dir);
+            const discovered = expandGlob(detectProjectPattern(dir), {
+                root: dir,
+                gitignoreRules: parseGitignore(dir, listing),
+                trackedPaths: gitTrackedPaths(dir, listing),
+            }).map(file => path.relative(dir, file).split(path.sep).join('/')).sort();
+            const gitView = git(dir, ['-c', 'core.excludesFile=/dev/null', 'ls-files', '-z',
+                '--cached', '--others', '--exclude-standard'])
+                .toString().split('\0').filter(rel => rel.endsWith('.js')).sort();
+            assert.deepEqual(discovered, gitView);
+            assert.ok(discovered.includes('out/deeper/tracked2.js'));
+            assert.ok(!discovered.includes('out/untracked.js'));
+            assert.ok(discovered.includes('cache/live.js') && !discovered.includes('cache/drop.js'));
+        } finally { rm(dir); }
+    });
+
+    it('matching does no per-rule path work: path.relative runs once per walk, not per rule', () => {
+        const { expandGlob, parseGitignore } = require('../core/discovery');
+        const files = {};
+        const rootRules = [];
+        for (let i = 0; i < 300; i++) rootRules.push(`nested/path${i}/**/gen${i}.js`, `name${i}`);
+        files['.gitignore'] = rootRules.join('\n') + '\n';
+        for (let d = 0; d < 20; d++) {
+            files[`pkg${d}/.gitignore`] = Array.from({ length: 30 }, (_, i) => `sub/r${i}.js`).join('\n') + '\n';
+            for (let f = 0; f < 10; f++) files[`pkg${d}/sub/f${f}.js`] = 'x';
+        }
+        const dir = tmp(files);
+        const original = path.relative;
+        let calls = 0;
+        try {
+            const rules = parseGitignore(dir, null);
+            path.relative = function countingRelative(...args) { calls++; return original.apply(this, args); };
+            const found = expandGlob('**/*.js', { root: dir, gitignoreRules: rules });
+            path.relative = original;
+            assert.equal(found.length, 200);
+            assert.ok(calls <= 2, `path.relative ran ${calls} times`);
+        } finally {
+            path.relative = original;
             rm(dir);
         }
     });

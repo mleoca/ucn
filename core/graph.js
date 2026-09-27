@@ -83,7 +83,8 @@ function imports(index, filePath) {
             let resolvedPath = resolveImport(imp.module, normalizedPath, {
                 aliases: index.config.aliases,
                 language: fileEntry.language,
-                root: index.root
+                root: index.root,
+                workspacePackages: require('./graph-build').jsWorkspacePackagesOf(index),
             });
 
             // Java package imports: resolve by progressive suffix matching
@@ -358,7 +359,8 @@ function fileExports(index, filePath, _visited) {
                 const resolvedSrc = resolveImport(exp.source, absPath, {
                     language: fileEntry.language,
                     root: index.root,
-                    extensions: index.extensions
+                    extensions: index.extensions,
+                    workspacePackages: require('./graph-build').jsWorkspacePackagesOf(index),
                 });
                 if (resolvedSrc) {
                     const sourceEntry = index.files.get(resolvedSrc);
@@ -367,6 +369,8 @@ function fileExports(index, filePath, _visited) {
                         if (exp.type === 're-export-all') {
                             const sourceExportsResult = fileExports(index, resolvedSrc, visited);
                             for (const srcExp of sourceExportsResult) {
+                                // `export *` never re-exports a default export.
+                                if (srcExp.isDefault) continue;
                                 if (!matchedNames.has(srcExp.name)) {
                                     matchedNames.add(srcExp.name);
                                     // The entry belongs to the BARREL file —
@@ -478,6 +482,35 @@ function fileExports(index, filePath, _visited) {
                 signature: srcSymbol ? index.formatSignature(srcSymbol)
                     : `export ${exp.name}${exp.alias ? ' as ' + exp.alias : ''}`,
                 ...(srcRel && { reExportedFrom: srcRel })
+            });
+        }
+    }
+
+    // fix #367d: default exports of a VALUE that is not an indexed symbol
+    // (`const axios = createInstance(); export default axios;`,
+    // `module.exports = instance`, `export default { ... }`). Import sites
+    // bind these; leaving them out made `api` report no exports at all.
+    if (fileEntry.exportDetails) {
+        const matched = new Set(results.map(r => r.sourceName || r.name));
+        for (const exp of fileEntry.exportDetails) {
+            const defaultExport = exp.type === 'default' ||
+                (exp.type === 'module.exports' && exp.defaultLike);
+            if (!defaultExport || !exp.name || matched.has(exp.name)) continue;
+            if (fileEntry.symbols.some(symbol => symbol.name === exp.name && !symbol.className)) continue;
+            matched.add(exp.name);
+            const anonymous = exp.type === 'default' && exp.name === 'default';
+            results.push({
+                name: exp.name,
+                type: 'variable',
+                file: fileEntry.relativePath,
+                startLine: exp.line,
+                endLine: exp.line,
+                params: undefined,
+                returnType: null,
+                signature: exp.type === 'module.exports'
+                    ? `module.exports = ${exp.localName || exp.name}`
+                    : anonymous ? 'export default' : `export default ${exp.name}`,
+                isDefault: true,
             });
         }
     }

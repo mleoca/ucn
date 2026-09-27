@@ -2451,9 +2451,9 @@ describe('fix #210: external-contract methods (Java)', () => {
 }
 `,
         'Caller.java': `public class Caller {
-    void use(Object o, LazyNum[] nums) {
+    void use(Object o, java.util.List<LazyNum> nums) {
         int a = ((Integer) o).intValue();
-        int b = nums[0].ownMethod();
+        int b = nums.get(0).ownMethod();
     }
 }
 `,
@@ -4511,6 +4511,1066 @@ describe('fix #299D: Java overload-ambiguous promotion by static shape', () => {
             assert.ok(!result.accountRaw.excludedEntries.some(e => e.line === 4),
                 'the project Integer may bind add(Element): ' +
                 JSON.stringify(result.accountRaw.excludedEntries));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #386: renaming a type edits every reference to it', () => {
+    const { applyRenamePlan } = require('./helpers');
+    const files = {
+        'src/com/a/Widget.java': [
+            'package com.a;',
+            '',
+            'public class Widget extends Base implements Shape {',
+            '    public static final int SIZE = 3;',
+            '    private Widget next;',
+            '    public Widget() { this(1); }',
+            '    public Widget(int n) { super(); }',
+            '    public static Widget make() { return new Widget(); }',
+            '    public Widget copy(Widget other) {',
+            '        Widget w = (Widget) other;',
+            '        if (other instanceof Widget) { return w; }',
+            '        return Widget.make();',
+            '    }',
+            '}',
+        ].join('\n'),
+        'src/com/a/Base.java': 'package com.a;\npublic class Base {}\n',
+        'src/com/a/Shape.java': 'package com.a;\npublic interface Shape {}\n',
+        'src/com/a/User.java': [
+            'package com.a;',
+            'import java.util.List;',
+            'public class User {',
+            '    List<Widget> items;',
+            '    Class<?> k = Widget.class;',
+            '    int s = Widget.SIZE;',
+            '    Widget build() { return Widget.make(); }',
+            '    void run() { java.util.function.Supplier<Widget> f = Widget::new; }',
+            '}',
+        ].join('\n'),
+        'src/com/b/Widget.java': 'package com.b;\npublic class Widget { }\n',
+        'src/com/b/Other.java': [
+            'package com.b;',
+            'import com.a.Shape;',
+            'public class Other extends com.a.Base {',
+            '    Widget local;',
+            '    com.a.Widget far;',
+            '}',
+        ].join('\n'),
+        'src/com/b/Imp.java': [
+            'package com.b;',
+            'import com.a.Widget;',
+            'public class Imp {',
+            '    Widget w = new Widget();',
+            '    Widget get() { return w; }',
+            '}',
+        ].join('\n'),
+    };
+
+    it('Java: type positions, constructors, casts, literals, imports and qualified names; the other package keeps its Widget', () => {
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: 'Widget', file: 'com/a/Widget.java', renameTo: 'Gadget' });
+            assert.ok(r.ok, r.error);
+            const { contents, reviews } = applyRenamePlan(dir, r.result);
+            assert.deepStrictEqual(reviews, []);
+            const renamed = text => text.replace(/\bWidget\b/g, 'Gadget');
+            assert.strictEqual(contents['src/com/a/Gadget.java'], renamed(files['src/com/a/Widget.java']));
+            assert.strictEqual(contents['src/com/a/Widget.java'], null, 'the public class moves to Gadget.java');
+            assert.strictEqual(contents['src/com/a/User.java'], renamed(files['src/com/a/User.java']));
+            assert.strictEqual(contents['src/com/b/Imp.java'], renamed(files['src/com/b/Imp.java']));
+            assert.strictEqual(contents['src/com/b/Other.java'],
+                files['src/com/b/Other.java'].replace('com.a.Widget far', 'com.a.Gadget far'));
+            assert.ok(!('src/com/b/Widget.java' in contents), 'com.b.Widget is another type');
+            assert.deepStrictEqual(r.result.fileRenames,
+                [{ from: 'src/com/a/Widget.java', to: 'src/com/a/Gadget.java' }]);
+            assert.strictEqual(r.result.unverifiedCount, 0, JSON.stringify(r.result.unverifiedSites));
+        } finally { rm(dir); }
+    });
+
+    it('Java: a field named like the type is not the type; a nested type is renamed through its outer name', () => {
+        const dir = tmp({
+            'src/p/Outer.java': [
+                'package p;',
+                'public class Outer {',
+                '    public static class Widget { static int N = 1; }',
+                '    Widget w;',
+                '}',
+            ].join('\n'),
+            'src/p/Use.java': [
+                'package p;',
+                'public class Use {',
+                '    Outer.Widget a = new Outer.Widget();',
+                '    int Widget = 2;',
+                '    int b() { return Widget + 1; }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: 'Widget', file: 'p/Outer.java', renameTo: 'Gadget' });
+            assert.ok(r.ok, r.error);
+            const { contents, reviews } = applyRenamePlan(dir, r.result);
+            assert.deepStrictEqual(reviews, []);
+            assert.ok(contents['src/p/Outer.java'].includes('public static class Gadget'));
+            assert.ok(contents['src/p/Outer.java'].includes('    Gadget w;'));
+            assert.ok(contents['src/p/Use.java'].includes('Outer.Gadget a = new Outer.Gadget();'));
+            assert.ok(contents['src/p/Use.java'].includes('int Widget = 2;'));
+            assert.ok(contents['src/p/Use.java'].includes('return Widget + 1;'));
+            assert.strictEqual(r.result.fileRenames, undefined);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #389: Java annotation types, local classes, serialization ancestry', () => {
+    const { applyRenamePlan } = require('./helpers');
+    const at = entries => (entries || []).map(entry => `${entry.relativePath || entry.file}:${entry.line}`).sort();
+
+    it('an @interface is an indexed interface: elements are methods, element keys are their sites, the shorthand is reviewed', () => {
+        const dir = tmp({
+            'src/Marker.java': [
+                'package p;',
+                '',
+                'import java.lang.annotation.Retention;',
+                'import java.lang.annotation.RetentionPolicy;',
+                '',
+                '@Retention(RetentionPolicy.RUNTIME)',
+                'public @interface Marker {',
+                '    String value() default "";',
+                '    int priority() default 0;',
+                '    int MAX = 10;',
+                '}',
+            ].join('\n'),
+            'src/Use.java': [
+                'package p;',
+                '',
+                '@Marker("x")',
+                'public class Use {',
+                '    @Marker(value = "y", priority = 2)',
+                '    void m() {',
+                '        Marker mk = Use.class.getAnnotation(Marker.class);',
+                '        int p = mk.priority() + Marker.MAX;',
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const marker = (index.symbols.get('Marker') || []).find(d => d.type === 'interface');
+            assert.ok(marker && marker.annotationType, JSON.stringify(index.symbols.get('Marker')));
+            assert.strictEqual(marker.nameLine, 7);
+            const priority = (index.symbols.get('priority') || [])[0];
+            assert.strictEqual(priority.className, 'Marker');
+            assert.deepStrictEqual((priority.modifiers || []).filter(m => m === 'default'), []);
+            assert.deepStrictEqual((index.symbols.get('MAX') || []).map(d => `${d.type}:${d.className}`), ['field:Marker']);
+            assert.deepStrictEqual(at(index.context('priority', { file: 'src/Marker.java' }).callers),
+                ['src/Use.java:5', 'src/Use.java:8']);
+            const type = execute(index, 'plan', { name: 'Marker', file: 'src/Marker.java', renameTo: 'Tag' });
+            assert.ok(type.ok, type.error);
+            const renamed = applyRenamePlan(dir, type.result);
+            assert.deepStrictEqual(renamed.reviews, []);
+            assert.ok(!/\bMarker\b/.test(renamed.contents['src/Use.java']), renamed.contents['src/Use.java']);
+            assert.strictEqual(renamed.contents['src/Marker.java'], null);
+            assert.ok(renamed.contents['src/Tag.java'].includes('public @interface Tag {'));
+            const element = execute(index, 'plan', { name: 'priority', file: 'src/Marker.java', renameTo: 'prio' });
+            const elementEdits = applyRenamePlan(dir, element.result);
+            assert.ok(elementEdits.contents['src/Use.java'].includes('@Marker(value = "y", prio = 2)'));
+            // `@Marker("x")` sets `value` with no name token: the rename names it.
+            const value = execute(index, 'plan', { name: 'value', file: 'src/Marker.java', renameTo: 'label' });
+            assert.deepStrictEqual(value.result.unverifiedSites || [], []);
+            const valueEdits = applyRenamePlan(dir, value.result);
+            assert.deepStrictEqual(valueEdits.reviews, []);
+            assert.ok(valueEdits.contents['src/Use.java'].includes('@Marker(label = "x")'), valueEdits.contents['src/Use.java']);
+            assert.ok(valueEdits.contents['src/Use.java'].includes('@Marker(label = "y", priority = 2)'));
+            // impact lists the site as a caller with its reason.
+            const impact = execute(index, 'impact', { name: 'value', file: 'src/Marker.java' });
+            assert.ok(JSON.stringify(impact.result).includes('annotation-shorthand'));
+        } finally { rm(dir); }
+    });
+
+    it('a local class and its members are not the top-level namesake (callers, callees, members, plans)', () => {
+        const dir = tmp({
+            'src/Mod.java': [
+                'package p;',
+                '',
+                'class Widget {',
+                '    String render() { return "top"; }',
+                '}',
+                '',
+                'public class Mod {',
+                '    String build() {',
+                '        class Widget {',
+                '            String render() { return "local"; }',
+                '        }',
+                '        Widget w = new Widget();',
+                '        return w.render();',
+                '    }',
+                '',
+                '    String useTop() {',
+                '        Widget w = new Widget();',
+                '        return w.render();',
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const top = index.context('render', { file: 'src/Mod.java', line: 4 });
+            assert.deepStrictEqual(at(top.callers), ['src/Mod.java:18']);
+            assert.deepStrictEqual(at(top.unverifiedCallers), []);
+            const local = index.context('render', { file: 'src/Mod.java', line: 10 });
+            assert.deepStrictEqual(at(local.callers), ['src/Mod.java:13']);
+            assert.deepStrictEqual(at(local.unverifiedCallers), []);
+            const build = index.context('build', { file: 'src/Mod.java' });
+            assert.deepStrictEqual(build.callees.map(c => `${c.name}:${c.startLine}`).sort(), ['Widget:9', 'render:10']);
+            const widget = index.symbols.get('Widget').find(d => d.startLine === 9);
+            assert.deepStrictEqual(index.findMethodsForType('Widget', widget).map(m => m.startLine), [10]);
+            const plan = execute(index, 'plan', { name: 'render', file: 'src/Mod.java', line: 4, renameTo: 'draw' });
+            assert.deepStrictEqual(plan.result.changes.map(c => c.line).sort((a, b) => a - b), [4, 18]);
+        } finally { rm(dir); }
+    });
+
+    it('serialization members of a class with an out-of-project supertype are possible protocol members', () => {
+        const dir = tmp({
+            'src/Err.java': [
+                'package p;',
+                '',
+                'import java.io.IOException;',
+                'import java.io.ObjectInputStream;',
+                'import java.io.ObjectOutputStream;',
+                'import java.util.ArrayList;',
+                '',
+                'class Err extends IOException {',
+                '    private static final long serialVersionUID = 1L;',
+                '    private void writeObject(ObjectOutputStream out) throws IOException { }',
+                '    private Object readResolve() { return this; }',
+                '    private Object readObject(String json) { return json; }',
+                '}',
+                '',
+                'class Bag extends ArrayList<String> {',
+                '    private Object writeReplace() { return this; }',
+                '}',
+                '',
+                'class Plain {',
+                '    private Object readResolve() { return this; }',
+                '}',
+                '',
+                'class Runner implements Runnable {',
+                '    public void run() { }',
+                '    private Object readResolve() { return this; }',
+                '}',
+                '',
+                'class Ser implements java.io.Serializable {',
+                '    private Object readResolve() { return this; }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const dead = execute(index, 'deadcode', {});
+            const claimed = (dead.result.results || dead.result).map?.(d => `${d.className}.${d.name}`) ||
+                JSON.stringify(dead.result);
+            const names = new Set(Array.isArray(claimed) ? claimed : []);
+            // Kept live: the JDK supertype may be Serializable.
+            for (const kept of ['Err.writeObject', 'Err.readResolve', 'Bag.writeReplace', 'Ser.readResolve']) {
+                assert.ok(!names.has(kept), `${kept} claimed: ${[...names]}`);
+            }
+            // Claimable: no out-of-project supertype, a java.lang type known
+            // not to be Serializable, or not the protocol's signature.
+            for (const claim of ['Plain.readResolve', 'Runner.readResolve', 'Err.readObject']) {
+                assert.ok(names.has(claim), `${claim} not claimed: ${[...names]}`);
+            }
+            const possible = execute(index, 'plan', { name: 'writeObject', file: 'src/Err.java', renameTo: 'w' });
+            assert.strictEqual(possible.result.contract?.blocked, false);
+            assert.strictEqual(possible.result.contract?.external?.[0]?.certainty, 'possible');
+            assert.ok(possible.result.changes.some(c => c.newExpression && c.line === 10));
+            const definite = execute(index, 'plan', { name: 'readResolve', file: 'src/Err.java', line: 29, renameTo: 'r' });
+            assert.strictEqual(definite.result.contract?.blocked, true);
+            const field = execute(index, 'plan', { name: 'serialVersionUID', file: 'src/Err.java', renameTo: 'uid' });
+            assert.strictEqual(field.result.contract?.external?.[0]?.reason, 'possible-protocol-member');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #390: Java generic base slots, same-name class identity, annotated field names', () => {
+    const { applyRenamePlan } = require('./helpers');
+    const planLines = (dir, index, handle, to) => {
+        const [file, line, name] = handle.split(':');
+        const r = execute(index, 'plan', { name, file, line: Number(line), renameTo: to });
+        assert.ok(r.ok, r.error);
+        const { contents } = applyRenamePlan(dir, r.result);
+        const out = [];
+        for (const [f, text] of Object.entries(contents)) {
+            if (text == null) continue;
+            text.split('\n').forEach((row, i) => { if (row.includes(to)) out.push(`${f}:${i + 1}`); });
+        }
+        return out.sort();
+    };
+
+    it('a rename follows the override slot through generic base clauses by substituted parameter types', () => {
+        const dir = tmp({
+            'src/p/Base.java': [
+                'package p;',
+                'public abstract class Base<S, R> {',
+                '    protected abstract R visit(S state, String x);',
+                '    public R run(S s) { return visit(s, "a"); }',
+                '}',
+            ].join('\n'),
+            'src/p/Impl.java': [
+                'package p;',
+                'public class Impl extends Base<StringBuilder, Boolean> {',
+                '    @Override',
+                '    protected Boolean visit(StringBuilder state, String x) { return true; }',
+                '    protected Boolean visit(Integer other, String x) { return false; }',
+                '    void use() {',
+                '        visit(new StringBuilder(), "b");',
+                '        visit(1, "c");',
+                '    }',
+                '}',
+            ].join('\n'),
+            'src/p/Mid.java': 'package p;\npublic abstract class Mid<T> extends Base<T, Boolean> {}\n',
+            'src/p/Leaf.java': [
+                'package p;',
+                'public class Leaf extends Mid<Integer> {',
+                '    @Override',
+                '    protected Boolean visit(Integer state, String x) { return false; }',
+                '    protected Boolean visit(Long state, String x) { return true; }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const slot = ['src/p/Base.java:3', 'src/p/Base.java:4', 'src/p/Impl.java:4', 'src/p/Impl.java:7',
+                'src/p/Leaf.java:4'];
+            // From the base, the override in each subclass, never the
+            // other overloads (visit(Integer) in Impl, visit(Long) in Leaf).
+            assert.deepStrictEqual(planLines(dir, index, 'src/p/Base.java:3:visit', 'visitZq'), slot);
+            // From a leaf through Mid<T> -> Base<T, Boolean>: the same slot.
+            assert.deepStrictEqual(planLines(dir, index, 'src/p/Leaf.java:3:visit', 'visitZq'), slot);
+            const other = planLines(dir, index, 'src/p/Impl.java:5:visit', 'visitZq');
+            assert.ok(!other.includes('src/p/Base.java:3'), other.join(' '));
+        } finally { rm(dir); }
+    });
+
+    it('a class named like a subclass of the target in another package binds its bare call through its static import', () => {
+        const dir = tmp({
+            'src/junit/framework/Assert.java': [
+                'package junit.framework;',
+                'public class Assert {',
+                '    public static void assertFalse(boolean c) {}',
+                '}',
+            ].join('\n'),
+            'src/junit/framework/TestCase.java': [
+                'package junit.framework;',
+                'public abstract class TestCase extends Assert {',
+                '    public static void assertTrue(boolean c) {}',
+                '}',
+            ].join('\n'),
+            'src/org/junit/Assert.java': [
+                'package org.junit;',
+                'public class Assert {',
+                '    public static void assertFalse(boolean c) {}',
+                '    public static void assertTrue(boolean c) {}',
+                '}',
+            ].join('\n'),
+            'test/junit/samples/MoneyTest.java': [
+                'package junit.samples;',
+                'import junit.framework.TestCase;',
+                'public class MoneyTest extends TestCase {',
+                '    public void testA() { assertFalse(false); assertTrue(true); }',
+                '}',
+            ].join('\n'),
+            'test/org/junit/samples/MoneyTest.java': [
+                'package org.junit.samples;',
+                'import static org.junit.Assert.assertFalse;',
+                'import static org.junit.Assert.assertTrue;',
+                'public class MoneyTest {',
+                '    public void testA() {',
+                '        assertFalse(false);',
+                '        assertTrue(true);',
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const callers = (file, line, name) => {
+                const r = index.context(name, { file, line });
+                const all = [...(r.callers || []), ...(r.unverifiedCallers || [])];
+                return all.map(c => `${c.relativePath || c.file}:${c.line}`).sort();
+            };
+            assert.deepStrictEqual(callers('src/junit/framework/Assert.java', 3, 'assertFalse'),
+                ['test/junit/samples/MoneyTest.java:4']);
+            assert.deepStrictEqual(callers('src/org/junit/Assert.java', 3, 'assertFalse'),
+                ['test/org/junit/samples/MoneyTest.java:6']);
+            // Callee side: the static import, not the other package's TestCase.
+            const r = index.context('testA', { file: 'test/org/junit/samples/MoneyTest.java' });
+            const callees = (r.callees || []).map(c => `${c.relativePath}:${c.startLine}`).sort();
+            assert.deepStrictEqual(callees, ['src/org/junit/Assert.java:3', 'src/org/junit/Assert.java:4']);
+        } finally { rm(dir); }
+    });
+
+    it('an annotated field is renamed on the line that names it', () => {
+        const dir = tmp({
+            'src/p/A.java': [
+                'package p;',
+                'public class A {',
+                '    @Deprecated',
+                '    int field = 1;',
+                '    int use() { return this.field; }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const def = index.symbols.get('field').find(d => d.className === 'A');
+            assert.strictEqual(def.nameLine, 4);
+            const r = execute(index, 'plan', { name: 'field', file: 'src/p/A.java', renameTo: 'count' });
+            assert.ok(r.ok, r.error);
+            const definition = r.result.changes.find(c => c.editKind === 'definition');
+            assert.strictEqual(definition.line, 4);
+            assert.match(definition.newExpression, /int count = 1;/);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #390: a static import binds a bare call only when no class in scope can supply the member', () => {
+    it('a class with an out-of-project supertype keeps its statically imported bare call unverified', () => {
+        const dir = tmp({
+            'src/org/junit/Assert.java': 'package org.junit;\npublic class Assert {\n    public static void assertTrue(boolean c) {}\n}\n',
+            'test/t/Closed.java': 'package t;\nimport static org.junit.Assert.assertTrue;\npublic class Closed {\n    void a() { assertTrue(true); }\n}\n',
+            'test/t/Open.java': 'package t;\nimport static org.junit.Assert.assertTrue;\npublic class Open extends junit.framework.TestCase {\n    void a() { assertTrue(true); }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const ctx = index.context('assertTrue', { file: 'src/org/junit/Assert.java' });
+            assert.deepStrictEqual((ctx.callers || []).map(c => `${c.relativePath}:${c.line}`), ['test/t/Closed.java:4']);
+            assert.deepStrictEqual((ctx.unverifiedCallers || []).map(c => `${c.relativePath || c.file}:${c.line}`),
+                ['test/t/Open.java:4']);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #390: anonymous class overrides rename with the slot', () => {
+    it('`new Listener<String>() { run(String, int) }` is renamed, another overload and an unrelated anonymous class are not, a diamond is reviewed', () => {
+        const dir = tmp({
+            'src/p/Listener.java': [
+                'package p;',
+                'public abstract class Listener<T> {',
+                '    public void run(T value, int n) {}',
+                '    public void fire(T v) { run(v, 1); }',
+                '}',
+            ].join('\n'),
+            'src/p/Use.java': [
+                'package p;',
+                'public class Use {',
+                '    void a() {',
+                '        Listener<String> l = new Listener<String>() {',
+                '            @Override',
+                '            public void run(String value, int n) {}',
+                '            public void run(Integer other, int n) {}',
+                '        };',
+                '        Listener<Long> m = new Listener<>() {',
+                '            @Override public void run(Long v, int n) {}',
+                '        };',
+                '        Object o = new Object() { public void run(String s, int n) {} };',
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: 'run', file: 'src/p/Listener.java', line: 3, renameTo: 'runZq' });
+            assert.ok(r.ok, r.error);
+            const use = r.result.changes.filter(c => c.file === 'src/p/Use.java');
+            assert.deepStrictEqual(use.map(c => `${c.line}:${c.needsReview ? 'review' : 'edit'}`), ['6:edit', '10:review']);
+            assert.match(use[0].newExpression, /public void runZq\(String value, int n\)/);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #390: member references and base names resolve like javac', () => {
+    it('a paren-less `this.size` is a field: neither a nested class field nor a same-name field is renamed with the method', () => {
+        const dir = tmp({
+            'src/p/Table.java': [
+                'package p;',
+                'public class Table {',
+                '    private int count;',
+                '    int flag;',
+                '    public int size() { return count; }',
+                '    public int flag() { return this.flag; }',
+                '    static final class Info {',
+                '        final int size;',
+                '        Info(int size) { this.size = size; }',
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const size = execute(index, 'plan', { name: 'size', file: 'src/p/Table.java', line: 5, renameTo: 'sizeZq' });
+            assert.ok(size.ok, size.error);
+            assert.deepStrictEqual(size.result.changes.map(c => c.line), [5]);
+            const flag = execute(index, 'plan', { name: 'flag', file: 'src/p/Table.java', line: 6, renameTo: 'flagZq' });
+            assert.ok(flag.ok, flag.error);
+            const edited = flag.result.changes.filter(c => c.newExpression !== undefined);
+            assert.deepStrictEqual(edited.map(c => c.newExpression), ['public int flagZq() { return this.flag; }']);
+        } finally { rm(dir); }
+    });
+
+    it('a base named like a project class but imported from outside the project is not that class', () => {
+        const dir = tmp({
+            'src/org/junit/internal/matchers/TypeSafeMatcher.java': [
+                'package org.junit.internal.matchers;',
+                'public abstract class TypeSafeMatcher<T> {',
+                '    public abstract boolean matchesSafely(T item);',
+                '}',
+            ].join('\n'),
+            'src/org/junit/internal/matchers/Stack.java': [
+                'package org.junit.internal.matchers;',
+                'public class Stack<T> extends TypeSafeMatcher<T> {',
+                '    @Override',
+                '    public boolean matchesSafely(T item) { return true; }',
+                '}',
+            ].join('\n'),
+            'src/org/junit/internal/matchers/Cause.java': [
+                'package org.junit.internal.matchers;',
+                'import org.hamcrest.TypeSafeMatcher;',
+                'public class Cause<T> extends TypeSafeMatcher<T> {',
+                '    @Override',
+                '    protected boolean matchesSafely(T item) { return false; }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const project = execute(index, 'plan', { name: 'matchesSafely',
+                file: 'src/org/junit/internal/matchers/TypeSafeMatcher.java', line: 3, renameTo: 'm2' });
+            assert.ok(project.ok, project.error);
+            const files = [...new Set(project.result.changes.map(c => c.file))].sort();
+            assert.deepStrictEqual(files, ['src/org/junit/internal/matchers/Stack.java',
+                'src/org/junit/internal/matchers/TypeSafeMatcher.java']);
+            // The hamcrest override fills an out-of-project slot.
+            const external = execute(index, 'plan', { name: 'matchesSafely',
+                file: 'src/org/junit/internal/matchers/Cause.java', line: 4, renameTo: 'm2' });
+            assert.ok(external.ok, external.error);
+            assert.ok(external.result.contract?.blocked, JSON.stringify(external.result.contract));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #390: a string concatenation argument is a String', () => {
+    it('`addStatement("a" + b)` selects addStatement(String, Object...), never addStatement(CodeBlock)', () => {
+        const dir = tmp({
+            'src/p/Code.java': 'package p;\npublic class Code {}\n',
+            'src/p/Builder.java': [
+                'package p;',
+                'public class Builder {',
+                '    public Builder addStatement(String format, Object... args) { return this; }',
+                '    public Builder addStatement(Code code) { return this; }',
+                '}',
+            ].join('\n'),
+            'src/p/Use.java': [
+                'package p;',
+                'public class Use {',
+                '    void a(Builder b, String x) {',
+                '        b.addStatement("return " + x);',
+                '        b.addStatement(new Code());',
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: 'addStatement', file: 'src/p/Builder.java', line: 4, renameTo: 'addCode' });
+            assert.ok(r.ok, r.error);
+            const use = r.result.changes.filter(c => c.file === 'src/p/Use.java').map(c => c.line);
+            assert.deepStrictEqual(use, [5]);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #392: enums implement interfaces; enum serialization callbacks', () => {
+    it('renaming an interface method renames the enum member and enum constant bodies', () => {
+        const dir = tmp({
+            'Op.java': 'public interface Op { int apply(int x); }\n',
+            'Ops.java': [
+                'public enum Ops implements Op {',
+                '    ADD {',
+                '        @Override',
+                '        public int apply(int x) { return x + 1; }',
+                '    },',
+                '    NEG;',
+                '',
+                '    @Override',
+                '    public int apply(int x) { return -x; }',
+                '}',
+            ].join('\n') + '\n',
+            'Use.java': 'public class Use {\n    static int run(Op o) { return o.apply(3); }\n}\n',
+        });
+        try {
+            const r = execute(idx(dir), 'plan', { name: 'apply', file: 'Op.java', line: 1, renameTo: 'applyZ' });
+            assert.ok(r.ok, r.error);
+            const edits = r.result.changes.filter(c => c.newExpression).map(c => `${c.file}:${c.line}`).sort();
+            assert.deepStrictEqual(edits, ['Op.java:1', 'Ops.java:4', 'Ops.java:9', 'Use.java:2']);
+        } finally { rm(dir); }
+    });
+
+    it('serialization callbacks of an enum are ordinary members (enum constants serialize by name)', () => {
+        const dir = tmp({
+            'Color.java': [
+                'import java.io.Serializable;',
+                'public enum Color implements Serializable {',
+                '    RED;',
+                '    private Object readResolve() { return this; }',
+                '}',
+            ].join('\n') + '\n',
+            'Ser.java': [
+                'import java.io.Serializable;',
+                'public class Ser implements Serializable {',
+                '    private Object readResolve() { return this; }',
+                '}',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const { protocolMemberOf } = require('../core/contract-membership');
+            const byClass = new Map((index.symbols.get('readResolve') || []).map(d => [d.className, d]));
+            assert.strictEqual(protocolMemberOf(index, byClass.get('Color')), false);
+            assert.strictEqual(protocolMemberOf(index, byClass.get('Ser')), true);
+            const dead = execute(index, 'deadcode', {}).result;
+            const names = (dead.symbols || dead.results || dead).map?.(s => `${s.className}.${s.name}`) || [];
+            assert.ok(names.includes('Color.readResolve'), JSON.stringify(names));
+            assert.ok(!names.includes('Ser.readResolve'));
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// fix #394: constructor names in type renames, check against the base
+// declaration, owner identity before overload fit, package-qualified and
+// nested types, field initializers, super calls, declared local types
+// ============================================================================
+
+describe('fix #394: Java identity, check and plan', () => {
+    const { execFileSync } = require('child_process');
+    const gitInit = (dir) => {
+        execFileSync('git', ['init', '-q'], { cwd: dir });
+        execFileSync('git', ['add', '.'], { cwd: dir });
+        execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init'], { cwd: dir });
+    };
+    const tiers = (index, name, def) => {
+        const r = index.findCallers(name, { includeMethods: true, targetDefinitions: [def], collectAccount: true });
+        return {
+            confirmed: [...new Set(r.filter(c => c.tier !== 'unverified').map(c => `${c.relativePath}:${c.line}`))].sort(),
+            unverified: [...new Set([...r.filter(c => c.tier === 'unverified'), ...(r.unverifiedEntries || [])]
+                .map(c => `${c.relativePath}:${c.line}`))].sort(),
+            excluded: r.accountRaw.excludedEntries.map(e => `${path.relative(index.root, e.file)}:${e.line}:${e.reason}`).sort(),
+        };
+    };
+    const defAt = (index, name, file, line) => index.symbols.get(name).find(d =>
+        d.relativePath === file && (line == null || d.startLine === line || d.nameLine === line));
+
+    it('renames an annotated class and its constructor without crashing', () => {
+        const dir = tmp({
+            'src/p/Base.java': 'package p;\n\npublic abstract class Base {\n}\n',
+            'src/p/Basic.java': 'package p;\n\n@Deprecated\npublic class Basic extends Base {\n\n    public Basic() {\n    }\n}\n',
+            'src/p/Use.java': 'package p;\n\npublic class Use {\n    Base make() {\n        return new Basic();\n    }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const plan = execute(index, 'plan', { name: 'Basic', file: 'src/p/Basic.java', line: 4, renameTo: 'Plain' });
+            assert.ok(plan.ok, plan.error);
+            const lines = plan.result.changes.map(c => `${c.file}:${c.line}`).sort();
+            assert.deepStrictEqual(lines, ['src/p/Basic.java:4', 'src/p/Basic.java:6', 'src/p/Use.java:5']);
+        } finally { rm(dir); }
+    });
+
+    it('check reports callers of a changed overload as mismatches, never other-target', () => {
+        const dir = tmp({
+            'src/p/Util.java': [
+                'package p;', '',
+                'final class Util {',
+                '    static boolean isEmpty(final Object[] array) {',
+                '        return array == null;',
+                '    }',
+                '',
+                '    static boolean isEmpty(final String str) {',
+                '        return str == null;',
+                '    }',
+                '}',
+            ].join('\n') + '\n',
+            'src/p/Use.java': [
+                'package p;', '',
+                'class Use {',
+                '    boolean a(String s) { return Util.isEmpty(s); }',
+                '    boolean b(String[] xs) { return Util.isEmpty(xs); }',
+                '}',
+            ].join('\n') + '\n',
+        });
+        try {
+            gitInit(dir);
+            const file = path.join(dir, 'src/p/Util.java');
+            fs.writeFileSync(file, fs.readFileSync(file, 'utf-8')
+                .replace('isEmpty(final String str)', 'isEmpty(final String str, final boolean trim)'));
+            const index = idx(dir);
+            const check = execute(index, 'check', { name: 'isEmpty', file: 'src/p/Util.java', line: 8 });
+            assert.ok(check.ok, check.error);
+            assert.deepStrictEqual(check.result.mismatchDetails.map(m => `${m.file}:${m.line}`), ['src/p/Use.java:4']);
+            assert.match(check.result.changedSince.signature, /isEmpty \(str: String\)/);
+            assert.strictEqual(check.result.account.confirmed + check.result.account.unverified >= 1, true);
+            // The array overload keeps its own caller; the String site never
+            // binds it.
+            const arrayDef = defAt(index, 'isEmpty', 'src/p/Util.java', 4);
+            assert.deepStrictEqual(tiers(index, 'isEmpty', arrayDef).confirmed, ['src/p/Use.java:5']);
+            const diff = execute(index, 'check', {});
+            assert.ok(diff.ok, diff.error);
+            assert.strictEqual(diff.result.trust?.status || diff.result.status, 'BLOCKED');
+            const text = require('../core/output').formatPublicText('check', diff.result, {}, diff);
+            assert.match(text, /SIG-DRIFT\(1\)/);
+        } finally { rm(dir); }
+    });
+
+    it('check fills the line of an overload-family call it validates', () => {
+        const dir = tmp({
+            'src/p/Opt.java': 'package p;\n\npublic class Opt {\n    public String getKey() {\n        return "k";\n    }\n}\n',
+            // More unverified family calls than the engine enriches with
+            // line text: every one must still be validated with its line.
+            'src/p/Group.java': 'package p;\n\npublic class Group {\n    String s;\n    void set(final Opt option) {\n' +
+                Array.from({ length: 12 }, () => '        s = option.getKey();\n').join('') + '    }\n}\n',
+        });
+        try {
+            gitInit(dir);
+            const file = path.join(dir, 'src/p/Opt.java');
+            fs.writeFileSync(file, fs.readFileSync(file, 'utf-8').replace('getKey()', 'getKey(int n)'));
+            const index = idx(dir);
+            const check = execute(index, 'check', { name: 'getKey', file: 'src/p/Opt.java', line: 4 });
+            assert.ok(check.ok, check.error);
+            assert.ok(check.result.mismatchDetails.every(m => m.expression === 's = option.getKey();'));
+            assert.deepStrictEqual(check.result.mismatchDetails.map(m => m.line),
+                Array.from({ length: 12 }, (_, i) => 6 + i));
+        } finally { rm(dir); }
+    });
+
+    it('a nested builder returned by another package namesake is its own type', () => {
+        const dir = tmp({
+            'src/p/A.java': 'package p;\n\npublic class A {\n    public static class Builder {\n        public A get() {\n            return new A();\n        }\n    }\n\n    public static Builder builder() {\n        return new Builder();\n    }\n}\n',
+            'src/p/B.java': 'package p;\n\npublic class B {\n    public static class Builder {\n        public B get() {\n            return new B();\n        }\n    }\n}\n',
+            'src/p/Use.java': 'package p;\n\npublic class Use {\n    void run() {\n        A a = A.builder().get();\n    }\n}\n',
+            'src/q/A.java': 'package q;\n\npublic class A {\n    public static class Builder {\n        public A get() {\n            return new A();\n        }\n    }\n\n    public static Builder builder() {\n        return new Builder();\n    }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(tiers(index, 'get', defAt(index, 'get', 'src/p/A.java')).confirmed, ['src/p/Use.java:5']);
+            const other = tiers(index, 'get', defAt(index, 'get', 'src/p/B.java'));
+            assert.deepStrictEqual(other.confirmed, []);
+            assert.deepStrictEqual(other.unverified, []);
+            assert.deepStrictEqual(tiers(index, 'get', defAt(index, 'get', 'src/q/A.java')).confirmed, []);
+        } finally { rm(dir); }
+    });
+
+    it('a returned nested builder reaches members it inherits from a same-name base builder', () => {
+        const dir = tmp({
+            'src/p/Base.java': [
+                'package p;', '',
+                'public abstract class Base {',
+                '    public abstract static class Builder<B extends Builder<B>> {',
+                '        public B setWidth(int w) {',
+                '            return (B) this;',
+                '        }',
+                '    }',
+                '}',
+            ].join('\n') + '\n',
+            'src/p/Fmt.java': [
+                'package p;', '',
+                'public class Fmt extends Base {',
+                '    public static class Builder extends Base.Builder<Builder> {',
+                '        public Fmt get() {',
+                '            return new Fmt();',
+                '        }',
+                '    }',
+                '    public static Builder builder() {',
+                '        return new Builder();',
+                '    }',
+                '}',
+            ].join('\n') + '\n',
+            'src/q/Fmt.java': 'package q;\n\npublic class Fmt {\n    public static Object builder() {\n        return null;\n    }\n}\n',
+            'src/p/Use.java': 'package p;\n\npublic class Use {\n    void run() {\n        Fmt.builder().setWidth(3);\n    }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(tiers(index, 'setWidth', defAt(index, 'setWidth', 'src/p/Base.java')).confirmed, ['src/p/Use.java:5']);
+        } finally { rm(dir); }
+    });
+
+    it('a package-qualified declared type names that package, never the current one', () => {
+        const dir = tmp({
+            'src/p/Node.java': 'package p;\n\npublic class Node {\n    public Node(String n) {}\n    public String label() {\n        return "p";\n    }\n}\n',
+            'src/q/Node.java': 'package q;\n\npublic class Node {\n    public String label() {\n        return "q";\n    }\n}\n',
+            'src/q/Use.java': [
+                'package q;', '',
+                'public class Use {',
+                '    String go() {',
+                '        p.Node pn = new p.Node("x");',
+                '        Node n = new Node();',
+                '        return pn.label() + n.label();',
+                '    }',
+                '    String go2(p.Node arg) {',
+                '        return arg.label();',
+                '    }',
+                '}',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const pLabel = tiers(index, 'label', defAt(index, 'label', 'src/p/Node.java'));
+            assert.deepStrictEqual(pLabel.confirmed, ['src/q/Use.java:10', 'src/q/Use.java:7']);
+            const plan = execute(index, 'plan', { name: 'label', file: 'src/q/Node.java', line: 4, renameTo: 'labelQ' });
+            assert.ok(plan.ok, plan.error);
+            const use = plan.result.changes.filter(c => c.file === 'src/q/Use.java');
+            assert.deepStrictEqual(use.map(c => c.line), [7]);
+            assert.strictEqual(use[0].newExpression, 'return pn.label() + n.labelQ();');
+        } finally { rm(dir); }
+    });
+
+    it('owner identity precedes overload fit across same-name classes of two packages', () => {
+        const dir = tmp({
+            'src/p/Util.java': 'package p;\n\nfinal class Util {\n    static boolean isEmpty(final String str) {\n        return str == null;\n    }\n}\n',
+            'src/p/help/Util.java': 'package p.help;\n\nfinal class Util {\n    static boolean isEmpty(final CharSequence str) {\n        return str == null;\n    }\n}\n',
+            'src/p/help/Fmt.java': 'package p.help;\n\npublic class Fmt {\n    void run(String s) {\n        if (Util.isEmpty(s)) {\n            return;\n        }\n    }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(tiers(index, 'isEmpty', defAt(index, 'isEmpty', 'src/p/help/Util.java')).confirmed,
+                ['src/p/help/Fmt.java:5']);
+            assert.deepStrictEqual(tiers(index, 'isEmpty', defAt(index, 'isEmpty', 'src/p/Util.java')).confirmed, []);
+            const plan = execute(index, 'plan', { name: 'isEmpty', file: 'src/p/help/Util.java', line: 4, renameTo: 'blank' });
+            assert.ok(plan.result.changes.some(c => c.file === 'src/p/help/Fmt.java' && c.line === 5));
+        } finally { rm(dir); }
+    });
+
+    it('a nested class field initializer never types the outer class field', () => {
+        const dir = tmp({
+            'src/p/Shape.java': 'package p;\n\npublic interface Shape {\n    double area();\n}\n',
+            'src/p/Circle.java': 'package p;\n\npublic class Circle implements Shape {\n    public static Circle make() {\n        return new Circle();\n    }\n    public double area() {\n        return 1;\n    }\n}\n',
+            'src/p/Square.java': 'package p;\n\npublic class Square implements Shape {\n    public double area() {\n        return 2;\n    }\n}\n',
+            'src/p/Outer.java': [
+                'package p;', '',
+                'public class Outer {',
+                '    public static class Builder {',
+                '        private Shape shape = Circle.make();',
+                '    }',
+                '    private final Shape shape;',
+                '    private Shape mutable = Circle.make();',
+                '    Outer(Shape s) {',
+                '        this.shape = s;',
+                '    }',
+                '    double draw() {',
+                '        return shape.area() + mutable.area();',
+                '    }',
+                '}',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(tiers(index, 'area', defAt(index, 'area', 'src/p/Shape.java')).confirmed, ['src/p/Outer.java:13']);
+            for (const file of ['src/p/Circle.java', 'src/p/Square.java']) {
+                const t = tiers(index, 'area', defAt(index, 'area', file));
+                assert.deepStrictEqual(t.confirmed, [], file);
+                assert.deepStrictEqual(t.excluded, [], file);
+                assert.ok(t.unverified.includes('src/p/Outer.java:13'), file);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('super.m() is a caller of the superclass method, not of the override', () => {
+        const dir = tmp({
+            'src/p/Node.java': 'package p;\n\npublic class Node {\n    public String label() {\n        return "n";\n    }\n}\n',
+            'src/p/Leaf.java': 'package p;\n\npublic class Leaf extends Node {\n    @Override\n    public String label() {\n        return "leaf:" + super.label();\n    }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(tiers(index, 'label', defAt(index, 'label', 'src/p/Node.java')).confirmed, ['src/p/Leaf.java:6']);
+            const leaf = tiers(index, 'label', defAt(index, 'label', 'src/p/Leaf.java', 4));
+            assert.deepStrictEqual(leaf.confirmed, []);
+            assert.deepStrictEqual(leaf.unverified, []);
+        } finally { rm(dir); }
+    });
+
+    it('super.m() into an external superclass member is never a project caller', () => {
+        const dir = tmp({
+            'src/p/Sub.java': 'package p;\n\npublic class Sub {\n    @Override\n    public String toString() {\n        return super.toString() + "!";\n    }\n}\n',
+            'src/p/Other.java': 'package p;\n\npublic class Other {\n    @Override\n    public String toString() {\n        return "o";\n    }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const other = tiers(index, 'toString', defAt(index, 'toString', 'src/p/Other.java', 5));
+            assert.deepStrictEqual(other.unverified, []);
+            assert.deepStrictEqual(other.excluded, ['src/p/Sub.java:6:other-definition']);
+        } finally { rm(dir); }
+    });
+
+    it('super.m() in an anonymous class body binds the anonymous base type member', () => {
+        const dir = tmp({
+            'src/p/Sb.java': 'package p;\n\npublic class Sb {\n    public Sb append(String s) {\n        return this;\n    }\n}\n',
+            'src/p/UseSb.java': [
+                'package p;', '',
+                'public class UseSb {',
+                '    Sb make() {',
+                '        return new Sb() {',
+                '            @Override',
+                '            public Sb append(String s) {',
+                '                return super.append(s);',
+                '            }',
+                '        };',
+                '    }',
+                '}',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(tiers(index, 'append', defAt(index, 'append', 'src/p/Sb.java')).confirmed, ['src/p/UseSb.java:8']);
+        } finally { rm(dir); }
+    });
+
+    it('a declared JDK-typed argument never binds a project-typed parameter', () => {
+        const dir = tmp({
+            'src/p/Opts.java': 'package p;\n\npublic class Opts {\n}\n',
+            'src/p/Fmt.java': [
+                'package p;', '',
+                'import java.util.List;', '',
+                'public class Fmt {',
+                '    public void print(Iterable<String> items) {',
+                '    }',
+                '    public void print(Opts opts) {',
+                '    }',
+                '}',
+            ].join('\n') + '\n',
+            'src/p/Use.java': [
+                'package p;', '',
+                'import java.util.ArrayList;',
+                'import java.util.List;', '',
+                'public class Use {',
+                '    void run(Fmt f) {',
+                '        final List<String> items = new ArrayList<>();',
+                '        f.print(items);',
+                '    }',
+                '}',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(tiers(index, 'print', defAt(index, 'print', 'src/p/Fmt.java', 6)).confirmed, ['src/p/Use.java:9']);
+            const opts = tiers(index, 'print', defAt(index, 'print', 'src/p/Fmt.java', 8));
+            assert.deepStrictEqual(opts.unverified, []);
+            assert.deepStrictEqual(opts.confirmed, []);
+        } finally { rm(dir); }
+    });
+
+    it('the declared type of a local is its static receiver type', () => {
+        const dir = tmp({
+            'src/p/Shape.java': 'package p;\n\npublic interface Shape {\n    double area();\n}\n',
+            'src/p/Circle.java': 'package p;\n\npublic class Circle implements Shape {\n    public double area() {\n        return 1;\n    }\n}\n',
+            'src/p/Square.java': 'package p;\n\npublic class Square implements Shape {\n    public double area() {\n        return 2;\n    }\n}\n',
+            'src/p/Main.java': [
+                'package p;', '',
+                'public class Main {',
+                '    void go() {',
+                '        Shape s = new Circle();',
+                '        s.area();',
+                '        var c = new Circle();',
+                '        c.area();',
+                '        Shape t = new Circle();',
+                '        t = new Square();',
+                '        t.area();',
+                '    }',
+                '}',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            // The declared type binds Shape.area; a local never reassigned
+            // runs Circle.area and never Square.area; a reassigned one may
+            // run either.
+            assert.deepStrictEqual(tiers(index, 'area', defAt(index, 'area', 'src/p/Shape.java')).confirmed,
+                ['src/p/Main.java:11', 'src/p/Main.java:6']);
+            const circle = tiers(index, 'area', defAt(index, 'area', 'src/p/Circle.java'));
+            assert.deepStrictEqual(circle.confirmed, ['src/p/Main.java:6', 'src/p/Main.java:8']);
+            assert.deepStrictEqual(circle.unverified, ['src/p/Main.java:11']);
+            const square = tiers(index, 'area', defAt(index, 'area', 'src/p/Square.java'));
+            assert.deepStrictEqual(square.excluded,
+                ['src/p/Main.java:6:receiver-type-mismatch', 'src/p/Main.java:8:receiver-type-mismatch']);
+            assert.deepStrictEqual(square.unverified, ['src/p/Main.java:11']);
+            // The callee side runs the same member.
+            const callees = index.findCallees(defAt(index, 'go', 'src/p/Main.java'), { collectAccount: true });
+            assert.ok(callees.some(c => c.name === 'area' && c.className === 'Circle' && c.tier === 'confirmed'));
+            assert.ok(!callees.some(c => c.name === 'area' && c.className === 'Square' && c.tier === 'confirmed'));
+        } finally { rm(dir); }
+    });
+
+    it('argument kinds keep array dimensions in overload choice', () => {
+        const dir = tmp({
+            'src/p/U.java': [
+                'package p;', '',
+                'public class U {',
+                '    static String F[] = null;',
+                '    static boolean isEmpty(Object[] a) { return a == null; }',
+                '    static boolean isEmpty(String s) { return s == null; }',
+                '    void t(String s, String[] arr, String c[]) {',
+                '        isEmpty(s);',
+                '        isEmpty(arr);',
+                '        isEmpty(new String[3]);',
+                '        isEmpty("lit");',
+                '        isEmpty((Object[]) null);',
+                '        isEmpty(c);',
+                '        isEmpty(F);',
+                '        isEmpty(arr[0]);',
+                '    }',
+                '}',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(tiers(index, 'isEmpty', defAt(index, 'isEmpty', 'src/p/U.java', 5)).confirmed,
+                ['src/p/U.java:10', 'src/p/U.java:12', 'src/p/U.java:13', 'src/p/U.java:14', 'src/p/U.java:9']);
+            assert.deepStrictEqual(tiers(index, 'isEmpty', defAt(index, 'isEmpty', 'src/p/U.java', 6)).confirmed,
+                ['src/p/U.java:11', 'src/p/U.java:15', 'src/p/U.java:8']);
+        } finally { rm(dir); }
+    });
+});
+
+// fix #395: `this::m` / `super::m` name a member of the enclosing class
+// definition or its ancestry, decided like a `this.m()` call.
+describe('fix #395: Java method references through this and super', () => {
+    const lineSet = (items) => [...new Set(items.map(c => `${c.relativePath}:${c.line}`))].sort();
+    const tiers = (index, name, def) => {
+        const r = index.findCallers(name, { includeMethods: true, targetDefinitions: [def], collectAccount: true });
+        return {
+            confirmed: lineSet(r.filter(c => c.tier !== 'unverified')),
+            unverified: lineSet([...r.filter(c => c.tier === 'unverified'), ...(r.unverifiedEntries || [])]),
+            excluded: r.accountRaw.excludedEntries.map(e => `${path.relative(index.root, e.file)}:${e.line}`).sort(),
+        };
+    };
+
+    it('this::build binds the enclosing class member; another class with its own build is not a caller', () => {
+        const dir = tmp({
+            'p/Host.java': 'package p;\nimport java.util.function.Function;\npublic class Host {\n' +
+                '    String build(int k) { return "" + k; }\n    void run() {\n        Function<Integer, String> f = this::build;\n    }\n}\n',
+            'p/Sub.java': 'package p;\nimport java.util.function.Function;\npublic class Sub extends Host {\n' +
+                '    void go() {\n        Function<Integer, String> f = this::build;\n        Function<Integer, String> g = super::build;\n    }\n}\n',
+            'p/Other.java': 'package p;\nimport java.util.function.Function;\npublic class Other {\n' +
+                '    String build(int k) { return ""; }\n    void go() {\n        Function<Integer, String> f = this::build;\n    }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const host = index.symbols.get('build').find(d => d.className === 'Host');
+            const t = tiers(index, 'build', host);
+            assert.deepStrictEqual(t.confirmed, ['p/Host.java:6', 'p/Sub.java:5', 'p/Sub.java:6']);
+            assert.ok(t.excluded.includes('p/Other.java:6'));
+            const r = execute(index, 'plan', { name: 'build', file: 'p/Host.java', line: 4, renameTo: 'make' });
+            assert.ok(r.ok, r.error);
+            const edited = r.result.changes.filter(c => c.newExpression !== undefined).map(c => `${c.file}:${c.line}`).sort();
+            assert.deepStrictEqual(edited, ['p/Host.java:4', 'p/Host.java:6', 'p/Sub.java:5', 'p/Sub.java:6']);
         } finally { rm(dir); }
     });
 });

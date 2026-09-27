@@ -295,6 +295,19 @@ function indexSnapshot(index) {
             importAliases: (fe.importAliases || []).map(a => `${a.original} ${a.local}`).sort(),
             exportDetails: (fe.exportDetails || []).map(e => JSON.stringify(e)).sort(),
             moduleAssignedNames: [...(fe.moduleAssignedNames || [])].sort(),
+            // Module-level value aliases (fix #389) come from the worker parse too.
+            moduleValueAliases: (fe.moduleValueAliases || []).map(alias => JSON.stringify(alias)),
+            // Reflection inventory (fix #363) is extracted in the worker too.
+            reflectionSites: (fe.reflectionSites || []).map(site => JSON.stringify(site)),
+            // C# compiler-feature facts (fix #380) come from the worker parse too.
+            languageFeatures: [...(fe.languageFeatures || [])],
+            conditionalViews: fe.conditionalViews || null,
+            // C/C++ recovery facts (fix #387, #396) come from the worker parse too.
+            recoveryBlanks: fe.recoveryBlanks || null,
+            parseErrorRegions: fe.parseErrorRegions || null,
+            recoveryCandidates: fe.recoveryCandidates || null,
+            externalMacroNames: fe.externalMacroNames || null,
+            externalMacroKey: fe.externalMacroKey || null,
             bindings: (fe.bindings || []).map(binding => JSON.stringify(Object.fromEntries(
                 Object.entries(binding).sort(([a], [b]) => a.localeCompare(b))))).sort(),
             parseRecovery: !!fe.parseRecovery,
@@ -307,7 +320,43 @@ function indexSnapshot(index) {
     return JSON.stringify({ symbols, files, calls });
 }
 
+/**
+ * Apply a rename plan's concrete edits the way an agent would (fix #386):
+ * each change's `expression` is replaced by its `newExpression` on its
+ * line, and `fileRenames` move files. Changes without a newExpression are
+ * review items and are not applied. Returns the resulting file contents by
+ * relative path plus the list of review changes.
+ */
+function applyRenamePlan(dir, plan) {
+    const byFile = new Map();
+    for (const change of plan.changes || []) {
+        if (!byFile.has(change.file)) byFile.set(change.file, []);
+        byFile.get(change.file).push(change);
+    }
+    const contents = {};
+    for (const [file, changes] of byFile) {
+        const lines = fs.readFileSync(path.join(dir, file), 'utf-8').split('\n');
+        for (const change of changes) {
+            if (change.newExpression === undefined) continue;
+            const line = lines[change.line - 1];
+            const at = line.indexOf(change.expression.trim());
+            if (at < 0) throw new Error(`expression not on ${file}:${change.line}: ${change.expression}`);
+            lines[change.line - 1] = line.slice(0, at) + change.newExpression.trim() +
+                line.slice(at + change.expression.trim().length);
+        }
+        contents[file] = lines.join('\n');
+    }
+    for (const rename of plan.fileRenames || []) {
+        contents[rename.to] = contents[rename.from] ?? fs.readFileSync(path.join(dir, rename.from), 'utf-8');
+        contents[rename.from] = null;
+    }
+    const reviews = (plan.changes || []).filter(change => change.needsReview)
+        .map(change => `${change.file}:${change.line}`);
+    return { contents, reviews };
+}
+
 module.exports = {
+    applyRenamePlan,
     PROJECT_DIR,
     FIXTURES_PATH,
     CLI_PATH,

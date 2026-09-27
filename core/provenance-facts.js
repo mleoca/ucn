@@ -6,6 +6,7 @@ const { NON_CALLABLE_TYPES } = require('./shared');
 const { declarationIdentity, identityKey, propertyReadMember } = require('./provenance');
 const { captureOverload, overloadMemberGroup } = require('./provenance-overload');
 const { splitParentList } = require('./graph-build');
+const { distinctOwnerDefinitions } = require('./class-identity');
 
 const TYPE_KINDS = new Set(['class', 'struct', 'interface', 'trait', 'record', 'enum', 'type', 'impl']);
 const ownerName = definition => definition.className || (definition.receiver || '').replace(/^\*/, '');
@@ -22,6 +23,72 @@ function occurrenceIdentity(file, call, siteId) {
         ...(Number.isInteger(end) && { end }),
         ...(siteId !== undefined && { siteId }),
     };
+}
+
+/**
+ * Callable same-name definitions owned by a type, in symbol-table order.
+ * Within an operation the name's definitions are grouped once (fix #382):
+ * an exact HOT ranking resolves every site of a name once per same-name
+ * definition, and a filter over thousands of definitions per site made the
+ * ranking quadratic.
+ */
+function callableMembersOwnedBy(index, name, owner) {
+    const definitions = index.symbols.get(name) || [];
+    const memo = index._opMemo?.('callableMembersByOwner', () => new WeakMap());
+    if (!memo) {
+        return definitions.filter(d => !NON_CALLABLE_TYPES.has(d.type) && ownerName(d) === owner);
+    }
+    let byOwner = memo.get(definitions);
+    if (!byOwner) {
+        byOwner = new Map();
+        for (const d of definitions) {
+            if (NON_CALLABLE_TYPES.has(d.type)) continue;
+            const key = ownerName(d);
+            let list = byOwner.get(key);
+            if (!list) {
+                list = [];
+                byOwner.set(key, list);
+            }
+            list.push(d);
+        }
+        memo.set(definitions, byOwner);
+    }
+    return byOwner.get(owner) || [];
+}
+
+/** Same-name definitions declared in one file, in symbol-table order. */
+function definitionsInFile(index, name, file) {
+    const definitions = index.symbols.get(name) || [];
+    const memo = index._opMemo?.('definitionsByFile', () => new WeakMap());
+    if (!memo) return definitions.filter(d => d.file === file);
+    let byFile = memo.get(definitions);
+    if (!byFile) {
+        byFile = new Map();
+        for (const d of definitions) {
+            let list = byFile.get(d.file);
+            if (!list) {
+                list = [];
+                byFile.set(d.file, list);
+            }
+            list.push(d);
+        }
+        memo.set(definitions, byFile);
+    }
+    return byFile.get(file) || [];
+}
+
+/** The first same-name definition in a file starting at `line`, if any. */
+function definitionAt(index, name, file, line) {
+    const inFile = definitionsInFile(index, name, file);
+    const memo = index._opMemo?.('definitionsByLine', () => new WeakMap());
+    if (!memo || inFile.length < 8) return inFile.find(d => d.startLine === line);
+    let byLine = memo.get(inFile);
+    if (!byLine) {
+        byLine = new Map();
+        for (const d of inFile) if (!byLine.has(d.startLine)) byLine.set(d.startLine, d);
+        memo.set(inFile, byLine);
+    }
+    return byLine.get(line);
 }
 
 /** Follow paired AST import/export names; an arbitrary file import is no hop. */
@@ -45,7 +112,7 @@ function namedDeclaration(index, file, name, accepts, line, seen = new Set()) {
             }, ...result.chain] };
         }
     }
-    let local = (index.symbols.get(name) || []).filter(d => d.file === file && accepts(d));
+    let local = definitionsInFile(index, name, file).filter(d => accepts(d));
     if (line != null) {
         local = local.filter(d => !d.lexicalScopeStartLine ||
             (line >= d.lexicalScopeStartLine && line <= d.lexicalScopeEndLine));
@@ -101,6 +168,23 @@ function namedDeclaration(index, file, name, accepts, line, seen = new Set()) {
     return distinct.size === 1 ? distinct.values().next().value : null;
 }
 
+// Distinct owners of a member name. Depends only on the symbol table, so
+// one operation (a findCallers pass visits every call site of the name)
+// computes it once per name; the memo dies with the operation's content cache.
+const ownerCountMemo = new WeakMap(); // op content cache -> Map<name, count>
+function ownerCountOf(index, name) {
+    const scope = index._opContentCache;
+    let memo = scope ? ownerCountMemo.get(scope) : null;
+    if (scope && !memo) { memo = new Map(); ownerCountMemo.set(scope, memo); }
+    const cached = memo?.get(name);
+    if (cached !== undefined) return cached;
+    const count = new Set((index.symbols.get(name) || [])
+        .filter(d => !NON_CALLABLE_TYPES.has(d.type) && ownerName(d))
+        .map(d => `${d.file}\0${ownerName(d)}\0${d.namespace || ''}`)).size;
+    memo?.set(name, count);
+    return count;
+}
+
 /** Collect independent facts; a failed lookup never manufactures a negative. */
 function confirmationFacts(index, file, call, targets, options = {}) {
     const entry = index.files.get(file);
@@ -114,9 +198,7 @@ function confirmationFacts(index, file, call, targets, options = {}) {
         receiverTypeSource: options.receiverTypeSource || call.receiverTypeSource || 'unknown',
         receiverOrigin: options.receiverOrigin || call.receiverTypeEvidence || null,
         ...(call.isFunctionReference && { valueReference: true }),
-        ownerCount: new Set((index.symbols.get(call.name) || [])
-            .filter(d => !NON_CALLABLE_TYPES.has(d.type) && ownerName(d))
-            .map(d => `${d.file}\0${ownerName(d)}\0${d.namespace || ''}`)).size,
+        ownerCount: ownerCountOf(index, call.name),
         ...((options.originFile || call.receiverTypeFlowFile) && {
             receiverTypeFlowFile: path.relative(index.root, options.originFile || call.receiverTypeFlowFile),
         }),
@@ -141,13 +223,13 @@ function confirmationFacts(index, file, call, targets, options = {}) {
     }
     let type = facts.receiverType;
     if (options.sameClass) {
-        const enclosing = index.findEnclosingFunction(file, call.line, true);
+        const enclosing = index.findEnclosingFunction(file, call.line, true, call);
         type = enclosing?.className || enclosing?.receiver?.replace(/^\*/, '');
         facts.receiverTypeSource = 'same-class';
         facts.receiverOrigin = { source: 'same-class', declaration: declarationIdentity(enclosing) };
     }
     if (language === 'csharp' && call.receiverCastThis) {
-        const enclosing = index.findEnclosingFunction(file, call.line, true);
+        const enclosing = index.findEnclosingFunction(file, call.line, true, call);
         if (enclosing?.className) {
             facts.receiverCastThis = { enclosing: declarationIdentity(enclosing), interfaceType: type };
             type = enclosing.className;
@@ -188,10 +270,13 @@ function confirmationFacts(index, file, call, targets, options = {}) {
     // already-pinned declaration file may be another crate/module, where
     // replaying `crate::Type` or an import alias would change its meaning.
     const receiverContext = qualifier && facts.receiverTypeSource === 'annotation' ? file : originFile;
-    let resolved = resolveType(type, receiverContext, receiverContext === file ? call.line : undefined, qualifier);
+    // A type name resolves where it was written: a field typed by
+    // `self.x = Local()` names the class visible at that write (fix #381).
+    const typeLine = Number.isInteger(options.receiverTypeLine) ? options.receiverTypeLine : call.line;
+    let resolved = resolveType(type, receiverContext, receiverContext === file ? typeLine : undefined, qualifier);
     if (resolved && receiverContext !== originFile && resolved.declaration.file !== originFile) resolved = null;
     if (!resolved && language === 'rust') {
-        const enclosing = index.findEnclosingFunction(file, call.line, true);
+        const enclosing = index.findEnclosingFunction(file, call.line, true, call);
         const bounds = enclosing?.genericBounds?.[type];
         const boundTypes = (bounds || []).map(bound => resolveType(bound, file, call.line))
             .filter(bound => bound?.declaration.type === 'trait' &&
@@ -224,8 +309,11 @@ function confirmationFacts(index, file, call, targets, options = {}) {
         const key = identityKey(identity);
         if (visited.has(key) || visited.size >= 16) return null;
         visited.add(key);
-        const members = (index.symbols.get(call.name) || []).filter(d => {
-            if (NON_CALLABLE_TYPES.has(d.type) || ownerName(d) !== owner.name) return false;
+        const ownerDefinition = owner.file && TYPE_KINDS.has(owner.type) ? owner : null;
+        const members = callableMembersOwnedBy(index, call.name, owner.name).filter(d => {
+            // A member of a same-name class declared in another scope of
+            // the file is not this owner's member (fix #389).
+            if (ownerDefinition && distinctOwnerDefinitions(index, d, ownerDefinition, true)) return false;
             if (language === 'csharp' && d.explicitInterface &&
                 (!facts.receiverCastThis || d.explicitInterface !== facts.receiverCastThis.interfaceType)) return false;
             if ((d.namespace || null) !== (owner.namespace || null)) return false;
@@ -269,12 +357,47 @@ function confirmationFacts(index, file, call, targets, options = {}) {
             receiver: declarationIdentity(resolved.declaration),
             steps: [...steps, step], selected: declarationIdentity(members[0]),
         };
+        // Configuration alternatives of one member (fix #385: `#ifdef _WIN32
+        // bool f() ... #else bool f() ... #endif` in one class body) are the
+        // member in each build configuration: the lookup selects the item.
+        if (members.length > 1) {
+            const { _isConfigurationAlternative } = require('./callers');
+            if (members.slice(1).every(member => _isConfigurationAlternative(index, members[0], member))) {
+                return {
+                    receiver: declarationIdentity(resolved.declaration),
+                    steps: [...steps, step], selected: declarationIdentity(members[0]),
+                    configurationItem: members.map(declarationIdentity),
+                };
+            }
+        }
         if (members.length > 1 && options.selectOverload) {
-            const overload = captureOverload(index, call, members, language, options.selectOverload);
+            // The choice is made on the index itself first (its memos stay
+            // on); only a selected member needs the replayable witness.
+            let choice;
+            try {
+                choice = options.selectOverload(index, call, members, language);
+            } catch {
+                choice = null;
+            }
+            const overload = choice?.match
+                ? captureOverload(index, call, members, language, options.selectOverload) : null;
             if (overload?.selected) return {
                 receiver: declarationIdentity(resolved.declaration),
                 steps: [...steps, { ...step, overload }], selected: overload.selected,
             };
+            // Every member the lookup found is known but the arguments cannot
+            // choose one (fix #396). Name lookup stops at the declaring class,
+            // so the callee is one of its members of that name: the witness
+            // (`memberSet`) proves that a target outside them is not the
+            // callee without replaying the overload choice. The hops before
+            // the declaring class declare no member of the name.
+            if (!choice?.match && choice?.ambiguous === true && steps.every(prior => prior.members.length === 0)) {
+                return {
+                    receiver: declarationIdentity(resolved.declaration),
+                    steps: [...steps, step],
+                    selected: declarationIdentity(members[0]), memberSet: true,
+                };
+            }
         }
         if (members.length || parents.length !== 1) return null;
         return walk(parents[0], [...steps, step]);
@@ -284,4 +407,4 @@ function confirmationFacts(index, file, call, targets, options = {}) {
     return facts;
 }
 
-module.exports = { confirmationFacts, namedDeclaration, occurrenceIdentity };
+module.exports = { confirmationFacts, namedDeclaration, occurrenceIdentity, definitionsInFile, definitionAt };

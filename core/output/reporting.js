@@ -167,6 +167,11 @@ function formatStats(stats, options = {}) {
             ? `${total} raw candidates`
             : `${total} called`;
         lines.push(`\nHottest functions (top ${items.length} of ${population}):`);
+        if (stats.hot.budgetExhausted) {
+            lines.push(`  Refinement budget reached after ${stats.hot.refined} of ${total} candidates ` +
+                `(${stats.hot.work ?? stats.hot.refined} ${stats.hot.work !== undefined ? 'call records' : 'refinements'}): ` +
+                'ranking approximate, counts exact; narrow with --in=<dir> for an exact list.');
+        }
         if (items.length === 0) {
             lines.push('  (no inbound calls detected)');
         } else {
@@ -298,8 +303,28 @@ function formatDeadcode(results, options = {}) {
     if (results.reflection?.literalCount > 0) {
         lines.push(`\n${results.reflection.literalCount} literal reflection use(s) name ${results.reflection.names.length} member spelling(s); matching symbols were withheld from deletion candidates.`);
     }
+    if (results.reflection?.withheld > 0) {
+        const byPattern = results.reflection.withheldByPattern || [];
+        const sample = byPattern.slice(0, 5).map(w => `\`${w.pattern}\`${w.namespaceOf ? ` in the module namespace of ${w.namespaceOf}` : ''} (${w.count})`).join(', ');
+        lines.push(`\n${results.reflection.withheld} candidate(s) withheld by reflection pattern: ${sample}${byPattern.length > 5 ? ', ...' : ''}. A reflective access builds these member names at runtime.`);
+    }
     if (results.reflection?.dynamicCount > 0) {
         lines.push(`\nWARNING: ${results.reflection.dynamicCount} dynamic reflection use(s) have no static member spelling. Dead-code results remain review candidates because runtime-selected members cannot be attributed.`);
+    }
+    if (results.macroPaste) {
+        const m = results.macroPaste;
+        if (m.withheld > 0) {
+            const sample = m.withheldNames.slice(0, 3)
+                .map(w => `${w.name} (${w.macro} at ${w.file}:${w.line})`).join(', ');
+            lines.push(`\n${m.withheld} candidate(s) withheld: a token-pasting macro whose expansions are not all visible could produce the name - ${sample}${m.withheld > 3 ? ', ...' : ''}.`);
+        }
+        if (m.blind?.count > 0) {
+            lines.push(`\nWARNING: ${m.blind.count} token-pasting macro dispatch invocation(s) in ${m.blind.fileCount} file(s) could not be expanded; names they produce are unattributed (${m.blind.files.slice(0, 3).join(', ')}).`);
+        }
+    }
+    if (results.macroRulesBlind?.count > 0) {
+        const b = results.macroRulesBlind;
+        lines.push(`\nWARNING: ${b.count} macro_rules! invocation(s) in ${b.fileCount} file(s) could not be expanded; calls and definitions they generate are unattributed (${b.files.slice(0, 3).join(', ')}).`);
     }
     if (results.coverage?.complete === false) {
         const c = results.coverage;
@@ -345,6 +370,8 @@ function formatDeadcodeJson(results) {
             ...(results.excludedDynamicDispatch > 0 && { excludedDynamicDispatch: results.excludedDynamicDispatch }),
             ...(results.computedDispatch?.count > 0 && { computedDispatch: results.computedDispatch }),
             ...(results.reflection?.count > 0 && { reflection: results.reflection }),
+            ...(results.macroPaste && { macroPaste: results.macroPaste }),
+            ...(results.macroRulesBlind && { macroRulesBlind: results.macroRulesBlind }),
             ...(results.coverage?.complete === false && { coverage: results.coverage }),
             symbols: results.map(item => {
                 const handleSym = { ...item, relativePath: item.relativePath || item.file };
@@ -490,9 +517,10 @@ function formatOrient(result, options = {}) {
         const population = result.hot.totalKind === 'raw-call-candidates'
             ? `${result.hot.total} raw candidates`
             : result.hot.total;
-        const budgetNote = result.hot.budgetExhausted
-            ? `; refinement budget ${result.hot.maxRefine} reached — ranking approximate, exact list: ucn repo --sections=stats --hot`
-            : '';
+        const budgetNote = !result.hot.budgetExhausted ? ''
+            : result.hot.maxRefine !== undefined
+                ? `; refinement budget ${result.hot.maxRefine} reached — ranking approximate, exact list: ucn repo --sections=stats --hot`
+                : `; refinement budget reached after ${result.hot.refined} of ${result.hot.total} candidates (${result.hot.work} call records) — ranking approximate, narrow with --in=<dir> for an exact list`;
         lines.push(`HOT (most-called ${scope}, top ${result.hot.items.length} of ${population}${budgetNote}):`);
         for (const h of result.hot.items) {
             const label = h.className ? `${h.className}.${h.name}` : h.name;

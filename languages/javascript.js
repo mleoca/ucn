@@ -6,6 +6,7 @@
  */
 
 const { ReceiverTypeMap, typeOrigin } = require('./type-evidence');
+const { referenceScope, scopeFields } = require('./lexical-scope');
 
 
 const {
@@ -19,6 +20,7 @@ const {
     buildTypeAnnotations,
     visitNameNodes,
     sameNode,
+    parseErrorRegions,
 } = require('./utils');
 const { PARSE_OPTIONS, safeParse } = require('./index');
 
@@ -103,6 +105,287 @@ function getAssignmentName(leftNode) {
     return null;
 }
 
+// Names of the global object itself: a property assigned on one of them
+// (unshadowed) is a global binding that bare names resolve to.
+const JS_GLOBAL_OBJECT_NAMES = new Set(['globalThis', 'window', 'self', 'global']);
+
+const FUNCTION_NODE_TYPES = new Set([
+    'function_declaration', 'function_expression', 'function', 'arrow_function',
+    'method_definition', 'generator_function', 'generator_function_declaration',
+]);
+
+function unwrapValueExpression(node) {
+    while (node && (node.type === 'parenthesized_expression' || node.type === 'as_expression' ||
+        node.type === 'non_null_expression' || node.type === 'satisfies_expression' ||
+        node.type === 'type_assertion')) {
+        node = node.type === 'type_assertion'
+            ? node.namedChild(node.namedChildCount - 1) : node.namedChild(0);
+    }
+    return node;
+}
+
+/** Names a binding pattern declares (identifiers, shorthand, rest, defaults' targets). */
+function collectPatternNames(pattern, out) {
+    if (!pattern) return;
+    if (pattern.type === 'required_parameter' || pattern.type === 'optional_parameter') {
+        collectPatternNames(pattern.childForFieldName('pattern') || pattern.childForFieldName('name'), out);
+        return;
+    }
+    if (pattern.type === 'identifier' || pattern.type === 'shorthand_property_identifier_pattern') {
+        out.push(pattern.text);
+        return;
+    }
+    if (pattern.type === 'pair_pattern' || pattern.type === 'pair') {
+        collectPatternNames(pattern.childForFieldName('value'), out);
+        return;
+    }
+    if (pattern.type === 'assignment_pattern') {
+        collectPatternNames(pattern.childForFieldName('left') || pattern.childForFieldName('pattern'), out);
+        return;
+    }
+    if (pattern.type === 'type_annotation') return;
+    for (let i = 0; i < pattern.namedChildCount; i++) collectPatternNames(pattern.namedChild(i), out);
+}
+
+// Module-level alias: findCallsInCode declares its own one-argument
+// collectPatternNames for module value bindings.
+const collectBoundPatternNames = collectPatternNames;
+
+// Function kinds whose parameters bind in their own range (fix #397).
+const JS_SHADOW_FUNCTIONS = new Set(['arrow_function', 'function_expression', 'function_declaration',
+    'function', 'method_definition', 'generator_function', 'generator_function_declaration']);
+
+/** A declarator value that is a require()/import() (through await, parens, `.member`). */
+function isImportInitializerNode(value) {
+    let v = value;
+    for (;;) {
+        if (!v) return false;
+        if (v.type === 'await_expression' || v.type === 'parenthesized_expression') {
+            v = v.namedChild(0);
+            continue;
+        }
+        if (v.type === 'member_expression' || v.type === 'subscript_expression') {
+            v = v.childForFieldName('object');
+            continue;
+        }
+        break;
+    }
+    if (v.type !== 'call_expression') return false;
+    const fn = v.childForFieldName('function');
+    return !!fn && (fn.type === 'import' || (fn.type === 'identifier' && fn.text === 'require'));
+}
+
+/** Record the bindings one statement introduces into `table` (first wins). */
+function collectStatementBindings(stmt, table) {
+    const add = (name, binding) => { if (name && !table.has(name)) table.set(name, binding); };
+    if (stmt.type === 'export_statement') {
+        const declaration = stmt.childForFieldName('declaration');
+        if (declaration) collectStatementBindings(declaration, table);
+        return;
+    }
+    if (stmt.type === 'lexical_declaration' || stmt.type === 'variable_declaration') {
+        for (let i = 0; i < stmt.namedChildCount; i++) {
+            const declarator = stmt.namedChild(i);
+            if (declarator.type !== 'variable_declarator') continue;
+            const target = declarator.childForFieldName('name');
+            const start = stmt.startIndex;
+            const line = stmt.startPosition.row + 1;
+            if (target?.type === 'identifier') {
+                add(target.text, { kind: 'declarator', value: declarator.childForFieldName('value'), declarator,
+                    start, line });
+            } else {
+                const names = [];
+                collectPatternNames(target, names);
+                for (const name of names) add(name, { kind: 'pattern', declarator, start, line });
+            }
+        }
+        return;
+    }
+    if (stmt.type === 'function_declaration' || stmt.type === 'generator_function_declaration' ||
+        stmt.type === 'class_declaration') {
+        add(stmt.childForFieldName('name')?.text,
+            { kind: stmt.type === 'class_declaration' ? 'class' : 'function', line: stmt.startPosition.row + 1 });
+        return;
+    }
+    if (stmt.type === 'import_statement') {
+        for (const clause of stmt.namedChildren) {
+            if (clause.type !== 'import_clause') continue;
+            for (const part of clause.namedChildren) {
+                if (part.type === 'identifier') add(part.text, { kind: 'import' });
+                else if (part.type === 'namespace_import') {
+                    for (const child of part.namedChildren) {
+                        if (child.type === 'identifier') add(child.text, { kind: 'import' });
+                    }
+                } else if (part.type === 'named_imports') {
+                    for (const spec of part.namedChildren) {
+                        const local = spec.childForFieldName('alias') || spec.childForFieldName('name');
+                        if (local) add(local.text, { kind: 'import' });
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Statement-list binding tables per tree, by node id: one scan per list
+// however many member assignments look names up in it.
+const statementListTables = new WeakMap();
+
+function statementListBindings(listNode) {
+    let byId = statementListTables.get(listNode.tree);
+    if (!byId) {
+        byId = new Map();
+        statementListTables.set(listNode.tree, byId);
+    }
+    let table = byId.get(listNode.id);
+    if (!table) {
+        table = new Map();
+        for (let i = 0; i < listNode.namedChildCount; i++) {
+            collectStatementBindings(listNode.namedChild(i), table);
+        }
+        byId.set(listNode.id, table);
+    }
+    return table;
+}
+
+/**
+ * The declaration of `name` visible at `refNode`: statement-list bindings
+ * (hoisted declarations anywhere in the list), loop and catch bindings,
+ * parameters and a function expression's own name; null when free.
+ */
+function declarationVisibleAt(refNode, name) {
+    for (let p = refNode.parent; p; p = p.parent) {
+        if (p.type === 'statement_block' || p.type === 'program' || p.type === 'class_static_block') {
+            const binding = statementListBindings(p).get(name);
+            if (binding) return binding;
+        } else if (p.type === 'for_statement' || p.type === 'for_in_statement') {
+            const head = p.childForFieldName('initializer') || p.childForFieldName('left');
+            if (head) {
+                const names = [];
+                if (head.type === 'lexical_declaration' || head.type === 'variable_declaration') {
+                    const table = new Map();
+                    collectStatementBindings(head, table);
+                    if (table.has(name)) return { kind: 'loop' };
+                } else {
+                    collectPatternNames(head, names);
+                    if (names.includes(name)) return { kind: 'loop' };
+                }
+            }
+        } else if (p.type === 'catch_clause') {
+            const names = [];
+            collectPatternNames(p.childForFieldName('parameter'), names);
+            if (names.includes(name)) return { kind: 'param' };
+        } else if (FUNCTION_NODE_TYPES.has(p.type)) {
+            const params = p.childForFieldName('parameters') || p.childForFieldName('parameter');
+            if (params) {
+                const names = [];
+                collectPatternNames(params, names);
+                if (names.includes(name)) return { kind: 'param' };
+            }
+            if ((p.type === 'function_expression' || p.type === 'function' ||
+                p.type === 'generator_function') && p.childForFieldName('name')?.text === name) {
+                return { kind: 'function' };
+            }
+        } else if (p.type === 'class' && p.childForFieldName('name')?.text === name) {
+            return { kind: 'class' };
+        }
+    }
+    return null;
+}
+
+/** A value that is a fresh or module object, never the global object. */
+function provablyNonGlobalValue(valueNode) {
+    let value = unwrapValueExpression(valueNode);
+    while (value?.type === 'assignment_expression') {
+        value = unwrapValueExpression(value.childForFieldName('right'));
+    }
+    if (!value) return false;
+    if (['new_expression', 'object', 'array', 'class', 'function_expression', 'function',
+        'arrow_function', 'generator_function'].includes(value.type)) return true;
+    const callee = value.type === 'call_expression' ? value.childForFieldName('function') : null;
+    return callee?.type === 'identifier' && callee.text === 'require';
+}
+
+/**
+ * Whether `this` at a node is an object other than the global object: a
+ * class member body, or a function installed as a method (object literal
+ * value, member assignment). A plain function's `this` can be the global
+ * object (a sloppy-mode plain call), as can module-level `this` in a script.
+ */
+function thisIsNonGlobalObject(thisNode) {
+    for (let p = thisNode.parent; p; p = p.parent) {
+        if (p.type === 'arrow_function') continue;
+        if (p.type === 'method_definition' || p.type === 'class_body' ||
+            p.type === 'class_static_block') return true;
+        if (p.type === 'function_expression' || p.type === 'function' ||
+            p.type === 'generator_function') {
+            const holder = p.parent;
+            if (holder?.type === 'pair' && sameNode(holder.childForFieldName('value'), p)) return true;
+            return holder?.type === 'assignment_expression' &&
+                sameNode(holder.childForFieldName('right'), p) &&
+                holder.childForFieldName('left')?.type === 'member_expression';
+        }
+        if (p.type === 'function_declaration' || p.type === 'generator_function_declaration' ||
+            p.type === 'program') return false;
+    }
+    return false;
+}
+
+/**
+ * What the object of a member assignment (`obj.f = function () {}`) is for
+ * bare-name lookup: 'global' when it is the global object (the member is a
+ * global binding), 'object' when it is provably another object (the member
+ * creates no name a bare call can reach), null when it may be either (a
+ * parameter, a plain function's `this`, a value UCN does not follow).
+ */
+function classifyAssignedObject(objectNode) {
+    const node = unwrapValueExpression(objectNode);
+    if (!node) return null;
+    if (node.type === 'this') return thisIsNonGlobalObject(node) ? 'object' : null;
+    if (node.type === 'identifier') {
+        const declaration = declarationVisibleAt(node, node.text);
+        if (!declaration) return JS_GLOBAL_OBJECT_NAMES.has(node.text) ? 'global' : 'object';
+        if (declaration.kind === 'function' || declaration.kind === 'class' ||
+            declaration.kind === 'import') return 'object';
+        if (declaration.kind === 'declarator' && provablyNonGlobalValue(declaration.value)) return 'object';
+        // `var global = globalThis` (fix #397, handlebars-measured): a
+        // binding of the global object itself, never assigned again, names
+        // the global object.
+        if (declaration.kind === 'declarator' && declaration.declarator &&
+            globalObjectAlias(declaration.declarator, node.text)) return 'global';
+        return null;
+    }
+    if (node.type === 'member_expression' || node.type === 'subscript_expression') {
+        // A property value is the global object only through a global
+        // alias of the global object itself (`window.self`).
+        const property = node.type === 'member_expression'
+            ? node.childForFieldName('property')?.text : null;
+        if (property && JS_GLOBAL_OBJECT_NAMES.has(property) &&
+            classifyAssignedObject(node.childForFieldName('object')) === 'global') return 'global';
+        return 'object';
+    }
+    return null;
+}
+
+/**
+ * Whether a declarator binds the global object and nothing assigns the name
+ * again in its scope: `var global = globalThis`, `const root = window`.
+ */
+function globalObjectAlias(declarator, name) {
+    const value = unwrapValueExpression(declarator.childForFieldName('value'));
+    if (value?.type !== 'identifier' || !JS_GLOBAL_OBJECT_NAMES.has(value.text) ||
+        declarationVisibleAt(value, value.text)) return false;
+    const statement = declarator.parent;
+    const scope = statement?.parent;
+    if (!scope) return false;
+    if (statement.type === 'lexical_declaration' && statement.child(0)?.type === 'const') return true;
+    for (const assignment of scope.descendantsOfType(['assignment_expression', 'augmented_assignment_expression'])) {
+        const left = assignment.childForFieldName('left');
+        if (left?.type === 'identifier' && left.text === name) return false;
+    }
+    return true;
+}
+
 /** True when a declaration is outside every function/class body. */
 function isModuleScope(node) {
     let current = node && node.parent;
@@ -174,6 +457,16 @@ function appendObjectFunctionMembers(objectNode, functions, lines, extraFields =
         }
         const name = objectPropertyName(nameNode);
         if (!name || !fnNode) continue;
+        // `get name() {}` / `set name(v) {}` in the literal: one property
+        // accessed by reads and writes (fix #397).
+        let accessorKind = null;
+        if (prop.type === 'method_definition') {
+            for (let c = 0; c < prop.childCount; c++) {
+                const token = prop.child(c);
+                if (nameNode && token.startIndex >= nameNode.startIndex) break;
+                if (token.type === 'get' || token.type === 'set') accessorKind = token.type;
+            }
+        }
 
         const paramsNode = fnNode.childForFieldName('parameters');
         const { startLine, endLine, indent } = nodeToLocation(prop, lines);
@@ -196,6 +489,16 @@ function appendObjectFunctionMembers(objectNode, functions, lines, extraFields =
             modifiers,
             memberAssigned: true,
             registryMember: true,
+            // The literal's own line: members of one object literal share it
+            // (fix #397: `this` in a member names that object).
+            objectLiteralLine: objectNode.startPosition.row + 1,
+            ...(accessorKind && { memberType: accessorKind }),
+            // An object literal member is a property of a fresh object: no
+            // bare name reaches it, except a self-named function
+            // expression's own name inside its body (fix #384).
+            assignedObject: 'object',
+            ...(fnNode.type !== 'method_definition' &&
+                fnNode.childForFieldName('name')?.text === name && { selfNamed: true }),
             ...extraFields,
             ...typeAnno,
             ...(generics && { generics }),
@@ -769,8 +1072,16 @@ function _processFunction(node, functions, processedRanges, lines) {
                     if (!isArrow && !isFnExpr && isModuleScope(node)) {
                         const registryObject = unwrapObjectRegistry(valueNode);
                         if (registryObject) {
+                            // The container's declared type (`const h: Handler =
+                            // {...}`) makes each member a structural contract
+                            // member of that type (fix #360: plan rename
+                            // closure over interface slots).
+                            const containerTypeNode = declarator.childForFieldName('type');
+                            const containerType = containerTypeNode
+                                ? containerTypeNode.text.replace(/^:\s*/, '').trim() : null;
                             const added = appendObjectFunctionMembers(registryObject, functions, lines, {
                                 registryContainer: nameNode.text,
+                                ...(containerType && { registryContainerType: containerType }),
                             });
                             if (added > 0) processedRanges.add(rangeKey);
                         }
@@ -875,6 +1186,18 @@ function _processFunction(node, functions, processedRanges, lines) {
                         ...(leftNode.type === 'member_expression' &&
                             leftNode.childForFieldName('object')?.type === 'identifier' &&
                             { assignedReceiver: leftNode.childForFieldName('object').text }),
+                        // Bare-name reachability of the member (fix #384): a
+                        // bare call resolves lexically, then globally, so it
+                        // reaches the member only when the object is the
+                        // global object, or inside a self-named function
+                        // expression's own body (ECMA-262 binds that name
+                        // there).
+                        ...(leftNode.type === 'member_expression' && (() => {
+                            const kind = classifyAssignedObject(leftNode.childForFieldName('object'));
+                            return kind ? { assignedObject: kind } : {};
+                        })()),
+                        ...(leftNode.type === 'member_expression' && expressionName === name &&
+                            { selfNamed: true }),
                         ...(prototypeOwner && { className: prototypeOwner, isMethod: true }),
                         ...typeAnno,
                         ...(generics && { generics }),
@@ -994,7 +1317,10 @@ function _processClass(node, classes, processedRanges, lines) {
                 ...(extendsInfo && { extends: extendsInfo }),
                 ...(implementsInfo.length > 0 && { implements: implementsInfo }),
                 ...(decorators.length > 0 && { decorators }),
-                ...(decoratorsWithArgs.some(d => d.firstStringArg) && { decoratorsWithArgs })
+                ...(decoratorsWithArgs.some(d => d.firstStringArg) && { decoratorsWithArgs }),
+                // A class declared in a function body is visible only there
+                // (fix #378).
+                ...(node.type !== 'class' && lexicalOwnerRange(node)),
             });
         }
         return true;
@@ -1473,6 +1799,10 @@ function extractClassMembers(classNode, codeOrLines) {
             if (nameNode) {
                 const { startLine, endLine } = nodeToLocation(child, code);
                 const name = nameNode.text;
+                // fix #390: a TS decorator is part of the field node; the
+                // name's line is where definition edits go.
+                const fieldNameLine = nameNode.startPosition.row + 1 !== startLine
+                    ? { nameLine: nameNode.startPosition.row + 1 } : {};
                 const valueNode = child.childForFieldName('value');
                 const isArrow = valueNode && valueNode.type === 'arrow_function';
                 const isStatic = Array.from({ length: child.childCount }, (_, ci) => child.child(ci))
@@ -1514,6 +1844,7 @@ function extractClassMembers(classNode, codeOrLines) {
                         paramsStructured,
                         startLine,
                         endLine,
+                        ...fieldNameLine,
                         memberType: name.startsWith('#') ? 'private' : 'field',
                         ...(isStatic && { modifiers: ['static'] }),
                         isArrow: true,
@@ -1540,6 +1871,7 @@ function extractClassMembers(classNode, codeOrLines) {
                         name,
                         startLine,
                         endLine,
+                        ...fieldNameLine,
                         memberType: name.startsWith('#') ? 'private field' : 'field',
                         ...(isStatic && { modifiers: ['static'] }),
                         ...(fieldType && { fieldType }),
@@ -1663,6 +1995,70 @@ function findStateObjects(code, parser) {
  * @param {object} parser - Tree-sitter parser instance
  * @returns {ParseResult}
  */
+/**
+ * Module-level `const` bindings of another name (fix #389): `const Alias =
+ * Box;`, `export const Alias = models.Box;`. A const is bound once; query
+ * time decides whether the target is a class (then `new Alias()` makes a
+ * Box).
+ */
+function jsModuleValueAliases(root) {
+    const aliases = [];
+    const mutable = [];
+    const declared = new Map();
+    for (let statement of root.namedChildren) {
+        if (statement.type === 'export_statement') {
+            statement = statement.childForFieldName('declaration') ||
+                statement.namedChildren.find(child => child.type === 'lexical_declaration');
+        }
+        if (statement?.type !== 'lexical_declaration' && statement?.type !== 'variable_declaration') continue;
+        const isConst = statement.children.some(child => child.type === 'const');
+        for (const declarator of statement.namedChildren) {
+            if (declarator.type !== 'variable_declarator') continue;
+            const nameNode = declarator.childForFieldName('name');
+            if (nameNode?.type === 'identifier') declared.set(nameNode.text, (declared.get(nameNode.text) || 0) + 1);
+            let value = declarator.childForFieldName('value');
+            if (declarator.childForFieldName('type')) continue;
+            while (value?.type === 'parenthesized_expression') value = value.namedChild(0);
+            if (nameNode?.type !== 'identifier' || !value) continue;
+            if ((value.type === 'identifier' || value.type === 'member_expression') &&
+                /^[A-Za-z_$][A-Za-z0-9_$]*(\.[A-Za-z_$][A-Za-z0-9_$]*)*$/.test(value.text) &&
+                value.text !== nameNode.text) {
+                const alias = { name: nameNode.text, target: value.text,
+                    line: declarator.startPosition.row + 1 };
+                if (isConst) aliases.push(alias);
+                else mutable.push(alias);
+            }
+        }
+    }
+    if (mutable.length > 0) {
+        // A `let`/`var` alias is the class only while nothing assigns the
+        // name again (fix #392): any write to that identifier anywhere in the
+        // module, or a second declaration, leaves it unbound.
+        const written = new Set();
+        const writeTargets = (node) => {
+            if (!node) return;
+            if (node.type === 'identifier') { written.add(node.text); return; }
+            if (/pattern$/.test(node.type) || node.type === 'pair_pattern' ||
+                node.type === 'shorthand_property_identifier_pattern') {
+                if (node.type === 'shorthand_property_identifier_pattern') written.add(node.text);
+                for (const child of node.namedChildren) writeTargets(child);
+            }
+        };
+        for (const node of root.descendantsOfType(['assignment_expression',
+            'augmented_assignment_expression', 'update_expression', 'for_in_statement'])) {
+            if (node.type === 'update_expression') writeTargets(node.namedChild(0));
+            else if (node.type === 'for_in_statement') {
+                if (!node.childForFieldName('kind')) writeTargets(node.childForFieldName('left'));
+            } else writeTargets(node.childForFieldName('left'));
+        }
+        for (const alias of mutable) {
+            if (!written.has(alias.name) && declared.get(alias.name) === 1) aliases.push(alias);
+        }
+        aliases.sort((a, b) => a.line - b.line);
+    }
+    return aliases;
+}
+
 function parse(code, parser) {
     const tree = parseTree(parser, code);
     const lines = code.split('\n');
@@ -1774,6 +2170,7 @@ function parse(code, parser) {
     classes.sort((a, b) => a.startLine - b.startLine);
     stateObjects.sort((a, b) => a.startLine - b.startLine);
     callableAliases.sort((a, b) => a.startLine - b.startLine);
+    const moduleValueAliases = jsModuleValueAliases(tree.rootNode);
 
     return {
         language: 'javascript',
@@ -1782,7 +2179,8 @@ function parse(code, parser) {
         classes,
         stateObjects,
         callableAliases,
-        ...(tree.rootNode.hasError && { parseRecovery: true }),
+        ...(moduleValueAliases.length > 0 && { moduleValueAliases }),
+        ...(tree.rootNode.hasError && { parseRecovery: true, parseErrorRegions: parseErrorRegions(tree.rootNode) }),
         imports: [],  // Handled by core/imports.js
         exports: []   // Handled by core/imports.js
     };
@@ -1912,11 +2310,36 @@ function tsArrayElement(node) {
             !(child.type === 'literal_type' && ['null', 'undefined'].includes(child.text)));
         return present.length === 1 ? tsArrayElement(present[0]) : null;
     }
-    if (node.type !== 'array_type') return null;
-    const item = node.namedChild(0);
+    let item = null;
+    let keyed = false;
+    if (node.type === 'array_type') {
+        item = node.namedChild(0);
+    } else if (node.type === 'generic_type') {
+        // Declared container slots (fix #359): Array<T> / ReadonlyArray<T>
+        // index to T; Record<K, V> keys to V.
+        const base = node.childForFieldName('name') || node.namedChild(0);
+        const argsNode = node.childForFieldName('type_arguments') ||
+            node.namedChildren.find(child => child.type === 'type_arguments');
+        const args = argsNode?.namedChildren || [];
+        if (base?.type === 'type_identifier' &&
+            ['Array', 'ReadonlyArray'].includes(base.text) && args.length === 1) {
+            item = args[0];
+        } else if (base?.type === 'type_identifier' && base.text === 'Record' &&
+            args.length === 2) {
+            item = args[1];
+            keyed = true;
+        }
+    } else if (node.type === 'object_type' && node.namedChildCount === 1 &&
+        node.namedChild(0).type === 'index_signature') {
+        // `{ [key: string]: T }` keys to T.
+        const signature = node.namedChild(0);
+        const valueType = signature.childForFieldName('type');
+        item = valueType?.type === 'type_annotation' ? valueType.namedChild(0) : valueType;
+        keyed = true;
+    }
     if (!['type_identifier', 'nested_type_identifier', 'generic_type', 'predefined_type'].includes(item?.type)) return null;
     const type = tsTypeName(item);
-    return type ? { type, qualifier: tsTypeQualifier(item), node: item } : null;
+    return type ? { type, qualifier: tsTypeQualifier(item), node: item, ...(keyed && { keyed: true }) } : null;
 }
 
 /**
@@ -2020,7 +2443,82 @@ function findCallsInCode(code, parser) {
         }
         return current?.type === 'identifier' ? current.text : undefined;
     };
+    // Local binding scopes by name (fix #397): every function-level
+    // declaration, parameter, catch and loop binding with the source range it
+    // binds in, so a reference's shadowing binding is found by range instead
+    // of a parent walk; and the names object patterns bind.
+    const bindingScopes = new Map(); // name -> [{ start, end, declStart, line }]
+    const destructuredNames = new Set();
+    const addScope = (pattern, scope, declStart, line) => {
+        const names = [];
+        collectBoundPatternNames(pattern, names);
+        for (const n of names) {
+            let list = bindingScopes.get(n);
+            if (!list) { list = []; bindingScopes.set(n, list); }
+            list.push({ start: scope.startIndex, end: scope.endIndex, declStart, line });
+        }
+    };
     traverseTreeCached(tree.rootNode, node => {
+        switch (node.type) {
+            case 'variable_declarator': {
+                const statement = node.parent;
+                const host = statement?.parent;
+                if (host?.type === 'statement_block') {
+                    // A declarator initialized from require()/import() is the
+                    // module's binding reaching the scope, not a shadow (#337).
+                    if (!isImportInitializerNode(node.childForFieldName('value'))) {
+                        addScope(node.childForFieldName('name'), host, statement.startIndex,
+                            statement.startPosition.row + 1);
+                    }
+                } else if (host?.type === 'for_statement' || host?.type === 'for_in_statement') {
+                    addScope(node.childForFieldName('name'), host, null, -1);
+                }
+                break;
+            }
+            case 'formal_parameters':
+                if (node.parent && JS_SHADOW_FUNCTIONS.has(node.parent.type)) addScope(node, node.parent, null, -1);
+                break;
+            case 'arrow_function': {
+                const single = node.childForFieldName('parameter');
+                if (single) addScope(single, node, null, -1);
+                break;
+            }
+            case 'catch_clause': {
+                const param = node.childForFieldName('parameter');
+                if (param) addScope(param, node, null, -1);
+                break;
+            }
+            case 'for_in_statement': {
+                const left = node.childForFieldName('left');
+                if (left && left.type !== 'lexical_declaration' && left.type !== 'variable_declaration') {
+                    addScope(left, node, null, -1);
+                }
+                break;
+            }
+            case 'function_declaration': case 'generator_function_declaration': case 'class_declaration':
+                if (node.parent?.type === 'statement_block') {
+                    const nameNode = node.childForFieldName('name');
+                    // Hoisted within the block: shadows at any position.
+                    if (nameNode) addScope(nameNode, node.parent, null, node.startPosition.row + 1);
+                }
+                break;
+            case 'object_pattern':
+                for (let i = 0; i < node.namedChildCount; i++) {
+                    const prop = node.namedChild(i);
+                    if (prop.type === 'shorthand_property_identifier_pattern') destructuredNames.add(prop.text);
+                    else if (prop.type === 'object_assignment_pattern') {
+                        const left = prop.childForFieldName('left');
+                        if (left) destructuredNames.add(left.text);
+                    } else if (prop.type === 'pair_pattern') {
+                        let value = prop.childForFieldName('value');
+                        if (value?.type === 'assignment_pattern') value = value.childForFieldName('left');
+                        if (value?.type === 'identifier') destructuredNames.add(value.text);
+                    }
+                }
+                break;
+            default:
+                break;
+        }
         if (['variable_declarator', 'required_parameter', 'optional_parameter'].includes(node.type)) {
             const name = node.childForFieldName('name') || node.childForFieldName('pattern');
             if (name?.type === 'identifier' && tsArrayElement(node.childForFieldName('type'))) {
@@ -2136,6 +2634,10 @@ function findCallsInCode(code, parser) {
     const aliases = new Map();  // aliasName -> [{ target, declarationIndex, scopeStart, scopeEnd }]
     const nonCallableNames = new Set();  // Track names assigned non-callable values
     const localVarTypes = new ReceiverTypeMap();  // Track local variable types: varName -> typeName (for receiverType inference)
+    // One-hop `const` aliases of member paths (fix #381):
+    // `const c = this.config; c.load()` receives through `this.config`.
+    // name -> { node: the aliased member_expression, scope: declaring block }.
+    const localFieldAliases = new Map();
     const localVarTypeQualifiers = new Map(); // qualifier provenance for new ns.Type()
     // Names whose type came from a DECLARED annotation (TS `x: Foo` / typed
     // params). The compiler enforces assignability for these, so reassignment
@@ -2175,6 +2677,176 @@ function findCallsInCode(code, parser) {
             count++;
         }
         return count;
+    };
+
+    // fix #366: request-config calls — `request(cfg, { method: 'POST',
+    // url: '/api/users' })`, `client.post({ url: '/api/items' })` (generated
+    // OpenAPI SDKs). Returns { url, interp, method? } for the first object
+    // literal argument carrying a string `url`/`path` property. Whether the
+    // callee really performs HTTP is decided at query time from the callee's
+    // definition, never from this record.
+    const getRequestConfig = (callNode) => {
+        const argsNode = callNode.childForFieldName('arguments');
+        if (!argsNode) return null;
+        for (let i = 0; i < argsNode.namedChildCount; i++) {
+            const arg = argsNode.namedChild(i);
+            if (arg.type !== 'object') continue;
+            let url = null;
+            let method = null;
+            let handler = null;
+            for (let j = 0; j < arg.namedChildCount; j++) {
+                const prop = arg.namedChild(j);
+                if (prop.type !== 'pair') continue;
+                const keyNode = prop.childForFieldName('key');
+                const valNode = prop.childForFieldName('value');
+                if (!keyNode || !valNode) continue;
+                const keyName = keyNode.type === 'string'
+                    ? keyNode.text.replace(/^['"`]|['"`]$/g, '') : keyNode.text;
+                if ((keyName === 'url' || keyName === 'path') && !url) {
+                    const v = _extractStringArg(valNode);
+                    if (v && typeof v.value === 'string' && v.value.length > 0) {
+                        url = { value: v.value, interp: !!v.interp, key: keyName };
+                    }
+                } else if (keyName === 'method') {
+                    const v = _extractStringArg(valNode);
+                    if (v && !v.interp && typeof v.value === 'string' && v.value.length > 0) {
+                        method = v.value.toUpperCase();
+                    }
+                } else if (keyName === 'handler') {
+                    // fix #383: `route({ method, url, handler })` names its handler.
+                    handler = handlerNameOf(valNode);
+                }
+            }
+            if (url) {
+                return { url: url.value, key: url.key, ...(url.interp && { interp: true }),
+                    ...(method && { method }), ...(handler && { handler }) };
+            }
+        }
+        return null;
+    };
+
+    // fix #383: the arguments of a route-shaped registration
+    // (`app.get('/x', mw, handler)`) after its path: each argument's name,
+    // '<anonymous>' for an inline function, the callee's name for a call
+    // (`wrap(handler)`), null for any other expression.
+    const ROUTE_VERB_METHODS = /^(get|post|put|delete|patch|options|head|all)$/;
+    const handlerNameOf = (node) => {
+        if (!node) return null;
+        if (node.type === 'identifier') return node.text;
+        if (node.type === 'member_expression') return node.childForFieldName('property')?.text || null;
+        if (/function|arrow/.test(node.type)) return '<anonymous>';
+        if (node.type === 'call_expression') {
+            const fn = node.childForFieldName('function');
+            if (fn?.type === 'identifier') return fn.text;
+            if (fn?.type === 'member_expression') return fn.childForFieldName('property')?.text || null;
+        }
+        return null;
+    };
+    // The names of a registration's arguments after its path (null for an
+    // expression with no name); the router decides which one is the handler.
+    const getHandlerArgs = (callNode) => {
+        const argsNode = callNode.childForFieldName('arguments');
+        if (!argsNode) return null;
+        const out = [];
+        let first = true;
+        for (let i = 0; i < argsNode.namedChildCount; i++) {
+            const arg = argsNode.namedChild(i);
+            if (arg.type.endsWith('comment')) continue;
+            if (first) { first = false; continue; }
+            out.push(handlerNameOf(arg));
+        }
+        return out.length > 0 ? out : null;
+    };
+
+    const hasObjectKeyArg = (callNode, key) => {
+        const argsNode = callNode.childForFieldName('arguments');
+        if (!argsNode) return false;
+        for (let i = 0; i < argsNode.namedChildCount; i++) {
+            const arg = argsNode.namedChild(i);
+            if (arg.type !== 'object') continue;
+            for (let j = 0; j < arg.namedChildCount; j++) {
+                const prop = arg.namedChild(j);
+                const keyNode = prop.type === 'pair' ? prop.childForFieldName('key') : prop;
+                if (keyNode && keyNode.text.replace(/^['"`]|['"`]$/g, '') === key) return true;
+            }
+        }
+        return false;
+    };
+
+    const getMountArgs = (callNode) => {
+        const argsNode = callNode.childForFieldName('arguments');
+        if (!argsNode) return null;
+        const out = [];
+        for (let i = 0; i < argsNode.namedChildCount; i++) {
+            const arg = argsNode.namedChild(i);
+            if (arg.type.endsWith('comment')) continue;
+            if (arg.type === 'identifier') out.push(arg.text);
+            else if (arg.type === 'string' || (arg.type === 'template_string' && arg.namedChildCount <= 1)) out.push('""');
+            else if (arg.type.includes('function')) out.push('fn');
+            else out.push('()');
+        }
+        return out;
+    };
+
+    // fix #366: `x.register(plugin, { prefix: '/v1' })` (Fastify plugin
+    // mounts). Records the prefix option (literal, or `prefixDynamic` for an
+    // expression) and, for an inline plugin function, its span and first
+    // parameter - the router the plugin registers routes on. Returns null
+    // when the call carries neither.
+    const getRegisterMount = (callNode) => {
+        const argsNode = callNode.childForFieldName('arguments');
+        if (!argsNode) return null;
+        const args = [];
+        for (let i = 0; i < argsNode.namedChildCount; i++) {
+            const arg = argsNode.namedChild(i);
+            if (!arg.type.endsWith('comment')) args.push(arg);
+        }
+        if (args.length === 0) return null;
+        const out = {};
+        const opts = args[1];
+        if (opts && opts.type === 'object') {
+            for (let j = 0; j < opts.namedChildCount; j++) {
+                const prop = opts.namedChild(j);
+                const keyNode = prop.type === 'pair' ? prop.childForFieldName('key') : prop;
+                if (!keyNode || keyNode.text.replace(/^['"`]|['"`]$/g, '') !== 'prefix') continue;
+                const v = prop.type === 'pair' ? _extractStringArg(prop.childForFieldName('value')) : null;
+                if (v && !v.interp && typeof v.value === 'string') out.prefix = v.value;
+                else out.prefixDynamic = true;
+            }
+        } else if (opts) {
+            out.prefixDynamic = true;
+        }
+        let plugin = args[0];
+        // `register(fp(function (instance) {...}))`: a wrapper call around an
+        // inline plugin function registers that function.
+        if (plugin.type === 'call_expression') {
+            const inner = plugin.childForFieldName('arguments')?.namedChild(0);
+            if (inner && ['arrow_function', 'function_expression', 'function'].includes(inner.type)) plugin = inner;
+        }
+        if (['arrow_function', 'function_expression', 'function'].includes(plugin.type)) {
+            const params = plugin.childForFieldName('parameters') || plugin.childForFieldName('parameter');
+            let first = params && params.type === 'identifier' ? params : null;
+            if (!first && params) {
+                for (let i = 0; i < params.namedChildCount; i++) {
+                    const p = params.namedChild(i);
+                    if (p.type.endsWith('comment')) continue;
+                    const pat = p.type === 'identifier' ? p : p.childForFieldName('pattern');
+                    first = pat && pat.type === 'identifier' ? pat : null;
+                    break;
+                }
+            }
+            if (first) {
+                out.plugin = { start: plugin.startIndex, end: plugin.endIndex, param: first.text };
+            }
+        } else if (plugin.type === 'identifier') {
+            // A named plugin: a same-file function composes from the index;
+            // anything else is resolved by the endpoints graph.
+            out.pluginName = plugin.text;
+        } else if (plugin.type === 'member_expression' || plugin.type === 'call_expression') {
+            out.pluginRef = true;
+        }
+        return (out.prefix != null || out.prefixDynamic || out.plugin || out.pluginRef || out.pluginName)
+            ? out : null;
     };
 
     // MEDIUM-5: extract HTTP method from `fetch(url, { method: 'POST' })`
@@ -2437,8 +3109,12 @@ function findCallsInCode(code, parser) {
         const root = object.childForFieldName('object');
         const offset = object.childForFieldName('index');
         if (root?.type !== 'identifier' || !arrayAnnotationNames.has(root.text) || !offset) return null;
-        let numeric = offset.type === 'number';
-        if (offset.type === 'identifier') {
+        const binding = indexedBinding(root.text, object);
+        const element = tsArrayElement(binding?.type);
+        // A keyed container (Record / index signature) accepts any key; an
+        // array index must be numeric (a string key reads a property).
+        let numeric = offset.type === 'number' || !!element?.keyed;
+        if (offset.type === 'identifier' && !element?.keyed) {
             const indexBinding = indexedBinding(offset.text, object);
             const annotation = indexBinding?.type?.namedChild(0);
             numeric = annotation?.type === 'predefined_type' && annotation.text === 'number';
@@ -2447,8 +3123,6 @@ function findCallsInCode(code, parser) {
             }
         }
         if (!numeric) return null;
-        const binding = indexedBinding(root.text, object);
-        const element = tsArrayElement(binding?.type);
         if (element && !element.qualifier) {
             for (let scope = binding.declaration.parent; scope; scope = scope.parent) {
                 const parameters = scope.childForFieldName('type_parameters');
@@ -2495,16 +3169,6 @@ function findCallsInCode(code, parser) {
         if (v.type !== 'call_expression') return false;
         const fn = v.childForFieldName('function');
         return !!fn && (fn.type === 'import' || (fn.type === 'identifier' && fn.text === 'require'));
-    };
-    const _declaresLocalShadow = (declNode, name) => {
-        for (let i = 0; i < declNode.namedChildCount; i++) {
-            const d = declNode.namedChild(i);
-            if (d.type !== 'variable_declarator') continue;
-            if (!_patternDeclaresName(d.childForFieldName('name'), name)) continue;
-            if (_isImportBindingInitializer(d.childForFieldName('value'))) continue;
-            return true;
-        }
-        return false;
     };
 
     // Bare callback references need to distinguish a module-owned VALUE from
@@ -2568,54 +3232,438 @@ function findCallsInCode(code, parser) {
     // findCallers — let locals and non-symbol arrow params are only
     // visible here. Module-level (program) declarations are NOT shadows:
     // that's the module binding itself, owned by binding resolution.
-    const isShadowedByLocal = (refNode, name) => {
-        for (let p = refNode.parent; p; p = p.parent) {
+    // Returns the 1-based line of the shadowing declaration statement, -1
+    // for a parameter / catch / loop binding (never an indexed definition),
+    // 0 when the name is not shadowed. The declaration line lets the query
+    // tell a shadow that IS the pinned definition (declared in any
+    // enclosing function of the reference, fix #397) from an unrelated
+    // local. Statement lists read their memoized binding tables: hoisted
+    // function/class declarations shadow anywhere in the block, lexical and
+    // var declarations from their statement on; a declarator initialized
+    // from require()/import() is the module's binding, not a shadow (#337).
+    // The innermost binding scope containing the reference: a hoisted
+    // function/class declaration anywhere in its block, a lexical or var
+    // declaration from its statement on, a parameter / catch / loop binding
+    // anywhere in its function or statement.
+    const shadowingLineOf = (refNode, name) => {
+        const scopes = bindingScopes.get(name);
+        if (!scopes) return 0;
+        const at = refNode.startIndex;
+        let best = null;
+        for (const scope of scopes) {
+            if (at < scope.start || at >= scope.end) continue;
+            if (scope.declStart != null && scope.declStart >= at) continue;
+            if (!best || scope.end - scope.start < best.end - best.start) best = scope;
+        }
+        return best ? best.line : 0;
+    };
+    const isShadowedByLocal = (refNode, name) => shadowingLineOf(refNode, name) !== 0;
+    // `localShadow` holds the shadowing declaration's line (-1 for a
+    // parameter / catch / loop binding): truthy like the other languages'
+    // `true`, and the query compares the line with the pinned definition.
+    const localShadowFields = (refNode, name) => {
+        const line = shadowingLineOf(refNode, name);
+        return line !== 0 ? { localShadow: line } : null;
+    };
+
+    // The aliased member expression when `refNode` names a live one-hop
+    // const alias: inside the declaring block, after the declaration, and
+    // not shadowed by a parameter or declaration in between (fix #381).
+    const localFieldAliasAt = (refNode) => {
+        const alias = localFieldAliases.get(refNode.text);
+        if (!alias || refNode.startIndex < alias.node.endIndex ||
+            refNode.startIndex < alias.scope.startIndex ||
+            refNode.endIndex > alias.scope.endIndex) return null;
+        const name = refNode.text;
+        for (let p = refNode.parent; p && p.id !== alias.scope.id; p = p.parent) {
             if (p.type === 'statement_block') {
                 for (let i = 0; i < p.namedChildCount; i++) {
                     const stmt = p.namedChild(i);
-                    // Nested function/class declarations are hoisted within
-                    // their block — they shadow regardless of position
-                    // (fix #218: `function getStyle() {}` after the ref).
-                    if ((stmt.type === 'function_declaration' ||
-                        stmt.type === 'generator_function_declaration' ||
-                        stmt.type === 'class_declaration') &&
-                        stmt.childForFieldName('name')?.text === name) return true;
-                    if (stmt.startIndex >= refNode.startIndex) continue; // declaration-before-use
                     if ((stmt.type === 'lexical_declaration' || stmt.type === 'variable_declaration') &&
-                        _declaresLocalShadow(stmt, name)) return true;
+                        _declaresName(stmt, name)) return null;
+                    if ((stmt.type === 'function_declaration' || stmt.type === 'class_declaration' ||
+                        stmt.type === 'generator_function_declaration') &&
+                        stmt.childForFieldName('name')?.text === name) return null;
                 }
-            } else if (p.type === 'for_statement') {
-                const init = p.childForFieldName('initializer');
-                if (init && (init.type === 'lexical_declaration' || init.type === 'variable_declaration') &&
-                    _declaresName(init, name)) return true;
-            } else if (p.type === 'for_in_statement') {
-                const left = p.childForFieldName('left');
-                if (_patternDeclaresName(left, name)) return true;
-                if (left && (left.type === 'lexical_declaration' || left.type === 'variable_declaration') &&
-                    _declaresName(left, name)) return true;
+            } else if (p.type === 'for_statement' || p.type === 'for_in_statement') {
+                const left = p.childForFieldName('initializer') || p.childForFieldName('left');
+                if (left && (_patternDeclaresName(left, name) ||
+                    ((left.type === 'lexical_declaration' || left.type === 'variable_declaration') &&
+                        _declaresName(left, name)))) return null;
             } else if (p.type === 'catch_clause') {
-                const param = p.childForFieldName('parameter');
-                if (_patternDeclaresName(param, name)) return true;
-            } else if (p.type === 'arrow_function' || p.type === 'function_expression' ||
-                p.type === 'function_declaration' || p.type === 'function' ||
-                p.type === 'method_definition' || p.type === 'generator_function' ||
-                p.type === 'generator_function_declaration') {
+                if (_patternDeclaresName(p.childForFieldName('parameter'), name)) return null;
+            } else if (isFunctionNode(p)) {
                 const params = p.childForFieldName('parameters') || p.childForFieldName('parameter');
-                if (params) {
-                    if (_patternDeclaresName(params, name)) return true;
-                    for (let i = 0; i < params.namedChildCount; i++) {
-                        const prm = params.namedChild(i);
-                        if (_patternDeclaresName(prm, name)) return true;
+                if (params && (_patternDeclaresName(params, name) ||
+                    params.namedChildren.some(prm => _patternDeclaresName(prm, name)))) return null;
+            }
+        }
+        return alias.node;
+    };
+
+    // Receiver facts of a member access `objNode.propName` (the receiver
+    // half of a method-call record). Shared by method calls and by bare
+    // calls of names destructured from an object (fix #397), which read the
+    // member of the destructuring source.
+    const memberReceiverFacts = (objNode, propName) => {
+        // Extract receiver: handles identifiers (obj), this, super
+        let receiver = undefined;
+        // fix #381: `c.load()` after `const c = this.config`
+        // receives exactly like `this.config.load()` while the
+        // const is the binding in scope.
+        const aliasedReceiver = objNode?.type === 'identifier' &&
+            !localVarTypes.has(objNode.text)
+            ? localFieldAliasAt(objNode) : null;
+        if (aliasedReceiver) objNode = aliasedReceiver;
+        if (objNode) {
+            if (objNode.type === 'identifier' || objNode.type === 'this' || objNode.type === 'super') {
+                receiver = objNode.text;
+            }
+        }
+        // One-hop field receiver (fix #219 — #202's shape for
+        // structural): this._map.has(x) / def.cache.get(k) —
+        // receiverRoot/Field let findCallers hop to the
+        // field's DECLARED type annotation. `this`-rooted hops
+        // resolve their root type query-side (the enclosing
+        // class); identifier roots type from local annotations.
+        let receiverRoot, receiverFieldName, receiverRootType, receiverBindingNode;
+        let receiverDeepPath = false;
+        if (receiver && objNode?.type === 'identifier') receiverBindingNode = objNode;
+        if (!receiver && objNode && objNode.type === 'member_expression') {
+            const rootNode = objNode.childForFieldName('object');
+            const fldNode = objNode.childForFieldName('property');
+            if (fldNode && rootNode &&
+                (rootNode.type === 'identifier' || rootNode.type === 'this')) {
+                receiverRoot = rootNode.text;
+                receiverBindingNode = rootNode.type === 'identifier' ? rootNode : undefined;
+                receiverFieldName = fldNode.text;
+                if (rootNode.type === 'identifier') {
+                    receiverRootType = localVarTypes.get(rootNode.text);
+                }
+            } else {
+                // Preserve unresolved deeper member chains
+                // (`client.req.query()`). Their terminal name
+                // must not borrow a same-file method binding
+                // while the root object's type is unknown.
+                receiverDeepPath = true;
+            }
+        }
+        // Chained receiver (fix #219): the receiver IS a call —
+        // parseAsync(args).catch(...) — record the producer so
+        // findCallers can type the receiver from its declared
+        // return annotation (Promise<...> → Promise).
+        let receiverCall, receiverCallIsMethod, receiverCallAwaited, receiverCallLine;
+        let receiverCallStart, receiverCallEnd;
+        {
+            let recvNode = objNode;
+            if (recvNode && recvNode.type === 'parenthesized_expression') {
+                recvNode = recvNode.namedChild(0);
+            }
+            if (recvNode && recvNode.type === 'await_expression') {
+                receiverCallAwaited = true;
+                recvNode = recvNode.namedChild(0);
+            }
+            if (recvNode && recvNode.type === 'call_expression') {
+                const prodFunc = recvNode.childForFieldName('function');
+                if (prodFunc?.type === 'identifier') {
+                    receiverCall = prodFunc.text;
+                    // Producer link (fix #258): plain-call
+                    // records carry the call node's start line
+                    receiverCallLine = recvNode.startPosition.row + 1;
+                    receiverCallStart = recvNode.startIndex;
+                    receiverCallEnd = recvNode.endIndex;
+                } else if (prodFunc?.type === 'member_expression') {
+                    const prodProp = prodFunc.childForFieldName('property');
+                    if (prodProp) {
+                        receiverCall = prodProp.text;
+                        receiverCallIsMethod = true;
+                        // Method records report the property
+                        // node's own line
+                        receiverCallLine = prodProp.startPosition.row + 1;
+                        receiverCallStart = recvNode.startIndex;
+                        receiverCallEnd = recvNode.endIndex;
                     }
                 }
             }
+            if (!receiverCall) receiverCallAwaited = undefined;
         }
-        return false;
+        // Literal receivers carry their builtin type: [].map() can
+        // never be a project class method
+        // A freshly constructed receiver has an exact runtime
+        // type as well: new Service().start(). Recording it here
+        // avoids treating the call as an untyped method dispatch.
+        const constructedReceiverType = objNode?.type === 'new_expression'
+            ? jsConstructorTypeName(objNode.childForFieldName('constructor'))
+            : undefined;
+        const constructedReceiverQualifier = objNode?.type === 'new_expression'
+            ? jsConstructorTypeQualifier(objNode.childForFieldName('constructor'))
+            : undefined;
+        const indexedReceiver = indexedArrayReceiver(objNode);
+        const receiverType = indexedReceiver?.type || (receiver
+            ? localVarTypes.get(receiver)
+            : (constructedReceiverType ||
+                (objNode ? JS_LITERAL_RECEIVER_TYPES[objNode.type] : undefined)));
+        // Module receiver (ns.helper()) — unless locally shadowed
+        // by a typed instance binding
+        const receiverModuleSpecifier = jsLiteralRequireModule(objNode);
+        const receiverIsModule = !!receiverModuleSpecifier ||
+            (!!receiver && moduleAliases.has(receiver) &&
+                !localVarTypes.has(receiver));
+        const receiverModuleComposition = receiver &&
+            !unsafeModuleCompositions.has(receiver)
+            ? moduleCompositions.get(receiver) : undefined;
+        return {
+            receiver,
+            ...(receiverType && { receiverType,
+                ...(indexedReceiver ? { receiverTypeSource: 'annotation',
+                    receiverTypeEvidence: indexedReceiver.evidence }
+                    : receiver ? localVarTypes.fields(receiver, receiverType) : {
+                    receiverTypeSource: constructedReceiverType ? 'constructor' : 'literal',
+                    receiverTypeEvidence: typeOrigin(constructedReceiverType ? 'constructor' : 'literal', objNode),
+                }),
+            }),
+            ...((indexedReceiver?.qualifier || constructedReceiverQualifier ||
+                (receiver && localVarTypeQualifiers.get(receiver))) && {
+                receiverTypeQualifier: indexedReceiver?.qualifier || constructedReceiverQualifier ||
+                    localVarTypeQualifiers.get(receiver),
+            }),
+            ...(receiverIsModule && { receiverIsModule: true }),
+            ...(receiverModuleSpecifier && { receiverModuleSpecifier }),
+            ...(receiverModuleComposition && {
+                receiverModuleComposition,
+            }),
+            ...(receiver && assignedMembers.has(`${receiver}.${propName}`) && {
+                receiverMemberAssigned: true,
+            }),
+            ...(receiverBindingNode &&
+                isShadowedByLocal(receiverBindingNode, receiverBindingNode.text) &&
+                { receiverLocalBinding: true }),
+            ...(receiverFieldName && { receiverRoot, receiverField: receiverFieldName }),
+            ...(receiverFieldName && receiverRootType && { receiverRootType }),
+            ...(receiverDeepPath && { receiverDeepPath: true }),
+            ...(receiverCall && { receiverCall }),
+            ...(receiverCallIsMethod && { receiverCallIsMethod: true }),
+            ...(receiverCallAwaited && { receiverCallAwaited: true }),
+            ...(receiverCallLine && { receiverCallLine }),
+            ...(receiverCallStart != null && { receiverCallStart }),
+            ...(receiverCallEnd != null && { receiverCallEnd }),
+        };
+    };
+
+    // Destructured member bindings (fix #397, immer-measured: `const {
+    // produce } = createPatchedImmer()` then `produce(...)` lost every
+    // caller). An object-pattern binding holds the MEMBER of its source
+    // object: `const { run } = make(); run()` reads `make().run`, so the bare
+    // call is that member access. Names some object pattern binds, so the
+    // lexical lookup below runs only for them.
+    // The node declaring `name` in a declaration / parameter pattern.
+    const patternBindingNode = (pattern, name) => {
+        if (!pattern) return null;
+        if (pattern.type === 'required_parameter' || pattern.type === 'optional_parameter') {
+            return patternBindingNode(pattern.childForFieldName('pattern') ||
+                pattern.childForFieldName('name'), name);
+        }
+        if (pattern.type === 'identifier' || pattern.type === 'shorthand_property_identifier_pattern') {
+            return pattern.text === name ? pattern : null;
+        }
+        if (pattern.type === 'pair_pattern' || pattern.type === 'pair') {
+            return patternBindingNode(pattern.childForFieldName('value'), name);
+        }
+        if (pattern.type === 'assignment_pattern' || pattern.type === 'object_assignment_pattern') {
+            return patternBindingNode(pattern.childForFieldName('left') ||
+                pattern.childForFieldName('pattern'), name);
+        }
+        if (pattern.type === 'type_annotation' || pattern.type === 'predefined_type') return null;
+        for (let i = 0; i < pattern.namedChildCount; i++) {
+            const found = patternBindingNode(pattern.namedChild(i), name);
+            if (found) return found;
+        }
+        return null;
+    };
+    const declarationBindingNode = (declaration, name) => {
+        for (let i = 0; i < declaration.namedChildCount; i++) {
+            const declarator = declaration.namedChild(i);
+            if (declarator.type !== 'variable_declarator') continue;
+            const found = patternBindingNode(declarator.childForFieldName('name'), name);
+            if (found) return found;
+        }
+        return null;
+    };
+    // The innermost lexical binding of `name` visible at `refNode`: the
+    // declaring identifier / shorthand pattern node, or a marker for a
+    // binding that is not a variable pattern (function, class, import,
+    // named function expression). Within the declaring block a let/const
+    // must precede the reference; from a nested function any position of
+    // the block counts (the closure runs after the block is initialized).
+    const innermostBinding = (refNode, name) => {
+        let crossedFunction = false;
+        for (let p = refNode.parent; p; p = p.parent) {
+            if (p.type === 'statement_block' || p.type === 'program') {
+                for (let i = 0; i < p.namedChildCount; i++) {
+                    let stmt = p.namedChild(i);
+                    if (stmt.type === 'export_statement') {
+                        stmt = stmt.childForFieldName('declaration') || stmt.namedChild(0);
+                        if (!stmt) continue;
+                    }
+                    if ((stmt.type === 'function_declaration' ||
+                        stmt.type === 'generator_function_declaration' ||
+                        stmt.type === 'class_declaration') &&
+                        stmt.childForFieldName('name')?.text === name) return { other: true };
+                    if (stmt.type === 'import_statement' && p.type === 'program') {
+                        const clause = stmt.namedChildren.find(c => c.type === 'import_clause');
+                        if (clause && clause.descendantsOfType(['identifier']).some(id => id.text === name)) {
+                            return { other: true };
+                        }
+                        continue;
+                    }
+                    if (stmt.type !== 'lexical_declaration' && stmt.type !== 'variable_declaration') continue;
+                    if (!crossedFunction && stmt.startIndex >= refNode.startIndex) continue;
+                    const found = declarationBindingNode(stmt, name);
+                    if (found) return { node: found };
+                }
+            } else if (p.type === 'for_statement') {
+                const init = p.childForFieldName('initializer');
+                if (init && (init.type === 'lexical_declaration' || init.type === 'variable_declaration')) {
+                    const found = declarationBindingNode(init, name);
+                    if (found) return { node: found };
+                }
+            } else if (p.type === 'for_in_statement') {
+                const left = p.childForFieldName('left');
+                const found = left && (patternBindingNode(left, name) ||
+                    ((left.type === 'lexical_declaration' || left.type === 'variable_declaration')
+                        ? declarationBindingNode(left, name) : null));
+                if (found) return { node: found };
+            } else if (p.type === 'catch_clause') {
+                const found = patternBindingNode(p.childForFieldName('parameter'), name);
+                if (found) return { node: found };
+            } else if (isFunctionNode(p)) {
+                const params = p.childForFieldName('parameters') || p.childForFieldName('parameter');
+                const found = params && patternBindingNode(params, name);
+                if (found) return { node: found };
+                if ((p.type === 'function_expression' || p.type === 'function') &&
+                    p.childForFieldName('name')?.text === name) return { other: true };
+                crossedFunction = true;
+            } else if (p.type === 'class' && p.childForFieldName('name')?.text === name) {
+                return { other: true };
+            }
+        }
+        return null;
+    };
+    // The destructuring that binds `name` at `refNode`, when the innermost
+    // binding is an object-pattern property whose source is not an import
+    // (`const { f } = require('./m')` stays an import binding): the property
+    // key, its position, and the receiver facts of the source object read as
+    // `source.key`. A parameter pattern's source is the argument (typed by a
+    // plain TS annotation when present); nested patterns, loop and catch
+    // bindings and defaulted properties have an unknown source.
+    const destructuredBindingOf = (refNode, name) => {
+        if (!destructuredNames.has(name)) return null;
+        const binding = innermostBinding(refNode, name);
+        const node = binding?.node;
+        if (!node) return null;
+        let keyNode = null;
+        let shorthand = false;
+        let hasDefault = false;
+        let property = node;
+        if (node.type === 'shorthand_property_identifier_pattern') {
+            keyNode = node;
+            shorthand = true;
+            if (node.parent?.type === 'object_assignment_pattern') {
+                hasDefault = true;
+                property = node.parent;
+            }
+        } else if (node.type === 'identifier') {
+            let holder = node.parent;
+            if (holder?.type === 'assignment_pattern' &&
+                sameNode(holder.childForFieldName('left'), node)) {
+                hasDefault = true;
+                holder = holder.parent;
+            }
+            if (holder?.type !== 'pair_pattern') return null;
+            const key = holder.childForFieldName('key');
+            if (!key || (key.type !== 'property_identifier' && key.type !== 'identifier')) return null;
+            keyNode = key;
+            property = holder;
+        }
+        const pattern = property.parent;
+        if (!keyNode || pattern?.type !== 'object_pattern') return null;
+        let holder = pattern.parent;
+        let facts = null;
+        let sourceKind = 'unknown';
+        if (holder?.type === 'variable_declarator' &&
+            sameNode(holder.childForFieldName('name'), pattern)) {
+            const value = holder.childForFieldName('value');
+            if (!value || _isImportBindingInitializer(value)) return null;
+            if (!hasDefault) {
+                facts = memberReceiverFacts(value, keyNode.text);
+                sourceKind = 'value';
+            }
+        } else {
+            let typeNode = null;
+            if (holder?.type === 'assignment_pattern' && sameNode(holder.childForFieldName('left'), pattern)) {
+                holder = holder.parent;
+            }
+            if (holder?.type === 'required_parameter' || holder?.type === 'optional_parameter') {
+                typeNode = holder.childForFieldName('type');
+                holder = holder.parent;
+            }
+            if (holder?.type === 'formal_parameters') {
+                sourceKind = 'parameter';
+                const written = typeNode?.namedChild(0);
+                if (!hasDefault && written?.type === 'type_identifier') {
+                    facts = { receiverType: written.text, receiverTypeSource: 'annotation',
+                        receiverTypeEvidence: typeOrigin('annotation', written) };
+                }
+            }
+        }
+        return {
+            key: keyNode.text,
+            line: keyNode.startPosition.row + 1,
+            column: keyNode.startPosition.column,
+            ...(shorthand && { shorthand: true }),
+            source: sourceKind,
+            receiver: facts || { receiverDeepPath: true },
+        };
+    };
+    // A method taken as a value (fix #397, immer-measured: `export const
+    // produce = immer.produce`): a paren-less member access stored by a
+    // declaration or assignment names the member exactly like a call on the
+    // same receiver. Recorded when the receiver has typing evidence (a typed
+    // local or `this`); an untyped `a.b` read stays a plain reference, since
+    // most such reads are data.
+    const memberValueReference = (valueNode) => {
+        let value = valueNode;
+        while (value && (value.type === 'parenthesized_expression' || value.type === 'as_expression' ||
+            value.type === 'satisfies_expression' || value.type === 'non_null_expression')) {
+            value = value.namedChild(0);
+        }
+        if (value?.type !== 'member_expression') return;
+        const prop = value.childForFieldName('property');
+        const obj = value.childForFieldName('object');
+        if (prop?.type !== 'property_identifier' || !obj ||
+            (obj.type !== 'identifier' && obj.type !== 'this') || SKIP_IDENTS.has(prop.text)) return;
+        const facts = memberReceiverFacts(obj, prop.text);
+        if (!facts.receiverType && facts.receiver !== 'this') return;
+        calls.push({
+            name: prop.text,
+            line: prop.startPosition.row + 1,
+            column: prop.startPosition.column,
+            isMethod: true,
+            ...facts,
+            isFunctionReference: true,
+            memberValue: true,
+            enclosingFunction: getCurrentEnclosingFunction(),
+        });
+    };
+    const destructuredFields = (refNode) => {
+        const destructured = destructuredBindingOf(refNode, refNode.text);
+        return destructured ? { destructured } : null;
     };
 
     const bareReferenceBindingFields = (refNode) => ({
-        ...(isShadowedByLocal(refNode, refNode.text) && { localShadow: true }),
+        ...localShadowFields(refNode, refNode.text),
         ...(moduleValueBindings.has(refNode.text) && { moduleLocalBinding: true }),
+        ...destructuredFields(refNode),
     });
 
     const isConditionalReassignment = node => {
@@ -2659,6 +3707,7 @@ function findCallsInCode(code, parser) {
         if (node.type === 'variable_declarator') {
             const nameNode = node.childForFieldName('name');
             const initNode = node.childForFieldName('value');
+            memberValueReference(initNode);
             // const pkg = require("./lib") — pkg is a module namespace
             if (nameNode?.type === 'identifier' && initNode?.type === 'call_expression') {
                 const fn = initNode.childForFieldName('function');
@@ -2669,6 +3718,29 @@ function findCallsInCode(code, parser) {
             if (nameNode?.type === 'identifier' && initNode?.type === 'identifier') {
                 // Simple alias: const p = parse
                 recordAlias(nameNode.text, initNode.text, node);
+            }
+            // One-hop const alias (fix #381): `const c = cfg` with a typed
+            // cfg carries cfg's type; `const c = this.config` receives like
+            // `this.config`. Only `const` (one binding, never reassigned).
+            if (nameNode?.type === 'identifier') localFieldAliases.delete(nameNode.text);
+            if (nameNode?.type === 'identifier' && !node.childForFieldName('type') &&
+                node.parent?.type === 'lexical_declaration' &&
+                node.parent.child(0)?.type === 'const' && initNode &&
+                initNode.text !== nameNode.text) {
+                if (initNode.type === 'identifier' && localVarTypes.has(initNode.text)) {
+                    localVarTypes.set(nameNode.text, localVarTypes.get(initNode.text),
+                        localVarTypes.origins.get(initNode.text) || 'flow');
+                    if (localVarTypeQualifiers.has(initNode.text)) {
+                        localVarTypeQualifiers.set(nameNode.text, localVarTypeQualifiers.get(initNode.text));
+                    } else {
+                        localVarTypeQualifiers.delete(nameNode.text);
+                    }
+                } else if (initNode.type === 'member_expression' &&
+                    initNode.childForFieldName('property')?.type === 'property_identifier' &&
+                    ['this', 'identifier'].includes(initNode.childForFieldName('object')?.type) &&
+                    node.parent.parent) {
+                    localFieldAliases.set(nameNode.text, { node: initNode, scope: node.parent.parent });
+                }
             }
             // Ternary alias: const fn = cond ? parseCSV : parseJSON → both targets
             if (nameNode?.type === 'identifier' && initNode?.type === 'ternary_expression') {
@@ -2729,6 +3801,17 @@ function findCallsInCode(code, parser) {
                             localVarTypeQualifiers.delete(nameNode.text);
                         }
                     }
+                } else if (initNode?.type === 'subscript_expression' &&
+                    indexedArrayReceiver(initNode)) {
+                    // Declared container element (fix #359): `const c =
+                    // items[0]` with `items: Conv[]` binds a Conv.
+                    const element = indexedArrayReceiver(initNode);
+                    localVarTypes.set(nameNode.text, element.type, 'annotation', element.node);
+                    if (element.qualifier) {
+                        localVarTypeQualifiers.set(nameNode.text, element.qualifier);
+                    } else {
+                        localVarTypeQualifiers.delete(nameNode.text);
+                    }
                 } else if (initNode && JS_LITERAL_ASSIGN_TYPES[initNode.type]) {
                     // Literal declaration types the variable (fix #262):
                     // `const lines = []` → Array. Annotation, when present,
@@ -2762,6 +3845,7 @@ function findCallsInCode(code, parser) {
         if (node.type === 'assignment_expression') {
             const left = node.childForFieldName('left');
             const right = node.childForFieldName('right');
+            memberValueReference(right);
             if (left?.type === 'identifier') {
                 if (right?.type === 'new_expression') {
                     nonCallableNames.add(left.text);
@@ -2884,6 +3968,7 @@ function findCallsInCode(code, parser) {
                 const optionsMethod = funcNode.text === 'fetch'
                     ? getOptionsMethod(node, 1)
                     : null;
+                const requestConfig = getRequestConfig(node);
                 calls.push({
                     name: funcNode.text,
                     ...(resolvedName && { resolvedName }),
@@ -2892,12 +3977,19 @@ function findCallsInCode(code, parser) {
                     callStart: node.startIndex,
                     callEnd: node.endIndex,
                     isMethod: false,
+                    // A local binding of the name (fix #397): the call runs
+                    // the local's value, not a same-name outer definition.
+                    ...localShadowFields(funcNode, funcNode.text),
+                    ...destructuredFields(funcNode),
                     ...(assignedTo && { assignedTo }),
                     ...assignedIterFields,
                     enclosingFunction,
-                    uncertain,
+                    // Recorded only when true (fix #397: a `false` on every
+                    // record was a twelfth of a JS calls cache).
+                    ...(uncertain && { uncertain: true }),
                     ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp }),
-                    ...(optionsMethod && { optionsMethod })
+                    ...(optionsMethod && { optionsMethod }),
+                    ...(requestConfig && { requestConfig })
                 });
             } else if (funcNode.type === 'super') {
                 // super(config) — the subclass constructor invoking the
@@ -2914,12 +4006,11 @@ function findCallsInCode(code, parser) {
                     receiver: 'super',
                     argCount: node.childForFieldName('arguments')?.namedChildCount ?? 0,
                     enclosingFunction,
-                    uncertain: false,
                 });
             } else if (funcNode.type === 'member_expression') {
                 // Method call: obj.foo() or foo.call/apply/bind()
                 const propNode = funcNode.childForFieldName('property');
-                const objNode = funcNode.childForFieldName('object');
+                let objNode = funcNode.childForFieldName('object');
 
                 if (propNode) {
                     const propName = propNode.text;
@@ -2938,6 +4029,7 @@ function findCallsInCode(code, parser) {
                                 line: node.startPosition.row + 1,
                                 isMethod: false,
                                 boundCall: true,
+                                ...destructuredFields(objNode),
                                 enclosingFunction
                             });
                         } else if (objNode.type === 'member_expression') {
@@ -2976,112 +4068,25 @@ function findCallsInCode(code, parser) {
                                             receiverLocalBinding: true,
                                         }),
                                     enclosingFunction,
-                                    uncertain
+                                    ...(uncertain && { uncertain: true }),
                                 });
                             }
                         }
                     } else {
                         // Regular method call: obj.foo()
-                        // Extract receiver: handles identifiers (obj), this, super
-                        let receiver = undefined;
-                        if (objNode) {
-                            if (objNode.type === 'identifier' || objNode.type === 'this' || objNode.type === 'super') {
-                                receiver = objNode.text;
-                            }
-                        }
-                        // One-hop field receiver (fix #219 — #202's shape for
-                        // structural): this._map.has(x) / def.cache.get(k) —
-                        // receiverRoot/Field let findCallers hop to the
-                        // field's DECLARED type annotation. `this`-rooted hops
-                        // resolve their root type query-side (the enclosing
-                        // class); identifier roots type from local annotations.
-                        let receiverRoot, receiverFieldName, receiverRootType, receiverBindingNode;
-                        let receiverDeepPath = false;
-                        if (receiver && objNode?.type === 'identifier') receiverBindingNode = objNode;
-                        if (!receiver && objNode && objNode.type === 'member_expression') {
-                            const rootNode = objNode.childForFieldName('object');
-                            const fldNode = objNode.childForFieldName('property');
-                            if (fldNode && rootNode &&
-                                (rootNode.type === 'identifier' || rootNode.type === 'this')) {
-                                receiverRoot = rootNode.text;
-                                receiverBindingNode = rootNode.type === 'identifier' ? rootNode : undefined;
-                                receiverFieldName = fldNode.text;
-                                if (rootNode.type === 'identifier') {
-                                    receiverRootType = localVarTypes.get(rootNode.text);
-                                }
-                            } else {
-                                // Preserve unresolved deeper member chains
-                                // (`client.req.query()`). Their terminal name
-                                // must not borrow a same-file method binding
-                                // while the root object's type is unknown.
-                                receiverDeepPath = true;
-                            }
-                        }
-                        // Chained receiver (fix #219): the receiver IS a call —
-                        // parseAsync(args).catch(...) — record the producer so
-                        // findCallers can type the receiver from its declared
-                        // return annotation (Promise<...> → Promise).
-                        let receiverCall, receiverCallIsMethod, receiverCallAwaited, receiverCallLine;
-                        let receiverCallStart, receiverCallEnd;
-                        {
-                            let recvNode = objNode;
-                            if (recvNode && recvNode.type === 'parenthesized_expression') {
-                                recvNode = recvNode.namedChild(0);
-                            }
-                            if (recvNode && recvNode.type === 'await_expression') {
-                                receiverCallAwaited = true;
-                                recvNode = recvNode.namedChild(0);
-                            }
-                            if (recvNode && recvNode.type === 'call_expression') {
-                                const prodFunc = recvNode.childForFieldName('function');
-                                if (prodFunc?.type === 'identifier') {
-                                    receiverCall = prodFunc.text;
-                                    // Producer link (fix #258): plain-call
-                                    // records carry the call node's start line
-                                    receiverCallLine = recvNode.startPosition.row + 1;
-                                    receiverCallStart = recvNode.startIndex;
-                                    receiverCallEnd = recvNode.endIndex;
-                                } else if (prodFunc?.type === 'member_expression') {
-                                    const prodProp = prodFunc.childForFieldName('property');
-                                    if (prodProp) {
-                                        receiverCall = prodProp.text;
-                                        receiverCallIsMethod = true;
-                                        // Method records report the property
-                                        // node's own line
-                                        receiverCallLine = prodProp.startPosition.row + 1;
-                                        receiverCallStart = recvNode.startIndex;
-                                        receiverCallEnd = recvNode.endIndex;
-                                    }
-                                }
-                            }
-                            if (!receiverCall) receiverCallAwaited = undefined;
-                        }
-                        // Literal receivers carry their builtin type: [].map() can
-                        // never be a project class method
-                        // A freshly constructed receiver has an exact runtime
-                        // type as well: new Service().start(). Recording it here
-                        // avoids treating the call as an untyped method dispatch.
-                        const constructedReceiverType = objNode?.type === 'new_expression'
-                            ? jsConstructorTypeName(objNode.childForFieldName('constructor'))
-                            : undefined;
-                        const constructedReceiverQualifier = objNode?.type === 'new_expression'
-                            ? jsConstructorTypeQualifier(objNode.childForFieldName('constructor'))
-                            : undefined;
-                        const indexedReceiver = indexedArrayReceiver(objNode);
-                        const receiverType = indexedReceiver?.type || (receiver
-                            ? localVarTypes.get(receiver)
-                            : (constructedReceiverType ||
-                                (objNode ? JS_LITERAL_RECEIVER_TYPES[objNode.type] : undefined)));
-                        // Module receiver (ns.helper()) — unless locally shadowed
-                        // by a typed instance binding
-                        const receiverModuleSpecifier = jsLiteralRequireModule(objNode);
-                        const receiverIsModule = !!receiverModuleSpecifier ||
-                            (!!receiver && moduleAliases.has(receiver) &&
-                                !localVarTypes.has(receiver));
-                        const receiverModuleComposition = receiver &&
-                            !unsafeModuleCompositions.has(receiver)
-                            ? moduleCompositions.get(receiver) : undefined;
+                        const receiverFacts = memberReceiverFacts(objNode, propName);
                         const firstArg = getFirstStringArg(node);
+                        const requestConfig = getRequestConfig(node);
+                        const handlerArgs = firstArg && ROUTE_VERB_METHODS.test(propNode.text) &&
+                            getArgCount(node) >= 2 ? getHandlerArgs(node) : null;
+                        // fix #366: `server.register(plugin, { prefix })` mounts
+                        // the plugin's routes under the prefix.
+                        const registerMount = propNode.text === 'register' ? getRegisterMount(node) : null;
+                        // fix #366: the argument shapes of a router mount
+                        // (`app.use('/api', router)`, `app.route('/v2', api)`):
+                        // identifier names, or '()' for any other expression.
+                        const mountArgs = (propNode.text === 'use' || propNode.text === 'route') &&
+                            getArgCount(node) >= 2 ? getMountArgs(node) : null;
                         const argCount = getArgCount(node);
                         let assignedTo = jsAssignmentTargetOf(node);
                         let assignedIterFields = {};
@@ -3106,45 +4111,16 @@ function findCallsInCode(code, parser) {
                             callStart: node.startIndex,
                             callEnd: node.endIndex,
                             isMethod: true,
-                            receiver,
-                            ...(receiverType && { receiverType,
-                                ...(indexedReceiver ? { receiverTypeSource: 'annotation',
-                                    receiverTypeEvidence: indexedReceiver.evidence }
-                                    : receiver ? localVarTypes.fields(receiver, receiverType) : {
-                                    receiverTypeSource: constructedReceiverType ? 'constructor' : 'literal',
-                                    receiverTypeEvidence: typeOrigin(constructedReceiverType ? 'constructor' : 'literal', objNode),
-                                }),
-                            }),
-                            ...((indexedReceiver?.qualifier || constructedReceiverQualifier ||
-                                (receiver && localVarTypeQualifiers.get(receiver))) && {
-                                receiverTypeQualifier: indexedReceiver?.qualifier || constructedReceiverQualifier ||
-                                    localVarTypeQualifiers.get(receiver),
-                            }),
-                            ...(receiverIsModule && { receiverIsModule: true }),
-                            ...(receiverModuleSpecifier && { receiverModuleSpecifier }),
-                            ...(receiverModuleComposition && {
-                                receiverModuleComposition,
-                            }),
-                            ...(receiver && assignedMembers.has(`${receiver}.${propName}`) && {
-                                receiverMemberAssigned: true,
-                            }),
-                            ...(receiverBindingNode &&
-                                isShadowedByLocal(receiverBindingNode, receiverBindingNode.text) &&
-                                { receiverLocalBinding: true }),
-                            ...(receiverFieldName && { receiverRoot, receiverField: receiverFieldName }),
-                            ...(receiverFieldName && receiverRootType && { receiverRootType }),
-                            ...(receiverDeepPath && { receiverDeepPath: true }),
-                            ...(receiverCall && { receiverCall }),
-                            ...(receiverCallIsMethod && { receiverCallIsMethod: true }),
-                            ...(receiverCallAwaited && { receiverCallAwaited: true }),
-                            ...(receiverCallLine && { receiverCallLine }),
-                            ...(receiverCallStart != null && { receiverCallStart }),
-                            ...(receiverCallEnd != null && { receiverCallEnd }),
+                            ...receiverFacts,
                             ...(assignedTo && { assignedTo }),
                             ...assignedIterFields,
                             enclosingFunction,
-                            uncertain,
+                            ...(uncertain && { uncertain: true }),
                             ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp }),
+                            ...(requestConfig && { requestConfig }),
+                            ...(registerMount && { registerMount }),
+                            ...(mountArgs && { mountArgs }),
+                            ...(handlerArgs && { handlerArgs }),
                             argCount
                         });
                     }
@@ -3288,13 +4264,17 @@ function findCallsInCode(code, parser) {
             if (ctorNode) {
                 const enclosingFunction = getCurrentEnclosingFunction();
 
+                // fix #366: `new Router({ prefix: '/api' })` (koa-router)
+                // carries a constructor mount prefix.
+                const ctorPrefix = hasObjectKeyArg(node, 'prefix');
                 if (ctorNode.type === 'identifier') {
                     calls.push({
                         name: ctorNode.text,
                         line: node.startPosition.row + 1,
                         isMethod: false,
                         isConstructor: true,
-                        ...(isShadowedByLocal(ctorNode, ctorNode.text) && { localShadow: true }),
+                        ...localShadowFields(ctorNode, ctorNode.text),
+                        ...(ctorPrefix && { prefixOption: true }),
                         enclosingFunction
                     });
                 } else if (ctorNode.type === 'member_expression') {
@@ -3306,6 +4286,7 @@ function findCallsInCode(code, parser) {
                             line: node.startPosition.row + 1,
                             isMethod: true,
                             isConstructor: true,
+                            ...(ctorPrefix && { prefixOption: true }),
                             enclosingFunction
                         });
                     }
@@ -3885,6 +4866,28 @@ function findImportsInCode(code, parser) {
                     // Check parent for variable name
                     let parent = node.parent;
                     let defaultLike = false;
+                    // `const stringify = require('url').format` binds the
+                    // module's member `format` under the local name (fix
+                    // #397, koa-measured): a renamed named import, never the
+                    // module value nor a binding of `stringify` itself.
+                    const memberOfRequire = parent?.type === 'member_expression' &&
+                        sameNode(parent.childForFieldName('object'), node) &&
+                        parent.childForFieldName('property')?.type === 'property_identifier' &&
+                        parent.parent?.type === 'variable_declarator' &&
+                        sameNode(parent.parent.childForFieldName('value'), parent)
+                        ? parent.childForFieldName('property').text : null;
+                    if (memberOfRequire) {
+                        const nameNode = parent.parent.childForFieldName('name');
+                        if (nameNode?.type === 'identifier') {
+                            names.push(memberOfRequire);
+                            if (nameNode.text !== memberOfRequire) {
+                                if (!importAliases) importAliases = [];
+                                importAliases.push({ original: memberOfRequire, local: nameNode.text });
+                                renames.push({ original: memberOfRequire, local: nameNode.text });
+                            }
+                        }
+                        parent = null;
+                    }
                     if (parent && parent.type === 'variable_declarator') {
                         const nameNode = parent.childForFieldName('name');
                         if (nameNode) {
@@ -4281,9 +5284,24 @@ function findExportsInCode(code, parser) {
  * @param {object} [tree] - Pre-parsed tree (per-operation cache); parsed here when absent
  * @returns {Array<{line: number, column: number, usageType: string}>}
  */
-function findUsagesInCode(code, name, parser, tree) {
+/** A shorthand property of a module export object (`module.exports = { f }`, `export default { f }`). */
+function jsExportObjectShorthand(node) {
+    const object = node.parent;
+    if (object?.type !== 'object') return false;
+    const holder = object.parent;
+    if (holder?.type === 'export_statement') return true;
+    if (holder?.type !== 'assignment_expression' ||
+        !sameNode(holder.childForFieldName('right'), object)) return false;
+    const left = holder.childForFieldName('left')?.text?.replace(/\s+/g, '') || '';
+    return left === 'module.exports' || left === 'exports' ||
+        left.startsWith('module.exports.') || left.startsWith('exports.');
+}
+
+function findUsagesInCode(code, name, parser, tree, options = {}) {
     tree = tree || parseTree(parser, code);
     const usages = [];
+    // Lexical scope verdicts (fix #392) only for refactoring internals.
+    const scopeMemo = options.lexicalScopes ? new Map() : null;
 
     visitNameNodes(tree, code, name, (node) => {
         // Look for identifier, property_identifier (method names in obj.method() calls),
@@ -4307,6 +5325,7 @@ function findUsagesInCode(code, name, parser, tree) {
 
         // Classify based on parent node
         let usageType = 'reference';
+        let importAliasLocal = false;
 
         if (parent) {
             // Import: identifier inside import_specifier or import_clause
@@ -4314,6 +5333,11 @@ function findUsagesInCode(code, name, parser, tree) {
                 parent.type === 'import_clause' ||
                 parent.type === 'namespace_import') {
                 usageType = 'import';
+                // `import { g as f }`: f is the importer's local alias.
+                const imported = parent.type === 'import_specifier' ? parent.childForFieldName('name') : null;
+                if (imported && sameNode(parent.childForFieldName('alias'), node) && imported.text !== node.text) {
+                    importAliasLocal = true;
+                }
             }
             // Call: identifier is function in call_expression
             else if (parent.type === 'call_expression' &&
@@ -4344,6 +5368,8 @@ function findUsagesInCode(code, name, parser, tree) {
                 }
                 // Unwrap require('./x').member — still an import binding
                 if (value && value.type === 'member_expression') {
+                    // `const f = require('m').g`: f is a local alias of g.
+                    if (value.childForFieldName('property')?.text !== node.text) importAliasLocal = true;
                     value = value.childForFieldName('object');
                 }
                 if (value && value.type === 'call_expression') {
@@ -4422,7 +5448,17 @@ function findUsagesInCode(code, name, parser, tree) {
             }
         }
 
-        usages.push({ line, column, usageType });
+        // Where a bare reference resolves (fix #392).
+        const scope = scopeMemo && usageType === 'reference'
+            ? scopeFields(referenceScope(node, 'javascript', scopeMemo)) : null;
+        // An object-literal shorthand `{ name }` is a key AND a reference to
+        // the binding (fix #397): a rename of the binding keeps the key
+        // (`{ name: renamed }`), except in a module's export object, whose
+        // keys are the export names a rename follows into every importer.
+        const shorthandProperty = scopeMemo && node.type === 'shorthand_property_identifier' &&
+            !jsExportObjectShorthand(node);
+        usages.push({ line, column, usageType, ...scope, ...(shorthandProperty && { shorthandProperty: true }),
+            ...(importAliasLocal && usageType === 'import' && { importAlias: true }) });
         return true;
     });
 

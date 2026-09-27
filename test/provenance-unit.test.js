@@ -52,6 +52,20 @@ describe('confirmation witnesses', () => {
         proof.facts.lookup.steps[1].members.push({ ...inherited, startLine: 25 });
         assert.equal(validateConfirmation(proof, inherited).verdict, 'incomplete');
     });
+    it('fix #396: a member-set witness proves only that a target outside the members is not the callee', () => {
+        const overloadB = { ...method, startLine: 4, endLine: 5 };
+        const proof = witness();
+        proof.facts.lookup.memberSet = true;
+        proof.facts.lookup.steps[0].members = [method, overloadB];
+        const other = { ...method, startLine: 12, className: 'Other' };
+        assert.equal(validateConfirmation(proof, other).verdict, 'establishes-other');
+        // A target among the members stays undecided, never confirmed.
+        assert.equal(validateConfirmation(proof, method).verdict, 'incomplete');
+        assert.equal(validateConfirmation(proof, overloadB).verdict, 'incomplete');
+        // A set of one member is no member-set witness.
+        proof.facts.lookup.steps[0].members = [method];
+        assert.equal(validateConfirmation(proof, other).verdict, 'inconsistent');
+    });
     it('does not turn unknown or inconsistent receiver origins into exclusions', () => {
         const proof = witness();
         proof.facts.receiverTypeSource = 'unknown';

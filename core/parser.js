@@ -6,6 +6,7 @@
  */
 
 const fs = require('fs');
+const { UcnError } = require('./errors');
 const { detectLanguage, getParser, getLanguageAdapter, isSupported } = require('../languages');
 
 /**
@@ -76,7 +77,7 @@ function parse(code, language) {
     }
 
     if (!language || !isSupported(language)) {
-        throw new Error(`Unsupported language: ${language}`);
+        throw new UcnError(`Unsupported language: ${language}`);
     }
 
     const parser = getParser(language);
@@ -95,7 +96,7 @@ function parseFile(filePath) {
     const language = detectLanguage(filePath);
 
     if (!language) {
-        throw new Error(`Cannot detect language for: ${filePath}`);
+        throw new UcnError(`Cannot detect language for: ${filePath}`);
     }
 
     const result = parse(code, language);

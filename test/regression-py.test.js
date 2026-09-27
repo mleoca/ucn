@@ -6754,3 +6754,1325 @@ describe('fix #338: TYPE_CHECKING-guarded imports are deferred edges', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #359: annotated container subscripts type their element receivers', () => {
+    const receiverTypes = (code) => {
+        const dir = tmp({ 'm.py': code });
+        try {
+            const index = idx(dir);
+            const file = path.join(dir, 'm.py');
+            const { getCachedCalls } = require('../core/callers');
+            return getCachedCalls(index, file)
+                .filter(c => c.name === 'render')
+                .map(c => [c.line, c.receiverType || null]);
+        } finally { rm(dir); }
+    };
+
+    it('dict/Mapping values and list/Sequence items are typed, Any and slices abstain', () => {
+        const got = receiverTypes([
+            'from typing import Any, Mapping, Sequence',
+            'class Conv:',
+            '    def render(self): return 1',
+            'def a(m: dict[str, Conv], k):',
+            '    c = m[k]',
+            '    return c.render()',
+            'def b(m: Mapping[str, Conv], k):',
+            '    return m[k].render()',
+            'def c(xs: Sequence[Conv]):',
+            '    return xs[0].render()',
+            'def d(m: dict[str, Any], k):',
+            '    return m[k].render()',
+            'def e(xs: list[Conv]):',
+            '    return xs[1:].render()',
+            'def f(xs: list[Conv]):',
+            '    xs = load()',
+            '    return xs[0].render()',
+            'def g(xs: tuple[Conv, ...]):',
+            '    return xs[0].render()',
+        ].join('\n') + '\n');
+        assert.deepStrictEqual(got, [
+            [6, 'Conv'], [8, 'Conv'], [10, 'Conv'], [12, null], [14, null],
+            [17, null], [19, 'Conv'],
+        ]);
+    });
+
+    it('an inner function rebinding the container name drops the outer contract', () => {
+        const got = receiverTypes([
+            'class Conv:',
+            '    def render(self): return 1',
+            'def outer(m: dict[str, Conv]):',
+            '    def inner(m):',
+            '        return m[0].render()',
+            '    return inner',
+        ].join('\n') + '\n');
+        assert.deepStrictEqual(got, [[5, null]]);
+    });
+});
+
+describe('fix #364: audit-async classifies async producers by what a call returns (Python)', () => {
+    it('async generators and async context managers are not missing awaits; coroutines are', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'app.py': [
+                'import contextlib',                                   // 1
+                'import contextlib as cl',                             // 2
+                'from contextlib import asynccontextmanager',           // 3
+                'from contextlib import asynccontextmanager as acm',    // 4
+                'from deco import unknown_deco',                       // 5
+                '',                                                    // 6
+                'async def gen():',                                    // 7
+                '    yield 1',                                         // 8
+                '',                                                    // 9
+                '@asynccontextmanager',                                // 10
+                'async def ctx():',                                    // 11
+                '    yield "r"',                                       // 12
+                '',                                                    // 13
+                '@contextlib.asynccontextmanager',                     // 14
+                'async def ctx2():',                                   // 15
+                '    yield "r"',                                       // 16
+                '',                                                    // 17
+                '@cl.asynccontextmanager',                             // 18
+                'async def ctx3():',                                   // 19
+                '    yield "r"',                                       // 20
+                '',                                                    // 21
+                '@acm',                                                // 22
+                'async def ctx4():',                                   // 23
+                '    yield "r"',                                       // 24
+                '',                                                    // 25
+                '@unknown_deco',                                       // 26
+                'async def wrapped():',                                // 27
+                '    return 1',                                        // 28
+                '',                                                    // 29
+                'async def outer_yield_in_nested():',                  // 30
+                '    def inner():',                                    // 31
+                '        yield 1',                                     // 32
+                '    return 1',                                        // 33
+                '',                                                    // 34
+                'async def fetch():',                                  // 35
+                '    return 1',                                        // 36
+                '',                                                    // 37
+                'async def main(stack):',                              // 38
+                '    async for v in gen():',                           // 39
+                '        print(v)',                                    // 40
+                '    s = gen()',                                       // 41
+                '    print([v async for v in gen()])',                 // 42
+                '    consume(gen())',                                  // 43
+                '    async with ctx() as r, ctx2(), ctx3(), ctx4():',  // 44
+                '        print(r)',                                    // 45
+                '    await stack.enter_async_context(ctx())',          // 46
+                '    wrapped()',                                       // 47
+                '    gen()',                                           // 48
+                '    ctx()',                                           // 49
+                '    outer_yield_in_nested()',                         // 50
+                '    fetch()',                                         // 51
+                '    x = fetch()',                                     // 52
+                '    await fetch()',                                   // 53
+                '',
+            ].join('\n'),
+        });
+        try {
+            const r = idx(dir).auditAsync({});
+            const got = r.issues.map(i => [i.line, i.calleeName, i.reason || null]);
+            assert.deepStrictEqual(got, [
+                [48, 'gen', 'async-iterator-discarded'],
+                [49, 'ctx', 'async-context-manager-discarded'],
+                [50, 'outer_yield_in_nested', null],
+                [51, 'fetch', null],
+                [52, 'fetch', null],
+            ]);
+            assert.strictEqual(r.skippedUnknown, 1, 'the unknown-decorated call is disclosed, not flagged');
+        } finally { rm(dir); }
+    });
+
+    it('bare calls resolve lexically: nested defs and parameters shadow same-name definitions', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'app.py': [
+                'async def receive():',                // 1
+                '    return {}',                       // 2
+                '',                                    // 3
+                'async def uses_generator():',         // 4
+                '    async def receive():',            // 5
+                '        yield {}',                    // 6
+                '    rcv = receive()',                 // 7
+                '',                                    // 8
+                'async def uses_param(receive):',      // 9
+                '    receive()',                       // 10
+                '',                                    // 11
+                'async def uses_module_level():',      // 12
+                '    receive()',                       // 13
+                '',
+            ].join('\n'),
+        });
+        try {
+            const r = idx(dir).auditAsync({});
+            assert.deepStrictEqual(r.issues.map(i => i.line), [13]);
+        } finally { rm(dir); }
+    });
+
+    it('Python calls named like JS runtime globals are not treated as promises', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'app.py': [
+                'async def run(state):',
+                '    state.fetch(1)',
+                '    fetch(2)',
+                '',
+            ].join('\n'),
+        });
+        try {
+            assert.strictEqual(idx(dir).auditAsync({}).totalIssues, 0);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #366: absolute imports resolve against a nested source root', () => {
+    it('backend/app/... imports `app.x` from the non-package ancestor holding `app/`', () => {
+        const dir = tmp({
+            'backend/app/__init__.py': '',
+            'backend/app/core/__init__.py': '',
+            'backend/app/core/config.py': 'def load():\n    return 1\n',
+            'backend/app/api/__init__.py': '',
+            'backend/app/api/deps.py': 'from app.core.config import load\n\ndef dep():\n    return load()\n',
+            'backend/app/api/routes/__init__.py': '',
+            'backend/app/api/routes/utils.py': 'X = 1\n',
+            // A sibling module named like a top-level package must not
+            // answer an absolute import from inside a package.
+            'backend/app/api/json.py': 'Y = 1\n',
+            'backend/app/api/use_json.py': 'import json\n',
+        });
+        try {
+            const index = idx(dir);
+            const deps = index.files.get(path.join(dir, 'backend/app/api/deps.py'));
+            assert.strictEqual(deps.moduleResolved['app.core.config'], path.join('backend', 'app', 'core', 'config.py'));
+            const callers = execute(index, 'impact', { name: 'load' });
+            assert.ok(callers.ok);
+            const useJson = index.files.get(path.join(dir, 'backend/app/api/use_json.py'));
+            assert.ok(!useJson.moduleResolved.json, 'stdlib json is not the sibling package module');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #367c: audit-async flags lost or misused coroutines, not ones that flow on (Python)', () => {
+    it('arguments, generators, spreads and conditional returns flow; discarded, unread and misused values are findings', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'app.py': [
+                'import asyncio',                                         // 1
+                '',                                                       // 2
+                'async def run(i, c):',                                   // 3
+                '    return i',                                           // 4
+                '',                                                       // 5
+                'async def fetch():',                                     // 6
+                '    return 1',                                           // 7
+                '',                                                       // 8
+                'async def parallel(*coros):',                            // 9
+                '    return await asyncio.gather(*coros)',                // 10
+                '',                                                       // 11
+                'async def main(tg, flag, items):',                       // 12
+                '    tg.create_task(run(1, fetch()))',                    // 13 flow (argument)
+                '    await parallel(*(run(i, x) for i, x in items))',     // 14 flow (generator in spread)
+                '    kept = fetch()',                                     // 15 stored, read at 16
+                '    await kept',                                         // 16
+                '    fetch()',                                            // 17 discarded
+                '    lost = fetch()',                                     // 18 stored, never read
+                '    if fetch():',                                        // 19 used as value
+                '        pass',                                           // 20
+                '    n = fetch().real',                                   // 21 used as value
+                '    return fetch() if flag else None',                   // 22 flow (conditional return)
+            ].join('\n'),
+        });
+        try {
+            const r = idx(dir).auditAsync({});
+            const byLine = new Map(r.issues.map(i => [i.line, i]));
+            assert.deepStrictEqual([...byLine.keys()].sort((a, b) => a - b), [17, 18, 19, 21],
+                JSON.stringify(r.issues));
+            assert.strictEqual(byLine.get(17).reason, undefined);
+            assert.strictEqual(byLine.get(18).reason, undefined);
+            assert.strictEqual(byLine.get(19).reason, 'async-result-used-as-value');
+            assert.strictEqual(byLine.get(21).reason, 'async-result-used-as-value');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #373: declarative Python route tables (endpoints)', () => {
+    const { extractServerRoutes, endpoints } = require('../core/bridge');
+    const routeSet = (index, filter = () => true) => extractServerRoutes(index).filter(filter)
+        .map(r => `${r.method} ${r.path}${r.derived ? ` [${r.derived}]` : ''}`).sort();
+
+    it('Django: include() by dotted path, module and list, converters, prefixes, ROOT_URLCONF', () => {
+        const dir = tmp({
+            'mysite/__init__.py': '',
+            'mysite/settings.py': 'ROOT_URLCONF = "mysite.urls"\n',
+            'mysite/urls.py': [
+                'from django.urls import include, path',
+                'from blog import urls as blog_urls',
+                'from . import views',
+                'extra = [path("reports/", views.report)]',
+                'urlpatterns = [',
+                '    path("", views.home),',
+                '    path("blog/", include("blog.urls")),',
+                '    path("mirror/", include(blog_urls)),',
+                '    path("extra/", include(extra)),',
+                '    path("inline/", include([path("a/", views.home)])),',
+                ']',
+                'urlpatterns += [path("late/", views.home)]',
+            ].join('\n'),
+            'mysite/views.py': [
+                'from django.views.decorators.http import require_http_methods, require_POST',
+                'def home(request): pass',
+                '@require_http_methods(["GET", "POST"])',
+                'def report(request): pass',
+                '@require_POST',
+                'def publish(request): pass',
+            ].join('\n'),
+            'tests_urls.py': [
+                'from django.urls import include, path',
+                'urlpatterns = [path("t/", include("mysite.urls"))]',
+            ].join('\n'),
+            'blog/__init__.py': '',
+            'blog/urls.py': [
+                'from django.urls import path',
+                'from mysite import views',
+                'urlpatterns = [',
+                '    path("articles/<int:year>/", views.home),',
+                '    path("publish/", views.publish),',
+                ']',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            // mysite.urls is ROOT_URLCONF (served at /) and also included
+            // by a test URLconf under t/.
+            const expected = [
+                'ALL /', 'ALL /blog/articles/<int:year>/', 'ALL /inline/a/', 'ALL /late/',
+                'ALL /mirror/articles/<int:year>/', 'GET /extra/reports/', 'POST /blog/publish/',
+                'POST /extra/reports/', 'POST /mirror/publish/',
+            ];
+            assert.deepStrictEqual(routeSet(index),
+                [...expected, ...expected.map(r => r.replace(' /', ' /t/'))].sort());
+            const year = extractServerRoutes(index).find(r => r.path === '/blog/articles/<int:year>/');
+            assert.strictEqual(year.normalizedPath, '/blog/articles/*');
+            assert.strictEqual(year.framework, 'django');
+        } finally { rm(dir); }
+    });
+
+    it('large modules parse only the definitions the route pass reads', () => {
+        const filler = Array.from({ length: 400 }, (_, i) =>
+            `def helper_${i}(a, b):\n    return a + b + ${i}\n`).join('\n');
+        const dir = tmp({
+            'tests.py': [
+                'from django.urls import path',
+                'from django.views import View',
+                'PREFIX = "api/"',
+                filler,
+                'class Detail(View):',
+                '    def get(self, request): pass',
+                '    def put(self, request): pass',
+                'class Unrelated:',
+                '    def method(self): pass',
+                'class RoutingTests:',
+                '    def test_other(self):',
+                '        return 1',
+                '    def test_routes(self):',
+                '        urlpatterns = [path(PREFIX + "detail/", Detail.as_view())]',
+                '        return urlpatterns',
+            ].join('\n'),
+        });
+        try {
+            assert.ok(fs.statSync(path.join(dir, 'tests.py')).size > 16384);
+            assert.deepStrictEqual(routeSet(idx(dir)), ['GET /api/detail/', 'PUT /api/detail/']);
+        } finally { rm(dir); }
+    });
+
+    it('Django: class-based view methods through project and framework bases', () => {
+        const dir = tmp({
+            'app/__init__.py': '',
+            'app/views.py': [
+                'from django.views import View',
+                'from django.views.generic import TemplateView',
+                'class Base(View):',
+                '    def get(self, request): pass',
+                'class ItemView(Base):',
+                '    def post(self, request): pass',
+                'class Page(TemplateView):',
+                '    pass',
+                'class Opaque(SomethingExternal):',
+                '    def delete(self, request): pass',
+            ].join('\n'),
+            'app/urls.py': [
+                'from django.urls import path',
+                'from django.views.generic import TemplateView',
+                'from . import views',
+                'urlpatterns = [',
+                '    path("item/", views.ItemView.as_view()),',
+                '    path("page/", views.Page.as_view()),',
+                '    path("about/", TemplateView.as_view(template_name="a.html")),',
+                '    path("opaque/", views.Opaque.as_view()),',
+                ']',
+            ].join('\n'),
+        });
+        try {
+            assert.deepStrictEqual(routeSet(idx(dir)), [
+                'ALL /opaque/', 'GET /about/', 'GET /item/', 'GET /page/', 'POST /item/',
+            ]);
+        } finally { rm(dir); }
+    });
+
+    it('Django: re_path regexes normalize to path form; unconvertible parts are disclosed', () => {
+        const dir = tmp({
+            'urls.py': [
+                'from django.urls import re_path',
+                'def v(request): pass',
+                'urlpatterns = [',
+                '    re_path(r"^articles/(?P<year>[0-9]{4})/$", v),',
+                '    re_path(r"^feed/?$", v),',
+                '    re_path(r"^files/(\\d+)\\.json$", v),',
+                '    re_path(r"^places?/$", v),',
+                ']',
+            ].join('\n'),
+        });
+        try {
+            assert.deepStrictEqual(routeSet(idx(dir)), [
+                'ALL /articles/<year>/ [regex]',
+                'ALL /feed [regex]',
+                'ALL /files/<arg1>.json [regex]',
+                // The literal '/' after an unconverted part stays (fix #383).
+                'ALL /place{?s}/ [regex]',
+            ]);
+        } finally { rm(dir); }
+    });
+
+    it('Django: unresolved includes stay visible as disclosed wildcard routes; mock.patch is not a route', () => {
+        const dir = tmp({
+            'urls.py': [
+                'from django.contrib import admin',
+                'from django.urls import include, path',
+                'urlpatterns = [',
+                '    path("admin/", admin.site.urls),',
+                '    path("ext/", include("some_external_pkg.urls")),',
+                ']',
+            ].join('\n'),
+            'test_x.py': [
+                'from unittest import mock',
+                '@mock.patch("pkg.mod.attr")',
+                'def test_it(m): pass',
+            ].join('\n'),
+        });
+        try {
+            assert.deepStrictEqual(routeSet(idx(dir)), [
+                'ALL /admin/{?admin.site.urls} [include]',
+                'ALL /ext/{?some_external_pkg.urls} [include]',
+            ]);
+        } finally { rm(dir); }
+    });
+
+    it('Django: function-built URL lists, i18n_patterns and translated routes', () => {
+        const dir = tmp({
+            'urls.py': [
+                'from django.conf.urls.i18n import i18n_patterns',
+                'from django.urls import include, path',
+                'from django.utils.translation import gettext_lazy as _',
+                'def v(request): pass',
+                'def build(prefix):',
+                '    patterns = [path("login/", v)]',
+                '    return [path("auth/", include(patterns))]',
+                'urlpatterns = [path("v1/", include(build("x")))]',
+                'urlpatterns += i18n_patterns(path(_("about/"), v))',
+            ].join('\n'),
+        });
+        try {
+            assert.deepStrictEqual(routeSet(idx(dir)), [
+                'ALL /v1/auth/login/',
+                'ALL /{?language_code}/about/',
+            ]);
+        } finally { rm(dir); }
+    });
+
+    it('DRF: router.register derives list/detail and @action routes from the viewset', () => {
+        const dir = tmp({
+            'api/__init__.py': '',
+            'api/views.py': [
+                'from rest_framework import mixins, viewsets',
+                'from rest_framework.decorators import action',
+                'class UserViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.GenericViewSet):',
+                '    lookup_field = "slug"',
+                '    @action(detail=True, methods=["post"])',
+                '    def activate(self, request, slug=None): pass',
+                'class ThingViewSet(viewsets.ModelViewSet):',
+                '    pass',
+            ].join('\n'),
+            'api/urls.py': [
+                'from django.urls import include, path',
+                'from rest_framework.routers import DefaultRouter',
+                'from . import views',
+                'router = DefaultRouter()',
+                'router.register(r"users", views.UserViewSet)',
+                'router.register(r"things", views.ThingViewSet)',
+                'urlpatterns = [path("api/", include(router.urls))]',
+            ].join('\n'),
+        });
+        try {
+            assert.deepStrictEqual(routeSet(idx(dir)), [
+                'DELETE /api/things/<pk>/ [drf-router]',
+                'GET /api/ [drf-router]',
+                'GET /api/things/ [drf-router]',
+                'GET /api/things/<pk>/ [drf-router]',
+                'GET /api/users/ [drf-router]',
+                'GET /api/users/<slug>/ [drf-router]',
+                'PATCH /api/things/<pk>/ [drf-router]',
+                'POST /api/things/ [drf-router]',
+                'POST /api/users/<slug>/activate/ [drf-router]',
+                'PUT /api/things/<pk>/ [drf-router]',
+            ]);
+        } finally { rm(dir); }
+    });
+
+    it('Starlette: Route/WebSocketRoute/Mount/Host lists, HTTPEndpoint methods, static mounts', () => {
+        const dir = tmp({
+            'app.py': [
+                'from starlette.applications import Starlette',
+                'from starlette.endpoints import HTTPEndpoint',
+                'from starlette.routing import Host, Mount, Route, Router, WebSocketRoute',
+                'from starlette.staticfiles import StaticFiles',
+                'async def homepage(request): pass',
+                'async def ws(websocket): pass',
+                'class Users(HTTPEndpoint):',
+                '    async def get(self, request): pass',
+                '    async def post(self, request): pass',
+                'async def raw_app(scope, receive, send): pass',
+                'api = Router(routes=[Route("/users", Users), Route("/save", homepage, methods=["PUT"])])',
+                'routes = [',
+                '    Route("/", homepage),',
+                '    WebSocketRoute("/ws", ws),',
+                '    Mount("/api", app=api),',
+                '    Mount("/v2", routes=[Route("/ping", homepage)]),',
+                '    Mount("/static", app=StaticFiles(directory="static")),',
+                '    Mount("/raw", app=raw_app),',
+                '    Host("api.example.org", app=Router([Route("/h", homepage)])),',
+                ']',
+                'app = Starlette(routes=routes)',
+                'app.add_route("/added", homepage, methods=["POST"])',
+            ].join('\n'),
+        });
+        try {
+            assert.deepStrictEqual(routeSet(idx(dir)), [
+                'ALL /raw/{?raw_app} [mount]',
+                'GET /',
+                'GET /api/users',
+                'GET /h',
+                'GET /static/{path:path} [static]',
+                'GET /v2/ping',
+                'POST /added',
+                'POST /api/users',
+                'PUT /api/save',
+                'WS /ws',
+            ]);
+        } finally { rm(dir); }
+    });
+
+    it('Starlette Mount composes with a FastAPI router mounted by variable', () => {
+        const dir = tmp({
+            'main.py': [
+                'from fastapi import APIRouter, FastAPI',
+                'from starlette.routing import Mount',
+                'router = APIRouter()',
+                '@router.get("/items")',
+                'def items(): pass',
+                'app = FastAPI(routes=[Mount("/v1", app=router)])',
+            ].join('\n'),
+        });
+        try {
+            assert.deepStrictEqual(routeSet(idx(dir)), ['GET /v1/items']);
+        } finally { rm(dir); }
+    });
+
+    it('Flask: add_url_rule with MethodView/View classes, every decorator method, blueprint prefix', () => {
+        const dir = tmp({
+            'app.py': [
+                'from flask import Blueprint, Flask',
+                'from flask.views import MethodView, View',
+                'app = Flask(__name__)',
+                'bp = Blueprint("bp", __name__, url_prefix="/bp")',
+                'class UserAPI(MethodView):',
+                '    def get(self): pass',
+                '    def delete(self): pass',
+                'class Plain(View):',
+                '    methods = ["POST"]',
+                '    def dispatch_request(self): pass',
+                'def index(): pass',
+                'app.add_url_rule("/users/", view_func=UserAPI.as_view("users"))',
+                'app.add_url_rule("/plain", view_func=Plain.as_view("plain"))',
+                'app.add_url_rule("/", "index", index)',
+                'bp.add_url_rule("/x", view_func=index, methods=["PATCH"])',
+                '@app.route("/form", methods=("GET", "POST"))',
+                'def form(): pass',
+                'app.register_blueprint(bp)',
+            ].join('\n'),
+        });
+        try {
+            assert.deepStrictEqual(routeSet(idx(dir)), [
+                'DELETE /users/', 'GET /', 'GET /form', 'GET /users/', 'PATCH /bp/x', 'POST /form', 'POST /plain',
+            ]);
+        } finally { rm(dir); }
+    });
+
+    it('aiohttp: add_routes tables, router.add_*, subapps, RouteTableDef decorators', () => {
+        const dir = tmp({
+            'app.py': [
+                'from aiohttp import web',
+                'routes = web.RouteTableDef()',
+                '@routes.get("/table")',
+                'async def table(request): pass',
+                'async def h(request): pass',
+                'class ItemView(web.View):',
+                '    async def get(self): pass',
+                '    async def put(self): pass',
+                'app = web.Application()',
+                'app.add_routes([web.get("/a", h), web.post("/b", h), web.view("/items", ItemView)])',
+                'app.router.add_route("DELETE", "/c", h)',
+                'sub = web.Application()',
+                'sub.router.add_get("/d", h)',
+                'app.add_subapp("/sub", sub)',
+                'app.add_routes(routes)',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(routeSet(index), [
+                'DELETE /c', 'GET /a', 'GET /items', 'GET /sub/d', 'GET /table', 'POST /b', 'PUT /items',
+            ]);
+            assert.ok(extractServerRoutes(index).filter(r => r.path === '/table').every(r => r.framework === 'aiohttp'));
+        } finally { rm(dir); }
+    });
+
+    it('bridge: JS clients match Django routes through composed includes', () => {
+        const dir = tmp({
+            'backend/__init__.py': '',
+            'backend/urls.py': [
+                'from django.urls import include, path',
+                'urlpatterns = [path("api/", include("backend.api_urls"))]',
+            ].join('\n'),
+            'backend/api_urls.py': [
+                'from django.urls import path',
+                'from django.views.decorators.http import require_GET',
+                '@require_GET',
+                'def article(request, slug): pass',
+                'urlpatterns = [path("articles/<slug:slug>/", article)]',
+            ].join('\n'),
+            'frontend/api.js': [
+                'export function load(slug) {',
+                '  return fetch(`/api/articles/${slug}/`);',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const result = endpoints(idx(dir), { bridge: true });
+            assert.strictEqual(result.bridges.length, 1);
+            assert.strictEqual(result.bridges[0].route.path, '/api/articles/<slug:slug>/');
+            assert.strictEqual(result.bridges[0].route.method, 'GET');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #383: framework join rules, regex anchors and catch-all parameters (endpoints)', () => {
+    const { extractServerRoutes, endpoints } = require('../core/bridge');
+    const routeSet = (index, filter = () => true) => extractServerRoutes(index).filter(filter)
+        .map(r => `${r.method} ${r.path}${r.derived ? ` [${r.derived}]` : ''}`).sort();
+
+    it('Django concatenates include prefixes and patterns as written; the root adds the leading slash', () => {
+        const dir = tmp({
+            'mysite/__init__.py': '',
+            'mysite/settings.py': 'ROOT_URLCONF = "mysite.urls"\n',
+            'mysite/urls.py': [
+                'from django.urls import include, path, re_path',
+                'urlpatterns = [',
+                '    path("api", include("app.urls")),',
+                '    path("v2/", include("app.urls")),',
+                '    re_path(r"^legacy/", include("app.urls")),',
+                ']',
+            ].join('\n'),
+            'app/__init__.py': '',
+            'app/views.py': 'def items(request): pass\ndef page(request, url): pass\n',
+            'app/urls.py': [
+                'from django.urls import path',
+                'from . import views',
+                'urlpatterns = [',
+                '    path("items/", views.items),',
+                '    path("<path:url>", views.page),',
+                ']',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const paths = routeSet(index, r => r.file === 'app/urls.py');
+            assert.deepStrictEqual(paths, [
+                'ALL /api<path:url>', 'ALL /apiitems/',
+                'ALL /legacy/<path:url>', 'ALL /legacy/items/',
+                'ALL /v2/<path:url>', 'ALL /v2/items/',
+            ]);
+            // A path converter spans segments: a client URL with several
+            // segments bridges to it.
+            const route = extractServerRoutes(index).find(r => r.path === '/v2/<path:url>');
+            assert.strictEqual(route.normalizedPath, '/v2/**');
+        } finally { rm(dir); }
+    });
+
+    it('Django re_path: unanchored start/end match any text, groups that match "/" span segments', () => {
+        const dir = tmp({
+            'mysite/__init__.py': '',
+            'mysite/settings.py': 'ROOT_URLCONF = "mysite.urls"\n',
+            'mysite/urls.py': [
+                'from django.urls import re_path',
+                'def v(request, **kw): pass',
+                'urlpatterns = [',
+                '    re_path(r"^exact/(?P<slug>[-\\w]+)/$", v),',
+                '    re_path(r"^prefix/", v),',
+                '    re_path(r"anywhere/$", v),',
+                '    re_path(r"^files/(?P<rest>.+)$", v),',
+                '    re_path(r"^neg/(?P<part>[^/]+)/$", v),',
+                '    re_path(r"^app-[135]/tail/$", v),',
+                ']',
+            ].join('\n'),
+        });
+        try {
+            assert.deepStrictEqual(routeSet(idx(dir)), [
+                'ALL /app-{?[135]}/tail/ [regex]',
+                'ALL /exact/<slug>/ [regex]',
+                'ALL /files/<path:rest> [regex]',
+                'ALL /neg/<part>/ [regex]',
+                'ALL /prefix/{?*} [regex]',
+                'ALL /{?*}anywhere/ [regex]',
+            ]);
+        } finally { rm(dir); }
+    });
+
+    it('Django re_path: a view without `$` serves its prefix and any tail (a proven catch-all, not an uncertain match)', () => {
+        const dir = tmp({
+            'mysite/__init__.py': '',
+            'mysite/settings.py': 'ROOT_URLCONF = "mysite.urls"\n',
+            'mysite/urls.py': [
+                'from django.urls import re_path',
+                'def v(request): pass',
+                'urlpatterns = [re_path(r"^prefix/", v)]',
+            ].join('\n'),
+            'mysite/test_views.py': [
+                'from django.test import Client',
+                'def test_it():',
+                '    c = Client()',
+                '    c.get("/prefix/")',
+                '    c.get("/prefix/more/deep/")',
+                '    c.get("/other/")',
+            ].join('\n'),
+        });
+        try {
+            const result = endpoints(idx(dir), { bridge: true });
+            assert.deepStrictEqual(result.bridges.map(b => `${b.request.path} ${b.matchType}`).sort(),
+                ['/prefix/ partial', '/prefix/more/deep/ partial']);
+        } finally { rm(dir); }
+    });
+
+    it('Starlette: a literal ":" is text and {name:path} spans segments; the client URL keeps its ":"', () => {
+        const dir = tmp({
+            'app.py': [
+                'from starlette.applications import Starlette',
+                'from starlette.routing import Route, Mount',
+                'from starlette.testclient import TestClient',
+                'async def disable(request): pass',
+                'async def files(request): pass',
+                'app = Starlette(routes=[',
+                '    Route("/users/{username}:disable", disable, methods=["PUT"]),',
+                '    Mount("/static/", routes=[Route("/{rest:path}", files)]),',
+                '])',
+                'client = TestClient(app)',
+                'def test_it():',
+                '    client.put("/users/tom:disable")',
+                '    client.get("/static/css/site.css")',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const routes = extractServerRoutes(index);
+            assert.deepStrictEqual(routes.map(r => r.normalizedPath).sort(), ['/static/**', '/users/*:disable']);
+            const result = endpoints(index, { bridge: true });
+            const pairs = result.bridges.map(b => `${b.request.path} -> ${b.route.path} ${b.matchType}`).sort();
+            assert.deepStrictEqual(pairs, [
+                '/static/css/site.css -> /static/{rest:path} partial',
+                '/users/tom:disable -> /users/{username}:disable partial',
+            ]);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #386: renaming a type edits every reference to it', () => {
+    const { applyRenamePlan } = require('./helpers');
+    const { execute } = require('../core/execute');
+    const files = {
+        'pkg/__init__.py': '',
+        'pkg/widget.py': [
+            'from typing import Optional, Union',
+            '',
+            '',
+            'class Base:',
+            '    pass',
+            '',
+            '',
+            'class Widget(Base):',
+            '    SIZE = 3',
+            '',
+            '    def __init__(self, nxt: "Widget | None" = None) -> None:',
+            '        self.nxt: Widget | None = nxt',
+            '',
+            '    @classmethod',
+            '    def make(cls) -> "Widget":',
+            '        return Widget()',
+            '',
+            '    def copy(self, other: Widget) -> Widget:',
+            '        if isinstance(other, Widget):',
+            '            return other',
+            '        return Widget.make()',
+            '',
+            '',
+            'Pair = Union["Widget", "Base"]',
+        ].join('\n'),
+        'pkg/user.py': [
+            'from pkg.widget import Widget',
+            'from pkg.widget import Widget as W2',
+            'from pkg import widget',
+            'import pkg.widget',
+            '',
+            '',
+            'def build() -> Widget:',
+            '    return Widget.make()',
+            '',
+            '',
+            'def other(x: W2) -> widget.Widget:',
+            '    try:',
+            '        return pkg.widget.Widget()',
+            '    except Widget:',
+            '        pass',
+            '    return issubclass(type(x), Widget)',
+            '',
+            '',
+            'class Sub(Widget):',
+            '    Widget = Widget',
+            '',
+            '',
+            'def shadow(Widget):',
+            '    return Widget',
+        ].join('\n'),
+        'pkg/other.py': 'class Widget:\n    pass\n\n\na = Widget()\n',
+    };
+
+    it('Python: annotations, forward-reference strings, isinstance/except, module attributes; parameters and namesakes stay', () => {
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: 'Widget', file: 'pkg/widget.py', renameTo: 'Gadget' });
+            assert.ok(r.ok, r.error);
+            const { contents, reviews } = applyRenamePlan(dir, r.result);
+            assert.deepStrictEqual(reviews, []);
+            assert.strictEqual(contents['pkg/widget.py'], files['pkg/widget.py'].replace(/\bWidget\b/g, 'Gadget'));
+            const user = files['pkg/user.py'].split('\n');
+            const expected = user.map((line, i) => {
+                if (i >= 22) return line; // def shadow(Widget): the parameter
+                if (i === 19) return '    Widget = Gadget'; // the class attribute keeps its name
+                return line.replace(/\bWidget\b/g, 'Gadget');
+            }).join('\n');
+            assert.strictEqual(contents['pkg/user.py'], expected);
+            assert.ok(!('pkg/other.py' in contents));
+            assert.ok(!(r.result.reviewItems || []).some(item => item.file === 'pkg/widget.py' &&
+                [11, 15, 24].includes(item.line)), 'edited forward references are not text items');
+        } finally { rm(dir); }
+    });
+
+    it('Python: a nested class is renamed through its outer class and `self`', () => {
+        const dir = tmp({
+            'm.py': [
+                'class Outer:',
+                '    class Inner:',
+                '        pass',
+                '',
+                '    def make(self):',
+                '        return self.Inner()',
+                '',
+                '',
+                'def f():',
+                '    return Outer.Inner()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: 'Inner', file: 'm.py', renameTo: 'Core' });
+            assert.ok(r.ok, r.error);
+            const { contents, reviews } = applyRenamePlan(dir, r.result);
+            assert.deepStrictEqual(reviews, []);
+            assert.strictEqual(contents['m.py'], [
+                'class Outer:', '    class Core:', '        pass', '', '    def make(self):',
+                '        return self.Core()', '', '', 'def f():', '    return Outer.Core()',
+            ].join('\n'));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #389: module class aliases and function-local classes', () => {
+    const at = entries => (entries || []).map(entry => `${entry.relativePath || entry.file}:${entry.line}`).sort();
+
+    it('a module-level alias bound once to a class types annotations and constructors, also when imported', () => {
+        const dir = tmp({
+            'pkg/__init__.py': 'from .models import Alias as Reexported\n',
+            'pkg/models.py': [
+                'class Box:',
+                '    def open(self):',
+                '        return 1',
+                '',
+                'class Crate:',
+                '    def open(self):',
+                '        return 2',
+                '',
+                'Alias = Box',
+                'Reassigned = Box',
+                'Reassigned = Crate',
+                'Chained = Alias',
+            ].join('\n'),
+            'pkg/use.py': [
+                'from pkg.models import Alias, Box, Reassigned, Chained',
+                'from pkg import models',
+                '',
+                'Local = Box',
+                '',
+                'def f(b: Alias):',
+                '    return b.open()',
+                '',
+                'def g(x: Local):',
+                '    return x.open()',
+                '',
+                'def h():',
+                '    y = Alias()',
+                '    return y.open()',
+                '',
+                'def r(z: Reassigned):',
+                '    return z.open()',
+                '',
+                'def q(w: models.Alias):',
+                '    return w.open()',
+                '',
+                'def c(v: Chained):',
+                '    return v.open()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const box = index.context('open', { file: 'pkg/models.py', line: 2 });
+            assert.deepStrictEqual(at(box.callers), ['pkg/use.py:10', 'pkg/use.py:14', 'pkg/use.py:20',
+                'pkg/use.py:23', 'pkg/use.py:7']);
+            // A name bound twice at module scope is no alias: still possible dispatch.
+            assert.deepStrictEqual(at(box.unverifiedCallers), ['pkg/use.py:17']);
+            const crate = index.context('open', { file: 'pkg/models.py', line: 6 });
+            assert.deepStrictEqual(at(crate.callers), []);
+            const callees = index.context('f', { file: 'pkg/use.py' });
+            assert.deepStrictEqual(callees.callees.map(c => `${c.relativePath}:${c.startLine}`), ['pkg/models.py:2']);
+        } finally { rm(dir); }
+    });
+
+    it('a class declared in a function is not its module-level namesake', () => {
+        const dir = tmp({
+            'mod.py': [
+                'class Widget:',
+                '    def render(self):',
+                '        return "top"',
+                '',
+                'def build():',
+                '    class Widget:',
+                '        def render(self):',
+                '            return "local"',
+                '    w = Widget()',
+                '    return w.render()',
+                '',
+                'def use_top():',
+                '    w = Widget()',
+                '    return w.render()',
+                '',
+                'def annotated(x: Widget):',
+                '    return x.render()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(at(index.context('render', { file: 'mod.py', line: 2 }).callers),
+                ['mod.py:14', 'mod.py:17']);
+            assert.deepStrictEqual(at(index.context('render', { file: 'mod.py', line: 7 }).callers), ['mod.py:10']);
+            assert.deepStrictEqual(index.context('build', { file: 'mod.py' }).callees
+                .map(c => `${c.name}:${c.startLine}`).sort(), ['Widget:6', 'render:7']);
+            const local = index.symbols.get('Widget').find(d => d.startLine === 6);
+            assert.deepStrictEqual(index.findMethodsForType('Widget', local).map(m => m.startLine), [7]);
+            const plan = execute(index, 'plan', { name: 'Widget', file: 'mod.py', line: 1, renameTo: 'Gadget' });
+            assert.deepStrictEqual(plan.result.changes.map(c => c.line).sort((a, b) => a - b), [1, 13, 16]);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #392: lexical references, decorators, class aliases and in-process clients', () => {
+    const { applyRenamePlan } = require('./helpers');
+    const plan = (index, handle, renameTo = 'NEW') => {
+        const r = execute(index, 'plan', { name: handle, renameTo });
+        assert.ok(r.ok, JSON.stringify(r.error));
+        return r.result;
+    };
+    const at = entries => (entries || []).map(entry => `${entry.relativePath || entry.file}:${entry.line}`).sort();
+
+    it('references resolve by Python scoping: decorator lines, function bodies, defaults, globals', () => {
+        const dir = tmp({
+            'm.py': [
+                'def helper(fn):',                       // 1
+                '    return fn',                         // 2
+                '',                                      // 3
+                '@helper',                               // 4
+                'def a(x=helper):',                      // 5
+                '    table = [helper, helper]',          // 6
+                '    return table',                      // 7
+                '',                                      // 8
+                'def b(helper):',                        // 9
+                '    return helper',                     // 10
+                '',                                      // 11
+                'def c():',                              // 12
+                '    f(helper=1)',                       // 13
+                '    return [helper for helper in []]',  // 14
+                '',                                      // 15
+                'def d():',                              // 16
+                '    global helper',                     // 17
+                '    return helper',                     // 18
+                '',                                      // 19
+                'def e():',                              // 20
+                '    from other import helper',          // 21
+                '    return helper',                     // 22
+                '',                                      // 23
+                'def f(**kw):',                          // 24
+                '    return kw',                         // 25
+            ].join('\n') + '\n',
+        });
+        try {
+            const result = plan(idx(dir), 'helper');
+            const byLine = new Map(result.changes.map(c => [c.line, c]));
+            assert.strictEqual(byLine.get(4).newExpression, '@NEW');
+            assert.strictEqual(byLine.get(5).newExpression, 'def a(x=NEW):');
+            assert.strictEqual(byLine.get(6).newExpression, 'table = [NEW, NEW]');
+            assert.strictEqual(byLine.get(18).newExpression, 'return NEW');
+            // A parameter, a comprehension target and a keyword name are
+            // other bindings; a local import may bind anything: review.
+            for (const line of [9, 10, 13, 14]) assert.ok(!byLine.has(line), `line ${line} untouched`);
+            assert.ok(byLine.get(22)?.needsReview, 'a name bound by a local import stays review');
+        } finally { rm(dir); }
+    });
+
+    it('a nested function is referenced where its own scope binds it', () => {
+        const dir = tmp({
+            'm.py': [
+                'def outer():',
+                '    def decorator(fn):',
+                '        return fn',
+                '    return decorator',
+                '',
+                'def decorator(fn):',
+                '    return fn',
+                '',
+                'x = decorator',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const nested = plan(index, 'm.py:2:decorator');
+            assert.deepStrictEqual(nested.changes.filter(c => c.newExpression).map(c => c.line).sort(), [2, 4]);
+            const top = plan(index, 'm.py:6:decorator');
+            assert.deepStrictEqual(top.changes.filter(c => c.newExpression).map(c => c.line).sort(), [6, 9]);
+        } finally { rm(dir); }
+    });
+
+    it('decorators that may bind the function by name are review; name-preserving ones are not', () => {
+        const dir = tmp({
+            'app/__init__.py': '',
+            'app/deco.py': [
+                'import functools',
+                'from functools import lru_cache, wraps',
+                'REGISTRY = {}',
+                '',
+                'def logged(fn):',
+                '    @functools.wraps(fn)',
+                '    def wrapper(*a, **k):',
+                '        return fn(*a, **k)',
+                '    return wrapper',
+                '',
+                'def registered(fn):',
+                '    REGISTRY[fn.__name__] = fn',
+                '    return fn',
+                '',
+                'def retry(times):',
+                '    def deco(fn):',
+                '        @wraps(fn)',
+                '        def inner():',
+                '            return fn()',
+                '        return inner',
+                '    return deco',
+                '',
+                '@logged',
+                'def compute():',
+                '    return 1',
+                '',
+                '@registered',
+                'def named():',
+                '    return 2',
+                '',
+                '@retry(3)',
+                'def flaky():',
+                '    return 3',
+                '',
+                '@lru_cache',
+                'def cached():',
+                '    return 4',
+                '',
+                'class Box:',
+                '    @property',
+                '    def size(self):',
+                '        return 5',
+                '',
+                '    @staticmethod',
+                '    def build():',
+                '        return Box()',
+            ].join('\n') + '\n',
+            'tests/conftest.py': 'import pytest\n\n\n@pytest.fixture\ndef client():\n    return object()\n',
+            'tests/test_a.py': 'def test_one(client):\n    assert client\n',
+        });
+        try {
+            const index = idx(dir);
+            const reviewed = handle => {
+                const result = plan(index, handle);
+                const def = result.changes.find(c => c.editKind === 'definition');
+                return def?.reviewReason === 'decorator-name-binding';
+            };
+            assert.strictEqual(reviewed('app/deco.py:24:compute'), false, 'a functools.wraps wrapper keeps the name');
+            assert.strictEqual(reviewed('app/deco.py:32:flaky'), false, 'a decorator factory returning a wraps wrapper');
+            assert.strictEqual(reviewed('app/deco.py:36:cached'), false, 'functools.lru_cache');
+            assert.strictEqual(reviewed('app/deco.py:41:size'), false, 'property');
+            assert.strictEqual(reviewed('app/deco.py:45:build'), false, 'staticmethod');
+            assert.strictEqual(reviewed('app/deco.py:28:named'), true, 'a registry keyed by __name__');
+            assert.strictEqual(reviewed('tests/conftest.py:5:client'), true, 'a pytest fixture is requested by name');
+            const text = require('../core/output').formatPlan(plan(index, 'tests/conftest.py:5:client'));
+            assert.match(text, /@pytest\.fixture receives client and may bind it by its name/);
+        } finally { rm(dir); }
+    });
+
+    it('a constructor call through a class alias is a caller of the class, across modules', () => {
+        const dir = tmp({
+            'box.py': 'class Box:\n    def size(self):\n        return 1\n\n\nAlias = Box\n\n\ndef make():\n    return Alias()\n',
+            'use.py': 'from box import Alias, Box\n\n\ndef other():\n    a = Alias()\n    return a, Box()\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(at(index.context('Box', { file: 'box.py', line: 1 }).callers),
+                ['box.py:10', 'use.py:5', 'use.py:6']);
+            // Renaming the class leaves the alias calls alone.
+            const result = plan(index, 'box.py:1:Box');
+            assert.ok(!result.changes.some(c => c.file === 'box.py' && c.line === 10));
+        } finally { rm(dir); }
+    });
+
+    it('an alias bound on several module-level paths names a class only when every path agrees', () => {
+        const dir = tmp({
+            'mod.py': [
+                'import sys',
+                '',
+                'class Box:',
+                '    def size(self):',
+                '        return 1',
+                '',
+                'class Other:',
+                '    def size(self):',
+                '        return 2',
+                '',
+                'if sys.version_info >= (3, 8):',
+                '    Same = Box',
+                'else:',
+                '    Same = Box',
+                '',
+                'try:',
+                '    Diff = Box',
+                'except ImportError:',
+                '    Diff = Other',
+                '',
+                'def f():',
+                '    return Same().size()',
+                '',
+                'def g():',
+                '    return Diff().size()',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const box = index.context('size', { file: 'mod.py', line: 4 });
+            assert.deepStrictEqual(at(box.callers), ['mod.py:22']);
+            assert.deepStrictEqual(at(box.unverifiedCallers), ['mod.py:25']);
+        } finally { rm(dir); }
+    });
+
+    it('endpoints: a test client reaches only the routes of the app it is built from', () => {
+        const dir = tmp({
+            'tests/conftest.py': [
+                'import functools',
+                'import pytest',
+                'from starlette.testclient import TestClient',
+                '',
+                '',
+                '@pytest.fixture',
+                'def test_client_factory():',
+                '    return functools.partial(TestClient)',
+            ].join('\n') + '\n',
+            'tests/test_one.py': [
+                'import pytest',
+                'from starlette.applications import Starlette',
+                'from starlette.routing import Route',
+                '',
+                '',
+                'def home(request):',
+                '    return None',
+                '',
+                '',
+                'app = Starlette(routes=[Route("/", home), Route("/items", home)])',
+                '',
+                '',
+                '@pytest.fixture',
+                'def client(test_client_factory):',
+                '    with test_client_factory(app) as client:',
+                '        yield client',
+                '',
+                '',
+                'def test_items(client):',
+                '    client.get("/items")',
+                '    client.head("/")',
+                '',
+                '',
+                'def test_local(test_client_factory):',
+                '    local = Starlette(routes=[Route("/", home)])',
+                '    client = test_client_factory(local)',
+                '    client.get("/")',
+                '',
+                '',
+                'async def raw(scope, receive, send):',
+                '    pass',
+                '',
+                '',
+                'def test_raw(test_client_factory):',
+                '    client = test_client_factory(raw)',
+                '    client.get("/")',
+                '',
+                '',
+                '@pytest.mark.parametrize("target", [app])',
+                'def test_param(target, test_client_factory):',
+                '    client = test_client_factory(target)',
+                '    client.get("/items")',
+            ].join('\n') + '\n',
+            'tests/test_two.py': [
+                'from starlette.applications import Starlette',
+                'from starlette.routing import Route',
+                '',
+                '',
+                'def page(request):',
+                '    return None',
+                '',
+                '',
+                'def test_other(test_client_factory):',
+                '    app = Starlette(routes=[Route("/", page), Route("/items", page)])',
+                '    client = test_client_factory(app)',
+                '    client.get("/")',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const bridges = require('../core/bridge').bridgeEndpoints(index);
+            const of = line => bridges.filter(b => b.request.file === 'tests/test_one.py' && b.request.line === line)
+                .map(b => `${b.route.file}:${b.route.line}${b.unscoped ? ':unscoped' : ''}`).sort();
+            assert.deepStrictEqual(of(20), ['tests/test_one.py:10'], 'the fixture client serves the module app');
+            assert.deepStrictEqual(of(21), ['tests/test_one.py:10'], 'HEAD is served by the GET route');
+            assert.deepStrictEqual(of(27), ['tests/test_one.py:25'], 'a local app serves its own route');
+            assert.deepStrictEqual(of(36), [], 'an ASGI callable serves the request itself');
+            assert.deepStrictEqual(of(42), ['tests/test_one.py:10:unscoped', 'tests/test_two.py:10:unscoped'],
+                'an unresolved app keeps every path match, marked unscoped');
+            const other = bridges.filter(b => b.request.file === 'tests/test_two.py').map(b => `${b.route.file}:${b.route.line}`);
+            assert.deepStrictEqual(other, ['tests/test_two.py:10']);
+            const json = JSON.parse(require('../core/output').formatEndpointsJson({
+                routes: [], requests: [], bridges: bridges.filter(b => b.unscoped),
+                unmatchedRoutes: [], unmatchedRequests: [], meta: {},
+            }));
+            assert.ok((json.data?.bridges || json.bridges || []).every(b => b.unscoped === true));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #393: Python type renames through TypeAlias strings and optional imports', () => {
+    const { applyRenamePlan } = require('./helpers');
+    const files = {
+        'pkg/__init__.py': '',
+        'pkg/proto.py': [
+            'class SansIOProtocol:',
+            '    pass',
+            '',
+            '',
+            'class WatchReload:',
+            '    pass',
+        ].join('\n'),
+        'tests/test_proto.py': [
+            'from typing import TYPE_CHECKING, TypeAlias',
+            'import typing',
+            '',
+            'from pkg.proto import SansIOProtocol',
+            '',
+            'try:',
+            '    from pkg.proto import WatchReload',
+            'except ImportError:',
+            '    WatchReload = None',
+            '',
+            'Proto: TypeAlias = "type[SansIOProtocol | int]"',
+            'Other: typing.TypeAlias = "SansIOProtocol"',
+            'Label = "SansIOProtocol"',
+            '',
+            '',
+            'def pick(flag):',
+            '    if WatchReload is not None and flag:',
+            '        return WatchReload()',
+            '    return None',
+        ].join('\n'),
+        'tests/test_other.py': [
+            'WatchReload = object',
+            '',
+            '',
+            'def unrelated():',
+            '    return WatchReload',
+        ].join('\n'),
+    };
+
+    it('edits the value of an explicit TypeAlias and leaves plain strings as text', () => {
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: 'SansIOProtocol', file: 'pkg/proto.py', line: 1, renameTo: 'Proto2' });
+            assert.ok(r.ok, r.error);
+            const { contents } = applyRenamePlan(dir, r.result);
+            const text = contents['tests/test_proto.py'];
+            assert.match(text, /Proto: TypeAlias = "type\[Proto2 \| int\]"/);
+            assert.match(text, /Other: typing.TypeAlias = "Proto2"/);
+            assert.match(text, /Label = "SansIOProtocol"/);
+        } finally { rm(dir); }
+    });
+
+    it('reviews every use of a module variable that an import of the type and an assignment both bind', () => {
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: 'WatchReload', file: 'pkg/proto.py', line: 5, renameTo: 'Reload2' });
+            assert.ok(r.ok, r.error);
+            const reviewed = r.result.changes.filter(c => c.needsReview).map(c => `${c.file}:${c.line}`).sort();
+            assert.deepEqual(reviewed, ['tests/test_proto.py:17', 'tests/test_proto.py:18', 'tests/test_proto.py:9']);
+            // A module that only assigns the name holds another value.
+            assert.ok(!r.result.changes.some(c => c.file === 'tests/test_other.py'));
+        } finally { rm(dir); }
+    });
+});

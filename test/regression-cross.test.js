@@ -5724,3 +5724,4918 @@ describe('fix #300: cross-case receiver-name match is never exclusion evidence',
         } finally { rm(dir); }
     });
 });
+
+describe('fix #358: self/this/Self/base calls resolve by class DEFINITION, not class name', () => {
+    // Two unrelated classes share the name Chunks in different modules /
+    // packages / namespaces / crates. `self.len()` inside the first one binds
+    // its OWN len and must never confirm the other class's len.
+    const LANGS = {
+        python: {
+            files: {
+                'pkg/__init__.py': '',
+                'pkg/slice.py': 'class Chunks:\n    def opt_len(self):\n        return self.len()\n\n    def len(self):\n        return 1\n',
+                'pkg/iter.py': 'class Chunks:\n    def len(self):\n        return 2\n',
+            },
+            caller: 'pkg/slice.py:2:opt_len', own: 'pkg/slice.py:5:len', other: 'pkg/iter.py:2:len', site: 'slice.py:3',
+        },
+        typescript: {
+            files: {
+                'slice.ts': 'export class Chunks {\n  optLen(): number { return this.len(); }\n  len(): number { return 1; }\n}\n',
+                'iter.ts': 'export class Chunks {\n  len(): number { return 2; }\n}\n',
+            },
+            caller: 'slice.ts:2:optLen', own: 'slice.ts:3:len', other: 'iter.ts:2:len', site: 'slice.ts:2',
+        },
+        java: {
+            files: {
+                'com/x/a/Chunks.java': 'package com.x.a;\npublic class Chunks {\n  public int optLen() { return this.len() + len(); }\n  public int len() { return 1; }\n}\n',
+                'com/x/b/Chunks.java': 'package com.x.b;\npublic class Chunks {\n  public int len() { return 2; }\n}\n',
+            },
+            caller: 'com/x/a/Chunks.java:3:optLen', own: 'com/x/a/Chunks.java:4:len', other: 'com/x/b/Chunks.java:3:len', site: 'Chunks.java:3',
+        },
+        csharp: {
+            files: {
+                'A.cs': 'namespace A {\n  public class Chunks {\n    public int OptLen() { return this.Len(); }\n    public int Len() { return 1; }\n  }\n}\n',
+                'B.cs': 'namespace B {\n  public class Chunks {\n    public int Len() { return 2; }\n  }\n}\n',
+            },
+            caller: 'A.cs:3:OptLen', own: 'A.cs:4:Len', other: 'B.cs:3:Len', site: 'A.cs:3',
+        },
+        rust: {
+            files: {
+                'Cargo.toml': '[package]\nname = "fx358"\nversion = "0.1.0"\nedition = "2021"\n',
+                'src/lib.rs': 'pub mod slice;\npub mod iter;\n',
+                'src/slice.rs': 'pub struct Chunks { n: usize }\nimpl Chunks {\n    pub fn opt_len(&self) -> Option<usize> { Some(self.len()) }\n    pub fn len(&self) -> usize { self.n }\n}\n',
+                'src/iter.rs': 'pub struct Chunks { m: usize }\nimpl Chunks {\n    pub fn len(&self) -> usize { self.m }\n}\n',
+            },
+            caller: 'src/slice.rs:3:opt_len', own: 'src/slice.rs:4:len', other: 'src/iter.rs:3:len', site: 'slice.rs:3',
+        },
+    };
+    const sites = list => (list || []).map(c => `${path.basename(c.file)}:${c.line}`);
+
+    for (const [lang, fx] of Object.entries(LANGS)) {
+        it(`${lang}: the cross-module same-name class site is not confirmed; the own-class site is`, () => {
+            const dir = tmp(fx.files);
+            try {
+                const index = idx(dir);
+                const other = execute(index, 'show', { name: fx.other, sections: 'callers' });
+                const own = execute(index, 'show', { name: fx.own, sections: 'callers' });
+                assert.ok(other.ok && own.ok);
+                assert.ok(!sites(other.result.context.callers).includes(fx.site),
+                    `other-module target must not confirm ${fx.site}: ${JSON.stringify(sites(other.result.context.callers))}`);
+                assert.ok(sites(own.result.context.callers).includes(fx.site),
+                    `own target keeps ${fx.site} confirmed: ${JSON.stringify(sites(own.result.context.callers))}`);
+                assert.strictEqual(other.result.context.meta.account.conserved, true);
+            } finally { rm(dir); }
+        });
+
+        it(`${lang}: the callee side binds the self call to its own class definition`, () => {
+            const dir = tmp(fx.files);
+            try {
+                const index = idx(dir);
+                const r = execute(index, 'show', { name: fx.caller, sections: 'callees' });
+                assert.ok(r.ok);
+                const confirmed = (r.result.context.callees || [])
+                    .filter(c => c.tier === 'confirmed')
+                    .map(c => `${c.relativePath}:${c.startLine}:${c.name}`);
+                assert.ok(confirmed.includes(fx.own), `callees: ${JSON.stringify(confirmed)}`);
+                assert.ok(!confirmed.includes(fx.other), `callees: ${JSON.stringify(confirmed)}`);
+            } finally { rm(dir); }
+        });
+    }
+
+    it('python/java/c#: inherited self calls follow the RESOLVED base, and a same-name subclass override is possible-dispatch', () => {
+        const cases = [
+            {
+                files: {
+                    'pkg/__init__.py': '',
+                    'pkg/base1.py': 'class Base:\n    def m(self):\n        return 1\n\n    def as_sql(self):\n        return "b"\n\n    def compile(self):\n        return self.as_sql()\n',
+                    'pkg/base2.py': 'class Base:\n    def m(self):\n        return 2\n',
+                    'pkg/child.py': 'from pkg.base1 import Base\n\n\nclass Child(Base):\n    def run(self):\n        return self.m()\n',
+                    'pkg/sub.py': 'from pkg import base1\n\n\nclass Base(base1.Base):\n    def as_sql(self):\n        return "c"\n',
+                },
+                base1m: 'pkg/base1.py:2:m', base2m: 'pkg/base2.py:2:m', inherited: 'child.py:6',
+                subOverride: 'pkg/sub.py:5:as_sql', baseSite: 'base1.py:9',
+            },
+            {
+                files: {
+                    'com/x/b1/Base.java': 'package com.x.b1;\npublic class Base {\n  public int m() { return 1; }\n  public String asSql() { return "b"; }\n  public String compile() { return this.asSql(); }\n}\n',
+                    'com/x/b2/Base.java': 'package com.x.b2;\npublic class Base {\n  public int m() { return 2; }\n}\n',
+                    'com/x/c/Child.java': 'package com.x.c;\nimport com.x.b1.Base;\npublic class Child extends Base {\n  public int run() { return this.m(); }\n}\n',
+                    'com/x/c2/Base.java': 'package com.x.c2;\npublic class Base extends com.x.b1.Base {\n  public String asSql() { return "c"; }\n}\n',
+                },
+                base1m: 'com/x/b1/Base.java:3:m', base2m: 'com/x/b2/Base.java:3:m', inherited: 'Child.java:4',
+                subOverride: 'com/x/c2/Base.java:3:asSql', baseSite: 'Base.java:5',
+            },
+            {
+                files: {
+                    'B1.cs': 'namespace X.B1 {\n  public class Base {\n    public int M() { return 1; }\n    public virtual string AsSql() { return "b"; }\n    public string Compile() { return this.AsSql(); }\n  }\n}\n',
+                    'B2.cs': 'namespace X.B2 {\n  public class Base {\n    public int M() { return 2; }\n  }\n}\n',
+                    'Child.cs': 'using X.B1;\nnamespace X.C {\n  public class Child : Base {\n    public int Run() { return this.M(); }\n  }\n}\n',
+                    'Sub.cs': 'namespace X.C2 {\n  public class Base : X.B1.Base {\n    public override string AsSql() { return "c"; }\n  }\n}\n',
+                },
+                base1m: 'B1.cs:3:M', base2m: 'B2.cs:3:M', inherited: 'Child.cs:4',
+                subOverride: 'Sub.cs:3:AsSql', baseSite: 'B1.cs:5',
+            },
+        ];
+        for (const c of cases) {
+            const dir = tmp(c.files);
+            try {
+                const index = idx(dir);
+                const b1 = execute(index, 'show', { name: c.base1m, sections: 'callers' });
+                const b2 = execute(index, 'show', { name: c.base2m, sections: 'callers' });
+                const sub = execute(index, 'show', { name: c.subOverride, sections: 'callers' });
+                assert.ok(b1.ok && b2.ok && sub.ok);
+                assert.ok(sites(b1.result.context.callers).includes(c.inherited),
+                    `${c.base1m}: ${JSON.stringify(sites(b1.result.context.callers))}`);
+                assert.ok(!sites(b2.result.context.callers).includes(c.inherited),
+                    `${c.base2m}: ${JSON.stringify(sites(b2.result.context.callers))}`);
+                // The base class's own self call can dispatch into the
+                // same-name subclass override: visible, never confirmed.
+                assert.ok(!sites(sub.result.context.callers).includes(c.baseSite));
+                const routed = (sub.result.context.unverifiedCallers || [])
+                    .filter(u => `${path.basename(u.file)}:${u.line}` === c.baseSite);
+                assert.strictEqual(routed.length, 1, JSON.stringify(sub.result.context.unverifiedCallers));
+                assert.strictEqual(routed[0].reason, 'possible-dispatch');
+            } finally { rm(dir); }
+        }
+    });
+
+    it('rust: an impl block in another file binds the struct its own `use` imports', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "fx358b"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/lib.rs': 'pub mod a;\npub mod b;\npub mod ximpl;\n',
+            'src/a.rs': 'pub struct Node { pub v: u32 }\nimpl Node { pub fn size(&self) -> u32 { self.v } }\n',
+            'src/b.rs': 'pub struct Node { pub w: u32 }\nimpl Node { pub fn size(&self) -> u32 { self.w } }\n',
+            'src/ximpl.rs': 'use crate::a::Node;\nimpl Node { pub fn half(&self) -> u32 { self.size() / 2 } }\n',
+        });
+        try {
+            const index = idx(dir);
+            const a = execute(index, 'show', { name: 'src/a.rs:2:size', sections: 'callers' });
+            const b = execute(index, 'show', { name: 'src/b.rs:2:size', sections: 'callers' });
+            assert.ok(sites(a.result.context.callers).includes('ximpl.rs:2'));
+            assert.ok(!sites(b.result.context.callers).includes('ximpl.rs:2'));
+        } finally { rm(dir); }
+    });
+
+    it('an owner that cannot be resolved to one definition is routed, never confirmed', () => {
+        // JS prototype methods on a name two classes share, with no import
+        // tying the assigning file to either: identity unknown.
+        const dir = tmp({
+            'a.js': 'class Chunks { len() { return 1; } }\nmodule.exports = { Chunks };\n',
+            'b.js': 'class Chunks { len() { return 2; } }\nmodule.exports = { Chunks };\n',
+            'c.js': 'function Chunks() {}\nChunks.prototype.optLen = function () { return this.len(); };\n',
+        });
+        try {
+            const index = idx(dir);
+            for (const handle of ['a.js:1:len', 'b.js:1:len']) {
+                const r = execute(index, 'show', { name: handle, sections: 'callers' });
+                assert.ok(r.ok);
+                assert.ok(!sites(r.result.context.callers).includes('c.js:2'),
+                    `${handle}: ${JSON.stringify(sites(r.result.context.callers))}`);
+            }
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #358: C# partial types are one class definition across files', () => {
+    it('base/this calls in one part resolve through bases declared in another part', () => {
+        const dir = tmp({
+            'Writer.cs': 'namespace N {\n  public abstract partial class Writer {\n    public virtual int Start() { return 1; }\n  }\n}\n',
+            'TextWriter.cs': 'namespace N {\n  public partial class TextWriter : Writer {\n    public int Size() { return 1; }\n  }\n}\n',
+            'TextWriter.Async.cs': 'namespace N {\n  public partial class TextWriter {\n    public override int Start() { return base.Start() + this.Size(); }\n  }\n}\n',
+            'Other.cs': 'namespace M {\n  public partial class TextWriter {\n    public int Size() { return 2; }\n  }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const sites = r => (r.result.context.callers || []).map(c => `${path.basename(c.file)}:${c.line}`);
+            const start = execute(index, 'show', { name: 'Writer.cs:3:Start', sections: 'callers' });
+            const size = execute(index, 'show', { name: 'TextWriter.cs:3:Size', sections: 'callers' });
+            const other = execute(index, 'show', { name: 'Other.cs:3:Size', sections: 'callers' });
+            assert.ok(sites(start).includes('TextWriter.Async.cs:3'), JSON.stringify(sites(start)));
+            assert.ok(sites(size).includes('TextWriter.Async.cs:3'), JSON.stringify(sites(size)));
+            assert.ok(!sites(other).includes('TextWriter.Async.cs:3'), JSON.stringify(sites(other)));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #359: subscripts of declared containers type their element receivers', () => {
+    // Each fixture: base class + override + unrelated same-name owner; the
+    // container-element calls must join the rename closure as edits, and the
+    // unrelated owner is never touched.
+    const cases = {
+        typescript: {
+            files: {
+                'conv.ts': [
+                    'export class Conv { render(v: number): string { return ""; } }',
+                    'export class IntConv extends Conv { render(v: number): string { return String(v); } }',
+                    'export class Other { render(v: number): string { return "o"; } }',
+                ].join('\n') + '\n',
+                'use.ts': [
+                    "import { Conv } from './conv';",
+                    'export function a(xs: Conv[]): string { const c = xs[0]; return c.render(1); }',
+                    'export function b(m: Record<string, Conv>, k: string): string { return m[k].render(2); }',
+                    'export function d(m: { [k: string]: Conv }, k: string): string { return m[k].render(3); }',
+                    'export function e(xs: Array<Conv>): string { return xs[1].render(4); }',
+                ].join('\n') + '\n',
+            },
+            handle: 'conv.ts:2:render',
+            lines: [2, 3, 4, 5],
+            file: 'use.ts',
+        },
+        java: {
+            files: {
+                'Conv.java': [
+                    'class Conv { String render(int v) { return ""; } }',
+                    'class IntConv extends Conv { String render(int v) { return ""; } }',
+                    'class Other { String render(int v) { return "o"; } }',
+                    'class Use {',
+                    '  String a(Conv[] xs) { return xs[0].render(1); }',
+                    '}',
+                ].join('\n') + '\n',
+            },
+            handle: 'Conv.java:2:render',
+            lines: [5],
+            file: 'Conv.java',
+        },
+        csharp: {
+            files: {
+                'Conv.cs': [
+                    'using System.Collections.Generic;',
+                    'class Conv { public virtual string Render(int v) { return ""; } }',
+                    'class IntConv : Conv { public override string Render(int v) { return ""; } }',
+                    'class Other { public string Render(int v) { return "o"; } }',
+                    'class Use {',
+                    '  string A(Conv[] xs) { return xs[0].Render(1); }',
+                    '  string B(Dictionary<string, Conv> m, string k) { var c = m[k]; return c.Render(2); }',
+                    '  string C(List<Conv> xs) { return xs[0].Render(3); }',
+                    '}',
+                ].join('\n') + '\n',
+            },
+            handle: 'Conv.cs:3:Render',
+            lines: [6, 7, 8],
+            file: 'Conv.cs',
+        },
+        cpp: {
+            files: {
+                'conv.cpp': [
+                    '#include <map>',
+                    '#include <string>',
+                    '#include <vector>',
+                    'struct Conv { virtual std::string render(int v) { return ""; } };',
+                    'struct IntConv : Conv { std::string render(int v) override { return ""; } };',
+                    'struct Other { std::string render(int v) { return "o"; } };',
+                    'std::string a(std::vector<Conv> &xs) { return xs[0].render(1); }',
+                    'std::string b(std::map<std::string, Conv> &m, const std::string &k) { auto &c = m[k]; return c.render(2); }',
+                    'std::string c(Conv xs[]) { return xs[0].render(3); }',
+                ].join('\n') + '\n',
+            },
+            handle: 'conv.cpp:5:render',
+            lines: [7, 8, 9],
+            file: 'conv.cpp',
+        },
+        rust: {
+            files: {
+                'Cargo.toml': '[package]\nname = "f359"\nversion = "0.1.0"\nedition = "2021"\n',
+                'src/lib.rs': [
+                    'use std::collections::HashMap;',
+                    'pub struct Conv;',
+                    'impl Conv { pub fn render(&self, v: i32) -> String { String::new() } }',
+                    'pub struct Other;',
+                    'impl Other { pub fn render(&self, v: i32) -> String { String::new() } }',
+                    'pub fn a(m: &HashMap<String, Conv>, k: &str) -> String { let c = &m[k]; c.render(1) }',
+                    'pub fn b(xs: &Vec<Conv>) -> String { xs[0].render(2) }',
+                    'pub fn c(xs: [Conv; 2]) -> String { xs[1].render(3) }',
+                ].join('\n') + '\n',
+            },
+            handle: 'src/lib.rs:3:render',
+            lines: [6, 7, 8],
+            file: 'src/lib.rs',
+        },
+    };
+    for (const [language, fixture] of Object.entries(cases)) {
+        it(`${language}: element receivers are rename edits, the unrelated owner is not`, () => {
+            const dir = tmp(fixture.files);
+            try {
+                const index = idx(dir);
+                const r = execute(index, 'plan', { name: fixture.handle, renameTo: 'paint' });
+                assert.ok(r.ok, JSON.stringify(r.error));
+                const changes = r.result.changes || [];
+                for (const line of fixture.lines) {
+                    assert.ok(changes.some(c => c.file === fixture.file && c.line === line &&
+                        /\.paint\(/.test(c.newExpression || '')),
+                    `${language} line ${line}: ${JSON.stringify(changes)}`);
+                }
+                assert.ok(!changes.some(c => /Other/.test(c.expression || '') &&
+                    /paint/.test(c.newExpression || '')), JSON.stringify(changes));
+                assert.ok(!(r.result.unverifiedSites || []).some(s => s.file === fixture.file &&
+                    fixture.lines.includes(s.line)), JSON.stringify(r.result.unverifiedSites));
+            } finally { rm(dir); }
+        });
+    }
+});
+
+describe('fix #360: external contract membership in plan --rename-to (all class languages)', () => {
+    const planOf = (dir, name) => {
+        const result = execute(idx(dir), 'plan', { name, renameTo: 'moved' });
+        assert.ok(result.ok, JSON.stringify(result.error));
+        return result.result;
+    };
+    const cases = [
+        {
+            lang: 'java',
+            files: {
+                'Main.java': [
+                    'public class Main {',
+                    '    static class Key implements Comparable<Key> {',
+                    '        public int compareTo(Key o) { return 0; }',
+                    '    }',
+                    '    static class Worker extends Thread {',
+                    '        @Override',
+                    '        public void run() { }',
+                    '    }',
+                    '    interface Shape { double area(); }',
+                    '    static class Sq implements Shape { public double area() { return 1; } }',
+                    '    static double total(Shape s) { return s.area(); }',
+                    '    public String toString() { return "m"; }',
+                    '}',
+                ].join('\n') + '\n',
+            },
+            possible: 'Main.java:3:compareTo', possibleSite: 2,
+            blocked: ['Main.java:7:run', 'Main.java:12:toString'],
+            closure: { pin: 'Main.java:10:area', lines: [9, 10, 11] },
+        },
+        {
+            lang: 'csharp',
+            files: {
+                'Main.cs': [
+                    'using System;',
+                    'namespace App {',
+                    '    public class Res : IDisposable {',
+                    '        public void Dispose() { }',
+                    '    }',
+                    '    public class Job : BaseJob {',
+                    '        public override string Describe() { return "j"; }',
+                    '    }',
+                    '}',
+                ].join('\n') + '\n',
+            },
+            possible: 'Main.cs:4:Dispose', possibleSite: 3,
+            blocked: ['Main.cs:7:Describe'],
+        },
+        {
+            lang: 'typescript',
+            files: {
+                'main.ts': [
+                    "import { EventEmitter } from 'events';",
+                    'export interface Handler { handle(x: number): void; }',
+                    'export class Impl implements Handler { handle(x: number): void {} }',
+                    'export const lit: Handler = { handle(x: number) {} };',
+                    'export class Bus extends EventEmitter {',
+                    '    override emit(event: string): boolean { return true; }',
+                    '    own(): void {}',
+                    '}',
+                    'export function run(h: Handler) { h.handle(1); }',
+                ].join('\n') + '\n',
+            },
+            possible: 'main.ts:7:own', possibleSite: 5,
+            blocked: ['main.ts:6:emit'],
+            closure: { pin: 'main.ts:4:handle', lines: [2, 3, 4, 9] },
+        },
+        {
+            lang: 'python',
+            files: {
+                'main.py': [
+                    'from http.server import BaseHTTPRequestHandler',
+                    'class H(BaseHTTPRequestHandler):',
+                    '    def do_GET(self):',
+                    '        pass',
+                    'class P:',
+                    '    def __eq__(self, other):',
+                    '        return True',
+                ].join('\n') + '\n',
+            },
+            possible: 'main.py:3:do_GET', possibleSite: 2,
+            blocked: ['main.py:6:__eq__'],
+        },
+        {
+            lang: 'cpp',
+            files: {
+                'main.cpp': [
+                    '#include <streambuf>',
+                    'class W : public std::streambuf {',
+                    'protected:',
+                    '    int overflow(int c) override { return c; }',
+                    'public:',
+                    '    void own() {}',
+                    '};',
+                ].join('\n') + '\n',
+            },
+            possible: 'main.cpp:6:own', possibleSite: 2,
+            blocked: ['main.cpp:4:overflow'],
+        },
+    ];
+    for (const c of cases) {
+        it(`${c.lang}: marked or root-contract members are blocked; external supertypes route review`, () => {
+            const dir = tmp(c.files);
+            try {
+                for (const pin of c.blocked) {
+                    const plan = planOf(dir, pin);
+                    assert.strictEqual(plan.contract?.blocked, true, `${pin}: ${JSON.stringify(plan.contract)}`);
+                    assert.ok(plan.changes.every(change => !change.newExpression), pin);
+                }
+                const plan = planOf(dir, c.possible);
+                assert.strictEqual(plan.contract?.blocked, false, JSON.stringify(plan.contract));
+                const definition = plan.changes.find(change => change.isDefinition);
+                assert.ok(definition.needsReview && definition.newExpression,
+                    'possible membership keeps the edit and requires review');
+                assert.ok(plan.reviewItems.some(item => item.contractDependency &&
+                    item.line === c.possibleSite), `declaration site listed: ${JSON.stringify(plan.reviewItems)}`);
+                if (c.closure) {
+                    const closure = planOf(dir, c.closure.pin);
+                    const lines = closure.changes.filter(change => change.newExpression)
+                        .map(change => change.line).sort((a, b) => a - b);
+                    assert.deepStrictEqual(lines, c.closure.lines,
+                        `project implements/typed-literal slot closes: ${JSON.stringify(closure.changes)}`);
+                    assert.ok(!closure.contract);
+                }
+            } finally { rm(dir); }
+        });
+    }
+});
+
+describe('fix #363: reflection by name pattern and runtime protocol hooks (deadcode + callers)', () => {
+    const names = result => result.map(c => (c.className ? `${c.className}.` : '') + c.name).sort();
+    const reflectionCallers = (index, name, file) => {
+        const def = (index.symbols.get(name) || []).find(d => !file || d.relativePath === file);
+        const callers = index.findCallers(name, { collectAccount: true, targetDefinitions: [def] });
+        return (callers.unverifiedEntries || [])
+            .filter(e => e.reason === 'reflection-pattern')
+            .map(e => `${e.relativePath}:${e.line}:${e.reflectionPattern}`);
+    };
+
+    it('python: %-format, f-string (one-hop local) and .format patterns withhold only reachable members', () => {
+        const dir = tmp({
+            'app.py': `class Backend:
+    def _get_user_perms(self, u):
+        return 1
+    def _get_group_perms(self, u):
+        return 2
+    def _truly_dead(self):
+        return 3
+    def load(self, src, u):
+        return getattr(self, "_get_%s_perms" % src)(u)
+
+class Other:
+    def _get_x_perms(self, u):
+        return 4
+
+def period(view, p):
+    name = f"_cur_{p}"
+    return getattr(view, name)()
+
+class View:
+    def _cur_year(self):
+        return 1
+    def _fmt_one(self):
+        return 1
+    def go(self, k):
+        return getattr(self, "_fmt_{}".format(k))()
+
+def untouched(o, x):
+    return getattr(o, x)
+
+def _short(o, x):
+    return getattr(o, "_%s" % x)
+`,
+        });
+        try {
+            const index = idx(dir);
+            const result = index.deadcode({ includeExported: true });
+            const claimed = names(result);
+            for (const live of ['Backend._get_user_perms', 'Backend._get_group_perms',
+                'View._cur_year', 'View._fmt_one']) {
+                assert.ok(!claimed.includes(live), `${live} is reached by a reflection pattern`);
+            }
+            assert.ok(claimed.includes('Backend._truly_dead'), 'a name the pattern cannot spell stays a claim');
+            assert.ok(claimed.includes('Other._get_x_perms'),
+                'self in an unrelated class never reaches another class\'s member');
+            assert.deepEqual(result.reflection.withheldByPattern, [
+                { pattern: '_get_*_perms', count: 2 },
+                { pattern: '_cur_*', count: 1 },
+                { pattern: '_fmt_*', count: 1 },
+            ]);
+            // `getattr(o, x)` and `"_%s" % x` name every member: disclosed, never a blanket withhold.
+            assert.equal(result.reflection.dynamicCount, 2);
+            assert.match(output.formatDeadcode(result),
+                /4 candidate\(s\) withheld by reflection pattern: `_get_\*_perms` \(2\)/);
+            assert.deepEqual(reflectionCallers(index, '_get_user_perms'), ['app.py:9:_get_*_perms']);
+            assert.deepEqual(reflectionCallers(index, '_get_x_perms'), []);
+            assert.deepEqual(reflectionCallers(index, '_cur_year'), ['app.py:17:_cur_*']);
+        } finally { rm(dir); }
+    });
+
+    it('python: eval/globals() lookups are bounded to the module namespace', () => {
+        const dir = tmp({
+            'tool.py': `def update_all():
+    return 1
+
+def stats():
+    return 2
+
+class Keep:
+    def _method_not_reached(self):
+        return 3
+
+if __name__ == "__main__":
+    import sys
+    cmd = sys.argv[1]
+    eval(cmd)()
+`,
+            'other.py': `def _elsewhere():
+    return 1
+
+def run(name):
+    return globals()["run_" + name]()
+
+def run_fast():
+    return 2
+`,
+        });
+        try {
+            const index = idx(dir);
+            const claimed = names(index.deadcode({ includeExported: true }));
+            assert.ok(!claimed.includes('update_all') && !claimed.includes('stats'),
+                'eval(<dynamic>) may call any top-level name of its own module');
+            assert.ok(claimed.includes('Keep._method_not_reached'), 'module lookups never reach class members');
+            assert.ok(claimed.includes('_elsewhere'), 'another module\'s namespace is not reached');
+            assert.ok(!claimed.includes('run_fast'), 'globals()["run_" + name] reaches run_*');
+        } finally { rm(dir); }
+    });
+
+    it('python: Enum hooks are runtime protocol members only on Enum subclasses', () => {
+        const dir = tmp({
+            'enums.py': `import enum
+class Choices(enum.Enum):
+    pass
+
+class TextChoices(str, Choices):
+    @staticmethod
+    def _generate_next_value_(name, start, count, last_values):
+        return name
+
+    @classmethod
+    def _missing_(cls, value):
+        return None
+
+class Plain:
+    @staticmethod
+    def _generate_next_value_(name, start, count, last_values):
+        return name
+`,
+        });
+        try {
+            const index = idx(dir);
+            const result = index.deadcode({ includeExported: true });
+            const claimed = names(result);
+            assert.ok(!claimed.includes('TextChoices._generate_next_value_'));
+            assert.ok(!claimed.includes('TextChoices._missing_'));
+            assert.ok(claimed.includes('Plain._generate_next_value_'),
+                'the hook name alone, without an Enum base, is an ordinary member');
+            const plan = index.plan('_generate_next_value_', { renameTo: 'gen', file: 'enums.py', line: 7 });
+            assert.ok(plan.contract?.blocked, 'renaming an Enum hook withdraws the protocol');
+        } finally { rm(dir); }
+    });
+
+    it('javascript/typescript: computed member patterns and runtime protocol members', () => {
+        const dir = tmp({
+            'package.json': '{"name":"x"}',
+            'emitter.js': `class Emitter {
+  _onOpen() { return 1; }
+  _onClose() { return 2; }
+  _deadHelper() { return 3; }
+  fire(evt) { return this['_on' + evt](); }
+  toJSON() { return {}; }
+  then(r) { r(1); }
+  [Symbol.iterator]() { return [][Symbol.iterator](); }
+}
+class Unrelated {
+  _onOther() { return 4; }
+}
+module.exports = { Emitter, Unrelated };
+`,
+            'router.ts': `export class Router {
+  private handleGet(): number { return 1; }
+  private skipped(): number { return 2; }
+  route(t: string): number { const key = \`handle\${t}\`; return (this as any)[key](); }
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const result = index.deadcode({ includeExported: true });
+            const claimed = names(result);
+            assert.ok(!claimed.includes('Emitter._onOpen') && !claimed.includes('Emitter._onClose'));
+            assert.ok(claimed.includes('Emitter._deadHelper'));
+            assert.ok(claimed.includes('Unrelated._onOther'), 'this inside Emitter never holds an Unrelated');
+            for (const hook of ['Emitter.toJSON', 'Emitter.then', 'Emitter.[Symbol.iterator]']) {
+                assert.ok(!claimed.includes(hook), `${hook} is invoked by the runtime`);
+            }
+            assert.ok(claimed.includes('Router.skipped'));
+            assert.deepEqual(reflectionCallers(index, '_onOpen'), ['emitter.js:5:_on*']);
+        } finally { rm(dir); }
+    });
+
+    it('java: getDeclaredMethod("get" + n) on a class literal, serialization callbacks need Serializable', () => {
+        const dir = tmp({
+            'src/A.java': `import java.io.Serializable;
+public class A implements Serializable {
+  private int getFoo() { return 1; }
+  private int deadOne() { return 3; }
+  private void readObject(java.io.ObjectInputStream in) {}
+  public Object read(String n) throws Exception { return A.class.getDeclaredMethod("get" + n).invoke(this); }
+}
+class B {
+  private int getBaz() { return 1; }
+  private void readObject(java.io.ObjectInputStream in) {}
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const claimed = names(index.deadcode({ includeExported: true }));
+            assert.ok(!claimed.includes('A.getFoo'));
+            assert.ok(claimed.includes('A.deadOne'));
+            assert.ok(claimed.includes('B.getBaz'), 'A.class never reaches B members');
+            assert.ok(!claimed.includes('A.readObject'), 'Serializable callback');
+            assert.ok(claimed.includes('B.readObject'), 'not Serializable: an ordinary private method');
+        } finally { rm(dir); }
+    });
+
+    it('csharp: GetMethod("Handle" + x) and compiler pattern members', () => {
+        const dir = tmp({
+            'A.cs': `using System;
+class A {
+  private int HandleOpen() { return 1; }
+  private int NotHandled() { return 3; }
+  public object Run(string x) { return typeof(A).GetMethod($"Handle{x}").Invoke(this, null); }
+  public System.Collections.IEnumerator GetEnumerator() { yield return 1; }
+  public void Deconstruct(out int a) { a = 1; }
+}
+class Program { static void Main() { new A().Run("x"); } }
+class Conv {
+  public object Cast(string t) { return typeof(Convert).GetMethod("To" + t).Invoke(null, null); }
+  public object ViaInterface(string t) { return typeof(IConvertible).GetMethod("To" + t).Invoke(this, null); }
+}
+class Unrelated { private int ToWidget() { return 1; } }
+class Impl : IConvertible { private int ToThing() { return 1; } }
+`,
+        });
+        try {
+            const index = idx(dir);
+            const claimed = names(index.deadcode({ includeExported: true }));
+            assert.ok(!claimed.includes('A.HandleOpen'));
+            assert.ok(claimed.includes('A.NotHandled'));
+            assert.ok(!claimed.includes('A.GetEnumerator') && !claimed.includes('A.Deconstruct'),
+                'foreach/deconstruction bind these members by pattern');
+            assert.ok(claimed.includes('Unrelated.ToWidget'),
+                'typeof(<external type>) reaches only project types deriving from it');
+            assert.ok(!claimed.includes('Impl.ToThing'),
+                'an IConvertible implementer is reachable through typeof(IConvertible)');
+        } finally { rm(dir); }
+    });
+
+    it('go: MethodByName(fmt.Sprintf("handle%s", y)) keeps matching methods only', () => {
+        const dir = tmp({
+            'go.mod': 'module ex\n\ngo 1.21\n',
+            'a.go': `package ex
+
+import (
+	"fmt"
+	"reflect"
+)
+
+type T struct{}
+
+func (t T) handleOpen() int { return 1 }
+func (t T) otherDead() int  { return 2 }
+func handleFree() int        { return 3 }
+
+func Dispatch(t T, y string) {
+	reflect.ValueOf(t).MethodByName(fmt.Sprintf("handle%s", y)).Call(nil)
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const claimed = names(index.deadcode({ includeExported: true }));
+            assert.ok(!claimed.includes('T.handleOpen'));
+            assert.ok(claimed.includes('T.otherDead'));
+            assert.ok(claimed.includes('handleFree'), 'MethodByName never reaches a free function');
+        } finally { rm(dir); }
+    });
+
+    it('reflection inventory persists with the index cache and is rebuilt on edit', () => {
+        const dir = tmp({
+            'app.py': `class B:
+    def _get_a_x(self):
+        return 1
+    def run(self, s):
+        return getattr(self, "_get_%s_x" % s)()
+`,
+        });
+        try {
+            let index = idx(dir);
+            index.deadcode({});
+            index.saveCache();
+            index = new ProjectIndex(dir);
+            assert.ok(index.loadCache());
+            const impact = execute(index, 'impact', { name: '_get_a_x' });
+            assert.deepEqual(impact.result.unverifiedSites.map(site => [site.line, site.reason, site.reflectionPattern]),
+                [[5, 'reflection-pattern', '_get_*_x']], 'impact lists the reflective site for review');
+            assert.equal(impact.result.account.unaccounted, 0);
+            assert.equal(impact.result.account.beyondText.count, 1,
+                'the site does not spell the name: it is a beyond-text claim, outside the text partition');
+            const entry = [...index.files.values()].find(fe => fe.relativePath === 'app.py');
+            assert.deepEqual(entry.reflectionSites.map(site => site.patterns), [['_get_*_x']],
+                'reflection sites come back from the cache');
+            assert.ok(!names(index.deadcode({ includeExported: true })).includes('B._get_a_x'));
+            fs.writeFileSync(path.join(dir, 'app.py'), `class B:
+    def _get_a_x(self):
+        return 1
+    def run(self, s):
+        return 0
+`);
+            index.build(null, { quiet: true });
+            assert.ok(names(index.deadcode({ includeExported: true })).includes('B._get_a_x'),
+                'removing the reflective access makes the member a claim again');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #366: router mount composition and request-helper clients (endpoints)', () => {
+    const { endpoints, extractServerRoutes, extractClientRequests } = require('../core/bridge');
+    const routeSet = (index) => extractServerRoutes(index).map(r => `${r.method} ${r.path}`);
+
+    it('FastAPI: nested source root, instance-attribute prefix, submodule include_router', () => {
+        const dir = tmp({
+            'backend/app/__init__.py': '',
+            'backend/app/core/__init__.py': '',
+            'backend/app/core/config.py': [
+                'class Settings:',
+                '    API_V1_STR: str = "/api/v1"',
+                '',
+                'settings = Settings()',
+            ].join('\n'),
+            'backend/app/api/__init__.py': '',
+            'backend/app/api/routes/__init__.py': '',
+            'backend/app/api/routes/items.py': [
+                'from fastapi import APIRouter',
+                'router = APIRouter(prefix="/items")',
+                '',
+                '@router.get("/{id}")',
+                'def read_item(id: int):',
+                '    return id',
+            ].join('\n'),
+            'backend/app/api/main.py': [
+                'from fastapi import APIRouter',
+                'from app.api.routes import items',
+                'api_router = APIRouter()',
+                'api_router.include_router(items.router)',
+            ].join('\n'),
+            'backend/app/main.py': [
+                'from fastapi import FastAPI',
+                'from app.api.main import api_router',
+                'from app.core.config import settings',
+                'app = FastAPI()',
+                'app.include_router(api_router, prefix=settings.API_V1_STR)',
+            ].join('\n'),
+        });
+        try {
+            assert.deepStrictEqual(routeSet(idx(dir)), ['GET /api/v1/items/{id}']);
+        } finally { rm(dir); }
+    });
+
+    it('Python prefixes fold f-strings and concatenation; unprovable ones stay as {?expr}', () => {
+        const dir = tmp({
+            'consts.py': 'BASE = "/api"\n',
+            'app.py': [
+                'from fastapi import FastAPI, APIRouter',
+                'from consts import BASE',
+                'import os',
+                'a = APIRouter()',
+                'b = APIRouter()',
+                '@a.get("/x")',
+                'def x():',
+                '    pass',
+                '@b.get("/y")',
+                'def y():',
+                '    pass',
+                'app = FastAPI()',
+                'app.include_router(a, prefix=f"{BASE}/v" + "2")',
+                'app.include_router(b, prefix=os.environ["P"])',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const paths = routeSet(index);
+            assert.ok(paths.includes('GET /api/v2/x'), `folded prefix, got ${paths}`);
+            const disclosed = paths.find(p => p.endsWith('/y'));
+            assert.ok(/\{\?os\.environ\[.P.\]\}\/y$/.test(disclosed), `unresolved prefix disclosed, got ${disclosed}`);
+        } finally { rm(dir); }
+    });
+
+    it('Flask: register_blueprint url_prefix from a module constant', () => {
+        const dir = tmp({
+            'settings.py': 'PREFIX = "/site"\n',
+            'views.py': [
+                'from flask import Blueprint',
+                'bp = Blueprint("v", __name__)',
+                '@bp.get("/home")',
+                'def home():',
+                '    return ""',
+            ].join('\n'),
+            'app.py': [
+                'from flask import Flask',
+                'import settings',
+                'from views import bp',
+                'app = Flask(__name__)',
+                'app.register_blueprint(bp, url_prefix=settings.PREFIX)',
+            ].join('\n'),
+        });
+        try {
+            assert.deepStrictEqual(routeSet(idx(dir)), ['GET /site/home']);
+        } finally { rm(dir); }
+    });
+
+    it('Express: constant prefix, require-mounted router, scope-accurate shadowed routers', () => {
+        const dir = tmp({
+            'package.json': '{"name":"x"}',
+            'users.js': [
+                "const express = require('express');",
+                'const router = express.Router();',
+                "router.get('/list', (req, res) => res.end());",
+                'module.exports = router;',
+            ].join('\n'),
+            'app.js': [
+                "const express = require('express');",
+                "const API = '/api';",
+                'const app = express();',
+                "app.use(API + '/users', require('./users'));",
+                'function a() {',
+                '  const r = express.Router();',
+                "  r.get('/one', h);",
+                "  app.use('/a', r);",
+                '}',
+                'function b() {',
+                '  const r = express.Router();',
+                "  r.get('/two', h);",
+                "  app.use('/b', r);",
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const paths = routeSet(idx(dir));
+            assert.ok(paths.includes('GET /api/users/list'), `got ${paths}`);
+            assert.ok(paths.includes('GET /a/one') && paths.includes('GET /b/two'), `got ${paths}`);
+            assert.ok(!paths.includes('GET /b/one') && !paths.includes('GET /a/two'),
+                `a shadowed name must not conflate mounts, got ${paths}`);
+        } finally { rm(dir); }
+    });
+
+    it('Hono: route() and basePath() compose; routers proven by construction, chains included', () => {
+        const dir = tmp({
+            'package.json': '{"name":"x"}',
+            'app.ts': [
+                "import { Hono } from 'hono'",
+                'const book = new Hono()',
+                "book.get('/', (c) => c.text('list')).post('/', (c) => c.text('create'))",
+                "const api = new Hono().basePath('/api')",
+                "api.route('/book', book)",
+            ].join('\n'),
+        });
+        try {
+            const paths = routeSet(idx(dir));
+            assert.ok(paths.includes('GET /api/book') && paths.includes('POST /api/book'), `got ${paths}`);
+        } finally { rm(dir); }
+    });
+
+    it('Fastify: register prefixes (inline, named, nested) and in-process inject requests', () => {
+        const dir = tmp({
+            'package.json': '{"name":"x"}',
+            'server.js': [
+                "const fastify = require('fastify')()",
+                'function v2 (instance, opts, done) {',
+                "  instance.get('/items', h)",
+                '  done()',
+                '}',
+                'fastify.register(async (instance) => {',
+                "  instance.get('/users', h)",
+                "  instance.register(v2, { prefix: '/v2' })",
+                "}, { prefix: '/api' })",
+                "fastify.route({ method: 'GET', url: '/health', handler: h })",
+                'async function t () {',
+                "  await fastify.inject({ method: 'GET', url: '/api/users' })",
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const paths = routeSet(index);
+            for (const p of ['GET /api/users', 'GET /api/v2/items', 'GET /health']) {
+                assert.ok(paths.includes(p), `${p} missing, got ${paths}`);
+            }
+            const result = endpoints(index, { bridge: true });
+            const inject = result.bridges.find(b => b.request.framework === 'inject');
+            assert.ok(inject && inject.route.path === '/api/users', 'inject request bridges to the route');
+        } finally { rm(dir); }
+    });
+
+    it('Koa-router constructor prefix and NestJS setGlobalPrefix', () => {
+        const dir = tmp({
+            'package.json': '{"name":"x"}',
+            'koa.js': [
+                "const Router = require('@koa/router')",
+                "const router = new Router({ prefix: '/k' })",
+                "router.get('/a', h)",
+                // koa-router concatenates a mount path (fix #383): `use('/',
+                // ...)` would register `//k/a`; the app mounts the routes.
+                "app.use(router.routes())",
+            ].join('\n'),
+            'main.ts': [
+                "import { NestFactory } from '@nestjs/core'",
+                'async function bootstrap() {',
+                '  const app = await NestFactory.create(AppModule)',
+                "  app.setGlobalPrefix('api')",
+                '}',
+            ].join('\n'),
+            'cats.controller.ts': [
+                "@Controller('cats')",
+                'export class CatsController {',
+                "  @Get(':id')",
+                '  findOne() {}',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const paths = routeSet(idx(dir));
+            assert.ok(paths.includes('GET /k/a'), `got ${paths}`);
+            assert.ok(paths.includes('GET /api/cats/:id'), `got ${paths}`);
+        } finally { rm(dir); }
+    });
+
+    it('Go gin: constant group prefix and a group passed to a router-typed parameter', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/m\n',
+            'routes/users.go': [
+                'package routes',
+                'import "github.com/gin-gonic/gin"',
+                'func Register(rg *gin.RouterGroup) {',
+                '\trg.GET("/users", list)',
+                '}',
+            ].join('\n'),
+            'main.go': [
+                'package main',
+                'import (',
+                '\t"github.com/gin-gonic/gin"',
+                '\t"example.com/m/routes"',
+                ')',
+                'const APIPrefix = "/api"',
+                'func main() {',
+                '\tr := gin.Default()',
+                '\tv1 := r.Group(APIPrefix + "/v1")',
+                '\troutes.Register(v1)',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            assert.deepStrictEqual(routeSet(idx(dir)), ['GET /api/v1/users']);
+        } finally { rm(dir); }
+    });
+
+    it('Go chi: Route closures, Mount of a router-returning function, With chains', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/c\n',
+            'main.go': [
+                'package main',
+                'import "github.com/go-chi/chi/v5"',
+                'func main() {',
+                '\tr := chi.NewRouter()',
+                '\tr.Route("/articles", func(r chi.Router) {',
+                '\t\tr.Get("/", list)',
+                '\t\tr.With(paginate).Get("/search", search)',
+                '\t})',
+                '\tr.Mount("/admin", adminRouter())',
+                '}',
+                'func adminRouter() chi.Router {',
+                '\tr := chi.NewRouter()',
+                '\tr.Get("/users", users)',
+                '\treturn r',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const paths = routeSet(idx(dir));
+            for (const p of ['GET /articles', 'GET /articles/search', 'GET /admin/users']) {
+                assert.ok(paths.includes(p), `${p} missing, got ${paths}`);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('Go gorilla/mux PathPrefix().Subrouter() and net/http StripPrefix', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/g\n',
+            'main.go': [
+                'package main',
+                'import (',
+                '\t"net/http"',
+                '\t"github.com/gorilla/mux"',
+                ')',
+                'func main() {',
+                '\tr := mux.NewRouter()',
+                '\ts := r.PathPrefix("/api").Subrouter()',
+                '\ts.HandleFunc("/products", products)',
+                '\tinner := http.NewServeMux()',
+                '\tinner.HandleFunc("/ping", ping)',
+                '\tmux2 := http.NewServeMux()',
+                '\tmux2.Handle("/v1/", http.StripPrefix("/v1", inner))',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const paths = routeSet(idx(dir));
+            assert.ok(paths.includes('ALL /api/products'), `got ${paths}`);
+            assert.ok(paths.includes('ALL /v1/ping'), `got ${paths}`);
+        } finally { rm(dir); }
+    });
+
+    it('Spring/JAX-RS: class and method mappings fold constants and arrays', () => {
+        const dir = tmp({
+            'Paths.java': 'package a;\npublic final class Paths { public static final String API = "/api"; public static final String ONE = "/{id}"; }\n',
+            'UsersController.java': [
+                'package a;',
+                '@RestController',
+                '@RequestMapping({Paths.API + "/users", "/v2/users"})',
+                'public class UsersController {',
+                '    @GetMapping(value = Paths.ONE)',
+                '    public String one() { return ""; }',
+                '}',
+            ].join('\n'),
+            'Res.java': [
+                'package a;',
+                '@Path(Res.BASE)',
+                'public class Res {',
+                '    static final String BASE = "/res";',
+                '    @GET @Path("/x")',
+                '    public String x() { return ""; }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const paths = routeSet(idx(dir));
+            for (const p of ['GET /api/users/{id}', 'GET /v2/users/{id}', 'GET /res/x']) {
+                assert.ok(paths.includes(p), `${p} missing, got ${paths}`);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('ASP.NET: [controller]/[action] tokens, method [Route], constants, MapGroup; case-insensitive bridge', () => {
+        const dir = tmp({
+            'UsersController.cs': [
+                'namespace A;',
+                '[ApiController]',
+                '[Route("api/[controller]")]',
+                'public class UsersController : ControllerBase {',
+                '    [HttpGet("{id}")]',
+                '    public string One(int id) => "";',
+                '    [HttpPost]',
+                '    [Route("create")]',
+                '    public string Two() => "";',
+                '    [HttpGet(Routes.Three)]',
+                '    public string Three() => "";',
+                '}',
+                'public static class Routes { public const string Three = "three"; }',
+            ].join('\n'),
+            'Program.cs': [
+                'var app = WebApplication.CreateBuilder(args).Build();',
+                'var api = app.MapGroup("/api");',
+                'api.MapGet("/ping", () => "ok");',
+            ].join('\n'),
+            'package.json': '{"name":"x"}',
+            'client.js': "fetch('/api/users/7')\n",
+        });
+        try {
+            const index = idx(dir);
+            const paths = routeSet(index);
+            for (const p of ['GET /api/Users/{id}', 'POST /api/Users/create', 'GET /api/Users/three', 'GET /api/ping']) {
+                assert.ok(paths.includes(p), `${p} missing, got ${paths}`);
+            }
+            const result = endpoints(index, { bridge: true });
+            assert.ok(result.bridges.some(b => b.route.path === '/api/Users/{id}'),
+                'ASP.NET routing is case-insensitive');
+        } finally { rm(dir); }
+    });
+
+    it('Rust: axum nest and actix scope compose', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "x"\nversion = "0.1.0"\n',
+            'src/main.rs': [
+                'use axum::{routing::get, Router};',
+                'mod api;',
+                'fn app() -> Router {',
+                '    Router::new().route("/", get(root)).nest("/api", api::routes())',
+                '}',
+                'async fn root() {}',
+                '#[get("/users/{id}")]',
+                'async fn get_user() -> String { String::new() }',
+                'fn actix() {',
+                '    App::new().service(web::scope("/v1").service(get_user));',
+                '}',
+            ].join('\n'),
+            'src/api.rs': [
+                'use axum::{routing::get, Router};',
+                'pub fn routes() -> Router {',
+                '    Router::new().route("/users", get(users))',
+                '}',
+                'async fn users() {}',
+            ].join('\n'),
+        });
+        try {
+            const paths = routeSet(idx(dir));
+            // The method router `get(users)` serves GET (fix #383).
+            assert.ok(paths.includes('GET /api/users'), `axum nest, got ${paths}`);
+            assert.ok(paths.includes('GET /v1/users/{id}'), `actix scope, got ${paths}`);
+        } finally { rm(dir); }
+    });
+
+    it('JS/TS: generated OpenAPI clients are proven request helpers (structural, any name)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"x"}',
+            'core/request.ts': [
+                'export const request = (config: any, options: any) => sendRequest(options.url);',
+                'const sendRequest = async (url: string) => fetch(url);',
+            ].join('\n'),
+            'client/client.ts': [
+                "import axios from 'axios';",
+                'export const createClient = () => {',
+                '  const instance = axios.create();',
+                "  const request = (o: any) => instance.request(o);",
+                "  return { post: (o: any) => request({ ...o, method: 'POST' }) };",
+                '};',
+            ].join('\n'),
+            'client/client.gen.ts': "import { createClient } from './client';\nexport const client = createClient();\n",
+            'sdk.gen.ts': [
+                "import { request as __doIt } from './core/request';",
+                "import { client } from './client/client.gen';",
+                'export class Svc {',
+                "  static a() { return __doIt(OpenAPI, { method: 'PUT', url: '/api/v1/items/{id}' }); }",
+                "  static b(options?: any) { return (options?.client ?? client).post({ url: '/api/v1/login' }); }",
+                "  static c() { return notAClient({ url: '/api/v1/other' }); }",
+                '}',
+                'function notAClient(cfg: any) { return cfg; }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const reqs = extractClientRequests(index).map(r => `${r.method} ${r.path} ${r.framework}`);
+            assert.ok(reqs.includes('PUT /api/v1/items/{id} request-helper'), `got ${reqs}`);
+            assert.ok(reqs.includes('POST /api/v1/login request-helper'), `got ${reqs}`);
+            assert.ok(!reqs.some(r => r.includes('/api/v1/other')), 'a helper that performs no HTTP is not a client');
+        } finally { rm(dir); }
+    });
+
+    it('Python keyword request configuration; unproven helpers stay in the uncertain band', () => {
+        const dir = tmp({
+            'client.py': [
+                'import requests',
+                'def a():',
+                '    requests.request(method="POST", url="/api/items")',
+                'def call_api(url):',
+                '    return requests.get(url)',
+                'def b():',
+                '    call_api(url="/api/users")',
+            ].join('\n'),
+            'app.py': [
+                'from fastapi import FastAPI',
+                'app = FastAPI()',
+                '@app.post("/api/items")',
+                'def create():',
+                '    pass',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = endpoints(index, { bridge: true });
+            assert.ok(result.bridges.some(b => b.request.path === '/api/items' && b.request.method === 'POST' &&
+                b.matchType === 'exact'), 'keyword url/method bridges exactly');
+            assert.ok(result.requests.some(r => r.path === '/api/users' && r.framework === 'request-helper'),
+                'a project helper that calls requests is proven');
+        } finally { rm(dir); }
+    });
+
+    it('client path templates match route parameters exactly; unresolved prefixes only uncertainly', () => {
+        const dir = tmp({
+            'app.py': [
+                'from fastapi import FastAPI, APIRouter',
+                'import os',
+                'r = APIRouter()',
+                '@r.get("/items/{item_id}")',
+                'def item(item_id: int):',
+                '    pass',
+                'app = FastAPI()',
+                'app.include_router(r, prefix=os.environ["PREFIX"])',
+            ].join('\n'),
+            'package.json': '{"name":"x"}',
+            'sdk.ts': [
+                "import axios from 'axios';",
+                "export const get = () => axios.request({ method: 'GET', url: '/api/v1/items/{id}' });",
+            ].join('\n'),
+        });
+        try {
+            const result = endpoints(idx(dir), { bridge: true });
+            const b = result.bridges.find(x => x.request.path === '/api/v1/items/{id}');
+            assert.ok(b, 'the SDK call bridges through the unresolved prefix');
+            assert.strictEqual(b.matchType, 'uncertain');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #367: evaluation leftovers (bare-call kinds, language branches, flow, exports, recovery, visibility, budget, bare this-calls)', () => {
+    const sites = list => (list || []).map(c => `${path.basename(c.file)}:${c.line}`);
+    const show = (index, name) => {
+        const r = execute(index, 'show', { name });
+        assert.ok(r.ok, JSON.stringify(r.error));
+        return r.result.context;
+    };
+
+    // #367a: a bare call can never denote a class member where bare-name
+    // lookup never enters class scope (bareCallReachesMethods false).
+    const BARE = {
+        python: {
+            files: { 'pkg/__init__.py': '', 'pkg/iter.py': 'class Chunks:\n    def len(self):\n        return len(self.it)\n',
+                'pkg/other.py': 'class Other:\n    def len(self):\n        return 0\n' },
+            target: 'pkg/iter.py:2:len', site: 'iter.py:3',
+        },
+        javascript: {
+            files: { 'package.json': '{"name":"t"}', 'a.js': 'class K {\n  len(x) { return len(x); }\n}\nmodule.exports = { K };\n',
+                'b.js': 'class Q {\n  len() { return 1; }\n}\nmodule.exports = { Q };\n' },
+            target: 'a.js:2:len', site: 'a.js:2',
+        },
+        typescript: {
+            files: { 'a.ts': 'export class K {\n  size(x: number[]): number { return size(x); }\n}\ndeclare function size(x: number[]): number;\n',
+                'b.ts': 'export class Q {\n  size(): number { return 1; }\n}\n' },
+            target: 'a.ts:2:size', site: 'a.ts:2',
+        },
+        go: {
+            files: { 'go.mod': 'module ex.com/p\ngo 1.21\n', 'p/a.go': 'package p\n\ntype A struct{ xs []int }\n\nfunc (a *A) Size() int { return Size(a.xs) }\n',
+                'p/b.go': 'package p\n\ntype B struct{}\n\nfunc (b *B) Size() int { return 0 }\n' },
+            target: 'p/a.go:5:Size', site: 'a.go:5',
+        },
+        rust: {
+            files: { 'Cargo.toml': '[package]\nname = "fx367"\nversion = "0.1.0"\nedition = "2021"\n',
+                'src/lib.rs': 'use ext::size;\npub struct A { n: usize }\nimpl A {\n    pub fn size(&self) -> usize { size(self.n) }\n}\npub struct B;\nimpl B {\n    pub fn size(&self) -> usize { 0 }\n}\n' },
+            target: 'src/lib.rs:4:size', site: 'lib.rs:4',
+        },
+    };
+    for (const [lang, fx] of Object.entries(BARE)) {
+        it(`#367a ${lang}: a bare call inside a same-named method is neither a caller nor a callee of that method`, () => {
+            const dir = tmp(fx.files);
+            try {
+                const ctx = show(idx(dir), fx.target);
+                assert.ok(!sites(ctx.callers).includes(fx.site), `confirmed: ${JSON.stringify(sites(ctx.callers))}`);
+                assert.ok(!sites(ctx.unverifiedCallers).includes(fx.site),
+                    `unverified: ${JSON.stringify(sites(ctx.unverifiedCallers))}`);
+                assert.ok(!(ctx.callees || []).some(c => c.name === ctx.function && c.startLine === ctx.startLine),
+                    `self callee: ${JSON.stringify((ctx.callees || []).map(c => `${c.name}:${c.startLine}`))}`);
+                assert.strictEqual(ctx.meta.account.conserved, true);
+            } finally { rm(dir); }
+        });
+    }
+
+    it('#367a javascript: a self-named function expression assigned to a prototype stays recursive', () => {
+        const dir = tmp({ 'package.json': '{"name":"t"}',
+            'a.js': 'function Foo() {}\nFoo.prototype.bar = function bar(n) { return n ? bar(n - 1) : 0; };\nmodule.exports = Foo;\n' });
+        try {
+            const ctx = show(idx(dir), 'a.js:2:bar');
+            assert.ok((ctx.callees || []).some(c => c.name === 'bar'));
+        } finally { rm(dir); }
+    });
+
+    it('#367a python: a class-body call to an earlier def in that body is not excluded', () => {
+        const dir = tmp({ 'm.py': 'class A:\n    def make():\n        return 1\n    value = make()\n' });
+        try {
+            const ctx = show(idx(dir), 'm.py:2:make');
+            assert.ok(!(ctx.meta.account.excluded.byReason['method-kind-mismatch']),
+                JSON.stringify(ctx.meta.account.excluded));
+        } finally { rm(dir); }
+    });
+
+    // #367d: default-exported VALUES are part of a file's API surface.
+    it('#367d api lists default-exported values (ESM default identifier, module.exports value, literal default)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': 'function make() { return {}; }\nconst api = make();\napi.x = 1;\nexport default api;\n',
+            'cjs.js': 'function make() { return {}; }\nconst inst = make();\nmodule.exports = inst;\n',
+            'lit.js': 'export default { a: 1 };\n',
+            'barrel.js': "export * from './lib.js';\n",
+        });
+        try {
+            const index = idx(dir);
+            const names = file => index.api(file).map(e => e.name);
+            assert.deepStrictEqual(names('lib.js'), ['api']);
+            assert.deepStrictEqual(names('cjs.js'), ['inst']);
+            assert.deepStrictEqual(names('lit.js'), ['default']);
+            // `export *` never re-exports a default export.
+            assert.ok(!names('barrel.js').includes('api'), JSON.stringify(names('barrel.js')));
+        } finally { rm(dir); }
+    });
+
+    it('#367d api lists Python __all__ variables, Go exported vars/consts and Rust pub static/const', () => {
+        const cases = [
+            [{ 'pkg/__init__.py': '', 'pkg/mod.py': '__all__ = ["VALUE", "helper"]\nVALUE = 1\ndef helper():\n    return VALUE\n' },
+                'pkg/mod.py', ['VALUE', 'helper']],
+            [{ 'go.mod': 'module ex.com/p\ngo 1.21\n', 'p/p.go': 'package p\n\nvar Default = New()\nconst Max = 10\nvar hidden = 1\n\ntype T struct{}\n\nfunc New() *T { return &T{} }\n' },
+                'p/p.go', ['Default', 'Max', 'New', 'T']],
+            [{ 'Cargo.toml': '[package]\nname = "r"\nversion = "0.1.0"\nedition = "2021"\n', 'src/lib.rs': 'pub static GLOBAL: i32 = 1;\npub const LIMIT: usize = 4;\nstatic PRIV: i32 = 2;\n' },
+                'src/lib.rs', ['GLOBAL', 'LIMIT']],
+        ];
+        for (const [files, file, expected] of cases) {
+            const dir = tmp(files);
+            try {
+                assert.deepStrictEqual(idx(dir).api(file).map(e => e.name).sort(), expected);
+            } finally { rm(dir); }
+        }
+    });
+
+    // #367e: ground-set lines inside parser-recovery regions are disclosed.
+    const BROKEN = {
+        javascript: { 'a.js': 'export function ok() { return 1; }\n', 'b.js': 'import { ok } from "./a.js";\nfunction caller() { ok(); }\nfunction broken( {\n  if (x {\n  ok();\n' },
+        python: { 'a.py': 'def ok():\n    return 1\n', 'b.py': 'from a import ok\ndef caller():\n    ok()\ndef broken(:\n    ok(\n' },
+        go: { 'go.mod': 'module ex.com/p\ngo 1.21\n', 'a.go': 'package p\n\nfunc ok() int { return 1 }\n', 'b.go': 'package p\n\nfunc caller() { ok() }\n\nfunc broken( {\n\tok(\n' },
+        java: { 'A.java': 'public class A {\n  static int ok() { return 1; }\n  void caller() { ok(); }\n  void broken( {\n    ok(\n' },
+        rust: { 'Cargo.toml': '[package]\nname = "b"\nversion = "0.1.0"\nedition = "2021"\n', 'src/lib.rs': 'fn ok() -> i32 { 1 }\nfn caller() { ok(); }\nfn broken( {\n    ok(\n' },
+        csharp: { 'A.cs': 'class A {\n  public static int Ok() { return 1; }\n}\n', 'B.cs': 'class B {\n  void Caller() { A.Ok(); }\n  void Broken( {\n    A.Ok(\n' },
+        c: { 'a.c': 'int ok(void) { return 1; }\nvoid caller(void) { ok(); }\nvoid broken( {\n    ok(\n' },
+    };
+    for (const [lang, files] of Object.entries(BROKEN)) {
+        it(`#367e ${lang}: a ground line in a recovered region is disclosed in the account`, () => {
+            const dir = tmp(files);
+            try {
+                const index = idx(dir);
+                const name = lang === 'csharp' ? 'Ok' : 'ok';
+                const r = execute(index, 'show', { name });
+                assert.ok(r.ok, JSON.stringify(r.error));
+                const recovered = r.result.context.meta.account.recovered;
+                assert.ok(recovered && recovered.lines >= 1, `${lang}: ${JSON.stringify(r.result.context.meta.account)}`);
+                const text = output.formatAccountLines
+                    ? output.formatAccountLines(r.result.context.meta.account).join('\n')
+                    : '';
+                if (text) assert.match(text, /syntax-error recovery/);
+                // The clean caller line is never flagged.
+                assert.ok(!recovered.sites.some(s => s.line === (lang === 'java' || lang === 'csharp' ? 3 : lang === 'rust' || lang === 'c' ? 2 : 3) &&
+                    /caller|Caller/.test(fs.readFileSync(path.join(dir, s.file), 'utf8').split('\n')[s.line - 1])),
+                `${lang}: ${JSON.stringify(recovered.sites)}`);
+            } finally { rm(dir); }
+        });
+    }
+
+    // #367f: interface/trait members inherit the container's visibility.
+    it('#367f deadcode treats members of exported traits/interfaces as public API (Rust, C#, Java)', () => {
+        const cases = [
+            [{ 'Cargo.toml': '[package]\nname = "r"\nversion = "0.1.0"\nedition = "2021"\n',
+                'src/lib.rs': 'pub trait T {\n    fn required(&self) -> i32;\n    fn provided(&self) -> i32 { 4 }\n}\ntrait Hidden {\n    fn hidden_provided(&self) -> i32 { 5 }\n}\n' },
+            ['provided', 'required'], ['hidden_provided']],
+            [{ 'Api.cs': 'namespace P {\n    public interface IApi {\n        void Run();\n        int Helper() => 1;\n    }\n    internal interface IInternal {\n        int InternalHelper() => 2;\n    }\n}\n' },
+            ['Run', 'Helper'], ['InternalHelper']],
+            [{ 'src/p/Api.java': 'package p;\npublic interface Api {\n    void run();\n    default int helper() { return 1; }\n}\n' },
+            ['run', 'helper'], []],
+        ];
+        for (const [files, publicNames, claimed] of cases) {
+            const dir = tmp(files);
+            try {
+                const dead = idx(dir).deadcode({}).map(d => d.name);
+                for (const name of publicNames) assert.ok(!dead.includes(name), `${name} claimed: ${JSON.stringify(dead)}`);
+                for (const name of claimed) assert.ok(dead.includes(name), `${name} not claimed: ${JSON.stringify(dead)}`);
+            } finally { rm(dir); }
+        }
+    });
+
+    // #367g: the text budget keeps a head of every tier section.
+    it('#367g output budget keeps a representative head of every tier section (CLI and MCP)', () => {
+        const { applyOutputBudget } = require('../core/output-budget');
+        const confirmed = Array.from({ length: 300 }, (_, i) => `  [${i + 1}] src/confirmed_${i}.js:${i + 1} [f]: target(${i})`);
+        const unverified = [
+            '  competing definitions (40; 40 dispatch owners):',
+            ...Array.from({ length: 40 }, (_, i) => `    - src/owner_${i}.js:1:target — method on O${i}`),
+            ...Array.from({ length: 200 }, (_, i) => `  [${i + 301}] src/unverified_${i}.js:${i + 1} [g]: x.target() (method-ambiguous)`),
+        ];
+        const text = [
+            'Context: target',
+            'CALLERS — CONFIRMED (300):',
+            ...confirmed,
+            'CALLERS — UNVERIFIED (200) — call or callable-reference syntax, no binding/receiver evidence:',
+            ...unverified,
+            'CALLEES (0):',
+            'ACCOUNT: "target" occurs on 540 lines in 500 files: 300 confirmed, 200 unverified, 40 non-call, 0 other-target, 0 unaccounted',
+            'CONTRACT: literal-name text partition complete; semantic completeness is not claimed.',
+        ].join('\n');
+        for (const surface of ['cli', 'mcp']) {
+            const out = applyOutputBudget(text, { command: 'show', surface });
+            assert.ok(out.truncated);
+            assert.ok(out.text.length <= 10000, `${surface}: ${out.text.length}`);
+            assert.match(out.text, /CALLERS — UNVERIFIED \(200\)/);
+            assert.match(out.text, /\[301\] src\/unverified_0\.js/, `${surface}: first unverified site kept`);
+            assert.match(out.text, /\[1\] src\/confirmed_0\.js/);
+            assert.match(out.text, /\.\.\. \+\d+ more/);
+            assert.match(out.text, /^ACCOUNT: "target"/m);
+            assert.match(out.text, /^CONTRACT:/m);
+            // The unverified band gets a comparable share of the budget.
+            const unverifiedShown = (out.text.match(/src\/unverified_/g) || []).length;
+            assert.ok(unverifiedShown >= 20, `${surface}: ${unverifiedShown}`);
+        }
+        // Commands without tier sections keep the head cut.
+        const plain = applyOutputBudget(text, { command: 'usages', surface: 'cli' });
+        assert.ok(!/\.\.\. \+\d+ more/.test(plain.text));
+    });
+
+    // #367i: a Java/C# bare this-call resolves through the caller class's
+    // resolved ancestry; an unrelated same-named owner is not its target.
+    it('#367i java: bare m() in a subclass of b1.Base is not a caller of b2.Base.m; anonymous classes stay visible', () => {
+        const dir = tmp({
+            'com/x/b1/Base.java': 'package com.x.b1;\npublic class Base {\n  public int m() { return 1; }\n}\n',
+            'com/x/b2/Base.java': 'package com.x.b2;\npublic class Base {\n  public int m() { return 2; }\n}\n',
+            'com/x/c/Child.java': 'package com.x.c;\nimport com.x.b1.Base;\npublic class Child extends Base {\n  public int run() {\n    return m();\n  }\n  public int anon() {\n    com.x.b2.Base o = new com.x.b2.Base() {\n      public int g() { return m(); }\n    };\n    return 0;\n  }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const other = show(index, 'com/x/b2/Base.java:3:m');
+            assert.ok(!sites(other.callers).includes('Child.java:5'));
+            assert.ok(!sites(other.unverifiedCallers).includes('Child.java:5'),
+                JSON.stringify(sites(other.unverifiedCallers)));
+            assert.ok(sites(other.unverifiedCallers).includes('Child.java:9'),
+                `anonymous subclass of b2.Base stays visible: ${JSON.stringify(sites(other.unverifiedCallers))}`);
+            const own = show(index, 'com/x/b1/Base.java:3:m');
+            assert.ok(sites(own.callers).includes('Child.java:5'), JSON.stringify(sites(own.callers)));
+            assert.strictEqual(other.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('#367i java: a bare call in a constructor or field initializer is analyzed without error', () => {
+        const dir = tmp({
+            'a/U.java': 'package a;\npublic class U {\n  public static int check(int x) { return x; }\n}\n',
+            'b/U.java': 'package b;\npublic class U {\n  public static int check(int x) { return -x; }\n}\n',
+            'a/T.java': 'package a;\npublic class T extends U {\n  static final int V = check(1);\n  private final int v;\n  private T(int x) {\n    this.v = check(x);\n  }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'show', { name: 'b/U.java:3:check' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            assert.strictEqual(r.result.context.meta.account.conserved, true);
+            const f = execute(index, 'find', { name: 'check' });
+            assert.ok(f.ok, JSON.stringify(f.error));
+        } finally { rm(dir); }
+    });
+
+    it('#367i csharp: bare M() resolves the base through the namespace the file imports', () => {
+        const dir = tmp({
+            'A.cs': 'using static N2.Util;\nusing N1;\nnamespace N3 {\n  public class Child : Base {\n    public int Run() { return M() + Helper(); }\n  }\n}\n',
+            'B.cs': 'namespace N1 { public class Base { public int M() { return 1; } } }\n',
+            'C.cs': 'namespace N2 { public class Base { public int M() { return 2; } } public static class Util { public static int Helper() { return 3; } } }\n',
+        });
+        try {
+            const index = idx(dir);
+            const other = show(index, 'C.cs:1:M');
+            assert.ok(!sites(other.callers).includes('A.cs:5'), JSON.stringify(sites(other.callers)));
+            assert.ok(!sites(other.unverifiedCallers).includes('A.cs:5'));
+            const own = show(index, 'B.cs:1:M');
+            assert.ok(sites(own.callers).includes('A.cs:5'), JSON.stringify(sites(own.callers)));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #369: C# bare invocations of local delegates', () => {
+    it('a local delegate, parameter or lambda parameter named like a method is the invoked value', () => {
+        const dir = tmp({
+            'A.cs': [
+                'namespace N {',
+                'class A {',
+                '    void Run() {}',
+                '    void Go(System.Action Other) {',
+                '        System.Action Run = () => {};',
+                '        Run();',
+                '        Other();',
+                '        System.Action<System.Action> f = Step => Step();',
+                '    }',
+                '    void Other() {}',
+                '    void Step() {}',
+                '    void Plain() { Run(); Other(); Step(); }',
+                '}',
+                '}',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const lines = entries => (entries || []).map(entry => `${entry.relativePath}:${entry.line}`);
+            assert.deepStrictEqual(lines(index.context('Run', { file: 'A.cs', line: 3 }).callers), ['A.cs:12']);
+            assert.deepStrictEqual(lines(index.context('Other', { file: 'A.cs', line: 10 }).callers), ['A.cs:12']);
+            assert.deepStrictEqual(lines(index.context('Step', { file: 'A.cs', line: 11 }).callers), ['A.cs:12']);
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #371: a type name written at a call site denotes what the file binds it to', () => {
+    // Each fixture defines a project type that shares its name with an
+    // external type. The "ext" file imports (or path-qualifies) the external
+    // one; the "own" file names the project type. Calls through the external
+    // name never confirm a member of the project type.
+    const pin = (index, handle) => {
+        const [rel, line, name] = handle.split(':');
+        const def = (index.symbols.get(name) || []).find(d => d.relativePath === rel && d.startLine === Number(line));
+        assert.ok(def, `fixture target ${handle}`);
+        return def;
+    };
+    const callers = (index, handle) => {
+        const def = pin(index, handle);
+        const result = index.findCallers(def.name, { includeMethods: true, targetDefinitions: [def], collectAccount: true });
+        return {
+            confirmed: result.filter(c => c.tier !== 'unverified').map(c => `${c.relativePath}:${c.line}`),
+            excluded: (result.accountRaw?.excludedEntries || []).map(e => `${path.relative(index.root, e.file)}:${e.line}:${e.reason}`),
+            unverified: [...result.filter(c => c.tier === 'unverified'), ...(result.unverifiedEntries || [])]
+                .map(c => `${c.relativePath || path.relative(index.root, c.file)}:${c.line}:${c.reason}`),
+        };
+    };
+    const calleesAt = (index, rel, line) => {
+        const fileEntry = index.files.get(path.join(index.root, rel));
+        const fn = fileEntry.symbols.filter(s => ['function', 'method'].includes(s.type) &&
+            s.startLine <= line && s.endLine >= line).sort((a, b) => b.startLine - a.startLine)[0];
+        return index.findCallees(fn, { includeMethods: true, collectAccount: true });
+    };
+    const LANGS = {
+        rust: {
+            files: {
+                'Cargo.toml': '[package]\nname = "fx371"\nversion = "0.1.0"\nedition = "2021"\n',
+                'src/lib.rs': 'pub mod fs;\npub mod ext;\npub mod own;\n',
+                'src/fs.rs': 'pub struct File { fd: i32 }\nimpl File {\n    pub fn create(p: &str) -> File { File { fd: p.len() as i32 } }\n    pub fn sync_all(&self) -> i32 { self.fd }\n}\n',
+                'src/ext.rs': 'use std::fs::File;\npub fn run() {\n    let _a = File::create("x");\n    let _b = std::fs::File::create("y");\n    let h: File = File::open("z").unwrap();\n    let _ = h.sync_all();\n}\n',
+                'src/own.rs': 'use crate::fs::File;\npub fn run() -> i32 {\n    let f = File::create("x");\n    f.sync_all()\n}\n',
+            },
+            targets: { create: 'src/fs.rs:3:create', member: 'src/fs.rs:4:sync_all' },
+            ext: ['src/ext.rs:3', 'src/ext.rs:4', 'src/ext.rs:6'],
+            own: ['src/own.rs:3', 'src/own.rs:4'],
+        },
+        java: {
+            files: {
+                'src/main/java/com/x/io/File.java': 'package com.x.io;\npublic class File {\n  public File(String p) {}\n  public boolean createNewFile() { return true; }\n  public static File createTempFile(String a) { return new File(a); }\n}\n',
+                'src/main/java/com/x/app/Ext.java': 'package com.x.app;\nimport java.io.File;\npublic class Ext {\n  public void run() throws Exception {\n    File f = new File("x");\n    f.createNewFile();\n    File.createTempFile("a", "b");\n    java.io.File.createTempFile("c", "d");\n  }\n}\n',
+                'src/main/java/com/x/app/Own.java': 'package com.x.app;\nimport com.x.io.File;\npublic class Own {\n  public void run() {\n    File f = new File("x");\n    f.createNewFile();\n    File.createTempFile("a");\n  }\n}\n',
+            },
+            targets: { create: 'src/main/java/com/x/io/File.java:5:createTempFile', member: 'src/main/java/com/x/io/File.java:4:createNewFile' },
+            ext: ['src/main/java/com/x/app/Ext.java:6', 'src/main/java/com/x/app/Ext.java:7', 'src/main/java/com/x/app/Ext.java:8'],
+            own: ['src/main/java/com/x/app/Own.java:6', 'src/main/java/com/x/app/Own.java:7'],
+        },
+        csharp: {
+            files: {
+                'Lib/File.cs': 'namespace Acme.IO {\n  public class File {\n    public static File Create(string p) { return new File(); }\n    public void Flush() {}\n  }\n}\n',
+                'App/Ext.cs': 'using SysFile = System.IO.File;\nnamespace Acme.App {\n  public class Ext {\n    public void Run() {\n      var b = SysFile.Create("y");\n    }\n  }\n}\n',
+                'App/Own.cs': 'using Acme.IO;\nnamespace Acme.App {\n  public class Own {\n    public void Run() {\n      var a = File.Create("x");\n    }\n  }\n}\n',
+            },
+            targets: { create: 'Lib/File.cs:3:Create' },
+            ext: ['App/Ext.cs:5'],
+            own: ['App/Own.cs:5'],
+        },
+        typescript: {
+            files: {
+                'package.json': '{"name":"fx371","version":"1.0.0"}',
+                'src/server.ts': 'export class Server {\n  listen(port: number): void {}\n}\n',
+                'src/ext.ts': "import { Server } from 'http';\nexport function run(): void {\n  const s = new Server();\n  s.listen(80);\n}\n",
+                'src/own.ts': "import { Server } from './server';\nexport function run(): void {\n  const s = new Server();\n  s.listen(80);\n}\n",
+            },
+            targets: { member: 'src/server.ts:2:listen' },
+            ext: ['src/ext.ts:4'],
+            own: ['src/own.ts:4'],
+        },
+        python: {
+            files: {
+                'pkg/__init__.py': '',
+                'pkg/paths.py': 'class Path:\n    def __init__(self, p):\n        self.p = p\n\n    def exists(self):\n        return True\n',
+                'pkg/ext.py': 'from pathlib import Path\n\n\ndef run():\n    p = Path("x")\n    p.exists()\n',
+                'pkg/own.py': 'from pkg.paths import Path\n\n\ndef run():\n    p = Path("x")\n    p.exists()\n',
+            },
+            targets: { member: 'pkg/paths.py:5:exists' },
+            ext: ['pkg/ext.py:6'],
+            own: ['pkg/own.py:6'],
+        },
+        cpp: {
+            files: {
+                'lib/mutex.h': '#pragma once\nnamespace acme {\nclass mutex {\npublic:\n  void lock();\n};\n}\n',
+                'lib/mutex.cpp': '#include "mutex.h"\nnamespace acme {\nvoid mutex::lock() {}\n}\n',
+                'app/ext.cpp': '#include <mutex>\nvoid ext() {\n  std::mutex m;\n  m.lock();\n}\n',
+                'app/own.cpp': '#include "../lib/mutex.h"\nvoid own() {\n  acme::mutex m;\n  m.lock();\n}\n',
+            },
+            targets: { member: 'lib/mutex.cpp:3:lock' },
+            ext: ['app/ext.cpp:4'],
+            own: ['app/own.cpp:4'],
+        },
+    };
+    for (const [lang, fx] of Object.entries(LANGS)) {
+        it(`${lang}: sites naming the external type are excluded, the project type's sites stay confirmed`, () => {
+            const dir = tmp(fx.files);
+            try {
+                const index = idx(dir);
+                const confirmed = new Set();
+                const excluded = new Set();
+                for (const handle of Object.values(fx.targets)) {
+                    const result = callers(index, handle);
+                    for (const site of result.confirmed) confirmed.add(site);
+                    for (const entry of result.excluded) excluded.add(entry);
+                }
+                for (const site of fx.ext) {
+                    assert.ok(!confirmed.has(site), `${site} names the external type: ${JSON.stringify([...confirmed])}`);
+                    assert.ok(excluded.has(`${site}:external-receiver`),
+                        `${site} excluded external-receiver: ${JSON.stringify([...excluded])}`);
+                }
+                for (const site of fx.own) {
+                    assert.ok(confirmed.has(site), `${site} names the project type: ${JSON.stringify([...confirmed])}`);
+                }
+                // Callee direction: the external-importing function never
+                // resolves to the project type's members.
+                const [extRel, extLine] = fx.ext[0].split(':');
+                const callees = calleesAt(index, extRel, Number(extLine));
+                const targetFiles = new Set(Object.values(fx.targets).map(h => h.split(':')[0]));
+                assert.ok(!callees.some(c => targetFiles.has(c.relativePath)),
+                    `callees of the external site: ${JSON.stringify(callees.map(c => `${c.relativePath}:${c.name}`))}`);
+            } finally { rm(dir); }
+        });
+    }
+
+    it('rust: an impl on the external type is possible dispatch, never confirmed or excluded', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "fx371b"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/lib.rs': 'pub mod a;\npub mod b;\npub struct File;\nimpl File { pub fn create() -> File { File } }\n',
+            'src/a.rs': 'pub trait Ext { fn tag(&self) -> u8; }\nimpl Ext for std::fs::File { fn tag(&self) -> u8 { 1 } }\n',
+            'src/b.rs': 'use std::fs::File;\nuse crate::a::Ext;\npub fn f(x: &File) -> u8 { x.tag() }\n',
+        });
+        try {
+            const index = idx(dir);
+            const result = callers(index, 'src/a.rs:2:tag');
+            assert.deepStrictEqual(result.confirmed, []);
+            assert.ok(result.unverified.includes('src/b.rs:3:possible-dispatch'), JSON.stringify(result));
+        } finally { rm(dir); }
+    });
+
+    it('rust: use scope, std producers and declared fields follow the written type', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "fx371c"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/lib.rs': 'pub mod time;\npub mod loom;\npub mod bench;\n',
+            'src/time.rs': 'pub struct Instant { t: u64 }\nimpl Instant {\n    pub fn now() -> Instant { Instant { t: 0 } }\n    pub fn elapsed(&self) -> u64 { self.t }\n}\n',
+            'src/loom.rs': 'pub struct AtomicU32 { v: u32 }\nimpl AtomicU32 {\n    pub fn new(v: u32) -> AtomicU32 { AtomicU32 { v } }\n    pub fn load(&self) -> u32 { self.v }\n}\n' +
+                'pub mod rand {\n    use std::sync::atomic::AtomicU32;\n    pub fn seed() { let _c = AtomicU32::new(1); }\n}\n' +
+                'pub mod own {\n    use crate::loom::AtomicU32;\n    pub fn seed() -> u32 { AtomicU32::new(1).load() }\n}\n',
+            'src/bench.rs': 'use std::time::Instant;\nuse std::sync::atomic::AtomicU32;\n' +
+                'struct Holder { count: AtomicU32 }\n' +
+                'pub fn run() -> u64 {\n    let start = Instant::now();\n    start.elapsed().as_secs()\n}\n' +
+                'impl Holder {\n    fn get(&self) -> u32 { self.count.load(std::sync::atomic::Ordering::SeqCst) }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const elapsed = callers(index, 'src/time.rs:4:elapsed');
+            assert.ok(!elapsed.confirmed.includes('src/bench.rs:6'), JSON.stringify(elapsed));
+            const newCallers = callers(index, 'src/loom.rs:3:new');
+            assert.ok(!newCallers.confirmed.includes('src/loom.rs:8'), `inline-module use of std: ${JSON.stringify(newCallers)}`);
+            assert.ok(newCallers.confirmed.includes('src/loom.rs:12'), `inline-module use of the project type: ${JSON.stringify(newCallers)}`);
+            const load = callers(index, 'src/loom.rs:4:load');
+            assert.ok(!load.confirmed.includes('src/bench.rs:9'), `std-typed field: ${JSON.stringify(load)}`);
+            assert.ok(load.excluded.includes('src/bench.rs:9:external-receiver'), JSON.stringify(load));
+        } finally { rm(dir); }
+    });
+
+    it('java: an import of a package no project file declares is never confirmed; a project type it cannot name is excluded (fix #372)', () => {
+        const dir = tmp({
+            'src/main/java/com/x/io/File.java': 'package com.x.io;\npublic class File {\n  public boolean createNewFile() { return true; }\n}\n',
+            'src/main/java/com/x/app/Gen.java': 'package com.x.app;\nimport org.generated.File;\npublic class Gen {\n  public void run(File f) {\n    f.createNewFile();\n  }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const result = callers(index, 'src/main/java/com/x/io/File.java:3:createNewFile');
+            assert.deepStrictEqual(result.confirmed, []);
+            // `import org.generated.File` names org.generated.File: com.x.io.File
+            // is not it even if org.generated is a resolver gap (fix #372).
+            assert.ok(result.excluded.includes('src/main/java/com/x/app/Gen.java:5:external-receiver'), JSON.stringify(result));
+        } finally { rm(dir); }
+    });
+
+    it('python: a self attribute built from an imported external class never resolves to a same-name project class', () => {
+        const dir = tmp({
+            'app/__init__.py': '',
+            'app/timer.py': 'class Timer:\n    def start(self):\n        return 1\n',
+            'app/watch.py': 'from threading import Timer\n\n\nclass Watch:\n    def __init__(self):\n        self.timer = Timer(1, print)\n\n    def go(self):\n        self.timer.start()\n',
+        });
+        try {
+            const index = idx(dir);
+            const callees = calleesAt(index, 'app/watch.py', 9);
+            assert.ok(!callees.some(c => c.relativePath === 'app/timer.py'), JSON.stringify(callees.map(c => c.relativePath)));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #372: Java/C# type names resolve by package and namespace scope', () => {
+    const pin = (index, handle) => {
+        const [rel, line, name] = handle.split(':');
+        const def = (index.symbols.get(name) || []).find(d => d.relativePath === rel && d.startLine === Number(line));
+        assert.ok(def, `fixture target ${handle}`);
+        return def;
+    };
+    const callers = (index, handle) => {
+        const def = pin(index, handle);
+        const result = index.findCallers(def.name, { includeMethods: true, targetDefinitions: [def], collectAccount: true });
+        return {
+            confirmed: result.filter(c => c.tier !== 'unverified').map(c => `${c.relativePath}:${c.line}`),
+            excluded: (result.accountRaw?.excludedEntries || []).map(e => `${path.relative(index.root, e.file)}:${e.line}:${e.reason}`),
+            unverified: [...result.filter(c => c.tier === 'unverified'), ...(result.unverifiedEntries || [])]
+                .map(c => `${c.relativePath || path.relative(index.root, c.file)}:${c.line}:${c.reason}`),
+        };
+    };
+    const javaThread = 'package b;\npublic class Thread {\n  public static void sleep(long ms) {}\n  public void start() {}\n}\n';
+    const javaRunner = (pkg, imports) => `package ${pkg};\n${imports}public class Runner {\n  void go() throws Exception {\n    Thread.sleep(1);\n    new Thread().start();\n  }\n}\n`;
+
+    it('java: java.lang wins over a project type of another package that is not imported', () => {
+        const dir = tmp({ 'src/b/Thread.java': javaThread, 'src/a/Runner.java': javaRunner('a', 'import java.util.*;\n') });
+        try {
+            const index = idx(dir);
+            const sleep = callers(index, 'src/b/Thread.java:3:sleep');
+            assert.deepStrictEqual(sleep.confirmed, [], JSON.stringify(sleep));
+            assert.ok(sleep.excluded.includes('src/a/Runner.java:5:external-receiver'), JSON.stringify(sleep));
+            const start = callers(index, 'src/b/Thread.java:4:start');
+            assert.deepStrictEqual(start.confirmed, [], JSON.stringify(start));
+        } finally { rm(dir); }
+    });
+
+    it('java: the same package and a single-type import win; an on-demand import beside java.lang is ambiguous', () => {
+        const dir = tmp({
+            'src/b/Thread.java': javaThread,
+            'src/b/Runner.java': javaRunner('b', ''),
+            'src/c/Runner.java': javaRunner('c', 'import b.Thread;\n'),
+            'src/d/Runner.java': javaRunner('d', 'import b.*;\n'),
+        });
+        try {
+            const index = idx(dir);
+            const sleep = callers(index, 'src/b/Thread.java:3:sleep');
+            assert.ok(sleep.confirmed.includes('src/b/Runner.java:4'), JSON.stringify(sleep));
+            assert.ok(sleep.confirmed.includes('src/c/Runner.java:5'), JSON.stringify(sleep));
+            assert.ok(!sleep.confirmed.includes('src/d/Runner.java:5'), JSON.stringify(sleep));
+            assert.ok(sleep.unverified.includes('src/d/Runner.java:5:method-ambiguous'), JSON.stringify(sleep));
+        } finally { rm(dir); }
+    });
+
+    it('java: an on-demand project import supplies a name java.lang lacks; nested member types keep engine resolution', () => {
+        const dir = tmp({
+            'src/b/Widget.java': 'package b;\npublic class Widget {\n  public static void make() {}\n}\n',
+            'src/d/User.java': 'package d;\nimport b.*;\npublic class User {\n  void go() { Widget.make(); }\n}\n',
+            'src/e/User.java': 'package e;\nimport java.util.*;\npublic class User {\n  void go() { Widget.make(); }\n  static class Widget { static void make() {} }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const make = callers(index, 'src/b/Widget.java:3:make');
+            assert.ok(make.confirmed.includes('src/d/User.java:4'), JSON.stringify(make));
+            assert.ok(!make.excluded.some(site => site.includes('external-receiver')), JSON.stringify(make));
+        } finally { rm(dir); }
+    });
+
+    it('java: a package-qualified constructor or declaration is not re-resolved by scope', () => {
+        const dir = tmp({
+            'src/b/Thread.java': javaThread,
+            'src/a/R.java': 'package a;\npublic class R {\n  void go() {\n    new b.Thread().start();\n    b.Thread t = new b.Thread();\n    t.start();\n  }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const start = callers(index, 'src/b/Thread.java:4:start');
+            assert.ok(start.confirmed.includes('src/a/R.java:4'), JSON.stringify(start));
+            assert.ok(start.confirmed.includes('src/a/R.java:6'), JSON.stringify(start));
+        } finally { rm(dir); }
+    });
+
+    const csFile = 'namespace Proj.Util { public class File { public static void Create(string s) {} } }\n';
+    const csUser = usings => `${usings}namespace Proj.App {\n    class Runner {\n        void Go() { File.Create("x"); }\n    }\n}\n`;
+
+    it('csharp: a namespace using of an external namespace names the external type when no project type is in scope', () => {
+        const dir = tmp({ 'Util.cs': csFile, 'App.cs': csUser('using System.IO;\n') });
+        try {
+            const index = idx(dir);
+            const create = callers(index, 'Util.cs:1:Create');
+            assert.deepStrictEqual(create.confirmed, [], JSON.stringify(create));
+            assert.ok(create.excluded.includes('App.cs:4:external-receiver'), JSON.stringify(create));
+        } finally { rm(dir); }
+    });
+
+    it('csharp: enclosing namespaces, usings, global usings and project-file <Using> items bring the project type into scope', () => {
+        const cases = {
+            using: { 'Util.cs': csFile, 'App.cs': csUser('using System.IO;\nusing Proj.Util;\n') },
+            enclosing: { 'Util.cs': csFile.replace('Proj.Util', 'Proj'), 'App.cs': csUser('using System.IO;\n') },
+            global: { 'Util.cs': csFile, 'App.cs': csUser('using System.IO;\n'), 'Globals.cs': 'global using Proj.Util;\n' },
+            projectFile: { 'Util.cs': csFile, 'App.cs': csUser('using System.IO;\n'),
+                'App.csproj': '<Project Sdk="Microsoft.NET.Sdk">\n  <ItemGroup>\n    <Using Include="Proj.Util" />\n  </ItemGroup>\n</Project>\n' },
+        };
+        for (const [label, files] of Object.entries(cases)) {
+            const dir = tmp(files);
+            try {
+                const index = idx(dir);
+                const create = callers(index, 'Util.cs:1:Create');
+                const line = files['App.cs'].split('\n').findIndex(text => text.includes('File.Create')) + 1;
+                assert.ok(create.confirmed.includes(`App.cs:${line}`), `${label}: ${JSON.stringify(create)}`);
+            } finally { rm(dir); }
+        }
+    });
+});
+
+describe('fix #377: annotation, attribute and decorator names vs same-named methods', () => {
+    const planEdits = (files, handle) => {
+        const dir = tmp(files);
+        try {
+            const r = execute(idx(dir), 'plan', { name: handle, renameTo: 'Zz' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            return r.result.changes.filter(c => c.newExpression !== undefined)
+                .map(c => `${c.file}:${c.line}`).sort();
+        } finally { rm(dir); }
+    };
+
+    it('Java @Name and C# [Name] denote annotation/attribute types, never a method Name', () => {
+        assert.deepStrictEqual(planEdits({
+            'src/p/Util.java': 'package p;\npublic class Util {\n    public static int Marker() { return 2; }\n}\n',
+            'src/p/Marker.java': 'package p;\npublic @interface Marker { }\n',
+            'src/p/B.java': 'package p;\nimport static p.Util.*;\n@Marker\npublic class B {\n    int m() { return Marker(); }\n}\n',
+        }, 'src/p/Util.java:3:Marker'), ['src/p/B.java:5', 'src/p/Util.java:3']);
+        assert.deepStrictEqual(planEdits({
+            'A.cs': [
+                'using System;',
+                'namespace P {',
+                '    public class Util { public static int Obsolete() { return 2; } }',
+                '    public class B {',
+                '        [Obsolete("x")]',
+                '        public int M() { return Util.Obsolete(); }',
+                '    }',
+                '}',
+            ].join('\n') + '\n',
+        }, 'A.cs:3:Obsolete'), ['A.cs:3', 'A.cs:6']);
+    });
+
+    it('a Python decorator is a reference to the decorating function (listed, never dropped)', () => {
+        const dir = tmp({ 'a.py': 'def trace(fn):\n    return fn\n\n@trace\ndef run():\n    return 1\n' });
+        try {
+            const r = execute(idx(dir), 'plan', { name: 'a.py:1:trace', renameTo: 'Zz' });
+            assert.ok(r.ok);
+            assert.deepStrictEqual(r.result.changes.map(c => `${c.file}:${c.line}`).sort(), ['a.py:1', 'a.py:4']);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #378: explicit generic call syntax and import-renamed type receivers', () => {
+    const relations = (dir, handle) => {
+        const index = idx(dir);
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, `context ${handle}: ${r.error}`);
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: [...new Set((json.data.callers || []).map(c => `${c.file}:${c.line}`))].sort(),
+            unverified: (json.data.unverifiedCallers || []).map(c => `${c.file}:${c.line}`).sort(),
+            callees: (json.data.callees || []).map(c => `${c.name}@${c.file}`).sort(),
+            conserved: json.meta.account?.conserved,
+        };
+    };
+    const planEdits = (dir, handle) => {
+        const r = execute(idx(dir), 'plan', { name: handle, renameTo: 'Zz' });
+        assert.ok(r.ok, JSON.stringify(r.error));
+        return r.result.changes.map(c => `${c.file}:${c.line}:${c.newExpression || ''}`.trim()).sort();
+    };
+
+    it('explicit type arguments at call sites are calls in every language', () => {
+        const cases = [
+            [{ 'Cargo.toml': '[package]\nname = "g"\nversion = "0.1.0"\nedition = "2021"\n',
+                'src/lib.rs': 'pub fn ident<T>(x: T) -> T { x }\npub struct W<T> { v: T }\nimpl<T> W<T> { pub fn new(v: T) -> Self { W { v } } }\npub fn run() { let a = ident::<i32>(1); let _ = W::<i32>::new(a); }\n' },
+            ['src/lib.rs:1:ident', 'src/lib.rs:3:new'], ['src/lib.rs:4']],
+            [{ 'a.ts': 'export function ident<T>(x: T): T { return x; }\nexport class B<T> { map<U>(f: (v: T) => U): U { return f(null as any); } }\n',
+                'b.ts': "import { ident, B } from './a';\nconst n = ident<number>(1);\nconst b = new B<number>();\nb.map<string>(v => String(v));\n" },
+            ['a.ts:1:ident', 'a.ts:2:map'], null],
+            [{ 'A.cs': 'namespace G {\n  public static class U { public static T Ident<T>(T x) => x; }\n  public class Run { public int Go() { return U.Ident<int>(1); } }\n}\n' },
+            ['A.cs:2:Ident'], ['A.cs:3']],
+            [{ 'A.java': 'public class A {\n  static <T> T ident(T x) { return x; }\n  <T> T inst(T x) { return x; }\n  void run() { A.<Integer>ident(1); this.<Integer>inst(2); }\n}\n' },
+            ['A.java:2:ident', 'A.java:3:inst'], ['A.java:4']],
+            [{ 'a.cpp': 'template <typename T> T ident(T x) { return x; }\ntemplate <typename T> struct Box {\n  T v;\n  template <typename U> U conv() const { return static_cast<U>(v); }\n};\nint run() {\n  Box<int> b{1};\n  long c = b.conv<long>();\n  long d = b.template conv<long>();\n  return ident<int>(1) + (int)c + (int)d;\n}\n' },
+            ['a.cpp:1:ident', 'a.cpp:4:conv'], null],
+        ];
+        for (const [files, handles, expected] of cases) {
+            const dir = tmp(files);
+            try {
+                for (const handle of handles) {
+                    const rel = relations(dir, handle);
+                    assert.ok(rel.confirmed.length > 0, `${handle}: ${JSON.stringify(rel)}`);
+                    if (expected) assert.deepStrictEqual(rel.confirmed, expected, handle);
+                    assert.strictEqual(rel.conserved, true, handle);
+                }
+            } finally { rm(dir); }
+        }
+        const dir = tmp(cases[4][0]);
+        try {
+            const conv = relations(dir, 'a.cpp:4:conv');
+            assert.deepStrictEqual(conv.confirmed, ['a.cpp:8', 'a.cpp:9']);
+            const edits = planEdits(dir, 'a.cpp:4:conv');
+            assert.ok(edits.some(e => e.includes('b.Zz<long>()')), edits.join('\n'));
+            assert.ok(edits.some(e => e.includes('b.template Zz<long>()')), edits.join('\n'));
+        } finally { rm(dir); }
+    });
+
+    it('a receiver annotated with an import rename or C# using alias is the original type (callers and callees)', () => {
+        const cases = [
+            [{ 'a.ts': 'export class Box<T> { constructor(public v: T) {} get(): T { return this.v; } }\nexport class Other { get(): number { return 1; } }\n',
+                'c.ts': "import { Box as B } from './a';\nexport function g(b: B<number>) { return b.get(); }\n" },
+            'a.ts:1:get', 'a.ts:2:get', 'c.ts:2', 'c.ts:2:g'],
+            [{ 'Cargo.toml': '[package]\nname = "al"\nversion = "0.1.0"\nedition = "2021"\n',
+                'src/lib.rs': 'pub mod third;\npub struct Wrap<T> { v: T }\nimpl<T> Wrap<T> { pub fn get(&self) -> &T { &self.v } }\npub struct Solo;\nimpl Solo { pub fn get(&self) -> i32 { 1 } }\n',
+                'src/third.rs': 'use crate::Wrap as W;\npub fn g(w: &W<i32>) { w.get(); }\n' },
+            'src/lib.rs:3:get', 'src/lib.rs:5:get', 'src/third.rs:2', 'src/third.rs:2:g'],
+            [{ 'a.py': 'class Box:\n    def get(self):\n        return 1\n\n\nclass Other:\n    def get(self):\n        return 2\n',
+                'c.py': 'from a import Box as B\n\n\ndef g(b: B):\n    return b.get()\n' },
+            'a.py:2:get', 'a.py:7:get', 'c.py:5', 'c.py:4:g'],
+            [{ 'A.cs': 'namespace G {\n  public class Box<T> { public T V; public Box(T v) { V = v; } public T Get() => V; }\n  public class Other { public int Get() => 1; }\n}\n',
+                'B.cs': 'using IntBox = G.Box<int>;\nnamespace H {\n  public class U { public int Run(IntBox b) { return b.Get(); } }\n}\n' },
+            'A.cs:2:Get', 'A.cs:3:Get', 'B.cs:3', 'B.cs:3:Run'],
+        ];
+        for (const [files, pin, other, site, caller] of cases) {
+            const dir = tmp(files);
+            try {
+                assert.deepStrictEqual(relations(dir, pin).confirmed, [site], pin);
+                const otherRel = relations(dir, other);
+                assert.ok(!otherRel.confirmed.includes(site) && !otherRel.unverified.includes(site),
+                    `${other}: ${JSON.stringify(otherRel)}`);
+                const callees = relations(dir, caller).callees;
+                assert.ok(callees.some(c => c.endsWith(`@${pin.split(':')[0]}`)), `${caller}: ${callees}`);
+            } finally { rm(dir); }
+        }
+    });
+
+    it('a function-local JS class is invisible outside its function', () => {
+        const dir = tmp({
+            'foo.js': 'export class Foo { run() { return 1; } }\n',
+            'a.js': "import { Foo } from './foo';\nfunction t() {\n  class Foo {}\n  return new Foo();\n}\nexport const made = new Foo();\nexport { t };\n",
+        });
+        try {
+            const index = idx(dir);
+            const outer = execute(index, 'context', { name: 'foo.js:1:Foo' });
+            assert.deepStrictEqual(outer.result.callers.map(c => `${c.relativePath}:${c.line}`), ['a.js:6']);
+        } finally { rm(dir); }
+    });
+
+    it('type aliases resolve on the callee side as on the caller side', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "al2"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/lib.rs': 'pub mod other;\npub struct Wrap<T> { v: T }\nimpl<T> Wrap<T> { pub fn get(&self) -> &T { &self.v } }\npub type IntWrap = Wrap<i32>;\n',
+            'src/other.rs': 'use crate::IntWrap;\npub struct Solo;\nimpl Solo { pub fn get(&self) -> i32 { 1 } }\ntype Mine = IntWrap;\npub fn f(w: &IntWrap, m: &Mine) { w.get(); m.get(); }\n',
+        });
+        try {
+            assert.deepStrictEqual(relations(dir, 'src/lib.rs:3:get').confirmed, ['src/other.rs:5']);
+            assert.deepStrictEqual(relations(dir, 'src/other.rs:5:f').callees, ['get@src/lib.rs']);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #380: C# generic arity, extension methods, partial parts; Java/C# inherited member receivers, qualified supertypes, compiler protocol types; stored awaitables', () => {
+    const relations = (dir, handle) => {
+        const index = idx(dir);
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, `context ${handle}: ${r.error}`);
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: [...new Set([...(json.data.callers || []),
+                ...(json.data.usages || []).filter(u => u.tier === 'confirmed')].map(c => `${c.file}:${c.line}`))].sort(),
+            unverified: (json.data.unverifiedCallers || []).map(c => `${c.file}:${c.line}:${c.reason}`).sort(),
+            callees: (json.data.callees || []).map(c => `${c.name}@${c.file}:${c.line}`).sort(),
+            excluded: json.meta.account?.excluded?.byReason || {},
+            conserved: json.meta.account?.conserved,
+        };
+    };
+    const planEdits = (dir, handle, renameTo = 'Zz') => {
+        const r = execute(idx(dir), 'plan', { name: handle, renameTo });
+        assert.ok(r.ok, JSON.stringify(r.error));
+        return r.result;
+    };
+    const csGeneric = {
+        'Outcome.cs': 'namespace P;\npublic static class Outcome\n{\n    public static Outcome<T> FromResult<T>(T v) => new Outcome<T>(v);\n    public static int Create() => 0;\n}\n',
+        'OutcomeT.cs': 'namespace P;\npublic readonly struct Outcome<T>\n{\n    public Outcome(T v) { Value = v; }\n    public T Value { get; }\n    public static int Create() => 1;\n    public int Describe() => 2;\n}\n',
+        'Box.cs': 'namespace P;\npublic class Box { public int Describe() => 3; }\npublic class Box<T> { public int Describe() => 4; }\n',
+        'Use.cs': 'namespace P;\ninternal class Use\n{\n    public Outcome<int> A() => Outcome.FromResult(1);\n    public int B() => Outcome.Create() + Outcome<int>.Create();\n    public int C(Box<int> b, Box c) => b.Describe() + c.Describe();\n    public Outcome<int> D() => new Outcome<int>(5);\n}\n',
+    };
+
+    it('C#: a written generic arity names one type (constructors, static calls, typed receivers, callees)', () => {
+        const dir = tmp(csGeneric);
+        try {
+            const generic = relations(dir, 'OutcomeT.cs:2:Outcome');
+            assert.deepStrictEqual(generic.confirmed, ['Outcome.cs:4', 'Use.cs:5', 'Use.cs:7'], JSON.stringify(generic));
+            assert.ok(generic.excluded['generic-arity-mismatch']?.count >= 1, JSON.stringify(generic.excluded));
+            assert.strictEqual(generic.conserved, true);
+            const plain = relations(dir, 'Outcome.cs:2:Outcome');
+            assert.ok(plain.confirmed.includes('Use.cs:4') && !plain.confirmed.includes('Use.cs:7') &&
+                !plain.confirmed.includes('Outcome.cs:4'), JSON.stringify(plain));
+            assert.deepStrictEqual(relations(dir, 'Outcome.cs:5:Create').confirmed, ['Use.cs:5']);
+            assert.deepStrictEqual(relations(dir, 'OutcomeT.cs:6:Create').confirmed, ['Use.cs:5']);
+            assert.deepStrictEqual(relations(dir, 'Box.cs:3:Describe').confirmed, ['Use.cs:6']);
+            assert.deepStrictEqual(relations(dir, 'Box.cs:2:Describe').confirmed, ['Use.cs:6']);
+            // Callee side: `new Outcome<T>(v)` constructs the generic struct.
+            const fromResult = relations(dir, 'Outcome.cs:4:FromResult');
+            assert.deepStrictEqual(fromResult.callees, ['Outcome@OutcomeT.cs:4'], JSON.stringify(fromResult));
+            const d = relations(dir, 'Use.cs:7:D');
+            assert.deepStrictEqual(d.callees, ['Outcome@OutcomeT.cs:4'], JSON.stringify(d));
+        } finally { rm(dir); }
+    });
+
+    it('C#: partial parts merge only with the same arity; a written base arity picks the base', () => {
+        const dir = tmp({
+            'Base.cs': 'namespace P;\npublic class Base { public int Run() => 0; }\npublic class Base<T> { public int Run() => 1; }\n',
+            'Sub.cs': 'namespace P;\npublic class Sub : Base<int> { public int Go() => this.Run(); }\n',
+            'Part1.cs': 'namespace P;\npublic partial class Pt { public int Solo() => 0; }\n',
+            'Part2.cs': 'namespace P;\npublic partial class Pt<T> { public int Solo() => 1; public int Use() => this.Solo(); }\n',
+            'Holder.cs': 'namespace P.Inner;\npublic class Holder { public P.Base Strategy { get; } = new P.Base(); public int Go() => Strategy.Run(); }\n',
+            'HolderT.cs': 'namespace P.Inner;\npublic class Holder<T> { public P.Base<T> Strategy { get; } = new P.Base<T>(); public int Go() => Strategy.Run(); }\n',
+            'Strategy.cs': 'namespace P;\npublic class Strategy : Base<int> { }\n',
+        });
+        try {
+            // Declared property types keep their arity through the hop, and a
+            // member named like a project type is the member (fix #380).
+            const genericRun = relations(dir, 'Base.cs:3:Run');
+            assert.ok(genericRun.confirmed.includes('HolderT.cs:2') && !genericRun.confirmed.includes('Holder.cs:2'),
+                JSON.stringify(genericRun));
+            const plainRun = relations(dir, 'Base.cs:2:Run');
+            assert.ok(plainRun.confirmed.includes('Holder.cs:2') && !plainRun.confirmed.includes('HolderT.cs:2'),
+                JSON.stringify(plainRun));
+            assert.deepStrictEqual(relations(dir, 'Base.cs:3:Run').confirmed.filter(s => s.startsWith('Sub')), ['Sub.cs:2']);
+            assert.deepStrictEqual(relations(dir, 'Base.cs:2:Run').confirmed.filter(s => s.startsWith('Sub')), []);
+            assert.deepStrictEqual(relations(dir, 'Part2.cs:2:Solo').confirmed, ['Part2.cs:2']);
+            assert.deepStrictEqual(relations(dir, 'Part1.cs:2:Solo').confirmed, []);
+        } finally { rm(dir); }
+    });
+
+    it('C#: extension-method calls are callers of the extension; plan renames them', () => {
+        const dir = tmp({
+            'Ext.cs': 'using System;\nnamespace P;\ninternal static class ExceptionUtilities\n{\n    public static T TrySetStackTrace<T>(this T exception) where T : Exception => exception;\n    public static int Twice(this Num n) => n.V * 2;\n    public static int Own(this Num n) => 0;\n}\n',
+            'Num.cs': 'namespace P;\npublic class Num { public int V; public int Own() => 1; }\npublic class Big : Num { }\n',
+            'Use.cs': 'using System;\nnamespace P;\ninternal class Use\n{\n    public Exception B() => new InvalidOperationException("x").TrySetStackTrace();\n    public Exception C(Exception e) => e.TrySetStackTrace();\n    public int D(Big b) => b.Twice() + b.Own();\n}\n',
+            'Other/Far.cs': 'namespace Q;\ninternal class Far { public int F(P.Num n) => n.Twice(); }\n',
+        });
+        try {
+            const tss = relations(dir, 'Ext.cs:5:TrySetStackTrace');
+            assert.deepStrictEqual(tss.confirmed, ['Use.cs:6'], JSON.stringify(tss));
+            assert.deepStrictEqual(tss.unverified, ['Use.cs:5:extension-receiver-unresolved']);
+            const twice = relations(dir, 'Ext.cs:6:Twice');
+            assert.deepStrictEqual(twice.confirmed, ['Use.cs:7'], JSON.stringify(twice));
+            // An instance method of the receiver type wins over the extension.
+            assert.deepStrictEqual(relations(dir, 'Ext.cs:7:Own').confirmed, []);
+            assert.deepStrictEqual(relations(dir, 'Num.cs:2:Own').confirmed, ['Use.cs:7']);
+            const plan = planEdits(dir, 'Ext.cs:5:TrySetStackTrace', 'Tss');
+            assert.ok(plan.changes.some(c => c.file === 'Use.cs' && c.line === 6 &&
+                /e\.Tss\(\)/.test(c.newExpression || '')), JSON.stringify(plan.changes));
+            const callees = relations(dir, 'Use.cs:7:D').callees;
+            assert.ok(callees.includes('Twice@Ext.cs:6') && callees.includes('Own@Num.cs:2') &&
+                !callees.includes('Own@Ext.cs:7'), callees.join(','));
+        } finally { rm(dir); }
+    });
+
+    it('C#/Java: a capitalized receiver declared as a member in another partial part or a base class is a field hop', () => {
+        const dir = tmp({
+            'Pipe.Sync.cs': 'namespace P;\npublic partial class Pipe\n{\n    public int Exec(int x) => Component.Run(x);\n}\n',
+            'Pipe.cs': 'using P.Utils;\nnamespace P;\npublic partial class Pipe\n{\n    internal Comp Component { get; } = new Comp();\n}\n',
+            'Utils/Comp.cs': 'namespace P.Utils;\ninternal class Comp { internal int Run(int x) => x; }\n',
+            'p/Base.java': 'package p;\nclass Base {\n    protected static final Helper HELPER = new Helper();\n}\n',
+            'p/Helper.java': 'package p;\nclass Helper { int run(int x) { return x; } }\n',
+            'p/Sub.java': 'package p;\nclass Sub extends Base {\n    int go() { return HELPER.run(1); }\n}\n',
+        });
+        try {
+            assert.deepStrictEqual(relations(dir, 'Utils/Comp.cs:2:Run').confirmed, ['Pipe.Sync.cs:4']);
+            assert.deepStrictEqual(relations(dir, 'Pipe.Sync.cs:4:Exec').callees, ['Run@Utils/Comp.cs:2']);
+            const plan = planEdits(dir, 'Utils/Comp.cs:2:Run', 'Go');
+            assert.ok(plan.changes.some(c => c.file === 'Pipe.Sync.cs' && c.line === 4), JSON.stringify(plan.changes));
+            assert.deepStrictEqual(relations(dir, 'p/Helper.java:2:run').confirmed, ['p/Sub.java:3']);
+            assert.deepStrictEqual(relations(dir, 'p/Sub.java:3:go').callees, ['run@p/Helper.java:2']);
+        } finally { rm(dir); }
+    });
+
+    it('Java/C#: qualified supertypes stay in the heritage list (serialization callbacks are not dead)', () => {
+        const dir = tmp({
+            'p/A.java': 'package p;\nclass A implements java.io.Serializable {\n    private Object readResolve() { return this; }\n    void used() {}\n}\n',
+            'p/C.java': 'package p;\nclass C extends A {\n    protected Object readResolve() { return this; }\n}\n',
+            'p/G.java': 'package p;\nclass G implements java.util.Comparator<String>, java.io.Externalizable {\n    public int compare(String a, String b) { return 0; }\n    private Object writeReplace() { return this; }\n}\n',
+            'p/N.java': 'package p;\nclass N extends Number {\n    public int intValue() { return 0; }\n    public long longValue() { return 0; }\n    public float floatValue() { return 0; }\n    public double doubleValue() { return 0; }\n    private Object writeReplace() { return this; }\n}\n',
+            'p/E.java': 'package p;\nclass E extends RuntimeException {\n    private Object readResolve() { return this; }\n}\n',
+            'p/Plain.java': 'package p;\nclass Plain {\n    private Object readResolve() { return this; }\n}\n',
+            'p/M.java': 'package p;\nclass M { void m(A a, C c, G g, N n, E e, Plain x) { a.used(); } }\n',
+            'K.cs': 'namespace N;\npublic class K : System.Exception, System.IComparable { public int CompareTo(object o) => 0; }\n',
+        });
+        try {
+            const index = idx(dir);
+            const a = (index.symbols.get('A') || []).find(d => d.type === 'class');
+            assert.deepStrictEqual(a.implements, ['java.io.Serializable']);
+            const g = (index.symbols.get('G') || []).find(d => d.type === 'class');
+            assert.deepStrictEqual(g.implements, ['java.util.Comparator<String>', 'java.io.Externalizable']);
+            const k = (index.symbols.get('K') || []).find(d => d.type === 'class');
+            assert.strictEqual(k.extends, 'System.Exception');
+            assert.deepStrictEqual(k.implements, ['System.IComparable']);
+            const dead = index.deadcode().map(d => `${d.className || ''}.${d.name}`);
+            assert.ok(!dead.includes('A.readResolve') && !dead.includes('C.readResolve') &&
+                !dead.includes('G.writeReplace') && !dead.includes('N.writeReplace') &&
+                !dead.includes('E.readResolve'), dead.join(','));
+            assert.ok(dead.includes('Plain.readResolve'), 'a class outside the serialization contract keeps the claim');
+        } finally { rm(dir); }
+    });
+
+    it('C#: compiler-required types are live when their feature is used, claimable when not', () => {
+        const polyfill = 'namespace System.Runtime.CompilerServices\n{\n    internal static class IsExternalInit\n    {\n    }\n}\n';
+        const withInit = tmp({
+            'Legacy/IsExternalInit.cs': polyfill,
+            'Model.cs': 'namespace App;\npublic class Opt { public string Name { get; init; } = ""; }\n',
+        });
+        const withRecord = tmp({
+            'Legacy/IsExternalInit.cs': polyfill,
+            'Model.cs': 'namespace App;\npublic record Point(int X, int Y);\n',
+        });
+        const without = tmp({
+            'Legacy/IsExternalInit.cs': polyfill,
+            'Model.cs': 'namespace App;\npublic class Opt { public string Name { get; set; } = ""; }\n',
+        });
+        const elsewhere = tmp({
+            'Legacy/IsExternalInit.cs': 'namespace App.Compat\n{\n    internal static class IsExternalInit\n    {\n    }\n}\n',
+            'Model.cs': 'namespace App;\npublic class Opt { public string Name { get; init; } = ""; }\n',
+        });
+        try {
+            const names = dir => idx(dir).deadcode().map(d => d.name);
+            assert.ok(!names(withInit).includes('IsExternalInit'));
+            assert.ok(!names(withRecord).includes('IsExternalInit'));
+            assert.ok(names(without).includes('IsExternalInit'), 'no init accessor, no record: the polyfill is unused');
+            assert.ok(names(elsewhere).includes('IsExternalInit'), 'the compiler looks the type up by its full name only');
+            const plan = planEdits(withInit, 'IsExternalInit', 'X');
+            assert.ok(plan.contract?.blocked, JSON.stringify(plan.contract));
+        } finally { rm(withInit); rm(withRecord); rm(without); rm(elsewhere); }
+    });
+
+    it('audit-async: an awaitable stored into a field, property or outer variable flows on; a lost local is still a finding', () => {
+        const dir = tmp({
+            'T.cs': 'using System.Threading.Tasks;\nnamespace P;\ninternal sealed class TaskExecution\n{\n    public Task? ExecutionTaskSafe { get; private set; }\n    private Task _field;\n    public async ValueTask<bool> InitializeAsync(bool b)\n    {\n        await Task.Delay(1);\n        ExecutionTaskSafe = RunAsync();\n        _field = RunAsync();\n        Task local;\n        local = RunAsync();\n        return b;\n    }\n    private async Task RunAsync() { await Task.Delay(1); }\n}\n',
+            'a.js': 'let pending;\nasync function load() { return 1; }\nasync function start() {\n  pending = load();\n  let mine;\n  mine = load();\n  await null;\n}\nmodule.exports = { start, get: () => pending };\n',
+            'm.py': 'LAST = None\nasync def load():\n    return 1\nasync def keep():\n    global LAST\n    LAST = load()\nasync def lose():\n    x = None\n    x = load()\n',
+        });
+        try {
+            const issues = idx(dir).auditAsync({}).issues.map(i => `${i.file}:${i.line}`).sort();
+            assert.deepStrictEqual(issues, ['T.cs:13', 'a.js:6', 'm.py:9'], JSON.stringify(issues));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #381: class identity by lexical scope, name-exact import bindings, one-hop local aliases', () => {
+    const relations = (dir, handle) => {
+        const index = idx(dir);
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, `context ${handle}: ${r.error}`);
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: [...new Set([...(json.data.callers || []),
+                ...(json.data.usages || []).filter(u => u.tier === 'confirmed')]
+                .map(c => `${c.file}:${c.line}`))].sort(),
+            unverified: (json.data.unverifiedCallers || []).map(c => `${c.file}:${c.line}`).sort(),
+            callees: (json.data.callees || []).map(c => `${c.name}@${c.file}:${c.line}`).sort(),
+            conserved: json.meta.account?.conserved,
+        };
+    };
+    const planFiles = (dir, handle) => {
+        const r = execute(idx(dir), 'plan', { name: handle, renameTo: 'zz_renamed' });
+        assert.ok(r.ok, JSON.stringify(r.error));
+        return [...new Set(r.result.changes.map(c => c.file))].sort();
+    };
+
+    it('Python: a field typed by a function-local class names that class, never a same-name module class', () => {
+        const dir = tmp({
+            'pkg/__init__.py': '',
+            'pkg/slmq.py': 'class Channel:\n    def basic_cancel(self, tag):\n        pass\n',
+            'pkg/ext.py': 'import amqp\n\n\nclass Channel(amqp.Channel):\n    pass\n',
+            'pkg/test_x.py': [
+                'from pkg import ext',
+                '',
+                '',
+                'class TestC:',
+                '    def setup_method(self):',
+                '        class Channel(ext.Channel):',
+                '            pass',
+                '        self.channel = Channel()',
+                '',
+                '    def test_it(self):',
+                "        self.channel.basic_cancel('t')",
+                '',
+            ].join('\n'),
+            'pkg/test_y.py': [
+                'from pkg.slmq import Channel',
+                '',
+                '',
+                'class TestD:',
+                '    def setup_method(self):',
+                '        class Channel:',
+                '            def basic_cancel(self, tag):',
+                '                pass',
+                '        self.channel = Channel()',
+                '        c = Channel()',
+                "        c.basic_cancel('a')",
+                '',
+                '    def test_local(self):',
+                "        self.channel.basic_cancel('t')",
+                '',
+                '    def test_imported(self):',
+                '        c = Channel()',
+                "        c.basic_cancel('b')",
+                '',
+                '',
+                'class TestE:',
+                '    def setup_method(self):',
+                '        self.channel = Channel()',
+                '',
+                '    def test_it(self):',
+                "        self.channel.basic_cancel('x')",
+                '',
+            ].join('\n'),
+        });
+        try {
+            const module = relations(dir, 'pkg/slmq.py:2:basic_cancel');
+            assert.deepStrictEqual(module.confirmed, ['pkg/test_y.py:18', 'pkg/test_y.py:26']);
+            assert.deepStrictEqual(module.unverified, []);
+            assert.strictEqual(module.conserved, true);
+            const local = relations(dir, 'pkg/test_y.py:7:basic_cancel');
+            assert.deepStrictEqual(local.confirmed, ['pkg/test_y.py:11', 'pkg/test_y.py:14']);
+            const localClass = relations(dir, 'pkg/test_y.py:6:Channel');
+            assert.deepStrictEqual(localClass.confirmed, ['pkg/test_y.py:10', 'pkg/test_y.py:9']);
+            const moduleClass = relations(dir, 'pkg/slmq.py:1:Channel');
+            assert.deepStrictEqual(moduleClass.confirmed, ['pkg/test_y.py:17', 'pkg/test_y.py:23']);
+            assert.deepStrictEqual(relations(dir, 'pkg/test_y.py:5:setup_method').callees,
+                ['Channel@pkg/test_y.py:6', 'basic_cancel@pkg/test_y.py:7']);
+            assert.deepStrictEqual(relations(dir, 'pkg/test_x.py:10:test_it').callees, []);
+            assert.ok(!planFiles(dir, 'pkg/slmq.py:2:basic_cancel').includes('pkg/test_x.py'));
+        } finally { rm(dir); }
+    });
+
+    it('Python: a field callee resolves to the imported class among same-name classes', () => {
+        const dir = tmp({
+            'pkg/__init__.py': '',
+            'pkg/a.py': 'class Channel:\n    def _put(self, m):\n        pass\n',
+            'pkg/b.py': 'class Channel:\n    def _put(self, m):\n        pass\n',
+            't/test_b.py': [
+                'from pkg.b import Channel',
+                '',
+                '',
+                'class TestB:',
+                '    def setup_method(self):',
+                '        self.channel = Channel()',
+                '',
+                '    def test_put(self):',
+                "        self.channel._put('m')",
+                '',
+            ].join('\n'),
+        });
+        try {
+            assert.deepStrictEqual(relations(dir, 't/test_b.py:8:test_put').callees, ['_put@pkg/b.py:2']);
+            assert.deepStrictEqual(relations(dir, 'pkg/a.py:2:_put').confirmed, []);
+            assert.deepStrictEqual(relations(dir, 'pkg/b.py:2:_put').confirmed, ['t/test_b.py:9']);
+        } finally { rm(dir); }
+    });
+
+    it('Python: a class-body assignment in a local class does not rebind the function\'s name', () => {
+        const dir = tmp({
+            'pkg/__init__.py': '',
+            'pkg/conn.py': 'class Connection:\n    def __init__(self, port=None):\n        self.port = port\n',
+            't/test_port.py': [
+                'from pkg.conn import Connection',
+                '',
+                '',
+                'class MockConnection(dict):',
+                '    pass',
+                '',
+                '',
+                'def test_default_port():',
+                '    class Transport:',
+                '        Connection = MockConnection',
+                '    c = Connection(port=None)',
+                '    return c, Transport',
+                '',
+            ].join('\n'),
+        });
+        try {
+            assert.deepStrictEqual(relations(dir, 't/test_port.py:8:test_default_port').callees,
+                ['Connection@pkg/conn.py:1']);
+        } finally { rm(dir); }
+    });
+
+    it('a name bound by an import of that name never borrows another import\'s re-export (Python, JS)', () => {
+        const py = tmp({
+            'pkg/__init__.py': '',
+            'pkg/base.py': 'class Transport:\n    def connect(self):\n        pass\n',
+            'pkg/qp.py': 'from pkg import base\n\n\nclass Transport(base.Transport):\n    def verify(self):\n        pass\n',
+            'pkg/virt/__init__.py': 'from .base import Transport\n\n\nclass Base64:\n    pass\n',
+            'pkg/virt/base.py': 'from pkg import base\n\n\nclass Transport(base.Transport):\n    def drain_events(self):\n        pass\n',
+            't/__init__.py': '',
+            't/test_qp.py': [
+                'from unittest.mock import patch',
+                'from pkg.virt import Base64',
+                'from pkg.qp import Transport',
+                '',
+                '',
+                "@patch.object(Transport, 'verify')",
+                'def test_a(m):',
+                '    pass',
+                '',
+                '',
+                'def test_b():',
+                '    Transport()',
+                '',
+            ].join('\n'),
+        });
+        try {
+            assert.deepStrictEqual(relations(py, 'pkg/virt/base.py:4:Transport').confirmed, []);
+            assert.deepStrictEqual(relations(py, 'pkg/qp.py:4:Transport').confirmed,
+                ['t/test_qp.py:12', 't/test_qp.py:6']);
+        } finally { rm(py); }
+        const js = tmp({
+            'a.ts': 'export class Transport { verify(): void {} }\n',
+            'other.ts': 'export class Transport { drain(): void {} }\n',
+            'barrel.ts': "export * from './other';\nexport class Base64 {}\n",
+            'use.ts': "import { Transport } from './a';\nimport { Base64 } from './barrel';\ndeclare function register(x: unknown): void;\nregister(Transport);\nregister(Base64);\n",
+        });
+        try {
+            assert.deepStrictEqual(relations(js, 'other.ts:1:Transport').confirmed, []);
+            assert.deepStrictEqual(relations(js, 'a.ts:1:Transport').confirmed, ['use.ts:4']);
+        } finally { rm(js); }
+    });
+
+    it('a one-hop local alias of a typed field, parameter or local carries its type in every language', () => {
+        const cases = [
+            [{
+                'config.py': 'class Config:\n    def load(self):\n        pass\n',
+                'other.py': 'class Other:\n    def load(self):\n        pass\n',
+                'server.py': [
+                    'from config import Config',
+                    '',
+                    '',
+                    'def make():',
+                    '    return None',
+                    '',
+                    '',
+                    'class Server:',
+                    '    def __init__(self, config: Config):',
+                    '        self.config = config',
+                    '',
+                    '    def run(self):',
+                    '        config = self.config',
+                    '        config.load()',
+                    '',
+                    '    def run2(self, cfg: Config):',
+                    '        c = cfg',
+                    '        c.load()',
+                    '',
+                    '    def run3(self):',
+                    '        c = Config()',
+                    '        d = c',
+                    '        d.load()',
+                    '',
+                    '    def reassigned(self):',
+                    '        config = self.config',
+                    '        config = make()',
+                    '        config.load()',
+                    '',
+                ].join('\n'),
+            }, 'config.py:2:load', ['server.py:14', 'server.py:18', 'server.py:23'], 'server.py:28'],
+            [{
+                'config.ts': 'export class Config {\n  load(): void {}\n}\n',
+                'other.ts': 'export class Other {\n  load(): void {}\n}\n',
+                'server.ts': [
+                    "import { Config } from './config';",
+                    '',
+                    'export class Server {',
+                    '  private config: Config;',
+                    '  constructor(config: Config) { this.config = config; }',
+                    '  run(): void {',
+                    '    const c = this.config;',
+                    '    c.load();',
+                    '  }',
+                    '  run2(cfg: Config): void {',
+                    '    const c = cfg;',
+                    '    c.load();',
+                    '  }',
+                    '  shadowed(items: any[]): void {',
+                    '    const c = this.config;',
+                    '    items.forEach((c) => c.load());',
+                    '  }',
+                    '}',
+                    '',
+                ].join('\n'),
+            }, 'config.ts:2:load', ['server.ts:12', 'server.ts:8'], 'server.ts:16'],
+            [{
+                'p/Config.java': 'package p;\npublic class Config {\n    public void load() {}\n}\n',
+                'p/Other.java': 'package p;\npublic class Other {\n    public void load() {}\n}\n',
+                'p/Server.java': [
+                    'package p;',
+                    'public class Server {',
+                    '    private Config config;',
+                    '    private Object other;',
+                    '    public void run() {',
+                    '        var c = this.config;',
+                    '        c.load();',
+                    '    }',
+                    '    public void run2(Config cfg) {',
+                    '        var c = cfg;',
+                    '        c.load();',
+                    '    }',
+                    '    public void reassigned(Config cfg) {',
+                    '        var c = this.config;',
+                    '        c = null;',
+                    '        c.load();',
+                    '    }',
+                    '}',
+                    '',
+                ].join('\n'),
+            }, 'p/Config.java:3:load', ['p/Server.java:11', 'p/Server.java:7'], null],
+            [{
+                'Config.cs': 'namespace P {\n    public class Config { public void Load() {} }\n    public class Other { public void Load() {} }\n}\n',
+                'Server.cs': [
+                    'namespace P {',
+                    '    public class Server {',
+                    '        private Config config;',
+                    '        public void Run() {',
+                    '            var c = this.config;',
+                    '            c.Load();',
+                    '        }',
+                    '        public void Run2(Config cfg) {',
+                    '            var c = cfg;',
+                    '            c.Load();',
+                    '        }',
+                    '        public void Run3() {',
+                    '            var c = config;',
+                    '            c.Load();',
+                    '        }',
+                    '    }',
+                    '}',
+                    '',
+                ].join('\n'),
+            }, 'Config.cs:2:Load', ['Server.cs:10', 'Server.cs:14', 'Server.cs:6'], null],
+            [{
+                'go.mod': 'module ex\ngo 1.21\n',
+                'config.go': 'package ex\n\ntype Config struct{}\n\nfunc (c *Config) Load() {}\n\ntype Other struct{}\n\nfunc (o *Other) Load() {}\n',
+                'server.go': [
+                    'package ex',
+                    '',
+                    'type Server struct {',
+                    '\tconfig *Config',
+                    '\tother  *Other',
+                    '}',
+                    '',
+                    'func (s *Server) Run() {',
+                    '\tc := s.config',
+                    '\tc.Load()',
+                    '}',
+                    '',
+                    'func (s *Server) Reassigned() {',
+                    '\tc := s.config',
+                    '\tif c == nil {',
+                    '\t\tc = nil',
+                    '\t}',
+                    '\tc.Load()',
+                    '}',
+                    '',
+                ].join('\n'),
+            }, 'config.go:5:Load', ['server.go:10'], 'server.go:18'],
+            [{
+                'Cargo.toml': '[package]\nname = "ex"\nversion = "0.1.0"\nedition = "2021"\n',
+                'src/lib.rs': [
+                    'pub mod config;',
+                    'pub struct Server {',
+                    '    config: config::Config,',
+                    '}',
+                    'impl Server {',
+                    '    pub fn run(&self) {',
+                    '        let c = &self.config;',
+                    '        c.load();',
+                    '    }',
+                    '    pub fn shadowed(&self, o: &config::Other) {',
+                    '        let c = &self.config;',
+                    '        let c = o;',
+                    '        c.load();',
+                    '    }',
+                    '}',
+                    '',
+                ].join('\n'),
+                'src/config.rs': 'pub struct Config;\nimpl Config {\n    pub fn load(&self) {}\n}\npub struct Other;\nimpl Other {\n    pub fn load(&self) {}\n}\n',
+            }, 'src/config.rs:3:load', ['src/lib.rs:8'], null],
+        ];
+        for (const [files, handle, expected, notConfirmed] of cases) {
+            const dir = tmp(files);
+            try {
+                const rel = relations(dir, handle);
+                assert.deepStrictEqual(rel.confirmed, expected, `${handle}: ${JSON.stringify(rel)}`);
+                if (notConfirmed) assert.ok(!rel.confirmed.includes(notConfirmed), handle);
+                assert.strictEqual(rel.conserved, true, handle);
+            } finally { rm(dir); }
+        }
+    });
+
+    it('Java and Rust function-local types are visible only in their scope', () => {
+        const java = tmp({
+            'p/Channel.java': 'package p;\npublic class Channel {\n    public void cancel() {}\n}\n',
+            'p/T.java': [
+                'package p;',
+                'public class T {',
+                '    void m() {',
+                '        class Channel {',
+                '            void cancel() {}',
+                '        }',
+                '        Channel c = new Channel();',
+                '        c.cancel();',
+                '    }',
+                '    void n() {',
+                '        Channel c = new Channel();',
+                '        c.cancel();',
+                '    }',
+                '}',
+                '',
+            ].join('\n'),
+        });
+        try {
+            assert.deepStrictEqual(relations(java, 'p/Channel.java:3:cancel').confirmed, ['p/T.java:12']);
+            assert.deepStrictEqual(relations(java, 'p/T.java:5:cancel').confirmed, ['p/T.java:8']);
+        } finally { rm(java); }
+        const rust = tmp({
+            'Cargo.toml': '[package]\nname = "ex"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/lib.rs': [
+                'pub mod chan;',
+                'use crate::chan::Channel;',
+                'pub fn m() {',
+                '    struct Channel;',
+                '    impl Channel {',
+                '        fn cancel(&self) {}',
+                '    }',
+                '    let c = Channel {};',
+                '    c.cancel();',
+                '}',
+                'pub fn n() {',
+                '    let c = Channel {};',
+                '    c.cancel();',
+                '}',
+                '',
+            ].join('\n'),
+            'src/chan.rs': 'pub struct Channel;\nimpl Channel {\n    pub fn cancel(&self) {}\n}\n',
+        });
+        try {
+            assert.deepStrictEqual(relations(rust, 'src/chan.rs:3:cancel').confirmed, ['src/lib.rs:13']);
+            assert.deepStrictEqual(relations(rust, 'src/lib.rs:6:cancel').confirmed, ['src/lib.rs:9']);
+        } finally { rm(rust); }
+    });
+});
+
+// fix #382: the HOT ranking lists each callable IDENTITY once. The caller
+// engine closes a pinned definition over its identity group (overload
+// signatures with their implementation, C/C++ prototypes with the definitions
+// of their linkage), so every member used to repeat the same count.
+describe('fix #382: HOT lists one entry per callable identity', () => {
+    const hot = (dir) => idx(dir).getStats({ hot: true, top: 10 }).hot.items
+        .map(item => `${item.name} ${item.file}:${item.startLine} ${item.callCount}`);
+
+    it('Python @overload stubs collapse into the implementation', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname="p"\n',
+            'lib.py': 'from typing import overload\n\n\n@overload\ndef conv(x: int) -> int: ...\n\n\n' +
+                '@overload\ndef conv(x: str) -> str: ...\n\n\ndef conv(x):\n    return x\n',
+            'app.py': 'from lib import conv\n\n\ndef run():\n    return [conv(1), conv("a"), conv(2)]\n',
+        });
+        try {
+            assert.deepStrictEqual(hot(dir), ['conv lib.py:12 3']);
+        } finally { rm(dir); }
+    });
+
+    it('TypeScript overload signatures collapse into the implementation', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'h.ts': 'export function h(a: string): string;\nexport function h(a: number): number;\n' +
+                'export function h(a: any): any { return a; }\n',
+            'app.ts': "import { h } from './h';\nexport function run() { return [h('x'), h(1)]; }\n",
+        });
+        try {
+            assert.deepStrictEqual(hot(dir), ['h h.ts:3 2']);
+        } finally { rm(dir); }
+    });
+
+    it('a C prototype and its definitions are one entry with the linkage count', () => {
+        const dir = tmp({
+            'CMakeLists.txt': 'cmake_minimum_required(VERSION 3.0)\n',
+            'include/api.h': 'int translate(int e);\nint single(int e);\n',
+            // Platform variants of one external function.
+            'src/unix/impl.c': '#include "../../include/api.h"\nint translate(int e) { return e; }\n',
+            'src/win/impl.c': '#include "../../include/api.h"\nint translate(int e) { return -e; }\n',
+            'src/single.c': '#include "../include/api.h"\nint single(int e) { return e; }\n',
+            'src/use.c': '#include "../include/api.h"\n' +
+                'int use(void) { return translate(1) + translate(2) + single(3); }\n' +
+                'int use2(void) { return translate(4) + single(5); }\n',
+        });
+        try {
+            // Two definitions: only the declaration's closure covers both, so
+            // the entity is shown there with all of its calls. One
+            // definition: shown at the implementation.
+            assert.deepStrictEqual(hot(dir), ['translate include/api.h:1 3', 'single src/single.c:2 2']);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #383: router frameworks, join rules, handlers and methods (endpoints)', () => {
+    const { extractServerRoutes, endpoints, normalizePath } = require('../core/bridge');
+    const rows = (index, filter = () => true) => extractServerRoutes(index).filter(filter)
+        .map(r => `${r.method} ${r.path} ${r.handler} [${r.framework}]`).sort();
+
+    it('JS: the imported framework labels its routes and decides the join (Fastify, koa-router, Express)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"app"}',
+            'fast.js': [
+                "const Fastify = require('fastify')",
+                'const app = Fastify()',
+                'app.register((instance, opts, done) => {',
+                "  instance.get('/', listUsers)",
+                "  instance.get('items', listItems)",
+                '  done()',
+                "}, { prefix: '/users' })",
+            ].join('\n'),
+            'koa.js': [
+                "const Router = require('@koa/router')",
+                'const api = new Router()',
+                "const sub = new Router({ prefix: '/k' })",
+                "sub.get('/a', handlerA)",
+                "api.use('/api', sub.routes())",
+            ].join('\n'),
+            'exp.js': [
+                "const express = require('express')",
+                'const app = express()',
+                "app.get('/files/*', auth, (req, res) => res.send(req.params))",
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(rows(index), [
+                'GET /api/k/a handlerA [koa]',
+                'GET /files/* <anonymous> [express]',
+                'GET /users listUsers [fastify]',
+                'GET /usersitems listItems [fastify]',
+            ]);
+            // Express `*` is a catch-all: it spans segments.
+            const files = extractServerRoutes(index).find(r => r.path === '/files/*');
+            assert.strictEqual(files.normalizedPath, '/files/**');
+        } finally { rm(dir); }
+    });
+
+    it('JS: a Fastify project labels its own tests through require of its package entry', () => {
+        const dir = tmp({
+            'package.json': '{"name":"fastify","main":"fastify.js"}',
+            'fastify.js': 'module.exports = function fastify () { return {} }\n',
+            'test/basic.test.js': [
+                "const Fastify = require('..')",
+                'const app = Fastify()',
+                "app.route({ method: 'GET', url: '/cfg', handler: cfgHandler })",
+                "app.get('/plain', opts, function (req, reply) { reply.send(new Error('x')) })",
+            ].join('\n'),
+        });
+        try {
+            assert.deepStrictEqual(rows(idx(dir)), [
+                'GET /cfg cfgHandler [fastify]',
+                'GET /plain <anonymous> [fastify]',
+            ]);
+        } finally { rm(dir); }
+    });
+
+    it('Go: gin and echo labels, echo concatenates group prefixes and takes the handler first; method-first registrations', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/m\n',
+            'g.go': [
+                'package main',
+                'import (',
+                '\t"net/http"',
+                '\t"github.com/gin-gonic/gin"',
+                ')',
+                'func g() {',
+                '\tr := gin.New()',
+                '\tr.GET("/a", func(c *gin.Context) { c.String(http.StatusOK, "x") })',
+                '\tr.GET("/static/*filepath", auth, serve)',
+                '}',
+            ].join('\n'),
+            'e.go': [
+                'package main',
+                'import "github.com/labstack/echo/v4"',
+                'func e() {',
+                '\tsrv := echo.New()',
+                '\tgrp := srv.Group("/api")',
+                '\tgrp.GET("items", listItems, logMiddleware)',
+                '\tsrv.Add(http.MethodPut, "/put", putItem)',
+                '\tsrv.Match([]string{http.MethodGet, "POST"}, "/both", both)',
+                '}',
+            ].join('\n').replace('import "github.com/labstack/echo/v4"',
+                'import (\n\t"net/http"\n\t"github.com/labstack/echo/v4"\n)'),
+            'h.go': [
+                'package main',
+                'import (',
+                '\t"net/http"',
+                '\t"github.com/gin-gonic/gin"',
+                ')',
+                'func h() {',
+                '\tr := gin.Default()',
+                '\tr.Handle(http.MethodDelete, "/items/:id", deleteItem)',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(rows(index), [
+                'DELETE /items/:id deleteItem [gin]',
+                'GET /a <anonymous> [gin]',
+                'GET /apiitems listItems [echo]',
+                'GET /both both [echo]',
+                'GET /static/*filepath serve [gin]',
+                'POST /both both [echo]',
+                'PUT /put putItem [echo]',
+            ]);
+            const catchAll = extractServerRoutes(index).find(r => r.path === '/static/*filepath');
+            assert.strictEqual(catchAll.normalizedPath, '/static/**');
+        } finally { rm(dir); }
+    });
+
+    it('Go: a context key lookup is not a request; NewRequest reads its method and URL; in-process requests bridge in their own test', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/m\n',
+            'x_test.go': [
+                'package main',
+                'import (',
+                '\t"net/http"',
+                '\t"testing"',
+                '\t"github.com/gin-gonic/gin"',
+                ')',
+                'func TestA(t *testing.T) {',
+                '\tr := gin.New()',
+                '\tr.GET("/users/:id", show)',
+                '\treq, _ := http.NewRequest(http.MethodGet, "/users/7", nil)',
+                '\tr.ServeHTTP(nil, req)',
+                '}',
+                'func TestB(t *testing.T) {',
+                '\treq, _ := http.NewRequest("QUERY", "/users/8", nil)',
+                '\t_ = req',
+                '}',
+                'func handler(c *gin.Context) {',
+                '\tc.Get("user")',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const result = endpoints(idx(dir), { bridge: true });
+            assert.deepStrictEqual(result.requests.map(r => `${r.method} ${r.path}`).sort(),
+                ['GET /users/7', 'QUERY /users/8']);
+            assert.deepStrictEqual(result.bridges.map(b => `${b.request.path} -> ${b.route.path}`),
+                ['/users/7 -> /users/:id']);
+        } finally { rm(dir); }
+    });
+
+    it('Rust: an axum route serves the methods of its method router, each with its handler', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "x"\nversion = "0.1.0"\n',
+            'src/main.rs': [
+                'use axum::{routing::{get, on, MethodFilter}, Router};',
+                'fn app() -> Router {',
+                '    Router::new()',
+                '        .route("/users", get(list_users).post(create_user))',
+                '        .route("/a", on(MethodFilter::PUT.or(MethodFilter::PATCH), update))',
+                '        .route("/b", get(|| async {}).layer(tower::layer::util::Identity::new()))',
+                '}',
+                'async fn list_users() {}',
+                'async fn create_user() {}',
+                'async fn update() {}',
+            ].join('\n'),
+        });
+        try {
+            assert.deepStrictEqual(rows(idx(dir)), [
+                'GET /b <anonymous> [axum]',
+                'GET /users list_users [axum]',
+                'PATCH /a update [axum]',
+                'POST /users create_user [axum]',
+                'PUT /a update [axum]',
+            ]);
+        } finally { rm(dir); }
+    });
+
+    it('normalizePath: parameter spellings by framework family', () => {
+        const cases = [
+            ['/users/:id', 'router', '/users/*'],
+            ['/files/:rest*', 'router', '/files/**'],
+            ['/{*rest}', 'router', '/**'],
+            ['/users/{username}:disable', 'python', '/users/*:disable'],
+            ['/files/<path:p>', 'python', '/files/**'],
+            ['/{tail:.*}', 'python', '/**'],
+            ['/x/*', 'jvm', '/x/*'],
+            ['/x/**', 'jvm', '/x/**'],
+            ['/users/tom:disable?x=1', 'client', '/users/tom:disable'],
+        ];
+        for (const [raw, syntax, expected] of cases) {
+            assert.strictEqual(normalizePath(raw, syntax), expected, `${syntax} ${raw}`);
+        }
+    });
+});
+
+describe('fix #383: trust lines survive every output budget (CLI and MCP)', () => {
+    const { applyOutputBudget } = require('../core/output-budget');
+    const TRUST = /^(?:ACCOUNT|CONTRACT|WARNING|FILTERED|CALLEE ACCOUNT|TREE ACCOUNT):/;
+    const trustLines = text => text.split('\n').map(line => line.trim()).filter(line => TRUST.test(line));
+    // Every truncated answer either carries all of the full answer's trust
+    // lines or withholds the answer and names the budget that carries them.
+    const checkBudget = (full, out, limit, label) => {
+        assert.ok(out.length <= limit, `${label}: ${out.length} > ${limit}`);
+        const shown = new Set(out.split('\n').map(line => line.trim()));
+        const missing = trustLines(full).filter(line => !shown.has(line));
+        if (missing.length > 0) {
+            assert.match(out, /withheld.*(?:at least |>=)\d+|^$/i,
+                `${label}: ${missing.length} trust line(s) dropped silently:\n${out}`);
+            // No body text accompanies an incomplete contract.
+            assert.doesNotMatch(out, /CALLERS|SUMMARY/, `${label}: body shown without its contract`);
+        }
+    };
+
+    it('applyOutputBudget reserves every trust line before the body, or withholds the answer', () => {
+        const full = [
+            'SUMMARY',
+            ...Array.from({ length: 80 }, (_, i) => `  [${i + 1}] src/f${i}.js:${i + 1}: target(${i})`),
+            `ACCOUNT: "target" occurs on 90 lines: 80 confirmed, 3 unverified, ${'x'.repeat(60)}`,
+            `CONTRACT: literal-name text partition is DEGRADED; ${'y'.repeat(80)}`,
+            `WARNING: 5 source discovery gap(s): ${'z'.repeat(250)}`,
+            'CALLEE ACCOUNT: 12 call sites = 2 confirmed + 10 unverified',
+        ].join('\n');
+        const needed = [];
+        for (const surface of ['cli', 'mcp']) {
+            for (const limit of [60, 150, 300, 400, 500, 600, 700, 800, 1000, 3000]) {
+                const out = applyOutputBudget(full, { command: 'show', maxChars: limit, surface });
+                checkBudget(full, out.text, limit, `${surface} ${limit}`);
+                if (/withheld/i.test(out.text)) assert.strictEqual(out.contractMetadataComplete, false);
+                const at = out.text.match(/(?:at least |>=)(\d+)/);
+                if (at) needed.push([surface, Number(at[1])]);
+            }
+        }
+        // The named budget carries the trust lines.
+        for (const [surface, limit] of needed) {
+            const out = applyOutputBudget(full, { command: 'show', maxChars: limit, surface });
+            assert.doesNotMatch(out.text, /withheld/, `${surface} ${limit}`);
+            for (const line of trustLines(full)) assert.ok(out.text.includes(line), `${surface} ${limit}: ${line}`);
+        }
+    });
+
+    it('CLI and MCP show/impact keep ACCOUNT and CONTRACT at 400, 600 and 800 chars', async () => {
+        const dir = tmp({
+            'package.json': '{"name":"x"}',
+            'lib.js': [
+                'function target(a) { return a + 1 }',
+                ...Array.from({ length: 40 }, (_, i) => `function caller${i}() { return target(${i}) }`),
+                'function other(o) { return o.target() }',
+                'module.exports = { target, other }',
+            ].join('\n'),
+        });
+        const { McpClient } = require('./helpers');
+        const client = new McpClient();
+        try {
+            await client.start();
+            await client.initialize();
+            for (const command of ['show', 'impact']) {
+                const full = runCli(dir, command, ['target'], ['--max-chars=100000']);
+                assert.ok(trustLines(full).length >= 2, full);
+                for (const limit of [200, 400, 600, 800, 1200]) {
+                    const cli = runCli(dir, command, ['target'], [`--max-chars=${limit}`]);
+                    checkBudget(full, cli.replace(/\n$/, ''), limit, `cli ${command} ${limit}`);
+                    const mcp = await client.callTool({ command, project_dir: dir, name: 'target', max_chars: limit });
+                    checkBudget(full, mcp.text, limit, `mcp ${command} ${limit}`);
+                }
+            }
+        } finally {
+            client.stop();
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #384: members differing only by parameter type are selected by argument type in every language', () => {
+    const tiers = (index, name, file, line) => {
+        const r = execute(index, 'show', { name, file, line, sections: 'callers' });
+        assert.ok(r.ok, r.error);
+        const ctx = r.result.context || r.result;
+        return {
+            confirmed: (ctx.callers || []).map(c => c.line).sort((a, b) => a - b),
+            mismatch: ctx.meta?.account?.excluded?.byReason?.['overload-mismatch']?.count || 0,
+        };
+    };
+    const cases = {
+        'C# class implementing IEquatable<A> and IEquatable<B>': {
+            files: { 'P.cs': 'using System;\nclass A {}\nclass B {}\nclass P : IEquatable<A>, IEquatable<B> {\n  public bool Equals(A a) { return true; }\n  public bool Equals(B b) { return false; }\n}\nclass U {\n  bool u(P p, A a, B b) {\n    var x = p.Equals(a);\n    var y = p.Equals(b);\n    return x && y;\n  }\n}\n' },
+            name: 'Equals', file: 'P.cs', lines: [5, 6], sites: [10, 11],
+        },
+        'Java overloads by parameter type': {
+            files: { 'src/A.java': 'public class A {}', 'src/B.java': 'public class B {}',
+                'src/P.java': 'public class P {\n  public boolean same(A a) { return true; }\n  public boolean same(B b) { return false; }\n}',
+                'src/U.java': 'public class U {\n  boolean u(P p, A a, B b) {\n    boolean x = p.same(a);\n    boolean y = p.same(b);\n    return x && y;\n  }\n}' },
+            name: 'same', file: 'src/P.java', lines: [2, 3], sites: [3, 4],
+        },
+    };
+    for (const [label, spec] of Object.entries(cases)) {
+        it(label, () => {
+            const dir = tmp(spec.files);
+            try {
+                const index = idx(dir);
+                spec.lines.forEach((line, i) => {
+                    const t = tiers(index, spec.name, spec.file, line);
+                    assert.deepStrictEqual(t.confirmed, [spec.sites[i]], `${label} ${line}: ${JSON.stringify(t)}`);
+                    assert.strictEqual(t.mismatch, 1);
+                });
+            } finally { rm(dir); }
+        });
+    }
+});
+
+describe('fix #384: a type-qualified call names the type its own module binds (Rust, Python, TS)', () => {
+    const cases = {
+        rust: { 'Cargo.toml': '[package]\nname = "m"\nversion = "0.1.0"\n', 'src/lib.rs': 'mod a;\nmod b;\n',
+            'src/a.rs': 'struct Shared;\nimpl Shared {\n    fn init() -> i32 { 1 }\n}\npub fn use_a() -> i32 { Shared::init() }\n',
+            'src/b.rs': 'struct Shared;\nimpl Shared {\n    fn init() -> i32 { 2 }\n}\npub fn use_b() -> i32 { Shared::init() }\n' },
+        python: { 'pkg/__init__.py': '',
+            'pkg/a.py': 'class Shared:\n    @staticmethod\n    def init():\n        return 1\n\ndef use_a():\n    return Shared.init()\n',
+            'pkg/b.py': 'class Shared:\n    @staticmethod\n    def init():\n        return 2\n\ndef use_b():\n    return Shared.init()\n' },
+        typescript: { 'package.json': '{"name":"x"}',
+            'a.ts': 'class Shared {\n  static init() { return 1; }\n}\nexport function useA() { return Shared.init(); }\n',
+            'b.ts': 'class Shared {\n  static init() { return 2; }\n}\nexport function useB() { return Shared.init(); }\n' },
+    };
+    const files = { rust: ['src/a.rs', 'src/b.rs'], python: ['pkg/a.py', 'pkg/b.py'], typescript: ['a.ts', 'b.ts'] };
+    const callLine = { rust: 5, python: 7, typescript: 4 };
+    for (const [language, fixture] of Object.entries(cases)) {
+        it(`${language}: each module's own Shared.init call is its only caller; plan renames only it`, () => {
+            const dir = tmp(fixture);
+            try {
+                const index = idx(dir);
+                for (const [i, file] of files[language].entries()) {
+                    const other = files[language][1 - i];
+                    const def = index.symbols.get('init').find(d => d.relativePath === file);
+                    const r = execute(index, 'show', { name: 'init', file, line: def.startLine, sections: 'callers' });
+                    const ctx = r.result.context || r.result;
+                    assert.deepStrictEqual((ctx.callers || []).map(c => `${c.relativePath}:${c.line}`),
+                        [`${file}:${callLine[language]}`]);
+                    assert.strictEqual(ctx.meta.account.excluded.byReason['path-type-mismatch']?.count, 1);
+                    const plan = execute(index, 'plan', { name: 'init', file, line: def.startLine, renameTo: 'boot' });
+                    assert.ok(!plan.result.changes.some(change => change.file === other),
+                        JSON.stringify(plan.result.changes));
+                }
+            } finally { rm(dir); }
+        });
+    }
+});
+
+describe('fix #386: renaming a C# type edits every reference to it', () => {
+    const { applyRenamePlan } = require('./helpers');
+    const files = {
+        'Widget.cs': [
+            'using System;',
+            'namespace App.Core',
+            '{',
+            '    public interface IShape { int Area(); }',
+            '    public class Base { }',
+            '    /// <summary>A <see cref="Widget"/> and <see cref="App.Core.Widget.Make"/>.</summary>',
+            '    public class Widget : Base, IShape',
+            '    {',
+            '        public const int Size = 3;',
+            '        private Widget _next;',
+            '        public Widget() : this(1) { }',
+            '        public Widget(int n) { }',
+            '        ~Widget() { }',
+            '        public static Widget Make() => new Widget();',
+            '        public int Area() => 1;',
+            '        public Widget Copy(Widget other)',
+            '        {',
+            '            var w = (Widget)other;',
+            '            if (other is Widget ww) return ww;',
+            '            var t = typeof(Widget);',
+            '            var n = nameof(Widget);',
+            '            return Widget.Make();',
+            '        }',
+            '    }',
+            '}',
+        ].join('\n'),
+        'User.cs': [
+            'using App.Core;',
+            'using W2 = App.Core.Widget;',
+            'namespace App.Use',
+            '{',
+            '    public class User',
+            '    {',
+            '        Widget a = new Widget();',
+            '        App.Core.Widget b = new App.Core.Widget();',
+            '        W2 c;',
+            '        System.Collections.Generic.List<Widget> d;',
+            '        int s = Widget.Size;',
+            '    }',
+            '    public class Sub : Widget { }',
+            '    public class Holder',
+            '    {',
+            '        public Widget? Widget { get; set; }',
+            '        public void Set(Widget w) { Widget = w; }',
+            '    }',
+            '}',
+        ].join('\n'),
+        'Other.cs': 'namespace App.Other\n{\n    public class Widget { }\n    public class O { Widget x = new Widget(); }\n}\n',
+    };
+
+    it('C#: constructors, the finalizer, casts, patterns, typeof/nameof, usings and doc crefs; a property named like the type stays', () => {
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            // The finalizer's handle plans the class rename.
+            const r = execute(index, 'plan', { name: 'Widget', file: 'Widget.cs', line: 13, renameTo: 'Gadget' });
+            assert.ok(r.ok, r.error);
+            const { contents, reviews } = applyRenamePlan(dir, r.result);
+            assert.deepStrictEqual(reviews, []);
+            assert.strictEqual(contents['Widget.cs'], files['Widget.cs'].replace(/\bWidget\b/g, 'Gadget'));
+            const user = files['User.cs'].replace(/\bWidget\b/g, 'Gadget')
+                .replace('public Gadget? Gadget { get; set; }', 'public Gadget? Widget { get; set; }')
+                .replace('{ Gadget = w; }', '{ Widget = w; }');
+            assert.strictEqual(contents['User.cs'], user);
+            assert.ok(!('Other.cs' in contents));
+            assert.ok(!(r.result.reviewItems || []).some(item => item.file === 'Widget.cs' && item.line === 6),
+                'edited crefs are not text items');
+        } finally { rm(dir); }
+    });
+
+    it('C#: an attribute class is renamed where it is applied by its short name', () => {
+        const dir = tmp({
+            'M.cs': [
+                'namespace N',
+                '{',
+                '    public sealed class MarkerAttribute : System.Attribute { }',
+                '    [Marker]',
+                '    public class A { }',
+                '    [N.Marker()]',
+                '    public class B { }',
+                '}',
+            ].join('\n'),
+            'O.cs': 'namespace O\n{\n    public sealed class MarkerAttribute : System.Attribute { }\n    [Marker] public class C { }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: 'MarkerAttribute', file: 'M.cs', renameTo: 'FlagAttribute' });
+            assert.ok(r.ok, r.error);
+            const { contents, reviews } = applyRenamePlan(dir, r.result);
+            assert.deepStrictEqual(reviews, []);
+            assert.ok(contents['M.cs'].includes('class FlagAttribute'));
+            assert.ok(contents['M.cs'].includes('    [Flag]'));
+            assert.ok(contents['M.cs'].includes('    [N.Flag()]'));
+            assert.ok(!('O.cs' in contents), 'namespace O applies its own MarkerAttribute');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #386: every type-like kind plan accepts renames its references', () => {
+    const { applyRenamePlan } = require('./helpers');
+    const cases = [
+        { lang: 'TypeScript type alias', handle: { name: 'Pair', file: 'a.ts' }, files: {
+            'package.json': '{"name":"t"}',
+            'a.ts': 'export type Pair = [number, number];\nexport function f(p: Pair): Pair { return p; }\n',
+            'b.ts': "import type { Pair } from './a';\nexport const z: Pair[] = [];\n" } },
+        { lang: 'TypeScript enum', handle: { name: 'Color', file: 'a.ts' }, files: {
+            'package.json': '{"name":"t"}',
+            'a.ts': 'export enum Color { Red }\nexport const c: Color = Color.Red;\n',
+            'b.ts': "import { Color } from './a';\nexport function g(x: Color) { return x === Color.Red; }\n" } },
+        { lang: 'Python TypeAlias', handle: { name: 'Point', file: 'a.py' }, files: {
+            'a.py': 'from typing import TypeAlias\n\nPoint: TypeAlias = tuple[int, int]\n\n\ndef f(p: Point) -> Point:\n    return p\n',
+            'b.py': 'from a import Point\n\n\ndef g(p: Point) -> "Point":\n    return p\n' } },
+        { lang: 'Go interface', handle: { name: 'Shape', file: 'a.go' }, files: {
+            'go.mod': 'module m\n\ngo 1.21\n',
+            'a.go': 'package m\n\ntype Shape interface{ Area() int }\n\nfunc Sum(xs []Shape) int { var s Shape; _ = s; return len(xs) }\n\nvar _ Shape = (*sq)(nil)\n\ntype sq struct{}\n\nfunc (*sq) Area() int { return 1 }\n' } },
+        { lang: 'Rust trait', handle: { name: 'Shape', file: 'src/lib.rs' }, files: {
+            'Cargo.toml': '[package]\nname = "k"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/lib.rs': 'pub trait Shape { fn area(&self) -> i32; }\npub struct Sq;\nimpl Shape for Sq { fn area(&self) -> i32 { 1 } }\npub fn total<T: Shape>(xs: &[T]) -> i32 { xs.iter().map(Shape::area).sum() }\npub fn boxed(x: Box<dyn Shape>) -> i32 { x.area() }\n' } },
+        { lang: 'Java enum', handle: { name: 'Level', file: 'p/Level.java' }, files: {
+            'p/Level.java': 'package p;\npublic enum Level { LOW, HIGH; static Level parse(String s) { return Level.valueOf(s); } }\n',
+            'p/Use.java': 'package p;\nimport java.util.EnumSet;\nclass Use { EnumSet<Level> all = EnumSet.allOf(Level.class); Level l = Level.LOW; }\n' } },
+    ];
+    for (const { lang, handle, files } of cases) {
+        it(`${lang}: every spelling is the renamed type`, () => {
+            const dir = tmp(files);
+            try {
+                const index = idx(dir);
+                const r = execute(index, 'plan', { ...handle, renameTo: 'Renamed' });
+                assert.ok(r.ok, r.error);
+                const { contents, reviews } = applyRenamePlan(dir, r.result);
+                assert.deepStrictEqual(reviews, []);
+                const re = new RegExp(`\\b${handle.name}\\b`, 'g');
+                for (const [file, text] of Object.entries(files)) {
+                    if (!re.test(text)) continue;
+                    re.lastIndex = 0;
+                    const moved = (r.result.fileRenames || []).find(m => m.from === file);
+                    const actual = moved ? contents[moved.to] : contents[file];
+                    assert.strictEqual(actual, text.replace(re, 'Renamed'), `${lang} ${file}`);
+                }
+            } finally { rm(dir); }
+        });
+    }
+});
+
+describe('fix #389: C# written generic arity selects the type in typeof and type renames', () => {
+    const { applyRenamePlan } = require('./helpers');
+
+    it('typeof(X<>) / typeof(X<,>) / nameof(X) name the type of that arity; members list per arity', () => {
+        const files = {
+            'c.csproj': '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>',
+            'Outcome.cs': [
+                'namespace Lib',
+                '{',
+                '    public static class Outcome',
+                '    {',
+                '        public static int Create() { return 1; }',
+                '    }',
+                '    public struct Outcome<T>',
+                '    {',
+                '        public T Value;',
+                '        private static int Probe() { return 2; }',
+                '    }',
+                '    public struct Outcome<T, U>',
+                '    {',
+                '        public T A; public U B;',
+                '        private static int Probe() { return 3; }',
+                '    }',
+                '    internal static class Use',
+                '    {',
+                '        private static string Suffix() { return ""; }',
+                '        internal static object Run()',
+                '        {',
+                '            var a = typeof(Outcome);',
+                '            var b = typeof(Outcome<>);',
+                '            var c = typeof(Outcome<,>);',
+                '            var d = typeof(Outcome<int>);',
+                '            var e = nameof(Outcome);',
+                '            return typeof(Outcome<>).GetMethod("Probe" + Suffix());',
+                '        }',
+                '    }',
+                '}',
+            ].join('\n'),
+        };
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const lines = (line, to) => {
+                const r = execute(index, 'plan', { name: 'Outcome', file: 'Outcome.cs', line, renameTo: to });
+                assert.ok(r.ok, r.error);
+                const { contents, reviews } = applyRenamePlan(dir, r.result);
+                assert.deepStrictEqual(reviews, []);
+                return contents['Outcome.cs'].split('\n').map((text, i) => text.includes(to) ? i + 1 : null)
+                    .filter(Boolean);
+            };
+            assert.deepStrictEqual(lines(3, 'Zero'), [3, 22, 26]);
+            assert.deepStrictEqual(lines(7, 'One'), [7, 23, 25, 27]);
+            assert.deepStrictEqual(lines(12, 'Two'), [12, 24]);
+            const one = index.symbols.get('Outcome').find(d => d.startLine === 7);
+            const shown = index.context('Outcome', { file: 'Outcome.cs', line: 7 });
+            assert.deepStrictEqual(shown.members?.map(m => m.name) ?? [], ['Value']);
+            assert.deepStrictEqual(index.findMethodsForType('Outcome', one).map(m => m.startLine), [10]);
+            // The reflective `typeof(Outcome<>)` reaches Outcome<T>.Probe only.
+            const dead = execute(index, 'deadcode', {});
+            const claimed = JSON.stringify(dead.result);
+            assert.ok(claimed.includes('"startLine":15') && !claimed.includes('"startLine":10'), claimed.slice(0, 600));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #390: C# generic base slots, attributed declaration names, doc cref member references, same-name class identity', () => {
+    const { applyRenamePlan } = require('./helpers');
+    const csproj = '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>';
+    const renamedLines = (dir, result, to) => {
+        const { contents } = applyRenamePlan(dir, result);
+        const out = [];
+        for (const [file, text] of Object.entries(contents)) {
+            if (text == null) continue;
+            text.split('\n').forEach((row, i) => { if (row.includes(to)) out.push(`${file}:${i + 1}`); });
+        }
+        return out.sort();
+    };
+
+    it('an override below a constructed generic base (`: Visitor<TextWriter, bool>`) joins the slot; another arity does not', () => {
+        const dir = tmp({
+            'c.csproj': csproj,
+            'Visitor.cs': [
+                'namespace N',
+                '{',
+                '    public abstract class Visitor<TState, TResult>',
+                '    {',
+                '        protected abstract TResult Visit(TState state, int x);',
+                '        public TResult Run(TState s) { return Visit(s, 1); }',
+                '    }',
+                '}',
+            ].join('\n'),
+            'One.cs': [
+                'namespace N',
+                '{',
+                '    public abstract class Visitor<TState>',
+                '    {',
+                '        protected abstract bool Visit(TState state, int x);',
+                '    }',
+                '    public class One : Visitor<System.IO.TextWriter>',
+                '    {',
+                '        protected override bool Visit(System.IO.TextWriter state, int x) { return true; }',
+                '    }',
+                '}',
+            ].join('\n'),
+            'Fmt.cs': [
+                'using System.IO;',
+                'namespace N',
+                '{',
+                '    public class Fmt : Visitor<TextWriter, bool>',
+                '    {',
+                '        protected override bool Visit(TextWriter state, int x) { return true; }',
+                '        protected bool Visit(string other, int x) { return false; }',
+                '    }',
+                '    public abstract class Mid<T> : Visitor<T, bool> { }',
+                '    public class Leaf : Mid<int>',
+                '    {',
+                '        protected override bool Visit(int state, int x) { return false; }',
+                '        protected bool Visit(long state, int x) { return true; }',
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const plan = (file, line) => {
+                const r = execute(index, 'plan', { name: 'Visit', file, line, renameTo: 'VisitZq' });
+                assert.ok(r.ok, r.error);
+                assert.ok(!r.result.contract?.blocked, JSON.stringify(r.result.contract));
+                return renamedLines(dir, r.result, 'VisitZq');
+            };
+            const slot = ['Fmt.cs:12', 'Fmt.cs:6', 'Visitor.cs:5', 'Visitor.cs:6'];
+            assert.deepStrictEqual(plan('Visitor.cs', 5), slot);
+            assert.deepStrictEqual(plan('Fmt.cs', 6), slot);
+            assert.deepStrictEqual(plan('Fmt.cs', 12), slot);
+            assert.deepStrictEqual(plan('One.cs', 9), ['One.cs:5', 'One.cs:9']);
+            const cls = index.symbols.get('Visitor').find(d => d.typeArity === 2);
+            assert.strictEqual(cls.generics, '<TState, TResult>');
+        } finally { rm(dir); }
+    });
+
+    it('members of two same-name generic classes of different arity in one file are two items, not configuration alternatives', () => {
+        const dir = tmp({
+            'c.csproj': csproj,
+            'Visitor.cs': [
+                'namespace N',
+                '{',
+                '    public abstract class Visitor<TState, TResult>',
+                '    {',
+                '        protected abstract TResult Visit(TState state, int x);',
+                '        public TResult Run(TState s) { return Visit(s, 1); }',
+                '    }',
+                '    public abstract class Visitor<TState>',
+                '    {',
+                '        protected abstract bool Visit(TState state, int x);',
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const two = index.context('Visit', { file: 'Visitor.cs', line: 5 });
+            assert.deepStrictEqual((two.callers || []).map(c => `${c.relativePath}:${c.line}`), ['Visitor.cs:6']);
+            const one = index.context('Visit', { file: 'Visitor.cs', line: 10 });
+            assert.deepStrictEqual((one.callers || []).map(c => `${c.relativePath}:${c.line}`), []);
+        } finally { rm(dir); }
+    });
+
+    it('a declaration whose attributes stand on their own lines is renamed on the line that names it', () => {
+        const dir = tmp({
+            'c.csproj': csproj,
+            'A.cs': [
+                'using System;',
+                'namespace N',
+                '{',
+                '    public class Widget',
+                '    {',
+                '        [Obsolete("x")]',
+                '        static int Compute(int a)',
+                '        {',
+                '            return a;',
+                '        }',
+                '        [Obsolete("y")]',
+                '        public int Size { get; set; }',
+                '        public int Use() { return Compute(1) + Size; }',
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const compute = index.symbols.get('Compute')[0];
+            assert.strictEqual(compute.startLine, 6);
+            assert.strictEqual(compute.nameLine, 7);
+            const r = execute(index, 'plan', { name: 'Compute', file: 'A.cs', line: 6, renameTo: 'ComputeZq' });
+            assert.ok(r.ok, r.error);
+            assert.deepStrictEqual(renamedLines(dir, r.result, 'ComputeZq'), ['A.cs:13', 'A.cs:7']);
+            assert.strictEqual(index.symbols.get('Size')[0].nameLine, 12);
+        } finally { rm(dir); }
+    });
+
+    it('doc cref attributes naming the renamed member are edited; other members and unresolved types are not', () => {
+        const dir = tmp({
+            'c.csproj': csproj,
+            'Ctx.cs': [
+                'namespace N',
+                '{',
+                '    public static class Ctx',
+                '    {',
+                '        /// <summary>Undo with <see cref="Suspend"/> or <see cref="Ctx.Suspend()"/>.</summary>',
+                '        public static int Suspend() { return 1; }',
+                '        /// <summary>See <see cref="Other.Suspend"/>.</summary>',
+                '        public static int Keep() { return Other.Suspend(); }',
+                '        /// <summary>See <see cref="Missing.Suspend"/>.</summary>',
+                '        public static int Also() { return Suspend(); }',
+                '    }',
+                '    public static class Other',
+                '    {',
+                '        /// <summary>Mine: <see cref="Suspend"/>.</summary>',
+                '        public static int Suspend() { return 2; }',
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: 'Suspend', file: 'Ctx.cs', line: 6, renameTo: 'Pause' });
+            assert.ok(r.ok, r.error);
+            const edited = new Map(r.result.changes.map(c => [c.line, c.newExpression]));
+            assert.match(edited.get(5), /cref="Pause"\/> or <see cref="Ctx\.Pause\(\)"/);
+            assert.ok(!edited.has(7) && !edited.has(14), JSON.stringify([...edited]));
+            // `Missing` is no project type here: an external type's member,
+            // never the renamed one (comment text only).
+            assert.ok(!edited.has(9));
+            const substantive = (r.result.reviewItems || []).filter(item => !item.textDependency);
+            assert.deepStrictEqual(substantive.map(item => item.line), []);
+        } finally { rm(dir); }
+    });
+
+    it('a class named like a subclass of the target in another namespace is not an implicit-this caller', () => {
+        const dir = tmp({
+            'c.csproj': csproj,
+            'Base.cs': [
+                'namespace N1',
+                '{',
+                '    public class Base { public static bool Check(bool c) { return c; } }',
+                '    public class Probe : Base { public bool Run() { return Check(true); } }',
+                '}',
+            ].join('\n'),
+            'Util.cs': [
+                'namespace N2',
+                '{',
+                '    public static class Util { public static bool Check(bool c) { return !c; } }',
+                '}',
+            ].join('\n'),
+            'Probe.cs': [
+                'using static N2.Util;',
+                'namespace N2',
+                '{',
+                '    public class Probe { public bool Run() { return Check(false); } }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const ctx = index.context('Check', { file: 'Base.cs', line: 3 });
+            const sites = [...(ctx.callers || []), ...(ctx.unverifiedCallers || [])]
+                .map(c => `${c.relativePath || c.file}:${c.line}`).sort();
+            assert.deepStrictEqual(sites, ['Base.cs:4']);
+            // The `using static` type supplies it: a confirmed caller and callee.
+            const util = index.context('Check', { file: 'Util.cs', line: 3 });
+            assert.deepStrictEqual((util.callers || []).map(c => `${c.relativePath}:${c.line}`), ['Probe.cs:4']);
+            const run = index.context('Run', { file: 'Probe.cs' });
+            assert.deepStrictEqual((run.callees || []).map(c => `${c.relativePath}:${c.startLine}`), ['Util.cs:3']);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #390: constructed generic bases join override slots in every class language', () => {
+    const { applyRenamePlan } = require('./helpers');
+    const cases = {
+        typescript: {
+            files: {
+                'base.ts': 'export abstract class Base<S> {\n    abstract visit(state: S, x: number): void;\n    run(s: S) { this.visit(s, 1); }\n}\n',
+                'impl.ts': "import { Base } from './base';\nexport class Impl extends Base<string> {\n    visit(state: string, x: number): void {}\n}\n",
+            },
+            pin: ['visit', 'base.ts', 2], expect: ['base.ts:2', 'base.ts:3', 'impl.ts:3'],
+        },
+        rust: {
+            files: {
+                'Cargo.toml': '[package]\nname = "fx"\nversion = "0.1.0"\nedition = "2021"\n',
+                'src/lib.rs': 'pub trait Visitor<T> {\n    fn visit(&self, t: T, x: i32);\n}\npub struct X;\nimpl Visitor<String> for X {\n    fn visit(&self, t: String, x: i32) {}\n}\npub fn run<V: Visitor<String>>(v: &V) {\n    v.visit(String::new(), 1);\n}\n',
+            },
+            pin: ['visit', 'src/lib.rs', 2], expect: ['src/lib.rs:2', 'src/lib.rs:6', 'src/lib.rs:9'],
+        },
+        python: {
+            files: {
+                'base.py': 'from typing import Generic, TypeVar\n\nT = TypeVar("T")\n\n\nclass Base(Generic[T]):\n    def visit(self, state: T, x: int) -> None:\n        raise NotImplementedError\n',
+                'impl.py': 'from base import Base\n\n\nclass Impl(Base[str]):\n    def visit(self, state: str, x: int) -> None:\n        pass\n',
+            },
+            pin: ['visit', 'base.py', 7], expect: ['base.py:7', 'impl.py:5'],
+        },
+    };
+    for (const [language, spec] of Object.entries(cases)) {
+        it(`${language}: a subclass of a constructed generic base renames with the slot`, () => {
+            const dir = tmp(spec.files);
+            try {
+                const index = idx(dir);
+                const [name, file, line] = spec.pin;
+                const r = execute(index, 'plan', { name, file, line, renameTo: `${name}Zq` });
+                assert.ok(r.ok, r.error);
+                const { contents } = applyRenamePlan(dir, r.result);
+                const hits = [];
+                for (const [f, text] of Object.entries(contents)) {
+                    (text || '').split('\n').forEach((row, i) => { if (row.includes(`${name}Zq`)) hits.push(`${f}:${i + 1}`); });
+                }
+                assert.deepStrictEqual(hits.sort(), spec.expect);
+            } finally { rm(dir); }
+        });
+    }
+});
+
+describe('fix #390: a C# string concatenation argument is a string', () => {
+    it('`Add("a" + x)` selects Add(string), never Add(Code)', () => {
+        const dir = tmp({
+            'c.csproj': '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>',
+            'B.cs': [
+                'namespace N',
+                '{',
+                '    public class Code { }',
+                '    public class B',
+                '    {',
+                '        public B Add(string format) { return this; }',
+                '        public B Add(Code code) { return this; }',
+                '        public void Use(string x)',
+                '        {',
+                '            Add("a" + x);',
+                '            Add(new Code());',
+                '        }',
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const ctx = index.context('Add', { file: 'B.cs', line: 7 });
+            assert.deepStrictEqual((ctx.callers || []).map(c => c.line), [11]);
+            assert.deepStrictEqual((ctx.unverifiedCallers || []).length, 0);
+            const plan = execute(index, 'plan', { name: 'Add', file: 'B.cs', line: 7, renameTo: 'AddCode' });
+            assert.ok(plan.ok, plan.error);
+            assert.deepStrictEqual(plan.result.changes.map(c => c.line), [7, 11]);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #390: a C# generic class renames its constructors and finalizer', () => {
+    it('`Strategy(..)` and `~Strategy()` inside `class Strategy<T>` rename with the type; the non-generic namesake keeps its own', () => {
+        const dir = tmp({
+            'c.csproj': '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>',
+            'S.cs': [
+                'namespace N;',
+                'internal sealed class Strategy<T>',
+                '{',
+                '    public Strategy(',
+                '        int x)',
+                '    {',
+                '    }',
+                '    ~Strategy() { }',
+                '    public static Strategy<T> Make() => new Strategy<T>(1);',
+                '}',
+                'internal sealed class Strategy',
+                '{',
+                '    public Strategy() { }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const lines = line => {
+                const r = execute(index, 'plan', { name: 'Strategy', file: 'S.cs', line, renameTo: 'Policy' });
+                assert.ok(r.ok, r.error);
+                return r.result.changes.filter(c => c.newExpression !== undefined && !c.needsReview).map(c => c.line).sort((a, b) => a - b);
+            };
+            assert.deepStrictEqual(lines(2), [2, 4, 8, 9]);
+            assert.deepStrictEqual(lines(11), [11, 13]);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #390: declarations in a standard-library namespace keep their names', () => {
+    it('a C# polyfill in System.* and a C++ std specialization member are contract-blocked', () => {
+        const dir = tmp({
+            'c.csproj': '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>',
+            'Poly.cs': 'namespace System.Diagnostics.CodeAnalysis\n{\n    internal enum DynamicallyAccessedMemberTypes { None = 0 }\n}\n',
+            'U.cs': 'using System.Diagnostics.CodeAnalysis;\nnamespace App\n{\n    public class U { public DynamicallyAccessedMemberTypes T; }\n    public class Own { public void Go() { } }\n}\n',
+            'h.hpp': '#include <functional>\nstruct Key { int v; };\nnamespace std {\ntemplate <> struct hash<Key> {\n    size_t operator()(const Key& k) const { return k.v; }\n    size_t mix(const Key& k) const { return k.v; }\n};\n}\n',
+            'main.cpp': '#include "h.hpp"\nint main() { return (int) std::hash<Key>{}.mix(Key{1}); }\n',
+        });
+        try {
+            const index = idx(dir);
+            const blocked = (name, file, line) => {
+                const r = execute(index, 'plan', { name, file, line, renameTo: `${name}Zq` });
+                assert.ok(r.ok, r.error);
+                return !!r.result.contract?.blocked;
+            };
+            assert.strictEqual(blocked('DynamicallyAccessedMemberTypes', 'Poly.cs', 3), true);
+            assert.strictEqual(blocked('mix', 'h.hpp', 6), true);
+            assert.strictEqual(blocked('Go', 'U.cs', 5), false);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #391: C# conditional directives that split a declaration', () => {
+    const FILES = {
+        'c.csproj': '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>',
+        'ILog.cs': [
+            'namespace N;',
+            'public interface ILog',
+            '{',
+            '#if FEATURE_DEFAULT',
+            '    private static readonly Logger Default = new Logger();',
+            '#endif',
+            '    ILog With(int x)',
+            '#if FEATURE_DEFAULT',
+            '        => new Logger().With(x)',
+            '#endif',
+            '    ;',
+            '    ILog With(string s)',
+            '#if FEATURE_DEFAULT',
+            '    {',
+            '        return With(s.Length);',
+            '    }',
+            '#else',
+            '        ;',
+            '#endif',
+            '    void Write(int level);',
+            '}',
+        ].join('\n'),
+        'Logger.cs': [
+            'namespace N;',
+            'public class Logger : ILog',
+            '{',
+            '    public ILog With(int x) => this;',
+            '    public ILog With(string s) => this;',
+            '    public void Write(int level) { }',
+            '}',
+        ].join('\n'),
+        'Binder.cs': [
+            'namespace N;',
+            'public class Binder',
+            '{',
+            '#if FEATURE_SPAN',
+            '    public int Bind(System.ReadOnlySpan<object> values)',
+            '#else',
+            '    public int Bind(object[] values)',
+            '#endif',
+            '    {',
+            '        return Count(values.Length);',
+            '    }',
+            '    int Count(int n) => n;',
+            '}',
+        ].join('\n'),
+        'Whole.cs': '#if FEATURE_WHOLE\nnamespace N.Inner;\npublic class Whole { }\n#endif\n',
+    };
+
+    it('reads the declarations of each configuration and keeps rows and namespaces', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const log = index.symbols.get('ILog').find(d => d.type === 'interface');
+            assert.ok(log, 'the interface is indexed');
+            const members = [...index.symbols.values()].flat()
+                .filter(d => d.className === 'ILog' && d.relativePath === 'ILog.cs')
+                .map(d => `${d.name}:${d.startLine}`).sort();
+            assert.deepStrictEqual(members, ['Default:5', 'With:12', 'With:7', 'Write:20']);
+            const binds = index.symbols.get('Bind').map(d => `${d.startLine}:${d.params}`).sort();
+            assert.deepStrictEqual(binds, ['5:System.ReadOnlySpan<object> values', '7:object[] values']);
+            assert.strictEqual(index.symbols.get('Whole')[0].namespace, 'N.Inner');
+            const file = [...index.files.values()].find(f => f.relativePath === 'ILog.cs');
+            assert.ok(!file.parseRecovery, JSON.stringify(file.parseErrorRegions));
+        } finally { rm(dir); }
+    });
+
+    it('queries read the configuration views the index recorded, also from a loaded cache', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const file = [...index.files.values()].find(f => f.relativePath === 'ILog.cs');
+            assert.ok(Array.isArray(file.conditionalViews) && file.conditionalViews.length > 0,
+                JSON.stringify(file.conditionalViews));
+            const answer = ix => {
+                const r = execute(ix, 'usages', { name: 'With' });
+                assert.ok(r.ok, r.error);
+                return JSON.stringify(r.result.map(u => `${u.relativePath || u.file}:${u.line}:${u.usageType || u.type}`).sort());
+            };
+            const fresh = answer(index);
+            assert.ok(fresh.includes('ILog.cs:9:call') && fresh.includes('ILog.cs:15:call'), fresh);
+            index.saveCache();
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loaded.loadCache(), 'cache loads');
+            assert.deepStrictEqual(
+                [...loaded.files.values()].find(f => f.relativePath === 'ILog.cs').conditionalViews,
+                file.conditionalViews);
+            assert.strictEqual(answer(loaded), fresh);
+        } finally { rm(dir); }
+    });
+
+    it('calls inside conditional bodies are calls of their member', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const logger = index.context('Logger', { file: 'Logger.cs', line: 2 });
+            const lines = (logger.callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(lines.includes('ILog.cs:5') && lines.includes('ILog.cs:9'), JSON.stringify(lines));
+            const count = index.context('Count', { file: 'Binder.cs', line: 12 });
+            assert.deepStrictEqual((count.callers || []).map(c => `${c.line}:${c.callerName}`), ['10:Bind']);
+        } finally { rm(dir); }
+    });
+
+    it('explicit interface properties, indexers and events are interface members, never dead', () => {
+        const dir = tmp({
+            'c.csproj': FILES['c.csproj'],
+            'Bag.cs': [
+                'using System.Collections;',
+                'namespace N;',
+                'public class Bag : ICollection',
+                '{',
+                '#if FEATURE_SYNC',
+                '    private object _sync = new object();',
+                '#endif',
+                '    object ICollection.SyncRoot => this;',
+                '    bool ICollection.IsSynchronized => false;',
+                '    int ICollection.Count => 0;',
+                '    void ICollection.CopyTo(System.Array array, int index) { }',
+                '    IEnumerator IEnumerable.GetEnumerator() => null;',
+                '    object IIndexed.this[int i] => null;',
+                '    event System.EventHandler INotify.Changed { add { } remove { } }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const explicit = name => (index.symbols.get(name) || []).map(d => d.explicitInterface);
+            assert.deepStrictEqual(explicit('SyncRoot'), ['ICollection']);
+            assert.deepStrictEqual(explicit('this[]'), ['IIndexed']);
+            assert.deepStrictEqual(explicit('Changed'), ['INotify']);
+            const dead = index.deadcode({ includeExported: true }).map(d => d.name);
+            for (const name of ['SyncRoot', 'IsSynchronized', 'Count', 'this[]', 'Changed']) {
+                assert.ok(!dead.includes(name), `${name} claimed dead: ${JSON.stringify(dead)}`);
+            }
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #391: an argument of unknown type leaves overload resolution open', () => {
+    it('C#: params vs span, generic vs object, explicit type arguments', () => {
+        const dir = tmp({
+            'c.csproj': '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>',
+            'W.cs': [
+                'namespace N;',
+                'public class W',
+                '{',
+                '    public void Write(int level, params object[] values) { }',
+                '    public void Write(int level, System.ReadOnlySpan<object> values) { }',
+                '    public void Use(Holder h)',
+                '    {',
+                '        Write(1, h.Values);',
+                '        Write(1, "a", "b");',
+                '        Write(1, new object[0]);',
+                '    }',
+                '    public static void With(string name, object value) { }',
+                '    public static void With<T>(string name, System.Func<T, bool> pred) { }',
+                '    public void Use2(Holder h)',
+                '    {',
+                '        With("n", h.Value);',
+                '        With<int>("n", p => p > 1);',
+                '        With("n", 3);',
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const sites = line => {
+                const ctx = index.context(line === 4 || line === 5 ? 'Write' : 'With', { file: 'W.cs', line });
+                return {
+                    confirmed: (ctx.callers || []).map(c => c.line),
+                    ambiguous: (ctx.unverifiedCallers || []).filter(c => c.reason === 'overload-ambiguous').map(c => c.line),
+                };
+            };
+            assert.deepStrictEqual(sites(4), { confirmed: [9, 10], ambiguous: [8] });
+            assert.deepStrictEqual(sites(5), { confirmed: [], ambiguous: [8] });
+            assert.deepStrictEqual(sites(12), { confirmed: [18], ambiguous: [16] });
+            assert.deepStrictEqual(sites(13), { confirmed: [17], ambiguous: [16] });
+        } finally { rm(dir); }
+    });
+
+    it('a lambda selects the delegate or functional interface with its parameter count', () => {
+        const dir = tmp({
+            'c.csproj': '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>',
+            'R.cs': [
+                'namespace N;',
+                'public class R',
+                '{',
+                '    public R Add(string key, System.Action<R> configure) => this;',
+                '    public R Add(string key, System.Action<R, int> configure) => this;',
+                '    public void Use(System.Action<R> given)',
+                '    {',
+                '        Add("a", r => { });',
+                '        Add("b", (r, i) => { });',
+                '        Add("c", given);',
+                '        Add("d", delegate { });',
+                '    }',
+                '}',
+            ].join('\n'),
+            'J.java': [
+                'import java.util.function.Consumer;',
+                'import java.util.function.BiConsumer;',
+                'public class J {',
+                '    J on(String k, Consumer<J> c) { return this; }',
+                '    J on(String k, BiConsumer<J, Integer> c) { return this; }',
+                '    void use(Object any) {',
+                '        on("a", j -> {});',
+                '        on("b", (j, i) -> {});',
+                '        on("c", this::sink);',
+                '    }',
+                '    void sink(J j) {}',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const sites = (name, file, line) => {
+                const ctx = index.context(name, { file, line });
+                return {
+                    confirmed: (ctx.callers || []).map(c => c.line),
+                    ambiguous: (ctx.unverifiedCallers || []).filter(c => c.reason === 'overload-ambiguous').map(c => c.line),
+                };
+            };
+            assert.deepStrictEqual(sites('Add', 'R.cs', 4), { confirmed: [8, 10], ambiguous: [11] });
+            assert.deepStrictEqual(sites('Add', 'R.cs', 5), { confirmed: [9], ambiguous: [11] });
+            assert.deepStrictEqual(sites('on', 'J.java', 4), { confirmed: [7], ambiguous: [9] });
+            assert.deepStrictEqual(sites('on', 'J.java', 5), { confirmed: [8], ambiguous: [9] });
+        } finally { rm(dir); }
+    });
+
+    it('C#: the expanded params form loses only on a tie of parameter types', () => {
+        const dir = tmp({
+            'c.csproj': '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>',
+            'F.cs': [
+                'namespace N;',
+                'public class F',
+                '{',
+                '    public void A(object o) { }',
+                '    public void A(params string[] s) { }',
+                '    public void B(string o) { }',
+                '    public void B(params object[] s) { }',
+                '    public void C(object o) { }',
+                '    public void C(params object[] s) { }',
+                '    public void Use()',
+                '    {',
+                '        A("x");',
+                '        B("x");',
+                '        C("x");',
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const confirmed = (name, line) => (index.context(name, { file: 'F.cs', line }).callers || []).map(c => c.line);
+            assert.deepStrictEqual([confirmed('A', 4), confirmed('A', 5)], [[], [12]]);
+            assert.deepStrictEqual([confirmed('B', 6), confirmed('B', 7)], [[13], []]);
+            assert.deepStrictEqual([confirmed('C', 8), confirmed('C', 9)], [[14], []]);
+        } finally { rm(dir); }
+    });
+
+    it('Java: the more specific and the fixed-arity candidate need a provable argument', () => {
+        const dir = tmp({
+            'P.java': [
+                'import com.acme.Remote;',
+                'class P {',
+                '    void f(String s) {}',
+                '    void f(Object o) {}',
+                '    void g(String s, Object... rest) {}',
+                '    void g(String s, int n) {}',
+                '    void use(Remote m) {',
+                '        f(m.get("k"));',
+                '        f("lit");',
+                '        g("a", m.get("n"));',
+                '        g("a", 1);',
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const sites = (name, line) => {
+                const ctx = index.context(name, { file: 'P.java', line });
+                return {
+                    confirmed: (ctx.callers || []).map(c => c.line),
+                    ambiguous: (ctx.unverifiedCallers || []).filter(c => c.reason === 'overload-ambiguous').map(c => c.line),
+                };
+            };
+            assert.deepStrictEqual(sites('f', 3), { confirmed: [9], ambiguous: [8] });
+            assert.deepStrictEqual(sites('f', 4), { confirmed: [], ambiguous: [8] });
+            assert.deepStrictEqual(sites('g', 5), { confirmed: [], ambiguous: [10] });
+            assert.deepStrictEqual(sites('g', 6), { confirmed: [11], ambiguous: [10] });
+        } finally { rm(dir); }
+    });
+
+    it('C#: arguments that fit no overload of the pinned class leave the site visible, not confirmed', () => {
+        const dir = tmp({
+            'c.csproj': '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>',
+            'B.cs': [
+                'namespace N;',
+                'public class Builder { }',
+                'public abstract class Strategy { }',
+                'public static class Ext1',
+                '{',
+                '    public static Builder Add(this Builder b, System.Func<int, Strategy> f) => b;',
+                '    public static Builder Add(this Builder b, System.Func<int, Strategy> f, int x) => b;',
+                '}',
+                'public static class Ext2',
+                '{',
+                '    public static Builder Add(this Builder b, Strategy s) => b;',
+                '}',
+                'public static class Use',
+                '{',
+                '    public static Builder Run(Strategy strategy) => new Builder().Add(strategy);',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const ext1 = index.context('Add', { file: 'B.cs', line: 6 });
+            assert.deepStrictEqual((ext1.callers || []).map(c => c.line), []);
+            assert.deepStrictEqual((ext1.unverifiedCallers || []).map(c => `${c.line}:${c.reason}`), ['15:overload-ambiguous']);
+            const ext2 = index.context('Add', { file: 'B.cs', line: 11 });
+            assert.deepStrictEqual((ext2.callers || []).map(c => c.line), [15]);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #391: C# argument and receiver facts that decide overloads', () => {
+    it('bare field and params arguments are typed, `T?` on a reference type converts, a string is never an Exception', () => {
+        const dir = tmp({
+            'c.csproj': '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>',
+            'L.cs': [
+                'namespace N;',
+                'public class Token { }',
+                'public class L',
+                '{',
+                '    static readonly object[] None = new object[0];',
+                '    public void Write(int level, System.Exception? error, string text, params object?[]? values) { }',
+                '    public void Write(int level, System.Exception? error, string text, System.ReadOnlySpan<object?> values) { }',
+                '    public void Write(int level, string text, params object?[]? values) { }',
+                '    public void Warn(System.Exception? error, string text) { Write(2, error, text, None); }',
+                '    public void Warn(System.Exception? error, string text, params object?[]? values) { Write(2, error, text, values); }',
+                '    public void Info(string text, string more) { Write(1, text, more); }',
+                '    void Check(Token t, Token? other) { }',
+                '    public void Use(Token? item) { Check(item, null); }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const confirmed = (name, line) => (index.context(name, { file: 'L.cs', line }).callers || []).map(c => c.line);
+            assert.deepStrictEqual(confirmed('Write', 6), [9, 10]);
+            assert.deepStrictEqual(confirmed('Write', 7), []);
+            assert.deepStrictEqual(confirmed('Write', 8), [11]);
+            assert.deepStrictEqual(confirmed('Check', 12), [13]);
+        } finally { rm(dir); }
+    });
+
+    it('a member named like a class, typed by an interface, is the member (not the class)', () => {
+        const dir = tmp({
+            'c.csproj': '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>',
+            'I.cs': 'namespace N;\npublic interface ILog { void Write(int level); }\n',
+            'Logger.cs': 'namespace N;\npublic class Logger : ILog { public void Write(int level) { } }\n',
+            'Log.cs': [
+                'namespace N;',
+                'public static class Log',
+                '{',
+                '    public static ILog Logger { get; set; } = new Logger();',
+                '    public static void Write(int level) { Logger.Write(level); }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const ctx = index.context('Write', { file: 'Logger.cs', line: 2 });
+            assert.deepStrictEqual((ctx.callers || []).map(c => c.line), []);
+            assert.deepStrictEqual((ctx.unverifiedCallers || []).map(c => `${c.relativePath}:${c.line}:${c.reason}`),
+                ['Log.cs:5:possible-dispatch']);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #391: a C# generic method fills only the slot of a method with as many type parameters', () => {
+    it('renaming Write<T>(.., T) leaves Write(.., params object[]) and its callers alone', () => {
+        const dir = tmp({
+            'c.csproj': '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>',
+            'I.cs': [
+                'namespace N;',
+                'public interface ILog',
+                '{',
+                '    void Write<T>(int level, T value);',
+                '    void Write(int level, params object[] values);',
+                '}',
+                'public class Log : ILog',
+                '{',
+                '    public void Write<T>(int level, T value) { Write(level, new object[] { value! }); }',
+                '    public void Write(int level, params object[] values) { }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: 'Write', file: 'I.cs', line: 9, renameTo: 'Put' });
+            assert.ok(r.ok, r.error);
+            const edited = r.result.changes.filter(c => c.newExpression !== undefined && !c.needsReview)
+                .map(c => c.line).sort((a, b) => a - b);
+            assert.deepStrictEqual(edited, [4, 9]);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #392: C# using static imports declared members; two same-name calls on one line', () => {
+    const at = entries => (entries || []).map(entry => `${entry.relativePath || entry.file}:${entry.line}`).sort();
+
+    it('C#: a `using static` type supplies the members it declares, never inherited ones', () => {
+        const dir = tmp({
+            'Lib.cs': [
+                'namespace Lib',
+                '{',
+                '    public class Base { public static int Helper() => 1; }',
+                '    public class Derived : Base { public static int Own() => 2; }',
+                '    public class Other { public static int Helper() => 3; }',
+                '}',
+            ].join('\n') + '\n',
+            'Use.cs': [
+                'using static Lib.Derived;',
+                'namespace App',
+                '{',
+                '    public class U',
+                '    {',
+                '        public int F() => Helper() + Own();',
+                '    }',
+                '}',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const base = index.context('Helper', { file: 'Lib.cs', line: 3 });
+            assert.deepStrictEqual(at(base.callers), []);
+            assert.deepStrictEqual(at(base.unverifiedCallers), []);
+            assert.deepStrictEqual(at(index.context('Own', { file: 'Lib.cs', line: 4 }).callers), ['Use.cs:6']);
+            const callees = index.context('F', { file: 'Use.cs' });
+            assert.deepStrictEqual(callees.callees.map(c => c.name), ['Own']);
+            assert.deepStrictEqual((callees.unverifiedCallees || []).map(c => c.name), []);
+        } finally { rm(dir); }
+    });
+
+    it('each same-name call token on a line is decided by its own call node', () => {
+        const dir = tmp({
+            'm.py': [
+                'class A:',
+                '    def run(self, x=None):',
+                '        return 1',
+                '',
+                'class B:',
+                '    def run(self, x=None):',
+                '        return 2',
+                '',
+                'def use():',
+                '    a = A()',
+                '    b = B()',
+                '    return a.run(b.run())',
+            ].join('\n') + '\n',
+            'm.ts': [
+                'class A { run(x?: number) { return 1; } }',
+                'class B { run(x?: number) { return 2; } }',
+                'export function use() {',
+                '  const a = new A();',
+                '  const b = new B();',
+                '  return a.run(b.run());',
+                '}',
+            ].join('\n') + '\n',
+            'P.java': [
+                'class A { int run(int x) { return 1; } }',
+                'class B { int run(int x) { return 2; } }',
+                'class U {',
+                '  int use() {',
+                '    A a = new A();',
+                '    B b = new B();',
+                '    return a.run(b.run(1)) + a.run(2);',
+                '  }',
+                '}',
+            ].join('\n') + '\n',
+            'Cargo.toml': '[package]\nname = "f392"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/lib.rs': [
+                'pub struct A;',
+                'pub struct B;',
+                'impl A { pub fn run(&self, x: i32) -> i32 { x } }',
+                'impl B { pub fn run(&self, x: i32) -> i32 { x } }',
+                'pub fn use_it() -> i32 { let a = A; let b = B; a.run(b.run(1)) + a.run(2) }',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const edit = (handle, file, line) => {
+                const r = execute(index, 'plan', { name: handle, renameTo: 'NEW' });
+                assert.ok(r.ok, r.error);
+                const change = r.result.changes.find(c => c.file === file && c.line === line);
+                assert.ok(change && !change.needsReview, `${handle}: ${JSON.stringify(change)}`);
+                return change.newExpression;
+            };
+            assert.strictEqual(edit('m.py:2:run', 'm.py', 12), 'return a.NEW(b.run())');
+            assert.strictEqual(edit('m.py:6:run', 'm.py', 12), 'return a.run(b.NEW())');
+            assert.strictEqual(edit('m.ts:1:run', 'm.ts', 6), 'return a.NEW(b.run());');
+            assert.strictEqual(edit('P.java:1:run', 'P.java', 7), 'return a.NEW(b.run(1)) + a.NEW(2);');
+            assert.strictEqual(edit('src/lib.rs:3:run', 'src/lib.rs', 5),
+                'pub fn use_it() -> i32 { let a = A; let b = B; a.NEW(b.run(1)) + a.NEW(2) }');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #393: overload families across partial parts, uninferable type arguments, project delegates', () => {
+    const { applyRenamePlan } = require('./helpers');
+    const CSPROJ = '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>';
+    const sitesOf = (index, name, file, line) => {
+        const ctx = index.context(name, { file, line });
+        return {
+            confirmed: (ctx.callers || []).map(c => `${c.relativePath}:${c.line}`).sort(),
+            unverified: (ctx.unverifiedCallers || []).map(c => `${c.relativePath}:${c.line}:${c.reason}`).sort(),
+        };
+    };
+
+    it('C#: a generic overload in another partial part is one family; a type parameter no argument fixes needs type arguments', () => {
+        const dir = tmp({
+            'c.csproj': CSPROJ,
+            'P.Sync.cs': [
+                'namespace N;',
+                'public partial class Pipe',
+                '{',
+                '    public int Run(System.Threading.CancellationToken ct) { return Ctx(ct); }',
+                '    private int Ctx(System.Threading.CancellationToken ct) => Ctx<int>(ct);',
+                '}',
+            ].join('\n'),
+            'P.SyncT.cs': [
+                'namespace N;',
+                'public partial class Pipe',
+                '{',
+                '    public T RunT<T>(System.Threading.CancellationToken ct) { Ctx<T>(ct); return default; }',
+                '    private int Ctx<TResult>(System.Threading.CancellationToken ct) { return 1; }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(sitesOf(index, 'Ctx', 'P.SyncT.cs', 5),
+                { confirmed: ['P.Sync.cs:5', 'P.SyncT.cs:4'], unverified: [] });
+            assert.deepStrictEqual(sitesOf(index, 'Ctx', 'P.Sync.cs', 5),
+                { confirmed: ['P.Sync.cs:4'], unverified: [] });
+            const r = execute(index, 'context', { name: 'Ctx', file: 'P.Sync.cs', line: 5 });
+            const callees = (r.result.callees || []).map(c => `${c.relativePath || c.file}:${c.startLine || c.line}`);
+            assert.deepStrictEqual(callees, ['P.SyncT.cs:5']);
+        } finally { rm(dir); }
+    });
+
+    it('C# delegates and Java functional interfaces the project declares give lambdas their parameter count', () => {
+        const dir = tmp({
+            'c.csproj': CSPROJ,
+            'A.cs': [
+                'namespace P;',
+                'public delegate void Handler(string a, int b);',
+                'public delegate T Maker<T>();',
+                'public class Api',
+                '{',
+                '    public void On(Handler h) { }',
+                '    public void On(System.Action a) { }',
+                '    public void Make(Maker<int> m) { }',
+                '    public void Make(System.Func<int, int> f) { }',
+                '    void Use()',
+                '    {',
+                '        On((a, b) => { });',
+                '        On(() => { });',
+                '        Make(() => 1);',
+                '        Make(x => x);',
+                '    }',
+                '}',
+            ].join('\n'),
+            'j/Api.java': [
+                'package j;',
+                '@FunctionalInterface',
+                'interface Handler { void handle(String a, int b); default void other() { } boolean equals(Object o); }',
+                'interface Sub extends Handler { }',
+                'interface Two { void a(); void b(int x); }',
+                'class Api {',
+                '    void on(Sub h) { }',
+                '    void on(Runnable r) { }',
+                '    void two(Two t) { }',
+                '    void two(Runnable r) { }',
+                '    void use() {',
+                '        on((a, b) -> { });',
+                '        on(() -> { });',
+                '        two(() -> { });',
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(sitesOf(index, 'On', 'A.cs', 6), { confirmed: ['A.cs:12'], unverified: [] });
+            assert.deepStrictEqual(sitesOf(index, 'On', 'A.cs', 7), { confirmed: ['A.cs:13'], unverified: [] });
+            assert.deepStrictEqual(sitesOf(index, 'Make', 'A.cs', 8), { confirmed: ['A.cs:14'], unverified: [] });
+            assert.deepStrictEqual(sitesOf(index, 'Make', 'A.cs', 9), { confirmed: ['A.cs:15'], unverified: [] });
+            assert.deepStrictEqual(sitesOf(index, 'on', 'j/Api.java', 7), { confirmed: ['j/Api.java:12'], unverified: [] });
+            assert.deepStrictEqual(sitesOf(index, 'on', 'j/Api.java', 8), { confirmed: ['j/Api.java:13'], unverified: [] });
+            // Two abstract methods: not a functional interface, so the site stays open.
+            assert.deepStrictEqual(sitesOf(index, 'two', 'j/Api.java', 9).confirmed, []);
+        } finally { rm(dir); }
+    });
+
+    it('C#: sbyte and byte are distinct overload parameter types', () => {
+        const dir = tmp({
+            'c.csproj': CSPROJ,
+            'F.cs': [
+                'namespace P;',
+                'public static class F',
+                '{',
+                '    static void Put(byte value) { }',
+                '    static void Put(sbyte value) { }',
+                '    public static void Use(object value)',
+                '    {',
+                '        if (value is byte b) Put(b);',
+                '        if (value is sbyte sb) Put(sb);',
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const use = index.symbols.get('Use')[0];
+            const callees = index.findCallees(use, { collectAccount: true, includeMethods: true })
+                .map(c => `${c.startLine}:${(c.sites || []).join(',')}`).sort();
+            assert.deepStrictEqual(callees, ['4:8', '5:9']);
+            assert.deepStrictEqual(sitesOf(index, 'Put', 'F.cs', 5), { confirmed: ['F.cs:9'], unverified: [] });
+        } finally { rm(dir); }
+    });
+
+    it('C#: renaming a type leaves an invoked method named like it (Color Color for methods)', () => {
+        const dir = tmp({
+            'c.csproj': CSPROJ,
+            'LogEvent.cs': 'namespace P;\npublic class LogEvent { public LogEvent(int level) { } }\n',
+            'Some.cs': [
+                'namespace P;',
+                'public static class Some',
+                '{',
+                '    public static LogEvent LogEvent(int level) { return new LogEvent(level); }',
+                '    public static LogEvent Info() { return LogEvent(1); }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: 'LogEvent', file: 'LogEvent.cs', line: 2, renameTo: 'Event2' });
+            assert.ok(r.ok, r.error);
+            const { contents } = applyRenamePlan(dir, r.result);
+            assert.match(contents['Some.cs'], /public static Event2 LogEvent\(int level\) \{ return new Event2\(level\); \}/);
+            assert.match(contents['Some.cs'], /public static Event2 Info\(\) \{ return LogEvent\(1\); \}/);
+        } finally { rm(dir); }
+    });
+
+    it('C#: a target-typed new(...) constructs the type its position declares, and a rename needs no edit there', () => {
+        const dir = tmp({
+            'c.csproj': CSPROJ,
+            'H.cs': [
+                'namespace P;',
+                'public record H(int A);',
+                'public class C',
+                '{',
+                '    H M() { return new(1); }',
+                '    H P => new(2);',
+                '    H f = new(3);',
+                '    async System.Threading.Tasks.Task<H> A() { return new(4); }',
+                '    void V() { H x = new(5); var z = new H(6); }',
+                '    System.Func<H> L() => () => new(7);',
+                '    object O() { return new(); }',
+                '}',
+            ].join('\n'),
+            'Reg.cs': 'namespace P;\npublic static class Reg { public static H H { get; set; } }\n',
+        });
+        try {
+            const index = idx(dir);
+            // The construction's callee is the record, never Reg's property named H.
+            const make = index.symbols.get('M').find(d => d.relativePath === 'H.cs');
+            const callees = index.findCallees(make, { collectAccount: true, includeMethods: true })
+                .map(c => `${c.relativePath}:${c.startLine}:${c.type}`);
+            assert.deepStrictEqual(callees, ['H.cs:2:record']);
+            const sites = sitesOf(index, 'H', 'H.cs', 2);
+            assert.deepStrictEqual(sites.confirmed, ['H.cs:5', 'H.cs:6', 'H.cs:7', 'H.cs:8', 'H.cs:9', 'H.cs:9']);
+            const r = execute(index, 'plan', { name: 'H', file: 'H.cs', line: 2, renameTo: 'H2' });
+            assert.ok(r.ok, r.error);
+            assert.ok(!r.result.changes.some(c => c.needsReview && c.editKind === 'call'),
+                JSON.stringify(r.result.changes.filter(c => c.needsReview)));
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// fix #394: internal errors are marked on every surface; type renames of
+// annotated classes with constructors; check against the base declaration
+// (overloads in C#/C++, arity in Go/Rust/Python); declared local types
+// ============================================================================
+
+describe('fix #394: internal errors, constructor renames, check before/after, declared types', () => {
+    const { execFileSync } = require('child_process');
+    const CLI = path.join(PROJECT_DIR, 'cli', 'index.js');
+    const gitInit = (dir) => {
+        execFileSync('git', ['init', '-q'], { cwd: dir });
+        execFileSync('git', ['add', '.'], { cwd: dir });
+        execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init'], { cwd: dir });
+    };
+    const lineSet = (items) => [...new Set(items.map(c => `${c.relativePath}:${c.line}`))].sort();
+    const tiers = (index, name, def) => {
+        const r = index.findCallers(name, { includeMethods: true, targetDefinitions: [def], collectAccount: true });
+        return {
+            confirmed: lineSet(r.filter(c => c.tier !== 'unverified')),
+            unverified: lineSet([...r.filter(c => c.tier === 'unverified'), ...(r.unverifiedEntries || [])]),
+            excluded: r.accountRaw.excludedEntries.map(e => `${path.relative(index.root, e.file)}:${e.line}`).sort(),
+        };
+    };
+    // Loaded with --require: makes every plan throw the way an engine defect does.
+    const faultInjector = (dir) => {
+        const file = path.join(dir, 'inject-fault.js');
+        fs.writeFileSync(file, `const { ProjectIndex } = require(${JSON.stringify(path.join(PROJECT_DIR, 'core', 'project.js'))});\n` +
+            'ProjectIndex.prototype.plan = function () { return null.verdict; };\n');
+        return file;
+    };
+    const run = (args, env = {}) => {
+        try {
+            const stdout = execFileSync('node', [CLI, ...args], {
+                encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, ...env },
+            });
+            return { code: 0, stdout, stderr: '' };
+        } catch (e) {
+            return { code: e.status, stdout: e.stdout || '', stderr: e.stderr || '' };
+        }
+    };
+
+    it('an engine exception is an internal error on CLI text, CLI JSON, interactive and MCP; a refusal is not', async () => {
+        const dir = tmp({ 'package.json': '{}', 'lib.js': 'function alpha() { return 1; }\nmodule.exports = { alpha };\n' });
+        const env = { NODE_OPTIONS: `--require ${faultInjector(dir)}` };
+        let client;
+        try {
+            const text = run([dir, 'plan', 'alpha', '--rename-to=beta'], env);
+            assert.strictEqual(text.code, 2);
+            assert.match(text.stderr, /^Internal error: Cannot read properties of null \(reading 'verdict'\) \(a defect in UCN/m);
+            const json = run([dir, 'plan', 'alpha', '--rename-to=beta', '--json'], env);
+            assert.strictEqual(json.code, 1);
+            const envelope = JSON.parse(json.stdout);
+            assert.strictEqual(envelope.meta.ok, false);
+            assert.strictEqual(envelope.meta.internalError, true);
+            assert.match(envelope.error, /^Internal error: /);
+            const refusal = run([dir, 'show', 'nosuchsymbol', '--json'], env);
+            assert.strictEqual(refusal.code, 1);
+            const refused = JSON.parse(refusal.stdout);
+            assert.strictEqual(refused.meta.ok, false);
+            assert.strictEqual(refused.meta.internalError, undefined);
+            assert.doesNotMatch(refused.error, /Internal error/);
+            const interactive = execFileSync('node', [CLI, '--interactive', dir], {
+                input: 'plan alpha --rename-to=beta\nquit\n', encoding: 'utf-8',
+                env: { ...process.env, ...env }, stdio: ['pipe', 'pipe', 'pipe'],
+            });
+            assert.match(interactive, /Internal error: Cannot read properties of null/);
+
+            const { McpClient } = require('./helpers');
+            const saved = process.env.NODE_OPTIONS;
+            process.env.NODE_OPTIONS = env.NODE_OPTIONS;
+            try {
+                client = new McpClient();
+                await client.start();
+            } finally {
+                if (saved === undefined) delete process.env.NODE_OPTIONS;
+                else process.env.NODE_OPTIONS = saved;
+            }
+            await client.initialize();
+            const res = await client.callTool('ucn', { command: 'plan', project_dir: dir, name: 'alpha', rename_to: 'beta' });
+            assert.strictEqual(res.result?.isError, true);
+            assert.match(res.result.content[0].text, /^Internal error: Cannot read properties of null/);
+            const missing = await client.callTool('ucn', { command: 'show', project_dir: dir, name: 'nosuchsymbol' });
+            assert.strictEqual(missing.result?.isError, true);
+            assert.match(missing.result.content[0].text, /^Error: /);
+        } finally {
+            if (client) client.stop();
+            rm(dir);
+        }
+    });
+
+    it('execute() marks a handler exception internal and keeps deliberate refusals plain', () => {
+        const dir = tmp({ 'package.json': '{}', 'lib.js': 'function alpha() { return 1; }\n' });
+        try {
+            const index = idx(dir);
+            const broken = Object.create(index);
+            broken.plan = () => { throw new TypeError('boom'); };
+            const crash = execute(broken, 'plan', { name: 'alpha', renameTo: 'beta' });
+            assert.strictEqual(crash.ok, false);
+            assert.strictEqual(crash.internalError, true);
+            assert.match(crash.error, /^Internal error: boom/);
+            const regex = execute(index, 'search', { term: '(a', regex: true });
+            assert.strictEqual(regex.ok, false);
+            assert.strictEqual(regex.internalError, undefined);
+        } finally { rm(dir); }
+    });
+
+    it('type renames of attributed C# classes and nested C++ structs edit their constructors', () => {
+        const dir = tmp({
+            'A.cs': 'namespace M;\n\n[System.Obsolete]\npublic class Basic {\n\n    public Basic() {\n    }\n    ~Basic() {\n    }\n}\n\npublic class Use {\n    public object Make() => new Basic();\n}\n',
+            's.h': [
+                '#pragma once',
+                'template <typename T>',
+                'class Schema {',
+                ' public:',
+                '  struct Property {',
+                '    Property() : required(false) {}',
+                '    ~Property() {}',
+                '    bool required;',
+                '  };',
+                '  void Clear(Property* p) { p->~Property(); }',
+                '  Property Make() { return Property(); }',
+                '};',
+            ].join('\n') + '\n',
+            // A C++ source makes the project's headers C++.
+            'm.cpp': '#include "s.h"\nint main() { Schema<int> s; s.Make(); return 0; }\n',
+        });
+        try {
+            const index = idx(dir);
+            const cs = execute(index, 'plan', { name: 'Basic', file: 'A.cs', line: 4, renameTo: 'Plain' });
+            assert.ok(cs.ok, cs.error);
+            assert.deepStrictEqual(cs.result.changes.map(c => c.line).sort((a, b) => a - b), [4, 6, 8, 13]);
+            const cpp = execute(index, 'plan', { name: 'Property', file: 's.h', line: 5, renameTo: 'Prop' });
+            assert.ok(cpp.ok, cpp.error);
+            assert.deepStrictEqual(cpp.result.changes.map(c => c.line).sort((a, b) => a - b), [5, 6, 7, 10, 11]);
+        } finally { rm(dir); }
+    });
+
+    it('check: C# and C++ callers of a changed overload are mismatches', () => {
+        const dir = tmp({
+            'Ext.cs': [
+                'namespace N;',
+                'public interface IB<T> { }',
+                'public static class Ext {',
+                '    public static IB<T> Length<T>(this IB<T> b, int min, int max) => b;',
+                '    public static IB<T> Length<T>(this IB<T> b, int exact) => b;',
+                '}',
+                'public class Use {',
+                '    public void Run(IB<string> b) {',
+                '        b.Length(1, 2);',
+                '        b.Length(3);',
+                '    }',
+                '}',
+            ].join('\n') + '\n',
+            'u.h': '#pragma once\nnamespace u {\nint size(const char* s);\nint size(int n, int m);\n}\n',
+            'u.cc': '#include "u.h"\nnamespace u {\nint size(const char* s) { return s ? 1 : 0; }\nint size(int n, int m) { return n + m; }\n}\n',
+            'm.cc': '#include "u.h"\nint main() { return u::size("abc") + u::size(1, 2); }\n',
+        });
+        try {
+            gitInit(dir);
+            const ext = path.join(dir, 'Ext.cs');
+            fs.writeFileSync(ext, fs.readFileSync(ext, 'utf-8').replace('int min, int max)', 'int min, int max, bool strict)'));
+            for (const file of ['u.h', 'u.cc']) {
+                const p = path.join(dir, file);
+                fs.writeFileSync(p, fs.readFileSync(p, 'utf-8').replace('int size(const char* s)', 'int size(const char* s, bool strict)'));
+            }
+            const index = idx(dir);
+            const cs = execute(index, 'check', { name: 'Length', file: 'Ext.cs', line: 4 });
+            assert.ok(cs.ok, cs.error);
+            assert.deepStrictEqual(cs.result.mismatchDetails.map(m => `${m.file}:${m.line}`), ['Ext.cs:9']);
+            const cpp = execute(index, 'check', { name: 'size', file: 'u.cc', line: 3 });
+            assert.ok(cpp.ok, cpp.error);
+            assert.deepStrictEqual(cpp.result.mismatchDetails.map(m => `${m.file}:${m.line}`), ['m.cc:2']);
+            const diff = execute(index, 'check', {});
+            assert.ok(diff.ok, diff.error);
+            const text = output.formatPublicText('check', diff.result, {}, diff);
+            assert.match(text, /TRUST: BLOCKED/);
+        } finally { rm(dir); }
+    });
+
+    it('check: arity changes without overloads (Go, Rust, Python) stay mismatches', () => {
+        const dir = tmp({
+            'go.mod': 'module ex\ngo 1.21\n',
+            'a.go': 'package main\n\ntype Other struct{}\n\nfunc (Other) Process(a, b int) int { return a + b }\n\nfunc Process(a, b int) int { return a * b }\n\nfunc main() {\n\t_ = Process(1, 2)\n\t_ = Other{}.Process(3, 4)\n}\n',
+            'Cargo.toml': '[package]\nname = "ex"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/main.rs': 'struct Other;\nimpl Other { fn process(&self, a: i32, b: i32) -> i32 { a + b } }\nfn process(a: i32, b: i32) -> i32 { a * b }\nfn main() {\n    let _ = process(1, 2);\n    let _ = Other.process(3, 4);\n}\n',
+            'p.py': 'def handle(a, b=1):\n    return a\n\ndef main():\n    return handle(1)\n',
+        });
+        try {
+            gitInit(dir);
+            const edit = (file, from, to) => {
+                const p = path.join(dir, file);
+                fs.writeFileSync(p, fs.readFileSync(p, 'utf-8').replace(from, to));
+            };
+            edit('a.go', 'func Process(a, b int) int { return a * b }', 'func Process(a int) int { return a }');
+            edit('src/main.rs', 'fn process(a: i32, b: i32) -> i32 { a * b }', 'fn process(a: i32) -> i32 { a }');
+            edit('p.py', 'def handle(a, b=1):', 'def handle(a, b):');
+            const index = idx(dir);
+            for (const [name, file, line, site] of [['Process', 'a.go', 7, 'a.go:10'],
+                ['process', 'src/main.rs', 3, 'src/main.rs:5'], ['handle', 'p.py', 1, 'p.py:5']]) {
+                const check = execute(index, 'check', { name, file, line });
+                assert.ok(check.ok, check.error);
+                assert.deepStrictEqual(check.result.mismatchDetails.map(m => `${m.file}:${m.line}`), [site], name);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('C#: an extension method called on its receiver counts the receiver as its this argument', () => {
+        const dir = tmp({
+            'Ext.cs': [
+                'namespace N;',
+                'public interface IB<T> { }',
+                'public static class Ext {',
+                '    public static IB<T> Length<T>(this IB<T> b, int min, int max) => b;',
+                '}',
+                'public class Use {',
+                '    public void Run(IB<string> b) {',
+                '        b.Length(1, 2);',
+                '        Ext.Length(b, 4, 5);',
+                '    }',
+                '}',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const check = execute(index, 'check', { name: 'Length', file: 'Ext.cs', line: 4 });
+            assert.ok(check.ok, check.error);
+            assert.strictEqual(check.result.mismatches, 0);
+            assert.strictEqual(check.result.valid, 2);
+        } finally { rm(dir); }
+    });
+
+    it('C#: the declared type of a local is its static receiver type', () => {
+        const dir = tmp({
+            'A.cs': [
+                'namespace Acme;',
+                'public interface IShape { double Area(); }',
+                'public class Square : IShape { public double Area() => 1; }',
+                'public class Program {',
+                '    public static void Main() {',
+                '        IShape s = new Square();',
+                '        s.Area();',
+                '        var q = new Square();',
+                '        q.Area();',
+                '    }',
+                '    public static void Blocks(int k) {',
+                '        if (k > 0) { IShape b = new Square(); b.Area(); }',
+                '        else { IShape b = new Square(); b.Area(); }',
+                '        if (k > 1) { IShape c = new Square(); c.Area(); }',
+                '        else { IShape c = new Circle(); c.Area(); }',
+                '    }',
+                '}',
+                'public class Circle : IShape { public double Area() => 3; }',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const defs = index.symbols.get('Area');
+            assert.deepStrictEqual(tiers(index, 'Area', defs.find(d => d.className === 'IShape')).confirmed,
+                ['A.cs:12', 'A.cs:13', 'A.cs:14', 'A.cs:15', 'A.cs:7']);
+            // A local never assigned (every declaration of the name holding
+            // the same constructed type) runs Square.Area; `c` holds either.
+            const square = tiers(index, 'Area', defs.find(d => d.className === 'Square'));
+            assert.deepStrictEqual(square.confirmed, ['A.cs:12', 'A.cs:13', 'A.cs:7', 'A.cs:9']);
+            assert.deepStrictEqual(square.unverified, ['A.cs:14', 'A.cs:15']);
+        } finally { rm(dir); }
+    });
+});
+
+// fix #395: C# name lookup and member identity - using directives resolved
+// from the namespace they sit in (spec 14.5), nested namespace blocks, object
+// initializer members, nested types of other classes, extension methods
+// against instance members and type arguments, method groups, local
+// functions, project-file static usings, explicit interface
+// implementations, audit-async member calls, static member paths from a type.
+describe('fix #395: C# name lookup, method groups and member identity', () => {
+    const { execFileSync } = require('child_process');
+    const { applyRenamePlan } = require('./helpers');
+    const lineSet = (items) => [...new Set(items.map(c => `${c.relativePath}:${c.line}`))].sort();
+    const tiers = (index, name, def) => {
+        const r = index.findCallers(name, { includeMethods: true, targetDefinitions: [def], collectAccount: true });
+        return {
+            confirmed: lineSet(r.filter(c => c.tier !== 'unverified')),
+            unverified: lineSet([...r.filter(c => c.tier === 'unverified'), ...(r.unverifiedEntries || [])]),
+            excluded: r.accountRaw.excludedEntries.map(e => `${path.relative(index.root, e.file)}:${e.line}`).sort(),
+        };
+    };
+    const defOf = (index, name, file, line) =>
+        index.symbols.get(name).find(d => d.relativePath === file && d.startLine === line);
+    const planOf = (index, name, file, line, renameTo) => {
+        const r = execute(index, 'plan', { name, file, line, renameTo });
+        assert.ok(r.ok, r.error);
+        return r.result;
+    };
+
+    it('a using directive inside a namespace resolves from that namespace outward (block, file-scoped, alias, static)', () => {
+        const dir = tmp({
+            'Lib.cs': 'namespace Acme.Internal;\npublic static class Cache {\n    public static void Clear() { }\n}\n' +
+                'public static class Util {\n    public static int Twice(int x) => x * 2;\n}\n',
+            'Other.cs': 'namespace Internal;\npublic static class Cache {\n    public static void Clear() { }\n}\n',
+            'Test.cs': 'namespace Acme.Tests;\n\nusing Internal;\nusing static Internal.Util;\nusing C = Internal.Cache;\n\n' +
+                'public class CacheTests {\n    public CacheTests() {\n        Cache.Clear();\n        C.Clear();\n        Twice(2);\n    }\n}\n',
+            'Block.cs': 'namespace Acme {\n    namespace Tests2 {\n        using Internal;\n        public class T2 {\n' +
+                '            public void Run() { Cache.Clear(); }\n        }\n    }\n}\n',
+            'Global.cs': 'using Internal;\nnamespace Zed;\npublic class G {\n    public void Run() { Cache.Clear(); }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            // Acme.Tests: `Internal` is Acme.Internal (the enclosing namespace
+            // declares it), never the global Internal namespace.
+            const acme = tiers(index, 'Clear', defOf(index, 'Clear', 'Lib.cs', 3));
+            assert.deepStrictEqual(acme.confirmed, ['Block.cs:5', 'Test.cs:10', 'Test.cs:9']);
+            assert.ok(!acme.confirmed.includes('Global.cs:4'));
+            const global = tiers(index, 'Clear', defOf(index, 'Clear', 'Other.cs', 3));
+            assert.deepStrictEqual(global.confirmed, ['Global.cs:4']);
+            assert.deepStrictEqual(tiers(index, 'Twice', defOf(index, 'Twice', 'Lib.cs', 6)).confirmed, ['Test.cs:11']);
+            const imports = index.files.get(path.join(dir, 'Test.cs')).importDetails;
+            assert.ok(imports.some(d => d.module === 'Internal' && d.namespace === 'Acme.Tests' && !d.static));
+            assert.ok(imports.some(d => d.module === 'Internal.Util' && d.static));
+            // A type rename reaches the constructor calls behind a relative using.
+            const typeDir = tmp({
+                'Results/Failure.cs': 'namespace Val.Results;\npublic class Failure {\n    public Failure(string m) { }\n}\n',
+                'Rule.cs': 'namespace Val;\n\nusing Results;\n\npublic class Rule {\n    public Failure Make() => new Failure("x");\n}\n',
+            });
+            try {
+                const typeIndex = idx(typeDir);
+                const { contents } = applyRenamePlan(typeDir, planOf(typeIndex, 'Failure', 'Results/Failure.cs', 2, 'Fault'));
+                assert.match(contents['Rule.cs'], /public Fault Make\(\) => new Fault\("x"\);/);
+            } finally { rm(typeDir); }
+        } finally { rm(dir); }
+    });
+
+    it('nested namespace blocks name their members by the full path, so overrides in them join the slot', () => {
+        const dir = tmp({
+            'Base.cs': 'namespace Acme.Tests\n{\n    public abstract class SpecBase\n    {\n        protected virtual int Create() => 0;\n' +
+                '        public int Run() => Create();\n    }\n}\n',
+            'Nested.cs': 'namespace Acme.Tests\n{\n    namespace Scanning\n    {\n        public class ByType : SpecBase\n        {\n' +
+                '            protected override int Create() => 1;\n        }\n    }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.strictEqual(index.symbols.get('ByType')[0].namespace, 'Acme.Tests.Scanning');
+            const { contents } = applyRenamePlan(dir, planOf(index, 'Create', 'Base.cs', 5, 'Build'));
+            assert.match(contents['Nested.cs'] || '', /protected override int Build\(\) => 1;/);
+        } finally { rm(dir); }
+    });
+
+    it('a type rename leaves object-initializer members named like the type', () => {
+        const files = {
+            'A.cs': 'namespace Acme;\npublic class Country { }\npublic class Home { public Country Country { get; set; } }\n' +
+                'public class Address { public Country Country { get; set; } public Home Home { get; } = new Home(); }\n' +
+                'public class Program {\n    public static Address Make() {\n        var a = new Address { Country = new Country() };\n' +
+                '        Address b = new() { Country = new Country(), Home = { Country = new Country() } };\n' +
+                '        var list = new System.Collections.Generic.List<Country> { new Country() };\n        return a;\n    }\n}\n',
+        };
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const { contents, reviews } = applyRenamePlan(dir, planOf(index, 'Country', 'A.cs', 2, 'Nation'));
+            assert.deepStrictEqual(reviews, []);
+            const lines = contents['A.cs'].split('\n');
+            assert.strictEqual(lines[6].trim(), 'var a = new Address { Country = new Nation() };');
+            assert.strictEqual(lines[7].trim(), 'Address b = new() { Country = new Nation(), Home = { Country = new Nation() } };');
+            assert.strictEqual(lines[8].trim(), 'var list = new System.Collections.Generic.List<Nation> { new Nation() };');
+            assert.strictEqual(lines[2], 'public class Home { public Nation Country { get; set; } }');
+        } finally { rm(dir); }
+    });
+
+    it('same-name nested types of different outer classes are two types; #if alternatives of one nested type stay one', () => {
+        const dir = tmp({
+            'A.cs': 'namespace Acme;\npublic class TestA {\n    class Destination { public string Name { get; set; } }\n' +
+                '    public object Make() => new Destination();\n}\npublic class TestB {\n' +
+                '    public record Destination(int Id) { public Destination(long x) : this(1) { } }\n' +
+                '    public object Make() => new Destination(2L);\n}\n',
+            'C.cs': 'namespace Acme;\npublic class Outer {\n#if FAST\n    public int Run() => 1;\n#else\n    public int Run() => 2;\n#endif\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const { contents } = applyRenamePlan(dir, planOf(index, 'Destination', 'A.cs', 3, 'Dest'));
+            const lines = contents['A.cs'].split('\n');
+            assert.match(lines[2], /class Dest \{/);
+            assert.match(lines[3], /new Dest\(\)/);
+            assert.match(lines[6], /public record Destination\(int Id\) \{ public Destination\(long x\)/);
+            assert.match(lines[7], /new Destination\(2L\)/);
+            const alt = applyRenamePlan(dir, planOf(index, 'Run', 'C.cs', 4, 'Go'));
+            assert.match(alt.contents['C.cs'], /public int Go\(\) => 1;[\s\S]*public int Go\(\) => 2;/);
+        } finally { rm(dir); }
+    });
+
+    it('an extension method never takes calls an instance member of the receiver owns or whose type arguments do not fit', () => {
+        const dir = tmp({
+            'Ext.cs': 'using System;\nusing System.Collections.Generic;\nusing System.Linq.Expressions;\n\nnamespace M;\n\n' +
+                'public class Transformer { }\npublic class Special : Transformer { }\n\npublic static class TransformerExtensions {\n' +
+                '    public static void Add<TValue>(this List<Transformer> list, Expression<Func<TValue, TValue>> f) =>\n' +
+                '        list.Add(new Transformer());\n' +
+                '    public static int Count2(this IEnumerable<Transformer> xs) => 0;\n}\n',
+            'Use.cs': 'using System;\nusing System.Collections.Generic;\n\nnamespace M;\n\npublic class Holder {\n' +
+                '    private readonly List<string> _names = new();\n    public List<Exception> Errors { get; } = new();\n' +
+                '    private readonly List<Transformer> _ts = new();\n\n    public void Run() {\n        _names.Add("a");\n' +
+                '        Errors.Add(new Exception());\n        var local = new List<int>();\n        local.Add(1);\n' +
+                '        _ts.Add<int>(x => x + 1);\n        _ts.Add(new Transformer());\n        var sp = new List<Special>();\n' +
+                '        sp.Count2();\n        local.Count2();\n    }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const add = tiers(index, 'Add', index.symbols.get('Add').find(d => d.isExtensionMethod));
+            // List<T>.Add(T) owns `_ts.Add(new Transformer())` and the
+            // extension's own recursive call; the other lists' element
+            // types never convert to Transformer; `Add<int>(lambda)` has
+            // explicit type arguments no instance Add takes.
+            assert.deepStrictEqual(add.confirmed, ['Use.cs:16']);
+            assert.deepStrictEqual(add.excluded, ['Ext.cs:12', 'Use.cs:12', 'Use.cs:13', 'Use.cs:15', 'Use.cs:17']);
+            // IEnumerable<out T> is covariant: a List<Special> takes it; a List<int> never does.
+            const count = tiers(index, 'Count2', index.symbols.get('Count2')[0]);
+            assert.deepStrictEqual(count.confirmed, ['Use.cs:19']);
+            assert.deepStrictEqual(count.excluded, ['Use.cs:20']);
+        } finally { rm(dir); }
+    });
+
+    it('plan renames method groups by simple-name lookup: delegates, events, LINQ, target-typed new, this/base, type-qualified', () => {
+        const files = {
+            'A.cs': 'using System;\nusing System.Collections.Generic;\nusing System.Linq;\n\nnamespace Acme;\n\n' +
+                'public class Cache {\n    public Cache(Func<int, string> factory, int size) { }\n}\n\npublic class Host {\n' +
+                '    private readonly Cache _a;\n    public event EventHandler Changed;\n\n    public Host() {\n' +
+                '        _a = new(Build, 4);\n        Changed += OnChanged;\n        var xs = new List<int> { 1 }.Select(Build).ToList();\n' +
+                '        Func<int, string> f = Build;\n        Func<int, string> g = this.Build;\n        var n = nameof(Build);\n' +
+                '        Func<int, string> s = Host.Make;\n    }\n\n    protected virtual string Build(int k) => k.ToString();\n' +
+                '    public static string Make(int k) => "";\n    private void OnChanged(object sender, EventArgs e) { }\n\n' +
+                '    public void Shadow(Func<int, string> Build) {\n        Func<int, string> f = Build;\n    }\n}\n\n' +
+                'public class Other {\n    public string Build { get; set; }\n    public void Use() { var b = Build; }\n}\n',
+            'B.cs': 'using System;\n\nnamespace Acme.Sub;\n\npublic class Derived : Acme.Host {\n' +
+                '    protected override string Build(int k) => "d";\n    public void Go() {\n        Func<int, string> f = base.Build;\n' +
+                '        Func<int, string> g = Build;\n    }\n}\n',
+        };
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const { contents, reviews } = applyRenamePlan(dir, planOf(index, 'Build', 'A.cs', 25, 'Compose'));
+            assert.deepStrictEqual(reviews, []);
+            const a = contents['A.cs'].split('\n');
+            for (const [row, text] of [[15, '_a = new(Compose, 4);'], [17, 'var xs = new List<int> { 1 }.Select(Compose).ToList();'],
+                [18, 'Func<int, string> f = Compose;'], [19, 'Func<int, string> g = this.Compose;'],
+                [20, 'var n = nameof(Compose);'], [24, 'protected virtual string Compose(int k) => k.ToString();'],
+                [29, 'Func<int, string> f = Build;'], [35, 'public void Use() { var b = Build; }']]) {
+                assert.strictEqual(a[row].trim(), text, `A.cs:${row + 1}`);
+            }
+            const b = contents['B.cs'].split('\n');
+            assert.strictEqual(b[7].trim(), 'Func<int, string> f = base.Compose;');
+            assert.strictEqual(b[8].trim(), 'Func<int, string> g = Compose;');
+            const events = applyRenamePlan(dir, planOf(index, 'OnChanged', 'A.cs', 27, 'OnChange'));
+            assert.strictEqual(events.contents['A.cs'].split('\n')[16].trim(), 'Changed += OnChange;');
+            const make = applyRenamePlan(dir, planOf(index, 'Make', 'A.cs', 26, 'Produce'));
+            assert.strictEqual(make.contents['A.cs'].split('\n')[21].trim(), 'Func<int, string> s = Host.Produce;');
+        } finally { rm(dir); }
+    });
+
+    it('a method group of overloads is a review item; a local function is renamed only in its block', () => {
+        const dir = tmp({
+            'A.cs': 'using System;\n\nnamespace Acme;\n\npublic interface IProfile { int[] Items { get; } }\n\npublic class Map {\n' +
+                '    private int _n;\n    public string Over(int k) => "";\n    public string Over(string s) => s;\n\n' +
+                '    public Map(IProfile profile) {\n        Items();\n        Func<int, string> o = Over;\n        return;\n' +
+                '        void Items() { _n = profile.Items.Length; }\n    }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const local = planOf(index, 'Items', 'A.cs', 16, 'Load');
+            const { contents } = applyRenamePlan(dir, local);
+            const lines = contents['A.cs'].split('\n');
+            assert.strictEqual(lines[12].trim(), 'Load();');
+            assert.strictEqual(lines[15].trim(), 'void Load() { _n = profile.Items.Length; }');
+            const over = applyRenamePlan(dir, planOf(index, 'Over', 'A.cs', 9, 'Pick'));
+            assert.deepStrictEqual(over.reviews, ['A.cs:14']);
+        } finally { rm(dir); }
+    });
+
+    it('a local function declared inside another local function is indexed and called', () => {
+        const dir = tmp({
+            'A.cs': 'namespace Acme;\npublic class M {\n    public int Map() {\n        return Core();\n' +
+                '        int Core() {\n            return Inner();\n            int Inner() => 1;\n        }\n    }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const inner = index.symbols.get('Inner');
+            assert.strictEqual(inner?.length, 1);
+            assert.deepStrictEqual(tiers(index, 'Inner', inner[0]).confirmed, ['A.cs:6']);
+        } finally { rm(dir); }
+    });
+
+    it('a call to a local function is its enclosing method\'s callee, before a class member of the name', () => {
+        const dir = tmp({
+            'A.cs': 'namespace Acme;\npublic class M {\n    public int Map(int x) {\n        var y = x switch {\n' +
+                '            0 => Fail(),\n            _ => x,\n        };\n        return y;\n        int Fail() => -1;\n    }\n' +
+                '    public int Other() => Fail();\n    private int Fail() => -2;\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const map = index.symbols.get('Map')[0];
+            const mapCallees = index.findCallees(map, { collectAccount: true });
+            assert.deepStrictEqual(mapCallees.map(c => `${c.name}:${c.startLine}`), ['Fail:9']);
+            const other = index.symbols.get('Other')[0];
+            assert.deepStrictEqual(index.findCallees(other).map(c => `${c.name}:${c.startLine}`), ['Fail:12']);
+        } finally { rm(dir); }
+    });
+
+    it('project-file static usings supply bare calls; ancestor Directory.Build.props usings reach a sub-project index', () => {
+        const dir = tmp({
+            'Directory.Build.props': '<Project>\n  <ItemGroup>\n    <Using Include="Acme.Internal" />\n  </ItemGroup>\n</Project>\n',
+            'src/App/App.csproj': '<Project Sdk="Microsoft.NET.Sdk">\n  <ItemGroup>\n' +
+                '    <Using Include="Acme.Execution.ExpressionBuilder" Static="true"/>\n  </ItemGroup>\n</Project>\n',
+            'src/App/Builder.cs': 'namespace Acme.Execution;\npublic static class ExpressionBuilder {\n    public static int ToType(int e, string t) => e;\n}\n',
+            'src/App/Ext.cs': 'namespace Acme.Internal;\npublic static class TypeExtensions {\n    public static bool IsBig(this string s) => s.Length > 3;\n}\n',
+            'src/App/Use.cs': 'namespace Acme.Planning;\npublic class Planner {\n    public int Plan(int x) => ToType(x, "int");\n' +
+                '    public bool Big(string s) => s.IsBig();\n}\n',
+        });
+        try {
+            execFileSync('git', ['init', '-q'], { cwd: dir });
+            const index = idx(dir);
+            assert.deepStrictEqual(tiers(index, 'ToType', index.symbols.get('ToType')[0]).confirmed, ['src/App/Use.cs:3']);
+            // Indexed from the sub-project, the repository's usings still apply.
+            const sub = idx(path.join(dir, 'src', 'App'));
+            assert.deepStrictEqual(tiers(sub, 'IsBig', sub.symbols.get('IsBig')[0]).confirmed, ['Use.cs:4']);
+            assert.deepStrictEqual(tiers(sub, 'ToType', sub.symbols.get('ToType')[0]).confirmed, ['Use.cs:3']);
+        } finally { rm(dir); }
+    });
+
+    it('an explicit interface implementation is never the target of a simple-name call', () => {
+        const dir = tmp({
+            'A.cs': 'using System.Collections;\nusing System.Collections.Generic;\n\nnamespace Acme;\n\n' +
+                'public class Bag<T> : IEnumerable<T> {\n    private readonly List<T> _items = new();\n' +
+                '    public IEnumerator<T> GetEnumerator() => _items.GetEnumerator();\n\n' +
+                '    IEnumerator IEnumerable.GetEnumerator() {\n        return GetEnumerator();\n    }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const defs = index.symbols.get('GetEnumerator');
+            const explicit = tiers(index, 'GetEnumerator', defs.find(d => d.explicitInterface));
+            assert.deepStrictEqual(explicit.confirmed, []);
+            assert.ok(explicit.excluded.includes('A.cs:11'));
+            assert.deepStrictEqual(tiers(index, 'GetEnumerator', defs.find(d => !d.explicitInterface)).confirmed, ['A.cs:11']);
+        } finally { rm(dir); }
+    });
+
+    it('an explicit implementation is reached through an interface-typed receiver by dispatch only', () => {
+        const dir = tmp({
+            'A.cs': 'namespace Acme;\npublic interface ISink { void Emit(int e); }\n' +
+                'public sealed class Logger : ISink {\n    void ISink.Emit(int e) { }\n}\n' +
+                'public sealed class Filter : ISink {\n    private readonly ISink _sink;\n' +
+                '    public Filter(ISink sink) { _sink = sink; }\n    public void Emit(int e) { _sink.Emit(e); }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const explicit = tiers(index, 'Emit', index.symbols.get('Emit').find(d => d.explicitInterface));
+            assert.deepStrictEqual(explicit.confirmed, []);
+            assert.deepStrictEqual(explicit.unverified, ['A.cs:9']);
+        } finally { rm(dir); }
+    });
+
+    it('an explicit interface implementation and a same-name protected virtual are two rename slots', () => {
+        const dir = tmp({
+            'I.cs': 'namespace Acme;\npublic interface IValidator { string Template(string code); }\n',
+            'P.cs': 'namespace Acme;\npublic abstract class PropertyValidator : IValidator {\n' +
+                '    string IValidator.Template(string code) => Template(code);\n' +
+                '    protected virtual string Template(string code) => "";\n}\n' +
+                'public class EnumValidator : PropertyValidator {\n' +
+                '    protected override string Template(string code) => "e";\n}\n',
+            'A.cs': 'namespace Acme;\npublic abstract class AsyncValidator : IValidator {\n' +
+                '    string IValidator.Template(string code) => Template(code);\n' +
+                '    protected virtual string Template(string code) => "";\n}\n' +
+                'public class Plain : IValidator {\n    public string Template(string code) => code;\n}\n' +
+                'public class Use {\n    public string Run(IValidator v) => v.Template("x");\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const edits = (file, line) => {
+                const plan = planOf(index, 'Template', file, line, 'Shape');
+                return plan.changes.filter(c => c.newExpression !== undefined).map(c => `${c.file}:${c.line}`).sort();
+            };
+            // The protected virtual chain: its base, overrides and the call
+            // inside the explicit shim; never the interface slot.
+            assert.deepStrictEqual(edits('P.cs', 7), ['P.cs:3', 'P.cs:4', 'P.cs:7']);
+            // The interface slot: the member, both explicit implementations,
+            // the public implicit one and the interface-typed call.
+            assert.deepStrictEqual(edits('I.cs', 2), ['A.cs:10', 'A.cs:3', 'A.cs:7', 'I.cs:2', 'P.cs:3']);
+        } finally { rm(dir); }
+    });
+
+    it('a bare value named like a type is never the type (a property named like its type)', () => {
+        const dir = tmp({
+            'A.cs': 'namespace Acme;\npublic readonly record struct MemberPath(int[] Members);\n' +
+                'public class Map {\n    public MemberPath MemberPath { get; } = new(new int[0]);\n' +
+                '    public int Use(Map m) => Take(MemberPath);\n    static int Take(MemberPath p) => 0;\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const t = tiers(index, 'MemberPath', index.symbols.get('MemberPath').find(d => d.type === 'record'));
+            assert.ok(!t.confirmed.includes('A.cs:5'));
+            assert.ok(!t.unverified.includes('A.cs:5'));
+        } finally { rm(dir); }
+    });
+
+    it('audit-async audits member calls on typed receivers', () => {
+        const dir = tmp({
+            'A.cs': 'using System.IO;\nusing System.Threading.Tasks;\n\nnamespace Acme;\n\npublic class Svc {\n' +
+                '    public async Task SaveAsync() { await Task.Delay(1); }\n}\n\npublic class Client {\n' +
+                '    private readonly Svc _svc = new Svc();\n    public async Task Local() { await Task.Delay(1); }\n' +
+                '    public async Task A(Svc p, Stream st) {\n        this.Local();\n        _svc.SaveAsync();\n' +
+                '        var s = new Svc();\n        s.SaveAsync();\n        p?.SaveAsync();\n        await p.SaveAsync();\n' +
+                '        st.FlushAsync();\n    }\n}\n',
+        });
+        try {
+            const issues = idx(dir).auditAsync({}).issues.map(i => `${i.file}:${i.line}`).sort();
+            assert.deepStrictEqual(issues, ['A.cs:14', 'A.cs:15', 'A.cs:17', 'A.cs:18']);
+        } finally { rm(dir); }
+    });
+
+    it('a static property path from a type types its chain on both sides', () => {
+        const dir = tmp({
+            'Pool.cs': 'namespace Acme;\npublic abstract class Pool {\n    public static Pool Shared { get; } = new Impl();\n' +
+                '    public Ctx Get() => new Ctx();\n    private sealed class Impl : Pool { }\n}\npublic class Ctx {\n' +
+                '    internal Ctx Initialize<T>(bool sync) => this;\n}\npublic class User {\n' +
+                '    public void Go() {\n        var c = Pool.Shared.Get().Initialize<int>(true);\n    }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const callees = index.findCallees(index.symbols.get('Go')[0], { includeMethods: true })
+                .map(c => `${c.name}:${c.startLine}`).sort();
+            assert.deepStrictEqual(callees, ['Get:4', 'Initialize:8']);
+            assert.deepStrictEqual(tiers(index, 'Get', index.symbols.get('Get')[0]).confirmed, ['Pool.cs:12']);
+            assert.deepStrictEqual(tiers(index, 'Initialize', index.symbols.get('Initialize')[0]).confirmed, ['Pool.cs:12']);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #397: members of classes deriving from an outside base are its possible overrides', () => {
+    it('underscore hooks stay out of deadcode and get the outside-supertype review; language-private names do not', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'l.js': [
+                "const { Transform } = require('stream');",
+                'class L extends Transform {',
+                '  _transform(chunk, enc, cb) { cb(null, chunk); }',
+                '  _flush(cb) { cb(); }',
+                '}',
+                'function mk() { return new L(); }',
+                'mk();',
+            ].join('\n') + '\n',
+            'q.ts': [
+                "import { Transform } from 'stream';",
+                'class Q extends Transform {',
+                '  _transform(chunk: any, enc: string, cb: () => void) { cb(); }',
+                '  private _secret(): number { return 1; }',
+                '}',
+                'export function mkQ() { return new Q(); }',
+            ].join('\n') + '\n',
+            'traps.ts': [
+                'const traps: ProxyHandler<object> = {',
+                '  deleteProperty(target, prop) { return true; },',
+                '};',
+                'export function make(o: object) { return new Proxy(o, traps); }',
+            ].join('\n') + '\n',
+            'w.py': [
+                'import textwrap',
+                '',
+                '',
+                'class W(textwrap.TextWrapper):',
+                '    def _handle_long_word(self, chunks, cur_line, cur_len, width):',
+                '        return None',
+                '',
+                '    def __mangled(self):',
+                '        return 1',
+                '',
+                '',
+                'W()',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'deadcode', {});
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const claims = (r.result.results || r.result).map(s => `${s.relativePath || s.file}:${s.name}`);
+            for (const hidden of ['l.js:_transform', 'l.js:_flush', 'q.ts:_transform', 'traps.ts:deleteProperty',
+                'w.py:_handle_long_word']) {
+                assert.ok(!claims.includes(hidden), `${hidden} may be called by the outside base: ${claims}`);
+            }
+            assert.ok(claims.includes('q.ts:_secret'), `a TS private member overrides nothing: ${claims}`);
+            assert.ok(claims.includes('w.py:__mangled'), `a mangled Python name overrides nothing: ${claims}`);
+            const plan = execute(index, 'plan', { name: 'l.js:3:_transform', renameTo: 'tZ' });
+            assert.ok(plan.ok, JSON.stringify(plan.error));
+            assert.ok((plan.result.reviewItems || []).some(item => item.contractDependency &&
+                /Transform \(outside the project\)/.test(item.suggestion)), JSON.stringify(plan.result.reviewItems));
+        } finally { rm(dir); }
+    });
+});

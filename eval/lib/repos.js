@@ -383,6 +383,19 @@ const REPOS = [
         language: 'rust',
         targetCandidates: ['.'],
     },
+    {
+        // Trait-dispatch-heavy Rust (graduated from FRESH_POOL 2026-09-24 -
+        // used to tune fix #368): dozens of same-name iterator types, closure
+        // parameters typed only by `F: Fn(Ctx)` bounds, `Self::Assoc` returns,
+        // generic-bounded `self.base.split_at()` fields, range/vec receivers.
+        // Known honest residual: blanket-impl members (`par_iter_mut` on
+        // std collections) stay possible-dispatch.
+        name: 'rayon',
+        url: 'https://github.com/rayon-rs/rayon',
+        commit: 'ee0a00bdb1ab039e178a215ad5712fb7fa58e58f',
+        language: 'rust',
+        targetCandidates: ['.'],
+    },
 ];
 
 // Publish-blocking board. Keep this as a named subset of REPOS so every
@@ -436,7 +449,9 @@ const FRESH_POOL = [
     // their first red draw drove fix #300 families A-D): pinned in REPOS at
     // the tuned SHAs. Replacements below are untuned.
     { name: 'jinja', url: 'https://github.com/pallets/jinja', language: 'python', targetCandidates: ['.'] },
-    { name: 'rayon', url: 'https://github.com/rayon-rs/rayon', language: 'rust', targetCandidates: ['.'] },
+    // rayon graduated OUT 2026-09-24 (its fresh-arm draw drove fix #368);
+    // pinned in REPOS. Replacement below is untuned.
+    { name: 'rand', url: 'https://github.com/rust-random/rand', language: 'rust', targetCandidates: ['.'] },
 ];
 
 // ============================================================================

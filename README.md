@@ -105,7 +105,8 @@ The ACCOUNT line reconciles the observed name occurrences: confirmed calls,
 unverified candidates, non-call occurrences, and matches attributed to another
 target. CONTRACT describes the scope of that accounting. Warnings identify
 source the index could not cover. These details survive text truncation for
-an agent's output budget.
+an agent's output budget; a budget too small to hold them withholds the answer
+and names the budget that would.
 
 An empty result therefore means something specific about the inspected code.
 It cannot establish that reflection, generated code, runtime registration, or
@@ -146,9 +147,9 @@ in either the confirmed or unverified band. Unverified candidates, oracle
 abstentions, and unscored findings remain separate. These measurements do not
 establish complete runtime knowledge or identical performance on every machine.
 
-The scheduled board covers 24 pinned repositories: the ten above plus zod,
+The scheduled board covers 25 pinned repositories: the ten above plus zod,
 express, hono, zustand, fastify, rich, click, attrs, grpc-go, chi, cursive,
-itertools, gson, and jsoup. A rotating fresh-repository arm checks codebases
+itertools, rayon, gson, and jsoup. A rotating fresh-repository arm checks codebases
 outside that pinned board.
 
 The [repository manifest](eval/lib/repos.js) records the full commits.
@@ -188,9 +189,10 @@ npm run trust:gate
 
 `deps --cycles` groups circular dependencies and distinguishes eager imports
 from deferred or type-only edges. Enumeration limits are disclosed. `repo`
-reports source coverage as well as project structure; its quick HOT ranking
-has a disclosed refinement budget, and `repo --sections=stats --hot` requests
-the exact ranking.
+reports source coverage as well as project structure; its HOT ranking counts
+confirmed production callers exactly (a refinement budget only binds on very
+large repositories, and is disclosed), and `repo --sections=stats --hot` ranks
+by all callers.
 
 `endpoints --bridge` matches server routes and client requests recognized by
 its framework extractors. `plan` handles code relationships
@@ -215,12 +217,16 @@ line limit is requested; any resulting truncation is reported on stderr.
 
 Ordinary text-mode command errors also exit 2. JSON keeps exit 0 for successful
 empty results and exit 1 for command errors (`meta.ok: false` plus `error`).
+An exception inside UCN is reported as `Internal error: ...` (JSON adds
+`meta.internalError: true`), never as an answer about the code.
 Target-less `check` exits 1 when `TRUST` is `BLOCKED`, 0 for other completed
 checks, and 2 if it could not run.
 
 Outside `--lines`, `find`, text `search`, `deadcode`, `api`, and
-`repo --sections=files` default to a maximum of 500 results. Use `--limit=N`
-to request more; `usages` lists every site unless a limit is given. Broad `find` queries select candidates by approximate usage
+`repo --sections=files` default to a maximum of 500 results. `find` text shows
+the top 5 in detail and counts the rest (JSON returns up to 500); `--limit=N`
+raises both. Use `--limit=N` to request more; `usages` lists every site,
+test files included, unless a limit or `--exclude-tests` is given. Broad `find` queries select candidates by approximate usage
 totals before calculating definition-pinned caller activity, and disclose
 that selection when limited.
 

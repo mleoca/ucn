@@ -1,5 +1,7 @@
 'use strict';
 
+const crypto = require('crypto');
+
 const {
     traverseTree,
     nodeTextWithoutComments,
@@ -9,7 +11,22 @@ const {
     extractStringArg,
     visitNameNodes,
     sameNode,
+    containsOwnNode,
+    parseErrorRegions,
+    genericArityOf,
 } = require('./utils');
+
+// An iterator method (`yield return` in its OWN body) returns an enumerable /
+// async enumerable, never a Task: `async IAsyncEnumerable<T>` is consumed by
+// `await foreach`, not awaited.
+const CS_YIELD_TYPES = new Set(['yield_statement']);
+const CS_SCOPE_BOUNDARIES = new Set(['local_function_statement', 'lambda_expression',
+    'anonymous_method_expression', 'class_declaration', 'struct_declaration', 'record_declaration']);
+function isCSharpIterator(fnNode) {
+    const body = fnNode.childForFieldName('body');
+    return !!body && body.text.includes('yield') &&
+        containsOwnNode(body, CS_YIELD_TYPES, CS_SCOPE_BOUNDARIES);
+}
 const { PARSE_OPTIONS, safeParse } = require('./index');
 
 const TYPE_DECLARATIONS = new Map([
@@ -53,24 +70,359 @@ function isControlFlowLocalArtifact(node) {
 }
 
 function parseTree(parser, code) {
-    return safeParse(parser, code, undefined, PARSE_OPTIONS);
+    const views = csharpViews(parser, code);
+    return views ? views.primary.tree : safeParse(parser, code, undefined, PARSE_OPTIONS);
 }
 
-function namespaceOf(node, tree) {
-    for (let parent = node?.parent; parent; parent = parent.parent) {
-        if (parent.type === 'namespace_declaration') {
-            return parent.childForFieldName('name')?.text ||
-                parent.namedChildren.find(child =>
-                    child.type === 'identifier' || child.type === 'qualified_name')?.text ||
-                null;
+/*
+ * Conditional compilation (fix #391). tree-sitter-c-sharp models `#if` as a
+ * node wrapping whole declarations or statements. A conditional that splits
+ * one (`ILogger F(..)` then `#if X => body #endif ;`, `#if X , IFoo #endif`
+ * in a base list, `else` before `#endif`, alternative method heads or
+ * parameters) leaves its directive tokens inside ERROR nodes and derails the
+ * parse, often of the rest of the file: serilog's ILogger.cs parsed as one
+ * ERROR, with no interface and no members. The C# preprocessor is line based
+ * and has no macros, so each conditional the damage touches is read in one
+ * configuration,
+ * keeping every row and column: its directive lines are blanked and one
+ * branch stays (a lone `#if` branch always; among alternatives the one with
+ * the most call sites, the first on ties). That is the primary view, kept
+ * when it has fewer syntax errors than the literal parse. The rows of the
+ * other alternatives are read from secondary views that keep those branches
+ * instead. Conditionals the grammar placed stay as they are (both branches
+ * of a structured `#if` are already in the tree), and a file whose literal
+ * parse is clean is read as before.
+ */
+const CS_CONDITIONAL_LINE = /^[ \t]*#[ \t]*(if|elif|else|endif)\b/;
+const CS_HAS_CONDITIONAL = /^[ \t]*#[ \t]*if\b/m;
+const CS_DIRECTIVE_TOKENS = new Set(['#if', '#elif', '#else', '#endif']);
+const CS_CALL_SHAPE = /[A-Za-z_]\w*\s*[<(]/g;
+const CS_VIEW_MEMO_MAX = 8;
+const csViewMemo = new Map();
+const csViewsByTree = new WeakMap();
+let csLastConditionalCode = null;
+let csLastConditional = false;
+
+function csHasConditional(code) {
+    if (code !== csLastConditionalCode) {
+        csLastConditionalCode = code;
+        csLastConditional = CS_HAS_CONDITIONAL.test(code);
+    }
+    return csLastConditional;
+}
+
+function csCountErrors(node) {
+    let count = node.type === 'ERROR' ? 1 : 0;
+    for (const child of node.children) {
+        if (child.isMissing) count++;
+        else if (child.hasError) count += csCountErrors(child);
+    }
+    return count;
+}
+
+function csBlankLine(line) {
+    return line.replace(/[^\r\n]/g, ' ');
+}
+
+/**
+ * 0-based rows where the literal parse is damaged: directive tokens left in
+ * ERROR nodes, the first and last rows of ERROR nodes, and MISSING tokens
+ * (a declaration head the grammar closed before a conditional body).
+ */
+function csDamagedRows(root) {
+    const rows = new Set();
+    // The syntax errors counted as csCountErrors counts them.
+    rows.errors = 0;
+    const visit = node => {
+        const error = node.type === 'ERROR';
+        if (error) {
+            rows.errors++;
+            rows.add(node.startPosition.row);
+            rows.add(node.endPosition.row);
+        }
+        for (const child of node.children) {
+            if (child.isMissing) {
+                rows.errors++;
+                rows.add(child.startPosition.row);
+            } else if (error && CS_DIRECTIVE_TOKENS.has(child.type)) {
+                rows.add(child.startPosition.row);
+            }
+            if (!child.isMissing && child.hasError) visit(child);
+        }
+    };
+    if (root.hasError) visit(root);
+    return rows;
+}
+
+/**
+ * The views of a C# file whose literal parse misplaces conditional
+ * directives (see above), memoized per content; null when the literal tree
+ * is the file's view. { primary: { tree }, secondary: [{ tree, owns }] }
+ * with `owns` the 0-based rows a secondary view supplies.
+ */
+function csharpViews(parser, code) {
+    if (!csHasConditional(code)) return null;
+    if (csViewMemo.has(code)) return csViewMemo.get(code);
+    const views = csBuildViews(parser, code);
+    csViewMemo.set(code, views);
+    if (views) csViewsByTree.set(views.primary.tree, { code, views });
+    if (csViewMemo.size > CS_VIEW_MEMO_MAX) csViewMemo.delete(csViewMemo.keys().next().value);
+    return views;
+}
+
+function csBuildViews(parser, code) {
+    const literal = safeParse(parser, code, undefined, PARSE_OPTIONS);
+    if (!literal.rootNode.hasError) return null;
+    const damaged = csDamagedRows(literal.rootNode);
+    const lines = code.match(/.*(?:\r\n|\n|\r|$)/g)?.filter(Boolean) || [];
+    // Conditional groups: directive rows of each branch, in nesting order.
+    const groups = [];
+    const stack = [];
+    for (let row = 0; row < lines.length; row++) {
+        const match = lines[row].match(CS_CONDITIONAL_LINE);
+        if (!match) continue;
+        if (match[1] === 'if') stack.push({ branches: [row] });
+        else if (match[1] === 'elif' || match[1] === 'else') {
+            if (!stack.length) return null;
+            stack[stack.length - 1].branches.push(row);
+        } else {
+            const group = stack.pop();
+            if (!group) return null;
+            group.end = row;
+            groups.push(group);
         }
     }
-    const fileScoped = (tree?.rootNode?.namedChildren || []).find(child =>
-        child.type === 'file_scoped_namespace_declaration');
-    return fileScoped?.childForFieldName('name')?.text ||
-        fileScoped?.namedChildren.find(child =>
-            child.type === 'identifier' || child.type === 'qualified_name')?.text ||
-        null;
+    if (stack.length > 0) return null;
+    // Conditionals the damage touches, from the row before `#if` (a head
+    // left open for the conditional body) to the `#endif`.
+    const resolved = groups.filter(group => {
+        for (let row = group.branches[0] - 1; row <= group.end; row++) {
+            if (damaged.has(row)) return true;
+        }
+        return false;
+    });
+    if (resolved.length === 0) return null;
+    for (const group of resolved) group.primary = csPrimaryBranch(group, lines);
+    return csViewsFromGroups(parser, code, lines, resolved, damaged.errors);
+}
+
+// Rows of branch b of a group (between its directive and the next).
+function csBranchRows(group, b) {
+    const bounds = [...group.branches, group.end];
+    const rows = [];
+    for (let row = bounds[b] + 1; row < bounds[b + 1]; row++) rows.push(row);
+    return rows;
+}
+
+// The branch a view keeps by default: the one with the most call shapes,
+// the first on ties.
+function csPrimaryBranch(group, lines) {
+    let keep = 0;
+    let keepCalls = -1;
+    for (let b = 0; b < group.branches.length; b++) {
+        let calls = 0;
+        for (const row of csBranchRows(group, b)) calls += (lines[row].match(CS_CALL_SHAPE) || []).length;
+        if (calls > keepCalls) {
+            keep = b;
+            keepCalls = calls;
+        }
+    }
+    return keep;
+}
+
+/**
+ * The views of `code` for its resolved conditional groups, one parse each.
+ * With the literal parse's error count (build) the views are kept only when
+ * the primary view has fewer syntax errors; a query rebuilds the views the
+ * index recorded for this content from `groups` (persisted per file as
+ * [branch rows..., end row, primary branch]) without the literal parse.
+ */
+function csViewsFromGroups(parser, code, lines, resolved, literalErrors = null) {
+    // One view per alternative position: view 0 keeps each group's primary
+    // branch, view k its k-th other branch (the primary one when it has no
+    // more). A lone `#if` branch is kept in every view.
+    const alternatives = Math.max(...resolved.map(group => group.branches.length));
+    const viewSource = k => {
+        const blank = new Set();
+        const kept = new Set();
+        for (const group of resolved) {
+            for (const row of [...group.branches, group.end]) blank.add(row);
+            const others = group.branches.map((_, b) => b).filter(b => b !== group.primary);
+            const chosen = k === 0 || others.length === 0 ? group.primary : others[(k - 1) % others.length];
+            for (let b = 0; b < group.branches.length; b++) {
+                for (const row of csBranchRows(group, b)) {
+                    if (b === chosen) {
+                        if (k > 0 && b !== group.primary) kept.add(row);
+                    } else {
+                        blank.add(row);
+                    }
+                }
+            }
+        }
+        return {
+            source: lines.map((line, row) => (blank.has(row) ? csBlankLine(line) : line)).join(''),
+            owns: kept,
+        };
+    };
+    const reparse = source => safeParse(parser, source, undefined, PARSE_OPTIONS);
+    const primaryTree = reparse(viewSource(0).source);
+    if (literalErrors != null && primaryTree.rootNode.hasError &&
+        csCountErrors(primaryTree.rootNode) >= literalErrors) return null;
+    const secondary = [];
+    for (let k = 1; k < alternatives; k++) {
+        const view = viewSource(k);
+        // Only rows that hold code are worth a parse.
+        const owns = new Set([...view.owns].filter(row => /\w/.test(lines[row])));
+        if (owns.size === 0) continue;
+        secondary.push({ tree: reparse(view.source), owns, reaches: csRowReach(owns) });
+    }
+    return {
+        primary: { tree: primaryTree },
+        secondary,
+        groups: resolved.map(group => [...group.branches, group.end, group.primary]),
+    };
+}
+
+/**
+ * Items of every view: the primary view's, then each secondary view's
+ * items on the rows it owns. `rowOf` gives an item's 1-based row.
+ */
+function csMergeViewItems(views, extract, rowOf) {
+    const merged = extract(views.primary.tree, null);
+    for (const view of views.secondary) {
+        for (const item of extract(view.tree, view.reaches)) {
+            if (view.owns.has(rowOf(item) - 1)) merged.push(item);
+        }
+    }
+    return merged;
+}
+
+/**
+ * Whether a node's rows reach a secondary view's owned rows: extractors
+ * skip every other subtree of that view, since only items on owned rows are
+ * taken from it (the primary view supplies the rest).
+ */
+function csRowReach(owns) {
+    const rows = [...owns].sort((a, b) => a - b);
+    return node => {
+        const start = node.startPosition.row;
+        const end = node.endPosition.row;
+        let lo = 0;
+        let hi = rows.length;
+        while (lo < hi) {
+            const mid = (lo + hi) >> 1;
+            if (rows[mid] < start) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo < rows.length && rows[lo] <= end;
+    };
+}
+
+/**
+ * The tree queries read for a C# file: its primary view (fix #391). With the
+ * file's index entry for this content, the views are rebuilt from the groups
+ * the index recorded (`conditionalViews`) and a file the index read literally
+ * is parsed once, without repeating the damage analysis.
+ */
+function queryTree(code, parser, entry = null) {
+    if (!entry?.hash || !csHasConditional(code) ||
+        crypto.createHash('md5').update(code).digest('hex') !== entry.hash) {
+        return parseTree(parser, code);
+    }
+    if (!Array.isArray(entry.conditionalViews)) {
+        const tree = safeParse(parser, code, undefined, PARSE_OPTIONS);
+        csViewsByTree.set(tree, { code, views: null });
+        return tree;
+    }
+    let views = csViewMemo.get(code);
+    if (!views) {
+        const lines = code.match(/.*(?:\r\n|\n|\r|$)/g)?.filter(Boolean) || [];
+        const resolved = entry.conditionalViews.map(group => ({
+            branches: group.slice(0, -2),
+            end: group[group.length - 2],
+            primary: group[group.length - 1],
+        }));
+        views = csViewsFromGroups(parser, code, lines, resolved);
+        csViewMemo.set(code, views);
+        if (csViewMemo.size > CS_VIEW_MEMO_MAX) csViewMemo.delete(csViewMemo.keys().next().value);
+    }
+    csViewsByTree.set(views.primary.tree, { code, views });
+    return views.primary.tree;
+}
+
+/**
+ * Whether queryTree for this source is its plain parse (fix #395): a file
+ * without a conditional directive, or one its index entry (same content)
+ * read literally, has one view.
+ */
+function queryTreeIsPlain(code, entry = null) {
+    if (!csHasConditional(code)) return true;
+    return !!entry?.hash && !Array.isArray(entry.conditionalViews) &&
+        crypto.createHash('md5').update(code).digest('hex') === entry.hash;
+}
+
+function namespaceDeclarationName(declaration) {
+    const nameNode = declaration.childForFieldName('name') ||
+        declaration.namedChildren.find(child =>
+            child.type === 'identifier' || child.type === 'qualified_name');
+    return nameNode ? nameNode.text.replace(/\s+/g, '') : null;
+}
+
+// The full namespace a node is declared in (fix #395): every enclosing
+// `namespace A { namespace B { .. } }` block contributes its name, outermost
+// first, under the file-scoped `namespace X;` that precedes the node. C#
+// names a nested block's members A.B, never B. Per tree, the file-scoped
+// declaration and each block's full path are computed once.
+const namespaceMemo = new WeakMap();
+function namespaceOf(node, tree) {
+    let memo = tree ? namespaceMemo.get(tree) : null;
+    if (tree && !memo) {
+        const fileScoped = fileScopedNamespace(tree.rootNode);
+        memo = {
+            fileScoped: fileScoped ? { name: namespaceDeclarationName(fileScoped), start: fileScoped.startIndex } : null,
+            blocks: new Map(),
+        };
+        namespaceMemo.set(tree, memo);
+    }
+    let block = null;
+    for (let parent = node?.parent; parent; parent = parent.parent) {
+        if (parent.type === 'namespace_declaration') { block = parent; break; }
+    }
+    let blockPath = null;
+    if (block) {
+        blockPath = memo?.blocks.get(block.id);
+        if (blockPath === undefined) {
+            const parts = [];
+            for (let current = block; current; current = current.parent) {
+                if (current.type !== 'namespace_declaration') continue;
+                const name = namespaceDeclarationName(current);
+                if (name) parts.unshift(name);
+            }
+            blockPath = parts.length > 0 ? parts.join('.') : null;
+            memo?.blocks.set(block.id, blockPath);
+        }
+    }
+    const fileScoped = memo ? memo.fileScoped : (() => {
+        const declaration = fileScopedNamespace(tree?.rootNode);
+        return declaration ? { name: namespaceDeclarationName(declaration), start: declaration.startIndex } : null;
+    })();
+    const scopedName = fileScoped?.name && (!node || fileScoped.start <= node.startIndex) ? fileScoped.name : null;
+    if (scopedName && blockPath) return `${scopedName}.${blockPath}`;
+    return scopedName || blockPath || null;
+}
+
+// The file-scoped namespace declaration of a compilation unit, also when a
+// conditional wraps the whole file (`#if X` ... `namespace N;` ... `#endif`,
+// fix #391).
+function fileScopedNamespace(root) {
+    for (const child of root?.namedChildren || []) {
+        if (child.type === 'file_scoped_namespace_declaration') return child;
+        if (child.type.startsWith('preproc_')) {
+            const nested = fileScopedNamespace(child);
+            if (nested) return nested;
+        }
+    }
+    return null;
 }
 
 function modifiersOf(node) {
@@ -95,6 +447,11 @@ function attributeData(node) {
                 ...(stringArg && {
                     arg: stringArg.value,
                     interp: stringArg.interp,
+                }),
+                // fix #366: non-literal arguments (constants, concatenation,
+                // nameof) keep their source so route extraction can fold them.
+                ...(!stringArg && args && args.namedChildCount > 0 && {
+                    args: args.text.replace(/^\(|\)$/g, '').trim(),
                 }),
             });
         }
@@ -143,7 +500,7 @@ function structuredParams(paramsNode) {
         if (modifiersOf(param).includes('this')) info.extensionReceiver = true;
         if (param.type === 'parameter_array') info.rest = true;
         const value = param.childForFieldName('value') ||
-            param.namedChildren.find(child => child !== nameNode && child !== typeNode &&
+            param.namedChildren.find(child => !sameNode(child, nameNode) && !sameNode(child, typeNode) &&
                 !['attribute_list', 'modifier', 'comment'].includes(child.type));
         if (value) {
             info.default = nodeTextWithoutComments(value);
@@ -202,11 +559,31 @@ function memberFromNode(node, className, lines) {
     if (node.type === 'destructor_declaration') modifiers.push('destructor');
     const conversion = conversionKind(node);
     if (conversion) modifiers.push(conversion);
-    const explicitInterfaceNode = node.namedChildren.find(child =>
-        child.type === 'explicit_interface_specifier');
-    const explicitInterface = explicitInterfaceNode?.text
-        .replace(/\.$/, '').trim() || null;
+    const explicitInterface = explicitInterfaceOf(node);
     const paramsStructured = structuredParams(paramsNode);
+    const generics = typeParameterNames(node);
+    // fix #380: an extension receiver typed by a METHOD type parameter
+    // (`static T Ext<T>(this T e) where T : Exception`) accepts any type
+    // satisfying the parameter's constraints.
+    const receiverParam = paramsStructured[0];
+    if (receiverParam?.extensionReceiver && receiverParam.type) {
+        const typeParams = node.childForFieldName('type_parameters');
+        const isTypeParam = (typeParams?.namedChildren || []).some(child =>
+            child.type === 'type_parameter' && child.childForFieldName('name')?.text === receiverParam.type);
+        if (isTypeParam) {
+            const constraints = [];
+            for (const clause of node.namedChildren) {
+                if (clause.type !== 'type_parameter_constraints_clause') continue;
+                if (clause.namedChild(0)?.text !== receiverParam.type) continue;
+                for (const constraint of clause.namedChildren.slice(1)) {
+                    const typeNode = constraint.childForFieldName('type');
+                    if (typeNode) constraints.push(nodeTextWithoutComments(typeNode));
+                }
+            }
+            paramsStructured[0] = { ...receiverParam, typeParameter: true,
+                ...(constraints.length > 0 && { constraints }) };
+        }
+    }
     return {
         name,
         params: paramsNode ? nodeTextWithoutComments(paramsNode).replace(/^\(|\)$/g, '').trim() : '...',
@@ -214,14 +591,17 @@ function memberFromNode(node, className, lines) {
         returnType: isConstructor ? null : nodeTextWithoutComments(returnNode).trim() || null,
         startLine,
         endLine,
+        ...nameLineOf(nameNode, startLine),
         indent,
         modifiers,
+        ...(generics && { generics }),
         memberType: isConstructor ? 'constructor' : 'method',
         isMethod: true,
         isConstructor,
         className,
         ...(explicitInterface && { explicitInterface }),
         isAsync: modifiers.includes('async'),
+        ...(isCSharpIterator(node) && { isGenerator: true }),
         ...(modifiers.includes('static') &&
             paramsStructured[0]?.extensionReceiver && {
                 isExtensionMethod: true,
@@ -257,11 +637,22 @@ function fieldMembers(node, lines) {
     return members;
 }
 
+// The interface an explicit implementation names (`void IDisposable.Dispose()`,
+// `object ICollection.SyncRoot`, `int IList<int>.this[int i]`, events):
+// such a member is reached only through that interface (fix #391 extends it
+// from methods to properties, indexers and events).
+function explicitInterfaceOf(node) {
+    const specifier = node.namedChildren.find(child =>
+        child.type === 'explicit_interface_specifier');
+    return specifier?.text.replace(/\.$/, '').trim() || null;
+}
+
 function indexerMember(node, className, lines) {
     if (node.type !== 'indexer_declaration') return null;
     const paramsNode = node.childForFieldName('parameters');
     const typeNode = node.childForFieldName('type');
     const { startLine, endLine, indent } = nodeToLocation(node, lines);
+    const explicitInterface = explicitInterfaceOf(node);
     return {
         name: 'this[]',
         params: paramsNode ? nodeTextWithoutComments(paramsNode).replace(/^\[|\]$/g, '').trim() : '...',
@@ -269,11 +660,13 @@ function indexerMember(node, className, lines) {
         returnType: nodeTextWithoutComments(typeNode).trim() || null,
         startLine,
         endLine,
+        ...nameLineOf((node.children || []).find(child => child.type === 'this') || null, startLine),
         indent,
         modifiers: modifiersOf(node),
         memberType: 'property',
         isMethod: true,
         className,
+        ...(explicitInterface && { explicitInterface }),
         docstring: extractJSDocstring(lines, startLine),
     };
 }
@@ -288,15 +681,51 @@ function propertyMember(node, lines) {
     // artifact instead of letting one invalid symbol discard the whole file.
     if (!nameNode?.text) return null;
     const { startLine, endLine, indent } = nodeToLocation(node, lines);
+    const explicitInterface = explicitInterfaceOf(node);
     return {
         name: nameNode.text,
         startLine,
         endLine,
+        ...nameLineOf(nameNode, startLine),
         indent,
         modifiers: modifiersOf(node),
         memberType: 'property',
         fieldType: typeNode?.text || null,
+        ...(explicitInterface && { explicitInterface }),
     };
+}
+
+// fix #380: a C# type's generic arity is part of its identity (`Outcome`,
+// `Outcome<T>` and `Outcome<T1, T2>` are three types).
+function typeParameterCount(node) {
+    const list = node?.namedChildren?.find(child => child.type === 'type_parameter_list');
+    if (!list) return 0;
+    return list.namedChildren.filter(child => child.type === 'type_parameter').length;
+}
+
+// fix #390: the declared type parameter NAMES, in order (`<TState, TResult>`;
+// variance and attributes dropped), so a base clause `: Visitor<TextWriter,
+// bool>` can be read as a substitution of those names.
+function typeParameterNames(node) {
+    const list = node?.childForFieldName?.('type_parameters') ||
+        node?.namedChildren?.find(child => child.type === 'type_parameter_list');
+    if (!list) return null;
+    const names = [];
+    for (const child of list.namedChildren) {
+        if (child.type !== 'type_parameter') continue;
+        const name = child.childForFieldName('name') ||
+            child.namedChildren.find(part => part.type === 'identifier');
+        if (name?.text) names.push(name.text);
+    }
+    return names.length > 0 ? `<${names.join(', ')}>` : null;
+}
+
+// fix #390: the line of the declared name when attributes on their own lines
+// start the declaration (`[Obsolete]` above `void M()`): definition edits and
+// definition-line classification use it.
+function nameLineOf(nameNode, startLine) {
+    const line = nameNode ? nameNode.startPosition.row + 1 : null;
+    return line != null && line !== startLine ? { nameLine: line } : {};
 }
 
 function baseHeadName(text) {
@@ -331,7 +760,43 @@ function classifyBases(bases, type, fileTypeKinds) {
 }
 
 function findClasses(code, parser) {
-    const tree = parseTree(parser, code);
+    const views = csharpViews(parser, code);
+    if (!views) return findClassesInTree(code, safeParse(parser, code, undefined, PARSE_OPTIONS));
+    const classes = findClassesInTree(code, views.primary.tree);
+    for (const view of views.secondary) {
+        csMergeSecondaryClasses(classes, findClassesInTree(code, view.tree), view.owns);
+    }
+    return classes;
+}
+
+/**
+ * Declarations a secondary view owns (fix #391): a type whose head it owns
+ * joins whole; members it owns join the primary view's type of the same
+ * name and head row.
+ */
+function csMergeSecondaryClasses(classes, secondary, owns) {
+    for (const cls of secondary) {
+        if (owns.has(cls.startLine - 1)) {
+            if (!classes.some(existing => existing.name === cls.name && existing.startLine === cls.startLine)) {
+                classes.push(cls);
+            }
+            continue;
+        }
+        const target = classes.find(existing => existing.name === cls.name && existing.startLine === cls.startLine);
+        if (!target) continue;
+        for (const member of cls.members || []) {
+            if (!owns.has(member.startLine - 1)) continue;
+            if (target.members.some(existing => existing.name === member.name &&
+                existing.startLine === member.startLine)) continue;
+            target.members.push(member);
+            target.endLine = Math.max(target.endLine, member.endLine);
+        }
+        target.members.sort((a, b) => a.startLine - b.startLine);
+    }
+    classes.sort((a, b) => a.startLine - b.startLine);
+}
+
+function findClassesInTree(code, tree) {
     const lines = code.split('\n');
     const classes = [];
     // Same-file type kinds override the I-prefix convention when classifying
@@ -351,11 +816,24 @@ function findClasses(code, parser) {
             const delegateName = node.childForFieldName('name');
             if (delegateName) {
                 const { startLine, endLine, indent } = nodeToLocation(node, lines);
+                const delegateArity = typeParameterCount(node);
+                const delegateGenerics = typeParameterNames(node);
+                // fix #393: the delegate's parameter count, the count a
+                // lambda converting to it must have (C# 10.7.1).
+                const delegateParamList = node.childForFieldName('parameters') ||
+                    node.namedChildren.find(child => child.type === 'parameter_list');
+                const delegateParams = delegateParamList
+                    ? delegateParamList.namedChildren.filter(child => child.type === 'parameter').length
+                    : null;
                 classes.push({
                     name: delegateName.text,
                     type: 'type',
+                    ...(delegateArity > 0 && { typeArity: delegateArity }),
+                    ...(delegateGenerics && { generics: delegateGenerics }),
+                    ...(Number.isInteger(delegateParams) && { delegateParams }),
                     startLine,
                     endLine,
+                    ...nameLineOf(delegateName, startLine),
                     indent,
                     modifiers: modifiersOf(node),
                     ...(namespaceOf(node, tree) && { namespace: namespaceOf(node, tree) }),
@@ -395,6 +873,7 @@ function findClasses(code, parser) {
                         name: enumName.text,
                         startLine,
                         endLine,
+                        ...nameLineOf(enumName, startLine),
                         indent,
                         modifiers: ['public', 'static'],
                         memberType: 'field',
@@ -422,13 +901,21 @@ function findClasses(code, parser) {
             enclosingType = parent.childForFieldName('name')?.text;
             if (enclosingType) break;
         }
+        const typeArity = typeParameterCount(node);
+        if (typeArity > 0) {
+            for (const member of members) member.ownerTypeArity = typeArity;
+        }
+        const generics = typeParameterNames(node);
         classes.push({
             name: nameNode.text,
             type,
             startLine,
             endLine,
+            ...nameLineOf(nameNode, startLine),
             indent,
             modifiers: modifiersOf(node),
+            ...(typeArity > 0 && { typeArity }),
+            ...(generics && { generics }),
             ...(enclosingType && { enclosingType }),
             ...(namespaceOf(node, tree) && { namespace: namespaceOf(node, tree) }),
             members,
@@ -463,6 +950,7 @@ function findClasses(code, parser) {
             .sort((a, b) => b.startLine - a.startLine)[0];
         if (!candidate) return false;
         const member = memberFromNode(node, candidate.name, lines);
+        if (member && candidate.typeArity) member.ownerTypeArity = candidate.typeArity;
         if (member && !candidate.members.some(existing =>
             existing.startLine === member.startLine &&
             existing.name === member.name)) {
@@ -475,10 +963,17 @@ function findClasses(code, parser) {
 }
 
 function findFunctions(code, parser) {
-    const tree = parseTree(parser, code);
+    const views = csharpViews(parser, code);
+    if (!views) return findFunctionsInTree(code, safeParse(parser, code, undefined, PARSE_OPTIONS));
+    return csMergeViewItems(views, (tree, reaches) => findFunctionsInTree(code, tree, reaches), fn => fn.startLine)
+        .sort((a, b) => a.startLine - b.startLine);
+}
+
+function findFunctionsInTree(code, tree, reaches = null) {
     const lines = code.split('\n');
     const functions = [];
     traverseTreeCached(tree.rootNode, node => {
+        if (reaches && !reaches(node)) return false;
         if (node.type !== 'local_function_statement') return true;
         const nameNode = node.childForFieldName('name');
         if (!nameNode) return true;
@@ -494,6 +989,7 @@ function findFunctions(code, parser) {
         const returnNode = node.childForFieldName('returns') || node.childForFieldName('type');
         const { startLine, endLine, indent } = nodeToLocation(node, lines);
         const modifiers = modifiersOf(node);
+        const localGenerics = typeParameterNames(node);
         functions.push({
             name: nameNode.text,
             params: paramsNode ? nodeTextWithoutComments(paramsNode).replace(/^\(|\)$/g, '').trim() : '...',
@@ -501,13 +997,18 @@ function findFunctions(code, parser) {
             returnType: nodeTextWithoutComments(returnNode).trim() || null,
             startLine,
             endLine,
+            ...nameLineOf(nameNode, startLine),
             indent,
             modifiers,
+            ...(localGenerics && { generics: localGenerics }),
             isAsync: modifiers.includes('async'),
+            ...(isCSharpIterator(node) && { isGenerator: true }),
             isNested: true,
             docstring: extractJSDocstring(lines, startLine),
         });
-        return false;
+        // A local function may declare local functions of its own (fix
+        // #395: AutoMapper's `MapCollectionCore` holds `GetDestinationType`).
+        return true;
     });
     const topLevel = (tree.rootNode.namedChildren || []).filter(child =>
         child.type === 'global_statement');
@@ -528,10 +1029,17 @@ function findFunctions(code, parser) {
 }
 
 function findStateObjects(code, parser) {
-    const tree = parseTree(parser, code);
+    const views = csharpViews(parser, code);
+    if (!views) return findStateObjectsInTree(code, safeParse(parser, code, undefined, PARSE_OPTIONS));
+    return csMergeViewItems(views, (tree, reaches) => findStateObjectsInTree(code, tree, reaches), state => state.startLine)
+        .sort((a, b) => a.startLine - b.startLine);
+}
+
+function findStateObjectsInTree(code, tree, reaches = null) {
     const lines = code.split('\n');
     const states = [];
     traverseTreeCached(tree.rootNode, node => {
+        if (reaches && !reaches(node)) return false;
         if (node.type !== 'global_statement') return true;
         const declaration = node.namedChildren.find(child =>
             child.type === 'local_declaration_statement')?.namedChild(0);
@@ -551,6 +1059,61 @@ function findStateObjects(code, parser) {
         return false;
     });
     return states;
+}
+
+const TASK_WRAPPERS = new Set(['Task', 'ValueTask']);
+
+/** The written type a target-typed `new(...)` constructs, or null (fix #393). */
+function implicitCreationTarget(node) {
+    const typeOf = typeNode => {
+        if (!typeNode) return null;
+        let current = typeNode;
+        if (current.type === 'nullable_type') current = current.namedChild(0);
+        if (!current || !['identifier', 'qualified_name', 'generic_name'].includes(current.type)) return null;
+        if (current.text === 'var' || current.text === 'dynamic') return null;
+        return current;
+    };
+    const parent = node.parent;
+    if (!parent) return null;
+    if (parent.type === 'variable_declarator') {
+        const declaration = parent.parent;
+        return declaration?.type === 'variable_declaration' ? typeOf(declaration.childForFieldName('type')) : null;
+    }
+    if (parent.type === 'equals_value_clause' && parent.parent?.type === 'property_declaration') {
+        return typeOf(parent.parent.childForFieldName('type'));
+    }
+    // An auto-property initializer (`List<T> Items { get; } = new();`, fix #395).
+    if (parent.type === 'property_declaration' && sameNode(parent.childForFieldName('value'), node)) {
+        return typeOf(parent.childForFieldName('type'));
+    }
+    if (parent.type !== 'return_statement' && parent.type !== 'arrow_expression_clause') return null;
+    for (let owner = parent.parent; owner; owner = owner.parent) {
+        if (owner.type === 'lambda_expression' || owner.type === 'anonymous_method_expression') return null;
+        if (owner.type === 'accessor_declaration') {
+            const keyword = owner.childForFieldName('name')?.text || owner.child(0)?.text;
+            if (keyword !== 'get') return null;
+            continue;
+        }
+        if (owner.type === 'property_declaration' || owner.type === 'indexer_declaration') {
+            return typeOf(owner.childForFieldName('type'));
+        }
+        if (owner.type === 'method_declaration' || owner.type === 'local_function_statement') {
+            const returns = owner.childForFieldName('returns') || owner.childForFieldName('type');
+            const isAsync = (owner.children || []).some(child => child.type === 'modifier' && child.text === 'async');
+            if (isAsync) {
+                const generic = returns?.type === 'generic_name' ? returns
+                    : returns?.type === 'qualified_name' && returns.namedChildren.at(-1)?.type === 'generic_name'
+                        ? returns.namedChildren.at(-1) : null;
+                const wrapper = generic?.namedChild(0)?.text;
+                const args = generic?.namedChildren.find(child => child.type === 'type_argument_list');
+                if (!TASK_WRAPPERS.has(wrapper) || args?.namedChildCount !== 1) return null;
+                return typeOf(args.namedChild(0));
+            }
+            return typeOf(returns);
+        }
+        if (owner.type === 'constructor_declaration' || TYPE_DECLARATIONS.has(owner.type)) return null;
+    }
+    return null;
 }
 
 function enclosingFunctionOf(node) {
@@ -634,6 +1197,85 @@ function enclosingTypeDeclaresMember(node, memberName) {
     return false;
 }
 
+const _memberTypesByType = new WeakMap();
+
+/**
+ * fix #391: the declared type of a bare identifier that names a field or
+ * property of its enclosing type (`Write(level, NoPropertyValues)`), or
+ * null. A name any local, parameter or pattern variable of the enclosing
+ * member binds is never read as the member; a name the type declares more
+ * than once (or only through a nested type) has no single type.
+ */
+function enclosingMemberValueType(identifier) {
+    const name = identifier.text;
+    let typeNode = null;
+    let callable = null;
+    for (let parent = identifier.parent; parent; parent = parent.parent) {
+        if (!callable && CALLABLE_SCOPE_NODES.has(parent.type)) callable = parent;
+        if (TYPE_DECLARATIONS.has(parent.type)) {
+            typeNode = parent;
+            break;
+        }
+    }
+    if (!typeNode) return null;
+    let members = _memberTypesByType.get(typeNode);
+    if (!members) {
+        members = new Map();
+        const record = (memberName, typeText) => {
+            if (!memberName || !typeText) return;
+            members.set(memberName, members.has(memberName) ? null : typeText);
+        };
+        const body = typeNode.childForFieldName('body') ||
+            typeNode.namedChildren.find(child => child.type === 'declaration_list');
+        const stack = [...(body?.namedChildren || [])];
+        while (stack.length > 0) {
+            const current = stack.pop();
+            if (current.type === 'property_declaration') {
+                record(current.childForFieldName('name')?.text, current.childForFieldName('type')?.text);
+            } else if (current.type === 'field_declaration') {
+                const declaration = current.namedChildren.find(child => child.type === 'variable_declaration');
+                const typeText = declaration?.childForFieldName('type')?.text;
+                for (const variable of declaration?.namedChildren || []) {
+                    if (variable.type !== 'variable_declarator') continue;
+                    record((variable.childForFieldName('name') || variable.namedChild(0))?.text, typeText);
+                }
+            } else if (current.type.startsWith('preproc_') || current.type === 'declaration_list') {
+                stack.push(...(current.namedChildren || []));
+            }
+        }
+        _memberTypesByType.set(typeNode, members);
+    }
+    const typeText = members.get(name);
+    if (!typeText || typeText === 'var') return null;
+    if (callable && _localNamesOfCallable(callable).has(name)) return null;
+    return typeText;
+}
+
+const _localNamesByCallable = new WeakMap();
+
+// Every name a member binds locally (parameters, locals, lambda and pattern
+// variables, foreach and catch variables), one native walk per member.
+function _localNamesOfCallable(callable) {
+    let names = _localNamesByCallable.get(callable);
+    if (names) return names;
+    names = new Set();
+    for (const node of callable.descendantsOfType(['variable_declarator', 'parameter', 'implicit_parameter',
+        'declaration_expression', 'declaration_pattern', 'foreach_statement', 'catch_declaration'])) {
+        const bound = node.type === 'implicit_parameter' ? node
+            : node.type === 'foreach_statement' ? node.childForFieldName('left')
+                : node.childForFieldName('name') || node.namedChildren.at(-1);
+        if (bound?.text) names.add(bound.text);
+    }
+    // `params T[] name` parameters are siblings of the list (structuredParams).
+    const list = callable.childForFieldName('parameters');
+    for (let i = 0; list && i < list.childCount; i++) {
+        const child = list.child(i);
+        if (child.type === 'identifier') names.add(child.text);
+    }
+    _localNamesByCallable.set(callable, names);
+    return names;
+}
+
 const CALLABLE_SCOPE_NODES = new Set([
     'method_declaration', 'constructor_declaration', 'destructor_declaration',
     'operator_declaration', 'conversion_operator_declaration',
@@ -649,6 +1291,130 @@ function variableScopeKey(node) {
         if (parent.type === 'global_statement') return 'global';
     }
     return 'global';
+}
+
+const localBindingFactsByTree = new WeakMap();
+
+/**
+ * Local binding facts of one callable (fix #381): how many times each name
+ * is declared (locals, parameters, pattern/out variables, foreach and catch
+ * variables, lambda parameters) and which names are assigned after their
+ * declaration. A one-hop `var` alias needs one declaration and no
+ * assignment.
+ */
+function csharpLocalBindingFacts(fnNode) {
+    let byId = localBindingFactsByTree.get(fnNode.tree);
+    if (!byId) { byId = new Map(); localBindingFactsByTree.set(fnNode.tree, byId); }
+    let facts = byId.get(fnNode.id);
+    if (facts) return facts;
+    facts = { declared: new Map(), assigned: new Set(), shapes: new Map() };
+    const declare = name => { if (name) facts.declared.set(name, (facts.declared.get(name) || 0) + 1); };
+    const walk = (node) => {
+        for (const child of node.namedChildren || []) {
+            if (child.type === 'variable_declarator' || child.type === 'parameter' ||
+                child.type === 'foreach_statement' || child.type === 'catch_declaration') {
+                const name = child.childForFieldName('name')?.text;
+                declare(name);
+                // Each declaration's `Declared x = new Constructed(..)` shape
+                // (fix #394): several declarations of one name in separate
+                // blocks hold the same exact type only when every shape agrees.
+                if (name) {
+                    if (!facts.shapes.has(name)) facts.shapes.set(name, new Set());
+                    facts.shapes.get(name).add(csharpDeclarationShape(child));
+                }
+            } else if (child.type === 'declaration_pattern' || child.type === 'declaration_expression') {
+                declare(child.childForFieldName('name')?.text || child.namedChildren.at(-1)?.text);
+            } else if (child.type === 'assignment_expression') {
+                const left = child.childForFieldName('left');
+                if (left?.type === 'identifier') facts.assigned.add(left.text);
+            } else if (child.type === 'prefix_unary_expression' || child.type === 'postfix_unary_expression') {
+                const operand = child.namedChildren.find(c => c.type === 'identifier');
+                if (operand) facts.assigned.add(operand.text);
+            } else if (child.type === 'argument' &&
+                (child.child(0)?.type === 'ref' || child.child(0)?.type === 'out')) {
+                const operand = child.namedChildren.find(c => c.type === 'identifier');
+                if (operand) facts.assigned.add(operand.text);
+            }
+            walk(child);
+        }
+    };
+    walk(fnNode);
+    byId.set(fnNode.id, facts);
+    return facts;
+}
+
+/** `Declared|Constructed` text of a variable declarator, or '?' for any other shape. */
+function csharpDeclarationShape(declarator) {
+    if (declarator.type !== 'variable_declarator') return '?';
+    const declaration = declarator.parent;
+    const typeText = declaration?.type === 'variable_declaration'
+        ? declaration.childForFieldName('type')?.text : null;
+    const value = csharpDeclaratorValue(declarator);
+    const constructed = value?.type === 'object_creation_expression' ? value.childForFieldName('type')?.text : null;
+    return typeText && constructed ? `${typeText.replace(/\s+/g, '')}|${constructed.replace(/\s+/g, '')}` : '?';
+}
+
+function csharpEnclosingCallable(node) {
+    for (let parent = node?.parent; parent; parent = parent.parent) {
+        if (CALLABLE_SCOPE_NODES.has(parent.type) && !isControlFlowLocalArtifact(parent)) return parent;
+    }
+    return null;
+}
+
+/** Initializer of a variable declarator (the node after its name). */
+function csharpDeclaratorValue(declarator) {
+    const named = declarator.namedChildren || [];
+    return declarator.childForFieldName('value') ||
+        (named.length === 2 && named[0].type === 'identifier' ? named[1] : null);
+}
+
+/** A `var` local declared once and never assigned in its callable. */
+function csharpSingleVarLocal(declarator, name) {
+    const declaration = declarator.parent;
+    if (declaration?.type !== 'variable_declaration' ||
+        declaration.childForFieldName('type')?.text !== 'var') return false;
+    const fnNode = csharpEnclosingCallable(declarator);
+    if (!fnNode) return false;
+    const facts = csharpLocalBindingFacts(fnNode);
+    return facts.declared.get(name) === 1 && !facts.assigned.has(name);
+}
+
+/**
+ * The member access a one-hop `var` alias stands for (fix #381): `var c =
+ * this.config;` or `var c = config;` (a field or property of the enclosing
+ * type), when `c` is declared once and never assigned. Null otherwise.
+ */
+function csharpFieldAliasOf(identNode) {
+    const fnNode = csharpEnclosingCallable(identNode);
+    if (!fnNode) return null;
+    const name = identNode.text;
+    const facts = csharpLocalBindingFacts(fnNode);
+    if (facts.declared.get(name) !== 1 || facts.assigned.has(name)) return null;
+    let found = null;
+    const stack = [fnNode];
+    while (stack.length > 0 && !found) {
+        const current = stack.pop();
+        for (const child of current.namedChildren || []) {
+            if (child.type === 'variable_declarator' &&
+                child.childForFieldName('name')?.text === name) {
+                found = child;
+                break;
+            }
+            stack.push(child);
+        }
+    }
+    if (!found || found.endIndex > identNode.startIndex || !csharpSingleVarLocal(found, name)) return null;
+    const value = csharpDeclaratorValue(found);
+    if (!value) return null;
+    if (value.type === 'member_access_expression' && value.namedChildCount === 1 &&
+        ['this', 'this_expression'].includes(value.child(0)?.type)) {
+        return value;
+    }
+    if (value.type === 'identifier' && value.text !== name && !facts.declared.has(value.text) &&
+        enclosingTypeDeclaresMember(identNode, value.text)) {
+        return value;
+    }
+    return null;
 }
 
 function buildVariableTypes(tree, parser) {
@@ -703,6 +1469,22 @@ function buildVariableTypes(tree, parser) {
                 });
             }
         }
+        if (node.type === 'parameter_list') {
+            // `params T[] name` is three siblings of the list (see
+            // structuredParams): its name is a typed parameter too (fix #391).
+            for (let i = 0; i < node.childCount; i++) {
+                if (node.child(i).type !== 'params') continue;
+                const named = [];
+                for (let j = i + 1; j < node.childCount && named.length < 2; j++) {
+                    const child = node.child(j);
+                    if (child.type === ',' || child.type === ')') break;
+                    if (child.isNamed) named.push(child);
+                }
+                if (named.length === 2 && named[1].type === 'identifier') {
+                    setType(currentKey, named[1].text, named[0].text, 'annotation', node);
+                }
+            }
+        }
         if (node.type === 'parameter') {
             let artifactParameter = false;
             for (let parent = node.parent; parent; parent = parent.parent) {
@@ -750,8 +1532,47 @@ function buildVariableTypes(tree, parser) {
                     declarator.namedChildren.find(child => child.type === 'object_creation_expression');
                 const dynamicType = value?.type === 'object_creation_expression'
                     ? value.childForFieldName('type')?.text : null;
-                const type = dynamicType || (typeNode?.text !== 'var' ? typeNode?.text : null);
-                setType(currentKey, name, type, dynamicType ? 'constructor' : 'annotation', value || typeNode);
+                // `var c = items[i]` takes the declared element (fix #359).
+                let elementType = null;
+                const indexedValue = value ||
+                    declarator.namedChildren.find(child => child.type === 'element_access_expression');
+                if (!dynamicType && typeNode?.text === 'var' &&
+                    indexedValue?.type === 'element_access_expression') {
+                    const indexed = indexedReceiverType(indexedValue, byScope.get(currentKey));
+                    if (indexed) {
+                        elementType = indexed.namespace
+                            ? `${indexed.namespace}.${indexed.name}` : indexed.name;
+                    }
+                }
+                // The declared type is the receiver's static type (fix
+                // #394): `IShape s = new Square(); s.Area()` binds
+                // IShape.Area. `var` takes the constructed type; a
+                // declaration of the constructed type keeps the exact
+                // constructor evidence.
+                const declared = typeNode?.text && typeNode.text !== 'var' ? typeNode.text : null;
+                const constructorTyped = !!dynamicType && (!declared ||
+                    declared.replace(/\s+/g, '') === dynamicType.replace(/\s+/g, ''));
+                const type = declared || dynamicType || elementType;
+                // A local declared once and never assigned holds exactly the
+                // constructed value: dispatch reaches that type's member,
+                // never an unrelated implementation of the declared type.
+                const fnOfLocal = dynamicType && declared && !constructorTyped
+                    ? csharpEnclosingCallable(declarator) : null;
+                const facts = fnOfLocal ? csharpLocalBindingFacts(fnOfLocal) : null;
+                const shapes = facts?.shapes.get(name);
+                const exactOrigin = facts && !facts.assigned.has(name) && shapes?.size === 1 && !shapes.has('?')
+                    ? { ...typeOrigin('annotation', typeNode), constructedType: dynamicType } : null;
+                setType(currentKey, name, type, exactOrigin || (constructorTyped ? 'constructor' : 'annotation'),
+                    constructorTyped ? value : (declared ? typeNode : (value || typeNode)));
+                // fix #381: `var c = cfg;` carries cfg's type when c is a
+                // single, never-assigned local.
+                const aliasValue = csharpDeclaratorValue(declarator);
+                if (!type && aliasValue?.type === 'identifier' && aliasValue.text !== name &&
+                    byScope.get(currentKey)?.has(aliasValue.text) && csharpSingleVarLocal(declarator, name)) {
+                    const types = byScope.get(currentKey);
+                    setType(currentKey, name, types.get(aliasValue.text),
+                        types.origins.get(aliasValue.text) || 'flow');
+                }
             }
         }
         return true;
@@ -774,10 +1595,59 @@ function normalizeReceiverType(raw) {
     const match = value.match(/^([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*(?:<.*>)?$/s);
     if (!match) return null;
     const parts = match[1].split('.');
+    const typeArgs = genericArityOf(value);
     return {
         name: parts.pop(),
         ...(parts.length > 0 && { namespace: parts.join('.') }),
+        ...(typeArgs > 0 && { typeArgs }),
     };
+}
+
+// Indexer contracts of BCL collections (fix #359): `Conv[] a` / `List<Conv>`
+// index to Conv, `Dictionary<K, Conv>` keys to Conv. The declared element slot
+// is read from the declaration's type text; anything else abstains.
+const CSHARP_LIST_INDEXERS = new Set(['List', 'IList', 'IReadOnlyList', 'Collection', 'ReadOnlyCollection']);
+const CSHARP_MAP_INDEXERS = new Set([
+    'Dictionary', 'IDictionary', 'IReadOnlyDictionary', 'SortedDictionary',
+    'SortedList', 'ConcurrentDictionary',
+]);
+function csharpIndexerElementText(raw) {
+    if (!raw) return null;
+    const value = String(raw).trim().replace(/\?$/, '');
+    if (value.endsWith('[]')) {
+        const inner = value.slice(0, -2).trim();
+        return inner && !inner.includes('[') ? inner : null;
+    }
+    const open = value.indexOf('<');
+    if (open <= 0 || !value.endsWith('>')) return null;
+    const base = value.slice(0, open).trim().split('.').pop();
+    const args = [];
+    let depth = 0;
+    let start = open + 1;
+    for (let i = open + 1; i < value.length - 1; i++) {
+        const ch = value[i];
+        if (ch === '<' || ch === '[' || ch === '(') depth++;
+        else if (ch === '>' || ch === ']' || ch === ')') depth--;
+        else if (ch === ',' && depth === 0) {
+            args.push(value.slice(start, i).trim());
+            start = i + 1;
+        }
+    }
+    args.push(value.slice(start, value.length - 1).trim());
+    if (CSHARP_LIST_INDEXERS.has(base) && args.length === 1) return args[0];
+    if (CSHARP_MAP_INDEXERS.has(base) && args.length === 2) return args[1];
+    return null;
+}
+
+function indexedReceiverType(node, variableTypes) {
+    if (node?.type !== 'element_access_expression') return null;
+    const expression = node.childForFieldName('expression') || node.namedChild(0);
+    if (expression?.type !== 'identifier') return null;
+    const element = csharpIndexerElementText(variableTypes?.get(expression.text));
+    const normalized = normalizeReceiverType(element);
+    if (!normalized || /^[A-Z][A-Z0-9]?$/.test(normalized.name) ||
+        normalized.name === 'Array') return null;
+    return normalized;
 }
 
 function literalReceiverType(node) {
@@ -822,7 +1692,7 @@ function receiverTypeFromNode(node, variableTypes) {
     if (current.type === 'identifier') {
         return normalizeReceiverType(variableTypes?.get(current.text));
     }
-    return null;
+    return indexedReceiverType(current, variableTypes);
 }
 
 function receiverCastIsThis(node) {
@@ -856,6 +1726,7 @@ function receiverFieldPath(node, variableTypes, enclosingClass) {
                 fields: [],
                 rootType: declared.name,
                 ...(declared.namespace && { rootNamespace: declared.namespace }),
+                ...(declared.typeArgs && { rootTypeArgs: declared.typeArgs }),
             };
         }
         return {
@@ -982,14 +1853,17 @@ function staticArgKind(node, variableTypes) {
         }
         case 'array_creation_expression': {
             const type = node.childForFieldName('type');
-            return type ? `type:${type.text}` : 'expr';
+            // `new object[0]` is an object[]: the rank's sizes are not part
+            // of the type (fix #391).
+            return type ? `type:${type.text.replace(/\[([^\]]*)\]/g, (_, inner) =>
+                `[${','.repeat((inner.match(/,/g) || []).length)}]`)}` : 'expr';
         }
         case 'cast_expression': {
             const type = node.childForFieldName('type');
             return type ? `cast:${type.text}` : 'expr';
         }
         case 'identifier': {
-            const type = variableTypes?.get(node.text);
+            const type = variableTypes?.get(node.text) || enclosingMemberValueType(node);
             return type ? `type:${type}` : 'expr';
         }
         case 'member_access_expression': {
@@ -1078,8 +1952,24 @@ function staticArgKind(node, variableTypes) {
                 ? staticArgKind(node.namedChild(0), variableTypes)
                 : 'expr';
         case 'lambda_expression':
-        case 'anonymous_method_expression':
-            return 'lambda';
+        case 'anonymous_method_expression': {
+            // Its parameter count selects among delegate overloads (fix
+            // #391); `delegate { }` without a list converts to any count.
+            const params = node.childForFieldName('parameters');
+            if (!params) return 'lambda';
+            return params.type === 'parameter_list'
+                ? `lambda:${params.namedChildren.filter(child => child.type === 'parameter').length}`
+                : 'lambda:1';
+        }
+        case 'binary_expression': {
+            // String concatenation: `+` with a string operand is a string
+            // (fix #390).
+            if (node.childForFieldName('operator')?.text !== '+') return 'expr';
+            const left = node.childForFieldName('left');
+            const right = node.childForFieldName('right');
+            return staticArgKind(left, variableTypes) === 'string' ||
+                staticArgKind(right, variableTypes) === 'string' ? 'string' : 'expr';
+        }
         default:
             return 'expr';
     }
@@ -1121,13 +2011,122 @@ function assignmentTargetOf(callNode) {
     return null;
 }
 
+/**
+ * A local variable, parameter or lambda parameter named like a bare
+ * invocation (`Action Run = ..; Run();`) is the invoked delegate, never a
+ * same-named method (fix #369). Walks enclosing blocks (declarations before
+ * the call), foreach/catch/using variables, lambda and callable parameters,
+ * stopping at the enclosing member. Local functions are methods, not values.
+ */
+const _csharpLocalNamesByTree = new WeakMap();
+/** Every local/parameter/lambda-parameter name the file declares (fix #369). */
+function csharpLocalBindingNames(tree) {
+    let names = _csharpLocalNamesByTree.get(tree);
+    if (names) return names;
+    names = new Set();
+    for (const node of tree.rootNode.descendantsOfType([
+        'variable_declarator', 'parameter', 'implicit_parameter', 'foreach_statement', 'catch_declaration'])) {
+        const nameNode = node.type === 'implicit_parameter' ? node
+            : node.type === 'foreach_statement' ? node.childForFieldName('left')
+                : node.childForFieldName('name') ||
+                    (node.type === 'variable_declarator' ? node.namedChild(0) : node.namedChildren.at(-1));
+        if (nameNode?.type === 'identifier' || nameNode?.type === 'implicit_parameter') names.add(nameNode.text);
+    }
+    _csharpLocalNamesByTree.set(tree, names);
+    return names;
+}
+
+function csharpBareNameShadowedByLocal(callNode, name) {
+    const declares = declaration => (declaration?.namedChildren || []).some(child =>
+        child.type === 'variable_declarator' &&
+        (child.childForFieldName('name') || child.namedChild(0))?.text === name);
+    const paramsDeclare = list => (list?.namedChildren || []).some(param =>
+        param.type === 'parameter' &&
+        (param.childForFieldName('name') || param.namedChildren.at(-1))?.text === name);
+    let child = callNode;
+    for (let p = callNode.parent; p; child = p, p = p.parent) {
+        switch (p.type) {
+            case 'block':
+            case 'switch_section':
+                for (let i = 0; i < p.namedChildCount; i++) {
+                    const statement = p.namedChild(i);
+                    if (statement.startIndex >= child.startIndex) break;
+                    if (statement.type === 'local_declaration_statement' &&
+                        declares(statement.namedChildren.find(c => c.type === 'variable_declaration'))) {
+                        return true;
+                    }
+                }
+                break;
+            case 'foreach_statement': {
+                const left = p.childForFieldName('left');
+                if (left?.type === 'identifier' && left.text === name) return true;
+                break;
+            }
+            case 'using_statement':
+            case 'for_statement':
+            case 'fixed_statement': {
+                const declaration = p.namedChildren.find(c => c.type === 'variable_declaration');
+                if (declaration && !sameNode(declaration, child) && declares(declaration)) return true;
+                break;
+            }
+            case 'catch_clause': {
+                const declaration = p.namedChildren.find(c => c.type === 'catch_declaration');
+                if ((declaration?.childForFieldName('name') || null)?.text === name) return true;
+                break;
+            }
+            case 'lambda_expression':
+            case 'anonymous_method_expression': {
+                const implicit = p.namedChildren.find(c => c.type === 'implicit_parameter');
+                if (implicit?.text === name) return true;
+                if (paramsDeclare(p.childForFieldName('parameters') ||
+                    p.namedChildren.find(c => c.type === 'parameter_list'))) return true;
+                break;
+            }
+            case 'local_function_statement':
+                // A local function sees its own parameters and the
+                // enclosing member's locals declared before it.
+                if (paramsDeclare(p.childForFieldName('parameters') ||
+                    p.namedChildren.find(c => c.type === 'parameter_list'))) return true;
+                break;
+            case 'method_declaration':
+            case 'constructor_declaration':
+            case 'operator_declaration':
+            case 'conversion_operator_declaration':
+            case 'destructor_declaration':
+                return paramsDeclare(p.childForFieldName('parameters') ||
+                    p.namedChildren.find(c => c.type === 'parameter_list'));
+            case 'accessor_declaration':
+            case 'property_declaration':
+            case 'indexer_declaration':
+            case 'class_declaration':
+            case 'struct_declaration':
+            case 'record_declaration':
+            case 'interface_declaration':
+                return false;
+            default:
+                break;
+        }
+    }
+    return false;
+}
+
 function findCallsInCode(code, parser) {
-    const tree = parseTree(parser, code);
+    const views = csharpViews(parser, code);
+    if (!views) return findCallsInTree(code, parser, safeParse(parser, code, undefined, PARSE_OPTIONS));
+    return csMergeViewItems(views, (tree, reaches) => findCallsInTree(code, parser, tree, reaches), call => call.line)
+        .sort((a, b) => a.line - b.line ||
+            (a.callSite?.column ?? 0) - (b.callSite?.column ?? 0));
+}
+
+function findCallsInTree(code, parser, tree, reaches = null) {
     const variableTypesByScope = buildVariableTypes(tree, parser);
     const calls = [];
+    // The variable types in scope at a call (only call nodes ask: the scope
+    // walk climbs parents).
+    const typesAt = node => variableTypesByScope.get(variableScopeKey(node)) ||
+        variableTypesByScope.get('global');
     traverseTree(tree.rootNode, node => {
-        const variableTypes = variableTypesByScope.get(variableScopeKey(node)) ||
-            variableTypesByScope.get('global');
+        if (reaches && !reaches(node)) return false;
         if (isControlFlowLocalArtifact(node)) {
             const paramsNode = node.childForFieldName('parameters');
             const raw = paramsNode?.text;
@@ -1150,15 +2149,26 @@ function findCallsInCode(code, parser) {
         if (node.type === 'invocation_expression') {
             const identity = invocationIdentity(node.childForFieldName('function'));
             if (!identity.name) return true;
+            const variableTypes = typesAt(node);
             const args = callArgs(node, variableTypes);
             const first = extractStringArg(args.firstArg);
-            const receiverRoot = identity.receiver?.split('.')[0];
+            let receiverRoot = identity.receiver?.split('.')[0];
             const functionNode = node.childForFieldName('function');
-            const receiverNode = functionNode?.type === 'member_access_expression'
+            let receiverNode = functionNode?.type === 'member_access_expression'
                 ? functionNode.childForFieldName('expression') || functionNode.namedChild(0)
                 : functionNode?.type === 'conditional_access_expression'
                     ? functionNode.childForFieldName('condition') || functionNode.namedChild(0)
                     : null;
+            // fix #381: `c.Load()` after `var c = this.config;` receives
+            // exactly like `this.config.Load()`.
+            if (receiverNode?.type === 'identifier' && !variableTypes.has(receiverNode.text)) {
+                const aliased = csharpFieldAliasOf(receiverNode);
+                if (aliased) {
+                    receiverNode = aliased;
+                    identity.receiver = aliased.text;
+                    receiverRoot = aliased.text.split('.')[0];
+                }
+            }
             const unwrappedReceiverNode = unwrapReceiverNode(receiverNode);
             // A root variable's type is the receiver type only for a direct
             // `value.Method()` call. For `value.Property.Method()` the static
@@ -1175,11 +2185,20 @@ function findCallsInCode(code, parser) {
                     : null);
             const receiverType = receiverTypeInfo?.name;
             const receiverCastThis = receiverCastIsThis(receiverNode);
+            // `Outcome<int>.Create()`: a generic type name is only ever a
+            // type (fix #380); its arity is part of the type's identity.
+            const genericTypeReceiver = identity.isMethod &&
+                unwrappedReceiverNode?.type === 'generic_name' &&
+                /^[A-Z]/.test(unwrappedReceiverNode.namedChild(0)?.text || '')
+                ? unwrappedReceiverNode : null;
+            if (genericTypeReceiver) identity.receiver = genericTypeReceiver.namedChild(0).text;
             const receiverIsTypeQualified = !!(identity.isMethod &&
-                unwrappedReceiverNode?.type === 'identifier' &&
+                (genericTypeReceiver || (unwrappedReceiverNode?.type === 'identifier' &&
                 /^[A-Z]/.test(identity.receiver || '') &&
                 !variableTypes.has(identity.receiver) &&
-                !enclosingTypeDeclaresMember(node, identity.receiver));
+                !enclosingTypeDeclaresMember(node, identity.receiver))));
+            const receiverTypeArgs = genericTypeReceiver
+                ? genericArityOf(genericTypeReceiver.text) : 0;
             const currentNamespace = namespaceOf(node, tree);
             let receiverCall = null;
             let receiverCallIsMethod = false;
@@ -1196,7 +2215,7 @@ function findCallsInCode(code, parser) {
                 }
             }
             const assignment = assignmentTargetOf(node);
-            let fieldRoot, fieldName, fieldNames, fieldRootType, fieldRootNamespace;
+            let fieldRoot, fieldName, fieldNames, fieldRootType, fieldRootNamespace, fieldRootTypeArgs;
             if (identity.isMethod && !receiverType && identity.receiver &&
                 !receiverIsTypeQualified) {
                 const fieldPath = receiverFieldPath(
@@ -1207,21 +2226,34 @@ function findCallsInCode(code, parser) {
                     fieldName = fieldNames[fieldNames.length - 1];
                     fieldRootType = fieldPath.rootType;
                     fieldRootNamespace = fieldPath.rootNamespace || currentNamespace;
+                    fieldRootTypeArgs = fieldPath.rootTypeArgs;
                 }
             }
+            const functionIsBareName = functionNode?.type === 'identifier' &&
+                csharpLocalBindingNames(tree).has(identity.name);
+            // `M<string>(..)`: explicit method type arguments (fix #391).
+            const methodTypeArgs = identity.nameNode?.type === 'generic_name'
+                ? genericArityOf(identity.nameNode.text) : 0;
             calls.push({
                 callSite: typeOrigin('call', identity.nameNode || node),
                 name: identity.name,
                 line: identity.nameNode?.startPosition.row + 1 || node.startPosition.row + 1,
                 isMethod: identity.isMethod,
+                ...(methodTypeArgs > 0 && { methodTypeArgs }),
+                ...(functionIsBareName && csharpBareNameShadowedByLocal(node, identity.name) &&
+                    { localShadow: true }),
                 ...(identity.receiver && { receiver: identity.receiver }),
                 ...(receiverIsTypeQualified && { receiverIsTypeQualified: true }),
+                ...(receiverTypeArgs > 0 && { receiverTypeArgs }),
+                ...(receiverType && receiverTypeInfo.typeArgs && { receiverTypeArgs: receiverTypeInfo.typeArgs }),
                 ...(receiverType && { receiverType, ...(unwrappedReceiverNode?.type === 'cast_expression' ? {
                     receiverTypeSource: 'cast', receiverTypeEvidence: typeOrigin('cast', unwrappedReceiverNode),
                 } : unwrappedReceiverNode?.type === 'object_creation_expression' ? {
                     receiverTypeSource: 'constructor', receiverTypeEvidence: typeOrigin('constructor', unwrappedReceiverNode),
                 } : literalReceiverType(unwrappedReceiverNode) ? {
                     receiverTypeSource: 'literal', receiverTypeEvidence: typeOrigin('literal', unwrappedReceiverNode),
+                } : unwrappedReceiverNode?.type === 'element_access_expression' ? {
+                    receiverTypeSource: 'annotation', receiverTypeEvidence: typeOrigin('annotation', unwrappedReceiverNode),
                 } : variableTypes.fields(identity.receiver)) }),
                 ...(receiverCastThis && { receiverCastThis: true }),
                 ...(receiverType && receiverTypeInfo.namespace && {
@@ -1233,8 +2265,13 @@ function findCallsInCode(code, parser) {
                     receiverFields: fieldNames,
                     ...(fieldRootType && { receiverRootType: fieldRootType }),
                     ...(fieldRootNamespace && { receiverRootNamespace: fieldRootNamespace }),
+                    ...(fieldRootTypeArgs && { receiverRootTypeArgs: fieldRootTypeArgs }),
                 }),
                 ...(receiverCall && { receiverCall }),
+                // The receiver IS the producer call (fix #395): chained
+                // consumers are typed from their producer, never read as a
+                // type name spelled like the receiver text.
+                ...(receiverCall && { receiverIsChainRoot: true }),
                 ...(receiverCallIsMethod && { receiverCallIsMethod: true }),
                 ...(receiverCallLine && { receiverCallLine }),
                 ...(receiverCallReceiver && { receiverCallReceiver }),
@@ -1280,17 +2317,28 @@ function findCallsInCode(code, parser) {
         }
         if (node.type === 'object_creation_expression' ||
             node.type === 'implicit_object_creation_expression') {
-            const typeNode = node.childForFieldName('type');
+            // A target-typed `new(...)` constructs the type its position
+            // declares (fix #393): a typed local or field, a property, or
+            // the return type of the enclosing member.
+            const typeNode = node.childForFieldName('type') ||
+                (node.type === 'implicit_object_creation_expression' ? implicitCreationTarget(node) : null);
             if (!typeNode) return true;
-            const args = callArgs(node, variableTypes);
+            const args = callArgs(node, typesAt(node));
             const raw = typeNode.text.replace(/<.*>$/, '');
             const name = raw.split('.').pop();
+            const typeArgs = genericArityOf(typeNode.text);
+            // A target-typed site is the `new` token; its type is written
+            // elsewhere.
+            const targetTyped = !node.childForFieldName('type');
+            const siteNode = targetTyped ? (node.child(0) || node) : typeNode;
             calls.push({
-                callSite: typeOrigin('call', typeNode),
+                callSite: typeOrigin('call', siteNode),
                 name,
-                line: typeNode.startPosition.row + 1,
+                line: siteNode.startPosition.row + 1,
+                ...(targetTyped && { targetTyped: true }),
                 isMethod: false,
                 isConstructor: true,
+                ...(typeArgs > 0 && { typeArgs }),
                 argCount: args.argCount,
                 ...(args.argKinds && { argKinds: args.argKinds }),
                 enclosingFunction: enclosingFunctionOf(node),
@@ -1302,7 +2350,13 @@ function findCallsInCode(code, parser) {
 }
 
 function findImportsInCode(code, parser) {
-    const tree = parseTree(parser, code);
+    const views = csharpViews(parser, code);
+    if (!views) return findImportsInTree(safeParse(parser, code, undefined, PARSE_OPTIONS));
+    return csMergeViewItems(views, findImportsInTree, item => item.line)
+        .sort((a, b) => a.line - b.line);
+}
+
+function findImportsInTree(tree) {
     const imports = [];
     traverseTreeCached(tree.rootNode, node => {
         if (node.type !== 'using_directive') return true;
@@ -1310,12 +2364,23 @@ function findImportsInCode(code, parser) {
         const named = node.namedChildren || [];
         const moduleNode = named[named.length - 1];
         if (!moduleNode) return false;
+        // `global::N.M` names N.M from the global namespace; any other
+        // spelling is resolved from the namespace the directive sits in
+        // (fix #395), which the directive records.
+        const written = moduleNode.text.replace(/\s+/g, '');
+        const rooted = written.startsWith('global::');
+        const head = node.text.trimStart();
+        const isGlobal = /^global\s+using\b/.test(head);
+        const enclosing = isGlobal ? null : namespaceOf(node, tree);
+        const isStatic = /^(?:global\s+)?using\s+static\b/.test(head);
         imports.push({
-            module: moduleNode.text,
+            module: rooted ? written.slice('global::'.length) : moduleNode.text,
             names: nameNode ? [nameNode.text] : ['*'],
             type: 'using',
             line: node.startPosition.row + 1,
-            ...(node.text.trimStart().startsWith('global using ') && { global: true }),
+            ...(isGlobal && { global: true }),
+            ...(isStatic && { static: true }),
+            ...(enclosing && !rooted && { namespace: enclosing }),
         });
         return false;
     });
@@ -1323,7 +2388,19 @@ function findImportsInCode(code, parser) {
 }
 
 function findUsagesInCode(code, name, parser, existingTree) {
-    const tree = existingTree || parseTree(parser, code);
+    // A query tree of a file with conditional directives is its primary
+    // view; the rows other views own are read from them (fix #391).
+    const known = existingTree && csViewsByTree.get(existingTree);
+    const views = known?.code === code ? known.views
+        : (!existingTree || existingTree.rootNode.hasError ? csharpViews(parser, code) : null);
+    if (views) {
+        return csMergeViewItems(views, tree => usagesInTree(code, name, parser, tree), usage => usage.line)
+            .sort((a, b) => a.line - b.line || (a.column ?? 0) - (b.column ?? 0));
+    }
+    return usagesInTree(code, name, parser, existingTree || safeParse(parser, code, undefined, PARSE_OPTIONS));
+}
+
+function usagesInTree(code, name, parser, tree) {
     const usages = [];
     const variableTypesByScope = buildVariableTypes(tree, parser);
     visitNameNodes(tree, code, name, node => {
@@ -1411,22 +2488,108 @@ function isPlatformConcreteCall(receiverType, _methodName) {
     return !!normalized && CSHARP_PLATFORM_RECEIVER_TYPES.has(normalized.name);
 }
 
+// fix #380: language features whose lowering references a compiler-required
+// type by its full name (IsExternalInit for `init` accessors and positional
+// records, RequiredMemberAttribute for `required`, System.Index/Range for
+// `^i`/`a..b`, ...). A project declaration of such a type is used by the
+// compiler exactly when the feature appears (trait languageProtocolType).
+function languageFeatures(tree) {
+    const features = new Set();
+    const root = tree.rootNode;
+    const hasToken = (node, token) => {
+        for (let i = 0; i < node.childCount; i++) {
+            if (node.child(i).type === token || node.child(i).text === token) return true;
+        }
+        return false;
+    };
+    const nodes = root.descendantsOfType([
+        'accessor_declaration', 'record_declaration', 'modifier', 'prefix_unary_expression',
+        'range_expression', 'nullable_type', 'nullable_directive', 'struct_declaration',
+        'type_parameter_constraint', 'tuple_element', 'parameter',
+    ]);
+    for (const node of nodes) {
+        switch (node.type) {
+            case 'accessor_declaration':
+                if (hasToken(node, 'init')) features.add('init');
+                break;
+            case 'record_declaration':
+                if (node.namedChildren.some(child => child.type === 'parameter_list')) features.add('init');
+                break;
+            case 'modifier':
+                if (node.text === 'required') features.add('required');
+                else if (node.text === 'this' && node.parent?.type === 'parameter') features.add('extension-method');
+                else if (node.text === 'in' && node.parent?.type === 'parameter') features.add('readonly');
+                break;
+            case 'prefix_unary_expression':
+                if (node.child(0)?.type === '^') features.add('index-range');
+                break;
+            case 'range_expression':
+                features.add('index-range');
+                break;
+            case 'nullable_type':
+            case 'nullable_directive':
+                features.add('nullable');
+                break;
+            case 'struct_declaration':
+                for (const child of node.namedChildren) {
+                    if (child.type !== 'modifier') continue;
+                    if (child.text === 'ref') features.add('ref-struct');
+                    if (child.text === 'readonly') features.add('readonly');
+                }
+                break;
+            case 'type_parameter_constraint':
+                if (node.text === 'unmanaged') features.add('unmanaged');
+                break;
+            case 'tuple_element':
+                if (node.childForFieldName('name')) features.add('tuple-names');
+                break;
+            default:
+                break;
+        }
+    }
+    return [...features].sort();
+}
+
 function parse(code, parser) {
-    const tree = parseTree(parser, code);
+    const views = csharpViews(parser, code);
+    const tree = views ? views.primary.tree : safeParse(parser, code, undefined, PARSE_OPTIONS);
+    const featureSet = new Set(languageFeatures(tree));
+    let errorRegions = tree.rootNode.hasError ? parseErrorRegions(tree.rootNode) : [];
+    for (const view of views?.secondary || []) {
+        for (const feature of languageFeatures(view.tree)) featureSet.add(feature);
+        if (!view.tree.rootNode.hasError) continue;
+        // A secondary view's damage counts where it supplies the rows.
+        const owned = parseErrorRegions(view.tree.rootNode).filter(([start, end]) => {
+            for (let row = start - 1; row < end; row++) if (view.owns.has(row)) return true;
+            return false;
+        });
+        errorRegions = [...errorRegions, ...owned].sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+    }
+    const features = [...featureSet].sort();
+    const classes = findClasses(code, parser);
     return {
         language: 'csharp',
         totalLines: code.length === 0 ? 0 : code.split('\n').length,
         functions: findFunctions(code, parser),
-        classes: findClasses(code, parser),
+        classes,
         stateObjects: findStateObjects(code, parser),
         imports: findImportsInCode(code, parser),
-        exports: findExportsInCodeShallow(code, parser),
-        ...(tree.rootNode.hasError && { parseRecovery: true }),
+        exports: exportsOfClasses(classes),
+        ...((tree.rootNode.hasError || errorRegions.length > 0) && {
+            parseRecovery: true, parseErrorRegions: errorRegions,
+        }),
+        ...(features.length > 0 && { languageFeatures: features }),
+        ...(views && { conditionalViews: views.groups.map(group => [...group]) }),
     };
 }
 
 function findExportsInCodeShallow(code, parser) {
-    const classes = findClasses(code, parser);
+    return exportsOfClasses(findClasses(code, parser));
+}
+
+// Public top-level types are the file's exports (read from the classes
+// parse() already extracted, instead of extracting them again).
+function exportsOfClasses(classes) {
     const exports = [];
     for (const cls of classes) {
         if (cls.modifiers.includes('public')) {
@@ -1437,6 +2600,9 @@ function findExportsInCodeShallow(code, parser) {
 }
 
 module.exports = {
+    queryTree,
+    queryTreeIsPlain,
+    analysisTree: queryTree,
     findFunctions,
     findClasses,
     findStateObjects,

@@ -1720,7 +1720,7 @@ describe('Confidence Scoring', () => {
             } finally { rm(dir); }
         });
 
-        it('2-hop re-export gets name-only (known limitation)', () => {
+        it('2-hop re-export is import evidence through the name-level chain (fix #397)', () => {
             const dir = tmp({
                 'package.json': '{"name":"test"}',
                 'lib.js': 'function deep() { return 42; }\nmodule.exports = { deep };',
@@ -1733,8 +1733,9 @@ describe('Confidence Scoring', () => {
                 const callers = index.findCallers('deep');
                 const appCaller = callers.find(c => c.file.endsWith('app.js'));
                 assert.ok(appCaller, 'should find caller through 2-hop re-export');
-                // 2-hop re-export: our fix covers 1 hop, 2 hops falls back to name-only
-                assert.strictEqual(appCaller.resolution, 'name-only', '2-hop re-export is name-only (known limitation)');
+                // The binding's own name chased through every re-export
+                // reaches lib.js: import evidence, not a bare name match.
+                assert.notStrictEqual(appCaller.resolution, 'name-only', JSON.stringify(appCaller));
             } finally { rm(dir); }
         });
     });

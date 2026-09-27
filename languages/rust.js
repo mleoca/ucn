@@ -6,6 +6,7 @@
  */
 
 const { ReceiverTypeMap, typeOrigin } = require('./type-evidence');
+const { referenceScope, scopeFields, rustSelfFieldBinding } = require('./lexical-scope');
 
 
 const {
@@ -17,8 +18,11 @@ const {
     extractRustDocstring,
     visitNameNodes,
     sameNode,
+    parseErrorRegions,
+    cachedNodeRange,
 } = require('./utils');
 const { PARSE_OPTIONS, safeParse } = require('./index');
+const { rustValueFacts } = require('./rust-value-flow');
 
 function parseTree(parser, code) {
     return safeParse(parser, code, undefined, PARSE_OPTIONS);
@@ -123,6 +127,185 @@ function declarationTrees(code, parser) {
     return result;
 }
 
+/** Names of the outer attributes preceding an item (`#[cfg(..)]` -> cfg). */
+function rustAttributeNames(node) {
+    const names = [];
+    for (let sibling = node.previousNamedSibling; sibling; sibling = sibling.previousNamedSibling) {
+        if (sibling.type === 'line_comment' || sibling.type === 'block_comment') continue;
+        if (sibling.type !== 'attribute_item') break;
+        const head = sibling.namedChildren.find(child => child.type === 'attribute')
+            ?.namedChildren.find(child => child.type === 'identifier' || child.type === 'scoped_identifier');
+        if (head) names.unshift(head.text);
+    }
+    return names;
+}
+
+/**
+ * Declaration trees for a source the caller already parsed and knows holds
+ * no macro item bodies to recover (fix #374: an expanded file, whose project
+ * invocations are already replaced by their expansions). Primes the memo
+ * the extractors below read, so they share that tree.
+ */
+function primeDeclarationTrees(code, parser, tree) {
+    lastDeclarationParser = parser;
+    lastDeclarationCode = code;
+    lastDeclarationTrees = {
+        primary: tree,
+        trees: [tree],
+        macroItemRecovery: false,
+        macroItemCount: 0,
+        macroDeclarationNameStarts: new Set(),
+    };
+}
+
+/**
+ * Function qualifiers from the AST `function_modifiers` node (fix #370): a
+ * first-line text probe misread `fn f() -> impl Future { async { .. } }` as
+ * an async fn and missed qualifiers written on a later line.
+ */
+function rustFunctionQualifiers(node) {
+    const out = { async: false, unsafe: false, const: false, extern: false };
+    const mods = node?.namedChildren?.find(child => child.type === 'function_modifiers');
+    if (!mods) return out;
+    for (let i = 0; i < mods.childCount; i++) {
+        const type = mods.child(i).type;
+        if (type === 'async') out.async = true;
+        else if (type === 'unsafe') out.unsafe = true;
+        else if (type === 'const') out.const = true;
+        else if (type === 'extern_modifier' || type === 'extern') out.extern = true;
+    }
+    return out;
+}
+
+// Future vocabulary (fix #370): the std/core Future trait, the smart-pointer
+// wrappers that keep a future a future, and the futures-crate boxed aliases.
+const RUST_FUTURE_TRAITS = new Set(['Future']);
+const RUST_FUTURE_WRAPPERS = new Set(['Pin', 'Box']);
+const RUST_FUTURE_ALIASES = new Set(['BoxFuture', 'LocalBoxFuture']);
+
+function rustTypeLastName(typeNode) {
+    if (!typeNode) return null;
+    if (typeNode.type === 'type_identifier') return typeNode.text;
+    if (typeNode.type === 'scoped_type_identifier') return typeNode.childForFieldName('name')?.text || null;
+    if (typeNode.type === 'generic_type') return rustTypeLastName(typeNode.childForFieldName('type'));
+    return null;
+}
+
+function rustTypeArguments(typeNode) {
+    const args = typeNode?.type === 'generic_type' ? typeNode.childForFieldName('type_arguments') : null;
+    return (args?.namedChildren || []).filter(arg => arg.type !== 'lifetime');
+}
+
+/**
+ * Whether a type node denotes a future, and its Output type text:
+ * `impl Future<Output = T> (+ Send)`, `dyn Future<..>` behind `Pin`/`Box`/
+ * references, `BoxFuture<'a, T>`. Returns { output } or null.
+ */
+function rustFutureShape(typeNode, depth = 0) {
+    if (!typeNode || depth > 8) return null;
+    switch (typeNode.type) {
+        case 'bounded_type':
+            for (const child of typeNode.namedChildren) {
+                const shape = rustFutureShape(child, depth + 1);
+                if (shape) return shape;
+            }
+            return null;
+        case 'abstract_type':
+        case 'dynamic_type': {
+            const bound = typeNode.childForFieldName('trait') || typeNode.namedChild(0);
+            if (bound?.type === 'bounded_type') return rustFutureShape(bound, depth + 1);
+            if (!RUST_FUTURE_TRAITS.has(rustTypeLastName(bound))) return null;
+            const args = bound.type === 'generic_type' ? bound.childForFieldName('type_arguments') : null;
+            const output = (args?.namedChildren || []).find(arg =>
+                arg.type === 'type_binding' && arg.childForFieldName('name')?.text === 'Output');
+            return { output: output?.childForFieldName('type')?.text || null };
+        }
+        case 'reference_type':
+            return rustFutureShape(typeNode.childForFieldName('type'), depth + 1);
+        case 'generic_type': {
+            const name = rustTypeLastName(typeNode);
+            const args = rustTypeArguments(typeNode);
+            if (RUST_FUTURE_WRAPPERS.has(name) && args.length === 1) return rustFutureShape(args[0], depth + 1);
+            if (RUST_FUTURE_ALIASES.has(name)) return { output: args.length > 0 ? args[args.length - 1].text : null };
+            return null;
+        }
+        case 'type_identifier':
+        case 'scoped_type_identifier':
+            return RUST_FUTURE_ALIASES.has(rustTypeLastName(typeNode)) ? { output: null } : null;
+        default:
+            return null;
+    }
+}
+
+// Attributes that never replace a function's body or signature: the
+// language's built-in lint/doc/codegen attributes and `tracing::instrument`
+// (which preserves the async signature). Any other attribute may be a
+// proc macro that rewrites the function (`#[tokio::main]` turns an async fn
+// into a blocking sync fn), so its call result is not known.
+const RUST_TRANSPARENT_FN_ATTRIBUTES = new Set([
+    'inline', 'cold', 'must_use', 'allow', 'warn', 'deny', 'forbid', 'expect',
+    'deprecated', 'doc', 'cfg', 'track_caller', 'target_feature', 'rustfmt::skip',
+    'instrument', 'tracing::instrument',
+]);
+
+function rustAttributePath(node) {
+    return node && ['identifier', 'scoped_identifier'].includes(node.type) ? node.text.replace(/\s+/g, '') : null;
+}
+
+/** Outer attribute paths of an item; `cfg_attr(pred, a, b)` yields a, b. */
+function rustOuterAttributePaths(itemNode) {
+    const paths = [];
+    for (let sibling = itemNode.previousNamedSibling; sibling; sibling = sibling.previousNamedSibling) {
+        if (sibling.type === 'line_comment' || sibling.type === 'block_comment') continue;
+        if (sibling.type !== 'attribute_item') break;
+        const attribute = sibling.namedChildren.find(child => child.type === 'attribute');
+        const path = rustAttributePath(attribute?.namedChild(0));
+        if (!path) { paths.push('?'); continue; }
+        if (path !== 'cfg_attr') { paths.push(path); continue; }
+        const args = attribute.childForFieldName('arguments');
+        let group = 0;
+        let expectPath = false;
+        let current = '';
+        for (let i = 0; args && i < args.childCount; i++) {
+            const token = args.child(i);
+            if (token.type === ',') {
+                if (current) paths.push(current);
+                current = '';
+                group++;
+                expectPath = true;
+                continue;
+            }
+            if (group === 0 || !expectPath) continue;
+            if (token.type === 'identifier' || token.type === '::') current += token.text;
+            else { if (current) paths.push(current); current = ''; expectPath = false; }
+        }
+        if (current) paths.push(current);
+    }
+    return paths;
+}
+
+/**
+ * What calling a function returns when that is a future (fix #370):
+ * `async fn` -> { kind: 'async', output }, a future-shaped return type ->
+ * { kind: 'future', output }. Null otherwise (named return types are
+ * resolved against project `impl Future` types and aliases at query time).
+ */
+function rustFutureReturn(fnNode, qualifiers) {
+    const returnNode = fnNode.childForFieldName('return_type');
+    let result = null;
+    if (qualifiers.async) {
+        result = { kind: 'async', output: returnNode ? nodeTextWithoutComments(returnNode).trim() : '()' };
+    } else {
+        const shape = rustFutureShape(returnNode);
+        if (shape) result = { kind: 'future', output: shape.output };
+    }
+    if (result) {
+        const wrapping = rustOuterAttributePaths(fnNode).find(path => !RUST_TRANSPARENT_FN_ATTRIBUTES.has(path));
+        if (wrapping) result = { kind: 'wrapped', output: result.output, attribute: wrapping };
+    }
+    return result;
+}
+
 /**
  * Extract return type from Rust function
  */
@@ -203,16 +386,82 @@ function extractRustParams(paramsNode) {
     return text.replace(/^\(|\)$/g, '').trim();
 }
 
-function extractRustCallbackParamTypes(paramsNode) {
+/**
+ * Generic parameters bounded by a closure trait (fix #368):
+ * `fn join<A: FnOnce(FnContext) -> R>(a: A)` and `where A: FnOnce(...)`.
+ * Returns name -> function_type node, plus every declared type-parameter
+ * name (a closure argument typed by a generic parameter has no concrete
+ * identity, so such slots stay unknown).
+ */
+function rustGenericClosureBounds(ownerNode) {
+    const bounds = new Map();
+    const declared = new Set();
+    if (!ownerNode) return { bounds, declared };
+    const functionTypeIn = (boundsNode) => {
+        const pending = boundsNode ? [boundsNode] : [];
+        while (pending.length > 0) {
+            const current = pending.pop();
+            if (current.type === 'function_type' &&
+                ['Fn', 'FnMut', 'FnOnce'].includes(current.childForFieldName('trait')?.text)) {
+                return current;
+            }
+            for (let j = 0; j < current.namedChildCount; j++) pending.push(current.namedChild(j));
+        }
+        return null;
+    };
+    const record = (nameNode, boundsNode) => {
+        if (nameNode?.type !== 'type_identifier') return;
+        const functionType = functionTypeIn(boundsNode);
+        if (!functionType) return;
+        if (bounds.has(nameNode.text) && bounds.get(nameNode.text) !== functionType) {
+            bounds.set(nameNode.text, null); // two closure bounds: ambiguous
+        } else {
+            bounds.set(nameNode.text, functionType);
+        }
+    };
+    const owners = [ownerNode];
+    for (let a = ownerNode.parent; a; a = a.parent) {
+        if (a.type === 'impl_item' || a.type === 'trait_item') {
+            owners.push(a);
+            break;
+        }
+        if (a.type === 'function_item') break;
+    }
+    for (const owner of owners) {
+        const typeParameters = owner.childForFieldName('type_parameters');
+        for (const child of typeParameters?.namedChildren || []) {
+            if (child.type === 'type_identifier') declared.add(child.text);
+            else if (child.type === 'constrained_type_parameter') {
+                const left = child.childForFieldName('left');
+                if (left?.type === 'type_identifier') declared.add(left.text);
+                if (owner === ownerNode) record(left, child.childForFieldName('bounds'));
+            } else if (child.type === 'optional_type_parameter') {
+                const name = child.childForFieldName('name');
+                if (name?.type === 'type_identifier') declared.add(name.text);
+            }
+        }
+        if (owner !== ownerNode) continue;
+        const whereClause = owner.namedChildren.find(child => child.type === 'where_clause');
+        for (const predicate of whereClause?.namedChildren || []) {
+            if (predicate.type !== 'where_predicate') continue;
+            record(predicate.childForFieldName('left'), predicate.childForFieldName('bounds'));
+        }
+    }
+    return { bounds, declared };
+}
+
+function extractRustCallbackParamTypes(paramsNode, ownerNode = null) {
     if (!paramsNode) return undefined;
     const callbacks = {};
     let callArgumentIndex = 0;
+    let generic = null;
     for (let i = 0; i < paramsNode.namedChildCount; i++) {
         const parameter = paramsNode.namedChild(i);
         if (parameter.type === 'self_parameter') continue;
         if (parameter.type !== 'parameter') continue;
         const typeNode = parameter.childForFieldName('type');
         let functionType = null;
+        let viaBound = false;
         const pending = typeNode ? [typeNode] : [];
         while (pending.length > 0 && !functionType) {
             const current = pending.pop();
@@ -224,19 +473,52 @@ function extractRustCallbackParamTypes(paramsNode) {
                 pending.push(current.namedChild(j));
             }
         }
+        if (!functionType && ownerNode) {
+            // `op: OP` / `op: &OP` / `op: &mut OP` with OP bounded by a
+            // closure trait on this function (fix #368).
+            let head = typeNode;
+            while (head?.type === 'reference_type') {
+                head = head.childForFieldName('type');
+            }
+            if (head?.type === 'type_identifier') {
+                generic = generic || rustGenericClosureBounds(ownerNode);
+                const bound = generic.bounds.get(head.text);
+                if (bound) {
+                    functionType = bound;
+                    viaBound = true;
+                }
+            }
+        }
         const callbackParams = functionType?.childForFieldName('parameters');
         if (callbackParams) {
+            if (viaBound || ownerNode) {
+                generic = generic || rustGenericClosureBounds(ownerNode);
+            }
             const types = [];
             let complete = true;
+            let known = 0;
             for (let j = 0; j < callbackParams.namedChildCount; j++) {
-                const name = aliasBaseTypeName(callbackParams.namedChild(j));
+                const slot = callbackParams.namedChild(j);
+                if (slot.type.endsWith('comment')) continue;
+                const name = aliasBaseTypeName(slot);
                 if (!name) {
-                    complete = false;
-                    break;
+                    if (!ownerNode) {
+                        complete = false;
+                        break;
+                    }
+                    types.push(null);
+                    continue;
+                }
+                // A slot naming a declared type parameter is not a concrete
+                // type; keep its position, never its spelling.
+                if (generic && generic.declared.has(name)) {
+                    types.push(null);
+                    continue;
                 }
                 types.push(name);
+                known++;
             }
-            if (complete && types.length > 0) callbacks[callArgumentIndex] = types;
+            if (complete && known > 0) callbacks[callArgumentIndex] = types;
         }
         callArgumentIndex++;
     }
@@ -337,7 +619,9 @@ function extractAttributesWithArgs(node, codeOrLines) {
         if (line.startsWith('#[')) {
             // Match #[name(...args...)] or #[name]
             // Need to handle nested parens; use a simple bracket-matching approach.
-            const m = line.match(/^#\[(.+)\]\s*$/);
+            // (The line is trimmed: only a line ending in ']' can match; a
+            // macro expansion's generated line can be very long.)
+            const m = line.charCodeAt(line.length - 1) === 93 ? line.match(/^#\[(.+)\]\s*$/) : null;
             if (m) {
                 const attrContent = m[1];
                 const parenIdx = attrContent.indexOf('(');
@@ -437,12 +721,13 @@ function _processFunction(node, functions, processedRanges, lines, code) {
         if (nameNode) {
             const { startLine, endLine, indent } = nodeToLocation(node, lines);
             const text = node.text;
-            const firstLine = text.split('\n')[0];
 
-            const isAsync = firstLine.includes('async ');
-            const isUnsafe = firstLine.includes('unsafe ');
-            const isConst = firstLine.includes('const fn');
-            const isExtern = firstLine.includes('extern ');
+            const qualifiers = rustFunctionQualifiers(node);
+            const isAsync = qualifiers.async;
+            const isUnsafe = qualifiers.unsafe;
+            const isConst = qualifiers.const;
+            const isExtern = qualifiers.extern;
+            const futureReturn = rustFutureReturn(node, qualifiers);
             const visibility = extractVisibility(text);
             const returnType = extractReturnType(node);
             const iteratorItemType = extractRustIteratorItemType(node);
@@ -452,7 +737,7 @@ function _processFunction(node, functions, processedRanges, lines, code) {
             const attributes = extractAttributes(node, lines);
             const attributesWithArgs = extractAttributesWithArgs(node, lines);
             const inCfgTest = _isInsideCfgTestModule(node, lines);
-            const callbackParamTypes = extractRustCallbackParamTypes(paramsNode);
+            const callbackParamTypes = extractRustCallbackParamTypes(paramsNode, node);
 
             const modifiers = [];
             if (visibility) modifiers.push(visibility);
@@ -478,6 +763,7 @@ function _processFunction(node, functions, processedRanges, lines, code) {
                 indent,
                 modifiers,
                 ...(returnType && { returnType }),
+                ...(futureReturn && { futureReturn }),
                 ...(iteratorItemType && { iteratorItemType }),
                 ...(docstring && { docstring }),
                 ...(generics && { generics }),
@@ -506,7 +792,7 @@ function _processFunction(node, functions, processedRanges, lines, code) {
                         const visibility = extractVisibility(child.text);
                         const returnType = extractReturnType(child);
                         const docstring = extractRustDocstring(lines, startLine);
-                        const callbackParamTypes = extractRustCallbackParamTypes(fParams);
+                        const callbackParamTypes = extractRustCallbackParamTypes(fParams, child);
                         const iteratorItemType = extractRustIteratorItemType(child);
                         const modifiers = ['extern'];
                         if (visibility) modifiers.push(visibility);
@@ -715,9 +1001,39 @@ function _inferMacroReturn(node, macroName) {
  * Returns true if node was matched, false otherwise
  * Note: for impl_item, caller should NOT skip subtrees (parse() always returns true)
  */
+/**
+ * Lexical scope of an item declared in a function body (fix #381): Rust
+ * items in a block are visible throughout that block and nowhere else.
+ */
+function rustBlockItemScope(node) {
+    for (let parent = node.parent; parent; parent = parent.parent) {
+        if (parent.type === 'declaration_list' || parent.type === 'source_file') return {};
+        if (parent.type === 'block') {
+            return {
+                lexicalScopeStartLine: parent.startPosition.row + 1,
+                lexicalScopeEndLine: parent.endPosition.row + 1,
+            };
+        }
+    }
+    return {};
+}
+
+/**
+ * How a struct's name works as a VALUE (fix #389): a unit struct (`struct
+ * S;`) names its only value, a tuple struct (`struct T(u8);`) names its
+ * constructor function; a braced struct's name is a type only.
+ */
+function rustStructValueShape(node) {
+    const body = node.childForFieldName('body');
+    if (!body) return 'unit';
+    if (body.type === 'ordered_field_declaration_list') return 'tuple';
+    return null;
+}
+
 function _processClass(node, types, processedRanges, lines, code) {
-    // Struct items
-    if (node.type === 'struct_item') {
+    // Struct and union items (a union is declared like a braced struct;
+    // its fields are its members, fix #389)
+    if (node.type === 'struct_item' || node.type === 'union_item') {
         const rangeKey = `${node.startIndex}-${node.endIndex}`;
         if (processedRanges.has(rangeKey)) return true;
         processedRanges.add(rangeKey);
@@ -732,14 +1048,17 @@ function _processClass(node, types, processedRanges, lines, code) {
             const attributes = extractAttributes(node, lines);
             const modifiers = visibility ? [visibility] : [];
             for (const attr of attributes) modifiers.push(attr);
+            const valueShape = node.type === 'struct_item' ? rustStructValueShape(node) : null;
 
             types.push({
                 name: nameNode.text,
                 startLine,
                 endLine,
-                type: 'struct',
+                type: node.type === 'union_item' ? 'union' : 'struct',
                 members,
                 modifiers,
+                ...(valueShape && { valueShape }),
+                ...rustBlockItemScope(node),
                 ...(docstring && { docstring }),
                 ...(generics && { generics })
             });
@@ -770,6 +1089,7 @@ function _processClass(node, types, processedRanges, lines, code) {
                 type: 'enum',
                 members: extractEnumVariants(node, lines),
                 modifiers,
+                ...rustBlockItemScope(node),
                 ...(docstring && { docstring }),
                 ...(generics && { generics })
             });
@@ -789,6 +1109,7 @@ function _processClass(node, types, processedRanges, lines, code) {
             const docstring = extractRustDocstring(lines, startLine);
             const visibility = extractVisibility(node.text);
             const generics = extractGenerics(node);
+            const supertraits = extractRustSupertraits(node);
 
             types.push({
                 name: nameNode.text,
@@ -797,8 +1118,10 @@ function _processClass(node, types, processedRanges, lines, code) {
                 type: 'trait',
                 members: extractTraitMembers(node, lines),
                 modifiers: visibility ? [visibility] : [],
+                ...rustBlockItemScope(node),
                 ...(docstring && { docstring }),
-                ...(generics && { generics })
+                ...(generics && { generics }),
+                ...(supertraits && { supertraits }),
             });
         }
         return true;
@@ -814,6 +1137,13 @@ function _processClass(node, types, processedRanges, lines, code) {
         const implInfo = extractImplInfo(node);
         const docstring = extractRustDocstring(lines, startLine);
         const derefTarget = extractDerefTarget(node, implInfo.traitName);
+        const implSelfTypeNode = node.childForFieldName('type');
+        const implSelfRef = implSelfTypeNode?.type === 'reference_type'
+            ? (implSelfTypeNode.namedChildren.some(child => child.type === 'mutable_specifier')
+                ? '&mut' : '&')
+            : null;
+        const blanketSelfBounds = implInfo.traitName
+            ? extractRustBlanketSelfBounds(node, implSelfTypeNode) : null;
 
         types.push({
             name: implInfo.name,
@@ -821,10 +1151,13 @@ function _processClass(node, types, processedRanges, lines, code) {
             endLine,
             type: 'impl',
             traitName: implInfo.traitName,
+                ...rustBlockItemScope(node),
             typeName: implInfo.typeName,
             members: extractImplMembers(node, lines, implInfo.typeName),
             modifiers: [],
             ...(implInfo.generics && { generics: implInfo.generics }),
+            ...(implSelfRef && { implSelfRef }),
+            ...(blanketSelfBounds && { blanketSelfBounds }),
             ...(derefTarget && { derefTarget }),
             ...(docstring && { docstring })
         });
@@ -871,13 +1204,33 @@ function _processClass(node, types, processedRanges, lines, code) {
             const docstring = extractRustDocstring(lines, startLine);
             const inferred = _inferMacroReturn(node, nameNode.text);
 
+            // Attributes and the textual scope a macro_rules! definition is
+            // visible in (fix #374: macro expansion resolves invocations by
+            // Rust's textual scoping without re-parsing the defining file).
+            const modifiers = rustAttributeNames(node).filter(name => name === 'macro_export' || name === 'cfg');
+            let macroScope = null;
+            for (let parent = node.parent; parent && parent.type !== 'source_file'; parent = parent.parent) {
+                if (parent.type === 'block' ||
+                    (parent.type === 'declaration_list' && parent.parent?.type === 'mod_item')) {
+                    const mod = parent.type === 'declaration_list';
+                    const macroUse = mod && rustAttributeNames(parent.parent).includes('macro_use');
+                    macroScope = {
+                        kind: mod ? 'mod' : 'block',
+                        startLine: parent.startPosition.row + 1, endLine: parent.endPosition.row + 1,
+                        ...(macroUse && { macroUse: true }),
+                    };
+                    break;
+                }
+            }
+
             types.push({
                 name: nameNode.text,
                 startLine,
                 endLine,
                 type: 'macro',
                 members: [],
-                modifiers: [],
+                modifiers,
+                ...(macroScope && { macroScope }),
                 ...inferred,
                 ...(docstring && { docstring })
             });
@@ -911,6 +1264,9 @@ function _processClass(node, types, processedRanges, lines, code) {
             // callers can treat alias-qualified receivers as the base type
             // (fix #208 — cursive StyledString::plain).
             const aliasOf = aliasBaseTypeName(node.childForFieldName('type'));
+            // An alias of a future type (`type Fut = Pin<Box<dyn Future..>>`)
+            // makes functions returning it future producers (fix #370).
+            const futureShape = rustFutureShape(node.childForFieldName('type'));
 
             types.push({
                 name: nameNode.text,
@@ -920,6 +1276,7 @@ function _processClass(node, types, processedRanges, lines, code) {
                 members: [],
                 modifiers: visibility ? [visibility] : [],
                 ...(aliasOf && { aliasOf }),
+                ...(futureShape && { futureReturn: { kind: 'future', output: futureShape.output } }),
                 aliasTypeText: node.childForFieldName('type')?.text,
                 aliasTypeParameters: (node.childForFieldName('type_parameters')?.namedChildren || [])
                     .map(parameter => parameter.type === 'type_identifier' ? parameter.text
@@ -982,29 +1339,26 @@ function extractDerefTarget(implNode, traitName) {
  * Returns true if node was matched, false otherwise
  */
 function _processState(node, objects, lines) {
-    // Handle const items (only top-level)
-    if (node.type === 'const_item') {
+    // Handle const and static items (only top-level). The declared type
+    // (fix #392) types the item when it is a method receiver (`FLAGS.iter()`).
+    if (node.type === 'const_item' || node.type === 'static_item') {
         if (!node.parent || node.parent.type !== 'source_file') return false;
         const nameNode = node.childForFieldName('name');
         if (nameNode) {
             const name = nameNode.text;
             if (_STATE_PATTERN.test(name)) {
                 const { startLine, endLine } = nodeToLocation(node, lines);
-                objects.push({ name, startLine, endLine });
-            }
-        }
-        return true;
-    }
-
-    // Handle static items (only top-level)
-    if (node.type === 'static_item') {
-        if (!node.parent || node.parent.type !== 'source_file') return false;
-        const nameNode = node.childForFieldName('name');
-        if (nameNode) {
-            const name = nameNode.text;
-            if (_STATE_PATTERN.test(name)) {
-                const { startLine, endLine } = nodeToLocation(node, lines);
-                objects.push({ name, startLine, endLine });
+                // Only a plain type path (behind any references) is recorded:
+                // a generic wrapper (`Lazy<T>`, `Mutex<T>`) owns the methods
+                // or derefs to its argument. A `static mut` is never typed.
+                let typeNode = node.childForFieldName('type');
+                while (typeNode?.type === 'reference_type') typeNode = typeNode.childForFieldName('type');
+                const mutable = node.type === 'static_item' &&
+                    node.children.some(child => child.type === 'mutable_specifier');
+                const plain = typeNode && (typeNode.type === 'type_identifier' ||
+                    typeNode.type === 'scoped_type_identifier');
+                objects.push({ name, startLine, endLine,
+                    ...(plain && !mutable && { valueType: typeNode.text }) });
             }
         }
         return true;
@@ -1054,7 +1408,10 @@ function extractGenericBounds(node) {
     const record = declaration => {
         if (!declaration) return;
         const children = declaration.namedChildren || [];
-        const parameter = children.find(child => child.type === 'type_identifier');
+        // `where for<'a> C: Trait<'a>` bounds C itself (fix #368).
+        const higherRanked = children.find(child => child.type === 'higher_ranked_trait_bound');
+        const parameter = children.find(child => child.type === 'type_identifier') ||
+            (higherRanked?.namedChildren || []).find(child => child.type === 'type_identifier');
         const bounds = children.find(child => child.type === 'trait_bounds');
         if (!parameter || !bounds) return;
         const names = bounds.namedChildren
@@ -1075,6 +1432,86 @@ function extractGenericBounds(node) {
     if (result.size === 0) return null;
     return Object.fromEntries([...result].map(([name, bounds]) =>
         [name, [...bounds].sort()]));
+}
+
+/**
+ * Declared supertraits of a trait (fix #368): `trait C<I>: Send + Sized`
+ * and `where Self: P`. Nominal trait heads only (paths keep their terminal
+ * name, `?Sized` and lifetimes add nothing).
+ */
+function extractRustSupertraits(traitNode) {
+    const names = new Set();
+    const addBounds = (boundsNode) => {
+        for (const bound of boundsNode?.namedChildren || []) {
+            if (bound.type === 'removed_trait_bound' || bound.type === 'lifetime') continue;
+            const name = aliasBaseTypeName(bound.type === 'higher_ranked_trait_bound'
+                ? bound.childForFieldName('type') || bound.namedChildren.at(-1) : bound);
+            if (name) names.add(name);
+        }
+    };
+    addBounds(traitNode.childForFieldName('bounds'));
+    const whereClause = traitNode.namedChildren.find(child => child.type === 'where_clause');
+    for (const predicate of whereClause?.namedChildren || []) {
+        if (predicate.type !== 'where_predicate') continue;
+        if (predicate.childForFieldName('left')?.text !== 'Self') continue;
+        addBounds(predicate.childForFieldName('bounds'));
+    }
+    return names.size > 0 ? [...names].sort() : null;
+}
+
+/**
+ * `[T]` behind any reference layers (`&[T]`, `&mut [T]`) is the primitive
+ * slice type (fix #368). Its methods are the slice's inherent methods and
+ * trait impls written `for [T]`; the canonical receiver name is 'slice'.
+ * Arrays (`[T; N]`) unsize to slices during method probing and abstain.
+ */
+function rustSliceTypeOf(typeNode) {
+    let current = typeNode;
+    while (current?.type === 'reference_type') current = current.childForFieldName('type');
+    return current?.type === 'array_type' && !current.childForFieldName('length') ? 'slice' : null;
+}
+
+/** Reference layer of a declared type node: 'owned', '&' or '&mut'. */
+function rustTypeRefKind(typeNode) {
+    if (typeNode?.type !== 'reference_type') return 'owned';
+    return typeNode.namedChildren.some(child => child.type === 'mutable_specifier') ? '&mut' : '&';
+}
+
+/**
+ * How a method takes `self`: 'value' (`self`, `mut self`), '&' (`&self`),
+ * '&mut' (`&mut self`); null for associated functions or typed self
+ * (`self: Box<Self>`), which method probing here does not model.
+ */
+function rustSelfParamKind(paramsNode) {
+    const selfParameter = paramsNode?.namedChildren?.find(child => child.type === 'self_parameter');
+    if (!selfParameter) return null;
+    let reference = false;
+    let mutable = false;
+    for (let i = 0; i < selfParameter.childCount; i++) {
+        const child = selfParameter.child(i);
+        if (child.type === '&') reference = true;
+        else if (child.type === 'mutable_specifier' && reference) mutable = true;
+    }
+    if (!reference) return 'value';
+    return mutable ? '&mut' : '&';
+}
+
+/**
+ * Generic arguments of an impl's self type, in declaration order, lifetimes
+ * excluded: `impl<'f, T, C> Consumer<T> for MapWith<'f, C, U>` -> ['C', 'U'].
+ * Maps a struct's positional type parameters to the impl's own names.
+ */
+function extractRustImplSelfArgs(implNode) {
+    let typeNode = implNode.childForFieldName('type');
+    while (typeNode?.type === 'reference_type') typeNode = typeNode.childForFieldName('type');
+    if (typeNode?.type !== 'generic_type') return null;
+    const argsNode = typeNode.childForFieldName('type_arguments');
+    const args = [];
+    for (const arg of argsNode?.namedChildren || []) {
+        if (arg.type === 'lifetime' || arg.type.endsWith('comment')) continue;
+        args.push(arg.text);
+    }
+    return args.length > 0 ? args : null;
 }
 
 /**
@@ -1160,6 +1597,58 @@ function extractStructFields(structNode, codeOrLines) {
 /**
  * Extract impl block info
  */
+/**
+ * Bounds of a blanket impl's self parameter (fix #369): for `impl<I: A>
+ * Trait for I where &'a mut I: B, I: C`, one entry per subject reference
+ * layer: [{ ref: 'owned', traits: ['A', 'C'] }, { ref: '&mut', traits:
+ * ['B'] }]. `?Sized` and lifetimes add nothing. null when the impl's self
+ * type is not one of its own type parameters.
+ */
+function extractRustBlanketSelfBounds(implNode, selfTypeNode) {
+    if (!selfTypeNode || selfTypeNode.type !== 'type_identifier') return null;
+    const param = selfTypeNode.text;
+    const typeParameters = implNode.childForFieldName('type_parameters');
+    const declared = (typeParameters?.namedChildren || []).some(child =>
+        (child.type === 'constrained_type_parameter' &&
+            child.namedChildren.some(n => n.type === 'type_identifier' && n.text === param)) ||
+        (child.type === 'type_identifier' && child.text === param) ||
+        (child.type === 'type_parameter' && child.text.split(/[\s:=]/)[0] === param));
+    if (!declared) return null;
+    const layers = new Map();
+    const add = (layer, boundsNode) => {
+        for (const bound of boundsNode?.namedChildren || []) {
+            if (bound.type === 'removed_trait_bound' || bound.type === 'lifetime') continue;
+            const name = aliasBaseTypeName(bound.type === 'higher_ranked_trait_bound'
+                ? bound.childForFieldName('type') || bound.namedChildren.at(-1) : bound);
+            if (!name) continue;
+            if (!layers.has(layer)) layers.set(layer, new Set());
+            layers.get(layer).add(name);
+        }
+    };
+    for (const child of typeParameters?.namedChildren || []) {
+        if (child.type !== 'constrained_type_parameter') continue;
+        if (!child.namedChildren.some(n => n.type === 'type_identifier' && n.text === param)) continue;
+        add('owned', child.namedChildren.find(n => n.type === 'trait_bounds'));
+    }
+    const whereClause = implNode.namedChildren.find(child => child.type === 'where_clause');
+    for (const predicate of whereClause?.namedChildren || []) {
+        if (predicate.type !== 'where_predicate') continue;
+        const left = predicate.childForFieldName('left') || predicate.namedChild(0);
+        const bounds = predicate.childForFieldName('bounds') ||
+            predicate.namedChildren.find(n => n.type === 'trait_bounds');
+        if (!left) continue;
+        if (left.type === 'type_identifier' && left.text === param) {
+            add('owned', bounds);
+        } else if (left.type === 'reference_type') {
+            const inner = left.namedChildren.find(n => n.type === 'type_identifier');
+            if (inner?.text !== param) continue;
+            add(left.namedChildren.some(n => n.type === 'mutable_specifier') ? '&mut' : '&', bounds);
+        }
+    }
+    return [...layers].map(([ref, traits]) => ({ ref, traits: [...traits].sort() }))
+        .sort((a, b) => (a.ref < b.ref ? -1 : a.ref > b.ref ? 1 : 0));
+}
+
 function extractImplInfo(implNode) {
     let traitName = null;
     let typeName = null;
@@ -1250,10 +1739,14 @@ function extractEnumVariants(enumNode, codeOrLines) {
                 const { startLine, endLine } = nodeToLocation(child, code);
                 // Check for tuple/struct variant data
                 let params = undefined;
+                // A unit variant names its value, a tuple variant its
+                // constructor (fix #389); a struct variant only a path.
+                let valueShape = 'unit';
                 for (let j = 0; j < child.namedChildCount; j++) {
                     const variantChild = child.namedChild(j);
                     if (variantChild.type === 'field_declaration_list' || variantChild.type === 'ordered_field_declaration_list') {
                         params = variantChild.text.slice(1, -1);
+                        valueShape = variantChild.type === 'ordered_field_declaration_list' ? 'tuple' : null;
                     }
                 }
                 variants.push({
@@ -1261,7 +1754,8 @@ function extractEnumVariants(enumNode, codeOrLines) {
                     startLine,
                     endLine,
                     memberType: 'variant',
-                    ...(params !== undefined && { params })
+                    ...(params !== undefined && { params }),
+                    ...(valueShape && { valueShape }),
                 });
             }
         }
@@ -1288,7 +1782,9 @@ function extractTraitMembers(traitNode, codeOrLines) {
                 const returnType = extractReturnType(child);
                 const iteratorItemType = extractRustIteratorItemType(child);
                 const hasSelf = paramsNode && paramsNode.text.includes('self');
-                const callbackParamTypes = extractRustCallbackParamTypes(paramsNode);
+                const callbackParamTypes = extractRustCallbackParamTypes(paramsNode, child);
+                const qualifiers = rustFunctionQualifiers(child);
+                const futureReturn = rustFutureReturn(child, qualifiers);
 
                 // Rust vocabulary (fix #248): trait members carry the trait's
                 // OWN visibility — a method of a private trait is not `pub`,
@@ -1300,7 +1796,9 @@ function extractTraitMembers(traitNode, codeOrLines) {
                     endLine,
                     memberType: 'method',
                     isMethod: true,
-                    modifiers: traitVisibility ? [traitVisibility] : [],
+                    ...(qualifiers.async && { isAsync: true }),
+                    modifiers: [...(traitVisibility ? [traitVisibility] : []), ...(qualifiers.async ? ['async'] : [])],
+                    ...(futureReturn && { futureReturn }),
                     ...(paramsNode && { params: extractRustParams(paramsNode) }),
                     ...(paramsNode && { paramsStructured: parseStructuredParams(paramsNode, 'rust') }),
                     ...(callbackParamTypes && { callbackParamTypes }),
@@ -1320,12 +1818,112 @@ function extractTraitMembers(traitNode, codeOrLines) {
  * @param {string} code - Source code
  * @param {string} [typeName] - The type this impl is for (e.g., "MyStruct")
  */
+/**
+ * `Self::Assoc` projections in an impl member's return type, resolved
+ * through the SAME impl block's `type Assoc = T;` items (fix #368):
+ * `type Folder = CollectResult<'c, T>; fn into_folder(self) -> Self::Folder`
+ * declares the concrete `CollectResult<'c, T>`. Returns the substituted
+ * return-type text, or null when nothing (or not everything) resolves.
+ */
+function rustResolveSelfProjections(functionNode, associatedTypes) {
+    const returnTypeNode = functionNode.childForFieldName('return_type');
+    if (!returnTypeNode || associatedTypes.size === 0) return null;
+    const replacements = [];
+    let unresolved = false;
+    const pending = [returnTypeNode];
+    while (pending.length > 0) {
+        const current = pending.pop();
+        if (current.type.endsWith('comment')) return null;
+        if (current.type === 'scoped_type_identifier' &&
+            current.childForFieldName('path')?.text === 'Self') {
+            const assoc = associatedTypes.get(current.childForFieldName('name')?.text);
+            if (!assoc) unresolved = true;
+            else replacements.push({ start: current.startIndex, end: current.endIndex, text: assoc });
+            continue;
+        }
+        for (let i = 0; i < current.namedChildCount; i++) pending.push(current.namedChild(i));
+    }
+    if (unresolved || replacements.length === 0) return null;
+    replacements.sort((a, b) => b.start - a.start);
+    const base = returnTypeNode.startIndex;
+    let text = returnTypeNode.text;
+    for (const replacement of replacements) {
+        text = text.slice(0, replacement.start - base) + replacement.text +
+            text.slice(replacement.end - base);
+    }
+    return text.trim() || null;
+}
+
+/**
+ * Associated types visible as `Self::X` inside an impl: its own items plus
+ * those of sibling impl blocks for the same self type in the same module
+ * scope (supertrait associated types). A name defined with different values
+ * by two sibling impls is ambiguous and dropped.
+ */
+function rustSiblingAssociatedTypes(implNode, own) {
+    const selfText = implNode.childForFieldName('type')?.text;
+    const merged = new Map(own);
+    const scope = implNode.parent;
+    if (!selfText || !scope) return merged;
+    const conflicting = new Set();
+    for (let i = 0; i < scope.namedChildCount; i++) {
+        const sibling = scope.namedChild(i);
+        if (sibling.type !== 'impl_item' || sibling.id === implNode.id ||
+            sibling.childForFieldName('type')?.text !== selfText) continue;
+        const body = sibling.childForFieldName('body');
+        for (let j = 0; j < (body?.namedChildCount || 0); j++) {
+            const item = body.namedChild(j);
+            if (item.type !== 'type_item') continue;
+            const name = item.childForFieldName('name')?.text;
+            const value = item.childForFieldName('type')?.text;
+            if (!name || !value || own.has(name) || /\/[/*]/.test(value)) continue;
+            if (merged.has(name) && merged.get(name) !== value) conflicting.add(name);
+            else merged.set(name, value);
+        }
+    }
+    for (const name of conflicting) merged.delete(name);
+    return merged;
+}
+
+/**
+ * The module path an impl's self type is written under (fix #371):
+ * `impl Ext for std::fs::File` -> 'std::fs', through `&`/`&mut` and generic
+ * arguments. null for an unqualified self type.
+ */
+function rustImplSelfQualifier(implSelfTypeNode) {
+    let node = implSelfTypeNode;
+    while (node?.type === 'reference_type') node = node.childForFieldName('type');
+    if (node?.type === 'generic_type') node = node.childForFieldName('type');
+    if (node?.type !== 'scoped_type_identifier') return null;
+    return node.childForFieldName('path')?.text || null;
+}
+
 function extractImplMembers(implNode, codeOrLines, typeName) {
     const code = codeOrLines;
     const members = [];
     const bodyNode = implNode.childForFieldName('body');
     if (!bodyNode) return members;
     const implAttributes = extractAttributes(implNode, codeOrLines);
+    const ownerGenericBounds = extractGenericBounds(implNode);
+    const ownerSelfArgs = extractRustImplSelfArgs(implNode);
+    // Reference impls (`impl Trait for &'a Vec<T>`) share the owner name with
+    // the owned impl; the reference layer decides method probing (fix #368).
+    const implSelfTypeNode = implNode.childForFieldName('type');
+    const implSelfRef = implSelfTypeNode?.type === 'reference_type'
+        ? (implSelfTypeNode.namedChildren.some(child => child.type === 'mutable_specifier')
+            ? '&mut' : '&')
+        : null;
+    const implSelfQualifier = rustImplSelfQualifier(implSelfTypeNode);
+    const associatedTypes = new Map();
+    for (let i = 0; i < bodyNode.namedChildCount; i++) {
+        const item = bodyNode.namedChild(i);
+        if (item.type !== 'type_item') continue;
+        const nameNode = item.childForFieldName('name');
+        const valueNode = item.childForFieldName('type');
+        if (nameNode && valueNode && !/\/[/*]/.test(valueNode.text)) {
+            associatedTypes.set(nameNode.text, valueNode.text);
+        }
+    }
 
     for (let i = 0; i < bodyNode.namedChildCount; i++) {
         const child = bodyNode.namedChild(i);
@@ -1337,7 +1935,6 @@ function extractImplMembers(implNode, codeOrLines, typeName) {
             if (nameNode) {
                 const { startLine, endLine } = nodeToLocation(child, code);
                 const text = child.text;
-                const firstLine = text.split('\n')[0];
                 const returnType = extractReturnType(child);
                 const iteratorItemType = extractRustIteratorItemType(child);
                 const docstring = extractRustDocstring(code, startLine);
@@ -1354,10 +1951,12 @@ function extractImplMembers(implNode, codeOrLines, typeName) {
                 // Function qualifiers, same vocabulary as free functions
                 // (fix #248: `pub async fn get` rendered as `pub get(...)`;
                 // const/unsafe methods had no machine-readable qualifier).
-                if (firstLine.includes('async ')) modifiers.push('async');
-                if (firstLine.includes('unsafe ')) modifiers.push('unsafe');
-                if (firstLine.includes('const fn')) modifiers.push('const');
-                if (firstLine.includes('extern ')) modifiers.push('extern');
+                const qualifiers = rustFunctionQualifiers(child);
+                const futureReturn = rustFutureReturn(child, qualifiers);
+                if (qualifiers.async) modifiers.push('async');
+                if (qualifiers.unsafe) modifiers.push('unsafe');
+                if (qualifiers.const) modifiers.push('const');
+                if (qualifiers.extern) modifiers.push('extern');
                 for (const attr of attributes) modifiers.push(attr);
                 for (const attr of implAttributes) {
                     if (!modifiers.includes(attr)) modifiers.push(attr);
@@ -1366,7 +1965,17 @@ function extractImplMembers(implNode, codeOrLines, typeName) {
 
                 const memberGenerics = extractGenerics(child);
                 const genericBounds = extractGenericBounds(child);
-                const callbackParamTypes = extractRustCallbackParamTypes(paramsNode);
+                const callbackParamTypes = extractRustCallbackParamTypes(paramsNode, child);
+                let returnTypeResolved = returnType
+                    ? rustResolveSelfProjections(child, associatedTypes) : null;
+                if (returnType && !returnTypeResolved && /\bSelf\s*::/.test(returnType)) {
+                    // A supertrait's associated type is defined by a sibling
+                    // impl block for the same self type (`impl Consumer for C
+                    // { type Reducer = R; }` + `impl UnindexedConsumer for C
+                    // { fn to_reducer(&self) -> Self::Reducer }`).
+                    returnTypeResolved = rustResolveSelfProjections(child,
+                        rustSiblingAssociatedTypes(implNode, associatedTypes));
+                }
                 members.push({
                     name: nameNode.text,
                     params: extractRustParams(paramsNode),
@@ -1375,11 +1984,18 @@ function extractImplMembers(implNode, codeOrLines, typeName) {
                     startLine,
                     endLine,
                     memberType: 'method',
-                    isAsync: firstLine.includes('async '),
+                    isAsync: qualifiers.async,
                     isMethod: hasSelf,  // Only true methods (with self) — associated functions are false
                     modifiers,
                     ...(typeName && { receiver: typeName }),  // All impl members get receiver for findMethodsForType
                     ...(returnType && { returnType }),
+                    ...(returnTypeResolved && { returnTypeResolved }),
+                    ...(futureReturn && { futureReturn }),
+                    ...(ownerGenericBounds && { ownerGenericBounds }),
+                    ...(ownerSelfArgs && { ownerSelfArgs }),
+                    ...(implSelfRef && { implSelfRef }),
+                    ...(implSelfQualifier && { implSelfQualifier }),
+                    ...(rustSelfParamKind(paramsNode) && { selfParamKind: rustSelfParamKind(paramsNode) }),
                     ...(iteratorItemType && { iteratorItemType }),
                     ...(docstring && { docstring }),
                     // Method-level type params (fix #229): generic-param receiver
@@ -1441,8 +2057,72 @@ function parse(code, parser) {
         ...((tree.rootNode.hasError || declaration.macroItemRecovery) && {
             parseRecovery: true,
         }),
+        ...(tree.rootNode.hasError && { parseErrorRegions: parseErrorRegions(tree.rootNode) }),
+        ...(() => {
+            const names = rustAsyncClosureNames(tree);
+            return names.length > 0 ? { asyncClosureNames: names } : {};
+        })(),
         imports: [], exports: [],
     };
+}
+
+const DECLARATION_NODE_TYPES = [
+    'function_item', 'foreign_mod_item', 'struct_item', 'union_item', 'enum_item', 'trait_item', 'impl_item',
+    'mod_item', 'macro_definition', 'type_item', 'const_item', 'static_item',
+];
+
+/**
+ * Declarations of the given subtrees only, extracted exactly as parse()
+ * extracts them (fix #374: the declarations a macro expansion generates,
+ * without walking the rest of the expanded file).
+ */
+function parseDeclarationsIn(code, roots) {
+    const lines = code.split('\n');
+    const functions = [], classes = [], stateObjects = [];
+    const processedFn = new Set(), processedCls = new Set();
+    for (const root of roots) {
+        const nodes = DECLARATION_NODE_TYPES.includes(root.type) ? [root] : [];
+        for (const node of nodes.concat(root.descendantsOfType(DECLARATION_NODE_TYPES))) {
+            _processFunction(node, functions, processedFn, lines, code);
+            _processClass(node, classes, processedCls, lines, code);
+            _processState(node, stateObjects, lines);
+        }
+    }
+    _postProcessTraitImpls(classes);
+    functions.sort((a, b) => a.startLine - b.startLine);
+    classes.sort((a, b) => a.startLine - b.startLine);
+    stateObjects.sort((a, b) => a.startLine - b.startLine);
+    return { language: 'rust', totalLines: lines.length, functions, classes, stateObjects, imports: [], exports: [] };
+}
+
+/**
+ * Local names bound to closures whose body is an async block
+ * (`let f = || async { .. }`, fix #370): calling one creates a future.
+ */
+function rustAsyncClosureNames(tree) {
+    const names = new Set();
+    // The flat node list the declaration pass built for this tree holds the
+    // same nodes in document order (fix #388: no second native walk).
+    const range = cachedNodeRange(tree.rootNode);
+    let blocks;
+    if (range) {
+        blocks = [];
+        const { nodes, subtreeEnds, index } = range;
+        for (let i = index, end = subtreeEnds[index]; i < end; i++) {
+            if (nodes[i].type === 'async_block') blocks.push(nodes[i]);
+        }
+    } else {
+        blocks = tree.rootNode.descendantsOfType('async_block');
+    }
+    for (const block of blocks) {
+        const closure = block.parent;
+        if (closure?.type !== 'closure_expression' || !sameNode(closure.childForFieldName('body'), block)) continue;
+        const binding = closure.parent;
+        if (binding?.type !== 'let_declaration') continue;
+        const pattern = binding.childForFieldName('pattern');
+        if (pattern?.type === 'identifier') names.add(pattern.text);
+    }
+    return [...names].sort();
 }
 
 /**
@@ -1570,6 +2250,235 @@ function extractTypeName(typeNode) {
 }
 
 
+// Argument type descriptors (fix #384): impls of one generic trait for one
+// self type (`impl From<Bytes> for Vec<u8>`, `impl From<BytesMut> for
+// Vec<u8>`) are selected by argument type, so method and path calls record
+// what each argument's type is known to be: '<refs><base>' where refs is a
+// run of '&' / '&mut ' and base a type name the site proves (a declared
+// parameter or local, a struct literal), '?<start>' for a local bound from
+// the path call starting at byte <start> (its declared return type decides
+// at query time), 'str'/'char'/'bool'/a suffixed numeric type for literals,
+// '#int'/'#float' for unsuffixed numeric literals, '#array' for a byte
+// string's array, '#slice' for a range-indexed slice; null when unknown.
+const RUST_NUMERIC_TYPES = ['i8', 'i16', 'i32', 'i64', 'i128', 'isize',
+    'u8', 'u16', 'u32', 'u64', 'u128', 'usize', 'f32', 'f64'];
+
+function rustLiteralArgType(node) {
+    switch (node.type) {
+        case 'string_literal':
+        case 'raw_string_literal':
+            return node.text.startsWith('b') ? '&#array:u8' : node.text.startsWith('c') ? null : '&str';
+        case 'char_literal':
+            return node.text.startsWith('b') ? 'u8' : 'char';
+        case 'boolean_literal':
+            return 'bool';
+        case 'integer_literal':
+        case 'float_literal': {
+            const text = node.text.replace(/_/g, '');
+            if (!/^[0-9]/.test(text) || /^0[xob]/i.test(text)) {
+                return node.type === 'integer_literal' ? '#int' : '#float';
+            }
+            const suffix = RUST_NUMERIC_TYPES.find(type => text.endsWith(type) &&
+                /[0-9.]$/.test(text.slice(0, -type.length)));
+            return suffix || (node.type === 'integer_literal' ? '#int' : '#float');
+        }
+        default:
+            return null;
+    }
+}
+
+/**
+ * Base of a range index (`&s[..]`, `&v[1..]`): 'str', '#slice:u8' for a
+ * byte string, '#slice' when the element type is unknown.
+ */
+function rustRangeIndexBase(container, typeOfName) {
+    if (!container) return null;
+    if (container.type === 'string_literal' || container.type === 'raw_string_literal') {
+        return container.text.startsWith('b') ? '#slice:u8' : 'str';
+    }
+    if (container.type !== 'identifier') return null;
+    const known = typeOfName(container.text, container);
+    const base = known ? known.replace(/^(?:&mut |&)+/, '') : null;
+    if (base === 'String' || base === 'str') return 'str';
+    if (base === 'Vec' || base?.startsWith('#slice') || base?.startsWith('#array')) {
+        return base?.includes(':') ? `#slice:${base.split(':')[1]}` : '#slice';
+    }
+    return null;
+}
+
+/**
+ * A local's type as an argument descriptor: declared (parameter, annotated
+ * `let`), constructed (struct literal) or literal types with their
+ * reference layer; a local bound from a path call as '?<start>'.
+ */
+function rustKnownArgNameType(name, atNode, getReceiverType, isPatternShadow, tokenTypes) {
+    // One evidence lookup (it checks pattern shadows itself); a declared or
+    // constructed type carries its name in the evidence.
+    let fields = getReceiverType?.(name, atNode, true);
+    let type = fields?.receiverTypeEvidence?.type;
+    if (!fields && tokenTypes?.has(name) && !isPatternShadow?.(atNode, name)) {
+        type = tokenTypes.get(name);
+        fields = tokenTypes.fields(name, type);
+    }
+    if (!type || !fields) return null;
+    const source = fields.receiverTypeSource;
+    const evidence = fields.receiverTypeEvidence;
+    if (source === 'guess') {
+        return evidence?.nodeType === 'call_expression' && Number.isInteger(evidence.start)
+            ? `?${evidence.start}` : null;
+    }
+    if (source !== 'annotation' && source !== 'constructor' && source !== 'literal') return null;
+    const ref = fields.receiverTypeRef;
+    if (!ref) return null;
+    const base = type === 'slice' ? '#slice' : type;
+    return (ref === '&' ? '&' : ref === '&mut' ? '&mut ' : '') + base;
+}
+
+function rustArgTypeOfNode(argNode, typeOfName) {
+    let node = argNode;
+    let refs = '';
+    let type = node?.type;
+    while (node) {
+        if (type === 'parenthesized_expression') {
+            node = node.namedChild(0);
+        } else if (type === 'reference_expression') {
+            refs += node.namedChildren.some(child => child.type === 'mutable_specifier') ? '&mut ' : '&';
+            node = node.childForFieldName('value');
+        } else {
+            break;
+        }
+        type = node?.type;
+    }
+    if (!node) return null;
+    if (type === 'identifier') {
+        const known = typeOfName(node.text, node);
+        return known ? refs + known : null;
+    }
+    const literal = rustLiteralArgType(node);
+    if (literal) return refs + literal;
+    if (type === 'identifier') {
+        const known = typeOfName(node.text, node);
+        return known ? refs + known : null;
+    }
+    if (node.type === 'struct_expression') {
+        const nameNode = node.childForFieldName('name');
+        let name = nameNode?.type === 'scoped_type_identifier'
+            ? nameNode.childForFieldName('name')?.text
+            : nameNode?.type === 'type_identifier' ? nameNode.text : null;
+        if (name === 'Self') name = findEnclosingImplType(node) || null;
+        return name ? refs + name : null;
+    }
+    if (node.type === 'index_expression' && node.namedChild(1)?.type === 'range_expression') {
+        const base = rustRangeIndexBase(node.namedChild(0), typeOfName);
+        return base ? refs + base : null;
+    }
+    // A value produced by a macro or a path call (`vec![..]`,
+    // `Bytes::from(v)`): its record at this byte decides at query time.
+    if (node.type === 'macro_invocation' ||
+        (node.type === 'call_expression' && node.childForFieldName('function')?.type === 'scoped_identifier')) {
+        return `${refs}?${node.startIndex}`;
+    }
+    // `x.clone()` of an owned local has the local's type.
+    if (node.type === 'call_expression' && node.childForFieldName('arguments')?.namedChildCount === 0) {
+        const callee = node.childForFieldName('function');
+        const object = callee?.type === 'field_expression' ? callee.childForFieldName('value') : null;
+        if (callee?.childForFieldName('field')?.text === 'clone' && object?.type === 'identifier') {
+            const known = typeOfName(object.text, object);
+            return known && !known.startsWith('&') ? refs + known : null;
+        }
+    }
+    return null;
+}
+
+function rustArgTypesOfNode(argNodes, typeOfName) {
+    if (argNodes.length === 0) return null;
+    let types = null;
+    for (let i = 0; i < argNodes.length; i++) {
+        const descriptor = rustArgTypeOfNode(argNodes[i], typeOfName);
+        if (descriptor) {
+            if (!types) types = new Array(argNodes.length).fill(null);
+            types[i] = descriptor;
+        }
+    }
+    return types;
+}
+
+/** The same descriptors read from a macro argument token tree. */
+function rustArgTypesOfTokens(argsTree, typeOfName) {
+    if (!argsTree) return null;
+    const children = argsTree.children;
+    let types = null;
+    let index = 0;
+    let start = 1; // skip `(`
+    for (let i = 1; i <= children.length - 1; i++) {
+        if (i < children.length - 1 && children[i].type !== ',') continue;
+        if (i > start) {
+            const descriptor = rustTokenSegmentType(children, start, i, typeOfName);
+            if (descriptor) {
+                if (!types) types = [];
+                types[index] = descriptor;
+            }
+        }
+        index++;
+        start = i + 1;
+    }
+    if (!types) return null;
+    for (let i = 0; i < index; i++) if (types[i] === undefined) types[i] = null;
+    types.length = Math.min(types.length, index);
+    return types;
+}
+
+/** Descriptor of one macro argument: the tokens children[from..to). */
+function rustTokenSegmentType(children, from, to, typeOfName) {
+    let refs = '';
+    let at = from;
+    while (at < to && (children[at].type === '&' || children[at].type === '&&')) {
+        const layers = children[at].type === '&&' ? 2 : 1;
+        const mutable = at + 1 < to && children[at + 1].type === 'mutable_specifier';
+        refs += '&'.repeat(layers - 1) + (mutable ? '&mut ' : '&');
+        at += mutable ? 2 : 1;
+    }
+    const count = to - at;
+    const first = children[at];
+    if (count === 1) {
+        if (first.type === 'identifier') {
+            const known = typeOfName(first.text, first);
+            return known ? refs + known : null;
+        }
+        const literal = rustLiteralArgType(first);
+        return literal ? refs + literal : null;
+    }
+    if (count === 2 && children[at + 1].type === 'token_tree') {
+        const group = children[at + 1];
+        const text = group.text;
+        if (text.startsWith('[')) {
+            let ranged = false;
+            for (const token of group.children) if (token.type === '..') { ranged = true; break; }
+            if (!ranged) return null;
+            const base = rustRangeIndexBase(first, typeOfName);
+            return base ? refs + base : null;
+        }
+        if (text.startsWith('{') && first.type === 'identifier') {
+            const name = first.text === 'Self' ? findEnclosingImplType(first) : first.text;
+            return name ? refs + name : null;
+        }
+        return null;
+    }
+    // `vec![..]` / `name!(..)`: the nested macro's own record.
+    if (count === 3 && first.type === 'identifier' && children[at + 1].type === '!' &&
+        children[at + 2].type === 'token_tree') {
+        return `${refs}?${first.startIndex}`;
+    }
+    // `x.clone()` of an owned local.
+    if (count === 4 && first.type === 'identifier' && children[at + 1].type === '.' &&
+        children[at + 2].text === 'clone' && children[at + 3].type === 'token_tree' &&
+        children[at + 3].text.replace(/\s+/g, '') === '()') {
+        const known = typeOfName(first.text, first);
+        return known && !known.startsWith('&') ? refs + known : null;
+    }
+    return null;
+}
+
 // Shared by ordinary AST calls and macro token-tree calls. Both carry the
 // same self-field owner identity; a field spelling is never a local receiver.
 function findEnclosingImplType(node) {
@@ -1629,6 +2538,9 @@ function extractCallsFromTokenTree(tree, enclosingFunction, calls, getReceiverTy
         i = close;
     }
     let lastProducer = null;
+    const scopedName = typeof context === 'object' ? context.scopeTypesName : null;
+    const argTypeOfName = (name, atNode) => (!scopedName || scopedName(name) || inheritedTokenTypes.has(name))
+        ? rustKnownArgNameType(name, atNode, getReceiverType, isPatternShadow, inheritedTokenTypes) : null;
     const macroFields = {
         inMacro: true,
         ...(contextKind === 'definition' && { inMacroDefinition: true }),
@@ -1643,6 +2555,7 @@ function extractCallsFromTokenTree(tree, enclosingFunction, calls, getReceiverTy
                     kind: contextKind,
                     ...(containerMacro && { containerMacro }),
                     tokenTypes,
+                    ...(scopedName && { scopeTypesName: scopedName }),
                 });
             continue;
         }
@@ -1725,6 +2638,7 @@ function extractCallsFromTokenTree(tree, enclosingFunction, calls, getReceiverTy
                 startNode = children[k];
                 j = k - 1;
             }
+            const tokenArgTypes = segments.length > 0 ? rustArgTypesOfTokens(callArgs, argTypeOfName) : null;
             const record = {
                 name: tok.text,
                 line: tok.startPosition.row + 1,
@@ -1733,6 +2647,7 @@ function extractCallsFromTokenTree(tree, enclosingFunction, calls, getReceiverTy
                 isMethod: segments.length > 0,
                 isPathCall: true,
                 receiver: segments.length > 0 ? segments.join('::') : undefined,
+                ...(tokenArgTypes && { argTypes: tokenArgTypes }),
                 ...macroFields,
                 enclosingFunction
             };
@@ -1756,9 +2671,14 @@ function extractCallsFromTokenTree(tree, enclosingFunction, calls, getReceiverTy
             }
             // Literal receivers type as builtins inside macros too (fix #220,
             // ripgrep-measured: assert_eq!(.., vec!["match:fg".parse()...]))
+            const groupedReceiver = recvTok?.type === 'token_tree' &&
+                rustTokenTreeIsGroupedExpression(children, i - 2);
+            const rangeType = groupedReceiver
+                ? (rustTokenTreeRangeType(recvTok) || rustTokenTreeTupleType(recvTok)) : null;
             const litType = recvTok
-                ? ({ string_literal: 'str', raw_string_literal: 'str',
-                    char_literal: 'char', boolean_literal: 'bool' })[recvTok.type]
+                ? (({ string_literal: 'str', raw_string_literal: 'str',
+                    char_literal: 'char', boolean_literal: 'bool' })[recvTok.type] ||
+                    rangeType || undefined)
                 : undefined;
             const receiverRootType = receiverRoot === 'self'
                 ? findEnclosingImplType(tok) : getReceiverType?.(receiverRoot, tok);
@@ -1771,16 +2691,21 @@ function extractCallsFromTokenTree(tree, enclosingFunction, calls, getReceiverTy
             const patternSource = rustPatternBindingOf(tok, receiver);
             const producer = !receiver && lastProducer &&
                 lastProducer.callEnd === recvTok?.endIndex ? lastProducer : null;
+            const tokenArgTypes = rustArgTypesOfTokens(callArgs, argTypeOfName);
             const record = {
                 name: tok.text,
                 line: tok.startPosition.row + 1,
                 callStart: producer?.callStart ?? recvTok?.startIndex ?? tok.startIndex,
                 callEnd: callArgs.endIndex,
                 isMethod: true,
+                ...(tokenArgTypes && { argTypes: tokenArgTypes }),
                 receiver: receiverField ? undefined : receiver,
                 ...(receiverField && { receiverRoot, receiverField }),
                 ...(receiverRootType && { receiverRootType }),
-                ...(receiverType && { receiverType, ...(getReceiverType?.(receiver, tok, true) || inheritedTokenTypes.fields(receiver, receiverType)) }),
+                ...(receiverType && { receiverType, ...((rangeType && receiverType === rangeType && !receiver)
+                    ? { receiverTypeSource: 'literal', receiverTypeEvidence: typeOrigin('literal', recvTok),
+                        receiverTypeStd: true, receiverTypeRef: 'owned' }
+                    : (getReceiverType?.(receiver, tok, true) || inheritedTokenTypes.fields(receiver, receiverType))) }),
                 ...(receiverPatternShadow && { receiverPatternShadow: true }),
                 ...(receiverFlowInvalidated && { receiverFlowInvalidated: true }),
                 ...(iterationSource || {}),
@@ -1799,6 +2724,11 @@ function extractCallsFromTokenTree(tree, enclosingFunction, calls, getReceiverTy
             calls.push(record);
             lastProducer = record;
         } else {
+            // `fn name(...)` inside a macro token tree is a DEFINITION
+            // template (deref-forwarding / impl-generating macros), not a
+            // call (fix #360): recording it as a call listed the definition
+            // line as a caller of every same-name function.
+            if (prev && prev.type === 'fn') continue;
             // Plain call: func(...) — includes enum-variant constructors
             const record = {
                 name: tok.text,
@@ -1903,11 +2833,49 @@ function rustAssignmentTargetOf(callNode) {
             const bindings = pattern.namedChildren
                 .filter(child => child.type === 'identifier')
                 .map(child => child.text);
+            // Positional targets (fix #368): `let (left, right, _) = c.split_at(i)`
+            // binds element i of the declared tuple return to each name.
+            // `_` and non-identifier sub-patterns keep their position but
+            // bind nothing typed.
+            const tupleTargets = [];
+            let position = 0;
+            let positional = true;
+            for (let i = 0; i < pattern.childCount; i++) {
+                const child = pattern.child(i);
+                if (['(', ')', ','].includes(child.type)) continue;
+                if (child.type.endsWith('comment')) continue;
+                if (child.type === 'remaining_field_pattern' || child.text === '..') {
+                    positional = false;
+                    break;
+                }
+                let binding = child;
+                // `mut x`: the pattern's named children are the
+                // `mutable_specifier` and then the identifier (fix #369).
+                if (binding.type === 'mut_pattern') {
+                    binding = binding.namedChildren.find(c => c.type === 'identifier') || null;
+                }
+                if (binding?.type === 'identifier') {
+                    tupleTargets.push({ name: binding.text, index: position });
+                }
+                position++;
+            }
             if (bindings.length === pattern.namedChildCount && bindings.length > 0) {
                 return {
                     assignedTo: bindings[0],
                     tuple: true,
                     ...(bindings.length > 1 && { tupleRest: bindings.slice(1) }),
+                    ...(positional && tupleTargets.length > 0 && { tupleTargets }),
+                    ...(unwrapped && { unwrapped: true }),
+                };
+            }
+            if (positional && tupleTargets.length > 0) {
+                return {
+                    assignedTo: tupleTargets[0].name,
+                    tuple: true,
+                    ...(tupleTargets.length > 1 && {
+                        tupleRest: tupleTargets.slice(1).map(target => target.name),
+                    }),
+                    tupleTargets,
                     ...(unwrapped && { unwrapped: true }),
                 };
             }
@@ -1922,6 +2890,114 @@ function rustAssignmentTargetOf(callNode) {
         }
     }
     return undefined;
+}
+
+/**
+ * Range expressions have a language-fixed type (fix #368): `a..b` is
+ * `std::ops::Range`, `a..=b` is `RangeInclusive`, `a..` / `..b` / `..=b` /
+ * `..` are RangeFrom / RangeTo / RangeToInclusive / RangeFull. A method call
+ * on a parenthesized range therefore dispatches on that std type exactly
+ * like a string literal dispatches on `str`.
+ */
+function rustRangeTypeName(operator, hasStart, hasEnd) {
+    if (operator === '..=' || operator === '...') {
+        if (!hasEnd) return null;
+        return hasStart ? 'RangeInclusive' : 'RangeToInclusive';
+    }
+    if (operator !== '..') return null;
+    if (hasStart && hasEnd) return 'Range';
+    if (hasStart) return 'RangeFrom';
+    if (hasEnd) return 'RangeTo';
+    return 'RangeFull';
+}
+
+function rustRangeLiteralType(node, allowBare = false) {
+    let current = node;
+    while (current?.type === 'parenthesized_expression' && current.namedChildCount === 1) {
+        current = current.namedChild(0);
+    }
+    // `0..8.len()` parses as a range whose END is the call; only a
+    // parenthesized range is a method receiver. A `let` value may be bare.
+    if (current?.type !== 'range_expression' || (current === node && !allowBare)) return null;
+    let operator = null;
+    let operatorIndex = -1;
+    for (let i = 0; i < current.childCount; i++) {
+        const child = current.child(i);
+        if (!child.isNamed && ['..', '..=', '...'].includes(child.type)) {
+            operator = child.type;
+            operatorIndex = child.startIndex;
+            break;
+        }
+    }
+    if (!operator) return null;
+    let hasStart = false;
+    let hasEnd = false;
+    for (let i = 0; i < current.namedChildCount; i++) {
+        const operand = current.namedChild(i);
+        if (operand.type.endsWith('comment')) continue;
+        if (operand.startIndex < operatorIndex) hasStart = true;
+        else hasEnd = true;
+    }
+    return rustRangeTypeName(operator, hasStart, hasEnd);
+}
+
+/**
+ * Token-tree twin of rustRangeLiteralType for macro arguments
+ * (`assert_eq!(4, (0..8).len())`): a parenthesized token tree holding exactly
+ * one top-level range operator and nothing that binds looser than a range
+ * (comma, assignment, closure bars, statement or control keywords).
+ */
+/**
+ * A parenthesized token tree is a grouped EXPRESSION only when nothing that
+ * makes it an argument list precedes it (`f(0..8)`, `m!(..)`, `x[..](..)`).
+ */
+const RUST_TOKEN_EXPRESSION_PRECEDERS = new Set(['(', '[', '{', ',', ';', '=', '=>', '&',
+    '&&', '||', '+', '-', '*', '/', '%', '==', '!=', '<', '<=', '>=', 'return', 'in', 'move', '|']);
+function rustTokenTreeIsGroupedExpression(children, index) {
+    const previous = children[index - 1];
+    return !previous || RUST_TOKEN_EXPRESSION_PRECEDERS.has(previous.type);
+}
+
+/**
+ * Tuple expressions have the language's tuple type (fix #368): `(a, b)` and
+ * `(a,)`. The canonical receiver name is 'tuple'.
+ */
+function rustTokenTreeTupleType(tokenTree) {
+    if (tokenTree?.type !== 'token_tree' || tokenTree.child(0)?.type !== '(' ||
+        tokenTree.child(tokenTree.childCount - 1)?.type !== ')') return null;
+    let commas = 0;
+    let values = 0;
+    for (let i = 1; i < tokenTree.childCount - 1; i++) {
+        const token = tokenTree.child(i);
+        if (token.type.endsWith('comment')) continue;
+        if (['..', '..=', '...', ';', '=', '|', '||'].includes(token.type)) return null;
+        if (token.type === ',') commas++;
+        else values++;
+    }
+    return commas > 0 && values > 0 ? 'tuple' : null;
+}
+
+function rustTokenTreeRangeType(tokenTree) {
+    if (tokenTree?.type !== 'token_tree' || tokenTree.child(0)?.type !== '(') return null;
+    const inner = [];
+    for (let i = 1; i < tokenTree.childCount - 1; i++) inner.push(tokenTree.child(i));
+    if (tokenTree.child(tokenTree.childCount - 1)?.type !== ')') return null;
+    const LOOSER = new Set([',', ';', '=', '|', '||', '+=', '-=', '*=', '/=', '%=',
+        '^=', '&=', '|=', '<<=', '>>=', 'return', 'break', 'continue', 'let', 'move']);
+    let operatorIndex = -1;
+    for (let i = 0; i < inner.length; i++) {
+        const token = inner[i];
+        if (LOOSER.has(token.type)) return null;
+        if (['..', '..=', '...'].includes(token.type)) {
+            if (operatorIndex >= 0) return null;
+            operatorIndex = i;
+        }
+    }
+    if (operatorIndex < 0) return null;
+    const isComment = token => token.type.endsWith('comment');
+    const hasStart = inner.slice(0, operatorIndex).some(token => !isComment(token));
+    const hasEnd = inner.slice(operatorIndex + 1).some(token => !isComment(token));
+    return rustRangeTypeName(inner[operatorIndex].type, hasStart, hasEnd);
 }
 
 function rustCallIdentity(callNode) {
@@ -2118,6 +3194,38 @@ function patternContainsIdentifier(pattern, name) {
     return false;
 }
 
+/**
+ * Syntactic context a macro invocation's expansion is parsed in: 'items'
+ * (module or impl/trait body), 'stmts' (statement or block tail), 'expr', or
+ * null where no expansion can stand (patterns, types).
+ */
+function rustMacroInvocationContext(node) {
+    const parent = node.parent;
+    if (!parent) return null;
+    switch (parent.type) {
+        case 'source_file':
+            return 'items';
+        case 'declaration_list':
+            return 'items';
+        case 'expression_statement':
+        case 'block':
+            return 'stmts';
+        default:
+            break;
+    }
+    if (/pattern/.test(parent.type)) return null;
+    for (const field of ['type', 'return_type', 'trait']) {
+        const typed = parent.childForFieldName(field);
+        if (typed && typed.startIndex === node.startIndex && typed.endIndex === node.endIndex) return null;
+    }
+    if (parent.type === 'type_arguments') return null;
+    if (parent.type === 'match_arm') {
+        const value = parent.childForFieldName('value');
+        return value && value.startIndex === node.startIndex && value.endIndex === node.endIndex ? 'expr' : null;
+    }
+    return 'expr';
+}
+
 function rustMacroCallIdentity(macroNode) {
     if (!macroNode) return null;
     const parts = macroNode.text.replace(/!$/, '').split('::').filter(Boolean);
@@ -2131,9 +3239,391 @@ function rustMacroCallIdentity(macroNode) {
     };
 }
 
+/**
+ * Is this expression the value the enclosing fn item returns (fix #369)?
+ * The fn body's tail expression, or the operand of a `return` whose nearest
+ * function-like ancestor is that fn item (a closure boundary stops it). The
+ * value then has the fn's declared return type, which lets a trait path call
+ * (`Trait::assoc(..)`) infer its Self from the declaration.
+ */
+function rustFunctionReturnPosition(node) {
+    const parent = node.parent;
+    if (!parent) return false;
+    if (parent.type === 'return_expression') {
+        for (let p = parent.parent; p; p = p.parent) {
+            if (p.type === 'closure_expression') return false;
+            if (p.type === 'function_item') return true;
+        }
+        return false;
+    }
+    if (parent.type !== 'block' || parent.parent?.type !== 'function_item') return false;
+    const last = parent.namedChild(parent.namedChildCount - 1);
+    return !!last && sameNode(last, node);
+}
+
+/**
+ * Does a local value binding shadow a bare callee name at this call (fix
+ * #369)? `let bridge = bridge_impl; join(|c| bridge(c))` calls the local
+ * function value, never the module item `bridge`. Walks the lexical scopes
+ * outward to the enclosing fn item: `let` patterns of earlier statements in
+ * each block, closure / fn parameters, `for` patterns, `if let` / `while let`
+ * conditions and match-arm patterns that enclose the call. Items (`fn`
+ * declared in a block) are not value bindings and do not count.
+ */
+function rustPatternBindsName(pattern, name) {
+    if (!pattern) return false;
+    const pending = [pattern];
+    while (pending.length > 0) {
+        const current = pending.pop();
+        if (current.type === 'identifier') {
+            if (current.text === name) return true;
+            continue;
+        }
+        // Type annotations, paths and literals inside a pattern bind nothing.
+        if (/type|scoped_identifier|field_identifier|literal/.test(current.type) &&
+            current.type !== 'tuple_struct_pattern') continue;
+        if (current.type === 'tuple_struct_pattern' || current.type === 'struct_pattern') {
+            // The first child is the constructor path, never a binding.
+            for (let i = 1; i < current.namedChildCount; i++) pending.push(current.namedChild(i));
+            continue;
+        }
+        if (current.type === 'field_pattern') {
+            const shorthand = current.namedChildren.find(c => c.type === 'shorthand_field_identifier');
+            if (shorthand?.text === name) return true;
+            const inner = current.childForFieldName('pattern');
+            if (inner) pending.push(inner);
+            continue;
+        }
+        if (current.type === 'shorthand_field_identifier') {
+            if (current.text === name) return true;
+            continue;
+        }
+        for (let i = 0; i < current.namedChildCount; i++) pending.push(current.namedChild(i));
+    }
+    return false;
+}
+
+function rustBareNameShadowedByLocal(callNode, name) {
+    let child = callNode;
+    for (let p = callNode.parent; p; child = p, p = p.parent) {
+        if (p.type === 'block') {
+            for (let i = 0; i < p.namedChildCount; i++) {
+                const statement = p.namedChild(i);
+                if (statement.startIndex >= child.startIndex) break;
+                if (statement.type === 'let_declaration' &&
+                    rustPatternBindsName(statement.childForFieldName('pattern'), name)) return true;
+            }
+        } else if (p.type === 'closure_expression') {
+            if (rustPatternBindsName(p.childForFieldName('parameters'), name)) return true;
+        } else if (p.type === 'function_item') {
+            const params = p.childForFieldName('parameters');
+            for (const param of params?.namedChildren || []) {
+                if (param.type === 'parameter' &&
+                    rustPatternBindsName(param.childForFieldName('pattern'), name)) return true;
+            }
+            return false;
+        } else if (p.type === 'for_expression') {
+            const body = p.childForFieldName('body');
+            if (body && sameNode(body, child) &&
+                rustPatternBindsName(p.childForFieldName('pattern'), name)) return true;
+        } else if (p.type === 'match_arm') {
+            const value = p.childForFieldName('value');
+            if (value && sameNode(value, child) &&
+                rustPatternBindsName(p.childForFieldName('pattern'), name)) return true;
+        } else if (p.type === 'if_expression' || p.type === 'while_expression') {
+            const condition = p.childForFieldName('condition');
+            const consequence = p.childForFieldName('consequence') || p.childForFieldName('body');
+            if (consequence && sameNode(consequence, child) && condition) {
+                const lets = [condition];
+                while (lets.length > 0) {
+                    const current = lets.pop();
+                    if (current.type === 'let_condition' &&
+                        rustPatternBindsName(current.childForFieldName('pattern'), name)) return true;
+                    if (current.type === 'let_chain') {
+                        for (let i = 0; i < current.namedChildCount; i++) lets.push(current.namedChild(i));
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
+const rustBindingFactsByTree = new WeakMap();
+const RUST_BINDING_HOLDERS = new Set(['let_declaration', 'parameter', 'closure_parameters',
+    'for_expression', 'let_condition', 'match_pattern', 'self_parameter']);
+
+/**
+ * Is `child` the binding of its holder rather than an expression inside it
+ * (fix #389): the value of `let x = v;`, a parameter's type, a loop's
+ * iterator or a match guard are not bindings.
+ */
+function rustBindingPosition(parent, child) {
+    const field = {
+        let_declaration: 'pattern', parameter: 'pattern', for_expression: 'pattern',
+        let_condition: 'pattern',
+    }[parent.type];
+    if (field) return sameNode(parent.childForFieldName(field), child);
+    if (parent.type === 'match_pattern') return !sameNode(parent.childForFieldName('condition'), child);
+    return true;
+}
+
+/**
+ * How many bindings of each name one function introduces (let patterns,
+ * parameters, closure parameters, loop/match/if-let patterns; shadowing
+ * `let` counts again) and which names are assigned (fix #381).
+ */
+function rustBindingFacts(fnNode) {
+    let byId = rustBindingFactsByTree.get(fnNode.tree);
+    if (!byId) { byId = new Map(); rustBindingFactsByTree.set(fnNode.tree, byId); }
+    let facts = byId.get(fnNode.id);
+    if (facts) return facts;
+    facts = { declared: new Map(), assigned: new Set() };
+    const record = (child) => {
+        if (child.type === 'identifier' || child.type === 'shorthand_field_identifier') {
+            const parent = child.parent;
+            if (parent && (RUST_BINDING_HOLDERS.has(parent.type) || parent.type.endsWith('pattern')) &&
+                rustBindingPosition(parent, child)) {
+                facts.declared.set(child.text, (facts.declared.get(child.text) || 0) + 1);
+            }
+        } else if (child.type === 'assignment_expression' || child.type === 'compound_assignment_expr') {
+            const left = child.childForFieldName('left');
+            if (left?.type === 'identifier') facts.assigned.add(left.text);
+        }
+    };
+    // Every named descendant, from the flat node list when one is cached
+    // (fix #388); the facts are counts and sets, so visit order is free.
+    const range = cachedNodeRange(fnNode);
+    if (range) {
+        const { nodes, subtreeEnds, index } = range;
+        for (let i = index + 1, end = subtreeEnds[index]; i < end; i++) record(nodes[i]);
+    } else {
+        const walk = (node) => {
+            for (const child of node.namedChildren) {
+                record(child);
+                walk(child);
+            }
+        };
+        walk(fnNode);
+    }
+    byId.set(fnNode.id, facts);
+    return facts;
+}
+
+// axum method routers (fix #383): `get(h)`, `post_service(svc)`, `any(h)`,
+// `on(MethodFilter::GET.or(MethodFilter::POST), h)`, chained with
+// `.post(h2)` and wrapped by combinators that return the same router.
+const RUST_METHOD_ROUTER_VERBS = {
+    get: 'GET', post: 'POST', put: 'PUT', delete: 'DELETE', patch: 'PATCH', head: 'HEAD',
+    options: 'OPTIONS', trace: 'TRACE', connect: 'CONNECT', any: 'ALL',
+};
+const RUST_METHOD_ROUTER_PASSTHROUGH = new Set(['layer', 'route_layer', 'with_state', 'handle_error']);
+
+function rustRouteArgs(callNode) {
+    const argsNode = callNode.childForFieldName('arguments');
+    const args = [];
+    for (let i = 0; argsNode && i < argsNode.namedChildCount; i++) {
+        const arg = argsNode.namedChild(i);
+        if (!arg.type.includes('comment') && arg.type !== 'attribute_item') args.push(arg);
+    }
+    return args;
+}
+
+function rustHandlerName(node) {
+    if (!node) return '<anonymous>';
+    if (node.type === 'identifier') return node.text;
+    if (node.type === 'scoped_identifier') return node.childForFieldName('name')?.text || node.text;
+    if (node.type === 'generic_function') return rustHandlerName(node.childForFieldName('function'));
+    if (node.type === 'field_expression') return node.childForFieldName('field')?.text || '<anonymous>';
+    if (node.type === 'call_expression') return rustHandlerName(node.childForFieldName('function'));
+    return '<anonymous>';
+}
+
+/** Methods a `MethodFilter` expression selects, or null. */
+function rustMethodFilter(node) {
+    if (!node) return null;
+    if (node.type === 'scoped_identifier') {
+        const name = node.childForFieldName('name')?.text;
+        return name && /^[A-Z]+$/.test(name) ? [name] : null;
+    }
+    if (node.type === 'call_expression') {
+        const fn = node.childForFieldName('function');
+        if (fn?.type === 'field_expression' && fn.childForFieldName('field')?.text === 'or') {
+            const left = rustMethodFilter(fn.childForFieldName('value'));
+            const right = rustMethodFilter(rustRouteArgs(node)[0]);
+            return left && right ? [...left, ...right] : null;
+        }
+    }
+    return null;
+}
+
+/** [{ method, handler }] a method-router expression serves, or null. */
+function rustMethodRouterEntries(node, depth = 0) {
+    if (!node || depth > 32) return null;
+    if (node.type === 'parenthesized_expression') return rustMethodRouterEntries(node.namedChild(0), depth + 1);
+    if (node.type !== 'call_expression') return null;
+    const fn = node.childForFieldName('function');
+    const args = rustRouteArgs(node);
+    const entriesFor = (name) => {
+        const base = name.replace(/_service$/, '');
+        if (RUST_METHOD_ROUTER_VERBS[base]) {
+            return [{ method: RUST_METHOD_ROUTER_VERBS[base], handler: rustHandlerName(args[0]) }];
+        }
+        if (base === 'on') {
+            const methods = rustMethodFilter(args[0]);
+            return methods ? methods.map(method => ({ method, handler: rustHandlerName(args[1]) })) : null;
+        }
+        return null;
+    };
+    if (fn?.type === 'identifier' || fn?.type === 'scoped_identifier') {
+        const name = fn.type === 'identifier' ? fn.text : fn.childForFieldName('name')?.text;
+        return name ? entriesFor(name) : null;
+    }
+    if (fn?.type === 'field_expression') {
+        const inner = rustMethodRouterEntries(fn.childForFieldName('value'), depth + 1);
+        if (!inner) return null;
+        const name = fn.childForFieldName('field')?.text || '';
+        if (RUST_METHOD_ROUTER_PASSTHROUGH.has(name)) return inner;
+        const added = entriesFor(name);
+        return added ? [...inner, ...added] : null;
+    }
+    return null;
+}
+
+/** axum `.route(path, <method router>)` / `.route_service(path, svc)`. */
+function rustMethodRouterOf(callNode, name) {
+    const args = rustRouteArgs(callNode);
+    if (args.length !== 2) return null;
+    if (name === 'route_service') return [{ method: 'ALL', handler: rustHandlerName(args[1]) }];
+    const entries = rustMethodRouterEntries(args[1]);
+    if (!entries || entries.length === 0) return null;
+    const seen = new Set();
+    return entries.filter(entry => {
+        const key = `${entry.method}\0${entry.handler}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
+}
+
+/**
+ * Is a bare identifier in expression position an item path rather than a
+ * local (fix #389)? A name no binding of the enclosing fn declares (let
+ * patterns, parameters, closure parameters, match/for/if-let patterns) is
+ * resolved in the item namespaces: a unit struct, a const, a variant... The
+ * per-fn binding facts are a superset, so any binding of the name anywhere
+ * in the fn keeps it a possible local.
+ */
+function rustIdentifierIsItemPath(identNode) {
+    let fnNode = null;
+    for (let parent = identNode.parent; parent; parent = parent.parent) {
+        if (parent.type === 'function_item') { fnNode = parent; break; }
+        if (parent.type === 'token_tree' || parent.type === 'macro_invocation') return false;
+    }
+    if (!fnNode) return !rustBareNameShadowedByLocal(identNode, identNode.text);
+    return !rustBindingFacts(fnNode).declared.has(identNode.text);
+}
+
+/**
+ * The item path a value receiver names (fix #389): a bare identifier that is
+ * no local (`S.plain()`), a path (`E::Unit.m()`, `m::S.m()`), a struct
+ * expression (`P { x }.m()`), or a once-bound immutable local holding one of
+ * those (`let w = S; w.m()`). Returns { path, kind } or null.
+ */
+function rustReceiverValuePath(valueNode) {
+    if (!valueNode) return null;
+    if (valueNode.type === 'scoped_identifier') {
+        return /^[A-Za-z_][A-Za-z0-9_]*(::[A-Za-z_][A-Za-z0-9_]*)+$/.test(valueNode.text)
+            ? { path: valueNode.text, kind: 'value' } : null;
+    }
+    if (valueNode.type === 'struct_expression') {
+        let nameNode = valueNode.childForFieldName('name');
+        if (nameNode?.type === 'generic_type' || nameNode?.type === 'generic_type_with_turbofish') {
+            nameNode = nameNode.childForFieldName('type');
+        }
+        const text = nameNode?.text?.replace(/\s+/g, '');
+        return text && /^[A-Za-z_][A-Za-z0-9_]*(::[A-Za-z_][A-Za-z0-9_]*)*$/.test(text)
+            ? { path: text, kind: 'struct' } : null;
+    }
+    if (valueNode.type !== 'identifier') return null;
+    if (rustIdentifierIsItemPath(valueNode)) return { path: valueNode.text, kind: 'value' };
+    // `let w = S;` (bound once, never assigned, not `mut`): w holds S.
+    let fnNode = null;
+    for (let parent = valueNode.parent; parent; parent = parent.parent) {
+        if (parent.type === 'function_item') { fnNode = parent; break; }
+    }
+    if (!fnNode) return null;
+    const name = valueNode.text;
+    const facts = rustBindingFacts(fnNode);
+    if (facts.declared.get(name) !== 1 || facts.assigned.has(name)) return null;
+    for (let block = valueNode.parent; block && block.id !== fnNode.id; block = block.parent) {
+        if (block.type !== 'block') continue;
+        for (const stmt of block.namedChildren) {
+            if (stmt.startIndex >= valueNode.startIndex) break;
+            if (stmt.type !== 'let_declaration') continue;
+            const pattern = stmt.childForFieldName('pattern');
+            if (pattern?.type !== 'identifier' || pattern.text !== name) continue;
+            const value = stmt.childForFieldName('value');
+            if (!value || value.type === 'identifier' && value.text === name) return null;
+            if (value.type === 'identifier' || value.type === 'scoped_identifier' ||
+                value.type === 'struct_expression') {
+                return rustReceiverValuePath(value);
+            }
+            return null;
+        }
+    }
+    return null;
+}
+
+/**
+ * The field path an immutable one-hop `let` alias stands for (fix #381):
+ * `let c = &self.config; c.load()` receives like `self.config.load()`. The
+ * name is bound once in the function (no shadowing `let`), not `mut`, and
+ * the path's root is `self` or a once-bound local.
+ */
+function rustFieldAliasOf(identNode) {
+    let fnNode = null;
+    for (let parent = identNode.parent; parent; parent = parent.parent) {
+        if (parent.type === 'function_item') { fnNode = parent; break; }
+    }
+    if (!fnNode) return null;
+    const name = identNode.text;
+    const facts = rustBindingFacts(fnNode);
+    if (facts.declared.get(name) !== 1 || facts.assigned.has(name)) return null;
+    for (let block = identNode.parent; block && block.id !== fnNode.id; block = block.parent) {
+        if (block.type !== 'block') continue;
+        for (const stmt of block.namedChildren) {
+            if (stmt.startIndex >= identNode.startIndex) break;
+            if (stmt.type !== 'let_declaration') continue;
+            const pattern = stmt.childForFieldName('pattern');
+            if (pattern?.type !== 'identifier' || pattern.text !== name) continue;
+            let value = stmt.childForFieldName('value');
+            if (value?.type === 'reference_expression') value = value.childForFieldName('value');
+            if (value?.type !== 'field_expression') return null;
+            let root = value;
+            while (root?.type === 'field_expression') {
+                if (root.childForFieldName('field')?.type !== 'field_identifier') return null;
+                root = root.childForFieldName('value');
+            }
+            if (root?.type === 'self') return value;
+            if (root?.type === 'identifier' && root.text !== name &&
+                facts.declared.get(root.text) === 1 && !facts.assigned.has(root.text)) return value;
+            return null;
+        }
+    }
+    return null;
+}
+
 function findCallsInCode(code, parser) {
     const tree = parseTree(parser, code);
     const calls = [];
+    // Words of every value-binding pattern seen so far in document order
+    // (fix #369). A binding shadows a bare call only if it precedes the call,
+    // so this superset gates the exact ancestor walk below.
+    const bindingWords = new Set();
+    const BINDING_HOLDERS = new Set(['let_declaration', 'parameter', 'closure_parameters',
+        'for_expression', 'match_arm', 'let_condition']);
+    const mayBeLocallyBound = name => bindingWords.has(name);
     const functionStack = [];  // Stack of { name, startLine, endLine }
     // Track variable -> type mappings per function scope (scopeStartLine -> Map<varName, typeName>)
     const scopeTypes = new Map();
@@ -2191,12 +3681,49 @@ function findCallsInCode(code, parser) {
         return null;
     };
 
+    // Index contracts of std containers (fix #359): `items: &Vec<Conv>` makes
+    // `items[i]` a Conv, `m: HashMap<K, Conv>` makes `m[&k]` a Conv, and
+    // `[Conv; N]` / `&[Conv]` index to Conv. Only the declared slot is used;
+    // generic parameters and unknown containers abstain.
+    const RUST_SEQUENCE_CONTAINERS = new Set(['Vec', 'VecDeque']);
+    const RUST_MAP_CONTAINERS = new Set(['HashMap', 'BTreeMap']);
+    const rustIndexElement = (typeNode) => {
+        let current = typeNode;
+        while (current?.type === 'reference_type') {
+            current = current.childForFieldName('type') ||
+                current.namedChildren.find(c => c.type !== 'lifetime' && c.type !== 'mutable_specifier');
+        }
+        if (!current) return null;
+        let element = null;
+        if (current.type === 'array_type') {
+            element = current.childForFieldName('element');
+        } else if (current.type === 'generic_type') {
+            const base = extractTypeName(current.childForFieldName('type') || current.namedChild(0));
+            const argsNode = current.childForFieldName('type_arguments') ||
+                current.namedChildren.find(c => c.type === 'type_arguments');
+            const args = (argsNode?.namedChildren || []).filter(c =>
+                c.type !== 'lifetime' && !c.type.endsWith('comment'));
+            if (RUST_SEQUENCE_CONTAINERS.has(base) && args.length === 1) element = args[0];
+            else if (RUST_MAP_CONTAINERS.has(base) && args.length === 2) element = args[1];
+        }
+        if (!element) return null;
+        const type = extractTypeName(element);
+        if (!type || /^[A-Z][A-Z0-9]?$/.test(type)) return null;
+        const qualifier = extractTypeQualifier(element);
+        return { type, ...(qualifier && { qualifier }) };
+    };
+    const isElementIndex = (indexNode) => indexNode?.type === 'index_expression' &&
+        indexNode.namedChild(1)?.type !== 'range_expression';
+
     // Build type map from function parameters (including self receiver for impl methods)
     const buildScopeTypeMap = (node) => {
         const typeMap = new ReceiverTypeMap();
         typeMap.qualifiers = new Map();
         typeMap.iteratorItems = new Map();
         typeMap.annotationTexts = new Map();
+        typeMap.indexElements = new Map();
+        typeMap.refKinds = new Map();
+        typeMap.stdTypes = new Set();
         typeMap.boundNames = new Set();
         const retainBoundNames = (pattern) => {
             if (!pattern) return;
@@ -2220,15 +3747,21 @@ function findCallsInCode(code, parser) {
                     const patternNode = param.childForFieldName('pattern');
                     retainBoundNames(patternNode);
                     const typeNode = param.childForFieldName('type');
-                    const typeName = extractTypeName(typeNode);
+                    const sliceType = rustSliceTypeOf(typeNode);
+                    const typeName = extractTypeName(typeNode) || sliceType;
                     const qualifier = extractTypeQualifier(typeNode);
                     const iteratorItem = extractRustIteratorItemTypeFromTypeNode(typeNode);
+                    const indexElement = patternNode?.type === 'identifier'
+                        ? rustIndexElement(typeNode) : null;
+                    if (indexElement) typeMap.indexElements.set(patternNode.text, indexElement);
                     if (patternNode && typeName) {
                         // Pattern can be identifier or _
                         const name = patternNode.type === 'identifier' ? patternNode.text : null;
                         if (name) {
                             typeMap.set(name, typeName, 'annotation', param);
                             typeMap.annotationTexts.set(name, typeNode.text);
+                            typeMap.refKinds.set(name, rustTypeRefKind(typeNode));
+                            if (sliceType && typeName === sliceType) typeMap.stdTypes.add(name);
                             if (qualifier) typeMap.qualifiers.set(name, qualifier);
                             if (iteratorItem) typeMap.iteratorItems.set(name, iteratorItem);
                         }
@@ -2339,12 +3872,26 @@ function findCallsInCode(code, parser) {
         for (let i = functionStack.length - 1; i >= 0; i--) {
             const typeMap = scopeTypes.get(functionStack[i].startLine);
             if (typeMap?.has(varName)) return evidence ? { ...typeMap.fields(varName),
-                ...(typeMap.qualifiers?.has(varName) && { receiverTypeQualifier: typeMap.qualifiers.get(varName) }) }
+                ...(typeMap.qualifiers?.has(varName) && { receiverTypeQualifier: typeMap.qualifiers.get(varName) }),
+                ...(typeMap.refKinds?.has(varName) && { receiverTypeRef: typeMap.refKinds.get(varName) }),
+                ...(typeMap.stdTypes?.has(varName) && { receiverTypeStd: true }) }
                 : typeMap.get(varName);
             if (typeMap?.boundNames?.has(varName)) return undefined;
         }
         return undefined;
     };
+
+    // Argument type descriptors for trait-impl selection (fix #384). Only
+    // names some enclosing scope types can have one (flow-typed locals are
+    // not argument evidence), so untyped names skip the positional lookup.
+    const scopeTypesName = (name) => {
+        for (let i = functionStack.length - 1; i >= 0; i--) {
+            if (scopeTypes.get(functionStack[i].startLine)?.has(name)) return true;
+        }
+        return false;
+    };
+    const astArgTypeOfName = (name, atNode) => scopeTypesName(name)
+        ? rustKnownArgNameType(name, atNode, getReceiverType, patternShadowsAt, null) : null;
 
     const getReceiverTypeQualifier = (varName, atNode) => {
         if (atNode && patternShadowsAt(atNode, varName)) return undefined;
@@ -2367,6 +3914,29 @@ function findCallsInCode(code, parser) {
             if (typeMap?.iteratorItems?.has(varName)) {
                 return typeMap.iteratorItems.get(varName);
             }
+            if (typeMap?.boundNames?.has(varName)) return undefined;
+        }
+        return undefined;
+    };
+
+    const getReceiverIndexElement = (varName, atNode) => {
+        if (atNode && patternShadowsAt(atNode, varName)) return undefined;
+        if (flowEventAt(atNode, varName)) return undefined;
+        for (let i = functionStack.length - 1; i >= 0; i--) {
+            const typeMap = scopeTypes.get(functionStack[i].startLine);
+            if (typeMap?.indexElements?.has(varName)) return typeMap.indexElements.get(varName);
+            if (typeMap?.has(varName) || typeMap?.boundNames?.has(varName)) return undefined;
+        }
+        return undefined;
+    };
+
+    // Reference layer of a variable's declared type (fix #368): 'owned',
+    // '&' or '&mut'. Unknown after a flow rebinding or for untyped names.
+    const getReceiverRefKind = (varName, atNode) => {
+        if (atNode && patternShadowsAt(atNode, varName)) return undefined;
+        for (let i = functionStack.length - 1; i >= 0; i--) {
+            const typeMap = scopeTypes.get(functionStack[i].startLine);
+            if (typeMap?.has(varName)) return typeMap.refKinds?.get(varName);
             if (typeMap?.boundNames?.has(varName)) return undefined;
         }
         return undefined;
@@ -2509,11 +4079,32 @@ function findCallsInCode(code, parser) {
         const parameterNames = [];
         let parametersComplete = true;
         if (parameters) {
-            for (let i = 0; i < parameters.namedChildCount; i++) {
-                const parameter = parameters.namedChild(i);
+            // Positions are the callback's argument slots (fix #368): the
+            // wildcard `_` is an anonymous token but still occupies a slot,
+            // so `|_, ctx|` binds ctx to slot 1, not slot 0. Unbound slots
+            // are recorded as null.
+            for (let i = 0; i < parameters.childCount; i++) {
+                const parameter = parameters.child(i);
+                if (parameter.type === '|' || parameter.type === ',' ||
+                    parameter.type.endsWith('comment')) continue;
+                if (!parameter.isNamed) {
+                    if (parameter.type === '_') {
+                        parameterNames.push(null);
+                        continue;
+                    }
+                    parametersComplete = false;
+                    break;
+                }
                 if (parameter.type === 'identifier') {
                     parameterNames.push(parameter.text);
                     continue;
+                }
+                if (parameter.type === 'parameter') {
+                    const pattern = parameter.childForFieldName('pattern');
+                    if (pattern?.type === 'identifier') {
+                        parameterNames.push(pattern.text);
+                        continue;
+                    }
                 }
                 // `|ref a, ref b|` and `|mut value|` bind the same callback
                 // parameter as their identifier child. Destructuring patterns
@@ -2542,7 +4133,7 @@ function findCallsInCode(code, parser) {
                 break;
             }
         }
-        if (!parametersComplete || parameterNames.length === 0) return null;
+        if (!parametersComplete || !parameterNames.some(Boolean)) return null;
         return {
             closureSourceCall: callName,
             closureSourceCallStart: outerCall.startIndex,
@@ -2554,6 +4145,14 @@ function findCallsInCode(code, parser) {
     };
 
     traverseTree(tree.rootNode, (node) => {
+        if (BINDING_HOLDERS.has(node.type)) {
+            const pattern = node.type === 'closure_parameters' ? node : node.childForFieldName('pattern');
+            if (pattern) {
+                for (const word of pattern.text.split(/[^A-Za-z0-9_]+/)) {
+                    if (word) bindingWords.add(word);
+                }
+            }
+        }
         // Track function entry
         if (isFunctionNode(node)) {
             const entry = {
@@ -2618,6 +4217,9 @@ function findCallsInCode(code, parser) {
             }
 
             const enclosingFunction = getCurrentEnclosingFunction();
+            // Where the value goes (fix #371/#372): audit-async reads only
+            // records whose value can be lost or used as a resolved value.
+            const { valueConsumed: consumedValue, consumingMethod } = rustValueFacts(node);
 
             // Assignment target for return-type flow (fix #207): let args =
             // parse_low_raw(...)? lets findCallers type args from the
@@ -2628,13 +4230,15 @@ function findCallsInCode(code, parser) {
             // UFCS `Type::method(&x, ...)` counts the explicit self — the
             // pruning range accounts for the shift).
             const argsNode = node.childForFieldName('arguments');
-            let argCount = 0;
+            const argNodes = [];
             if (argsNode) {
                 for (let i = 0; i < argsNode.namedChildCount; i++) {
-                    if (argsNode.namedChild(i).type.endsWith('comment')) continue;
-                    argCount++;
+                    const arg = argsNode.namedChild(i);
+                    if (arg.type.endsWith('comment')) continue;
+                    argNodes.push(arg);
                 }
             }
+            const argCount = argNodes.length;
 
             if (funcNode.type === 'identifier') {
                 // Direct call: foo()
@@ -2644,19 +4248,30 @@ function findCallsInCode(code, parser) {
                     line: node.startPosition.row + 1,
                     callStart: node.startIndex,
                     callEnd: node.endIndex,
+                    ...(consumedValue && { valueConsumed: consumedValue }),
+                    ...(consumingMethod && { consumingMethod }),
                     isMethod: false,
                     argCount,
                     ...(assigned && { assignedTo: assigned.assignedTo }),
                     ...(assigned?.unwrapped && { assignedUnwrap: true }),
                     ...(assigned?.tuple && { assignedTuple: true }),
                     ...(assigned?.tupleRest && { assignedTupleRest: assigned.tupleRest }),
+                    ...(assigned?.tupleTargets && { assignedTupleTargets: assigned.tupleTargets }),
                     enclosingFunction,
-                    ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
+                    ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp }),
+                    ...(mayBeLocallyBound(funcNode.text) &&
+                        rustBareNameShadowedByLocal(node, funcNode.text) && { localShadow: true }),
                 });
             } else if (funcNode.type === 'field_expression') {
                 // Method call: obj.method()
                 const fieldNode = funcNode.childForFieldName('field');
-                const valueNode = funcNode.childForFieldName('value');
+                let valueNode = funcNode.childForFieldName('value');
+                // fix #381: `c.load()` after `let c = &self.config;`
+                // receives like `self.config.load()`.
+                if (valueNode?.type === 'identifier' && !getReceiverType(valueNode.text, node)) {
+                    const aliased = rustFieldAliasOf(valueNode);
+                    if (aliased) valueNode = aliased;
+                }
 
                 if (fieldNode) {
                     let receiver = (valueNode?.type === 'identifier' || valueNode?.type === 'self') ? valueNode.text : undefined;
@@ -2698,6 +4313,7 @@ function findCallsInCode(code, parser) {
                     // let findCallers hop to the field's declared type cross-file.
                     let receiverRoot, receiverField, receiverFields, receiverRootType;
                     let receiverFieldCallRoot;
+                    let receiverViaClone = false;
                     if (!receiver) {
                         let obj = valueNode;
                         while (obj?.type === 'call_expression') {
@@ -2739,6 +4355,19 @@ function findCallsInCode(code, parser) {
                             (obj.type === 'identifier' || obj.type === 'self')) {
                             // x.clone().m() — the receiver is effectively x
                             receiver = obj.text;
+                            receiverViaClone = true;
+                        }
+                    } else if (valueNode?.type === 'identifier' && !getReceiverType(receiver, node)) {
+                        // fix #392: a local destructured from `self`
+                        // (`let Self { iter, .. } = self;`) holds that field's
+                        // value: the receiver is the field, like `self.iter`.
+                        const field = rustSelfFieldBinding(valueNode);
+                        if (field) {
+                            receiverRoot = 'self';
+                            receiverFields = [field];
+                            receiverField = field;
+                            receiverRootType = findEnclosingImplType(node);
+                            receiver = undefined;
                         }
                     }
                     // Chained receiver (fix #220): the receiver IS a call —
@@ -2825,20 +4454,33 @@ function findCallsInCode(code, parser) {
                     // ripgrep-measured): "match:fg:magenta".parse() is
                     // str::parse, never a project method. Numeric literals
                     // stay untyped (i32/u64/f64 ambiguity).
+                    const rangeReceiverType = (!receiver && valueNode)
+                        ? (rustRangeLiteralType(valueNode) ||
+                            (valueNode.type === 'tuple_expression' ? 'tuple' : null)) : null;
                     const literalReceiverType = (!receiver && valueNode)
-                        ? ({ string_literal: 'str', raw_string_literal: 'str',
-                            char_literal: 'char', boolean_literal: 'bool' })[valueNode.type]
+                        ? (({ string_literal: 'str', raw_string_literal: 'str',
+                            char_literal: 'char', boolean_literal: 'bool' })[valueNode.type] ||
+                            rangeReceiverType || undefined)
                         : undefined;
+                    // Element receiver (fix #359): `items[i].m()` on a
+                    // declared std container dispatches on its element.
+                    const indexRoot = !receiver && isElementIndex(valueNode)
+                        ? valueNode.namedChild(0) : null;
+                    const indexElement = indexRoot?.type === 'identifier'
+                        ? getReceiverIndexElement(indexRoot.text, node) : undefined;
                     const receiverType = (receiver && receiver !== 'self' && !receiverIsChainRoot)
                         ? getReceiverType(receiver, node)
-                        : literalReceiverType;
+                        : (literalReceiverType || indexElement?.type);
                     const receiverTypeQualifier = receiver && receiverType
                         ? getReceiverTypeQualifier(receiver, node)
-                        : undefined;
+                        : indexElement?.qualifier;
                     const receiverIteratorItemType = receiver
                         ? getReceiverIteratorItemType(receiver, node)
                         : undefined;
                     const receiverPatternShadow = !!(receiver && patternShadowsAt(node, receiver));
+                    const receiverValuePath = !receiverType && !receiverIsChainRoot && !receiverField &&
+                        (!receiver || receiver === valueNode?.text) && receiver !== 'self'
+                        ? rustReceiverValuePath(valueNode) : null;
                     const receiverPatternBinding = rustPatternBindingOf(node, receiver);
                     if (receiverPatternBinding?.receiverPatternSourceVariable) {
                         const sourceType = getReceiverAnnotationText(
@@ -2850,6 +4492,19 @@ function findCallsInCode(code, parser) {
                     const receiverFlowInvalidated = !!(receiver && flowInvalidatedAt(node, receiver));
                     const iterationSource = rustIterationSourceOf(node, receiver);
                     const firstArg = getFirstStringArg(node);
+                    // fix #383: axum `.route(path, get(h).post(h2))` - the
+                    // methods and handlers its method router serves.
+                    const methodRouter = fieldNode.text === 'route' || fieldNode.text === 'route_service'
+                        ? rustMethodRouterOf(node, fieldNode.text) : null;
+                    // fix #366: actix `.service(handler)` - the registered
+                    // handler function's name (route prefixes compose from the
+                    // `web::scope("/api")` chain it is registered on).
+                    let serviceArg = null;
+                    if (fieldNode.text === 'service') {
+                        const a = node.childForFieldName('arguments');
+                        const first = a && a.namedChildCount === 1 ? a.namedChild(0) : null;
+                        if (first && first.type === 'identifier') serviceArg = first.text;
+                    }
                     // RUST-2: For chained calls like `a().b().parse::<T>().ok()`,
                     // each method should report the line where its OWN identifier
                     // appears, not the line where the outer expression begins.
@@ -2860,12 +4515,35 @@ function findCallsInCode(code, parser) {
                         line: fieldNode.startPosition.row + 1,
                         callStart: node.startIndex,
                         callEnd: node.endIndex,
+                        ...(consumedValue && { valueConsumed: consumedValue }),
+                        ...(consumingMethod && { consumingMethod }),
                         isMethod: true,
                         receiver,
-                        ...(receiverType && { receiverType, ...(getReceiverType(receiver, node, true) || { receiverTypeSource: 'unknown' }) }),
+                        ...(receiverType && { receiverType, ...(getReceiverType(receiver, node, true) ||
+                            (indexElement ? { receiverTypeSource: 'annotation',
+                                receiverTypeEvidence: typeOrigin('annotation', valueNode) } : null) ||
+                            (rangeReceiverType && receiverType === rangeReceiverType
+                                ? { receiverTypeSource: 'literal',
+                                    receiverTypeEvidence: typeOrigin('literal', valueNode),
+                                    receiverTypeStd: true } : null) ||
+                            { receiverTypeSource: 'unknown' }) }),
                         ...(receiverTypeQualifier && { receiverTypeQualifier }),
+                        ...(receiverType && (() => {
+                            // `x.clone()` and range literals are owned values.
+                            const kind = receiverViaClone || (rangeReceiverType && receiverType === rangeReceiverType)
+                                ? 'owned'
+                                : (receiver && receiver !== 'self' ? getReceiverRefKind(receiver, node) : undefined);
+                            return kind ? { receiverTypeRef: kind } : {};
+                        })()),
                         ...(receiverIteratorItemType && { receiverIteratorItemType }),
                         ...(receiverPatternShadow && { receiverPatternShadow: true }),
+                        // A path value receiver: `HAlign::Center.get_offset(..)`
+                        // (unit variant or associated const, fix #369), a unit
+                        // struct `S.plain()` or struct expression, directly or
+                        // through a once-bound local (fix #389); query time
+                        // decides what the path names.
+                        ...(receiverValuePath && { receiverValuePath: receiverValuePath.path,
+                            ...(receiverValuePath.kind !== 'value' && { receiverValueKind: receiverValuePath.kind }) }),
                         ...(receiverPatternBinding || {}),
                         ...(receiverFlowInvalidated && { receiverFlowInvalidated: true }),
                         ...(iterationSource || {}),
@@ -2882,16 +4560,23 @@ function findCallsInCode(code, parser) {
                         ...(receiverCallStart != null && { receiverCallStart }),
                         ...(receiverCallEnd != null && { receiverCallEnd }),
                         argCount,
+                        ...(() => {
+                            const argTypes = rustArgTypesOfNode(argNodes, astArgTypeOfName);
+                            return argTypes ? { argTypes } : {};
+                        })(),
                         ...(assigned && { assignedTo: assigned.assignedTo }),
                         ...(assigned?.unwrapped && { assignedUnwrap: true }),
                         ...(assigned?.tuple && { assignedTuple: true }),
                         ...(assigned?.tupleRest && { assignedTupleRest: assigned.tupleRest }),
+                    ...(assigned?.tupleTargets && { assignedTupleTargets: assigned.tupleTargets }),
                         ...(collectResult && {
                             explicitResultType: collectResult.type,
                             explicitResultItemType: collectResult.itemType,
                         }),
                         enclosingFunction,
-                        ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
+                        ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp }),
+                        ...(serviceArg && { serviceArg }),
+                        ...(methodRouter && { methodRouter })
                     });
                 }
             } else if (funcNode.type === 'scoped_identifier') {
@@ -2911,16 +4596,24 @@ function findCallsInCode(code, parser) {
                     line: node.startPosition.row + 1,
                     callStart: node.startIndex,
                     callEnd: node.endIndex,
+                    ...(consumedValue && { valueConsumed: consumedValue }),
+                    ...(consumingMethod && { consumingMethod }),
                     isMethod: segments.length > 1,
                     isPathCall: true,  // Distinguishes Type::func()/module::func() from obj.method()
                     receiver: recvSegments.length > 0 ? recvSegments.join('::') : undefined,
                     argCount,
+                    ...(segments.length > 1 && (() => {
+                        const argTypes = rustArgTypesOfNode(argNodes, astArgTypeOfName);
+                        return argTypes ? { argTypes } : {};
+                    })()),
                     ...(assigned && { assignedTo: assigned.assignedTo }),
                     ...(assigned?.unwrapped && { assignedUnwrap: true }),
                     ...(assigned?.tuple && { assignedTuple: true }),
                     ...(assigned?.tupleRest && { assignedTupleRest: assigned.tupleRest }),
+                    ...(assigned?.tupleTargets && { assignedTupleTargets: assigned.tupleTargets }),
                     enclosingFunction,
-                    ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
+                    ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp }),
+                    ...(rustFunctionReturnPosition(node) && { returnPosition: true }),
                 });
             }
             return true;
@@ -3004,6 +4697,11 @@ function findCallsInCode(code, parser) {
                     ...(assigned?.unwrapped && { assignedUnwrap: true }),
                     ...(assigned?.tuple && { assignedTuple: true }),
                     ...(assigned?.tupleRest && { assignedTupleRest: assigned.tupleRest }),
+                    ...(assigned?.tupleTargets && { assignedTupleTargets: assigned.tupleTargets }),
+                    // Expression position (fix #375): lets the macro_rules!
+                    // expansion pass skip files whose value-forwarding
+                    // invocations all sit where no value is taken.
+                    ...(rustMacroInvocationContext(node) === 'expr' && { macroExpr: true }),
                     enclosingFunction
                 });
             }
@@ -3019,6 +4717,7 @@ function findCallsInCode(code, parser) {
                         patternShadowsAt, flowInvalidatedAt, {
                             kind: 'invocation',
                             containerMacro: macro?.name,
+                            scopeTypesName,
                         });
                 }
             }
@@ -3043,6 +4742,7 @@ function findCallsInCode(code, parser) {
                     patternShadowsAt, flowInvalidatedAt, {
                         kind: 'attribute',
                         containerMacro: attributeName,
+                        scopeTypesName,
                     });
             }
             return true;
@@ -3107,6 +4807,19 @@ function findCallsInCode(code, parser) {
             const patternNode = node.childForFieldName('pattern');
             const valueNode = node.childForFieldName('value');
             const typeAnnotation = node.childForFieldName('type');
+            if (patternNode && patternNode.type !== 'identifier') {
+                // A destructuring `let` shadows every name it binds; their
+                // earlier declared reference layers no longer apply.
+                const refKinds = scopeTypes.get(functionStack[functionStack.length - 1].startLine)?.refKinds;
+                if (refKinds) {
+                    const pending = [patternNode];
+                    while (pending.length > 0) {
+                        const current = pending.pop();
+                        if (current.type === 'identifier') refKinds.delete(current.text);
+                        for (let i = 0; i < current.namedChildCount; i++) pending.push(current.namedChild(i));
+                    }
+                }
+            }
             if (patternNode && patternNode.type === 'identifier') {
                 const varName = patternNode.text;
                 const scopeKey = functionStack[functionStack.length - 1].startLine;
@@ -3114,10 +4827,40 @@ function findCallsInCode(code, parser) {
                 if (typeMap) {
                     let typeName = null;
                     let typeQualifier = null;
+                    let stdLiteral = false;
                     // Pattern 3: explicit type annotation — let s: Server = ...
                     if (typeAnnotation) {
                         typeName = extractTypeName(typeAnnotation);
+                        if (!typeName && rustSliceTypeOf(typeAnnotation)) {
+                            typeName = rustSliceTypeOf(typeAnnotation);
+                            stdLiteral = true;
+                        }
                         typeQualifier = extractTypeQualifier(typeAnnotation);
+                        const indexElement = rustIndexElement(typeAnnotation);
+                        if (indexElement) typeMap.indexElements.set(varName, indexElement);
+                        else typeMap.indexElements.delete(varName);
+                    } else {
+                        typeMap.indexElements.delete(varName);
+                    }
+                    let indexedValue = valueNode;
+                    while (indexedValue && (indexedValue.type === 'reference_expression' ||
+                        indexedValue.type === 'parenthesized_expression')) {
+                        indexedValue = indexedValue.childForFieldName('value') || indexedValue.namedChild(0);
+                    }
+                    if (!typeName && isElementIndex(indexedValue) &&
+                        indexedValue.namedChild(0)?.type === 'identifier') {
+                        const element = getReceiverIndexElement(indexedValue.namedChild(0).text, node);
+                        if (element) {
+                            typeName = element.type;
+                            typeQualifier = element.qualifier || null;
+                        }
+                    }
+                    if (!typeName && valueNode) {
+                        const rangeType = rustRangeLiteralType(valueNode, true);
+                        if (rangeType) {
+                            typeName = rangeType;
+                            stdLiteral = true;
+                        }
                     }
                     if (!typeName && valueNode) {
                         // Pattern 1: struct expression — let s = Server { ... }
@@ -3161,9 +4904,18 @@ function findCallsInCode(code, parser) {
                             }
                         }
                     }
+                    typeMap.refKinds.delete(varName);
+                    typeMap.stdTypes.delete(varName);
                     if (typeName) {
-                        typeMap.set(varName, typeName, typeAnnotation ? 'annotation' : valueNode?.type === 'call_expression' ? 'guess' : 'constructor', typeAnnotation || valueNode);
+                        typeMap.set(varName, typeName, stdLiteral && !typeAnnotation ? 'literal'
+                            : typeAnnotation || isElementIndex(indexedValue) ? 'annotation' : valueNode?.type === 'call_expression' ? 'guess' : 'constructor', typeAnnotation || valueNode);
                         if (typeQualifier) typeMap.qualifiers.set(varName, typeQualifier);
+                        if (typeAnnotation) {
+                            typeMap.refKinds.set(varName, rustTypeRefKind(typeAnnotation));
+                        } else if (valueNode?.type === 'struct_expression' || stdLiteral) {
+                            typeMap.refKinds.set(varName, 'owned');
+                        }
+                        if (stdLiteral) typeMap.stdTypes.add(varName);
                     }
                 }
             }
@@ -3307,6 +5059,22 @@ function findImportsInCode(code, parser) {
             return true;
         }
 
+        // `extern crate itertools as it;` binds the crate under a local
+        // name exactly like `use itertools as it;` (fix #369). A plain
+        // `extern crate x;` adds no name beyond the extern prelude.
+        if (node.type === 'extern_crate_declaration') {
+            const nameNode = node.childForFieldName('name');
+            const aliasNode = node.childForFieldName('alias');
+            if (nameNode && aliasNode && aliasNode.text !== nameNode.text) {
+                const local = aliasNode.text;
+                addLeaf(nameNode.text, local, 'use', false, node.startPosition.row + 1,
+                    { original: nameNode.text, local });
+                if (!imports.aliases) imports.aliases = [];
+                imports.aliases.push({ original: nameNode.text, local });
+            }
+            return true;
+        }
+
         // mod declarations (external module imports)
         if (node.type === 'mod_item') {
             const line = node.startPosition.row + 1;
@@ -3435,13 +5203,13 @@ function findExportsInCode(code, parser) {
             return true;
         }
 
-        // Public structs
-        if (node.type === 'struct_item' && hasVisibility(node)) {
+        // Public structs and unions
+        if ((node.type === 'struct_item' || node.type === 'union_item') && hasVisibility(node)) {
             const nameNode = node.childForFieldName('name');
             if (nameNode) {
                 append({
                     name: nameNode.text,
-                    type: 'struct',
+                    type: node.type === 'union_item' ? 'union' : 'struct',
                     line: node.startPosition.row + 1
                 });
             }
@@ -3548,9 +5316,11 @@ function _indexInParent(node, parent) {
     return -1;
 }
 
-function findUsagesInCode(code, name, parser, tree) {
+function findUsagesInCode(code, name, parser, tree, options = {}) {
     tree = tree || parseTree(parser, code);
     const usages = [];
+    // Lexical scope verdicts (fix #392) only for refactoring internals.
+    const scopeMemo = options.lexicalScopes ? new Map() : null;
     // Lazy same-file enum→variants map: built only when a paren-less
     // `Type::name` reference needs the enum-variant check.
     let _enumVariants = null;
@@ -3691,8 +5461,8 @@ function findUsagesInCode(code, name, parser, tree) {
                      sameNode(parent.childForFieldName('name'), node)) {
                 usageType = 'definition';
             }
-            // Definition: struct name
-            else if (parent.type === 'struct_item' &&
+            // Definition: struct / union name
+            else if ((parent.type === 'struct_item' || parent.type === 'union_item') &&
                      sameNode(parent.childForFieldName('name'), node)) {
                 usageType = 'definition';
             }
@@ -3771,7 +5541,11 @@ function findUsagesInCode(code, name, parser, tree) {
                 if (idx >= 0) {
                     // Check no preceding dot (would be method call handled above)
                     const prev = idx > 0 ? parent.child(idx - 1) : null;
-                    if ((!prev || prev.text !== '.') && callArgs) {
+                    if (prev?.type === 'fn') {
+                        // `fn name(...)` in a token tree is a definition
+                        // template, not a call (fix #360).
+                        usageType = 'definition';
+                    } else if ((!prev || prev.text !== '.') && callArgs) {
                         usageType = 'call';
                     }
                 }
@@ -3802,19 +5576,60 @@ function findUsagesInCode(code, name, parser, tree) {
         }
 
         let inAttribute = false;
+        let attributeNode = null;
         for (let a = parent; a; a = a.parent) {
             if (a.type === 'attribute' || a.type === 'attribute_item') {
                 inAttribute = true;
+                attributeNode = a.type === 'attribute' ? a
+                    : a.namedChildren.find(child => child.type === 'attribute') || null;
                 break;
             }
             if (a.type === 'function_item' || a.type === 'impl_item' ||
                 a.type === 'struct_item') break;
         }
-        usages.push({ line, column, usageType, ...(inAttribute && { inAttribute: true }) });
+        // Macro namespace (fix #377): a macro invocation's name, an
+        // attribute's path (`#[must_use]`, `#[tokio::main]`) and a derive
+        // list entry (`#[derive(Debug)]`) name macros or built-in
+        // attributes, never a same-named fn, const or local.
+        const macroNamespace = rustMacroNamespaceName(node, parent, attributeNode);
+        // Where a bare reference resolves (fix #392).
+        const scope = scopeMemo && usageType === 'reference' && !macroNamespace
+            ? scopeFields(inAttribute ? 'unknown' : referenceScope(node, 'rust', scopeMemo)) : null;
+        // `S { name }` names the field too: a rename keeps the key (fix #397).
+        const shorthandProperty = scopeMemo && parent?.type === 'shorthand_field_initializer';
+        usages.push({ line, column, usageType, ...(inAttribute && { inAttribute: true }),
+            ...(macroNamespace && { namespace: 'macro' }), ...scope,
+            ...(shorthandProperty && { shorthandProperty: true }) });
         return true;
     });
 
     return usages;
+}
+
+/**
+ * Is this identifier a name in the macro namespace (fix #377)? The name of a
+ * macro invocation, the path of an attribute, or an entry of a derive list
+ * (also inside `cfg_attr(..., derive(...))`).
+ */
+function rustMacroNamespaceName(node, parent, attributeNode) {
+    if (!parent) return false;
+    if (parent.type === 'macro_invocation') return sameNode(parent.childForFieldName('macro'), node);
+    if (parent.type === 'scoped_identifier' && sameNode(parent.childForFieldName('name'), node)) {
+        const up = parent.parent;
+        if (up?.type === 'macro_invocation') return sameNode(up.childForFieldName('macro'), parent);
+        if (up?.type === 'attribute') return sameNode(up.namedChild(0), parent);
+    }
+    if (!attributeNode) return false;
+    if (parent.type === 'attribute') return sameNode(parent.namedChild(0), node);
+    if (parent.type !== 'token_tree') return false;
+    // derive(A, path::B): the token tree follows the `derive` path (the
+    // attribute's own path, or an identifier token inside cfg_attr).
+    const opener = parent.parent?.type === 'attribute' && sameNode(parent.parent.childForFieldName('arguments'), parent)
+        ? parent.parent.namedChild(0)
+        : parent.previousSibling;
+    if (!opener || opener.text !== 'derive') return false;
+    const next = node.nextSibling;
+    return !next || next.type !== '::';
 }
 
 /**
@@ -3854,6 +5669,9 @@ function isEntryPoint(symbol) {
 }
 
 module.exports = {
+    primeDeclarationTrees,
+    parseDeclarationsIn,
+    rustMacroInvocationContext,
     findFunctions,
     findClasses,
     findStateObjects,

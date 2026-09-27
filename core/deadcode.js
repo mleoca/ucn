@@ -13,7 +13,9 @@ const { isTestFile } = require('./discovery');
 const { isFrameworkEntrypoint } = require('./entrypoints');
 const { splitParentList } = require('./graph-build');
 const { isOverrideMarked, codeUnitCompare, lineInRanges, maskBlockComments, escapeRegExp } = require('./shared');
-const { projectComputedDispatch, reflectionSites } = require('./ast-analysis');
+const { projectComputedDispatch, projectReflectionSites } = require('./ast-analysis');
+const { reflectionPatternReferences } = require('./reflection');
+const { protocolMemberOf, protocolTypeOf, typedLiteralContract } = require('./contract-membership');
 
 const _CLASS_KINDS = ['class', 'struct', 'interface', 'trait', 'record'];
 
@@ -215,10 +217,25 @@ function overridesOutOfTreeBase(index, symbol) {
         if (owners.length <= 1) return true;
     }
     const mods = symbol.modifiers || [];
-    const publicByShape = !mods.includes('private') &&
-        !symbol.name.startsWith('#') && !symbol.name.startsWith('_');
+    // Language-private spellings (`#x`, Python `__x`) never override a base
+    // member; a leading `_` is only a convention in languages that say so
+    // (fix #397: Node stream `_transform` hooks).
+    const privateName = langTraits(index.files.get(symbol.file)?.language)?.privateMemberName;
+    const publicByShape = !mods.includes('private') && !symbol.name.startsWith('#') &&
+        (typeof privateName === 'function' ? !privateName(symbol.name) : !symbol.name.startsWith('_'));
     if (publicByShape && _classHasExternalBase(index, symbol)) return true;
     return false;
+}
+
+/**
+ * A member of an object literal declared with an out-of-project type
+ * (`const traps: ProxyHandler<T> = { get() {} }`, fix #397): the type's
+ * consumer (the runtime, a library) calls it by name, so a zero in-project
+ * usage count is not evidence of deadness.
+ */
+function typedLiteralExternalMember(index, symbol) {
+    if (!symbol.registryContainerType || symbol.className) return false;
+    return !!typedLiteralContract(index, symbol)?.external;
 }
 
 // Go satisfies interfaces implicitly, so no `implements` edge exists for
@@ -626,6 +643,15 @@ function symbolIsExported(index, symbol, fileEntry) {
     if (fileEntry.exports.includes(name) || mods.includes('export') || mods.includes('public')) {
         return true;
     }
+    // fix #379: a C++ member that follows a macro invocation whose access
+    // effect the parser could not read (the macro is defined in another
+    // file) takes the access its project definitions spell; an external or
+    // configuration-dependent macro leaves it unknown, and an unknown-access
+    // member is treated as public API.
+    if (symbol.accessAfterMacro && symbol.className) {
+        const access = memberAccessAfterMacro(index, symbol.accessAfterMacro);
+        if (access === null || access === 'public') return true;
+    }
     const traits = langTraits(fileEntry.language);
     // Python's language-level public surface is every top-level non-underscore
     // name when __all__ is absent. Apply the same rule here as `api`: deadcode
@@ -645,6 +671,22 @@ function symbolIsExported(index, symbol, fileEntry) {
     if (traits?.exportVisibility === 'capitalization') {
         return /^[A-Z]/.test(name);
     }
+    // fix #367f: members of an interface/trait carry the container's
+    // visibility (Rust trait items cannot be marked `pub`; Java and C#
+    // interface members are implicitly public), so the members of an
+    // exported interface/trait are public API exactly as `api` lists them.
+    if (symbol.className && !mods.includes('private')) {
+        const container = (index.symbols.get(symbol.className) || []).find(c =>
+            c.file === symbol.file && (c.type === 'interface' || c.type === 'trait') &&
+            c.startLine <= symbol.startLine && symbol.startLine <= (c.endLine ?? c.startLine));
+        if (container) {
+            const cmods = container.modifiers || [];
+            if (fileEntry.exports.includes(container.name) || cmods.includes('export') ||
+                cmods.includes('public') || cmods.includes('pub')) {
+                return true;
+            }
+        }
+    }
     if (traits?.implicitlyPublicMembers && symbol.className &&
         !mods.includes('private') && !name.startsWith('#') && !name.startsWith('_')) {
         const classSyms = index.symbols.get(symbol.className) || [];
@@ -661,6 +703,21 @@ function symbolIsExported(index, symbol, fileEntry) {
     return false;
 }
 
+/**
+ * Access in effect after `macro` for a member whose lexical access before the
+ * invocation was `before`: the last access specifier every project
+ * definition of the macro spells (or `before` when none spells one). Null
+ * when the macro has no readable project definition or its definitions
+ * disagree.
+ */
+function memberAccessAfterMacro(index, { macro, before } = {}) {
+    const { macroAccessEffect } = require('../languages/c-family');
+    const definitions = (index.symbols.get(macro) || []).filter(d => d.type === 'macro');
+    if (definitions.length === 0 || definitions.some(d => typeof d.ppBody !== 'string')) return null;
+    const effects = new Set(definitions.map(d => macroAccessEffect(d.ppBody) || before || null));
+    return effects.size === 1 ? [...effects][0] : null;
+}
+
 function isPythonPackageFile(index, fileEntry) {
     if (fileEntry?.language !== 'python' || !fileEntry.relativePath) return false;
     let dir = path.dirname(path.join(index.root, fileEntry.relativePath));
@@ -672,40 +729,6 @@ function isPythonPackageFile(index, fileEntry) {
         dir = parent;
     }
     return false;
-}
-
-const JAVA_SERIALIZATION_CALLBACKS = new Set([
-    'readResolve', 'writeReplace', 'readObject', 'writeObject',
-    'readObjectNoData',
-]);
-
-/**
- * Java serialization invokes these callbacks reflectively, so there is no
- * text call edge. Require a Serializable/Externalizable heritage path before
- * suppressing a dead-code claim; name alone is not enough.
- */
-function isJavaSerializationCallback(index, symbol, fileEntry) {
-    if (fileEntry?.language !== 'java' || !symbol.className ||
-        !JAVA_SERIALIZATION_CALLBACKS.has(symbol.name)) return false;
-    const head = value => String(value || '')
-        .replace(/<.*$/, '').split(/[.$]/).pop().trim();
-    const seen = new Set();
-    const serializable = className => {
-        const normalized = head(className);
-        if (!normalized || seen.has(normalized)) return false;
-        if (normalized === 'Serializable' || normalized === 'Externalizable') return true;
-        seen.add(normalized);
-        const defs = (index.symbols.get(normalized) || []).filter(candidate =>
-            ['class', 'interface', 'record', 'enum'].includes(candidate.type));
-        return defs.some(definition => {
-            const implemented = Array.isArray(definition.implements)
-                ? definition.implements : String(definition.implements || '').split(',');
-            const parents = [definition.extends, ...implemented]
-                .filter(Boolean).map(head);
-            return parents.some(serializable);
-        });
-    };
-    return serializable(symbol.className);
 }
 
 /**
@@ -742,29 +765,48 @@ function deadcode(index, options = {}) {
     const reflectionInfo = {
         count: 0,
         literalCount: 0,
+        patternCount: 0,
         dynamicCount: 0,
         fileCount: 0,
         files: [],
         names: [],
+        patterns: [],
+        withheld: 0,
+        withheldByPattern: [],
     };
-    for (const [reflectionFile, fe] of index.files) {
+    // Reflection is liveness evidence wherever it sits (a test or script
+    // outside --in still reaches the member); the disclosure counts cover the
+    // audited scope.
+    const reflectionPatterns = new Set();
+    for (const [reflectionFile, sites] of projectReflectionSites(index)) {
+        const fe = index.files.get(reflectionFile);
+        if (!fe || sites.length === 0) continue;
+        for (const site of sites) {
+            if (site.name) literalReflectionNames.add(site.name);
+            if (site.patterns && site.patterns.length > 0 && !site.name) {
+                // Exact alternatives of a multi-spelling site are literals.
+                for (const pattern of site.patterns) {
+                    if (!pattern.includes('*')) literalReflectionNames.add(pattern);
+                }
+            }
+        }
         if (!index.matchesFilters(fe.relativePath, options)) continue;
-        let sites = [];
-        try {
-            sites = reflectionSites(index._readFile(reflectionFile), fe.language);
-        } catch { /* coverage diagnostics own unreadable-file reporting */ }
-        if (sites.length === 0) continue;
         reflectionInfo.count += sites.length;
-        reflectionInfo.literalCount += sites.filter(site => !site.dynamic).length;
-        reflectionInfo.dynamicCount += sites.filter(site => site.dynamic).length;
+        for (const site of sites) {
+            if (site.name) reflectionInfo.literalCount++;
+            else if (site.patterns && site.patterns.length > 0) reflectionInfo.patternCount++;
+            if (site.dynamic) reflectionInfo.dynamicCount++;
+            for (const pattern of site.patterns || []) {
+                if (pattern.includes('*')) reflectionPatterns.add(pattern);
+            }
+        }
         reflectionInfo.fileCount++;
         if (reflectionInfo.files.length < 10) {
             reflectionInfo.files.push(fe.relativePath);
         }
-        for (const site of sites) {
-            if (site.name) literalReflectionNames.add(site.name);
-        }
     }
+    reflectionInfo.patterns = [...reflectionPatterns].sort(codeUnitCompare);
+    const reflectionWithheldByPattern = new Map();
     reflectionInfo.names = [...literalReflectionNames].sort(codeUnitCompare);
 
     // Ensure callee index is built (lazy, reused across operations)
@@ -845,10 +887,48 @@ function deadcode(index, options = {}) {
         potentiallyDeadNames.delete(reflectedName);
     }
 
+    // C/C++ token-pasting macros (fix #362): names an expanded invocation
+    // produces in value position (`{ #name, handle_##name }` tables) are
+    // uses. A paste pattern whose produced names cannot be enumerated (a
+    // pasting macro with a blind invocation, or one never seen expanded)
+    // withholds every candidate the pattern could spell.
+    const macroPaste = { sites: 0, blind: null, withheld: 0, withheldNames: [], patterns: 0 };
+    const macroSuppressedNames = new Set();
+    if ([...index.files.values()].some(fe => langTraits(fe.language)?.textualIncludes)) {
+        const { macroExpansionSummary } = require('./macro-expansion');
+        const { matchesPastePattern } = require('../languages/c-preprocessor');
+        const summary = macroExpansionSummary(index);
+        macroPaste.sites = summary.sites;
+        macroPaste.blind = summary.blind;
+        for (const name of summary.refNames) {
+            potentiallyDeadNames.delete(name);
+            macroSuppressedNames.add(name);
+        }
+        const patterns = summary.patterns.filter(p => p.pattern.some(piece => piece && piece.length > 0));
+        macroPaste.patterns = patterns.length;
+        if (patterns.length > 0) {
+            for (const name of [...potentiallyDeadNames].sort(codeUnitCompare)) {
+                const cFamily = (index.symbols.get(name) || []).some(def =>
+                    langTraits(index.files.get(def.file)?.language)?.textualIncludes);
+                if (!cFamily) continue;
+                const pattern = patterns.find(p => matchesPastePattern(p.pattern, name));
+                if (!pattern) continue;
+                potentiallyDeadNames.delete(name);
+                macroSuppressedNames.add(name);
+                macroPaste.withheld++;
+                if (macroPaste.withheldNames.length < 10) {
+                    macroPaste.withheldNames.push({ name, macro: pattern.macro,
+                        file: pattern.file, line: pattern.line });
+                }
+            }
+        }
+    }
+
     const coverage = scanDeadcodeCoverage(index, potentiallyDeadNames);
     const coverageSuppressedNames = new Set([
         ...coverage.matchedNames,
         ...literalReflectionNames,
+        ...macroSuppressedNames,
     ]);
     if (coverage.claimsWithdrawn) {
         // An unreadable file/directory can contain a use of any candidate.
@@ -1205,6 +1285,12 @@ function deadcode(index, options = {}) {
             if (symbol.bodyScopedName) {
                 continue;
             }
+            // Generated by a project macro_rules! invocation (fix #374): the
+            // definition is the macro's template or the invocation's
+            // arguments, never a deletable declaration of its own.
+            if (symbol.macroExpansion) {
+                continue;
+            }
             const fileEntry = index.files.get(symbol.file);
             const lang = fileEntry?.language;
 
@@ -1267,7 +1353,11 @@ function deadcode(index, options = {}) {
             if (langModule.isEntryPoint?.(symbol)) {
                 continue;
             }
-            if (isJavaSerializationCallback(index, symbol, fileEntry)) {
+            // Members the runtime/compiler invokes by name (trait
+            // languageProtocolMember): Java serialization callbacks on
+            // Serializable types, Python Enum hooks on Enum subclasses, C#
+            // pattern-bound members, JS toJSON/then/[Symbol.*] (fix #363).
+            if (protocolMemberOf(index, symbol) || protocolTypeOf(index, symbol)) {
                 excludedRuntimeContract++;
                 continue;
             }
@@ -1422,6 +1512,7 @@ function deadcode(index, options = {}) {
                 const isExternalContract = classAuditSet.has(symbol.type)
                     ? _heritageReachesExternalBase(index, symbol, lang, false)
                     : overridesOutOfTreeBase(index, symbol) ||
+                        typedLiteralExternalMember(index, symbol) ||
                         (lang === 'go' && goImplicitExternalContract(symbol));
                 if (isExternalContract && !options.includeExported) {
                     excludedExternalContract++;
@@ -1472,6 +1563,22 @@ function deadcode(index, options = {}) {
                     continue;
                 }
 
+                // Reflection by name pattern (fix #363): a reflective access
+                // whose name is built from literal fragments around a runtime
+                // part (`getattr(self, "_get_%s_permissions" % src)`) can
+                // reach every member the pattern spells on a receiver that may
+                // hold this class. That is a runtime use, not deadness.
+                const reflected = reflectionPatternReferences(index, symbol);
+                if (reflected.length > 0) {
+                    const first = reflected[0];
+                    const pattern = first.site.receiver?.kind === 'module'
+                        ? `${first.pattern}\u0000${first.relativePath}` : first.pattern;
+                    reflectionWithheldByPattern.set(pattern,
+                        (reflectionWithheldByPattern.get(pattern) || 0) + 1);
+                    reflectionInfo.withheld++;
+                    continue;
+                }
+
                 results.push({
                     name: symbol.name,
                     type: symbol.type,
@@ -1508,7 +1615,22 @@ function deadcode(index, options = {}) {
     results.excludedRuntimeContract = excludedRuntimeContract;
     results.excludedDynamicDispatch = excludedDynamicDispatch;
     results.computedDispatch = computedDispatchInfo;
+    reflectionInfo.withheldByPattern = [...reflectionWithheldByPattern]
+        .map(([key, count]) => {
+            const [pattern, namespaceOf] = key.split('\u0000');
+            return { pattern, count, ...(namespaceOf && { namespaceOf }) };
+        })
+        .sort((a, b) => b.count - a.count || codeUnitCompare(a.pattern, b.pattern));
     results.reflection = reflectionInfo;
+    if (macroPaste.sites > 0 || macroPaste.blind?.count > 0 || macroPaste.withheld > 0) {
+        results.macroPaste = macroPaste;
+    }
+    // Project macro_rules! invocations that could not be expanded (fix #374).
+    if ([...index.files.values()].some(fe => fe.rustMacroExpansion?.blind)) {
+        const { rustMacroExpansionSummary } = require('./rust-macro-expansion');
+        const summary = rustMacroExpansionSummary(index);
+        if (summary.blind.count > 0) results.macroRulesBlind = summary.blind;
+    }
     results.coverage = {
         complete: coverage.complete,
         claimsWithdrawn: coverage.claimsWithdrawn,

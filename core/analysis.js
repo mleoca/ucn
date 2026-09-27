@@ -10,13 +10,19 @@
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
+const { UcnError } = require('./errors');
 const { parse } = require('./parser');
 const { detectLanguage, langTraits } = require('../languages');
 const { NON_CALLABLE_TYPES, addTestExclusions, countTextBlindspots,
     codeUnitCompare, formatSymbolHandle } = require('./shared');
 const { isTestFile } = require('./discovery');
-const { computeReachability, symbolKey } = require('./entrypoints');
+// Entry-point detection loads on first use (fix #375).
+let entrypointsModule = null;
+const entrypoints = () => (entrypointsModule ||= require('./entrypoints'));
+const computeReachability = index => entrypoints().computeReachability(index);
+const symbolKey = (file, line) => entrypoints().symbolKey(file, line);
 const { getLanguageAdapter } = require('../languages');
+const { parseOpenCallShape } = require('../languages/rust-value-flow');
 const { projectComputedDispatch, declarationSnapshots } = require('./ast-analysis');
 const { findAccessorReferences } = require('./accessors');
 
@@ -360,9 +366,14 @@ function context(index, name, options = {}) {
     if (['class', 'struct', 'interface', 'type', 'enum', 'record', 'trait', 'namespace']
         .includes(def.type)) {
         const methods = index.findMethodsForType(name, def);
+        const { ownerDefinitionOf, classKeyOf } = require('./class-identity');
+        const typeKey = classKeyOf(index, def);
         const members = (index.files.get(def.file)?.symbols || []).filter(symbol =>
             symbol.className === def.name &&
-            ['field', 'constant', 'state'].includes(symbol.type));
+            ['field', 'constant', 'state'].includes(symbol.type) &&
+            // A member of another same-name type body is not this type's (fix #389).
+            (!ownerDefinitionOf(index, symbol) ||
+                classKeyOf(index, ownerDefinitionOf(index, symbol)) === typeKey));
 
         // Pin caller resolution to the resolved class definition — same as the
         // function path below. Without this, same-name classes in other files
@@ -1275,6 +1286,8 @@ function impact(index, name, options = {}) {
             ...(u.reason && { reason: u.reason }),
             ...(u.dispatchVia && { dispatchVia: u.dispatchVia }),
             ...(u.dispatchCandidates != null && { dispatchCandidates: u.dispatchCandidates }),
+            ...(u.reflectionPattern && { reflectionPattern: u.reflectionPattern }),
+            ...(u.reflectionScope && { reflectionScope: u.reflectionScope }),
         });
     }
     unverifiedSites.sort((a, b) => {
@@ -1969,7 +1982,7 @@ function diffImpact(index, options = {}) {
 
     // Validate base ref format to prevent argument injection
     if (base && !/^[a-zA-Z0-9._\-~\/^@{}:]+$/.test(base)) {  // eslint-disable-line no-useless-escape
-        throw new Error(`Invalid git ref format: ${base}`);
+        throw new UcnError(`Invalid git ref format: ${base}`);
     }
 
     // Verify git repo
@@ -1977,7 +1990,7 @@ function diffImpact(index, options = {}) {
     try {
         gitRoot = execFileSync('git', ['rev-parse', '--show-toplevel'], { cwd: index.root, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
     } catch (e) {
-        throw new Error('Not a git repository. impact without a symbol requires git.', { cause: e });
+        throw new UcnError('Not a git repository. impact without a symbol requires git.', { cause: e });
     }
 
     // Build git diff command (use execFileSync to avoid shell expansion)
@@ -2006,7 +2019,7 @@ function diffImpact(index, options = {}) {
             diffText = e.stdout;
         } else {
             const fatal = String(e.stderr || '').split('\n').find(l => l.startsWith('fatal:'));
-            throw new Error(fatal
+            throw new UcnError(fatal
                 ? `git diff failed — ${fatal.replace(/^fatal:\s*/, '')}`
                 : `git diff failed: ${e.message}`, { cause: e });
         }
@@ -2385,6 +2398,29 @@ function diffImpact(index, options = {}) {
                 includeMethods: true,
                 collectAccount: true,
             });
+            // Call sites the base declaration bound that the changed one's
+            // sweep excludes (fix #394) are the change's likeliest breaks:
+            // unverified, never other-target.
+            const baseDeclaration = oldCallables && targetDefs.length === 1
+                ? require('./verify').baseCounterpartOf(fileEntry.symbols, oldCallables, targetDefs[0]) : null;
+            if (baseDeclaration) {
+                const { sitesReboundByChange } = require('./verify');
+                const rebound = sitesReboundByChange(index, symbol.name, targetDefs[0], rawCallers,
+                    rawCallers.filter(c => c.tier !== 'unverified'),
+                    rawCallers.filter(c => c.tier === 'unverified').concat(rawCallers.unverifiedEntries || []),
+                    [{ def: targetDefs[0], before: baseDeclaration }]);
+                // Sites already in the unverified band stay listed as they are.
+                const hidden = rebound.filter(site => !site.stillUnverified);
+                if (hidden.length > 0) {
+                    const moved = new Set(hidden.map(site => `${site.file}\0${site.line}`));
+                    rawCallers.accountRaw = {
+                        ...rawCallers.accountRaw,
+                        excludedEntries: rawCallers.accountRaw.excludedEntries.filter(entry =>
+                            !moved.has(`${entry.file}\0${entry.line}`)),
+                    };
+                    rawCallers.unverifiedEntries = [...(rawCallers.unverifiedEntries || []), ...hidden];
+                }
+            }
 
             const confirmed = rawCallers.filter(c => c.tier !== 'unverified');
             let unverified = rawCallers.filter(c => c.tier === 'unverified')
@@ -2638,15 +2674,18 @@ function isDiffCallable(symbol) {
  */
 function extractCallableSymbols(parsed) {
     const symbols = [];
+    // Declared parameters travel with each symbol: `check` compares a
+    // changed definition with its base declaration (fix #394).
+    const signature = s => ({ params: s.params, paramsStructured: s.paramsStructured, generics: s.generics });
     for (const fn of parsed.functions) {
         const className = fn.className || (fn.receiver ? fn.receiver.replace(/^\*/, '') : '');
-        symbols.push({ name: fn.name, className, startLine: fn.startLine, endLine: fn.endLine });
+        symbols.push({ name: fn.name, className, startLine: fn.startLine, endLine: fn.endLine, ...signature(fn) });
     }
     for (const cls of parsed.classes) {
         if (cls.members) {
             for (const m of cls.members) {
                 if (!isDiffCallable(m)) continue;
-                symbols.push({ name: m.name, className: cls.name, startLine: m.startLine, endLine: m.endLine });
+                symbols.push({ name: m.name, className: cls.name, startLine: m.startLine, endLine: m.endLine, ...signature(m) });
             }
         }
     }
@@ -2751,33 +2790,10 @@ function parseDiff(diffText, root) {
 // ============================================================================
 
 // Languages for which audit-async runs (those with async/await keyword we
-// track). Go/Java/Rust have async machinery but audit-async is scoped to
-// JS/TS/Python per spec.
+// track). Rust futures are audited separately (processRustFile, fix #370);
+// Go/Java have no awaitable call results.
 const _AUDIT_ASYNC_LANGS = new Set([
     'javascript', 'typescript', 'tsx', 'python', 'html', 'csharp',
-]);
-
-// Built-in/standard-library callees that return promises and are commonly
-// missing-awaited. Conservative starter set (rule #9 — generic, not
-// project-specific). The audit only flags when the caller is async, the
-// callee is provably async, AND the call isn't awaited; this set covers
-// callees we can recognize without project-symbol resolution.
-const _KNOWN_ASYNC_CALLEES = new Set([
-    // JS/TS
-    'fetch',
-    // Node.js fs.promises etc. are method calls — `fs.readFile` resolves
-    // through the symbol table as a method. We avoid hardcoding receiver
-    // names here. setTimeout/setInterval are fire-and-forget by design.
-]);
-
-// Fire-and-forget patterns — calls inside these contexts are intentionally
-// unawaited. Used to suppress false positives.
-//   - Promise.all / Promise.allSettled / Promise.race / Promise.any
-//   - void <expr>
-//   - <expr>.then() / .catch() (the call provides its own handler)
-const _FIRE_AND_FORGET_PROMISE_FNS = new Set(['all', 'allSettled', 'race', 'any']);
-const _ASYNCIO_CONSUMER_FNS = new Set([
-    'gather', 'create_task', 'ensure_future', 'wait', 'as_completed',
 ]);
 
 // Follow a captured JS promise within its lexical scope, looking only for
@@ -2862,9 +2878,10 @@ function storedPromiseMisuse(call, functionNodes) {
  *   2. The callee is provably async (its symbol's `isAsync` is true) OR
  *      the callee is a known async standard function (e.g., `fetch`).
  *   3. The call is not wrapped in `await` (or its Python equivalent).
- *   4. The call is not in a known fire-and-forget context (Promise.all
- *      arguments, `void fn()`, `.then(...)`, return statement, assignment
- *      to a variable — these are intentional non-await uses).
+ *   4. The value is lost or misused: discarded as a bare statement, stored
+ *      in a local that is never read, or used as if it were the resolved
+ *      value. A value that flows on (argument, collection, spread, return,
+ *      conditional branch, stored field) hands the awaitable to other code.
  *
  * Detection is AST-based per language; the language must support an
  * `await` keyword (JS/TS/Python/C#). Other languages are skipped.
@@ -2890,104 +2907,114 @@ function auditAsync(index, options = {}) {
         // definition wins regardless of what other files contain. This is
         // critical to avoid silent false-negatives caused by name collisions
         // across files (HIGH-1 fix).
-        const asyncNames = new Set();
-        const ambiguousNames = new Set(); // any non-async def exists somewhere
-        const callableDefs = (defs) => defs.filter(d => d && (
-            d.type === 'function' || d.type === 'method' ||
-            d.type === 'constructor' || d.type === 'arrow' ||
-            d.params != null || d.paramsStructured != null
-        ));
-        const isDefAsync = (d) => d.isAsync === true ||
-            (Array.isArray(d.modifiers) && d.modifiers.includes('async'));
+        // What each async definition's call RETURNS decides the audit
+        // (fix #364): coroutines must be awaited; async iterators and async
+        // context managers are consumed by `async for` / `async with` and
+        // only a discarded call is a defect; unknown producers (unresolved
+        // decorators, disagreeing same-name definitions) are not audited.
+        const producers = require('./async-producers');
+        const kindMemo = new Map();
+        const asyncCandidateNames = new Set();
         for (const [name, defs] of index.symbols) {
-            const callable = callableDefs(defs);
-            if (callable.length === 0) continue;
-            const allAsync = callable.every(isDefAsync);
-            if (allAsync) {
-                asyncNames.add(name);
-            } else if (callable.some(isDefAsync)) {
-                ambiguousNames.add(name);
+            if (defs.some(def => producers.isCallableDef(def) && producers.isDefAsync(def))) {
+                asyncCandidateNames.add(name);
             }
         }
+        // Project-wide lookup: a sync definition anywhere keeps the name
+        // ambiguous (`Map.get()` vs an async `DataService.get()`).
+        const globalKinds = new Map();
+        const globalKind = (name) => {
+            if (!globalKinds.has(name)) {
+                globalKinds.set(name, producers.collapseKinds(index, index.symbols.get(name) || [], kindMemo, true));
+            }
+            return globalKinds.get(name);
+        };
+        let skippedUnknown = 0;
+        const knownAsyncGlobalNames = new Set();
+        for (const fileEntry of index.files.values()) {
+            for (const name of langTraits(fileEntry.language)?.knownAsyncGlobals || []) knownAsyncGlobalNames.add(name);
+        }
 
-        // Helper: does the call site (callExpr node) sit in a "fire-and-forget"
-        // context? Walk up at most a few levels and check for known patterns.
-        function isFireAndForget(callNode, language) {
-            let p = callNode.parent;
-            // 1. Direct `void fn()` (JS/TS only)
-            if (p && p.type === 'unary_expression') {
-                const op = p.childForFieldName('operator');
-                if (op && op.text === 'void') return true;
-                // Some grammars expose first child as the operator
-                const first = p.namedChild(0);
-                if (first && first.type === 'void') return true;
-            }
-            // 2. Argument of `Promise.all([...])` / `Promise.allSettled` / etc.
-            //    Walk up: arguments > call > selector_expression(member) > 'Promise'.<allSettled>.
-            //    The call site is somewhere inside the array; check if the
-            //    enclosing call is a Promise.all-style helper.
-            let cur = callNode.parent;
-            let depth = 0;
-            while (cur && depth++ < 6) {
-                if ((cur.type === 'call_expression' || cur.type === 'call') && cur !== callNode) {
-                    const fn = cur.childForFieldName('function');
-                    if (fn) {
-                        if (fn.type === 'member_expression' || fn.type === 'attribute') {
-                            const obj = fn.childForFieldName('object') || fn.namedChild(0);
-                            const prop = fn.childForFieldName('property') || fn.namedChild(fn.namedChildCount - 1);
-                            if (obj && prop) {
-                                const objText = obj.text;
-                                const propText = prop.text;
-                                if ((objText === 'Promise' &&
-                                    _FIRE_AND_FORGET_PROMISE_FNS.has(propText)) ||
-                                    (objText === 'asyncio' &&
-                                    _ASYNCIO_CONSUMER_FNS.has(propText))) {
-                                    return true;
-                                }
-                                // .then(...) / .catch(...) — caller is providing a handler;
-                                // the inner call is intentional.
-                                if (propText === 'then' || propText === 'catch' || propText === 'finally') {
-                                    // Only flag when callNode is INSIDE the chain target,
-                                    // not just an argument
-                                    return true;
-                                }
-                            }
-                        }
+        // Rust futures (fix #370): producers are definitions whose call
+        // returns a future; every call site is audited, sync fns included.
+        let rustContext = null;
+        const skippedFutures = { count: 0 };
+        const rustProducers = () => {
+            if (!rustContext) {
+                const futureTypes = producers.rustProjectFutureTypes(index);
+                const candidateNames = new Set();
+                for (const [name, defs] of index.symbols) {
+                    if (defs.some(def => isCallableDef(def) && producers.rustDefFuture(def, futureTypes))) {
+                        candidateNames.add(name);
                     }
-                    // Stop at the first enclosing call — we don't want to leak
-                    // analysis past the immediate parent call.
-                    break;
                 }
-                cur = cur.parent;
+                rustContext = { futureTypes, candidateNames,
+                    futureDefs: producers.rustFutureDefIndex(index, futureTypes) };
             }
-            // 3. Right-hand side of an assignment / variable_declarator — the
-            //    promise is being captured for later use, not lost. NOT
-            //    fire-and-forget but also NOT a missing-await; treat as
-            //    intentional.
-            //    (We keep this distinct so the "captured" call doesn't get
-            //    flagged.)
-            let q = callNode.parent;
-            // Skip await wrappers (already handled by caller)
-            if (q && (q.type === 'await_expression' || q.type === 'await')) {
-                q = q.parent;
+            return rustContext;
+        };
+        const isCallableDef = producers.isCallableDef;
+        function processRustFile(filePath, fileEntry) {
+            const { futureTypes, candidateNames, futureDefs } = rustProducers();
+            // Local future closures (`let f = || async {..}`) are a parser
+            // fact of the file; with neither those nor any project producer
+            // there is nothing to audit.
+            const asyncClosures = new Set(fileEntry.asyncClosureNames || []);
+            if (futureDefs.size === 0 && asyncClosures.size === 0) return;
+            // Build-time fact (fix #371/#372): the shapes of calls whose value
+            // is not consumed where produced. Unless one of them can reach a
+            // visible future producer (the same record-level tests, on the
+            // fields the shape keeps), the file's call records are never
+            // loaded.
+            // A file whose macro expansions' calls are not derived yet may
+            // hold a lost future among them (fix #374): read its calls.
+            if (asyncClosures.size === 0 && Array.isArray(fileEntry.openCalls) &&
+                !(fileEntry.rustMacroExpansion?.callsPending &&
+                    (fileEntry.rustMacroExpansion.calleeNames || []).some(name => futureDefs.has(name))) &&
+                !fileEntry.openCalls.some(shape => {
+                    const record = parseOpenCallShape(shape);
+                    return futureDefs.has(record.name) &&
+                        !producers.rustRecordValueConsumed(index, futureDefs, futureTypes, record) &&
+                        producers.rustRecordMayReachFuture(record, futureDefs, index, filePath);
+                })) return;
+            const calls = index.getCachedCalls(filePath);
+            if (!Array.isArray(calls)) return;
+            // Only files with a call shape that can reach a future producer
+            // or a local future closure, and whose value is not consumed
+            // right away (`.await`ed or passed on, a parser fact), are
+            // re-parsed (fix #371).
+            const candidates = calls.filter(call => call?.name && !call.inMacro &&
+                Number.isInteger(call.callStart) && Number.isInteger(call.callEnd) &&
+                !producers.rustRecordValueConsumed(index, futureDefs, futureTypes, call) &&
+                ((call.localShadow && asyncClosures.has(call.name)) ||
+                producers.rustRecordMayReachFuture(call, futureDefs, index, filePath)));
+            if (candidates.length === 0) return;
+            // Resolve before reading (fix #371): a file whose candidates reach
+            // no future producer through the engine is never parsed. Local
+            // future closures are file facts and always need the tree.
+            let calleeMemo;
+            if (!candidates.some(call => call.localShadow && asyncClosures.has(call.name))) {
+                const resolved = producers.rustResolveCandidates(
+                    { index, futureTypes, fileEntry, filePath }, candidates);
+                if (!resolved.needsTree) return;
+                calleeMemo = resolved.calleeMemo;
             }
-            if (q) {
-                if (q.type === 'variable_declarator' || q.type === 'assignment_expression') {
-                    return true;
-                }
-                if (q.type === 'return_statement') {
-                    return true;  // returning the promise — caller awaits it
-                }
-                // Yielded as an expression: `yield fn()` — caller awaits / async iterator
-                if (q.type === 'yield_expression' || q.type === 'yield') {
-                    return true;
-                }
-            }
-            return false;
+            let tree;
+            try {
+                const parser = getParser('rust');
+                if (!parser) return;
+                tree = safeParse(parser, index._readFile(filePath));
+            } catch (_) { return; }
+            if (!tree) return;
+            for (const issue of producers.auditRustFile({
+                index, futureTypes, candidateNames, futureDefs, fileEntry, filePath, tree, calls,
+                asyncClosures, skipped: skippedFutures, calleeMemo,
+            })) issues.push(issue);
         }
 
         // Process one file: find async functions, then call sites within them.
         function processFile(filePath, fileEntry) {
+            if (fileEntry?.language === 'rust') return processRustFile(filePath, fileEntry);
             if (!fileEntry || !_AUDIT_ASYNC_LANGS.has(fileEntry.language)) return;
             const language = fileEntry.language;
             const indexedCalls = language === 'csharp'
@@ -3002,25 +3029,31 @@ function auditAsync(index, options = {}) {
             // shouldn't make `helper()` ambiguous in a file that defines
             // `async function helper()` locally.
             const asyncFns = [];
-            const fileAsyncNames = new Set();
-            const fileAnyDefNames = new Set();
+            const fileDefs = new Map();
             if (Array.isArray(fileEntry.symbols)) {
                 for (const sym of fileEntry.symbols) {
                     if (!sym || !sym.startLine || !sym.endLine) continue;
-                    const isAsync = sym.isAsync === true ||
-                                    (Array.isArray(sym.modifiers) && sym.modifiers.includes('async'));
-                    if (isAsync) asyncFns.push(sym);
-                    if (sym.name && (
-                        sym.type === 'function' || sym.type === 'method' ||
-                        sym.type === 'constructor' || sym.type === 'arrow' ||
-                        sym.params != null || sym.paramsStructured != null
-                    )) {
-                        fileAnyDefNames.add(sym.name);
-                        if (isAsync) fileAsyncNames.add(sym.name);
+                    if (producers.isDefAsync(sym)) asyncFns.push(sym);
+                    if (sym.name && producers.isCallableDef(sym)) {
+                        if (!fileDefs.has(sym.name)) fileDefs.set(sym.name, []);
+                        fileDefs.get(sym.name).push(sym);
                     }
                 }
             }
             if (asyncFns.length === 0 && language !== 'python') return;
+            // A file none of whose indexed calls names an async producer has
+            // nothing to audit: skip the re-parse (dominant cost on large
+            // repos). Files without call records are parsed as before.
+            if (language !== 'html') {
+                const calls = index.getCachedCalls(filePath);
+                const fileAsync = name => fileDefs.get(name)?.some(producers.isDefAsync);
+                if (Array.isArray(calls) && !calls.some(call => call?.name &&
+                    (knownAsyncGlobalNames.has(call.name) || (asyncCandidateNames.has(call.name) &&
+                        // C# resolves per receiver type: any async def counts.
+                        (language === 'csharp' || fileAsync(call.name) || globalKind(call.name)))))) {
+                    return;
+                }
+            }
 
             // Re-parse file to find awaited-vs-not call sites. We use a fresh
             // parse rather than tree cache because we want to walk every
@@ -3045,6 +3078,9 @@ function auditAsync(index, options = {}) {
                 }
             } catch (_) { return; }
             if (!tree) return;
+            const resolveLexical = producers.createLexicalResolver(fileEntry, language);
+            // Runtime globals that return promises (`fetch`), bare calls only.
+            const knownAsyncGlobals = new Set(langTraits(language)?.knownAsyncGlobals || []);
 
             // Walk every call_expression within an async function range.
             const callTypes = new Set([
@@ -3123,137 +3159,173 @@ function auditAsync(index, options = {}) {
                 return discardedPython ? { name: '<module>' } : null;
             }
 
+            // Which definition a call reaches, and what calling it returns.
+            // Lexical scope first (a local def, or a parameter/variable that
+            // shadows every definition), then this file's definitions (a
+            // same-file def shadows imports), then the whole project.
+            function calleeProducerKind(callNode, calleeName, isMethodCall, line) {
+                if (language === 'csharp') {
+                    // C# method identity is nominal. Prefer the indexed
+                    // receiver type at this call site; fall back only when
+                    // every project definition with the name is async.
+                    const indexed = indexedCalls.find(call =>
+                        call.name === calleeName && call.line === line &&
+                        call.isMethod === isMethodCall);
+                    let receiverType = indexed?.receiverType || null;
+                    if (!receiverType && indexed?.receiverField && indexed?.receiverRootType) {
+                        const field = (fileEntry.symbols || []).find(symbol =>
+                            symbol.type === 'field' &&
+                            symbol.className === indexed.receiverRootType &&
+                            symbol.name === indexed.receiverField);
+                        receiverType = field?.fieldType || null;
+                    }
+                    // The receiver's type and its project ancestors own the
+                    // member (fix #395: `s.SaveAsync()`, `_svc.SaveAsync()`);
+                    // a typed receiver owning none of the async definitions
+                    // (an external type's own method) is not audited.
+                    const owners = new Set();
+                    const typeName = receiverType ? String(receiverType).replace(/<.*$/s, '').replace(/\?$/, '')
+                        .split('.').pop() : null;
+                    for (const queue = typeName ? [typeName] : []; queue.length > 0 && owners.size < 64;) {
+                        const owner = queue.shift();
+                        if (!owner || owners.has(owner)) continue;
+                        owners.add(owner);
+                        for (const parent of index._getInheritanceParents?.(owner, filePath) || []) {
+                            queue.push(typeof parent === 'string' ? parent : parent?.name);
+                        }
+                    }
+                    const receiverDefs = owners.size > 0
+                        ? (index.symbols.get(calleeName) || []).filter(def =>
+                            producers.isCallableDef(def) && owners.has(def.className))
+                        : [];
+                    if (receiverDefs.length > 0) return producers.collapseKinds(index, receiverDefs, kindMemo, true);
+                    return typeName && isMethodCall && indexed?.receiver !== 'this' ? null : globalKind(calleeName);
+                }
+                if (!isMethodCall && resolveLexical) {
+                    const lexical = resolveLexical(callNode, calleeName);
+                    if (lexical?.shadowed) return null;
+                    if (lexical?.defs) return producers.collapseKinds(index, lexical.defs, kindMemo, false);
+                }
+                const local = fileDefs.get(calleeName);
+                if (local) return producers.collapseKinds(index, local, kindMemo, false);
+                return globalKind(calleeName) ||
+                    (!isMethodCall && knownAsyncGlobals.has(calleeName) ? 'coroutine' : null);
+            }
+
+            function isAwaited(callNode) {
+                let current = callNode.parent;
+                let depth = 0;
+                while (current && depth++ < 5) {
+                    if (current.type === 'parenthesized_expression') {
+                        current = current.parent;
+                        continue;
+                    }
+                    if (current.type === 'await_expression' || current.type === 'await') return true;
+                    // C#'s canonical `await Task().ConfigureAwait(false)`
+                    // wraps the original invocation in a member-access +
+                    // invocation chain before the await node.
+                    if (language === 'csharp' && [
+                        'member_access_expression',
+                        'invocation_expression',
+                        'conditional_access_expression',
+                        'member_binding_expression',
+                    ].includes(current.type)) {
+                        current = current.parent;
+                        continue;
+                    }
+                    return false;
+                }
+                return false;
+            }
+
             function visit(node) {
                 if (!node) return;
                 if (callTypes.has(node.type)) {
                     const line = node.startPosition.row + 1;
-                    const enclosing = nearestAsyncEnclosing(node);
-                    if (enclosing) {
+                    let enclosing;
+                    {
                         // Get the callee name + skip if not async.
-                        const funcNode = node.childForFieldName('function') ||
+                        let funcNode = node.childForFieldName('function') ||
                                          node.childForFieldName('name');
+                        // C# `obj?.DoAsync()`: the member binding names it (fix #395).
+                        if (funcNode?.type === 'conditional_access_expression') {
+                            funcNode = (funcNode.namedChildren || []).find(child =>
+                                child.type === 'member_binding_expression') || funcNode;
+                        }
                         if (funcNode) {
                             let calleeName;
                             let isMethodCall = false;
                             if (funcNode.type === 'member_expression' || funcNode.type === 'attribute' ||
-                                funcNode.type === 'selector_expression' || funcNode.type === 'field_expression') {
+                                funcNode.type === 'selector_expression' || funcNode.type === 'field_expression' ||
+                                // C# `obj.DoAsync()`, `obj?.DoAsync()` (fix #395).
+                                funcNode.type === 'member_access_expression' ||
+                                funcNode.type === 'member_binding_expression') {
                                 const prop = funcNode.childForFieldName('property') ||
                                              funcNode.childForFieldName('field') ||
                                              funcNode.childForFieldName('attribute') ||
                                              funcNode.childForFieldName('name');
-                                calleeName = prop ? prop.text : null;
+                                // `obj.Save<T>()` names the method Save.
+                                calleeName = prop ? (prop.type === 'generic_name'
+                                    ? (prop.namedChild(0)?.text || null) : prop.text) : null;
                                 isMethodCall = true;
+                            } else if (funcNode.type === 'generic_name') {
+                                calleeName = funcNode.namedChild(0)?.text || null;
                             } else {
                                 calleeName = funcNode.text;
                             }
-                            if (calleeName) {
-                                // Check whether the callee is provably async.
-                                // File-local resolution wins (HIGH-1 fix): if
-                                // THIS file defines an async function with that
-                                // name, the call resolves to it regardless of
-                                // what other files contain. This avoids silent
-                                // false-negatives caused by name collisions
-                                // (e.g., async helper in bad.js + sync helper
-                                // in unrelated.js — bad.js's helper() should
-                                // still be flagged).
-                                let calleeIsAsync;
-                                if (language === 'csharp') {
-                                    // C# method identity is nominal. Prefer the
-                                    // indexed receiver type at this call site;
-                                    // fall back only when every project
-                                    // definition with the name is async.
-                                    const indexed = indexedCalls.find(call =>
-                                        call.name === calleeName && call.line === line &&
-                                        call.isMethod === isMethodCall);
-                                    let receiverType = indexed?.receiverType || null;
-                                    if (!receiverType && indexed?.receiverField &&
-                                        indexed?.receiverRootType) {
-                                        const field = (fileEntry.symbols || []).find(symbol =>
-                                            symbol.type === 'field' &&
-                                            symbol.className === indexed.receiverRootType &&
-                                            symbol.name === indexed.receiverField);
-                                        receiverType = field?.fieldType || null;
-                                    }
-                                    const receiverDefs = receiverType
-                                        ? callableDefs(index.symbols.get(calleeName) || [])
-                                            .filter(def => def.className === receiverType)
-                                        : [];
-                                    calleeIsAsync = receiverDefs.length > 0
-                                        ? receiverDefs.every(isDefAsync)
-                                        : asyncNames.has(calleeName);
-                                } else if (fileAsyncNames.has(calleeName)) {
-                                    calleeIsAsync = true;
-                                } else if (fileAnyDefNames.has(calleeName)) {
-                                    // Same-file def exists and isn't async →
-                                    // local def shadows globals → not async.
-                                    calleeIsAsync = false;
-                                } else {
-                                    // No same-file def — fall back to global
-                                    // all-or-nothing check.
-                                    calleeIsAsync = asyncNames.has(calleeName) ||
-                                                    _KNOWN_ASYNC_CALLEES.has(calleeName);
-                                }
-                                if (calleeIsAsync) {
-                                    // Skip method calls in structural type
-                                    // systems (JS/TS/Python). Without receiver
-                                    // type evidence we can't tell `obj.get()`
-                                    // calling `Map.get` (sync) from a project
-                                    // class's async `get`. Method-call audits
-                                    // need a more sophisticated receiver
-                                    // resolution that we don't have here.
-                                    if (isMethodCall && language !== 'csharp') {
-                                        // (Allow only when callee is in the
-                                        // KNOWN_ASYNC_CALLEES list — those are
-                                        // standard global functions, not
-                                        // methods.)
-                                        if (!_KNOWN_ASYNC_CALLEES.has(calleeName)) {
-                                            // Continue walking — don't flag.
-                                        } else {
-                                            // Fall through to common flag logic
-                                        }
-                                    }
-                                    if (!isMethodCall || language === 'csharp' ||
-                                        _KNOWN_ASYNC_CALLEES.has(calleeName)) {
-                                        // Check: is the call awaited?
-                                        let awaited = false;
-                                        let current = node.parent;
-                                        let awaitDepth = 0;
-                                        while (current && awaitDepth++ < 5) {
-                                            if (current.type === 'parenthesized_expression') {
-                                                current = current.parent;
-                                                continue;
-                                            }
-                                            if (current.type === 'await_expression' ||
-                                                current.type === 'await') {
-                                                awaited = true;
-                                                break;
-                                            }
-                                            // C#'s canonical
-                                            // `await Task().ConfigureAwait(false)`
-                                            // wraps the original invocation in
-                                            // a member-access + invocation
-                                            // chain before the await node.
-                                            if (language === 'csharp' && [
-                                                'member_access_expression',
-                                                'invocation_expression',
-                                                'conditional_access_expression',
-                                                'member_binding_expression',
-                                                'parenthesized_expression',
-                                            ].includes(current.type)) {
-                                                current = current.parent;
-                                                continue;
-                                            }
-                                            break;
-                                        }
-                                        const storedMisuse = !awaited && langTraits(language)?.storedPromises
-                                            ? storedPromiseMisuse(node, FN_NODE_TYPES) : null;
-                                        if (storedMisuse || (!awaited && !isFireAndForget(node, language))) {
+                            // Structural method calls (`obj.get()`) need
+                            // receiver evidence this audit does not have.
+                            const methodBlocked = isMethodCall && language !== 'csharp';
+                            if (calleeName && !methodBlocked && (asyncCandidateNames.has(calleeName) ||
+                                (!isMethodCall && knownAsyncGlobals.has(calleeName))) &&
+                                (enclosing = nearestAsyncEnclosing(node))) {
+                                const kind = calleeProducerKind(node, calleeName, isMethodCall, line);
+                                if (kind && kind !== 'void' &&
+                                    !producers.asyncConsumerRole(node)) {
+                                    const awaited = isAwaited(node);
+                                    if (kind === 'unknown') {
+                                        if (!awaited) skippedUnknown++;
+                                    } else if (kind === 'iterator' || kind === 'context-manager') {
+                                        // Not awaitable: iterated / entered /
+                                        // passed on. Only a discarded call
+                                        // is lost.
+                                        if (producers.isDiscardedCall(node)) {
                                             issues.push({
                                                 file: fileEntry.relativePath || filePath,
                                                 line,
                                                 callerName: enclosing.name,
                                                 calleeName,
-                                                ...(storedMisuse || {}),
+                                                reason: kind === 'iterator'
+                                                    ? 'async-iterator-discarded'
+                                                    : 'async-context-manager-discarded',
+                                            });
+                                        }
+                                    } else {
+                                        // fix #367c: an awaitable that flows on
+                                        // (argument, collection, return, branch)
+                                        // is not a missing await; a lost value or
+                                        // one used as if resolved is.
+                                        let finding = null;
+                                        if (!awaited) {
+                                            const flow = producers.valueFlow(node, language);
+                                            if (flow.kind === 'discarded') {
+                                                finding = {};
+                                            } else if (flow.kind === 'used-as-value') {
+                                                finding = { reason: 'async-result-used-as-value' };
+                                            } else if (flow.kind === 'stored') {
+                                                finding = (langTraits(language)?.storedPromises
+                                                    ? storedPromiseMisuse(node, FN_NODE_TYPES) : null) ||
+                                                    (producers.storedValueRead(flow.holder, flow.binding, FN_NODE_TYPES)
+                                                        ? null : {});
+                                            }
+                                        }
+                                        if (finding) {
+                                            issues.push({
+                                                file: fileEntry.relativePath || filePath,
+                                                line,
+                                                callerName: enclosing.name,
+                                                calleeName,
+                                                ...finding,
                                             });
                                         }
                                     }
@@ -3293,6 +3365,8 @@ function auditAsync(index, options = {}) {
             issues,
             totalIssues: issues.length,
             filesAffected: new Set(issues.map(i => i.file)).size,
+            skippedUnknown,
+            ...(skippedFutures.count > 0 && { skippedFutures: skippedFutures.count }),
         };
     } finally { index._endOp(); }
 }

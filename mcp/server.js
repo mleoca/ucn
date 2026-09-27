@@ -7,6 +7,11 @@
  * Keeps a per-project index cache for fast repeat queries.
  */
 
+// Reuse V8 code caches across processes (Node >= 22.1; fix #365): compiling
+// the engine's modules is a fixed cost of every command. Node validates each
+// entry against the source, and NODE_DISABLE_COMPILE_CACHE turns it off.
+try { require('module').enableCompileCache?.(); } catch (_) { /* optional */ }
+
 const fs = require('fs');
 const path = require('path');
 const { StdioMcpServer } = require('./stdio-server');
@@ -30,6 +35,7 @@ const {
     formatSurfaceMessage,
 } = require('../core/registry');
 const { execute } = require('../core/execute');
+const { describeError, UcnError } = require('../core/errors');
 const { applyOutputBudget, MAX_OUTPUT_CHARS } = require('../core/output-budget');
 
 // ============================================================================
@@ -41,14 +47,14 @@ const MAX_CACHE_SIZE = 10;
 
 function getIndex(projectDir, options) {
     if (typeof projectDir !== 'string' || projectDir.trim().length === 0) {
-        throw new Error('project_dir is required and must be a non-empty path.');
+        throw new UcnError('project_dir is required and must be a non-empty path.');
     }
     const maxFiles = options && options.maxFiles;
     const followSymlinks = options && options.followSymlinks;
     const includeBundled = options?.includeBundled === true;
     const absDir = path.resolve(projectDir);
     if (!fs.existsSync(absDir) || !fs.statSync(absDir).isDirectory()) {
-        throw new Error(`Project directory not found: ${absDir}`);
+        throw new UcnError(`Project directory not found: ${absDir}`);
     }
     const root = findProjectRoot(absDir);
     const cached = indexCache.get(root);
@@ -135,6 +141,11 @@ function toolResult(text, command, maxChars, suffixNote, params = {}) {
 
 function toolError(message) {
     return { content: [{ type: 'text', text: `Error: ${message}` }], isError: true };
+}
+
+/** An exception inside UCN: marked internal, never rendered as a refusal (fix #394). */
+function internalToolError(message) {
+    return { content: [{ type: 'text', text: message }], isError: true };
 }
 
 function paramEditDistance(a, b) {
@@ -260,7 +271,7 @@ const INPUT_SHAPE = {
     sections: stringParam('Comma-separated projection. show: summary,callers,callees,source,dependencies,tests,types,example,related. repo: summary,files,stats,health.'),
     exclude: stringParam('Comma-separated patterns to exclude (e.g. "test,mock,vendor")'),
     include_tests: booleanParam('Include test files in results (excluded by default)'),
-    exclude_tests: booleanParam('Explicit spelling of the default test-file exclusion (entrypoints). Use include_tests=true to include test files.'),
+    exclude_tests: booleanParam('Exclude test files: the default for entrypoints (include_tests=true lists them); usages and endpoints list test files unless exclude_tests=true.'),
     include_methods: booleanParam('Include method callees where receiver evidence permits. Caller-bearing views always tier method sites.'),
     expand_unverified: booleanParam('trace callers: follow unverified edges; downstream nodes remain marked possible, never confirmed.'),
     min_confidence: numberParam('Minimum ordinal evidence weight (legacy name; not a probability) for caller/callee edges', { minimum: 0, maximum: 1 }),
@@ -305,7 +316,7 @@ const INPUT_SHAPE = {
     top_level: booleanParam('repo files: show only top-level functions.'),
     class_name: stringParam('Class name to scope method analysis (e.g. "MarketDataFetcher" for close)'),
     line: integerParam('Definition line pin. Resolves the symbol defined at this exact line (the middle component of a file:line:name handle). Disambiguates same-file same-name definitions.', { exclusiveMinimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
-    limit: integerParam('Max results to return (default: 500; structural search: 50; usages and lines: uncapped). Caps find, usages, search, deadcode, api, and repo files. Must be a positive integer.', { exclusiveMinimum: 0, maximum: 1000000 }),
+    limit: integerParam('Max results to return (default: 500; structural search: 50; usages and lines: uncapped). Caps find, usages, search, deadcode, api, and repo files. find text shows the top 5 in detail and counts the rest; limit raises both. Must be a positive integer.', { exclusiveMinimum: 0, maximum: 1000000 }),
     max_files: integerParam('Max files to index (default: 10000). Use for very large codebases. Must be a positive integer.', { exclusiveMinimum: 0, maximum: 10000000 }),
     max_chars: integerParam('Max output characters, not UTF-8 bytes, including notes and preserved metadata. Broad sweep commands (repo, entrypoints, endpoints, deadcode, deps, check, audit_async) default to 3K; all other commands default to 10K. Maximum: 100K. all=true lifts formatter caps but keeps the 100K transport ceiling.', { exclusiveMinimum: 0, maximum: 100000 }),
     type: stringParam('Symbol type filter for structural search: function, class, call, method, type, state, field, constant, macro. Triggers index-based search.'),
@@ -469,6 +480,7 @@ server.registerTool(
             }
             const execution = execute(index, canonicalCommand, ep);
             if (!execution.ok) {
+                if (execution.internalError) return internalToolError(execution.error + strippedNote);
                 return te(formatSurfaceMessage(execution.error, 'mcp'));
             }
 
@@ -507,7 +519,9 @@ server.registerTool(
             ));
 
         } catch (e) {
-            return te(e.message);
+            const described = describeError(e);
+            if (described.internalError) return internalToolError(described.error + strippedNote);
+            return te(described.error);
         } finally {
             // Persist calls cache after command execution.
             // getIndex() only saves after build (when callsCache is empty).
@@ -516,7 +530,7 @@ server.registerTool(
             // MED-1: also persist when reachability was computed in-process so
             // long-lived MCP servers carry the BFS result forward to disk.
             if (index && !ep.includeBundled && !ep.maxFiles &&
-                (index.callsCacheDirty || index.reachabilityDirty || index.computedDispatchDirty)) {
+                (index.callsCacheDirty || index.reachabilityDirty || index.computedDispatchDirty || index.macroExpansionDirty)) {
                 try { index.saveCache(); } catch (_) { /* best-effort */ }
                 index.callsCacheDirty = false;
             }

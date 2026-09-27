@@ -4479,8 +4479,8 @@ describe('Feature B: JS awaited flag + audit-async', () => {
                 'async function helper() { return 1; }',
                 'async function caller() {',
                 '    await helper();',
-                '    const x = helper();',  // captured, not fire-and-forget
-                '    return helper();',     // returned, caller awaits
+                '    const x = helper();',  // captured and read later (fix #367c: an unread capture is lost)
+                '    if (await x) return helper();', // returned, caller awaits
                 '}',
                 'caller();',
             ].join('\n'),
@@ -10904,6 +10904,906 @@ describe('fix #338: JS/TS deferred import edges classify cycles', () => {
             assert.match(text, /DEFERRED CYCLES \(2\)/);
             assert.ok(index.imports('b.js').filter(i => i.module === './a')
                 .every(i => i.deferred && i.deferredReason === 'function-local'));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #364: audit-async classifies async producers by what a call returns (JS/TS)', () => {
+    it('async generators are consumed, not awaited; params shadow; fetch is a bare global', () => {
+        const dir = tmp({
+            'package.json': '{"name":"x"}',
+            'app.js': [
+                'const readStream = async function* (s) { yield s; };', // 1
+                'async function* gen() { yield 1; }',                  // 2
+                'async function work() { return 1; }',                 // 3
+                'async function main(stream, fetch) {',                // 4
+                '  for await (const c of readStream(stream)) {}',       // 5
+                '  const r = Readable.from(gen());',                    // 6
+                '  gen();',                                             // 7
+                '  work();',                                            // 8
+                "  fetch('x');",                                        // 9
+                '  return r;',                                          // 10
+                '}',                                                    // 11
+                'async function other(client) {',                       // 12
+                "  client.fetch('x');",                                 // 13
+                "  fetch('y');",                                        // 14
+                '}',                                                    // 15
+                'module.exports = { main, other };',
+            ].join('\n'),
+        });
+        try {
+            const r = idx(dir).auditAsync({});
+            assert.deepStrictEqual(r.issues.map(i => [i.line, i.calleeName, i.reason || null]), [
+                [7, 'gen', 'async-iterator-discarded'],
+                [8, 'work', null],
+                [14, 'fetch', null],
+            ]);
+        } finally { rm(dir); }
+    });
+
+    it('TS for await over an async generator function', () => {
+        const dir = tmp({
+            'package.json': '{"name":"x"}',
+            'app.ts': [
+                'async function* pages(): AsyncGenerator<number> { yield 1; }',
+                'export async function main(): Promise<number> {',
+                '  let total = 0;',
+                '  for await (const p of pages()) total += p;',
+                '  return total;',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            assert.strictEqual(idx(dir).auditAsync({}).totalIssues, 0);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #367c: audit-async flags lost or misused promises, not ones that flow on (JS/TS)', () => {
+    it('ternary returns, arguments, arrays, logical fallbacks flow; discarded, unread, misused values are findings', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'app.ts': [
+                'async function load(): Promise<number> { return 1; }',          // 1
+                'declare const t: { throwsAsync(p: Promise<unknown>): Promise<Error> };', // 2
+                'export async function main(flag: boolean, cached?: Promise<number>) {', // 3
+                '    await t.throwsAsync(load());',                              // 4 flow (argument)
+                '    const all = [load(), load()];',                             // 5 flow (array)
+                '    await Promise.all(all);',                                   // 6
+                '    const p = cached ?? load();',                               // 7 flow (logical)
+                '    await p;',                                                  // 8
+                '    load();',                                                   // 9 discarded
+                '    const unused = load();',                                    // 10 stored, never read
+                '    const n = load().toFixed();',                               // 11 used as value
+                '    const { x } = load() as any;',                              // 12 destructured
+                '    void load();',                                              // 13 explicit discard
+                '    return flag ? load() : 0;',                                 // 14 flow (ternary return)
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const r = idx(dir).auditAsync({});
+            const byLine = new Map(r.issues.map(i => [i.line, i]));
+            assert.deepStrictEqual([...byLine.keys()].sort((a, b) => a - b), [9, 10, 11, 12],
+                JSON.stringify(r.issues));
+            assert.strictEqual(byLine.get(11).reason, 'async-result-used-as-value');
+            assert.strictEqual(byLine.get(12).reason, 'async-result-used-as-value');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #384: a bare name reaches a member-assigned callable only through the global object or its own name', () => {
+    const callersOf = (index, file, name) => {
+        const def = (index.symbols.get(name) || []).find(d => d.relativePath === file);
+        assert.ok(def, `${file}:${name} indexed`);
+        const r = execute(index, 'show', { name, file, line: def.startLine, sections: 'callers' });
+        assert.ok(r.ok, r.error);
+        const ctx = r.result.context || r.result;
+        return {
+            def,
+            confirmed: (ctx.callers || []).map(c => `${c.relativePath}:${c.line}`).sort(),
+            unverified: (ctx.unverifiedCallers || []).map(c => `${c.relativePath}:${c.line}:${c.reason}`).sort(),
+            excluded: Object.fromEntries(Object.entries(ctx.meta?.account?.excluded?.byReason || {})
+                .map(([reason, v]) => [reason, v.count])),
+            conserved: ctx.meta?.account?.conserved,
+        };
+    };
+
+    it('a mocked builtin on a local object is not the global the bare call reaches (axios shape)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"x"}',
+            'a.test.js': [
+                "const { EventEmitter } = require('events');",
+                'function transport() {',
+                '  const req = new EventEmitter();',
+                '  req.setTimeout = () => {};',
+                '  return req;',
+                '}',
+                'function wait() {',
+                '  setTimeout(() => 1, 10);',
+                '  return transport().setTimeout(5);',
+                '}',
+                'module.exports = { wait };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const c = callersOf(index, 'a.test.js', 'setTimeout');
+            assert.strictEqual(c.def.assignedObject, 'object');
+            assert.deepStrictEqual(c.confirmed, []);
+            assert.strictEqual(c.excluded['method-kind-mismatch'], 1, JSON.stringify(c.excluded));
+            assert.ok(c.unverified.some(u => u.startsWith('a.test.js:9:')), JSON.stringify(c.unverified));
+            assert.strictEqual(c.conserved, true);
+            const callees = execute(index, 'show', { name: 'wait', sections: 'callees' });
+            const ctx = callees.result.context || callees.result;
+            assert.ok(!(ctx.callees || []).some(x => x.name === 'setTimeout' && x.startLine === 4),
+                JSON.stringify(ctx.callees));
+        } finally { rm(dir); }
+    });
+
+    it('exports, object-literal and prototype members: unreachable by bare names, except a self-named expression inside itself; imports still reach', () => {
+        const dir = tmp({
+            'package.json': '{"name":"x"}',
+            'a.js': [
+                'exports.go = function () { return 1; };',
+                'exports.walk = function walk(n) { return n ? walk(n.next) : 0; };',
+                'const reg = { baz() { return 2; }, qux: function qux(n) { return n && qux(n - 1); } };',
+                'function Foo() {}',
+                'Foo.prototype.bar = function () { return 3; };',
+                'function t() { return go() + baz() + qux(1) + bar() + walk(null); }',
+                'module.exports.t = t;',
+                'module.exports.reg = reg;',
+            ].join('\n'),
+            'b.js': "const { go } = require('./a');\nfunction u() { return go(); }\nmodule.exports = { u };\n",
+            'c.mjs': "import { go } from './a.js';\nexport function v() { return go(); }\n",
+            'd.js': "require('./a');\nfunction w() { return go(); }\nmodule.exports = { w };\n",
+        });
+        try {
+            const index = idx(dir);
+            const go = callersOf(index, 'a.js', 'go');
+            assert.deepStrictEqual(go.confirmed, ['b.js:2', 'c.mjs:2']);
+            assert.strictEqual(go.excluded['method-kind-mismatch'], 2, JSON.stringify(go.excluded));
+            const walk = callersOf(index, 'a.js', 'walk');
+            assert.strictEqual(walk.def.selfNamed, true);
+            assert.deepStrictEqual(walk.confirmed, ['a.js:2']);
+            assert.strictEqual(walk.excluded['method-kind-mismatch'], 1, JSON.stringify(walk.excluded));
+            const baz = callersOf(index, 'a.js', 'baz');
+            assert.deepStrictEqual(baz.confirmed, []);
+            assert.strictEqual(baz.excluded['method-kind-mismatch'], 1);
+            const qux = callersOf(index, 'a.js', 'qux');
+            assert.deepStrictEqual(qux.confirmed, ['a.js:3']);
+            const bar = callersOf(index, 'a.js', 'bar');
+            assert.deepStrictEqual(bar.confirmed, []);
+            assert.deepStrictEqual(bar.unverified, []);
+            assert.strictEqual(bar.excluded['method-kind-mismatch'], 1);
+            for (const c of [go, walk, baz, qux, bar]) assert.strictEqual(c.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('a member of the global object is a global; an object that may be the global object routes visible', () => {
+        const dir = tmp({
+            'package.json': '{"name":"x"}',
+            'e.ts': '(window as any).helper = () => 1;\nexport function x() { return helper(); }\n',
+            'f.ts': "import { EventEmitter } from 'events';\nexport function y() { return helper() + new EventEmitter().listenerCount('a'); }\n",
+            'g.js': [
+                'function patch(target) { target.use = function () { return 1; }; }',
+                'function C() { this.run = () => 1; }',
+                'function z() { return use() + run(); }',
+                'function shadow() { const self = {}; self.later = () => 1; return later(); }',
+                'module.exports = { patch, C, z, shadow };',
+            ].join('\n'),
+            // A module file no import of `use` binds: the name reaches only
+            // globals, and `target` is no global another module installs.
+            'h.js': "const { z } = require('./g');\nfunction k() { return use() + z(); }\nmodule.exports = { k };\n",
+        });
+        try {
+            const index = idx(dir);
+            const helper = callersOf(index, 'e.ts', 'helper');
+            assert.strictEqual(helper.def.assignedObject, 'global');
+            assert.deepStrictEqual(helper.confirmed, ['e.ts:2']);
+            assert.ok(helper.unverified.some(u => u.startsWith('f.ts:2:')),
+                `a global member is never excluded as out of scope: ${JSON.stringify(helper)}`);
+            const use = callersOf(index, 'g.js', 'use');
+            assert.strictEqual(use.def.assignedObject, undefined);
+            assert.deepStrictEqual(use.unverified, ['g.js:3:member-object-unresolved']);
+            assert.strictEqual(use.excluded['name-not-in-scope'], 1, JSON.stringify(use.excluded));
+            const run = callersOf(index, 'g.js', 'run');
+            assert.deepStrictEqual(run.unverified, ['g.js:3:member-object-unresolved']);
+            const later = callersOf(index, 'g.js', 'later');
+            assert.strictEqual(later.def.assignedObject, 'object', 'a shadowing const self is not the global self');
+            assert.strictEqual(later.excluded['method-kind-mismatch'], 1);
+            for (const c of [helper, use, run, later]) assert.strictEqual(c.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #386: renaming a type edits every reference to it', () => {
+    const { applyRenamePlan } = require('./helpers');
+    const files = {
+        'package.json': '{"name":"t","version":"1.0.0"}',
+        'src/widget.ts': [
+            'export interface Shape { area(): number; }',
+            'export class Base {}',
+            'export class Widget extends Base implements Shape {',
+            '    static SIZE = 3;',
+            '    next: Widget | null = null;',
+            '    area(): number { return 1; }',
+            '    static make(): Widget { return new Widget(); }',
+            '    copy(other: Widget): Widget {',
+            '        const w = other as Widget;',
+            '        if (other instanceof Widget) return w;',
+            '        return Widget.make();',
+            '    }',
+            '}',
+            'export type WidgetList = Array<Widget>;',
+        ].join('\n'),
+        'src/user.ts': [
+            "import { Widget, Shape } from './widget';",
+            "import { Widget as W2 } from './widget';",
+            "import * as wm from './widget';",
+            'export function build(): Widget { return Widget.make(); }',
+            'const k: typeof Widget = Widget;',
+            'const s = Widget.SIZE;',
+            'let x: wm.Widget = new wm.Widget();',
+            'let y: W2 = new W2();',
+            'function f<T extends Widget>(t: T): Map<string, Widget> { return new Map(); }',
+            'export { Widget };',
+            'export class Sub extends Widget {}',
+        ].join('\n'),
+        'src/other.ts': 'export class Widget { z = 1; }\nconst a: Widget = new Widget();\n',
+        'src/glob.ts': [
+            'function g(Widget: number) { return Widget + 1; }',
+            'const obj = { Widget: 1 };',
+            'obj.Widget;',
+            'function h<Widget>(v: Widget): Widget { return v; }',
+        ].join('\n'),
+    };
+
+    it('TypeScript: type and value positions, namespace imports, aliases and re-exports; shadows and namesakes stay', () => {
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: 'Widget', file: 'src/widget.ts', renameTo: 'Gadget' });
+            assert.ok(r.ok, r.error);
+            const { contents, reviews } = applyRenamePlan(dir, r.result);
+            assert.deepStrictEqual(reviews, []);
+            assert.strictEqual(contents['src/widget.ts'], files['src/widget.ts'].replace(/\bWidget\b/g, 'Gadget'));
+            assert.strictEqual(contents['src/user.ts'], files['src/user.ts'].replace(/\bWidget\b/g, 'Gadget'),
+                'the W2 alias keeps its name; every other spelling is the class');
+            assert.ok(!('src/other.ts' in contents) && !('src/glob.ts' in contents),
+                'a parameter, a property key, a type parameter and another module\'s Widget are not the class');
+        } finally { rm(dir); }
+    });
+
+    it('JavaScript: a class used by an inline HTML script of a global script file is reviewed', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t","version":"1.0.0"}',
+            'lib.js': 'class Widget { run() {} }\n',
+            'page.html': '<html><body>\n<script>\nconst w = new Widget();\n</script>\n<p>Widget docs</p>\n</body></html>\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: 'Widget', file: 'lib.js', renameTo: 'Gadget' });
+            assert.ok(r.ok, r.error);
+            const html = (r.result.changes || []).filter(c => c.file === 'page.html');
+            assert.ok(html.some(c => c.line === 3 && (c.needsReview || c.newExpression === 'const w = new Gadget();')),
+                JSON.stringify(html));
+            assert.ok(!html.some(c => c.line === 5), 'page text is not code');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #389: const class aliases, function-local classes, namespaces', () => {
+    const { applyRenamePlan } = require('./helpers');
+    const at = entries => (entries || []).map(entry => `${entry.relativePath || entry.file}:${entry.line}`).sort();
+
+    it('TS/JS: a module-level `const Alias = Box` makes `new Alias()` a Box, locally and through imports', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'src/models.ts': [
+                'export class Box { open(): number { return 1; } }',
+                'export class Crate { open(): number { return 2; } }',
+                'export const CAlias = Box;',
+            ].join('\n'),
+            'src/use.ts': [
+                "import { CAlias, Box } from './models';",
+                'const LocalC = Box;',
+                'export function h() { const c = new CAlias(); return c.open(); }',
+                'export function k() { const d = new LocalC(); return d.open(); }',
+            ].join('\n'),
+            'lib/models.js': [
+                'class Box { open() { return 1; } }',
+                'class Crate { open() { return 2; } }',
+                'const CAlias = Box;',
+                'module.exports = { Box, Crate, CAlias };',
+            ].join('\n'),
+            'lib/cjs.js': [
+                "const { CAlias } = require('./models');",
+                'function j() { const e = new CAlias(); return e.open(); }',
+                'module.exports = { j };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(at(index.context('open', { file: 'src/models.ts', line: 1 }).callers),
+                ['src/use.ts:3', 'src/use.ts:4']);
+            assert.deepStrictEqual(at(index.context('open', { file: 'src/models.ts', line: 2 }).callers), []);
+            assert.deepStrictEqual(at(index.context('open', { file: 'src/models.ts', line: 2 }).unverifiedCallers), []);
+            assert.deepStrictEqual(at(index.context('open', { file: 'lib/models.js', line: 1 }).callers), ['lib/cjs.js:2']);
+            assert.deepStrictEqual(at(index.context('open', { file: 'lib/models.js', line: 2 }).unverifiedCallers), []);
+        } finally { rm(dir); }
+    });
+
+    it('TS: a class declared in a function is not its module-level namesake', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'src/mod.ts': [
+                'export class Widget {',
+                '  render(): string { return "top"; }',
+                '}',
+                '',
+                'export function build(): string {',
+                '  class Widget {',
+                '    render(): string { return "local"; }',
+                '  }',
+                '  const w = new Widget();',
+                '  return w.render();',
+                '}',
+                '',
+                'export function useTop(): string {',
+                '  const w = new Widget();',
+                '  return w.render();',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(at(index.context('render', { file: 'src/mod.ts', line: 2 }).callers), ['src/mod.ts:15']);
+            assert.deepStrictEqual(at(index.context('render', { file: 'src/mod.ts', line: 7 }).callers), ['src/mod.ts:10']);
+            assert.deepStrictEqual(index.context('build', { file: 'src/mod.ts' }).callees
+                .map(c => `${c.name}:${c.startLine}`).sort(), ['Widget:6', 'render:7']);
+        } finally { rm(dir); }
+    });
+
+    it('TS: a namespace is renamed with its type and value references', () => {
+        const files = {
+            'package.json': '{"name":"t"}',
+            'src/ns.ts': [
+                'export namespace Geometry {',
+                '  export class Point { constructor(public x: number) {} len(): number { return this.x; } }',
+                '  export function origin(): Point { return new Point(0); }',
+                '}',
+                'export function typed(p: Geometry.Point): number { return Geometry.origin().len() + p.len(); }',
+            ].join('\n'),
+            'src/other.ts': [
+                "import { Geometry } from './ns';",
+                'export const q: Geometry.Point = Geometry.origin();',
+            ].join('\n'),
+        };
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: 'Geometry', file: 'src/ns.ts', renameTo: 'Geo' });
+            assert.ok(r.ok, r.error);
+            const { contents, reviews } = applyRenamePlan(dir, r.result);
+            assert.deepStrictEqual(reviews, []);
+            for (const file of ['src/ns.ts', 'src/other.ts']) {
+                assert.strictEqual(contents[file], files[file].replace(/\bGeometry\b/g, 'Geo'));
+            }
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #390: a decorated TypeScript field is renamed on the line that names it', () => {
+    it('plan edits the name line, not the decorator line', () => {
+        const dir = tmp({
+            'a.ts': [
+                'function dec(t: any, k?: any): any { return t; }',
+                'export class Widget {',
+                '    @dec',
+                '    size = 1;',
+                '    use() { return this.size; }',
+                '}',
+            ].join('\n'),
+            'tsconfig.json': '{ "compilerOptions": { "experimentalDecorators": true } }',
+        });
+        try {
+            const index = idx(dir);
+            const def = index.symbols.get('size').find(d => d.className === 'Widget');
+            assert.strictEqual(def.startLine, 3);
+            assert.strictEqual(def.nameLine, 4);
+            const r = execute(index, 'plan', { name: 'size', file: 'a.ts', renameTo: 'count' });
+            assert.ok(r.ok, r.error);
+            const definition = r.result.changes.find(c => c.editKind === 'definition');
+            assert.strictEqual(definition.line, 4);
+            assert.match(definition.newExpression, /count = 1;/);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #390: a class expression extending a slot owner renames its override', () => {
+    it('`new (class extends Base<string> { visit() {} })()` joins the rename of Base.visit', () => {
+        const dir = tmp({
+            'base.ts': 'export abstract class Base<S> {\n    abstract visit(state: S): void;\n    run(s: S) { this.visit(s); }\n}\n',
+            'use.ts': "import { Base } from './base';\nexport const b = new (class extends Base<string> {\n    visit(state: string): void {}\n})();\n",
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: 'visit', file: 'base.ts', line: 2, renameTo: 'visitZq' });
+            assert.ok(r.ok, r.error);
+            const use = r.result.changes.filter(c => c.file === 'use.ts');
+            assert.deepStrictEqual(use.map(c => c.line), [3]);
+            assert.match(use[0].newExpression, /visitZq\(state: string\)/);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #392: lexical references, member decorators and class aliases', () => {
+    const plan = (index, handle, renameTo = 'NEW') => {
+        const r = execute(index, 'plan', { name: handle, renameTo });
+        assert.ok(r.ok, JSON.stringify(r.error));
+        return r.result;
+    };
+    const at = entries => (entries || []).map(entry => `${entry.relativePath || entry.file}:${entry.line}`).sort();
+
+    it('references in function bodies resolve by JS scoping', () => {
+        const dir = tmp({
+            'm.js': [
+                'function helper() {}',                                   // 1
+                'function a() {',                                         // 2
+                '  const list = [helper, helper];',                       // 3
+                '  if (list) { let helper = 1; return helper; }',         // 4
+                '  try { run(); } catch (helper) { return helper; }',     // 5
+                '  return { k: helper };',                                // 6
+                '}',                                                      // 7
+                'function b() { var x = helper; { var helper = 2; } return x; }', // 8
+                'function c() { eval("0"); return helper; }',             // 9
+                'function d(helper) { return helper; }',                  // 10
+                'module.exports = { a, b, c, d };',                       // 11
+            ].join('\n') + '\n',
+        });
+        try {
+            const result = plan(idx(dir), 'helper');
+            const byLine = new Map(result.changes.map(c => [c.line, c]));
+            assert.strictEqual(byLine.get(3).newExpression, 'const list = [NEW, NEW];');
+            assert.strictEqual(byLine.get(6).newExpression, 'return { k: NEW };');
+            for (const line of [4, 5, 8, 10]) assert.ok(!byLine.has(line), `line ${line}: another binding`);
+            assert.ok(byLine.get(9)?.needsReview, 'direct eval keeps the reference in review');
+        } finally { rm(dir); }
+    });
+
+    it('a TS member decorator that reads the property key is review; one that does not is not', () => {
+        const dir = tmp({
+            'a.ts': [
+                'function log(target: any, key: string, desc: PropertyDescriptor) { console.log(key); return desc; }',
+                'function quiet(target: any) { return target; }',
+                'function route(path: string) { return (target: any, key: string) => { void target; }; }',
+                'export class Svc {',
+                '  @log',
+                '  run() { return 1; }',
+                '  @quiet',
+                '  stop() { return 2; }',
+                '  @route("/x")',
+                '  get() { return 3; }',
+                '}',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const reason = handle => plan(index, handle).changes.find(c => c.editKind === 'definition')?.reviewReason;
+            assert.strictEqual(reason('Svc.run'), 'decorator-name-binding');
+            assert.strictEqual(reason('Svc.stop'), undefined);
+            assert.strictEqual(reason('Svc.get'), undefined);
+        } finally { rm(dir); }
+    });
+
+    it('new Alias() through a const or never-reassigned let/var alias constructs the class', () => {
+        const dir = tmp({
+            'box.ts': [
+                'export class Box { size() { return 1; } }',
+                'export class Other { size() { return 2; } }',
+                'export const Alias = Box;',
+                'let L = Box;',
+                'var V = Box;',
+                'let W = Box;',
+                'export function reset() { W = Other; }',
+                'export function make() {',
+                '  const a = new L();',
+                '  const b = new V();',
+                '  const c = new W();',
+                '  return a.size() + b.size() + c.size();',
+                '}',
+            ].join('\n') + '\n',
+            'use.ts': 'import { Alias } from "./box";\nexport function other() {\n  return new Alias();\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(at(index.context('Box', { file: 'box.ts', line: 1 }).callers),
+                ['box.ts:10', 'box.ts:9', 'use.ts:3']);
+            const size = index.context('size', { file: 'box.ts', line: 1 });
+            assert.deepStrictEqual(at(size.callers), ['box.ts:12', 'box.ts:12']);
+            assert.deepStrictEqual(at(size.unverifiedCallers), ['box.ts:12'], 'a reassigned let stays unbound');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #397: JS/TS binding identity, renames and in-process clients', () => {
+    const plan = (index, handle, renameTo = 'NEW') => {
+        const r = execute(index, 'plan', { name: handle, renameTo });
+        assert.ok(r.ok, JSON.stringify(r.error));
+        return r.result;
+    };
+    const target = (index, name, file, line) => index.symbols.get(name)
+        .find(d => d.relativePath === file && d.startLine === line);
+    const tiers = (index, name, file, line) => {
+        const callers = index.findCallers(name, {
+            targetDefinitions: [target(index, name, file, line)], collectAccount: true,
+        });
+        const map = new Map();
+        for (const c of callers) {
+            map.set(`${c.relativePath}:${c.line}`, c.tier === 'unverified' ? `unverified:${c.reason}` : 'confirmed');
+        }
+        for (const c of callers.unverifiedEntries || []) map.set(`${c.relativePath}:${c.line}`, `unverified:${c.reason}`);
+        for (const e of callers.accountRaw?.excludedEntries || []) {
+            map.set(`${path.relative(index.root, e.file)}:${e.line}`, `excluded:${e.reason}`);
+        }
+        return map;
+    };
+    const edits = (result, file) => new Map((result.changes || [])
+        .filter(c => c.file === file && c.newExpression !== undefined)
+        .map(c => [c.line, c.newExpression]));
+
+    it('a destructured name reads the member of its source', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'api.ts': [
+                'export class Api {',                                          // 1
+                '  run(): number { return 1 }',                                // 2
+                '  stop(): number { return 2 }',                               // 3
+                '}',                                                           // 4
+                'const api = new Api()',                                       // 5
+                'const { run, stop: halt } = api',                             // 6
+                'run()',                                                       // 7
+                'halt()',                                                      // 8
+                'export function viaParam({ run }: Api): number { return run() }', // 9
+                'export function untyped(o: any): number {',                   // 10
+                '  const { run } = o',                                         // 11
+                '  return run()',                                              // 12
+                '}',                                                           // 13
+            ].join('\n') + '\n',
+            'free.ts': 'export function run(): number { return 3 }\n',
+            'make.js': [
+                'function make() {',                                           // 1
+                '  const o = {}',                                              // 2
+                '  o.go = function () { return 1 }',                           // 3
+                '  return o',                                                  // 4
+                '}',                                                           // 5
+                'function main() {',                                           // 6
+                '  const { go } = make()',                                     // 7
+                '  return go()',                                               // 8
+                '}',                                                           // 9
+                'module.exports = { main }',                                   // 10
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const run = tiers(index, 'run', 'api.ts', 2);
+            assert.strictEqual(run.get('api.ts:7'), 'confirmed');
+            assert.strictEqual(run.get('api.ts:9'), 'confirmed', 'a parameter pattern typed Api');
+            assert.match(run.get('api.ts:12') || '', /^unverified:/, 'an untyped source stays visible');
+            // A free function of the name is never what a destructured local reads.
+            const free = tiers(index, 'run', 'free.ts', 1);
+            assert.strictEqual(free.get('api.ts:7'), 'excluded:local-shadow');
+            // Member assigned on a local object a factory returns: visible, never excluded.
+            assert.match(tiers(index, 'go', 'make.js', 3).get('make.js:8') || '', /^unverified:/);
+            // The caller's callees list the member.
+            const api = index.findCallees(target(index, 'viaParam', 'api.ts', 9), { collectAccount: true });
+            assert.ok(api.some(c => c.name === 'run' && c.relativePath === 'api.ts'), JSON.stringify(api));
+            // plan renames the pattern key and keeps the local binding.
+            assert.deepStrictEqual([...edits(plan(index, 'api.ts:2:run'), 'api.ts')].sort((a, b) => a[0] - b[0]), [
+                [2, 'run(): number { return 1 }'.replace('run', 'NEW')],
+                [6, 'const { NEW: run, stop: halt } = api'],
+                [9, 'export function viaParam({ NEW: run }: Api): number { return run() }'],
+            ]);
+            assert.strictEqual(edits(plan(index, 'api.ts:3:stop'), 'api.ts').get(6),
+                'const { run, NEW: halt } = api');
+        } finally { rm(dir); }
+    });
+
+    it('a workspace package import resolves to the package source', () => {
+        const dir = tmp({
+            'package.json': '{"name":"root","private":true,"workspaces":["packages/*"]}',
+            'packages/core/package.json': JSON.stringify({ name: '@x/core', main: 'dist/index.js',
+                exports: { '.': { import: './dist/index.mjs' }, './extra': { import: './dist/extra.mjs' } } }),
+            'packages/core/src/index.ts': "export { Client } from './client'\n",
+            'packages/core/src/client.ts': 'export class Client {\n  setData(key: string): string {\n    return key\n  }\n}\n',
+            'packages/solid/package.json': '{"name":"@x/solid","dependencies":{"@x/core":"workspace:*"}}',
+            'packages/solid/src/client.ts': "import { Client as CoreClient } from '@x/core'\n\nexport class Client extends CoreClient {}\n",
+            'packages/solid/src/use.ts': [
+                "import { Client } from './client'",
+                "import { helper } from '@x/core/extra'",
+                'export function run(c: Client): string {',
+                "  helper()",
+                "  return c.setData('k')",
+                '}',
+            ].join('\n') + '\n',
+            'packages/core/src/extra.ts': 'export function helper(): number { return 1 }\n',
+        });
+        try {
+            const index = idx(dir);
+            const entry = index.files.get(path.join(dir, 'packages/solid/src/client.ts'));
+            assert.strictEqual(entry.moduleResolved['@x/core'], path.join('packages', 'core', 'src', 'index.ts'));
+            assert.strictEqual(tiers(index, 'setData', 'packages/core/src/client.ts', 2)
+                .get('packages/solid/src/use.ts:5'), 'confirmed');
+            // A subpath whose manifest names build output absent from the
+            // checkout is unresolved: visible, never an external exclusion.
+            assert.match(tiers(index, 'helper', 'packages/core/src/extra.ts', 1)
+                .get('packages/solid/src/use.ts:4') || '', /^(unverified:|confirmed)/);
+        } finally { rm(dir); }
+    });
+
+    it('an import alias keeps its local name; aliases chain through renames', () => {
+        const dir = tmp({
+            'src/a.ts': 'export function f(): number {\n  return 1\n}\n',
+            'src/index.ts': "export { f as g } from './a'\n",
+            't.ts': "import {\n  g as f,\n} from './src/index'\n\nexport const v = f()\n",
+            'x.ts': "import { f as other } from './src/a'\n\nexport function useIt(): number {\n  return f() + other()\n}\n",
+            'c.ts': 'function getBB(x: number): number {\n  return x\n}\n\nexport { getBB as INTERNAL_getBBRev4 }\n',
+            'd.ts': "import { INTERNAL_getBBRev4 as INTERNAL_getBB } from './c'\n\nexport function use(): number {\n  return INTERNAL_getBB(1)\n}\n",
+        });
+        try {
+            const index = idx(dir);
+            const f = tiers(index, 'f', 'src/a.ts', 1);
+            assert.strictEqual(f.get('t.ts:5'), 'confirmed');
+            const fCallers = index.findCallers('f', {
+                targetDefinitions: [target(index, 'f', 'src/a.ts', 1)], collectAccount: true,
+            });
+            assert.ok(fCallers.some(c => c.relativePath === 'x.ts' && c.line === 4 && c.calledAs === 'other'),
+                'x.ts calls f through its alias other');
+            const result = plan(index, 'src/a.ts:1:f');
+            assert.strictEqual(edits(result, 't.ts').size, 0, 'the importer keeps `g as f` and `f()`');
+            assert.strictEqual(edits(result, 'src/index.ts').get(1), "export { NEW as g } from './a'");
+            assert.strictEqual(edits(result, 'x.ts').get(1), "import { NEW as other } from './src/a'");
+            assert.ok(!edits(result, 'x.ts').has(4), 'the unbound f() in x.ts is not the import');
+            const getBB = index.findCallers('getBB', {
+                targetDefinitions: [target(index, 'getBB', 'c.ts', 1)], collectAccount: true,
+            });
+            assert.ok(getBB.some(c => c.relativePath === 'd.ts' && c.line === 4), JSON.stringify(getBB));
+            const callees = index.findCallees(target(index, 'use', 'd.ts', 3), { collectAccount: true });
+            assert.ok(callees.some(c => c.name === 'getBB'), JSON.stringify(callees));
+            assert.strictEqual(edits(plan(index, 'c.ts:1:getBB'), 'd.ts').size, 0);
+        } finally { rm(dir); }
+    });
+
+    it('shorthand properties keep their key; module export objects follow their importers', () => {
+        const dir = tmp({
+            'a.ts': [
+                'interface Plugin { gen_: (x: number) => number }',            // 1
+                'function load(p: Plugin): void { void p }',                    // 2
+                'export function enable(): void {',                            // 3
+                '  function gen_(x: number): number { return x }',             // 4
+                '  load({',                                                     // 5
+                '    gen_,',                                                    // 6
+                '  })',                                                         // 7
+                '}',                                                            // 8
+            ].join('\n') + '\n',
+            'c.js': 'function helper(x) {\n  return x\n}\n\nmodule.exports = {\n  helper,\n}\n',
+            'd.js': "const { helper } = require('./c')\n\nhelper(1)\n",
+        });
+        try {
+            const index = idx(dir);
+            assert.strictEqual(edits(plan(index, 'a.ts:4:gen_'), 'a.ts').get(6), 'gen_: NEW,');
+            const cjs = plan(index, 'c.js:1:helper');
+            assert.strictEqual(edits(cjs, 'c.js').get(6), 'NEW,');
+            assert.strictEqual(edits(cjs, 'd.js').get(1), "const { NEW } = require('./c')");
+            assert.strictEqual(edits(cjs, 'd.js').get(3), 'NEW(1)');
+        } finally { rm(dir); }
+    });
+
+    it('bound methods and method values are edits where show confirms them', () => {
+        const dir = tmp({
+            'a.ts': [
+                'class Immer {',                                                // 1
+                '  setStrict(v: boolean): void { void v }',                     // 2
+                '}',                                                            // 3
+                'const immer = new Immer()',                                    // 4
+                'export const setStrict = immer.setStrict.bind(immer)',         // 5
+                'export const produce2 = immer.setStrict',                      // 6
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const map = tiers(index, 'setStrict', 'a.ts', 2);
+            assert.strictEqual(map.get('a.ts:5'), 'confirmed');
+            assert.strictEqual(map.get('a.ts:6'), 'confirmed');
+            const result = edits(plan(index, 'a.ts:2:setStrict'), 'a.ts');
+            assert.strictEqual(result.get(5), 'export const setStrict = immer.NEW.bind(immer)');
+            assert.strictEqual(result.get(6), 'export const produce2 = immer.NEW');
+        } finally { rm(dir); }
+    });
+
+    it('a nested closure reaches a declaration of any enclosing function; locals shadow', () => {
+        const dir = tmp({
+            'a.js': [
+                'function outer() {',                                           // 1
+                '  function Helper() {}',                                       // 2
+                '  function inner() { return new Helper() }',                   // 3
+                '  function inner2() {',                                        // 4
+                '    function Helper() {}',                                     // 5
+                '    return new Helper()',                                      // 6
+                '  }',                                                          // 7
+                '  return [inner(), inner2()]',                                 // 8
+                '}',                                                            // 9
+                'function helper() { return 1 }',                               // 10
+                'function use(helper) { return helper() }',                     // 11
+                'module.exports = { outer, use, helper }',                      // 12
+            ].join('\n') + '\n',
+            'c.ts': 'export function outerT(): unknown[] {\n  class HelperT {}\n  function innerT(): HelperT {\n    return new HelperT()\n  }\n  return [innerT(), new HelperT()]\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const helper = tiers(index, 'Helper', 'a.js', 2);
+            assert.strictEqual(helper.get('a.js:3'), 'confirmed');
+            assert.match(helper.get('a.js:6') || '', /^excluded:/, 'the nearer namesake owns the call');
+            assert.strictEqual(tiers(index, 'HelperT', 'c.ts', 2).get('c.ts:4'), 'confirmed');
+            assert.strictEqual(tiers(index, 'helper', 'a.js', 10).get('a.js:11'), 'excluded:local-shadow',
+                'a parameter of the name is not the module function');
+        } finally { rm(dir); }
+    });
+
+    it("`const x = require('m').y` binds the module's member, never a definition named x", () => {
+        const dir = tmp({
+            'sp.js': 'module.exports = {\n  stringify: (o) => String(o),\n  parse: (s) => s,\n}\n',
+            'req.js': "const stringify = require('url').format\nconst sp = require('./sp.js')\n\nfunction f(u) {\n  return stringify(u) + sp.stringify(u)\n}\n\nmodule.exports = { f }\n",
+            'req2.js': "const parse = require('parseurl')\nconst sp = require('./sp.js')\n\nfunction g(req) {\n  return parse(req) + sp.parse(req)\n}\n\nmodule.exports = { g }\n",
+        });
+        try {
+            const index = idx(dir);
+            const binding = index.files.get(path.join(dir, 'req.js')).importBindings
+                .find(b => b.module === 'url');
+            assert.deepStrictEqual({ name: binding.name, alias: binding.alias }, { name: 'format', alias: 'stringify' });
+            const result = edits(plan(index, 'sp.js:2:stringify'), 'req.js');
+            assert.ok(!result.has(1), 'the url import is not edited');
+            assert.strictEqual(result.get(5), 'return stringify(u) + sp.NEW(u)');
+            const external = edits(plan(index, 'sp.js:3:parse'), 'req2.js');
+            assert.ok(!external.has(1), 'an outside module import of the name is not the rename');
+            assert.strictEqual(external.get(5), 'return parse(req) + sp.NEW(req)');
+        } finally { rm(dir); }
+    });
+
+    it('getter/setter pairs are one property: reads, writes and destructuring keys', () => {
+        const dir = tmp({
+            'a.js': [
+                'class A {',                                                    // 1
+                '  get body() { return this._b }',                              // 2
+                '  set body(v) { this._b = v }',                                // 3
+                '  reset() { this.body = null; return this.body }',             // 4
+                '}',                                                            // 5
+                'module.exports = { A }',                                       // 6
+            ].join('\n') + '\n',
+            'o.js': [
+                'module.exports = {',                                           // 1
+                '  get size() { return this._s },',                             // 2
+                '  set size(v) { this._s = v },',                               // 3
+                '  reset() {',                                                  // 4
+                '    this.size = 0',                                            // 5
+                '    const { size } = this',                                    // 6
+                '    return size',                                              // 7
+                '  },',                                                         // 8
+                '}',                                                            // 9
+            ].join('\n') + '\n',
+            'u.js': "const proto = require('./o')\nconst r = Object.create(proto)\nr.size = 3\n",
+        });
+        try {
+            const index = idx(dir);
+            const cls = edits(plan(index, 'a.js:3:body'), 'a.js');
+            assert.strictEqual(cls.get(2), 'get NEW() { return this._b }');
+            assert.strictEqual(cls.get(4), 'reset() { this.NEW = null; return this.NEW }');
+            const result = plan(index, 'o.js:3:size');
+            const obj = edits(result, 'o.js');
+            assert.strictEqual(obj.get(2), 'get NEW() { return this._s },');
+            assert.strictEqual(obj.get(5), 'this.NEW = 0');
+            assert.strictEqual(obj.get(6), 'const { NEW: size } = this');
+            assert.ok(!obj.has(7), 'the local keeps its name');
+            assert.ok(result.changes.some(c => c.file === 'u.js' && c.line === 3 && c.needsReview),
+                'an untyped receiver is listed for review');
+        } finally { rm(dir); }
+    });
+
+    it('a global-object alias installs global members', () => {
+        const dir = tmp({
+            'env.js': 'var global = globalThis;\nglobal.expectT = function (s) {\n  return s;\n};\n',
+            'spec.js': "expectT('a');\n",
+        });
+        try {
+            const index = idx(dir);
+            const def = target(index, 'expectT', 'env.js', 2);
+            assert.strictEqual(def.assignedObject, 'global');
+            assert.doesNotMatch(tiers(index, 'expectT', 'env.js', 2).get('spec.js:1') || 'missing', /^excluded:|missing/);
+        } finally { rm(dir); }
+    });
+
+    it('a JS file resolves a TS source through re-export chains', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'src/utils/common.ts': 'export function original(v: unknown): unknown {\n  return v\n}\n',
+            'src/internal.ts': "export * from './utils/common'\n",
+            'src/index.ts': "export { original } from './internal'\n",
+            'test/original.js': "import { original } from '../src/index'\n\noriginal(1)\n",
+        });
+        try {
+            const index = idx(dir);
+            assert.strictEqual(index.files.get(path.join(dir, 'test/original.js')).moduleResolved['../src/index'],
+                path.join('src', 'index.ts'));
+            assert.strictEqual(tiers(index, 'original', 'src/utils/common.ts', 1).get('test/original.js:3'), 'confirmed');
+        } finally { rm(dir); }
+    });
+
+    it("an import chain that reaches the target outranks a file's same-name field (jotai examples)", () => {
+        const dir = tmp({
+            'package.json': '{"name":"lib","exports":{".":"./dist/index.js"}}',
+            'src/index.ts': "export { atom } from './atom'\n",
+            'src/atom.ts': 'export function atom(v: unknown): unknown {\n  return v\n}\n',
+            'examples/app/package.json': '{"name":"app","dependencies":{"lib":"^1.0.0"}}',
+            'examples/app/src/App.tsx': "import { atom } from 'lib'\n\nconst a = atom(1)\ntype Props = { atom: unknown }\nexport { a }\nexport type { Props }\n",
+        });
+        try {
+            const index = idx(dir);
+            assert.strictEqual(tiers(index, 'atom', 'src/atom.ts', 1).get('examples/app/src/App.tsx:3'), 'confirmed');
+        } finally { rm(dir); }
+    });
+
+    it('supertest requests are client requests served by the app they are built from', () => {
+        const dir = tmp({
+            'package.json': '{"name":"st-app"}',
+            'app.js': [
+                "const express = require('express')",
+                'const app = express()',
+                'const router = express.Router()',
+                "router.get('/items', (req, res) => res.send('i'))",
+                "app.use('/api', router)",
+                "app.get('/health', (req, res) => res.send('ok'))",
+                'module.exports = app',
+            ].join('\n') + '\n',
+            'other.js': "const express = require('express')\nconst other = express()\nother.get('/health', (req, res) => res.send('x'))\nmodule.exports = other\n",
+            'test/a.test.js': [
+                "const request = require('supertest')",
+                "const app = require('../app')",
+                "it('health', async () => {",
+                "  await request(app).get('/health').expect(200)",
+                "  await request(app).get('/api/items')",
+                '  const agent = request.agent(app)',
+                "  await agent.post('/health')",
+                "  await request(unknownApp()).get('/health')",
+                '})',
+            ].join('\n') + '\n',
+            'test/b.test.mjs': "import supertest from 'supertest'\nimport other from '../other.js'\n\nit('other', async () => {\n  await supertest(other).get('/health')\n})\n",
+            'test/c.test.js': "const request = require('./not-supertest')\nit('x', () => request(app).get('/health'))\n",
+            'app2.js': "const express = require('express')\nvar app = module.exports = express()\napp.get('/health', (req, res) => res.send('2'))\n",
+            'test/d.test.js': "const request = require('supertest')\nconst app2 = require('../app2')\nit('d', () => request(app2).get('/health'))\n",
+            'mw.js': "const express = require('express')\nconst mw = express()\nmw.use((req, res) => res.end())\nmodule.exports = mw\n",
+            'test/e.test.js': "const request = require('supertest')\nconst mw = require('../mw')\nit('e', () => request(mw).get('/health'))\n",
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'endpoints', { bridge: true });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const requests = (r.result.clientRequests || r.result.requests || []);
+            const bridges = r.result.bridges || [];
+            const show = b => `${b.request.file}:${b.request.line}->${b.route.file}:${b.route.line}${b.unscoped ? ' unscoped' : ''}`;
+            const got = bridges.map(show).sort();
+            assert.ok(got.includes('test/a.test.js:4->app.js:6'), got.join('\n'));
+            assert.ok(got.includes('test/a.test.js:5->app.js:4'), got.join('\n'));
+            assert.ok(got.includes('test/b.test.mjs:5->other.js:3'), got.join('\n'));
+            assert.ok(!got.includes('test/a.test.js:4->other.js:3'), 'scoped to its app');
+            assert.ok(!got.includes('test/b.test.mjs:5->app.js:6'), 'scoped to its app');
+            assert.ok(got.includes('test/a.test.js:8->app.js:6 unscoped'), 'an unresolved app keeps every match, unscoped');
+            assert.ok(!got.some(line => line.startsWith('test/c.test.js')), 'module identity, not the name');
+            assert.deepStrictEqual(got.filter(line => line.startsWith('test/d.test.js')), ['test/d.test.js:3->app2.js:3'],
+                '`var app = module.exports = express()` keys the exported app');
+            assert.deepStrictEqual(got.filter(line => line.startsWith('test/e.test.js')), [],
+                'an app serving only middleware bridges to no route');
+            void requests;
         } finally { rm(dir); }
     });
 });

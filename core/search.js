@@ -15,6 +15,7 @@ const { getCachedCalls } = require('./callers');
 const { extractImports } = require('./imports');
 const isSafeRegex = require('safe-regex2');
 const { RE2JS } = require('re2js');
+const { UcnError } = require('./errors');
 
 // Keep the established search-input contract for the canonical catastrophic
 // nested-single-atom family even though the RE2-compatible engine could run it
@@ -331,7 +332,10 @@ function usages(index, name, options = {}) {
             const lines = content.split('\n');
 
             // Try AST-based detection first (with per-operation cache)
-            const astUsages = index._getCachedUsages(filePath, name);
+            // Refactoring internals also read each bare reference's lexical
+            // scope verdict (fix #392).
+            const astUsages = index._getCachedUsages(filePath, name,
+                options.internalEvidence ? { lexicalScopes: true } : undefined);
             if (astUsages !== null) {
                 for (const u of astUsages) {
                     // Skip if this is a definition line (already added above)
@@ -372,6 +376,11 @@ function usages(index, name, options = {}) {
                             ...(Number.isInteger(u.column) && { column: u.column }),
                             ...(u.receiverIsModule && { receiverIsModule: true }),
                             ...(u.receiverLocalBinding && { receiverLocalBinding: true }),
+                            ...(u.namespace && { namespace: u.namespace }),
+                            ...(u.scopeBinding && { scopeBinding: u.scopeBinding }),
+                            ...(u.scopeDefLines && { scopeDefLines: u.scopeDefLines }),
+                            ...(u.shorthandProperty && { shorthandProperty: true }),
+                            ...(u.importAlias && { importAlias: true }),
                         }),
                         ...(callerSym && {
                             callerName: callerSym.name,
@@ -476,13 +485,23 @@ function usages(index, name, options = {}) {
 
     // Deduplicate same-file, same-line, same-usageType entries
     // (e.g., `detectLanguage: parser.detectLanguage` has the name twice on one line)
-    const seen = new Set();
+    // Refactoring internals keep the other same-line records on the kept
+    // one (`sameLine`): every token of a line is decided (fix #392).
+    const seen = new Map();
     const deduped = [];
     for (const u of usagesList) {
         const key = `${u.file}:${u.line}:${u.usageType}:${u.isDefinition}`;
         if (!seen.has(key)) {
-            seen.add(key);
+            seen.set(key, u);
             deduped.push(u);
+        } else if (options.internalEvidence && !u.isDefinition) {
+            const kept = seen.get(key);
+            if (!kept.sameLine) {
+                Object.defineProperty(kept, 'sameLine', {
+                    value: [], enumerable: false, writable: true, configurable: true,
+                });
+            }
+            kept.sameLine.push(u);
         }
     }
     return deduped;
@@ -510,14 +529,14 @@ function search(index, term, options = {}) {
     let linearRegex = null;
     if (useRegex) {
         if (NESTED_SINGLE_ATOM_REPEAT.test(term)) {
-            throw new Error(
+            throw new UcnError(
                 `Unsafe regular expression "${term}": nested repetition is not accepted. Simplify it or use ripgrep.`,
             );
         }
         try {
             regex = new RegExp(term, regexFlags);
         } catch (e) {
-            throw new Error(
+            throw new UcnError(
                 `Invalid regular expression "${term}": ${e.message}`,
                 { cause: e },
             );
@@ -533,7 +552,7 @@ function search(index, term, options = {}) {
             linearRegex = RE2JS.compile(term, re2Flags);
         } catch (re2Error) {
             if (!isSafeRegex(term)) {
-                throw new Error(
+                throw new UcnError(
                     `Unsafe regular expression "${term}": this JavaScript-only pattern cannot run in UCN's linear-time engine and its repetition shape may backtrack catastrophically. Simplify it or use ripgrep.`,
                     { cause: re2Error },
                 );

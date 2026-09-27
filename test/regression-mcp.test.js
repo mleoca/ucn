@@ -556,7 +556,8 @@ describe('MCP two-tier output limits', () => {
             });
             const text = res.result?.content?.map(c => c.text).join('') || '';
             assert.ok(text.includes('OUTPUT TRUNCATED'), text);
-            assert.ok(text.includes('PRESERVED CONTRACT METADATA'), text);
+            // fix #367g: the section-aware cut keeps ACCOUNT/CONTRACT in
+            // place; other answers carry them in the preserved block.
             assert.ok(text.includes('ACCOUNT: "target"'), text);
             assert.ok(text.includes('CONTRACT: literal-name text partition complete'), text);
             // Fix #284: no structuredContent side-channel — clients that
@@ -803,7 +804,7 @@ describe('fix: MCP surfaces unknown, typo\'d, and camelCase params', () => {
 
             // A valid param produces no unknown-param note.
             const valid = await client.callTool('ucn', {
-                command: 'usages', project_dir: dir, name: 'alpha', include_tests: true,
+                command: 'usages', project_dir: dir, name: 'alpha', exclude_tests: true,
             });
             const validText = valid.result?.content?.map(c => c.text).join('') || '';
             assert.ok(!/unknown parameter|not an accepted parameter/.test(validText),

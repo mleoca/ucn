@@ -10,16 +10,56 @@
  * @param {function} [options.onLeave] - Called when leaving each node (after children processed)
  */
 function traverseTree(node, callback, options) {
+    // The flat node list an extractor pass already built for this tree
+    // (fix #388): the same nodes in the same order, without a native
+    // children read per node. Never built here, so a walk of an uncached
+    // tree cannot evict a list another pass still uses.
+    const range = cachedNodeRange(node);
+    if (range) {
+        traverseNodeRange(range, callback, options?.onLeave);
+        return;
+    }
+    traverseTreeWalk(node, callback, options);
+}
+
+function traverseTreeWalk(node, callback, options) {
     if (callback(node) === false) return;
     // Single batched native call per node — namedChildCount + N × namedChild(i)
     // costs N+1 native round-trips for the same children.
     const children = node.namedChildren;
     for (let i = 0; i < children.length; i++) {
-        traverseTree(children[i], callback, options);
+        traverseTreeWalk(children[i], callback, options);
     }
     if (options?.onLeave) {
         options.onLeave(node);
     }
+}
+
+/**
+ * Depth-first visit of one subtree of a cached flat node list: `callback`
+ * on entry (false skips the node's descendants and its `onLeave`), then
+ * `onLeave` after its descendants, exactly as the recursive walk orders them.
+ */
+function traverseNodeRange({ nodes, subtreeEnds, index }, callback, onLeave) {
+    const end = subtreeEnds[index];
+    if (!onLeave) {
+        for (let i = index; i < end; ) {
+            if (callback(nodes[i]) === false) i = subtreeEnds[i];
+            else i++;
+        }
+        return;
+    }
+    const open = [];
+    for (let i = index; i < end; ) {
+        while (open.length > 0 && subtreeEnds[open[open.length - 1]] <= i) onLeave(nodes[open.pop()]);
+        if (callback(nodes[i]) === false) {
+            i = subtreeEnds[i];
+        } else {
+            open.push(i);
+            i++;
+        }
+    }
+    while (open.length > 0) onLeave(nodes[open.pop()]);
 }
 
 /**
@@ -776,8 +816,29 @@ function findMatchesWithASTFilter(content, term, parser, options = {}) {
  * traversal overhead (namedChild object creation, function call overhead).
  */
 let _cachedRootNode = null;
+let _cachedRootId = null;
 let _cachedNodeList = null;
 let _cachedSubtreeEnds = null;
+let _previousRootNode = null;
+let _previousRootId = null;
+let _previousNodeList = null;
+let _previousSubtreeEnds = null;
+
+// The same syntax node can reach a caller through a different wrapper: the
+// binding keeps one wrapper per node only while the last one is alive, so a
+// collected wrapper makes every later `tree.rootNode` a fresh object (fix
+// #387). A node is identified by its tree plus the native node id.
+function nodeIdOf(node) {
+    const id = node?.tree ? node.id : undefined;
+    return typeof id === 'number' ? id : null;
+}
+
+function sameCachedNode(node, cached, cachedId) {
+    if (!cached || cachedId === null || node.tree !== cached.tree) return false;
+    return nodeIdOf(node) === cachedId;
+}
+
+const NAMED_CHILDREN_LIST = Symbol.for('ucn.namedChildrenList');
 
 function _buildNodeList(rootNode) {
     const nodes = [];
@@ -788,8 +849,9 @@ function _buildNodeList(rootNode) {
         const idx = nodes.length;
         nodes.push(node);
         subtreeEnds.push(0);
-        // Batched children read — one native call instead of N+1 (see traverseTree)
-        const children = node.namedChildren;
+        // Batched children read — one native call instead of N+1 (see
+        // traverseTree); the array stays on the node for later reads.
+        const children = node[NAMED_CHILDREN_LIST] ? node[NAMED_CHILDREN_LIST]() : node.namedChildren;
         for (let i = 0; i < children.length; i++) {
             collect(children[i]);
         }
@@ -806,14 +868,85 @@ function _buildNodeList(rootNode) {
  * enabling O(1) subtree skipping (for 'return false' semantics).
  */
 function getCachedNodeList(rootNode) {
-    if (rootNode === _cachedRootNode && _cachedNodeList) {
+    if (_cachedNodeList && (rootNode === _cachedRootNode ||
+        sameCachedNode(rootNode, _cachedRootNode, _cachedRootId))) {
         return { nodes: _cachedNodeList, subtreeEnds: _cachedSubtreeEnds };
     }
+    // Two slots (fix #365): C/C++ indexing alternates between a selected
+    // recovery tree and its literal all-source tree, which evicted a single
+    // slot on every extractor pass.
+    if (_previousNodeList && (rootNode === _previousRootNode ||
+        sameCachedNode(rootNode, _previousRootNode, _previousRootId))) {
+        const nodes = _previousNodeList;
+        const subtreeEnds = _previousSubtreeEnds;
+        const id = _previousRootId;
+        _previousRootNode = _cachedRootNode;
+        _previousRootId = _cachedRootId;
+        _previousNodeList = _cachedNodeList;
+        _previousSubtreeEnds = _cachedSubtreeEnds;
+        _cachedRootNode = rootNode;
+        _cachedRootId = id;
+        _cachedNodeList = nodes;
+        _cachedSubtreeEnds = subtreeEnds;
+        return { nodes, subtreeEnds };
+    }
     const { nodes, subtreeEnds } = _buildNodeList(rootNode);
+    _previousRootNode = _cachedRootNode;
+    _previousRootId = _cachedRootId;
+    _previousNodeList = _cachedNodeList;
+    _previousSubtreeEnds = _cachedSubtreeEnds;
     _cachedRootNode = rootNode;
+    _cachedRootId = nodeIdOf(rootNode);
     _cachedNodeList = nodes;
     _cachedSubtreeEnds = subtreeEnds;
     return { nodes, subtreeEnds };
+}
+
+/** Index of `node` in a flat preorder list (sorted by start offset), or -1. */
+function nodeListIndex(nodes, node) {
+    const start = node.startIndex;
+    let lo = 0;
+    let hi = nodes.length;
+    while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (nodes[mid].startIndex < start) lo = mid + 1;
+        else hi = mid;
+    }
+    for (let i = lo; i < nodes.length && nodes[i].startIndex === start; i++) {
+        if (nodes[i] === node) return i;
+    }
+    const id = nodeIdOf(node);
+    if (id === null) return -1;
+    for (let i = lo; i < nodes.length && nodes[i].startIndex === start; i++) {
+        if (nodeIdOf(nodes[i]) === id) return i;
+    }
+    return -1;
+}
+
+/**
+ * The already-built flat node list holding `node` (fix #388), as
+ * { nodes, subtreeEnds, index } with nodes[index] the node, or null when no
+ * cached list covers it. Named nodes only, like `namedChildren`.
+ */
+function cachedNodeRange(node) {
+    if (!node) return null;
+    const tree = node.tree;
+    if (!tree) return null;
+    if (_cachedNodeList && _cachedRootNode?.tree === tree) {
+        if (node === _cachedRootNode || sameCachedNode(node, _cachedRootNode, _cachedRootId)) {
+            return { nodes: _cachedNodeList, subtreeEnds: _cachedSubtreeEnds, index: 0 };
+        }
+        const index = nodeListIndex(_cachedNodeList, node);
+        if (index >= 0) return { nodes: _cachedNodeList, subtreeEnds: _cachedSubtreeEnds, index };
+    }
+    if (_previousNodeList && _previousRootNode?.tree === tree) {
+        if (node === _previousRootNode || sameCachedNode(node, _previousRootNode, _previousRootId)) {
+            return { nodes: _previousNodeList, subtreeEnds: _previousSubtreeEnds, index: 0 };
+        }
+        const index = nodeListIndex(_previousNodeList, node);
+        if (index >= 0) return { nodes: _previousNodeList, subtreeEnds: _previousSubtreeEnds, index };
+    }
+    return null;
 }
 
 /**
@@ -873,8 +1006,13 @@ function visitNameNodes(tree, code, name, callback) {
  */
 function clearNodeListCache() {
     _cachedRootNode = null;
+    _cachedRootId = null;
     _cachedNodeList = null;
     _cachedSubtreeEnds = null;
+    _previousRootNode = null;
+    _previousRootId = null;
+    _previousNodeList = null;
+    _previousSubtreeEnds = null;
 }
 
 /**
@@ -1071,13 +1209,131 @@ function sameNode(a, b) {
     return !!a && !!b && (a === b || a.id === b.id);
 }
 
+/**
+ * Whether a function body contains a node of `targetTypes` in its OWN scope:
+ * nested scopes listed in `boundaryTypes` (inner functions, lambdas, classes)
+ * are not descended. Used to recognize generator/iterator functions by their
+ * `yield` (a yield inside a nested def makes the NESTED def the generator).
+ */
+function containsOwnNode(body, targetTypes, boundaryTypes) {
+    if (!body) return false;
+    const stack = [body];
+    while (stack.length > 0) {
+        const node = stack.pop();
+        const count = node.namedChildCount;
+        for (let i = 0; i < count; i++) {
+            const child = node.namedChild(i);
+            if (targetTypes.has(child.type)) return true;
+            if (!boundaryTypes.has(child.type)) stack.push(child);
+        }
+    }
+    return false;
+}
+
+/**
+ * fix #367e: line ranges the parser could only recover, not parse. Inside an
+ * outermost ERROR node, a damaged child (loose token, erroneous or MISSING
+ * content) opens a region; clean statements/expressions that follow extend
+ * it (they sit in unparsed context: `ok();` after a broken signature); a
+ * clean complete declaration/definition/import/directive closes it, and
+ * comments are neutral. A MISSING token outside any ERROR marks its own line.
+ * Only subtrees with `hasError` are visited. Returns merged, sorted
+ * [startLine, endLine] pairs (1-based), or [] for a clean tree.
+ */
+const COMPLETE_CONSTRUCT_RE = /declaration|definition|_item$|^import|^preproc_|^package_clause$|^using_directive$|^module$/;
+
+function parseErrorRegions(rootNode) {
+    const regions = [];
+    if (!rootNode?.hasError) return regions;
+    const lineOf = position => position.row + 1;
+    // Children are read in one batch per node (fix #388).
+    const errorRegions = node => {
+        let open = null;
+        const close = () => { if (open) { regions.push(open); open = null; } };
+        const children = node.children;
+        for (let i = 0; i < children.length; i++) {
+            const child = children[i];
+            const type = child.type;
+            if (type.includes('comment')) continue;
+            const damaged = child.hasError || child.isMissing || type === 'ERROR' ||
+                !child.isNamed || child.childCount === 0;
+            const start = lineOf(child.startPosition);
+            const end = lineOf(child.endPosition);
+            if (damaged) {
+                if (open) open[1] = Math.max(open[1], end);
+                else open = [start, end];
+            } else if (COMPLETE_CONSTRUCT_RE.test(type)) {
+                close();
+            } else if (open) {
+                open[1] = Math.max(open[1], end);
+            }
+        }
+        close();
+    };
+    const visit = node => {
+        if (node.isMissing) {
+            const line = lineOf(node.startPosition);
+            regions.push([line, line]);
+            return;
+        }
+        if (!node.hasError) return;
+        if (node.type === 'ERROR') {
+            errorRegions(node);
+            return;
+        }
+        const children = node.children;
+        for (let i = 0; i < children.length; i++) visit(children[i]);
+    };
+    visit(rootNode);
+    regions.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+    const merged = [];
+    for (const region of regions) {
+        const last = merged[merged.length - 1];
+        if (last && region[0] <= last[1]) last[1] = Math.max(last[1], region[1]);
+        else merged.push([...region]);
+    }
+    return merged;
+}
+
+/**
+ * fix #380: generic arity of the LAST segment of a written type name
+ * (`Outcome` 0, `Outcome<int>` 1, `Dictionary<string, List<int>>` 2,
+ * `Outcome<,>` 2, `A<int>.B` 0, `Outcome<int>?` 1). Null for text that is not
+ * a type-name shape.
+ */
+function genericArityOf(text) {
+    if (text == null) return null;
+    let value = String(text).trim().replace(/\?$/, '');
+    while (value.endsWith('[]')) value = value.slice(0, -2).trim();
+    if (!value) return null;
+    if (!value.endsWith('>')) {
+        return /^[A-Za-z_@][\w@]*$/.test(value.split(/::|\./).pop() || '') ? 0 : null;
+    }
+    let depth = 0;
+    let commas = 0;
+    for (let i = value.length - 1; i >= 0; i--) {
+        const ch = value[i];
+        if (ch === '>') depth++;
+        else if (ch === '<') {
+            depth--;
+            if (depth === 0) return commas + 1;
+        } else if (ch === ',' && depth === 1) commas++;
+    }
+    return null;
+}
+
 module.exports = {
+    genericArityOf,
+    parseErrorRegions,
+    containsOwnNode,
     nodeTextWithoutComments,
     sameNode,
     traverseTree,
     traverseTreeCached,
     visitNameNodes,
     getCachedNodeList,
+    cachedNodeRange,
+    traverseNodeRange,
     clearNodeListCache,
     nodeToLocation,
     extractParams,

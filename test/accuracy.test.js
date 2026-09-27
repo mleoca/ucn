@@ -269,6 +269,38 @@ describe('Oracle contract', () => {
         }), null, 'a nearer non-constructor assignment invalidates runtime provenance');
     });
 
+    it('fix #390: jdtls constructed-receiver provenance reads a multi-line try header and ignores braces in strings', () => {
+        const source = [
+            'void fused() throws Exception {',
+            '    for (int mode : ALL_MODES) {',
+            '        try (JsonParser p = new RenamingDelegate(createParser(JSON_F, mode,',
+            '                a2q("{\'legacy\':\'x\',\'b\':123}")))) {',
+            '            assertEquals(123, p.getIntValue());',
+            '        }',
+            '    }',
+            '}',
+        ];
+        assert.deepStrictEqual(constructedReceiverAt({
+            source, sourceLine: source[4], line: 5, name: 'getIntValue',
+        }), {
+            receiver: 'p', rawType: 'RenamingDelegate', ownerName: 'RenamingDelegate',
+            line: 3, character: 32,
+        });
+        // A method opener still floors the scan: a same-named local of an
+        // earlier method is not this receiver's provenance.
+        const two = [
+            'void a() {',
+            '    Parser p = new Special();',
+            '}',
+            'void b(Parser p) {',
+            '    p.getIntValue();',
+            '}',
+        ];
+        assert.strictEqual(constructedReceiverAt({
+            source: two, sourceLine: two[4], line: 5, name: 'getIntValue',
+        }), null);
+    });
+
     it('ts-morph call oracle keeps interface/base dispatch but rejects concrete sibling methods', async () => {
         const d = tmp({
             'tsconfig.json': '{"compilerOptions":{"strict":true,"target":"ES2022"},"include":["**/*.ts"]}',
@@ -1104,7 +1136,7 @@ def main():
 
 describe('6. Dead Code False Positives', () => {
 
-    it('LIMITATION: visitor pattern methods reported dead', () => {
+    it('FIXED (fix #363): visitor methods reached by an f-string getattr pattern are not dead', () => {
         const d = tmp({
             'pyproject.toml': '[project]\nname = "t"',
             'visitor.py': `
@@ -1128,11 +1160,12 @@ class NodeVisitor:
             const index = idx(d);
             const dead = index.deadcode({ includeExported: true });
             const deadNames = dead.map(d => d.name);
-            // These are called via getattr with f-string — name never appears as identifier
+            // getattr(self, f'visit_{node_type}') spells visit_* on self.
             const visitorDead = ['visit_number', 'visit_string', 'visit_bool']
                 .filter(n => deadNames.includes(n));
-            assert.ok(visitorDead.length > 0,
+            assert.deepStrictEqual(visitorDead, [],
                 `Visitor methods false-positive dead: ${visitorDead.join(', ')}`);
+            assert.deepStrictEqual(dead.reflection.withheldByPattern, [{ pattern: 'visit_*', count: 3 }]);
         } finally { rm(d); }
     });
 
@@ -1163,7 +1196,7 @@ module.exports = { dispatch, handlers };
         } finally { rm(d); }
     });
 
-    it('LIMITATION: Rust macro-generated functions invisible', () => {
+    it('FIXED: Rust macro-generated functions are indexed (fix #374)', () => {
         const d = tmp({
             'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\nedition = "2021"',
             'src/main.rs': `
@@ -1185,10 +1218,17 @@ fn main() {
 `});
         try {
             const index = idx(d);
-            // Macro-generated functions don't appear in AST
-            const symbols = index.symbols.get('handle_get');
-            assert.ok(!symbols || symbols.length === 0,
-                'Macro-generated functions invisible to tree-sitter');
+            // Project macro_rules! invocations are expanded: the generated
+            // function is indexed at the invocation, attributed to the macro.
+            const lines = require('fs').readFileSync(require('path').join(d, 'src/main.rs'), 'utf-8').split('\n');
+            const invocation = lines.findIndex(l => l.startsWith('create_handler!(handle_get)')) + 1;
+            const call = lines.findIndex(l => l.trim() === 'handle_get();') + 1;
+            const symbols = index.symbols.get('handle_get') || [];
+            assert.strictEqual(symbols.length, 1);
+            assert.strictEqual(symbols[0].startLine, invocation);
+            assert.strictEqual(symbols[0].macroExpansion.macro, 'create_handler');
+            const callers = index.findCallers('handle_get');
+            assert.ok(callers.some(c => c.line === call), JSON.stringify(callers));
         } finally { rm(d); }
     });
 

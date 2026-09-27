@@ -410,14 +410,30 @@ async function resolveConstructedReceiverMethods(handle, query) {
 // floor the scan.
 function methodScanFloor(source, fromLine) {
     let depth = 0;
+    // Braces inside string/char literals and line comments are not block
+    // delimiters (`a2q("{'a':1}")`), and a statement head can span lines: a
+    // multi-line `try (JsonParser p = new X(...,\n ...)) {` opens a
+    // try block, not a method.
+    const code = at => String(source[at] || '')
+        .replace(/"(?:\\.|[^"\\])*"/g, '""')
+        .replace(/'(?:\\.|[^'\\])+'/g, "''")
+        .replace(/\/\/.*$/, '');
+    const statementHead = (at, column) => {
+        let head = code(at).slice(0, column);
+        for (let up = at - 1; up >= 0 && !/[;{}]/.test(head) && at - up <= 20; up--) {
+            head = `${code(up)} ${head}`;
+        }
+        const boundary = Math.max(head.lastIndexOf(';'), head.lastIndexOf('{'), head.lastIndexOf('}'));
+        return boundary >= 0 ? head.slice(boundary + 1) : head;
+    };
     for (let at = fromLine - 2; at >= 0; at--) {
-        const text = source[at] || '';
+        const text = code(at);
         for (let i = text.length - 1; i >= 0; i--) {
             const ch = text[i];
             if (ch === '}') depth++;
             else if (ch === '{') {
                 if (depth > 0) { depth--; continue; }
-                const head = text.slice(0, i);
+                const head = statementHead(at, i);
                 if (!/\b(?:if|else|for|while|switch|try|catch|finally|do|synchronized)\b[^{]*$/.test(head)) {
                     return at;
                 }

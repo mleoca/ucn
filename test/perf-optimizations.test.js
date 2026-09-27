@@ -12,7 +12,7 @@ const path = require('path');
 const { tmp, rm, idx } = require('./helpers');
 const { execute } = require('../core/execute');
 const { computeGroundSet } = require('../core/account');
-const { partitionFiles } = require('../core/parallel-build');
+const { scheduleFiles } = require('../core/parallel-build');
 const {
     saveCache, loadCache, isCacheStale, getProjectCacheDir, getProjectCachePath,
     CACHE_FORMAT_VERSION,
@@ -45,18 +45,16 @@ module.exports = { main };
 };
 
 describe('perf: size-aware worker scheduling', () => {
-    it('separates giant sources instead of balancing only file counts', () => {
+    it('queues giant sources first so workers start on them together (fix #365)', () => {
         const sizes = new Map([
-            ['huge-a', { size: 500 }],
-            ['huge-b', { size: 450 }],
             ['small-a', { size: 30 }],
-            ['small-b', { size: 20 }],
+            ['huge-b', { size: 450 }],
+            ['small-b', { size: 30 }],
+            ['huge-a', { size: 500 }],
         ]);
-        const chunks = partitionFiles({ files: sizes }, [...sizes.keys()], 2);
-        assert.strictEqual(chunks.length, 2);
-        assert.ok(!chunks.some(chunk =>
-            chunk.files.includes('huge-a') && chunk.files.includes('huge-b')));
-        assert.deepStrictEqual(chunks.map(chunk => chunk.bytes), [500, 500]);
+        const order = scheduleFiles({ files: sizes }, [...sizes.keys()]).map(item => item.file);
+        // Largest first; equal sizes keep discovery order.
+        assert.deepStrictEqual(order, ['huge-a', 'huge-b', 'small-a', 'small-b']);
     });
 
     it('honors an explicit worker count as the measured build shape', () => {
@@ -221,7 +219,7 @@ describe('perf: repeated C++ overload identity caches', () => {
                     targetDefinitions: [target], collectAccount: true,
                 });
                 const normalizedCount = index._opCppTypeCategoryCache.size;
-                const receiverTypeCount = index._opCppPathReceiverTypeCache.size;
+                const receiverTypeCount = index._cppScope.resolved.size;
                 const derefPairs = index._opDerefPairs;
                 const aliasPairs = index._opAliasPairs;
                 const second = index.findCallers('format', {
@@ -233,7 +231,7 @@ describe('perf: repeated C++ overload identity caches', () => {
                     'qualified C++ receiver identity should be cached');
                 assert.strictEqual(index._opCppTypeCategoryCache.size, normalizedCount,
                     'identical overload analysis reuses normalized types');
-                assert.strictEqual(index._opCppPathReceiverTypeCache.size, receiverTypeCount,
+                assert.strictEqual(index._cppScope.resolved.size, receiverTypeCount,
                     'identical overload analysis reuses qualified receiver identity');
                 assert.strictEqual(index._opDerefPairs, derefPairs,
                     'Deref identity scan is shared');
@@ -245,7 +243,6 @@ describe('perf: repeated C++ overload identity caches', () => {
                 index._endOp();
             }
             assert.strictEqual(index._opCppTypeCategoryCache, null);
-            assert.strictEqual(index._opCppPathReceiverTypeCache, null);
             assert.strictEqual(index._opDerefPairs, null);
             assert.strictEqual(index._opAliasPairs, null);
         } finally { rm(dir); }
@@ -1616,6 +1613,16 @@ describe('index reliability: parallel build equals sequential build', () => {
             '    int use(Object o) { return ((Inner) o).size(); }',
             '}',
         ].join('\n');
+        // Reflection inventory (fix #363): name patterns and receivers are
+        // extracted inside the worker's parse.
+        spec['rich7.py'] = [
+            'class Backend:',
+            '    def _get_user_perms(self, u):',
+            '        return 1',
+            '    def load(self, src, u):',
+            '        name = f"_get_{src}_perms"',
+            '        return getattr(self, name)(u)',
+        ].join('\n');
         const dir = tmp(spec);
         try {
             const seq = new ProjectIndex(dir);
@@ -1626,6 +1633,8 @@ describe('index reliability: parallel build equals sequential build', () => {
                 .filter(call => call.name === 'load').map(call => call.receiverTypeSource));
             assert.deepStrictEqual(sourceKinds, new Set(['annotation', 'constructor']),
                 'the parity fixture must actually produce both receiver origins');
+            assert.ok([...par.files.values()].some(fe => fe.reflectionSites?.[0]?.patterns?.[0] === '_get_*_perms'),
+                'the parity fixture must actually produce a reflection pattern');
             assert.strictEqual(indexSnapshot(par), indexSnapshot(seq),
                 'parallel and sequential builds must produce identical indexes');
         } finally { rm(dir); }
@@ -1737,6 +1746,1293 @@ describe('fix #340: orientation refines HOT within a disclosed budget', () => {
             assert.match(text, /refinement budget 1 reached — ranking approximate, exact list: ucn repo --sections=stats --hot/);
             const exactText = require('../core/output').formatOrient(exact);
             assert.ok(!/refinement budget/.test(exactText), 'an exact orientation carries no budget note');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #365: HOT ranking and caller scans stay exact while doing less work', () => {
+    it('a production ranking bounds and scans production call sites only', () => {
+        const dir = tmp({
+            'package.json': '{"name":"hotprod"}',
+            'lib.js': [
+                'function alpha() { return 1; }',
+                'function beta() { return 2; }',
+                'module.exports = { alpha, beta };',
+            ].join('\n'),
+            'app.js': [
+                'const { alpha, beta } = require("./lib");',
+                'function run() {',
+                '  beta();',
+                '  beta();',
+                '  return alpha();',
+                '}',
+                'module.exports = { run };',
+            ].join('\n'),
+            'test/lib.test.js': [
+                'const { alpha } = require("../lib");',
+                'function check() {',
+                '  alpha();',
+                '  alpha();',
+                '  alpha();',
+                '  alpha();',
+                '  alpha();',
+                '}',
+                'module.exports = { check };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const { orient } = require('../core/reporting');
+            // alpha's five test calls can never count toward a production
+            // ranking, so its ceiling is 1 and one exact refinement (beta, 2)
+            // settles the top item without touching the budget.
+            const result = orient(index, { top: 1, hotRefineBudget: 1 });
+            assert.equal(result.hot.budgetExhausted, undefined, JSON.stringify(result.hot));
+            assert.equal(result.hot.refined, 1);
+            assert.equal(result.hot.items[0].name, 'beta');
+            assert.equal(result.hot.items[0].callCount, 2);
+            // The all-callers ranking still counts the tests.
+            const stats = index.getStats({ hot: true, top: 1 });
+            assert.equal(stats.hot.items[0].name, 'alpha');
+            assert.equal(stats.hot.items[0].callCount, 6);
+        } finally { rm(dir); }
+    });
+
+    it('findCallers candidateFiles keeps every retained site identical', () => {
+        const dir = tmp({
+            'package.json': '{"name":"candfiles"}',
+            'lib.js': 'function helper(x) { return x; }\nmodule.exports = { helper };\n',
+            'a.js': 'const { helper } = require("./lib");\nfunction a() { return helper(1) + helper(2); }\nmodule.exports = { a };\n',
+            'b.js': 'const { helper } = require("./lib");\nfunction b() { return helper(3); }\nmodule.exports = { b };\n',
+        });
+        try {
+            const index = idx(dir);
+            const { findCallers } = require('../core/callers');
+            const def = index.symbols.get('helper')[0];
+            const strip = callers => JSON.stringify(callers.map(c => ({ ...c, provenance: undefined })));
+            const all = findCallers(index, 'helper', { targetDefinitions: [def], collectAccount: true });
+            const aFile = path.join(dir, 'a.js');
+            const onlyA = findCallers(index, 'helper', {
+                targetDefinitions: [def], collectAccount: true, candidateFiles: new Set([aFile]),
+            });
+            assert.equal(all.length, 3);
+            assert.equal(strip(onlyA), strip(all.filter(c => c.file === aFile)));
+        } finally { rm(dir); }
+    });
+
+    it('computed dispatch sites come from index expressions in document order', () => {
+        const { computedDispatchSites } = require('../core/ast-analysis');
+        const js = [
+            'function run(handlers, key, xs) {',
+            '  handlers[key](1);',
+            '  const h = handlers[key];',
+            '  h();',
+            '  const v = xs[0];',
+            '  return table[name]();',
+            '}',
+        ].join('\n');
+        assert.deepEqual(computedDispatchSites(js, 'javascript').map(s => [s.line, s.receiver]),
+            [[2, 'handlers'], [6, 'table'], [3, 'handlers']]);
+        const py = 'def run(ops, name):\n    ops[name]()\n    f = ops[name]\n    f()\n    return ops[0]()\n';
+        assert.deepEqual(computedDispatchSites(py, 'python').map(s => [s.line, s.receiver]),
+            [[2, 'ops'], [3, 'ops']]);
+        const c = 'void run(void (*table[])(int), int i) {\n  table[i](i);\n}\n';
+        assert.deepEqual(computedDispatchSites(c, 'c').map(s => [s.line, s.receiver]), [[2, 'table']]);
+    });
+
+    it('a single file loads only its calls shard, and a save still writes every shard', () => {
+        const dir = tmp({
+            'package.json': '{"name":"shards"}',
+            'a/one.js': 'function one() { two(); }\nfunction two() {}\nmodule.exports = { one, two };\n',
+            'b/three.js': 'const { one } = require("../a/one");\nfunction three() { one(); }\nmodule.exports = { three };\n',
+        });
+        try {
+            const { ProjectIndex } = require('../core/project');
+            const built = new ProjectIndex(dir);
+            built.build(null, { quiet: true });
+            built.saveCache();
+
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loaded.loadCache());
+            const one = path.join(dir, 'a', 'one.js');
+            const three = path.join(dir, 'b', 'three.js');
+            assert.ok(loaded.getCachedCalls(one).some(call => call.name === 'two'));
+            assert.ok(loaded.callsCache.has(one));
+            assert.ok(!loaded.callsCache.has(three), 'other directories stay unloaded');
+            loaded.saveCache();
+
+            const reloaded = new ProjectIndex(dir);
+            assert.ok(reloaded.loadCache());
+            require('../core/cache').ensureCallsCacheLoaded(reloaded);
+            assert.ok(reloaded.callsCache.get(three).calls.some(call => call.name === 'one'),
+                'the save completed the partially loaded cache first');
+        } finally { rm(dir); }
+    });
+
+    it('complexity measures the callable at the range without walking the rest of the file', () => {
+        const { computeAstComplexity } = require('../core/ast-analysis');
+        const code = [
+            'function first(a) { if (a) { return 1; } return 0; }',
+            'function second(a, b) {',
+            '  if (a) { for (const x of b) { if (x) return x; } }',
+            '  return a ? 1 : 2;',
+            '}',
+        ].join('\n');
+        const result = computeAstComplexity(code, 'javascript', { startLine: 2, endLine: 5 });
+        assert.equal(result.branches, 4);
+        assert.equal(result.maxDepth, 3);
+    });
+});
+
+describe('fix #371: audit-async resolves before it reads, and only the sites it needs', () => {
+    const files = {
+        'Cargo.toml': '[package]\nname = "fx371aa"\nversion = "0.1.0"\nedition = "2021"\n',
+        'src/lib.rs': 'pub mod net;\npub mod busy;\npub mod lost;\n',
+        'src/net.rs': 'pub struct Conn;\nimpl Conn {\n    pub async fn send(&self) -> u8 { 1 }\n    pub fn close(&self) {}\n}\npub async fn fetch() -> u8 { 2 }\npub fn helper(x: u8) -> u8 { x }\n',
+        'src/busy.rs': 'use crate::net::{fetch, helper, Conn};\npub async fn run(c: &Conn) -> u8 {\n    let a = fetch().await;\n    let b = helper(fetch().await);\n    c.send().await;\n    c.close();\n    a + b\n}\n',
+        'src/lost.rs': 'use crate::net::{fetch, Conn};\npub async fn run(c: &Conn) {\n    fetch();\n    c.close();\n    let _ = c.send();\n}\n',
+    };
+
+    it('Rust call records say how a value is consumed where it is produced', () => {
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const calls = index.getCachedCalls(path.join(dir, 'src/busy.rs'));
+            const fetches = calls.filter(c => c.name === 'fetch').map(c => c.valueConsumed);
+            assert.deepStrictEqual(fetches, ['awaited', 'awaited']);
+            assert.strictEqual(calls.find(c => c.name === 'helper').valueConsumed, undefined);
+            const src = 'pub fn f(v: Vec<u8>) -> usize { make().len() + g(h()) }\nfn make() -> Vec<u8> { vec![] }\nfn g(x: u8) -> usize { x as usize }\nfn h() -> u8 { 1 }\n';
+            fs.writeFileSync(path.join(dir, 'src/lost.rs'), src);
+            const index2 = idx(dir);
+            const records = index2.getCachedCalls(path.join(dir, 'src/lost.rs'));
+            assert.strictEqual(records.find(c => c.name === 'make').consumingMethod, 'len');
+            assert.strictEqual(records.find(c => c.name === 'h').valueConsumed, 'argument');
+        } finally { rm(dir); }
+    });
+
+    it('findCallees siteStarts returns exactly the full run\'s edges at those sites', () => {
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const run = (index.symbols.get('run') || []).find(d => d.relativePath === 'src/busy.rs');
+            const full = index.findCallees(run, { collectAccount: true });
+            const calls = index.getCachedCalls(path.join(dir, 'src/busy.rs'));
+            for (const call of calls.filter(c => c.line >= run.startLine && c.line <= run.endLine)) {
+                const restricted = index.findCallees(run, { collectAccount: true, siteStarts: new Set([call.callStart]) });
+                const at = list => list.filter(c => (c.siteProvenance || []).some(s => s.start === call.callStart))
+                    .map(c => `${c.relativePath}:${c.startLine}:${c.name}`).sort();
+                assert.deepStrictEqual(at(restricted), at(full), `site ${call.name}@${call.line}`);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('a file whose candidates are all consumed or resolve to no future is never read', () => {
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const read = [];
+            const original = index._readFile.bind(index);
+            index._readFile = file => { read.push(path.relative(dir, file)); return original(file); };
+            const result = index.auditAsync();
+            assert.ok(!read.includes('src/busy.rs'), `busy.rs awaits everything: ${JSON.stringify(read)}`);
+            assert.ok(read.includes('src/lost.rs'), JSON.stringify(read));
+            const lines = result.issues.map(i => `${i.file}:${i.line}:${i.reason}`).sort();
+            assert.deepStrictEqual(lines, ['src/lost.rs:3:future-discarded', 'src/lost.rs:5:future-dropped']);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #372: build-time Cargo manifests, lazy return flow, record-level audit facts, bucketed shards', () => {
+    const { ProjectIndex } = require('../core/project');
+    const workspace = () => ({
+        'Cargo.toml': '[workspace]\nmembers = ["alpha", "beta"]\n',
+        'alpha/Cargo.toml': '[package]\nname = "alpha"\nversion = "0.1.0"\n',
+        'alpha/src/lib.rs': 'pub fn thing() -> u8 { 1 }\n',
+        'beta/Cargo.toml': '[package]\nname = "beta"\nversion = "0.1.0"\n',
+        'beta/src/lib.rs': 'use alpha::thing;\npub fn run() -> u8 { thing() }\n',
+    });
+    const alphaEdge = index => [...(index.importGraph.get(path.join(index.root, 'beta/src/lib.rs')) || [])]
+        .some(file => file.endsWith(path.join('alpha', 'src', 'lib.rs')));
+
+    it('the workspace crate registry is persisted and seeded: a loaded index resolves crates without walking the tree', () => {
+        const dir = tmp(workspace());
+        try {
+            const built = new ProjectIndex(dir);
+            built.build(null, { quiet: true });
+            assert.deepStrictEqual(built.cargoManifests.map(m => m.dir).sort(), ['', 'alpha', 'beta']);
+            built.saveCache();
+            const imports = require('../core/imports');
+            imports.resetCargoCaches(built.root);
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loaded.loadCache());
+            const readdir = fs.readdirSync;
+            fs.readdirSync = function (target, ...rest) {
+                if (path.resolve(String(target)) === path.resolve(loaded.root)) throw new Error('query-time tree walk');
+                return readdir.call(this, target, ...rest);
+            };
+            try {
+                const resolved = imports.resolveRustImport('alpha::thing', path.join(loaded.root, 'beta/src/lib.rs'), loaded.root);
+                assert.ok(resolved && resolved.endsWith(path.join('alpha', 'src', 'lib.rs')), String(resolved));
+            } finally { fs.readdirSync = readdir; }
+        } finally { rm(dir); }
+    });
+
+    it('a changed, removed or added Cargo.toml makes the cache stale and an incremental rebuild re-resolves imports', () => {
+        const dir = tmp(workspace());
+        try {
+            const built = new ProjectIndex(dir);
+            built.build(null, { quiet: true });
+            built.saveCache();
+            assert.ok(alphaEdge(built));
+            // Rename the alpha package: `use alpha::..` no longer names a workspace crate.
+            const manifest = path.join(dir, 'alpha/Cargo.toml');
+            fs.writeFileSync(manifest, '[package]\nname = "alpha_renamed"\nversion = "0.1.0"\n');
+            const future = new Date(Date.now() + 5000);
+            fs.utimesSync(manifest, future, future);
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loaded.loadCache());
+            assert.strictEqual(loaded.isCacheStale(), true);
+            loaded.build(null, { quiet: true, forceRebuild: true });
+            assert.ok(!alphaEdge(loaded), 'the import graph follows the renamed manifest');
+            loaded.saveCache();
+            // A new manifest (discovery sees it) is also staleness.
+            fs.mkdirSync(path.join(dir, 'gamma'));
+            fs.writeFileSync(path.join(dir, 'gamma/Cargo.toml'), '[package]\nname = "gamma"\nversion = "0.1.0"\n');
+            const again = new ProjectIndex(dir);
+            assert.ok(again.loadCache());
+            again._lastFreshAt = 0;
+            assert.strictEqual(again.isCacheStale(), true);
+        } finally { rm(dir); }
+    });
+
+    it('Rust call records say whether a value can be lost, following stored locals; open-call shapes keep the reachability fields', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "fx372"\nversion = "0.1.0"\n',
+            'src/lib.rs': [
+                'pub async fn fetch() -> u8 { 1 }',
+                'pub fn make() -> Vec<u8> { vec![] }',
+                'pub async fn run() -> u8 {',
+                '    let a = fetch();',
+                '    let b = make();',
+                '    let n = b.len();',
+                '    fetch();',
+                '    let c = fetch();',
+                '    a.await + n as u8',
+                '}',
+                'pub fn wrap() -> impl std::future::Future<Output = u8> { fetch() }',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const file = path.join(dir, 'src/lib.rs');
+            const calls = index.getCachedCalls(file);
+            const at = line => calls.find(call => call.line === line && ['fetch', 'make'].includes(call.name));
+            assert.strictEqual(at(4).valueConsumed, 'stored');
+            assert.strictEqual(at(5).consumingMethod, 'len');
+            assert.strictEqual(at(7).valueConsumed, undefined, 'a discarded value stays open');
+            assert.strictEqual(at(8).valueConsumed, undefined, 'a local never read stays open');
+            assert.strictEqual(at(11).valueConsumed, 'flow');
+            const shapes = index.files.get(file).openCalls;
+            assert.ok(shapes.includes('fetch') && shapes.includes('make~len'), JSON.stringify(shapes));
+            const { parseOpenCallShape, openCallShape } = require('../languages/rust-value-flow');
+            for (const record of [{ name: 'f', isMethod: true, receiverType: 'T', consumingMethod: 'm' },
+                { name: 'g', isMethod: true, isPathCall: true, receiver: 'std::fs::File' },
+                { name: 'h', isMethod: true, isPathCall: true, receiver: 'crate::a::B' }]) {
+                const parsed = parseOpenCallShape(openCallShape(record));
+                assert.strictEqual(parsed.name, record.name);
+                assert.strictEqual(openCallShape(parsed), openCallShape(record));
+            }
+            const issues = index.auditAsync({}).issues.map(issue => `${issue.line}:${issue.reason}`).sort();
+            assert.deepStrictEqual(issues, ['7:future-discarded', '8:future-unused']);
+        } finally { rm(dir); }
+    });
+
+    it('return-type flow fills only the looked-up variable\'s records', () => {
+        const dir = tmp({
+            'src/a.py': 'class A:\n    def m(self):\n        return 1\n\ndef make() -> A:\n    return A()\n\ndef use():\n    x = make()\n    y = make()\n    z = make()\n    x.m()\n',
+        });
+        try {
+            const index = idx(dir);
+            const { _buildReturnTypeFlowMap } = require('../core/callers');
+            const file = path.join(dir, 'src/a.py');
+            index._opReturnTypeFlowCache = null;
+            index._returnTypeFlowCache = null;
+            const calls = index.getCachedCalls(file);
+            const map = _buildReturnTypeFlowMap(index, file, calls);
+            const scope = calls.find(call => call.assignedTo === 'x').enclosingFunction.startLine;
+            const entries = map.get(`${scope}:x`);
+            assert.ok(entries && entries[0].type === 'A', JSON.stringify(entries));
+            assert.strictEqual(map._processed.size, 1, 'only the record assigning x was typed');
+        } finally { rm(dir); }
+    });
+
+    it('large directories split their calls shard into path buckets; one file loads one bucket', () => {
+        const files = { 'package.json': '{"name":"buckets"}' };
+        const body = Array.from({ length: 400 }, (_, i) => `  helper${i % 7}(${i});`).join('\n');
+        for (let i = 0; i < 12; i++) {
+            files[`big/f${i}.js`] = `function helper${i % 7}(x) { return x; }\nfunction run${i}() {\n${body}\n}\nmodule.exports = { run${i} };\n`;
+        }
+        const dir = tmp(files);
+        try {
+            const built = new ProjectIndex(dir);
+            built.build(null, { quiet: true });
+            built.saveCache();
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loaded.loadCache());
+            const shard = loaded._callsManifest.get('big');
+            assert.ok(shard.buckets > 1, `buckets: ${shard.buckets}`);
+            const one = path.join(dir, 'big/f0.js');
+            assert.ok(loaded.getCachedCalls(one).some(call => call.name === 'helper0'));
+            assert.strictEqual(shard.loadedBuckets.size, 1);
+            assert.ok(loaded.callsCache.size < 12, `loaded ${loaded.callsCache.size} files`);
+            require('../core/cache').ensureCallsCacheLoaded(loaded);
+            assert.strictEqual(loaded.callsCache.size, 12);
+            for (const [file, entry] of built.callsCache) {
+                assert.deepStrictEqual(loaded.callsCache.get(file).calls, entry.calls);
+            }
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #375: build parallelism, compact calls shards and one git listing', () => {
+    const { ProjectIndex } = require('../core/project');
+    const { indexSnapshot } = require('./helpers');
+
+    it('sizes the automatic worker pool by the source bytes a build must parse', () => {
+        const files = { 'package.json': '{"name":"bytes"}' };
+        const body = Array.from({ length: 900 }, (_, i) => `export function f${i}(x) { return helper(x) + ${i}; }`).join('\n');
+        // A comment block pads each file (cheap to parse, counted as bytes).
+        const pad = `/*\n${'x'.repeat(78)}\n`.repeat(4300) + '*/\n';
+        for (let i = 0; i < 6; i++) files[`src/m${i}.js`] = `import { helper } from './h.js';\n${body}\n${pad}`;
+        files['src/h.js'] = 'export function helper(x) { return x; }\n';
+        const dir = tmp(files);
+        try {
+            // ~2.3MB in 7 files: parallel although far below 150 files (fix
+            // #388: from 2MB of parse work, 1MB per worker).
+            const parallel = new ProjectIndex(dir);
+            parallel.build(null, { quiet: true });
+            assert.ok(parallel.lastBuildWorkerCount >= 2, `workers: ${parallel.lastBuildWorkerCount}`);
+            const sequential = new ProjectIndex(dir);
+            sequential.build(null, { quiet: true, workers: 0 });
+            assert.strictEqual(sequential.lastBuildWorkerCount, 1);
+            assert.strictEqual(indexSnapshot(parallel), indexSnapshot(sequential));
+            // An incremental rebuild parses only what changed: one small file
+            // is not worth a worker pool.
+            fs.appendFileSync(path.join(dir, 'src/h.js'), 'export function extra() { return 0; }\n');
+            parallel.build(null, { quiet: true, forceRebuild: true });
+            assert.strictEqual(parallel.lastBuildWorkerCount, 1);
+            assert.ok(parallel.symbols.has('extra'));
+        } finally { rm(dir); }
+    });
+
+    it('stores repeated record objects once per file and restores every record exactly', () => {
+        const dir = tmp({
+            'package.json': '{"name":"tables"}',
+            'lib.py': [
+                'class Store:',
+                '    def get(self): return 1',
+                '',
+                'def run(store: Store):',
+                '    store.get()',
+                '    store.get()',
+                '    helper()',
+                '',
+                'def helper(): pass',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            index.findCallers('get');
+            const file = path.join(dir, 'lib.py');
+            const before = JSON.stringify(index.callsCache.get(file).calls);
+            index.saveCache();
+            const callsDir = path.join(getProjectCacheDir(dir), 'calls');
+            const shard = fs.readdirSync(callsDir).filter(name => name !== 'manifest.json')
+                .map(name => JSON.parse(fs.readFileSync(path.join(callsDir, name), 'utf8')))
+                .flat().find(([relPath]) => relPath === 'lib.py')[1];
+            // One enclosing-function object for the three calls in run(), one
+            // receiver-evidence object for the two typed calls.
+            assert.deepStrictEqual(shard.fx.map(f => f.name), ['run']);
+            assert.deepStrictEqual(shard.calls.map(call => call.enclosingFunction), [0, 0, 0]);
+            assert.strictEqual(shard.rx.length, 1);
+            assert.deepStrictEqual(shard.calls.map(call => call.receiverTypeEvidence), [0, 0, undefined]);
+            // Saving never changes the in-memory records.
+            assert.strictEqual(JSON.stringify(index.callsCache.get(file).calls), before);
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loaded.loadCache());
+            loaded.loadCallsCache();
+            assert.strictEqual(JSON.stringify(loaded.callsCache.get(file).calls), before);
+        } finally { rm(dir); }
+    });
+
+    it('one git listing answers both discovery questions exactly as two did', () => {
+        const { execFileSync } = require('child_process');
+        const { parseGitignore, gitTrackedPaths, gitListing } = require('../core/discovery');
+        const dir = tmp({
+            '.gitignore': 'build/\n*.log\n!keep.log\n',
+            'src/.gitignore': 'gen/\n',
+            'src/a.py': 'def a(): pass\n',
+            'src/gen/b.py': 'def b(): pass\n',
+            'docs/.gitignore': '*.tmp\n',
+            'build/.gitignore': 'x\n',
+            'notes.log': 'x\n',
+            'keep.log': 'x\n',
+        });
+        try {
+            try {
+                execFileSync('git', ['init', '-q'], { cwd: dir, stdio: 'ignore' });
+                execFileSync('git', ['add', '.gitignore', 'src/.gitignore', 'src/a.py'], { cwd: dir, stdio: 'ignore' });
+            } catch {
+                return; // git unavailable
+            }
+            const listing = gitListing(dir);
+            assert.ok(listing);
+            assert.strictEqual(parseGitignore(dir, listing).fingerprint(), parseGitignore(dir).fingerprint());
+            const tracked = gitTrackedPaths(dir, listing);
+            const separate = gitTrackedPaths(dir);
+            assert.deepStrictEqual([...tracked.files].sort(), [...separate.files].sort());
+            assert.deepStrictEqual([...tracked.directories].sort(), [...separate.directories].sort());
+            // The untracked docs/.gitignore counts; the one under ignored build/ does not.
+            assert.ok(parseGitignore(dir, listing).isIgnored('docs/a.tmp'));
+            assert.ok(!parseGitignore(dir, listing).fingerprint().includes('@build'));
+            assert.strictEqual(gitListing(path.join(dir, '..', 'no-such-dir')), null);
+        } finally { rm(dir); }
+    });
+
+    it('show loads neither dead-code analysis nor entry-point detection', () => {
+        const { execFileSync } = require('child_process');
+        const dir = tmp({
+            'package.json': '{"name":"lazy"}',
+            'a.js': 'function helper() { return 1; }\nfunction main() { return helper(); }\nmodule.exports = { main };\n',
+        });
+        try {
+            const script = [
+                `const { ProjectIndex } = require(${JSON.stringify(path.join(__dirname, '../core/project'))});`,
+                `const { execute } = require(${JSON.stringify(path.join(__dirname, '../core/execute'))});`,
+                `const index = new ProjectIndex(${JSON.stringify(dir)});`,
+                'index.build(null, { quiet: true });',
+                'if (!execute(index, "show", { name: "helper" }).ok) process.exit(2);',
+                'console.log(Object.keys(require.cache).filter(k => /core[\\\\/](deadcode|entrypoints)\\.js$/.test(k)).length);',
+            ].join('\n');
+            const loaded = execFileSync(process.execPath, ['-e', script], { encoding: 'utf8' }).trim();
+            assert.strictEqual(loaded, '0');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #382: exact HOT refinement at scale', () => {
+    it('per-operation memos never change a pinned caller answer', () => {
+        const { findCallers } = require('../core/callers');
+        const fixtures = {
+            go: {
+                'go.mod': 'module example.com/m\n\ngo 1.21\n',
+                'a/a.go': [
+                    'package a',
+                    'type Namer interface { Name() string }',
+                    'type Base struct{}',
+                    'func (b *Base) Name() string { return "base" }',
+                    'type Pod struct { Base; Spec Spec }',
+                    'type Spec struct{}',
+                    'func (s Spec) Name() string { return "spec" }',
+                    'type Node struct { Spec Spec }',
+                    'func (n *Node) Name() string { return "node" }',
+                ].join('\n'),
+                'b/b.go': [
+                    'package b',
+                    'import "example.com/m/a"',
+                    'func Use(p *a.Pod, n *a.Node, x a.Namer) string {',
+                    '    return p.Name() + p.Spec.Name() + n.Name() + n.Spec.Name() + x.Name()',
+                    '}',
+                ].join('\n'),
+            },
+            java: {
+                'pom.xml': '<project/>',
+                'src/main/java/p/Shape.java': 'package p;\npublic interface Shape { double area(); }\n',
+                'src/main/java/p/Square.java': 'package p;\npublic class Square implements Shape { public double area() { return 1; } }\n',
+                'src/main/java/p/Circle.java': 'package p;\npublic class Circle extends Square { public double area() { return 2; } }\n',
+                'src/main/java/p/Use.java': 'package p;\npublic class Use {\n  double f(Shape s, Square q, Circle c) { return s.area() + q.area() + c.area(); }\n}\n',
+            },
+            python: {
+                'pyproject.toml': '[project]\nname="p"\n',
+                'm.py': 'class A:\n    def run(self):\n        return 1\n\n\nclass B(A):\n    def run(self):\n        return 2\n',
+                'u.py': 'from m import A, B\n\n\ndef go(a: A, b: B):\n    return a.run() + b.run() + B().run()\n',
+            },
+        };
+        const names = { go: 'Name', java: 'area', python: 'run' };
+        for (const [language, files] of Object.entries(fixtures)) {
+            const dir = tmp(files);
+            try {
+                const index = idx(dir);
+                const name = names[language];
+                const definitions = (index.symbols.get(name) || []).filter(d => d.type !== 'field');
+                assert.ok(definitions.length >= 2, `${language}: fixture defines several ${name}`);
+                const answer = (definition) => findCallers(index, name, {
+                    targetDefinitions: [definition], collectAccount: true, includeTests: true,
+                }).map(c => `${c.relativePath}:${c.line}:${c.tier}:${c.reason || ''}`).sort();
+                const alone = definitions.map(answer);
+                index._beginOp();
+                let shared;
+                try {
+                    shared = definitions.map(answer);
+                } finally { index._endOp(); }
+                assert.deepStrictEqual(shared, alone, `${language}: memoized answers equal fresh ones`);
+            } finally { rm(dir); }
+        }
+    });
+
+    it('a work budget bounds refinement, completes in fair-share order, and is disclosed', () => {
+        const dir = tmp({
+            'package.json': '{"name":"hotbudget"}',
+            'lib.js': [
+                'class A { run() { return 1; } }',
+                'class B { run() { return 2; } }',
+                'class C { run() { return 3; } }',
+                'class D { run() { return 4; } }',
+                'function hot() { return 5; }',
+                'module.exports = { A, B, C, D, hot };',
+            ].join('\n'),
+            'app.js': [
+                'const { hot } = require("./lib");',
+                'function go(x) {',
+                '  x.run();', '  x.run();', '  x.run();', '  x.run();', '  x.run();', '  x.run();',
+                '  hot();', '  hot();',
+                '  return hot();',
+                '}',
+                'module.exports = { go };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const exact = index.getStats({ hot: true, top: 1 });
+            assert.equal(exact.hot.budgetExhausted, undefined);
+            assert.deepStrictEqual(exact.hot.items.map(i => [i.name, i.callCount]), [['hot', 3]]);
+            // Six `run` records per refinement: the ceiling walk (ceiling 6
+            // per `run` definition, 3 for `hot`) spends the budget on one of
+            // the four `run` definitions; the completion walk (fair share:
+            // 6/4 < 3/1) refines `hot` next. Three `run` ceilings of 6 stay
+            // unrefined above the count 3, so the answer is not proven.
+            const bounded = index.getStats({ hot: true, top: 1, workBudget: 6 });
+            assert.equal(bounded.hot.budgetExhausted, true);
+            assert.equal(bounded.hot.workBudget, 6);
+            assert.equal(bounded.hot.work, 9);
+            assert.equal(bounded.hot.refined, 2);
+            assert.deepStrictEqual(bounded.hot.items.map(i => [i.name, i.callCount]), [['hot', 3]]);
+            // Deterministic: the same work unit gives the same answer.
+            assert.deepStrictEqual(index.getStats({ hot: true, top: 1, workBudget: 6 }).hot, bounded.hot);
+            const { orient } = require('../core/reporting');
+            const text = require('../core/output').formatOrient(orient(index, { top: 1, hotWorkBudget: 6 }));
+            assert.match(text, /refinement budget reached after 2 of \d+ candidates \(9 call records\) — ranking approximate/);
+            const statsText = require('../core/output').formatStats(bounded);
+            assert.match(statsText, /Refinement budget reached after 2 of \d+ candidates \(9 call records\): ranking approximate, counts exact/);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #385: cold-build CPU without answer changes', () => {
+    const { getParser, safeParse, PARSE_OPTIONS } = require('../languages');
+
+    it('node parent, offset and field accessors return the native answers', () => {
+        const parser = getParser('cpp');
+        const code = 'namespace n { struct S { int f(int x) { return g(x + 1); } }; }\nint g(int y) { return y; }\n';
+        const walk = tree => {
+            const nodes = [];
+            const stack = [tree.rootNode];
+            while (stack.length > 0) {
+                const node = stack.pop();
+                nodes.push(node);
+                for (let i = node.childCount - 1; i >= 0; i--) stack.push(node.child(i));
+            }
+            return nodes;
+        };
+        const describeNode = node => node ? `${node.type}@${node.startIndex}-${node.endIndex}` : 'null';
+        const facts = (node, reads) => {
+            let out = '';
+            for (let round = 0; round < reads; round++) {
+                out = [node.startIndex, node.endIndex, describeNode(node.parent),
+                    ...['name', 'body', 'declarator', 'type', 'function', 'arguments']
+                        .map(field => describeNode(node.childForFieldName(field)))].join('|');
+            }
+            return out;
+        };
+        // Tree A answers from the caches (read three times), tree B from the
+        // first, native read of every accessor.
+        const a = walk(safeParse(parser, code, undefined, PARSE_OPTIONS)).map(node => facts(node, 3));
+        const b = walk(safeParse(parser, code, undefined, PARSE_OPTIONS)).map(node => facts(node, 1));
+        assert.deepEqual(a, b);
+        assert.ok(a.length > 30);
+    });
+
+    it('C++ override/final specifiers keep their order in modifiers', () => {
+        const dir = tmp({
+            'a.cpp': 'struct B { virtual void f(); virtual void g(); };\nstruct D : B { void f() override final; void g() final override; };\n',
+        });
+        try {
+            const index = idx(dir);
+            const byName = name => index.symbols.get(name).find(d => d.className === 'D');
+            assert.deepEqual(byName('f').modifiers.filter(m => m === 'override' || m === 'final'), ['final', 'override']);
+            assert.deepEqual(byName('g').modifiers.filter(m => m === 'override' || m === 'final'), ['override', 'final']);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('a selected preprocessor configuration reuses its all-source tree instead of parsing it again', () => {
+        const TreeSitter = require('tree-sitter');
+        const code = [
+            '#ifdef A', 'int f(int x) {', '#else', 'int f(long x) {', '#endif',
+            '  return (int) x;', '}', 'int g(void) { return f(1); }', '',
+        ].join('\n');
+        const original = TreeSitter.prototype.parse;
+        const sources = [];
+        TreeSitter.prototype.parse = function (input, ...rest) {
+            if (typeof input === 'string') sources.push(input);
+            return original.call(this, input, ...rest);
+        };
+        try {
+            const dir = tmp({ 'x.c': code });
+            try {
+                const index = idx(dir);
+                assert.ok(index.symbols.get('g'));
+            } finally {
+                rm(dir);
+            }
+        } finally {
+            TreeSitter.prototype.parse = original;
+        }
+        const whole = sources.filter(source => source.length === code.length);
+        assert.equal(new Set(whole).size, whole.length, 'no source text is parsed twice');
+    });
+
+    it('a paste no project name can match is not expanded; one that can is', () => {
+        const dir = tmp({
+            'suite.h': [
+                '#define CLASS_NAME(a, b) a##_##b##_Test',
+                '#define TEST(a, b) struct CLASS_NAME(a, b) { void run(); }; void CLASS_NAME(a, b)::run()',
+                '#define HANDLER(n) handle_##n',
+                '#define CALL(n) HANDLER(n)()',
+                'void handle_open(void);',
+                '',
+            ].join('\n'),
+            'use.cpp': '#include "suite.h"\nTEST(io, open) { CALL(open); }\nvoid go() { CALL(open); }\n',
+        });
+        try {
+            const index = idx(dir);
+            const { expansionState, macroExpansionSummary } = require('../core/macro-expansion');
+            const state = expansionState(index);
+            assert.ok(!state.relevant.has('TEST'));
+            assert.ok(!state.relevant.has('CLASS_NAME'));
+            assert.ok(state.relevant.has('CALL') && state.relevant.has('HANDLER'));
+            const open = index.context('handle_open', { file: 'suite.h', line: 5 });
+            assert.deepEqual(open.callers.map(c => `${c.relativePath}:${c.line}`).sort(), ['use.cpp:2', 'use.cpp:3']);
+            assert.deepEqual(macroExpansionSummary(index).patterns.map(p => p.macro), []);
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #387: type-rename latency without answer changes', () => {
+    const { getParser, getLanguageAdapter } = require('../languages');
+
+    it('the persisted recovery blanks rebuild the tree the recovery selects, with one parse', () => {
+        const code = [
+            '#pragma once',
+            'namespace lib {',
+            'LIB_INLINE App *App::callback(int fn) {',
+            '    return this;',
+            '}',
+            'LIB_NODISCARD LIB_INLINE Option *App::get_option(int key) const {',
+            '    return nullptr;',
+            '}',
+            '#ifdef _WIN32',
+            'int platform() { return 1;',
+            '#else',
+            'int platform() { return 2;',
+            '#endif',
+            '}',
+            '}',
+        ].join('\n');
+        const language = getLanguageAdapter('cpp');
+        const parser = getParser('cpp');
+        const parsed = language.parse(code, parser);
+        assert.ok(Array.isArray(parsed.recoveryBlanks) && parsed.recoveryBlanks.length > 0);
+        const cpp = require('../languages').LANGUAGES.cpp.module();
+        const replayed = cpp.recoveredTree(code, parser);
+        const rebuilt = cpp.recoveredTree(code, parser, parsed.recoveryBlanks);
+        assert.strictEqual(rebuilt.rootNode.toString(), replayed.rootNode.toString());
+        // No blanks: the literal tree is the recovered tree.
+        assert.strictEqual(cpp.recoveredTree('int f() { return 1; }\n', parser, []), null);
+    });
+
+    it('type plans are identical with and without the persisted blanks', () => {
+        const dir = tmp({
+            'include/Macros.hpp': '#pragma once\n#define LIB_INLINE\n#define LIB_NODISCARD [[nodiscard]]\n',
+            'include/App.hpp': '#pragma once\n#include "Macros.hpp"\nnamespace lib {\nclass Option {};\nclass App {\n  public:\n    App *callback(int fn);\n    LIB_NODISCARD Option *get_option(int key) const;\n};\n}\n',
+            'include/App_inl.hpp': '#pragma once\n#include "App.hpp"\nnamespace lib {\nLIB_INLINE App *App::callback(int fn) { return this; }\nLIB_NODISCARD LIB_INLINE Option *App::get_option(int key) const { return nullptr; }\n}\n',
+            'main.cpp': '#include "include/App_inl.hpp"\nint main() { lib::App app; lib::App *p = app.callback(1); return p != nullptr; }\n',
+        });
+        try {
+            const plan = strip => {
+                const index = idx(dir);
+                if (strip) for (const entry of index.files.values()) delete entry.recoveryBlanks;
+                const r = execute(index, 'plan', { name: 'App', file: 'include/App.hpp', line: 5, renameTo: 'Gadget' });
+                assert.ok(r.ok, r.error);
+                return JSON.stringify(r.result.changes);
+            };
+            const withBlanks = plan(false);
+            assert.strictEqual(withBlanks, plan(true));
+            assert.ok(withBlanks.includes('App_inl.hpp'));
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('the flat node list is reused when the same root arrives through another wrapper', () => {
+        // The binding keeps one wrapper per node only while it is alive, so
+        // a collected root wrapper makes each later `tree.rootNode` a new
+        // object; every extractor pass rebuilt the whole node list.
+        const { traverseTreeCached } = require('../languages/utils');
+        const parser = getParser('c');
+        const tree = parser.parse('int f(void) { return 1; }\nint g;\n');
+        const root = tree.rootNode;
+        const other = new root.constructor(root.tree);
+        for (let i = 0; i < 6; i++) other[i] = root[i];
+        assert.notStrictEqual(other, root);
+        assert.strictEqual(other.id, root.id);
+        const firstVisited = start => {
+            let first = null;
+            traverseTreeCached(start, node => { first ??= node; });
+            return first;
+        };
+        assert.strictEqual(firstVisited(root), root);
+        assert.strictEqual(firstVisited(other), root, 'cache hit: the list built from the first wrapper');
+        const otherTree = parser.parse('int f(void) { return 1; }\nint g;\n');
+        assert.notStrictEqual(firstVisited(otherTree.rootNode), root, 'a different tree never shares the list');
+    });
+});
+
+describe('fix #388: cold-build CPU and wall without answer changes', () => {
+    const { ProjectIndex } = require('../core/project');
+    const { getParser, safeParse, PARSE_OPTIONS } = require('../languages');
+    const { getCachedNodeList, traverseTree, cachedNodeRange } = require('../languages/utils');
+    const SAMPLES = {
+        javascript: 'function f(a, b) { /* c */ return g(a) + h(b, [1, 2]); }\nclass K { m() { return this.f(1); } }\n',
+        python: 'def f(a, b):\n    # c\n    return g(a) + h(b, [1, 2])\n\nclass K:\n    def m(self):\n        return self.f(1)\n',
+        go: 'package p\n\nfunc F(a int, b int) int { return g(a) + h(b, []int{1, 2}) }\n\ntype K struct{ x int }\n\nfunc (k K) M() int { return k.x }\n',
+        rust: 'fn f(a: u8, b: u8) -> u8 { /* c */ g(a) + h(b, &[1, 2]) }\nimpl K { fn m(&self) -> u8 { self.f(1) } }\n',
+        java: 'class K { int f(int a, int b) { return g(a) + h(b, new int[]{1, 2}); } int m() { return this.f(1, 2); } }\n',
+        csharp: 'class K { int F(int a, int b) { return G(a) + H(b, new[] { 1, 2 }); } int M() => this.F(1, 2); }\n',
+        cpp: 'namespace n { struct K { int f(int a) { return g(a + 1); } }; }\nint g(int y) { return y; }\n',
+        c: 'static int g(int y) { return y; }\nint f(int a, int b) { /* c */ return g(a) + g(b); }\n',
+    };
+    const describeNode = node => node ? `${node.type}@${node.startIndex}-${node.endIndex}` : 'null';
+    const allNodes = root => {
+        const out = [];
+        const stack = [root];
+        while (stack.length > 0) {
+            const node = stack.pop();
+            out.push(node);
+            for (let i = node.childCount - 1; i >= 0; i--) stack.push(node.child(i));
+        }
+        return out;
+    };
+
+    it('named children are read natively once per node and served exactly as the binding serves them', () => {
+        for (const [language, code] of Object.entries(SAMPLES)) {
+            const parser = getParser(language);
+            const facts = node => [
+                node.namedChildren.map(describeNode).join(','),
+                node.namedChildCount,
+                describeNode(node.firstNamedChild),
+                describeNode(node.lastNamedChild),
+                ...Array.from({ length: node.namedChildCount + 2 }, (_, i) => describeNode(node.namedChild(i - 1))),
+            ].join('|');
+            // Tree A: every named node listed first (the extractors' flat
+            // list), then read twice from the cache; tree B: native reads.
+            const a = safeParse(parser, code, undefined, PARSE_OPTIONS);
+            getCachedNodeList(a.rootNode);
+            const cached = allNodes(a.rootNode).map(node => { facts(node); return facts(node); });
+            const b = parser.parse(code, undefined, PARSE_OPTIONS);
+            const native = allNodes(b.rootNode).map(facts);
+            assert.deepEqual(cached, native, language);
+            // Callers own the array they get.
+            const node = a.rootNode;
+            const first = node.namedChildren;
+            first.length = 0;
+            assert.ok(node.namedChildren.length > 0, `${language}: a caller's mutation never reaches the cache`);
+        }
+    });
+
+    it('traverseTree over the cached flat list visits and leaves exactly as the recursive walk', () => {
+        for (const [language, code] of Object.entries(SAMPLES)) {
+            const parser = getParser(language);
+            const events = (root, subtree) => {
+                const out = [];
+                const start = subtree ? root.namedChild(root.namedChildCount - 1) : root;
+                traverseTree(start, node => {
+                    out.push(`in ${describeNode(node)}`);
+                    // Skipped subtrees are neither walked nor left.
+                    return !/parameter|argument/.test(node.type);
+                }, { onLeave: node => out.push(`out ${describeNode(node)}`) });
+                return out;
+            };
+            const listed = safeParse(parser, code, undefined, PARSE_OPTIONS);
+            getCachedNodeList(listed.rootNode);
+            assert.ok(cachedNodeRange(listed.rootNode), `${language}: the list is cached`);
+            const walked = parser.parse(code, undefined, PARSE_OPTIONS);
+            assert.strictEqual(cachedNodeRange(walked.rootNode), null, `${language}: no list for a fresh tree`);
+            for (const subtree of [false, true]) {
+                const expected = events(walked.rootNode, subtree);
+                assert.ok(expected.length > 4);
+                assert.deepEqual(events(listed.rootNode, subtree), expected, `${language} subtree=${subtree}`);
+            }
+        }
+    });
+
+    it("a stored future's use walk only descends into nodes whose text holds its name", () => {
+        const { rustValueFacts } = require('../languages/rust-value-flow');
+        const code = [
+            'async fn run(c: &Client) {',
+            '    let fut = c.fetch();',
+            '    let other = helper(1, 2, 3);',
+            '    for i in 0..10 { log(i); other.push(i); }',
+            '    if ready() { let fut = 5; use_it(fut); }',
+            '    fut.await;',
+            '}',
+            'async fn lost(c: &Client) {',
+            '    let pending = c.fetch();',
+            '    let data = vec![1, 2, 3];',
+            '    process(&data);',
+            '}',
+            '',
+        ].join('\n');
+        const TreeSitter = require('tree-sitter');
+        const descriptor = Object.getOwnPropertyDescriptor(TreeSitter.SyntaxNode.prototype, 'namedChildCount');
+        const tree = safeParse(getParser('rust'), code, undefined, PARSE_OPTIONS);
+        const calls = tree.rootNode.descendantsOfType('call_expression')
+            .filter(call => call.childForFieldName('function')?.text === 'c.fetch');
+        assert.strictEqual(calls.length, 2);
+        const enumerated = [];
+        Object.defineProperty(TreeSitter.SyntaxNode.prototype, 'namedChildCount', {
+            configurable: true,
+            get() { enumerated.push(this.text); return descriptor.get.call(this); },
+        });
+        let facts;
+        try {
+            facts = calls.map(call => { enumerated.length = 0; const f = rustValueFacts(call); return { f, seen: [...enumerated] }; });
+        } finally {
+            Object.defineProperty(TreeSitter.SyntaxNode.prototype, 'namedChildCount', descriptor);
+        }
+        // `fut` is awaited after an inner shadow; `pending` is never read.
+        assert.deepEqual(facts.map(entry => entry.f.valueConsumed), ['stored', null]);
+        for (const [i, name] of ['fut', 'pending'].entries()) {
+            const walked = facts[i].seen.filter(text => !text.startsWith('{'));
+            assert.ok(walked.every(text => text.includes(name)),
+                `${name}: only nodes holding the name are descended into (${walked.filter(t => !t.includes(name)).join(' | ')})`);
+        }
+    });
+
+    it('an overload witness replay answers a map read with one object per key, like the live index', () => {
+        const { factIndex } = require('../core/provenance-overload');
+        const live = {
+            files: new Map([['/p/a.java', { language: 'java', relativePath: 'a.java',
+                importBindings: [{ name: 'X', source: 'b' }], moduleResolved: null, other: 1 }]]),
+            symbols: new Map([['f', [{ name: 'f', file: '/p/a.java' }]]]),
+        };
+        const reads = {};
+        const capture = factIndex(reads, live);
+        const captured = capture.files.get('/p/a.java');
+        assert.strictEqual(capture.files.get('/p/a.java'), captured, 'capture: one object per key');
+        assert.deepEqual(captured, { language: 'java', relativePath: 'a.java',
+            importBindings: [{ name: 'X', source: 'b' }], moduleResolved: null });
+        const replay = factIndex(reads);
+        const first = replay.files.get('/p/a.java');
+        assert.strictEqual(replay.files.get('/p/a.java'), first, 'replay: one object per key');
+        assert.deepEqual(first, captured);
+        assert.strictEqual(replay.files.has('/p/a.java'), true);
+        assert.throws(() => replay.symbols.get('f'), /Missing overload fact/, 'unrecorded reads still abstain');
+    });
+
+    it('a sequential build expands macros in place; a parallel build expands in parse workers it kept', () => {
+        const files = {
+            'Cargo.toml': '[package]\nname = "keep388"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/lib.rs': [
+                '#[macro_export]',
+                'macro_rules! tests { ($(fn $n:ident() $b:block)*) => { $( pub fn $n() { let t = crate::helper(0); $b; } )* }; }',
+                'pub fn helper(x: u32) -> u32 { x }',
+            ].join('\n') + '\n',
+        };
+        const body = Array.from({ length: 240 }, (_, i) => `        let v${i} = crate::helper(${i});`).join('\n');
+        for (let f = 0; f < 6; f++) {
+            files['src/lib.rs'] += `pub mod m${f};\n`;
+            files[`src/m${f}.rs`] = ['tests! {', `    fn case_${f}() {`, body, '    }', '}', ''].join('\n');
+        }
+        const dir = tmp(files);
+        try {
+            const { indexSnapshot } = require('./helpers');
+            const facts = index => {
+                require('../core/rust-macro-expansion').materializeRustMacroCalls(index);
+                return indexSnapshot(index) + [...index.files.values()]
+                    .map(entry => JSON.stringify([entry.relativePath, entry.rustMacroExpansion || null])).sort().join('\n');
+            };
+            const sequential = new ProjectIndex(dir);
+            sequential.build(null, { quiet: true, workers: 1 });
+            assert.strictEqual(sequential.lastBuildWorkerCount, 1);
+            assert.strictEqual(sequential.lastBuildExpansionWorkers, 0, 'no thread for a sequential build');
+            const parallel = new ProjectIndex(dir);
+            parallel.build(null, { quiet: true, workers: 3 });
+            assert.strictEqual(parallel.lastBuildWorkerCount, 3);
+            assert.ok(parallel.lastBuildExpansionWorkers >= 1 && parallel.lastBuildExpansionWorkers <= 3,
+                `kept parse workers expand: ${parallel.lastBuildExpansionWorkers}`);
+            assert.ok(parallel.symbols.has('case_5'), 'generated declarations indexed');
+            assert.strictEqual(facts(parallel), facts(sequential));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #389: new parser facts are identical in parallel and sequential builds', () => {
+    const { ProjectIndex } = require('../core/project');
+    const { tmp, rm, indexSnapshot } = require('./helpers');
+
+    it('valueShape, unions, annotation types, value aliases and C++ local class scopes survive workers', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "p"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/lib.rs': 'pub struct S;\npub struct T(u8);\npub enum E { A, B(u8), C { x: u8 } }\npub union U { a: u32 }\n' +
+                'impl S { pub fn m(&self) {} }\npub fn f() { S.m(); let w = S; w.m(); }\n',
+            'src/Marker.java': 'package p;\npublic @interface Marker { String value() default ""; int MAX = 1; }\n',
+            'src/Use.java': 'package p;\n@Marker("x")\nclass Use { @Marker(value = "y") void m() {} }\n',
+            'pkg/models.py': 'class Box:\n    pass\nAlias = Box\n',
+            'web/models.js': 'class Box {}\nconst Alias = Box;\nmodule.exports = { Box, Alias };\n',
+            'native/mod.cpp': 'int f() { struct L { int g() { return 1; } }; L l; return l.g(); }\n',
+        });
+        try {
+            const sequential = new ProjectIndex(dir);
+            sequential.build(null, { quiet: true, workers: 0 });
+            const parallel = new ProjectIndex(dir);
+            parallel.build(null, { quiet: true, workers: 2 });
+            assert.ok(parallel.lastBuildWorkerCount >= 2, `workers: ${parallel.lastBuildWorkerCount}`);
+            assert.strictEqual(indexSnapshot(parallel), indexSnapshot(sequential));
+            const snapshot = indexSnapshot(sequential);
+            for (const fact of ['"valueShape":"unit"', '"valueShape":"tuple"', '"type":"union"',
+                '"annotationType":true', 'moduleValueAliases', '"lexicalScopeStartLine":1']) {
+                assert.ok(snapshot.includes(fact), fact);
+            }
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #390: C#/C++ generics and name lines are identical in parallel and sequential builds', () => {
+    const { ProjectIndex } = require('../core/project');
+    const { tmp, rm, indexSnapshot } = require('./helpers');
+
+    it('C# type parameter names and attribute-started name lines, C++ template parameters, Java/TS field name lines survive workers', () => {
+        const dir = tmp({
+            'src/V.cs': 'namespace N\n{\n    [System.Serializable]\n    public abstract class V<TState, TResult>\n    {\n' +
+                '        [System.Obsolete]\n        protected abstract TResult Visit<TArg>(TState s, TArg a);\n    }\n}\n',
+            'src/b.hpp': 'template <typename S, int N>\nclass Base { public: virtual void visit(S s) = 0; };\n',
+            'src/b.cpp': '#include "b.hpp"\nclass Impl : public Base<int, 2> { public: void visit(int s) override {} };\n',
+            'src/A.java': 'package p;\nclass A {\n    @Deprecated\n    int field = 1;\n}\n',
+            'src/a.ts': 'function dec(t: any, k?: any): any { return t; }\nexport class W {\n    @dec\n    size = 1;\n}\n',
+        });
+        try {
+            const sequential = new ProjectIndex(dir);
+            sequential.build(null, { quiet: true, workers: 0 });
+            const parallel = new ProjectIndex(dir);
+            parallel.build(null, { quiet: true, workers: 2 });
+            assert.ok(parallel.lastBuildWorkerCount >= 2, `workers: ${parallel.lastBuildWorkerCount}`);
+            assert.strictEqual(indexSnapshot(parallel), indexSnapshot(sequential));
+            const snapshot = indexSnapshot(sequential);
+            for (const fact of ['"generics":"<TState, TResult>"', '"generics":"<TArg>"', '"generics":"<S, N>"',
+                '"nameLine":4', '"nameLine":7']) {
+                assert.ok(snapshot.includes(fact), fact);
+            }
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #391: friend functions, macro-generated callables, C# configuration views and method type arguments survive workers', () => {
+    const { ProjectIndex } = require('../core/project');
+    const { tmp, rm, indexSnapshot } = require('./helpers');
+
+    it('parallel and sequential builds carry the same facts', () => {
+        const dir = tmp({
+            'src/v.hpp': 'namespace ns {\nclass V {\n  public:\n    friend bool eq(const V& a, const V& b) { return true; }\n    friend void sw(V& a, V& b);\n};\n}\n',
+            'tests/t.cc': '#include "../src/v.hpp"\nTEST(Suite, Name) {\n  ns::V a, b;\n  eq(a, b);\n}\nTEST_CASE("x", "[y]") {\n  eq(ns::V(), ns::V());\n}\n',
+            'src/I.cs': 'namespace N;\npublic interface I\n{\n    int F(int x)\n#if FEATURE\n        => G<int>(x)\n#endif\n    ;\n    int G<T>(T x);\n}\n',
+            'src/P.java': 'class P {\n    <T> T id(T x) { return x; }\n    void use() { this.<String>id("a"); }\n}\n',
+        });
+        try {
+            const sequential = new ProjectIndex(dir);
+            sequential.build(null, { quiet: true, workers: 0 });
+            const parallel = new ProjectIndex(dir);
+            parallel.build(null, { quiet: true, workers: 2 });
+            assert.ok(parallel.lastBuildWorkerCount >= 2, `workers: ${parallel.lastBuildWorkerCount}`);
+            assert.strictEqual(indexSnapshot(parallel), indexSnapshot(sequential));
+            const snapshot = indexSnapshot(sequential);
+            for (const fact of ['"friendOf":"V"', '"generatedByMacro":{"name":"TEST","args":["Suite","Name"]}',
+                '"generatedByMacro":{"name":"TEST_CASE"}']) {
+                assert.ok(snapshot.includes(fact), fact);
+            }
+            const { getCachedCalls } = require('../core/callers');
+            const typeArgs = [...sequential.files.keys()].flatMap(file =>
+                (getCachedCalls(sequential, file) || []).filter(call => call.methodTypeArgs)
+                    .map(call => `${call.name}:${call.methodTypeArgs}`));
+            assert.deepStrictEqual(typeArgs.sort(), ['G:1', 'id:1']);
+            assert.ok(sequential.symbols.get('F').some(d => d.className === 'I'));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #392: const/static types, module alias alternatives and enum interfaces survive workers', () => {
+    const { ProjectIndex } = require('../core/project');
+    const { tmp, rm, indexSnapshot } = require('./helpers');
+
+    it('parallel and sequential builds carry the same facts', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "p392"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/lib.rs': 'pub struct Flags;\nimpl Flags { pub fn iter(&self) -> u32 { 1 } }\npub const FLAGS: Flags = Flags;\npub static REFS: &Flags = &FLAGS;\n',
+            'mod.py': 'import sys\n\nclass Box:\n    pass\n\nif sys.version_info > (3,):\n    Same = Box\nelse:\n    Same = Box\n',
+            'a.js': 'class Box {}\nlet L = Box;\nmodule.exports = { L };\n',
+            'Ops.java': 'interface Op { int apply(int x); }\nenum Ops implements Op {\n    NEG;\n    @Override\n    public int apply(int x) { return -x; }\n}\n',
+        });
+        try {
+            const sequential = new ProjectIndex(dir);
+            sequential.build(null, { quiet: true, workers: 0 });
+            const parallel = new ProjectIndex(dir);
+            parallel.build(null, { quiet: true, workers: 2 });
+            assert.ok(parallel.lastBuildWorkerCount >= 2, `workers: ${parallel.lastBuildWorkerCount}`);
+            assert.strictEqual(indexSnapshot(parallel), indexSnapshot(sequential));
+            const snapshot = indexSnapshot(sequential);
+            for (const fact of ['"valueType":"Flags"', '"implements":["Op"]',
+                '\\"alternatives\\":[{\\"target\\":\\"Box\\"},{\\"target\\":\\"Box\\"}]',
+                '\\"name\\":\\"L\\",\\"target\\":\\"Box\\"']) {
+                assert.ok(snapshot.includes(fact), fact);
+            }
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #393: unnamed parameters, arrow receivers, template heads and delegate counts survive workers', () => {
+    const { ProjectIndex } = require('../core/project');
+    const { tmp, rm, indexSnapshot } = require('./helpers');
+
+    it('parallel and sequential builds carry the same facts', () => {
+        const dir = tmp({
+            'a.hpp': [
+                '#include <memory>',
+                'class App;',
+                'using App_p = std::shared_ptr<App>;',
+                'class App { public: virtual int f(const App *) const; void g(); };',
+                'template<typename J> int from(const J &j) { App_p p; p->g(); return j.size(); }',
+            ].join('\n'),
+            'D.cs': 'namespace N;\npublic delegate void Handler(string a, int b);\n',
+        });
+        try {
+            const sequential = new ProjectIndex(dir);
+            sequential.build(null, { quiet: true, workers: 0 });
+            const parallel = new ProjectIndex(dir);
+            parallel.build(null, { quiet: true, workers: 2 });
+            assert.ok(parallel.lastBuildWorkerCount >= 2, `workers: ${parallel.lastBuildWorkerCount}`);
+            assert.strictEqual(indexSnapshot(parallel), indexSnapshot(sequential));
+            const snapshot = indexSnapshot(sequential);
+            for (const fact of ['"unnamed":true', '"templateParams":"<J>"', '"delegateParams":2',
+                '\\"receiverArrow\\":true', '\\"receiverArrowObject\\":\\"App_p\\"']) {
+                assert.ok(snapshot.includes(fact), fact);
+            }
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #395: C# using directive facts survive workers; strict-owner memo keeps answers', () => {
+    const { ProjectIndex } = require('../core/project');
+    const { tmp, rm, indexSnapshot } = require('./helpers');
+
+    it('parallel and sequential builds carry directive namespaces, static and global flags, nested namespaces', () => {
+        const dir = tmp({
+            'src/A.cs': 'namespace Acme.Tests;\n\nusing Internal;\nusing static Internal.Util;\nusing C = Internal.Cache;\n\npublic class T { }\n',
+            'src/B.cs': 'global using Acme.Internal;\nnamespace Acme\n{\n    namespace Deep\n    {\n        using Internal;\n        public class D { }\n    }\n}\n',
+            'src/L.cs': 'namespace Acme.Internal;\npublic static class Util { public static int One() => 1; }\npublic static class Cache { }\n',
+        });
+        try {
+            const sequential = new ProjectIndex(dir);
+            sequential.build(null, { quiet: true, workers: 0 });
+            const parallel = new ProjectIndex(dir);
+            parallel.build(null, { quiet: true, workers: 2 });
+            assert.ok(parallel.lastBuildWorkerCount >= 2, `workers: ${parallel.lastBuildWorkerCount}`);
+            assert.strictEqual(indexSnapshot(parallel), indexSnapshot(sequential));
+            const details = [...sequential.files.values()].flatMap(entry => entry.importDetails || [])
+                .map(detail => `${detail.module}|${detail.namespace || ''}|${detail.static ? 's' : ''}|${detail.global ? 'g' : ''}`)
+                .sort();
+            assert.deepStrictEqual(details, ['Acme.Internal|||g', 'Internal.Cache|Acme.Tests||',
+                'Internal.Util|Acme.Tests|s|', 'Internal|Acme.Deep||', 'Internal|Acme.Tests||']);
+            assert.strictEqual(sequential.symbols.get('D')[0].namespace, 'Acme.Deep');
+        } finally { rm(dir); }
+    });
+
+    it('bare-call bindings among many same-name nested types resolve the same with and without the operation memo', () => {
+        const classes = [];
+        for (let i = 0; i < 30; i++) {
+            classes.push(`public class Test${i} {\n    class Source { }\n    public object Make() => new Source();\n}\n`);
+        }
+        const dir = tmp({ 'Many.cs': `namespace Acme;\n${classes.join('')}` });
+        try {
+            const index = new ProjectIndex(dir);
+            index.build(null, { quiet: true });
+            const target = index.symbols.get('Source')[7];
+            const answer = () => {
+                const r = index.findCallers('Source', { targetDefinitions: [target], collectAccount: true });
+                return [...r.map(c => `${c.line}:${c.tier}`),
+                    ...(r.unverifiedEntries || []).map(e => `${e.line}:${e.reason}`),
+                    ...r.accountRaw.excludedEntries.map(e => `${e.line}:${e.reason}`)].sort();
+            };
+            const plain = answer();
+            index._beginOp();
+            let memoized;
+            try { memoized = answer(); } finally { index._endOp(); }
+            assert.deepStrictEqual(memoized, plain);
+            assert.strictEqual(plain.length, 30);
+        } finally { rm(dir); }
+    });
+
+    it('a C# rename parses each caller file once across its slot sweeps; split conditionals keep every branch', () => {
+        const TreeSitter = require('tree-sitter');
+        const files = {
+            'Shapes.cs': 'namespace Acme;\npublic interface IShape { int Area(int k); }\n' +
+                'public class Sq : IShape { public int Area(int k) => k * k; }\n' +
+                'public class Ci : IShape { public int Area(int k) => 3 * k; }\n',
+            'Use.cs': 'namespace Acme;\npublic class Use {\n    public int A(IShape s) => s.Area(1) + s.Area(2);\n' +
+                '    public int B(Sq q) => q.Area(3);\n}\n',
+            'Cond.cs': 'namespace Acme;\npublic class Cond {\n#if FAST\n    public int F(Ci c) => c.Area(4);\n#else\n' +
+                '    public int F(Ci c) => c.Area(5) + 1;\n#endif\n}\n',
+            'Split.cs': 'namespace Acme;\npublic class Split {\n    public int G(Ci c)\n#if FAST\n        => c.Area(6);\n' +
+                '#else\n        => c.Area(7) + 1;\n#endif\n}\n',
+        };
+        const dir = tmp(files);
+        const original = TreeSitter.prototype.parse;
+        try {
+            const index = new ProjectIndex(dir);
+            index.build(null, { quiet: true });
+            const sources = [];
+            TreeSitter.prototype.parse = function (input, ...rest) {
+                if (typeof input === 'string') sources.push(input);
+                return original.call(this, input, ...rest);
+            };
+            let result;
+            try {
+                result = index.plan('Area', { file: 'Shapes.cs', line: 2, renameTo: 'Size' });
+            } finally {
+                TreeSitter.prototype.parse = original;
+            }
+            for (const file of ['Use.cs', 'Cond.cs', 'Split.cs']) {
+                assert.ok(sources.filter(source => source === files[file]).length <= 1, `${file} parsed once`);
+            }
+            const calls = result.changes.filter(change => change.editKind === 'call')
+                .map(change => `${change.file}:${change.line}`).sort();
+            assert.deepStrictEqual(calls, ['Cond.cs:4', 'Cond.cs:6', 'Split.cs:5', 'Split.cs:7',
+                'Use.cs:3', 'Use.cs:4']);
+        } finally {
+            TreeSitter.prototype.parse = original;
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #396: C/C++ recovery facts survive workers; cheaper probes and plans keep answers', () => {
+    const { ProjectIndex } = require('../core/project');
+    const { tmp, rm, indexSnapshot } = require('./helpers');
+
+    it('parallel and sequential builds carry typedef names, nested owners, macro facts and external macro records', () => {
+        const dir = tmp({
+            'lib/common.hpp': '#pragma once\n#define LIB_INLINE inline\n#define LIB_TRY try\n#define LIB_CATCH catch (...) {}\n',
+            'lib/pool.hpp': '#pragma once\n#include "common.hpp"\ntemplate <typename K>\nclass List {\n  struct Node;\n  Node* head_;\n};\ntemplate <typename K>\nstruct List<K>::Node { void Next() {} };\n',
+            'lib/pool-inl.hpp': '#pragma once\n#include "pool.hpp"\nclass Pool { public: void Stop(); bool Next(); };\nLIB_INLINE void Pool::Stop() {\n    LIB_TRY {\n        for (int i = 0; i < 3; i++) { while (Next()) {} }\n    }\n    LIB_CATCH\n}\n',
+            'lib/t.cc': '#include "pool-inl.hpp"\n#define STR_(name) static int Get##name() { return 0; }\nclass S { public: STR_(Min) };\nTEST_F(Fixture, Name) { Next(); }\n',
+            'src/a.c': 'typedef struct { int pos; } stream_t, *stream_p;\n#define DEF(x) \\\n    x = 0; /* note */ \\\n    reset(x);\nstatic void reset(int x) { (void)x; }\n',
+        });
+        try {
+            const sequential = new ProjectIndex(dir);
+            sequential.build(null, { quiet: true, workers: 0 });
+            const parallel = new ProjectIndex(dir);
+            parallel.build(null, { quiet: true, workers: 2 });
+            assert.ok(parallel.lastBuildWorkerCount >= 2, `workers: ${parallel.lastBuildWorkerCount}`);
+            const snapshot = indexSnapshot(sequential);
+            assert.strictEqual(indexSnapshot(parallel), snapshot);
+            for (const fact of ['"typedefName":true', '"enclosingType":"List"', '"unspelled":true',
+                '"args":["Fixture","Name"]', '"externalMacroNames":["LIB_CATCH","LIB_INLINE","LIB_TRY"]']) {
+                assert.ok(snapshot.includes(fact), fact);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('a small parse buffer yields the tree of the default buffer', () => {
+        const { getParser, safeParse } = require('../languages');
+        const parser = getParser('cpp');
+        const source = 'namespace n { template <typename T> struct S { T* f(int a) const { return nullptr; } }; }';
+        const small = safeParse(parser, source);
+        const large = parser.parse(source, undefined, { bufferSize: 1024 * 1024 });
+        assert.strictEqual(small.rootNode.toString(), large.rootNode.toString());
+    });
+
+    it('a rename plan without call-argument analysis is the plan with it', () => {
+        const dir = tmp({
+            'a.hpp': 'class A { public: int f(int x, int y) { return x + y; } };\n',
+            'b.cpp': '#include "a.hpp"\nint g(A& a) { return a.f(1, 2) + a.f(3, 4); }\n',
+            'c.py': 'def h(x, y=1):\n    return x\n\ndef use():\n    return h(1, y=2) + h(3)\n',
+        });
+        try {
+            const index = new ProjectIndex(dir);
+            index.build(null, { quiet: true });
+            const verify = require('../core/verify');
+            for (const [name, file, line] of [['f', 'a.hpp', 1], ['h', 'c.py', 1]]) {
+                const def = index.symbols.get(name).find(d => d.relativePath === file && d.startLine === line);
+                index._beginOp();
+                let withArgs;
+                let without;
+                try {
+                    withArgs = verify.computePlanCallSites(index, name, def);
+                    without = verify.computePlanCallSites(index, name, def, { analyzeArgs: false });
+                } finally { index._endOp(); }
+                const strip = sites => sites.map(({ args: _a, argCount: _c, keywordArgNames: _k, positionalCount: _p, ...rest }) => rest);
+                assert.deepStrictEqual(strip(without.sites), strip(withArgs.sites));
+                const renamed = index.plan(name, { file, line, renameTo: `${name}2` });
+                assert.ok(renamed.changes.some(change => change.editKind === 'call'), name);
+            }
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #397: JS destructured members, local shadows, member values and literal accessors survive workers', () => {
+    const { ProjectIndex } = require('../core/project');
+    const { tmp, rm, indexSnapshot } = require('./helpers');
+
+    it('parallel and sequential builds carry the same facts', () => {
+        const dir = tmp({
+            'package.json': '{"name":"p397"}',
+            'a.ts': [
+                'export class Api { run(): number { return 1 } }',
+                'const api = new Api()',
+                'const { run } = api',
+                'run()',
+                'export const bound = api.run',
+                'export function f(helper: () => number) { return helper() }',
+            ].join('\n') + '\n',
+            'o.js': 'module.exports = {\n  get size() { return 1 },\n  set size(v) { void v },\n}\n',
+            'r.js': "const stringify = require('url').format\nmodule.exports = { stringify }\n",
+        });
+        try {
+            const sequential = new ProjectIndex(dir);
+            sequential.build(null, { quiet: true, workers: 0 });
+            const parallel = new ProjectIndex(dir);
+            parallel.build(null, { quiet: true, workers: 2 });
+            assert.ok(parallel.lastBuildWorkerCount >= 2, `workers: ${parallel.lastBuildWorkerCount}`);
+            assert.strictEqual(indexSnapshot(parallel), indexSnapshot(sequential));
+            const snapshot = indexSnapshot(sequential);
+            for (const fact of ['\\"destructured\\":{\\"key\\":\\"run\\"', '\\"localShadow\\":-1',
+                '\\"memberValue\\":true', '"objectLiteralLine":1', '"memberType":"set"',
+                '\\"alias\\":\\"stringify\\"']) {
+                assert.ok(snapshot.includes(fact), fact);
+            }
         } finally { rm(dir); }
     });
 });

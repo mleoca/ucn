@@ -7,6 +7,11 @@
  * Auto-detects mode from target (file path → file mode, directory → project mode).
  */
 
+// Reuse V8 code caches across processes (Node >= 22.1; fix #365): compiling
+// the engine's modules is a fixed cost of every command. Node validates each
+// entry against the source, and NODE_DISABLE_COMPILE_CACHE turns it off.
+try { require('module').enableCompileCache?.(); } catch (_) { /* optional */ }
+
 const fs = require('fs');
 const path = require('path');
 
@@ -28,6 +33,7 @@ const {
 } = require('../core/registry');
 const { buildPublicParams, isPublicCommand } = require('../core/public-command');
 const { execute } = require('../core/execute');
+const { describeError } = require('../core/errors');
 const { applyOutputBudget, MAX_OUTPUT_CHARS } = require('../core/output-budget');
 const { clearAllCaches } = require('../core/cache');
 const { commentLines } = require('../core/output/lines');
@@ -188,7 +194,7 @@ function validateNumericFlags(flags) {
 }
 
 /** Emit the one CLI error contract, including failures before main dispatch. */
-function emitCliError(msg, command = activeCanonicalCommand) {
+function emitCliError(msg, command = activeCanonicalCommand, { internal = false } = {}) {
     const wantsJson = process.argv.includes('--json');
     const error = typeof msg === 'string' ? msg : String(msg);
     if (wantsJson) {
@@ -201,6 +207,8 @@ function emitCliError(msg, command = activeCanonicalCommand) {
         const env = {
             meta: {
                 ok: false,
+                // An exception inside UCN, not a refusal (fix #394).
+                ...(internal && { internalError: true }),
                 ...(surfaceCommand && {
                     command: surfaceCommand,
                     ...(canonical && surfaceCommand !== canonical && {
@@ -223,9 +231,22 @@ function emitCliError(msg, command = activeCanonicalCommand) {
  * Print an error message and abort command execution. Throw instead of calling
  * process.exit so index/cache finally blocks still run.
  */
-function fail(msg, command = activeCanonicalCommand) {
-    emitCliError(msg, command);
+function fail(msg, command = activeCanonicalCommand, options = {}) {
+    emitCliError(msg, command, options);
     throw new CommandError();
+}
+
+/** Fail with an execute() error: refusals are rendered for the CLI, internal errors kept verbatim. */
+function failExecution(execution) {
+    if (execution.internalError) fail(execution.error, activeCanonicalCommand, { internal: true });
+    fail(formatSurfaceMessage(execution.error, 'cli'));
+}
+
+/** Report an exception caught outside execute(). */
+function emitCaughtError(e) {
+    const described = describeError(e);
+    emitCliError(described.internalError ? described.error : `Error: ${described.error}`,
+        activeCanonicalCommand, { internal: !!described.internalError });
 }
 
 // ============================================================================
@@ -607,7 +628,7 @@ function main() {
         }
     } catch (e) {
         if (!(e instanceof CommandError)) {
-            emitCliError(`Error: ${e.message}`);
+            emitCaughtError(e);
         }
         process.exitCode = flags.json ? 1 : 2;
     }
@@ -717,8 +738,8 @@ function runFileCommand(filePath, command, arg) {
     warnInapplicableFlags(canonical, scopedFlags, (message) => console.error(message));
     const params = buildPublicParams(canonical, arg, scopedFlags);
     const execution = execute(index, canonical, params);
-    const { ok, result, error } = execution;
-    if (!ok) fail(formatSurfaceMessage(error, 'cli'));
+    const { ok, result } = execution;
+    if (!ok) failExecution(execution);
     emitCliText(flags.json
         ? output.formatPublicJson(canonical, result, params, {
             ...execution, surface: 'cli',
@@ -799,7 +820,7 @@ function runProjectCommand(rootDir, command, arg) {
     });
     const publicExecution = execute(index, canonical, publicParams);
     if (!publicExecution.ok) {
-        fail(formatSurfaceMessage(publicExecution.error, 'cli'));
+        failExecution(publicExecution);
     }
     emitCliText(flags.json
         ? output.formatPublicJson(canonical, publicExecution.result, publicParams, {
@@ -813,7 +834,7 @@ function runProjectCommand(rootDir, command, arg) {
         resultExitCode(canonical, publicExecution.result));
     } catch (e) {
         if (!(e instanceof CommandError)) {
-            emitCliError(`Error: ${e.message}`);
+            emitCaughtError(e);
         }
         process.exitCode = flags.json ? 1 : 2;
     } finally {
@@ -822,7 +843,7 @@ function runProjectCommand(rootDir, command, arg) {
         // On cache-hit runs, only re-save if callsCache was mutated OR
         // reachability was computed (MED-1: persists the BFS result so
         // subsequent cold invocations don't repeat the 7-11s tax).
-        if (flags.cache && (needsCacheSave || index.callsCacheDirty || index.reachabilityDirty || index.computedDispatchDirty)) {
+        if (flags.cache && (needsCacheSave || index.callsCacheDirty || index.reachabilityDirty || index.computedDispatchDirty || index.macroExpansionDirty)) {
             try { index.saveCache(); } catch (e) { /* best-effort */ }
         }
         if (flags.cache && index.usageCacheDirty) {
@@ -866,7 +887,7 @@ function runGlobCommand(pattern, command, arg) {
     const publicParams = buildPublicParams(canonical, arg, flags);
     const publicExecution = execute(index, canonical, publicParams);
     if (!publicExecution.ok) {
-        fail(formatSurfaceMessage(publicExecution.error, 'cli'));
+        failExecution(publicExecution);
     }
     emitCliText(flags.json
         ? output.formatPublicJson(canonical, publicExecution.result, publicParams, {
@@ -906,7 +927,10 @@ Commands:
   show <symbol>                   Symbol summary and relationships
     --sections=summary,callers,callees,source,dependencies,tests,types,example,related
   find <name>                     Definitions; --type=type, --with-source
-  usages <name>                   Calls, imports, definitions, references
+    text: top 5 in detail + a count of the rest; --json: up to 500;
+    --limit=N raises both
+  usages <name>                   Calls, imports, definitions, references (test files
+                                  included; --exclude-tests hides them with a count)
   search [term]                   Text or structural search
     literal text by default; --regex enables regular-expression syntax
   source <symbol|file:range>      Exact function, class, or line extraction
@@ -1045,7 +1069,7 @@ function runInteractive(rootDir) {
 Commands:
   repo                   Repository overview (--sections=files,stats,health)
   show <name>            Symbol summary + relationships (--sections=...)
-  find <name>            Find definitions (--type=type, --with-source)
+  find <name>            Find definitions (--type=type, --with-source; top 5 shown, --limit=N)
   usages <name>          All usages grouped by type
   source <target>        Extract a symbol or file:line-range
   trace <name>           Call tree (--direction=callees|callers, --to=entrypoints)
@@ -1155,7 +1179,8 @@ Flags can be added per-command: show myFunc --sections=source,callers
             if (e instanceof FlagValidationError) {
                 console.log(e.message);
             } else {
-                console.error(`Error: ${e.message}`);
+                const described = describeError(e);
+                console.error(described.internalError ? described.error : `Error: ${described.error}`);
             }
         }
 
@@ -1177,7 +1202,8 @@ function executeInteractiveCommand(index, command, arg, iflags = {}) {
     const publicParams = buildPublicParams(command, arg, iflags);
     const publicExecution = execute(index, command, publicParams);
     if (!publicExecution.ok) {
-        console.log(formatSurfaceMessage(publicExecution.error, 'cli'));
+        console.log(publicExecution.internalError ? publicExecution.error
+            : formatSurfaceMessage(publicExecution.error, 'cli'));
         return;
     }
     console.log(formatCliText(

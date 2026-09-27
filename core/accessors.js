@@ -45,6 +45,34 @@ function accessKind(tree, usage) {
     return 'read';
 }
 
+// How an occurrence without a simple receiver touches a property (fix #397):
+// 'member' (the property of a longer member chain, `this.ctx.body`),
+// { pattern: true, thisSource } (a destructuring key, `const { body } =
+// this`, which reads the property from the source), or 'none' (a bare
+// variable, an object-literal key: never a property access). null when the
+// token cannot be located.
+const MEMBER_ACCESS_TYPES = new Set(['attribute', 'member_expression', 'member_access_expression',
+    'field_expression', 'selector_expression', 'field_access']);
+function receiverlessShape(tree, usage) {
+    if (!tree || !Number.isInteger(usage.column)) return null;
+    const node = tree.rootNode.descendantForPosition({ row: usage.line - 1, column: usage.column });
+    if (!node) return null;
+    const parent = node.parent;
+    if (MEMBER_ACCESS_TYPES.has(parent?.type) && node.startIndex > parent.startIndex) return 'member';
+    let key = null;
+    if (node.type === 'shorthand_property_identifier_pattern') key = node;
+    else if (parent?.type === 'pair_pattern' && parent.childForFieldName('key')?.startIndex === node.startIndex) key = node;
+    if (key) {
+        let pattern = key.parent;
+        if (pattern?.type === 'pair_pattern' || pattern?.type === 'object_assignment_pattern') pattern = pattern.parent;
+        const holder = pattern?.type === 'object_pattern' ? pattern.parent : null;
+        const source = holder?.type === 'variable_declarator' ? holder.childForFieldName('value') : null;
+        return { pattern: true, thisSource: source?.type === 'this',
+            shorthand: key.type === 'shorthand_property_identifier_pattern' };
+    }
+    return 'none';
+}
+
 // Descriptors/properties are consumed through reads and writes, not only
 // call syntax. Keep this vocabulary shared by impact and refactoring so the
 // two commands cannot disagree about whether a selected symbol is an accessor.
@@ -61,6 +89,8 @@ function isAccessorDefinition(definition) {
 
 function ownerName(definition) {
     if (definition.className) return definition.className;
+    // An object-literal accessor's owner is the literal (fix #397).
+    if (definition.objectLiteralLine && definition.registryContainer) return definition.registryContainer;
     if (!definition.receiver) return null;
     return String(definition.receiver)
         .replace(/^[*&]\s*/, '')
@@ -89,11 +119,19 @@ function typeMatchesOwner(index, typeName, contextFile, owner, ownerFile) {
         path.resolve(ownerDefs[0].file) === path.resolve(ownerFile);
 }
 
+// Members of the same object literal (fix #397): `this` in one names the
+// object the literal builds (or an object inheriting from it).
+function sameObjectLiteral(a, b) {
+    return !!a && !!b && !!a.objectLiteralLine && a.objectLiteralLine === b.objectLiteralLine &&
+        a.file === b.file;
+}
+
 function insideSelectedAccessorBody(index, name, definition, file, line) {
     return (index.symbols.get(name) || []).some(candidate =>
         isAccessorDefinition(candidate) &&
         candidate.file === definition.file &&
         candidate.className === definition.className &&
+        (candidate.objectLiteralLine || null) === (definition.objectLiteralLine || null) &&
         file === candidate.file &&
         line >= candidate.startLine &&
         line <= (candidate.endLine || candidate.startLine));
@@ -134,9 +172,15 @@ function findAccessorReferences(index, name, definition, options = {}) {
         const lines = content.split('\n');
         for (const usage of occurrences) {
             if (usage.usageType !== 'reference') continue;
+            let shape = null;
+            if (!usage.receiver) {
+                shape = receiverlessShape(tree, usage);
+                if (shape === 'none') continue;
+            }
             refs.push({
                 ...usage,
-                accessKind: accessKind(tree, usage),
+                ...(shape?.pattern && { patternKey: shape, ...(shape.thisSource && { receiver: 'this' }) }),
+                accessKind: shape?.pattern ? 'read' : accessKind(tree, usage),
                 file,
                 relativePath: entry.relativePath,
                 content: lines[usage.line - 1] || '',
@@ -154,6 +198,7 @@ function findAccessorReferences(index, name, definition, options = {}) {
             accessKind: ref.accessKind,
             ...(Number.isInteger(ref.column) && { column: ref.column }),
             ...(ref.receiver && { receiver: ref.receiver }),
+            ...(ref.patternKey && { patternKey: { shorthand: !!ref.patternKey.shorthand } }),
         };
 
         // A backing-store attribute inside the selected getter/setter body
@@ -168,7 +213,9 @@ function findAccessorReferences(index, name, definition, options = {}) {
         const enclosing = index.findEnclosingFunction(ref.file, ref.line, true);
         const receiver = ref.receiver || null;
         if (receiver && ['self', 'cls', 'this'].includes(receiver) &&
-            ((enclosing?.className === owner && enclosing.file === definition.file) ||
+            ((definition.className && enclosing?.className === owner &&
+                enclosing.file === definition.file) ||
+                (!definition.className && sameObjectLiteral(enclosing, definition)) ||
                 inheritedAccessor(index, enclosing, name, definition))) {
             confirmed.push({
                 ...shaped,

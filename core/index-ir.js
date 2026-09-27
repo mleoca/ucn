@@ -27,6 +27,7 @@ function createImportBindings(imports) {
                 ...(item.defaultLike && { defaultLike: true }),
                 ...(item.deferred && { deferred: true }),
                 ...(item.dynamic && { dynamic: true }),
+                ...(item.namespace && { namespace: item.namespace }),
             };
         }));
 }
@@ -63,6 +64,12 @@ function createFileEntryFromIR({
             ...(item.line != null && { line: item.line }),
             ...(item.deferred && { deferred: true }),
             ...(item.deferredReason && { deferredReason: item.deferredReason }),
+            // C# using directives (fix #395): the namespace the directive
+            // sits in (its name resolves from there), `using static`, and
+            // `global using`.
+            ...(item.namespace && { namespace: item.namespace }),
+            ...(item.static && { static: true }),
+            ...(item.global && { global: true }),
         })),
         globalImports: imports.filter(item => item.global).map(item => item.module),
         importNames: imports.flatMap(item => item.names || []),
@@ -73,10 +80,38 @@ function createFileEntryFromIR({
         bindings: [],
         dynamicImports: ir.dynamicImports || 0,
         ...(ir.diagnostics?.parseRecovery && { parseRecovery: true }),
+        ...(ir.diagnostics?.parseErrorRegions?.length > 0 && {
+            parseErrorRegions: ir.diagnostics.parseErrorRegions,
+        }),
         ...(ir.importAliases && { importAliases: ir.importAliases }),
         ...(ir.moduleAssignedNames?.length > 0 && {
             moduleAssignedNames: ir.moduleAssignedNames,
         }),
+        ...(ir.asyncClosureNames?.length > 0 && {
+            asyncClosureNames: ir.asyncClosureNames,
+        }),
+        ...(Array.isArray(ir.openCalls) && { openCalls: ir.openCalls }),
+        ...(ir.typeConversions?.length > 0 && {
+            typeConversions: ir.typeConversions,
+        }),
+        ...(ir.reflectionSites?.length > 0 && {
+            reflectionSites: ir.reflectionSites,
+        }),
+        ...(ir.macroScopeMarkers?.length > 0 && {
+            macroScopeMarkers: ir.macroScopeMarkers,
+        }),
+        ...(ir.cppUsings?.length > 0 && {
+            cppUsings: ir.cppUsings,
+        }),
+        ...(ir.languageFeatures?.length > 0 && {
+            languageFeatures: ir.languageFeatures,
+        }),
+        ...(Array.isArray(ir.conditionalViews) && { conditionalViews: ir.conditionalViews }),
+        ...(ir.packageName && { packageName: ir.packageName }),
+        ...(ir.moduleValueAliases?.length > 0 && { moduleValueAliases: ir.moduleValueAliases }),
+        ...(Array.isArray(ir.recoveryBlanks) && { recoveryBlanks: ir.recoveryBlanks }),
+        ...(Array.isArray(ir.recoveryCandidates) && { recoveryCandidates: ir.recoveryCandidates }),
+        ...(Array.isArray(ir.externalMacroNames) && { externalMacroNames: ir.externalMacroNames }),
         ...(isBundled && { isBundled: true }),
         ...(isGenerated && { isGenerated: true }),
     };
@@ -85,20 +120,25 @@ function createFileEntryFromIR({
 const OPTIONAL_SYMBOL_FIELDS = Object.freeze([
     'returnedFunctionResult', 'isFunctionVariable', 'paramTypes', 'isAsync',
     'isGenerator', 'generics', 'ownerGenerics', 'genericBounds', 'extends', 'implements', 'indent', 'isNested',
-    'enclosingType', 'isMethod', 'receiver', 'memberType', 'fieldType',
-    'aliasOf', 'aliasMembers', 'aliasTypeText', 'aliasTypeParameters', 'aliasTypeDefaults', 'derefTarget', 'decorators', 'decoratorsWithArgs',
+    'enclosingType', 'isMethod', 'receiver', 'memberType', 'fieldType', 'embedded',
+    'aliasOf', 'aliasQualifier', 'aliasMembers', 'aliasTypeText', 'aliasTypeParameters', 'aliasTypeDefaults', 'derefTarget', 'decorators', 'decoratorsWithArgs',
     'annotationsWithArgs', 'attributesWithArgs', 'nameLine', 'traitImpl',
-    'traitName', 'isSignature', 'memberAssigned', 'assignedReceiver', 'bodyScopedName',
-    'registryMember', 'registryContainer', 'namespace',
+    'traitName', 'isSignature', 'memberAssigned', 'assignedReceiver', 'assignedObject', 'selfNamed', 'bodyScopedName',
+    'registryMember', 'registryContainer', 'registryContainerType', 'objectLiteralLine', 'namespace',
     'isExtensionMethod', 'extensionReceiver', 'explicitInterface',
     'lexicalScopeStartLine', 'lexicalScopeEndLine',
-    'returnTypeQualifier', 'macroNeverReturns', 'callbackParamTypes', 'iteratorItemType',
+    'returnTypeQualifier', 'returnTypeResolved', 'supertraits', 'ownerGenericBounds', 'ownerSelfArgs', 'implSelfRef', 'implSelfQualifier', 'blanketSelfBounds', 'selfParamKind', 'macroNeverReturns', 'callbackParamTypes', 'iteratorItemType', 'futureReturn',
     'returnedConcreteType', 'returnedConstructors', 'templateDependent',
     'returnedCallStart', 'returnedCallEnd',
-    'returnedReceiverPath',
+    'returnedReceiverPath', 'valueType',
     'isSpecialization',
     'linkage', 'functionLike', 'callableAlias', 'exportedAlias',
     'aliasOwner', 'aliasMember', 'callableTarget', 'macroParamEffects',
+    'namespaceScope', 'ppParams', 'ppVariadic', 'ppBody', 'ppConditional', 'languageBranch', 'macroExpansion', 'macroScope', 'accessAfterMacro', 'ppBranch',
+    'generatedByMacro',
+    'typeArity', 'ownerTypeArity',
+    'annotationType', 'valueShape', 'friendOf', 'templateParams', 'delegateParams',
+        'typedefName',
 ]);
 
 function materializeSymbol(fileEntry, item) {

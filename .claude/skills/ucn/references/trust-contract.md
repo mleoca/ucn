@@ -4,7 +4,7 @@ Use this reference when an agent, CI job, or script will make decisions from UCN
 
 ## Evidence classes
 
-`confirmed` means UCN found positive identity evidence such as an exact binding, a same-class target, a validated receiver type, or an owned import/export chain. It does not mean the edge has a calibrated probability.
+`confirmed` means UCN found positive identity evidence such as an exact binding, a target on the same class definition (a same-name class in another module does not count), a validated receiver type, or an owned import/export chain. It does not mean the edge has a calibrated probability.
 
 `unverified` means a syntactic candidate could reach the target but identity could not be established. Preserve and expose these edges. Do not silently treat them as negatives.
 
@@ -12,7 +12,7 @@ Use this reference when an agent, CI job, or script will make decisions from UCN
 
 `non-call` means the literal name occurred as a definition, import, type reference, property, comment/string, or other text. Use `usages` for the underlying sites; comment/string occurrences appear under `OTHER TEXT` unless `codeOnly=true`.
 
-`beyond-text` means semantic binding or alias evidence produced an edge that a literal-name ground set could not observe.
+`beyond-text` means semantic binding or alias evidence produced an edge that a literal-name ground set could not observe. A reflective access whose member name is built at runtime from literal fragments (`getattr(self, "_get_%s_perms" % src)`) is also beyond text: it is listed as an unverified caller with reason `reflection-pattern` and the pattern, never confirmed. A Java single-element annotation (`@Marker("x")`) sets the element `value` without naming it: it is listed as an unverified caller of that element with reason `annotation-shorthand`, and `plan` names the element there when the annotation type resolves.
 
 ## Conservation scope
 
@@ -22,7 +22,7 @@ Required automation checks:
 
 1. `account.conserved` is true.
 2. `account.contract.textComplete` is true.
-3. No unreadable or unparsed files are reported.
+3. No unreadable or unparsed files are reported, and no ground line sits in a syntax-error recovery region (`account.recovered`, WARNING line).
 4. No contract metadata was lost to truncation.
 5. Unverified and excluded reasons are retained for review.
 6. Compiler/LSP evaluation reports keep configuration-unscored evidence below the release ceiling; a high-precision result from an undersized scored subset is not accepted.
@@ -58,7 +58,11 @@ The performance gate runs each pinned repository in three independent processes 
 ## Truncation
 
 CLI and MCP text share the same 10K targeted / 3K broad default budgets and
-100K ceiling. CLI truncation appends preserved contract lines directly. MCP
+100K ceiling. Room for every trust line (ACCOUNT, CONTRACT, WARNING, FILTERED,
+CALLEE ACCOUNT, TREE ACCOUNT) is reserved before any body text, and truncation
+appends the ones the kept body does not show. A limit that cannot hold them
+withholds the answer: the text states how many trust lines it shows and the
+budget that carries all of them, and never shows body text without them. MCP
 results may additionally include:
 
 ```json
@@ -85,5 +89,7 @@ Allow an automated change to proceed to compiler/tests only when:
 
 Never auto-delete from a UCN-only signal. Computed dispatch is reported as a
 health blind spot, and modeled registry members are withheld from candidates,
-but neither protection proves runtime reachability. Require usages, entry-point
+but neither protection proves runtime reachability. C/C++ token-pasting macro
+invocations and Rust `macro_rules!` invocations that cannot be expanded are
+reported the same way. Require usages, entry-point
 review, public API review, and external validation.

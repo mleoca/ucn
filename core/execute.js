@@ -17,6 +17,7 @@ const { cleanHtmlScriptTags, detectLanguage } = require('./parser');
 const { renderExpandItem } = require('./expand-cache');
 const { CANONICAL_COMMANDS } = require('./registry');
 const { isAccessorDefinition } = require('./accessors');
+const { describeError } = require('./errors');
 
 // ============================================================================
 // HELPERS
@@ -1129,7 +1130,7 @@ const HANDLERS = {
             addMode(result, 'diff');
             return { ok: true, result };
         } catch (e) {
-            return { ok: false, error: e && e.message ? e.message : String(e) };
+            return { ok: false, ...describeError(e) };
         }
     },
 
@@ -1280,17 +1281,18 @@ const HANDLERS = {
         applyClassMethodSyntax(p);
         const inErr = validateInFilter(index, p.in);
         if (inErr) return { ok: false, error: inErr };
-        const exclude = applyTestExclusions(p.exclude, p.includeTests);
+        // The literal-name inventory lists every line the ACCOUNT counts,
+        // test files included (fix #394); --exclude-tests hides them with a
+        // disclosed count.
+        const exclude = applyTestExclusions(p.exclude, !p.excludeTests);
         const fileErr = checkFilePatternMatch(index, p.file);
         if (fileErr) return { ok: false, error: fileErr };
         if (p.className) {
             const classErr = validateClassName(index, p.name, p.className);
             if (classErr) return { ok: false, error: classErr };
         }
-        // Scan once WITHOUT the default test exclusion, then filter in the
-        // handler — the hidden count must be VISIBLE (fix #234, campaign
-        // G2-java: usages silently hid test-file usages while search noted
-        // them — a silently incomplete answer from the raw escape hatch).
+        // Scan once WITHOUT the test exclusion, then filter in the handler —
+        // the hidden count must be VISIBLE (fix #234).
         // Normalize the user's exclude first (fix #239): MCP delivers a CSV
         // STRING, and matchesFilters iterates its CHARACTERS — exclude=test
         // emptied every TypeScript project ('t' matched the .ts extension).
@@ -1312,7 +1314,7 @@ const HANDLERS = {
         if (exclude.length !== userExclude.length && Array.isArray(unfiltered)) {
             result = unfiltered.filter(u => index.matchesFilters(u.relativePath, { exclude }));
             const hidden = unfiltered.length - result.length;
-            if (hidden > 0) notes.push(`${hidden} test-file usage(s) hidden by default — pass --include-tests to include them.`);
+            if (hidden > 0) notes.push(`${hidden} test-file usage(s) hidden by --exclude-tests; omit it to list them.`);
         }
         // Apply limit to total usages (result is a flat array). usages is the
         // escape-hatch listing (fix #284): only an EXPLICIT limit caps it; the
@@ -2551,7 +2553,9 @@ function execute(index, command, params = {}) {
         }
         return response;
     } catch (e) {
-        return { ok: false, error: e.message };
+        // A deliberate refusal keeps its message; an exception inside the
+        // engine is marked internal on every surface (fix #394).
+        return { ok: false, ...describeError(e) };
     }
 }
 

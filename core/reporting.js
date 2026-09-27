@@ -220,14 +220,37 @@ function getStats(index, options = {}) {
             }
             return ranges.length > 0 && lineInRanges(line, ranges);
         };
-        for (const [filePath, entry] of index.callsCache) {
-            if (!scopedPaths.has(filePath)) continue;
+        // Files whose callers can COUNT (fix #365). The exact count below
+        // keeps only callers in scope, outside bundles, and - for a
+        // production-only ranking - outside test files, so records elsewhere
+        // can never raise a definition's count: they leave the bound, and
+        // the exact passes never scan them (every per-site verdict is
+        // file-local). Orientation on django spent most of its time
+        // resolving the test suite's calls, which it then discarded.
+        const { isTestPath } = require('./shared');
+        const countableFile = (filePath) => {
+            if (!scopedPaths.has(filePath)) return false;
             const fileEntry = index.files.get(filePath);
-            if (fileEntry?.isBundled) continue;
+            if (!fileEntry || fileEntry.isBundled) return false;
+            return !options.productionCallsOnly || !isTestPath(fileEntry.relativePath || filePath);
+        };
+        const countableFiles = new Set([...index.files.keys()].filter(countableFile));
+        // Call records per name in the countable files: what one exact
+        // refinement of that name scans (the HOT work unit, fix #382).
+        const recordsByName = new Map();
+        // The bound must count calls macro expansions generate (fix #374).
+        require('./rust-macro-expansion').materializeRustMacroCalls(index);
+        for (const [filePath, entry] of index.callsCache) {
+            if (!countableFiles.has(filePath)) continue;
+            const fileEntry = index.files.get(filePath);
             if (!entry || !Array.isArray(entry.calls)) continue;
             const seenInFile = new Set();
             for (const c of entry.calls) {
                 if (!c || !c.name) continue;
+                recordsByName.set(c.name, (recordsByName.get(c.name) || 0) + 1);
+                if (c.resolvedName && c.resolvedName !== c.name) {
+                    recordsByName.set(c.resolvedName, (recordsByName.get(c.resolvedName) || 0) + 1);
+                }
                 if (receiverProvablyExternal(filePath, fileEntry, c)) continue;
                 if (options.productionCallsOnly && inInlineTest(filePath, c.line)) continue;
                 // Distinct receiver types on one line can confirm DIFFERENT
@@ -252,6 +275,16 @@ function getStats(index, options = {}) {
         }
         const ownerOf = (symbol) => normalizeTypeName(symbol.className || symbol.receiver || '');
 
+        // One HOT entry per callable IDENTITY (fix #382). The caller engine
+        // closes a pinned definition over its identity group (overload
+        // signatures with their implementation, C/C++ prototypes with their
+        // definitions, C++ specializations with their primary template), so
+        // definitions whose closed groups are the same set answer the same
+        // query: HOT listed a Python @overload stub pair beside the
+        // implementation and each TS overload signature of `h` with one
+        // count. Members of one closed set collapse into one entry, shown at
+        // its first implementation (else its first declaration).
+        const { _closeCallableIdentityGroup } = require('./callers');
         const candidates = [];
         const seenDefinitions = new Set();
         for (const [name, symbols] of index.symbols) {
@@ -262,6 +295,7 @@ function getStats(index, options = {}) {
                 FUNCTION_TYPES.has(symbol.type) &&
                 matchesReportingScope(index, symbol.relativePath, options));
             const definers = new Set(callable.map(ownerOf).filter(Boolean));
+            const eligible = [];
             for (const symbol of callable) {
                 let upper = untyped;
                 if (typedByClass) {
@@ -271,14 +305,6 @@ function getStats(index, options = {}) {
                     }
                 }
                 if (upper === 0) continue;
-                // Fair share of the name's ceiling: a name shared by 278
-                // methods cannot make all 278 hot, so a definition's likely
-                // count is nearer upper/definers than upper. Ordering by the
-                // share puts the genuinely hot definitions first; the early
-                // stop below still uses the exact remaining ceiling, so the
-                // exact answer is unchanged and only a bounded refinement
-                // (`maxRefine`) benefits from the order.
-                const share = upper / Math.max(1, callable.length);
                 if (index.files.get(symbol.file)?.isBundled) continue;
                 if (options.productionCallsOnly &&
                     (require('./shared').isTestPath(symbol.relativePath) ||
@@ -287,63 +313,159 @@ function getStats(index, options = {}) {
                     `${symbol.className || symbol.receiver || ''}:${symbol.params || ''}`;
                 if (seenDefinitions.has(identity)) continue;
                 seenDefinitions.add(identity);
-
-                // A linked C/C++ prototype and implementation close to the
-                // same compiler identity. Show the implementation once.
-                if (symbol.isSignature && callable.some(candidate =>
-                    !candidate.isSignature &&
-                    (candidate.className || candidate.receiver || null) ===
-                        (symbol.className || symbol.receiver || null) &&
-                    (index.importGraph.get(candidate.file)?.has(symbol.file) ||
-                        index.importGraph.get(symbol.file)?.has(candidate.file)))) {
-                    continue;
+                eligible.push({ name, symbol, upper });
+            }
+            // Groups close only over a signature or a C++ template
+            // specialization; names with neither keep one entry per
+            // definition without asking.
+            const grouped = eligible.length > 1 && symbols.some(definition =>
+                definition.isSignature || definition.isSpecialization || definition.templateDependent);
+            if (!grouped) {
+                candidates.push(...eligible);
+                continue;
+            }
+            // Entries whose closures reach each other are one entity (a C
+            // prototype closes over every definition of its linkage, each
+            // definition over the prototypes). The entity is counted through
+            // a member whose closure covers all of it (the implementation
+            // when it does, else the declaration), so the count is the
+            // entity's; without such a member, each distinct closure keeps
+            // its own entry.
+            const closures = eligible.map(entry =>
+                new Set(_closeCallableIdentityGroup(index, [entry.symbol], symbols)));
+            const parent = eligible.map((entry, i) => i);
+            const find = i => (parent[i] === i ? i : (parent[i] = find(parent[i])));
+            for (let i = 0; i < eligible.length; i++) {
+                for (let j = i + 1; j < eligible.length; j++) {
+                    if (closures[i].has(eligible[j].symbol) || closures[j].has(eligible[i].symbol)) {
+                        parent[find(j)] = find(i);
+                    }
                 }
-                candidates.push({ name, symbol, upper, share });
+            }
+            const components = new Map(); // root -> entry indexes in symbol order
+            for (let i = 0; i < eligible.length; i++) {
+                const root = find(i);
+                if (!components.has(root)) components.set(root, []);
+                components.get(root).push(i);
+            }
+            const position = new Map(symbols.map((definition, i) => [definition, i]));
+            for (const members of components.values()) {
+                const covering = members.filter(i =>
+                    members.every(j => closures[i].has(eligible[j].symbol)));
+                const groups = covering.length > 0 ? [covering] : [...members.reduce((byKey, i) => {
+                    const key = [...closures[i]].map(definition => position.get(definition))
+                        .sort((a, b) => a - b).join(',');
+                    if (!byKey.has(key)) byKey.set(key, []);
+                    byKey.get(key).push(i);
+                    return byKey;
+                }, new Map()).values()];
+                for (const group of groups) {
+                    const shown = group.find(i => !eligible[i].symbol.isSignature) ?? group[0];
+                    candidates.push({
+                        ...eligible[shown],
+                        upper: Math.max(...(covering.length > 0 ? members : group).map(i => eligible[i].upper)),
+                    });
+                }
             }
         }
         const maxRefine = Number.isInteger(options.maxRefine) && options.maxRefine > 0
             ? options.maxRefine : Infinity;
-        // Exact mode walks the ceilings in descending order so the early stop
-        // fires as soon as possible; a bounded refinement walks fair shares so
-        // the budget lands on the definitions most likely to be hot.
+        // Refinement work is bounded by call records, not wall time, so the
+        // answer is the same on every run and machine (fix #382). One
+        // refinement scans the call records of its name in the countable
+        // files; `workBudget` caps their sum. Exact answers on real projects
+        // stay far below it; a very large repository (kubernetes: ~68M
+        // records under its candidate ceilings) stops and says so.
+        const workBudget = Number.isFinite(options.workBudget) && options.workBudget > 0
+            ? options.workBudget : STATS_HOT_WORK_BUDGET;
+        const workOf = candidate => recordsByName.get(candidate.name) || 0;
+        // Ceilings in descending order: the early stop fires as soon as no
+        // unseen ceiling can reach the current Nth count, so exactly the
+        // candidates able to enter the top N are refined.
         candidates.sort((a, b) =>
-            (maxRefine !== Infinity ? (b.share - a.share) : 0) ||
             (b.upper - a.upper) ||
             codeUnitCompare(a.symbol.relativePath, b.symbol.relativePath) ||
             (a.symbol.startLine || 0) - (b.symbol.startLine || 0));
-        // Suffix maximum of the exact ceilings: once no unseen candidate can
-        // beat the current Nth result, the answer is exact regardless of order.
-        const remainingUpper = new Array(candidates.length + 1).fill(-1);
-        for (let i = candidates.length - 1; i >= 0; i--) {
-            remainingUpper[i] = Math.max(candidates[i].upper, remainingUpper[i + 1]);
-        }
+        // Ceiling order is the cheapest exact walk. When the budget binds
+        // first, the ceiling walk has spent it on the definitions of a few
+        // names shared by hundreds of types (every `String`, `Name`,
+        // generated `DeepCopyInto` carries its whole name's ceiling), so a
+        // second budget walks the rest in fair-share order (ceiling per
+        // same-name candidate) and the approximate list spans many names.
+        // Exactness is proven the same way in both walks: no unrefined
+        // ceiling can reach the current Nth count.
+        const fairShareOrder = () => {
+            const definitionsOf = new Map();
+            for (const candidate of candidates) {
+                definitionsOf.set(candidate.name, (definitionsOf.get(candidate.name) || 0) + 1);
+            }
+            return candidates.map((candidate, i) => i).sort((a, b) =>
+                (candidates[b].upper / definitionsOf.get(candidates[b].name)) -
+                    (candidates[a].upper / definitionsOf.get(candidates[a].name)) || a - b);
+        };
+        const completionBudget = Number.isFinite(workBudget)
+            ? Math.floor(workBudget * HOT_COMPLETION_BUDGET_SHARE) : 0;
 
         const hotList = [];
         const { findCallers } = require('./callers');
         const scopedCallerQuery = !!(options.file || options.in ||
             (options.exclude && options.exclude.length > 0));
         let refined = 0;
+        let work = 0;
+        // One test-path verdict per caller file (fix #382: asked per caller
+        // of every refinement).
+        const testPathMemo = new Map();
+        const testPath = (file) => {
+            let verdict = testPathMemo.get(file);
+            if (verdict === undefined) {
+                verdict = require('./shared').isTestPath(file);
+                testPathMemo.set(file, verdict);
+            }
+            return verdict;
+        };
         let budgetExhausted = false;
+        const topCounts = []; // the `top` largest counts so far, descending
+        const done = new Uint8Array(candidates.length);
+        let ceilingHead = 0; // first candidate in ceiling order not refined
         // One operation scope for the whole refinement loop (fix #340): the
         // per-file derivations findCallers builds are shared across candidates.
         if (top > 0) index._beginOp();
         try {
         if (top > 0) {
-            for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex++) {
+            let order = null; // null = ceiling order
+            let limit = workBudget;
+            let exact = false;
+            for (let step = 0; step < candidates.length && !exact;) {
+                const candidateIndex = order ? order[step] : step;
+                step++;
+                if (done[candidateIndex]) continue;
                 if (refined >= maxRefine) { budgetExhausted = true; break; }
+                if (work >= limit) {
+                    budgetExhausted = true;
+                    if (order || completionBudget === 0) break;
+                    // Ceiling budget spent: complete in fair-share order.
+                    order = fairShareOrder();
+                    limit = work + completionBudget;
+                    step = 0;
+                    continue;
+                }
                 const { name, symbol } = candidates[candidateIndex];
-                const exact = findCallers(index, name, {
+                const callers = findCallers(index, name, {
                     targetDefinitions: [symbol],
                     includeTests: true,
                     collectAccount: true,
+                    ...(countableFiles.size < index.files.size && { candidateFiles: countableFiles }),
                 });
                 refined++;
-                const count = exact.filter(caller =>
+                work += workOf(candidates[candidateIndex]);
+                done[candidateIndex] = 1;
+                while (ceilingHead < candidates.length && done[ceilingHead]) ceilingHead++;
+                const count = callers.filter(caller =>
                     caller.tier !== 'unverified' &&
                     (!scopedCallerQuery || scopedPaths.has(caller.file)) &&
                     !index.files.get(caller.file)?.isBundled &&
                     (!options.productionCallsOnly ||
-                        (!require('./shared').isTestPath(caller.relativePath || caller.file) &&
+                        (!testPath(caller.relativePath || caller.file) &&
                             !inInlineTest(caller.file, caller.line)))).length;
                 if (count > 0) {
                     const owner = symbol.className ||
@@ -356,16 +478,22 @@ function getStats(index, options = {}) {
                         callCount: count,
                         evidence: 'confirmed-callers',
                     });
+                    // The stop test needs only the top-th largest count;
+                    // the full list is sorted once below (fix #365: sorting
+                    // it per refinement was quadratic in refinements).
+                    let at = topCounts.length;
+                    while (at > 0 && topCounts[at - 1] < count) at--;
+                    if (at < top) {
+                        topCounts.splice(at, 0, count);
+                        if (topCounts.length > top) topCounts.pop();
+                    }
                 }
-                hotList.sort((a, b) =>
-                    (b.callCount - a.callCount) ||
-                    codeUnitCompare(a.file, b.file) ||
-                    (a.startLine || 0) - (b.startLine || 0));
-                if (hotList.length >= top) {
-                    const threshold = hotList[top - 1].callCount;
-                    if (remainingUpper[candidateIndex + 1] < threshold) break;
-                }
+                // Exact once no unrefined ceiling can reach the Nth count
+                // (the highest unrefined ceiling is the ceiling-order head).
+                if (topCounts.length >= top && (ceilingHead >= candidates.length ||
+                    candidates[ceilingHead].upper < topCounts[top - 1])) exact = true;
             }
+            if (exact) budgetExhausted = false;
         }
         } finally { if (top > 0) index._endOp(); }
 
@@ -382,7 +510,10 @@ function getStats(index, options = {}) {
             totalKind: refined === candidates.length ? 'confirmed' : 'raw-call-candidates',
             refined,
             items: hotList.slice(0, top),
-            ...(budgetExhausted && { budgetExhausted: true, maxRefine }),
+            ...(budgetExhausted && {
+                budgetExhausted: true,
+                ...(refined >= maxRefine ? { maxRefine } : { workBudget, work }),
+            }),
             note: refined === candidates.length
                 ? 'Counts are confirmed caller-engine edges pinned to each displayed definition; unverified dispatch is excluded.'
                 : `Displayed counts are exact confirmed caller-engine edges; ${candidates.length} raw candidates were bounded and ${refined} required exact refinement.`,
@@ -700,6 +831,37 @@ function doctor(index, options = {}) {
     }
     fileCounts.skipped = blindSpots.skippedSources.fileCount;
 
+    // C/C++ token-pasting macro invocations whose expansion cannot be
+    // computed (fix #362). Deep mode only: it reads the calls of every
+    // C/C++ file.
+    if (options.deep && [...index.files.values()].some(fe => langTraits(fe.language)?.textualIncludes)) {
+        const { macroExpansionSummary } = require('./macro-expansion');
+        const summary = macroExpansionSummary(index);
+        blindSpots.macroPasteDispatch = {
+            count: summary.blind.count,
+            fileCount: summary.blind.fileCount,
+            files: summary.blind.files,
+            expandedSites: summary.sites,
+            unexpandedPatterns: summary.patterns.length,
+        };
+    }
+
+    // Rust macro_rules! invocations of project macros that could not be
+    // expanded (fix #374): read from the persisted per-file records.
+    if ([...index.files.values()].some(fe => fe.rustMacroExpansion)) {
+        const { rustMacroExpansionSummary } = require('./rust-macro-expansion');
+        const summary = rustMacroExpansionSummary(index);
+        if (summary.sites > 0 || summary.blind.count > 0) {
+            blindSpots.macroRulesExpansion = {
+                count: summary.blind.count,
+                fileCount: summary.blind.fileCount,
+                files: summary.blind.files,
+                expandedSites: summary.sites,
+                ...(summary.blind.reasons && { reasons: summary.blind.reasons }),
+            };
+        }
+    }
+
     // Evidence profile — sampled only in deep mode. This is deliberately NOT
     // called "accuracy" or "coverage": it describes how UCN classified edges
     // it found. Compiler/LSP oracle evaluation is the accuracy measurement.
@@ -725,6 +887,12 @@ function doctor(index, options = {}) {
     if (blindSpots.reflection.count > 0) blindSignals.push(`${blindSpots.reflection.count} reflection use(s) in ${blindSpots.reflection.fileCount} file(s)`);
     if (blindSpots.computedDispatch.count > 0) {
         blindSignals.push(`${blindSpots.computedDispatch.count} computed dispatch call(s) in ${blindSpots.computedDispatch.fileCount} file(s)`);
+    }
+    if (blindSpots.macroPasteDispatch?.count > 0) {
+        blindSignals.push(`${blindSpots.macroPasteDispatch.count} token-pasting macro dispatch invocation(s) not expanded in ${blindSpots.macroPasteDispatch.fileCount} file(s)`);
+    }
+    if (blindSpots.macroRulesExpansion?.count > 0) {
+        blindSignals.push(`${blindSpots.macroRulesExpansion.count} macro_rules! invocation(s) not expanded in ${blindSpots.macroRulesExpansion.fileCount} file(s)`);
     }
     if (blindSpots.dynamicImports.count > 0) blindSignals.push(`${blindSpots.dynamicImports.count} ${importBlindspotLabel} in ${blindSpots.dynamicImports.fileCount} file(s)`);
     if (blindSpots.unsupportedSources.count > 0) {
@@ -940,11 +1108,20 @@ function computeEvidenceProfile(index, { sampleSize, matchInFilter }) {
  * trust verdict. Composes existing engine reads; counts and pointers only
  * (no caller claims, so no account — the toc/stats category).
  */
-// Orientation refines at most this many HOT candidates exactly (fix #340).
-// grpc-go (1037 files): exact refinement walks 1089 candidates in ~20s; 400
-// in fair-share order reproduces the exact top 8 in under 5s. When the budget
-// binds, the header says so and points at the exact command.
-const ORIENT_HOT_REFINE_BUDGET = 400;
+// Orientation's HOT list is exact unless exact refinement would examine more
+// call records than this (fix #382; a count of 10000 refinements before, fix
+// #340/#365). A production ranking charges its bound only with production
+// call records and scans only production files, so exact lists on real
+// projects examine well under a million records (django ~450k, tokio ~500k).
+// The budget binds only on very large repositories (kubernetes), where the
+// header says the ranking is approximate.
+const ORIENT_HOT_WORK_BUDGET = 1500000;
+// `repo --sections=stats --hot` ranks by all callers and is the explicit
+// request for an exact list: a larger budget, disclosed the same way.
+const STATS_HOT_WORK_BUDGET = 8000000;
+// When a ceiling-order walk exhausts its budget, this share of it again is
+// spent completing the ranking in fair-share order.
+const HOT_COMPLETION_BUDGET_SHARE = 0.5;
 
 function orient(index, options = {}) {
     const top = options.top || 8;
@@ -968,8 +1145,10 @@ function orient(index, options = {}) {
         // actually contains production files. In an all-test repository it
         // would erase the raw ranking that orient promises as its fallback.
         productionCallsOnly: options.includeTests !== true && hasProductionFiles,
-        maxRefine: Number.isInteger(options.hotRefineBudget) && options.hotRefineBudget > 0
-            ? options.hotRefineBudget : ORIENT_HOT_REFINE_BUDGET,
+        ...(Number.isInteger(options.hotRefineBudget) && options.hotRefineBudget > 0 &&
+            { maxRefine: options.hotRefineBudget }),
+        workBudget: Number.isFinite(options.hotWorkBudget) && options.hotWorkBudget > 0
+            ? options.hotWorkBudget : ORIENT_HOT_WORK_BUDGET,
     });
     const health = doctor(index, scope);
 
@@ -1053,7 +1232,10 @@ function orient(index, options = {}) {
             totalKind: stats.hot?.totalKind || 'confirmed',
             refined: stats.hot?.refined ?? 0,
             ...(stats.hot?.budgetExhausted && {
-                budgetExhausted: true, maxRefine: stats.hot.maxRefine,
+                budgetExhausted: true,
+                ...(stats.hot.maxRefine !== undefined
+                    ? { maxRefine: stats.hot.maxRefine }
+                    : { workBudget: stats.hot.workBudget, work: stats.hot.work }),
             }),
             top,
             production,

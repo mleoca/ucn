@@ -2025,7 +2025,7 @@ describe('UCN v5 prerelease audit regressions', () => {
             index.failedFiles.add(visibleFailed);
             index.failedFiles.add(missingFailed);
 
-            const usages = execute(index, 'usages', { name: 'target' });
+            const usages = execute(index, 'usages', { name: 'target', excludeTests: true });
             assert.match(usages.note, /unparsed file/i);
             assert.match(usages.note, /unreadable file/i);
             const usageText = publicOutput.formatPublicText('usages', usages.result,
@@ -2033,7 +2033,7 @@ describe('UCN v5 prerelease audit regressions', () => {
             const capped = applyOutputBudget(usageText, {
                 command: 'usages', maxChars: 180,
             });
-            assert.match(capped.text, /test-file usage.*hidden by default/i);
+            assert.match(capped.text, /test-file usage.*hidden by --exclude-tests/i);
 
             const decorated = execute(index, 'usages', {
                 name: 'target', includeTests: true,

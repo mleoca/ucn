@@ -7017,8 +7017,11 @@ describe('fix #300: plan export-pass symbol identity + def-line name-only rename
             assert.ok(r.ok, JSON.stringify(r.error));
             const changes = r.result.changes || [];
             assert.ok(changes.some(c => c.line === 4 && c.editKind === 'definition'));
-            assert.ok(!changes.some(c => c.line === 9),
-                `method def line must not be edited under the type pin: ${JSON.stringify(changes)}`);
+            // fix #386: the method keeps its name; its parameter type is a
+            // reference to the renamed type.
+            const methodLine = changes.find(c => c.line === 9);
+            assert.strictEqual(methodLine?.newExpression, 'func (r *Route) BuildVarsFunc(f BuildVarsFn) *Route {',
+                `only the parameter type changes on the method line: ${JSON.stringify(changes)}`);
         } finally { rm(dir); }
     });
 });
@@ -7792,5 +7795,766 @@ describe('fix #353: Rust aliased calls, Java package-qualified and C# namespace-
         } finally {
             rm(dir);
         }
+    });
+});
+
+describe('fix #359: plan rename edits target the declaration token and its own identity', () => {
+    const planRename = (files, handle, renameTo = 'NEW') => {
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: handle, renameTo });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            return r.result;
+        } finally { rm(dir); }
+    };
+    const defEdit = (result, line) => (result.changes || []).find(c =>
+        c.line === line && c.editKind === 'definition');
+
+    it('Go: a named result sharing the name is not the declaration token', () => {
+        const r = planRename({
+            'go.mod': 'module f359\n\ngo 1.21\n',
+            'c.go': 'package main\n\nfunc head(s string) (head string) { head = s; return }\n\nfunc main() { _ = head("x") }\n',
+        }, 'c.go:3:head');
+        assert.strictEqual(defEdit(r, 3).newExpression,
+            'func NEW(s string) (head string) { head = s; return }');
+    });
+
+    it('Go: a qualified return type sharing the name keeps its spelling', () => {
+        const r = planRename({
+            'go.mod': 'module f359\n\ngo 1.21\n',
+            'w.go': [
+                'package f359',
+                '',
+                'import "net/http"',
+                '',
+                'type W struct{ rw http.ResponseWriter }',
+                '',
+                'func (w *W) Pusher() (pusher http.Pusher) {',
+                '\tpusher, _ = w.rw.(http.Pusher)',
+                '\treturn',
+                '}',
+            ].join('\n') + '\n',
+        }, 'w.go:7:Pusher', 'PusherZq');
+        assert.strictEqual(defEdit(r, 7).newExpression,
+            'func (w *W) PusherZq() (pusher http.Pusher) {');
+    });
+
+    it('Java: a parameter sharing the method name is not renamed', () => {
+        const r = planRename({
+            'D.java': 'public class D {\n  static String head(String head) { return head; }\n  void m() { head("x"); }\n}\n',
+        }, 'D.java:2:head');
+        assert.strictEqual(defEdit(r, 2).newExpression,
+            'static String NEW(String head) { return head; }');
+    });
+
+    it('TypeScript: an exported declaration line renames only its name, no review flag', () => {
+        const r = planRename({
+            'b.ts': 'export function head(head: string): string { return head; }\nhead("x");\n',
+        }, 'b.ts:1:head');
+        const edit = defEdit(r, 1);
+        assert.strictEqual(edit.newExpression,
+            'export function NEW(head: string): string { return head; }');
+        assert.ok(!edit.needsReview, JSON.stringify(edit));
+    });
+
+    it('Python: a parameter sharing the function name is not renamed', () => {
+        const r = planRename({
+            'a.py': 'def head(head, sep):\n    return head\n\nprint(head("a", ","))\n',
+        }, 'a.py:1:head');
+        assert.strictEqual(defEdit(r, 1).newExpression, 'def NEW(head, sep):');
+    });
+
+    it('Rust: a return type sharing the name keeps its spelling', () => {
+        const r = planRename({
+            'Cargo.toml': '[package]\nname = "f359"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/lib.rs': 'pub struct Item;\npub fn make_item(item: Item) -> Item { item }\npub fn item(x: Item) -> Item { make_item(x) }\n',
+        }, 'src/lib.rs:3:item', 'item2');
+        assert.strictEqual(defEdit(r, 3).newExpression,
+            'pub fn item2(x: Item) -> Item { make_item(x) }');
+    });
+
+    it('C: a parameter declarator sharing the name is not renamed', () => {
+        const r = planRename({
+            'h.c': 'int head(int head) { return head; }\nint main(void) { return head(1); }\n',
+        }, 'h.c:1:head');
+        assert.strictEqual(defEdit(r, 1).newExpression,
+            'int NEW(int head) { return head; }');
+    });
+
+    it('one-line class: a member pin whose name equals the class is the member', () => {
+        const r = planRename({
+            'Box.java': 'public class Box { Box Box; }\n',
+        }, 'Box.java:1:Box', 'Other');
+        const edit = (r.changes || []).find(c => c.line === 1);
+        assert.ok(edit && edit.newExpression, JSON.stringify(r.changes));
+        // The field pin renames its own name token; the class pin renames the
+        // class and the field's TYPE (fix #386), never the field's name.
+        // (a class pin also renames Box.java with the public class).
+        const expected = r.fileRenames ? 'public class Other { Other Box; }' : 'public class Box { Box Other; }';
+        assert.strictEqual(edit.newExpression, expected, JSON.stringify(r.before));
+    });
+
+    it('Python: a method pin never edits a same-named module import', () => {
+        const r = planRename({
+            'req.py': [
+                'import json',
+                '',
+                '',
+                'class Request:',
+                '    def json(self):',
+                '        return json.loads("{}")',
+                '',
+                '',
+                'def use(r: Request):',
+                '    return r.json()',
+            ].join('\n') + '\n',
+        }, 'req.py:5:json', 'jsonZq');
+        assert.ok(!(r.changes || []).some(c => c.editKind === 'import'),
+            JSON.stringify(r.changes));
+        assert.ok((r.changes || []).some(c => c.line === 10 && c.newExpression === 'return r.jsonZq()'),
+            JSON.stringify(r.changes));
+    });
+
+    it('TypeScript: a method pin never edits a same-named named import', () => {
+        const r = planRename({
+            'fmt.ts': 'export function format(x: number): string { return String(x); }\n',
+            'box.ts': [
+                "import { format } from './fmt';",
+                'export class Box {',
+                '  format(): string { return format(1); }',
+                '}',
+            ].join('\n') + '\n',
+        }, 'box.ts:3:format', 'render');
+        assert.ok(!(r.changes || []).some(c => c.file === 'box.ts' && c.line === 1),
+            JSON.stringify(r.changes));
+    });
+
+    it('Java: a static member import that binds the pin is still edited', () => {
+        const r = planRename({
+            'a/D.java': 'package a;\npublic class D {\n  public static String head(String s) { return s; }\n}\n',
+            'U.java': 'import static a.D.head;\npublic class U {\n  void m() { head("x"); }\n}\n',
+        }, 'a/D.java:3:head');
+        assert.ok((r.changes || []).some(c => c.editKind === 'import' &&
+            c.newExpression === 'import static a.D.NEW;'), JSON.stringify(r.changes));
+    });
+
+    it('JS/TS: a property assignment on a function-local object routes review, no edit', () => {
+        const r = planRename({
+            'ky.ts': [
+                'export function decorate(response: Response): Response {',
+                '  response.json = async () => {',
+                '    return JSON.parse(await response.text());',
+                '  };',
+                '  return response;',
+                '}',
+            ].join('\n') + '\n',
+        }, 'ky.ts:2:json', 'jsonZq');
+        const edit = defEdit(r, 2);
+        assert.ok(edit.needsReview, JSON.stringify(edit));
+        assert.strictEqual(edit.newExpression, undefined);
+        assert.strictEqual(edit.reviewReason, 'member-assignment-local-object');
+    });
+
+    it('JS: a property assignment on a module-level project object stays a mechanical edit', () => {
+        const r = planRename({
+            'api.js': 'const api = {};\napi.fetchAll = function () { return 1; };\nmodule.exports = api;\n',
+            'app.js': "const api = require('./api');\napi.fetchAll();\n",
+        }, 'api.js:2:fetchAll', 'loadAll');
+        const edit = defEdit(r, 2);
+        assert.strictEqual(edit.newExpression, 'api.loadAll = function () { return 1; };');
+        assert.ok(!edit.needsReview, JSON.stringify(edit));
+    });
+
+    it('JS: a property assignment on an undeclared global routes review', () => {
+        const r = planRename({
+            'patch.js': 'console.trace = function () { return 1; };\n',
+        }, 'patch.js:1:trace', 'trace2');
+        const edit = defEdit(r, 1);
+        assert.ok(edit.needsReview, JSON.stringify(edit));
+        assert.strictEqual(edit.reviewReason, 'member-assignment-external-object');
+    });
+
+    it('Python: calls through annotated container elements join the override closure', () => {
+        const r = planRename({
+            'conv.py': [
+                'class Convertor:',
+                '    def to_string(self, value) -> str:',
+                '        raise NotImplementedError',
+                '',
+                '',
+                'class IntConvertor(Convertor):',
+                '    def to_string(self, value) -> str:',
+                '        return str(value)',
+            ].join('\n') + '\n',
+            'use.py': [
+                'from conv import Convertor',
+                '',
+                '',
+                'def replace(params: dict[str, Convertor], key: str) -> str:',
+                '    convertor = params[key]',
+                '    return convertor.to_string(1)',
+                '',
+                '',
+                'def first(items: list[Convertor]) -> str:',
+                '    return items[0].to_string(2)',
+            ].join('\n') + '\n',
+        }, 'conv.py:7:to_string', 'render');
+        const changes = r.changes || [];
+        assert.ok(changes.some(c => c.file === 'use.py' && c.line === 6 &&
+            c.newExpression === 'return convertor.render(1)'), JSON.stringify(changes));
+        assert.ok(changes.some(c => c.file === 'use.py' && c.line === 10 &&
+            c.newExpression === 'return items[0].render(2)'), JSON.stringify(changes));
+        assert.ok(!(r.unverifiedSites || []).some(s => s.file === 'use.py'),
+            JSON.stringify(r.unverifiedSites));
+    });
+});
+
+describe('fix #376: plan rename closure over the full hierarchy, alternatives and exact tokens', () => {
+    const planRename = (files, handle, renameTo = 'NEW') => {
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: handle, renameTo });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            return r.result;
+        } finally { rm(dir); }
+    };
+    const edited = (result, file, line) => (result.changes || []).find(c =>
+        c.file === file && c.line === line && c.newExpression !== undefined);
+    const editLines = (result, file) => (result.changes || [])
+        .filter(c => c.file === file && c.newExpression !== undefined)
+        .map(c => c.line).sort((a, b) => a - b);
+
+    it('TypeScript: an override under an intermediate class renames the declaring base and siblings', () => {
+        const r = planRename({
+            'a.ts': [
+                'export abstract class Gen { abstract close(): void }',
+                'export abstract class Mid extends Gen {}',
+                'export class Impl extends Mid { override close(): void {} }',
+                'export class Other extends Mid { override close(): void {} }',
+            ].join('\n') + '\n',
+        }, 'a.ts:3:close');
+        assert.deepStrictEqual(editLines(r, 'a.ts'), [1, 3, 4]);
+    });
+
+    it('Python: an override under an intermediate class renames the base, siblings and slot calls', () => {
+        const r = planRename({
+            'a.py': [
+                'class Gen:',
+                '    def shut(self): raise NotImplementedError',
+                'class Mid(Gen):',
+                '    pass',
+                'class Impl(Mid):',
+                '    def shut(self): return 1',
+                'class Other(Mid):',
+                '    def shut(self): return 2',
+                'def use(g: Gen):',
+                '    g.shut()',
+            ].join('\n') + '\n',
+        }, 'a.py:6:shut');
+        assert.deepStrictEqual(editLines(r, 'a.py'), [2, 6, 8, 10]);
+        assert.strictEqual(r.account.unverified, 0, JSON.stringify(r.account));
+        assert.strictEqual(r.account.confirmed, 1, JSON.stringify(r.account));
+    });
+
+    it('C#: an override under an intermediate class renames the abstract base', () => {
+        const r = planRename({
+            'A.cs': [
+                'namespace P;',
+                'public abstract class Gen { public abstract void Stop(); }',
+                'public abstract class Mid : Gen {}',
+                'public class Impl : Mid { public override void Stop() {} }',
+                'public class Other : Mid { public override void Stop() {} }',
+            ].join('\n') + '\n',
+        }, 'A.cs:4:Stop');
+        assert.deepStrictEqual(editLines(r, 'A.cs'), [2, 4, 5]);
+    });
+
+    it('C++: an override under an intermediate class renames the virtual base', () => {
+        const r = planRename({
+            'a.cpp': [
+                'class Gen { public: virtual void halt() = 0; virtual ~Gen() {} };',
+                'class Mid : public Gen {};',
+                'class Impl : public Mid { public: void halt() override {} };',
+                'class Other : public Mid { public: void halt() override {} };',
+            ].join('\n') + '\n',
+        }, 'a.cpp:3:halt');
+        assert.deepStrictEqual(editLines(r, 'a.cpp'), [1, 3, 4]);
+    });
+
+    it('Java: intermediate class, same-signature overload slot only', () => {
+        const files = {
+            'p/Gen.java': 'package p;\npublic abstract class Gen {\n    public abstract Gen writeName(String name);\n' +
+                '    public abstract Gen writeName(CharSequence name);\n}\n',
+            'p/Mid.java': 'package p;\npublic abstract class Mid extends Gen {\n}\n',
+            'p/Impl.java': 'package p;\npublic class Impl extends Mid {\n    @Override\n' +
+                '    public Gen writeName(String name) { return this; }\n    @Override\n' +
+                '    public Gen writeName(CharSequence name) { return this; }\n}\n',
+        };
+        const r = planRename(files, 'p/Impl.java:4:writeName');
+        assert.deepStrictEqual(editLines(r, 'p/Gen.java'), [3]);
+        assert.deepStrictEqual(editLines(r, 'p/Impl.java'), [4]);
+        assert.ok(!r.contract?.blocked, JSON.stringify(r.contract));
+    });
+
+    it('Java: a nested supertype spelled Outer.Inner<T> resolves to the nested class', () => {
+        const r = planRename({
+            'p/Pool.java': 'package p;\npublic interface Pool<T> {\n    T acquire();\n' +
+                '    abstract class Base<T> implements Pool<T> {\n        public abstract T acquire();\n    }\n}\n',
+            'p/Leaf.java': 'package p;\npublic class Leaf extends Pool.Base<String> {\n    @Override\n' +
+                '    public String acquire() { return ""; }\n}\n',
+        }, 'p/Leaf.java:4:acquire');
+        assert.deepStrictEqual(editLines(r, 'p/Pool.java'), [3, 5]);
+        assert.deepStrictEqual(editLines(r, 'p/Leaf.java'), [4]);
+        assert.ok(!r.contract?.blocked, JSON.stringify(r.contract));
+    });
+
+    it('Java: an @Override whose overridden member is not in the project is blocked', () => {
+        const r = planRename({
+            'Base.java': 'public abstract class Base implements Comparable<Base> {\n    public void compareTo() {}\n}\n',
+            'Impl.java': 'public class Impl extends Base {\n    @Override\n    public int compareTo(Base o) { return 0; }\n}\n',
+        }, 'Impl.java:3:compareTo');
+        assert.strictEqual(r.contract?.blocked, true, JSON.stringify(r.contract));
+        assert.ok(r.changes.every(c => c.newExpression === undefined), JSON.stringify(r.changes));
+        assert.ok(r.contract.external.some(e => e.reason === 'overrides-unlocated-member'),
+            JSON.stringify(r.contract));
+    });
+
+    it('TypeScript: an interface implemented by an intermediate abstract class joins the slot', () => {
+        const r = planRename({
+            'a.ts': [
+                'export interface I { m(): void }',
+                'export abstract class A implements I { abstract other(): void }',
+                'export class B extends A { m(): void {} other(): void {} }',
+                'export function f(i: I) { i.m() }',
+            ].join('\n') + '\n',
+        }, 'a.ts:3:m');
+        assert.deepStrictEqual(editLines(r, 'a.ts'), [1, 3, 4]);
+    });
+
+    it('Rust: a generic trait declaration joins its impls, and the account matches the listing', () => {
+        const files = {
+            'Cargo.toml': '[package]\nname = "t376"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/lib.rs': [
+                'mod imp;',
+                'pub trait Ctx<T> { fn ctx(self, m: &str) -> Option<T>; }',
+                'pub trait Plain { fn plain(&self) -> i32; }',
+                'pub struct S;',
+                'impl Plain for S { fn plain(&self) -> i32 { 1 } }',
+                'pub fn use_it(r: Result<i32, ()>) -> Option<i32> { let _ = S.plain(); r.ctx("x") }',
+            ].join('\n') + '\n',
+            'src/imp.rs': [
+                'use crate::{Ctx, Plain};',
+                'impl<T, E> Ctx<T> for Result<T, E> { fn ctx(self, _m: &str) -> Option<T> { self.ok() } }',
+                'impl<T> Ctx<T> for Option<T> { fn ctx(self, _m: &str) -> Option<T> { self } }',
+                'pub struct Q;',
+                'impl Plain for Q { fn plain(&self) -> i32 { 2 } }',
+            ].join('\n') + '\n',
+        };
+        const ctx = planRename(files, 'src/imp.rs:2:ctx');
+        assert.deepStrictEqual(editLines(ctx, 'src/imp.rs'), [2, 3]);
+        assert.deepStrictEqual(editLines(ctx, 'src/lib.rs'), [2, 6]);
+        const plain = planRename(files, 'src/imp.rs:5:plain');
+        const listed = (plain.unverifiedSites || []).length;
+        assert.strictEqual(plain.account.unverified, listed, JSON.stringify(plain.account));
+        assert.strictEqual(plain.account.excluded.total, 0, JSON.stringify(plain.account));
+        assert.strictEqual(plain.account.contract.observedTextZero, false);
+    });
+
+    it('Rust: a trait name bound to std under one cfg and a project trait under another is blocked', () => {
+        const files = {
+            'Cargo.toml': '[package]\nname = "t376b"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/lib.rs': [
+                'mod err;',
+                'use core::fmt::{Debug, Display};',
+                '#[cfg(feature = "std")]',
+                'use std::error::Error as StdError;',
+                '#[cfg(not(feature = "std"))]',
+                'trait StdError: Debug + Display {',
+                '    fn source(&self) -> Option<&(dyn StdError + \'static)> { None }',
+                '}',
+            ].join('\n') + '\n',
+            'src/err.rs': [
+                'use crate::StdError;',
+                '#[derive(Debug)]',
+                'pub struct E;',
+                'impl core::fmt::Display for E { fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result { Ok(()) } }',
+                'impl StdError for E {',
+                '    fn source(&self) -> Option<&(dyn StdError + \'static)> { None }',
+                '}',
+            ].join('\n') + '\n',
+            'tests/t.rs': [
+                'use std::error::Error as StdError;',
+                '#[derive(Debug)]',
+                'struct T;',
+                'impl std::fmt::Display for T { fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { Ok(()) } }',
+                'impl StdError for T {',
+                '    fn source(&self) -> Option<&(dyn StdError + \'static)> { None }',
+                '}',
+            ].join('\n') + '\n',
+        };
+        const r = planRename(files, 'src/err.rs:6:source');
+        assert.strictEqual(r.contract?.blocked, true, JSON.stringify(r.contract));
+        assert.ok(r.changes.every(c => c.newExpression === undefined), JSON.stringify(r.changes));
+        const t = planRename(files, 'tests/t.rs:6:source');
+        assert.strictEqual(t.contract?.blocked, true, JSON.stringify(t.contract));
+    });
+
+    it('Rust: cfg-alternative functions are renamed together with their calls', () => {
+        const r = planRename({
+            'Cargo.toml': '[package]\nname = "t376c"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/lib.rs': [
+                '#[cfg(feature = "x")]',
+                'pub fn pick() -> i32 { 1 }',
+                '#[cfg(not(feature = "x"))]',
+                'pub fn pick() -> i32 { 2 }',
+                'pub fn go() -> i32 { pick() }',
+            ].join('\n') + '\n',
+        }, 'src/lib.rs:4:pick');
+        assert.deepStrictEqual(editLines(r, 'src/lib.rs'), [2, 4, 5]);
+        assert.strictEqual(r.account.excluded.total, 0, JSON.stringify(r.account));
+    });
+
+    it('C: #if-alternative definitions are renamed together with their calls', () => {
+        const r = planRename({
+            'a.c': [
+                '#ifdef FAST',
+                'static int pick(int x) { return x; }',
+                '#else',
+                'static int pick(int x) { return x + 1; }',
+                '#endif',
+                'int run(void) { return pick(2); }',
+            ].join('\n') + '\n',
+        }, 'a.c:4:pick');
+        assert.deepStrictEqual(editLines(r, 'a.c'), [2, 4, 6]);
+    });
+
+    it('Python: version-conditional definitions and an import fallback are one binding', () => {
+        const r = planRename({
+            'compat.py': [
+                'import asyncio',
+                'import sys',
+                'if sys.version_info >= (3, 12):',
+                '    arun = asyncio.run',
+                'elif sys.version_info >= (3, 11):',
+                '    def arun(main):',
+                '        return main',
+                'else:',
+                '    def arun(main):',
+                '        return None',
+            ].join('\n') + '\n',
+            'fast.py': [
+                'try:',
+                '    from speedups import speed',
+                'except ImportError:',
+                '    def speed(x):',
+                '        return x',
+            ].join('\n') + '\n',
+            'use.py': 'from compat import arun\nfrom fast import speed\narun(speed(1))\n',
+        }, 'compat.py:6:arun');
+        assert.deepStrictEqual(editLines(r, 'compat.py'), [4, 6, 9]);
+        assert.strictEqual(edited(r, 'compat.py', 4).newExpression, 'NEW = asyncio.run');
+        const s = planRename({
+            'fast.py': [
+                'try:',
+                '    from speedups import speed',
+                'except ImportError:',
+                '    def speed(x):',
+                '        return x',
+            ].join('\n') + '\n',
+            'use.py': 'from fast import speed\nspeed(1)\n',
+        }, 'fast.py:4:speed');
+        assert.strictEqual(edited(s, 'fast.py', 2).newExpression, 'from speedups import speed as NEW');
+        assert.deepStrictEqual(editLines(s, 'use.py'), [1, 2]);
+    });
+
+    it('Python: class-body aliases and property setters reference the renamed member', () => {
+        const r = planRename({
+            'm.py': [
+                'class P:',
+                '    def __init__(self, release=None):',
+                '        self.r = release',
+                '    def __exit__(self, *a):',
+                '        self.release()',
+                '    def release(self):',
+                '        pass',
+                '    close = release',
+                '    @property',
+                '    def size(self):',
+                '        return 1',
+                '    @size.setter',
+                '    def size(self, v):',
+                '        pass',
+            ].join('\n') + '\n',
+        }, 'm.py:6:release');
+        assert.strictEqual(edited(r, 'm.py', 8).newExpression, 'close = NEW');
+        // A parameter named like the member is not a class-scope read.
+        assert.ok(!(r.changes || []).some(c => c.line === 2 || c.line === 3), JSON.stringify(r.changes));
+        const s = planRename({
+            'm.py': [
+                'class P:',
+                '    @property',
+                '    def size(self):',
+                '        return 1',
+                '    @size.setter',
+                '    def size(self, v):',
+                '        pass',
+            ].join('\n') + '\n',
+        }, 'm.py:3:size');
+        assert.deepStrictEqual(editLines(s, 'm.py'), [3, 5, 6]);
+        assert.strictEqual(edited(s, 'm.py', 5).newExpression, '@NEW.setter');
+    });
+
+    it('TypeScript: bind() and object-literal values edit the member tokens, not the key', () => {
+        const r = planRename({
+            'a.ts': [
+                'export interface Result { go: () => number }',
+                'export class Obs {',
+                '  constructor() {',
+                '    this.go = this.go.bind(this)',
+                '  }',
+                '  go(): number { return 1 }',
+                '  result(): Result {',
+                '    return { go: this.go }',
+                '  }',
+                '}',
+            ].join('\n') + '\n',
+        }, 'a.ts:6:go');
+        assert.strictEqual(edited(r, 'a.ts', 4).newExpression, 'this.NEW = this.NEW.bind(this)');
+        assert.strictEqual(edited(r, 'a.ts', 8).newExpression, 'return { go: this.NEW }');
+    });
+
+    it('Java: a one-line delegating override renames its declaration and its call together', () => {
+        const r = planRename({
+            'P.java': 'public abstract class P {\n    public abstract String val();\n    public abstract String val(String d);\n}\n',
+            'D.java': 'public class D extends P {\n    P delegate;\n' +
+                '    @Override public String val() { return delegate.val(); }\n' +
+                '    @Override public String val(String d) { return delegate.val(d); }\n}\n',
+        }, 'P.java:2:val');
+        assert.strictEqual(edited(r, 'D.java', 3).newExpression,
+            '@Override public String NEW() { return delegate.NEW(); }');
+        assert.deepStrictEqual(editLines(r, 'D.java'), [3]);
+    });
+
+    it('Python: a one-line recursive definition keeps its recursive call in the edit', () => {
+        const r = planRename({
+            'r.py': 'def fact(n): return 1 if n < 2 else n * fact(n - 1)\nprint(fact(3))\n',
+        }, 'r.py:1:fact');
+        assert.strictEqual(edited(r, 'r.py', 1).newExpression,
+            'def NEW(n): return 1 if n < 2 else n * NEW(n - 1)');
+    });
+
+    it('Java: a same-class call whose arity fits a sibling overload is not the pin\'s caller', () => {
+        const files = {
+            'G.java': [
+                'public abstract class G {',
+                '    public abstract void w(java.io.Reader r, int n);',
+                '    public abstract void w(char[] c, int o, int n);',
+                '    protected void copy(Src p) { w(p.chars(), p.offset(), p.length()); }',
+                '}',
+            ].join('\n') + '\n',
+            'Src.java': 'public abstract class Src {\n    public abstract char[] chars();\n' +
+                '    public abstract int offset();\n    public abstract int length();\n}\n',
+        };
+        const r = planRename(files, 'G.java:2:w');
+        assert.deepStrictEqual(editLines(r, 'G.java'), [2]);
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const def = index.symbols.get('w').find(d => d.startLine === 2);
+            const callers = index.findCallers('w', { targetDefinitions: [def], collectAccount: true });
+            assert.ok(!callers.some(c => c.line === 4 && c.tier !== 'unverified'), JSON.stringify(callers));
+        } finally { rm(dir); }
+    });
+
+    it('Java: generic slot parameters match their concrete override, a different type does not', () => {
+        const r = planRename({
+            'B.java': 'public abstract class B<T> {\n    public abstract int put(T v);\n    public abstract int put(java.io.Writer w);\n}\n',
+            'S.java': 'public class S extends B<String> {\n    @Override public int put(String v) { return 1; }\n' +
+                '    @Override public int put(java.io.Writer w) { return 2; }\n}\n',
+        }, 'S.java:2:put');
+        assert.deepStrictEqual(editLines(r, 'B.java'), [2]);
+        assert.deepStrictEqual(editLines(r, 'S.java'), [2]);
+    });
+
+    it('Java: renaming a nested base reaches subclasses that spell it Outer.Inner', () => {
+        const r = planRename({
+            'p/Pool.java': 'package p;\npublic interface Pool<T> {\n    T acquire();\n' +
+                '    abstract class Base<T> implements Pool<T> {\n        public abstract T acquire();\n    }\n}\n',
+            'p/Leaf.java': 'package p;\npublic class Leaf extends Pool.Base<String> {\n    @Override\n' +
+                '    public String acquire() { return ""; }\n}\n',
+        }, 'p/Pool.java:5:acquire');
+        assert.deepStrictEqual(editLines(r, 'p/Leaf.java'), [4]);
+        assert.deepStrictEqual(editLines(r, 'p/Pool.java'), [3, 5]);
+    });
+
+    it('TypeScript: an aliased import of another module\'s same-named export is not edited', () => {
+        const r = planRename({
+            'utils.ts': 'export const flag = true\n',
+            'env.ts': 'import { flag as baseFlag } from \'./utils\'\nexport const flag = (): boolean => baseFlag\n',
+            'use.ts': 'import { flag } from \'./env\'\nexport const x = flag()\n',
+        }, 'env.ts:2:flag');
+        assert.deepStrictEqual(editLines(r, 'env.ts'), [2]);
+        assert.deepStrictEqual(editLines(r, 'use.ts'), [1, 2]);
+        assert.deepStrictEqual(editLines(r, 'utils.ts'), []);
+    });
+});
+
+describe('fix #383: plan summary lines reconcile with its lists; find text shows the top results and counts the rest', () => {
+    // A plan's ACCOUNT counts the lines it lists: every listed unverified
+    // site that is not also an edited call line is an unverified line of
+    // the account, and an observed-text zero never accompanies a listed site.
+    const reconcile = (index, label) => {
+        let plans = 0;
+        for (const [name, defs] of index.symbols) {
+            for (const def of defs) {
+                if (!['function', 'method'].includes(def.type)) continue;
+                const r = execute(index, 'plan', { name, file: def.relativePath, line: def.startLine, renameTo: `${name}Zq` });
+                if (!r.ok) continue;
+                plans++;
+                const p = r.result;
+                const listed = new Set((p.unverifiedSites || []).map(u => `${u.file}:${u.line}`));
+                const edited = new Set(p.changes.filter(c => c.editKind === 'call').map(c => `${c.file}:${c.line}`));
+                const listedOnly = [...listed].filter(key => !edited.has(key)).length;
+                const where = `${label} ${def.relativePath}:${def.startLine}:${name} ${JSON.stringify(p.account)}`;
+                assert.strictEqual(p.account.unverified, listedOnly, where);
+                assert.ok(p.account.confirmed + p.account.beyondText.count >= edited.size, where);
+                if (listed.size > 0 || edited.size > 0) assert.strictEqual(p.account.contract.observedTextZero, false, where);
+            }
+        }
+        assert.ok(plans > 3, `${label}: ${plans} plans`);
+    };
+
+    it('Java overloads and overrides: the account counts the sites the plan lists', () => {
+        const dir = tmp({
+            'src/Parser.java': [
+                'public abstract class Parser {',
+                '    public boolean getValue() { return getValue(false); }',
+                '    public boolean getValue(boolean d) { return d; }',
+                '    public abstract int next();',
+                '}',
+            ].join('\n'),
+            'src/Impl.java': [
+                'public class Impl extends Parser {',
+                '    @Override public boolean getValue(boolean d) { return !d; }',
+                '    @Override public int next() { return 1; }',
+                '}',
+            ].join('\n'),
+            'src/Use.java': [
+                'public class Use {',
+                '    boolean a(Parser p) { return p.getValue(); }',
+                '    boolean b(Parser p) { return p.getValue(true); }',
+                '    int c(Object o) { return ((Parser) o).next() + helper(o).next(); }',
+                '    Parser helper(Object o) { return (Parser) o; }',
+                '}',
+            ].join('\n'),
+        });
+        try { reconcile(idx(dir), 'java'); } finally { rm(dir); }
+    });
+
+    it('Python and Go: the account counts the sites the plan lists', () => {
+        const dir = tmp({
+            'a.py': [
+                'class Base:',
+                '    def run(self): return 1',
+                'class Child(Base):',
+                '    def run(self): return 2',
+                'def use(x, y: Base):',
+                '    x.run()',
+                '    y.run()',
+                '    return run_all([x])',
+                'def run_all(items):',
+                '    return [i.run() for i in items]',
+            ].join('\n'),
+            'go.mod': 'module example.com/m\n',
+            'm.go': [
+                'package m',
+                'type Runner interface { Run() int }',
+                'type T struct{}',
+                'func (T) Run() int { return 1 }',
+                'func Use(r Runner, t T, x interface{ Run() int }) int { return r.Run() + t.Run() + x.Run() }',
+            ].join('\n'),
+        });
+        try { reconcile(idx(dir), 'py+go'); } finally { rm(dir); }
+    });
+
+    it('find text shows the top 5 in detail and counts the rest; JSON returns up to 500; limit raises both (fix #384)', async () => {
+        const files = { 'package.json': '{"name":"x"}' };
+        for (let i = 0; i < 12; i++) files[`m${String(i).padStart(2, '0')}.js`] = `function load(x) { return x + ${i} }\nmodule.exports = { load }\n`;
+        const dir = tmp(files);
+        const { McpClient } = require('./helpers');
+        const client = new McpClient();
+        try {
+            const text = runCli(dir, 'find', ['load']);
+            assert.match(text, /Found 12 match\(es\) for "load" \(showing top 5\):/);
+            assert.strictEqual((text.match(/^m\d\d\.js:1:load/gm) || []).length, 5, text);
+            assert.match(text, /7 more result\(s\)\. Use --limit=N to return and display more results\./);
+            const json = JSON.parse(runCli(dir, 'find', ['load'], ['--json']));
+            assert.strictEqual(json.data.length, 12);
+            const limited = runCli(dir, 'find', ['load'], ['--limit=8']);
+            assert.strictEqual((limited.match(/^m\d\d\.js:1:load/gm) || []).length, 8, limited);
+            assert.match(limited, /\(showing top 8\)/);
+            assert.match(limited, /4 more result\(s\)\. Use --limit=N/);
+            const limitedJson = JSON.parse(runCli(dir, 'find', ['load'], ['--limit=8', '--json']));
+            assert.strictEqual(limitedJson.data.length, 8);
+            const all = runCli(dir, 'find', ['load'], ['--all']);
+            assert.strictEqual((all.match(/^m\d\d\.js:1:load/gm) || []).length, 12, all);
+            assert.doesNotMatch(all, /more result\(s\)/);
+            await client.start();
+            await client.initialize();
+            const mcp = await client.callTool({ command: 'find', project_dir: dir, name: 'load' });
+            assert.strictEqual((mcp.text.match(/^m\d\d\.js:1:load/gm) || []).length, 5, mcp.text);
+            assert.match(mcp.text, /7 more result\(s\)\. Use limit=<n> to return and display more results\./);
+            const mcpLimited = await client.callTool({ command: 'find', project_dir: dir, name: 'load', limit: 9 });
+            assert.strictEqual((mcpLimited.text.match(/^m\d\d\.js:1:load/gm) || []).length, 9, mcpLimited.text);
+            assert.match(mcpLimited.text, /3 more result\(s\)\. Use limit=<n>/);
+        } finally {
+            client.stop();
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #386: plan token columns on lines with non-ASCII text', () => {
+    it('renames every call on a line whose earlier text holds multi-byte characters', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t","type":"module"}',
+            'lib.js': 'export function helper(s) { return s; }\n',
+            'use.js': "import { helper } from './lib.js';\nexport const x = helper('näme') + helper('日本');\n",
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: 'helper', file: 'lib.js', renameTo: 'aid' });
+            assert.ok(r.ok, r.error);
+            const line = r.result.changes.find(c => c.file === 'use.js' && c.line === 2);
+            assert.strictEqual(line.newExpression, "export const x = aid('näme') + aid('日本');");
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// fix #394: usages is the complete literal-name inventory (test files too)
+// ============================================================================
+
+describe('fix #394: usages lists test files by default and discloses --exclude-tests', () => {
+    it('lists every line the ACCOUNT counts; --exclude-tests hides test files with a count', () => {
+        const dir = tmp({
+            'lib.py': 'def target(x):\n    return x\n\ndef run():\n    return target(1)\n',
+            'test_lib.py': 'from lib import target\n\ndef test_target():\n    assert target(2) == 2\n',
+        });
+        try {
+            const index = idx(dir);
+            const all = execute(index, 'usages', { name: 'target' });
+            assert.ok(all.ok, all.error);
+            const lines = [...new Set(all.result.map(u => `${u.relativePath}:${u.line}`))].sort();
+            assert.deepStrictEqual(lines, ['lib.py:1', 'lib.py:5', 'test_lib.py:1', 'test_lib.py:4']);
+            assert.doesNotMatch(all.note || '', /hidden/);
+            const impact = execute(index, 'impact', { name: 'target' });
+            assert.strictEqual(impact.result.account.groundTotal, lines.length);
+            const prod = execute(index, 'usages', { name: 'target', excludeTests: true });
+            assert.deepStrictEqual([...new Set(prod.result.map(u => u.relativePath))], ['lib.py']);
+            assert.match(prod.note, /2 test-file usage\(s\) hidden by --exclude-tests/);
+        } finally { rm(dir); }
     });
 });

@@ -147,6 +147,14 @@ function formatAccountLines(account) {
             `(${account.unparsed.lines} line${account.unparsed.lines === 1 ? '' : 's'}, NOT analyzed): ` +
             account.unparsed.files.join(', '));
     }
+    if (account.recovered && account.recovered.lines > 0) {
+        const rec = account.recovered;
+        const shown = rec.sites.slice(0, 5).map(site => `${site.file}:${site.line}`);
+        lines.push(`WARNING: ${rec.lines} line${rec.lines === 1 ? '' : 's'} with "${account.symbol}" in ` +
+            `${rec.fileCount} file${rec.fileCount === 1 ? '' : 's'} sit${rec.lines === 1 ? 's' : ''} in syntax-error recovery ` +
+            `regions (partially parsed; classification there may be wrong): ${shown.join(', ')}` +
+            `${rec.lines > shown.length ? `, ... and ${rec.lines - shown.length} more` : ''}`);
+    }
     if (unsupported.lines > 0) {
         const langParts = Object.entries(unsupported.languages)
             .map(([lang, count]) => `${lang}: ${count}`).join(', ');
@@ -270,6 +278,7 @@ function formatContextJson(context) {
                     ...(c.resolution && { resolution: c.resolution }),
                     ...(c.provenance && { provenance: c.provenance }),
                     ...(c.siteProvenance && { siteProvenance: c.siteProvenance }),
+                    ...(c.macroExpansion && { macroExpansion: c.macroExpansion }),
                     ...(c.tier && { tier: c.tier })
                 })),
                 unverifiedCallers: (context.unverifiedCallers || []).map(c => ({
@@ -287,6 +296,7 @@ function formatContextJson(context) {
                     ...(c.resolution && { resolution: c.resolution }),
                     ...(c.provenance && { provenance: c.provenance }),
                     ...(c.siteProvenance && { siteProvenance: c.siteProvenance }),
+                    ...(c.macroExpansion && { macroExpansion: c.macroExpansion }),
                     ...(c.reason && { reason: c.reason }),
                     ...(c.dispatchVia && { dispatchVia: c.dispatchVia }),
                     ...(c.dispatchCandidates != null && { dispatchCandidates: c.dispatchCandidates }),
@@ -329,6 +339,7 @@ function formatContextJson(context) {
                 ...(c.confidence != null && { confidence: c.confidence, resolution: c.resolution }),
                 ...(c.provenance && { provenance: c.provenance }),
                 ...(c.siteProvenance && { siteProvenance: c.siteProvenance }),
+                ...(c.macroExpansion && { macroExpansion: c.macroExpansion }),
                 ...(c.evidenceScore != null && { evidenceScore: c.evidenceScore }),
                 ...(c.scoreKind && { scoreKind: c.scoreKind }),
                 ...(c.tier && { tier: c.tier }),
@@ -345,6 +356,7 @@ function formatContextJson(context) {
                 ...(c.confidence != null && { confidence: c.confidence, resolution: c.resolution }),
                 ...(c.provenance && { provenance: c.provenance }),
                 ...(c.siteProvenance && { siteProvenance: c.siteProvenance }),
+                ...(c.macroExpansion && { macroExpansion: c.macroExpansion }),
                 ...(c.evidenceScore != null && { evidenceScore: c.evidenceScore }),
                 ...(c.scoreKind && { scoreKind: c.scoreKind }),
                 tier: 'unverified',
@@ -370,6 +382,7 @@ function formatContextJson(context) {
                 ...(c.confidence != null && { confidence: c.confidence, resolution: c.resolution }),
                 ...(c.provenance && { provenance: c.provenance }),
                 ...(c.siteProvenance && { siteProvenance: c.siteProvenance }),
+                ...(c.macroExpansion && { macroExpansion: c.macroExpansion }),
                 ...(c.evidenceScore != null && { evidenceScore: c.evidenceScore }),
                 ...(c.scoreKind && { scoreKind: c.scoreKind }),
                 ...(c.tier && { tier: c.tier }),
@@ -545,12 +558,15 @@ function formatContext(ctx, options = {}) {
     const renderCaller = (c) => {
         const callerName = c.callerName ? ` [${c.callerName}]` : '';
         const unreachableMark = (callerReach.perLine && c.reachable === false) ? ' [unreachable]' : '';
+        // The call target is produced by expanding a macro invocation on
+        // this line; the line itself does not spell the name (fix #362).
+        const viaMacro = c.macroExpansion ? ` [via macro ${c.macroExpansion.macro}]` : '';
         if (compact) {
             // One line per caller: "[N] file:line [callerName]: expression"
             const expr = c.content ? c.content.trim().replace(/\s+/g, ' ').slice(0, 100) : '';
-            lines.push(`  [${itemNum}] ${c.relativePath}:${c.line}${callerName}${unreachableMark}: ${expr}`);
+            lines.push(`  [${itemNum}] ${c.relativePath}:${c.line}${callerName}${unreachableMark}${viaMacro}: ${expr}`);
         } else {
-            lines.push(`  [${itemNum}] ${c.relativePath}:${c.line}${callerName}${unreachableMark}`);
+            lines.push(`  [${itemNum}] ${c.relativePath}:${c.line}${callerName}${unreachableMark}${viaMacro}`);
             lines.push(`    ${c.content.trim()}`);
         }
         expandable.push({

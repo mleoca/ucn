@@ -136,7 +136,7 @@ const FLAG_APPLICABILITY = {
     // related. Caller-bearing projections always preserve ACCOUNT/CONTRACT.
     show:         ['name', 'file', 'exclude', 'className', 'line', 'sections', 'includeMethods', 'includeTests', 'top', 'all', 'withTypes', 'minConfidence', 'showConfidence', 'unreachableOnly', 'compact', 'git', 'diverse', 'lines'],
     find:         ['name', 'file', 'exclude', 'className', 'includeTests', 'limit', 'exact', 'in', 'compact', 'type', 'withSource', 'lines'],
-    usages:       ['name', 'file', 'exclude', 'className', 'includeTests', 'limit', 'codeOnly', 'context', 'in', 'compact', 'all', 'lines'],
+    usages:       ['name', 'file', 'exclude', 'className', 'excludeTests', 'limit', 'codeOnly', 'context', 'in', 'compact', 'all', 'lines'],
     search:       ['term', 'file', 'exclude', 'includeTests', 'top', 'limit', 'codeOnly', 'caseSensitive', 'context', 'regex', 'in', 'type', 'param', 'receiver', 'returns', 'decorator', 'exported', 'unused', 'lines'],
     source:       ['name', 'file', 'className', 'line', 'range', 'all', 'maxLines', 'raw'],
     trace:        ['name', 'file', 'exclude', 'className', 'line', 'direction', 'to', 'includeMethods', 'depth', 'all', 'expandUnverified'],

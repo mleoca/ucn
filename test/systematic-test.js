@@ -401,8 +401,8 @@ function testEdgeCases() {
       expect: (r) => r.success,
     },
     {
-      name: 'Include tests flag',
-      run: () => runUcn(languages.javascript.path, 'usages', ['processData', '--include-tests']),
+      name: 'Exclude tests flag',
+      run: () => runUcn(languages.javascript.path, 'usages', ['processData', '--exclude-tests']),
       expect: (r) => r.success,
     },
     // Composed show sections

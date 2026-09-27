@@ -298,23 +298,28 @@ config/local.json
 `);
 
     try {
-        const patterns = parseGitignore(tmpDir);
+        // fix #382: parseGitignore returns compiled rules with git's matching
+        // semantics (core/ignore-rules.js); the same intents, asked as paths.
+        const rules = parseGitignore(tmpDir);
+        const ignored = (rel, isDir = false) => rules.isIgnored(rel, isDir);
 
-        assert.ok(patterns.includes('public'), 'Should include public');
-        assert.ok(!patterns.includes('next.lock'), 'Should skip next.lock (already in DEFAULT_IGNORES)');
-        assert.ok(patterns.includes('.cache'), 'Should include .cache');
-        // fix #226: root-relative patterns KEEP the leading slash (anchored —
-        // git semantics: /tmp_build ignores only the root-level tmp_build,
-        // never src/tmp_build; shouldIgnore applies them at anchorRoot only).
-        assert.ok(patterns.includes('/tmp_build'), 'Should include /tmp_build (anchored, slash preserved)');
-        assert.ok(!patterns.includes('tmp_build'), 'Anchored pattern must not appear unanchored');
-        assert.ok(patterns.includes('*.bak'), 'Should include *.bak glob');
-        assert.ok(!patterns.includes('node_modules'), 'Should skip node_modules (already in DEFAULT_IGNORES)');
-        assert.ok(patterns.includes('!important.log'),
-            'Should preserve negation patterns for git-compatible re-inclusion');
-        assert.ok(patterns.includes('src/generated/output.js'));
-        assert.ok(patterns.includes('config/local.json'));
-        assert.ok(patterns.includes('*.log'), 'Should include *.log');
+        assert.ok(ignored('public', true) && ignored('src/public', true), 'public/ ignored at any depth');
+        assert.ok(ignored('next.lock', true), 'next.lock/ ignores the directory');
+        assert.ok(!ignored('next.lock', false), 'a trailing slash matches directories only');
+        assert.ok(ignored('.cache') && ignored('a/.cache', true), '.cache ignored at any depth');
+        // fix #226: a leading slash anchors to the .gitignore's directory:
+        // /tmp_build ignores only the root-level tmp_build, never src/tmp_build.
+        assert.ok(ignored('tmp_build', true), 'anchored /tmp_build ignores the root entry');
+        assert.ok(!ignored('src/tmp_build', true), 'anchored pattern must not match deeper');
+        assert.ok(ignored('x/y.bak'), '*.bak glob');
+        assert.ok(ignored('node_modules', true), 'node_modules/ rule applies');
+        assert.ok(ignored('debug.log') && !ignored('important.log'),
+            'a later negation re-includes (last match wins)');
+        assert.ok(ignored('src/generated/output.js') && !ignored('lib/src/generated/output.js'),
+            'a rule with an inner slash is relative to the .gitignore directory');
+        assert.ok(ignored('config/local.json'));
+        assert.ok(!ignored('src/app.js'), 'unmatched source stays');
+        assert.equal(DEFAULT_IGNORES.includes('next.lock'), true);
     } finally {
         fs.rmSync(tmpDir, { recursive: true, force: true });
     }

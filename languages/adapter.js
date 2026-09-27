@@ -28,8 +28,11 @@ const OPTIONAL_HELPERS = Object.freeze([
     'getBuiltinFieldType',
     'findPytestFunctions',
     'findPythonModuleEvidence',
+    'findScopeAlternativeBindings',
     'isPlatformConcreteCall',
     'isPlatformConcreteType',
+    'queryTree',
+    'queryTreeIsPlain',
 ]);
 
 function adapterCapabilities(languageModule) {
@@ -79,8 +82,12 @@ function createLanguageAdapter(config) {
         findExports(code, parser) {
             return languageModule.findExportsInCode(code, parser);
         },
-        findUsages(code, name, parser, tree) {
-            return languageModule.findUsagesInCode(code, name, parser, tree);
+        findUsages(code, name, parser, tree, options) {
+            // Only the lexical-scope request (fix #392) reaches the parser;
+            // other query options keep the adapter's historical behavior.
+            return options?.lexicalScopes
+                ? languageModule.findUsagesInCode(code, name, parser, tree, { lexicalScopes: true })
+                : languageModule.findUsagesInCode(code, name, parser, tree);
         },
         getEntryPointKind(symbol) {
             return languageModule.getEntryPointKind(symbol);
@@ -88,7 +95,7 @@ function createLanguageAdapter(config) {
         isEntryPoint(symbol) {
             return languageModule.isEntryPoint(symbol);
         },
-        analyze(code, parser, file = null) {
+        analyze(code, parser, file = null, analyzeOptions = {}) {
             // Full-file indexing consumes immutable records, not native ASTs.
             // Parsers with a heavier internal recovery cache (notably C/C++)
             // may release analysis-only trees as soon as those records have
@@ -96,6 +103,9 @@ function createLanguageAdapter(config) {
             // retain their bounded cross-operation cache.
             const parsed = languageModule.parse(code, parser, {
                 releaseAnalysisTree: true,
+                // Macro definitions the file's include closure supplies
+                // (C/C++ recovery, fix #396).
+                ...(analyzeOptions.externalMacros && { externalMacros: analyzeOptions.externalMacros }),
             });
             const parseProvidesFacts = !!languageModule.parseProvidesAnalysisFacts;
             const imports = parseProvidesFacts
@@ -115,6 +125,18 @@ function createLanguageAdapter(config) {
             const calls = parseProvidesFacts && Array.isArray(parsed.calls)
                 ? parsed.calls
                 : languageModule.findCallsInCode(code, parser, callOptions);
+            // Reflective member accesses (fix #363), from the same parse:
+            // safeParse returns the tree the extractors above just built.
+            if (config.traits?.reflectionApi && !parsed.reflectionSites) {
+                const { safeParse } = require('./index');
+                const { reflectionSitesInTree } = require('../core/reflection');
+                // A language reading the file through its own view (C#
+                // conditional compilation, fix #391) supplies that tree.
+                const analysisTree = typeof languageModule.analysisTree === 'function'
+                    ? languageModule.analysisTree(code, parser) : safeParse(parser, code);
+                const sites = reflectionSitesInTree(analysisTree, config.name, code);
+                if (sites.length > 0) parsed.reflectionSites = sites;
+            }
             return createFileIR({
                 language: config.name,
                 file,

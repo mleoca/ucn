@@ -10,7 +10,7 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 const {
-    expandGlob, detectProjectPattern, parseGitignore, gitTrackedPaths, DEFAULT_IGNORES,
+    expandGlob, detectProjectPattern, parseGitignore, gitTrackedPaths, gitListing, DEFAULT_IGNORES,
     classifyUnsupportedSourceFile,
 } = require('./discovery');
 const { codeUnitCompare } = require('./shared');
@@ -26,9 +26,21 @@ const CACHE_PRUNE_INTERVAL_MS = 60 * 60 * 1000;
 const CACHE_MAX_PROJECTS = 128;
 const CACHE_MAX_BYTES = 1024 * 1024 * 1024;
 
-function discoveryRulesHash(root, patterns = null) {
-    const rules = patterns || parseGitignore(root);
-    return crypto.createHash('md5').update(rules.join('\0')).digest('hex');
+/**
+ * Fingerprint of what decides the discovered file set besides the tree
+ * itself: the compiled .gitignore rules and whether git could list the
+ * tracked paths (a failed listing changes which files rules may exclude).
+ */
+function discoveryFingerprint(rules, listing) {
+    return crypto.createHash('md5')
+        .update(rules.fingerprint())
+        .update(listing?.failure ? '\0git-listing-failed' : '')
+        .digest('hex');
+}
+
+function discoveryRulesHash(root) {
+    const listing = gitListing(root);
+    return discoveryFingerprint(parseGitignore(root, listing), listing);
 }
 
 /**
@@ -714,7 +726,166 @@ function clearAllCaches() {
 // v226: bundled/minified filename exclusions are disclosed in discoveryIssues.
 // v227: signature parameter/return text excludes AST comments in every language.
 // v228: Python keyword arguments retain the same callable-reference facts as positional arguments.
-const CACHE_FORMAT_VERSION = 228;
+// v229 (fix #359): subscripts of declared containers type their element
+// receivers (Python dict/list/Sequence, TS Array/Record/index signatures and
+// `const c = xs[i]`, Java/C/C++ arrays, C# BCL indexers, C++ std containers,
+// Rust Vec/HashMap/arrays).
+// v230 (fix #360): Go embedded-field symbols carry `embedded`; Go files carry
+// typeConversions (concrete values flowing into differently-typed slots);
+// Rust `fn name(...)` inside macro token trees is no longer a call record.
+// v231 (fix #361): C/C++ recovery keeps include-guarded bodies and
+// access-specifier/statement macros inside class bodies; C++ macros carry
+// namespaceScope, C++ files carry macroScopeMarkers and cppUsings, C++ path
+// calls carry qualifierTemplateParam; angle-bracket project includes resolve
+// through include directories and basename-resolved quoted includes are
+// recorded in fileEntry.includeFallback.
+// v232 (fix #362): C/C++ function-like macros carry their replacement-list
+// template (ppParams/ppVariadic/ppBody); `#define`/`#include` directives the
+// grammar places inside enumerator lists or initializers are indexed; the
+// index cache carries per-file macro-expansion records (`macroExpansion`).
+// v233 (fix #363): file entries carry `reflectionSites` (reflective member
+// accesses: literal names, name patterns built from literal fragments,
+// receiver facts), extracted from each file's own parse at index time.
+// v234 (fix #364): Python functions whose own body yields and C# iterator
+// methods (`yield return`) carry `isGenerator`, so audit-async classifies
+// async generators as async iterators rather than coroutines.
+// v235 (fix #366): JS/TS and Python call records carry `requestConfig`
+// (object-literal / keyword `url`/`path` request configuration), C#
+// attributes keep non-literal `args`, and Python absolute imports resolve
+// against nested source roots (moduleResolved/importGraph content changed).
+// v236 (fix #367): C/C++ definitions and calls inside `__cplusplus` blocks
+// the file's own language skips are indexed with `languageBranch`.
+// v238 (fix #369): Rust path calls carry `returnPosition` (the value the
+// enclosing fn returns) and aliased `extern crate x as y;` declarations
+// become import bindings.
+// v239 (fix #370): Rust functions, methods and type aliases carry
+// `futureReturn`; Rust qualifiers (async/unsafe/const/extern) come from the
+// AST, and trait `async fn` members carry isAsync.
+// v242 (fix #372): the index carries `cargoManifests` (the workspace crate
+// registry's manifest snapshot, stat-validated for staleness).
+// v243 (fix #372): Rust call records mark every value that flows on or is
+// read from its local (`valueConsumed` 'flow'/'stored'), and a method taken
+// on a stored value as `consumingMethod`; file entries carry `openCalls`
+// (call shapes, replacing openCallNames); large directories' calls shards
+// are split into path buckets.
+// v244 (fix #374): Rust files invoking project macro_rules! carry
+// `rustMacroExpansion` (expansion record, revalidated per build); their
+// symbols and call records are those of the expanded file, and facts
+// produced inside an invocation carry `macroExpansion`.
+// v245 (fix #375): calls shards store each file's enclosing-function,
+// macro-expansion and receiver-evidence objects once (`fx` / `mx` / `rx`
+// tables, referenced by position).
+// v246 (fix #377): Rust `mod` declarations resolve by the module layout
+// rules (foo.rs + foo/ children, #[path], inline-module nesting); persisted
+// moduleResolved/importGraph content changed.
+// v247 (fix #378): Go generic instantiation calls (`f[T](x)`, `pkg.F[T](x)`)
+// are call records, generic receivers/parameters are typed by their base
+// type, Go aliases record `aliasOf` for generic bases and `aliasQualifier`
+// for package-qualified ones, package-qualified function values are function
+// references, and function-local Go types and JS classes carry their lexical
+// scope.
+// v248 (fix #379): C/C++ recovery blanks a decoration macro before a second
+// type specifier and in `class EXPORT Name : bases` heads, member-list macro
+// invocations carry their access effect (`accessAfterMacro`), and functions
+// under a preprocessor conditional record `ppBranch`.
+// v249 (fix #380): C# type definitions carry `typeArity` and their members
+// `ownerTypeArity`; call records carry the written type-argument count of
+// constructors (`typeArgs`), type-qualified and typed receivers
+// (`receiverTypeArgs`, `receiverRootTypeArgs`); generic type receivers
+// (`Outcome<int>.Create()`) are type-qualified; Java `implements` keeps
+// qualified supertypes.
+// v250 (fix #381): Python function-local classes carry their lexical scope,
+// and Python/JS/Java/C#/Go/Rust call records on a one-hop local alias of a
+// field path or typed local receive like the aliased expression.
+// v251 (fix #383): route registrations carry `handlerArgs` (JS/TS, Go),
+// Go method-first registrations (`Handle(method, path, h)`)
+// `methodFirstRoute`, Fastify route-config objects their `handler`, Go request constructors
+// `requestTarget` { method, url }, and axum `.route()` calls `methodRouter`;
+// Go file entries carry `packageName` (the package clause).
+// v252 (fix #384): JS/TS member-assigned functions carry `assignedObject`
+// ('global' | 'object') and `selfNamed` (bare-name reachability).
+// v253 (fix #385): C/C++ members inside preprocessor conditionals of a class
+// body are indexed (with `ppBranch`), invocations of a file's own
+// function-like macros read as declarations are recovered (members they
+// declare carry `generatedByMacro`), and macro invocations read as functions
+// are not indexed.
+// v254 (fix #386): specs of a grouped Go `type ( ... )` declaration carry
+// `nameLine` (the line naming the type).
+// v255 (fix #387): C/C++ recovery blanks declaration-specifier macros, never
+// the type, scope or keyword next to them (return types, members and line
+// numbers of recovered declarations changed); C/C++ file entries carry
+// `recoveryBlanks` (the byte ranges the recovery blanked).
+// v256 (fix #389): Java annotation types (`@interface`, `annotationType`) with
+// their elements and interface constants, Java type `nameLine`, Rust unions,
+// struct/variant `valueShape` ('unit' | 'tuple'), C/C++ function-local class
+// scopes, file-level `moduleValueAliases` (Python/JS/TS), Rust call records'
+// `receiverValuePath` for unbound identifiers / struct expressions / one-hop
+// locals (`receiverValueKind`), Java annotation element call records
+// (`annotationElement`, `implicitName`), C# typeof reflection `arity`.
+// v257 (fix #390): C# declarations carry `nameLine` when attributes start
+// them and `generics` (type parameter names) on generic types, methods and
+// local functions; C++ class templates carry `generics`; Java fields and
+// TS/JS decorated fields carry `nameLine`; Java/C# call records read a `+`
+// with a string operand as a `string` argument.
+// v259 (fix #391): C++ friend functions are namespace-scope functions
+// (`friendOf` names the befriending class) instead of members, and member
+// templates carry their return type and `templateDependent`; namespace-scope
+// macro invocations followed by a body are generated callables
+// (`generatedByMacro`); C# files whose `#if` splits a declaration are read
+// through configuration views, recorded per file as `conditionalViews`;
+// C# explicit interface properties, indexers and events carry
+// `explicitInterface`; large C/C++ files resolve the conditionals the
+// grammar could not place; C#/Java call records carry explicit method type
+// arguments (`methodTypeArgs`) and lambda parameter counts (`lambda:N`), and
+// C# argument kinds type `params` parameters, fields of the enclosing type
+// and array creations by rank.
+// v260 (fix #392): Rust top-level const/static items carry their declared
+// type (`valueType`); Python module aliases bound on several module-level
+// paths carry `alternatives`, JS/TS `let`/`var` aliases never reassigned are
+// aliases; Java enums record `implements` and their methods' `nameLine` /
+// annotations; Rust call records on locals destructured from `self` carry
+// the field-hop receiver; Python usage records classify default values as
+// references and bare/lambda parameters as definitions (plan's usage mode
+// adds each bare reference's lexical scope verdict).
+// v261 (fix #393): C/C++ unnamed parameters carry `unnamed` with their type
+// as the name; C++ `v->m()` call records carry `receiverArrow` (and the
+// declared object type `receiverArrowObject` when `v` is an object); C++
+// function templates carry `templateParams`, member templates with a body
+// are definitions, members in skipped conditional branches are indexed,
+// namespaces left as ERROR tokens or closed early by the parse scope their
+// declarations, large files resolve brace-splitting conditionals, pointer
+// arguments keep their pointer level in `type:` argument kinds; C#
+// delegates carry `delegateParams` and target-typed `new(..)` records a
+// constructor call (`targetTyped`).
+// v262 (fix #394): Java argument kinds keep array dimensions
+// (`type:java.lang.String[]`, `new:..[]`, `cast:..[]`) and receivers
+// declared with a package-qualified type carry the package as
+// `receiverTypeQualifier`.
+// v263 (fix #395): C# declarations carry their full namespace (every
+// enclosing `namespace` block), C# using directives record the namespace
+// they sit in, `using static` and `global using`.
+// v264 (fix #396): C/C++ anonymous typedef'd specifiers record
+// `typedefName`, nested classes (in-class and `struct Outer::Inner`)
+// `enclosingType`, generated callables their identifier arguments
+// (`generatedByMacro.args`) and pasted member-list names `unspelled`; calls
+// on `#define` continuation lines are replacement-list calls; recovery blanks
+// decoration macros before parenthesized names and return-type macro
+// invocations; files record the project macro names their recovery used
+// (`externalMacroNames`, `externalMacroKey`, `recoveryCandidates`).
+// v265 (fix #396): a replacement-list receiver declared with a macro
+// parameter as its type carries no receiver type.
+// v266 (fix #396): a class body the grammar closed early is never read as
+// the return type of the next member (no decoration blank there).
+// v267 (fix #397): JS/TS bare records of names an object pattern binds carry
+// `destructured` (property key, position, source receiver facts); local
+// shadows carry the shadowing declaration's line as `localShadow` (-1 for a
+// parameter) and plain calls carry them too; stored methods record `memberValue` references;
+// `require('m').y` binds y under the local name; object-literal members
+// carry `objectLiteralLine` (accessors their get/set kind); usages mark
+// shorthand properties and import aliases; the index persists the
+// in-repository JS packages (`jsWorkspacePackages`); JS call records carry
+// `uncertain` only when true.
+const CACHE_FORMAT_VERSION = 267;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**
@@ -815,21 +986,25 @@ function saveCache(index, cachePath) {
 
     const cacheFile = cachePath || path.join(cacheDir, 'index.json');
 
+    // A partially loaded (per-file) calls cache must be complete before it
+    // is rewritten: the shard directory is replaced wholesale below.
+    if (index._callsCachePrepared && !index._callsCacheLoaded) {
+        ensureCallsCacheLoaded(index);
+    }
+
     // Prepare callsCache for serialization (exclude content, use relative paths)
     const callsCacheData = [];
     for (const [filePath, entry] of index.callsCache) {
-        callsCacheData.push([path.relative(index.root, filePath), {
-            mtime: entry.mtime,
-            hash: entry.hash,
-            calls: entry.calls
-            // content is not persisted - will be read on demand
-        }]);
+        callsCacheData.push([path.relative(index.root, filePath), entry]);
     }
 
     // Hash config to detect when graph rebuild is needed on load
     const configHash = crypto.createHash('md5')
         .update(JSON.stringify(index.config || {})).digest('hex');
-    const discoveryHash = discoveryRulesHash(index.root);
+    // The rules the index was discovered with (fix #382: re-asking git at
+    // save time cost a second listing and could describe newer rules).
+    const discoveryHash = index._discoveryHash || index._loadedDiscoveryHash ||
+        discoveryRulesHash(index.root);
 
     // Strip redundant fields from symbols and file entries to reduce cache size.
     // v6: All paths stored as relative paths (saves ~60% on large codebases).
@@ -938,6 +1113,20 @@ function saveCache(index, cachePath) {
         unsupportedFiles: Array.isArray(index.unsupportedFiles)
             ? index.unsupportedFiles
             : [],
+        ...(Array.isArray(index.cargoManifests) && {
+            cargoManifests: index.cargoManifests,
+            cargoManifestsSeen: index.cargoManifestsSeen || null,
+        }),
+        // In-repository JS packages (fix #397), so a cache-loaded query
+        // never re-reads the manifests.
+        // Names and directories only; a manifest is read again when an
+        // import resolves through it.
+        ...(index._jsWorkspacePackages !== undefined && {
+            jsWorkspacePackages: index._jsWorkspacePackages
+                ? [...index._jsWorkspacePackages].map(([name, pkg]) =>
+                    [name, pkg.ambiguous ? null : path.relative(root, pkg.dir)])
+                : null,
+        }),
         includeBundled: index.includeBundled === true,
         discoveryIssues: Array.isArray(index.discoveryIssues)
             ? index.discoveryIssues
@@ -947,6 +1136,12 @@ function saveCache(index, cachePath) {
             reachableSymbols: reachableSymbolsRel,
             reachableFingerprint,
         }),
+        // C/C++ macro-expansion records (fix #362), revalidated per file on use.
+        ...(() => {
+            const { persistableMacroExpansion } = require('./macro-expansion');
+            const macroExpansion = persistableMacroExpansion(index);
+            return macroExpansion ? { macroExpansion } : {};
+        })(),
         ...(index._computedDispatchBlindspots instanceof Map && {
             computedDispatchBlindspots: [...index._computedDispatchBlindspots]
                 .map(([filePath, sites]) => [path.relative(root, filePath), sites]),
@@ -966,6 +1161,7 @@ function saveCache(index, cachePath) {
         index.reachabilityDirty = false;
     }
     index.computedDispatchDirty = false;
+    index.macroExpansionDirty = false;
 
     // Save callsCache sharded by directory for lazy loading.
     // Write to a temp directory first, then atomic swap to avoid data loss on crash.
@@ -988,13 +1184,26 @@ function saveCache(index, cachePath) {
             shards.get(dir).push([relPath, entry]);
         }
 
-        // Write all shards to temp directory
+        // Write all shards to temp directory. A large directory is split
+        // into buckets by file path (fix #372), so a per-file consumer loads
+        // roughly that file's records instead of its whole directory.
         const shardManifest = [];
         for (const [dir, entries] of shards) {
             const hash = crypto.createHash('md5').update(dir).digest('hex').slice(0, 10);
-            const shardFile = path.join(callsTmpDir, `${hash}.json`);
-            fs.writeFileSync(shardFile, JSON.stringify(entries));
-            shardManifest.push([dir, hash, entries.length]);
+            const serialized = entries.map(([relPath, entry]) => serializeCallsEntry(relPath, entry));
+            const bytes = serialized.reduce((total, text) => total + text.length + 1, 0);
+            const buckets = Math.max(1, Math.min(entries.length, Math.ceil(bytes / CALLS_SHARD_TARGET_BYTES)));
+            if (buckets === 1) {
+                fs.writeFileSync(path.join(callsTmpDir, `${hash}.json`), `[${serialized.join(',')}]`);
+                shardManifest.push([dir, hash, entries.length]);
+                continue;
+            }
+            const parts = Array.from({ length: buckets }, () => []);
+            entries.forEach(([relPath], i) => parts[callsShardBucket(relPath, buckets)].push(serialized[i]));
+            parts.forEach((part, k) => {
+                fs.writeFileSync(path.join(callsTmpDir, `${hash}.${k}.json`), `[${part.join(',')}]`);
+            });
+            shardManifest.push([dir, hash, entries.length, buckets]);
         }
 
         // Write manifest to temp directory
@@ -1084,6 +1293,14 @@ function loadCache(index, cachePath) {
         index._groundSetCacheLines = 0;
         index._nameBindingReachCache = new Map();
         index._returnTypeFlowCache = new Map();
+        index._classIdentity = null;
+        index._macroExpansion = null;
+        index._macroSpellable = null; // fix #385: paste-spellability memo over the same symbols
+        index._rustMacroState = null;
+        index._cppScope = null;
+        index._contractIndex = null;
+        index._typeDenotation = null;
+        index._languageFeatureMemo = null; // fix #380 protocol-type feature memo
 
         // Reconstruct files Map: relative key → absolute key, restore path and relativePath
         // Initialize symbols/bindings arrays (will be populated from top-level symbols)
@@ -1168,6 +1385,22 @@ function loadCache(index, cachePath) {
         index.unsupportedFiles = Array.isArray(cacheData.unsupportedFiles)
             ? cacheData.unsupportedFiles
             : [];
+        // Cargo manifest snapshot (fix #372): seeds the workspace crate
+        // registry so queries never walk the tree for it.
+        index.cargoManifests = Array.isArray(cacheData.cargoManifests)
+            ? cacheData.cargoManifests
+            : null;
+        index.cargoManifestsSeen = cacheData.cargoManifestsSeen || null;
+        if (index.cargoManifests) {
+            require('./imports').seedWorkspaceManifests(index.root, index.cargoManifests);
+        }
+        if (cacheData.jsWorkspacePackages !== undefined) {
+            index._jsWorkspacePackages = Array.isArray(cacheData.jsWorkspacePackages)
+                ? new Map(cacheData.jsWorkspacePackages.map(([name, dir]) => [name, typeof dir === 'string'
+                    ? { name, dir: path.join(index.root, dir), workspace: true, manifestPending: true }
+                    : { ambiguous: true }]))
+                : null;
+        }
         index.includeBundled = cacheData.includeBundled === true;
         index.discoveryIssues = Array.isArray(cacheData.discoveryIssues)
             ? cacheData.discoveryIssues
@@ -1175,6 +1408,11 @@ function loadCache(index, cachePath) {
         index.truncated = cacheData.truncated || null;
         index._loadedConfigHash = cacheData.configHash || null;
         index._loadedDiscoveryHash = cacheData.discoveryHash || null;
+        index._discoveryHash = null;
+        index._macroExpansionPersisted = cacheData.macroExpansion &&
+            typeof cacheData.macroExpansion.signature === 'string'
+            ? cacheData.macroExpansion : null;
+        index.macroExpansionDirty = false;
         if (Array.isArray(cacheData.computedDispatchBlindspots)) {
             index._computedDispatchBlindspots = new Map(
                 cacheData.computedDispatchBlindspots.map(([relPath, sites]) => [
@@ -1184,6 +1422,7 @@ function loadCache(index, cachePath) {
             );
             index.computedDispatchDirty = false;
         }
+        index._reflectionPatternIndex = null;
 
         // Restore calleeIndex if persisted (v7 caches only; v8+ rebuilds lazily)
         if (Array.isArray(cacheData.calleeIndex)) {
@@ -1253,11 +1492,13 @@ function isCacheStale(index) {
     // new-file walk below. On a fresh cache these used to run two identical
     // `git ls-files` subprocesses per one-shot CLI invocation, accounting for
     // roughly a third of warm-start staleness time on measured repositories.
-    let gitignorePatterns = null;
+    let gitignoreRules = null;
+    // One git subprocess answers both questions discovery asks (fix #375).
+    let listing;
+    const gitListingOnce = () => (listing === undefined ? (listing = gitListing(index.root)) : listing);
     if (index._loadedDiscoveryHash) {
-        gitignorePatterns = parseGitignore(index.root);
-        if (discoveryRulesHash(index.root, gitignorePatterns) !==
-            index._loadedDiscoveryHash) {
+        gitignoreRules = parseGitignore(index.root, gitListingOnce());
+        if (discoveryFingerprint(gitignoreRules, listing) !== index._loadedDiscoveryHash) {
             return true;
         }
     }
@@ -1296,6 +1537,12 @@ function isCacheStale(index) {
         }
     }
 
+    // Cargo manifests steer Rust import resolution (fix #372).
+    if (index.cargoManifests &&
+        !require('./imports').workspaceManifestsCurrent(index.root, index.cargoManifests)) {
+        return true;
+    }
+
     // Ultra-fast skip for the SLOW path only: last confirmed-fresh < 2s ago
     // (covers MCP burst calls). Uses _lastFreshAt (set at the end of a
     // successful full check), never the cache save timestamp.
@@ -1308,6 +1555,7 @@ function isCacheStale(index) {
     const pattern = detectProjectPattern(index.root);
     const currentUnsupported = [];
     const currentBundled = [];
+    const currentManifests = [];
     const globOpts = {
         root: index.root,
         includeBundled: index.includeBundled === true,
@@ -1315,6 +1563,9 @@ function isCacheStale(index) {
             if (issue.reason === 'bundled') currentBundled.push(path.relative(index.root, issue.path));
         },
         onSkippedFile: (filePath) => {
+            if (path.basename(filePath) === 'Cargo.toml') {
+                currentManifests.push(path.relative(index.root, filePath));
+            }
             const kind = classifyUnsupportedSourceFile(filePath);
             if (!kind) return;
             currentUnsupported.push({
@@ -1323,9 +1574,9 @@ function isCacheStale(index) {
             });
         },
     };
-    if (!gitignorePatterns) gitignorePatterns = parseGitignore(index.root);
-    globOpts.gitignorePatterns = gitignorePatterns;
-    globOpts.trackedPaths = gitTrackedPaths(index.root);
+    if (!gitignoreRules) gitignoreRules = parseGitignore(index.root, gitListingOnce());
+    globOpts.gitignoreRules = gitignoreRules;
+    globOpts.trackedPaths = gitTrackedPaths(index.root, gitListingOnce());
     const configExclude = index.config.exclude || [];
     if (configExclude.length > 0) {
         globOpts.ignores = [...DEFAULT_IGNORES, ...configExclude];
@@ -1363,6 +1614,12 @@ function isCacheStale(index) {
         return true;
     }
 
+    if (index.cargoManifests &&
+        !require('./imports').workspaceManifestsCurrent(index.root, index.cargoManifests,
+            currentManifests, index.cargoManifestsSeen)) {
+        return true;
+    }
+
     // Record when we last confirmed the cache is fresh (enables 2s skip on burst calls)
     index._lastFreshAt = Date.now();
     return false;
@@ -1389,8 +1646,11 @@ function _prepareCallsCache(index, cacheFile) {
         try {
             const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf-8'));
             index._callsManifest = new Map();
-            for (const [dir, hash, count] of manifest) {
-                index._callsManifest.set(dir, { hash, count, loaded: false });
+            for (const [dir, hash, count, buckets] of manifest) {
+                index._callsManifest.set(dir, {
+                    hash, count, buckets: buckets || 1,
+                    loaded: false, loadedBuckets: buckets > 1 ? new Set() : null,
+                });
             }
             index._callsCachePrepared = true;
             return;
@@ -1418,10 +1678,19 @@ function loadCallsCache(index) {
     if (index._callsCacheLoaded) return index.callsCache.size > 0;
     index._callsCacheLoaded = true;
 
-    // If manifest was prepared lazily, load all shards now
+    // If manifest was prepared lazily, load all shards now (a shard already
+    // loaded for a single file is not parsed twice).
     if (index._callsManifest) {
-        for (const [, { hash }] of index._callsManifest) {
-            _loadCallsShard(index, hash);
+        for (const [, shard] of index._callsManifest) {
+            if (shard.loaded) continue;
+            shard.loaded = true;
+            if (shard.buckets > 1) {
+                for (let k = 0; k < shard.buckets; k++) {
+                    if (!shard.loadedBuckets.has(k)) _loadCallsShard(index, `${shard.hash}.${k}`);
+                }
+            } else {
+                _loadCallsShard(index, shard.hash);
+            }
         }
         return index.callsCache.size > 0;
     }
@@ -1438,7 +1707,7 @@ function loadCallsCache(index) {
                 if (!relPath || !entry) continue;
                 const absPath = path.isAbsolute(relPath) ? relPath : path.join(index.root, relPath);
                 if (!index.callsCache.has(absPath)) {
-                    index.callsCache.set(absPath, entry);
+                    index.callsCache.set(absPath, decodeCallsEntry(entry));
                 }
             }
             return index.callsCache.size > 0;
@@ -1458,6 +1727,194 @@ function ensureCallsCacheLoaded(index) {
     if (index._callsCachePrepared && !index._callsCacheLoaded) {
         loadCallsCache(index);
     }
+}
+
+/**
+ * Make one file's persisted call records available without loading every
+ * shard (fix #365): a per-file consumer (audit-async's prefilter, single-file
+ * queries) used to pay for parsing the whole sharded calls cache. Shards are
+ * per directory, as saveCache writes them; whole-cache consumers still call
+ * ensureCallsCacheLoaded, which loads the remaining shards.
+ * @param {object} index - ProjectIndex instance
+ * @param {string} filePath - Absolute file path
+ */
+function ensureCallsShardForFile(index, filePath) {
+    if (!index._callsCachePrepared || index._callsCacheLoaded) return;
+    if (!index._callsManifest) {
+        loadCallsCache(index);
+        return;
+    }
+    const relPath = path.relative(index.root, filePath);
+    const shard = index._callsManifest.get(path.dirname(relPath) || '.');
+    if (!shard || shard.loaded) return;
+    if (shard.buckets > 1) {
+        const bucket = callsShardBucket(relPath, shard.buckets);
+        if (shard.loadedBuckets.has(bucket)) return;
+        shard.loadedBuckets.add(bucket);
+        if (shard.loadedBuckets.size === shard.buckets) shard.loaded = true;
+        _loadCallsShard(index, `${shard.hash}.${bucket}`);
+        return;
+    }
+    shard.loaded = true;
+    _loadCallsShard(index, shard.hash);
+}
+
+// Calls shards are split into buckets of about this many serialized bytes
+// (fix #372); small directories keep one shard.
+const CALLS_SHARD_TARGET_BYTES = 64 * 1024;
+
+/** Stable bucket of a project-relative path among `buckets` (FNV-1a). */
+function callsShardBucket(relPath, buckets) {
+    const key = String(relPath).split(path.sep).join('/');
+    let h = 0x811c9dc5;
+    for (let i = 0; i < key.length; i++) {
+        h ^= key.charCodeAt(i);
+        h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return h % buckets;
+}
+
+/**
+ * Record fields whose objects repeat within a file (the records of one
+ * function share their `enclosingFunction`, those of one macro invocation
+ * their `macroExpansion`, those of one typed local its receiver evidence),
+ * persisted once per file in a table and referenced by position (fix #375:
+ * they were a third of a large project's calls cache).
+ */
+const CALL_OBJECT_TABLES = [
+    ['enclosingFunction', 'fx'],
+    ['macroExpansion', 'mx'],
+    ['receiverTypeEvidence', 'rx'],
+    ['destructured', 'dx'],
+];
+
+/**
+ * JSON text of `[relPath, entry]` for a calls shard, the repeated record
+ * objects tabled (CALL_OBJECT_TABLES). The records are swapped in place
+ * while serializing and restored.
+ */
+function serializeCallsEntry(relPath, entry) {
+    const calls = entry.calls;
+    const out = {
+        mtime: entry.mtime,
+        hash: entry.hash,
+        calls,
+        // content is not persisted - will be read on demand
+    };
+    if (!Array.isArray(calls)) return JSON.stringify([relPath, out]);
+    const tables = CALL_OBJECT_TABLES.map(() => new SlotTable());
+    const swapped = [];
+    try {
+        for (const call of calls) {
+            for (let t = 0; t < CALL_OBJECT_TABLES.length; t++) {
+                const field = CALL_OBJECT_TABLES[t][0];
+                const value = call[field];
+                if (value === null || typeof value !== 'object') continue;
+                swapped.push(call, field, value);
+                call[field] = tables[t].slot(value);
+            }
+        }
+        CALL_OBJECT_TABLES.forEach(([, key], t) => {
+            if (tables[t].values.length > 0) out[key] = tables[t].values;
+        });
+        return JSON.stringify([relPath, out]);
+    } finally {
+        for (let i = 0; i < swapped.length; i += 3) swapped[i][swapped[i + 1]] = swapped[i + 2];
+    }
+}
+
+/**
+ * Distinct JSON values in first-seen order. Equal values (same keys in the
+ * same order, same values) share a slot. Candidates are bucketed by name and
+ * lines; a crowded bucket (minified code puts every function on one line)
+ * switches to serialized keys. Consecutive records usually repeat the
+ * previous value, which is checked first.
+ */
+class SlotTable {
+    constructor() {
+        this.values = [];
+        this.buckets = new Map();
+        this.last = undefined;
+        this.lastKey = -1;
+    }
+
+    slot(value) {
+        if (this.last !== undefined && (value === this.last || sameJsonValue(this.last, value))) {
+            this.last = value;
+            return this.lastKey;
+        }
+        const key = this._find(value);
+        this.last = value;
+        this.lastKey = key;
+        return key;
+    }
+
+    _find(value) {
+        const values = this.values;
+        const probe = `${value.name ?? value.macro}\0${value.startLine ?? value.line}\0${value.endLine}`;
+        let bucket = this.buckets.get(probe);
+        if (!bucket) this.buckets.set(probe, bucket = { keys: [], byText: null });
+        if (bucket.byText) {
+            const text = JSON.stringify(value);
+            let key = bucket.byText.get(text);
+            if (key === undefined) {
+                key = values.length;
+                values.push(value);
+                bucket.byText.set(text, key);
+            }
+            return key;
+        }
+        for (const key of bucket.keys) {
+            if (sameJsonValue(values[key], value)) return key;
+        }
+        const key = values.length;
+        values.push(value);
+        bucket.keys.push(key);
+        if (bucket.keys.length >= 32) {
+            bucket.byText = new Map(bucket.keys.map(k => [JSON.stringify(values[k]), k]));
+        }
+        return key;
+    }
+}
+
+/** Whether two JSON values serialize identically (key order included). */
+function sameJsonValue(a, b) {
+    if (a === b) return true;
+    if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false;
+    if (Array.isArray(a)) {
+        if (!Array.isArray(b) || a.length !== b.length) return false;
+        for (let i = 0; i < a.length; i++) {
+            if (!sameJsonValue(a[i], b[i])) return false;
+        }
+        return true;
+    }
+    if (Array.isArray(b)) return false;
+    const keysA = Object.keys(a);
+    const keysB = Object.keys(b);
+    if (keysA.length !== keysB.length) return false;
+    for (let i = 0; i < keysA.length; i++) {
+        const key = keysA[i];
+        if (key !== keysB[i] || !sameJsonValue(a[key], b[key])) return false;
+    }
+    return true;
+}
+
+/** In-memory form of a persisted calls-cache entry (see serializeCallsEntry). */
+function decodeCallsEntry(entry) {
+    let tabled = null;
+    for (const [field, key] of CALL_OBJECT_TABLES) {
+        if (!entry[key]) continue;
+        (tabled ||= []).push(field, entry[key]);
+        delete entry[key];
+    }
+    if (!tabled) return entry;
+    for (const call of entry.calls || []) {
+        for (let i = 0; i < tabled.length; i += 2) {
+            const at = call[tabled[i]];
+            if (typeof at === 'number') call[tabled[i]] = tabled[i + 1][at];
+        }
+    }
+    return entry;
 }
 
 /**
@@ -1483,7 +1940,7 @@ function _loadCallsShard(index, hash) {
             // parse of current disk content (or an earlier load) — never
             // clobber it with persisted shard data (fix #227).
             if (!index.callsCache.has(absPath)) {
-                index.callsCache.set(absPath, entry);
+                index.callsCache.set(absPath, decodeCallsEntry(entry));
             }
         }
     } catch (e) {
@@ -1617,8 +2074,9 @@ function buildWithLock(index, buildOpts = {}, options = {}) {
 module.exports = {
     buildWithLock,
     saveCache, saveUsageCache, loadCache, loadCallsCache, isCacheStale, ensureCallsCacheLoaded,
+    ensureCallsShardForFile,
     getUserCacheRoot, getProjectCacheDir, getProjectCachePath,
     getLegacyProjectCacheDir, migrateLegacyProjectCache, clearProjectCache,
     clearAllCaches, pruneUserCache,
-    _computeReachabilityFingerprint, CACHE_FORMAT_VERSION,
+    _computeReachabilityFingerprint, CACHE_FORMAT_VERSION, discoveryFingerprint,
 };

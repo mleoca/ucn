@@ -2844,9 +2844,9 @@ describe('fix: C typedefs and unnamed parameters', () => {
         const code = 'int unnamed(size_t, int b) { return b; }\nvoid takes_ptr(void *) {}\n';
         const result = parse(code, 'c');
         const fn = result.functions.find(item => item.name === 'unnamed');
-        assert.deepEqual(fn.paramsStructured, [{ name: 'size_t' }, { name: 'b', type: 'int' }]);
+        assert.deepEqual(fn.paramsStructured, [{ name: 'size_t', unnamed: true }, { name: 'b', type: 'int' }]);
         const ptr = result.functions.find(item => item.name === 'takes_ptr');
-        assert.deepEqual(ptr.paramsStructured, [{ name: 'void *' }],
+        assert.deepEqual(ptr.paramsStructured, [{ name: 'void *', unnamed: true }],
             'an unnamed void* parameter must not collapse into the zero-param (void) form');
     });
 });
@@ -3348,6 +3348,3531 @@ describe('fix #299: C++ overload-ambiguous promotion by static shape', () => {
             assert.equal(result.length, 0,
                 'ambiguous primary ownership must not confirm: ' +
                 JSON.stringify(result.map(c => c.line)));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #361: C/C++ qualifier resolution and include-closure evidence', () => {
+    const answer = (index, name, pin) => {
+        const result = index.findCallers(name, {
+            targetDefinitions: [pin], collectAccount: true, includeMethods: true,
+        });
+        const site = entry => `${path.basename(entry.file)}:${entry.line}`;
+        return {
+            confirmed: result.map(site).sort(),
+            unverified: (result.unverifiedEntries || [])
+                .map(entry => `${site(entry)}:${entry.reason}`).sort(),
+            excluded: (result.accountRaw?.excludedEntries || [])
+                .map(entry => `${site(entry)}:${entry.reason}`).sort(),
+            result,
+        };
+    };
+    const pinOf = (index, name, file, className) => index.symbols.get(name).find(d =>
+        d.relativePath === file && (className === undefined || d.className === className));
+
+    const namespaceMacroProject = () => tmp({
+        'include/lib/macros.hpp': [
+            '#ifndef LIB_MACROS_HPP',
+            '#define LIB_MACROS_HPP',
+            '#define LIB_BEGIN namespace lib { \\',
+            '    inline namespace LIB_CONCAT(v, 1) {',
+            '#define LIB_END \\',
+            '    }  /* inline */ \\',
+            '    }  // namespace lib',
+            '#define LIB_TRY try',
+            '#endif',
+        ].join('\n'),
+        'include/lib/fwd.hpp': [
+            '#ifndef LIB_FWD_HPP',
+            '#define LIB_FWD_HPP',
+            '#include <lib/macros.hpp>',
+            'LIB_BEGIN',
+            'template<typename T = int> class basic_doc;',
+            'using doc = basic_doc<>;',
+            'LIB_END',
+            '#endif',
+        ].join('\n'),
+        'include/lib/doc.hpp': [
+            '#ifndef LIB_DOC_HPP',
+            '#define LIB_DOC_HPP',
+            '#include <lib/fwd.hpp>',
+            'LIB_BEGIN',
+            'template<typename T>',
+            'class basic_doc {',
+            '  LIB_PRIVATE_UNLESS_TESTED:',
+            '    int state = 0;',
+            '  public:',
+            '    static basic_doc parse(const char* text) {',
+            '        LIB_TRY',
+            '        {',
+            '            return basic_doc();',
+            '        }',
+            '        LIB_CATCH (int&)',
+            '        {',
+            '            return basic_doc();',
+            '        }',
+            '    }',
+            '};',
+            'struct formatter {',
+            '    int parse(int context) { return context; }',
+            '};',
+            'LIB_END',
+            '#endif',
+        ].join('\n'),
+        'src/alias_user.cpp': [
+            '#include <lib/doc.hpp>',
+            'using doc = lib::doc;',
+            'int main() {',
+            '    auto d = doc::parse("x");',
+            '    return 0;',
+            '}',
+        ].join('\n'),
+        'src/using_user.cpp': [
+            '#include <lib/doc.hpp>',
+            'using lib::doc;',
+            'int run() {',
+            '    auto d = doc::parse("y");',
+            '    return 0;',
+            '}',
+        ].join('\n'),
+        'src/generic_user.cpp': [
+            '#include <lib/doc.hpp>',
+            'template<typename T> int generic() {',
+            '    auto d = T::parse("z");',
+            '    return 0;',
+            '}',
+            'int external() {',
+            '    auto e = vendor::widget::parse("w");',
+            '    return 0;',
+            '}',
+        ].join('\n'),
+    });
+
+    it('recovers class bodies through guard, access-specifier and statement macros', () => {
+        const dir = namespaceMacroProject();
+        try {
+            const index = idx(dir);
+            const parse = pinOf(index, 'parse', 'include/lib/doc.hpp', 'basic_doc');
+            assert.ok(parse, JSON.stringify(index.symbols.get('parse')));
+            assert.equal(parse.className, 'basic_doc');
+            assert.ok(!index.symbols.get('parse').some(d =>
+                d.relativePath === 'include/lib/doc.hpp' && !d.className),
+                'the member is not also indexed as a free function');
+        } finally { rm(dir); }
+    });
+
+    it('never selects the configuration that skips an include-guarded body', () => {
+        const code = [
+            '#ifndef LIB_DOC_HPP',
+            '#define LIB_DOC_HPP',
+            'LIB_BEGIN',
+            'class basic_doc',
+            '{',
+            '  public:',
+            '#if defined(LIB_HAS_X)',
+            '    void a() {',
+            '#else',
+            '    void a(int x) {',
+            '#endif',
+            '    }',
+            '    static basic_doc parse(const char* text) { return basic_doc(); }',
+            '};',
+            'LIB_END',
+            '#endif',
+        ].join('\n');
+        for (const source of conditionalRecoverySources(code)) {
+            assert.ok(source.includes('static basic_doc parse'),
+                'the guard macro is undefined on the parsed inclusion');
+        }
+        const parsed = getLanguageAdapter('cpp').parse(code, getParser('cpp'));
+        const owner = parsed.classes.find(cls => cls.name === 'basic_doc');
+        assert.ok(owner, JSON.stringify(parsed.classes));
+        assert.ok(owner.members.some(member => member.name === 'parse'),
+            JSON.stringify(owner.members));
+    });
+
+    it('decides __cplusplus blocks by language before recovery', () => {
+        const code = [
+            '#ifndef API_H',
+            '#define API_H',
+            '#ifdef __cplusplus',
+            'extern "C" {',
+            '#endif',
+            '#define XX(name) int name;',
+            'union any_handle {',
+            '  HANDLE_MAP(XX)',
+            '};',
+            'struct loop { int flags; LOOP_PRIVATE_FIELDS };',
+            'API_EXTERN int api_length(const char* text, long size);',
+            '#ifdef __cplusplus',
+            '}',
+            '#endif',
+            '#endif',
+        ].join('\n');
+        const parsed = getLanguageAdapter('c').parse(code, getParser('c'));
+        const decl = parsed.functions.find(fn => fn.name === 'api_length');
+        assert.ok(decl, JSON.stringify(parsed.functions));
+        assert.equal(decl.className, undefined);
+        assert.ok(!parsed.classes.some(cls => (cls.members || [])
+            .some(member => member.name === 'api_length')), JSON.stringify(parsed.classes));
+    });
+
+    it('resolves aliases through macro-opened namespaces and confirms the member', () => {
+        const dir = namespaceMacroProject();
+        try {
+            const index = idx(dir);
+            const pin = pinOf(index, 'parse', 'include/lib/doc.hpp', 'basic_doc');
+            const got = answer(index, 'parse', pin);
+            assert.deepEqual(got.confirmed, ['alias_user.cpp:4', 'using_user.cpp:4'],
+                JSON.stringify(got));
+            assert.deepEqual(got.unverified, [
+                'generic_user.cpp:3:dependent-qualifier',
+                'generic_user.cpp:7:unresolved-qualifier',
+            ], JSON.stringify(got));
+        } finally { rm(dir); }
+    });
+
+    it('excludes a qualifier that resolves to an unrelated class', () => {
+        const dir = namespaceMacroProject();
+        try {
+            const index = idx(dir);
+            const pin = pinOf(index, 'parse', 'include/lib/doc.hpp', 'formatter');
+            const got = answer(index, 'parse', pin);
+            assert.deepEqual(got.confirmed, [], JSON.stringify(got));
+            assert.ok(got.excluded.includes('alias_user.cpp:4:receiver-type-mismatch') &&
+                got.excluded.includes('using_user.cpp:4:receiver-type-mismatch'),
+                JSON.stringify(got));
+            assert.ok(got.unverified.includes('generic_user.cpp:3:dependent-qualifier'),
+                JSON.stringify(got));
+        } finally { rm(dir); }
+    });
+
+    it('records namespace effects of macros and standalone macro markers', () => {
+        const adapter = getLanguageAdapter('cpp');
+        const parsed = adapter.parse([
+            '#define OPEN namespace outer { inline namespace v2 {',
+            '#define CLOSE } }',
+            'OPEN',
+            'class widget {};',
+            'CLOSE',
+            'const char* s = "OPEN";',
+        ].join('\n'), getParser('cpp'));
+        const effects = Object.fromEntries(parsed.macros
+            .filter(macro => macro.namespaceScope)
+            .map(macro => [macro.name, macro.namespaceScope]));
+        assert.deepEqual(effects, {
+            OPEN: { opens: [['outer'], []], closes: 0 },
+            CLOSE: { opens: [], closes: 2 },
+        });
+        assert.deepEqual(parsed.macroScopeMarkers.map(marker => `${marker.name}:${marker.line}`),
+            ['OPEN:3', 'CLOSE:5']);
+    });
+
+    it('follows transitive quoted includes, resolving an -I-only header by unique basename', () => {
+        const dir = tmp({
+            'src/common.h': 'void lib_free(void* p);\n',
+            'src/common.c': [
+                '#include "common.h"',
+                'void lib_free(void* p) { (void)p; }',
+            ].join('\n'),
+            'src/unix/internal.h': '#include "common.h"\n',
+            'src/unix/core.c': [
+                '#include "internal.h"',
+                'void release(void* p) {',
+                '    lib_free(p);',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const pin = pinOf(index, 'lib_free', 'src/common.c');
+            const got = answer(index, 'lib_free', pin);
+            assert.deepEqual(got.confirmed, ['core.c:3'], JSON.stringify(got));
+            const site = got.result.find(entry => entry.line === 3);
+            assert.equal(site.provenance?.rule, 'include-basename', JSON.stringify(site));
+        } finally { rm(dir); }
+    });
+
+    it('treats compile-database include paths as proven include edges', () => {
+        const dir = tmp({
+            'src/common.h': 'void lib_free(void* p);\n',
+            'src/common.c': '#include "common.h"\nvoid lib_free(void* p) { (void)p; }\n',
+            'src/unix/internal.h': '#include "common.h"\n',
+            'src/unix/core.c': '#include "internal.h"\nvoid release(void* p) {\n    lib_free(p);\n}\n',
+        });
+        try {
+            fs.writeFileSync(path.join(dir, 'compile_commands.json'), JSON.stringify([
+                { directory: dir, file: 'src/common.c', arguments: ['cc', '-Isrc', '-c', 'src/common.c'] },
+                { directory: dir, file: 'src/unix/core.c', arguments: ['cc', '-Isrc', '-c', 'src/unix/core.c'] },
+            ]));
+            const index = idx(dir);
+            const pin = pinOf(index, 'lib_free', 'src/common.c');
+            const got = answer(index, 'lib_free', pin);
+            assert.deepEqual(got.confirmed, ['core.c:3'], JSON.stringify(got));
+            assert.equal(got.result[0].provenance?.rule, 'import-supported');
+        } finally { rm(dir); }
+    });
+
+    it('keeps platform-variant definitions link-ambiguous unless the unit separates them', () => {
+        const files = {
+            'include/api.h': 'int translate(int code);\n',
+            'src/unix/core.c': [
+                '#include "../../include/api.h"',
+                'int translate(int code) { return code; }',
+                'int unix_user(void) { return translate(1); }',
+            ].join('\n'),
+            'src/win/error.c': [
+                '#include "../../include/api.h"',
+                'int translate(int code) { return -code; }',
+            ].join('\n'),
+            'src/common.c': [
+                '#include "../include/api.h"',
+                'int shared_user(void) { return translate(2); }',
+            ].join('\n'),
+        };
+        let dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const winPin = pinOf(index, 'translate', 'src/win/error.c');
+            const got = answer(index, 'translate', winPin);
+            assert.deepEqual(got.confirmed, [], JSON.stringify(got));
+            assert.deepEqual(got.unverified, ['common.c:2:link-ambiguous'], JSON.stringify(got));
+            assert.ok(got.excluded.includes('core.c:3:other-definition'), JSON.stringify(got));
+            const unixPin = pinOf(index, 'translate', 'src/unix/core.c');
+            const unix = answer(index, 'translate', unixPin);
+            assert.deepEqual(unix.confirmed, ['core.c:3'], JSON.stringify(unix));
+            assert.deepEqual(unix.unverified, ['common.c:2:link-ambiguous'], JSON.stringify(unix));
+        } finally { rm(dir); }
+        dir = tmp(files);
+        try {
+            fs.writeFileSync(path.join(dir, 'compile_commands.json'), JSON.stringify(
+                ['src/unix/core.c', 'src/common.c'].map(file => ({
+                    directory: dir, file, arguments: ['cc', '-c', file],
+                }))));
+            const index = idx(dir);
+            const unix = answer(index, 'translate', pinOf(index, 'translate', 'src/unix/core.c'));
+            assert.deepEqual(unix.confirmed, ['common.c:2', 'core.c:3'], JSON.stringify(unix));
+            const win = answer(index, 'translate', pinOf(index, 'translate', 'src/win/error.c'));
+            assert.ok(win.excluded.includes('common.c:2:other-definition'), JSON.stringify(win));
+        } finally { rm(dir); }
+    });
+
+    it('resolves angle-bracket project includes through include directories', () => {
+        const dir = tmp({ 'include/pkg/api.h': 'int f(void);\n', 'src/a.c': '#include <pkg/api.h>\n' });
+        try {
+            assert.equal(resolveImport('pkg/api.h', path.join(dir, 'src/a.c'),
+                { language: 'c', root: dir }), path.join(dir, 'include/pkg/api.h'));
+            assert.equal(resolveImport('stdio.h', path.join(dir, 'src/a.c'),
+                { language: 'c', root: dir }), null);
+        } finally { rm(dir); }
+    });
+
+    it('gives every resolution-tiered unverified caller a reason', () => {
+        const dir = tmp({
+            'lib/lib.c': 'int helper(int x) { return x; }\n',
+            'app/user.c': 'int use(void) { return helper(1); }\n',
+        });
+        try {
+            const index = idx(dir);
+            const got = answer(index, 'helper', pinOf(index, 'helper', 'lib/lib.c'));
+            const unverified = [...got.result, ...(got.result.unverifiedEntries || [])]
+                .filter(entry => entry.tier === 'unverified');
+            assert.ok(unverified.length > 0, JSON.stringify(got));
+            assert.deepEqual(unverified.map(entry => entry.reason), ['no-scope-evidence']);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #362: token-pasting macro dispatch', () => {
+    const callersOf = (index, name) => {
+        const pin = index.symbols.get(name).find(d => d.type === 'function');
+        const result = index.findCallers(name, {
+            targetDefinitions: [pin], collectAccount: true,
+        });
+        const site = entry => `${path.basename(entry.file)}:${entry.line}`;
+        return {
+            confirmed: result.map(site).sort(),
+            rules: result.map(entry => entry.provenance?.rule),
+            macros: result.map(entry => entry.macroExpansion?.macro),
+            unverified: (result.unverifiedEntries || [])
+                .map(entry => `${site(entry)}:${entry.reason}`).sort(),
+        };
+    };
+    const deadNames = index => {
+        const response = execute(index, 'deadcode', {});
+        assert.ok(response.ok, response.error);
+        return { names: response.result.map(item => item.name).sort(), result: response.result };
+    };
+
+    it('pasted call targets in a switch dispatch are callers; the unreferenced sibling stays dead', () => {
+        const dir = tmp({
+            'fs.c': [
+                'typedef struct { int type; } req_t;',
+                'static void fs__rmdir(req_t* req) { (void)req; }',
+                'static void fs__stat(req_t* req) { (void)req; }',
+                'static void fs__orphan(req_t* req) { (void)req; }',
+                '#define XX(uc, lc)  case UV_FS_##uc: fs__##lc(req); break;',
+                'enum { UV_FS_RMDIR, UV_FS_STAT };',
+                'static void dispatch(req_t* req) {',
+                '  switch (req->type) {',
+                '    XX(RMDIR, rmdir)',
+                '    XX(STAT, stat)',
+                '    default: break;',
+                '  }',
+                '}',
+                '#undef XX',
+                'int main(void) { req_t r = {0}; dispatch(&r); return 0; }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const stat = callersOf(index, 'fs__stat');
+            assert.deepEqual(stat.confirmed, ['fs.c:10']);
+            assert.deepEqual(stat.rules, ['macro-expansion']);
+            assert.deepEqual(stat.macros, ['XX']);
+            assert.deepEqual(callersOf(index, 'fs__rmdir').confirmed, ['fs.c:9']);
+            assert.deepEqual(deadNames(index).names, ['fs__orphan']);
+            const callees = index.findCallees(index.symbols.get('dispatch')[0])
+                .map(callee => callee.name).sort();
+            assert.ok(callees.includes('fs__stat') && callees.includes('fs__rmdir'));
+        } finally { rm(dir); }
+    });
+
+    it('X-macro tables through a header list and an unindexed .def list keep handlers alive', () => {
+        const dir = tmp({
+            'list.h': [
+                '#ifndef LIST_H',
+                '#define LIST_H',
+                '#define HANDLERS(X) X(open) X(close)',
+                '#endif',
+            ].join('\n'),
+            'cmds.def': 'CMD(start)\nCMD(stop)\n',
+            'table.c': [
+                '#include "list.h"',
+                'typedef void (*fn)(void);',
+                'struct entry { const char* name; fn handler; };',
+                'void handle_open(void) {}',
+                'void handle_close(void) {}',
+                'static void handle_unused(void) {}',
+                'static void cmd_start(void) {}',
+                'static void cmd_stop(void) {}',
+                'static void cmd_dead(void) {}',
+                '#define X(n) { #n, handle_##n },',
+                'static const struct entry table[] = { HANDLERS(X) };',
+                '#undef X',
+                '#define CMD(n) { #n, cmd_##n },',
+                'static const struct entry cmds[] = {',
+                '#include "cmds.def"',
+                '};',
+                '#undef CMD',
+                'int main(void) { return (int)(table[0].handler == 0) + (int)(cmds[0].handler == 0); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const dead = deadNames(index).names;
+            assert.ok(dead.includes('handle_unused'), dead.join(','));
+            assert.ok(dead.includes('cmd_dead'), dead.join(','));
+            for (const live of ['handle_open', 'handle_close', 'cmd_start', 'cmd_stop']) {
+                assert.ok(!dead.includes(live), `${live} must not be dead: ${dead.join(',')}`);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('higher-order and nested pasting macros produce calls at the argument spelling', () => {
+        const dir = tmp({
+            'run.c': [
+                'static int work(int x) { return x; }',
+                'static int do_task(void) { return 1; }',
+                '#define CALL(f, x) f(x)',
+                '#define CAT(a, b) a##b',
+                '#define MK(n) CAT(do_, n)()',
+                'int main(void) {',
+                '  int r = CALL(work, 2);',
+                '  return r + MK(task);',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const work = index.findCallers('work', { collectAccount: true });
+            assert.deepEqual(work.map(c => `${c.line}:${c.column}`), ['7:15']);
+            assert.equal(work[0].macroExpansion.origin, 'argument');
+            const task = callersOf(index, 'do_task');
+            assert.deepEqual(task.confirmed, ['run.c:8']);
+            assert.deepEqual(task.macros, ['MK']);
+        } finally { rm(dir); }
+    });
+
+    it('conditional macro definitions that disagree route the produced call unverified', () => {
+        const dir = tmp({
+            'cfg.c': [
+                'static void impl_safe(void) {}',
+                'static void impl_safe_fast(void) {}',
+                'static void log_safe(void) {}',
+                '#ifdef FAST',
+                '#define RUN(k) impl_##k##_fast(); log_##k()',
+                '#else',
+                '#define RUN(k) impl_##k(); log_##k()',
+                '#endif',
+                'int main(void) { RUN(safe); return 0; }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            // Every alternative produces log_safe: one answer.
+            assert.deepEqual(callersOf(index, 'log_safe').confirmed, ['cfg.c:9']);
+            for (const name of ['impl_safe', 'impl_safe_fast']) {
+                const answer = callersOf(index, name);
+                assert.deepEqual(answer.confirmed, []);
+                assert.deepEqual(answer.unverified, ['cfg.c:9:macro-definition-ambiguous']);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('C++ pasted qualified calls resolve like written ones', () => {
+        const dir = tmp({
+            'h.cpp': [
+                'namespace ns {',
+                'void handle_a() {}',
+                'void handle_b() {}',
+                '}',
+                '#define DISPATCH(n) ns::handle_##n()',
+                'int main() { DISPATCH(a); return 0; }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.deepEqual(callersOf(index, 'handle_a').confirmed, ['h.cpp:6']);
+            assert.deepEqual(callersOf(index, 'handle_b').confirmed, []);
+        } finally { rm(dir); }
+    });
+
+    it('a pasting macro that is never expanded withholds names it could spell and discloses blind sites', () => {
+        const dir = tmp({
+            'api.h': [
+                '#define ON(n) on_##n',
+                '#define PREFIX uv_',
+                '#ifdef ALT',
+                '#define PFX alt_',
+                '#else',
+                '#define PFX std_',
+                '#endif',
+                '#define CAT(a, b) a##b',
+                '#define XCAT(a, b) CAT(a, b)',
+            ].join('\n'),
+            'impl.c': [
+                '#include "api.h"',
+                'static void on_click(void) {}',
+                'static void other_dead(void) {}',
+                'static void uv_run(void) {}',
+                'static void std_stop(void) {}',
+                'int main(void) { XCAT(PREFIX, run)(); XCAT(PFX, stop)(); return 0; }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            // An object-like argument is pre-expanded before the paste.
+            assert.deepEqual(callersOf(index, 'uv_run').confirmed, ['impl.c:6']);
+            const { names, result } = deadNames(index);
+            assert.ok(!names.includes('on_click'), names.join(','));
+            assert.ok(!names.includes('uv_run'), names.join(','));
+            assert.ok(names.includes('other_dead'), names.join(','));
+            // Disagreeing configurations of PFX: the paste is not computed.
+            assert.ok(names.includes('std_stop'), names.join(','));
+            assert.equal(result.macroPaste.withheld, 1);
+            assert.equal(result.macroPaste.blind.count, 1);
+            assert.equal(result.macroPaste.blind.sample[0].reason, 'opaque-paste-operand');
+            const { formatDeadcode } = require('../core/output');
+            const text = formatDeadcode(result);
+            assert.match(text, /1 candidate\(s\) withheld: a token-pasting macro/);
+            assert.match(text, /WARNING: 1 token-pasting macro dispatch invocation/);
+            const health = execute(index, 'doctor', { deep: true });
+            assert.ok(health.ok, health.error);
+            assert.equal(health.result.blindSpots.macroPasteDispatch.count, 1);
+        } finally { rm(dir); }
+    });
+
+    it('expansion edges follow edits to the invoking file without a stale cache', () => {
+        const dir = tmp({
+            'd.c': [
+                'static void op_a(void) {}',
+                'static void op_b(void) {}',
+                '#define OP(n) op_##n();',
+                'int main(void) { OP(a) OP(b) return 0; }',
+            ].join('\n'),
+        });
+        try {
+            let index = idx(dir);
+            assert.deepEqual(deadNames(index).names, []);
+            index.saveCache();
+            const file = path.join(dir, 'd.c');
+            fs.writeFileSync(file, fs.readFileSync(file, 'utf-8')
+                .replace('OP(a) OP(b)', 'OP(a)'));
+            const future = new Date(Date.now() + 5000);
+            fs.utimesSync(file, future, future);
+            index = idx(dir);
+            assert.deepEqual(deadNames(index).names, ['op_b']);
+        } finally { rm(dir); }
+    });
+
+    it('persisted expansions are reused warm and revalidated against include targets', () => {
+        const { ProjectIndex } = require('../core/project');
+        const dir = tmp({
+            'cmds.def': 'CMD(start)\n',
+            'table.c': [
+                'static void cmd_start(void) {}',
+                'static void cmd_later(void) {}',
+                'struct e { const char* n; void (*f)(void); };',
+                '#define CMD(n) { #n, cmd_##n },',
+                'static const struct e cmds[] = {',
+                '#include "cmds.def"',
+                '};',
+                'int main(void) { return cmds[0].f == 0; }',
+            ].join('\n'),
+        });
+        try {
+            const cold = idx(dir);
+            assert.deepEqual(deadNames(cold).names, ['cmd_later']);
+            cold.saveCache();
+
+            const warm = new ProjectIndex(dir);
+            assert.equal(warm.loadCache(), true);
+            assert.deepEqual(deadNames(warm).names, ['cmd_later']);
+            assert.equal(warm.macroExpansionDirty, false, 'warm run reuses persisted expansions');
+
+            fs.writeFileSync(path.join(dir, 'cmds.def'), 'CMD(start)\nCMD(later)\n');
+            const edited = new ProjectIndex(dir);
+            assert.equal(edited.loadCache(), true);
+            assert.deepEqual(deadNames(edited).names, []);
+            assert.equal(edited.macroExpansionDirty, true, 'changed include target recomputes');
+        } finally { rm(dir); }
+    });
+
+    it('#define inside an enumerator list is an indexed macro definition', () => {
+        const dir = tmp({
+            'e.h': [
+                '#define ERRS(XX) XX(EIO) XX(EAGAIN)',
+                'typedef enum {',
+                '#define XX(code) E_##code,',
+                '  ERRS(XX)',
+                '#undef XX',
+                '  E_MAX',
+                '} err_t;',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const xx = (index.symbols.get('XX') || []).map(d => [d.startLine, d.functionLike, d.ppBody]);
+            assert.deepEqual(xx, [[3, true, 'E_ ## code ,']]);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #364: audit-async classifies C# async producers by what a call returns', () => {
+    it('async iterators feed await foreach, async void has nothing to await, Task calls must be awaited', () => {
+        const dir = tmp({
+            'Fixture.csproj': '<Project Sdk="Microsoft.NET.Sdk"></Project>',
+            'Worker.cs': [
+                'using System.Collections.Generic;',                         // 1
+                'using System.Threading.Tasks;',                             // 2
+                'class Worker {',                                            // 3
+                '    async IAsyncEnumerable<int> Items() {',                 // 4
+                '        await Task.Yield();',                               // 5
+                '        yield return 1;',                                   // 6
+                '    }',                                                     // 7
+                '    async void Fire() { await Task.Yield(); }',             // 8
+                '    async Task SaveAsync() { await Task.Yield(); }',        // 9
+                '    async Task Run() {',                                    // 10
+                '        await foreach (var i in Items()) { }',              // 11
+                '        Fire();',                                           // 12
+                '        SaveAsync();',                                      // 13
+                '        Items();',                                          // 14
+                '        await SaveAsync();',                                // 15
+                '    }',                                                     // 16
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const audit = idx(dir).auditAsync();
+            assert.deepEqual(audit.issues.map(i => [i.line, i.calleeName, i.reason || null]), [
+                [13, 'SaveAsync', null],
+                [14, 'Items', 'async-iterator-discarded'],
+            ]);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #367: C# audit-async flow and C/C++ language-conditional header branches', () => {
+    it('#367c C#: tasks passed on or explicitly discarded are not findings; a discarded or unread task is', () => {
+        const dir = tmp({
+            'App.cs': [
+                'using System.Threading.Tasks;',                       // 1
+                'public class App {',                                  // 2
+                '  async Task<int> Load() { return 1; }',              // 3
+                '  async Task Use(Task<int> t) { await t; }',          // 4
+                '  async Task Run() {',                                // 5
+                '    await Use(Load());',                              // 6 flow
+                '    _ = Load();',                                     // 7 explicit discard
+                '    Load();',                                         // 8 discarded
+                '    var unused = Load();',                            // 9 never read
+                '    var kept = Load();',                              // 10
+                '    await kept;',                                     // 11
+                '  }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const lines = idx(dir).auditAsync({}).issues.map(i => i.line).sort((a, b) => a - b);
+            assert.deepStrictEqual(lines, [8, 9]);
+        } finally { rm(dir); }
+    });
+
+    it('#367b a C header keeps its `#ifdef __cplusplus` overload, visible only to C++ translation units', () => {
+        const dir = tmp({
+            'include/api.h': [
+                '#ifndef API_H',                                                  // 1
+                '#define API_H',                                                  // 2
+                '#ifdef __cplusplus',                                             // 3
+                'extern "C" {',                                                   // 4
+                '#endif',                                                         // 5
+                'typedef enum { MODE_A, MODE_B } mode_t2;',                       // 6
+                'int set_mode(int fd, mode_t2 mode);',                            // 7
+                '#ifdef __cplusplus',                                             // 8
+                '}',                                                              // 9
+                'inline int set_mode(int fd, int mode) {',                        // 10
+                '  return set_mode(fd, static_cast<mode_t2>(mode));',             // 11
+                '}',                                                              // 12
+                '#endif',                                                         // 13
+                '#endif',                                                         // 14
+            ].join('\n'),
+            'src/impl.c': '#include "../include/api.h"\nint set_mode(int fd, mode_t2 mode) { return fd + (int)mode; }\n',
+            'src/use.c': '#include "../include/api.h"\nint use_c(void) { return set_mode(1, MODE_A); }\n',
+            'src/user.cpp': '#include "../include/api.h"\nint use_cpp() { return set_mode(1, 0); }\n',
+        });
+        try {
+            const index = idx(dir);
+            const defs = (index.symbols.get('set_mode') || []).map(d => `${d.relativePath}:${d.startLine}:${d.languageBranch || ''}`);
+            assert.ok(defs.includes('include/api.h:10:cpp'), JSON.stringify(defs));
+            assert.ok(defs.includes('include/api.h:7:'), JSON.stringify(defs));
+            const r = execute(index, 'show', { name: 'include/api.h:10:set_mode' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const lines = [...r.result.context.callers, ...r.result.context.unverifiedCallers]
+                .map(c => `${path.basename(c.file)}:${c.line}`);
+            assert.ok(!lines.includes('use.c:2'), `C translation unit never sees the C++ overload: ${JSON.stringify(lines)}`);
+            assert.strictEqual(r.result.context.meta.account.conserved, true);
+            const c = execute(index, 'show', { name: 'include/api.h:7:set_mode' });
+            const cLines = c.result.context.callers.map(x => `${path.basename(x.file)}:${x.line}`);
+            assert.ok(cLines.includes('use.c:2'), JSON.stringify(cLines));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #369: bare calls to local function values (C/C++)', () => {
+    it('a local lambda or function-pointer parameter named like a project function is the callee', () => {
+        const dir = tmp({
+            'a.cpp': [
+                'void run() {}',
+                'void cb() {}',
+                'void decl() {}',
+                'void go(int p, void (*cb)(void)) {',
+                '    auto run = []() {};',
+                '    run();',
+                '    cb();',
+                '    void decl();',
+                '    decl();',
+                '    for (auto &f : std::vector<int>{}) {}',
+                '}',
+                'void other() { run(); }',
+            ].join('\n') + '\n',
+            'b.c': [
+                'void tick(void) {}',
+                'void loop(void (*tick)(void)) { tick(); }',
+                'void main_loop(void) { tick(); }',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const lines = entries => (entries || []).map(entry => `${entry.relativePath}:${entry.line}`);
+            assert.deepStrictEqual(lines(index.context('run', { file: 'a.cpp', line: 1 }).callers), ['a.cpp:12']);
+            assert.deepStrictEqual(lines(index.context('cb', { file: 'a.cpp', line: 2 }).callers), []);
+            // A block-scope function declaration is not a value: decl() is the function.
+            assert.deepStrictEqual(lines(index.context('decl', { file: 'a.cpp', line: 3 }).callers), ['a.cpp:9']);
+            assert.deepStrictEqual(lines(index.context('tick', { file: 'b.c', line: 1 }).callers), ['b.c:3']);
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #377: a call spelled NAME( under #define NAME is the macro (C/C++)', () => {
+    const at = entries => (entries || []).map(entry => `${entry.relativePath || entry.file}:${entry.line}`).sort();
+    const reasonOf = (ctx, reason) => ((ctx.meta.account.excluded.byReason[reason] || {}).sample || [])
+        .map(site => `${site.file}:${site.line}`).sort();
+
+    it('C: an included function-like macro shadows the function; conditional and wrapper macros do not decide', () => {
+        const dir = tmp({
+            't.h': 'int twice(int x);\nint helper(int x);\n',
+            'm.h': '#ifndef M_H\n#define M_H\n#define twice(x) ((x) << 1)\n#endif\n',
+            'a.c': '#include "t.h"\nint twice(int x) { return x + x; }\nint helper(int x) { return x; }\n',
+            'e.c': '#include "t.h"\n#include "m.h"\nint use_e(void) { return twice(4); }\n',
+            'f.c': '#include "t.h"\nint use_f(void) { return twice(6); }\n',
+            'g.c': '#include "t.h"\n#ifdef FAST\n#define helper(x) ((x) + 1)\n#endif\nint use_g(void) { return helper(7); }\n',
+            'h.c': '#include "t.h"\nint use_h(void) { return helper(8); }\n',
+            'alt.h': '#ifdef HAVE_IO\nint io_close(int fd);\n#else\n#define io_close(fd) 0\n#endif\n',
+            'io.c': '#include "alt.h"\nint io_close(int fd) { return fd; }\n',
+            'k.c': '#include "alt.h"\nint use_k(void) { return io_close(3); }\n',
+        });
+        try {
+            const index = idx(dir);
+            const twice = index.context('twice', { file: 'a.c', line: 2 });
+            assert.deepEqual(at(twice.callers), ['f.c:2']);
+            assert.deepEqual(reasonOf(twice, 'macro-namespace'), ['e.c:3']);
+            const helper = index.context('helper', { file: 'a.c', line: 3 });
+            assert.deepEqual(at(helper.callers), ['h.c:2']);
+            assert.deepEqual(at(helper.unverifiedCallers), ['g.c:5']);
+            assert.equal(helper.unverifiedCallers[0].reason, 'macro-namespace');
+            // Declaration and macro in one header are configuration alternatives.
+            const close = index.context('io_close', { file: 'io.c', line: 2 });
+            assert.deepEqual(at(close.callers), ['k.c:2']);
+            // Callee side: the macro in effect is the callee.
+            const useE = index.context('use_e', { file: 'e.c', line: 3 });
+            assert.deepEqual(useE.callees.map(c => `${c.relativePath}:${c.startLine}:${c.type}`), ['m.h:3:macro']);
+            const useF = index.context('use_f', { file: 'f.c', line: 2 });
+            assert.deepEqual(useF.callees.map(c => `${c.relativePath}:${c.startLine}:${c.type}`), ['a.c:2:function']);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('C++: a function-like macro in effect shadows member and qualified calls of the name', () => {
+        const dir = tmp({
+            'box.hpp': 'struct Box {\n    int grow(int x) { return x + 1; }\n};\n',
+            'shim.hpp': '#pragma once\n#define grow(x) (x)\n',
+            'a.cpp': '#include "box.hpp"\nint use_a(Box& b) { return b.grow(1); }\n',
+            'b.cpp': '#include "box.hpp"\n#include "shim.hpp"\nint use_b(Box& b, int v) { return b.grow(v); }\n',
+        });
+        try {
+            const index = idx(dir);
+            const grow = index.context('grow', { file: 'box.hpp', line: 2 });
+            assert.deepEqual(at(grow.callers), ['a.cpp:2']);
+            assert.deepEqual(reasonOf(grow, 'macro-namespace'), ['b.cpp:3']);
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #379: C/C++ linkage identity, decoration macros, macro access, configuration variants', () => {
+    const at = entries => (entries || []).map(entry => `${entry.relativePath || entry.file}:${entry.line}`).sort();
+    const symbolsOf = (index, name) => (index.symbols.get(name) || [])
+        .map(d => `${d.relativePath}:${d.startLine}:${d.className || ''}:${d.type}`).sort();
+    const planSites = (index, params) => {
+        const response = execute(index, 'plan', params);
+        assert.ok(response.ok, response.error);
+        return response.result.changes.map(change => `${change.file}:${change.line}`).sort();
+    };
+
+    it('C: a local forward declaration denotes the external definition (callers, callees, plan)', () => {
+        const dir = tmp({
+            'a.c': 'static int unused_local(void){return 0;}\nint helper(int x) { return x + 1; }\n',
+            'b.c': 'int helper(int x);\nint main(void) { return helper(2); }\n',
+            'c.c': 'int helper(int);\nint other(void) { return helper(3); }\n',
+            's.c': 'static int twice(int x);\nint run(void) { return twice(2); }\nstatic int twice(int x) { return x * 2; }\n',
+            't.c': 'static int twice(int x) { return x; }\nint run2(void) { return twice(5); }\n',
+        });
+        try {
+            const index = idx(dir);
+            const fromDefinition = index.context('helper', { file: 'a.c', line: 2 });
+            assert.deepEqual(at(fromDefinition.callers), ['b.c:2', 'c.c:2']);
+            assert.equal(fromDefinition.meta.account.excluded.total, 0);
+            // Pinning a prototype gives the same answer: declarations are not
+            // call targets of their own.
+            const fromPrototype = index.context('helper', { file: 'b.c', line: 1 });
+            assert.deepEqual(at(fromPrototype.callers), ['b.c:2', 'c.c:2']);
+            const main = index.findCallees(index.symbols.get('main')[0], { collectAccount: true });
+            assert.deepEqual(main.map(c => `${c.relativePath}:${c.startLine}`), ['a.c:2']);
+            assert.deepEqual(planSites(index, { name: 'helper', file: 'a.c', line: 2, renameTo: 'zz' }),
+                ['a.c:2', 'b.c:1', 'b.c:2', 'c.c:1', 'c.c:2']);
+            // Internal linkage: a static forward declaration announces its own
+            // file's definition; another file's static namesake stays apart.
+            const twice = index.context('twice', { file: 's.c', line: 3 });
+            assert.deepEqual(at(twice.callers), ['s.c:2']);
+            assert.deepEqual(planSites(index, { name: 'twice', file: 's.c', line: 3, renameTo: 'tw' }),
+                ['s.c:1', 's.c:2', 's.c:3']);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('C: definitions in complementary preprocessor branches stay link-ambiguous on both sides', () => {
+        const dir = tmp({
+            'alloc.h': [
+                '#ifndef ALLOC_H', '#define ALLOC_H', '#ifndef _WIN32',
+                'static inline void *hi_realloc(void *p, int n) { return p; }',
+                '#else', 'void *hi_realloc(void *p, int n);', '#endif', '#endif', '',
+            ].join('\n'),
+            'alloc.c': '#include "alloc.h"\n#ifdef _WIN32\nvoid *hi_realloc(void *p, int n) { return p; }\n#endif\n',
+            'read.c': '#include "alloc.h"\nvoid *grow(void *p) { return hi_realloc(p, 2); }\n',
+            'solo.h': '#ifdef FEATURE\nint only_here(int x) { return x; }\n#endif\n',
+            'use.c': '#include "solo.h"\nint use(void) { return only_here(1); }\n',
+        });
+        try {
+            const index = idx(dir);
+            for (const [file, line] of [['alloc.h', 4], ['alloc.c', 3]]) {
+                const ctx = index.context('hi_realloc', { file, line });
+                assert.deepEqual(at(ctx.callers), [], `${file}:${line}`);
+                assert.deepEqual(at(ctx.unverifiedCallers), ['read.c:2']);
+                assert.equal(ctx.unverifiedCallers[0].reason, 'link-ambiguous');
+            }
+            const grow = index.findCallees(index.symbols.get('grow')[0], { collectAccount: true });
+            assert.deepEqual(grow.map(c => c.name), []);
+            assert.deepEqual(grow.unverifiedCallees.map(c => `${c.name}:${c.reason}`), ['hi_realloc:link-ambiguous']);
+            // A conditional definition without alternatives still confirms.
+            const only = index.context('only_here', { file: 'solo.h', line: 2 });
+            assert.deepEqual(at(only.callers), ['use.c:2']);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('C++: a decoration macro before a qualified return type keeps names and classes intact', () => {
+        const dir = tmp({
+            'f.hpp': [
+                '#pragma once', '#include <string>', '#define MY_INLINE inline',
+                '#define MY_NODISCARD [[nodiscard]]',
+                'namespace sinks { template <typename M> struct Sink { void flush(); Sink(); }; }',
+                'class Fmt {', 'public:', '    std::string make(int x) const;', '    std::string other() const;',
+                '    MY_NODISCARD std::size_t count() const { return 1; }',
+                '    MY_NODISCARD bool empty() const { return true; }',
+                '    Fmt *flag(bool v = true) { return this; }', '};',
+                'MY_INLINE std::string Fmt::make(int x) const { return other(); }',
+                'MY_INLINE std::string Fmt::other() const { return "a"; }',
+                'template <typename M>', 'void MY_INLINE sinks::Sink<M>::flush() {}',
+                'template <typename M>', 'MY_INLINE sinks::Sink<M>::Sink() {}',
+                'inline std::string use(const Fmt &f, Fmt *o) { o->flag(); return f.make(1); }', '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.deepEqual(symbolsOf(index, 'make'), ['f.hpp:14:Fmt:function', 'f.hpp:8:Fmt:method']);
+            assert.deepEqual(symbolsOf(index, 'flag'), ['f.hpp:12:Fmt:method']);
+            assert.deepEqual(symbolsOf(index, 'count'), ['f.hpp:10:Fmt:method']);
+            assert.deepEqual(symbolsOf(index, 'flush'), ['f.hpp:17:Sink<M>:function', 'f.hpp:5:Sink:method']);
+            const sink = (index.symbols.get('Sink') || []).find(d => d.startLine === 19);
+            assert.ok(sink && sink.type === 'constructor' && sink.namespace === 'sinks', JSON.stringify(sink));
+            const flag = index.context('flag', { file: 'f.hpp', line: 12 });
+            assert.deepEqual(at(flag.callers), ['f.hpp:20']);
+            const other = index.context('other', { file: 'f.hpp', line: 9 });
+            assert.deepEqual(at(other.callers), ['f.hpp:14']);
+            assert.deepEqual(planSites(index, { name: 'make', file: 'f.hpp', line: 8, renameTo: 'mk' }),
+                ['f.hpp:14', 'f.hpp:20', 'f.hpp:8']);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('C++: an export macro in a class head with a templated base keeps the class and its dispatch', () => {
+        const dir = tmp({
+            'a.h': [
+                '#pragma once', '#include <memory>', '#define X_API',
+                'class Base {', 'public:', '    virtual ~Base() = default;', '    void flush() { flush_(); }',
+                'protected:', '    virtual void flush_();', '};',
+                'class X_API Derived : public std::enable_shared_from_this<Derived>, public Base {',
+                'protected:', '    void flush_() override;', '};',
+                'class X_API Final final : public Base {', 'protected:', '    void flush_() override;', '};', '',
+            ].join('\n'),
+            'a.cpp': '#include "a.h"\nvoid Base::flush_() {}\nvoid Derived::flush_() {}\nvoid Final::flush_() {}\n',
+        });
+        try {
+            const index = idx(dir);
+            const derived = (index.symbols.get('Derived') || []).find(d => d.type === 'class');
+            assert.ok(derived, 'Derived is a class');
+            assert.match(derived.extends || '', /\bBase\b/);
+            assert.ok((index.symbols.get('Final') || []).some(d => d.type === 'class'));
+            assert.ok(!index.symbols.has('X_API') ||
+                index.symbols.get('X_API').every(d => d.type === 'macro'));
+            const ctx = index.context('flush_', { file: 'a.cpp', line: 3 });
+            assert.deepEqual([...at(ctx.callers), ...at(ctx.unverifiedCallers)], ['a.h:7']);
+            assert.equal(ctx.meta.account.excluded.total, 0);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('C++: access after a member-list macro follows its body; unknown access is never claimed dead', () => {
+        const dir = tmp({
+            'm.hpp': '#pragma once\n#define DECLARE_IMPL(n) void n##_impl();\n#define OPEN_UP() public:\n',
+            'a.hpp': [
+                '#pragma once', '#include <string>', '#include "m.hpp"',
+                '#define ERR_DEF(parent, name) \\', '  protected: \\', '    name(int code) : parent(code) {} \\', '  public:',
+                'class Base { public: Base(int) {} };',
+                'class Err : public Base {', '    ERR_DEF(Base, Err)', '    static Err Make(std::string n) { return Err(1); }', '};',
+                'class Other {', '    UNKNOWN_MACRO(Other)', '    static int Hidden() { return 1; }',
+                '  private:', '    static int Secret() { return 2; }', '};',
+                'class Third {', '    DECLARE_IMPL(Third)', '    static int Mine() { return 3; }',
+                '    OPEN_UP()', '    static int Opened() { return 4; }', '};', '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const make = index.symbols.get('Make')[0];
+            assert.ok(make.modifiers.includes('public'), JSON.stringify(make.modifiers));
+            const response = execute(index, 'deadcode', {});
+            assert.ok(response.ok, response.error);
+            const dead = response.result.map(item => item.name).sort();
+            // Hidden: access unknown after an external macro; Opened: the
+            // project macro body spells public:; Make: same-file body.
+            assert.deepEqual(dead, ['Mine', 'Secret']);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('C++: a block-scope type alias shadows a member alias of the same name, and template owners reach implicit-this calls', () => {
+        const dir = tmp({
+            'a.hpp': [
+                '#pragma once',
+                'template <typename C> struct field { using char_type = C; };',
+                'template <typename S> int parse() {',
+                '  using char_type = typename S::char_type;',
+                '  char_type c = char_type();',
+                '  return 0;',
+                '}',
+                'namespace sp { namespace sinks {',
+                'template <typename M> class base_sink {', 'public:', '    void flush();',
+                'protected:', '    virtual void flush_() = 0;', '};', '} }', '',
+            ].join('\n'),
+            'a-inl.hpp': '#pragma once\n#include "a.hpp"\nnamespace sp {\ntemplate <typename M>\nvoid sinks::base_sink<M>::flush() {\n    flush_();\n}\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const alias = index.context('char_type', { file: 'a.hpp', line: 2 });
+            assert.deepEqual(at(alias.callers), []);
+            const flush = index.context('flush_', { file: 'a.hpp', line: 13 });
+            assert.deepEqual([...at(flush.callers), ...at(flush.unverifiedCallers)], ['a-inl.hpp:6']);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('C++: plan renames the out-of-line definitions of overrides in the slot', () => {
+        const dir = tmp({
+            'b.hpp': '#pragma once\nclass Base {\npublic:\n    virtual ~Base() = default;\n    void run() { step_(); }\nprotected:\n    virtual void step_();\n};\n',
+            'b.cpp': '#include "b.hpp"\nvoid Base::step_() {}\n',
+            'd.hpp': '#pragma once\n#include "b.hpp"\n#define API\n#define NS_BEGIN namespace ns {\n#define NS_END }\nNS_BEGIN\nclass API Derived final : public Base {\nprotected:\n    void step_() override;\n};\nNS_END\n#ifdef HEADER_ONLY\n#include "d-inl.hpp"\n#endif\n',
+            'd-inl.hpp': '#pragma once\n#ifndef HEADER_ONLY\n#include "d.hpp"\n#endif\n#define INL inline\nNS_BEGIN\nINL void Derived::step_() {}\nNS_END\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepEqual(planSites(index, { name: 'step_', file: 'b.hpp', line: 7, renameTo: 'st' }),
+                ['b.cpp:2', 'b.hpp:5', 'b.hpp:7', 'd-inl.hpp:7', 'd.hpp:9']);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('C++: implicit this reaches inherited members; ->m() through an object goes through operator->', () => {
+        const dir = tmp({
+            'f.hpp': [
+                '#pragma once', '#include <memory>',
+                'class Base { public: bool enabled() const { return true; } };',
+                'class Fmt : public Base { public: int make(); };',
+                'class Option { public: Option *def_fn(int f) { return this; } };',
+                'using Option_p = std::unique_ptr<Option>;', '',
+            ].join('\n'),
+            'f.cpp': [
+                '#include "f.hpp"',
+                'int Fmt::make() { return enabled() ? 1 : 0; }',
+                'void add(Option_p &option) { option->def_fn(1); }', '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const enabled = index.context('enabled', { file: 'f.hpp', line: 3 });
+            assert.deepEqual([...at(enabled.callers), ...at(enabled.unverifiedCallers)], ['f.cpp:2']);
+            const defFn = index.context('def_fn', { file: 'f.hpp', line: 5 });
+            assert.deepEqual([...at(defFn.callers), ...at(defFn.unverifiedCallers)], ['f.cpp:3']);
+            assert.equal(defFn.meta.account.excluded.total, 0);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('C++: members that escaped an early-closed class body sit in a disclosed recovery region', () => {
+        const dir = tmp({
+            'o.hpp': [
+                '#pragma once', 'class Option {', '  public:', '    int a() const { return 1; }',
+                '    X x = {1, 2; int y; }', '    Option *flag(bool v = true) { return this; }',
+                '    int tail() { return 2; }', '};', 'inline int use() { return 0; }', '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'show', { name: 'tail' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const recovered = r.result.context.meta.account.recovered;
+            assert.ok(recovered && recovered.sites.some(site => site.line === 7), JSON.stringify(recovered));
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #385: configuration alternatives, preprocessor-model macro bindings, misread macro invocations', () => {
+    const at = entries => (entries || []).map(entry => `${entry.relativePath || entry.file}:${entry.line}`).sort();
+    const reasonOf = (ctx, reason) => ((ctx.meta.account.excluded.byReason[reason] || {}).sample || [])
+        .map(site => `${site.file}:${site.line}`).sort();
+    const symbolsOf = (index, name) => (index.symbols.get(name) || [])
+        .map(d => `${d.relativePath}:${d.startLine}:${d.className || ''}:${d.type}`).sort();
+    const planSites = (index, params) => {
+        const response = execute(index, 'plan', params);
+        assert.ok(response.ok, response.error);
+        return response.result.changes.map(change => `${change.file}:${change.line}`).sort();
+    };
+
+    it('C: a binding to one #if variant binds every variant of the item', () => {
+        const dir = tmp({
+            'thread.h': 'int do_set_name(const char* name);\n',
+            'thread.c': [
+                '#include "thread.h"',
+                'int set_name(const char* name) { return do_set_name(name); }',
+                '#if defined(_AIX)',
+                'int do_set_name(const char* name) { return -2; }',
+                '#elif defined(__APPLE__)',
+                'int do_set_name(const char* name) { return 0; }',
+                'int apple_name(void) { return do_set_name("a"); }',
+                '#else',
+                'int do_set_name(const char* name) { return 1; }',
+                '#endif',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            for (const line of [4, 6, 9]) {
+                const ctx = index.context('do_set_name', { file: 'thread.c', line });
+                const shown = [...at(ctx.callers), ...at(ctx.unverifiedCallers)];
+                // A call inside one variant's branch is compiled with that
+                // variant only.
+                assert.deepEqual(shown, line === 6 ? ['thread.c:2', 'thread.c:7'] : ['thread.c:2'],
+                    `variant at line ${line}`);
+                assert.deepEqual(reasonOf(ctx, 'other-definition'), line === 6 ? [] : ['thread.c:7'],
+                    `variant at line ${line}`);
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('C++: #ifdef members of one class body are indexed, bound as one item, renamed together', () => {
+        const dir = tmp({
+            'client.h': [
+                '#pragma once',
+                'class client {',
+                'public:',
+                '#ifdef _WIN32',
+                '    bool is_connected() const { return sock_ != 0; }',
+                '    void shutdown_socket() { sock_ = 0; }',
+                '#else',
+                '    bool is_connected() const { return sock_ != -1; }',
+                '#endif',
+                '    void close() { if (is_connected()) { sock_ = -1; } }',
+                '    int sock_ = -1;',
+                '};',
+                '',
+            ].join('\n'),
+            'sink.cpp': '#include "client.h"\nbool check(client& c) { return c.is_connected(); }\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepEqual(symbolsOf(index, 'is_connected'),
+                ['client.h:5:client:method', 'client.h:8:client:method']);
+            assert.deepEqual(symbolsOf(index, 'shutdown_socket'), ['client.h:6:client:method']);
+            const members = index.symbols.get('is_connected');
+            assert.ok(members.every(member => Array.isArray(member.ppBranch)));
+            for (const line of [5, 8]) {
+                const ctx = index.context('is_connected', { file: 'client.h', line });
+                assert.deepEqual(at(ctx.callers), ['client.h:10', 'sink.cpp:2'], `member at line ${line}`);
+            }
+            assert.deepEqual(planSites(index, { name: 'is_connected', file: 'client.h', line: 5, renameTo: 'is_open' }),
+                ['client.h:10', 'client.h:5', 'client.h:8', 'sink.cpp:2']);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('Rust and C#: a caller of a later configuration variant is not excluded', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "cfgs"\nversion = "0.1.0"\n',
+            'src/lib.rs': [
+                '#[cfg(unix)]',
+                'fn set_name(name: &str) -> i32 {',
+                '    name.len() as i32',
+                '}',
+                '',
+                '#[cfg(windows)]',
+                'fn set_name(name: &str) -> i32 {',
+                '    -1',
+                '}',
+                '',
+                'pub fn run() -> i32 {',
+                '    set_name("x")',
+                '}',
+                '',
+            ].join('\n'),
+            'Thread.cs': [
+                'namespace Demo {',
+                'public static class Threads {',
+                '#if WINDOWS',
+                '    static int SetName(string name) { return 1; }',
+                '#else',
+                '    static int SetName(string name) { return 0; }',
+                '#endif',
+                '    public static int Run() { return SetName("x"); }',
+                '}',
+                '}',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            for (const line of [2, 7]) {
+                const ctx = index.context('set_name', { file: 'src/lib.rs', line });
+                assert.deepEqual(at(ctx.callers), ['src/lib.rs:12'], `rust variant at line ${line}`);
+            }
+            for (const line of [4, 6]) {
+                const ctx = index.context('SetName', { file: 'Thread.cs', line });
+                assert.deepEqual(at(ctx.callers), ['Thread.cs:8'], `C# variant at line ${line}`);
+                assert.deepEqual(at(ctx.unverifiedCallers), []);
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('C++: an implicit-this call reaches its own class definition, not a same-name class elsewhere', () => {
+        const dir = tmp({
+            'tcp_client.h': [
+                '#pragma once',
+                'namespace details {',
+                'class tcp_client {',
+                '    int socket_ = -1;',
+                'public:',
+                '    bool is_connected() const { return socket_ != -1; }',
+                '    void close() { if (is_connected()) { socket_ = -1; } }',
+                '};',
+                '}',
+                '',
+            ].join('\n'),
+            'tcp_client-windows.h': [
+                '#pragma once',
+                'namespace details {',
+                'class tcp_client {',
+                '    unsigned socket_ = 0;',
+                'public:',
+                '    bool is_connected() const { return socket_ != 0; }',
+                '    void connect() { if (is_connected()) { return; } }',
+                '};',
+                '}',
+                '',
+            ].join('\n'),
+            'sink.h': [
+                '#pragma once',
+                '#ifdef _WIN32',
+                '#include "tcp_client-windows.h"',
+                '#else',
+                '#include "tcp_client.h"',
+                '#endif',
+                'struct sink { details::tcp_client client_; bool ok() { return client_.is_connected(); } };',
+                '',
+            ].join('\n'),
+            'main.cpp': '#include "sink.h"\nint main() { sink s; return s.ok() ? 0 : 1; }\n',
+        });
+        try {
+            const index = idx(dir);
+            const unix = index.context('is_connected', { file: 'tcp_client.h', line: 6 });
+            assert.deepEqual(at(unix.callers), ['tcp_client.h:7']);
+            // The two headers are included in complementary branches: the
+            // other class body's own call is the same member in the other
+            // configuration, shown but never confirmed for this body.
+            assert.deepEqual(at(unix.unverifiedCallers), ['sink.h:7', 'tcp_client-windows.h:7']);
+            assert.equal(unix.unverifiedCallers.find(c => c.line === 7 &&
+                c.relativePath === 'tcp_client-windows.h').reason, 'configuration-alternative');
+            const windows = index.context('is_connected', { file: 'tcp_client-windows.h', line: 6 });
+            assert.deepEqual(at(windows.callers), ['tcp_client-windows.h:7']);
+            assert.deepEqual(at(windows.unverifiedCallers), ['sink.h:7', 'tcp_client.h:7']);
+            // A rename keeps every configuration compiling.
+            const plan = execute(index, 'plan', { name: 'is_connected', file: 'tcp_client.h', line: 6, renameTo: 'is_open' });
+            assert.ok(plan.ok, plan.error);
+            assert.deepEqual(plan.result.changes.map(c => `${c.file}:${c.line}:${c.needsReview ? 'review' : 'edit'}`).sort(),
+                ['sink.h:7:edit', 'tcp_client-windows.h:6:edit', 'tcp_client-windows.h:7:edit',
+                    'tcp_client.h:6:edit', 'tcp_client.h:7:edit']);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('C: a same-name wrapper macro (#define f(x) f(x)) calls the function; a spelled-only name stays review', () => {
+        const dir = tmp({
+            'impl.c': '#include <stdlib.h>\nvoid *track_alloc(size_t n) { return malloc(n); }\nint count(int n) { return n; }\n',
+            'api.h': '#include <stddef.h>\nvoid *track_alloc(size_t n);\nint count(int n);\n',
+            'user.c': [
+                '#include "api.h"',
+                '#define track_alloc(n) track_alloc(n)',
+                '#define count(n) apply(count, n)',
+                'int apply(int (*f)(int), int n);',
+                'void *use_alloc(void) { return track_alloc(64); }',
+                'int use_count(void) { return count(3); }',
+                '',
+            ].join('\n'),
+            'alt.c': [
+                '#ifdef __linux__',
+                '#define init_once() 0',
+                '#else',
+                'static int init_once(void) { return 1; }',
+                '#endif',
+                'int start(void) { return init_once(); }',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const alloc = index.context('track_alloc', { file: 'impl.c', line: 2 });
+            assert.ok(at(alloc.callers).includes('user.c:5'), JSON.stringify(at(alloc.callers)));
+            assert.equal(alloc.meta.account.excluded.total, 0);
+            const callees = index.findCallees(index.symbols.get('use_alloc')[0], { collectAccount: true });
+            assert.deepEqual(callees.map(c => `${c.relativePath}:${c.startLine}:${c.type}`), ['impl.c:2:function']);
+            const count = index.context('count', { file: 'impl.c', line: 3 });
+            assert.deepEqual(at(count.callers), []);
+            assert.deepEqual(at(count.unverifiedCallers), ['user.c:6']);
+            assert.equal(count.unverifiedCallers[0].reason, 'macro-namespace');
+            // Macro and function as configuration alternatives in one file.
+            const once = index.context('init_once', { file: 'alt.c', line: 4 });
+            assert.deepEqual(at(once.callers), ['alt.c:6']);
+            assert.deepEqual(reasonOf(once, 'other-definition'), []);
+            // The rename edits the call once, not also as a review site the
+            // macro alternative's sweep found.
+            const plan = execute(index, 'plan', { name: 'init_once', file: 'alt.c', line: 4, renameTo: 'start_once' });
+            assert.ok(plan.ok, plan.error);
+            assert.deepEqual(plan.result.changes.map(c => `${c.file}:${c.line}:${c.needsReview ? 'review' : 'edit'}`).sort(),
+                ['alt.c:2:edit', 'alt.c:4:edit', 'alt.c:6:edit']);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('C++: a member-list invocation of the file\'s own macro keeps the class and declares its members', () => {
+        const dir = tmp({
+            'error.hpp': [
+                '#include <string>',
+                'enum class ExitCodes : int { Success = 0, BaseClass = 127 };',
+                '#define ERROR_DEF(parent, name) \\',
+                '  protected: \\',
+                '    name(std::string ename, std::string msg, int exit_code) : parent(ename, msg, exit_code) {} \\',
+                '  public: \\',
+                '    name(std::string msg, ExitCodes exit_code) : parent(#name, msg, exit_code) {}',
+                '#define ERROR_SIMPLE(name) \\',
+                '    explicit name(std::string msg) : name(#name, msg, ExitCodes::BaseClass) {}',
+                'class Error {',
+                'public:',
+                '  Error(std::string name, std::string msg, int exit_code) {}',
+                '  Error(std::string name, std::string msg, ExitCodes exit_code) {}',
+                '};',
+                'class ConstructionError : public Error {',
+                '    ERROR_DEF(Error, ConstructionError)',
+                '};',
+                'class BadName : public ConstructionError {',
+                '    ERROR_DEF(ConstructionError, BadName)',
+                '    ERROR_SIMPLE(BadName)',
+                '    static BadName Missing(std::string name) { return BadName("missing " + name); }',
+                '};',
+                '#undef ERROR_DEF',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.deepEqual(symbolsOf(index, 'ERROR_DEF'), ['error.hpp:3::macro']);
+            assert.deepEqual(symbolsOf(index, 'ERROR_SIMPLE'), ['error.hpp:8::macro']);
+            assert.deepEqual(symbolsOf(index, 'ConstructionError').filter(s => s.endsWith(':class')),
+                ['error.hpp:15::class']);
+            const ctors = (index.symbols.get('ConstructionError') || []).filter(d => d.type === 'constructor');
+            assert.deepEqual(ctors.map(d => `${d.startLine}:${d.params}:${d.modifiers.includes('public') ? 'public' : 'protected'}`),
+                ['16:std::string ename, std::string msg, int exit_code:protected',
+                    '16:std::string msg, ExitCodes exit_code:public']);
+            assert.ok(ctors.every(d => d.generatedByMacro?.name === 'ERROR_DEF'));
+            assert.equal(new Set(ctors.map(d => d.bindingId)).size, 2);
+            const badName = (index.symbols.get('BadName') || []).filter(d => d.type === 'constructor');
+            assert.equal(badName.length, 3);
+            // The access the expansion leaves in effect (public) applies after it.
+            const missing = index.symbols.get('Missing')[0];
+            assert.equal(missing.className, 'BadName');
+            assert.ok(missing.modifiers.includes('public'));
+            // Renaming the class renames the argument that declares its
+            // constructors through the macro.
+            const plan = execute(index, 'plan', { name: 'ConstructionError', file: 'error.hpp', line: 15, renameTo: 'BuildError' });
+            assert.ok(plan.ok, plan.error);
+            const edits = plan.result.changes.map(c => `${c.line}:${c.editKind}:${c.newExpression?.trim()}`);
+            assert.ok(edits.includes('15:definition:class BuildError : public Error {'), JSON.stringify(edits));
+            assert.ok(edits.includes('16:reference:ERROR_DEF(Error, BuildError)'), JSON.stringify(edits));
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('C++: plan renames the using-declarations that name the renamed function', () => {
+        const dir = tmp({
+            'os.h': [
+                '#pragma once',
+                '#define NS_BEGIN namespace app {',
+                '#define NS_END }',
+                'NS_BEGIN',
+                'namespace details { namespace os {',
+                'int remove_if_exists(const char *name);',
+                '} }',
+                'NS_END',
+                '',
+            ].join('\n'),
+            'os.cpp': '#include "os.h"\nnamespace app { namespace details { namespace os {\nint remove_if_exists(const char *name) { return name ? 0 : 1; }\n} } }\n',
+            'sink.h': [
+                '#pragma once',
+                '#include "os.h"',
+                'namespace app { namespace sinks {',
+                'inline int clean(const char *name) {',
+                '    using details::os::remove_if_exists;',
+                '    return remove_if_exists(name);',
+                '}',
+                '} }',
+                'namespace other { namespace os { int remove_if_exists(const char *name); } }',
+                'inline int drop(const char *name) { using other::os::remove_if_exists; return remove_if_exists(name); }',
+                '',
+            ].join('\n'),
+            'main.cpp': '#include "sink.h"\nint main() { return app::sinks::clean("x"); }\n',
+        });
+        try {
+            const index = idx(dir);
+            const plan = execute(index, 'plan', { name: 'remove_if_exists', file: 'os.cpp', line: 3, renameTo: 'remove_file' });
+            assert.ok(plan.ok, plan.error);
+            const edits = plan.result.changes.map(c => `${c.file}:${c.line}:${c.editKind}`);
+            assert.ok(edits.includes('sink.h:5:reference'), JSON.stringify(edits));
+            assert.ok(!edits.some(edit => edit.startsWith('sink.h:10')), JSON.stringify(edits));
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('C/C++: macro invocations read as declarations are calls or nothing, never functions', () => {
+        const dir = tmp({
+            'task.h': '#define CHECK_LOOP(loop) do { close_loop(loop); } while (0)\nvoid close_loop(void *loop);\nvoid *default_loop(void);\n',
+            'test_addr.c': [
+                '#include "task.h"',
+                'int parse_addr(const char *s);',
+                '#define GOOD_LIST(X) X("::") X("::1")',
+                '#define TEST_GOOD(ADDR) parse_addr(ADDR);',
+                'int run_addr(void) {',
+                '  int addr;',
+                '  GOOD_LIST(TEST_GOOD)',
+                '  CHECK_LOOP(default_loop());',
+                '  return 0;',
+                '}',
+                '',
+            ].join('\n'),
+            'suite.cpp': [
+                'int helper(int x);',
+                'TEST(suite_one, adds) {',
+                '  helper(1);',
+                '}',
+                'REGISTER_HANDLER(on_start);',
+                'int helper(int x) { return x; }',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.deepEqual(symbolsOf(index, 'default_loop'), ['task.h:3::function']);
+            const loop = index.context('default_loop', { file: 'task.h', line: 3 });
+            assert.deepEqual([...at(loop.callers), ...at(loop.unverifiedCallers)], ['test_addr.c:8']);
+            // C++ has no implicit int: TEST(...) { } and REGISTER_HANDLER(x);
+            // are invocations, not functions named after the macro.
+            assert.deepEqual(symbolsOf(index, 'TEST'), []);
+            assert.deepEqual(symbolsOf(index, 'REGISTER_HANDLER'), []);
+            const helper = index.context('helper', { file: 'suite.cpp', line: 6 });
+            assert.deepEqual(at(helper.callers), ['suite.cpp:3']);
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #386: renaming a type edits every reference to it', () => {
+    const { applyRenamePlan } = require('./helpers');
+    const files = {
+        'include/widget.h': [
+            '#pragma once',
+            'namespace app {',
+            'class Base {};',
+            'class Widget : public Base {',
+            'public:',
+            '    static const int SIZE = 3;',
+            '    Widget();',
+            '    explicit Widget(int n);',
+            '    ~Widget();',
+            '    Widget* next;',
+            '    static Widget make();',
+            '    Widget copy(const Widget& other) const;',
+            '};',
+            'typedef Widget WidgetT;',
+            'using WidgetAlias = Widget;',
+            '}',
+        ].join('\n'),
+        'include/fwd.h': '#pragma once\nnamespace app { class Widget; }\n',
+        'widget.cpp': [
+            '#include "include/widget.h"',
+            'namespace app {',
+            'Widget::Widget() : Base(), next(nullptr) {}',
+            'Widget::Widget(int n) : Widget() { (void)n; }',
+            'Widget::~Widget() {}',
+            'Widget Widget::make() { return Widget(); }',
+            'Widget Widget::copy(const Widget& other) const {',
+            '    Widget w = static_cast<Widget>(other);',
+            '    (void)sizeof(Widget);',
+            '    int s = Widget::SIZE;',
+            '    (void)s;',
+            '    return w;',
+            '}',
+            '}',
+        ].join('\n'),
+        'user.cpp': [
+            '#include "include/widget.h"',
+            '#include "include/fwd.h"',
+            'namespace other { class Widget {}; }',
+            'class Sub : public app::Widget {',
+            'public:',
+            '    Sub() : app::Widget(1) {}',
+            '    Sub(int) : Widget() {}',
+            '};',
+            'template <typename T = app::Widget> T mk() { return T(); }',
+            'app::Widget build() { return app::Widget::make(); }',
+            'other::Widget ow;',
+        ].join('\n'),
+    };
+
+    it('C++: constructors, destructors, out-of-line members, member initializers, casts, aliases, forward declarations and injected base names', () => {
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: 'Widget', file: 'include/widget.h', line: 4, renameTo: 'Gadget' });
+            assert.ok(r.ok, r.error);
+            const { contents, reviews } = applyRenamePlan(dir, r.result);
+            assert.deepStrictEqual(reviews, []);
+            const renamed = text => text.replace(/\bWidget\b/g, 'Gadget');
+            assert.strictEqual(contents['include/widget.h'], renamed(files['include/widget.h']));
+            assert.strictEqual(contents['include/fwd.h'], renamed(files['include/fwd.h']));
+            assert.strictEqual(contents['widget.cpp'], renamed(files['widget.cpp']));
+            assert.strictEqual(contents['user.cpp'], renamed(files['user.cpp'])
+                .replace('class Gadget {}', 'class Widget {}').replace('other::Gadget ow', 'other::Widget ow'),
+                'other::Widget is another class');
+        } finally { rm(dir); }
+    });
+
+    it('C++: a macro argument the replacement list also uses as another scope\'s member is reviewed', () => {
+        const dir = tmp({
+            'err.hpp': [
+                'enum class Codes : int { Ok = 0, BadName };',
+                '#define ERROR_SIMPLE(name) explicit name(int m) : name(m, Codes::name) {}',
+                'class BadName {',
+                '  public:',
+                '    BadName(int m, Codes c) {}',
+                '    ERROR_SIMPLE(BadName)',
+                '};',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: 'BadName', file: 'err.hpp', line: 3, renameTo: 'Renamed' });
+            assert.ok(r.ok, r.error);
+            const change = (r.result.changes || []).find(c => c.line === 6);
+            assert.ok(change && change.needsReview && change.newExpression === undefined, JSON.stringify(r.result.changes));
+            assert.ok(!(r.result.changes || []).some(c => c.line === 1 && c.newExpression),
+                'the enumerator is another entity');
+        } finally { rm(dir); }
+    });
+
+    it('C: a struct tag rename edits tag references; a typedef of the same spelling is another name', () => {
+        const dir = tmp({
+            'w.h': 'struct Widget { int n; struct Widget *next; };\ntypedef struct Widget Widget;\nstruct Widget *widget_new(void);\n',
+            'w.c': '#include "w.h"\nWidget *make(void) { struct Widget *w = 0; return w; }\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: 'Widget', file: 'w.h', line: 1, renameTo: 'Gadget' });
+            assert.ok(r.ok, r.error);
+            const { contents, reviews } = applyRenamePlan(dir, r.result);
+            assert.deepStrictEqual(reviews, []);
+            assert.strictEqual(contents['w.h'],
+                'struct Gadget { int n; struct Gadget *next; };\ntypedef struct Gadget Widget;\nstruct Gadget *widget_new(void);\n');
+            assert.strictEqual(contents['w.c'], '#include "w.h"\nWidget *make(void) { struct Gadget *w = 0; return w; }\n');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #386: C++ type spellings keep names that start like a keyword', () => {
+    it('stripTemplateArguments removes a leading keyword token, never the start of a name', () => {
+        const { stripTemplateArguments } = require('../core/cpp-scope');
+        assert.strictEqual(stripTemplateArguments('classify_object<T>'), 'classify_object');
+        assert.strictEqual(stripTemplateArguments('structure::inner'), 'structure::inner');
+        assert.strictEqual(stripTemplateArguments('constant_t'), 'constant_t');
+        assert.strictEqual(stripTemplateArguments('typename T::value_type'), 'T::value_type');
+        assert.strictEqual(stripTemplateArguments('struct S'), 'S');
+    });
+});
+
+describe('fix #387: macro recovery blanks decoration only, never the tokens around it', () => {
+    const fns = result => result.functions.map(fn => `${fn.startLine}:${fn.className || ''}:${fn.name}:${fn.returnType}`);
+
+    it('C++: the type after a stacked specifier macro stays the return type (qualifier and constructor intact)', () => {
+        const result = parse([
+            'namespace CLI {',
+            'CLI11_INLINE App::App(std::string description, App *parent)',
+            '    : name_(std::move(description)), parent_(parent) {',
+            '    set_help_flag("-h");',
+            '}',
+            'CLI11_INLINE App *App::callback(std::function<void()> fn) {',
+            '    callback_ = std::move(fn);',
+            '    return this;',
+            '}',
+            'CLI11_NODISCARD CLI11_INLINE CLI::App *App::get_option_group(std::string name) const {',
+            '    return nullptr;',
+            '}',
+            'CLI11_INLINE Option *App::add_flag(std::string name) {',
+            '    return add_option(name);',
+            '}',
+            'CLI11_INLINE bool App::remove_option(Option *opt) {',
+            '    return opt != nullptr;',
+            '}',
+            '}',
+        ].join('\n'), 'cpp');
+        assert.deepEqual(fns(result), [
+            '2:App:App:null', '6:App:callback:App *', '10:App:get_option_group:CLI::App *',
+            '13:App:add_flag:Option *', '16:App:remove_option:bool',
+        ]);
+        assert.ok(!result.parseRecovery);
+    });
+
+    it('C++: reserved words are never blanked; a macro before `explicit` or `auto` is the decoration', () => {
+        const result = parse([
+            'FMT_CONSTEXPR inline auto parse_align(char c) -> int {',
+            '  return c;',
+            '}',
+            'class dynamic_arg_list {',
+            '  friend class basic_format_args;',
+            ' public:',
+            '  FMT_CONSTEXPR explicit dynamic_arg_list(int n) : n_(n) {}',
+            '  FMT_CONSTEXPR20 ~dynamic_arg_list() = default;',
+            '  FMT_NO_UNIQUE_ADDRESS locale_ref loc_;',
+            '  int n_;',
+            '};',
+        ].join('\n'), 'cpp');
+        assert.deepEqual(fns(result), ['1::parse_align:int']);
+        const cls = result.classes.find(item => item.name === 'dynamic_arg_list');
+        assert.deepEqual(cls.members.map(member => `${member.startLine}:${member.name}`),
+            ['7:dynamic_arg_list', '8:~dynamic_arg_list', '9:loc_', '10:n_']);
+    });
+
+    it('C: a calling-convention macro after a typedef return type keeps the typedef', () => {
+        const result = parse([
+            'typedef int BOOL;',
+            'typedef unsigned long DWORD;',
+            'static DWORD counter;',
+            'BOOL WINAPI CtrlHandler(DWORD type) {',
+            '  return type != 0;',
+            '}',
+            'static DWORD WINAPI thread_proc(void* arg) {',
+            '  return 0;',
+            '}',
+        ].join('\n'), 'c');
+        assert.deepEqual(fns(result), ['4::CtrlHandler:BOOL', '7::thread_proc:DWORD']);
+    });
+
+    it('C++: a trailing specifier macro after a declarator is not a declaration of its own', () => {
+        const result = parse([
+            'namespace os {',
+            'SPDLOG_API int pid() SPDLOG_NOEXCEPT;',
+            'SPDLOG_API bool is_color_terminal() SPDLOG_NOEXCEPT;',
+            'SPDLOG_INLINE int remove(const filename_t &filename) SPDLOG_NOEXCEPT {',
+            '  return 0;',
+            '}',
+            'static const char *names[] LEVEL_NAMES;',
+            '}',
+        ].join('\n'), 'cpp');
+        assert.deepEqual(fns(result), ['2::pid:int', '3::is_color_terminal:bool', '4::remove:int']);
+        assert.deepEqual((result.stateObjects || []).map(state => state.name), ['names']);
+    });
+
+    it('C: member-list macros alone on their line leave the members and later enums intact', () => {
+        const result = parse([
+            '#define UV_HANDLE_FIELDS void* data; int flags;',
+            'struct uv_timer_s {',
+            '  UV_HANDLE_FIELDS',
+            '  int timeout;',
+            '  UV_TIMER_PRIVATE_FIELDS',
+            '};',
+            'typedef enum {',
+            '  UV_TTY_MODE_NORMAL,',
+            '  UV_TTY_MODE_RAW',
+            '} uv_tty_mode_t;',
+        ].join('\n'), 'c');
+        const timer = result.classes.find(item => item.name === 'uv_timer_s');
+        assert.deepEqual(timer.members.map(member => member.name), ['timeout']);
+        const mode = result.classes.find(item => item.name === 'uv_tty_mode_t');
+        assert.deepEqual(mode?.members.map(member => member.name), ['UV_TTY_MODE_NORMAL', 'UV_TTY_MODE_RAW']);
+    });
+
+    it('C++: a blanked multi-line invocation keeps every later line number', () => {
+        const result = parse([
+            'void test_one() {',
+            '  CHECK_THROWS_WITH_AS(it1 < it1,',
+            '                       "message one",',
+            '                       invalid_iterator&)',
+            '  int x = 1',
+            '}',
+            'int after_invocation(int v) {',
+            '  return v;',
+            '}',
+        ].join('\n'), 'cpp');
+        assert.ok(result.functions.some(fn => fn.name === 'after_invocation' && fn.startLine === 7),
+            JSON.stringify(fns(result)));
+    });
+
+    it('C++: the out-of-line definition keeps its return type, so a chained call flows through it', () => {
+        const dir = tmp({
+            'include/Macros.hpp': '#pragma once\n#ifdef LIB_HEADER_ONLY\n#define LIB_INLINE inline\n#else\n#define LIB_INLINE\n#endif\n',
+            'include/App.hpp': [
+                '#pragma once', '#include "Macros.hpp"', '#include <functional>', '#include <string>',
+                'namespace lib {', 'class App {', '  public:', '    App *callback(std::function<void()> fn);',
+                '    App *name(std::string value);', '    std::string name_;', '};', '}',
+            ].join('\n'),
+            'include/App_inl.hpp': [
+                '#pragma once', '#include "App.hpp"', 'namespace lib {',
+                'LIB_INLINE App *App::callback(std::function<void()> fn) {', '    return this;', '}',
+                'LIB_INLINE App *App::name(std::string value) {', '    name_ = value;', '    return this;', '}', '}',
+            ].join('\n'),
+            'main.cpp': [
+                '#include "include/App_inl.hpp"', 'int main() {', '    lib::App app;',
+                '    app.callback([] {})->name("renamed");', '    return 0;', '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const inline = (index.symbols.get('callback') || []).find(def => def.relativePath === 'include/App_inl.hpp');
+            assert.strictEqual(inline?.returnType, 'App *');
+            const result = index.context('name', { file: 'include/App.hpp', line: 9 });
+            assert.deepEqual(result.callers.map(call => `${call.relativePath}:${call.line}`), ['main.cpp:4']);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('C/C++: a name joined by ## in a macro body the grammar misread is not a function', () => {
+        const result = parse([
+            '#define RB_GENERATE_INSERT(name, type) \\',
+            '  /* insert */ \\',
+            'type *name##_RB_INSERT(type *elm) { \\',
+            '  name##_RB_INSERT_COLOR(elm); \\',
+            '  return (0); \\',
+            '}',
+            'int real(void) { return 1; }',
+        ].join('\n'), 'c');
+        assert.ok(!result.functions.some(fn => /_RB_INSERT/.test(fn.name)), JSON.stringify(fns(result)));
+        assert.ok(result.functions.some(fn => fn.name === 'real'));
+    });
+});
+
+describe('fix #387: a dependent using-declaration leaves the overload to instantiation', () => {
+    it('C++: an unqualified call through `using Base<T>::name` is compile-time dispatch; a concrete base confirms', () => {
+        const dir = tmp({
+            'buf.hpp': [
+                'namespace detail {',
+                'template <typename T> class buffer {',
+                ' public:',
+                '  template <typename U> void append(const U* begin, const U* end) { (void)begin; (void)end; }',
+                '};',
+                'class plain {',
+                ' public:',
+                '  void put(const char* begin, const char* end) { (void)begin; (void)end; }',
+                '};',
+                '}',
+                'template <typename T> class memory_buffer : public detail::buffer<T> {',
+                ' public:',
+                '  using detail::buffer<T>::append;',
+                '  template <typename Range> void append(const Range& range) {',
+                '    append(range.data(), range.data() + range.size());',
+                '  }',
+                '};',
+                'class writer : public detail::plain {',
+                ' public:',
+                '  using detail::plain::put;',
+                '  void put(const char* text) {',
+                '    put(text, text + 1);',
+                '  }',
+                '};',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const append = index.context('append', { file: 'buf.hpp', line: 4 });
+            assert.deepEqual((append.callers || []).map(call => call.line), []);
+            const site = (append.unverifiedCallers || []).find(call => call.line === 15);
+            assert.ok(site, JSON.stringify(append.unverifiedCallers));
+            assert.strictEqual(site.uncertaintyClass, 'compile-time-dispatch');
+            const put = index.context('put', { file: 'buf.hpp', line: 8 });
+            assert.deepEqual((put.callers || []).map(call => call.line), [22]);
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #387: C++ type renames through template-qualified constructors and member types', () => {
+    const { applyRenamePlan } = require('./helpers');
+
+    it('C++: `Sink<M>::Sink()` and `Sink<M>::~Sink()` rename the constructor names too', () => {
+        const dir = tmp({
+            'sink.hpp': [
+                'template <typename M> class Sink {',
+                ' public:',
+                '  Sink();',
+                '  ~Sink();',
+                '};',
+                'template <typename M> Sink<M>::Sink() {}',
+                'template <typename M> Sink<M>::~Sink() {}',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: 'Sink', file: 'sink.hpp', line: 1, renameTo: 'Drain' });
+            assert.ok(r.ok, r.error);
+            const { contents } = applyRenamePlan(dir, r.result);
+            assert.strictEqual(contents['sink.hpp'], [
+                'template <typename M> class Drain {',
+                ' public:',
+                '  Drain();',
+                '  ~Drain();',
+                '};',
+                'template <typename M> Drain<M>::Drain() {}',
+                'template <typename M> Drain<M>::~Drain() {}',
+                '',
+            ].join('\n'));
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('C++: a member type alias is found in the class body that holds the site, not in a sibling specialization', () => {
+        const dir = tmp({
+            'fmt.hpp': [
+                'template <typename R, typename E = void> struct formatter;',
+                'template <typename R> struct formatter<R, int> {',
+                '  using range_type = const R;',
+                '  range_type *first = nullptr;',
+                '  void format(range_type &range) const { (void)range; }',
+                '};',
+                'template <typename R> struct formatter<R, long> {',
+                '  using range_type = R;',
+                '  void format(range_type &range) const { (void)range; }',
+                '};',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: 'range_type', file: 'fmt.hpp', line: 3, renameTo: 'span_type' });
+            assert.ok(r.ok, r.error);
+            const { contents, reviews } = applyRenamePlan(dir, r.result);
+            assert.deepStrictEqual(reviews, []);
+            const lines = contents['fmt.hpp'].split('\n');
+            assert.deepStrictEqual(lines.slice(2, 5), [
+                '  using span_type = const R;',
+                '  span_type *first = nullptr;',
+                '  void format(span_type &range) const { (void)range; }',
+            ]);
+            assert.deepStrictEqual(lines.slice(7, 9), [
+                '  using range_type = R;',
+                '  void format(range_type &range) const { (void)range; }',
+            ]);
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #389: C++ function-local classes', () => {
+    const at = entries => (entries || []).map(entry => `${entry.relativePath || entry.file}:${entry.line}`).sort();
+
+    it('a class declared in a function body is not its namespace-scope namesake (callers, callees, plans)', () => {
+        const dir = tmp({
+            'mod.cpp': [
+                'struct Widget {',
+                '    int render() { return 1; }',
+                '};',
+                '',
+                'int build() {',
+                '    struct Widget {',
+                '        int render() { return 2; }',
+                '    };',
+                '    Widget w;',
+                '    return w.render();',
+                '}',
+                '',
+                'int use_top() {',
+                '    Widget w;',
+                '    return w.render();',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const local = index.symbols.get('Widget').find(d => d.startLine === 6);
+            assert.strictEqual(local.lexicalScopeStartLine, 6);
+            assert.strictEqual(local.lexicalScopeEndLine, 11);
+            assert.deepStrictEqual(at(index.context('render', { file: 'mod.cpp', line: 2 }).callers), ['mod.cpp:15']);
+            assert.deepStrictEqual(at(index.context('render', { file: 'mod.cpp', line: 7 }).callers), ['mod.cpp:10']);
+            assert.deepStrictEqual(index.context('build', { file: 'mod.cpp' }).callees
+                .map(c => `${c.name}:${c.startLine}`), ['render:7']);
+            const fn = execute(index, 'plan', { name: 'render', file: 'mod.cpp', line: 7, renameTo: 'draw' });
+            assert.deepStrictEqual(fn.result.changes.map(c => c.line).sort((a, b) => a - b), [7, 10]);
+            const type = execute(index, 'plan', { name: 'Widget', file: 'mod.cpp', line: 1, renameTo: 'Gadget' });
+            assert.deepStrictEqual(type.result.changes.map(c => `${c.line}:${!!c.needsReview}`)
+                .sort(), ['14:false', '1:false']);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #390: C++ class template bases substitute their parameters in override slots', () => {
+    const { applyRenamePlan } = require('./helpers');
+    it('an override below `: public Base<std::string>` joins the slot; a non-overriding overload does not', () => {
+        const dir = tmp({
+            'base.hpp': [
+                '#pragma once',
+                '#include <string>',
+                'template <typename S, int N>',
+                'class Base {',
+                'public:',
+                '    virtual ~Base() {}',
+                '    virtual void visit(S s, int x) = 0;',
+                '    void run(S s) { visit(s, N); }',
+                '};',
+                'class Impl : public Base<std::string, 3> {',
+                'public:',
+                '    void visit(std::string s, int x) override {}',
+                '    void visit(long s, int x) {}',
+                '};',
+            ].join('\n'),
+            'main.cpp': '#include "base.hpp"\nint main() { Impl i; i.run(std::string("a")); return 0; }\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.equal(index.symbols.get('Base').find(d => d.type === 'class').generics, '<S, N>');
+            const lines = line => {
+                const r = execute(index, 'plan', { name: 'visit', file: 'base.hpp', line, renameTo: 'visitZq' });
+                assert.ok(r.ok, r.error);
+                const { contents } = applyRenamePlan(dir, r.result);
+                return (contents['base.hpp'] || '').split('\n').map((row, i) => (row.includes('visitZq') ? i + 1 : null))
+                    .filter(Boolean);
+            };
+            assert.deepEqual(lines(7), [7, 8, 12]);
+            assert.deepEqual(lines(12), [7, 8, 12]);
+            // The overload that overrides nothing renames alone.
+            assert.deepEqual(lines(13), [13]);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #391: C++ friend functions are namespace-scope functions', () => {
+    const { applyRenamePlan } = require('./helpers');
+    const output = require('../core/output');
+    const callersOf = (index, handle) => {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, r.error);
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(c => `${c.file}:${c.line}`),
+        };
+    };
+    const FILES = {
+        'vec.hpp': [
+            'namespace ns {',
+            'class Vec {',
+            '  public:',
+            '    int x;',
+            '    friend Vec operator+(const Vec& a, const Vec& b) { return add(a, b); }',
+            '    friend bool equal(const Vec& a, const Vec& b) { return a.x == b.x; }',
+            '    friend inline long hash_value(const Vec& v) noexcept { return v.x; }',
+            '    friend void swap(Vec& a, Vec& b);',
+            '    friend class Other;',
+            '    friend void Other::touch();',
+            '    template <typename U> friend bool same(const Vec& a, const U& b) { return true; }',
+            '    static Vec add(const Vec& a, const Vec& b) { Vec r; r.x = a.x + b.x; return r; }',
+            '    bool member(const Vec& o) const { return equal(*this, o); }',
+            '};',
+            'void swap(Vec& a, Vec& b) { int t = a.x; a.x = b.x; b.x = t; }',
+            '}',
+        ].join('\n'),
+        'main.cpp': [
+            '#include "vec.hpp"',
+            'int use() { ns::Vec a, b; bool e = equal(a, b); swap(a, b); return e ? 1 : 0; }',
+        ].join('\n'),
+    };
+
+    it('a friend is indexed in its namespace with its return type, never as a member', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const fn = name => (index.symbols.get(name) || []).map(d =>
+                `${d.type}:${d.className || ''}:${d.namespace || ''}:${d.returnType || ''}:${d.friendOf || ''}:${d.startLine}`);
+            assert.deepEqual(fn('equal'), ['function::ns:bool:Vec:6']);
+            assert.deepEqual(fn('hash_value'), ['function::ns:long:Vec:7']);
+            assert.deepEqual(fn('operator+'), ['function::ns:Vec:Vec:5']);
+            assert.deepEqual(fn('same'), ['function::ns:bool:Vec:11']);
+            assert.deepEqual(fn('swap').sort(), ['function::ns:void::15', 'function::ns:void:Vec:8']);
+            // `friend class` and a friend naming another class's member declare nothing.
+            assert.equal(index.symbols.get('touch'), undefined);
+            const members = index.symbols.get('Vec').find(d => d.type === 'class');
+            assert.ok(members);
+            assert.ok(!(index.symbols.get('equal') || []).some(d => d.className === 'Vec'));
+        } finally { rm(dir); }
+    });
+
+    it('argument-dependent and in-class calls reach the friend; its body sees the class scope', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const equal = callersOf(index, 'vec.hpp:6:equal');
+            assert.ok(equal.confirmed.includes('main.cpp:2'), JSON.stringify(equal));
+            assert.ok(equal.confirmed.includes('vec.hpp:13'), JSON.stringify(equal));
+            // `add(a, b)` in the friend body is the class's static member.
+            const add = callersOf(index, 'vec.hpp:12:add');
+            assert.ok(add.confirmed.includes('vec.hpp:5'), JSON.stringify(add));
+        } finally { rm(dir); }
+    });
+
+    it('renaming the function renames the friend declaration with the definition and calls', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: 'swap', file: 'vec.hpp', line: 15, renameTo: 'swap2' });
+            assert.ok(r.ok, r.error);
+            const { contents } = applyRenamePlan(dir, r.result);
+            assert.match(contents['vec.hpp'], /friend void swap2\(Vec& a, Vec& b\);/);
+            assert.match(contents['vec.hpp'], /void swap2\(Vec& a, Vec& b\) \{/);
+            assert.match(contents['main.cpp'], /swap2\(a, b\)/);
+        } finally { rm(dir); }
+    });
+
+    it('a friend declaration and its definition are one producer for a call receiver', () => {
+        const dir = tmp({
+            'style.hpp': [
+                'class style {',
+                '  public:',
+                '    bool has_bold() const { return bits != 0; }',
+                '    friend auto make_style(int b) -> style;',
+                '  private:',
+                '    int bits = 0;',
+                '};',
+                'inline auto make_style(int b) -> style { style s; return s; }',
+                'class other {',
+                '  public:',
+                '    static bool has_bold(int mask, int bit) { return (mask & bit) != 0; }',
+                '};',
+            ].join('\n'),
+            'use.cpp': [
+                '#include "style.hpp"',
+                'bool check() { return make_style(1).has_bold(); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const hasBold = callersOf(index, 'style.hpp:3:has_bold');
+            assert.ok(hasBold.confirmed.includes('use.cpp:2'), JSON.stringify(hasBold));
+        } finally { rm(dir); }
+    });
+
+    it('member templates keep their return type', () => {
+        const result = parse([
+            'class W {',
+            '  public:',
+            '    template <typename T> static T make(int x) { return T(x); }',
+            '    template <typename T> T get() const;',
+            '};',
+        ].join('\n'), 'cpp');
+        const members = result.classes.find(cls => cls.name === 'W').members;
+        assert.deepEqual(members.map(m => `${m.name}:${m.returnType}`), ['make:T', 'get:T']);
+    });
+});
+
+describe('fix #391: a macro invocation with a body at namespace scope defines a callable', () => {
+    const output = require('../core/output');
+    const callersOf = (index, handle) => {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, r.error);
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return (json.data.callers || []).map(c => `${c.file}:${c.line}:${c.callerName || ''}`);
+    };
+    const FILES = {
+        'lib.h': 'int add(int a, int b);\nvoid run_fixture();\n',
+        'lib.cc': '#include "lib.h"\nint add(int a, int b) { return a + b; }\nvoid run_fixture() {}\n',
+        'tests/lib_test.cc': [
+            '#include "gtest/gtest.h"',
+            '#include "lib.h"',
+            'TEST(MathSuite, Adds) {',
+            '  EXPECT_EQ(add(1, 2), 3);',
+            '}',
+            '// a fixture test',
+            'TEST_F(Fixture, Works) {',
+            '  run_fixture();',
+            '}',
+            'TEST_CASE("vector can be sized", "[vector]") {',
+            '  add(2, 3);',
+            '}',
+            'namespace ns {',
+            'TEST(Inner, Case) { add(4, 5); }',
+            '}',
+        ].join('\n'),
+        'tests/annotated.cc': [
+            '#include "lib.h"',
+            'struct Mutex {};',
+            'Mutex mu;',
+            'int locked_add()',
+            '    LOCKS_EXCLUDED(mu) {',
+            '  return add(6, 7);',
+            '}',
+            '#define DECLARE_TABLE(name) struct name##_table { int size; };',
+            'DECLARE_TABLE(fruit) { }',
+        ].join('\n'),
+    };
+
+    it('bodies of TEST(...)/TEST_CASE("...") are callables owning their calls', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const generated = [];
+            for (const [, defs] of index.symbols) {
+                for (const d of defs) {
+                    if (d.generatedByMacro && !d.className) {
+                        generated.push(`${d.relativePath}:${d.startLine}-${d.endLine}:${d.name}:${d.generatedByMacro.name}`);
+                    }
+                }
+            }
+            assert.deepEqual(generated.sort(), [
+                'tests/lib_test.cc:10-12:vector_can_be_sized_vector:TEST_CASE',
+                'tests/lib_test.cc:14-14:Inner_Case:TEST',
+                'tests/lib_test.cc:3-5:MathSuite_Adds:TEST',
+                'tests/lib_test.cc:7-9:Fixture_Works:TEST_F',
+            ]);
+            const add = callersOf(index, 'lib.cc:2:add');
+            for (const site of ['tests/lib_test.cc:4:MathSuite_Adds', 'tests/lib_test.cc:11:vector_can_be_sized_vector',
+                'tests/lib_test.cc:14:Inner_Case']) {
+                assert.ok(add.includes(site), `${site} in ${JSON.stringify(add)}`);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('an annotation after an open function head and a non-function macro expansion define nothing', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const generated = [];
+            for (const [, defs] of index.symbols) {
+                for (const d of defs) {
+                    if (d.generatedByMacro && d.relativePath === 'tests/annotated.cc') generated.push(d.name);
+                }
+            }
+            assert.deepEqual(generated, []);
+        } finally { rm(dir); }
+    });
+
+    it('the generated callable is an entry point and its rename is blocked', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const dead = execute(index, 'deadcode', { includeExported: true, includeTests: true });
+            assert.ok(dead.ok, dead.error);
+            assert.ok(!JSON.stringify(dead.result).includes('MathSuite_Adds'));
+            const plan = execute(index, 'plan', { name: 'MathSuite_Adds', renameTo: 'Other' });
+            assert.ok(plan.ok, plan.error);
+            assert.equal(plan.result.contract?.blocked, true);
+            assert.equal(plan.result.contract.external[0].reason, 'macro-generated-name');
+            assert.ok(plan.result.changes.every(change => change.newExpression === undefined));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #391: large C/C++ files resolve the conditionals the grammar could not place', () => {
+    it('a member-initializer list split by #if keeps its constructor and class', () => {
+        const filler = [];
+        for (let i = 0; i < 5200; i++) filler.push(`inline int filler_${i}(int v) { return v + ${i}; }`);
+        const source = [
+            '#pragma once',
+            ...filler,
+            'namespace lib {',
+            'class Json {',
+            '  public:',
+            '    int start_position = 0;',
+            '    Json(const Json& other)',
+            '#if DIAGNOSTIC_POSITIONS',
+            '        : start_position(other.start_pos()),',
+            '          end_position(other.start_pos())',
+            '#endif',
+            '    {',
+            '        switch (other.kind()) {',
+            '            case 1: copy_structured(other); break;',
+            '        }',
+            '        assert_invariant();',
+            '    }',
+            '    int kind() const { return 1; }',
+            '    int end_position = 0;',
+            '    int start_pos() const { return start_position; }',
+            '    void copy_structured(const Json& o) {}',
+            '    void assert_invariant() const {}',
+            '  private:',
+            '    int base_;',
+            '#ifdef NO_THREAD_LOCAL',
+            '    int depth() const { return 0; }',
+            '#else',
+            '    int depth() const { return nesting(); }',
+            '#endif',
+            '    static int nesting() { return 1; }',
+            '};',
+            '}',
+        ].join('\n');
+        assert.ok(Buffer.byteLength(source) > 256 * 1024);
+        const offset = filler.length + 1;
+        const result = parse(source, 'cpp');
+        const json = result.classes.find(cls => cls.name === 'Json');
+        assert.ok(json, 'the class survives the split initializer list');
+        const ctor = json.members.find(m => m.name === 'Json');
+        assert.equal(ctor?.startLine, offset + 5);
+        assert.ok(!result.functions.some(fn => ['start_pos', 'kind'].includes(fn.name) && !fn.className),
+            'no phantom free functions from the split list');
+        const calls = getLanguageAdapter('cpp').findCallsInCode(source, getParser('cpp'))
+            .filter(call => call.line > offset && call.line < offset + 20 &&
+                ['copy_structured', 'assert_invariant', 'start_pos', 'kind'].includes(call.name));
+        assert.deepEqual(calls.map(call => `${call.name}@${call.line}:${call.enclosingFunction?.name}`).sort(), [
+            `assert_invariant@${offset + 14}:Json`,
+            `copy_structured@${offset + 12}:Json`,
+            `kind@${offset + 11}:Json`,
+            `start_pos@${offset + 7}:Json`,
+            `start_pos@${offset + 8}:Json`,
+        ]);
+    });
+});
+
+describe('fix #391: C++ nested classes see their enclosing class; member templates are templates', () => {
+    it('a member type alias used by bare name belongs to the class scope chain of the use', () => {
+        const dir = tmp({
+            'a.hpp': [
+                '#include <string>',
+                'template <typename B> struct Sax {',
+                '    using text_t = typename B::text_t;',
+                '};',
+                'template <typename B> class Reader {',
+                '    using text_t = typename B::text_t;',
+                '    text_t read(const char* s) { return text_t(s); }',
+                '};',
+                'template <typename B> class Writer {',
+                '    using text_t = typename B::text_t;',
+                '    void write(const char* s) { auto t = text_t(s); (void)t; }',
+                '};',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const shown = line => {
+                const ctx = index.context('text_t', { file: 'a.hpp', line });
+                return [...(ctx.callers || []), ...(ctx.unverifiedCallers || [])].map(c => c.line);
+            };
+            assert.deepStrictEqual(shown(3), []);
+            assert.deepStrictEqual(shown(6), [7]);
+            assert.deepStrictEqual(shown(10), [11]);
+        } finally { rm(dir); }
+    });
+
+    it('a nested class member calls the enclosing class static template by bare name', () => {
+        const dir = tmp({
+            'j.hpp': [
+                'namespace lib {',
+                'class Json {',
+                '  public:',
+                '    template <typename T, typename... Args>',
+                '    static T* create(Args&&... args) { return new T(args...); }',
+                '    union Value {',
+                '        int* number;',
+                '        Value(int v) : number(create<int>(v)) {}',
+                '    };',
+                '    void reset() { Value v(create<int>(1) ? 1 : 0); }',
+                '};',
+                'class Other {',
+                '    void f() { create<int>(2); }',
+                '};',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const create = index.symbols.get('create').find(d => d.className === 'Json');
+            assert.equal(create.templateDependent, true);
+            assert.equal(create.returnType, 'T *');
+            const ctx = index.context('create', { file: 'j.hpp', line: create.startLine });
+            const shown = [...(ctx.callers || []), ...(ctx.unverifiedCallers || [])].map(c => c.line).sort((a, b) => a - b);
+            assert.deepStrictEqual(shown, [8, 10]);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #393: C/C++ rename and caller identity leftovers', () => {
+    const { applyRenamePlan } = require('./helpers');
+    const output = require('../core/output');
+    const shownOf = (index, name, file, line) => {
+        const r = execute(index, 'context', { name, file, line });
+        assert.ok(r.ok, r.error);
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`).sort(),
+            unverified: (json.data.unverifiedCallers || []).map(c => `${c.file}:${c.line}:${c.reason}`).sort(),
+            excluded: Object.keys(json.data.account?.excluded?.byReason || r.result.meta?.account?.excluded?.byReason || {}),
+        };
+    };
+
+    it('an unnamed prototype parameter keeps its type, joining the out-of-line definition and its calls', () => {
+        const dir = tmp({
+            'fmt.hpp': [
+                'class Option;',
+                'class Formatter {',
+                '  public:',
+                '    virtual int describe(const Option *) const;',
+                '    int text(const Option *opt) const { return describe(opt); }',
+                '};',
+            ].join('\n'),
+            'fmt_inl.hpp': [
+                '#include "fmt.hpp"',
+                'inline int Formatter::describe(const Option *opt) const { return 1; }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const decl = index.symbols.get('describe').find(d => d.isSignature);
+            assert.deepEqual(decl.paramsStructured, [{ name: 'const Option *', unnamed: true }]);
+            const r = execute(index, 'plan', { name: 'describe', file: 'fmt.hpp', line: 4, renameTo: 'describe2' });
+            assert.ok(r.ok, r.error);
+            const { contents } = applyRenamePlan(dir, r.result);
+            assert.match(contents['fmt.hpp'], /virtual int describe2\(const Option \*\) const;/);
+            assert.match(contents['fmt.hpp'], /return describe2\(opt\);/);
+            assert.match(contents['fmt_inl.hpp'], /Formatter::describe2\(const Option \*opt\)/);
+        } finally { rm(dir); }
+    });
+
+    it('v->m() reaches the pointee: smart pointers behind aliases, auto locals, operator->', () => {
+        const dir = tmp({
+            'app.hpp': [
+                '#include <memory>',
+                'namespace N {',
+                'class App;',
+                'using App_p = std::shared_ptr<App>;',
+                'class App {',
+                '  public:',
+                '    App_p ptr();',
+                '    App *raw();',
+                '    void remove();',
+                '};',
+                'struct Handle { App *operator->() const; };',
+                'class Other { public: void remove(); };',
+                'std::shared_ptr<App> make_app();',
+                'std::unique_ptr<Other> make_other();',
+                'inline void use(App *a) {',
+                '    App_p declared = a->ptr();',
+                '    declared->remove();',
+                '    auto flowed = a->ptr();',
+                '    flowed->remove();',
+                '    auto pointer = a->raw();',
+                '    pointer->remove();',
+                '    Handle handle;',
+                '    handle->remove();',
+                '    App_p made = std::make_shared<App>();',
+                '    made->remove();',
+                '    auto shared = make_app();',
+                '    shared->remove();',
+                '    auto other = make_other();',
+                '    other->remove();',
+                '}',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const shown = shownOf(index, 'remove', 'app.hpp', 9);
+            // Every line reaching App::remove is shown; Other's is excluded.
+            assert.deepEqual(shown.confirmed,
+                ['app.hpp:17', 'app.hpp:19', 'app.hpp:21', 'app.hpp:23', 'app.hpp:25', 'app.hpp:27']);
+            assert.deepEqual(shown.unverified, []);
+            const r = execute(index, 'context', { name: 'remove', file: 'app.hpp', line: 9 });
+            assert.equal(r.result.meta.account.excluded.total, 1);
+        } finally { rm(dir); }
+    });
+
+    it('a receiver typed by a template parameter or an alias of a dependent type is never excluded', () => {
+        const dir = tmp({
+            'j.hpp': [
+                '#include <type_traits>',
+                'namespace N {',
+                'template<bool B, class T, class F>',
+                'using conditional_t = typename std::conditional<B, T, F>::type;',
+                'class context { public: int arg_id(int) const; };',
+                'template<typename C> class generic_context { public: int arg_id(int) const; };',
+                'template<typename T>',
+                'using buffered_context = conditional_t<std::is_same<T, char>::value, context, generic_context<T>>;',
+                'template<typename Char> struct handler {',
+                '    buffered_context<Char> ctx;',
+                '    int on(int id) { return ctx.arg_id(id); }',
+                '};',
+                'template<typename BasicJsonType>',
+                'int from_json(const BasicJsonType &j) { return j.arg_id(0); }',
+                'struct holder {',
+                '    template<typename ThisType>',
+                '    static int ref(ThisType &obj) { return obj.arg_id(1); }',
+                '};',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const fn = index.symbols.get('from_json')[0];
+            assert.equal(fn.templateParams, '<BasicJsonType>');
+            const shown = shownOf(index, 'arg_id', 'j.hpp', 5);
+            assert.deepEqual(shown.confirmed, []);
+            assert.deepEqual(shown.unverified.map(s => s.split(':').slice(0, 2).join(':')),
+                ['j.hpp:11', 'j.hpp:14', 'j.hpp:17']);
+            const r = execute(index, 'context', { name: 'arg_id', file: 'j.hpp', line: 5 });
+            assert.equal(r.result.meta.account.excluded.total || 0, 0);
+        } finally { rm(dir); }
+    });
+
+    it('::f() names the global namespace: a namespace member is not it without a global using', () => {
+        const dir = tmp({
+            'os.hpp': [
+                '#include <unistd.h>',
+                'namespace spd { namespace os {',
+                'inline bool fsync(FILE *fp) { return ::fsync(fileno(fp)) == 0; }',
+                '} }',
+            ].join('\n'),
+            'user.cpp': [
+                '#include "os.hpp"',
+                'namespace spd { namespace os { bool helper(); } }',
+                'using namespace spd::os;',
+                'bool run(FILE *fp) { return ::fsync(fp); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'fsync', file: 'os.hpp', line: 3 });
+            assert.ok(r.ok, r.error);
+            const account = r.result.meta.account;
+            assert.equal(account.excluded.byReason['global-qualified']?.count, 1);
+            const unverified = (r.result.unverifiedCallers || []).map(c => `${c.relativePath}:${c.line}:${c.reason}`);
+            assert.deepEqual(unverified, ['user.cpp:4:global-qualified-using']);
+            assert.deepEqual((r.result.callers || []).map(c => c.line), []);
+            const callees = execute(index, 'context', { name: 'fsync', file: 'os.hpp', line: 3 }).result.callees || [];
+            assert.ok(!callees.some(c => c.name === 'fsync'), 'the POSIX ::fsync is not a project callee');
+        } finally { rm(dir); }
+    });
+
+    it('members a class declares only in a skipped configuration branch are indexed', () => {
+        const dir = tmp({
+            'chrono.hpp': [
+                '#if FMT_A',
+                'int broken( {',
+                '#endif',
+                'inline bool gm(int t) {',
+                '  struct dispatcher {',
+                '    bool fallback(int res) { return res == 0; }',
+                '#if FMT_A',
+                '    bool fallback(double) { return true; }',
+                '#endif',
+                '    bool run() { return fallback(1); }',
+                '  };',
+                '  return dispatcher().run();',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const lines = (index.symbols.get('fallback') || []).map(d => `${d.className}:${d.startLine}`).sort();
+            assert.deepEqual(lines, ['dispatcher:6', 'dispatcher:8']);
+        } finally { rm(dir); }
+    });
+
+    it('a large file whose conditionals split braces keeps its namespaces and declarations', () => {
+        const pad = `// ${'x'.repeat(78)}\n`.repeat(3400);
+        const dir = tmp({
+            'big.hpp': [
+                '#ifndef GUARD_H',
+                '#define GUARD_H',
+                'namespace nl {',
+                'namespace detail {',
+                'struct from_json_fn { int operator()(int v) const { return v; } };',
+                '}',
+                '#ifndef HAS_CPP_17',
+                'namespace',
+                '{',
+                '#endif',
+                'constexpr const auto& from_json = detail::from_json_fn{};',
+                '#ifndef HAS_CPP_17',
+                '}  // namespace',
+                '#endif',
+                'namespace detail {',
+                'enum class tag_t { error, store };',
+                'class reader {',
+                '  public:',
+                '    bool get_number(int format, int& result) { return format == result; }',
+                '};',
+                '}',
+                'class basic_json {',
+                '  public:',
+                '    using tag_t = detail::tag_t;',
+                '};',
+                '}',
+                '#endif',
+                pad,
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const ns = name => (index.symbols.get(name) || []).map(d => `${d.startLine}:${d.namespace || ''}`);
+            assert.deepEqual(ns('tag_t'), ['16:nl::detail', '24:nl']);
+            assert.deepEqual(ns('reader'), ['17:nl::detail']);
+            const r = execute(index, 'plan', { name: 'tag_t', file: 'big.hpp', line: 16, renameTo: 'tag2_t' });
+            assert.ok(r.ok, r.error);
+            const { contents } = applyRenamePlan(dir, r.result);
+            assert.match(contents['big.hpp'], /using tag_t = detail::tag2_t;/);
+        } finally { rm(dir); }
+    });
+
+    it('a qualified reference (an explicit instantiation) is renamed when its qualifier names the renamed function\'s namespace', () => {
+        const dir = tmp({
+            'fmt.hpp': [
+                'namespace fmt { namespace detail { namespace dragonbox {',
+                'template <typename T> T to_decimal(T x) { return x; }',
+                '} } }',
+            ].join('\n'),
+            'inst.cpp': [
+                '#include "fmt.hpp"',
+                'namespace fmt { namespace detail {',
+                'template float dragonbox::to_decimal(float x);',
+                '} }',
+                'namespace other { namespace dragonbox { template <typename T> T to_decimal(T x) { return x; } } }',
+                'namespace other {',
+                'template double dragonbox::to_decimal(double x);',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: 'to_decimal', file: 'fmt.hpp', line: 2, renameTo: 'td2' });
+            assert.ok(r.ok, r.error);
+            const { contents } = applyRenamePlan(dir, r.result);
+            assert.match(contents['inst.cpp'], /template float dragonbox::td2\(float x\);/);
+            assert.match(contents['inst.cpp'], /template double dragonbox::to_decimal\(double x\);/);
+        } finally { rm(dir); }
+    });
+
+    it('a globally qualified type (`::ns::T<X>`, also behind a member alias) is the type', () => {
+        const dir = tmp({
+            'p.hpp': [
+                'namespace nl {',
+                'template<typename S> class json_pointer {',
+                '  public:',
+                '    json_pointer<S> convert() const& { return *this; }',
+                '};',
+                'template<typename S> class basic_json {',
+                '  public:',
+                '    using json_pointer = ::nl::json_pointer<S>;',
+                '    int value(const ::nl::json_pointer<S>& ptr) const { ptr.convert(); return 0; }',
+                '    int other(const json_pointer& ptr) const { ptr.convert(); return 1; }',
+                '};',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const shown = shownOf(index, 'convert', 'p.hpp', 4);
+            assert.deepEqual(shown.confirmed, ['p.hpp:10', 'p.hpp:9']);
+        } finally { rm(dir); }
+    });
+
+    it('a namespace the parse left as loose tokens of an ERROR still scopes what it encloses', () => {
+        const dir = tmp({
+            'e.hpp': [
+                '#ifndef G',
+                '#define G',
+                'namespace outer {',
+                'struct S { int x; }',
+                '}',
+                ')',
+                'namespace detail',
+                '{',
+                'enum class tag_t { a, b };',
+                '}',
+                '#endif',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.equal(index.symbols.get('S')[0].namespace, 'outer');
+        } finally { rm(dir); }
+    });
+
+    it('a pointer argument keeps its pointer level and pointee const in overload choice', () => {
+        const dir = tmp({
+            'emit.hpp': [
+                '#include <string_view>',
+                'namespace lib {',
+                'void emit(std::string_view text);',
+                'void emit(char c);',
+                'void put(const char* text);',
+                'void put(char* text);',
+                '}',
+            ].join('\n'),
+            'run.cpp': [
+                '#include "emit.hpp"',
+                'void run(const char* text, char* buffer) {',
+                '    lib::emit(text);',
+                '    lib::put(text);',
+                '    lib::put(buffer);',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const callersOf = line => {
+                const r = execute(index, 'context', { name: line < 5 ? 'emit' : 'put', file: 'emit.hpp', line });
+                assert.ok(r.ok, r.error);
+                return {
+                    confirmed: (r.result.callers || []).map(c => c.line),
+                    unverified: (r.result.unverifiedCallers || []).map(c => c.line),
+                };
+            };
+            assert.deepEqual(callersOf(3), { confirmed: [3], unverified: [] });
+            assert.deepEqual(callersOf(4), { confirmed: [], unverified: [] });
+            assert.deepEqual(callersOf(5), { confirmed: [4], unverified: [] });
+            assert.deepEqual(callersOf(6), { confirmed: [5], unverified: [] });
+        } finally { rm(dir); }
+    });
+
+    it('a namespace whose closing brace the parse gave to an earlier declaration still scopes what follows', () => {
+        const dir = tmp({
+            'lib.hpp': [
+                '#include <utility>',
+                '',
+                'namespace lib {',
+                'namespace detail {',
+                '',
+                'class type_error {',
+                '  public:',
+                '    static type_error create(int id) { return type_error(); }',
+                '};',
+                '',
+                'template<typename BasicJsonType, typename ArrayType>',
+                'auto fill(const BasicJsonType& j, ArrayType& arr)',
+                '-> decltype(',
+                '    arr.reserve(std::declval<typename ArrayType::size_type>()),',
+                '    j.template get<typename ArrayType::value_type>(),',
+                '    void())',
+                '{',
+                '    ArrayType ret;',
+                '    ret.reserve(j.size());',
+                '    arr = std::move(ret);',
+                '}',
+                '',
+                'template<typename BasicJsonType>',
+                'void check(const BasicJsonType& j)',
+                '{',
+                '    if (!j.is_array())',
+                '    {',
+                '        throw type_error::create(302);',
+                '    }',
+                '}',
+                '',
+                '}  // namespace detail',
+                'namespace other {',
+                'class type_error { public: static type_error create(int id) { return type_error(); } };',
+                '}',
+                '}  // namespace lib',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.equal(index.symbols.get('check')[0].namespace, 'lib::detail');
+            assert.deepEqual(index.symbols.get('type_error').map(d => d.namespace).sort(), ['lib::detail', 'lib::other']);
+            const r = execute(index, 'context', { name: 'create', file: 'lib.hpp', line: 8 });
+            assert.ok(r.ok, r.error);
+            assert.deepEqual((r.result.callers || []).map(c => c.line), [28]);
+            assert.deepEqual((r.result.unverifiedCallers || []).map(c => c.line), []);
+            const other = execute(index, 'context', { name: 'create', file: 'lib.hpp', line: 34 });
+            assert.deepEqual((other.result.callers || []).map(c => c.line), []);
+            assert.deepEqual((other.result.unverifiedCallers || []).map(c => c.line), []);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #396: C and C++ name lookup, preprocessor model and recovery leftovers', () => {
+    const { applyRenamePlan } = require('./helpers');
+    const output = require('../core/output');
+    const shownOf = (index, name, file, line) => {
+        const r = execute(index, 'context', { name, file, line });
+        assert.ok(r.ok, r.error);
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`).sort(),
+            unverified: (json.data.unverifiedCallers || []).map(c => `${c.file}:${c.line}:${c.reason}`).sort(),
+            excluded: Object.keys(r.result.meta?.account?.excluded?.byReason || {}).sort(),
+        };
+    };
+    const planOf = (index, params) => {
+        const r = execute(index, 'plan', params);
+        assert.ok(r.ok, r.error);
+        return r.result;
+    };
+    const reviewLines = plan => (plan.reviewItems || []).map(item => `${item.file}:${item.line}`).sort();
+
+    it('an implicit-this call names the enclosing class member; an override below it is runtime dispatch only when virtual', () => {
+        const header = virtual => [
+            '#pragma once',
+            'class Shape {',
+            ' public:',
+            `  ${virtual ? 'virtual ' : ''}double Area() const${virtual ? ' = 0' : ''};`,
+            '  double Twice() const;',
+            '};',
+            'class Circle : public Shape {',
+            ' public:',
+            `  double Area() const${virtual ? ' override' : ''};`,
+            '};',
+        ].join('\n');
+        const source = virtual => [
+            '#include "shape.h"',
+            virtual ? '' : 'double Shape::Area() const { return 1.0; }',
+            'double Shape::Twice() const { return 2 * Area(); }',
+            'double Circle::Area() const { return 3.14; }',
+        ].join('\n');
+        for (const virtual of [true, false]) {
+            const dir = tmp({ 'shape.h': header(virtual), 'shape.cc': source(virtual) });
+            try {
+                const index = idx(dir);
+                const base = shownOf(index, 'Area', 'shape.h', 4);
+                assert.deepEqual(base.confirmed, ['shape.cc:3'], `virtual=${virtual}`);
+                const override = shownOf(index, 'Area', 'shape.h', 9);
+                assert.deepEqual(override.confirmed, [], `virtual=${virtual}`);
+                if (virtual) {
+                    assert.deepEqual(override.unverified, ['shape.cc:3:possible-dispatch']);
+                } else {
+                    assert.deepEqual(override.unverified, []);
+                    assert.deepEqual(override.excluded, ['other-definition']);
+                }
+            } finally { rm(dir); }
+        }
+    });
+
+    it('a type rename of an anonymous struct typedef edits every use of the typedef name (C)', () => {
+        const dir = tmp({
+            'a.c': [
+                'typedef struct {',
+                '    int pos;',
+                '} stream_t, *stream_p;',
+                'typedef struct lex_s {',
+                '    stream_t stream;',
+                '} lex_t;',
+                'static int stream_get(stream_t *stream) { return stream->pos; }',
+                'static int stream_peek(stream_p s) { return s->pos; }',
+                'int lex_get(lex_t *lex) { return stream_get(&lex->stream); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const def = index.symbols.get('stream_t').find(d => d.type === 'struct');
+            assert.equal(def.typedefName, true);
+            assert.equal(index.symbols.get('stream_p')[0].aliasOf, 'stream_t');
+            const plan = planOf(index, { name: 'stream_t', file: 'a.c', line: 1, renameTo: 'stream_z' });
+            const { contents } = applyRenamePlan(dir, plan);
+            assert.match(contents['a.c'], /\} stream_z, \*stream_p;/);
+            assert.match(contents['a.c'], /stream_z stream;/);
+            assert.match(contents['a.c'], /stream_get\(stream_z \*stream\)/);
+            assert.deepEqual(reviewLines(plan), []);
+        } finally { rm(dir); }
+    });
+
+    it('value references to a C function reach it through its forward declaration and the include closure', () => {
+        const dir = tmp({
+            'a.c': [
+                'typedef void (*cb_t)(int);',
+                'static void on_event(int x);',
+                'static void set_cb(cb_t f) { f(1); }',
+                'static void use_int(int v) { (void)v; }',
+                'void run(void) {',
+                '    set_cb(on_event);',
+                '    cb_t g = on_event;',
+                '    g(2);',
+                '}',
+                'void shadow(int on_event) { use_int(on_event); }',
+                'void local(void) { int on_event = 1; use_int(on_event); }',
+                'static cb_t table[] = { on_event };',
+                'static void on_event(int x) { (void)x; }',
+            ].join('\n'),
+            'h.h': 'void handler(int x);',
+            'b.c': '#include "h.h"\nvoid handler(int x) { (void)x; }',
+            'c.c': [
+                '#include "h.h"',
+                'typedef void (*cb_t)(int);',
+                'static void set(cb_t f) { f(1); }',
+                'void go(void) { set(handler); handler(3); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const plan = planOf(index, { name: 'on_event', file: 'a.c', line: 13, renameTo: 'on_evt' });
+            const { contents } = applyRenamePlan(dir, plan);
+            assert.match(contents['a.c'], /static void on_evt\(int x\);/);
+            assert.match(contents['a.c'], /set_cb\(on_evt\);/);
+            assert.match(contents['a.c'], /cb_t g = on_evt;/);
+            assert.match(contents['a.c'], /\{ on_evt \};/);
+            assert.match(contents['a.c'], /void shadow\(int on_event\) \{ use_int\(on_event\); \}/);
+            assert.match(contents['a.c'], /int on_event = 1; use_int\(on_event\);/);
+            assert.deepEqual(reviewLines(plan), []);
+            const cross = planOf(index, { name: 'handler', file: 'b.c', line: 2, renameTo: 'handle' });
+            const crossApplied = applyRenamePlan(dir, cross).contents;
+            assert.match(crossApplied['c.c'], /set\(handle\); handle\(3\);/);
+            assert.match(crossApplied['h.h'], /void handle\(int x\);/);
+        } finally { rm(dir); }
+    });
+
+    it('an out-of-class nested type definition joins its owner: members, calls, qualified and unqualified spellings', () => {
+        const dir = tmp({
+            'sk.hpp': [
+                '#pragma once',
+                'namespace ns {',
+                'template <typename Key, class Comparator>',
+                'class SkipList {',
+                ' public:',
+                '  void Insert(const Key& key);',
+                ' private:',
+                '  struct Node;',
+                '  Node* NewNode(const Key& key);',
+                '  Node* head_;',
+                '};',
+                'template <typename Key, class Comparator>',
+                'struct SkipList<Key, Comparator>::Node {',
+                '  explicit Node(const Key& k) : key(k) {}',
+                '  void SetNext(int n, Node* x) { next_ = x; }',
+                '  Key const key;',
+                '  Node* next_;',
+                '};',
+                'template <typename Key, class Comparator>',
+                'typename SkipList<Key, Comparator>::Node* SkipList<Key, Comparator>::NewNode(const Key& key) {',
+                '  return new Node(key);',
+                '}',
+                'template <typename Key, class Comparator>',
+                'void SkipList<Key, Comparator>::Insert(const Key& key) {',
+                '  Node* x = NewNode(key);',
+                '  x->SetNext(0, head_);',
+                '  head_ = x;',
+                '}',
+                '}  // namespace ns',
+            ].join('\n'),
+            'list.hpp': [
+                '#pragma once',
+                'template <typename Key>',
+                'class List {',
+                '  struct Node;',
+                '  Node* head_;',
+                ' public:',
+                '  void Push(const Key& key);',
+                '};',
+                'template <typename Key>',
+                'struct List<Key>::Node {',
+                '  void SetNext(int n, Node* x) { next = x; }',
+                '  Node* next;',
+                '};',
+                'template <typename Key>',
+                'void List<Key>::Push(const Key& key) { Node* n = nullptr; n->SetNext(1, head_); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const node = index.symbols.get('Node').find(d => d.type === 'struct' && d.file.endsWith('sk.hpp'));
+            assert.equal(node.enclosingType, 'SkipList');
+            assert.equal(node.namespace, 'ns');
+            const setNext = index.symbols.get('SetNext').find(d => d.file.endsWith('sk.hpp'));
+            assert.equal(setNext.className, 'Node');
+            assert.deepEqual(shownOf(index, 'SetNext', 'sk.hpp', 15).confirmed, ['sk.hpp:26']);
+            assert.deepEqual(shownOf(index, 'SetNext', 'list.hpp', 11).confirmed, ['list.hpp:15']);
+            const plan = planOf(index, { name: 'Node', file: 'sk.hpp', line: 13, renameTo: 'Cell' });
+            const { contents } = applyRenamePlan(dir, plan);
+            const text = contents['sk.hpp'];
+            assert.match(text, /struct Cell;/);
+            assert.match(text, /struct SkipList<Key, Comparator>::Cell \{/);
+            assert.match(text, /explicit Cell\(const Key& k\)/);
+            assert.match(text, /typename SkipList<Key, Comparator>::Cell\* SkipList<Key, Comparator>::NewNode/);
+            assert.match(text, /return new Cell\(key\);/);
+            assert.match(text, /Cell\* x = NewNode\(key\);/);
+            assert.equal(contents['list.hpp'], undefined);
+            assert.deepEqual(reviewLines(plan), []);
+        } finally { rm(dir); }
+    });
+
+    it('a nested type spelled through its enclosing class in another file is renamed', () => {
+        const dir = tmp({
+            'vs.h': [
+                '#pragma once',
+                'namespace ns {',
+                'class VersionSet {',
+                ' public:',
+                '  struct Storage { char buffer[100]; };',
+                '  const char* Summary(Storage* s) const;',
+                '};',
+                '}  // namespace ns',
+            ].join('\n'),
+            'vs.cc': '#include "vs.h"\nnamespace ns {\nconst char* VersionSet::Summary(Storage* s) const { return s->buffer; }\n}',
+            'impl.cc': '#include "vs.h"\nnamespace ns {\nvoid Log(const VersionSet* v) {\n  VersionSet::Storage tmp;\n  v->Summary(&tmp);\n}\n}',
+        });
+        try {
+            const index = idx(dir);
+            const plan = planOf(index, { name: 'Storage', file: 'vs.h', line: 5, renameTo: 'Store' });
+            const { contents } = applyRenamePlan(dir, plan);
+            assert.match(contents['impl.cc'], /VersionSet::Store tmp;/);
+            assert.match(contents['vs.cc'], /Summary\(Store\* s\)/);
+            assert.match(contents['vs.h'], /struct Store \{/);
+        } finally { rm(dir); }
+    });
+
+    it('a call in a macro replacement list binds at the macro expansion sites, through nested macros', () => {
+        const dir = tmp({
+            'reader.hpp': [
+                '#define CHECK(x) (void)(x)',
+                '#define ERROR_NORETURN(c) \\',
+                '    CHECK(!HasErr()); /* once */ \\',
+                '    SetErr(c);',
+                '#define ERROR(c) do { ERROR_NORETURN(c); return; } while (0)',
+                'class Reader {',
+                ' public:',
+                '  bool HasErr() const { return err_ != 0; }',
+                '  void SetErr(int c) { err_ = c; }',
+                '  void Parse(int x) {',
+                '    if (x < 0) ERROR(1);',
+                '    if (x > 9) ERROR_NORETURN(2);',
+                '  }',
+                ' private:',
+                '  int err_ = 0;',
+                '};',
+                'class Other {',
+                ' public:',
+                '  void SetErr(int c) { e = c; }',
+                '  int e;',
+                '};',
+                '#define MIXED(c) Touch(c)',
+                'class A { public: void Touch(int) {} void Run() { MIXED(1); } };',
+                'class B { public: void Touch(int) {} };',
+                'inline void run_free() { MIXED(2); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.deepEqual(shownOf(index, 'SetErr', 'reader.hpp', 9).confirmed, ['reader.hpp:4']);
+            assert.deepEqual(shownOf(index, 'HasErr', 'reader.hpp', 8).confirmed, ['reader.hpp:3']);
+            const other = shownOf(index, 'SetErr', 'reader.hpp', 19);
+            assert.deepEqual([other.confirmed, other.unverified], [[], []]);
+            // One site in A's member, one in a free function: A's Touch is
+            // unverified, B's is reached by no expansion.
+            assert.deepEqual(shownOf(index, 'Touch', 'reader.hpp', 23).unverified,
+                ['reader.hpp:22:macro-body-context']);
+            const b = shownOf(index, 'Touch', 'reader.hpp', 24);
+            assert.deepEqual([b.confirmed, b.unverified], [[], []]);
+            const plan = planOf(index, { name: 'SetErr', file: 'reader.hpp', line: 9, renameTo: 'SetError' });
+            const { contents } = applyRenamePlan(dir, plan);
+            assert.match(contents['reader.hpp'], /^ {4}SetError\(c\);$/m);
+            assert.match(contents['reader.hpp'], /void SetError\(int c\) \{ err_ = c; \}/);
+            assert.match(contents['reader.hpp'], /void SetErr\(int c\) \{ e = c; \}/);
+        } finally { rm(dir); }
+    });
+
+    it('a decoration macro before a return type and a parenthesized name (`API int (f)(..)`) names the function', () => {
+        const dir = tmp({
+            'conf.h': '#define LUA_API extern\n#define LUALIB_API LUA_API',
+            'lua.h': [
+                '#include "conf.h"',
+                'typedef struct lua_State lua_State;',
+                'typedef void * (*lua_Alloc) (void *ud, void *ptr, unsigned osize);',
+                'LUA_API int   (lua_gettop) (lua_State *L);',
+                'LUA_API lua_Alloc (lua_getallocf) (lua_State *L, void **ud);',
+                'LUALIB_API void (luaL_buffinit) (lua_State *L, lua_Alloc f);',
+            ].join('\n'),
+            'api.c': [
+                '#include "lua.h"',
+                'LUA_API int lua_gettop (lua_State *L) { return 0; }',
+                'int use(lua_State *L) { return lua_gettop(L); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            for (const garbage of ['int', 'void', 'lua_Alloc']) {
+                assert.ok(!(index.symbols.get(garbage) || []).some(d => d.type === 'function'), garbage);
+            }
+            const getallocf = index.symbols.get('lua_getallocf')[0];
+            assert.equal(getallocf.returnType, 'lua_Alloc');
+            assert.ok(index.symbols.get('luaL_buffinit'));
+            const plan = planOf(index, { name: 'lua_Alloc', file: 'lua.h', line: 3, renameTo: 'lua_Allocator' });
+            const { contents } = applyRenamePlan(dir, plan);
+            assert.match(contents['lua.h'], /LUA_API lua_Allocator \(lua_getallocf\)/);
+            assert.match(contents['lua.h'], /luaL_buffinit\) \(lua_State \*L, lua_Allocator f\)/);
+            const fn = planOf(index, { name: 'lua_gettop', file: 'api.c', line: 2, renameTo: 'lua_top' });
+            assert.match(applyRenamePlan(dir, fn).contents['lua.h'], /LUA_API int {3}\(lua_top\)/);
+        } finally { rm(dir); }
+    });
+
+    it('a type name a macro spells by token pasting lists the pasting macro and each invocation producing it', () => {
+        const dir = tmp({
+            'sds.h': [
+                'struct sdshdr8 { unsigned char len; };',
+                'struct sdshdr16 { unsigned short len; };',
+                '#define SDS_HDR_VAR(T,s) struct sdshdr##T *sh = (void*)((s)-(sizeof(struct sdshdr##T)));',
+                '#define SDS_HDR(T,s) ((struct sdshdr##T *)((s)-(sizeof(struct sdshdr##T))))',
+                '#define CAT(a, b) a##b',
+            ].join('\n'),
+            'sds.c': [
+                '#include "sds.h"',
+                'int len8(char *s) { SDS_HDR_VAR(8,s); return sh->len; }',
+                'int len16(char *s) { return SDS_HDR(16,s)->len; }',
+                'int alloc8(char *s) { return SDS_HDR(8,s)->len; }',
+                'int size(void) { return sizeof(struct CAT(sdshdr, 8)); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const plan = planOf(index, { name: 'sdshdr8', file: 'sds.h', line: 1, renameTo: 'sdshdr8x' });
+            assert.deepEqual(reviewLines(plan), ['sds.c:2', 'sds.c:4', 'sds.c:5', 'sds.h:3', 'sds.h:4']);
+        } finally { rm(dir); }
+    });
+
+    it('a body a namespace-scope macro invocation wraps reaches members of a class its argument names, unverified', () => {
+        const dir = tmp({
+            'fixture.h': [
+                '#pragma once',
+                'class Base { public: int Helper() { return 1; } void Check(int) {} };',
+                'class Other { public: void Unrelated() {} int CreateFile(int n) { return n; } };',
+            ].join('\n'),
+            'fixture_test.cc': [
+                '#include "fixture.h"',
+                'class VersionTest : public Base {',
+                ' public:',
+                '  int CreateFile(int n) { return n + Helper(); }',
+                '};',
+                'TEST_F(VersionTest, Empty) {',
+                '  int f = CreateFile(3);',
+                '  Check(f);',
+                '  Unrelated();',
+                '}',
+                'TEST(Plain, Case) {',
+                '  CreateFile(1);',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const generated = index.symbols.get('VersionTest_Empty')[0];
+            assert.deepEqual(generated.generatedByMacro, { name: 'TEST_F', args: ['VersionTest', 'Empty'] });
+            assert.deepEqual(shownOf(index, 'CreateFile', 'fixture_test.cc', 4).unverified,
+                ['fixture_test.cc:7:macro-generated-scope']);
+            assert.deepEqual(shownOf(index, 'Check', 'fixture.h', 2).unverified,
+                ['fixture_test.cc:8:macro-generated-scope']);
+            const unrelated = shownOf(index, 'Unrelated', 'fixture.h', 3);
+            assert.deepEqual([unrelated.confirmed, unrelated.unverified], [[], []]);
+        } finally { rm(dir); }
+    });
+
+    it('a member a member-list macro builds by token pasting is not renamed, and a return-type macro keeps the function', () => {
+        const dir = tmp({
+            'schema.hpp': [
+                '#define STRING_(name, ...) \\',
+                '    static const int& Get##name##String() { static const int v = 0; return v; }',
+                '#define DISABLEIF_RETURN(cond, rt) rt',
+                'class Schema {',
+                ' public:',
+                '    STRING_(MinProperties, 1, 2)',
+                '    STRING_(MaxProperties, 3, 4)',
+                '#undef STRING_',
+                '    int Use() { return GetMinPropertiesString(); }',
+                '    template <typename T>',
+                '    DISABLEIF_RETURN((IsPointer<T>), (Schema&))',
+                '    AddMember(Schema& name, T value, int& allocator) {',
+                '        return AddMember(name, value, allocator);',
+                '    }',
+                '    template <typename T>',
+                '    DISABLEIF_RETURN((NotExpr<IsSame<T, char> >),(Schema&)) operator[](T* name) {',
+                '        return *this;',
+                '    }',
+                '    int Size() const { return 1; }',
+                '};',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const generated = index.symbols.get('GetMinPropertiesString')[0];
+            assert.equal(generated.generatedByMacro.unspelled, true);
+            const r = execute(index, 'plan', { name: 'GetMinPropertiesString', file: 'schema.hpp', line: 6, renameTo: 'GetMin' });
+            assert.match(JSON.stringify(r.result), /macro-generated-name/);
+            assert.ok(r.ok, r.error);
+            assert.equal((r.result.changes || []).filter(change => change.newExpression !== undefined &&
+                !change.needsReview).length, 0);
+            const addMember = index.symbols.get('AddMember');
+            assert.equal(addMember.length, 1);
+            assert.equal(addMember[0].className, 'Schema');
+            assert.equal(index.symbols.get('operator[]')?.[0]?.className, 'Schema');
+            assert.equal(index.symbols.get('Size')?.[0]?.className, 'Schema');
+            for (const symbols of index.symbols.values()) {
+                assert.ok(!symbols.some(d => d.generatedByMacro && !d.className), symbols[0].name);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('other external definitions of a declared C function are renamed with it; one no declaration reaches is a review item', () => {
+        const files = {
+            'net.h': '#ifndef NET_H\n#define NET_H\nint net_open(const char *host);\n#endif',
+            'net.c': '#include "net.h"\n#ifdef _WIN32\nint net_open(const char *host) { return 1; }\n#else\nint net_open(const char *host) { return 2; }\n#endif',
+            'net_win.c': '#include "net.h"\n#if defined(_WIN32) && defined(ALT)\nint net_open(const char *host) { return 3; }\n#endif',
+            'main.c': '#include "net.h"\nint main(void) { return net_open("x"); }',
+        };
+        let dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const plan = planOf(index, { name: 'net_open', file: 'net.c', line: 3, renameTo: 'net_connect' });
+            const { contents } = applyRenamePlan(dir, plan);
+            assert.match(contents['net_win.c'], /int net_connect\(const char \*host\)/);
+            assert.match(contents['main.c'], /return net_connect\("x"\);/);
+            assert.equal((contents['net.c'].match(/net_connect/g) || []).length, 2);
+            assert.deepEqual(reviewLines(plan), []);
+        } finally { rm(dir); }
+        dir = tmp({ ...files, 'tool/other.c': 'int net_open(const char *host) { return 4; }' });
+        try {
+            const index = idx(dir);
+            const plan = planOf(index, { name: 'net_open', file: 'net.c', line: 3, renameTo: 'net_connect' });
+            assert.ok(reviewLines(plan).includes('tool/other.c:1'), JSON.stringify(reviewLines(plan)));
+            assert.match(applyRenamePlan(dir, plan).contents['net_win.c'], /net_connect/);
+        } finally { rm(dir); }
+    });
+
+    it('a call in a header to a static function it declares binds each including unit, unverified', () => {
+        const dir = tmp({
+            'util.h': '#ifndef UTIL_H\n#define UTIL_H\nstatic void run_tests();\nint main() {\n    run_tests();\n    return 0;\n}\n#endif',
+            'test_a.c': '#include "util.h"\nstatic void run_tests() { }',
+            'test_b.c': '#include "util.h"\nstatic void run_tests() { }',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepEqual(shownOf(index, 'run_tests', 'test_a.c', 2).unverified, ['util.h:5:translation-unit-binding']);
+            assert.deepEqual(shownOf(index, 'run_tests', 'test_b.c', 2).unverified, ['util.h:5:translation-unit-binding']);
+        } finally { rm(dir); }
+    });
+
+    it('a receiver whose class overloads the name excludes an unrelated target even when the arguments choose no overload', () => {
+        const dir = tmp({
+            'writer.hpp': '#include <string>\nclass Writer {\npublic:\n    bool Key(const char* s, unsigned n, bool copy = false) { return true; }\n    bool Key(const std::string& s) { return true; }\n    bool Key(const char* const& s) { return true; }\n};',
+            'doc.hpp': 'class Document {\npublic:\n    bool Key(const char* s, unsigned n, bool copy) { return true; }\n};',
+            'main.cc': '#include "writer.hpp"\n#include "doc.hpp"\nint main() {\n    Writer writer;\n    writer.Key("hello");\n    Document d;\n    d.Key("k", 1, false);\n    return 0;\n}',
+        });
+        try {
+            const index = idx(dir);
+            const doc = shownOf(index, 'Key', 'doc.hpp', 3);
+            assert.deepEqual(doc.confirmed, ['main.cc:7']);
+            assert.deepEqual(doc.unverified, []);
+            // Counter-probe: for Writer's own overloads the site stays open.
+            const writer = shownOf(index, 'Key', 'writer.hpp', 6);
+            assert.deepEqual(writer.confirmed, []);
+            assert.deepEqual(writer.unverified.map(site => site.split(':').slice(0, 2).join(':')), ['main.cc:5']);
+        } finally { rm(dir); }
+    });
+
+    it('a receiver a replacement list declares with a macro parameter as its type has no type there', () => {
+        const dir = tmp({
+            'v.hpp': 'class Validator {\npublic:\n    void SetFlags(unsigned f) { }\n};\nclass Other {\npublic:\n    void SetFlags(unsigned f) { }\n};',
+            't.cc': '#include "v.hpp"\n#define CHECK(Validator, \\\n    flags) \\\n{ \\\n    Validator validator; \\\n    validator.SetFlags(flags); \\\n}\nvoid run() {\n    CHECK(Other, 1);\n}',
+        });
+        try {
+            const index = idx(dir);
+            // The parameter is spelled like Validator; the invocation passes Other.
+            for (const line of [3, 7]) {
+                const shown = shownOf(index, 'SetFlags', 'v.hpp', line);
+                assert.deepEqual(shown.confirmed, []);
+                assert.deepEqual(shown.unverified.map(site => site.split(':').slice(0, 2).join(':')), ['t.cc:6']);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('a namespace an object-like macro names is the namespace it expands to; a C++ alias is looked up where it is written', () => {
+        const dir = tmp({
+            'config.hpp': '#ifndef CONFIG_HPP\n#define CONFIG_HPP\n#ifndef LIB_NAMESPACE\n#define LIB_NAMESPACE lib\n#endif\n#define LIB_NAMESPACE_BEGIN namespace LIB_NAMESPACE {\n#define LIB_NAMESPACE_END }\n#endif',
+            'value.hpp': '#ifndef VALUE_HPP\n#define VALUE_HPP\n#include "config.hpp"\nLIB_NAMESPACE_BEGIN\nclass GenericValue {\npublic:\n    bool IsString() const { return true; }\n};\ntypedef GenericValue Value;\nLIB_NAMESPACE_END\n#endif',
+            'other.hpp': 'namespace other {\nclass Doc {\npublic:\n    bool IsString() const { return false; }\n};\ntypedef Doc Value;\n}',
+            'use.cpp': '#include "value.hpp"\nusing namespace lib;\nbool check() {\n    Value v;\n    return v.IsString();\n}',
+            'use2.cpp': '#include "other.hpp"\nbool other_check() { other::Value d; return d.IsString(); }',
+            'use3.cpp': '#include "value.hpp"\nLIB_NAMESPACE::GenericValue make();\nusing namespace LIB_NAMESPACE;\nGenericValue make2();',
+        });
+        try {
+            const index = idx(dir);
+            // `Value` in use.cpp is lib::Value (a typedef of GenericValue);
+            // other::Value is not visible there.
+            assert.deepEqual(shownOf(index, 'IsString', 'value.hpp', 7).confirmed, ['use.cpp:5']);
+            const other = shownOf(index, 'IsString', 'other.hpp', 4);
+            assert.ok(!other.confirmed.includes('use.cpp:5') &&
+                !other.unverified.some(site => site.startsWith('use.cpp:5')));
+            // Qualifiers and using-directives spelled with the macro name the
+            // same namespace.
+            const plan = planOf(index, { name: 'GenericValue', file: 'value.hpp', line: 5, renameTo: 'GV2' });
+            assert.deepEqual((plan.changes || []).map(change =>
+                `${change.file}:${change.line}:${change.needsReview ? 'review' : 'edit'}`).sort(),
+            ['use3.cpp:2:edit', 'use3.cpp:4:edit', 'value.hpp:5:edit', 'value.hpp:9:edit']);
+        } finally { rm(dir); }
+    });
+
+    it('a class the grammar closed early is no return type: the next member keeps its declared type', () => {
+        const dir = tmp({
+            'config.hpp': '#ifndef CONFIG_HPP\n#define CONFIG_HPP\n#if __cplusplus >= 201703L\n#define LIB_IF_CONSTEXPR if constexpr\n#else\n#define LIB_IF_CONSTEXPR if\n#endif\n#endif',
+            'pointer.hpp': [
+                '#ifndef POINTER_HPP', '#define POINTER_HPP', '#include "config.hpp"', 'namespace lib {',
+                'template <typename ValueType, typename Allocator>', 'class Pointer {', 'public:',
+                '    typedef typename ValueType::Ch Ch;',
+                '    Pointer Append(const Ch* name, int length) const {', '        return *this;', '    }',
+                '    Pointer Append(int index) const {', '        char buffer[21];',
+                '        LIB_IF_CONSTEXPR (sizeof(Ch) == 1) {', '            return Append(buffer, index);', '        }',
+                '        else {', '            Ch name[21];', '            return Append(name, index);', '        }', '    }',
+                '    Pointer Append(const ValueType& token) const {', '        if (token.IsString())',
+                '            return Append(token.GetString(), 1);', '        return Append(0);', '    }',
+                '};', '}', '#endif',
+            ].join('\n'),
+            'value.hpp': 'namespace lib {\nclass Value {\npublic:\n    typedef char Ch;\n    bool IsString() const { return true; }\n    const char* GetString() const { return ""; }\n};\n}',
+            'main.cpp': '#include "pointer.hpp"\n#include "value.hpp"\nint main() { return 0; }',
+        });
+        try {
+            const index = idx(dir);
+            const appends = (index.symbols.get('Append') || []).map(d => `${d.startLine}:${d.type}:${d.className || ''}`).sort();
+            assert.deepEqual(appends, ['12:method:Pointer', '22:method:Pointer', '9:method:Pointer']);
+        } finally { rm(dir); }
+    });
+
+    it('a nested type used in a class body the literal parse split is renamed through the recovered owners', () => {
+        const dir = tmp({
+            // A conditional whose branches split the braces: the literal
+            // tree reads `union Data` outside every class.
+            'value.hpp': [
+                '#ifndef VALUE_HPP', '#define VALUE_HPP', 'class Value {', '#if LIB_LITTLE_ENDIAN', '        struct I {', '#endif',
+                '    struct ArrayData {', '    };', '    union Data {', '        ArrayData a;', '    }',
+                '    void AddMember(Value& name) {', '    }', '#if LIB_HAS_RVALUE_REFS', '    }', '#endif', '#endif',
+            ].join('\n'),
+            'main.cpp': '#include "value.hpp"\nint main() { return 0; }',
+        });
+        try {
+            const index = idx(dir);
+            const plan = planOf(index, { name: 'ArrayData', file: 'value.hpp', line: 7, renameTo: 'AD2' });
+            assert.deepEqual(reviewLines(plan), []);
+            const edits = (plan.changes || []).map(change =>
+                `${change.file}:${change.line}:${change.needsReview ? 'review' : 'edit'}`).sort();
+            assert.deepEqual(edits, ['value.hpp:10:edit', 'value.hpp:7:edit']);
+        } finally { rm(dir); }
+    });
+
+    it('a member type spelled through a dependent specialization stays a review item when the template has explicit specializations', () => {
+        const dir = tmp({
+            'acc.hpp': [
+                'namespace ns {', 'template <typename T> struct Acc;', 'template <> struct Acc<float> {',
+                '    struct Result { bool parity; };', '    static auto compute() -> Result { return {true}; }', '};',
+                'template <> struct Acc<double> {', '    struct Result { bool parity; };',
+                '    static auto compute() -> Result { return {false}; }', '};',
+                'template <typename T> bool use() {', '    const typename Acc<T>::Result r = Acc<T>::compute();',
+                '    return r.parity;', '}', '}',
+            ].join('\n'),
+            'main.cpp': '#include "acc.hpp"\nint main() { return ns::use<float>() ? 0 : 1; }',
+        });
+        try {
+            const index = idx(dir);
+            const plan = planOf(index, { name: 'Result', file: 'acc.hpp', line: 4, renameTo: 'Result2' });
+            const changes = (plan.changes || []).map(change =>
+                `${change.line}:${change.needsReview ? 'review' : 'edit'}`).sort();
+            assert.deepEqual(changes, ['12:review', '4:edit', '5:edit']);
+        } finally { rm(dir); }
+    });
+
+    it('a call excluded inside a parse-recovery region is a plan review item', () => {
+        const dir = tmp({
+            'pool.cpp': [
+                '#include <lib/common.h>',
+                'class Pool {',
+                ' public:',
+                '  void Stop();',
+                '  bool Next();',
+                '  int n_ = 0;',
+                '};',
+                'void Pool::Stop() {',
+                '    LIB_TRY {',
+                '        for (int i = 0; i < n_; i++) {',
+                '            while (Next()) {}',
+                '        }',
+                '    }',
+                '    LIB_CATCH',
+                '}',
+                'bool Pool::Next() { return false; }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.ok(index.files.get(path.join(dir, 'pool.cpp')).parseErrorRegions?.length > 0);
+            const plan = planOf(index, { name: 'Next', file: 'pool.cpp', line: 5, renameTo: 'Advance' });
+            assert.ok(reviewLines(plan).includes('pool.cpp:11'), JSON.stringify(plan.reviewItems));
+        } finally { rm(dir); }
+    });
+
+    it('decoration, statement and attribute macros another header defines are read by the recovery of its includers', () => {
+        const files = {
+            'lib/common.hpp': [
+                '#pragma once',
+                '#ifdef LIB_HEADER_ONLY',
+                '#define LIB_INLINE inline',
+                '#else',
+                '#define LIB_INLINE',
+                '#endif',
+                '#ifdef LIB_NO_EXCEPTIONS',
+                '#define LIB_TRY',
+                '#define LIB_CATCH',
+                '#else',
+                '#define LIB_TRY try',
+                '#define LIB_CATCH catch (...) {}',
+                '#endif',
+                '#define LIB_NONNULL(...) __attribute__((__nonnull__(__VA_ARGS__)))',
+                '#if __cplusplus >= 201703L',
+                '#define LIB_IF_CONSTEXPR if constexpr',
+                '#else',
+                '#define LIB_IF_CONSTEXPR if',
+                '#endif',
+            ].join('\n'),
+            'lib/pool.hpp': [
+                '#pragma once',
+                '#include "common.hpp"',
+                'class Pool {',
+                ' public:',
+                '  void Stop();',
+                '  bool Next();',
+                '  LIB_NONNULL(2)',
+                '  bool Put(int a, const char *b);',
+                '  int Size() const;',
+                '  int n_ = 0;',
+                '};',
+            ].join('\n'),
+            'lib/pool-inl.hpp': [
+                '#pragma once',
+                '#include "pool.hpp"',
+                'void LIB_INLINE Pool::Stop() {',
+                '    LIB_TRY {',
+                '        for (int i = 0; i < n_; i++) {',
+                '            while (Next()) {}',
+                '        }',
+                '    }',
+                '    LIB_CATCH',
+                '}',
+                'LIB_INLINE bool Pool::Next() { return Size() > 0; }',
+                'LIB_INLINE int Pool::Size() const {',
+                '    LIB_IF_CONSTEXPR (sizeof(int) == 4) {',
+                '        return n_;',
+                '    }',
+                '    else {',
+                '        return 0;',
+                '    }',
+                '}',
+            ].join('\n'),
+            // Spells the names without including the header that defines them.
+            'other/unrelated.cpp': [
+                'class Other { public: void Stop(); bool Next(); };',
+                'void Other::Stop() {',
+                '    LIB_TRY {',
+                '        for (int i = 0; i < 3; i++) {',
+                '            while (Next()) {}',
+                '        }',
+                '    }',
+                '    LIB_CATCH',
+                '}',
+            ].join('\n'),
+        };
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const inl = index.files.get(path.join(dir, 'lib/pool-inl.hpp'));
+            assert.equal(inl.parseErrorRegions, undefined, JSON.stringify(inl.parseErrorRegions));
+            assert.deepEqual(inl.externalMacroNames, ['LIB_CATCH', 'LIB_IF_CONSTEXPR', 'LIB_INLINE', 'LIB_TRY']);
+            // The keyword a macro stands for is kept in the persisted
+            // recovery, which rebuilds the same clean tree.
+            assert.ok(inl.recoveryBlanks.some(range => range.length === 3 && range[2].trim() === 'if'));
+            const { getParser } = require('../languages');
+            const cpp = require('../languages/cpp');
+            const rebuilt = cpp.recoveredTree(fs.readFileSync(path.join(dir, 'lib/pool-inl.hpp'), 'utf-8'),
+                getParser('cpp'), inl.recoveryBlanks);
+            assert.equal(rebuilt.rootNode.hasError, false);
+            assert.equal(index.symbols.get('Size').find(d => d.file.endsWith('pool-inl.hpp'))?.className, 'Pool');
+            const header = index.files.get(path.join(dir, 'lib/pool.hpp'));
+            assert.equal(header.parseErrorRegions, undefined, JSON.stringify(header.parseErrorRegions));
+            const stop = index.symbols.get('Stop').find(d => d.file.endsWith('pool-inl.hpp'));
+            assert.equal(stop.className, 'Pool');
+            assert.deepEqual(shownOf(index, 'Next', 'lib/pool.hpp', 6).confirmed, ['lib/pool-inl.hpp:6']);
+            // A file whose includes never define the names is read without them.
+            const other = index.files.get(path.join(dir, 'other/unrelated.cpp'));
+            assert.ok(other.parseErrorRegions?.length > 0);
+            assert.equal(other.externalMacroNames, undefined);
+        } finally { rm(dir); }
+    });
+
+    it('a typedef declared in a block does not make a project alias ambiguous elsewhere', () => {
+        const dir = tmp({
+            'fwd.hpp': '#pragma once\ntemplate <typename E, typename A> class GenericBuffer;\ntypedef GenericBuffer<char, int> Buffer;',
+            'buffer.hpp': [
+                '#pragma once',
+                '#include "fwd.hpp"',
+                'template <typename E, typename A = int>',
+                'class GenericBuffer {',
+                ' public:',
+                '  const E* Get() const { return 0; }',
+                '};',
+                'typedef GenericBuffer<char> Buffer;',
+                'class Other { public: const char* Get() const { return 0; } };',
+            ].join('\n'),
+            'use.cpp': '#include "buffer.hpp"\nconst char* use() { Buffer sb; return sb.Get(); }',
+            'test.cpp': [
+                '#include "buffer.hpp"',
+                'void check() {',
+                '    typedef ::Buffer Buffer;',
+                '    Buffer local;',
+                '    local.Get();',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const local = index.symbols.get('Buffer').find(d => d.file.endsWith('test.cpp'));
+            assert.equal(local.lexicalScopeStartLine, 3);
+            const shown = shownOf(index, 'Get', 'buffer.hpp', 6);
+            assert.ok(shown.confirmed.includes('use.cpp:2'), JSON.stringify(shown));
+            assert.deepEqual(shownOf(index, 'Get', 'buffer.hpp', 9).confirmed, []);
+        } finally { rm(dir); }
+    });
+
+    it('a string literal may bind a pointer to an aliased character type, never one to a project class', () => {
+        const dir = tmp({
+            're.hpp': [
+                'struct Utf8 { typedef char Ch; };',
+                'struct Widget { int w; };',
+                'template <typename Encoding>',
+                'class Search {',
+                ' public:',
+                '    typedef typename Encoding::Ch Ch;',
+                '    bool Find(const Ch* s) { return s != 0; }',
+                '    bool Put(const Widget* w) { return w != 0; }',
+                '    bool Put(const char* n) { return n != 0; }',
+                '};',
+                'inline bool use(Search<Utf8>& rs) { return rs.Find("abc") && rs.Put("x"); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const find = shownOf(index, 'Find', 're.hpp', 7);
+            assert.deepEqual([...find.confirmed, ...find.unverified.map(u => u.split(':').slice(0, 2).join(':'))], ['re.hpp:11']);
+            const put = shownOf(index, 'Put', 're.hpp', 8);
+            assert.deepEqual([put.confirmed, put.unverified], [[], []]);
+            assert.deepEqual(shownOf(index, 'Put', 're.hpp', 9).confirmed, ['re.hpp:11']);
+        } finally { rm(dir); }
+    });
+
+    it('a conditional that splits a block\'s braces is repaired in a small file, then misread macros around it', () => {
+        const dir = tmp({
+            'macros.hpp': '#pragma once\n#define LIB_NON_NULL(...) __attribute__((__nonnull__(__VA_ARGS__)))\n#define LIB_INLINE_VAR inline\n',
+            'reader.hpp': [
+                '#pragma once',
+                '#include "macros.hpp"',
+                'namespace detail {',
+                'LIB_INLINE_VAR constexpr int max_size = 1 << 20;',
+                'class reader {',
+                '  public:',
+                '    LIB_NON_NULL(3)',
+                '    bool parse(int format, int strict, const char* sax);',
+                '    template<class N>',
+                '    static void swap(N& number) {',
+                '        constexpr int sz = sizeof(number);',
+                '#ifdef HAVE_BYTESWAP',
+                '        if constexpr (sz == 1) {',
+                '            return;',
+                '        } else {',
+                '#endif',
+                '            number = number;',
+                '#ifdef HAVE_BYTESWAP',
+                '        }',
+                '#endif',
+                '    }',
+                '    LIB_NON_NULL(2)',
+                '    bool eof(int format, const char* context) const;',
+                '    int get() { return eof(1, "x") ? 0 : 1; }',
+                '};',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const entry = index.files.get(path.join(dir, 'reader.hpp'));
+            assert.equal(entry.parseErrorRegions, undefined, JSON.stringify(entry.parseErrorRegions));
+            for (const member of ['parse', 'swap', 'eof', 'get']) {
+                assert.equal(index.symbols.get(member)?.[0]?.className, 'reader', member);
+            }
+            assert.deepEqual(shownOf(index, 'eof', 'reader.hpp', 23).confirmed, ['reader.hpp:24']);
+        } finally { rm(dir); }
+    });
+
+    it('a file read with another header\'s macro definitions is read again when they change', () => {
+        const { ProjectIndex } = require('../core/project');
+        const { indexSnapshot } = require('./helpers');
+        const dir = tmp({
+            'common.hpp': '#pragma once\n#define LIB_TRY try\n#define LIB_CATCH catch (...) {}',
+            'pool.cpp': [
+                '#include "common.hpp"',
+                'class Pool { public: void Stop(); bool Next(); int n_ = 0; };',
+                'void Pool::Stop() {',
+                '    LIB_TRY {',
+                '        for (int i = 0; i < n_; i++) {',
+                '            while (Next()) {}',
+                '        }',
+                '    }',
+                '    LIB_CATCH',
+                '}',
+                'bool Pool::Next() { return false; }',
+            ].join('\n'),
+        });
+        try {
+            const first = new ProjectIndex(dir);
+            first.build(null, { quiet: true });
+            first.saveCache();
+            const pool = path.join(dir, 'pool.cpp');
+            assert.equal(first.files.get(pool).parseErrorRegions, undefined);
+            // The definition changes to something that is not a statement
+            // fragment: the unchanged includer is read again.
+            fs.writeFileSync(path.join(dir, 'common.hpp'), '#pragma once\n#define LIB_TRY if (x) + \n#define LIB_CATCH catch (...) {}');
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loaded.loadCache());
+            loaded.build(null, { quiet: true, forceRebuild: true });
+            const fresh = new ProjectIndex(dir);
+            fresh.build(null, { quiet: true });
+            assert.ok(loaded.files.get(pool).parseErrorRegions?.length > 0);
+            assert.equal(indexSnapshot(loaded), indexSnapshot(fresh));
         } finally { rm(dir); }
     });
 });

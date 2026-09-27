@@ -6,7 +6,23 @@
  */
 
 const path = require('path');
-const { resolveImport } = require('./imports');
+const { resolveImport, resolveRustModuleFile, rustModDeclarationFiles, jsWorkspacePackages } = require('./imports');
+
+const JS_WORKSPACE_LANGUAGES = new Set(['javascript', 'typescript', 'tsx']);
+
+/**
+ * The project's in-repository JS/TS packages by name (fix #397), computed
+ * once per build and on first use after a cache load.
+ */
+function jsWorkspacePackagesOf(index, refresh = false) {
+    if (!refresh && index._jsWorkspacePackages !== undefined) return index._jsWorkspacePackages;
+    const dirs = new Set();
+    for (const [fp, fe] of index.files) {
+        if (JS_WORKSPACE_LANGUAGES.has(fe.language)) dirs.add(path.dirname(fp));
+    }
+    index._jsWorkspacePackages = dirs.size > 0 ? jsWorkspacePackages(index.root, dirs) : null;
+    return index._jsWorkspacePackages;
+}
 const { langTraits, getParser, safeParse } = require('../languages');
 
 function _javaPackageTypes(index) {
@@ -161,6 +177,32 @@ function _buildCSharpNamespaceIndex(index) {
     return namespaces;
 }
 
+/**
+ * A C# file's using directives by the names C# resolves them to (fix #395):
+ * each written name resolved from the namespace its directive sits in,
+ * generic arguments of `using static T<X>` dropped. `written` collects the
+ * written spellings of names that resolved to something else.
+ */
+function _csharpResolvedImports(index, fileEntry, written) {
+    const { csharpResolveUsingName } = require('./type-denotation');
+    const details = (fileEntry.importDetails || []).filter(detail => detail.module);
+    if (details.length === 0) return fileEntry.imports || [];
+    const out = [];
+    for (const detail of details) {
+        if (!detail.namespace) {
+            out.push(String(detail.module).replace(/<.*$/s, ''));
+            continue;
+        }
+        const resolved = csharpResolveUsingName(index, detail.module, detail.namespace).replace(/<.*$/s, '');
+        out.push(resolved);
+        if (resolved !== detail.module) {
+            if (!written.has(resolved)) written.set(resolved, []);
+            written.get(resolved).push(detail.module);
+        }
+    }
+    return out;
+}
+
 function _resolveCSharpUsing(index, importModule, namespaceIndex = null, opts = {}) {
     const map = namespaceIndex || _buildCSharpNamespaceIndex(index);
     const matches = map.get(importModule) || [];
@@ -171,6 +213,105 @@ function _resolveCSharpUsing(index, importModule, namespaceIndex = null, opts = 
 /**
  * Build import/export relationship graphs
  */
+/** basename -> C/C++ project files carrying it (for include suffix matching). */
+function _buildCIncludeSuffixIndex(index) {
+    const byBasename = new Map();
+    for (const [filePath, fileEntry] of index.files) {
+        if (fileEntry.language !== 'c' && fileEntry.language !== 'cpp') continue;
+        const base = path.basename(filePath);
+        if (!byBasename.has(base)) byBasename.set(base, []);
+        byBasename.get(base).push(filePath);
+    }
+    return byBasename;
+}
+
+function _resolveCIncludeBySuffix(byBasename, includeName, fromFile) {
+    const normalized = String(includeName || '').replace(/\\/g, '/');
+    if (!normalized || normalized.startsWith('../') || normalized.includes('/../')) return null;
+    const candidates = (byBasename.get(path.posix.basename(normalized)) || [])
+        .filter(file => file !== fromFile &&
+            file.split(path.sep).join('/').endsWith(`/${normalized}`));
+    return candidates.length === 1 ? candidates[0] : null;
+}
+
+function _isRustCrateRootFile(file) {
+    const base = path.basename(file);
+    return base === 'lib.rs' || base === 'main.rs';
+}
+
+/**
+ * Rust module files a `use` path names when a segment is reached through a
+ * glob re-export or a module re-export binding rather than a `mod` file
+ * (fix #369). Walks the module segments from the path root, at each module
+ * trying its child module file, then its `pub use m as seg` / `use x::seg`
+ * bindings, then its top-level glob imports (bounded depth). Returns the one
+ * module file that holds the final item (declared or re-exported), or null
+ * when the walk is ambiguous or leaves the project.
+ */
+function _rustWalkUsePath(index, fromFile, spec) {
+    const segments = String(spec).split('::').filter(Boolean);
+    if (segments.length < 2) return null;
+    const root = segments[0];
+    let start;
+    try {
+        start = resolveRustModuleFile(root, fromFile, index.root);
+    } catch { start = null; }
+    if (!start || !index.files.has(start)) return null;
+    const childModule = (file, name) => {
+        const base = path.basename(file);
+        const dir = base === 'lib.rs' || base === 'main.rs' || base === 'mod.rs'
+            ? path.dirname(file) : path.join(path.dirname(file), path.basename(file, '.rs'));
+        for (const candidate of [path.join(dir, `${name}.rs`), path.join(dir, name, 'mod.rs')]) {
+            if (index.files.has(candidate)) {
+                const declares = (index.files.get(file)?.symbols || []).some(symbol =>
+                    symbol.type === 'module' && symbol.name === name);
+                if (declares) return candidate;
+            }
+        }
+        return null;
+    };
+    const topLevel = (entry, line) => line == null || !(entry.symbols || []).some(symbol =>
+        symbol.type === 'module' && symbol.startLine < line && symbol.endLine >= line);
+    // Module files reachable as `name` inside module file `file`.
+    const lookup = (file, name, seen, depth) => {
+        const key = `${file}\0${name}`;
+        if (seen.has(key) || depth > 6) return [];
+        seen.add(key);
+        const entry = index.files.get(file);
+        if (!entry) return [];
+        const child = childModule(file, name);
+        if (child) return [child];
+        const out = [];
+        for (const binding of entry.importBindings || []) {
+            if ((binding.alias || binding.name) !== name || binding.name === '*') continue;
+            try {
+                const target = resolveRustModuleFile(binding.module, file, index.root);
+                if (target && index.files.has(target) && target !== file) out.push(target);
+            } catch { /* resolver gap */ }
+        }
+        if (out.length > 0) return out;
+        for (const detail of entry.importDetails || []) {
+            if (detail.type !== 'use-glob' || !detail.module || !topLevel(entry, detail.line)) continue;
+            let target;
+            try { target = resolveRustModuleFile(detail.module, file, index.root); } catch { target = null; }
+            if (!target || !index.files.has(target) || target === file) continue;
+            out.push(...lookup(target, name, seen, depth + 1));
+        }
+        return out;
+    };
+    let current = [start];
+    for (let i = 1; i < segments.length - 1; i++) {
+        const next = new Set();
+        for (const file of current) {
+            for (const hit of lookup(file, segments[i], new Set(), 0)) next.add(hit);
+        }
+        if (next.size !== 1) return null;
+        current = [...next];
+    }
+    const result = current[0];
+    return result && result !== fromFile ? result : null;
+}
+
 function buildImportGraph(index) {
     index.importGraph.clear();
     index.exportGraph.clear();
@@ -198,6 +339,9 @@ function buildImportGraph(index) {
         }
     }
 
+    let cIncludeSuffixIndex = null;
+    const includeProbeCache = new Map(); // include search results for this build (fix #365)
+    const workspacePackages = jsWorkspacePackagesOf(index, true);
     for (const [filePath, fileEntry] of index.files) {
         const importedFiles = new Set();
         const seenModules = new Set();
@@ -208,10 +352,21 @@ function buildImportGraph(index) {
         // importGraph edges can't (a file importing the target for OTHER
         // names is not evidence about THIS name's module).
         const moduleResolved = {};
+        const includeFallback = {};
 
-        const effectiveImports = fileEntry.language === 'csharp'
-            ? [...(fileEntry.imports || []), ...csharpGlobalImports]
+        // C# using directives name what C# resolves them to from the
+        // namespace each is written in (fix #395): `using Internal;` inside
+        // `namespace Acme.Tests` imports Acme.Internal.
+        const csharpWritten = fileEntry.language === 'csharp' ? new Map() : null;
+        const effectiveImports = csharpWritten
+            ? [..._csharpResolvedImports(index, fileEntry, csharpWritten), ...csharpGlobalImports]
             : (fileEntry.imports || []);
+        // Rust `mod NAME;` declarations load files by the module layout
+        // rules (fix #377: foo.rs + foo/ children, #[path], inline-module
+        // nesting), never by a plain name lookup from the declaring directory.
+        const rustModFiles = fileEntry.language === 'rust'
+            ? rustModDeclarationFiles(filePath, fileEntry, candidate => index.files.has(candidate))
+            : null;
         for (const importModule of effectiveImports) {
             // Skip null modules (e.g., dynamic include! macros in Rust)
             if (!importModule) continue;
@@ -221,11 +376,16 @@ function buildImportGraph(index) {
             if (seenModules.has(importModule)) continue;
             seenModules.add(importModule);
 
-            let resolved = resolveImport(importModule, filePath, {
+            const rustModTargets = rustModFiles &&
+                (fileEntry.importDetails || []).some(detail => detail.type === 'mod' && detail.module === importModule)
+                ? (rustModFiles.get(importModule) || []) : null;
+            let resolved = rustModTargets ? (rustModTargets[0] || null) : resolveImport(importModule, filePath, {
                 aliases: index.config.aliases,
                 includePaths: index.config.includePaths,
                 language: fileEntry.language,
-                root: index.root
+                root: index.root,
+                probeCache: includeProbeCache,
+                workspacePackages,
             });
 
             // Java package imports: resolve by progressive suffix matching
@@ -246,6 +406,22 @@ function buildImportGraph(index) {
                 }
             }
 
+            // C/C++ quoted include that neither the including file's
+            // directory nor any known include directory resolves: the build
+            // adds an -I path the index cannot see (no compile database). A
+            // project header whose path ends with the include name, when
+            // exactly one such header exists, is the only file a compiler
+            // search could find inside the project. The edge is recorded as
+            // basename-resolved so consumers can weigh it below edges the
+            // resolver proved (fix #361).
+            if (!resolved && (fileEntry.language === 'c' || fileEntry.language === 'cpp') &&
+                importModule.startsWith('./')) {
+                if (!cIncludeSuffixIndex) cIncludeSuffixIndex = _buildCIncludeSuffixIndex(index);
+                resolved = _resolveCIncludeBySuffix(
+                    cIncludeSuffixIndex, importModule.slice(2), filePath);
+                if (resolved) includeFallback[importModule] = true;
+            }
+
             let csharpFiles = null;
             if (!resolved && fileEntry.language === 'csharp') {
                 const all = _resolveCSharpUsing(
@@ -256,13 +432,24 @@ function buildImportGraph(index) {
                 }
             }
 
+            // Rust module paths through glob re-exports (fix #369): `use
+            // cursive::views::LinearLayout` where cursive's root is `pub use
+            // cursive_core::*` resolves past the facade crate root instead
+            // of stopping at it.
+            if (fileEntry.language === 'rust' && importModule.includes('::') &&
+                (!resolved || _isRustCrateRootFile(resolved))) {
+                const walked = _rustWalkUsePath(index, filePath, importModule);
+                if (walked) resolved = walked;
+            }
+
             if (resolved && index.files.has(resolved)) {
                 moduleResolved[importModule] = path.relative(index.root, resolved);
                 // For Go, a package import means all files in that directory are dependencies
                 // (Go packages span multiple files in the same directory)
                 const filesToLink = javaWildcardFiles
                     ? [...javaWildcardFiles]
-                    : csharpFiles ? [...csharpFiles] : [resolved];
+                    : csharpFiles ? [...csharpFiles]
+                    : rustModTargets?.length > 1 ? [...rustModTargets] : [resolved];
                 if (langTraits(fileEntry.language)?.packageScope === 'directory') {
                     const pkgDir = path.dirname(resolved);
                     const dirFiles = dirToGoFiles.get(pkgDir) || [];
@@ -282,6 +469,18 @@ function buildImportGraph(index) {
                         index.exportGraph.set(linkedFile, new Set());
                     }
                     index.exportGraph.get(linkedFile).add(filePath);
+                }
+            }
+        }
+
+        // The written spelling of a relative C# directive maps to the file
+        // its resolved name reaches (alias bindings keep the written text).
+        if (csharpWritten) {
+            for (const [resolvedName, writtens] of csharpWritten) {
+                const rel = moduleResolved[resolvedName];
+                if (!rel) continue;
+                for (const written of writtens) {
+                    if (!moduleResolved[written]) moduleResolved[written] = rel;
                 }
             }
         }
@@ -315,7 +514,8 @@ function buildImportGraph(index) {
                 const resolved = resolveImport(spec, filePath, {
                     aliases: index.config.aliases,
                     language: fileEntry.language,
-                    root: index.root
+                    root: index.root,
+                    probeCache: includeProbeCache,
                 });
                 if (resolved && index.files.has(resolved)) {
                     moduleResolved[spec] = path.relative(index.root, resolved);
@@ -330,6 +530,11 @@ function buildImportGraph(index) {
 
         index.importGraph.set(filePath, importedFiles);
         fileEntry.moduleResolved = moduleResolved;
+        if (Object.keys(includeFallback).length > 0) {
+            fileEntry.includeFallback = includeFallback;
+        } else {
+            delete fileEntry.includeFallback;
+        }
     }
 }
 
@@ -504,8 +709,10 @@ function splitParentList(clause) {
 module.exports = {
     buildDirIndex,
     buildImportGraph,
+    jsWorkspacePackagesOf,
     buildInheritanceGraph,
     splitParentList,
     _resolveJavaPackageImport,
     _resolveCSharpUsing,
+    _rustWalkUsePath,
 };

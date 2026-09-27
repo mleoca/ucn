@@ -2163,7 +2163,7 @@ describe('fix #201 (rust): calls inside macro bodies are extracted', () => {
         } finally { rm(dir); }
     });
 
-    it('macro_rules! transcriber calls are conserved as templates, not concrete callers', () => {
+    it('fix #360: macro_rules! transcriber calls stay visible as unverified templates, never confirmed', () => {
         const dir = tmp({
             'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"',
             'src/lib.rs': [
@@ -2180,12 +2180,15 @@ describe('fix #201 (rust): calls inside macro bodies are extracted', () => {
             const index = idx(dir);
             const r = execute(index, 'context', { name: 'emit' });
             assert.ok(r.ok);
-            const all = [...(r.result.callers || []), ...(r.result.unverifiedCallers || [])]
-                .map(c => `${c.relativePath}:${c.line}`);
-            assert.ok(!all.includes('src/lib.rs:5'),
-                `template line is not a runtime dispatch site: ${all}`);
-            assert.ok(r.result.meta.account.excluded.byReason['macro-template'],
-                `template occurrence remains conserved: ${JSON.stringify(r.result.meta.account)}`);
+            const confirmed = (r.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(!confirmed.includes('src/lib.rs:5'),
+                `template line is not a confirmed dispatch site: ${confirmed}`);
+            const template = (r.result.unverifiedCallers || []).find(c =>
+                c.relativePath === 'src/lib.rs' && c.line === 5);
+            assert.strictEqual(template?.reason, 'macro-template',
+                `template site is disclosed with its reason: ${JSON.stringify(r.result.unverifiedCallers)}`);
+            assert.ok(!r.result.meta.account.excluded.byReason?.['macro-template'],
+                'a template site is never excluded');
             assert.strictEqual(r.result.meta.account.conserved, true);
         } finally { rm(dir); }
     });
@@ -3094,9 +3097,9 @@ pub fn check() -> usize {
         } finally { rm(dir); }
     });
 
-    it('same-type sibling impls route overload-ambiguous (class-level evidence only)', () => {
+    it('same-type sibling impls: the argument type selects the impl, an unknown argument routes overload-ambiguous (fix #384)', () => {
         // cursive: impl From<Color> for ColorStyle ×4 — ColorStyle::from(x)
-        // proves SOME from, never the pinned impl block's.
+        // proves SOME from; the argument's type picks the impl block.
         const dir = tmp({
             'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\n',
             'src/style.rs': `pub struct ColorStyle;
@@ -3116,16 +3119,29 @@ impl From<Palette> for ColorStyle {
 pub fn apply(color: Color) -> ColorStyle {
     ColorStyle::from(color)
 }
+
+pub fn pick<T>(t: T) -> T { t }
+
+pub fn apply_any(color: Color) -> ColorStyle {
+    ColorStyle::from(pick(color))
+}
 `,
         });
         try {
             const index = idx(dir);
             const m = contractCallers(index, 'src/style.rs:6:from');
-            assert.ok(!m.confirmed.includes('src/use_site.rs:4'),
-                `sibling impls make the pin ambiguous: ${m.confirmed}`);
-            assert.ok(m.unverified.some(u => u === 'src/use_site.rs:4:overload-ambiguous'),
+            assert.ok(m.confirmed.includes('src/use_site.rs:4'),
+                `a Color argument selects From<Color>: ${m.confirmed}`);
+            assert.ok(!m.confirmed.includes('src/use_site.rs:10'),
+                `an untyped argument never confirms: ${m.confirmed}`);
+            assert.ok(m.unverified.some(u => u === 'src/use_site.rs:10:overload-ambiguous'),
                 `routed visible overload-ambiguous: ${JSON.stringify(m.unverified)}`);
             assert.strictEqual(m.conserved, true);
+            const p = contractCallers(index, 'src/style.rs:10:from');
+            assert.ok(!p.confirmed.includes('src/use_site.rs:4'), `Color never selects From<Palette>: ${p.confirmed}`);
+            assert.strictEqual(p.excluded?.byReason?.['overload-mismatch']?.count, 1, JSON.stringify(p.excluded));
+            assert.ok(p.unverified.some(u => u === 'src/use_site.rs:10:overload-ambiguous'), JSON.stringify(p.unverified));
+            assert.strictEqual(p.conserved, true);
         } finally { rm(dir); }
     });
 
@@ -4220,7 +4236,7 @@ pub fn nested_same_line() -> Cfg {
         } finally { rm(dir); }
     });
 
-    it('folds exact macro-return builders but leaves unknown macro values unverified', () => {
+    it('folds exact macro-return builders and expanded project macros, leaves external macro values unverified', () => {
         const dir = tmp({
             'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\n',
             'src/lib.rs': [
@@ -4236,6 +4252,7 @@ pub fn nested_same_line() -> Cfg {
                 'pub fn exact() { command!().arg(); }',
                 'pub fn unknown() { identity!(Command::new()).arg(); }',
                 'pub fn assigned() { let cmd = command!(); cmd.arg(); }',
+                'pub fn external() { other::identity!(Command::new()).arg(); }',
             ].join('\n'),
         });
         try {
@@ -4243,8 +4260,11 @@ pub fn nested_same_line() -> Cfg {
             const result = contract(index, 'src/lib.rs:4:arg');
             assert.ok(result.confirmed.includes('src/lib.rs:10'),
                 `macro transcriber pins Command: ${JSON.stringify(result)}`);
-            assert.ok(result.unverified.includes('src/lib.rs:11'),
-                `opaque identity macro remains visible: ${JSON.stringify(result)}`);
+            // fix #374: the project identity! macro expands to its argument.
+            assert.ok(result.confirmed.includes('src/lib.rs:11'),
+                `expanded identity macro types its value: ${JSON.stringify(result)}`);
+            assert.ok(result.unverified.includes('src/lib.rs:13'),
+                `external macro value remains visible: ${JSON.stringify(result)}`);
             assert.ok(result.confirmed.includes('src/lib.rs:12'),
                 `exact macro assignment outranks parser invalidation: ${JSON.stringify(result)}`);
             assert.strictEqual(result.conserved, true);
@@ -5717,6 +5737,2099 @@ describe('fix #357: same-name items renamed from different modules pair with the
             assert.deepStrictEqual(callerLines(alpha), ['main.rs:6']);
             // The external rename is a different binding; it must not become a confirmed edge of alpha.
             assert.ok(!callerLines(alpha).includes('main.rs:7'));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #360: Rust contract membership and macro templates in plan --rename-to', () => {
+    const files = {
+        'Cargo.toml': '[package]\nname = "f360"\nversion = "0.1.0"\nedition = "2021"\n',
+        'src/lib.rs': [
+            'use std::cmp::Ordering;',
+            'pub struct B(u8);',
+            'impl PartialEq for B { fn eq(&self, o: &B) -> bool { self.0 == o.0 } }',
+            'impl PartialOrd for B {',
+            '    fn partial_cmp(&self, o: &B) -> Option<Ordering> { self.0.partial_cmp(&o.0) }',
+            '}',
+            'pub trait Get { fn get_one(&mut self) -> u8; fn size(&self) -> usize; }',
+            'pub trait Other { fn get_one(&mut self) -> u8; }',
+            'fn panic_small(n: usize) -> ! { panic!("{}", n) }',
+            'macro_rules! fwd {',
+            '    () => {',
+            '        fn get_one(&mut self) -> u8 { (**self).get_one() }',
+            '        fn size(&self) -> usize { if (**self).size() == 0 { panic_small(0) } else { 1 } }',
+            '    };',
+            '}',
+            'macro_rules! other_fwd {',
+            '    () => {',
+            '        fn get_one(&mut self) -> u8 { 0 }',
+            '    };',
+            '}',
+            'impl<T: Get + ?Sized> Get for &mut T { fwd!(); }',
+            'impl Other for u8 { other_fwd!(); }',
+            'impl Get for B {',
+            '    fn get_one(&mut self) -> u8 { self.0 }',
+            '    fn size(&self) -> usize { 1 }',
+            '}',
+            'pub fn use_it(b: &mut B) -> u8 { b.get_one() }',
+        ].join('\n') + '\n',
+    };
+    const planOf = (index, name) => {
+        const result = execute(index, 'plan', { name, renameTo: 'moved' });
+        assert.ok(result.ok, JSON.stringify(result.error));
+        return result.result;
+    };
+
+    it('an impl of an external trait is blocked with no edits', () => {
+        const dir = tmp(files);
+        try {
+            const plan = planOf(idx(dir), 'src/lib.rs:5:partial_cmp');
+            assert.strictEqual(plan.contract?.blocked, true);
+            assert.deepStrictEqual(plan.contract.external.map(item => item.reason),
+                ['implements-external-trait']);
+            assert.ok(plan.changes.every(change => !change.newExpression),
+                JSON.stringify(plan.changes));
+        } finally { rm(dir); }
+    });
+
+    it('a deref-forwarding macro template joins its trait slot; a template under another trait is left alone', () => {
+        const dir = tmp(files);
+        try {
+            const plan = planOf(idx(dir), 'src/lib.rs:24:get_one');
+            const edited = new Map(plan.changes.filter(change => change.newExpression)
+                .map(change => [change.line, change.newExpression]));
+            for (const line of [7, 12, 24, 27]) assert.ok(edited.has(line), `line ${line}: ${JSON.stringify(plan.changes)}`);
+            assert.match(edited.get(12), /fn moved\(&mut self\) -> u8 \{ \(\*\*self\)\.moved\(\) \}/);
+            assert.ok(!edited.has(8) && !edited.has(18), 'Other::get_one and its template stay');
+            assert.ok(!plan.contract, 'a project trait slot is complete');
+        } finally { rm(dir); }
+    });
+
+    it('a free-function call inside a macro template is edited when its binding reaches the pin', () => {
+        const dir = tmp(files);
+        try {
+            const plan = planOf(idx(dir), 'src/lib.rs:9:panic_small');
+            const template = plan.changes.find(change => change.line === 13);
+            assert.match(template?.newExpression || '', /moved\(0\)/, JSON.stringify(plan.changes));
+        } finally { rm(dir); }
+    });
+
+    it('a template token the pin cannot be proven to own is a review item, never omitted', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "f360m"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/lib.rs': [
+                'pub struct S;',
+                'impl S { pub fn tick(&self) {} }',
+                'macro_rules! call_tick { ($e:expr) => { $e.tick() }; }',
+                'pub fn run(s: &S) { call_tick!(s); }',
+            ].join('\n') + '\n',
+        });
+        try {
+            const plan = planOf(idx(dir), 'src/lib.rs:2:tick');
+            const listed = [...plan.reviewItems, ...plan.unverifiedSites]
+                .some(item => item.line === 3);
+            assert.ok(listed, `template line listed: ${JSON.stringify({ r: plan.reviewItems, u: plan.unverifiedSites })}`);
+            assert.ok(!plan.changes.some(change => change.line === 3 && change.newExpression));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #361: path qualifiers through type aliases and use-renames', () => {
+    const project = () => tmp({
+        'Cargo.toml': '[package]\nname = "fxa"\nversion = "0.1.0"\nedition = "2021"\n',
+        'src/lib.rs': 'pub mod doc;\npub mod other;\npub mod user;\n',
+        'src/doc.rs': [
+            'pub struct Document;',
+            'impl Document {',
+            '    pub fn parse(s: &str) -> Document { let _ = s; Document }',
+            '}',
+            'pub type Handle = Document;',
+        ].join('\n'),
+        'src/other.rs': [
+            'pub struct Config;',
+            'impl Config {',
+            '    pub fn parse(s: &str) -> Config { let _ = s; Config }',
+            '}',
+            'pub type Handle = Config;',
+        ].join('\n'),
+        'src/user.rs': [
+            'use crate::doc::Handle;',
+            'use crate::doc::Document as D2;',
+            'use crate::other::Config;',
+            'pub fn run() {',
+            '    let _a = Handle::parse("a");',
+            '    let _b = D2::parse("b");',
+            '    let _c = Config::parse("c");',
+            '}',
+        ].join('\n'),
+    });
+    const answer = (index, file) => {
+        const pin = index.symbols.get('parse').find(d => d.relativePath === file);
+        const result = index.findCallers('parse', {
+            targetDefinitions: [pin], collectAccount: true, includeMethods: true,
+        });
+        return {
+            confirmed: result.map(c => c.line).sort(),
+            unverified: (result.unverifiedEntries || []).map(e => e.line).sort(),
+            excluded: (result.accountRaw?.excludedEntries || [])
+                .map(e => `${e.line}:${e.reason}`).sort(),
+        };
+    };
+
+    it('an alias in scope names its base type, in both directions', () => {
+        const dir = project();
+        try {
+            const index = idx(dir);
+            const doc = answer(index, 'src/doc.rs');
+            assert.deepStrictEqual(doc.confirmed, [5, 6], JSON.stringify(doc));
+            assert.deepStrictEqual(doc.excluded, ['7:path-type-mismatch'], JSON.stringify(doc));
+            const other = answer(index, 'src/other.rs');
+            assert.deepStrictEqual(other.confirmed, [7], JSON.stringify(other));
+            assert.deepStrictEqual(other.excluded,
+                ['5:path-type-mismatch', '6:path-type-mismatch'], JSON.stringify(other));
+        } finally { rm(dir); }
+    });
+
+    it('a module-qualified alias resolves in that module', () => {
+        const dir = project();
+        try {
+            fs.writeFileSync(path.join(dir, 'src/lib.rs'),
+                'pub mod doc;\npub mod other;\npub mod user;\npub mod fnv;\n');
+            fs.writeFileSync(path.join(dir, 'src/fnv.rs'),
+                'pub type Handle = std::collections::HashMap<u8, u8>;\n');
+            fs.writeFileSync(path.join(dir, 'src/user.rs'), [
+                'use crate::fnv;',
+                'pub fn run() {',
+                '    let _a = fnv::Handle::parse("a");',
+                '}',
+            ].join('\n'));
+            const index = idx(dir);
+            const doc = answer(index, 'src/doc.rs');
+            assert.deepStrictEqual(doc.unverified, [], JSON.stringify(doc));
+            assert.deepStrictEqual(doc.excluded, ['3:path-type-mismatch'], JSON.stringify(doc));
+        } finally { rm(dir); }
+    });
+
+    it('an alias the file cannot pin stays visible instead of excluded', () => {
+        const dir = project();
+        try {
+            fs.writeFileSync(path.join(dir, 'src/user.rs'), [
+                'use crate::doc::*;',
+                'use crate::other::*;',
+                'pub fn run() {',
+                '    let _a = Handle::parse("a");',
+                '}',
+            ].join('\n'));
+            const index = idx(dir);
+            const doc = answer(index, 'src/doc.rs');
+            assert.deepStrictEqual(doc.confirmed, [], JSON.stringify(doc));
+            assert.deepStrictEqual(doc.unverified, [4], JSON.stringify(doc));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #368: Rust trait-heavy receiver typing', () => {
+    const tiers = (index, handle) => {
+        const [file, line, name] = handle.split(':');
+        const result = index.context(name, { file, line: Number(line) });
+        const at = entry => `${entry.relativePath || entry.file}:${entry.line}`;
+        return {
+            confirmed: (result.callers || []).map(at),
+            unverified: (result.unverifiedCallers || []).map(entry => `${at(entry)}:${entry.reason}` +
+                (entry.dispatchVia ? `:${entry.dispatchVia}` : '')),
+        };
+    };
+    const cargo = { 'Cargo.toml': '[package]\nname = "f368"\nversion = "0.1.0"\nedition = "2021"\n' };
+
+    it('range expressions and vec! type receivers; reference impls are probed by layer', () => {
+        const dir = tmp({
+            ...cargo,
+            'src/lib.rs': [
+                'use std::ops::{Range, RangeInclusive};',
+                'pub trait IntoPar { fn into_par(self) -> i32; }',
+                'impl IntoPar for Range<i32> { fn into_par(self) -> i32 { self.start } }',
+                'impl IntoPar for RangeInclusive<i32> { fn into_par(self) -> i32 { *self.start() } }',
+                'impl<T> IntoPar for Vec<T> { fn into_par(self) -> i32 { 0 } }',
+                "impl<'a, T> IntoPar for &'a Vec<T> { fn into_par(self) -> i32 { 1 } }",
+                'pub fn owned() -> i32 { (0..8).into_par() + (0..=8).into_par() }',
+                'pub fn in_macro() { assert_eq!(0, (0..8).into_par()); }',
+                'pub fn bound() -> i32 { let r = 0..=5; r.into_par() }',
+                'pub fn vecs(v: &Vec<i32>) -> i32 { let o: Vec<i32> = Vec::new(); vec![1].into_par() + o.into_par() + v.into_par() }',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const range = tiers(index, 'src/lib.rs:3:into_par');
+            assert.deepStrictEqual(range.confirmed.sort(), ['src/lib.rs:7', 'src/lib.rs:8']);
+            assert.deepStrictEqual(range.unverified, []);
+            const inclusive = tiers(index, 'src/lib.rs:4:into_par');
+            assert.deepStrictEqual(inclusive.confirmed.sort(), ['src/lib.rs:7', 'src/lib.rs:9']);
+            const ownedVec = tiers(index, 'src/lib.rs:5:into_par');
+            assert.deepStrictEqual([...new Set(ownedVec.confirmed)], ['src/lib.rs:10'],
+                'vec![..] and a Vec<i32> local take the owned impl');
+            assert.deepStrictEqual(ownedVec.unverified, []);
+            const refVec = tiers(index, 'src/lib.rs:6:into_par');
+            assert.deepStrictEqual(refVec.confirmed, ['src/lib.rs:10'], '&Vec<i32> takes the reference impl');
+            assert.deepStrictEqual(refVec.unverified, []);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('a project type named like a std range withdraws the literal typing', () => {
+        const dir = tmp({
+            ...cargo,
+            'src/lib.rs': [
+                'pub struct Range { pub a: i32 }',
+                'pub trait IntoPar { fn into_par(self) -> i32; }',
+                'impl IntoPar for Range { fn into_par(self) -> i32 { self.a } }',
+                'impl IntoPar for std::ops::Range<i32> { fn into_par(self) -> i32 { self.start } }',
+                'pub fn f() -> i32 { (0..8).into_par() }',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const own = tiers(index, 'src/lib.rs:3:into_par');
+            assert.deepStrictEqual(own.confirmed, []);
+            assert.ok(own.unverified.some(entry => entry.startsWith('src/lib.rs:5:')));
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('closure parameters take the callee closure bound: use binding, glob, module path, method, nested', () => {
+        const dir = tmp({
+            ...cargo,
+            'src/lib.rs': 'pub mod ctx;\npub mod uses;\npub mod globbed;\n',
+            'src/ctx.rs': [
+                'pub struct FnContext { m: bool }',
+                'impl FnContext { pub fn migrated(&self) -> bool { self.m } }',
+                'pub struct BroadcastContext { i: usize }',
+                'impl BroadcastContext { pub fn index(&self) -> usize { self.i } }',
+                'pub struct Other;',
+                'impl Other { pub fn index(&self) -> usize { 0 } pub fn migrated(&self) -> bool { true } }',
+                'pub fn join_context<A, B, RA, RB>(a: A, b: B) -> (RA, RB)',
+                'where A: FnOnce(FnContext) -> RA, B: FnOnce(FnContext) -> RB',
+                '{ (a(FnContext { m: false }), b(FnContext { m: true })) }',
+                'pub fn broadcast<OP: Fn(BroadcastContext) -> R, R>(op: OP) -> R { op(BroadcastContext { i: 0 }) }',
+                'pub struct Scope;',
+                'impl Scope {',
+                '    pub fn spawn_broadcast<B>(&self, body: B) where B: Fn(&Scope, BroadcastContext) { body(self, BroadcastContext { i: 1 }) }',
+                '}',
+                'pub fn scope<F: FnOnce(&Scope) -> R, R>(f: F) -> R { f(&Scope) }',
+            ].join('\n') + '\n',
+            'src/uses.rs': [
+                'use crate::ctx::{join_context, broadcast, scope};',
+                'pub fn run() -> usize {',
+                '    let (a, b) = join_context(|a| a.migrated(), |b| b.migrated());',
+                '    let v = crate::ctx::broadcast(|ctx| ctx.index()) + broadcast(|ctx| ctx.index());',
+                '    scope(|s| s.spawn_broadcast(|_, ctx| { ctx.index(); }));',
+                '    (a as usize) + (b as usize) + v',
+                '}',
+            ].join('\n') + '\n',
+            'src/globbed.rs': [
+                'use crate::ctx::*;',
+                'pub fn run() -> bool { join_context(|a| a.migrated(), |_| 0).0 }',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const migrated = tiers(index, 'src/ctx.rs:2:migrated');
+            assert.deepStrictEqual([...new Set(migrated.confirmed)].sort(), ['src/globbed.rs:2', 'src/uses.rs:3']);
+            assert.deepStrictEqual(migrated.unverified, []);
+            const bcIndex = tiers(index, 'src/ctx.rs:4:index');
+            assert.deepStrictEqual([...new Set(bcIndex.confirmed)].sort(), ['src/uses.rs:4', 'src/uses.rs:5'],
+                '`|_, ctx|` binds ctx to slot 1 (BroadcastContext), not slot 0 (&Scope)');
+            assert.deepStrictEqual(bcIndex.unverified, []);
+            const other = tiers(index, 'src/ctx.rs:6:index');
+            assert.deepStrictEqual(other.confirmed, []);
+            assert.deepStrictEqual(other.unverified, []);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('Self::Assoc returns resolve through the impl (and a sibling supertrait impl); tuple lets bind by position', () => {
+        const dir = tmp({
+            ...cargo,
+            'src/lib.rs': [
+                'pub trait Consumer: Sized { type Folder; type Reducer;',
+                '    fn split_at(self, i: usize) -> (Self, Self, Self::Reducer); fn into_folder(self) -> Self::Folder; }',
+                'pub trait Unindexed: Consumer { fn to_reducer(&self) -> Self::Reducer; }',
+                'pub trait Folder { type Result; fn consume(self, x: i32) -> Self; fn complete(self) -> Self::Result; }',
+                'pub struct CollectConsumer; pub struct CollectResult { n: usize } pub struct Red;',
+                'impl Red { pub fn reduce(self, a: CollectResult, b: CollectResult) -> CollectResult { CollectResult { n: a.n + b.n } } }',
+                'impl Consumer for CollectConsumer { type Folder = CollectResult; type Reducer = Red;',
+                '    fn split_at(self, _i: usize) -> (Self, Self, Red) { (CollectConsumer, CollectConsumer, Red) }',
+                '    fn into_folder(self) -> Self::Folder { CollectResult { n: 0 } } }',
+                'impl Unindexed for CollectConsumer { fn to_reducer(&self) -> Self::Reducer { Red } }',
+                'impl Folder for CollectResult { type Result = Self; fn consume(mut self, _x: i32) -> Self { self.n += 1; self }',
+                '    fn complete(self) -> Self::Result { self } }',
+                'pub struct Noop;',
+                'impl Folder for Noop { type Result = (); fn consume(self, _x: i32) -> Self { self } fn complete(self) {} }',
+                'pub fn with<F: FnOnce(CollectConsumer) -> CollectResult>(f: F) -> CollectResult { f(CollectConsumer) }',
+                'pub fn run() -> CollectResult {',
+                '    with(|consumer| {',
+                '        let reducer = consumer.to_reducer();',
+                '        let (left, _, _) = consumer.split_at(1);',
+                '        let folder = left.into_folder().consume(1);',
+                '        reducer.reduce(folder.complete(), CollectResult { n: 0 })',
+                '    })',
+                '}',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(tiers(index, 'src/lib.rs:6:reduce').confirmed, ['src/lib.rs:21']);
+            assert.deepStrictEqual(tiers(index, 'src/lib.rs:11:consume').confirmed, ['src/lib.rs:20']);
+            const complete = tiers(index, 'src/lib.rs:12:complete');
+            assert.deepStrictEqual(complete.confirmed, ['src/lib.rs:21']);
+            assert.deepStrictEqual(tiers(index, 'src/lib.rs:14:complete').confirmed, []);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('trait-provided methods type chains through the traits the receiver implements', () => {
+        const dir = tmp({
+            ...cargo,
+            'src/lib.rs': [
+                'pub trait Par: Sized { fn chunks(self, n: usize) -> Chunks<Self> { Chunks { base: self, n } } }',
+                'pub struct Chunks<I> { base: I, n: usize }',
+                'impl<I> Chunks<I> { pub fn len(&self) -> usize { self.n } }',
+                'pub struct Iter;',
+                'impl Par for Iter {}',
+                'pub struct Other;',
+                'impl Other { pub fn len(&self) -> usize { 0 } }',
+                'pub fn make() -> Iter { Iter }',
+                'pub fn run() -> usize { make().chunks(2).len() }',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(tiers(index, 'src/lib.rs:3:len').confirmed, ['src/lib.rs:9']);
+            const other = tiers(index, 'src/lib.rs:7:len');
+            assert.deepStrictEqual(other.confirmed, []);
+            assert.deepStrictEqual(other.unverified, []);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('generic-bounded receivers dispatch through the bound trait only', () => {
+        const dir = tmp({
+            ...cargo,
+            'src/lib.rs': [
+                'pub trait Consumer<T>: Sized { fn split_at(self, i: usize) -> (Self, Self); }',
+                'pub trait Producer: Sized { fn split_at(self, i: usize) -> (Self, Self); }',
+                'pub struct Wrap<C> { base: C }',
+                'impl<T, C> Consumer<T> for Wrap<C> where C: Consumer<T> {',
+                '    fn split_at(self, i: usize) -> (Self, Self) { let (a, b) = self.base.split_at(i); (Wrap { base: a }, Wrap { base: b }) }',
+                '}',
+                'pub struct Prod;',
+                'impl Producer for Prod { fn split_at(self, _i: usize) -> (Self, Self) { (Prod, Prod) } }',
+                'pub struct Plain;',
+                'impl Plain { pub fn split_at(&self, _i: usize) {} }',
+                'pub fn drive<P: Producer>(p: P) -> (P, P) { p.split_at(1) }',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const consumerImpl = tiers(index, 'src/lib.rs:5:split_at');
+            assert.deepStrictEqual(consumerImpl.confirmed, []);
+            assert.deepStrictEqual(consumerImpl.unverified, ['src/lib.rs:5:possible-dispatch:Consumer'],
+                'self.base with base: C, C: Consumer is one Consumer implementation; P: Producer never reaches it');
+            const producerImpl = tiers(index, 'src/lib.rs:8:split_at');
+            assert.deepStrictEqual(producerImpl.unverified, ['src/lib.rs:11:possible-dispatch:Producer']);
+            const inherent = tiers(index, 'src/lib.rs:10:split_at');
+            assert.deepStrictEqual(inherent.confirmed, []);
+            assert.deepStrictEqual(inherent.unverified, [], 'a generic receiver cannot reach an inherent method');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #368: trait-path calls and configuration-variant aliases', () => {
+    const cargo = { 'Cargo.toml': '[package]\nname = "f368b"\nversion = "0.1.0"\nedition = "2021"\n' };
+    const lines = (entries) => (entries || []).map(entry => `${entry.relativePath || entry.file}:${entry.line}` +
+        (entry.reason ? `:${entry.reason}` : ''));
+
+    it('`Trait::method()` stays visible for an impl member of that trait', () => {
+        const dir = tmp({
+            ...cargo,
+            'src/lib.rs': [
+                'pub trait Sampler: Sized { fn new(x: u8) -> Self; fn new_inclusive(x: u8) -> Self; }',
+                'pub struct Uni(u8);',
+                'impl Sampler for Uni {',
+                '    fn new(x: u8) -> Self { Uni(x) }',
+                '    fn new_inclusive(x: u8) -> Self { let v = Sampler::new(x); v }',
+                '}',
+                'pub struct Other(u8);',
+                'impl Other { pub fn new(x: u8) -> Self { Other(x) } }',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const own = index.context('new', { file: 'src/lib.rs', line: 4 });
+            assert.deepStrictEqual(lines(own.unverifiedCallers), ['src/lib.rs:5:possible-dispatch']);
+            const other = index.context('new', { file: 'src/lib.rs', line: 8 });
+            assert.deepStrictEqual(lines(other.callers), []);
+            assert.deepStrictEqual(lines(other.unverifiedCallers), []);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('a field typed by cfg-variant aliases is not exclusion evidence', () => {
+        const dir = tmp({
+            ...cargo,
+            'src/lib.rs': [
+                'pub struct Small(u8);',
+                'impl Small { pub fn fill(&mut self) {} }',
+                'pub struct Big(u64);',
+                'impl Big { pub fn fill(&mut self) {} }',
+                '#[cfg(target_pointer_width = "32")]',
+                'type Inner = Small;',
+                '#[cfg(not(target_pointer_width = "32"))]',
+                'type Inner = Big;',
+                'pub struct Wrapper(Inner);',
+                'impl Wrapper { pub fn go(&mut self) { self.0.fill() } }',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const big = index.context('fill', { file: 'src/lib.rs', line: 4 });
+            assert.deepStrictEqual(lines(big.callers), []);
+            assert.deepStrictEqual(lines(big.unverifiedCallers), ['src/lib.rs:10:alias-variants']);
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #369: Rust crate aliases, re-export paths, blanket traits, std receivers', () => {
+    const cargo = name => ({ 'Cargo.toml': `[package]\nname = "${name}"\nversion = "0.1.0"\nedition = "2021"\n` });
+    const at = entries => (entries || []).map(entry =>
+        `${entry.relativePath || entry.file}:${entry.line}${entry.reason ? `:${entry.reason}` : ''}`);
+    const withIndex = (files, fn) => {
+        const dir = tmp(files);
+        try { fn(idx(dir)); } finally { rm(dir); }
+    };
+
+    it('crate-name and crate-alias path calls (`use x as y`, `extern crate x as y`) bind the crate root', () => {
+        withIndex({
+            ...cargo('mylib'),
+            'src/lib.rs': [
+                'mod inner;',
+                'pub use crate::inner::assert_equal;',
+                'pub struct Runner;',
+                'impl Runner { pub fn go(&self) {} }',
+                'pub fn make() -> Runner { Runner }',
+            ].join('\n') + '\n',
+            'src/inner.rs': 'pub fn assert_equal(a: u8, b: u8) -> bool { a == b }\n',
+            'tests/a.rs': 'use mylib as ml;\n#[test]\nfn t() { ml::assert_equal(1, 1); }\n',
+            'tests/b.rs': 'extern crate mylib as lb;\n#[test]\nfn t() { lb::assert_equal(1, 1); }\n',
+            'examples/e.rs': 'fn main() { let r = mylib::make(); r.go(); }\n',
+        }, index => {
+            const eq = index.context('assert_equal', { file: 'src/inner.rs', line: 1 });
+            assert.deepStrictEqual(at(eq.callers).sort(), ['tests/a.rs:3', 'tests/b.rs:3']);
+            assert.deepStrictEqual(at(eq.unverifiedCallers), []);
+            const go = index.context('go', { file: 'src/lib.rs', line: 4 });
+            assert.deepStrictEqual(at(go.callers), ['examples/e.rs:1']);
+        });
+    });
+
+    it('module paths walk glob and `pub use` re-exports (facade crates, qualified paths, struct literals)', () => {
+        withIndex({
+            'Cargo.toml': '[workspace]\nmembers = ["core", "facade"]\n',
+            'core/Cargo.toml': '[package]\nname = "core_crate"\nversion = "0.1.0"\n',
+            'core/src/lib.rs': 'pub mod views;\npub mod theme;\nmod style;\n',
+            'core/src/views/mod.rs': 'mod layout;\npub use self::layout::Layout;\n',
+            'core/src/views/layout.rs': 'pub struct Layout;\nimpl Layout { pub fn vertical() -> Self { Layout } }\n',
+            'core/src/theme.rs': 'pub use crate::style::Pair;\n',
+            'core/src/style.rs': 'pub struct Pair { pub a: u8 }\n',
+            'facade/Cargo.toml': '[package]\nname = "facade"\nversion = "0.1.0"\n[dependencies]\ncore_crate = { path = "../core" }\n',
+            'facade/src/lib.rs': 'pub use core_crate::*;\n',
+            'facade/examples/one.rs': [
+                'use facade::views::Layout;',
+                'use facade::theme;',
+                'fn main() {',
+                '    let _a = Layout::vertical();',
+                '    let _b = facade::views::Layout::vertical();',
+                '    let _c = theme::Pair { a: 1 };',
+                '}',
+            ].join('\n') + '\n',
+        }, index => {
+            const vertical = index.context('vertical', { file: 'core/src/views/layout.rs', line: 2 });
+            assert.deepStrictEqual(at(vertical.callers).sort(),
+                ['facade/examples/one.rs:4', 'facade/examples/one.rs:5']);
+            const pair = index.context('Pair', { file: 'core/src/style.rs', line: 1 });
+            assert.deepStrictEqual(at(pair.usages || pair.callers).filter(s => s.includes('one.rs')),
+                ['facade/examples/one.rs:6']);
+        });
+    });
+
+    it('bare calls see names through `use super::*` and the parent\'s own globs; nested fns bind lexically', () => {
+        withIndex({
+            ...cargo('globs'),
+            'src/lib.rs': 'mod iter;\n',
+            'src/iter/mod.rs': 'mod plumbing;\nmod chunks;\nuse self::plumbing::*;\n',
+            'src/iter/plumbing/mod.rs': 'pub fn bridge(x: u8) -> u8 { x }\n',
+            'src/iter/chunks.rs': [
+                'use super::*;',
+                'pub fn run() -> u8 { bridge(1) }',
+                'pub fn shadow() -> u8 { let bridge = |x: u8| x; bridge(2) }',
+            ].join('\n') + '\n',
+            'src/checks.rs': [
+                'fn first() { fn check(a: u8) {} check(1); }',
+                'fn second() {',
+                '    fn check(a: u8) {}',
+                '    check(2);',
+                '}',
+            ].join('\n') + '\n',
+        }, index => {
+            const bridge = index.context('bridge', { file: 'src/iter/plumbing/mod.rs', line: 1 });
+            assert.deepStrictEqual(at(bridge.callers), ['src/iter/chunks.rs:2']);
+            assert.deepStrictEqual(at(bridge.unverifiedCallers), []);
+            const second = index.context('check', { file: 'src/checks.rs', line: 3 });
+            assert.deepStrictEqual(at(second.callers), ['src/checks.rs:4']);
+            assert.deepStrictEqual(at(second.unverifiedCallers), []);
+        });
+    });
+
+    it('in-scope blanket extension traits type chains; upstream-bound generics are one external family', () => {
+        withIndex({
+            ...cargo('ext'),
+            'src/lib.rs': [
+                'pub struct Tee<I> { it: I }',
+                'impl<I: Iterator> Iterator for Tee<I> { type Item = I::Item; fn next(&mut self) -> Option<I::Item> { self.it.next() } }',
+                'pub struct Other;',
+                'impl Iterator for Other { type Item = u8; fn next(&mut self) -> Option<u8> { None } }',
+                'pub trait Ext: Iterator {',
+                '    fn tee(self) -> (Tee<Self>, Tee<Self>) where Self: Sized + Clone { (Tee { it: self.clone() }, Tee { it: self }) }',
+                '}',
+                'impl<T: Iterator + ?Sized> Ext for T {}',
+            ].join('\n') + '\n',
+            'tests/t.rs': [
+                'use ext::Ext;',
+                '#[test]',
+                'fn t() {',
+                '    let v = vec![1u8, 2];',
+                '    let (mut a, mut b) = v.iter().tee();',
+                '    a.next();',
+                '    b.next();',
+                '}',
+            ].join('\n') + '\n',
+        }, index => {
+            const tee = index.context('next', { file: 'src/lib.rs', line: 2 });
+            assert.deepStrictEqual(at(tee.callers).sort(), ['tests/t.rs:6', 'tests/t.rs:7']);
+            // `self.it.next()` with `it: I, I: Iterator` may reach any Iterator impl.
+            assert.deepStrictEqual(tee.unverifiedCallers.map(entry => [entry.line, entry.reason, entry.dispatchVia]),
+                [[2, 'possible-dispatch', 'Iterator']]);
+            const other = index.context('next', { file: 'src/lib.rs', line: 4 });
+            assert.deepStrictEqual(at(other.callers), []);
+            assert.deepStrictEqual(at(other.unverifiedCallers), ['src/lib.rs:2:possible-dispatch']);
+        });
+    });
+
+    it('a blanket impl member confirms when its where-clause holds through exactly one visible impl', () => {
+        withIndex({
+            ...cargo('par'),
+            'src/lib.rs': [
+                'pub trait IntoPar { fn into_par(self) -> u8; }',
+                "impl<'a, T> IntoPar for &'a mut Vec<T> { fn into_par(self) -> u8 { 0 } }",
+                "pub trait ParMut<'a> { fn par_mut(&'a mut self) -> u8; }",
+                "impl<'a, I: 'a + ?Sized> ParMut<'a> for I where &'a mut I: IntoPar {",
+                "    fn par_mut(&'a mut self) -> u8 { self.into_par() }",
+                '}',
+            ].join('\n') + '\n',
+            'tests/t.rs': [
+                'use par::*;',
+                'use std::collections::HashMap;',
+                '#[test]',
+                'fn t() {',
+                '    let mut v: Vec<u8> = Vec::new();',
+                '    v.par_mut();',
+                '    let mut m: HashMap<u8, u8> = HashMap::new();',
+                '    m.par_mut();',
+                '}',
+            ].join('\n') + '\n',
+        }, index => {
+            const member = index.context('par_mut', { file: 'src/lib.rs', line: 5 });
+            assert.deepStrictEqual(at(member.callers), ['tests/t.rs:6']);
+            assert.deepStrictEqual(at(member.unverifiedCallers), ['tests/t.rs:8:possible-dispatch']);
+        });
+    });
+
+    it('`Trait::assoc()` returned from a member of that trait\'s impl binds that impl (both directions)', () => {
+        withIndex({
+            ...cargo('ufcs'),
+            'src/lib.rs': [
+                'pub trait Sampler: Sized { fn new(x: u8) -> Self; fn new_inclusive(x: u8) -> Self; }',
+                'pub struct Uni(u8);',
+                'impl Sampler for Uni {',
+                '    fn new(x: u8) -> Self { Uni(x) }',
+                '    fn new_inclusive(x: u8) -> Self { Sampler::new(x) }',
+                '}',
+                'pub struct Two(u8);',
+                'impl Sampler for Two {',
+                '    fn new(x: u8) -> Self { Two(x) }',
+                '    fn new_inclusive(x: u8) -> Self { Two(x) }',
+                '}',
+            ].join('\n') + '\n',
+        }, index => {
+            assert.deepStrictEqual(at(index.context('new', { file: 'src/lib.rs', line: 4 }).callers), ['src/lib.rs:5']);
+            const two = index.context('new', { file: 'src/lib.rs', line: 9 });
+            assert.deepStrictEqual([...at(two.callers), ...at(two.unverifiedCallers)], []);
+            const caller = index.findEnclosingFunction(path.join(index.root, 'src/lib.rs'), 5, true);
+            const callees = index.findCallees(caller, { collectAccount: true, includeMethods: true });
+            assert.deepStrictEqual(callees.filter(c => c.name === 'new').map(c => c.startLine), [4]);
+        });
+    });
+
+    it('lifetime-annotated self parameters are receivers for arity', () => {
+        withIndex({
+            ...cargo('arity'),
+            'src/lib.rs': [
+                "pub struct Slice<'a> { s: &'a [u8] }",
+                "impl<'a> Slice<'a> { pub fn head(&'a self) -> u8 { 0 } }",
+                "pub fn run<'a>(x: &'a Slice<'a>) -> u8 { x.head() }",
+                'pub struct Other;',
+                'impl Other { pub fn head(&self) -> u8 { 1 } }',
+            ].join('\n') + '\n',
+        }, index => {
+            assert.deepStrictEqual(at(index.context('head', { file: 'src/lib.rs', line: 2 }).callers), ['src/lib.rs:3']);
+        });
+    });
+
+    it('enum-variant path values, closures through Deref wrappers, and deref-free std receivers', () => {
+        withIndex({
+            ...cargo('recv'),
+            'src/lib.rs': [
+                'pub enum Align { Left, Center }',
+                'impl Align { pub fn offset(&self, w: usize) -> usize { w } }',
+                'pub struct Other;',
+                'impl Other { pub fn offset(&self, w: usize) -> usize { w } }',
+                'pub fn use_align() -> usize { Align::Center.offset(3) }',
+                'pub struct App;',
+                'impl App { pub fn quit(&mut self) {} pub fn on<F: FnMut(&mut App)>(&mut self, f: F) {} }',
+                'pub struct Runnable { app: App }',
+                'impl std::ops::Deref for Runnable { type Target = App; fn deref(&self) -> &App { &self.app } }',
+                'impl std::ops::DerefMut for Runnable { fn deref_mut(&mut self) -> &mut App { &mut self.app } }',
+                'pub fn wire(r: &mut Runnable) { r.on(|s| s.quit()); }',
+                'pub struct Chunks<\'a> { slice: &\'a [u8] }',
+                'impl<\'a> Chunks<\'a> { pub fn len(&self) -> usize { self.slice.len() } }',
+                'pub struct Rgb(u8);',
+                'impl Rgb { pub fn map(self, f: impl Fn(u8) -> u8) -> Rgb { Rgb(f(self.0)) } }',
+                'pub struct Bag { items: Vec<u8> }',
+                'impl Bag { pub fn doubled(&self) -> Vec<u8> { self.items.iter().map(|x| x * 2).collect() } }',
+            ].join('\n') + '\n',
+        }, index => {
+            assert.deepStrictEqual(at(index.context('offset', { file: 'src/lib.rs', line: 2 }).callers), ['src/lib.rs:5']);
+            const other = index.context('offset', { file: 'src/lib.rs', line: 4 });
+            assert.deepStrictEqual([...at(other.callers), ...at(other.unverifiedCallers)], []);
+            assert.deepStrictEqual(at(index.context('quit', { file: 'src/lib.rs', line: 7 }).callers), ['src/lib.rs:11']);
+            const len = index.context('len', { file: 'src/lib.rs', line: 13 });
+            assert.deepStrictEqual([...at(len.callers), ...at(len.unverifiedCallers)], []);
+            const map = index.context('map', { file: 'src/lib.rs', line: 15 });
+            assert.deepStrictEqual([...at(map.callers), ...at(map.unverifiedCallers)], []);
+        });
+    });
+
+    it('parser: `mut` tuple bindings keep their positions; aliased extern crates bind; return position', () => {
+        const rust = require('../languages/rust');
+        const { getParser } = require('../languages');
+        const parser = getParser('rust');
+        const calls = rust.findCallsInCode([
+            'fn f() -> u8 { let (mut a, b, mut c) = g(); Sampler::make(1) }',
+            'fn h(bridge: u8) { let q = |x: u8| x; q(1); bridge(); w(); }',
+        ].join('\n'), parser);
+        const g = calls.find(call => call.name === 'g');
+        assert.deepStrictEqual(g.assignedTupleTargets, [
+            { name: 'a', index: 0 }, { name: 'b', index: 1 }, { name: 'c', index: 2 }]);
+        assert.strictEqual(calls.find(call => call.name === 'make').returnPosition, true);
+        assert.strictEqual(calls.find(call => call.name === 'q').localShadow, true);
+        assert.strictEqual(calls.find(call => call.name === 'bridge').localShadow, true);
+        assert.strictEqual(calls.find(call => call.name === 'w').localShadow, undefined);
+        const imports = rust.findImportsInCode('extern crate core as std;\nextern crate alloc;\n', parser);
+        assert.deepStrictEqual(imports.map(entry => [entry.module, entry.names]), [['core', ['std']]]);
+    });
+});
+
+describe('fix #370: audit-async covers Rust futures', () => {
+    const CARGO = '[package]\nname = "fx"\nversion = "0.1.0"\nedition = "2021"\n';
+    const LIB = [
+        'use std::future::Future;',
+        'use std::pin::Pin;',
+        'pub mod more;',
+        'pub struct User { pub name: String }',
+        'impl User { pub fn display(&self) -> String { self.name.clone() } }',
+        'pub async fn fetch() -> User { User { name: String::new() } }',
+        'pub fn fetch_later() -> impl Future<Output = User> { async { User { name: String::new() } } }',
+        'pub fn boxed() -> Pin<Box<dyn Future<Output = ()> + Send>> { Box::pin(async {}) }',
+        'pub type Fut = Pin<Box<dyn Future<Output = u8> + Send>>;',
+        'pub fn aliased() -> Fut { Box::pin(async { 1 }) }',
+        'pub fn sync_helper() -> u32 { 1 }',
+        'pub struct Client;',
+        'impl Client { pub async fn get(&self) -> User { fetch().await } }',
+        'pub trait Service { async fn call(&self) -> u32; }',
+        'pub struct Holder { pub f: Fut, pub v: Vec<Fut> }',
+        'fn spawn_it<F: Future>(_f: F) {}',
+        '',
+        'pub async fn findings(c: &Client, s: &dyn Service) {',
+        '    fetch();',                                   // 19 discarded
+        '    let _ = fetch_later();',                     // 20 dropped
+        '    let fut = fetch();',                         // 21 unused
+        '    let name = fetch().display();',              // 22 Output method
+        '    let u = fetch();',                           // 23
+        '    u.display();',                               // 24 stored used as Output
+        '    c.get();',                                   // 25 method discarded
+        '    s.call();',                                  // 26 trait dispatch discarded
+        '    let n = aliased() + 1;',                     // 27 arithmetic
+        '    let f = || async { 1 };',                    // 28
+        '    f();',                                       // 29 local async closure
+        '    if true { fetch() } else { fetch() };',      // 30 both branches lost
+        '}',
+        'pub fn sync_caller() {',
+        '    fetch();',                                   // 33 sync fn discarding
+        '}',
+        'pub async fn flows(c: &Client, h: &mut Holder, cond: bool) -> u8 {',
+        '    let a = fetch().await;',
+        '    let b = fetch();',
+        '    b.await;',
+        '    let v = vec![fetch()];',
+        '    spawn_it(fetch());',
+        '    let p = Box::pin(fetch());',
+        '    futures::join!(fetch(), fetch_later());',
+        '    boxed().await;',
+        '    c.get().await;',
+        '    h.f = aliased();',
+        '    h.v.push(aliased());',
+        '    let st = Holder { f: aliased(), v: vec![] };',
+        '    let cl = || fetch();',
+        '    let x = fetch();',
+        '    let x = x.await;',
+        '    let z = fetch();',
+        '    let q = async move { z.await };',
+        '    let w = aliased();',
+        '    tokio::join!(w);',
+        '    let r = if cond { aliased() } else { aliased() };',
+        '    let shadow = || 1;',
+        '    shadow();',
+        '    let _w = sync_helper();',
+        '    r.await',
+        '}',
+        'pub fn returns(cond: bool) -> Fut {',
+        '    if cond { aliased() } else { match cond { _ => aliased() } }',
+        '}',
+        '',
+    ].join('\n');
+
+    it('reports lost, dropped, unused and Output-used futures; value flows are fine', () => {
+        const dir = tmp({ 'Cargo.toml': CARGO, 'src/lib.rs': LIB, 'src/more.rs': 'pub fn noop() {}\n' });
+        try {
+            const index = idx(dir);
+            const result = index.auditAsync();
+            const got = result.issues.map(issue => `${issue.line}:${issue.calleeName}:${issue.reason}`);
+            assert.deepStrictEqual(got, [
+                '19:fetch:future-discarded',
+                '20:fetch_later:future-dropped',
+                '21:fetch:future-unused',
+                '22:fetch:async-result-used-as-value',
+                '24:fetch:stored-future-used-as-value',
+                '25:get:future-discarded',
+                '26:call:future-discarded',
+                '27:aliased:async-result-used-as-value',
+                '29:f:future-discarded',
+                '30:fetch:future-discarded',
+                '30:fetch:future-discarded',
+                '33:fetch:future-discarded',
+            ]);
+            const stored = result.issues.find(issue => issue.reason === 'stored-future-used-as-value');
+            assert.strictEqual(stored.variable, 'u');
+            assert.strictEqual(stored.originLine, 23);
+            assert.strictEqual(result.issues.find(issue => issue.line === 33).callerName, 'sync_caller');
+            const text = require('../core/output').formatAuditAsync(result);
+            assert.match(text, /fetch\(\) — future created and never polled \(discarded\)/);
+            assert.match(text, /fetch_later\(\) — future dropped by `let _ =`/);
+            assert.match(text, /future bound to fut and never used/);
+            assert.match(text, /u used as its Output; future from fetch\(\) at line 23/);
+        } finally { rm(dir); }
+    });
+
+    it('records future producers and qualifiers from the AST', () => {
+        const dir = tmp({ 'Cargo.toml': CARGO, 'src/lib.rs': LIB, 'src/more.rs': 'pub fn noop() {}\n' });
+        try {
+            const index = idx(dir);
+            const def = name => index.symbols.get(name).find(symbol => symbol.type !== 'module');
+            assert.deepStrictEqual(def('fetch').futureReturn, { kind: 'async', output: 'User' });
+            // `async { .. }` on the first line of a sync fn is not an async fn.
+            assert.ok(!def('fetch_later').modifiers.includes('async'));
+            assert.deepStrictEqual(def('fetch_later').futureReturn, { kind: 'future', output: 'User' });
+            assert.deepStrictEqual(def('boxed').futureReturn, { kind: 'future', output: '()' });
+            assert.deepStrictEqual(def('Fut').futureReturn, { kind: 'future', output: 'u8' });
+            assert.strictEqual(def('aliased').futureReturn, undefined, 'resolved through the alias at query time');
+            assert.strictEqual(def('call').isAsync, true, 'trait async fn');
+            assert.strictEqual(def('sync_helper').futureReturn, undefined);
+            const lib = [...index.files.values()].find(entry => entry.relativePath === 'src/lib.rs');
+            assert.deepStrictEqual(lib.asyncClosureNames, ['f']);
+        } finally { rm(dir); }
+    });
+
+    it('does not audit futures that are not known to be lazy or whose type is another type', () => {
+        const dir = tmp({
+            'Cargo.toml': CARGO,
+            'src/lib.rs': [
+                'use std::future::Future;',
+                'use std::pin::Pin;',
+                'use std::task::{Context, Poll};',
+                'pub mod fs;',
+                'pub struct Handle;',
+                'impl Future for Handle {',
+                '    type Output = ();',
+                '    fn poll(self: Pin<&mut Self>, _cx: &mut Context<\'_>) -> Poll<()> { Poll::Ready(()) }',
+                '}',
+                'pub fn spawn() -> Handle { Handle }',
+                '#[tokio::main]',
+                'pub async fn entry() {}',
+                '#[inline]',
+                '#[cfg_attr(docsrs, doc(cfg(feature = "x")))]',
+                'pub async fn plain() {}',
+                'pub fn caller() {',
+                '    spawn();',          // 17 a type implementing Future: may be started work
+                '    entry();',          // 18 proc-macro attribute rewrote the fn
+                '    plain();',          // 19 builtin attributes are transparent: reported
+                '}',
+                '',
+            ].join('\n'),
+            'src/fs.rs': [
+                'pub struct File;',
+                'impl File { pub async fn create(path: &str) -> std::io::Result<File> { Ok(File) } }',
+                '',
+            ].join('\n'),
+            'tests/t.rs': [
+                'use std::fs::File;',
+                'fn uses_std() -> std::io::Result<()> {',
+                '    File::create("x")?;',   // std File, not the project's async File::create
+                '    Ok(())',
+                '}',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = index.auditAsync();
+            assert.deepStrictEqual(result.issues.map(issue => `${issue.file}:${issue.line}:${issue.calleeName}`),
+                ['src/lib.rs:19:plain']);
+            assert.strictEqual(result.skippedFutures, 2);
+            assert.match(require('../core/output').formatAuditAsync(result), /2 unpolled Rust future\(s\) not known to be lazy/);
+        } finally { rm(dir); }
+    });
+
+    it('a private async fn is only reachable from its own module', () => {
+        const dir = tmp({
+            'Cargo.toml': CARGO,
+            'src/lib.rs': 'pub mod a;\npub mod b;\n',
+            'src/a.rs': 'pub struct Worker;\nimpl Worker {\n    async fn run(&self) {}\n    pub fn go(&self) { self.run(); }\n}\n',
+            'src/b.rs': 'pub struct Other;\nimpl Other { pub fn run(&self) {} }\npub fn f(o: &Other) { o.run(); }\n',
+        });
+        try {
+            const result = idx(dir).auditAsync();
+            assert.deepStrictEqual(result.issues.map(issue => `${issue.file}:${issue.line}:${issue.reason}`),
+                ['src/a.rs:4:future-discarded']);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #374: project macro_rules! invocations are expanded into index facts', () => {
+    const cargo = name => ({ 'Cargo.toml': `[package]\nname = "${name}"\nversion = "0.1.0"\nedition = "2021"\n` });
+    const at = entries => (entries || []).map(entry => `${entry.relativePath || entry.file}:${entry.line}`);
+    const withIndex = (files, fn) => {
+        const dir = tmp(files);
+        try { fn(idx(dir), dir); } finally { rm(dir); }
+    };
+    const lineOf = (dir, rel, text) => fs.readFileSync(path.join(dir, rel), 'utf-8')
+        .split('\n').findIndex(line => line.includes(text)) + 1;
+
+    it('fragment specifiers, nested repetitions and separators generate functions and calls', () => {
+        withIndex({
+            ...cargo('frag'),
+            'src/lib.rs': [
+                'pub mod util { pub fn compute(x: u32) -> u32 { x } }',
+                'pub fn helper() -> u32 { 1 }',
+                'macro_rules! getters {',
+                '    ($v:vis struct $name:ident { $($field:ident : $ty:ty),* $(,)? }) => {',
+                '        $v struct $name { $($field: $ty),* }',
+                '        impl $name { $( pub fn $field(&self) -> &$ty { &self.$field } )* }',
+                '    };',
+                '}',
+                'macro_rules! blocky {',
+                "    ($l:lifetime, $n:literal, $b:block) => {",
+                "        pub fn blocky() -> u32 { let mut t = 0; $l: for _ in 0..$n { t += $b; break $l; } t }",
+                '    };',
+                '}',
+                'macro_rules! call_path { ($p:path, $e:expr) => { pub fn via_path() -> u32 { $p($e) } }; }',
+                'macro_rules! matcher { ($pat:pat, $e:expr) => { pub fn matched() -> u32 { match $e { $pat => helper(), _ => 0 } } }; }',
+                'macro_rules! attributed { ($m:meta, $it:item) => { #[$m] $it }; }',
+                'macro_rules! stmts { ($s:stmt) => { pub fn with_stmt() -> u32 { $s x } }; }',
+                'macro_rules! table { ($($group:ident => [$($entry:ident),*]);* $(;)?) => { $( pub fn $group() -> u32 { 0 $(+ $entry())* } )* }; }',
+                'getters! { pub struct Point { x: i32, y: i32, } }',
+                "blocky!('outer, 3, { helper() });",
+                'call_path!(crate::util::compute, 2 + 3);',
+                'matcher!(Some(_), Some(1u8));',
+                'attributed!(inline, pub fn attributed_fn() -> u32 { helper() });',
+                'stmts!(let x = helper());',
+                'table! { first => [helper]; second => [helper, helper] }',
+                'pub fn user(p: &Point) -> i32 { *p.x() + *p.y() }',
+            ].join('\n') + '\n',
+        }, (index, dir) => {
+            for (const name of ['blocky', 'via_path', 'matched', 'attributed_fn', 'with_stmt', 'first', 'second']) {
+                const defs = (index.symbols.get(name) || []).filter(d => d.macroExpansion);
+                assert.strictEqual(defs.length, 1, `${name} generated: ${JSON.stringify(index.symbols.get(name))}`);
+            }
+            const x = (index.symbols.get('x') || []).find(d => d.type === 'method');
+            assert.strictEqual(x.className, 'Point');
+            assert.strictEqual(x.macroExpansion.macro, 'getters');
+            const userLine = lineOf(dir, 'src/lib.rs', 'pub fn user');
+            assert.ok(at(index.context('x', { file: 'src/lib.rs', line: x.startLine }).callers)
+                .includes(`src/lib.rs:${userLine}`));
+            const helper = index.context('helper', { file: 'src/lib.rs', line: 2 });
+            const callers = at(helper.callers);
+            for (const text of ['blocky!(', 'matcher!(', 'attributed!(', 'stmts!(', 'table!']) {
+                assert.ok(callers.includes(`src/lib.rs:${lineOf(dir, 'src/lib.rs', text)}`), `${text}: ${callers}`);
+            }
+            assert.ok(helper.callers.every(c => c.macroExpansion?.macro), JSON.stringify(helper.callers));
+            const compute = index.context('compute', { file: 'src/lib.rs', line: 1 });
+            assert.deepStrictEqual(at(compute.callers), [`src/lib.rs:${lineOf(dir, 'src/lib.rs', 'call_path!(')}`]);
+            const rec = index.files.get(path.join(dir, 'src/lib.rs')).rustMacroExpansion;
+            assert.strictEqual(rec.sites, 7);
+            assert.ok(!rec.blind, JSON.stringify(rec.blind));
+        });
+    });
+
+    it('generated impls are real trait members; callees stay with their own generated function', () => {
+        withIndex({
+            ...cargo('deleg'),
+            'src/lib.rs': [
+                '#[macro_use]',
+                'mod delegate;',
+                'pub mod iter;',
+                'pub mod map;',
+                'pub struct Inner;',
+                'impl Inner { pub fn drive(&self) -> u32 { 1 } pub fn len(&self) -> usize { 0 } }',
+            ].join('\n') + '\n',
+            'src/delegate.rs': [
+                'macro_rules! delegate {',
+                '    ($t:ty => $item:ty, impl $($args:tt)*) => {',
+                '        impl $($args)* Drive for $t {',
+                '            type Item = $item;',
+                '            fn go(&self) -> u32 { self.inner.drive() }',
+                '            fn size(&self) -> usize { let n = self.inner.len(); n }',
+                '        }',
+                '    };',
+                '}',
+            ].join('\n') + '\n',
+            'src/iter.rs': 'pub trait Drive { type Item; fn go(&self) -> u32; fn size(&self) -> usize; }\n',
+            'src/map.rs': [
+                'use crate::Inner;',
+                'use crate::iter::Drive;',
+                "pub struct Outer<'a, K> { inner: Inner, k: &'a K }",
+                'delegate! {',
+                "    Outer<'a, K> => (&'a K, u8),",
+                "    impl<'a, K: Sync>",
+                '}',
+                'pub fn user(o: &Outer<u8>) -> u32 { o.go() }',
+            ].join('\n') + '\n',
+        }, index => {
+            const generated = (index.symbols.get('go') || []).find(d => d.macroExpansion);
+            assert.ok(generated, 'generated trait member');
+            assert.strictEqual(generated.className, 'Outer');
+            assert.strictEqual(generated.macroExpansion.origin, 'template');
+            assert.deepStrictEqual(at(index.context('go', { file: 'src/map.rs', line: generated.startLine }).callers),
+                ['src/map.rs:8']);
+            const drive = index.context('drive', { file: 'src/lib.rs', line: 6 });
+            assert.ok(drive.callers.some(c => c.relativePath === 'src/map.rs' && c.macroExpansion?.macro === 'delegate'),
+                JSON.stringify(drive.callers));
+            const callees = index.findCallees(generated).map(c => c.name);
+            assert.deepStrictEqual(callees, ['drive'], 'the sibling generated on the same line keeps its own callees');
+            // plan: the invocation line is review-only; the template carries the edit
+            const r = execute(index, 'plan', { name: `src/map.rs:${generated.startLine}:go`, renameTo: 'run' });
+            assert.ok(r.ok, r.error);
+            const edits = r.result.changes.map(c => `${c.file}:${c.line}`);
+            assert.ok(!edits.includes(`src/map.rs:${generated.startLine}`), edits.join(','));
+            assert.ok(edits.includes('src/map.rs:8') && edits.includes('src/iter.rs:1') &&
+                edits.includes('src/delegate.rs:5'), edits.join(','));
+        });
+    });
+
+    it('argument code is typed in its expanded context and keeps its own lines', () => {
+        withIndex({
+            ...cargo('props'),
+            'src/lib.rs': [
+                'pub struct Counter;',
+                'impl Counter { pub fn count(&self) -> usize { 0 } }',
+                'pub struct Other;',
+                'impl Other { pub fn count(&self) -> usize { 1 } }',
+                'macro_rules! props {',
+                '    ($(fn $name:ident($($arg:ident : $ty:ty),*) -> bool $body:block)*) => {',
+                '        $( #[test] fn $name() { fn prop($($arg: $ty),*) -> bool $body } )*',
+                '    };',
+                '}',
+                'props! {',
+                '    fn size_ok(a: Counter) -> bool {',
+                '        let n = a.count();',
+                '        n > 0',
+                '    }',
+                '}',
+            ].join('\n') + '\n',
+        }, index => {
+            const counter = index.context('count', { file: 'src/lib.rs', line: 2 });
+            assert.deepStrictEqual(at(counter.callers), ['src/lib.rs:12']);
+            assert.strictEqual(counter.callers[0].macroExpansion.origin, 'argument');
+            const other = index.context('count', { file: 'src/lib.rs', line: 4 });
+            assert.deepStrictEqual(at(other.callers), []);
+            assert.deepStrictEqual(at(other.unverifiedCallers), []);
+            const sizeOk = (index.symbols.get('size_ok') || [])[0];
+            assert.strictEqual(sizeOk.startLine, 11);
+            assert.ok((index.symbols.get('prop') || []).length === 1);
+        });
+    });
+
+    it('recursive tt-munchers expand to a bounded depth; a runaway macro is disclosed blind', () => {
+        withIndex({
+            ...cargo('rec'),
+            'src/lib.rs': [
+                'pub fn helper() -> u32 { 1 }',
+                'macro_rules! chain {',
+                '    () => {};',
+                '    ($head:ident $($tail:ident)*) => { pub fn $head() -> u32 { helper() } chain!($($tail)*); };',
+                '}',
+                'macro_rules! forever { ($x:ident) => { fn $x() {} forever!($x); }; }',
+                'macro_rules! only_pairs { ($a:ident, $b:ident) => { pub fn $a() {} pub fn $b() {} }; }',
+                'chain!(one two three);',
+                'forever!(z);',
+                'only_pairs!(lonely);',
+            ].join('\n') + '\n',
+        }, (index, dir) => {
+            for (const name of ['one', 'two', 'three']) {
+                assert.ok((index.symbols.get(name) || []).some(d => d.macroExpansion), name);
+            }
+            const rec = index.files.get(path.join(dir, 'src/lib.rs')).rustMacroExpansion;
+            const reasons = (rec.blind || []).map(b => `${b.line}:${b.macro}:${b.reason}`);
+            assert.ok(reasons.some(r => r.startsWith('9:forever:')), reasons.join(','));
+            assert.ok(reasons.includes('10:only_pairs:no-matching-rule'), reasons.join(','));
+            const health = execute(index, 'repo', { sections: 'health' });
+            assert.ok(health.ok, health.error);
+            const text = require('../core/output').formatDoctor(health.result.health || health.result);
+            assert.match(text, /Unexpanded macro_rules! invocations/);
+            const dead = execute(index, 'deadcode', {});
+            assert.ok(dead.ok, dead.error);
+            assert.match(require('../core/output').formatDeadcode(dead.result), /macro_rules! invocation\(s\) in 1 file\(s\) could not be expanded/);
+        });
+    });
+
+    it('hygiene: locals a transcriber introduces never capture the invocation\'s tokens', () => {
+        withIndex({
+            ...cargo('hyg'),
+            'src/lib.rs': [
+                'pub struct Wrapper;',
+                'impl Wrapper { pub fn make() -> Wrapper { Wrapper } pub fn run(&self) {} pub fn len(&self) -> usize { 0 } }',
+                'pub struct Items;',
+                'impl Items { pub fn make() -> Items { Items } pub fn len(&self) -> usize { 2 } }',
+                'macro_rules! bind { ($name:ident = $e:expr) => { let $name = $e; let v = Wrapper::make(); v.run(); }; }',
+                'pub fn user() -> usize {',
+                '    let v = Items::make();',
+                '    bind!(w = Items::make());',
+                '    v.len() +',
+                '        w.len()',
+                '}',
+            ].join('\n') + '\n',
+        }, index => {
+            assert.deepStrictEqual(at(index.context('len', { file: 'src/lib.rs', line: 4 }).callers),
+                ['src/lib.rs:9', 'src/lib.rs:10']);
+            assert.deepStrictEqual(at(index.context('len', { file: 'src/lib.rs', line: 2 }).callers), []);
+            assert.deepStrictEqual(at(index.context('run', { file: 'src/lib.rs', line: 2 }).callers), ['src/lib.rs:8']);
+        });
+    });
+
+    it('$crate names the defining crate from another crate of the package; scope follows macro_use order', () => {
+        withIndex({
+            ...cargo('mylib'),
+            'src/lib.rs': [
+                'pub mod late;',
+                '#[macro_use]',
+                'mod macros;',
+                'pub mod util;',
+                'pub mod early_use;',
+            ].join('\n') + '\n',
+            'src/macros.rs': [
+                '#[macro_export]',
+                'macro_rules! make_it { ($name:ident, $x:expr) => { let $name = $crate::util::build($x); }; }',
+                'macro_rules! local_only { ($name:ident) => { let $name = crate::util::build(0); }; }',
+            ].join('\n') + '\n',
+            'src/util.rs': 'pub struct Built;\nimpl Built { pub fn finish(&self) {} }\npub fn build(_x: u8) -> Built { Built }\n',
+            'src/late.rs': 'pub fn f() { local_only!(a); }\n',
+            'src/early_use.rs': 'pub fn g() { local_only!(a); }\n',
+            'tests/t.rs': 'use mylib::make_it;\n#[test]\nfn t() { make_it!(b, 3); b.finish(); }\n',
+        }, index => {
+            const build = index.context('build', { file: 'src/util.rs', line: 3 });
+            const callers = at(build.callers).sort();
+            assert.ok(callers.includes('tests/t.rs:3'), callers.join(','));
+            assert.ok(callers.includes('src/early_use.rs:1'), callers.join(','));
+            assert.ok(!callers.includes('src/late.rs:1'), 'declared before the #[macro_use] module: not in scope');
+            const finish = index.context('finish', { file: 'src/util.rs', line: 2 });
+            assert.deepStrictEqual(at(finish.callers), ['tests/t.rs:3']);
+        });
+    });
+
+    it('persisted expansions are revalidated when a macro definition changes', () => {
+        const dir = tmp({
+            ...cargo('inc'),
+            'src/lib.rs': [
+                'pub fn alpha() {}',
+                'pub fn beta() {}',
+                'macro_rules! call { () => { pub fn generated() { alpha() } }; }',
+                'call!();',
+            ].join('\n') + '\n',
+        });
+        try {
+            const first = idx(dir);
+            assert.deepStrictEqual(at(first.context('alpha', { file: 'src/lib.rs', line: 1 }).callers), ['src/lib.rs:4']);
+            first.saveCache();
+            const file = path.join(dir, 'src/lib.rs');
+            fs.writeFileSync(file, fs.readFileSync(file, 'utf-8').replace('{ alpha() }', '{ beta() }'));
+            fs.utimesSync(file, new Date(), new Date(Date.now() + 5000));
+            const second = new ProjectIndex(dir);
+            assert.ok(second.loadCache());
+            assert.ok(second.isCacheStale());
+            second.build(null, { quiet: true, forceRebuild: true });
+            assert.deepStrictEqual(at(second.context('alpha', { file: 'src/lib.rs', line: 1 }).callers), []);
+            assert.deepStrictEqual(at(second.context('beta', { file: 'src/lib.rs', line: 2 }).callers), ['src/lib.rs:4']);
+            second.saveCache();
+            const third = new ProjectIndex(dir);
+            assert.ok(third.loadCache());
+            assert.ok(!third.isCacheStale());
+            assert.deepStrictEqual(at(third.context('beta', { file: 'src/lib.rs', line: 2 }).callers), ['src/lib.rs:4']);
+            assert.ok(third.files.get(file).rustMacroExpansion.expanded);
+        } finally { rm(dir); }
+    });
+
+    it('deadcode never claims generated definitions and sees callers produced by expansions', () => {
+        withIndex({
+            ...cargo('dead'),
+            'src/main.rs': [
+                'fn only_via_macro() {}',
+                'fn truly_dead() {}',
+                'macro_rules! make { ($name:ident) => { fn $name() { only_via_macro(); } }; }',
+                'make!(generated_unused);',
+                'fn main() {}',
+            ].join('\n') + '\n',
+        }, index => {
+            const r = execute(index, 'deadcode', {});
+            assert.ok(r.ok, r.error);
+            const names = r.result.map(item => item.name).sort();
+            assert.ok(names.includes('truly_dead'), names.join(','));
+            assert.ok(!names.includes('only_via_macro'), names.join(','));
+            assert.ok(!names.includes('generated_unused'), names.join(','));
+        });
+    });
+
+    it('cfg-gated alternative definitions all expand: calls under any configuration are kept', () => {
+        withIndex({
+            ...cargo('cfgalt'),
+            'src/lib.rs': [
+                '#[cfg(feature = "trace")]',
+                'macro_rules! traced { ($name:ident = $e:expr) => { let $name = $e; eprintln!("{:?}", $name); }; }',
+                '#[cfg(not(feature = "trace"))]',
+                'macro_rules! traced { ($name:ident = $e:expr) => { let $name = $e; }; }',
+                'pub struct Node;',
+                'impl Node { pub fn depth(&self) -> usize { 0 } }',
+                'pub fn walk(n: &Node) { traced!(d = n.depth()); }',
+            ].join('\n') + '\n',
+        }, index => {
+            const depth = index.context('depth', { file: 'src/lib.rs', line: 6 });
+            assert.deepStrictEqual(at(depth.callers), ['src/lib.rs:7']);
+            assert.strictEqual(depth.callers[0].macroExpansion.origin, 'argument');
+            const text = require('../core/output').formatContext(depth).text;
+            assert.match(text, /src\/lib\.rs:7 \[walk\] \[via macro traced\]/);
+        });
+    });
+
+    it('worker-thread expansion equals in-process expansion; calls derive on first use and persist', () => {
+        const files = { ...cargo('par'), 'src/lib.rs': '#[macro_use]\nmod gen;\n' };
+        files['src/gen.rs'] = 'macro_rules! tests { ($(fn $n:ident() $b:block)*) => { $( pub fn $n() $b )* }; }\n';
+        const body = Array.from({ length: 200 }, (_, i) => `        let v${i} = helper(${i});`).join('\n');
+        for (let f = 0; f < 10; f++) {
+            files['src/lib.rs'] += `pub mod m${f};\n`;
+            files[`src/m${f}.rs`] = `use crate::helper;\ntests! {\n    fn case_${f}() {\n${body}\n    }\n}\n`;
+        }
+        files['src/lib.rs'] += 'pub fn helper(x: u32) -> u32 { x }\n';
+        const dir = tmp(files);
+        try {
+            const snapshot = index => [...index.symbols.values()].flat()
+                .filter(def => def.macroExpansion)
+                .map(def => `${def.relativePath}:${def.startLine}:${def.type}:${def.name}`).sort();
+            const sequential = new ProjectIndex(dir);
+            sequential.build(null, { quiet: true, workers: 0 });
+            const parallel = new ProjectIndex(dir);
+            parallel.build(null, { quiet: true });
+            assert.strictEqual(snapshot(sequential).length, 10);
+            assert.deepStrictEqual(snapshot(parallel), snapshot(sequential));
+            const m0 = path.join(dir, 'src/m0.rs');
+            assert.ok(parallel.files.get(m0).rustMacroExpansion.callsPending);
+            assert.ok(parallel.getCalleeFiles('helper').has(m0), 'pending files are callee candidates');
+            const callers = parallel.findCallers('helper').filter(c => c.relativePath === 'src/m0.rs');
+            assert.strictEqual(callers.length, 200);
+            assert.ok(callers.every(c => c.callerName === 'case_0'));
+            assert.ok(!parallel.files.get(m0).rustMacroExpansion.callsPending);
+            parallel.saveCache();
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loaded.loadCache());
+            assert.ok(!loaded.files.get(m0).rustMacroExpansion.callsPending);
+            assert.strictEqual(loaded.findCallers('helper').filter(c => c.relativePath === 'src/m0.rs').length, 200);
+        } finally { rm(dir); }
+    });
+
+    it('an argument placed in callee position is a call at its own token; logging-style macros stay unexpanded', () => {
+        withIndex({
+            ...cargo('callee'),
+            'src/lib.rs': [
+                'pub struct Thing;',
+                'impl Thing { pub fn frob(&self, _n: u8) {} pub fn peek(&self) -> u8 { 0 } }',
+                'macro_rules! apply { ($m:ident, $x:expr) => { $x.$m(1) }; }',
+                'macro_rules! note { ($($t:tt)*) => { eprintln!($($t)*) }; }',
+                'pub fn run(thing: &Thing) {',
+                '    apply!(frob, thing);',
+                '    note!("{}", thing.peek());',
+                '}',
+            ].join('\n') + '\n',
+        }, (index, dir) => {
+            const frob = index.context('frob', { file: 'src/lib.rs', line: 2 });
+            assert.deepStrictEqual(at(frob.callers), ['src/lib.rs:6']);
+            assert.strictEqual(frob.callers[0].macroExpansion.origin, 'argument');
+            const peek = index.context('peek', { file: 'src/lib.rs', line: 2 });
+            assert.deepStrictEqual(at(peek.callers), ['src/lib.rs:7']);
+            assert.ok(!peek.callers[0].macroExpansion, 'a pass-along macro keeps the token-tree view');
+            assert.strictEqual(index.files.get(path.join(dir, 'src/lib.rs')).rustMacroExpansion.sites, 1);
+            const r = execute(index, 'plan', { name: 'src/lib.rs:2:frob', renameTo: 'poke' });
+            assert.ok(r.ok, r.error);
+            assert.ok(r.result.changes.some(c => c.line === 6 && c.newExpression === 'apply!(poke, thing);'),
+                JSON.stringify(r.result.changes));
+        });
+    });
+
+    it('arguments naming a generated function are its rename sites', () => {
+        withIndex({
+            ...cargo('ren'),
+            'src/main.rs': [
+                'macro_rules! handler { ($name:ident) => { fn $name() -> u8 { 1 } }; }',
+                'handler!(handle_get);',
+                'fn main() { handle_get(); }',
+            ].join('\n') + '\n',
+        }, index => {
+            const r = execute(index, 'plan', { name: 'handle_get', renameTo: 'fetch' });
+            assert.ok(r.ok, r.error);
+            assert.deepStrictEqual(r.result.changes.map(c => `${c.file}:${c.line}:${c.newExpression}`).sort(), [
+                'src/main.rs:2:handler!(fetch);',
+                'src/main.rs:3:fn main() { fetch(); }',
+            ]);
+        });
+    });
+});
+
+describe('fix #375: macro_rules! expansion is identical in worker threads and in place, and cheaper', () => {
+    const cargo = name => ({ 'Cargo.toml': `[package]\nname = "${name}"\nversion = "0.1.0"\nedition = "2021"\n` });
+    const { indexSnapshot } = require('./helpers');
+    // Facts of every Rust file after every expansion's calls are derived.
+    const facts = index => {
+        require('../core/rust-macro-expansion').materializeRustMacroCalls(index);
+        const out = [];
+        for (const [file, entry] of [...index.files].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+            out.push(JSON.stringify([entry.relativePath, entry.rustMacroExpansion || null,
+                index.callsCache.get(file)?.calls || null]));
+        }
+        return `${indexSnapshot(index)}\n${out.join('\n')}`;
+    };
+    // Enough invoking files and bytes that the build expands in workers.
+    const project = () => {
+        const files = {
+            ...cargo('par375'),
+            'src/lib.rs': [
+                'pub struct Thing;',
+                'impl Thing { pub fn frob(&self, _n: u8) {} }',
+                '#[macro_export]',
+                'macro_rules! apply { ($m:ident, $x:expr) => { $x.$m(1) }; }',
+                '#[macro_export]',
+                'macro_rules! tests { ($(fn $n:ident() $b:block)*) => { $( pub fn $n() { let t = crate::helper(0); $b; } )* }; }',
+                'pub fn helper(x: u32) -> u32 { x }',
+            ].join('\n') + '\n',
+        };
+        const body = Array.from({ length: 160 }, (_, i) => `        let v${i} = crate::helper(${i});`).join('\n');
+        for (let f = 0; f < 6; f++) {
+            files['src/lib.rs'] += `pub mod m${f};\n`;
+            files[`src/m${f}.rs`] = [
+                'use crate::Thing;',
+                `pub fn run${f}(thing: &Thing) { apply!(frob, thing); }`,
+                'tests! {',
+                `    fn case_${f}() {`,
+                body,
+                '    }',
+                '}',
+            ].join('\n') + '\n';
+        }
+        return files;
+    };
+
+    it('workers see project callables: a callee-position macro expands as it does in place', () => {
+        const dir = tmp(project());
+        try {
+            const sequential = new ProjectIndex(dir);
+            sequential.build(null, { quiet: true, workers: 0 });
+            const parallel = new ProjectIndex(dir);
+            parallel.build(null, { quiet: true, workers: 3 });
+            const m0 = path.join(dir, 'src/m0.rs');
+            // apply!(frob, thing) puts `frob` in callee position: expanded.
+            assert.strictEqual(parallel.files.get(m0).rustMacroExpansion.sites, 2);
+            assert.strictEqual(facts(parallel), facts(sequential));
+            const callers = parallel.findCallers('frob').map(c => `${c.relativePath}:${c.line}`).sort();
+            assert.deepStrictEqual(callers, ['src/m0.rs', 'src/m1.rs', 'src/m2.rs', 'src/m3.rs', 'src/m4.rs', 'src/m5.rs']
+                .map(file => `${file}:2`));
+        } finally { rm(dir); }
+    });
+
+    it('hygienic renames are numbered per file, whatever else the state expanded first', () => {
+        const dir = tmp(project());
+        try {
+            const renamed = index => {
+                const calls = index.getCachedCalls(path.join(dir, 'src/m3.rs'));
+                return [...new Set(JSON.stringify(calls).match(/t__ucn_h\d+/g) || [])];
+            };
+            const a = new ProjectIndex(dir);
+            a.build(null, { quiet: true, workers: 0 });
+            for (const f of [0, 1, 2]) a.getCachedCalls(path.join(dir, `src/m${f}.rs`));
+            const b = new ProjectIndex(dir);
+            b.build(null, { quiet: true, workers: 0 });
+            assert.deepStrictEqual(renamed(a), renamed(b));
+            assert.deepStrictEqual(renamed(b), ['t__ucn_h2']);
+        } finally { rm(dir); }
+    });
+
+    it('macro invocation records say when they sit in expression position', () => {
+        const dir = tmp({
+            ...cargo('ctx375'),
+            'src/lib.rs': [
+                'macro_rules! id { ($e:expr) => { $e }; }',
+                'id! { struct S; }',
+                'pub fn f() -> u32 {',
+                '    id!(1);',
+                '    let x = id!(2);',
+                '    x + id!(3)',
+                '}',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const calls = index.callsCache.get(path.join(dir, 'src/lib.rs')).calls
+                .filter(call => call.isMacro && call.name === 'id' && !call.inMacro);
+            assert.deepStrictEqual(calls.map(call => [call.line, !!call.macroExpr]),
+                [[2, false], [4, false], [5, true], [6, true]]);
+        } finally { rm(dir); }
+    });
+
+    it('re-canonicalizing only what the expansions touched equals a full pass', () => {
+        const dir = tmp(project());
+        try {
+            const index = new ProjectIndex(dir);
+            index.build(null, { quiet: true, workers: 0 });
+            const order = () => JSON.stringify([
+                [...index.symbols.keys()],
+                [...index.symbols.values()].map(defs => defs.map(def => `${def.relativePath}:${def.startLine}:${def.type}`)),
+                [...index.files.values()].map(entry => (entry.symbols || []).map(s => `${s.startLine}:${s.name}`)),
+                [...index.files.values()].map(entry => (entry.bindings || []).map(b => `${b.startLine}:${b.name}`)),
+            ]);
+            const before = order();
+            assert.ok(index.symbols.has('case_0'), 'generated functions indexed');
+            index._canonicalizeOrder();
+            assert.strictEqual(order(), before);
+        } finally { rm(dir); }
+    });
+
+    it('a query no record answers derives only the expansions whose text can hold the name', () => {
+        const dir = tmp({ ...project(), 'src/lonely.rs': 'pub fn lonely() {}\n' });
+        try {
+            const index = new ProjectIndex(dir);
+            index.build(null, { quiet: true, workers: 0 });
+            const pending = () => [...index.files.values()]
+                .filter(entry => entry.rustMacroExpansion?.callsPending).map(entry => entry.relativePath).sort();
+            assert.strictEqual(pending().length, 6);
+            assert.deepStrictEqual(index.findCallers('lonely'), []);
+            assert.strictEqual(pending().length, 6, 'no expansion can call lonely');
+            // case_3 is declared by m3's expansion only: m3 is derived.
+            assert.deepStrictEqual(index.findCallers('case_3'), []);
+            assert.deepStrictEqual(pending(), ['src/m0.rs', 'src/m1.rs', 'src/m2.rs', 'src/m4.rs', 'src/m5.rs']);
+        } finally { rm(dir); }
+    });
+
+    it('module resolution sees a module file created between two builds of one index', () => {
+        const dir = tmp({
+            ...cargo('mods375'),
+            'src/lib.rs': 'pub mod later;\npub fn root() {}\n',
+            'src/other.rs': 'pub fn other() {}\n',
+        });
+        try {
+            const index = new ProjectIndex(dir);
+            index.build(null, { quiet: true });
+            const lib = path.join(dir, 'src/lib.rs');
+            assert.strictEqual(index.files.get(lib).moduleResolved?.later, undefined);
+            fs.writeFileSync(path.join(dir, 'src/later.rs'), 'pub fn later_fn() {}\n');
+            index.build(null, { quiet: true, forceRebuild: true });
+            assert.strictEqual(index.files.get(lib).moduleResolved.later, 'src/later.rs');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #377: Rust macro namespace, bare-call fields, module-path calls', () => {
+    const cargo = { 'Cargo.toml': '[package]\nname = "m377"\nversion = "0.1.0"\nedition = "2021"\n' };
+    const at = entries => (entries || []).map(entry => `${entry.relativePath || entry.file}:${entry.line}`);
+    const withIndex = (files, fn) => {
+        const dir = tmp({ ...cargo, ...files });
+        try { fn(idx(dir)); } finally { rm(dir); }
+    };
+    const excludedFor = (ctx, reason) => ((ctx.meta.account.excluded.byReason[reason] || {}).sample || [])
+        .map(site => `${site.file}:${site.line}`);
+
+    it('macro invocations and attributes never reach a same-named fn (callers, plan)', () => {
+        withIndex({
+            'src/lib.rs': [
+                'pub fn format(x: i32) -> String { x.to_string() }',
+                'pub fn must_use() -> i32 { 0 }',
+                'pub fn derive() -> i32 { 0 }',
+                'pub fn run() -> String {',
+                '    let a = format!("{}", 1);',
+                '    let b = format(2);',
+                '    a + &b',
+                '}',
+                '#[must_use]',
+                'pub fn other() -> i32 { must_use() + derive() }',
+                '#[derive(Debug, Clone)]',
+                'pub struct S;',
+                'macro_rules! twice { ($e:expr) => { $e + $e } }',
+                'pub fn twice(x: i32) -> i32 { x }',
+                'pub fn use_twice() -> i32 { twice!(1) + twice(2) }',
+            ].join('\n') + '\n',
+        }, index => {
+            const fmt = index.context('format', { file: 'src/lib.rs', line: 1 });
+            assert.deepStrictEqual(at(fmt.callers), ['src/lib.rs:6']);
+            assert.deepStrictEqual(excludedFor(fmt, 'macro-namespace'), ['src/lib.rs:5']);
+            const fnTwice = index.context('twice', { file: 'src/lib.rs', line: 14 });
+            assert.deepStrictEqual(at(fnTwice.callers), ['src/lib.rs:15']);
+            const macroTwice = index.context('twice', { file: 'src/lib.rs', line: 13 });
+            assert.deepStrictEqual(at(macroTwice.callers), ['src/lib.rs:15']);
+            const useTwice = index.context('use_twice', { file: 'src/lib.rs', line: 15 });
+            assert.deepStrictEqual(useTwice.callees.map(c => `${c.type}:${c.startLine}`).sort(),
+                ['function:14', 'macro:13']);
+
+            for (const [handle, attrLine] of [['src/lib.rs:2:must_use', 9], ['src/lib.rs:3:derive', 11]]) {
+                const r = execute(index, 'plan', { name: handle, renameTo: 'zz' });
+                assert.ok(r.ok, JSON.stringify(r.error));
+                const lines = r.result.changes.filter(c => c.newExpression !== undefined).map(c => c.line);
+                assert.ok(!lines.includes(attrLine), `${handle} must not edit the attribute: ${lines}`);
+                assert.ok(lines.includes(10), `${handle} renames its call`);
+            }
+            const usages = index._getCachedUsages(path.join(index.root, 'src/lib.rs'), 'Debug');
+            assert.deepStrictEqual(usages.map(u => u.namespace), ['macro']);
+        });
+    });
+
+    it('a nested fn is out of scope for bare calls outside its body; macro invocations stay apart', () => {
+        withIndex({
+            'src/lib.rs': [
+                'fn outer() {',
+                '    fn assert() {}',
+                '    assert();',
+                '}',
+                'pub fn other() { assert!(true); outer(); }',
+            ].join('\n') + '\n',
+            'tests/t.rs': '#[test]\nfn t() { assert!(1 == 1); assert_eq!(1, 1); }\n',
+        }, index => {
+            const ctx = index.context('assert', { file: 'src/lib.rs', line: 2 });
+            assert.deepStrictEqual(at(ctx.callers), ['src/lib.rs:3']);
+            assert.deepStrictEqual(at(ctx.unverifiedCallers), []);
+            const r = execute(index, 'plan', { name: 'src/lib.rs:2:assert', renameTo: 'zz' });
+            assert.ok(r.ok);
+            assert.deepStrictEqual(r.result.changes.filter(c => c.newExpression !== undefined)
+                .map(c => `${c.file}:${c.line}`).sort(), ['src/lib.rs:2', 'src/lib.rs:3']);
+        });
+    });
+
+    it('a bare call never resolves to a struct field of the same name', () => {
+        withIndex({
+            'src/lib.rs': [
+                'pub struct VT { vtable: fn(i32) -> i32 }',
+                'fn vtable(p: i32) -> i32 { p }',
+                'impl VT {',
+                '    pub fn go(&self, p: i32) -> i32 { (self.vtable)(p) + vtable(p) }',
+                '}',
+            ].join('\n') + '\n',
+        }, index => {
+            const go = index.context('go', { file: 'src/lib.rs', line: 4 });
+            const vt = go.callees.filter(c => c.name === 'vtable');
+            assert.deepStrictEqual(vt.map(c => `${c.type}:${c.startLine}`), ['function:2']);
+        });
+    });
+
+    it('crate::/super::/self::/child-module path calls resolve through the module tree', () => {
+        withIndex({
+            'src/lib.rs': [
+                'mod util;',
+                'mod net;',
+                '#[path = "deep/inner_impl.rs"]',
+                'mod inner;',
+                'pub mod inl {',
+                '    pub fn nested_f() -> i32 { 1 }',
+                '    pub mod sub {',
+                '        pub fn call_up() -> i32 { super::nested_f() }',
+                '    }',
+                '}',
+                'pub fn compute(x: i32) -> i32 { x }',
+                'pub fn caller_self() -> i32 { self::inner::deep_fn() + net::conn::connect() }',
+            ].join('\n') + '\n',
+            'src/util.rs': [
+                'pub fn helper() -> i32 { crate::compute(3) }',
+                'pub fn helper3() -> i32 { super::compute(4) }',
+                'pub fn helper4() -> i32 { self::local_fn() }',
+                'fn local_fn() -> i32 { 0 }',
+                'pub fn compute(x: i32) -> i32 { x }',
+                'pub fn helper5() -> i32 { self::compute(5) }',
+            ].join('\n') + '\n',
+            'src/net.rs': 'pub mod conn;\npub fn up() -> i32 { self::conn::connect() }\n',
+            'src/net/conn.rs': 'pub fn connect() -> i32 { super::super::compute(1) + crate::net::up() }\n',
+            'src/deep/inner_impl.rs': 'pub fn deep_fn() -> i32 { super::inl::sub::call_up() }\n',
+            'src/conn.rs': 'pub fn connect() -> i32 { 0 }\n',
+        }, index => {
+            const lib = index.files.get(path.join(index.root, 'src/lib.rs'));
+            assert.strictEqual(lib.moduleResolved.inner, 'src/deep/inner_impl.rs');
+            assert.strictEqual(index.files.get(path.join(index.root, 'src/net.rs')).moduleResolved.conn,
+                'src/net/conn.rs');
+            const compute = index.context('compute', { file: 'src/lib.rs', line: 11 });
+            assert.deepStrictEqual(at(compute.callers).sort(),
+                ['src/net/conn.rs:1', 'src/util.rs:1', 'src/util.rs:2']);
+            assert.deepStrictEqual(at(compute.unverifiedCallers), []);
+            assert.deepStrictEqual(excludedFor(compute, 'other-definition'), ['src/util.rs:6']);
+            for (const [name, file, line, expected] of [
+                ['local_fn', 'src/util.rs', 4, ['src/util.rs:3']],
+                ['connect', 'src/net/conn.rs', 1, ['src/lib.rs:12', 'src/net.rs:2']],
+                ['deep_fn', 'src/deep/inner_impl.rs', 1, ['src/lib.rs:12']],
+                ['call_up', 'src/lib.rs', 8, ['src/deep/inner_impl.rs:1']],
+                ['nested_f', 'src/lib.rs', 6, ['src/lib.rs:8']],
+                ['up', 'src/net.rs', 2, ['src/net/conn.rs:1']],
+            ]) {
+                const ctx = index.context(name, { file, line });
+                assert.deepStrictEqual(at(ctx.callers).sort(), expected, name);
+                assert.deepStrictEqual(at(ctx.unverifiedCallers), [], name);
+            }
+            const stray = index.context('connect', { file: 'src/conn.rs', line: 1 });
+            assert.deepStrictEqual(at(stray.callers), []);
+            // Callee side agrees.
+            const helper3 = index.context('helper3', { file: 'src/util.rs', line: 2 });
+            assert.deepStrictEqual(helper3.callees.map(c => `${c.relativePath}:${c.startLine}`),
+                ['src/lib.rs:11']);
+            const conn = index.context('connect', { file: 'src/net/conn.rs', line: 1 });
+            assert.deepStrictEqual(conn.callees.map(c => `${c.relativePath}:${c.startLine}`).sort(),
+                ['src/lib.rs:11', 'src/net.rs:2']);
+        });
+    });
+});
+
+describe('fix #384: impls of one generic trait for one self type are selected by argument type', () => {
+    const callersOf = (index, file, line) => {
+        const def = (index.symbols.get('from') || []).concat(index.symbols.get('conv') || [])
+            .find(d => d.relativePath === file && d.startLine === line);
+        assert.ok(def, `${file}:${line} indexed`);
+        const r = execute(index, 'show', { name: def.name, file, line, sections: 'callers' });
+        assert.ok(r.ok, r.error);
+        const ctx = r.result.context || r.result;
+        return {
+            confirmed: (ctx.callers || []).map(c => `${c.relativePath}:${c.line}`).sort(),
+            unverified: (ctx.unverifiedCallers || []).map(c => `${c.relativePath}:${c.line}:${c.reason}`).sort(),
+            mismatch: ctx.meta?.account?.excluded?.byReason?.['overload-mismatch']?.count || 0,
+            conserved: ctx.meta?.account?.conserved,
+        };
+    };
+
+    it('From<Bytes>/From<BytesMut> for Vec<u8> in two files: typed arguments select one, std arguments exclude both, unknown ones stay visible (bytes shape)', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "m"\nversion = "0.1.0"\n',
+            'src/lib.rs': 'mod bytes;\nmod bytes_mut;\npub use crate::bytes::Bytes;\npub use crate::bytes_mut::BytesMut;\n',
+            'src/bytes.rs': [
+                'pub struct Bytes { pub v: Vec<u8> }',
+                'impl From<Vec<u8>> for Bytes {',
+                '    fn from(v: Vec<u8>) -> Bytes { Bytes { v } }',
+                '}',
+                'impl From<Bytes> for Vec<u8> {',
+                '    fn from(b: Bytes) -> Vec<u8> { b.v }',
+                '}',
+            ].join('\n'),
+            'src/bytes_mut.rs': [
+                'pub struct BytesMut { pub v: Vec<u8> }',
+                'impl BytesMut { pub fn new() -> BytesMut { BytesMut { v: Vec::new() } } }',
+                'impl From<BytesMut> for Vec<u8> {',
+                '    fn from(b: BytesMut) -> Self { b.v }',
+                '}',
+            ].join('\n'),
+            'tests/t.rs': [
+                'use m::{Bytes, BytesMut};',
+                '#[test]',
+                'fn t1() {',
+                '    let b = Bytes::from(vec![1u8]);',
+                '    let v = Vec::from(b);',
+                '    let w = Vec::from(&b"abc"[..]);',
+                '    let m = BytesMut::new();',
+                '    let x = Vec::from(m);',
+                '    let s: Bytes = Bytes::from(vec![2u8]);',
+                '    assert_eq!(Vec::from(s), w);',
+                '    let lit = BytesMut { v: vec![] };',
+                '    assert_eq!(Vec::from(lit), v);',
+                '    assert_eq!(Vec::from("abc"), x);',
+                '    let c = v.clone();',
+                '    assert_eq!(Vec::from(c), x);',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const bytes = callersOf(index, 'src/bytes.rs', 6);
+            assert.deepStrictEqual(bytes.confirmed, ['tests/t.rs:10', 'tests/t.rs:5']);
+            assert.deepStrictEqual(bytes.unverified, ['tests/t.rs:15:overload-ambiguous']);
+            assert.strictEqual(bytes.mismatch, 4);
+            const mut = callersOf(index, 'src/bytes_mut.rs', 4);
+            assert.deepStrictEqual(mut.confirmed, ['tests/t.rs:12', 'tests/t.rs:8']);
+            assert.deepStrictEqual(mut.unverified, ['tests/t.rs:15:overload-ambiguous']);
+            assert.strictEqual(mut.mismatch, 4);
+            for (const c of [bytes, mut]) assert.strictEqual(c.conserved, true);
+            // `vec![..]` is a Vec: it selects From<Vec<u8>> for Bytes (the
+            // only other impl for Bytes is the reflexive one).
+            const vecImpl = callersOf(index, 'src/bytes.rs', 3);
+            assert.deepStrictEqual(vecImpl.confirmed, ['tests/t.rs:4', 'tests/t.rs:9']);
+            // The callee side selects the same impls.
+            const t1 = execute(index, 'show', { name: 't1', sections: 'callees' });
+            const ctx = t1.result.context || t1.result;
+            const callees = (ctx.callees || []).filter(c => c.name === 'from')
+                .map(c => `${c.relativePath}:${c.startLine}`).sort();
+            assert.deepStrictEqual(callees, ['src/bytes.rs:3', 'src/bytes.rs:6', 'src/bytes_mut.rs:4']);
+        } finally { rm(dir); }
+    });
+
+    it('one project impl of an out-of-project trait never confirms an undecided argument; a project trait with one impl does', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "m"\nversion = "0.1.0"\n',
+            'src/lib.rs': [
+                'use std::io::Error as IoError;',
+                'pub struct Label(pub u8);',
+                'pub struct S;',
+                'impl From<Label> for String {',
+                '    fn from(l: Label) -> String { l.0.to_string() }',
+                '}',
+                'pub struct MyError;',
+                'impl From<IoError> for MyError {',
+                '    fn from(e: IoError) -> MyError { MyError }',
+                '}',
+                'pub trait Conv<T> { fn conv(t: T) -> Self; }',
+                'impl Conv<u8> for S { fn conv(t: u8) -> S { S } }',
+                'pub fn mk() -> Label { Label(1) }',
+                'pub fn use_them(l: Label, e: std::io::Error, n: u8) -> usize {',
+                '    let a = String::from(l);',
+                '    let b = String::from("text");',
+                '    let c = String::from(mk());',
+                '    let _d = MyError::from(e);',
+                '    let _s = S::conv(n.clone());',
+                '    a.len() + b.len() + c.len()',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const label = callersOf(index, 'src/lib.rs', 5);
+            assert.deepStrictEqual(label.confirmed, ['src/lib.rs:15']);
+            assert.deepStrictEqual(label.unverified, ['src/lib.rs:17:overload-ambiguous']);
+            assert.strictEqual(label.mismatch, 1);
+            // `use std::io::Error as IoError`: the argument's `Error` is the
+            // parameter's `IoError`, never a mismatch.
+            const io = callersOf(index, 'src/lib.rs', 9);
+            assert.deepStrictEqual(io.confirmed, ['src/lib.rs:18']);
+            const conv = callersOf(index, 'src/lib.rs', 12);
+            assert.deepStrictEqual(conv.confirmed, ['src/lib.rs:19']);
+            for (const c of [label, io, conv]) assert.strictEqual(c.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #386: renaming a type edits every reference to it', () => {
+    const { applyRenamePlan } = require('./helpers');
+    const files = {
+        'Cargo.toml': '[package]\nname = "rt"\nversion = "0.1.0"\nedition = "2021"\n',
+        'src/lib.rs': 'pub mod widget;\npub mod user;\npub mod other;\npub use crate::widget::Widget;\n',
+        'src/widget.rs': [
+            'pub trait Shape { fn area(&self) -> i32; }',
+            '',
+            '#[derive(Debug, Clone, Default)]',
+            'pub struct Widget {',
+            '    pub next: Option<Box<Widget>>,',
+            '}',
+            '',
+            'impl Widget {',
+            '    pub const SIZE: i32 = 3;',
+            '    pub fn new() -> Widget { Widget { next: None } }',
+            '    pub fn copy(&self, other: &Widget) -> Widget {',
+            '        let w: Widget = other.clone();',
+            '        let _ = Widget::SIZE;',
+            '        w',
+            '    }',
+            '}',
+            '',
+            'impl Shape for Widget { fn area(&self) -> i32 { 1 } }',
+            '',
+            'pub type WidgetList = Vec<Widget>;',
+            '',
+            'pub fn generic<T: Into<Widget>>(t: T) -> Widget { t.into() }',
+        ].join('\n'),
+        'src/user.rs': [
+            'use crate::widget::Widget;',
+            'use crate::widget::{self, Shape};',
+            'use crate::widget::Widget as W2;',
+            '',
+            'pub fn build() -> Widget { Widget::new() }',
+            'pub fn other(x: W2) -> widget::Widget { let v = vec![crate::widget::Widget::new()]; let _ = v; x }',
+            'pub fn far() -> crate::widget::Widget { crate::widget::Widget { next: None } }',
+            'pub fn pat(w: Widget) -> i32 { let Widget { next } = w; if next.is_some() { 1 } else { 0 } }',
+        ].join('\n'),
+        'src/other.rs': 'pub struct Widget;\npub fn a() -> Widget { Widget }\n',
+        'tests/it.rs': [
+            'use ::rt::Widget;',
+            '',
+            'mod rt {',
+            '    pub struct Local;',
+            '}',
+            '',
+            '#[test]',
+            'fn t() { let _w: Widget = rt::Widget::new(); let _ = rt::Local; }',
+        ].join('\n'),
+    };
+
+    it('Rust: impl heads, bounds, paths, struct literals and patterns, `use` trees, macro tokens and the package crate from tests', () => {
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: 'Widget', file: 'src/widget.rs', renameTo: 'Gadget' });
+            assert.ok(r.ok, r.error);
+            const { contents, reviews } = applyRenamePlan(dir, r.result);
+            assert.deepStrictEqual(reviews, []);
+            const renamed = text => text.replace(/\bWidget\b/g, 'Gadget');
+            assert.strictEqual(contents['src/widget.rs'], renamed(files['src/widget.rs']));
+            assert.strictEqual(contents['src/user.rs'], renamed(files['src/user.rs']));
+            assert.strictEqual(contents['src/lib.rs'], renamed(files['src/lib.rs']));
+            // `::rt` is the package crate, never the test's own `mod rt`.
+            assert.strictEqual(contents['tests/it.rs'], files['tests/it.rs']
+                .replace('use ::rt::Widget;', 'use ::rt::Gadget;').replace('_w: Widget', '_w: Gadget'));
+            assert.ok(!('src/other.rs' in contents));
+        } finally { rm(dir); }
+    });
+
+    it('Rust: a name only a macro expansion can bring into scope is reviewed, `#[cfg]` module alternatives are one type', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "rt"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/lib.rs': [
+                'pub mod sync;',
+                'macro_rules! import_parent { () => { use super::*; }; }',
+                'pub struct Widget;',
+                'mod inner {',
+                '    import_parent!();',
+                '    pub fn f() -> Widget { Widget }',
+                '}',
+                'macro_rules! mk { () => { Widget } }',
+                'pub fn g() -> Widget { mk!() }',
+            ].join('\n'),
+            'src/sync.rs': [
+                '#[cfg(not(loom))]',
+                'pub mod atomic { pub trait Marker {} }',
+                '#[cfg(loom)]',
+                'pub mod atomic { pub trait Marker {} }',
+                'pub fn g<T: atomic::Marker>(_t: T) {}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: 'Widget', file: 'src/lib.rs', renameTo: 'Gadget' });
+            assert.ok(r.ok, r.error);
+            const review = (r.result.changes || []).find(c => c.file === 'src/lib.rs' && c.line === 6);
+            assert.ok(review && review.needsReview && review.newExpression === undefined, JSON.stringify(review));
+            // A bare name in a macro_rules! template binds where the macro
+            // expands: decided at each project invocation.
+            const expand = (r.result.changes || []).find(c => c.file === 'src/lib.rs' && c.line === 8);
+            assert.strictEqual(expand?.newExpression, 'macro_rules! mk { () => { Gadget } }', JSON.stringify(r.result.changes));
+            const m = execute(index, 'plan', { name: 'Marker', file: 'src/sync.rs', line: 2, renameTo: 'Flag' });
+            assert.ok(m.ok, m.error);
+            const { contents, reviews } = applyRenamePlan(dir, m.result);
+            assert.deepStrictEqual(reviews, []);
+            assert.strictEqual(contents['src/sync.rs'].split('\n').filter(l => l.includes('Flag')).length, 3);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #389: Rust value paths, block-scoped types and unions', () => {
+    const { applyRenamePlan } = require('./helpers');
+    const at = entries => (entries || []).map(entry => `${entry.relativePath || entry.file}:${entry.line}`).sort();
+
+    it('unit structs, tuple-struct and tuple-variant constructors, struct expressions and `use E::*` variants type their receivers', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "vp"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/lib.rs': [
+                'pub mod m;',
+                'use crate::m::Deep;',
+                'pub struct S;',
+                'pub struct T(pub i32);',
+                'pub struct W<X>(pub X);',
+                'pub enum E { Unit, Tup(i32), Rec { x: i32 } }',
+                'pub struct Other;',
+                'impl S { pub fn plain(&self) -> i32 { 1 } }',
+                'impl T { pub fn plain(&self) -> i32 { Self(2).helper() } pub fn helper(&self) -> i32 { self.0 } }',
+                'impl<X> W<X> { pub fn plain(&self) -> i32 { 7 } }',
+                'impl E { pub fn plain(&self) -> i32 { Self::Tup(1).helper() } pub fn helper(&self) -> i32 { 3 } }',
+                'impl Other { pub fn plain(&self) -> i32 { 4 } }',
+                'pub fn use_it() -> i32 {',
+                '    use E::*;',
+                '    let a = S.plain() + T(1).plain() + W::<u8>(1).plain();',
+                '    let b = E::Unit.plain() + E::Tup(2).plain() + E::Rec { x: 1 }.plain() + Unit.plain();',
+                '    let c = m::Deep.plain() + Deep.plain() + crate::T(3).plain();',
+                '    let o = Other;',
+                '    a + b + c + o.plain()',
+                '}',
+                'pub fn shadow() -> i32 {',
+                '    let S = Other;',
+                '    S.plain()',
+                '}',
+            ].join('\n'),
+            'src/m.rs': 'pub struct Deep;\nimpl Deep { pub fn plain(&self) -> i32 { 9 } }\n',
+        });
+        try {
+            const index = idx(dir);
+            const callers = (line) => [...new Set(at(index.context('plain', { file: 'src/lib.rs', line }).callers))];
+            assert.deepStrictEqual(callers(8), ['src/lib.rs:15']);
+            assert.deepStrictEqual(callers(9), ['src/lib.rs:15', 'src/lib.rs:17']);
+            assert.deepStrictEqual(callers(10), ['src/lib.rs:15']);
+            assert.deepStrictEqual(callers(11), ['src/lib.rs:16']);
+            assert.deepStrictEqual(callers(12), ['src/lib.rs:19', 'src/lib.rs:23']);
+            assert.deepStrictEqual([...new Set(at(index.context('plain', { file: 'src/m.rs', line: 2 }).callers))], ['src/lib.rs:17']);
+            // `Self(2)` / `Self::Tup(1)` construct the impl's own type.
+            assert.deepStrictEqual(at(index.context('helper', { file: 'src/lib.rs', line: 9 }).callers), ['src/lib.rs:9']);
+            assert.deepStrictEqual(at(index.context('helper', { file: 'src/lib.rs', line: 11 }).callers), ['src/lib.rs:11']);
+            // The callee side types the same receivers.
+            const callees = index.context('use_it', { file: 'src/lib.rs' });
+            assert.deepStrictEqual(callees.unverifiedCallees || [], []);
+            assert.strictEqual(callees.callees.filter(c => c.name === 'plain').length, 6);
+        } finally { rm(dir); }
+    });
+
+    it('a block-local struct and its impl are not the module-level namesake (callers, callees, plans)', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "bl"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/lib.rs': [
+                'pub struct Widget;',
+                'impl Widget {',
+                '    pub fn render(&self) -> i32 { 1 }',
+                '}',
+                '',
+                'pub fn build() -> i32 {',
+                '    struct Widget;',
+                '    impl Widget {',
+                '        fn render(&self) -> i32 { 2 }',
+                '    }',
+                '    let w = Widget;',
+                '    w.render()',
+                '}',
+                '',
+                'pub fn use_top() -> i32 {',
+                '    let w = Widget;',
+                '    w.render()',
+                '}',
+                '',
+                'pub fn typed(x: &Widget) -> i32 {',
+                '    x.render()',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const top = index.context('render', { file: 'src/lib.rs', line: 3 });
+            assert.deepStrictEqual(at(top.callers), ['src/lib.rs:17', 'src/lib.rs:21']);
+            assert.deepStrictEqual(at(top.unverifiedCallers), []);
+            const local = index.context('render', { file: 'src/lib.rs', line: 9 });
+            assert.deepStrictEqual(at(local.callers), ['src/lib.rs:12']);
+            assert.deepStrictEqual(at(local.unverifiedCallers), []);
+            const built = index.context('build', { file: 'src/lib.rs' });
+            assert.deepStrictEqual(built.callees.map(c => `${c.name}:${c.startLine}`), ['render:9']);
+            const plan = execute(index, 'plan', { name: 'Widget', file: 'src/lib.rs', line: 7, renameTo: 'Gadget' });
+            assert.ok(plan.ok, plan.error);
+            assert.deepStrictEqual(plan.result.changes.map(c => c.line).sort((a, b) => a - b), [7, 8, 11]);
+            const fn = execute(index, 'plan', { name: 'render', file: 'src/lib.rs', line: 3, renameTo: 'draw' });
+            assert.deepStrictEqual(fn.result.changes.map(c => c.line).sort((a, b) => a - b), [3, 17, 21]);
+        } finally { rm(dir); }
+    });
+
+    it('a union is indexed with its fields and renamed as a type', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "un"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/lib.rs': [
+                '#[repr(C)]',
+                'pub union Bits {',
+                '    pub i: u32,',
+                '    pub f: f32,',
+                '}',
+                'impl Bits { pub fn as_int(&self) -> u32 { unsafe { self.i } } }',
+                'pub fn make() -> u32 { let b = Bits { i: 1 }; b.as_int() }',
+                'pub fn takes(b: Bits) -> u32 { b.as_int() }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const union = (index.symbols.get('Bits') || []).find(d => d.type === 'union');
+            assert.ok(union, 'union indexed');
+            assert.deepStrictEqual((index.symbols.get('f') || []).map(d => `${d.type}:${d.className}`), ['field:Bits']);
+            assert.deepStrictEqual(at(index.context('as_int', { file: 'src/lib.rs' }).callers), ['src/lib.rs:7', 'src/lib.rs:8']);
+            const r = execute(index, 'plan', { name: 'Bits', file: 'src/lib.rs', line: 2, renameTo: 'Word' });
+            assert.ok(r.ok, r.error);
+            const { contents, reviews } = applyRenamePlan(dir, r.result);
+            assert.deepStrictEqual(reviews, []);
+            assert.strictEqual(contents['src/lib.rs'].match(/\bWord\b/g).length, 4);
+            assert.ok(!/\bBits\b/.test(contents['src/lib.rs']));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #392: Rust item references, const/static receivers, autoref probing', () => {
+    const cargo = { 'Cargo.toml': '[package]\nname = "f392"\nversion = "0.1.0"\nedition = "2021"\n' };
+    const at = entries => (entries || []).map(entry => `${entry.relativePath || entry.file}:${entry.line}`).sort();
+
+    it('fn references resolve by block scoping and module imports', () => {
+        const dir = tmp({
+            ...cargo,
+            'src/lib.rs': [
+                'fn helper(x: i32) -> i32 { x + 1 }',                              // 1
+                'pub fn use_it() -> i32 {',                                        // 2
+                '    let f = helper;',                                             // 3
+                '    let v: Vec<i32> = vec![1].into_iter().map(helper).collect();', // 4
+                '    let helper = |x: i32| x;',                                    // 5
+                '    let g = helper;',                                             // 6
+                '    f(1) + v[0] + g(1)',                                          // 7
+                '}',                                                               // 8
+                'mod tests {',                                                     // 9
+                '    use super::*;',                                               // 10
+                '    fn t() -> i32 { let h = helper; h(1) }',                      // 11
+                '}',                                                               // 12
+                'mod other {',                                                     // 13
+                '    fn t() -> i32 { let h = helper; h(1) }',                      // 14
+                '}',                                                               // 15
+            ].join('\n') + '\n',
+        });
+        try {
+            const r = execute(idx(dir), 'plan', { name: 'helper', file: 'src/lib.rs', line: 1, renameTo: 'NEW' });
+            assert.ok(r.ok, r.error);
+            const byLine = new Map(r.result.changes.map(c => [c.line, c]));
+            assert.strictEqual(byLine.get(3).newExpression, 'let f = NEW;');
+            assert.strictEqual(byLine.get(4).newExpression, 'let v: Vec<i32> = vec![1].into_iter().map(NEW).collect();');
+            assert.strictEqual(byLine.get(11).newExpression, 'fn t() -> i32 { let h = NEW; h(1) }');
+            assert.ok(!byLine.has(6), 'a let binding shadows the fn');
+            assert.ok(byLine.get(14)?.needsReview, 'a module without the parent in scope stays review');
+        } finally { rm(dir); }
+    });
+
+    it('a const or static item types its method receivers by its declared type', () => {
+        const dir = tmp({
+            ...cargo,
+            'src/lib.rs': [
+                'pub struct Flags { bits: u32 }',
+                'impl Flags { pub const fn new() -> Self { Flags { bits: 0 } } pub fn iter(&self) -> u32 { self.bits } }',
+                'pub struct Other;',
+                'impl Other { pub fn iter(&self) -> u32 { 1 } }',
+                'pub const FLAGS: Flags = Flags::new();',
+                'pub static GLOBAL: Flags = Flags { bits: 1 };',
+                'static REFS: &Flags = &FLAGS;',
+                'pub static mut MUTABLE: Flags = Flags { bits: 2 };',
+                'pub fn f() -> u32 {',
+                '    FLAGS.iter()',
+                '        + GLOBAL.iter()',
+                '        + REFS.iter()',
+                '        + unsafe { MUTABLE.iter() }',
+                '}',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const flags = index.context('iter', { file: 'src/lib.rs', line: 2 });
+            assert.deepStrictEqual(at(flags.callers), ['src/lib.rs:10', 'src/lib.rs:11', 'src/lib.rs:12']);
+            assert.deepStrictEqual(at(flags.unverifiedCallers), ['src/lib.rs:13'], 'a static mut is never typed');
+            assert.deepStrictEqual(at(index.context('iter', { file: 'src/lib.rs', line: 4 }).callers), []);
+        } finally { rm(dir); }
+    });
+
+    it('self receivers are probed by reference layer: an autoref step may select another impl', () => {
+        const dir = tmp({
+            ...cargo,
+            'src/lib.rs': [
+                'pub struct Buf { v: Vec<u8> }',
+                'impl AsRef<[u8]> for Buf { fn as_ref(&self) -> &[u8] { &self.v } }',
+                'pub trait Named { fn name(&self) -> u8; }',
+                'impl Named for Buf { fn name(&self) -> u8 { 1 } }',
+                'impl Buf {',
+                '    pub fn by_ref(&self) -> usize { self.as_ref().len() + self.name() as usize }',
+                '    pub fn by_mut(&mut self) -> usize { self.as_ref().len() + self.name() as usize }',
+                '    pub fn by_val(self) -> usize { self.as_ref().len() + self.name() as usize }',
+                '}',
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const asRef = index.context('as_ref', { file: 'src/lib.rs', line: 2 });
+            assert.deepStrictEqual(at(asRef.callers), ['src/lib.rs:6', 'src/lib.rs:8']);
+            const probed = (asRef.unverifiedCallers || []).find(c => c.line === 7);
+            assert.strictEqual(probed?.reason, 'autoref-dispatch',
+                "std's `impl AsRef<U> for &mut T` is found at the autoref step of `&mut self`");
+            // A project trait has no impl for `&mut Buf`: provable.
+            assert.deepStrictEqual(at(index.context('name', { file: 'src/lib.rs', line: 4 }).callers),
+                ['src/lib.rs:6', 'src/lib.rs:7', 'src/lib.rs:8']);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #397: a field init shorthand keeps its field key when the value is renamed', () => {
+    it('`S { gen }` becomes `S { gen: renamed }`; a local of the name stays', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "sh397"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/lib.rs': [
+                'pub struct Plugin {',                      // 1
+                '    pub gen: fn(u32) -> u32,',             // 2
+                '}',                                        // 3
+                'fn gen(x: u32) -> u32 {',                  // 4
+                '    x',                                    // 5
+                '}',                                        // 6
+                'pub fn make() -> Plugin {',                // 7
+                '    Plugin { gen }',                       // 8
+                '}',                                        // 9
+                'pub fn other() -> Plugin {',               // 10
+                '    let gen = |x: u32| x + 1;',            // 11
+                '    Plugin { gen }',                       // 12
+                '}',                                        // 13
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: 'src/lib.rs:4:gen', renameTo: 'NEW' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const byLine = new Map(r.result.changes.filter(c => c.newExpression !== undefined)
+                .map(c => [c.line, c.newExpression]));
+            assert.strictEqual(byLine.get(8), 'Plugin { gen: NEW }');
+            assert.ok(!byLine.has(12), 'the local closure keeps its shorthand');
         } finally { rm(dir); }
     });
 });

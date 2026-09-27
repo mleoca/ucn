@@ -8,6 +8,8 @@
  * this boundary. The shape is deliberately data-only and versioned.
  */
 
+const { openCallShape } = require('../languages/rust-value-flow');
+
 const IR_SCHEMA_VERSION = 1;
 const EVIDENCE_TIERS = Object.freeze(['confirmed', 'unverified', 'excluded']);
 
@@ -62,20 +64,25 @@ function normalizeSymbol(symbol, family, language, kind, owner = null) {
     const passthrough = [
         'docstring', 'returnedFunctionResult', 'isFunctionVariable', 'paramTypes',
         'isAsync', 'isGenerator', 'generics', 'ownerGenerics', 'genericBounds', 'extends', 'implements', 'indent',
-        'isNested', 'enclosingType', 'isMethod', 'memberType', 'fieldType',
-        'aliasOf', 'aliasMembers', 'aliasTypeText', 'aliasTypeParameters', 'aliasTypeDefaults', 'derefTarget', 'decorators', 'decoratorsWithArgs',
+        'isNested', 'enclosingType', 'isMethod', 'memberType', 'fieldType', 'embedded',
+        'aliasOf', 'aliasQualifier', 'aliasMembers', 'aliasTypeText', 'aliasTypeParameters', 'aliasTypeDefaults', 'derefTarget', 'decorators', 'decoratorsWithArgs',
         'annotationsWithArgs', 'attributesWithArgs', 'nameLine', 'traitImpl',
-        'traitName', 'isSignature', 'memberAssigned', 'assignedReceiver', 'bodyScopedName',
-        'registryMember', 'registryContainer', 'isConstructor',
+        'traitName', 'isSignature', 'memberAssigned', 'assignedReceiver', 'assignedObject', 'selfNamed', 'bodyScopedName',
+        'registryMember', 'registryContainer', 'registryContainerType', 'objectLiteralLine', 'isConstructor',
         'isExtensionMethod', 'extensionReceiver', 'explicitInterface',
         'namespace', 'lexicalScopeStartLine', 'lexicalScopeEndLine',
-        'returnTypeQualifier', 'macroNeverReturns', 'callbackParamTypes', 'iteratorItemType',
+        'returnTypeQualifier', 'returnTypeResolved', 'supertraits', 'ownerGenericBounds', 'ownerSelfArgs', 'implSelfRef', 'implSelfQualifier', 'blanketSelfBounds', 'selfParamKind', 'macroNeverReturns', 'callbackParamTypes', 'iteratorItemType', 'futureReturn',
         'returnedConcreteType', 'returnedConstructors', 'templateDependent',
         'returnedCallStart', 'returnedCallEnd',
-        'returnedReceiverPath',
+        'returnedReceiverPath', 'valueType',
         'isSpecialization',
         'linkage', 'functionLike', 'callableAlias', 'exportedAlias',
         'aliasOwner', 'aliasMember', 'callableTarget', 'macroParamEffects',
+        'namespaceScope', 'ppParams', 'ppVariadic', 'ppBody', 'ppConditional', 'languageBranch', 'macroScope', 'accessAfterMacro', 'ppBranch',
+        'generatedByMacro',
+        'typeArity', 'ownerTypeArity',
+        'annotationType', 'valueShape', 'friendOf', 'templateParams', 'delegateParams',
+        'typedefName',
     ];
     for (const field of passthrough) {
         if (symbol[field] !== undefined && symbol[field] !== null) {
@@ -101,8 +108,11 @@ function createFileIR({
     const normalizedSymbols = [];
     const seen = new Set();
     const append = (symbol, family, kind, owner = null) => {
+        // Members one macro invocation declares share its lines (fix #385):
+        // their own binding ids keep overloads apart.
         const key = `${owner || symbol.className || ''}\0${symbol.name}\0${kind}\0` +
-            `${symbol.startLine}\0${symbol.endLine}`;
+            `${symbol.startLine}\0${symbol.endLine}` +
+            (symbol.generatedByMacro ? `\0${symbol.bindingId || ''}` : '');
         if (seen.has(key)) return;
         seen.add(key);
         normalizedSymbols.push(normalizeSymbol(symbol, family, language, kind, owner));
@@ -223,8 +233,58 @@ function createFileIR({
         dynamicImports: imports.filter(item => item.dynamic).length,
         importAliases: parsed.imports?.aliases || null,
         moduleAssignedNames: [...(parsed.moduleAssignedNames || [])],
+        ...(parsed.asyncClosureNames?.length > 0 && {
+            asyncClosureNames: [...parsed.asyncClosureNames],
+        }),
+        // Shapes of calls whose value is not consumed where it is produced
+        // (fix #371/#372): audit-async reads a file's call records only when
+        // one of these can reach a future producer.
+        ...(require('../languages').langTraits(language)?.callValueFacts && {
+            openCalls: [...new Set(calls.filter(call => call?.name && !call.inMacro &&
+                !call.valueConsumed).map(openCallShape))].sort(),
+        }),
+        ...(parsed.typeConversions?.length > 0 && {
+            typeConversions: parsed.typeConversions.map(item => ({ ...item })),
+        }),
+        ...(parsed.reflectionSites?.length > 0 && {
+            reflectionSites: parsed.reflectionSites.map(item => ({ ...item })),
+        }),
+        ...(parsed.macroScopeMarkers?.length > 0 && {
+            macroScopeMarkers: parsed.macroScopeMarkers.map(item => ({ ...item })),
+        }),
+        ...(parsed.cppUsings?.length > 0 && {
+            cppUsings: parsed.cppUsings.map(item => ({ ...item })),
+        }),
+        ...(parsed.languageFeatures?.length > 0 && {
+            languageFeatures: [...parsed.languageFeatures],
+        }),
+        // C# conditional groups read through configuration views (fix #391).
+        ...(Array.isArray(parsed.conditionalViews) && {
+            conditionalViews: parsed.conditionalViews.map(group => [...group]),
+        }),
+        ...(parsed.packageName && { packageName: parsed.packageName }),
+        // Module-level names bound once to another name (fix #389): class
+        // aliases when the target resolves to a class.
+        ...(parsed.moduleValueAliases?.length > 0 && {
+            moduleValueAliases: parsed.moduleValueAliases.map(item => ({ ...item })),
+        }),
+        // The byte ranges the C/C++ recovery blanked (fix #387): a query
+        // rebuilds the recovered tree with one parse.
+        ...(Array.isArray(parsed.recoveryBlanks) && {
+            recoveryBlanks: parsed.recoveryBlanks.map(range => [...range]),
+        }),
+        // Names at the C/C++ parse damage (fix #396).
+        ...(Array.isArray(parsed.recoveryCandidates) && {
+            recoveryCandidates: [...parsed.recoveryCandidates],
+        }),
+        ...(Array.isArray(parsed.externalMacroNames) && {
+            externalMacroNames: [...parsed.externalMacroNames],
+        }),
         diagnostics: {
             parseRecovery: !!parsed.parseRecovery,
+            ...(parsed.parseErrorRegions?.length > 0 && {
+                parseErrorRegions: parsed.parseErrorRegions.map(region => [...region]),
+            }),
         },
         capabilities: { ...capabilities },
     };

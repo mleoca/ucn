@@ -166,7 +166,7 @@ describe('18-command CLI/MCP/interactive parity', () => {
         { command: 'repo', cliArgs: [], cliFlags: [], mcp: {} },
         { command: 'show', cliArgs: ['processData'], cliFlags: [], mcp: { name: 'processData' } },
         { command: 'find', cliArgs: ['processData'], cliFlags: [], mcp: { name: 'processData' } },
-        { command: 'usages', cliArgs: ['processData'], cliFlags: ['--include-tests'], mcp: { name: 'processData', include_tests: true } },
+        { command: 'usages', cliArgs: ['processData'], cliFlags: [], mcp: { name: 'processData' } },
         { command: 'search', cliArgs: ['processData'], cliFlags: ['--include-tests'], mcp: { term: 'processData', include_tests: true } },
         { command: 'source', cliArgs: ['processData'], cliFlags: ['--file=src/service.js'], mcp: { name: 'processData', file: 'src/service.js' } },
         { command: 'trace', cliArgs: ['processData'], cliFlags: ['--depth=1'], mcp: { name: 'processData', depth: 1 } },

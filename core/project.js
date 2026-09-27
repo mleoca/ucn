@@ -6,11 +6,13 @@
  */
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
+const { UcnError } = require('./errors');
 const {
     expandGlob, findProjectRoot, detectProjectPattern, isTestFile,
-    parseGitignore, gitTrackedPaths, DEFAULT_IGNORES, compareNames, classifyUnsupportedSourceFile,
+    parseGitignore, gitTrackedPaths, gitListing, DEFAULT_IGNORES, compareNames, classifyUnsupportedSourceFile,
 } = require('./discovery');
 const { cleanHtmlScriptTags } = require('./parser');
 const { detectLanguage, getParser, getLanguageAdapter, safeParse, langTraits, PARSE_OPTIONS } = require('../languages');
@@ -20,7 +22,10 @@ const { getTokenTypeAtPosition } = require('../languages/utils');
 const { escapeRegExp, NON_CALLABLE_TYPES, codeUnitCompare, literalNameRegex } = require('./shared');
 const stacktrace = require('./stacktrace');
 const indexCache = require('./cache');
-const deadcodeModule = require('./deadcode');
+// Loaded on first use (fix #375): most commands never reach dead-code
+// analysis, and loading it (with entry-point detection) was a fixed cost of
+// every CLI command.
+const deadcodeModule = () => require('./deadcode');
 const verifyModule = require('./verify');
 const callersModule = require('./callers');
 const tracingModule = require('./tracing');
@@ -41,6 +46,15 @@ let LANGUAGE_KEYWORDS = null;
 // memory instead of waiting for N-API finalizers.
 const PARSED_TREE_CACHE_MAX_ENTRIES = 128;
 const PARSED_TREE_CACHE_MAX_SOURCE_BYTES = 32 * 1024 * 1024;
+// Automatic build parallelism (fix #375): source bytes to (re)parse before a
+// build uses workers, and per worker. A worker's fixed cost (thread start
+// and its own JIT warm-up of the parsers) is about the CPU of parsing 300KB
+// on a warm thread (fix #388: at 128KB per worker from 256KB, start-up cost
+// more CPU than the parsing it moved off the main thread).
+const PARALLEL_MIN_WORK_BYTES = 2 * 1024 * 1024;
+const PARALLEL_BYTES_PER_WORKER = 1024 * 1024;
+// fileEntry.symbols array -> { length, byName } (see _symbolsNamedAt).
+const symbolsByNameAndLine = new WeakMap();
 
 /**
  * ProjectIndex - Manages symbol table for a project
@@ -66,9 +80,14 @@ class ProjectIndex {
         this.lastBuildWorkerCount = 1;
         this.lastBuildParallelEligible = false;
         this.lastBuildRequestedWorkers = null;
+        // Parse workers the last build kept for Rust macro expansion (0: the
+        // expansion ran in place or had nothing to expand).
+        this.lastBuildExpansionWorkers = 0;
         this.callsCache = new Map();     // filePath -> { mtime, hash, calls, content }
         this.callsCacheDirty = false;    // set by getCachedCalls when entries are added or mutated
         this.computedDispatchDirty = false; // persisted project-wide AST blind-spot inventory
+        this.macroExpansionDirty = false;  // persisted C/C++ macro-expansion records (core/macro-expansion.js)
+        this._macroExpansionPersisted = null;
         this.failedFiles = new Set();    // files that failed to index (e.g. large minified bundles)
         this.unsupportedFiles = [];      // common source files skipped by the parser registry
         this.discoveryIssues = [];       // explicit reasons the index may be partial
@@ -80,7 +99,6 @@ class ProjectIndex {
         this._opInnerSymbolRangesCache = null; // per-operation sorted class-method ranges by file
         this._opFlowTypeOriginCache = null; // per-operation annotation type identity results
         this._opCppTypeCategoryCache = null; // per-operation normalized C++ parameter categories
-        this._opCppPathReceiverTypeCache = null; // per-operation C++ qualified receiver identity
         this._opDerefPairs = null;      // per-operation Rust Deref identity pairs
         this._opAliasPairs = null;      // per-operation language type-alias identity pairs
         this._parsedTreeCache = new Map(); // cross-operation LRU: filePath -> immutable tree entry
@@ -106,6 +124,16 @@ class ProjectIndex {
         // deliberately never persisted. It is safe across commands only
         // until the next build, which resets it below.
         this._returnTypeFlowCache = new Map();
+        this._classIdentity = null;      // class-definition identity memo, reset at every build/load
+        this._macroExpansion = null;     // C/C++ macro-expansion memo (core/macro-expansion.js), reset with _classIdentity
+        this._macroSpellable = null; // fix #385: paste-spellability memo over the same symbols
+        this._rustMacroState = null;     // Rust macro_rules! expansion state (core/rust-macro-expansion.js)
+        this._cppScope = null;           // C++ qualified-name memo (core/cpp-scope.js)
+        this._contractIndex = null;      // contract-membership index memo (core/contract-membership.js)
+        this._typeDenotation = null;     // type-name denotation memo (core/type-denotation.js), reset with _classIdentity
+        this._languageFeatureMemo = null; // fix #380 protocol-type feature memo
+        this._rustScopeMemo = null; // fix #368: Rust glob/bound resolution memo, index-lifetime
+        require('./imports').resetRustResolveMemo(); // fix #372: the tree may have changed
         this.calleeIndex = null;         // name -> Set<filePath> — inverted call index (built lazily)
     }
 
@@ -146,10 +174,18 @@ class ProjectIndex {
             this._opFlowTypeOriginCache = new Map();
             this._opImportReachCache = new Map();
             this._opCppTypeCategoryCache = new Map();
-            this._opCppPathReceiverTypeCache = new Map();
+            // Literal-name ground sets (name -> groundSet): a rename plan
+            // sweeps every slot member of one name (fix #376).
+            this._opGroundSetCache = new Map();
             this._opDerefPairs = undefined;
             this._opAliasPairs = undefined;
             this._opFindCallersCaches = null; // fix #340: findCallers per-file derivations
+            // Index-derived lookups that are pure functions of the symbol
+            // table and graphs, memoized for one operation (fix #382):
+            // ancestor closures, class-file resolution, same-name definitions
+            // grouped by owner. An exact HOT ranking asks them once per
+            // candidate for every same-name definition.
+            this._opMemos = new Map();
             this._opDepth = 0;
         }
         this._opDepth++;
@@ -176,16 +212,39 @@ class ProjectIndex {
             this._opFlowTypeOriginCache = null;
             this._opImportReachCache = null;
             this._opCppTypeCategoryCache = null;
-            this._opCppPathReceiverTypeCache = null;
+            this._opGroundSetCache = null;
             this._opDerefPairs = null;
             this._opAliasPairs = null;
             this._opFindCallersCaches = null;
+            this._opMemos = null;
             // Free cached file content from callsCache entries (retained during
             // operation for _readFile caching, not needed between operations)
             for (const entry of this.callsCache.values()) {
                 if (entry.content !== undefined) entry.content = undefined;
             }
             this._opDepth = 0;
+        }
+    }
+
+    /**
+     * Run `fn` in an operation of its own, with fresh per-operation caches,
+     * and give the enclosing operation (if any) its caches back afterwards
+     * (fix #394). For work that queries the index under a temporary view of
+     * a definition: no memo of the enclosing operation sees the view.
+     */
+    _isolatedOperation(fn) {
+        const keys = Object.keys(this).filter(key => key.startsWith('_op') &&
+            !['_opMemo'].includes(key) && typeof this[key] !== 'function');
+        const saved = new Map(keys.map(key => [key, this[key]]));
+        for (const key of keys) this[key] = key === '_opDepth' ? 0 : null;
+        this._opDerefPairs = undefined;
+        this._opAliasPairs = undefined;
+        this._beginOp();
+        try {
+            return fn();
+        } finally {
+            this._endOp();
+            for (const [key, value] of saved) this[key] = value;
         }
     }
 
@@ -252,7 +311,12 @@ class ProjectIndex {
         let tree;
         try {
             const parser = getParser(language);
-            tree = parser ? safeParse(parser, content, undefined, PARSE_OPTIONS) : null;
+            // A language may read files through its own view of the source
+            // (C# conditional compilation, fix #391); queries read the same.
+            const queryTree = parser && getLanguageAdapter(language)?.queryTree;
+            tree = !parser ? null : queryTree
+                ? queryTree(content, parser, this.files.get(filePath))
+                : safeParse(parser, content, undefined, PARSE_OPTIONS);
         } catch (e) {
             tree = null;
         }
@@ -303,6 +367,7 @@ class ProjectIndex {
         // account classification can never poison the full `usages` result.
         const mode = [
             options.skipCallRecovery ? 'skip-call-recovery' : '',
+            options.lexicalScopes ? 'lexical-scopes' : '',
         ].filter(Boolean).join('+');
         const modeSuffix = mode ? `\0${mode}` : '';
         const cacheKey = `${filePath}\0${name}${modeSuffix}`;
@@ -408,6 +473,18 @@ class ProjectIndex {
         this._groundSetCacheLines = 0;
         this._nameBindingReachCache = new Map();
         this._returnTypeFlowCache = new Map();
+        this._classIdentity = null; // class-definition identity memo (core/class-identity.js)
+        this._macroExpansion = null; // macro-expansion memo (core/macro-expansion.js)
+        this._macroSpellable = null; // fix #385: paste-spellability memo over the same symbols
+        this._rustMacroState = null; // Rust macro_rules! expansion state (core/rust-macro-expansion.js)
+        this._cppScope = null; // C++ qualified-name memo (core/cpp-scope.js)
+        this._contractIndex = null; // contract-membership memo (core/contract-membership.js)
+        this._typeDenotation = null; // type-name denotation memo (core/type-denotation.js)
+        this._languageFeatureMemo = null; // fix #380 protocol-type feature memo
+        this._rustScopeMemo = null; // fix #368: Rust glob/bound resolution memo, index-lifetime
+        // Rust module resolutions and the directory listings behind them
+        // describe the tree this build reads (fix #375).
+        require('./imports').resetRustResolveMemo();
 
         // A (re)build invalidates any cache-loaded reachability set — the
         // fingerprint guard in computeReachability is content-shaped and
@@ -421,6 +498,7 @@ class ProjectIndex {
 
         // Accept pre-expanded file array (glob mode) or a pattern string
         let files;
+        let discoveredCargoManifests = null;
         const implicitProjectDiscovery = !Array.isArray(pattern) && !pattern;
         this.unsupportedFiles = [];
         this.discoveryIssues = [];
@@ -456,9 +534,20 @@ class ProjectIndex {
             };
 
             // Merge .gitignore and .ucn.json exclude into file discovery
-            const gitignorePatterns = parseGitignore(this.root);
-            globOpts.gitignorePatterns = gitignorePatterns;
-            globOpts.trackedPaths = gitTrackedPaths(this.root);
+            const listing = gitListing(this.root);
+            const gitignoreRules = parseGitignore(this.root, listing);
+            globOpts.gitignoreRules = gitignoreRules;
+            globOpts.trackedPaths = gitTrackedPaths(this.root, listing);
+            this._discoveryHash = indexCache.discoveryFingerprint(gitignoreRules, listing);
+            // Git could not list the tracked files (fix #382): .gitignore
+            // rules then apply to every path, so a tracked file matching a
+            // rule is not indexed. Disclosed, never a silent file-set change.
+            if (listing?.failure) {
+                recordDiscoveryIssue({
+                    path: this.root, kind: 'directory', reason: 'git-listing-failed',
+                    detail: `${listing.failure.detail}; tracked files that match .gitignore rules could not be identified and are not indexed`,
+                });
+            }
             const configExclude = Array.isArray(this.config.exclude)
                 ? this.config.exclude
                 : (this.config.exclude ? [String(this.config.exclude)] : []);
@@ -469,7 +558,11 @@ class ProjectIndex {
             globOpts.onDiscoveryIssue = recordDiscoveryIssue;
 
             if (implicitProjectDiscovery) {
+                discoveredCargoManifests = [];
                 globOpts.onSkippedFile = (filePath) => {
+                    if (path.basename(filePath) === 'Cargo.toml') {
+                        discoveredCargoManifests.push(path.relative(this.root, filePath));
+                    }
                     const kind = classifyUnsupportedSourceFile(filePath);
                     if (!kind) return;
                     this.unsupportedFiles.push({
@@ -528,7 +621,11 @@ class ProjectIndex {
         this._completenessCache = null;
         this._attrTypeCache = null;
         this._computedDispatchBlindspots = null;
+        this._reflectionPatternIndex = null;
         this._cppVisibleFilesCache?.clear();
+        this._textualIncludeClosureCache?.clear();
+        this._translationUnitLanguageCache?.clear();
+        if (this._compiledTranslationUnits !== undefined) this._compiledTranslationUnits = undefined;
         this._cppTargetVisibilityCache?.clear();
         this._cppMacroParamOutcomesCache?.clear();
         // Endpoints cache (server routes / client requests / bridges) becomes
@@ -555,31 +652,79 @@ class ProjectIndex {
         // native projects therefore benefit from workers well before the
         // generic 150-file crossover; measured release repos cross over at
         // roughly 25 C-family files.
-        const cFamilyFileCount = files.reduce((count, filePath) => {
+        let cFamilyFileCount = 0;
+        let rustFileCount = 0;
+        for (const filePath of files) {
             const language = detectLanguage(filePath, this.root);
-            return count + (language === 'c' || language === 'cpp' ? 1 : 0);
-        }, 0);
+            if (language === 'c' || language === 'cpp') cFamilyFileCount++;
+            else if (language === 'rust') rustFileCount++;
+        }
+        // The project's C/C++ macro definitions, so each recovery sees the
+        // decoration, statement and attribute macros other headers define
+        // (fix #396). A sequential build reads them before its first file;
+        // parse workers receive them while they parse and wait only when a
+        // recovery consults them.
+        this._macroDictionary = undefined;
+        const readMacroDictionary = () => {
+            if (this._macroDictionary === undefined && cFamilyFileCount > 0) {
+                this._macroDictionary = require('./external-macros').projectMacroDictionary(this, files);
+            }
+            return this._macroDictionary;
+        };
         // An explicit worker count is a request for a reproducible execution
         // shape (not merely an upper bound). This is useful to users tuning a
         // constrained host and lets the release gate compare like with like.
+        // Without an explicit count, the worker count follows the parse work:
+        // the source bytes of the files this build must (re)parse (fix #375).
+        // A file count alone kept 100-file Rust projects (ripgrep: 1.8MB,
+        // ~1.8s of parsing) on one thread while a 151-file project of stubs
+        // paid for two workers, and an incremental rebuild of one changed
+        // file in a large project spawned the full pool.
+        const workSizes = new Map();
+        let workBytes = 0;
+        let workFiles = 0;
+        if (!disableParallel && !explicitWorkerCount && cFamilyFileCount < 25 && files.length >= 2) {
+            for (const filePath of files) {
+                let stat;
+                try { stat = fs.statSync(filePath); } catch (_) { continue; }
+                workSizes.set(filePath, stat.size);
+                const existing = this.files.get(filePath);
+                if (existing && existing.mtime === stat.mtimeMs && existing.size === stat.size) continue;
+                workBytes += stat.size;
+                workFiles++;
+            }
+        }
+        const availableCpus = typeof os.availableParallelism === 'function'
+            ? os.availableParallelism() : os.cpus().length;
+        const byteWorkers = Math.min(workFiles >> 1, Math.max(availableCpus - 1, 1),
+            Math.ceil(workBytes / PARALLEL_BYTES_PER_WORKER));
         const parallelWorthwhile = explicitWorkerCount
             ? files.length >= 2
-            : files.length > 150 || cFamilyFileCount >= 25;
+            : cFamilyFileCount >= 25 || (workBytes >= PARALLEL_MIN_WORK_BYTES && byteWorkers >= 2);
         this.lastBuildParallelEligible = !disableParallel && parallelWorthwhile;
         if (!disableParallel && parallelWorthwhile) {
             try {
                 const { parallelBuild } = require('./parallel-build');
+                const autoCFamily = cFamilyFileCount >= 25 && !explicitWorkerCount;
                 const result = parallelBuild(this, files, {
-                    workerCount: workersSetting > 0 ? workersSetting : (envWorkers > 0 ? envWorkers : undefined),
+                    macroDictionary: cFamilyFileCount > 0
+                        ? () => require('./external-macros').serializeDictionary(readMacroDictionary()) : null,
+                    workerCount: workersSetting > 0 ? workersSetting
+                        : (envWorkers > 0 ? envWorkers : (autoCFamily ? undefined : byteWorkers)),
                     // After the recovery scorer stopped repeatedly walking
                     // every candidate tree, real-repo sweeps put the native
                     // throughput knee at 5-6 workers. Default to the lower
                     // knee (five) for RSS headroom; explicit user settings
                     // retain the ordinary eight-worker safety cap.
-                    maxWorkers: cFamilyFileCount >= 25 && !explicitWorkerCount
-                        ? 5 : 8,
-                    minFilesPerWorker: explicitWorkerCount
-                        ? 1 : (cFamilyFileCount >= 25 ? 10 : 100),
+                    maxWorkers: autoCFamily ? 5 : 8,
+                    minFilesPerWorker: autoCFamily ? 10 : 1,
+                    sizes: workSizes,
+                    // Rust macro expansion runs in parse workers kept for it
+                    // (fix #388; fix #375 started fresh threads, whose parser
+                    // code ran cold again).
+                    retainWorkers: rustFileCount > 0
+                        ? require('./rust-macro-expansion').EXPANSION_WORKERS : 0,
+                    onParsed: rustFileCount > 0 ? (pool) => { this._buildPool = pool || null; } : null,
                     quiet,
                 });
                 if (result !== false) {
@@ -595,30 +740,88 @@ class ProjectIndex {
             }
         }
 
-        if (!usedParallel) {
-            for (const file of files) {
-                try {
-                    if (this.indexFile(file)) changed++;
-                    indexed++;
-                    this.failedFiles.delete(file); // Succeeded now, remove from failed
-                } catch (e) {
-                    this.failedFiles.add(file); // Track files that fail to index
-                    if (!quiet) {
-                        console.error(`  Warning: Could not index ${file}: ${e.message}`);
+        // Parse workers kept for Rust macro expansion (fix #388); ended once
+        // the expansion no longer needs them.
+        const buildPool = this._buildPool || null;
+        this._buildPool = null;
+        try {
+            if (!usedParallel) {
+                readMacroDictionary();
+                for (const file of files) {
+                    try {
+                        if (this.indexFile(file)) changed++;
+                        indexed++;
+                        this.failedFiles.delete(file); // Succeeded now, remove from failed
+                    } catch (e) {
+                        this.failedFiles.add(file); // Track files that fail to index
+                        if (!quiet) {
+                            console.error(`  Warning: Could not index ${file}: ${e.message}`);
+                        }
                     }
                 }
             }
-        }
 
-        // Canonical order BEFORE derived indexes, so graphs / dir index /
-        // callee index inherit it. This is what makes incremental rebuilds
-        // byte-equivalent to fresh builds (see _canonicalizeOrder).
-        this._canonicalizeOrder();
+            // Project macro_rules! invocations (fix #374): what they generate
+            // (functions, impls, calls) becomes ordinary facts of the invoking
+            // file before any derived index is built. Persisted per file and
+            // revalidated against the file, the macro definitions it used and
+            // its module ancestry; a stale expanded file is re-parsed first.
+            const rustMacroExpansion = require('./rust-macro-expansion');
+            const pendingMacroFiles = rustMacroExpansion.planRustMacroExpansion(this, {
+                reindex: file => { if (this.indexFile(file, { force: true })) changed++; },
+            });
 
-        // Skip graph rebuild when incremental rebuild found no changes
-        if (changed > 0 || deletedInRebuild > 0 || !options.forceRebuild) {
-            this.buildImportGraph();
-            this.buildInheritanceGraph();
+            // Canonical order BEFORE derived indexes, so graphs / dir index /
+            // callee index inherit it. This is what makes incremental rebuilds
+            // byte-equivalent to fresh builds (see _canonicalizeOrder).
+            this._canonicalizeOrder();
+
+            // Cargo manifests (fix #372): the workspace crate registry is scanned
+            // here, once, and persisted; a query never walks the tree for it. An
+            // incremental rebuild rescans only when a manifest changed, vanished
+            // or appeared, and then the import graph is rebuilt even when no
+            // source file changed (import resolution reads the manifests).
+            const manifestsChanged = this._refreshCargoManifests(options.forceRebuild, discoveredCargoManifests);
+
+            // Macro expansion workers run while the import graph is built (fix
+            // #375); their records are applied after it.
+            const macroOptions = { workers: options.workers, pool: buildPool };
+            const macroRun = rustMacroExpansion.startRustMacroExpansion(this, pendingMacroFiles, macroOptions);
+            this.lastBuildExpansionWorkers = macroRun?.results?.workerCount || 0;
+            if (!macroRun?.results?.usesPool) buildPool?.dispose();
+            try {
+                // Skip graph rebuild when incremental rebuild found no changes
+                if (changed > 0 || deletedInRebuild > 0 || manifestsChanged || !options.forceRebuild) {
+                    this.buildImportGraph();
+                    const touched = rustMacroExpansion.applyRustMacroExpansion(this, pendingMacroFiles, macroOptions, macroRun);
+                    if (touched) this._canonicalizeTouched(touched);
+                    // Project macro definitions a C/C++ recovery used are
+                    // checked against the file's include closure, and files
+                    // whose recorded definitions changed are read again
+                    // (fix #396). Their #include lines do not change, so the
+                    // import graph stands.
+                    if (this._macroDictionary !== undefined) {
+                        const dictionary = this._macroDictionary;
+                        const recovered = require('./external-macros').verifyExternalMacros(this, dictionary, {
+                            reindex: (file, externalMacros) => {
+                                if (this.indexFile(file, { force: true, externalMacros })) changed++;
+                            },
+                        });
+                        if (recovered) this._canonicalizeTouched(recovered);
+                    }
+                    this.buildInheritanceGraph();
+                } else {
+                    const touched = rustMacroExpansion.applyRustMacroExpansion(this, pendingMacroFiles, macroOptions, macroRun);
+                    if (touched) {
+                        this._canonicalizeTouched(touched);
+                        this.buildInheritanceGraph();
+                    }
+                }
+            } finally {
+                macroRun?.results?.dispose();
+            }
+        } finally {
+            buildPool?.dispose();
         }
 
         // Build directory→files index for O(1) same-package lookups
@@ -642,27 +845,65 @@ class ProjectIndex {
     }
 
     /**
+     * Keep `this.cargoManifests` (persisted Cargo manifest snapshot) current.
+     * Rust projects only. Returns true when the snapshot changed on an
+     * incremental rebuild.
+     * @param {boolean} incremental
+     * @param {string[]|null} discovered - Cargo.toml paths discovery saw
+     */
+    _refreshCargoManifests(incremental, discovered) {
+        const {
+            snapshotWorkspaceManifests, workspaceManifestsCurrent, resetCargoCaches,
+            manifestSetFingerprint,
+        } = require('./imports');
+        let hasRust = false;
+        for (const entry of this.files.values()) {
+            if (entry.language === 'rust') { hasRust = true; break; }
+        }
+        const previous = this.cargoManifests || null;
+        if (!hasRust) {
+            this.cargoManifests = null;
+            this.cargoManifestsSeen = null;
+            if (previous) resetCargoCaches(this.root);
+            return incremental && !!previous;
+        }
+        if (incremental && workspaceManifestsCurrent(this.root, previous, discovered,
+            this.cargoManifestsSeen)) {
+            return false;
+        }
+        this.cargoManifests = snapshotWorkspaceManifests(this.root);
+        this.cargoManifestsSeen = discovered ? manifestSetFingerprint(discovered) : null;
+        return incremental && JSON.stringify(previous) !== JSON.stringify(this.cargoManifests);
+    }
+
+    /**
      * Build a minimal index for a single file (no glob, no cache, no import graph).
      * Used by CLI file mode to route through execute().
      */
     buildSingleFile(filePath) {
         const absPath = path.resolve(filePath);
         if (!fs.existsSync(absPath)) {
-            throw new Error(`File not found: ${filePath}`);
+            throw new UcnError(`File not found: ${filePath}`);
         }
         this.indexFile(absPath);
+        const rustMacroExpansion = require('./rust-macro-expansion');
+        rustMacroExpansion.applyRustMacroExpansion(this,
+            rustMacroExpansion.planRustMacroExpansion(this, { files: [absPath] }));
         this.buildTime = 0;
     }
 
     /**
      * Index a single file
      */
-    indexFile(filePath) {
+    indexFile(filePath, options = {}) {
         const stat = fs.statSync(filePath);
         const existing = this.files.get(filePath);
+        // `force` re-derives an unchanged file's parser facts (fix #374: a
+        // macro-expanded file whose macro definitions changed).
+        const force = options.force === true;
 
         // Fast path: skip read entirely when mtime+size both match
-        if (existing && existing.mtime === stat.mtimeMs && existing.size === stat.size) {
+        if (!force && existing && existing.mtime === stat.mtimeMs && existing.size === stat.size) {
             return false;
         }
 
@@ -670,7 +911,7 @@ class ProjectIndex {
         const hash = crypto.createHash('md5').update(content).digest('hex');
 
         // Content-based skip: mtime changed but content didn't (touch, git checkout)
-        if (existing && existing.hash === hash) {
+        if (!force && existing && existing.hash === hash) {
             existing.mtime = stat.mtimeMs;
             existing.size = stat.size;
             return false;
@@ -680,6 +921,9 @@ class ProjectIndex {
         // A changed file can alter either even before a full rebuild reaches
         // its graph phase, so no prior call-identity verdict may survive.
         this._cppVisibleFilesCache?.clear();
+        this._textualIncludeClosureCache?.clear();
+        this._translationUnitLanguageCache?.clear();
+        if (this._compiledTranslationUnits !== undefined) this._compiledTranslationUnits = undefined;
         this._cppTargetVisibilityCache?.clear();
         this._cppMacroParamOutcomesCache?.clear();
 
@@ -692,7 +936,12 @@ class ProjectIndex {
 
         const adapter = getLanguageAdapter(language);
         const parser = getParser(language);
-        const ir = adapter.analyze(content, parser, filePath);
+        // C/C++: the project macro dictionary of the current build (fix
+        // #396), unless the caller supplies the view.
+        const externalMacros = options.externalMacros !== undefined ? options.externalMacros
+            : this._macroDictionary ? require('./external-macros').contextFor(this._macroDictionary, language) : null;
+        const ir = adapter.analyze(content, parser, filePath,
+            externalMacros ? { externalMacros } : undefined);
         const irFailures = validateFileIR(ir);
         if (irFailures.length > 0) {
             throw new Error(`Invalid ${language} IR: ${irFailures.join('; ')}`);
@@ -787,7 +1036,9 @@ class ProjectIndex {
         // Incrementally update callee index before deleting cached calls
         const oldCached = this.callsCache.get(filePath);
         if (oldCached) {
-            this._removeFromCalleeIndex(filePath, oldCached.calls);
+            const { withMacroExpansion } = require('./macro-expansion');
+            this._removeFromCalleeIndex(filePath, withMacroExpansion(this, filePath, oldCached.calls,
+                { materialize: false }));
         }
         this.callsCache.delete(filePath);
 
@@ -798,8 +1049,57 @@ class ProjectIndex {
         this._javaFileIndex = null;
         // Computed-dispatch diagnostics are project-wide and read source text.
         this._computedDispatchBlindspots = null;
+        this._reflectionPatternIndex = null;
         // Endpoints cache is project-wide; safest to clear on any file removal.
         this._endpointsCache = null;
+    }
+
+    /**
+     * _canonicalizeOrder() after a change confined to `files` (their symbols
+     * and bindings) and the symbol `names` involved (fix #375: Rust macro
+     * expansion replaces a few files' declarations). Everything else is
+     * already canonical, so the result equals a full pass.
+     */
+    _canonicalizeTouched({ files, names }) {
+        this._classIdentity = null;
+        this._macroExpansion = null;
+        this._macroSpellable = null; // fix #385: paste-spellability memo over the same symbols
+        this._rustMacroState = null;
+        this._cppScope = null;
+        this._contractIndex = null;
+        this._typeDenotation = null; // type-name denotation memo (core/type-denotation.js)
+        this._languageFeatureMemo = null; // fix #380 protocol-type feature memo
+        this._rustScopeMemo = null;
+        const feCmp = (a, b) => (a.startLine - b.startLine)
+            || codeUnitCompare(String(a.type), String(b.type))
+            || codeUnitCompare(String(a.className || ''), String(b.className || ''))
+            || codeUnitCompare(String(a.name), String(b.name));
+        for (const file of files) {
+            const fe = this.files.get(file);
+            if (Array.isArray(fe?.symbols)) fe.symbols.sort(feCmp);
+            if (Array.isArray(fe?.bindings)) fe.bindings.sort(feCmp);
+        }
+        const defCmp = (a, b) => compareNames(a.relativePath || '', b.relativePath || '')
+            || (a.startLine - b.startLine)
+            || codeUnitCompare(String(a.type), String(b.type))
+            || codeUnitCompare(String(a.className || ''), String(b.className || ''))
+            || ((a.endLine || 0) - (b.endLine || 0));
+        const present = [...names].filter(name => this.symbols.has(name)).sort();
+        for (const name of present) this.symbols.get(name).sort(defCmp);
+        // Untouched names are still in canonical order; merge the touched ones in.
+        const merged = new Map();
+        let t = 0;
+        for (const [name, defs] of this.symbols) {
+            if (names.has(name)) continue;
+            while (t < present.length && present[t] < name) {
+                merged.set(present[t], this.symbols.get(present[t]));
+                t++;
+            }
+            merged.set(name, defs);
+        }
+        for (; t < present.length; t++) merged.set(present[t], this.symbols.get(present[t]));
+        this.symbols = merged;
+        if (this.calleeIndex) this._canonicalizeOrder();
     }
 
     /**
@@ -822,6 +1122,16 @@ class ProjectIndex {
      * by name with file sets in path order.
      */
     _canonicalizeOrder() {
+        // Symbol arrays are rebuilt below; identity memos keyed on them are stale.
+        this._classIdentity = null;
+        this._macroExpansion = null;
+        this._macroSpellable = null; // fix #385: paste-spellability memo over the same symbols
+        this._rustMacroState = null;
+        this._cppScope = null;
+        this._contractIndex = null;
+        this._typeDenotation = null; // type-name denotation memo (core/type-denotation.js)
+        this._languageFeatureMemo = null; // fix #380 protocol-type feature memo
+        this._rustScopeMemo = null; // fix #368: Rust glob/bound resolution memo, index-lifetime
         // Plain code-unit comparison — canonical order must not depend on the
         // host ICU locale (localeCompare does).
         const cmpStr = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
@@ -943,13 +1253,15 @@ class ProjectIndex {
     buildCalleeIndex() {
         const { getCachedCalls } = require('./callers');
         const { ensureCallsCacheLoaded } = require('./cache');
+        const { withMacroExpansion } = require('./macro-expansion');
         ensureCallsCacheLoaded(this);
         this.calleeIndex = new Map();
 
         for (const [filePath] of this.files) {
             // Fast path: use pre-populated callsCache (avoids stat per file)
             const cached = this.callsCache.get(filePath);
-            const calls = cached ? cached.calls : getCachedCalls(this, filePath);
+            const calls = cached ? withMacroExpansion(this, filePath, cached.calls, { materialize: false })
+                : getCachedCalls(this, filePath);
             this._addToCalleeIndex(filePath, calls);
         }
     }
@@ -1018,6 +1330,13 @@ class ProjectIndex {
             // Prefer same-file match
             const match = entries.find(e => e.file === contextFile);
             if (match) return match.parents;
+            // A file that declares the class itself without a base clause
+            // names no parents (fix #390): a same-name class elsewhere
+            // (another package's `ListTest extends TestCase`) is a different
+            // class. Only partial types gather bases from other files, and a
+            // C/C++ declaration may be a forward declaration of a class
+            // defined in another file.
+            if (contextFile && require('./class-identity').fileDeclaresClass(this, className, contextFile)) return null;
 
             // Try imported file
             if (contextFile) {
@@ -1066,6 +1385,34 @@ class ProjectIndex {
      * @returns {string|null} Resolved file path
      */
     _resolveClassFile(className, contextFile) {
+        const memo = this._opMemo('resolveClassFile');
+        if (!memo) return this._resolveClassFileUncached(className, contextFile);
+        const key = `${className}\0${contextFile}`;
+        let file = memo.get(key);
+        if (file === undefined) {
+            file = this._resolveClassFileUncached(className, contextFile);
+            memo.set(key, file);
+        }
+        return file;
+    }
+
+    /**
+     * A memo for the current operation (fix #382), or null outside one. Only
+     * for values that are pure functions of the index, which an operation
+     * never changes.
+     */
+    _opMemo(key, make) {
+        const memos = this._opMemos;
+        if (!memos) return null;
+        let memo = memos.get(key);
+        if (!memo) {
+            memo = make ? make() : new Map();
+            memos.set(key, memo);
+        }
+        return memo;
+    }
+
+    _resolveClassFileUncached(className, contextFile) {
         const symbols = this.symbols.get(className);
         if (!symbols) return contextFile;
         const classSymbols = symbols.filter(s =>
@@ -1703,12 +2050,24 @@ class ProjectIndex {
             return symbol.file === definition.file;
         };
 
+        // A member declared in another same-name type's body (a
+        // function-local class beside its module-level namesake, C#
+        // `Outcome` beside `Outcome<T>`) is not this type's (fix #389).
+        const { ownerDefinitionOf, classKeyOf } = require('./class-identity');
+        const typeKey = definition && definition.name === baseTypeName ? classKeyOf(this, definition) : null;
+        const ownedHere = symbol => {
+            if (!typeKey) return true;
+            const owner = ownerDefinitionOf(this, symbol);
+            return !owner || classKeyOf(this, owner) === typeKey;
+        };
+
         for (const [, symbols] of this.symbols) {
             for (const symbol of symbols) {
                 // Skip non-method types (fields, properties, etc.)
                 if (symbol.type === 'field' || symbol.type === 'property') {
                     continue;
                 }
+                if (!ownedHere(symbol)) continue;
 
                 // Check Go/Rust-style receiver (e.g., func (r *Router) Method())
                 // Also matches Rust associated functions (have receiver but isMethod=false)
@@ -1992,7 +2351,11 @@ class ProjectIndex {
                 return false;
             }
 
-            const tree = safeParse(parser, content);
+            // The operation's shared tree when one is active (fix #365): a
+            // rename plan parses the same large files for its own edits.
+            const tree = (this.files.has(filePath) &&
+                this._getParsedTree(filePath, content, language)) ||
+                safeParse(parser, content);
             if (!tree) return false;
             const tokenType = getTokenTypeAtPosition(tree.rootNode, lineNum, column);
             return tokenType === 'comment' || tokenType === 'string';
@@ -2213,15 +2576,51 @@ class ProjectIndex {
     }
 
     /**
+     * A file's symbols with this name declared on this line, in file order
+     * (fix #375: generated calls look up their parser-given enclosing
+     * function; a file with hundreds of generated functions made that a scan
+     * per call).
+     */
+    _symbolsNamedAt(fileEntry, name, startLine) {
+        // Keyed by the symbols array itself (replaced whenever a file's
+        // symbols are rebuilt) and its length.
+        const symbols = fileEntry.symbols;
+        let memo = symbolsByNameAndLine.get(symbols);
+        if (!memo || memo.length !== symbols.length) {
+            const byName = new Map();
+            for (const symbol of symbols) {
+                const at = `${symbol.name}\0${symbol.startLine}`;
+                const list = byName.get(at);
+                if (list) list.push(symbol);
+                else byName.set(at, [symbol]);
+            }
+            memo = { length: symbols.length, byName };
+            symbolsByNameAndLine.set(symbols, memo);
+        }
+        return memo.byName.get(`${name}\0${startLine}`) || [];
+    }
+
+    /**
      * Find the enclosing function at a line
      * @param {string} filePath - File path
      * @param {number} lineNum - Line number
      * @param {boolean} returnSymbol - If true, return full symbol info instead of just name
      * @returns {string|object|null} Function name, symbol object, or null
      */
-    findEnclosingFunction(filePath, lineNum, returnSymbol = false) {
+    findEnclosingFunction(filePath, lineNum, returnSymbol = false, call = null) {
         const fileEntry = this.files.get(filePath);
         if (!fileEntry) return null;
+
+        // A call generated by a macro expansion (fix #374) shares its line
+        // with every function that expansion generated there; the parser's
+        // own enclosing function picks among them.
+        const hint = call?.macroExpansion && call.enclosingFunction;
+        if (hint?.name) {
+            const exact = this._symbolsNamedAt(fileEntry, hint.name, hint.startLine)
+                .find(symbol => !NON_CALLABLE_TYPES.has(symbol.type) &&
+                    symbol.startLine <= lineNum && symbol.endLine >= lineNum);
+            if (exact) return returnSymbol ? exact : exact.name;
+        }
 
         // Per-operation cache: avoid rescanning symbols for same (file, line)
         const cacheKey = filePath + '\0' + lineNum;
@@ -2404,10 +2803,10 @@ class ProjectIndex {
 
 
     /** Build a usage index for all identifiers in the codebase (optimized for deadcode) */
-    buildUsageIndex() { return deadcodeModule.buildUsageIndex(this); }
+    buildUsageIndex() { return deadcodeModule().buildUsageIndex(this); }
 
     /** Find dead code (unused functions/classes) */
-    deadcode(options) { return deadcodeModule.deadcode(this, options); }
+    deadcode(options) { return deadcodeModule().deadcode(this, options); }
 
     /**
      * Get dependency graph for a file

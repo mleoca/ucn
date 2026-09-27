@@ -78,6 +78,14 @@ function resolveImport(importPath, fromFile, config = {}) {
     // Strip query strings (e.g., ?raw, ?url)
     importPath = importPath.split('?')[0];
 
+    // C/C++ angle-bracket includes search the -I directories (never the
+    // including file's directory); a project header found there is part of
+    // the translation unit exactly like a quoted include.
+    if ((config.language === 'c' || config.language === 'cpp') &&
+        !importPath.startsWith('.') && !importPath.startsWith('/')) {
+        return resolveCIncludeFromDirectories(importPath, fromFile, config);
+    }
+
     // External packages (not relative or alias)
     if (!importPath.startsWith('.') && !importPath.startsWith('/')) {
         // Check aliases
@@ -124,6 +132,9 @@ function resolveImport(importPath, fromFile, config = {}) {
             // Package self-reference (import own package by name)
             const selfResolved = resolveSelfReference(importPath, fromDir, config);
             if (selfResolved) return selfResolved;
+            // Another package of the same repository (fix #397).
+            const workspaceResolved = resolveWorkspacePackage(importPath, config);
+            if (workspaceResolved) return workspaceResolved;
         }
 
         // Check Go module imports
@@ -154,6 +165,15 @@ function resolveImport(importPath, fromFile, config = {}) {
             const srcPath = path.join(config.root, 'src', modulePath);
             const srcResolved = resolveFilePath(srcPath, getExtensions('python'));
             if (srcResolved) return srcResolved;
+            // Nested source root (fix #366): an application under a
+            // subdirectory (`backend/app/...`) runs with that subdirectory on
+            // sys.path, so `from app.core import x` means backend/app/core.
+            // The nearest ancestor of the importing file that is NOT itself a
+            // package and directly contains the module's first segment is
+            // the source root the interpreter would use. Package directories
+            // are skipped so a sibling module never answers an absolute import.
+            const nested = _resolvePythonNestedRoot(importPath, fromDir, config);
+            if (nested) return nested;
         }
 
         return null;  // External package
@@ -186,32 +206,51 @@ function resolveImport(importPath, fromFile, config = {}) {
     if (direct) return direct;
 
     // C/C++ quoted includes may be rooted at compiler -I/-iquote paths rather
-    // than the importing file. compile_commands.json is the authoritative
-    // build metadata when present; unresolved system includes remain external.
+    // than the importing file.
     if (config.language === 'c' || config.language === 'cpp') {
-        const { includeDirectoriesForFile } = require('./compilation-database');
-        const includeName = normalizedPath.replace(/^\.\//, '');
-        const includeDirs = includeDirectoriesForFile(fromFile, config.root);
-        for (const configured of config.includePaths || []) {
-            if (typeof configured !== 'string' || !configured.trim()) continue;
-            includeDirs.push(path.isAbsolute(configured)
-                ? configured
-                : path.resolve(config.root || fromDir, configured));
-        }
-        // Header-only/source-distribution projects commonly omit a generated
-        // compile_commands.json but still use the conventional public
-        // `include/` root (`#include "fmt/format.h"`). These are project-owned
-        // files, not external packages. Try explicit compiler metadata first,
-        // then deterministic project roots; never search arbitrary parents.
-        if (config.root) {
-            includeDirs.push(config.root, path.join(config.root, 'include'));
-        }
-        for (const includeDir of [...new Set(includeDirs)]) {
-            const candidate = resolveFilePath(path.resolve(includeDir, includeName), extensions);
-            if (candidate) return candidate;
-        }
+        return resolveCIncludeFromDirectories(normalizedPath.replace(/^\.\//, ''), fromFile, config);
     }
     return null;
+}
+
+/**
+ * Search the compiler include directories for a C/C++ include name.
+ * compile_commands.json is the authoritative build metadata when present;
+ * configured include paths follow, then the deterministic project roots.
+ * Unresolved system includes remain external.
+ */
+function resolveCIncludeFromDirectories(includeName, fromFile, config) {
+    const { includeDirectoriesForFile } = require('./compilation-database');
+    const extensions = config.extensions || getExtensions(config.language);
+    const includeDirs = includeDirectoriesForFile(fromFile, config.root);
+    for (const configured of config.includePaths || []) {
+        if (typeof configured !== 'string' || !configured.trim()) continue;
+        includeDirs.push(path.isAbsolute(configured)
+            ? configured
+            : path.resolve(config.root || path.dirname(fromFile), configured));
+    }
+    // Header-only/source-distribution projects commonly omit a generated
+    // compile_commands.json but still use the conventional public
+    // `include/` root (`#include "fmt/format.h"`). These are project-owned
+    // files, not external packages. Try explicit compiler metadata first,
+    // then deterministic project roots; never search arbitrary parents.
+    if (config.root) {
+        includeDirs.push(config.root, path.join(config.root, 'include'));
+    }
+    // One import-graph build probes the same few directories for the same
+    // system headers from every file (`<stdio.h>`); the filesystem does not
+    // change within it, so a caller-owned memo answers repeats (fix #365).
+    const dirs = [...new Set(includeDirs)];
+    const memo = config.probeCache;
+    const memoKey = memo ? `${includeName}\0${extensions.join(',')}\0${dirs.join('\0')}` : null;
+    if (memo && memo.has(memoKey)) return memo.get(memoKey);
+    let found = null;
+    for (const includeDir of dirs) {
+        const candidate = resolveFilePath(path.resolve(includeDir, includeName), extensions);
+        if (candidate) { found = candidate; break; }
+    }
+    if (memo) memo.set(memoKey, found);
+    return found;
 }
 
 // Cache for Go module paths
@@ -331,19 +370,25 @@ const cargoCache = new Map();
 // Workspace crate registry (fix #258): Cargo [package] name → crate source
 // root for EVERY crate in the project tree, so cross-crate workspace imports
 // (`use clap::Command` from clap_bench/) resolve like own-package imports.
-// One bounded scan per project root, cached.
+// One bounded scan per project root. The scan runs at build time and its
+// manifests are persisted in the index cache (fix #372): a cache-loaded index
+// seeds the registry instead of walking the tree on the first query.
 const workspaceCrateCache = new Map();
 const _WORKSPACE_SCAN_PRUNE = new Set([
     'node_modules', '.git', 'target', 'vendor', 'dist', 'build', '.ucn-cache',
 ]);
+const _WORKSPACE_SCAN_MAX_DEPTH = 6;
 
-function workspaceCrateRegistry(projectRoot) {
-    if (workspaceCrateCache.has(projectRoot)) {
-        return workspaceCrateCache.get(projectRoot);
-    }
-    const registry = new Map();
+/**
+ * Directories holding a Cargo.toml, in the registry scan's order (depth-first,
+ * directory-entry order). Bounded by depth and the prune set.
+ * @param {string} projectRoot
+ * @returns {string[]} absolute directories
+ */
+function scanWorkspaceManifestDirs(projectRoot) {
+    const dirs = [];
     const walk = (dir, depth) => {
-        if (depth > 6) return;
+        if (depth > _WORKSPACE_SCAN_MAX_DEPTH) return;
         let entries;
         try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
         catch { return; }
@@ -352,16 +397,123 @@ function workspaceCrateRegistry(projectRoot) {
                 if (_WORKSPACE_SCAN_PRUNE.has(e.name) || e.name.startsWith('.')) continue;
                 walk(path.join(dir, e.name), depth + 1);
             } else if (e.name === 'Cargo.toml') {
-                const info = findCargoRoot(dir);
-                if (info && info.packageName && !registry.has(info.packageName)) {
-                    registry.set(info.packageName, info);
-                }
+                dirs.push(dir);
             }
         }
     };
     walk(projectRoot, 0);
+    return dirs;
+}
+
+/**
+ * Order-free fingerprint of the Cargo.toml paths file discovery reports, so
+ * a staleness check (which walks the tree for new files anyway) sees a
+ * manifest appear or disappear without a second walk.
+ * @param {string[]} relativeManifestPaths
+ */
+function manifestSetFingerprint(relativeManifestPaths) {
+    const sorted = [...relativeManifestPaths].sort((x, y) => (x < y ? -1 : x > y ? 1 : 0));
+    return require('crypto').createHash('md5').update(sorted.join('\0')).digest('hex');
+}
+
+function _registryFromManifestDirs(dirs) {
+    const registry = new Map();
+    for (const dir of dirs) {
+        const info = findCargoRoot(dir);
+        if (info && info.packageName && !registry.has(info.packageName)) {
+            registry.set(info.packageName, info);
+        }
+    }
+    return registry;
+}
+
+function workspaceCrateRegistry(projectRoot) {
+    if (workspaceCrateCache.has(projectRoot)) {
+        return workspaceCrateCache.get(projectRoot);
+    }
+    const registry = _registryFromManifestDirs(scanWorkspaceManifestDirs(projectRoot));
     workspaceCrateCache.set(projectRoot, registry);
     return registry;
+}
+
+/**
+ * Snapshot of the project's Cargo manifests for the index cache: every
+ * manifest the registry scan reaches, with its stat identity and the parsed
+ * crate facts findCargoRoot derives from it. Also (re)seeds the in-process
+ * caches from a fresh read.
+ * @param {string} projectRoot
+ * @returns {Array<{dir, mtime, size, packageName, srcDir, targetDirs}>} project-relative
+ */
+function snapshotWorkspaceManifests(projectRoot) {
+    resetCargoCaches(projectRoot);
+    const dirs = scanWorkspaceManifestDirs(projectRoot);
+    const rel = p => path.relative(projectRoot, p);
+    const out = [];
+    for (const dir of dirs) {
+        let stat;
+        try { stat = fs.statSync(path.join(dir, 'Cargo.toml')); } catch { continue; }
+        const info = findCargoRoot(dir);
+        if (!info || info.root !== dir) continue;
+        out.push({
+            dir: rel(dir), mtime: stat.mtimeMs, size: stat.size,
+            packageName: info.packageName,
+            srcDir: rel(info.srcDir),
+            targetDirs: info.targetDirs.map(rel),
+        });
+    }
+    workspaceCrateCache.set(projectRoot, _registryFromManifestDirs(dirs));
+    return out;
+}
+
+/**
+ * Seed the in-process manifest caches from a persisted snapshot, so a
+ * cache-loaded index resolves workspace crates without reading the tree.
+ */
+function seedWorkspaceManifests(projectRoot, manifests) {
+    if (!Array.isArray(manifests)) return;
+    const dirs = [];
+    for (const m of manifests) {
+        const dir = path.join(projectRoot, m.dir);
+        dirs.push(dir);
+        cargoCache.set(dir, {
+            root: dir,
+            srcDir: path.join(projectRoot, m.srcDir),
+            packageName: m.packageName,
+            targetDirs: m.targetDirs.map(t => path.join(projectRoot, t)),
+        });
+    }
+    workspaceCrateCache.set(projectRoot, _registryFromManifestDirs(dirs));
+}
+
+/**
+ * Whether a persisted manifest snapshot still describes the tree: every
+ * manifest keeps its size and mtime, and (when discovery results are given)
+ * discovery reports the same set of Cargo.toml paths as when it was taken.
+ * @param {string} projectRoot
+ * @param {Array} manifests - persisted snapshot
+ * @param {string[]|null} [discovered] - project-relative Cargo.toml paths discovery saw now
+ * @param {string|null} [seenFingerprint] - manifestSetFingerprint at snapshot time
+ */
+function workspaceManifestsCurrent(projectRoot, manifests, discovered = null, seenFingerprint = null) {
+    if (!Array.isArray(manifests)) return false;
+    for (const m of manifests) {
+        let stat;
+        try { stat = fs.statSync(path.join(projectRoot, m.dir, 'Cargo.toml')); } catch { return false; }
+        if (stat.size !== m.size || stat.mtimeMs !== m.mtime) return false;
+    }
+    if (discovered && seenFingerprint &&
+        manifestSetFingerprint(discovered) !== seenFingerprint) return false;
+    return true;
+}
+
+/** Drop in-process manifest facts below a project root (a manifest changed). */
+function resetCargoCaches(projectRoot) {
+    workspaceCrateCache.delete(projectRoot);
+    rustImportMemo.clear();
+    const prefix = projectRoot.endsWith(path.sep) ? projectRoot : projectRoot + path.sep;
+    for (const key of [...cargoCache.keys()]) {
+        if (key === projectRoot || key.startsWith(prefix)) cargoCache.delete(key);
+    }
 }
 
 /**
@@ -451,13 +603,30 @@ function rustPathHasExactCase(base, file) {
     // Check directory entries, rather than realpath, so legitimate symlinked
     // modules keep their declared spelling and remain resolvable.
     let current = base;
-    try {
-        for (const part of path.relative(base, file).split(path.sep)) {
-            if (!fs.readdirSync(current).includes(part)) return false;
-            current = path.join(current, part);
+    for (const part of path.relative(base, file).split(path.sep)) {
+        const entries = rustDirEntries(current);
+        if (!entries || !entries.has(part)) return false;
+        current = path.join(current, part);
+    }
+    return true;
+}
+
+// Directory listings the case check reads, memoized with the resolution memo
+// below (fix #375: every module probe re-read its directories; ~40% of a
+// large workspace's import graph build).
+const rustDirEntriesMemo = new Map();
+
+function rustDirEntries(dir) {
+    let entries = rustDirEntriesMemo.get(dir);
+    if (entries === undefined) {
+        try {
+            entries = new Set(fs.readdirSync(dir));
+        } catch {
+            entries = null;
         }
-        return true;
-    } catch { return false; }
+        rustDirEntriesMemo.set(dir, entries);
+    }
+    return entries;
 }
 
 function resolveRustModulePath(dir, segments) {
@@ -486,7 +655,27 @@ function resolveRustModulePath(dir, segments) {
  * @param {string} projectRoot - Project root directory
  * @returns {string|null}
  */
+// Resolution memo (fix #372): a query resolves the same use paths from the
+// same files many times (receiver typing, module producers, glob walks), each
+// probing the filesystem. Answers depend only on the tree, so they are
+// memoized until the next build (resetRustResolveMemo).
+const rustImportMemo = new Map();
+
 function resolveRustImport(importPath, fromFile, projectRoot) {
+    const key = `${projectRoot}\0${fromFile}\0${importPath}`;
+    if (rustImportMemo.has(key)) return rustImportMemo.get(key);
+    const resolved = resolveRustImportUncached(importPath, fromFile, projectRoot);
+    rustImportMemo.set(key, resolved);
+    return resolved;
+}
+
+/** Forget memoized Rust import resolutions (the tree may have changed). */
+function resetRustResolveMemo() {
+    rustImportMemo.clear();
+    rustDirEntriesMemo.clear();
+}
+
+function resolveRustImportUncached(importPath, fromFile, projectRoot) {
     const fromDir = path.dirname(fromFile);
 
     // crate:: paths - resolve from the crate's src/ directory, or from a
@@ -627,6 +816,55 @@ function resolveRustImport(importPath, fromFile, projectRoot) {
 }
 
 /**
+ * The file that holds a Rust module's own items (fix #368): `self` is the
+ * current file, `super` (repeatable) the parent module's file, `crate` the
+ * crate root, and any other path the module file resolveRustImport finds.
+ * Used to anchor glob imports (`use super::*`) and module-qualified calls
+ * (`crate::f()`), whose items live IN the module file, not in a child file.
+ * @returns {string|null}
+ */
+function resolveRustModuleFile(modulePath, fromFile, projectRoot, inlineDepth = 0) {
+    let spec = String(modulePath || '');
+    if (!spec) return null;
+    if (spec === 'self') return fromFile;
+    // Inside `mod tests { use super::*; }` the first `super` hops out of the
+    // inline module, which still lives in this file.
+    let depth = inlineDepth;
+    while (depth > 0 && (spec === 'super' || spec.startsWith('super::'))) {
+        spec = spec === 'super' ? 'self' : spec.slice('super::'.length);
+        depth--;
+    }
+    if (spec === 'self') return fromFile;
+    if (depth > 0) return null; // crate/self paths from inside an inline module
+    if (spec.startsWith('self::')) return resolveRustImport(spec, fromFile, projectRoot);
+    const fromDir = path.dirname(fromFile);
+    if (spec === 'crate') {
+        const cargo = findCargoRoot(fromDir);
+        if (!cargo) return null;
+        const candidates = [cargo.srcDir, ...(cargo.targetDirs || [])]
+            .filter(d => fromDir === d || fromDir.startsWith(d + path.sep))
+            .sort((a, b) => b.length - a.length);
+        if (candidates.length === 0) candidates.push(cargo.srcDir);
+        for (const cand of candidates) {
+            for (const root of ['lib.rs', 'main.rs']) {
+                const file = path.join(cand, root);
+                if (fs.existsSync(file) && fs.statSync(file).isFile()) return file;
+            }
+        }
+        return null;
+    }
+    if (/^super(::super)*$/.test(spec)) {
+        const superCount = spec.split('::').length;
+        const basename = path.basename(fromFile);
+        const isMod = basename === 'mod.rs' || basename === 'lib.rs' || basename === 'main.rs';
+        let dir = fromDir;
+        for (let i = 0; i < (isMod ? superCount : superCount - 1); i++) dir = path.dirname(dir);
+        return rustModuleOwnFile(dir, fromFile);
+    }
+    return resolveRustImport(spec, fromFile, projectRoot);
+}
+
+/**
  * Try to resolve a path with various extensions
  */
 // package.json lookup cache for self-reference resolution (dir -> info|null).
@@ -652,6 +890,8 @@ function _findPackageJson(fromDir, stopDir) {
                         exports: pkg.exports,
                         main: pkg.main,
                         source: pkg.source,
+                        module: pkg.module,
+                        types: pkg.types,
                     };
                 }
             } catch { /* unreadable or invalid JSON */ }
@@ -694,6 +934,63 @@ function resolveSelfReference(importPath, fromDir, config) {
     const pkg = _findPackageJson(fromDir, config.root ? path.dirname(config.root) : null);
     if (!pkg || !pkg.name) return null;
     if (importPath !== pkg.name && !importPath.startsWith(pkg.name + '/')) return null;
+    return _resolvePackageSpecifier(pkg, importPath, config);
+}
+
+/**
+ * In-repository workspace packages (fix #397, TanStack-query-measured: a
+ * subclass in packages/solid-query extending `QueryClient` imported from
+ * '@tanstack/query-core' left every inherited call unresolved): a bare
+ * specifier naming a package whose package.json sits inside the project
+ * resolves to that package's source, the way the workspace links it.
+ * `packages` maps each package name declared exactly once in the project to
+ * its manifest facts (a name declared by two manifests stays unresolved).
+ */
+function resolveWorkspacePackage(importPath, config) {
+    const packages = config.workspacePackages;
+    if (!packages || packages.size === 0) return null;
+    let name = importPath;
+    for (;;) {
+        let pkg = packages.get(name);
+        if (pkg?.manifestPending) {
+            // Restored from a cache: the manifest is read on first use.
+            const manifest = _findPackageJson(pkg.dir, pkg.dir);
+            pkg = manifest ? { ...manifest, workspace: true } : { ambiguous: true };
+            packages.set(name, pkg);
+        }
+        if (pkg) return pkg.ambiguous ? null : _resolvePackageSpecifier(pkg, importPath, config);
+        const slash = name.lastIndexOf('/');
+        if (slash <= 0) return null;
+        name = name.slice(0, slash);
+    }
+}
+
+/**
+ * The package manifests of a project's JS/TS directories: the nearest
+ * package.json of every directory holding a JS/TS source file, inside the
+ * project root. Returns Map name -> manifest facts ({ ambiguous: true } for a
+ * name two manifests declare).
+ * @param {string} root - project root
+ * @param {Iterable<string>} dirs - directories of the project's JS/TS files
+ */
+function jsWorkspacePackages(root, dirs) {
+    const packages = new Map();
+    const seenDirs = new Set();
+    const seenManifests = new Set();
+    for (const dir of dirs) {
+        if (seenDirs.has(dir)) continue;
+        seenDirs.add(dir);
+        const pkg = _findPackageJson(dir, root);
+        if (!pkg || !pkg.name || seenManifests.has(pkg.dir)) continue;
+        seenManifests.add(pkg.dir);
+        if (pkg.dir !== root && !pkg.dir.startsWith(root + path.sep)) continue;
+        const existing = packages.get(pkg.name);
+        packages.set(pkg.name, existing ? { ambiguous: true } : { ...pkg, workspace: true });
+    }
+    return packages;
+}
+
+function _resolvePackageSpecifier(pkg, importPath, config) {
     const subpath = importPath === pkg.name ? '.' : './' + importPath.slice(pkg.name.length + 1);
     const extensions = config.extensions || getExtensions(config.language);
     const tryTargets = (entry, wildcard) => {
@@ -733,14 +1030,27 @@ function resolveSelfReference(importPath, fromDir, config) {
             const source = resolveFilePath(path.resolve(pkg.dir, pkg.source), extensions);
             if (source) return source;
         }
+        if (subpath === '.' && pkg.workspace) return _workspaceSourceEntry(pkg, extensions);
         return null;
     }
     // No exports map: bare name -> main/index; subpath -> direct file
     if (subpath === '.') {
         return (pkg.main && resolveFilePath(path.resolve(pkg.dir, pkg.main), extensions)) ||
+            (pkg.workspace && _workspaceSourceEntry(pkg, extensions)) ||
             resolveFilePath(path.resolve(pkg.dir, 'index'), extensions);
     }
     return resolveFilePath(path.resolve(pkg.dir, subpath), extensions);
+}
+
+// A workspace package whose `main` names a build artifact absent from the
+// source checkout: its declared source/module/types entries, else src/index.
+function _workspaceSourceEntry(pkg, extensions) {
+    for (const entry of [pkg.source, pkg.module, pkg.types]) {
+        if (typeof entry !== 'string') continue;
+        const hit = resolveFilePath(path.resolve(pkg.dir, entry), extensions);
+        if (hit && !hit.endsWith('.d.ts')) return hit;
+    }
+    return resolveFilePath(path.resolve(pkg.dir, 'src', 'index'), extensions);
 }
 
 function resolveFilePath(basePath, extensions) {
@@ -779,13 +1089,61 @@ function resolveFilePath(basePath, extensions) {
     return null;
 }
 
+function _probeCached(cache, key, probe) {
+    if (!cache) return probe();
+    if (cache.has(key)) return cache.get(key);
+    const value = probe();
+    cache.set(key, value);
+    return value;
+}
+
+function _isFile(p) {
+    try { return fs.statSync(p).isFile(); } catch { return false; }
+}
+
+function _isDir(p) {
+    try { return fs.statSync(p).isDirectory(); } catch { return false; }
+}
+
+/**
+ * Resolve an absolute Python module against the nearest non-package ancestor
+ * of the importing file (fix #366). Walks from the importing directory up to
+ * (excluding) the project root, which the caller already tried.
+ */
+function _resolvePythonNestedRoot(importPath, fromDir, config) {
+    const root = path.resolve(config.root);
+    const first = importPath.split('.')[0];
+    if (!first) return null;
+    const cache = config.probeCache;
+    const modulePath = importPath.replace(/\./g, '/');
+    let dir = path.resolve(fromDir);
+    while (dir.length > root.length && dir.startsWith(root + path.sep)) {
+        const isPackage = _probeCached(cache, `pyinit\0${dir}`,
+            () => _isFile(path.join(dir, '__init__.py')));
+        if (!isPackage) {
+            const hasFirst = _probeCached(cache, `pyfirst\0${dir}\0${first}`,
+                () => _isDir(path.join(dir, first)) || _isFile(path.join(dir, first + '.py')) ||
+                    _isFile(path.join(dir, first + '.pyi')));
+            if (hasFirst) {
+                const resolved = resolveFilePath(path.join(dir, modulePath), getExtensions('python'));
+                if (resolved) return resolved;
+            }
+        }
+        dir = path.dirname(dir);
+    }
+    return null;
+}
+
 /**
  * Get file extensions for a language
  */
 function getExtensions(language) {
     switch (language) {
         case 'javascript':
-            return ['.js', '.jsx', '.mjs', '.cjs'];
+            // A JS file's extensionless specifier names a TS source when that
+            // is the only file there (JS tests of a TS package run through a
+            // TS-aware loader, fix #397); JS files win when both exist.
+            return ['.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx', '.mts', '.cts'];
         case 'typescript':
         case 'tsx':
             return ['.ts', '.tsx', '.js', '.jsx'];
@@ -978,11 +1336,115 @@ function stripJsonComments(content) {
     return result.replace(/,(\s*[}\]])/g, '$1');
 }
 
+/**
+ * The inline `mod NAME { ... }` blocks of a Rust file (module symbols that
+ * are not `mod NAME;` declarations), as { name, startLine, endLine }.
+ */
+function rustInlineModules(fileEntry) {
+    const declared = new Set();
+    for (const detail of fileEntry.importDetails || []) {
+        if (detail.type === 'mod' && detail.module) declared.add(`${detail.module}\0${detail.line}`);
+    }
+    const inline = [];
+    for (const symbol of fileEntry.symbols || []) {
+        if (symbol.type !== 'module' || declared.has(`${symbol.name}\0${symbol.startLine}`)) continue;
+        inline.push({ name: symbol.name, startLine: symbol.startLine, endLine: symbol.endLine });
+    }
+    inline.sort((a, b) => a.startLine - b.startLine || b.endLine - a.endLine);
+    return inline;
+}
+
+/** Names of the inline modules enclosing `line`, outermost first. */
+function rustInlineChainAt(inlineModules, line) {
+    const chain = [];
+    for (const mod of inlineModules) {
+        if (mod.startLine <= line && mod.endLine >= line) chain.push(mod.name);
+    }
+    return chain;
+}
+
+/**
+ * Files a Rust `mod NAME;` declaration loads (fix #377), per the Rust
+ * reference: in a mod-rs file (lib.rs, main.rs, mod.rs) the module directory
+ * is the file's directory, in any other file `foo.rs` it is `foo/`; enclosing
+ * inline modules add their names; `#[path = "p"]` is relative to the file's
+ * directory outside inline modules and to the module directory inside them.
+ * A non-mod-rs file can itself be a crate root (src/bin/x.rs, tests/x.rs,
+ * build.rs), whose module directory is the file's directory: that layout is
+ * the fallback when the first one names no indexed file. `exists(path)`
+ * decides which candidate is loaded. Returns Map name -> [files] (several
+ * files for cfg-selected alternatives of one name).
+ */
+function rustModDeclarationFiles(filePath, fileEntry, exists, inlineModules = null) {
+    const out = new Map();
+    const details = (fileEntry.importDetails || []).filter(detail => detail.type === 'mod' && detail.module);
+    if (details.length === 0) return out;
+    const inline = inlineModules || rustInlineModules(fileEntry);
+    const moduleSymbols = new Map();
+    for (const symbol of fileEntry.symbols || []) {
+        if (symbol.type === 'module') moduleSymbols.set(`${symbol.name}\0${symbol.startLine}`, symbol);
+    }
+    const dir = path.dirname(filePath);
+    const base = path.basename(filePath);
+    const modRs = base === 'mod.rs' || base === 'lib.rs' || base === 'main.rs';
+    const layouts = modRs ? [dir] : [path.join(dir, path.basename(filePath, '.rs')), dir];
+    for (const detail of details) {
+        const decl = moduleSymbols.get(`${detail.module}\0${detail.line}`);
+        let pathAttr = null;
+        for (const modifier of decl?.modifiers || []) {
+            const match = /^path\s*=\s*"([^"]*)"$/.exec(String(modifier).trim());
+            if (match) pathAttr = match[1];
+        }
+        const chain = rustInlineChainAt(inline, detail.line);
+        let hit = null;
+        for (const layout of layouts) {
+            const moduleDir = path.join(layout, ...chain);
+            const candidates = pathAttr != null
+                ? [chain.length === 0 ? path.join(dir, pathAttr) : path.join(moduleDir, pathAttr)]
+                : [path.join(moduleDir, detail.module + '.rs'), path.join(moduleDir, detail.module, 'mod.rs')];
+            hit = candidates.find(candidate => candidate !== filePath && exists(candidate));
+            if (hit) break;
+        }
+        if (!hit) continue;
+        if (!out.has(detail.module)) out.set(detail.module, []);
+        if (!out.get(detail.module).includes(hit)) out.get(detail.module).push(hit);
+    }
+    return out;
+}
+
+/**
+ * `moduleResolved` entries of a Rust file's `mod` declarations, resolved as
+ * the import graph build resolves them (rustModDeclarationFiles against the
+ * indexed files). `index` needs root and files (fix #375: macro expansion
+ * workers derive module ancestry while the main thread builds the import
+ * graph).
+ */
+function rustModuleDeclarationsResolved(index, filePath, fileEntry) {
+    const out = {};
+    const declared = rustModDeclarationFiles(filePath, fileEntry, candidate => index.files.has(candidate));
+    for (const [name, files] of declared) out[name] = path.relative(index.root, files[0]);
+    return out;
+}
+
 module.exports = {
     extractImports,
+    jsWorkspacePackages,
+    rustModuleDeclarationsResolved,
+    rustModDeclarationFiles,
+    rustInlineModules,
+    rustInlineChainAt,
     extractExports,
     resolveImport,
     resolveFilePath,
     resolveRustImport,
-    findGoModule
+    resolveRustModuleFile,
+    findGoModule,
+    findCargoRoot,
+    workspaceCrateRegistry,
+    snapshotWorkspaceManifests,
+    seedWorkspaceManifests,
+    workspaceManifestsCurrent,
+    manifestSetFingerprint,
+    resetCargoCaches,
+    resetRustResolveMemo,
 };

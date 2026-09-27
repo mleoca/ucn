@@ -52,10 +52,13 @@ function formatUncertainRequests(result, options) {
     const list = result?.uncertainRequests || [];
     if (list.length === 0) return [];
     const lines = [];
-    lines.push(`Possible client requests (${list.length}) — request-shaped call with a path literal, receiver not recognized as an HTTP client:`);
+    lines.push(`Possible client requests (${list.length}) — request-shaped call with a path literal, receiver or helper not proven to be an HTTP client:`);
     const cap = options.all ? Infinity : 10;
     for (const r of list.slice(0, cap)) {
-        lines.push(`  ${r.file}:${r.line} ${r.receiver}.${r.method}(${JSON.stringify(r.path)}) in ${r.callerName}${r.isTest ? ' [test]' : ''}`);
+        const callee = r.receiver ? `${r.receiver}.${r.method}` : r.method;
+        const why = String(r.reason || '').startsWith('request-helper-unproven')
+            ? ` [${r.reason.replace(/^request-helper-unproven:?/, 'helper not proven HTTP: ')}]` : '';
+        lines.push(`  ${r.file}:${r.line} ${callee}(${JSON.stringify(r.path)}) in ${r.callerName}${r.isTest ? ' [test]' : ''}${why}`);
     }
     if (list.length > cap) lines.push(`  (+${list.length - cap} more — use --all)`);
     return lines;
@@ -88,7 +91,8 @@ function formatRoutesAndRequests(routes, requests, meta, options, advisory = nul
                 for (const r of list) {
                     const handler = r.handler || '<anonymous>';
                     const fw = r.framework ? `[${r.framework}]` : '';
-                    lines.push(`  ${pad(r.method, 7)} ${pad(r.path, 40)} → ${handler} ${fw}${r.isTest ? ' [test]' : ''} :${r.line}`);
+                    const derived = r.derived ? ` [${r.derived}]` : '';
+                    lines.push(`  ${pad(r.method, 7)} ${pad(r.path, 40)} → ${handler} ${fw}${derived}${r.isTest ? ' [test]' : ''} :${r.line}`);
                 }
                 lines.push('');
             }
@@ -166,12 +170,15 @@ function formatBridges(bridges, unmatchedRoutes, unmatchedRequests, meta, option
 
         lines.push(`Matched (${sorted.length} routes):`);
         for (const { route, clients } of sorted) {
-            lines.push(`  ${pad(route.method, 7)} ${route.path}  [${route.framework}]${route.isTest ? ' [test]' : ''}  ${route.file}:${route.line}`);
+            lines.push(`  ${pad(route.method, 7)} ${route.path}  [${route.framework}]${route.derived ? ` [${route.derived}]` : ''}${route.isTest ? ' [test]' : ''}  ${route.file}:${route.line}`);
             for (const b of clients) {
                 const conf = b.confidence.toFixed(2);
                 const tier = b.matchType.toUpperCase();
                 const inf = b.methodInferred ? ' method?' : '';
-                lines.push(`    ↔ ${pad(b.request.method + inf, 9)} ${pad(b.request.path, 30)}  ${tier} (${conf})  from ${b.request.callerName}${b.request.isTest ? ' [test]' : ''}  ${b.request.file}:${b.request.line}`);
+                // An in-process client whose app did not resolve matches by path
+                // across every app (fix #392).
+                const unscoped = b.unscoped ? ' [unscoped]' : '';
+                lines.push(`    ↔ ${pad(b.request.method + inf, 9)} ${pad(b.request.path, 30)}  ${tier} (${conf})${unscoped}  from ${b.request.callerName}${b.request.isTest ? ' [test]' : ''}  ${b.request.file}:${b.request.line}`);
             }
             lines.push('');
         }
@@ -180,7 +187,7 @@ function formatBridges(bridges, unmatchedRoutes, unmatchedRequests, meta, option
     if (unmatchedRoutes.length > 0) {
         lines.push(`Unmatched server routes (${unmatchedRoutes.length}):`);
         for (const r of unmatchedRoutes) {
-            lines.push(`  ${pad(r.method, 7)} ${pad(r.path, 40)} → ${r.handler}  [${r.framework}]${r.isTest ? ' [test]' : ''}  ${r.file}:${r.line}`);
+            lines.push(`  ${pad(r.method, 7)} ${pad(r.path, 40)} → ${r.handler}  [${r.framework}]${r.derived ? ` [${r.derived}]` : ''}${r.isTest ? ' [test]' : ''}  ${r.file}:${r.line}`);
         }
         lines.push('');
     }
@@ -215,6 +222,7 @@ function formatEndpointsJson(result, options = {}) {
         framework: r.framework,
         isTest: !!r.isTest,
         ...(r.classPrefix && { classPrefix: r.classPrefix }),
+        ...(r.derived && { derived: r.derived }),
     });
     const trimReq = (r) => ({
         method: r.method,
@@ -235,6 +243,7 @@ function formatEndpointsJson(result, options = {}) {
         matchType: b.matchType,
         confidence: b.confidence,
         ...(b.methodInferred && { methodInferred: true }),
+        ...(b.unscoped && { unscoped: true }),
     });
 
     return JSON.stringify({

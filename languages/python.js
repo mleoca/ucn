@@ -6,6 +6,7 @@
  */
 
 const { ReceiverTypeMap, typeOrigin } = require('./type-evidence');
+const { referenceScope, scopeFields } = require('./lexical-scope');
 
 
 const {
@@ -18,7 +19,19 @@ const {
     paramTypesFromStructured,
     visitNameNodes,
     sameNode,
+    containsOwnNode,
+    parseErrorRegions,
 } = require('./utils');
+
+// A function whose OWN body yields is a generator: calling it returns an
+// iterator (an async iterator for `async def`), never a coroutine.
+const PY_YIELD_TYPES = new Set(['yield']);
+const PY_SCOPE_BOUNDARIES = new Set(['function_definition', 'lambda', 'class_definition']);
+function isPythonGenerator(fnNode) {
+    const body = fnNode.childForFieldName('body');
+    return !!body && body.text.includes('yield') &&
+        containsOwnNode(body, PY_YIELD_TYPES, PY_SCOPE_BOUNDARIES);
+}
 const { PARSE_OPTIONS, safeParse } = require('./index');
 
 function parseTree(parser, code) {
@@ -182,6 +195,7 @@ function _processFunction(node, functions, processedRanges, lines, code) {
 
             // Check for async
             const isAsync = node.text.trimStart().startsWith('async ');
+            const isGenerator = isPythonGenerator(node);
 
             // Extract decorators
             const decorators = extractDecorators(node);
@@ -200,6 +214,7 @@ function _processFunction(node, functions, processedRanges, lines, code) {
                 endLine,
                 indent,
                 isAsync,
+                ...(isGenerator && { isGenerator }),
                 modifiers: isAsync ? ['async'] : [],
                 ...(returnType && { returnType }),
                 ...(returnedConstructors && { returnedConstructors }),
@@ -243,6 +258,7 @@ function _processClass(node, classes, processedRanges, lines) {
         const decorators = extractDecorators(node);
         const bases = extractBases(node);
         const nameLine = nameNode.startPosition.row + 1;
+        const lexicalScope = pythonFunctionLocalScope(node);
 
         classes.push({
             name: nameNode.text,
@@ -253,10 +269,32 @@ function _processClass(node, classes, processedRanges, lines) {
             ...(docstring && { docstring }),
             ...(decorators.length > 0 && { decorators }),
             ...(bases.length > 0 && { extends: bases.join(', ') }),
-            ...(nameLine !== startLine && { nameLine })
+            ...(nameLine !== startLine && { nameLine }),
+            ...lexicalScope,
         });
     }
     return true;
+}
+
+/**
+ * Lexical scope of a class declared inside a function (fix #381): the
+ * enclosing function's body. The name is a local of that function, so it
+ * is visible only there (including nested functions, which close over it).
+ * Module-level and class-body classes are unscoped.
+ */
+function pythonFunctionLocalScope(node) {
+    for (let parent = node.parent; parent; parent = parent.parent) {
+        if (parent.type === 'class_definition') return {};
+        if (parent.type === 'function_definition' ||
+            parent.type === 'async_function_definition') {
+            const body = parent.childForFieldName('body') || parent;
+            return {
+                lexicalScopeStartLine: body.startPosition.row + 1,
+                lexicalScopeEndLine: body.endPosition.row + 1,
+            };
+        }
+    }
+    return {};
 }
 
 // Module-level state detection patterns
@@ -334,6 +372,156 @@ function _processModuleAssign(node, names) {
             if (c.type === 'identifier') names.add(c.text);
         }
     }
+}
+
+/**
+ * Module-level names bound exactly once, to another name (fix #389):
+ * `Alias = Box`, `Alias = models.Box`. Query time decides whether the
+ * target is a class; such an alias then denotes it in annotations and
+ * constructor calls. A name bound again at module scope (assignment,
+ * augmented assignment, loop/with/except target, import, def, class, walrus,
+ * del) or declared `global` in any function is not an alias.
+ */
+function pythonModuleValueAliases(root) {
+    // Cheap first pass: a module-level statement `Name = other.name` at all
+    // (directly, or in a module-level if/try/with block).
+    const aliasShaped = (expr) => expr?.type === 'assignment' &&
+        expr.childForFieldName('left')?.type === 'identifier' &&
+        ['identifier', 'attribute'].includes(expr.childForFieldName('right')?.type);
+    let shaped = false;
+    const probe = (node) => {
+        for (const statement of node.namedChildren) {
+            if (shaped) return;
+            if (statement.type === 'expression_statement') {
+                if (statement.namedChildren.some(aliasShaped)) shaped = true;
+            } else if (/^(if_statement|elif_clause|else_clause|try_statement|except_clause|finally_clause|with_statement|block)$/.test(statement.type)) {
+                probe(statement);
+            }
+        }
+    };
+    probe(root);
+    if (!shaped) return [];
+    // Every module-level binding of each name (fix #392): an alias
+    // assignment, an import, or anything else.
+    const bindings = new Map();
+    const bind = (name, entry) => {
+        if (!name) return;
+        if (!bindings.has(name)) bindings.set(name, []);
+        bindings.get(name).push(entry);
+    };
+    const bindTarget = (node) => {
+        if (!node) return;
+        if (node.type === 'identifier') { bind(node.text, { kind: 'other' }); return; }
+        if (['pattern_list', 'tuple_pattern', 'list_pattern', 'tuple', 'list', 'expression_list',
+            'parenthesized_expression', 'list_splat_pattern', 'list_splat', 'as_pattern_target'].includes(node.type)) {
+            for (const child of node.namedChildren) bindTarget(child);
+        }
+    };
+    const visit = (node) => {
+        for (const child of node.namedChildren) {
+            switch (child.type) {
+                case 'function_definition':
+                case 'class_definition':
+                    bind(child.childForFieldName('name')?.text, { kind: 'other' });
+                    continue;
+                case 'decorated_definition':
+                    bind(child.childForFieldName('definition')?.childForFieldName('name')?.text, { kind: 'other' });
+                    continue;
+                case 'import_statement':
+                case 'future_import_statement':
+                    for (const part of child.namedChildren) {
+                        if (part.type === 'aliased_import') bind(part.childForFieldName('alias')?.text, { kind: 'other' });
+                        else if (part.type === 'dotted_name') bind(part.namedChild(0)?.text, { kind: 'other' });
+                    }
+                    continue;
+                case 'import_from_statement': {
+                    const moduleName = child.childForFieldName('module_name')?.text;
+                    for (const part of child.namedChildren) {
+                        if (sameNode(part, child.childForFieldName('module_name'))) continue;
+                        if (part.type === 'wildcard_import') { bind('*', { kind: 'other' }); continue; }
+                        const imported = part.type === 'aliased_import'
+                            ? part.childForFieldName('name')?.text : part.type === 'dotted_name' ? part.text : null;
+                        const local = part.type === 'aliased_import'
+                            ? part.childForFieldName('alias')?.text : part.type === 'dotted_name'
+                                ? part.namedChild(part.namedChildCount - 1)?.text : null;
+                        if (!local) continue;
+                        // A from-import binds the imported object: one binding
+                        // site of a class the name may alias.
+                        bind(local, moduleName && imported && !imported.includes('.')
+                            ? { kind: 'import', module: moduleName, imported, line: child.startPosition.row + 1 }
+                            : { kind: 'other' });
+                    }
+                    continue;
+                }
+                case 'expression_statement':
+                    for (let expr of child.namedChildren) {
+                        while (expr?.type === 'assignment' || expr?.type === 'augmented_assignment') {
+                            const left = expr.childForFieldName('left');
+                            const right = expr.childForFieldName('right');
+                            if (expr.type === 'assignment' && left?.type === 'identifier' &&
+                                !expr.childForFieldName('type') &&
+                                (right?.type === 'identifier' || right?.type === 'attribute') &&
+                                /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$/.test(right.text) &&
+                                right.text !== left.text) {
+                                bind(left.text, { kind: 'alias', target: right.text,
+                                    line: expr.startPosition.row + 1 });
+                            } else {
+                                bindTarget(left);
+                            }
+                            expr = expr.type === 'assignment' ? right : null;
+                        }
+                    }
+                    continue;
+                case 'delete_statement':
+                    for (const target of child.namedChildren) bindTarget(target);
+                    continue;
+                case 'for_statement':
+                    bindTarget(child.childForFieldName('left'));
+                    break;
+                case 'with_statement':
+                case 'try_statement':
+                    for (const target of child.descendantsOfType('as_pattern_target')) bindTarget(target);
+                    break;
+                default:
+                    break;
+            }
+            if (child.namedChildCount > 0 && child.type !== 'expression_statement') visit(child);
+        }
+    };
+    visit(root);
+    for (const walrus of root.descendantsOfType('named_expression')) {
+        let inFunction = false;
+        for (let p = walrus.parent; p; p = p.parent) {
+            if (p.type === 'function_definition' || p.type === 'class_definition' || p.type === 'lambda') {
+                inFunction = true;
+                break;
+            }
+        }
+        if (!inFunction) bind(walrus.childForFieldName('name')?.text, { kind: 'other' });
+    }
+    const declaredGlobal = new Set();
+    for (const statement of root.descendantsOfType('global_statement')) {
+        for (const name of statement.namedChildren) declaredGlobal.add(name.text);
+    }
+    const aliases = [];
+    for (const [name, sites] of bindings) {
+        if (declaredGlobal.has(name) || sites.some(site => site.kind === 'other')) continue;
+        const assignments = sites.filter(site => site.kind === 'alias');
+        if (assignments.length === 0) continue;
+        if (sites.length === 1) {
+            // Bound once (also inside a module-level block, fix #392).
+            aliases.push({ name, target: assignments[0].target, line: assignments[0].line });
+            continue;
+        }
+        // Bound on several paths (if/else, try/except): an alias only when
+        // every binding site names the same class, decided where it resolves.
+        aliases.push({
+            name, target: assignments[0].target, line: assignments[0].line,
+            alternatives: sites.map(site => site.kind === 'alias'
+                ? { target: site.target } : { module: site.module, imported: site.imported }),
+        });
+    }
+    return aliases;
 }
 
 // --- End single-pass helpers ---
@@ -586,6 +774,7 @@ function extractClassMembers(classNode, code) {
                 }
 
                 const isAsync = funcNode.text.trimStart().startsWith('async ');
+                const isGenerator = isPythonGenerator(funcNode);
                 const returnType = extractReturnType(funcNode);
                 const returnedConstructors = extractReturnedConstructors(funcNode);
                 const defLine = getDefLine(funcNode);
@@ -603,6 +792,7 @@ function extractClassMembers(classNode, code) {
                     endLine,
                     memberType,
                     isAsync,
+                    ...(isGenerator && { isGenerator }),
                     isMethod: true,  // Mark as method for context() lookups
                     // Match top-level Python functions: `async def` → ['async'] modifiers.
                     modifiers: isAsync ? ['async'] : [],
@@ -661,6 +851,7 @@ function parse(code, parser) {
     functions.sort((a, b) => a.startLine - b.startLine);
     classes.sort((a, b) => a.startLine - b.startLine);
     stateObjects.sort((a, b) => a.startLine - b.startLine);
+    const moduleValueAliases = moduleAssigned.size > 0 ? pythonModuleValueAliases(tree.rootNode) : [];
 
     return {
         language: 'python',
@@ -668,7 +859,8 @@ function parse(code, parser) {
         functions,
         classes,
         stateObjects,
-        ...(tree.rootNode.hasError && { parseRecovery: true }),
+        ...(moduleValueAliases.length > 0 && { moduleValueAliases }),
+        ...(tree.rootNode.hasError && { parseRecovery: true, parseErrorRegions: parseErrorRegions(tree.rootNode) }),
         ...(moduleAssigned.size > 0 && { moduleAssignedNames: [...moduleAssigned].sort() }),
         imports: [],
         exports: []
@@ -841,6 +1033,40 @@ function iterableBindingTypes(typeNode) {
     }
     const typeName = typeNameFromExpr(unwrapTypeNode(item));
     return typeName ? [typeName] : [];
+}
+
+// Subscript contracts of builtin/typing containers (fix #359, starlette-
+// measured): `params: dict[str, Convertor]` makes `params[key]` a Convertor;
+// `items: list[Conv]` makes `items[0]` a Conv. The element is the declared
+// value slot of the annotation, never guessed: unions, Any/object, bare
+// type variables and heterogeneous tuples abstain.
+const PY_MAPPING_ANNOTATIONS = new Set([
+    'dict', 'Dict', 'Mapping', 'MutableMapping', 'OrderedDict', 'defaultdict',
+    'DefaultDict',
+]);
+const PY_SEQUENCE_ANNOTATIONS = new Set([
+    'list', 'List', 'Sequence', 'MutableSequence', 'deque', 'Deque',
+]);
+function subscriptElementContract(typeNode) {
+    const outerRaw = typeNode && typeNode.type === 'type' && typeNode.namedChildCount > 0
+        ? typeNode.namedChild(0) : typeNode;
+    const outer = genericTypeParts(outerRaw);
+    if (!outer) return null;
+    let element = null;
+    if (PY_MAPPING_ANNOTATIONS.has(outer.base) && outer.args.length === 2) {
+        element = outer.args[1];
+    } else if (PY_SEQUENCE_ANNOTATIONS.has(outer.base) && outer.args.length === 1) {
+        element = outer.args[0];
+    } else if (['tuple', 'Tuple'].includes(outer.base) && outer.args.length === 2 &&
+        outer.args[1]?.type === 'ellipsis') {
+        element = outer.args[0];
+    }
+    if (!element) return null;
+    const type = typeNameFromExpr(unwrapTypeNode(element));
+    if (!type || type === 'Any' || type === 'object' || type === 'None' ||
+        /^[A-Z][A-Z0-9]?$/.test(type)) return null;
+    const qualifier = typeQualifierFromExpr(unwrapTypeNode(element));
+    return { type, ...(qualifier && { qualifier }), node: element };
 }
 
 function patternIdentifiers(node, out = []) {
@@ -1372,6 +1598,108 @@ function pythonScopeBoundNames(scopeNode) {
     return names;
 }
 
+/** Type of the innermost scope node (function, lambda, class, module). */
+function pythonEnclosingScopeType(node) {
+    for (let parent = node?.parent; parent; parent = parent.parent) {
+        if (['function_definition', 'async_function_definition', 'lambda',
+            'class_definition', 'module'].includes(parent.type)) return parent.type;
+    }
+    return 'module';
+}
+
+/** Innermost enclosing function of a node; null at module/class/lambda level. */
+function pythonEnclosingFunctionNode(node) {
+    for (let parent = node?.parent; parent; parent = parent.parent) {
+        if (parent.type === 'function_definition' ||
+            parent.type === 'async_function_definition') return parent;
+        if (parent.type === 'lambda' || parent.type === 'class_definition') return null;
+    }
+    return null;
+}
+
+const scopeBindingCountsByTree = new WeakMap();
+
+/**
+ * How many times a function binds each local name (fix #381): parameters,
+ * assignment/augmented/walrus targets, loop and comprehension-free for
+ * targets, with/except `as` targets, imports, nested def/class names; a
+ * `global`/`nonlocal`/`del` of the name counts as two (never a single local
+ * binding). Nested functions, lambdas and classes are their own scopes.
+ */
+function pythonBindingCount(fnNode, name) {
+    let byId = scopeBindingCountsByTree.get(fnNode.tree);
+    if (!byId) { byId = new Map(); scopeBindingCountsByTree.set(fnNode.tree, byId); }
+    let counts = byId.get(fnNode.id);
+    if (!counts) {
+        counts = new Map();
+        const add = (id, n = 1) => { if (id) counts.set(id, (counts.get(id) || 0) + n); };
+        // Only names in binding position: `self.x = ...` / `a[i] = ...`
+        // bind no local.
+        const addTarget = (target) => {
+            if (!target) return;
+            if (target.type === 'identifier') { add(target.text); return; }
+            if (['pattern_list', 'tuple_pattern', 'list_pattern', 'tuple', 'list',
+                'parenthesized_expression', 'list_splat_pattern', 'list_splat'].includes(target.type)) {
+                for (const item of target.namedChildren) addTarget(item);
+            }
+        };
+        const params = fnNode.childForFieldName('parameters');
+        if (params) {
+            for (const param of params.namedChildren) {
+                const id = param.type === 'identifier' ? param
+                    : (param.childForFieldName('name') || param.namedChild(0));
+                if (id?.type === 'identifier') add(id.text);
+            }
+        }
+        const walk = (node) => {
+            for (const child of node.namedChildren) {
+                if (child.type === 'function_definition' ||
+                    child.type === 'async_function_definition' ||
+                    child.type === 'class_definition') {
+                    add(child.childForFieldName('name')?.text);
+                    continue;
+                }
+                if (child.type === 'lambda') continue;
+                if (child.type === 'assignment' || child.type === 'augmented_assignment') {
+                    addTarget(child.childForFieldName('left'));
+                } else if (child.type === 'named_expression') {
+                    addTarget(child.childForFieldName('name'));
+                } else if (child.type === 'for_statement' || child.type === 'for_in_clause') {
+                    addTarget(child.childForFieldName('left'));
+                } else if (child.type === 'as_pattern') {
+                    addTarget(child.childForFieldName('alias') || child.namedChild(child.namedChildCount - 1));
+                } else if (child.type === 'except_clause') {
+                    for (const part of child.namedChildren) {
+                        if (part.type === 'as_pattern') continue;
+                        if (part.type === 'identifier' && part.previousSibling?.type === 'as') add(part.text);
+                    }
+                } else if (child.type === 'import_statement' || child.type === 'import_from_statement') {
+                    for (const part of child.namedChildren) {
+                        if (part.type === 'aliased_import') {
+                            add(part.childForFieldName('alias')?.text);
+                        } else if (part.type === 'dotted_name' &&
+                            !(child.type === 'import_from_statement' && part === child.childForFieldName('module_name'))) {
+                            add(part.text.split('.')[0]);
+                        }
+                    }
+                } else if (child.type === 'global_statement' || child.type === 'nonlocal_statement' ||
+                    child.type === 'delete_statement') {
+                    for (const id of patternIdentifiers(child)) add(id, 2);
+                }
+                walk(child);
+            }
+        };
+        const body = fnNode.childForFieldName('body');
+        if (body) walk(body);
+        byId.set(fnNode.id, counts);
+    }
+    return counts.get(name) || 0;
+}
+
+function pythonSingleLocalBinding(fnNode, name) {
+    return pythonBindingCount(fnNode, name) === 1;
+}
+
 function pythonScopeBindsName(scopeNode, name) {
     return pythonScopeBoundNames(scopeNode).has(name);
 }
@@ -1676,6 +2004,8 @@ function findCallsInCode(code, parser) {
     const localIterationSources = new Map(); // loop variable -> declared iterable path + tuple index
     const localDictValueTypes = new Map(); // local dict -> exact string-key value types
     const localSubscriptSources = new Map(); // local value -> exact typed container selected by []
+    const localSubscriptElements = new Map(); // container binding -> declared element contract (fix #359)
+    const localSubscriptElementsStack = [];
     const localVarStdlibContracts = new Map(); // variable -> stdlib module proving its type flow
     const assignmentRhsReceiverTypes = new Map(); // call-node id -> pre-assignment type and origin
     const constructedReceiverVars = new Set(); // exact constructor-result bindings
@@ -1688,6 +2018,10 @@ function findCallsInCode(code, parser) {
     // receiver is null for chained/deep objects (self._text.append) — the
     // rewritten call is then receiver-blind and routes through dispatch tiering.
     const memberAliases = new Map();
+    // One-hop local aliases of attribute paths (fix #381):
+    // `config = self.config; config.load()` receives through `self.config`.
+    // name -> { node: the aliased attribute node, scope: function node id }.
+    const localFieldAliases = new Map();
     const memberAliasesStack = [];  // function-scoped save/restore, like localVarTypes
     // Exact class-value aliases: `_Segment = Segment` makes later
     // `_Segment.line()` dispatch through the imported/local class object.
@@ -1719,25 +2053,61 @@ function findCallsInCode(code, parser) {
         for (let i = 0; i < argsNode.namedChildCount; i++) {
             const arg = argsNode.namedChild(i);
             if (arg.type.endsWith('comment')) continue;
-            // Handle f-string explicitly
-            if (arg.type === 'string') {
-                // f-string detection: tree-sitter-python wraps interpolations as 'interpolation' children.
-                // If any interpolation child exists, this is interpolated; extract literal prefix.
-                let interp = false;
-                let prefix = '';
-                for (let j = 0; j < arg.namedChildCount; j++) {
-                    const sc = arg.namedChild(j);
-                    if (sc.type === 'interpolation') { interp = true; break; }
-                    if (sc.type === 'string_content') prefix += sc.text;
-                }
-                if (interp) {
-                    return { value: prefix + (prefix.endsWith('*') ? '' : '*'), interp: true };
-                }
-                return _extractStringArg(arg);
-            }
-            return _extractStringArg(arg);
+            return stringValueOf(arg);
         }
         return null;
+    };
+    const stringValueOf = (arg) => {
+        // Handle f-string explicitly
+        if (arg.type === 'string') {
+            // f-string detection: tree-sitter-python wraps interpolations as 'interpolation' children.
+            // If any interpolation child exists, this is interpolated; extract literal prefix.
+            let interp = false;
+            let prefix = '';
+            for (let j = 0; j < arg.namedChildCount; j++) {
+                const sc = arg.namedChild(j);
+                if (sc.type === 'interpolation') { interp = true; break; }
+                if (sc.type === 'string_content') prefix += sc.text;
+            }
+            if (interp) {
+                return { value: prefix + (prefix.endsWith('*') ? '' : '*'), interp: true };
+            }
+        }
+        return _extractStringArg(arg);
+    };
+
+    // fix #366: keyword request configuration — `session.request(
+    // method="POST", url="/api/items")`, `send(url="/x")`. Returns
+    // { url, interp, method? } when a `url=` keyword carries a string.
+    // Whether the callee performs HTTP is decided at query time.
+    const getRequestConfig = (callNode) => {
+        const argsNode = callNode.childForFieldName('arguments');
+        if (!argsNode) return null;
+        let url = null;
+        let method = null;
+        for (let i = 0; i < argsNode.namedChildCount; i++) {
+            const arg = argsNode.namedChild(i);
+            if (arg.type !== 'keyword_argument') continue;
+            const nameNode = arg.childForFieldName('name');
+            const valueNode = arg.childForFieldName('value');
+            if (!nameNode || !valueNode || valueNode.type !== 'string') continue;
+            // `path=` is overwhelmingly a filesystem path in Python APIs;
+            // only `url=` names a request target.
+            if (nameNode.text === 'url' && !url) {
+                const v = stringValueOf(valueNode);
+                if (v && typeof v.value === 'string' && v.value.length > 0) {
+                    url = { value: v.value, interp: !!v.interp, key: nameNode.text };
+                }
+            } else if (nameNode.text === 'method') {
+                const v = _extractStringArg(valueNode);
+                if (v && !v.interp && typeof v.value === 'string' && v.value.length > 0) {
+                    method = v.value.toUpperCase();
+                }
+            }
+        }
+        if (!url) return null;
+        return { url: url.value, key: url.key, ...(url.interp && { interp: true }),
+            ...(method && { method }) };
     };
 
     // Helper to check if a node is a non-callable literal
@@ -2075,6 +2445,7 @@ function findCallsInCode(code, parser) {
                 [...localDictValueTypes].map(([name, values]) =>
                     [name, new Map(values)])));
             localSubscriptSourcesStack.push(new Map(localSubscriptSources));
+            localSubscriptElementsStack.push(new Map(localSubscriptElements));
             localVarStdlibContractsStack.push(new Map(localVarStdlibContracts));
             constructedReceiverVarsStack.push(new Set(constructedReceiverVars));
             withBindingVarsStack.push(new Set(withBindingVars));
@@ -2107,6 +2478,12 @@ function findCallsInCode(code, parser) {
                 if ((body && pythonScopeBindsName(body, name)) ||
                     functionParameterBindsName(node, name)) {
                     localSubscriptSources.delete(name);
+                }
+            }
+            for (const name of localSubscriptElements.keys()) {
+                if ((body && pythonScopeBindsName(body, name)) ||
+                    functionParameterBindsName(node, name)) {
+                    localSubscriptElements.delete(name);
                 }
             }
             for (const name of classValueAliases.keys()) {
@@ -2151,6 +2528,10 @@ function findCallsInCode(code, parser) {
                 else localVarUnionTypes.delete(nameNode.text);
                 if (itemTypes.length > 0) localIterableTypes.set(nameNode.text, itemTypes);
                 else localIterableTypes.delete(nameNode.text);
+                const elementContract = parameterPattern?.type === 'identifier'
+                    ? subscriptElementContract(typeNode) : null;
+                if (elementContract) localSubscriptElements.set(nameNode.text, elementContract);
+                else localSubscriptElements.delete(nameNode.text);
             }
         }
 
@@ -2257,6 +2638,9 @@ function findCallsInCode(code, parser) {
                     else localVarUnionTypes.delete(left.text);
                     if (itemTypes.length > 0) localIterableTypes.set(left.text, itemTypes);
                     else localIterableTypes.delete(left.text);
+                    const elementContract = subscriptElementContract(typeNode);
+                    if (elementContract) localSubscriptElements.set(left.text, elementContract);
+                    else localSubscriptElements.delete(left.text);
                 }
                 memberAliases.delete(left.text); // any assignment rebinds the name
                 constructedReceiverVars.delete(left.text);
@@ -2270,6 +2654,7 @@ function findCallsInCode(code, parser) {
                     localVarTypeQualifiers.delete(left.text);
                     localVarUnionTypes.delete(left.text);
                     localIterableTypes.delete(left.text);
+                    localSubscriptElements.delete(left.text);
                     localIterationSources.delete(left.text);
                     localDictValueTypes.delete(left.text);
                     localVarStdlibContracts.delete(left.text);
@@ -2357,6 +2742,21 @@ function findCallsInCode(code, parser) {
                 }
                 if (!typeNode && right?.type === 'subscript') {
                     const base = right.childForFieldName('value');
+                    // Declared container element (fix #359): `c = params[k]`
+                    // with `params: dict[str, Convertor]` types c. A slice
+                    // (`items[1:]`) is a container, not an element.
+                    const element = base?.type === 'identifier' && base.text !== left.text
+                        ? localSubscriptElements.get(base.text) : null;
+                    const subscriptKey = right.childForFieldName('subscript');
+                    if (element && subscriptKey?.type !== 'slice' &&
+                        !declaredVarTypes.get(left.text)) {
+                        localVarTypes.set(left.text, element.type, 'annotation', element.node);
+                        if (element.qualifier) {
+                            localVarTypeQualifiers.set(left.text, element.qualifier);
+                        } else {
+                            localVarTypeQualifiers.delete(left.text);
+                        }
+                    }
                     if (base?.type === 'identifier' && base.text !== left.text) {
                         const rootType = localVarTypes.get(base.text);
                         if (rootType) {
@@ -2376,7 +2776,14 @@ function findCallsInCode(code, parser) {
                     localVarTypes.set(left.text, roundTripType, 'flow', node);
                     localVarStdlibContracts.set(left.text, 'pickle');
                 }
-                if (right?.type === 'identifier') {
+                // A class-body assignment binds a class attribute, never a
+                // name of the enclosing function (fix #381): `Connection =
+                // Mock` inside a local class leaves the function's
+                // `Connection(...)` calls alone.
+                const classBodyAssignment = pythonEnclosingScopeType(node) === 'class_definition';
+                if (right?.type === 'identifier' && classBodyAssignment) {
+                    // attribute binding only
+                } else if (right?.type === 'identifier') {
                     aliases.set(left.text, right.text);
                     const classValue = !typeNode && isDirectScopeAssignment(node)
                         ? exactConstructorInfo(right) : null;
@@ -2419,6 +2826,37 @@ function findCallsInCode(code, parser) {
                                 }
                                 if (arg.type === 'keyword_argument') continue;
                                 break;
+                            }
+                        }
+                    }
+                }
+                // One-hop local alias (fix #381): a function local bound
+                // exactly once, by `x = y` or `x = self.attr`, receives
+                // like its initializer. A second binding anywhere in the
+                // function (reassignment, loop target, global/nonlocal)
+                // leaves it untyped.
+                localFieldAliases.delete(left.text);
+                if (!typeNode && right && right.text !== left.text &&
+                    (right.type === 'identifier' || right.type === 'attribute')) {
+                    const scope = pythonEnclosingFunctionNode(node);
+                    if (scope && pythonSingleLocalBinding(scope, left.text)) {
+                        if (right.type === 'identifier' && localVarTypes.has(right.text) &&
+                            !localVarUnionTypes.has(right.text)) {
+                            localVarTypes.set(left.text, localVarTypes.get(right.text),
+                                localVarTypes.origins.get(right.text) || 'flow');
+                            if (localVarTypeQualifiers.has(right.text)) {
+                                localVarTypeQualifiers.set(left.text, localVarTypeQualifiers.get(right.text));
+                            }
+                            if (constructedReceiverVars.has(right.text)) constructedReceiverVars.add(left.text);
+                            if (localVarStdlibContracts.has(right.text)) {
+                                localVarStdlibContracts.set(left.text, localVarStdlibContracts.get(right.text));
+                            }
+                        } else if (right.type === 'attribute') {
+                            const path = attributeReceiverPath(right);
+                            if (path && path.root !== left.text &&
+                                (path.root === 'self' || path.root === 'cls' ||
+                                    pythonBindingCount(scope, path.root) <= 1)) {
+                                localFieldAliases.set(left.text, { node: right, scope: scope.id });
                             }
                         }
                     }
@@ -2538,6 +2976,7 @@ function findCallsInCode(code, parser) {
                     // Direct call: foo()
                     const resolvedName = aliases.get(funcNode.text);
                     const firstArg = getFirstStringArg(node);
+                    const requestConfig = argCount > 0 ? getRequestConfig(node) : null;
                     calls.push({
                         callSite: typeOrigin('call', funcNode),
                         name: funcNode.text,
@@ -2552,13 +2991,21 @@ function findCallsInCode(code, parser) {
                         enclosingFunction,
                         uncertain,
                         ...(isShadowedByLocal(funcNode, funcNode.text) && { localShadow: true }),
-                        ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
+                        ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp }),
+                        ...(requestConfig && { requestConfig })
                     });
                 }
             } else if (funcNode.type === 'attribute') {
                 // Method/attribute call: obj.foo() or self.attr.foo()
                 const attrNode = funcNode.childForFieldName('attribute');
-                const objNode = funcNode.childForFieldName('object');
+                let objNode = funcNode.childForFieldName('object');
+                // fix #381: `config.load()` after `config = self.config`
+                // receives exactly like `self.config.load()`.
+                if (objNode?.type === 'identifier' && localFieldAliases.has(objNode.text) &&
+                    !localVarTypes.has(objNode.text)) {
+                    const alias = localFieldAliases.get(objNode.text);
+                    if (alias.scope === pythonEnclosingFunctionNode(objNode)?.id) objNode = alias.node;
+                }
 
                 if (attrNode) {
                     let receiver = objNode?.type === 'identifier' ? objNode.text : undefined;
@@ -2629,6 +3076,7 @@ function findCallsInCode(code, parser) {
                     // Literal receivers carry their builtin type: {}.get() can
                     // never be a project class method
                     let subscriptReceiverType;
+                    let subscriptElementReceiver = null;
                     let receiverSubscriptRoot;
                     let receiverSubscriptRootType;
                     let receiverSubscriptRootTypeQualifier;
@@ -2644,6 +3092,12 @@ function findCallsInCode(code, parser) {
                             if (key != null) {
                                 subscriptReceiverType =
                                     localDictValueTypes.get(base.text)?.get(key);
+                            }
+                            const element = localSubscriptElements.get(base.text);
+                            if (!subscriptReceiverType && element &&
+                                objNode.childForFieldName('subscript')?.type !== 'slice') {
+                                subscriptReceiverType = element.type;
+                                subscriptElementReceiver = element;
                             }
                         }
                     }
@@ -2695,7 +3149,7 @@ function findCallsInCode(code, parser) {
                     }
                     const receiverTypeQualifier = receiver
                         ? localVarTypeQualifiers.get(receiver)
-                        : undefined;
+                        : subscriptElementReceiver?.qualifier;
                     const receiverRootType = receiverPath
                         ? localVarTypes.get(receiverPath.root) : undefined;
                     const dottedReceiver = receiverPath
@@ -2710,6 +3164,7 @@ function findCallsInCode(code, parser) {
                     const receiverIsModule = !!receiver && moduleAliases.has(receiver) &&
                         !localVarTypes.has(receiver);
                     const firstArg = getFirstStringArg(node);
+                    const requestConfig = argCount > 0 ? getRequestConfig(node) : null;
                     const capabilityGuard = receiverCapabilityGuard(
                         node, objNode, attrNode.text);
                     calls.push({
@@ -2733,7 +3188,11 @@ function findCallsInCode(code, parser) {
                                 receiver && !localVarTypes.has(receiver) && rhsReceiver?.type === receiverType
                                     ? { receiverTypeSource: rhsReceiver.receiverTypeSource,
                                         receiverTypeEvidence: rhsReceiver.receiverTypeEvidence } :
-                                receiver ? localVarTypes.fields(receiver, receiverType) : {
+                                receiver ? localVarTypes.fields(receiver, receiverType) :
+                                subscriptElementReceiver ? {
+                                    receiverTypeSource: 'annotation',
+                                    receiverTypeEvidence: typeOrigin('annotation', subscriptElementReceiver.node),
+                                } : {
                                     receiverTypeSource: 'literal', receiverTypeEvidence: typeOrigin('literal', objNode),
                                 }),
                         }),
@@ -2788,7 +3247,8 @@ function findCallsInCode(code, parser) {
                         ...(argSpread && { argSpread: true }),
                         enclosingFunction,
                         uncertain,
-                        ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
+                        ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp }),
+                        ...(requestConfig && { requestConfig })
                     });
                 }
             }
@@ -2923,6 +3383,13 @@ function findCallsInCode(code, parser) {
                     localDictValueTypes.clear();
                     for (const [name, values] of savedDictValueTypes) {
                         localDictValueTypes.set(name, values);
+                    }
+                }
+                const savedSubscriptElements = localSubscriptElementsStack.pop();
+                if (savedSubscriptElements) {
+                    localSubscriptElements.clear();
+                    for (const [name, element] of savedSubscriptElements) {
+                        localSubscriptElements.set(name, element);
                     }
                 }
                 const savedSubscriptSources = localSubscriptSourcesStack.pop();
@@ -3326,10 +3793,12 @@ function findExportsInCode(code, parser) {
  * @param {object} [tree] - Pre-parsed tree (per-operation cache); parsed here when absent
  * @returns {Array<{line: number, column: number, usageType: string}>}
  */
-function findUsagesInCode(code, name, parser, tree) {
+function findUsagesInCode(code, name, parser, tree, options = {}) {
     tree = tree || parseTree(parser, code);
     const usages = [];
     const moduleAliases = pythonModuleAliases(tree);
+    // Lexical scope verdicts (fix #392) only for refactoring internals.
+    const scopeMemo = options.lexicalScopes ? new Map() : null;
 
     visitNameNodes(tree, code, name, (node) => {
         // Only look for identifiers with the matching name
@@ -3372,11 +3841,19 @@ function findUsagesInCode(code, name, parser, tree) {
                      sameNode(parent.childForFieldName('name'), node)) {
                 usageType = 'definition';
             }
-            // Definition: parameter
+            // Definition: parameter name. A default VALUE is a reference
+            // evaluated in the enclosing scope (fix #392).
             else if (parent.type === 'parameter' ||
-                     parent.type === 'default_parameter' ||
-                     parent.type === 'typed_parameter' ||
-                     parent.type === 'typed_default_parameter') {
+                     parent.type === 'parameters' ||
+                     parent.type === 'lambda_parameters' ||
+                     ((parent.type === 'default_parameter' ||
+                       parent.type === 'typed_default_parameter') &&
+                      sameNode(parent.childForFieldName('name'), node)) ||
+                     (parent.type === 'typed_parameter' &&
+                      sameNode(parent.namedChild(0), node)) ||
+                     ((parent.type === 'list_splat_pattern' ||
+                       parent.type === 'dictionary_splat_pattern') &&
+                      /^(parameters|lambda_parameters|typed_parameter)$/.test(parent.parent?.type || ''))) {
                 usageType = 'definition';
             }
             // Definition: assignment target (x = ...)
@@ -3439,7 +3916,11 @@ function findUsagesInCode(code, name, parser, tree) {
             }
         }
 
-        usages.push({ line, column, usageType });
+        // Where a bare reference resolves (fix #392): plan edits it only
+        // when the language's scoping proves it names the renamed binding.
+        const scope = scopeMemo && usageType === 'reference'
+            ? scopeFields(referenceScope(node, 'python', scopeMemo)) : null;
+        usages.push({ line, column, usageType, ...scope });
         return true;
     });
 
@@ -3519,6 +4000,16 @@ function findInstanceAttributeTypes(code, parser, options = {}) {
         Object.defineProperty(attrTypes, 'origins', { value: attrOrigins });
         const externalFlows = new Map();
         Object.defineProperty(attrTypes, 'externalFlows', { value: externalFlows });
+        // Lines of the writes that typed each field (fix #381): a class name
+        // resolves where it is written, so a function-local class assigned
+        // to self.x names that local class, not a same-name module class.
+        const typeWrites = new Map();
+        const writeLines = new Map();
+        Object.defineProperty(attrTypes, 'writeLines', { value: writeLines });
+        const noteTypeWrite = (field, type, node) => {
+            if (!typeWrites.has(field)) typeWrites.set(field, []);
+            typeWrites.get(field).push({ type, line: node.startPosition.row + 1 });
+        };
         for (const [field, contract] of explicitContracts.get(className) || []) {
             if (contract.type) attrTypes.set(field, contract.type);
         }
@@ -3662,6 +4153,7 @@ function findInstanceAttributeTypes(code, parser, options = {}) {
                     extractConstructorName(rhs);
                 if (typeName) {
                     attrTypes.set(attrName, typeName);
+                    noteTypeWrite(attrName, typeName, assign);
                 } else if (rhs.type === 'call') {
                     const fn = rhs.childForFieldName('function');
                     if (fn?.type === 'attribute') {
@@ -3678,6 +4170,7 @@ function findInstanceAttributeTypes(code, parser, options = {}) {
                 } else if (rhs.type === 'identifier' && paramTypes.has(rhs.text)) {
                     // self.X = param where param has type annotation
                     attrTypes.set(attrName, paramTypes.get(rhs.text));
+                    noteTypeWrite(attrName, paramTypes.get(rhs.text), assign);
                 }
 
                 return true;
@@ -3772,6 +4265,9 @@ function findInstanceAttributeTypes(code, parser, options = {}) {
                 }
                 if (!runtimeFieldTypes.has(field)) runtimeFieldTypes.set(field, new Set());
                 runtimeFieldTypes.get(field).add(runtimeType);
+                if (directConstructor && runtimeType === directConstructor) {
+                    noteTypeWrite(field, runtimeType, assignment);
+                }
                 if (!runtimeFieldWrites.has(field)) runtimeFieldWrites.set(field, []);
                 runtimeFieldWrites.get(field).push({ type: runtimeType,
                     assignment: typeOrigin('field', assignment), expression: typeOrigin('field', right),
@@ -3797,6 +4293,11 @@ function findInstanceAttributeTypes(code, parser, options = {}) {
             }
         }
 
+        for (const [field, writes] of typeWrites) {
+            const lines = writes.filter(write => write.type === attrTypes.get(field))
+                .map(write => write.line);
+            if (lines.length > 0) writeLines.set(field, [...new Set(lines)].sort((a, b) => a - b));
+        }
         if (attrTypes.size > 0 || externalFlows.size > 0) {
             result.set(className, attrTypes);
         }
@@ -4015,7 +4516,191 @@ function getBuiltinFieldType(moduleName, fieldName) {
     return PY_BUILTIN_FIELD_TYPES[`${moduleName}.${fieldName}`] || null;
 }
 
+/**
+ * Other bindings of `name` in the scope that holds the definition on
+ * `defLine` (fix #376). Python binds names at run time: every `def`,
+ * `class`, assignment target and import of the name in one scope (module,
+ * class body or function body, through if/elif/else, try/except/finally,
+ * with and loop blocks) is the SAME variable, so version-conditional
+ * definitions (`if sys.version_info >= ...: f = lib.f else: def f(...)`),
+ * try/except import fallbacks and class-body rebindings are alternatives a
+ * rename must change together. In a class body, bare reads of the name
+ * (`close = release`, `@prop.setter`) bind to the class-scope variable and
+ * are references to the member.
+ * @returns {{line, column, kind: 'definition'|'assignment'|'import'|'import-name'|'reference'}[]}
+ *   column is the byte column of the name token; 'import-name' is an
+ *   unaliased `from m import name` (its alias must be added, not renamed).
+ */
+function findScopeAlternativeBindings(tree, defLine, name) {
+    if (!tree || !name) return [];
+    const row = defLine - 1;
+    let defNode = null;
+    const stack = [tree.rootNode];
+    while (stack.length > 0 && !defNode) {
+        const node = stack.pop();
+        if (node.startPosition.row > row || node.endPosition.row < row) continue;
+        if ((node.type === 'function_definition' || node.type === 'class_definition')) {
+            const nameNode = node.childForFieldName('name');
+            if (nameNode && nameNode.text === name && nameNode.startPosition.row === row) {
+                defNode = node;
+                break;
+            }
+        }
+        for (let i = node.namedChildCount - 1; i >= 0; i--) stack.push(node.namedChild(i));
+    }
+    if (!defNode) return [];
+    let container = null;
+    for (let cur = defNode; cur.parent; cur = cur.parent) {
+        const parent = cur.parent;
+        if (parent.type === 'module') { container = parent; break; }
+        if (parent.type === 'block' && parent.parent &&
+            (parent.parent.type === 'class_definition' ||
+                parent.parent.type === 'function_definition')) {
+            container = parent;
+            break;
+        }
+    }
+    if (!container) return [];
+    const classBody = container.parent?.type === 'class_definition';
+    const out = [];
+    const push = (node, kind) => out.push({
+        line: node.startPosition.row + 1, column: node.startPosition.column, kind,
+    });
+    const references = expr => {
+        if (!classBody || !expr) return;
+        const refStack = [expr];
+        while (refStack.length > 0) {
+            const node = refStack.pop();
+            if (node.type === 'lambda' || node.type === 'function_definition' ||
+                node.type === 'class_definition' || node.type.endsWith('comprehension') ||
+                node.type === 'generator_expression') continue;
+            if (node.type === 'identifier') {
+                if (node.text === name) push(node, 'reference');
+                continue;
+            }
+            if (node.type === 'attribute') {
+                refStack.push(node.childForFieldName('object'));
+                continue;
+            }
+            if (node.type === 'keyword_argument') {
+                refStack.push(node.childForFieldName('value'));
+                continue;
+            }
+            for (let i = 0; i < node.namedChildCount; i++) {
+                const child = node.namedChild(i);
+                if (child) refStack.push(child);
+            }
+        }
+    };
+    const targets = (target, kind) => {
+        if (!target) return;
+        if (target.type === 'identifier') {
+            if (target.text === name) push(target, kind);
+            return;
+        }
+        if (['pattern_list', 'tuple_pattern', 'list_pattern', 'expression_list', 'tuple',
+            'list', 'parenthesized_expression'].includes(target.type)) {
+            for (let i = 0; i < target.namedChildCount; i++) targets(target.namedChild(i), kind);
+            return;
+        }
+        references(target);
+    };
+    const visit = node => {
+        for (let i = 0; i < node.namedChildCount; i++) {
+            const child = node.namedChild(i);
+            if (!child) continue;
+            switch (child.type) {
+                case 'function_definition':
+                case 'class_definition': {
+                    const nameNode = child.childForFieldName('name');
+                    if (nameNode && nameNode.text === name && child.startIndex !== defNode.startIndex) {
+                        push(nameNode, 'definition');
+                    }
+                    // Evaluated in this scope: base classes, return and
+                    // parameter annotations, parameter defaults - never the
+                    // parameter names themselves.
+                    references(child.childForFieldName('superclasses'));
+                    references(child.childForFieldName('return_type'));
+                    const params = child.childForFieldName('parameters');
+                    for (let j = 0; j < (params?.namedChildCount || 0); j++) {
+                        const param = params.namedChild(j);
+                        references(param.childForFieldName?.('type'));
+                        references(param.childForFieldName?.('value'));
+                    }
+                    break;
+                }
+                case 'decorated_definition':
+                    for (let j = 0; j < child.namedChildCount; j++) {
+                        const part = child.namedChild(j);
+                        if (part.type === 'decorator') references(part);
+                    }
+                    visit({ namedChildCount: 1, namedChild: () => child.childForFieldName('definition') });
+                    break;
+                case 'expression_statement':
+                    visit(child);
+                    break;
+                case 'assignment':
+                case 'augmented_assignment': {
+                    targets(child.childForFieldName('left'), 'assignment');
+                    references(child.childForFieldName('type'));
+                    const right = child.childForFieldName('right');
+                    if (right && right.type === 'assignment') visit({ namedChildCount: 1, namedChild: () => right });
+                    else references(right);
+                    break;
+                }
+                case 'import_from_statement':
+                case 'import_statement':
+                    for (let j = 0; j < child.namedChildCount; j++) {
+                        const item = child.namedChild(j);
+                        if (item.type === 'aliased_import') {
+                            const alias = item.childForFieldName('alias');
+                            if (alias && alias.text === name) push(alias, 'import');
+                        } else if (item.type === 'dotted_name' &&
+                            (child.type === 'import_statement' ||
+                                !sameNode(item, child.childForFieldName('module_name')))) {
+                            const parts = item.namedChildren || [];
+                            if (parts.length === 1 && parts[0].text === name) {
+                                push(parts[0], 'import-name');
+                            }
+                        }
+                    }
+                    break;
+                case 'if_statement':
+                case 'elif_clause':
+                case 'else_clause':
+                case 'try_statement':
+                case 'except_clause':
+                case 'except_group_clause':
+                case 'finally_clause':
+                case 'with_statement':
+                case 'for_statement':
+                case 'while_statement':
+                case 'block':
+                case 'match_statement':
+                case 'case_clause':
+                    if (child.type === 'for_statement') {
+                        targets(child.childForFieldName('left'), 'assignment');
+                        references(child.childForFieldName('right'));
+                        for (const field of ['body', 'alternative']) {
+                            const part = child.childForFieldName(field);
+                            if (part) visit({ namedChildCount: 1, namedChild: () => part });
+                        }
+                        break;
+                    }
+                    visit(child);
+                    break;
+                default:
+                    if (child.type !== 'comment' && child.type !== 'pass_statement') references(child);
+            }
+        }
+    };
+    visit(container);
+    out.sort((a, b) => a.line - b.line || a.column - b.column);
+    return out;
+}
+
 module.exports = {
+    findScopeAlternativeBindings,
     findPythonModuleEvidence,
     findFunctions,
     findClasses,

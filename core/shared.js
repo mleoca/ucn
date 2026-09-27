@@ -59,7 +59,10 @@ function codeUnitCompare(a, b) {
  */
 function isTestPath(rp) {
     if (!rp) return false;
-    const language = detectLanguage(rp);
+    // A `.h` header tests the same under the C and C++ conventions (neither
+    // has a `.spec` form, only C's patterns name `.h`): no header-language
+    // detection, which walks the project directory (fix #396).
+    const language = path.extname(rp).toLowerCase() === '.h' ? 'c' : detectLanguage(rp);
     const { langTraits } = require('../languages');
     const specConvention = langTraits(language)?.testFileCandidates?.('sample', '')
         .some(candidate => candidate.includes('.spec'));
@@ -484,6 +487,20 @@ function maskBlockComments(content, language) {
     return out.join('');
 }
 
+/**
+ * Is a definition invoked through the macro namespace (fix #377)? A Rust
+ * `macro_rules!` macro, or a procedural macro function (`#[proc_macro]`,
+ * `#[proc_macro_attribute]`, `#[proc_macro_derive]`). C/C++ preprocessor
+ * macros are type 'macro' too; their invocations are ordinary call syntax.
+ */
+function isMacroNamespaceDefinition(def) {
+    if (!def) return false;
+    if (def.type === 'macro') return true;
+    const modifiers = def.modifiers || [];
+    return modifiers.includes('proc_macro') || modifiers.includes('proc_macro_attribute') ||
+        modifiers.includes('proc_macro_derive');
+}
+
 module.exports = { literalNameRegex,
     pickBestDefinition,
     addTestExclusions,
@@ -503,4 +520,5 @@ module.exports = { literalNameRegex,
     hasTextBlindspots,
     countTextBlindspots,
     isPathInsideRoot,
+    isMacroNamespaceDefinition,
 };

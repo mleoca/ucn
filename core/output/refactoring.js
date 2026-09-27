@@ -28,6 +28,46 @@ function _unverifiedBandLines(sites, cap = 10) {
 }
 
 /**
+ * Review items grouped by finding: one finding (same reason, same
+ * consequence) often holds at many sites, e.g. every place a type is used as
+ * an interface, or every comment naming the symbol. Each finding is stated
+ * once with its sites; at most `cap` sites are listed in total and every
+ * group keeps its count.
+ */
+function groupedReviewLines(items, cap = 20) {
+    const groups = new Map();
+    for (const item of items) {
+        const key = `${item.reviewReason || ''}\0${item.suggestion}`;
+        if (!groups.has(key)) groups.set(key, { suggestion: item.suggestion, items: [] });
+        groups.get(key).items.push(item);
+    }
+    const siteLine = item => `${item.file}:${item.line}: ${item.expression.replace(/\s+/g, ' ').slice(0, 120)}`;
+    const lines = [];
+    let budget = cap;
+    for (const group of groups.values()) {
+        if (group.items.length === 1) {
+            const [item] = group.items;
+            if (budget > 0) {
+                lines.push(`  ${siteLine(item)}`);
+                lines.push(`    → ${group.suggestion}`);
+                budget--;
+            } else {
+                lines.push(`  ${item.file}:${item.line}: ${group.suggestion}`);
+            }
+            continue;
+        }
+        lines.push(`  ${group.suggestion} (${group.items.length} sites):`);
+        const shown = group.items.slice(0, Math.max(1, budget));
+        for (const item of shown) lines.push(`    ${siteLine(item)}`);
+        budget -= shown.length;
+        if (group.items.length > shown.length) {
+            lines.push(`    (+${group.items.length - shown.length} more sites)`);
+        }
+    }
+    return lines;
+}
+
+/**
  * Format plan command output - text
  * Shows before/after signatures and all changes needed
  */
@@ -70,7 +110,7 @@ function formatPlan(plan, options = {}) {
     lines.push(`  Files affected: ${plan.filesAffected}`);
     if (plan.changeSummary) {
         const summary = plan.changeSummary;
-        lines.push(`  Definition ${summary.definitions}, calls ${summary.calls}, references ${summary.references || 0}, text dependencies ${summary.textReferences || 0}, imports ${summary.imports}, exports ${summary.exports}; manual review items ${summary.reviewRequired}`);
+        lines.push(`  Definition ${summary.definitions}, calls ${summary.calls}, references ${summary.references || 0}, ${summary.examples ? `examples ${summary.examples}, ` : ''}text dependencies ${summary.textReferences || 0}, ${summary.contracts ? `contract sites ${summary.contracts}, ` : ''}imports ${summary.imports}, exports ${summary.exports}; manual review items ${summary.reviewRequired}`);
     }
     if (plan.unchangedSites > 0) {
         lines.push(`  ${plan.unchangedSites} existing call site${plan.unchangedSites === 1 ? '' : 's'} require no edit because the new parameter has a default.`);
@@ -80,6 +120,9 @@ function formatPlan(plan, options = {}) {
     }
     if (plan.outsideIndexedSource) {
         lines.push(`  Source boundary: ${plan.outsideIndexedSource.action}`);
+    }
+    for (const rename of plan.fileRenames || []) {
+        lines.push(`  Rename file: ${rename.from} -> ${rename.to}`);
     }
     lines.push('');
 
@@ -104,15 +147,33 @@ function formatPlan(plan, options = {}) {
         }
     }
 
-    if (plan.reviewItems?.length > 0) {
-        lines.push(`\nREVIEW ITEMS (${plan.reviewItems.length}) — source text dependencies are never rewritten automatically:`);
-        for (const item of plan.reviewItems.slice(0, 20)) {
-            lines.push(`  ${item.file}:${item.line}: ${item.expression.replace(/\s+/g, ' ').slice(0, 120)}`);
-            lines.push(`    → ${item.suggestion}`);
-        }
-        if (plan.reviewItems.length > 20) {
-            lines.push(`  (+${plan.reviewItems.length - 20} more review items)`);
-        }
+    const contractItems = (plan.reviewItems || []).filter(item => item.contractDependency);
+    const templateItems = (plan.reviewItems || []).filter(item => item.templateDependency);
+    const bindingItems = (plan.reviewItems || []).filter(item => item.testBinding);
+    const textItems = (plan.reviewItems || []).filter(item =>
+        !item.contractDependency && !item.templateDependency && !item.testBinding);
+    if (plan.contract?.blocked || contractItems.length > 0) {
+        const generatedName = (plan.contract?.external || []).some(entry =>
+            entry.certainty === 'definite' && entry.reason === 'macro-generated-name');
+        const heading = plan.contract?.blocked
+            ? (generatedName
+                ? 'CONTRACT: rename blocked, a macro invocation generates the name; no edits are proposed'
+                : 'CONTRACT: rename blocked, the member fills a slot of a contract outside the project; no edits are proposed')
+            : 'CONTRACT REVIEW — the member takes part in a contract this plan cannot complete by editing project declarations';
+        lines.push(`\n${heading}:`);
+        lines.push(...groupedReviewLines(contractItems));
+    }
+    if (templateItems.length > 0) {
+        lines.push(`\nMACRO TEMPLATE SITES (${templateItems.length}) — tokens that bind at each macro expansion; review before renaming:`);
+        lines.push(...groupedReviewLines(templateItems));
+    }
+    if (bindingItems.length > 0) {
+        lines.push(`\nTEST FUNCTIONS BOUND BY NAME (${bindingItems.length}) — review before renaming:`);
+        lines.push(...groupedReviewLines(bindingItems));
+    }
+    if (textItems.length > 0) {
+        lines.push(`\nREVIEW ITEMS (${textItems.length}) — source text dependencies are never rewritten automatically:`);
+        lines.push(...groupedReviewLines(textItems));
     }
 
     // v4 tiered contract: candidates without evidence are not planned but
@@ -175,6 +236,7 @@ function formatPlanJson(plan) {
                 outsideIndexedSource: plan.outsideIndexedSource,
             }),
             ...(plan.unchangedSites > 0 && { unchangedSites: plan.unchangedSites }),
+            ...(plan.fileRenames?.length > 0 && { fileRenames: plan.fileRenames }),
             changes: plan.changes.map(c => ({
                 file: c.file,
                 line: c.line,
@@ -186,6 +248,7 @@ function formatPlanJson(plan) {
                 ...(c.isImport && { isImport: true }),
                 ...(c.isExport && { isExport: true }),
                 ...(c.needsReview && { needsReview: true }),
+                ...(c.reviewReason && { reviewReason: c.reviewReason }),
                 ...(c.textDependency && { textDependency: true }),
             })),
             reviewItems: (plan.reviewItems || []).map(item => ({
@@ -195,8 +258,13 @@ function formatPlanJson(plan) {
                 suggestion: item.suggestion,
                 editKind: item.editKind,
                 needsReview: true,
-                textDependency: true,
+                ...(item.contractDependency
+                    ? { contractDependency: true, reviewReason: item.reviewReason }
+                    : item.templateDependency
+                        ? { templateDependency: true, reviewReason: item.reviewReason }
+                        : { textDependency: true }),
             })),
+            ...(plan.contract && { contract: plan.contract }),
             // v4 tiered contract passthrough
             unverifiedCount: plan.unverifiedCount,
             unverifiedSites: plan.unverifiedSites,
@@ -239,6 +307,10 @@ function formatVerify(result, options = {}) {
     lines.push('═'.repeat(60));
     lines.push(`${result.file}:${result.startLine}`);
     lines.push(result.signature);
+    if (result.changedSince) {
+        lines.push(`Changed since ${result.changedSince.base}: was ${result.changedSince.signature}; ` +
+            `${result.changedSince.callSites} call site(s) of the old declaration checked against the new one`);
+    }
     for (const warning of result.warnings || []) {
         lines.push(`Note: ${warning.message}`);
     }
@@ -504,8 +576,18 @@ function formatStackTraceJson(result) {
 function formatAuditAsync(result) {
     if (!result) return 'No async audit data.';
     const issues = Array.isArray(result.issues) ? result.issues : [];
+    const skippedLines = [];
+    if (result.skippedUnknown > 0) {
+        skippedLines.push(`${result.skippedUnknown} unawaited call(s) to async functions whose call result is not known (unrecognized decorator or disagreeing same-name definitions) were not audited.`);
+    }
+    if (result.skippedFutures > 0) {
+        skippedLines.push(`${result.skippedFutures} unpolled Rust future(s) not known to be lazy (a type implementing Future can be a handle to started work; a non-builtin attribute can rewrite an async fn) were not audited.`);
+    }
+    const skipped = skippedLines.length > 0 ? skippedLines.join('\n') : null;
     if (issues.length === 0) {
-        return 'Async audit: no missing-await issues found.';
+        return skipped
+            ? `Async audit: no missing-await issues found.\n${skipped}`
+            : 'Async audit: no missing-await issues found.';
     }
     const lines = [];
     lines.push(`Async audit: ${result.totalIssues} likely missing-await call site(s) across ${result.filesAffected} file(s)`);
@@ -522,11 +604,29 @@ function formatAuditAsync(result) {
         lines.push(`${file} (${fileIssues.length})`);
         for (const issue of fileIssues) {
             const caller = issue.callerName ? ` [${issue.callerName}]` : '';
-            const detail = issue.reason === 'stored-promise-used-as-value'
+            const detail = issue.reason === 'future-discarded'
+                ? `${issue.calleeName}() — future created and never polled (discarded)`
+                : issue.reason === 'future-dropped'
+                    ? `${issue.calleeName}() — future dropped by \`let _ =\` without being polled`
+                : issue.reason === 'future-unused'
+                    ? `${issue.calleeName}() — future bound to ${issue.variable} and never used`
+                : issue.reason === 'stored-future-used-as-value'
+                    ? `${issue.variable} used as its Output; future from ${issue.calleeName}() at line ${issue.originLine} is not awaited`
+                : issue.reason === 'stored-promise-used-as-value'
                 ? `${issue.variable} used as a resolved value; promise from ${issue.calleeName}() at line ${issue.originLine}`
-                : `${issue.calleeName}() — async, not awaited`;
+                : issue.reason === 'async-result-used-as-value'
+                    ? `${issue.calleeName}() — result used as a resolved value, not awaited`
+                : issue.reason === 'async-iterator-discarded'
+                    ? `${issue.calleeName}() — async iterator created and never iterated`
+                    : issue.reason === 'async-context-manager-discarded'
+                        ? `${issue.calleeName}() — async context manager created and never entered`
+                        : `${issue.calleeName}() — async, not awaited`;
             lines.push(`  :${issue.line}${caller}  ${detail}`);
         }
+    }
+    if (skipped) {
+        lines.push('');
+        lines.push(skipped);
     }
     return lines.join('\n');
 }
@@ -544,7 +644,12 @@ function formatAuditAsyncJson(result) {
             line: i.line,
             callerName: i.callerName,
             calleeName: i.calleeName,
+            ...(i.reason && { reason: i.reason }),
+            ...(i.reason && i.reason.startsWith('stored-future') && { variable: i.variable, originLine: i.originLine }),
+            ...(i.reason === 'future-unused' && { variable: i.variable }),
         })),
+        ...(result.skippedUnknown > 0 && { skippedUnknown: result.skippedUnknown }),
+        ...(result.skippedFutures > 0 && { skippedFutures: result.skippedFutures }),
     }, null, 2);
 }
 

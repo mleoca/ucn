@@ -124,7 +124,9 @@ const RECEIVER_SHAPES = {
     },
     rust: {
         classWithMethod: name => `struct ${name} {}\nimpl ${name} { fn as_posix(&self) -> i32 { 1 } }`,
-        untypedOrExternalReceiverCall: () => 'trait Contract { fn as_posix(&self) -> i32; }\nfn unresolved<T: Contract>(value: &T) -> i32 { value.as_posix() }',
+        // A generic `T: Contract` receiver is provably NOT an inherent
+        // `Local::as_posix` caller (fix #368); an externally produced value is.
+        untypedOrExternalReceiverCall: () => 'fn unresolved() -> i32 { let value = external::make(); value.as_posix() }',
         annotatedReceiverCall: () => 'fn declared(value: &Local) -> i32 { value.as_posix() }',
         constructorReceiverCall: () => 'fn constructed() -> i32 { let value = Local {}; value.as_posix() }',
         unrelatedTypedReceiverCall: () => 'fn different(value: &Other) -> i32 { value.as_posix() }',

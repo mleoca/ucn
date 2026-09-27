@@ -8,6 +8,7 @@ const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const { langTraits } = require('../languages');
+const { IgnoreRules } = require('./ignore-rules');
 
 // Always ignore - unambiguous, never user code
 const DEFAULT_IGNORES = [
@@ -60,6 +61,11 @@ const DEFAULT_IGNORES = [
 // These can contain user code: disclose their exclusion, unlike dependency
 // and VCS directories. Source maps are data and cannot be parsed as code.
 const BUNDLED_PATTERNS = ['*.min.js', '*.bundle.js', '*.map'];
+let _bundledList = null;
+function bundledList() {
+    if (!_bundledList) _bundledList = compileIgnoreList(BUNDLED_PATTERNS);
+    return _bundledList;
+}
 
 // Conditional ignores - only ignore when marker file exists in same directory
 // Maps directory name -> array of marker files that indicate it's a vendor dir
@@ -141,69 +147,6 @@ const TEST_PATTERNS = {
     ]
 };
 
-/**
- * Parse .gitignore file and return patterns compatible with shouldIgnore().
- * Handles simple directory/file patterns. Skips negation patterns and comments.
- *
- * @param {string} projectRoot - Project root directory
- * @returns {string[]} - Array of ignore patterns (directory/file names and globs)
- */
-function parseGitignoreFile(projectRoot, gitignorePath) {
-    let content;
-    try { content = fs.readFileSync(gitignorePath, 'utf-8'); } catch { return []; }
-    const baseRelative = path.relative(projectRoot, path.dirname(gitignorePath))
-        .replaceAll(path.sep, '/');
-    const patterns = [];
-    for (const rawLine of content.split('\n')) {
-        const line = rawLine.trim();
-        // Keep negations and ordering: gitignore is a last-match-wins rule.
-        if (!line || line.startsWith('#')) continue;
-
-        const negated = line.startsWith('!');
-        const body = negated ? line.slice(1) : line;
-        if (!body) continue;
-
-        // Strip trailing slash (directory indicator) — shouldIgnore checks
-        // directories before descending, so an exact directory match covers
-        // its whole subtree.
-        let pattern = body.endsWith('/') ? body.slice(0, -1) : body;
-
-        // Leading slash = ANCHORED to the .gitignore's directory (fix #226).
-        // git semantics: `/locale` ignores only the root-level locale, never
-        // src/locale. Stripping the slash and matching by bare name silently
-        // excluded real source trees (dayjs ignores its BUILD outputs /locale
-        // /plugin — src/locale and src/plugin are ~160 tracked source files
-        // UCN never indexed, with no warning). Anchored patterns keep the
-        // slash; shouldIgnore applies them only at the walk's anchor root.
-        const anchored = pattern.startsWith('/');
-        if (anchored) pattern = pattern.slice(1);
-
-        // Skip empty after stripping
-        if (!pattern) continue;
-
-        // Avoid duplicating built-in ignores
-        if (!negated && DEFAULT_IGNORES.includes(pattern)) continue;
-
-        if (!baseRelative) {
-            const normalized = anchored ? '/' + pattern : pattern;
-            patterns.push((negated ? '!' : '') + normalized);
-            continue;
-        }
-
-        // Nested .gitignore rules are scoped to their own directory. Flatten
-        // that scope into root-relative patterns for shouldIgnore(). A rule
-        // without a slash matches at every depth below its .gitignore; emit
-        // both the direct and descendant forms so the glob stays exact.
-        const scoped = `${baseRelative}/${pattern}`;
-        patterns.push((negated ? '!' : '') + scoped);
-        if (!anchored && !pattern.includes('/')) {
-            patterns.push((negated ? '!' : '') + `${baseRelative}/**/${pattern}`);
-        }
-    }
-
-    return patterns;
-}
-
 function fallbackGitignoreFiles(projectRoot) {
     const found = [];
     const visit = dir => {
@@ -230,63 +173,117 @@ function hasGitMetadata(projectRoot) {
     }
 }
 
-function gitignoreFiles(projectRoot) {
-    if (!hasGitMetadata(projectRoot)) return fallbackGitignoreFiles(projectRoot);
-    try {
-        const output = execFileSync('git', [
-            '-C', projectRoot, 'ls-files', '-z', '--cached', '--others',
-            '--exclude-standard', '--', '.gitignore', '**/.gitignore',
-        ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
-        return output.split('\0').filter(Boolean)
-            .map(relative => path.resolve(projectRoot, relative))
-            .filter(file => file === projectRoot || file.startsWith(projectRoot + path.sep));
-    } catch {
-        return fallbackGitignoreFiles(projectRoot);
-    }
+/** First line of a failed git invocation, for disclosure. */
+function describeGitFailure(error) {
+    if (error && error.code === 'ENOENT') return 'git is not installed or not on PATH';
+    if (error && error.code === 'ENOBUFS') return 'git ls-files output exceeded the process output limit';
+    const stderr = error && error.stderr ? String(error.stderr).trim().split('\n')[0] : '';
+    if (stderr) return stderr;
+    if (error && typeof error.status === 'number') return `git ls-files exited with status ${error.status}`;
+    return (error && error.message) ? error.message.split('\n')[0] : 'git ls-files failed';
 }
 
 /**
- * Parse the root and every applicable nested .gitignore, preserving Git's
- * parent-before-child override order.
+ * One `git ls-files` for everything discovery asks git (fix #375): the
+ * tracked paths (which .gitignore rules never exclude) and the .gitignore
+ * files git honors, tracked or untracked-and-not-ignored. Tags tell tracked
+ * entries (`H`, `S`, `M`...) from untracked ones (`?`).
+ *
+ * Returns null when the project is not inside a git work tree. Otherwise the
+ * listing is complete whatever its size (fix #382: the output is read as a
+ * buffer with no size cap; a 1MB cap used to empty the tracked set on large
+ * repositories, silently dropping tracked files that match a .gitignore
+ * rule). When git itself fails, `failure` says why: the tracked set is then
+ * unknown, discovery falls back to the rules alone, and the caller records a
+ * `git-listing-failed` discovery issue, so the index is disclosed as
+ * possibly partial instead of silently changing its file set.
  */
-function parseGitignore(projectRoot) {
+function gitListing(projectRoot) {
     const root = path.resolve(projectRoot);
-    const files = gitignoreFiles(root).sort((a, b) => {
-        const depthA = path.relative(root, a).split(path.sep).length;
-        const depthB = path.relative(root, b).split(path.sep).length;
-        return depthA - depthB || compareNames(a, b);
-    });
-    const patterns = [];
-    for (const file of files) patterns.push(...parseGitignoreFile(root, file));
-    return patterns;
-}
-
-/** Return tracked files and their ancestor directories, relative to root. */
-function gitTrackedPaths(projectRoot) {
-    if (!hasGitMetadata(projectRoot)) {
-        return { files: new Set(), directories: new Set() };
-    }
+    if (!hasGitMetadata(root)) return null;
+    let output;
     try {
-        const output = execFileSync('git', [
-            '-C', projectRoot, 'ls-files', '-z', '--cached',
-        ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
-        const files = new Set();
-        const directories = new Set();
-        for (const raw of output.split('\0')) {
-            if (!raw) continue;
-            const relative = path.normalize(raw).replaceAll(path.sep, '/');
-            if (relative === '..' || relative.startsWith('../') || path.isAbsolute(relative)) continue;
-            files.add(relative);
-            let parent = path.posix.dirname(relative);
-            while (parent && parent !== '.') {
-                directories.add(parent);
-                parent = path.posix.dirname(parent);
+        output = execFileSync('git', [
+            '-C', root, 'ls-files', '-z', '-t', '--cached', '--others', '--exclude-standard',
+        ], { stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: Infinity, windowsHide: true });
+    } catch (error) {
+        return {
+            tracked: { files: new Set(), directories: new Set() },
+            gitignores: null,
+            failure: { detail: describeGitFailure(error) },
+        };
+    }
+    const files = new Set();
+    const directories = new Set();
+    const gitignores = [];
+    let start = 0;
+    const length = output.length;
+    while (start < length) {
+        let end = output.indexOf(0, start);
+        if (end < 0) end = length;
+        // `<tag> <path>`: at least one tag byte, a space, one path byte.
+        if (end - start >= 3 && output[start + 1] === 0x20) {
+            const untracked = output[start] === 0x3f; // '?'
+            const raw = output.toString('utf8', start + 2, end);
+            // gitignoreFiles' pathspecs `.gitignore` (literal: the file, or a
+            // directory of that name) and `**/.gitignore`.
+            if (raw === '.gitignore' || raw.startsWith('.gitignore/') || raw.endsWith('/.gitignore')) {
+                const file = path.resolve(root, raw);
+                if (file === root || file.startsWith(root + path.sep)) gitignores.push(file);
+            }
+            if (!untracked) {
+                // git prints '/'-separated paths on every platform.
+                const relative = path.posix.normalize(raw);
+                if (relative !== '..' && !relative.startsWith('../') && !path.isAbsolute(relative)) {
+                    files.add(relative);
+                    let slash = relative.lastIndexOf('/');
+                    while (slash > 0) {
+                        const parent = relative.slice(0, slash);
+                        if (directories.has(parent)) break;
+                        directories.add(parent);
+                        slash = parent.lastIndexOf('/');
+                    }
+                }
             }
         }
-        return { files, directories };
-    } catch {
-        return { files: new Set(), directories: new Set() };
+        start = end + 1;
     }
+    return { tracked: { files, directories }, gitignores, failure: null };
+}
+
+/**
+ * The project's .gitignore rules, compiled (core/ignore-rules.js): the root
+ * file and every applicable nested one, parent before child. `listing`
+ * (gitListing) supplies the .gitignore files when the caller already asked
+ * git; without git metadata (or when git failed) the tree is walked for them.
+ * @returns {IgnoreRules}
+ */
+function parseGitignore(projectRoot, listing) {
+    const root = path.resolve(projectRoot);
+    if (listing === undefined) listing = gitListing(root);
+    const files = (listing?.gitignores ? [...listing.gitignores] : fallbackGitignoreFiles(root))
+        .map(file => ({ file, base: path.relative(root, path.dirname(file)).split(path.sep).join('/') }))
+        .sort((a, b) => {
+            const depthA = a.base ? a.base.split('/').length : 0;
+            const depthB = b.base ? b.base.split('/').length : 0;
+            return depthA - depthB || compareNames(a.file, b.file);
+        });
+    const sources = [];
+    for (const { file, base } of files) {
+        let content;
+        try { content = fs.readFileSync(file, 'utf-8'); } catch { continue; }
+        sources.push({ base, content });
+    }
+    return new IgnoreRules(sources);
+}
+
+/**
+ * Return tracked files and their ancestor directories, relative to root
+ * (from `listing`, a gitListing result, when given).
+ */
+function gitTrackedPaths(projectRoot, listing) {
+    if (listing === undefined) listing = gitListing(projectRoot);
+    return listing ? listing.tracked : { files: new Set(), directories: new Set() };
 }
 
 function compareNames(a, b) {
@@ -317,7 +314,7 @@ function expandGlob(pattern, options = {}) {
     const maxFiles = options.maxFiles ?? 50000;
     const maxFileSize = options.maxFileSize ?? (8 * 1024 * 1024);
     const followSymlinks = options.followSymlinks !== false; // default true
-    const gitignorePatterns = options.gitignorePatterns || [];
+    const gitignoreRules = options.gitignoreRules || null;
     const trackedPaths = options.trackedPaths || { files: new Set(), directories: new Set() };
 
     // Handle home directory expansion
@@ -334,7 +331,8 @@ function expandGlob(pattern, options = {}) {
         filePattern,
         recursive,
         ignores,
-        gitignorePatterns,
+        policy: compileIgnoreList(ignores),
+        gitignoreRules,
         trackedPaths,
         maxDepth,
         maxFileSize,
@@ -346,6 +344,7 @@ function expandGlob(pattern, options = {}) {
         onSkippedFile: options.onSkippedFile,
         onDiscoveryIssue: options.onDiscoveryIssue,
         disclosureIgnores: options.disclosureIgnores,
+        disclosure: options.disclosureIgnores?.length ? compileIgnoreList(options.disclosureIgnores) : null,
         onFile: (filePath) => {
             if (files.length < maxFiles) {
                 files.push(filePath);
@@ -358,9 +357,120 @@ function expandGlob(pattern, options = {}) {
                 });
             }
         }
-    });
+    }, 0, new Set(), null, walkContext(root, baseDir, gitignoreRules));
 
     return files.sort(compareNames);
+}
+
+/**
+ * Where a walk starts, relative to the project root: the '/'-separated path
+ * every entry's root-relative path extends (computed once per directory, never
+ * per rule), the .gitignore scope chain in effect, and whether a parent
+ * directory is already excluded.
+ */
+function walkContext(root, baseDir, gitignoreRules) {
+    const relative = path.relative(root, path.resolve(baseDir)).split(path.sep).join('/');
+    const inside = relative === '' ||
+        (relative !== '..' && !relative.startsWith('../') && !path.isAbsolute(relative));
+    if (!inside) return { rel: relative, inside: false, segments: 0, scopes: [], excluded: false };
+    return {
+        rel: relative,
+        inside: true,
+        segments: relative ? relative.split('/').length : 0,
+        scopes: gitignoreRules ? gitignoreRules.chainFor(relative) : [],
+        excluded: !!(relative && gitignoreRules && gitignoreRules.isIgnored(relative, true)),
+    };
+}
+
+const LITERAL_NAME = 0;
+const GLOB_NAME = 1;
+const PATH_GLOB = 2;
+
+/**
+ * A UCN ignore list (DEFAULT_IGNORES, .ucn.json `exclude`, bundled names)
+ * compiled once with shouldIgnore()'s semantics minus the conditional vendor
+ * checks: a pattern with '/' is a glob over the root-relative path (leading
+ * slashes dropped, `dir/**` also naming `dir`), others match the basename
+ * (literal or glob); the last match wins and a later `!pattern` re-includes.
+ */
+function compileIgnoreList(patterns) {
+    const rules = [];
+    const literals = new Set();
+    const globs = [];
+    const paths = [];
+    const reincludes = [];
+    let hasNegation = false;
+    for (const raw of patterns || []) {
+        const negated = raw.charCodeAt(0) === 33 /* ! */;
+        const pattern = negated ? raw.slice(1) : raw;
+        let rule;
+        if (pattern.includes('/')) {
+            const normalized = pattern.replace(/^\/+/, '').replaceAll('\\', '/');
+            rule = {
+                negated, kind: PATH_GLOB, regex: cachedGlobRegex(`path:${normalized}`, normalized),
+                dirPrefix: normalized.endsWith('/**') ? normalized.slice(0, -3).replace(/\/+$/, '') : null,
+            };
+            if (!negated) paths.push(rule);
+        } else if (pattern.includes('*')) {
+            rule = { negated, kind: GLOB_NAME, regex: cachedGlobRegex(pattern, pattern) };
+            if (!negated) globs.push(rule);
+        } else {
+            rule = { negated, kind: LITERAL_NAME, name: pattern };
+            if (!negated) literals.add(pattern);
+        }
+        if (negated) {
+            hasNegation = true;
+            const reinclude = pattern.replace(/^\/+/, '');
+            if (reinclude.includes('/')) reincludes.push(reinclude);
+        }
+        rules.push(rule);
+    }
+    const ruleMatches = (rule, name, rel) => {
+        if (rule.kind === LITERAL_NAME) return rule.name === name;
+        if (rule.kind === GLOB_NAME) return rule.regex.test(name);
+        return rel !== null && (rule.regex.test(rel) || (rule.dirPrefix !== null && rel === rule.dirPrefix));
+    };
+    return {
+        size: rules.length,
+        /** @param {string|null} rel - root-relative path ('..'-prefixed outside the root) */
+        matches(name, rel, isDirectory) {
+            if (!hasNegation) {
+                if (literals.has(name)) return true;
+                for (const rule of globs) if (rule.regex.test(name)) return true;
+                for (const rule of paths) if (ruleMatches(rule, name, rel)) return true;
+                return false;
+            }
+            let ignored = false;
+            for (const rule of rules) {
+                if (ruleMatches(rule, name, rel)) ignored = !rule.negated;
+            }
+            // A later negation can re-include a descendant: keep walking a
+            // matched directory whenever such a rule might apply below it.
+            if (ignored && isDirectory && rel !== null &&
+                reincludes.some(p => p.startsWith(rel + '/') || p.includes('**'))) {
+                ignored = false;
+            }
+            return ignored;
+        },
+    };
+}
+
+function cachedGlobRegex(key, glob) {
+    let regex = _globRegexCache.get(key);
+    if (!regex) {
+        regex = globToRegex(glob);
+        _globRegexCache.set(key, regex);
+    }
+    return regex;
+}
+
+/** Conditional vendor-style ignores: the name plus a marker file beside it. */
+function conditionallyIgnored(name, parentDir) {
+    if (!Array.isArray(CONDITIONAL_IGNORES[name])) return false;
+    for (const marker of CONDITIONAL_IGNORES[name]) {
+        if (fs.existsSync(path.join(parentDir, marker))) return true;
+    }
+    return false;
 }
 
 /**
@@ -423,7 +533,7 @@ function globToRegex(glob) {
 /**
  * Walk a directory tree, calling onFile for each matching file
  */
-function walkDir(dir, options, depth = 0, visited = new Set()) {
+function walkDir(dir, options, depth = 0, visited = new Set(), knownRealDir = null, context = null) {
     if (depth > options.maxDepth) {
         options.onDiscoveryIssue?.({
             path: dir, kind: 'directory', reason: 'max-depth',
@@ -431,18 +541,23 @@ function walkDir(dir, options, depth = 0, visited = new Set()) {
         });
         return;
     }
-    if (!fs.existsSync(dir)) return;
+    // A plain (non-symlink) subdirectory of a resolved directory is its own
+    // real path: only the root and symlinked entries need realpath (fix #372,
+    // one lstat per path component per directory on every staleness walk).
+    if (!knownRealDir && !fs.existsSync(dir)) return;
 
     // Track visited directories to avoid circular symlinks
-    let realDir;
-    try {
-        realDir = fs.realpathSync(dir);
-    } catch (e) {
-        options.onDiscoveryIssue?.({
-            path: dir, kind: 'directory', reason: 'unreadable-directory',
-            detail: e.message,
-        });
-        return; // broken symlink
+    let realDir = knownRealDir;
+    if (!realDir) {
+        try {
+            realDir = fs.realpathSync(dir);
+        } catch (e) {
+            options.onDiscoveryIssue?.({
+                path: dir, kind: 'directory', reason: 'unreadable-directory',
+                detail: e.message,
+            });
+            return; // broken symlink
+        }
     }
     if (visited.has(realDir)) return;
     visited.add(realDir);
@@ -461,46 +576,40 @@ function walkDir(dir, options, depth = 0, visited = new Set()) {
     entries.sort((a, b) => compareNames(a.name, b.name));
 
     const followSymlinks = options.followSymlinks !== false; // default true
+    if (!context) {
+        context = walkContext(options.anchorRoot || dir, dir, options.gitignoreRules || null);
+    }
+    const policy = options.policy || (options.policy = compileIgnoreList(options.ignores || DEFAULT_IGNORES));
+    const rules = context.inside ? options.gitignoreRules || null : null;
+    const trackedFiles = options.trackedPaths?.files;
+    const trackedDirectories = options.trackedPaths?.directories;
 
     for (const entry of entries) {
-        const fullPath = path.join(dir, entry.name);
-
+        const name = entry.name;
+        const fullPath = path.join(dir, name);
         const entryIsDirectory = entry.isDirectory();
-        const policyIgnored = shouldIgnore(
-            entry.name,
-            options.ignores,
-            dir,
-            dir === options.anchorRoot,
-            options.anchorRoot,
-            fullPath,
-            entryIsDirectory,
-        );
-        const relative = options.anchorRoot
-            ? path.relative(options.anchorRoot, fullPath).replaceAll(path.sep, '/')
-            : '';
-        const tracked = entryIsDirectory
-            ? options.trackedPaths?.directories?.has(relative)
-            : options.trackedPaths?.files?.has(relative);
-        const gitIgnored = !tracked && options.gitignorePatterns?.length > 0 && shouldIgnore(
-            entry.name,
-            options.gitignorePatterns,
-            dir,
-            dir === options.anchorRoot,
-            options.anchorRoot,
-            fullPath,
-            entryIsDirectory,
-        );
-        if (policyIgnored || gitIgnored) {
-            if (options.disclosureIgnores && shouldIgnore(
-                entry.name,
-                options.disclosureIgnores,
-                dir,
-                dir === options.anchorRoot,
-                options.anchorRoot,
-                fullPath,
-                entryIsDirectory,
-                false,
-            )) {
+        // Root-relative path, extended once per entry (never per rule).
+        const relative = context.rel ? `${context.rel}/${name}` : name;
+        const policyIgnored = policy.matches(name, relative, entryIsDirectory) ||
+            conditionallyIgnored(name, dir);
+        // .gitignore verdict for the untracked view of this entry. Tracked
+        // paths are never excluded by rules (git keeps tracking them), but a
+        // tracked DIRECTORY still needs the verdict: its untracked contents
+        // inherit an exclusion (git cannot re-include below an excluded
+        // directory).
+        let tracked = false;
+        let excluded = false;
+        if (!policyIgnored && context.inside) {
+            tracked = entryIsDirectory
+                ? !!trackedDirectories?.has(relative)
+                : !!trackedFiles?.has(relative);
+            if (context.excluded) excluded = true;
+            else if (rules && (!tracked || entryIsDirectory)) {
+                excluded = rules.decide(context.scopes, relative, context.segments, name, entryIsDirectory);
+            }
+        }
+        if (policyIgnored || (excluded && !tracked)) {
+            if (options.disclosure && options.disclosure.matches(name, relative, entryIsDirectory)) {
                 options.onDiscoveryIssue?.({
                     path: fullPath,
                     kind: entryIsDirectory ? 'directory' : 'file',
@@ -527,10 +636,17 @@ function walkDir(dir, options, depth = 0, visited = new Set()) {
 
         if (isDir) {
             if (options.recursive) {
-                walkDir(fullPath, options, depth + 1, visited);
+                walkDir(fullPath, options, depth + 1, visited,
+                    entry.isSymbolicLink() ? null : path.join(realDir, entry.name), {
+                        rel: relative,
+                        inside: context.inside,
+                        segments: context.segments + 1,
+                        scopes: rules && !excluded ? rules.scopesFor(context.scopes, relative) : context.scopes,
+                        excluded,
+                    });
             }
         } else if (isFile) {
-            if (shouldIgnore(entry.name, BUNDLED_PATTERNS) &&
+            if (bundledList().matches(entry.name, null, false) &&
                 (!options.includeBundled || entry.name.endsWith('.map'))) {
                 options.onDiscoveryIssue?.({
                     path: fullPath, kind: 'file', reason: 'bundled',
@@ -906,6 +1022,7 @@ module.exports = {
     findTestFileFor,
     parseGitignore,
     gitTrackedPaths,
+    gitListing,
     DEFAULT_IGNORES,
     PROJECT_MARKERS,
     TEST_PATTERNS,

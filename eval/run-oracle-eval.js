@@ -490,9 +490,28 @@ async function evaluateRepo(repo, oracle) {
         }
 
         const sameNameDefs = index.symbols.get(sym.name) || [];
-        const targetDef = sameNameDefs.find(d =>
+        let targetDef = sameNameDefs.find(d =>
             d.relativePath === sym.file &&
             (d.startLine === sym.line || d.nameLine === sym.line));
+        // A bodyless C/C++ type declaration (`struct S;`) is a redeclaration
+        // of the one type; the engine indexes the type once, at its body.
+        // Map a sampled forward declaration to the definition the oracle
+        // resolves it to, as for function prototypes below.
+        if (!targetDef && sym.kind === 'class' &&
+            /\.(?:c|h|cc|cpp|cxx|hh|hpp|hxx)$/i.test(sym.file)) {
+            for (const location of await resolvedDefinitions(sym.file, sym.line, sym.name)) {
+                const equivalent = sameNameDefs.find(definition =>
+                    !definition.className && definition.type !== 'function' &&
+                    definition.type !== 'method' &&
+                    definition.relativePath === location.file &&
+                    location.line >= definition.startLine &&
+                    location.line <= definition.endLine);
+                if (equivalent) {
+                    targetDef = equivalent;
+                    break;
+                }
+            }
+        }
         const targetLanguage = targetDef
             ? index.files.get(targetDef.file)?.language : null;
         // A C/C++ header prototype and its source definition are distinct
@@ -770,7 +789,12 @@ async function evaluateRepo(repo, oracle) {
 
         // UCN answer via the REAL contract surface: execute → formatContextJson.
         // Pin resolution to the oracle's exact declaration via symbol handle.
-        const handleName = `${sym.file}:${sym.line}:${sym.name}`;
+        // A sampled redeclaration mapped to its definition (a forward type
+        // declaration) is pinned at the definition.
+        const handleName = targetDef && !(targetDef.relativePath === sym.file &&
+            (targetDef.startLine === sym.line || targetDef.nameLine === sym.line))
+            ? `${targetDef.relativePath}:${targetDef.startLine}:${sym.name}`
+            : `${sym.file}:${sym.line}:${sym.name}`;
         const r = execute(index, 'context', { name: handleName });
         if (!r.ok) {
             perSymbol.push({ name: sym.name, file: sym.file, line: sym.line, kind: sym.kind, error: r.error });
@@ -791,6 +815,7 @@ async function evaluateRepo(repo, oracle) {
             ...(c.calledAs && c.calledAs !== 'bound' && { calledAs: c.calledAs }),
             usageStyle: c.calledAs === 'bound' || !!c.functionReference,
             resolution: c.resolution, tier: c.tier, provenance: c.provenance,
+            ...(c.macroExpansion?.origin && { macroOrigin: c.macroExpansion.origin }),
             target: { file: sym.file, startLine: sym.line, name: sym.name, kind: sym.kind },
         })));
         const confirmed = dedupe(confirmedOccurrences);
@@ -807,6 +832,7 @@ async function evaluateRepo(repo, oracle) {
             ...(c.externalContract && { externalContract: true }),
             uncertaintyClass: c.uncertaintyClass || 'actionable-ambiguity',
             ...(c.dispatchFamily && { dispatchFamily: c.dispatchFamily }),
+            ...(c.macroExpansion?.origin && { macroOrigin: c.macroExpansion.origin }),
         })));
         const account = json.meta.account;
 
@@ -890,6 +916,16 @@ async function evaluateRepo(repo, oracle) {
             superCtorSite(c);
         const edgeMatchesTarget = async c => {
             if (superCtorSite(c)) return { hit: true, scorable: true, definitionValidated: false };
+            // A call a project macro_rules! transcriber generated (fix #374):
+            // the name token lives in the macro definition, and rust-analyzer
+            // reports such expansion references at neither the definition
+            // token nor the invocation (measured on a probe crate). The
+            // compiler oracle cannot score it; argument-origin tokens keep
+            // their own source position and are scored normally.
+            if (c.macroOrigin === 'template' && !edgeHitWithoutDefinition(c)) {
+                return { hit: false, scorable: false, definitionValidated: false,
+                    abstention: 'macro-template-expansion' };
+            }
             if (needsDefinitionAdjudication) {
                 if (oracleMayReachKeys.has(key(c.file, c.line))) {
                     return { hit: true, scorable: true, definitionValidated: true };

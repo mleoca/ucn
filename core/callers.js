@@ -9,16 +9,40 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { detectLanguage, getParser, getLanguageAdapter, langTraits } = require('../languages');
+const { genericArityOf } = require('../languages/utils');
 const { isTestFile } = require('./discovery');
-const { NON_CALLABLE_TYPES, isOverrideMarked, codeUnitCompare, isTestPath, CALLABLE_SYMBOL_KINDS } = require('./shared');
-const { _resolveJavaPackageImport } = require('./graph-build');
+const { NON_CALLABLE_TYPES, isOverrideMarked, codeUnitCompare, isTestPath, CALLABLE_SYMBOL_KINDS,
+    isMacroNamespaceDefinition } = require('./shared');
+const { _resolveJavaPackageImport, _rustWalkUsePath, splitParentList } = require('./graph-build');
+const { externalTypeGate, stripExternalReceiverType, externalTypeDenotation, externalProducerVia, externalReceiverVerdict, csharpUsings, siteNamespaceOf } = require('./type-denotation');
 const { scoreEdge, tierForResolution, TIER, validateConfirmation } = require('./confidence');
 const { summarizeProvenance, declarationIdentity, sameDeclaration } = require('./provenance');
-const { confirmationFacts, occurrenceIdentity } = require('./provenance-facts');
+const { confirmationFacts, occurrenceIdentity, definitionsInFile, definitionAt } = require('./provenance-facts');
 const { BUILTIN_RECEIVER_TYPES, isProvenanceBuiltinReceiver } = require('./receiver-types');
-const { findGoModule, resolveRustImport } = require('./imports');
+const { findGoModule, resolveRustImport, resolveRustModuleFile } = require('./imports');
 const { rustWrapperContract, validateRustWrapperContract } = require('./rust-result-flow');
 const { pythonFixtureReceiver, pythonFixtureType } = require('./python-fixture-flow');
+const { reflectionPatternReferences: _reflectionPatternReferences } = require('./reflection');
+const {
+    ownerRefOf, ownerNameOf, ownedBy, findDeclaringClass, relationToTargets,
+    shareDescendant: shareClassDescendant, parentRefsOf: parentRefsOfClass,
+    descendantKeys, classKeyOf, classDefsNamed, distinctOwnerDefinitions, ownerDefinitionOf,
+    hasFunctionLocalClass, descendsFromTargets, resolveClassRef,
+} = require('./class-identity');
+const { resolveQualifier: resolveCppQualifier, effectiveNamespace: cppEffectiveNamespace,
+    globalQualifiedReaches: cppGlobalQualifiedReaches, includeClosure: cppIncludeClosure } =
+    require('./cpp-scope');
+
+/**
+ * fix #358: false only for a member whose owner carries the same NAME as
+ * `ref` but is provably a different class definition (a same-name class in
+ * another module/package/namespace). Members of other-named classes (for
+ * inherited lookup) and unresolved owners pass.
+ */
+function _notForeignSameNameOwner(index, member, ref) {
+    if (!ref || ownerNameOf(member) !== ref.name) return true;
+    return ownedBy(index, member, ref) !== 'no';
+}
 
 const CONSTRUCTABLE_BINDING_KINDS = new Set([
     'class', 'struct', 'record', 'enum', 'function',
@@ -57,9 +81,8 @@ function _confirmationFacts(index, file, call, targets, options = {}) {
             }
             const origin = _resolveFlowTypeOrigin(index, context, name, qualified);
             if (!origin?.fromFile) return null;
-            const definitions = (index.symbols.get(name) || []).filter(d =>
+            const definitions = definitionsInFile(index, name, origin.fromFile).filter(d =>
                 (IDENTITY_TYPE_KINDS.has(d.type) || (d.type === 'type' && d.aliasOf)) &&
-                d.file === origin.fromFile &&
                 (!d.lexicalScopeStartLine || (line != null &&
                     line >= d.lexicalScopeStartLine && line <= d.lexicalScopeEndLine)));
             return definitions.length === 1 ? definitions[0] : null;
@@ -108,18 +131,46 @@ function getLine(content, lineNum) {
  * @param {boolean} [options.includeContent] - Also return file content (avoids double read)
  * @returns {Array|null|{calls: Array, content: string}} Array of calls, or object with content if requested
  */
+/**
+ * Calls of a file: the parser's call records plus, for C/C++, the records
+ * that invocations of project token-pasting / higher-order macros expand to
+ * (fix #362, core/macro-expansion.js - derived, never persisted).
+ */
 function getCachedCalls(index, filePath, options = {}) {
+    const result = _getCachedCallsRaw(index, filePath, options);
+    if (!result) return result;
+    const { withMacroExpansion } = require('./macro-expansion');
+    if (Array.isArray(result)) return withMacroExpansion(index, filePath, result);
+    const calls = withMacroExpansion(index, filePath, result.calls);
+    return calls === result.calls ? result : { ...result, calls };
+}
+
+const _opStatMemos = new WeakMap(); // operation content cache -> Map<filePath, mtimeMs>
+function _opStatMemo(scope) {
+    let memo = _opStatMemos.get(scope);
+    if (!memo) { memo = new Map(); _opStatMemos.set(scope, memo); }
+    return memo;
+}
+
+function _getCachedCallsRaw(index, filePath, options = {}) {
     try {
-        // Trigger lazy calls cache load if prepared but not yet loaded
+        // Load this file's persisted records (its directory shard) if the
+        // calls cache is prepared but not yet loaded (fix #365).
         if (index._callsCachePrepared && !index._callsCacheLoaded) {
-            const { ensureCallsCacheLoaded } = require('./cache');
-            ensureCallsCacheLoaded(index);
+            const { ensureCallsShardForFile } = require('./cache');
+            ensureCallsShardForFile(index, filePath);
         }
         const cached = index.callsCache.get(filePath);
 
-        // Fast path: check mtime first (stat is much faster than read+hash)
-        const stat = fs.statSync(filePath);
-        const mtime = stat.mtimeMs;
+        // Fast path: check mtime first (stat is much faster than read+hash).
+        // One stat per file per operation (fix #365): stats --hot and repo
+        // visit the same callee files for hundreds of definitions.
+        const opStats = index._opContentCache ? _opStatMemo(index._opContentCache) : null;
+        let mtime = opStats ? opStats.get(filePath) : undefined;
+        if (mtime === undefined) {
+            mtime = fs.statSync(filePath).mtimeMs;
+            if (opStats) opStats.set(filePath, mtime);
+        }
 
         if (cached && cached.mtime === mtime) {
             // mtime matches - cache is likely valid
@@ -166,8 +217,11 @@ function getCachedCalls(index, filePath, options = {}) {
         }
         const calls = langModule.findCallsInCode(content, parser, callOpts);
 
-        // Remove old callee index entries before overwriting cache
-        if (cached) index._removeFromCalleeIndex(filePath, cached.calls);
+        // Remove old callee index entries before overwriting cache (the
+        // macro-expanded view carries every name the old entry contributed)
+        const { withMacroExpansion } = require('./macro-expansion');
+        if (cached) index._removeFromCalleeIndex(filePath, withMacroExpansion(index, filePath, cached.calls,
+            { materialize: false }));
         index.callsCache.set(filePath, {
             mtime,
             hash,
@@ -176,7 +230,7 @@ function getCachedCalls(index, filePath, options = {}) {
         });
         index.callsCacheDirty = true;
         // Incrementally update callee index with new calls
-        index._addToCalleeIndex(filePath, calls);
+        index._addToCalleeIndex(filePath, withMacroExpansion(index, filePath, calls, { materialize: false }));
 
         if (options.includeContent) {
             return { calls, content };
@@ -277,7 +331,7 @@ function _javaConstructorDisposition(index, filePath, fileEntry, call, targetDef
         return 'unknown';
     }
 
-    const caller = index.findEnclosingFunction(filePath, call.line, true);
+    const caller = index.findEnclosingFunction(filePath, call.line, true, call);
     if (targets.some(d => d.file === filePath &&
         (!d.enclosingType || d.enclosingType === caller?.className))) return 'target';
 
@@ -305,6 +359,103 @@ function isDataMemberReference(fileEntry, call, definitions) {
         // the separate property-access inventory, never the call band.
         (!require('./accessors').isAccessorDefinition(def) || call.receiverType) &&
         (def.className || def.receiver));
+}
+
+// Per-operation index of a file's call records by the names they bear
+// (`name`, `resolvedName`, `resolvedNames`), each list in record order.
+// stats --hot / repo run findCallers for hundreds of definitions over the
+// same files; scanning every record of every callee file per query was the
+// loop's largest fixed cost (fix #365).
+function _callsBearingName(index, filePath, calls, name) {
+    const caches = index._opFindCallersCaches;
+    if (!caches) return calls.filter(call => _callBearsName(call, name));
+    let memo = caches.callsByName.get(filePath);
+    if (!memo || memo.calls !== calls) {
+        const byName = new Map();
+        const add = (key, call) => {
+            let list = byName.get(key);
+            if (!list) { list = []; byName.set(key, list); }
+            if (list[list.length - 1] !== call) list.push(call);
+        };
+        for (const call of calls) {
+            if (!call) continue;
+            if (call.name) add(call.name, call);
+            if (call.resolvedName) add(call.resolvedName, call);
+            if (Array.isArray(call.resolvedNames)) {
+                for (const resolved of call.resolvedNames) if (resolved) add(resolved, call);
+            }
+        }
+        memo = { calls, byName };
+        caches.callsByName.set(filePath, memo);
+    }
+    return memo.byName.get(name) || [];
+}
+
+// A file's bindings with one name, in binding order, indexed once per
+// operation (fix #365) - the same per-call filter ran for every definition.
+function _bindingsNamed(index, fileEntry, name) {
+    const bindings = fileEntry?.bindings || [];
+    const caches = index._opFindCallersCaches;
+    if (!caches) return bindings.filter(b => b.name === name);
+    let memo = caches.bindingsByName.get(fileEntry);
+    if (!memo || memo.bindings !== bindings) {
+        const byName = new Map();
+        for (const binding of bindings) {
+            let list = byName.get(binding.name);
+            if (!list) { list = []; byName.set(binding.name, list); }
+            list.push(binding);
+        }
+        memo = { bindings, byName };
+        caches.bindingsByName.set(fileEntry, memo);
+    }
+    return memo.byName.get(name) || [];
+}
+
+function _callBearsName(call, name) {
+    return !!call && (call.name === name || call.resolvedName === name ||
+        (Array.isArray(call.resolvedNames) && call.resolvedNames.includes(name)));
+}
+
+// Name-keyed views of the two whole-project rename scans findCallers runs
+// per query (fix #365), built once per operation: stats --hot / repo issue
+// hundreds of queries, each of which walked every file's import aliases,
+// export details and import bindings. Views keep project file order, and
+// the default-like links keep (file, binding) order via `seq`, so the
+// consumers insert into their maps exactly as the full scans did.
+const _renameSurfaceMemos = new WeakMap(); // operation content cache -> view
+function _renameSurfaceIndex(index) {
+    const scope = index._opContentCache;
+    const cached = scope && _renameSurfaceMemos.get(scope);
+    if (cached && cached.files === index.files) return cached;
+    const renamingFiles = new Map(); // name -> [filePath] (file order)
+    const defaultLikeByModule = new Map(); // module file -> [{ fp, b, moduleFile, seq }]
+    let seq = 0;
+    for (const [fp, fe] of index.files) {
+        const names = new Set();
+        for (const a of fe.importAliases || []) {
+            if (a && a.original && a.local && a.local !== a.original) names.add(a.original);
+        }
+        for (const e of fe.exportDetails || []) {
+            if (e && e.alias && e.name && e.alias !== e.name) names.add(e.name);
+        }
+        for (const n of names) {
+            let list = renamingFiles.get(n);
+            if (!list) { list = []; renamingFiles.set(n, list); }
+            list.push(fp);
+        }
+        for (const b of (fe.importBindings || [])) {
+            if (!b.defaultLike) continue;
+            const rel = fe.moduleResolved && fe.moduleResolved[b.module];
+            if (!rel) continue;
+            const moduleFile = path.join(index.root, rel);
+            let list = defaultLikeByModule.get(moduleFile);
+            if (!list) { list = []; defaultLikeByModule.set(moduleFile, list); }
+            list.push({ fp, b, moduleFile, seq: seq++ });
+        }
+    }
+    const view = { files: index.files, renamingFiles, defaultLikeByModule };
+    if (scope) _renameSurfaceMemos.set(scope, view);
+    return view;
 }
 
 /**
@@ -382,6 +533,9 @@ function findCallers(index, name, options = {}) {
                 definition.type === target.type &&
                 definition.name === target.name &&
                 (definition.namespace || null) === (target.namespace || null) &&
+                (definition.enclosingType || null) === (target.enclosingType || null) &&
+                // Parts merge only with the same generic arity (fix #380).
+                (definition.typeArity || 0) === (target.typeArity || 0) &&
                 definition.modifiers?.includes('partial')));
         if (closed.length > partialTargets.length) {
             options = { ...options, targetDefinitions: closed };
@@ -398,6 +552,11 @@ function findCallers(index, name, options = {}) {
     // disambiguation set (target classes + non-overriding subtypes); owner
     // keys are the distinct types defining a same-name method project-wide.
     let _dispatchTargetTypes = null;
+    // Per-query memos of the bare-call identity rules (fix #390): an owner
+    // class's descent from the targets and a file's `using static`
+    // suppliers of the name depend only on the query.
+    const bareOwnerDescent = new Map();
+    const usingStaticSuppliers = new Map();
     const dispatchTargetTypes = (targetDefs) => {
         if (!_dispatchTargetTypes) _dispatchTargetTypes = _buildTargetTypeSet(index, targetDefs, definitions);
         return _dispatchTargetTypes;
@@ -431,8 +590,15 @@ function findCallers(index, name, options = {}) {
             `${definition.enclosingType || ''}:${owner}`;
     };
     const methodOwnerKeys = () => {
+        // Depends only on the name's definitions: one set per operation
+        // (fix #365; stats --hot pins each of a name's definitions in turn).
+        const ownerKeyMemo = index._opFindCallersCaches?.methodOwnerKeys;
+        if (!_methodOwnerKeys && ownerKeyMemo?.has(definitions)) {
+            _methodOwnerKeys = ownerKeyMemo.get(definitions);
+        }
         if (!_methodOwnerKeys) {
             _methodOwnerKeys = new Set();
+            ownerKeyMemo?.set(definitions, _methodOwnerKeys);
             for (const d of definitions) {
                 if (NON_CALLABLE_TYPES.has(d.type)) {
                     // Function-typed FIELDS are callable owners (fix #219):
@@ -454,6 +620,80 @@ function findCallers(index, name, options = {}) {
             }
         }
         return _methodOwnerKeys;
+    };
+    // Per-call constants of the pinned targets (fix #382): the loops below
+    // asked them once per call record.
+    let _pinnedTargetFiles = null;
+    const pinnedTargetFiles = () => {
+        if (!_pinnedTargetFiles) {
+            _pinnedTargetFiles = new Set((options.targetDefinitions || definitions)
+                .map(d => d.file).filter(Boolean));
+        }
+        return _pinnedTargetFiles;
+    };
+    const _importEdgeLinkByFile = new Map();
+    // Does the file import a target file, directly or through one re-export
+    // hop? The caller's OWN file never counts as an import-edge hit (fix
+    // #294): an import cycle (flask json/__init__ -> wrappers ->
+    // json/__init__) would launder same-file membership into "import edge"
+    // evidence, bypassing the same-file clause's receiver guard. Same-file
+    // evidence is governed there, not here.
+    const fileImportEdgeLink = (filePath, callerImports, targetFiles) => {
+        let link = _importEdgeLinkByFile.get(filePath);
+        if (link !== undefined) return link;
+        link = !!(callerImports && setSome(callerImports,
+            imp => imp !== filePath && targetFiles.has(imp)));
+        // One level of re-exports (barrel files).
+        if (!link && callerImports) {
+            for (const imp of callerImports) {
+                if (imp === filePath) continue;
+                const transImports = index.importGraph.get(imp);
+                if (transImports && setSome(transImports,
+                    ti => ti !== filePath && targetFiles.has(ti))) {
+                    link = true;
+                    break;
+                }
+            }
+        }
+        _importEdgeLinkByFile.set(filePath, link);
+        return link;
+    };
+    let _otherCallableDefinitions = null;
+    let _otherCallableDefinitionsFor = null;
+    const otherCallableDefinitions = (targetDefs) => {
+        if (_otherCallableDefinitionsFor !== targetDefs) {
+            const pinnedKeys = new Set(targetDefs.map(d => `${d.file}:${d.startLine}`));
+            _otherCallableDefinitions = definitions.filter(d =>
+                !NON_CALLABLE_TYPES.has(d.type) && !pinnedKeys.has(`${d.file}:${d.startLine}`));
+            _otherCallableDefinitionsFor = targetDefs;
+        }
+        return _otherCallableDefinitions;
+    };
+    // Owner types of the name's definitions outside the target types, and
+    // their lowercase spellings: fixed per call (fix #382; built per record).
+    let _nonTargetOwners = null;
+    let _nonTargetOwnersFor = null;
+    const nonTargetOwnerClasses = (targetTypes) => {
+        if (_nonTargetOwnersFor !== targetTypes) {
+            const classes = new Set();
+            for (const d of definitions) {
+                const t = d.className || (d.receiver && d.receiver.replace(/^\*/, ''));
+                if (t && !targetTypes.has(t)) classes.add(t);
+            }
+            _nonTargetOwners = { classes, lower: new Set([...classes].map(cn => cn.toLowerCase())) };
+            _nonTargetOwnersFor = targetTypes;
+        }
+        return _nonTargetOwners;
+    };
+    // Owner names (className, else receiver without `*`) of the name's
+    // definitions, fixed per call (fix #382).
+    let _definitionOwners = null;
+    const definitionOwners = () => {
+        if (!_definitionOwners) {
+            _definitionOwners = new Set(definitions.map(d =>
+                d.className || (d.receiver || '').replace(/^\*/, '')));
+        }
+        return _definitionOwners;
     };
     const _dispatchCountCache = new Map(); // via type -> candidate count
     const countDispatchCandidates = (via) => {
@@ -503,7 +743,9 @@ function findCallers(index, name, options = {}) {
         .map(d => d.file).filter(Boolean));
     const importAliasLocals = new Map(); // filePath -> Set<localName>
     const exportAliasRenamers = new Map(); // aliasName -> Set<renamingFilePath>
-    for (const [fp, fe] of index.files) {
+    const renameSurfaces = _renameSurfaceIndex(index);
+    for (const fp of renameSurfaces.renamingFiles.get(name) || []) {
+        const fe = index.files.get(fp);
         const hasImportRenames = fe.importAliases &&
             fe.importAliases.some(a => a && a.original === name && a.local && a.local !== name);
         const exportRenames = fe.exportDetails
@@ -548,26 +790,24 @@ function findCallers(index, name, options = {}) {
     // `module.exports`, even though the call-site spelling differs. This is
     // exact module ownership: require bindings preserve their default-like
     // shape and the resolved module records the assigned local definition.
-    for (const [fp, fe] of index.files) {
-        for (const b of (fe.importBindings || [])) {
-            if (!b.defaultLike) continue;
-            const rel = fe.moduleResolved && fe.moduleResolved[b.module];
-            if (!rel) continue;
-            const moduleFile = path.join(index.root, rel);
-            if (!aliasTargetFiles.has(moduleFile)) continue;
-            const exported = index.files.get(moduleFile)?.exportDetails || [];
-            if (!exported.some(e => e.type === 'module.exports' &&
-                e.defaultLike && (e.localName || e.name) === name)) continue;
-            if (!importAliasLocals.has(fp)) importAliasLocals.set(fp, new Set());
-            importAliasLocals.get(fp).add(b.alias || b.name);
-        }
+    const defaultLikeLinks = [];
+    for (const moduleFile of aliasTargetFiles) {
+        for (const link of renameSurfaces.defaultLikeByModule.get(moduleFile) || []) defaultLikeLinks.push(link);
+    }
+    if (aliasTargetFiles.size > 1) defaultLikeLinks.sort((a, b) => a.seq - b.seq);
+    for (const { fp, b, moduleFile } of defaultLikeLinks) {
+        const exported = index.files.get(moduleFile)?.exportDetails || [];
+        if (!exported.some(e => e.type === 'module.exports' &&
+            e.defaultLike && (e.localName || e.name) === name)) continue;
+        if (!importAliasLocals.has(fp)) importAliasLocals.set(fp, new Set());
+        importAliasLocals.get(fp).add(b.alias || b.name);
     }
     // Files that can reach each renaming module through imports — re-export
     // chains run deep (test → mini/index → external → schemas), so a fixed
     // hop count misses real surfaces. Bounded reverse-import BFS; matching
     // stays name+path specific, and tiering still demands its own evidence.
     const aliasReachers = new Map(); // aliasName -> Set<filePath> (renamers + transitive importers)
-    for (const [aliasName, renamers] of exportAliasRenamers) {
+    const reachersOf = (renamers) => {
         const reach = new Set(renamers);
         let frontier = [...renamers];
         for (let depth = 0; depth < 4 && frontier.length && reach.size <= 5000; depth++) {
@@ -584,15 +824,93 @@ function findCallers(index, name, options = {}) {
             }
             frontier = next;
         }
-        aliasReachers.set(aliasName, reach);
+        return reach;
+    };
+    for (const [aliasName, renamers] of exportAliasRenamers) {
+        aliasReachers.set(aliasName, reachersOf(renamers));
+    }
+    // Rename chains (fix #397, jotai-measured: `export { getBuildingBlocks
+    // as INTERNAL_getBuildingBlocksRev4 }` then `import {
+    // INTERNAL_getBuildingBlocksRev4 as INTERNAL_getBuildingBlocks }` lost
+    // every caller): a file that sees an alias surface and renames it again
+    // on import or export makes the new name a surface too (its own file for
+    // an import rename, its importers for an export). A local import rename
+    // re-exported (`import { f as g }; export { g }`) likewise. Bounded
+    // rounds; each hop stays name- and path-specific.
+    {
+        const exportedLocals = [];
+        for (const [fp, locals] of importAliasLocals) {
+            for (const local of locals) exportedLocals.push({ fp, local });
+        }
+        let frontier = [...exportAliasRenamers.keys()];
+        const seenSurfaces = new Set(frontier);
+        for (let round = 0; round < 4 && (frontier.length > 0 || exportedLocals.length > 0); round++) {
+            const added = new Map(); // alias -> Set<renamer>
+            const addExport = (alias, fp) => {
+                if (!alias || seenSurfaces.has(alias) || alias === name) return;
+                if (!added.has(alias)) added.set(alias, new Set());
+                added.get(alias).add(fp);
+            };
+            for (const alias of frontier) {
+                const reach = aliasReachers.get(alias);
+                if (!reach) continue;
+                for (const fp of renameSurfaces.renamingFiles.get(alias) || []) {
+                    if (!reach.has(fp)) continue;
+                    const fe = index.files.get(fp);
+                    for (const a of fe.importAliases || []) {
+                        if (!a || a.original !== alias || !a.local || a.local === alias) continue;
+                        if (!importAliasLocals.has(fp)) importAliasLocals.set(fp, new Set());
+                        if (!importAliasLocals.get(fp).has(a.local)) {
+                            importAliasLocals.get(fp).add(a.local);
+                            exportedLocals.push({ fp, local: a.local });
+                        }
+                    }
+                    for (const e of fe.exportDetails || []) {
+                        if (e && e.alias && e.name === alias && e.alias !== alias) addExport(e.alias, fp);
+                    }
+                }
+            }
+            for (const { fp, local } of exportedLocals.splice(0)) {
+                for (const e of index.files.get(fp)?.exportDetails || []) {
+                    if (e && e.name === local && !e.source) addExport(e.alias || e.name, fp);
+                }
+            }
+            frontier = [];
+            for (const [alias, renamers] of added) {
+                seenSurfaces.add(alias);
+                exportAliasRenamers.set(alias, renamers);
+                aliasReachers.set(alias, reachersOf(renamers));
+                frontier.push(alias);
+            }
+        }
     }
     const aliasNames = new Set(exportAliasRenamers.keys());
     for (const locals of importAliasLocals.values()) {
         for (const local of locals) aliasNames.add(local);
     }
+    // Module value aliases of a target class (fix #392): `Alias = Box` /
+    // `const Alias = Box` make `Alias(...)` / `new Alias(...)` construct Box
+    // wherever the alias resolves to it (the #389 identity rules).
+    const valueAliasSurfaces = _classValueAliasSurfaces(index, name,
+        options.targetDefinitions || definitions);
+    for (const aliasName of valueAliasSurfaces) aliasNames.add(aliasName);
     const hasAliasSurfaces = aliasNames.size > 0;
     const shadowCanReachPinnedTarget = (filePath, call) => {
         if (call.resolvedName === name || call.resolvedNames?.includes(name)) return true;
+        // The parser names the shadowing binding's line (fix #397): the
+        // shadow is the pinned definition itself when the innermost
+        // same-name definition of the file enclosing that line is a target,
+        // whichever enclosing function of the reference declares it
+        // (`new Helper()` in a closure nested in the function declaring
+        // `function Helper() {}`).
+        // A parameter, catch or loop binding (-1) is never a definition.
+        const shadowLine = _shadowLineOf(call);
+        if (shadowLine) {
+            if (shadowLine < 0) return false;
+            const targets = options.targetDefinitions || definitions;
+            return targets.some(d => d.file === filePath && d.name === call.name &&
+                d.startLine === shadowLine);
+        }
         const scope = call.enclosingFunction;
         return !!scope && (options.targetDefinitions || definitions).some(d =>
             d.file === filePath && d.name === call.name &&
@@ -683,6 +1001,9 @@ function findCallers(index, name, options = {}) {
             returnFlowCache: new Map(), // filePath -> return-type-flow map (see _buildReturnTypeFlowMap)
             foldCtxCache: new Map(), // filePath -> chained-receiver fold context (fix #258)
             pythonIndexedReceiverCache: new Map(),
+            callsByName: new Map(), // filePath -> { calls, byName } (fix #365)
+            bindingsByName: new Map(), // fileEntry -> { bindings, byName } (fix #365)
+            methodOwnerKeys: new WeakMap(), // definitions array -> owner key Set (fix #365)
         };
     }
     const { localTypeCache, returnFlowCache, foldCtxCache, pythonIndexedReceiverCache } =
@@ -699,6 +1020,14 @@ function findCallers(index, name, options = {}) {
         }
         if (union.size > 0) calleeFiles = union;
     }
+    // `candidateFiles` (internal, fix #365): the only files whose callers the
+    // consumer keeps (stats --hot counts in-scope, non-bundled, and for a
+    // production ranking non-test files). Every per-site verdict is
+    // file-local, so narrowing the scan never changes a retained site.
+    if (options.candidateFiles) {
+        const candidateFiles = options.candidateFiles;
+        calleeFiles = [...(calleeFiles || index.files.keys())].filter(fp => candidateFiles.has(fp));
+    }
     const fileIterator = calleeFiles
         ? [...calleeFiles].map(fp => [fp, index.files.get(fp)]).filter(([, fe]) => fe)
         : index.files;
@@ -706,14 +1035,43 @@ function findCallers(index, name, options = {}) {
     for (const [filePath, fileEntry] of fileIterator) {
         // Early exit when maxResults is reached (skip when caller needs the true total)
         if (maxResults && !needsTotal && pendingCount >= maxResults) break;
+        // No record anywhere bears the name (fix #375): a file whose macro
+        // expansions' calls are not derived yet is derived only when its
+        // expanded text can hold the name; otherwise it has nothing to visit.
+        if (!calleeFiles && !hasAliasSurfaces && !targetIsTypeQuery &&
+            fileEntry.rustMacroExpansion?.callsPending &&
+            !require('./rust-macro-expansion').rustPendingMayBear(fileEntry, name)) continue;
         try {
             const calls = getCachedCalls(index, filePath);
             if (!calls) continue;
             const structuralLanguage =
                 langTraits(fileEntry.language)?.typeSystem === 'structural';
+            // Only records bearing the name can match below unless an alias
+            // surface or a type-qualifier reference can (fix #365): visit
+            // those, in record order, instead of every call in the file.
+            const visitCalls = hasAliasSurfaces || targetIsTypeQuery
+                ? calls : _callsBearingName(index, filePath, calls, name);
 
-            for (let call of calls) {
+            for (let call of visitCalls) {
+                if (call.destructured) {
+                    // A destructured name reads a member (fix #397): it
+                    // reaches member targets through the member view, and a
+                    // free function never (the local binding shadows it).
+                    const targets = options.targetDefinitions || definitions;
+                    if (!targets.some(d => d.className || d.memberAssigned || d.receiver)) {
+                        if (call.name === name || call.resolvedName === name) {
+                            recordExcluded(filePath, call.line, 'local-shadow');
+                        }
+                        continue;
+                    }
+                    call = _destructuredMemberView(call);
+                }
                 if (isDataMemberReference(fileEntry, call, options.targetDefinitions || definitions)) continue;
+                call = _withoutAmbiguousSliceType(_withoutShadowedStdLiteral(index, call),
+                    options.targetDefinitions || definitions);
+                if (structuralLanguage && call.receiverType) {
+                    call = _withModuleValueAliasReceiver(index, filePath, call, true);
+                }
                 // fix #353: C# `Beta.Helper.Widget()` — the parser records a
                 // field hop rooted at `this` (Beta is no local). When the
                 // prefix names a project NAMESPACE that declares the last
@@ -721,8 +1079,15 @@ function findCallers(index, name, options = {}) {
                 // qualified; the hop shape would only ever fail the field
                 // walk and route method-ambiguous.
                 if (fileEntry.language === 'csharp') {
-                    const rewritten = _csharpNamespaceQualifiedReceiver(index, call,
-                        index.findEnclosingFunction(filePath, call.line, true));
+                    const enclosingForRewrite = index.findEnclosingFunction(filePath, call.line, true, call);
+                    const rewritten = _csharpNamespaceQualifiedReceiver(index, call, enclosingForRewrite) ||
+                        _csharpTypeRootedPath(index, call, enclosingForRewrite, filePath) ||
+                        _implicitMemberReceiver(index, call, enclosingForRewrite);
+                    if (rewritten) call = rewritten;
+                } else if (call.receiverIsTypeQualified &&
+                    langTraits(fileEntry.language)?.bareCallReachesMethods) {
+                    const rewritten = _implicitMemberReceiver(index, call,
+                        index.findEnclosingFunction(filePath, call.line, true, call));
                     if (rewritten) call = rewritten;
                 }
                 // Skip if not matching our target name (also check alias resolution)
@@ -741,12 +1106,32 @@ function findCallers(index, name, options = {}) {
                         const reach = aliasReachers.get(call.name);
                         if (reach && reach.has(filePath)) calledAs = call.name;
                     }
+                    if (!calledAs && valueAliasSurfaces.has(call.name) && !call.isMethod &&
+                        !call.localShadow && !call.isFunctionReference) {
+                        const aliased = _moduleValueAliasType(index, filePath, call.name);
+                        if (aliased && aliased.type === name &&
+                            (options.targetDefinitions || definitions).some(d =>
+                                d.file === aliased.fromFile && IDENTITY_TYPE_KINDS.has(d.type))) {
+                            calledAs = call.name;
+                        }
+                    }
                     if (!calledAs) continue;
                 }
                 if (!calledAs && call.name !== name &&
                     (call.resolvedName === name ||
                      (call.resolvedNames && call.resolvedNames.includes(name)))) {
                     calledAs = call.name;
+                }
+                // fix #380: a written generic arity names one type of the
+                // name (`Outcome.X()` is never `Outcome<T>`'s, `new
+                // Outcome<T>(v)` never constructs `static class Outcome`).
+                if (typeQualifierReference || call.isConstructor || call.isMethod) {
+                    const arity = _genericAritySplit(fileEntry.language, call,
+                        options.targetDefinitions || definitions);
+                    if (arity && arity.related.length > 0 && arity.matching.length === 0) {
+                        recordExcluded(filePath, call.line, 'generic-arity-mismatch');
+                        continue;
+                    }
                 }
 
                 const standardWrapper = fileEntry.language === 'rust'
@@ -777,6 +1162,150 @@ function findCallers(index, name, options = {}) {
                         _calleeLanguageCompatible(index, target, fileEntry.language))) {
                     recordExcluded(filePath, call.line, 'language-boundary');
                     continue;
+                }
+
+                // Single-element annotation shorthand (fix #389): `@Marker(x)`
+                // sets the element `value` of Marker with no name token. It
+                // is a site of that element's rename (the shorthand needs the
+                // name), never an edit: listed unverified when Marker may be
+                // the target's owner, skipped (beyond the text) otherwise.
+                if (call.implicitName) {
+                    const shorthand = _annotationShorthandReaches(index, filePath, call,
+                        options.targetDefinitions || definitions);
+                    if (shorthand) {
+                        routeUnverified(filePath, fileEntry, call, 'annotation-shorthand', calledAs, {
+                            annotationShorthand: { column: call.argColumn, certain: shorthand === 'target' },
+                        });
+                    }
+                    continue;
+                }
+
+                // Macro namespace (fix #377). Rust marks invocations
+                // (`name!(...)`): a macro invocation never calls a same-named
+                // fn, and a call never invokes a macro_rules! macro (a
+                // procedural macro fn is reached only by its invocations).
+                // C/C++ invoke function-like macros with call syntax: a call
+                // spelled NAME( where #define NAME is in effect is the macro,
+                // unless its replacement list spells NAME again (the
+                // expansion then reaches the function).
+                const macroSyntax = langTraits(fileEntry.language)?.macroInvocationSyntax;
+                if (macroSyntax === 'marked' && pinnedLanguageTargets.length > 0) {
+                    const valueTargets = !pinnedLanguageTargets.some(isMacroNamespaceDefinition);
+                    const macroRulesTargets = pinnedLanguageTargets.every(d => d.type === 'macro');
+                    if ((call.isMacro && valueTargets) || (!call.isMacro && macroRulesTargets)) {
+                        recordExcluded(filePath, call.line, 'macro-namespace');
+                        continue;
+                    }
+                }
+                if (macroSyntax === 'call' && pinnedLanguageTargets.length > 0 &&
+                    !call.macroExpansion && !call.inMacroDefinition && !call.macroParameter &&
+                    !call.isFunctionReference &&
+                    pinnedLanguageTargets.every(d => d.type !== 'macro')) {
+                    const shadow = _cMacroShadowedCall(index, filePath, call);
+                    if (shadow === 'macro' || shadow?.macro) {
+                        recordExcluded(filePath, call.line, 'macro-namespace');
+                        continue;
+                    }
+                    if (shadow === 'ambiguous') {
+                        routeUnverified(filePath, fileEntry, call, 'macro-namespace', calledAs);
+                        continue;
+                    }
+                }
+
+                // A type or function declared in a function body (fix #381:
+                // Python/JS/Go/Rust/Java local classes and functions carry
+                // their lexical scope) is visible only inside that scope: a
+                // bare name outside it names something else.
+                // The value can still flow out (a returned local class held
+                // by a dynamic binding), so only a name the site binds to
+                // something else (an import or a module-level definition)
+                // excludes; any other spelling stays visible.
+                if (!call.receiver && !call.isMethod && pinnedLanguageTargets.length > 0 &&
+                    pinnedLanguageTargets.every(target => _isFunctionLocalType(target) &&
+                        IDENTITY_TYPE_KINDS.has(target.type) &&
+                        (target.file !== filePath || call.line < target.lexicalScopeStartLine ||
+                            call.line > target.lexicalScopeEndLine))) {
+                    const boundElsewhere = (fileEntry.importBindings || []).some(binding =>
+                        binding.name !== '*' && (binding.alias || binding.name) === call.name) ||
+                        definitionsInFile(index, call.name, filePath).some(d =>
+                            !_isFunctionLocalType(d) && !d.className && IDENTITY_TYPE_KINDS.has(d.type)) ||
+                        !!_functionLocalTypeInScope(index, filePath, call.name, call.line);
+                    if (boundElsewhere) recordExcluded(filePath, call.line, 'other-definition');
+                    else routeUnverified(filePath, fileEntry, call, 'ambiguous-binding', calledAs);
+                    continue;
+                }
+
+                // A fn declared in a fn body is visible only inside that
+                // body (fix #377): a bare call elsewhere names something else.
+                if (!call.receiver && !call.isMethod && pinnedLanguageTargets.length > 0 &&
+                    langTraits(fileEntry.language)?.nestedItemsBlockScoped) {
+                    const outside = pinnedLanguageTargets.every(target => {
+                        const container = _enclosingFunctionOfDefinition(index, target);
+                        return container && (container.file !== filePath ||
+                            call.line < container.startLine || call.line > container.endLine);
+                    });
+                    if (outside) {
+                        recordExcluded(filePath, call.line, 'other-definition');
+                        continue;
+                    }
+                }
+
+                // Rust module paths (fix #377): `crate::f()`, `super::f()`,
+                // `self::m::f()`, `m::f()` name an item of one module of
+                // this crate. The module tree (mod declarations, #[path],
+                // inline modules, foo.rs + foo/ layout) resolves the
+                // qualifier; the item declared there IS the callee.
+                if (macroSyntax === 'marked' && call.isPathCall && call.receiver && !call.isMacro) {
+                    const moduleRoute = _rustModulePathRoute(index, filePath, call, name, pinnedLanguageTargets);
+                    if (moduleRoute === 'other') {
+                        recordExcluded(filePath, call.line, 'other-definition');
+                        continue;
+                    }
+                    if (moduleRoute === 'target') {
+                        const owned = { ...call, moduleOwnedPath: true };
+                        const callerSymbol = index.findEnclosingFunction(filePath, call.line, true, call);
+                        if (!pendingByFile.has(filePath)) pendingByFile.set(filePath, []);
+                        pendingByFile.get(filePath).push({
+                            call: owned, fileEntry, callerSymbol,
+                            isMethod: false,
+                            isFunctionReference: !!call.isFunctionReference,
+                            receiver: call.receiver,
+                            calledAs,
+                            _evidence: {
+                                facts: _confirmationFacts(index, filePath, owned, pinnedLanguageTargets, {}),
+                                moduleOwnedPath: true,
+                                hasImportEvidence: true,
+                            },
+                        });
+                        pendingCount++;
+                        continue;
+                    }
+                }
+
+                // Type-name denotation (fix #371): a type name written at the
+                // site (constructor, type-qualified path, annotated or
+                // constructed receiver) denotes what THIS file's bindings
+                // resolve it to. An external type never reaches a member of
+                // a same-name project type; an impl on the external type
+                // itself may supply the method (possible dispatch).
+                const denotation = externalTypeGate(index, filePath, fileEntry, call,
+                    pinnedLanguageTargets);
+                if (denotation?.verdict === 'exclude') {
+                    recordExcluded(filePath, call.line, denotation.reason);
+                    continue;
+                }
+                if (denotation?.verdict === 'dispatch' && collectAccount) {
+                    routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
+                        dispatchVia: `${denotation.via} — impl on the external type`,
+                    });
+                    continue;
+                }
+                if (denotation?.verdict === 'unverified') {
+                    routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs);
+                    continue;
+                }
+                if (denotation?.verdict === 'strip') {
+                    call = stripExternalReceiverType(call, denotation.via);
                 }
 
                 if (fileEntry.language === 'go' && call.isMethod &&
@@ -839,6 +1368,28 @@ function findCallers(index, name, options = {}) {
                     }
                 }
 
+                // `::f(...)` looks f up in the global namespace only (fix
+                // #393): a namespace member is reached through a global-scope
+                // using-directive or using-declaration, never otherwise
+                // (spdlog `::fsync(fileno(fp))` inside os::fsync is POSIX).
+                if (call.globalQualified && fileEntry.language === 'cpp' &&
+                    pinnedLanguageTargets.length > 0 &&
+                    pinnedLanguageTargets.every(target => !target.className && !target.receiver &&
+                        !NON_CALLABLE_TYPES.has(target.type))) {
+                    const visible = cppIncludeClosure(index, filePath);
+                    const verdicts = pinnedLanguageTargets.map(target => cppGlobalQualifiedReaches(index,
+                        { file: filePath, line: call.line }, cppEffectiveNamespace(index, target),
+                        call.name, visible));
+                    if (verdicts.every(verdict => verdict === 'no')) {
+                        recordExcluded(filePath, call.line, 'global-qualified');
+                        continue;
+                    }
+                    if (verdicts.every(verdict => verdict !== 'yes')) {
+                        routeUnverified(filePath, fileEntry, call, 'global-qualified-using', calledAs);
+                        continue;
+                    }
+                }
+
                 // Static member syntax carries two compiler symbols:
                 // `JValue.Compare(...)` calls Compare and references the
                 // JValue type. Class/type queries promise usages rather than
@@ -876,7 +1427,7 @@ function findCallers(index, name, options = {}) {
                         continue;
                     }
                     const callerSymbol = index.findEnclosingFunction(
-                        filePath, call.line, true);
+                        filePath, call.line, true, call);
                     if (!pendingByFile.has(filePath)) {
                         pendingByFile.set(filePath, []);
                     }
@@ -899,14 +1450,24 @@ function findCallers(index, name, options = {}) {
                 }
 
                 // A macro_rules! transcriber is a template, not a concrete
-                // dispatch site. rust-analyzer attributes calls to expansion
-                // sites (when available), never to the template token line.
-                // Keep the text occurrence conserved but out of both evidence
-                // tiers; invocations whose argument token trees contain real
-                // source calls use inMacro without inMacroDefinition and are
-                // still analyzed normally.
+                // dispatch site: its tokens bind at every expansion site, so
+                // the receiver/binding a template token denotes is not
+                // decidable at the template line. It is still a site a
+                // rename or signature change must edit (fix #360: a
+                // deref-forwarding `(**self).get_i8()` template breaks the
+                // build when left behind), so it stays VISIBLE in the
+                // unverified tier with its own reason, never excluded.
+                // Invocations whose argument token trees contain real source
+                // calls use inMacro without inMacroDefinition and are still
+                // analyzed normally.
                 if (collectAccount && call.inMacroDefinition) {
-                    recordExcluded(filePath, call.line, 'macro-template');
+                    // Expansion binds the token at compile time: the same
+                    // family as template/overload selection, grouped per
+                    // macro so repeated template tokens read as one decision.
+                    routeUnverified(filePath, fileEntry, call, 'macro-template', calledAs, {
+                        uncertaintyClass: 'compile-time-dispatch',
+                        dispatchFamily: `${call.macroContainer || name} macro template`,
+                    });
                     continue;
                 }
 
@@ -1126,7 +1687,7 @@ function findCallers(index, name, options = {}) {
                     let rootType = call.receiverIterationRootType;
                     if (!rootType && call.receiverIterationRoot === 'self') {
                         rootType = index.findEnclosingFunction(
-                            filePath, call.line, true)?.className;
+                            filePath, call.line, true, call)?.className;
                     }
                     if (!rootType && call.receiverIterationRoot) {
                         let flowMap = returnFlowCache.get(filePath);
@@ -1173,7 +1734,8 @@ function findCallers(index, name, options = {}) {
                     langTraits(fileEntry.language)?.typeSystem === 'structural') {
                     const origin = _resolveFlowTypeOrigin(
                         index, filePath, call.receiverType,
-                        call.receiverTypeQualifier);
+                        call.receiverTypeQualifier,
+                        call.receiverTypeEvidence?.line ?? call.line);
                     if (origin?.fromFile) {
                         call = {
                             ...call,
@@ -1197,7 +1759,7 @@ function findCallers(index, name, options = {}) {
                 if (collectAccount && fileEntry.language === 'java' &&
                     call.isMethod && !call.receiverType && call.receiverCallTypePath) {
                     const returnInfo = _javaCallReturnInfo(
-                        index, call.receiverCallTypePath);
+                        index, call.receiverCallTypePath, filePath);
                     if (returnInfo?.type) {
                         call = {
                             ...call,
@@ -1223,10 +1785,11 @@ function findCallers(index, name, options = {}) {
                 if (collectAccount && fileEntry.language === 'rust' &&
                     call.isMethod && call.receiverType &&
                     !call.receiverTypeFlowFile && !call.receiverTypeGuessed) {
+                    const typeLine = call.receiverTypeEvidence?.line ?? call.line;
                     const origin = _resolveFlowTypeOrigin(
                         index, filePath, call.receiverType,
-                        call.receiverTypeQualifier);
-                    if (origin?.fromFile) {
+                        call.receiverTypeQualifier, typeLine);
+                    if (_rustPinsReceiverFlowFile(index, filePath, call, origin, typeLine)) {
                         call = { ...call, receiverTypeFlowFile: origin.fromFile };
                     }
                 }
@@ -1292,7 +1855,9 @@ function findCallers(index, name, options = {}) {
                 // path because they may hold a project subtype.
                 if (call.isMethod && call.receiverConstructed && call.receiverType &&
                     !call.receiverTypeQualifier &&
-                    langTraits(fileEntry.language)?.typeSystem === 'structural') {
+                    langTraits(fileEntry.language)?.typeSystem === 'structural' &&
+                    !_functionLocalTypeInScope(index, filePath, call.receiverType,
+                        call.receiverTypeEvidence?.line ?? call.line)) {
                     const bindings = (fileEntry.importBindings || []).filter(b =>
                         b.name === call.receiverType || b.alias === call.receiverType);
                     if (bindings.length > 0) {
@@ -1510,6 +2075,43 @@ function findCallers(index, name, options = {}) {
                     }
                 }
 
+                // Value-path receivers: unit enum variants (fix #369,
+                // `HAlign::Center.get_offset(..)`), unit structs and struct
+                // expressions (fix #389, `S.plain()`, `P { .. }.m()`) are
+                // values of the type the path names.
+                if (fileEntry.language === 'rust' && call.isMethod &&
+                    !call.receiverType && call.receiverValuePath) {
+                    const valueType = _rustValuePathReceiverType(index, filePath, call);
+                    if (valueType) call = { ...call, ...valueType };
+                }
+
+                // Generic-bounded receivers (fix #368): `self.base.split_at(i)`
+                // with `base: C`, `C: Consumer<R>` dispatches through the
+                // bound's trait slots only. A pinned impl member of a bound
+                // trait is one of that trait's implementations (visible
+                // possible-dispatch, one family); a concrete member of any
+                // other trait, or an inherent method, cannot be reached.
+                if (collectAccount && call.isMethod && !call.isPathCall &&
+                    langTraits(fileEntry.language)?.genericBoundDispatchClosed) {
+                    const bound = _rustGenericBoundReceiver(index, filePath, call);
+                    if (bound) {
+                        const verdict = _rustGenericBoundDispatchVerdict(index, filePath, bound,
+                            options.targetDefinitions || definitions);
+                        if (verdict?.exclude) {
+                            recordExcluded(filePath, call.line, 'generic-bound-mismatch');
+                            continue;
+                        }
+                        if (verdict?.via) {
+                            routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
+                                dispatchVia: verdict.via,
+                                dispatchCandidates: countDispatchCandidates(verdict.via),
+                                ...(verdict.externalContract && { externalContract: true }),
+                            });
+                            continue;
+                        }
+                    }
+                }
+
                 // Intra-class constructor mechanics are never caller edges
                 // (fix #238, jdtls-measured): an enum CONSTANT is part of the
                 // enum's own declaration (JsonToken's 10 constants confirmed
@@ -1536,6 +2138,19 @@ function findCallers(index, name, options = {}) {
                     if (!syms || syms.length === 0) continue;
                     const cbTargetDefs = options.targetDefinitions || definitions;
 
+                    // Where bare names reach members (C#, Java), a type name
+                    // is no value (fix #395): a bare reference `MemberPath`
+                    // passed as an argument is a local, a member of the
+                    // enclosing class (C# "Color Color": the property named
+                    // like its type) or a method group, never the type.
+                    if (!call.receiver && !call.isMethod && cbTargetDefs.length > 0 &&
+                        cbTargetDefs.every(definition => _ARITY_TYPE_KINDS.has(definition.type) ||
+                            definition.type === 'constructor' || definition.isConstructor) &&
+                        langTraits(fileEntry.language)?.bareCallReachesMethods) {
+                        recordExcluded(filePath, call.line, 'method-kind-mismatch');
+                        continue;
+                    }
+
                     // Go unexported visibility: lowercase functions are package-private.
                     // Only allow callers from the same package directory. Recorded
                     // with reason (not a silent drop) — same disposition as the
@@ -1557,7 +2172,8 @@ function findCallers(index, name, options = {}) {
                     // references the CONST priority.Name, not a pinned method
                     // `Name` — the target's own same-file/same-package evidence
                     // says nothing about what a qualified name resolves to.
-                    if (call.isMethod && call.receiver &&
+                    let cbPackageQualified = false;
+                    if (call.receiver && (call.isMethod || call.isFunctionReference) &&
                         langTraits(fileEntry.language)?.hasReceiverPackageCalls) {
                         const cbPkgRes = _receiverPackageResolution(index, fileEntry, call.receiver, cbTargetDefs);
                         if (cbPkgRes) {
@@ -1569,6 +2185,23 @@ function findCallers(index, name, options = {}) {
                             if (!cbPkgRes.targetInPkg) {
                                 recordExcluded(filePath, call.line, 'other-definition');
                                 continue;
+                            }
+                            // The parser marks an unshadowed import qualifier
+                            // (fix #378): `cast.ToBool` passed as a value names
+                            // the package-level symbol ToBool of the imported
+                            // package - a package-level name can never denote
+                            // a method, and Go cannot import its own package.
+                            if (!call.isMethod) {
+                                if (cbTargetDefs.length > 0 && cbTargetDefs.every(d =>
+                                    !NON_CALLABLE_TYPES.has(d.type) && (d.className || d.receiver))) {
+                                    recordExcluded(filePath, call.line, 'method-kind-mismatch');
+                                    continue;
+                                }
+                                if (cbTargetDefs.length > 0 && cbTargetDefs.every(d => d.file === filePath)) {
+                                    recordExcluded(filePath, call.line, 'other-definition');
+                                    continue;
+                                }
+                                cbPackageQualified = true;
                             }
                         }
                     }
@@ -1725,13 +2358,37 @@ function findCallers(index, name, options = {}) {
                         // a package-qualified name can, and that resolved
                         // above; an alias-imported package receiver stays
                         // visible here rather than excluded).
+                        // `this::m` / `super::m` (Java) name a member of
+                        // the enclosing class DEFINITION or its ancestry
+                        // (fix #395): that lookup decides, as for a
+                        // `this.m()` call.
+                        let cbThisReached = false;
+                        if ((call.receiver === 'this' || call.receiver === 'super') &&
+                            langTraits(fileEntry.language)?.bareCallReachesMethods) {
+                            const cbCaller = index.findEnclosingFunction(filePath, call.line, true, call);
+                            const cbStart = cbCaller?.className ? ownerRefOf(index, cbCaller) : null;
+                            const cbMembers = definitions.filter(d => d.className && !NON_CALLABLE_TYPES.has(d.type));
+                            const cbDeclaring = cbStart?.key && (!call.enclosingFunction ||
+                                (call.enclosingFunction.name === cbCaller.name &&
+                                    call.enclosingFunction.startLine === cbCaller.startLine))
+                                ? findDeclaringClass(index, cbStart, cbMembers,
+                                    call.receiver === 'super' ? { parentsOnly: true } : {})
+                                : null;
+                            if (cbDeclaring && !cbDeclaring.uncertain) {
+                                if (!cbDeclaring.members.some(member => cbTargetDefs.includes(member))) {
+                                    recordExcluded(filePath, call.line, 'other-definition');
+                                    continue;
+                                }
+                                cbThisReached = true;
+                            }
+                        }
                         if (collectAccount) {
                             const cbTypes = dispatchTargetTypes(cbTargetDefs);
                             const cbTypeQualified = call.receiver && cbTypes.has(call.receiver);
                             const cbTypedMatch = call.receiverType && cbTypes.has(call.receiverType);
                             const cbAllTypeTargets = cbTargetDefs.length > 0 &&
                                 cbTargetDefs.every(d => IDENTITY_TYPE_KINDS.has(d.type));
-                            if (!cbTypeQualified && !cbTypedMatch) {
+                            if (!cbTypeQualified && !cbTypedMatch && !cbThisReached) {
                                 routeUnverified(filePath, fileEntry, call,
                                     methodOwnerKeys().size === 1 && !cbAllTypeTargets ? 'single-owner' : 'method-ambiguous', calledAs,
                                     { dispatchCandidates: methodOwnerKeys().size });
@@ -1758,19 +2415,36 @@ function findCallers(index, name, options = {}) {
                     // names never own module scope — a same-file `class X {
                     // validate() {} }` must not exclude the imported
                     // validate passed as a callback.
-                    if (!cbSameFile && (index.symbols.get(call.name) || []).some(d =>
-                        d.file === filePath && !cbTargetFiles.has(d.file) &&
+                    if (!cbSameFile && !cbPackageQualified && definitionsInFile(index, call.name, filePath).some(d =>
+                        !cbTargetFiles.has(d.file) &&
                         d.startLine <= call.line &&
                         !d.className && !d.memberAssigned && !d.bodyScopedName &&
                         !NON_CALLABLE_TYPES.has(d.type))) {
                         recordExcluded(filePath, call.line, 'other-definition-import');
                         continue;
                     }
-                    const cbSamePackage = !cbSameFile &&
+                    const cbSamePackage = !cbSameFile && !cbPackageQualified &&
                         langTraits(fileEntry.language)?.typeSystem === 'nominal' &&
                         cbTargetDefs.some(d => d.file &&
                             _sameNominalPackageDir(path.dirname(d.file), path.dirname(filePath), fileEntry.language));
-                    let cbImportLink = false;
+                    // A bare reference to a member-assigned target (fix
+                    // #384): same reach rule as bare calls.
+                    if (!call.isMethod && !call.receiver && !call.localShadow && !calledAs &&
+                        !call.moduleLocalBinding &&
+                        _bindingsNamed(index, fileEntry, call.name).length === 0) {
+                        const memberVerdict = _bareNameMemberVerdict(fileEntry, filePath, call.name,
+                            call.line, call.line, cbTargetDefs);
+                        if (memberVerdict === 'no') {
+                            recordExcluded(filePath, call.line, 'method-kind-mismatch');
+                            continue;
+                        }
+                        if (memberVerdict === 'maybe') {
+                            routeUnverified(filePath, fileEntry, call, 'member-object-unresolved', calledAs);
+                            continue;
+                        }
+                    }
+                    // A resolved package qualifier is the import evidence.
+                    let cbImportLink = cbPackageQualified;
                     // A module-scoped variable passed as a callback has a
                     // concrete lexical owner, but its VALUE may be dynamic
                     // (`const app = express(); use(app)`). It must not borrow
@@ -1780,13 +2454,26 @@ function findCallers(index, name, options = {}) {
                     // elsewhere exclude; dynamic/CJS factory values remain
                     // visible. Account-gated to preserve legacy trace/blast
                     // behavior while strengthening grep-reliable surfaces.
-                    if (collectAccount && !cbSameFile && call.moduleLocalBinding &&
-                        langTraits(fileEntry.language)?.typeSystem === 'structural') {
+                    // fix #381: a bare name bound by the file's own import
+                    // of that NAME resolves through that import only. Another
+                    // import of the same module file graph (`from pkg.virt
+                    // import Base64`, whose package re-exports a different
+                    // Transport) is not evidence for `Transport`.
+                    const cbNamedImport = !cbSameFile && !cbPackageQualified &&
+                        !call.moduleLocalBinding &&
+                        langTraits(fileEntry.language)?.typeSystem === 'structural' &&
+                        (fileEntry.importBindings || []).some(binding =>
+                            binding.name !== '*' &&
+                            (binding.alias || binding.name) === call.name);
+                    if ((collectAccount && !cbSameFile && call.moduleLocalBinding &&
+                        langTraits(fileEntry.language)?.typeSystem === 'structural') ||
+                        cbNamedImport) {
                         const cbNameBindings = (fileEntry.importBindings || []).filter(binding =>
                             binding.name === call.name || binding.alias === call.name);
                         let cbBindingReaches = false;
                         let cbBindingUnknown = cbNameBindings.length === 0;
                         for (const binding of cbNameBindings) {
+                            if (cbNamedImport && (binding.alias || binding.name) !== call.name) continue;
                             const rel = fileEntry.moduleResolved?.[binding.module];
                             if (!rel) {
                                 if (_unresolvedModuleIsGap(index, binding.module, binding)) {
@@ -1814,7 +2501,7 @@ function findCallers(index, name, options = {}) {
                         }
                         cbImportLink = true;
                     }
-                    if (!cbSameFile && !cbSamePackage) {
+                    if (!cbSameFile && !cbSamePackage && !cbPackageQualified) {
                         const cbImports = index.importGraph.get(filePath);
                         cbImportLink = cbImportLink ||
                             !!(cbImports && setSome(cbImports, imp => cbTargetFiles.has(imp)));
@@ -1835,12 +2522,12 @@ function findCallers(index, name, options = {}) {
                             // Bare-name bindable defs only (#222(3)): a foreign
                             // class's same-name METHOD is unreachable by a bare
                             // reference and proves no mis-link.
-                            const cbOtherDefFiles = new Set((index.symbols.get(call.name) || [])
-                                .filter(d => !d.className && !d.memberAssigned &&
-                                    !d.bodyScopedName && !NON_CALLABLE_TYPES.has(d.type))
-                                .map(d => d.file).filter(f => f && !cbTargetFiles.has(f)));
-                            if (cbOtherDefFiles.has(filePath) ||
-                                (cbImports && setSome(cbImports, imp => cbOtherDefFiles.has(imp)))) {
+                            const bareDefFiles = _definitionFileSet(index, call.name, 'bare-bindable',
+                                d => !d.className && !d.memberAssigned &&
+                                    !d.bodyScopedName && !NON_CALLABLE_TYPES.has(d.type));
+                            const otherDefFile = f => bareDefFiles.has(f) && !cbTargetFiles.has(f);
+                            if (otherDefFile(filePath) ||
+                                (cbImports && setSome(cbImports, otherDefFile))) {
                                 recordExcluded(filePath, call.line, 'other-definition-import');
                                 continue;
                             }
@@ -1848,7 +2535,7 @@ function findCallers(index, name, options = {}) {
                     }
 
                     // Find the enclosing function
-                    const callerSymbol = index.findEnclosingFunction(filePath, call.line, true);
+                    const callerSymbol = index.findEnclosingFunction(filePath, call.line, true, call);
                     // A parameter of the enclosing function with the same name
                     // shadows the target: `disposeEffect(effect)` inside
                     // `function disposeEffect(effect)` references the parameter,
@@ -1857,7 +2544,7 @@ function findCallers(index, name, options = {}) {
                     // lexical scope walk sets call.localShadow; JS block-accurate,
                     // Python function-wide assignment semantics).
                     if ((call.localShadow && !shadowCanReachPinnedTarget(filePath, call)) ||
-                        (callerSymbol && Array.isArray(callerSymbol.paramsStructured) &&
+                        (!cbPackageQualified && callerSymbol && Array.isArray(callerSymbol.paramsStructured) &&
                             callerSymbol.paramsStructured.some(p => p && p.name === call.name))) {
                         recordExcluded(filePath, call.line, 'local-shadow');
                         continue;
@@ -1889,7 +2576,12 @@ function findCallers(index, name, options = {}) {
                 // binding resolution and exact-confirm on the shadowed name.
                 if (call.localShadow && !call.isPotentialCallback &&
                     !shadowCanReachPinnedTarget(filePath, call)) {
-                    recordExcluded(filePath, call.line, 'local-shadow');
+                    // A local declaration the index holds (a nested function)
+                    // is another definition the name resolves to (fix #397).
+                    const shadowLine = _shadowLineOf(call);
+                    const shadowDef = shadowLine > 0 && !call.isFunctionReference &&
+                        definitionsInFile(index, call.name, filePath).some(d => d.startLine === shadowLine);
+                    recordExcluded(filePath, call.line, shadowDef ? 'other-definition' : 'local-shadow');
                     continue;
                 }
 
@@ -1930,16 +2622,37 @@ function findCallers(index, name, options = {}) {
                     const bareNeverMethod = !call.isMethod &&
                         (!langTraits(fileEntry.language)?.bareCallReachesMethods ||
                          call.globalQualified);
-                    const defsOfName = bareNeverMethod ? (index.symbols.get(call.name) || []) : null;
                     const dropMethodBindings = (list, file) => {
                         if (!bareNeverMethod || list.length === 0) return list;
                         return list.filter(b => {
-                            const sym = defsOfName.find(s => s.file === file && s.startLine === b.startLine);
+                            const sym = definitionAt(index, call.name, file, b.startLine);
                             return !(sym && (sym.className || sym.receiver));
                         });
                     };
-                    let bindings = dropMethodBindings(
-                        (fileEntry.bindings || []).filter(b => b.name === call.name), filePath);
+                    // The file's bare-name bindings of the name are the same
+                    // for every record in it: filter them once per operation
+                    // (fix #382; a test file binding one name 147 times
+                    // repeated the filter for each of its records).
+                    let fileBindings;
+                    if (bareNeverMethod) {
+                        const memo = index._opMemo?.('methodFreeBindings');
+                        const key = `${filePath}\0${call.name}`;
+                        fileBindings = memo?.get(key);
+                        if (!fileBindings) {
+                            fileBindings = dropMethodBindings(_bindingsNamed(index, fileEntry, call.name).slice(), filePath);
+                            memo?.set(key, fileBindings);
+                        }
+                        fileBindings = fileBindings.slice();
+                    } else {
+                        fileBindings = _bindingsNamed(index, fileEntry, call.name).slice();
+                    }
+                    let bindings = _arityCompatibleBindings(index, fileEntry.language, call,
+                        _dropOutOfScopeBindings(index, filePath, call.name, call.line, fileBindings));
+                    // A marked macro invocation binds only macros, a call
+                    // only fns and values (fix #377).
+                    if (langTraits(fileEntry.language)?.macroInvocationSyntax === 'marked') {
+                        bindings = bindings.filter(b => (b.type === 'macro') === !!call.isMacro);
+                    }
                     // For Go, also check sibling files in same directory (same package scope)
                     if (bindings.length === 0 && langTraits(fileEntry.language)?.packageScope === 'directory') {
                         const dir = path.dirname(filePath);
@@ -1981,10 +2694,9 @@ function findCallers(index, name, options = {}) {
                         // function before module/same-class heuristics (Click
                         // defines TestContext/CustomContext independently in
                         // several tests in one file).
-                        const callerSym = index.findEnclosingFunction(filePath, call.line, true);
+                        const callerSym = index.findEnclosingFunction(filePath, call.line, true, call);
                         const lexicalMatches = bindings.map(binding => {
-                            const symbol = (index.symbols.get(call.name) || []).find(candidate =>
-                                candidate.file === filePath &&
+                            const symbol = definitionsInFile(index, call.name, filePath).find(candidate =>
                                 candidate.startLine === binding.startLine);
                             return { binding, symbol };
                         }).filter(({ symbol }) =>
@@ -1994,9 +2706,41 @@ function findCallers(index, name, options = {}) {
                             .sort((a, b) =>
                                 (a.symbol.lexicalScopeEndLine - a.symbol.lexicalScopeStartLine) -
                                 (b.symbol.lexicalScopeEndLine - b.symbol.lexicalScopeStartLine));
-                        const sameLexicalOwner = callerSym ? bindings.filter(b => {
-                            const owner = index.findEnclosingFunction(filePath, b.startLine, true);
-                            return owner && owner.file === callerSym.file &&
+                        // The binding's OWNER is the function strictly
+                        // containing its definition: looking up the binding's
+                        // own start line returns the nested definition itself
+                        // (fix #369, a Rust `fn check` nested in several tests
+                        // of one file).
+                        const fileSymbols = fileEntry.symbols || [];
+                        // A pure function of the file's symbols, asked for
+                        // every binding of every same-name call (fix #395:
+                        // AutoMapper test files declare hundreds of nested
+                        // same-name types): memoized per operation.
+                        const ownerMemo = index._opMemo?.('bindingStrictOwner', () => new Map());
+                        const strictOwner = binding => {
+                            const memoKey = `${filePath}\0${call.name}\0${binding.startLine}`;
+                            if (ownerMemo?.has(memoKey)) return ownerMemo.get(memoKey);
+                            const own = fileSymbols.find(symbol => symbol.name === call.name &&
+                                symbol.startLine === binding.startLine);
+                            let best = null;
+                            if (!own) {
+                                best = index.findEnclosingFunction(filePath, binding.startLine, true);
+                            } else {
+                                for (const symbol of fileSymbols) {
+                                    if (symbol === own || NON_CALLABLE_TYPES.has(symbol.type) ||
+                                        symbol.startLine > own.startLine || symbol.endLine < own.endLine ||
+                                        (symbol.startLine === own.startLine && symbol.endLine === own.endLine)) continue;
+                                    if (!best || symbol.endLine - symbol.startLine < best.endLine - best.startLine) {
+                                        best = symbol;
+                                    }
+                                }
+                            }
+                            ownerMemo?.set(memoKey, best);
+                            return best;
+                        };
+                        const sameLexicalOwner = callerSym && lexicalMatches.length === 0 ? bindings.filter(b => {
+                            const owner = strictOwner(b);
+                            return owner && (owner.file || filePath) === callerSym.file &&
                                 owner.startLine === callerSym.startLine;
                         }) : [];
                         if (lexicalMatches.length > 0) {
@@ -2007,8 +2751,19 @@ function findCallers(index, name, options = {}) {
                         // this.execute()), try the caller class next.
                         } else if (callerSym?.className) {
                             const callSymbols = index.symbols.get(call.name);
-                            const sameClassSym = callSymbols?.find(s => s.className === callerSym.className);
-                            if (sameClassSym) {
+                            // fix #358: the caller's class DEFINITION owns the
+                            // member, not any same-name class elsewhere.
+                            const callerClassRef = ownerRefOf(index, callerSym);
+                            let sameClassSym = null;
+                            let sameClassMaybe = false;
+                            for (const s of callSymbols || []) {
+                                const owned = ownedBy(index, s, callerClassRef);
+                                if (owned === 'yes') { sameClassSym = s; break; }
+                                if (owned === 'maybe') sameClassMaybe = true;
+                            }
+                            if (!sameClassSym && sameClassMaybe) {
+                                isUncertain = true;
+                            } else if (sameClassSym) {
                                 const matchingBinding = bindings.find(b => b.startLine === sameClassSym.startLine);
                                 bindingId = matchingBinding?.id || sameClassSym.bindingId;
                             } else {
@@ -2041,7 +2796,8 @@ function findCallers(index, name, options = {}) {
                             if (defs) {
                                 // Sort bindings by indent desc (most nested first)
                                 const scopedBindings = bindings.map(b => {
-                                    const sym = defs.find(s => s.startLine === b.startLine && s.file === filePath);
+                                    const sym = definitionsInFile(index, call.name, filePath)
+                                        .find(s => s.startLine === b.startLine);
                                     return { ...b, indent: sym?.indent ?? 0, endLine: sym?.endLine ?? b.startLine };
                                 }).sort((a, b) => b.indent - a.indent);
 
@@ -2077,7 +2833,7 @@ function findCallers(index, name, options = {}) {
                     if (bindings.length === 0 && call.isMethod &&
                         langTraits(fileEntry.language)?.typeSystem === 'structural') {
                         const hasReceiverEvidence = call.receiver &&
-                            (fileEntry.bindings || []).some(b => b.name === call.receiver);
+                            _bindingsNamed(index, fileEntry, call.receiver).length > 0;
                         if (!hasReceiverEvidence) {
                             isUncertain = true;
                         }
@@ -2091,16 +2847,19 @@ function findCallers(index, name, options = {}) {
                 // possible-dispatch instead of excluding it as another def.
                 if (collectAccount && bindingId && !call.isMethod && !call.receiver &&
                     langTraits(fileEntry.language)?.bareCallReachesMethods) {
-                    const bound = (index.symbols.get(call.name) || [])
-                        .find(s => s.bindingId === bindingId);
+                    const bound = _definitionByBindingId(index, call.name, bindingId);
                     const tDefs = options.targetDefinitions || definitions;
                     const boundOwner = bound && (bound.className ||
                         (bound.receiver && bound.receiver.replace(/^\*/, '')));
                     const targetOwners = new Set(tDefs.map(d => d.className ||
                         (d.receiver && d.receiver.replace(/^\*/, ''))).filter(Boolean));
+                    // C++ dispatches only through a virtual member (fix
+                    // #396): a non-virtual base member binds statically.
                     if (boundOwner && !targetOwners.has(boundOwner) &&
                         (_isAncestorOfTargetClass(index, boundOwner, tDefs) ||
-                         _isDispatchAncestor(index, boundOwner, tDefs))) {
+                         _isDispatchAncestor(index, boundOwner, tDefs)) &&
+                        (!langTraits(fileEntry.language)?.explicitVirtualDispatch ||
+                         _dispatchCapableSupertype(index, fileEntry.language, boundOwner, tDefs, definitions))) {
                         routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
                             dispatchVia: boundOwner,
                         });
@@ -2146,13 +2905,35 @@ function findCallers(index, name, options = {}) {
                 // `string !== StringUtils`.
                 let resolvedByExtensionMethod = false;
                 if (call.isMethod && fileEntry.language === 'csharp') {
-                    resolvedByExtensionMethod = _csharpExtensionCallMatches(
+                    const extensionVerdict = _csharpExtensionCallVerdict(
                         index,
                         filePath,
                         fileEntry,
                         call,
                         options.targetDefinitions || definitions);
+                    resolvedByExtensionMethod = extensionVerdict === 'match';
                     if (resolvedByExtensionMethod) receiverTypeValidated = true;
+                    // fix #380: a receiver whose type ancestry cannot decide
+                    // the extension's `this` parameter (an external type) is
+                    // a visible unverified caller, never a type mismatch.
+                    if (extensionVerdict === 'possible') {
+                        routeUnverified(filePath, fileEntry, call, 'extension-receiver-unresolved', calledAs);
+                        continue;
+                    }
+                    // A typed receiver no pinned extension can take (out of
+                    // scope, `this` type, arguments, an instance member
+                    // winning) is not their caller (fix #395); the static
+                    // class's own spelling (`Ext.M(x)`) stays ordinary.
+                    // Argument fit stays with the overload discipline.
+                    const extensionTargets = options.targetDefinitions || definitions;
+                    if (extensionVerdict === 'no' && extensionTargets.length > 0 &&
+                        extensionTargets.every(definition => definition.isExtensionMethod &&
+                            call.receiver !== definition.className) &&
+                        _csharpExtensionCallVerdict(index, filePath, fileEntry, call, extensionTargets,
+                            { receiverOnly: true }) === 'no') {
+                        recordExcluded(filePath, call.line, 'receiver-type-mismatch');
+                        continue;
+                    }
                 }
                 // A static-imported FIELD shadows the capitalized static-
                 // qualifier reading (fix #286c, jsoup-measured): javac binds
@@ -2181,7 +2962,7 @@ function findCallers(index, name, options = {}) {
                     // TypeVariableName.get(Object.class) → inherited
                     // TypeName.get(Type) from the subclass's inapplicable get
                     // overloads.
-                    const callerSymbol = index.findEnclosingFunction(filePath, call.line, true) ||
+                    const callerSymbol = index.findEnclosingFunction(filePath, call.line, true, call) ||
                         { file: filePath };
                     const qualifiedTargetDefs = options.targetDefinitions || definitions;
                     if (call.receiverIsTypeQualified) {
@@ -2245,7 +3026,7 @@ function findCallers(index, name, options = {}) {
                 if (call.isMethod) {
                     if (call.selfAttribute && fileEntry.language === 'python') {
                         // self.attr.method() — resolve via attribute type inference
-                        const callerSymbol = index.findEnclosingFunction(filePath, call.line, true);
+                        const callerSymbol = index.findEnclosingFunction(filePath, call.line, true, call);
                         if (!callerSymbol?.className) {
                             // Can't resolve — include only if includeMethods requested
                             if (options.collectAccount || !options.includeMethods) {
@@ -2273,14 +3054,70 @@ function findCallers(index, name, options = {}) {
                                 targetClass = _pureAliasBase(index, targetClass) || targetClass;
                                 const tDefs = options.targetDefinitions || definitions;
                                 const compatibleTypes = dispatchTargetTypes(tDefs);
+                                // fix #381: the field's class by DEFINITION.
+                                // A same-name class the file cannot see
+                                // (another module's, a function-local one
+                                // out of scope) never confirms.
+                                const fieldRef = compatibleTypes.has(targetClass)
+                                    ? _pythonFieldClassRef(index, filePath, targetClass,
+                                        attrTypes, call.selfAttribute, callerSymbol)
+                                    : null;
+                                let fieldVerdict = null;
+                                if (fieldRef) {
+                                    const declaring = fieldRef.key
+                                        ? findDeclaringClass(index, fieldRef, tDefs) : null;
+                                    if (declaring && !declaring.uncertain) fieldVerdict = 'confirm';
+                                    else if (fieldRef.key) {
+                                        // An uncertain match (through an
+                                        // unresolved same-name ancestor) is
+                                        // 'maybe', never confirmation.
+                                        const relation = declaring
+                                            ? 'maybe' : relationToTargets(index, fieldRef, tDefs);
+                                        // The field's class itself declares the
+                                        // method (own or resolved ancestor): the
+                                        // call binds there unless a target owner
+                                        // is a resolved descendant (override).
+                                        const ownDecl = relation === 'maybe'
+                                            ? findDeclaringClass(index, fieldRef,
+                                                (index.symbols.get(call.name) || []).filter(d =>
+                                                    !NON_CALLABLE_TYPES.has(d.type)))
+                                            : null;
+                                        const below = ownDecl && !ownDecl.uncertain
+                                            ? descendantKeys(index, fieldRef) : null;
+                                        // A capped descendant walk is incomplete:
+                                        // a target owner may sit below it.
+                                        const targetBelow = !!below && (below.size >= 256 || tDefs.some(t => {
+                                            const owner = ownerRefOf(index, t);
+                                            return !owner?.key || below.has(owner.key);
+                                        }));
+                                        fieldVerdict = relation === 'unrelated' ||
+                                            (ownDecl && !ownDecl.uncertain && below && !targetBelow)
+                                            ? 'exclude' : 'route';
+                                    } else fieldVerdict = 'route';
+                                }
+                                if (fieldVerdict === 'exclude') {
+                                    // The field's class is a resolved project
+                                    // definition that neither is nor inherits
+                                    // the target's owner.
+                                    recordExcluded(filePath, call.line, 'receiver-type-mismatch');
+                                    continue;
+                                }
+                                if (fieldVerdict === 'route') {
+                                    routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
+                                        dispatchVia: targetClass,
+                                    });
+                                    continue;
+                                }
                                 if (compatibleTypes.has(targetClass)) {
                                     resolvedBySameClass = true;
                                     resolvedByTypedAttribute = true;
+                                    const writeLines = attrTypes?.writeLines?.get(call.selfAttribute);
                                     resolvedReceiverFacts = {
                                         receiverType: targetClass, receiverTypeSource: 'field',
                                         receiverOrigin: { source: 'field', rootType: callerSymbol.className,
                                             field: call.selfAttribute, scope: declarationIdentity(callerSymbol),
                                             ...attrTypes?.origins?.get(call.selfAttribute) },
+                                        ...(fieldRef?.key && writeLines?.length && { receiverTypeLine: writeLines[0] }),
                                     };
                                 } else if (_isAncestorOfTargetClass(index, targetClass, tDefs)) {
                                     // A field declared as a strict ancestor can
@@ -2330,7 +3167,7 @@ function findCallers(index, name, options = {}) {
                         // sibling — it must never reach the uppercase path-receiver
                         // discipline below (which excluded it as path-type-mismatch
                         // whenever the method name had several project-wide owners).
-                        const callerSymbol = index.findEnclosingFunction(filePath, call.line, true);
+                        const callerSymbol = index.findEnclosingFunction(filePath, call.line, true, call);
                         if (!callerSymbol?.className) {
                             if (options.collectAccount || !options.includeMethods) {
                                 routeUnverified(filePath, fileEntry, call, 'method-no-evidence', calledAs);
@@ -2340,62 +3177,73 @@ function findCallers(index, name, options = {}) {
                             // For super(), skip same-class — only check parent chain
                             const parentOnlyReceiver = call.receiver === 'super' ||
                                 (call.receiver === 'base' && fileEntry.language === 'csharp');
-                            let matchedClass = !parentOnlyReceiver &&
-                                definitions.some(d => d.className === callerSymbol.className)
-                                ? callerSymbol.className : null;
-                            // Walk inheritance chain using BFS if not found in same class
-                            if (!matchedClass) {
-                                const visited = new Set([callerSymbol.className]);
-                                const callerFile = callerSymbol.file || filePath;
-                                const startParents = index._getInheritanceParents(callerSymbol.className, callerFile) || [];
-                                const queue = startParents.map(p => ({ name: p, contextFile: callerFile }));
-                                while (queue.length > 0 && !matchedClass) {
-                                    const { name: current, contextFile } = queue.shift();
-                                    if (visited.has(current)) continue;
-                                    visited.add(current);
-                                    if (definitions.some(d => d.className === current)) matchedClass = current;
-                                    if (!matchedClass) {
-                                        const resolvedFile = index._resolveClassFile(current, contextFile);
-                                        const grandparents = index._getInheritanceParents(current, resolvedFile) || [];
-                                        for (const gp of grandparents) {
-                                            if (!visited.has(gp)) queue.push({ name: gp, contextFile: resolvedFile });
-                                        }
-                                    }
-                                }
+                            // fix #358: resolve by class DEFINITION identity, not
+                            // class name. `self.len()` inside slice.Chunks never
+                            // reaches iter.Chunks.len just because both classes
+                            // are named Chunks (Python modules, TS files, Java
+                            // packages, C# namespaces, Rust modules). The caller's
+                            // owning class and each inheritance parent resolve to
+                            // definitions through the language's own scoping; an
+                            // owner/parent that cannot be resolved to exactly one
+                            // definition makes the match uncertain (routed, never
+                            // confirmed or excluded).
+                            let callerClassRef = ownerRefOf(index, callerSymbol);
+                            let parentsOnly = parentOnlyReceiver;
+                            // `super` inside an anonymous class body names that
+                            // class's base type (fix #394).
+                            if (parentOnlyReceiver && call.receiverSuperType) {
+                                callerClassRef = resolveClassRef(index, call.receiverSuperType, filePath,
+                                    { line: call.line });
+                                parentsOnly = false;
                             }
+                            const declaring = callerClassRef?.external ? null
+                                : findDeclaringClass(index, callerClassRef, definitions, { parentsOnly });
+                            const matchedClass = declaring ? declaring.ref.name : null;
                             if (matchedClass) {
-                                // fix #202b: same-class resolution must land on the
-                                // TARGET's class (or an ancestor — dynamic dispatch
-                                // may run the target override). self.path() inside
-                                // StandardImpl resolves to StandardImpl::path — not
-                                // a caller of a pinned target Haystack::path.
-                                // NOMINAL languages + Python: the exclusion is sound
-                                // only when the inheritance graph is complete; TS
-                                // hierarchies hide edges UCN can't see (zod's
-                                // `declare class` merging — measured: the structural
-                                // guard excluded true callers). Python's recorded
-                                // bases are reliable, but MRO adds a trap nominal
-                                // languages lack: `self.method()` inside Mixin can
-                                // dispatch to a CO-PARENT's method through a common
-                                // subclass (class C(Target, Mixin) — C's MRO finds
-                                // Target.method before Mixin's). Exclusion therefore
-                                // also requires that the matched class and the
-                                // target's class share no project descendant.
+                                const tDefs = options.targetDefinitions || definitions;
+                                // same | ancestor | maybe | unrelated (by definition)
+                                const relation = declaring.uncertain
+                                    ? 'maybe'
+                                    : relationToTargets(index, declaring.ref, tDefs);
+                                const isTargetClass = relation === 'same';
                                 const sameClassTraits = langTraits(fileEntry.language);
-                                if (sameClassTraits?.typeSystem === 'nominal' ||
+                                if (relation === 'maybe') {
+                                    // A same-name owner or ancestor whose definition
+                                    // cannot be resolved: neither confirmation nor
+                                    // exclusion evidence. Legacy keeps the edge.
+                                    if (collectAccount) {
+                                        routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs);
+                                        continue;
+                                    }
+                                } else if (sameClassTraits?.typeSystem === 'nominal' ||
                                     fileEntry.language === 'python') {
-                                    const tDefs = options.targetDefinitions || definitions;
-                                    const targetClasses = new Set(tDefs.map(d => d.className).filter(Boolean));
+                                    // fix #202b: same-class resolution must land on the
+                                    // TARGET's class (or an ancestor — dynamic dispatch
+                                    // may run the target override). self.path() inside
+                                    // StandardImpl resolves to StandardImpl::path — not
+                                    // a caller of a pinned target Haystack::path.
+                                    // NOMINAL languages + Python: the exclusion is sound
+                                    // only when the inheritance graph is complete; TS
+                                    // hierarchies hide edges UCN can't see (zod's
+                                    // `declare class` merging — measured: the structural
+                                    // guard excluded true callers). Python's recorded
+                                    // bases are reliable, but MRO adds a trap nominal
+                                    // languages lack: `self.method()` inside Mixin can
+                                    // dispatch to a CO-PARENT's method through a common
+                                    // subclass (class C(Target, Mixin) — C's MRO finds
+                                    // Target.method before Mixin's). Exclusion therefore
+                                    // also requires that the matched class and the
+                                    // target's class share no project descendant.
                                     // `super` dispatches statically UP the chain — the
                                     // ancestor/descendant dynamic-dispatch exemptions
                                     // are inverted for it: a super call can never bind
                                     // a def below the matched parent (fix #238).
                                     const superSkipsExemptions = parentOnlyReceiver;
-                                    if (!targetClasses.has(matchedClass) &&
+                                    if (!isTargetClass &&
                                         (superSkipsExemptions ||
-                                         (!_isAncestorOfTargetClass(index, matchedClass, tDefs) &&
+                                         (relation !== 'ancestor' &&
                                           !(fileEntry.language === 'python' &&
-                                            _shareProjectDescendant(index, matchedClass, targetClasses))))) {
+                                            shareClassDescendant(index, declaring.ref, tDefs))))) {
                                         recordExcluded(filePath, call.line, 'other-definition');
                                         continue;
                                     }
@@ -2407,9 +3255,8 @@ function findCallers(index, name, options = {}) {
                                     // pinned SUBCLASS override is dynamic dispatch,
                                     // possible but not confirmable (#204 physics).
                                     // Demote-only, account-gated; when the pinned
-                                    // target IS the declaring class, matchedClass ∈
-                                    // targetClasses and confirmation stands.
-                                    if (collectAccount && !targetClasses.has(matchedClass)) {
+                                    // target IS the declaring class confirmation stands.
+                                    if (collectAccount && !isTargetClass) {
                                         routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
                                             dispatchVia: matchedClass,
                                         });
@@ -2426,21 +3273,28 @@ function findCallers(index, name, options = {}) {
                                     // edges, so an unrelated-looking class may still be
                                     // an ancestor (the original #202b structural revert).
                                     // Legacy keeps confirming (drop-vs-route asymmetry).
-                                    const tDefs = options.targetDefinitions || definitions;
-                                    const targetClasses = new Set(tDefs.map(d => d.className).filter(Boolean));
                                     // super: static upward dispatch — no ancestor/
                                     // descendant exemptions (fix #238), routed visible
                                     // like the rest of the #213 branch (TS declare-class
                                     // merging can hide the true parent edge).
-                                    if (!targetClasses.has(matchedClass) &&
+                                    if (!isTargetClass &&
                                         (parentOnlyReceiver ||
-                                         (!_isAncestorOfTargetClass(index, matchedClass, tDefs) &&
-                                          !_shareProjectDescendant(index, matchedClass, targetClasses)))) {
+                                         (relation !== 'ancestor' &&
+                                          !shareClassDescendant(index, declaring.ref, tDefs)))) {
                                         routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs);
                                         continue;
                                     }
                                 }
                                 resolvedBySameClass = true;
+                            } else if (collectAccount && parentOnlyReceiver && (callerClassRef?.external ||
+                                ((callerClassRef?.key || callerClassRef?.def) &&
+                                    _ancestryFullyResolved(index, callerClassRef)))) {
+                                // `super.m()` binds the superclass chain's member
+                                // statically; no project class in a fully resolved
+                                // chain declares it, so it is an external member
+                                // (`super.toString()` is Object's) (fix #394).
+                                recordExcluded(filePath, call.line, 'other-definition');
+                                continue;
                             } else if (options.collectAccount || !options.includeMethods) {
                                 routeUnverified(filePath, fileEntry, call, 'method-no-evidence', calledAs);
                                 continue;
@@ -2537,7 +3391,7 @@ function findCallers(index, name, options = {}) {
                     !resolvedBySameClass &&
                     (langTraits(fileEntry.language)?.typeSystem === 'structural' ||
                      fileEntry.language === 'csharp')) {
-                    const hopEnclosing = index.findEnclosingFunction(filePath, call.line, true);
+                    const hopEnclosing = index.findEnclosingFunction(filePath, call.line, true, call);
                     if (hopEnclosing?.className) fieldHopRootType = hopEnclosing.className;
                 }
                 if (call.isMethod && !call.receiverType && call.receiverField && fieldHopRootType &&
@@ -2546,7 +3400,20 @@ function findCallers(index, name, options = {}) {
                     fieldHopType = _declaredFieldPathType(index, fieldHopRootType,
                         call.receiverFields || [call.receiverField],
                         fileEntry.language, hopInfo,
-                        call.receiverRootNamespace);
+                        call.receiverRootNamespace,
+                        fieldHopRootType === call.receiverRootType
+                            ? _fieldHopRootArity(index, filePath, call, fileEntry.language) : null);
+                    // fix #380: the declared type's arity names one type.
+                    if (fieldHopType && Number.isInteger(hopInfo.typeArgs)) {
+                        call = { ...call, receiverHopType: fieldHopType, receiverHopTypeArgs: hopInfo.typeArgs,
+                            ...(hopInfo.typeTexts && { receiverHopTypeTexts: hopInfo.typeTexts }) };
+                        const arity = _genericAritySplit(fileEntry.language, call,
+                            options.targetDefinitions || definitions);
+                        if (arity && arity.related.length > 0 && arity.matching.length === 0) {
+                            recordExcluded(filePath, call.line, 'generic-arity-mismatch');
+                            continue;
+                        }
+                    }
                     if (fieldHopType && hopInfo.fromFile &&
                         !call.receiverTypeFlowFile) {
                         call = {
@@ -2562,6 +3429,15 @@ function findCallers(index, name, options = {}) {
                     // Handler elsewhere in the project) — rides the #220(6)
                     // external-flow rail: defeats single-owner confirmation,
                     // routes possible-dispatch, never excludes.
+                    // A field declared with an external type that shares a
+                    // project type's name (fix #371): no project member of
+                    // that type is reachable; impls on the external type are.
+                    if (!fieldHopType && hopInfo.externalType &&
+                        externalReceiverVerdict(index, fileEntry.language,
+                            options.targetDefinitions || definitions, hopInfo.externalType) === 'exclude') {
+                        recordExcluded(filePath, call.line, 'external-receiver');
+                        continue;
+                    }
                     if (!fieldHopType && hopInfo.externalVia && !call.receiverExternalFlow) {
                         call = {
                             ...call,
@@ -2595,18 +3471,25 @@ function findCallers(index, name, options = {}) {
                 }
                 if (!resolvedByExtensionMethod && fileEntry.language === 'csharp' &&
                     fieldHopType) {
-                    resolvedByExtensionMethod = _csharpExtensionCallMatches(
+                    const hopVerdict = _csharpExtensionCallVerdict(
                         index,
                         filePath,
                         fileEntry,
                         { ...call, receiverType: fieldHopType },
                         options.targetDefinitions || definitions);
+                    resolvedByExtensionMethod = hopVerdict === 'match';
                     if (resolvedByExtensionMethod) receiverTypeValidated = true;
+                    // A platform instance member that may take the arguments
+                    // leaves the extension undecided (fix #395).
+                    if (hopVerdict === 'possible') {
+                        routeUnverified(filePath, fileEntry, call, 'extension-receiver-unresolved', calledAs);
+                        continue;
+                    }
                 }
                 if (fileEntry.language === 'csharp' &&
                     call.receiverIsTypeQualified && !fieldHopType &&
                     !resolvedByExtensionMethod) {
-                    const callerSymbol = index.findEnclosingFunction(filePath, call.line, true) ||
+                    const callerSymbol = index.findEnclosingFunction(filePath, call.line, true, call) ||
                         { file: filePath };
                     const targetDefs = options.targetDefinitions || definitions;
                     const targetOwners = new Set(targetDefs
@@ -2671,6 +3554,19 @@ function findCallers(index, name, options = {}) {
                             call.receiverField, fileEntry.language, call.receiverRootNamespace);
                     }
                 }
+                // A C# explicit interface implementation is reached through
+                // an interface-typed receiver only by dispatch (fix #395):
+                // the call binds the interface member, never the
+                // implementation statically.
+                if (fieldDispatchType && fileEntry.language === 'csharp' && !call.receiverCastThis &&
+                    (options.targetDefinitions || definitions).length > 0 &&
+                    (options.targetDefinitions || definitions).every(definition => definition.explicitInterface)) {
+                    routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
+                        dispatchVia: fieldDispatchType,
+                        dispatchCandidates: _countDispatchCandidates(index, fieldDispatchType, definitions),
+                    });
+                    continue;
+                }
 
                 // Resolve this before the generic untyped-field guard below:
                 // `api.nested.run()` is syntactically a field receiver, but an
@@ -2714,21 +3610,64 @@ function findCallers(index, name, options = {}) {
                 if (fileEntry.language === 'cpp' &&
                     !call.isMethod && !call.receiver && !call.isPathCall) {
                     const cppTargets = options.targetDefinitions || definitions;
-                    if (cppTargets.some(definition => definition.className)) {
-                        const enclosing = index.findEnclosingFunction(
-                            filePath, call.line, true);
-                        const targetOwners = new Set(cppTargets
-                            .map(definition => definition.className)
-                            .filter(Boolean));
-                        const enclosingOwner = enclosing?.className;
-                        const ownerCanReachTarget = enclosingOwner &&
-                            (targetOwners.has(enclosingOwner) ||
-                             _isAncestorOfTargetClass(
-                                 index, enclosingOwner, cppTargets));
-                        if (!ownerCanReachTarget) {
-                            recordExcluded(filePath, call.line,
-                                'method-kind-mismatch');
+                    // A member type alias (`using string_t = ..` in a class
+                    // body) is found by bare name only from its class scope
+                    // chain, like a member function (fix #391).
+                    const memberOwnerOf = definition => definition.className ||
+                        (definition.type === 'type' && definition.enclosingType) || null;
+                    if (cppTargets.some(memberOwnerOf)) {
+                        // A call spelled in a macro replacement list binds at
+                        // each expansion site (fix #396): the classes of the
+                        // functions invoking the macro (through other macros
+                        // too) decide it.
+                        const siteVerdicts = call.inMacroBody && !call.macroParameter && call.enclosingFunction?.isMacro
+                            ? _cppMacroBodySiteVerdicts(index, filePath, call, cppTargets, definitions)
+                            : [_cppMemberSiteVerdict(index, filePath,
+                                index.findEnclosingFunction(filePath, call.line, true, call), cppTargets, definitions)];
+                        if (siteVerdicts === null) {
+                            routeUnverified(filePath, fileEntry, call, 'macro-body-context', calledAs);
                             continue;
+                        }
+                        const kinds = new Set(siteVerdicts.map(verdict => verdict.kind));
+                        if (kinds.size === 0 || (kinds.size === 1 && kinds.has('unreachable'))) {
+                            recordExcluded(filePath, call.line, 'method-kind-mismatch');
+                            continue;
+                        }
+                        if (kinds.has('reach') && kinds.size > 1) {
+                            routeUnverified(filePath, fileEntry, call, 'macro-body-context', calledAs);
+                            continue;
+                        }
+                        const generated = siteVerdicts.find(verdict => verdict.kind === 'generated-scope');
+                        if (generated && !kinds.has('reach')) {
+                            routeUnverified(filePath, fileEntry, call, 'macro-generated-scope', calledAs, {
+                                dispatchVia: generated.via,
+                            });
+                            continue;
+                        }
+                        const dispatch = siteVerdicts.find(verdict => verdict.kind === 'dispatch');
+                        if (dispatch) {
+                            routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
+                                dispatchVia: dispatch.declaring.name,
+                                dispatchCandidates: _countDispatchCandidates(
+                                    index, dispatch.declaring.name, definitions),
+                            });
+                            continue;
+                        }
+                        if (!kinds.has('reach')) {
+                            recordExcluded(filePath, call.line,
+                                kinds.has('static-other') ? 'other-definition' : 'method-kind-mismatch');
+                            continue;
+                        }
+                        if (call.inMacroBody && call.enclosingFunction?.isMacro) resolvedBySameClass = true;
+                        // A file binding to another class's out-of-line
+                        // member (`Circle::Area` defined in the same .cc) is
+                        // not in scope of an implicit-this call (fix #396).
+                        const declaring = siteVerdicts.length === 1 ? siteVerdicts[0].declaring : null;
+                        if (declaring && bindingId) {
+                            const bound = _definitionByBindingId(index, name, bindingId);
+                            if (bound?.className && ownedBy(index, bound, declaring) === 'no') {
+                                bindingId = null;
+                            }
                         }
                     }
                 }
@@ -2766,7 +3705,119 @@ function findCallers(index, name, options = {}) {
                 // If we have a binding id on definition, require match when available
                 // When targetDefinitions is provided, only those definitions' bindings are valid targets
                 const targetDefs = options.targetDefinitions || definitions;
+                // A C# static method is never reached through an instance
+                // (CS0176, fix #395): a call on a value - a chained call's
+                // result, `this`/`base`, a field path or a declared local -
+                // is not its caller. Extension methods take instance syntax.
+                if (fileEntry.language === 'csharp' && call.isMethod && call.receiver && targetDefs.length > 0 &&
+                    targetDefs.every(definition => (definition.modifiers || []).includes('static') &&
+                        !definition.isExtensionMethod && !NON_CALLABLE_TYPES.has(definition.type)) &&
+                    (call.receiverIsChainRoot || call.receiver === 'this' || call.receiver === 'base' ||
+                        (call.receiverField && !call.receiverRootIsType) ||
+                        (call.receiverType && ['declared', 'constructor', 'parameter', 'annotation', 'literal', 'cast']
+                            .includes(call.receiverTypeSource)))) {
+                    recordExcluded(filePath, call.line, 'method-kind-mismatch');
+                    continue;
+                }
+                // C# explicit interface implementations (fix #395, spec
+                // 18.6.2): `IEnumerator IEnumerable.GetEnumerator()` is not
+                // a member the class's own name lookup finds, so a simple
+                // name or a `this.`/`base.` access never reaches it; only an
+                // interface-typed receiver does (a cast `((I)this).M()`
+                // included). Inside the shim, `GetEnumerator()` binds the
+                // class's public member.
+                if (fileEntry.language === 'csharp' && targetDefs.length > 0 &&
+                    targetDefs.every(definition => definition.explicitInterface) &&
+                    !call.receiverCastThis &&
+                    (!call.receiver || call.receiver === 'this' || call.receiver === 'base')) {
+                    recordExcluded(filePath, call.line, 'other-definition');
+                    continue;
+                }
+                // fix #367b: a definition compiled only as another language
+                // (`#ifdef __cplusplus` overload in a C header) is not in this
+                // call's translation units.
+                if (langTraits(fileEntry.language)?.textualIncludes &&
+                    targetDefs.some(d => d.languageBranch) &&
+                    targetDefs.every(d => !_languageBranchVisible(index, d, filePath, call))) {
+                    recordExcluded(filePath, call.line, 'language-conditional');
+                    continue;
+                }
+                // A call inside such a branch is compiled as the branch's
+                // language: with overloading (C++ code in a C header) two
+                // arity-compatible visible functions of the name are an
+                // overload choice the file's own (C) binding table cannot make.
+                if (call.languageBranch && !call.isMethod && !call.receiver &&
+                    langTraits(call.languageBranch)?.hasArityOverloads) {
+                    const visibleFiles = _cppVisibleFiles(index, filePath);
+                    const overloads = definitions.filter(d =>
+                        !NON_CALLABLE_TYPES.has(d.type) && !d.className && !d.receiver &&
+                        visibleFiles.has(d.file) &&
+                        _languageBranchVisible(index, d, filePath, call) &&
+                        _callArityCompatible(call, [d], call.languageBranch));
+                    if (overloads.length > 1 && overloads.some(d => targetDefs.includes(d))) {
+                        routeUnverified(filePath, fileEntry, call, 'overload-ambiguous', calledAs);
+                        continue;
+                    }
+                }
                 const targetBindingIds = new Set(targetDefs.map(d => d.bindingId).filter(Boolean));
+                // fix #385: a call inside the conditional branch of one
+                // configuration variant is compiled with that variant only
+                // (two bodies of one function in one unit do not compile):
+                // another variant's branch holding the call makes it that
+                // variant's caller, whichever variant the name table bound.
+                if (bindingId && targetDefs.some(target => target.file === filePath && target.ppBranch) &&
+                    langTraits(fileEntry.language)?.conditionalDefinitions) {
+                    const holds = definition => definition.file === filePath &&
+                        Array.isArray(definition.ppBranch) &&
+                        definition.ppBranch[0] <= call.line && call.line <= definition.ppBranch[1];
+                    const decider = definitions.find(definition => holds(definition) &&
+                        targetDefs.some(target => definition === target ||
+                            _isConfigurationAlternative(index, definition, target)));
+                    if (decider && !targetDefs.includes(decider)) {
+                        recordExcluded(filePath, call.line, 'other-definition');
+                        continue;
+                    }
+                }
+                // `new X(..)` names a type (fix #395): a receiver-blind file
+                // binding of the name to a member (the property `X` of the
+                // enclosing class, C# "Color Color") is no binding of it.
+                if (bindingId && call.isConstructor && targetBindingIds.size > 0 && !targetBindingIds.has(bindingId)) {
+                    const bound = _definitionByBindingId(index, name, bindingId);
+                    if (bound && !_ARITY_TYPE_KINDS.has(bound.type) && bound.type !== 'constructor' &&
+                        !bound.isConstructor && bound.className) bindingId = null;
+                }
+                // A C# explicit interface implementation is not in simple-
+                // name scope (fix #395): a file binding of a bare or `this.`
+                // call to one binds nothing; the class's own member decides.
+                if (bindingId && fileEntry.language === 'csharp' && targetBindingIds.size > 0 &&
+                    !targetBindingIds.has(bindingId) &&
+                    (!call.receiver || call.receiver === 'this' || call.receiver === 'base')) {
+                    if (_definitionByBindingId(index, name, bindingId)?.explicitInterface) bindingId = null;
+                }
+                if (targetBindingIds.size > 0 && bindingId && !targetBindingIds.has(bindingId)) {
+                    // fix #385: a binding to one configuration alternative of
+                    // a pinned definition binds the item (libuv thread.c's
+                    // five `#if` variants of uv__thread_setname: the call
+                    // bound the first and excluded the rest), and a same-file
+                    // macro binding the preprocessor model set aside above
+                    // (`#define f(x) f(x)`, `#ifdef A #define f() 0 #else
+                    // static int f(void)`) is no binding of the call.
+                    const bound = _definitionByBindingId(index, name, bindingId);
+                    const alternative = bound && targetDefs.find(target =>
+                        target.bindingId && _isConfigurationAlternative(index, bound, target));
+                    if (alternative) {
+                        bindingId = alternative.bindingId;
+                    } else if (_cMacroBindingInert(index, filePath, call, bound)) {
+                        bindingId = _cFunctionBindingForMacroSite(index, fileEntry, name, targetBindingIds);
+                    } else if (bound && targetDefs.some(target => _isCrossFileConfigurationMember(index, bound, target))) {
+                        // The member of the same class in the other build
+                        // configuration (spdlog tcp_client-windows.h beside
+                        // tcp_client.h): one entity across configurations,
+                        // never the pinned body in one build.
+                        routeUnverified(filePath, fileEntry, call, 'configuration-alternative', calledAs);
+                        continue;
+                    }
+                }
                 if (targetBindingIds.size > 0 && bindingId && !targetBindingIds.has(bindingId)) {
                     // fix #202: a declared-field receiver type that VALIDATES
                     // against the target overrides name-binding evidence —
@@ -2788,8 +3839,7 @@ function findCallers(index, name, options = {}) {
                     // receive Java calls (separate namespaces), so a
                     // field-binding hit is treated the same way.
                     let overloadGroupBinding = false;
-                    const boundDefinition = definitions.find(definition =>
-                        definition.bindingId === bindingId);
+                    const boundDefinition = _definitionByBindingId(index, name, bindingId);
                     if (collectAccount && fileEntry.language === 'cpp' &&
                         _cppExternalLinkVariant(
                             boundDefinition, targetDefs)) {
@@ -2809,6 +3859,23 @@ function findCallers(index, name, options = {}) {
                             });
                         continue;
                     }
+                    if (collectAccount && fileEntry.language === 'cpp' && !call.receiver &&
+                        _cppDependentUsingOverload(index, filePath, call, boundDefinition, targetDefs)) {
+                        // fix #387: the derived class brings the inherited
+                        // member in by `using Base<T>::name;` - a dependent
+                        // using-declaration inside a template, resolved with
+                        // the call only at instantiation (spdlog/fmt
+                        // basic_memory_buffer::append calling buffer<T>::append).
+                        routeUnverified(filePath, fileEntry, call, 'overload-ambiguous', calledAs, {
+                            uncertaintyClass: 'compile-time-dispatch',
+                            dispatchFamily: `${name} C++ method dispatch set`,
+                            // The owners whose members the set holds: the
+                            // class's own and the inherited ones.
+                            dispatchCandidates: new Set([boundDefinition.className,
+                                ...targetDefs.map(target => target.className).filter(Boolean)]).size,
+                        });
+                        continue;
+                    }
                     if (!fieldHopMatchesTarget &&
                         langTraits(fileEntry.language)?.hasArityOverloads &&
                         (!call.receiver ||
@@ -2817,8 +3884,21 @@ function findCallers(index, name, options = {}) {
                         const boundDef = boundDefinition;
                         overloadGroupBinding = !!(boundDef && (
                             (boundDef.className && targetDefs.some(d => {
+                                // One class DEFINITION (fix #390): C#
+                                // `Visitor<T, R>` and `Visitor<T>` in one
+                                // file are two classes, not one overload
+                                // family.
                                 if (d.className === boundDef.className &&
-                                    d.file === boundDef.file) {
+                                    d.file === boundDef.file &&
+                                    !distinctOwnerDefinitions(index, d, boundDef)) {
+                                    return true;
+                                }
+                                // The parts of one partial type (C#) are one
+                                // class (fix #393): overloads declared in two
+                                // files are one family.
+                                if (d.className === boundDef.className &&
+                                    d.file !== boundDef.file &&
+                                    _samePartialOwner(index, d, boundDef)) {
                                     return true;
                                 }
                                 const inherited = _isAncestorOfTargetClass(
@@ -2849,6 +3929,17 @@ function findCallers(index, name, options = {}) {
                              !boundDef.className && !boundDef.receiver &&
                              targetDefs.every(d => !d.className && !d.receiver) &&
                              _cppTargetVisibleFrom(index, filePath, targetDefs))));
+                    }
+                    // fix #396: a `static` declaration in a header is a
+                    // declaration of each including translation unit's own
+                    // function: a call in that header binds the pinned
+                    // `static` definition in the unit of the pin's file, and
+                    // another unit's elsewhere (jansson's shared test
+                    // `main` calling each suite's `static run_tests`).
+                    if (!fieldHopMatchesTarget && !resolvedBySameClass && !overloadGroupBinding &&
+                        _headerStaticDeclarationOfUnit(index, boundDefinition, targetDefs)) {
+                        routeUnverified(filePath, fileEntry, call, 'translation-unit-binding', calledAs);
+                        continue;
                     }
                     // A validated self.attr receiver is the Python analogue
                     // of a declared-field hop: the binding table only knows
@@ -2887,6 +3978,32 @@ function findCallers(index, name, options = {}) {
                     _cppTargetVisibility(index, filePath, targetDefs) === 'no') {
                     recordExcluded(filePath, call.line, 'target-not-visible');
                     continue;
+                }
+
+                // Member-assigned targets (fix #384, axios-measured: bare
+                // `setTimeout(...)` calls were confirmed callers of a
+                // same-file `req.setTimeout = () => {}` through same-file
+                // evidence). A bare name with no lexical or import binding
+                // resolves to the global scope: a member of a provably
+                // non-global object is out of reach, a member of an object
+                // that may be the global object routes visible, and a
+                // global member defined in another file is never excluded
+                // as out of scope (it routes like any unlinked global).
+                let bareGlobalMember = false;
+                let bareMaybeMember = false;
+                if (!bindingId && !call.isMethod && !call.receiver && !call.localShadow &&
+                    !call.isConstructor && !call.resolvedName && !calledAs) {
+                    const memberVerdict = _bareNameMemberVerdict(fileEntry, filePath, call.name,
+                        call.line, call.line, targetDefs);
+                    if (memberVerdict === 'no') {
+                        recordExcluded(filePath, call.line, 'method-kind-mismatch');
+                        continue;
+                    }
+                    // Routed after the module-scope rule below: a bare name
+                    // no import binds in a module file never reaches a member
+                    // of another module that is not provably global (#215).
+                    bareMaybeMember = memberVerdict === 'maybe';
+                    bareGlobalMember = memberVerdict === 'global';
                 }
 
                 // Name-level import shadowing (fix #209, httpx-measured): an
@@ -2938,6 +4055,10 @@ function findCallers(index, name, options = {}) {
                     }
                 }
 
+                // The name's own import binding provably reaches a target
+                // (fix #397): file-level import-graph fallbacks below never
+                // override that name-level evidence.
+                let importChainReachesTarget = false;
                 if (!bindingId && !call.isMethod &&
                     langTraits(fileEntry.language)?.typeSystem === 'structural' &&
                     (fileEntry.importBindings || []).length > 0) {
@@ -2957,8 +4078,13 @@ function findCallers(index, name, options = {}) {
                     // renames still exclude other-definition-import) instead
                     // of the empty lookup excluding every legitimate renamed
                     // call as name-not-in-scope.
+                    // An aliased import binds its LOCAL name only (fix #397,
+                    // jotai-measured): `import { g as f }` binds `f` (then
+                    // chased by its imported name `g`) and leaves `g` unbound
+                    // in the file.
                     let nameBindings = fileEntry.importBindings.filter(b =>
-                        b.name === lookupName ||
+                        (b.alias ? b.alias === call.name : b.name === lookupName) ||
+                        (call.resolvedName && b.name === call.resolvedName) ||
                         (calledAs && b.alias === lookupName));
                     // Python bindings carry no alias field — the pairing
                     // lives in fileEntry.importAliases ({original, local});
@@ -3011,7 +4137,7 @@ function findCallers(index, name, options = {}) {
                     // (`const { parse: csvParse } = require(...)`) — name-level
                     // evidence by construction; importBindings store the
                     // ORIGINAL name, so the local alias must not look unbound.
-                    if (nameBindings.length === 0 && !call.resolvedName &&
+                    if (nameBindings.length === 0 && !call.resolvedName && !bareGlobalMember &&
                         tFiles.size > 0 && !tFiles.has(filePath) &&
                         !(fileEntry.importNames || []).includes('*')) {
                         recordExcluded(filePath, call.line, 'name-not-in-scope');
@@ -3056,6 +4182,7 @@ function findCallers(index, name, options = {}) {
                             if (verdict === 'yes') { reaches = true; break; }
                             if (verdict === 'unknown') undetermined = true;
                         }
+                        if (reaches) importChainReachesTarget = true;
                         if (!reaches && !undetermined) {
                             // Every import binding of this name pins away from
                             // the pinned targets (external module, or a project
@@ -3082,12 +4209,18 @@ function findCallers(index, name, options = {}) {
                     }
                 }
 
+                if (bareMaybeMember) {
+                    routeUnverified(filePath, fileEntry, call, 'member-object-unresolved', calledAs);
+                    continue;
+                }
+
                 // Import-graph disambiguation for JS/TS/Python: when multiple definitions of
                 // the same name exist and this call has no bindingId, check whether the calling
                 // file imports from the target definition's file. Skips false positives like
                 // user_b importing from b.js being reported as a caller of a.js:process.
                 // Go/Java/Rust are excluded — they use package/module scoping, not file imports.
                 if (!bindingId && !call.isMethod && options.targetDefinitions && definitions.length > 1 &&
+                    !importChainReachesTarget &&
                     langTraits(fileEntry.language)?.typeSystem === 'structural') {
                     const targetFiles = new Set(targetDefs.map(d => d.file).filter(Boolean));
                     if (targetFiles.size > 0 && !targetFiles.has(filePath)) {
@@ -3109,10 +4242,10 @@ function findCallers(index, name, options = {}) {
                                 //    mis-link evidence → excluded other-definition-import
                                 //  - imports neither def → pure ambiguity, no positive
                                 //    evidence → unverified tier (visible), per the contract
-                                const otherDefFiles = new Set((index.symbols.get(name) || [])
-                                    .map(d => d.file).filter(f => f && !targetFiles.has(f)));
-                                const importsOtherDef = imports && setSome(imports, imp => otherDefFiles.has(imp));
-                                if (importsOtherDef || otherDefFiles.has(filePath)) {
+                                const defFiles = _definitionFileSet(index, name, 'any', null);
+                                const otherDefFile = f => defFiles.has(f) && !targetFiles.has(f);
+                                const importsOtherDef = imports && setSome(imports, otherDefFile);
+                                if (importsOtherDef || otherDefFile(filePath)) {
                                     recordExcluded(filePath, call.line, 'other-definition-import');
                                     continue;
                                 }
@@ -3152,36 +4285,61 @@ function findCallers(index, name, options = {}) {
                 // keeps !bindingId — the upstream binding filter already
                 // re-resolves those to function defs where methods are
                 // unreachable.
-                const cppTypeQualifiedPath = fileEntry.language === 'cpp' &&
-                    call.isPathCall &&
-                    _cppPathReceiverNamesType(index, call.receiver);
+                // C++ `Q::f(...)` (fix #361): what Q denotes decides the
+                // edge, and only a POSITIVE resolution may exclude. A
+                // namespace path cannot name a class member; a type path
+                // reaches a member of that class or of one of its bases and
+                // never a namespace-scope function; a qualifier that resolves
+                // to neither (template parameter, external or unresolved
+                // alias) stays visible.
                 const cppTargetHasClass = fileEntry.language === 'cpp' &&
                     targetDefs.some(definition => definition.className);
-                if (fileEntry.language === 'cpp' && cppTargetHasClass &&
-                    call.isPathCall && !cppTypeQualifiedPath) {
-                    // `detail::write(...)` is a namespace free-function call.
-                    // A namespace path cannot denote `file::write`, even
-                    // though both use C++'s qualified_identifier AST shape.
-                    recordExcluded(filePath, call.line,
-                        'method-kind-mismatch');
-                    continue;
+                let cppTypeQualifiedPath = false;
+                let cppQualifierClasses = null;
+                if (fileEntry.language === 'cpp' && call.isPathCall &&
+                    call.receiver && !call.globalQualified) {
+                    const verdict = _cppPathQualifierVerdict(
+                        index, filePath, call, targetDefs);
+                    cppQualifierClasses = verdict.classes || null;
+                    if (verdict.exclude) {
+                        recordExcluded(filePath, call.line, verdict.exclude);
+                        continue;
+                    }
+                    if (verdict.unverified) {
+                        if (collectAccount) {
+                            routeUnverified(filePath, fileEntry, call,
+                                verdict.unverified, calledAs);
+                        }
+                        continue;
+                    }
+                    cppTypeQualifiedPath = verdict.kind === 'type';
                 }
                 if (fileEntry.language === 'cpp' && cppTargetHasClass &&
-                    !call.isMethod && !call.receiver && !call.isPathCall) {
+                    !call.isMethod && !call.receiver && !call.isPathCall &&
+                    // A replacement-list call was decided at its expansion
+                    // sites above (fix #396).
+                    !(call.inMacroBody && call.enclosingFunction?.isMacro)) {
                     // A bare C++ member call is implicit-this lookup and only
                     // exists inside the target owner (or a derived class).
                     // At namespace scope or in an unrelated class, the same
                     // spelling can only name a free function/macro result.
                     const enclosing = index.findEnclosingFunction(
-                        filePath, call.line, true);
+                        filePath, call.line, true, call);
+                    // An out-of-line template member names its owner with
+                    // the template arguments (`base_sink<Mutex>::flush`).
+                    const ownerOf = owner => owner && String(owner).replace(/<.*>$/s, '');
                     const targetOwners = new Set(targetDefs
-                        .map(definition => definition.className)
+                        .map(definition => ownerOf(definition.className))
                         .filter(Boolean));
-                    const enclosingOwner = enclosing?.className;
+                    const enclosingOwner = ownerOf(enclosing?.className || enclosing?.friendOf);
                     const ownerCanReachTarget = enclosingOwner &&
                         ([...targetOwners].includes(enclosingOwner) ||
                          _isAncestorOfTargetClass(
-                             index, enclosingOwner, targetDefs));
+                             index, enclosingOwner, targetDefs) ||
+                         [...targetOwners].some(owner => _isAncestorOfTargetClass(
+                             index, owner, [{ ...enclosing, className: enclosingOwner }])) ||
+                         _cppEnclosingClassNames(index, filePath, enclosingOwner, enclosing)
+                             .some(owner => targetOwners.has(owner)));
                     if (!ownerCanReachTarget) {
                         recordExcluded(filePath, call.line,
                             'method-kind-mismatch');
@@ -3224,6 +4382,22 @@ function findCallers(index, name, options = {}) {
                         recordExcluded(filePath, call.line, 'method-kind-mismatch');
                         continue;
                     }
+                }
+                // fix #367a: structural twin of the rule above. Python and
+                // JS/TS bare-name lookup inside a function body never enters
+                // class scope, so `len(x)` inside `def len(self)` binds the
+                // module/builtin name, never a class-body member. Calls
+                // outside any function (a Python class body can call a def
+                // declared earlier in that body) and function EXPRESSIONS
+                // assigned to members (`Foo.prototype.bar = function bar()`,
+                // self-named) keep the existing routing.
+                if (!call.isMethod && !call.receiver && !call.localShadow &&
+                    !call.isConstructor && call.enclosingFunction &&
+                    langTraits(fileEntry.language)?.typeSystem === 'structural' &&
+                    targetDefs.length > 0 &&
+                    targetDefs.every(d => bareCallCannotDenote(d, fileEntry.language))) {
+                    recordExcluded(filePath, call.line, 'method-kind-mismatch');
+                    continue;
                 }
 
                 // From-import submodule receiver (fix #224): `from . import
@@ -3503,12 +4677,15 @@ function findCallers(index, name, options = {}) {
                 // but the receiver IS a str — the literal type outranks the
                 // name binding (str/dict/Array are never project classes).
                 const normalizedReceiverType = call.receiverType
-                    ? (_aliasBaseAtOrigin(
+                    ? (_importRenamedTypeName(index, call.receiverTypeFlowFile || filePath, call.receiverType) ||
+                        _aliasBaseAtOrigin(
                         index, call.receiverType,
                         call.receiverTypeFlowFile || filePath,
                         !call.receiverTypeFlowFile ||
                             call.receiverTypeFlowFile === filePath
                             ? call.line : undefined) ||
+                        (!call.receiverTypeFlowFile &&
+                            _cppVisibleAliasBase(index, call.receiverType, filePath, call.line)) ||
                         _pureAliasBase(index, call.receiverType) ||
                         call.receiverType)
                     : null;
@@ -3539,20 +4716,57 @@ function findCallers(index, name, options = {}) {
                         // shadows even a same-named project type), 1-2-char
                         // ALL-CAPS convention as fallback.
                         let knownType = call.receiverType || fieldHopType;
+                        let renamedTypeQualifier;
                         if (knownType) {
+                            const renamed = call.receiverType
+                                ? _importRenamedTypeName(index, call.receiverTypeFlowFile || filePath, knownType,
+                                    { withQualifier: true })
+                                : null;
+                            if (renamed) {
+                                knownType = renamed.name;
+                                renamedTypeQualifier = renamed.qualifier;
+                            }
                             knownType = _aliasBaseAtOrigin(
                                 index, knownType,
                                 call.receiverTypeFlowFile || filePath,
                                 !call.receiverTypeFlowFile ||
                                     call.receiverTypeFlowFile === filePath
                                     ? call.line : undefined) ||
+                                (!call.receiverTypeFlowFile && !renamedTypeQualifier &&
+                                    _cppVisibleAliasBase(index, knownType, filePath, call.line)) ||
                                 _pureAliasBase(index, knownType) ||
                                 knownType;
+                        }
+                        // An alias of an opaque written type (a dependent
+                        // member type) is no class identity (fix #393).
+                        if (knownType && _aliasChainOpaque(index, call.receiverType || fieldHopType)) {
+                            knownType = null;
+                        }
+                        // A local declared with a supertype and never reassigned
+                        // after `new T(..)` holds exactly a T (fix #394): the
+                        // declared type binds its own member (`Shape.area`), and
+                        // the member dispatch runs is reached through T.
+                        if (knownType && call.receiverType && !targetTypes.has(knownType)) {
+                            const exact = _constructedValueType(index, call, knownType);
+                            if (exact && targetTypes.has(exact)) {
+                                call = { ...call, receiverType: exact, receiverTypeSource: 'constructor',
+                                    receiverTypeEvidence: { ...call.receiverTypeEvidence, source: 'constructor', type: exact } };
+                                knownType = exact;
+                            }
                         }
                         if (knownType && !BUILTIN_RECEIVER_TYPES.has(knownType) &&
                             _isGenericParamReceiverType(index, filePath, call.line, knownType)) {
                             knownType = _genericParamTraitTarget(
                                 index, filePath, call.line, knownType, targetDefs);
+                        }
+                        // Configuration variants of one alias (fix #368, rand-measured:
+                        // `#[cfg(..)] type Rng = Xoshiro128PlusPlus;` beside
+                        // `#[cfg(..)] type Rng = Xoshiro256PlusPlus;`) name
+                        // different types per build; the receiver is neither
+                        // variant for exclusion purposes.
+                        if (collectAccount && knownType && _isConfigurationVariantAlias(index, knownType)) {
+                            routeUnverified(filePath, fileEntry, call, 'alias-variants', calledAs);
+                            continue;
                         }
                         if (knownType) {
                             const explicitInterfaceTarget = fileEntry.language === 'csharp' &&
@@ -3626,13 +4840,22 @@ function findCallers(index, name, options = {}) {
                                     // Flow-typed receivers (fix #207) resolve identity
                                     // from the producing annotation's scope — the name
                                     // was written THERE, not in the consuming file.
+                                    // A C# field hop's type resolved in the field's
+                                    // file: the root object's namespace is not
+                                    // the type's (fix #380); its written arity
+                                    // selects among same-name types.
+                                    const hopArity = call.receiverHopType === knownType
+                                        ? call.receiverHopTypeArgs : undefined;
                                     const identity = _resolveReceiverTypeIdentity(
                                         index, call.receiverTypeFlowFile || filePath, knownType, targetDefs,
                                         call.receiverTypeFlowFile ? undefined : call.line,
-                                        call.receiverTypeNamespace ||
-                                            call.receiverRootNamespace ||
-                                            call.receiverTypeQualifier);
-                                    if (identity === 'other') {
+                                        renamedTypeQualifier ||
+                                            call.receiverTypeNamespace ||
+                                            (viaFieldHop && fileEntry.language === 'csharp'
+                                                ? undefined : call.receiverRootNamespace) ||
+                                            call.receiverTypeQualifier,
+                                        hopArity);
+                                                                    if (identity === 'other') {
                                         receiverTypeValidated = false;
                                     } else if (identity === 'unknown') {
                                         receiverTypeValidated = false;
@@ -3720,8 +4943,7 @@ function findCallers(index, name, options = {}) {
                                 getLanguageAdapter('csharp')?.isPlatformConcreteCall?.(
                                     knownType, call.name);
                             const fieldHopDefinesMethod = !viaFieldHop || platformOwnsFieldCall ||
-                                definitions.some(d =>
-                                    (d.className || (d.receiver || '').replace(/^\*/, '')) === knownType) ||
+                                definitionOwners().has(knownType) ||
                                 (!/^[A-Z][A-Z0-9]?$/.test(knownType) &&
                                     !knownTypeHasProjectIdentity &&
                                     _targetAncestryFullyResolved(index, targetDefs));
@@ -3752,6 +4974,18 @@ function findCallers(index, name, options = {}) {
                                     // excluded.
                                     if (_dispatchCapableSupertype(index, fileEntry.language, knownType, targetDefs, definitions) ||
                                         (!knownTypeHasProjectIdentity && externalContractTarget()?.via === knownType)) {
+                                        // Declared with a supertype, holding exactly a
+                                        // constructed value (fix #394): a constructed type
+                                        // that is neither a target class nor a subclass
+                                        // inheriting the target never dispatches into it.
+                                        if (_constructedValueExcludes(index, call, knownType, targetTypes)) {
+                                            const exact = _constructedValueName(call, knownType);
+                                            excludeReceiver(filePath, fileEntry, { ...call, receiverType: exact,
+                                                receiverTypeSource: 'constructor',
+                                                receiverTypeEvidence: { ...call.receiverTypeEvidence,
+                                                    source: 'constructor', type: exact } }, calledAs);
+                                            continue;
+                                        }
                                         const externalContract = externalContractTarget();
                                         routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
                                             dispatchVia: knownType,
@@ -3762,7 +4996,15 @@ function findCallers(index, name, options = {}) {
                                         });
                                         continue;
                                     }
-                                    excludeReceiver(filePath, fileEntry, call, calledAs, fieldHopType && !call.receiverType ? {
+                                    // A never-reassigned local's exact value is the
+                                    // stronger exclusion fact (fix #394).
+                                    const exactValue = _constructedValueExcludes(index, call, knownType, targetTypes)
+                                        ? _constructedValueName(call, knownType) : null;
+                                    excludeReceiver(filePath, fileEntry, exactValue ? { ...call, receiverType: exactValue,
+                                        receiverTypeSource: 'constructor',
+                                        receiverTypeEvidence: { ...call.receiverTypeEvidence,
+                                            source: 'constructor', type: exactValue } } : call,
+                                    calledAs, fieldHopType && !call.receiverType ? {
                                         receiverType: fieldHopType, receiverTypeSource: 'field',
                                         receiverOrigin: { source: 'field', root: call.receiverRoot,
                                             rootType: call.receiverRootType, field: call.receiverField },
@@ -3822,7 +5064,7 @@ function findCallers(index, name, options = {}) {
                             let inferredMatch = false;
                             let inferredMismatch = false;
                             if (langTraits(fileEntry.language)?.typeSystem === 'nominal') {
-                                const callerSym = index.findEnclosingFunction(filePath, call.line, true);
+                                const callerSym = index.findEnclosingFunction(filePath, call.line, true, call);
                                 if (callerSym && callerSym.startLine != null && callerSym.endLine != null) {
                                     const cacheKey = `${filePath}:${callerSym.startLine}`;
                                     let localTypes = localTypeCache.get(cacheKey);
@@ -3941,7 +5183,51 @@ function findCallers(index, name, options = {}) {
                                     ? String(call.receiver).split('::').pop()
                                     : call.receiver;
                                 const receiverLower = receiverSegment.toLowerCase();
-                                const matchesTarget = [...targetTypes].some(cn => cn.toLowerCase() === receiverLower);
+                                let matchesTarget = [...targetTypes].some(cn => cn.toLowerCase() === receiverLower);
+                                // A path qualifier that is a type ALIAS (or a
+                                // resolved C++ alias chain) names its base
+                                // type: judge the base, and never exclude an
+                                // alias the file cannot pin (fix #361).
+                                let aliasIdentity = null;
+                                if (!matchesTarget && call.isPathCall) {
+                                    aliasIdentity = _pathQualifierAliasIdentity(index, filePath,
+                                        fileEntry, receiverSegment, targetTypes, targetDefs,
+                                        cppQualifierClasses, call.receiver);
+                                    if (aliasIdentity === 'unknown' && collectAccount) {
+                                        routeUnverified(filePath, fileEntry, call,
+                                            'unresolved-qualifier', calledAs);
+                                        continue;
+                                    }
+                                    if (aliasIdentity === 'target') matchesTarget = true;
+                                }
+                                // `Trait::assoc(..)` whose Self is the enclosing
+                                // impl's type (fix #369): the impl member is
+                                // the callee, other implementations are not.
+                                if (!matchesTarget && call.isPathCall && fileEntry.language === 'rust' &&
+                                    _traitPathImplMemberRoute(index, filePath, receiverSegment, targetDefs)) {
+                                    const selfMember = _rustTraitPathSelfImplMemberForCaller(index, filePath,
+                                        call, index.findEnclosingFunction(filePath, call.line, true, call),
+                                        receiverSegment);
+                                    if (selfMember) {
+                                        if (!targetDefs.some(d => sameDeclaration(
+                                            declarationIdentity(d), declarationIdentity(selfMember)))) {
+                                            if (collectAccount) {
+                                                recordExcluded(filePath, call.line, 'path-type-mismatch');
+                                                continue;
+                                            }
+                                        } else {
+                                            matchesTarget = true;
+                                            inferredMatch = true;
+                                            nominalInferredMatch = true;
+                                            resolvedReceiverFacts = {
+                                                receiverType: selfMember.className || selfMember.receiver,
+                                                receiverTypeSource: 'type-qualified',
+                                                receiverOrigin: { source: 'type-qualified',
+                                                    site: occurrenceIdentity(fileEntry.relativePath, call) },
+                                            };
+                                        }
+                                    }
+                                }
                                 // Type-qualified identity discipline (fix #220,
                                 // ripgrep-measured): a path-call receiver that
                                 // matches the target type's NAME must also
@@ -3955,7 +5241,7 @@ function findCallers(index, name, options = {}) {
                                 // its type is unknown, identity proves nothing.
                                 if (matchesTarget && call.isPathCall &&
                                     langTraits(fileEntry.language)?.typeQualifiedCallStyle === 'path') {
-                                    const identity = _resolveReceiverTypeIdentity(index, filePath,
+                                    const identity = aliasIdentity || _resolveReceiverTypeIdentity(index, filePath,
                                         receiverSegment, targetDefs, call.line);
                                     if (identity === 'other') {
                                         isUncertain = true;
@@ -3990,7 +5276,7 @@ function findCallers(index, name, options = {}) {
                                         // multi-def fallback didn't): `F::as_cast(x)`
                                         // instantiates with ANY bound-satisfying
                                         // type — visible, never excluded.
-                                        if (collectAccount &&
+                                        if (collectAccount && aliasIdentity !== 'other' &&
                                             /^[A-Z][A-Z0-9]?$/.test(receiverSegment) &&
                                             !(index.symbols.get(receiverSegment) || []).some(d => IDENTITY_TYPE_KINDS.has(d.type))) {
                                             routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs, {
@@ -4003,7 +5289,8 @@ function findCallers(index, name, options = {}) {
                                         // implement the pinned trait — route
                                         // visible, never exclude.
                                         const traitVia = collectAccount &&
-                                            _traitDeclPinImplementorRoute(index, fileEntry, receiverSegment, targetDefs);
+                                            (_traitDeclPinImplementorRoute(index, fileEntry, receiverSegment, targetDefs) ||
+                                                _traitPathImplMemberRoute(index, filePath, receiverSegment, targetDefs));
                                         if (traitVia) {
                                             routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
                                                 dispatchVia: `${receiverSegment} — ${traitVia} implementor`,
@@ -4021,14 +5308,10 @@ function findCallers(index, name, options = {}) {
                                             continue;
                                         }
                                     }
-                                    const nonTargetClasses = new Set();
-                                    for (const d of definitions) {
-                                        const t = d.className || (d.receiver && d.receiver.replace(/^\*/, ''));
-                                        if (t && !targetTypes.has(t)) nonTargetClasses.add(t);
-                                    }
-                                    const matchesOtherExact = [...nonTargetClasses].some(cn => cn === receiverSegment);
-                                    const matchesOther = matchesOtherExact ||
-                                        [...nonTargetClasses].some(cn => cn.toLowerCase() === receiverLower);
+                                    const { classes: nonTargetClasses, lower: nonTargetLower } =
+                                        nonTargetOwnerClasses(targetTypes);
+                                    const matchesOtherExact = nonTargetClasses.has(receiverSegment);
+                                    const matchesOther = matchesOtherExact || nonTargetLower.has(receiverLower);
                                     if (matchesOther) {
                                         isUncertain = true;
                                         typeMismatch = true;
@@ -4097,9 +5380,25 @@ function findCallers(index, name, options = {}) {
                 let arityNoFit = false;
                 const cppArityOverridesBinding =
                     fileEntry.language === 'cpp';
+                // Same-class and name-binding evidence name the OWNER, not the
+                // overload: in a language with overloads by parameter list, a
+                // bare call whose argument count fits a sibling overload of the
+                // same owner (and not the pin) binds that sibling - the
+                // compiler selects by arity (fix #376, jackson
+                // `writeString(chars, off, len)` inside JsonGenerator
+                // confirmed as a caller of `writeString(Reader, int)`).
+                const siblingOverloadFits = (resolvedBySameClass || bindingId) &&
+                    collectAccount && call.argCount != null && !call.argSpread &&
+                    langTraits(fileEntry.language)?.hasArityOverloads &&
+                    !_callArityCompatible(call, targetDefs, fileEntry.language) &&
+                    _callArityCompatible(call, definitions.filter(d =>
+                        !NON_CALLABLE_TYPES.has(d.type) && d.className &&
+                        targetDefs.some(t => t.className === d.className && t.file === d.file) &&
+                        !targetDefs.some(t => t.file === d.file && t.startLine === d.startLine)),
+                    fileEntry.language);
                 if (collectAccount &&
                     ((!bindingId && !resolvedBySameClass) ||
-                     cppArityOverridesBinding) &&
+                     cppArityOverridesBinding || siblingOverloadFits) &&
                     call.argCount != null && !call.argSpread &&
                     langTraits(fileEntry.language)?.typeSystem === 'nominal' &&
                     !_callArityCompatible(call, targetDefs, fileEntry.language)) {
@@ -4119,9 +5418,7 @@ function findCallers(index, name, options = {}) {
                     // candidate, which the wrong arity disproves toward
                     // EXTERNAL code (Arrays.asList(1,2,3) vs a project 0-param
                     // asList: unique project ownership is not evidence here).
-                    const pinnedKeys = new Set(targetDefs.map(d => `${d.file}:${d.startLine}`));
-                    const otherDefs = definitions.filter(d =>
-                        !NON_CALLABLE_TYPES.has(d.type) && !pinnedKeys.has(`${d.file}:${d.startLine}`));
+                    const otherDefs = otherCallableDefinitions(targetDefs);
                     if (otherDefs.length > 0 && _callArityCompatible(call, otherDefs, fileEntry.language)) {
                         recordExcluded(filePath, call.line, 'arity-mismatch');
                         continue;
@@ -4161,46 +5458,115 @@ function findCallers(index, name, options = {}) {
                 }
 
                 // Find the enclosing function (get full symbol info)
-                const callerSymbol = index.findEnclosingFunction(filePath, call.line, true);
+                const callerSymbol = index.findEnclosingFunction(filePath, call.line, true, call);
 
                 // Method call whose receiver has no binding evidence in this file's
                 // scope (structural languages only) — receiver-evidence-free.
                 // Hoisted because it also limits what counts as import evidence.
                 const uncertainMethodReceiver = skipLocalBinding && call.isMethod && !resolvedBySameClass &&
                     langTraits(fileEntry.language)?.typeSystem === 'structural' &&
-                    !(call.receiver && (fileEntry.bindings || []).some(b => b.name === call.receiver));
+                    !(call.receiver && _bindingsNamed(index, fileEntry, call.receiver).length > 0);
 
                 // Check import graph evidence: does this file import from the target definition's file?
                 const targetDefs2 = options.targetDefinitions || definitions;
-                const targetFiles2 = new Set(targetDefs2.map(d => d.file).filter(Boolean));
+                const targetFiles2 = pinnedTargetFiles();
                 const callerImports = index.importGraph.get(filePath);
-                // The caller's OWN file never counts as an import-edge hit
-                // (fix #294): an import cycle (flask json/__init__ →
-                // wrappers → json/__init__) would launder same-file
-                // membership into "import edge" evidence, bypassing the
-                // same-file clause's receiver guard below. Same-file
-                // evidence is governed there, not here.
-                let importEdgeLink = !!(callerImports && setSome(callerImports,
-                    imp => imp !== filePath && targetFiles2.has(imp)));
-                // Check one level of re-exports (barrel files) for import evidence
-                if (!importEdgeLink && callerImports) {
-                    for (const imp of callerImports) {
-                        if (imp === filePath) continue;
-                        const transImports = index.importGraph.get(imp);
-                        if (transImports && setSome(transImports,
-                            ti => ti !== filePath && targetFiles2.has(ti))) {
-                            importEdgeLink = true;
-                            break;
-                        }
-                    }
-                }
+                // The name's own import binding chased to a target through
+                // any number of re-exports (fix #397) is import evidence; the
+                // file-level edge check looks one re-export hop deep.
+                let importEdgeLink = importChainReachesTarget ||
+                    fileImportEdgeLink(filePath, callerImports, targetFiles2);
                 // Same-file membership is module-scope evidence for plain calls,
                 // but says nothing about a method receiver: `foo.map()` sharing a
                 // file with `function map()` must not confirm while foo's type is
                 // unknown. Real import edges keep counting — importing the
                 // defining module is evidence the file uses its API.
+                // Textual inclusion (C/C++, fix #361): a translation unit
+                // sees every declaration in its transitive #include closure,
+                // so reach is the closure, not one or two import hops. A
+                // closure that needs a basename-resolved include edge is
+                // weaker evidence and carries its own provenance rule.
+                let includeReach = null;
+                if (langTraits(fileEntry.language)?.textualIncludes) {
+                    includeReach = _textualIncludeReach(index, filePath, targetFiles2);
+                    importEdgeLink = !!includeReach;
+                }
+                // Rust glob imports (fix #369): `use super::*` has no import
+                // edge, yet the parent module's own glob (`use
+                // self::plumbing::*`) binds the name here. Name-level reach
+                // only: a file merely reachable proves nothing about the name.
+                if (!importEdgeLink && fileEntry.language === 'rust' && !call.isMethod &&
+                    !call.receiver && !call.localShadow &&
+                    _rustGlobNameReaches(index, filePath, call.name, targetDefs2)) {
+                    importEdgeLink = true;
+                }
+                // A `use` binding of the called/constructed name whose re-export
+                // chain (`use crate::theme::ColorPair` -> `pub use crate::style::
+                // {ColorPair}` -> `pub use self::color_pair::ColorPair`) reaches
+                // the target's file names it exactly (fix #369).
+                if (!importEdgeLink && fileEntry.language === 'rust' &&
+                    (!call.isMethod || call.isConstructor) && !call.localShadow &&
+                    (!call.receiver || call.isConstructor)) {
+                    for (const binding of fileEntry.importBindings || []) {
+                        if ((binding.alias || binding.name) !== call.name || binding.name === '*') continue;
+                        const rel = fileEntry.moduleResolved?.[binding.module];
+                        const start = rel ? path.join(index.root, rel) : null;
+                        if (start && (targetFiles2.has(start) ||
+                            _nameBindingReaches(index, start, binding.name, targetFiles2) === 'yes')) {
+                            importEdgeLink = true;
+                            break;
+                        }
+                    }
+                }
+                // A qualified Rust path (`cursive::views::LinearLayout::
+                // vertical()`, `views::LinearLayout::vertical()` under `use
+                // cursive::views`) names its item's module by the path itself:
+                // walked through re-exports, reaching the target's file is the
+                // same evidence a `use` edge gives (fix #369).
+                if (!importEdgeLink && fileEntry.language === 'rust' && call.receiver &&
+                    ((call.isPathCall && String(call.receiver).includes('::')) ||
+                        (call.isConstructor && !['Self', 'self', 'super', 'crate'].includes(call.receiver)))) {
+                    const walked = _rustQualifiedPathFile(index, fileEntry, filePath,
+                        call.receiver, call.name);
+                    if (walked && (targetFiles2.has(walked) || (call.isConstructor &&
+                        _nameBindingReaches(index, walked, call.name, targetFiles2) === 'yes'))) {
+                        importEdgeLink = true;
+                    }
+                }
                 const hasImportLink = importEdgeLink ||
                     (targetFiles2.has(filePath) && !uncertainMethodReceiver);
+
+                // Several external-linkage definitions of one free function
+                // (platform variants: src/unix vs src/win) are chosen by the
+                // LINKER. A shared prototype in the include closure is not
+                // evidence for either; only a definition in the caller's own
+                // translation unit or compile-database membership separates
+                // them (fix #361).
+                if (collectAccount && langTraits(fileEntry.language)?.textualIncludes &&
+                    !resolvedBySameClass && !call.isMethod && !call.isPathCall) {
+                    const linkVerdict = _textualLinkVerdict(
+                        index, filePath, targetDefs2, definitions, call.line);
+                    if (linkVerdict === 'other') {
+                        recordExcluded(filePath, call.line, 'other-definition');
+                        continue;
+                    }
+                    if (linkVerdict && linkVerdict.ambiguous) {
+                        // extern "C" implementations linked into separate
+                        // targets share one link slot (the prototype joins
+                        // them, fix #393): compile-time dispatch, as when
+                        // the prototype binds the call.
+                        const externC = fileEntry.language === 'cpp' && targetDefs2.length > 0 &&
+                            targetDefs2.every(d => d.linkage === 'c');
+                        routeUnverified(filePath, fileEntry, call,
+                            externC ? 'link-variant' : 'link-ambiguous', calledAs, externC ? {
+                                uncertaintyClass: 'compile-time-dispatch',
+                                dispatchFamily: `${name} external-linkage implementations`,
+                            } : {
+                                dispatchCandidates: linkVerdict.candidates,
+                            });
+                        continue;
+                    }
+                }
 
                 // Same-package evidence (nominal type systems): Java/Rust/Go
                 // resolve same-package/module names without import statements,
@@ -4286,6 +5652,45 @@ function findCallers(index, name, options = {}) {
                         receiverName = String(receiverName).split('::').pop();
                     }
                     let aliasResolvedFile = null;
+                    let aliasIdentity = null;
+                    // C++ qualifiers were resolved above (fix #361): a
+                    // qualifier that reaches the pinned member's class is
+                    // type-qualified evidence under that class's name.
+                    if (cppQualifierClasses && call.isPathCall && receiverName &&
+                        !tTypes.has(receiverName)) {
+                        const reached = cppQualifierClasses.find(classDef => tTypes.has(classDef.name));
+                        if (reached) {
+                            receiverName = reached.name;
+                            aliasIdentity = 'target';
+                        }
+                    }
+                    // A path qualifier naming a type ALIAS (`type Handle =
+                    // Document`) denotes the alias's base type. Resolve the
+                    // alias in scope (this file, or the file its import
+                    // binding resolves to); an alias the file cannot pin is
+                    // unknown, never evidence for a different type (fix #361).
+                    let pathAliasUnresolved = false;
+                    if (call.isPathCall && receiverName && !tTypes.has(receiverName) &&
+                        !aliasIdentity && fileEntry.language !== 'cpp') {
+                        const alias = _pathAliasInScope(index, filePath, fileEntry, receiverName,
+                            call.receiver);
+                        if (alias?.definition) {
+                            const base = String(_normalizedAliasBase(index, alias.definition) || '')
+                                .replace(/<.*$/, '').split(/::|\./).pop();
+                            if (base && tTypes.has(base)) {
+                                receiverName = base;
+                                aliasIdentity = _resolveReceiverTypeIdentity(index,
+                                    alias.definition.file, base, targetDefs2,
+                                    alias.definition.startLine);
+                            }
+                        } else if (alias?.unresolved) {
+                            pathAliasUnresolved = true;
+                        }
+                    }
+                    if (pathAliasUnresolved) {
+                        routeUnverified(filePath, fileEntry, call, 'unresolved-qualifier', calledAs);
+                        continue;
+                    }
                     if (receiverName && !tTypes.has(receiverName)) {
                         for (const im of (fileEntry.importBindings || [])) {
                             // fix #357: Rust rename bindings carry the local
@@ -4310,7 +5715,15 @@ function findCallers(index, name, options = {}) {
                     // T.M(recv, ...) pass the receiver as the first argument,
                     // so a zero-arg call on a type-named receiver is a
                     // variable, not the type (grpc-go's `bb` collision).
-                    let typeQualifiedReceiver = !!(receiverName && tTypes.has(receiverName));
+                    // A receiver the parser recorded as a declared member hop
+                    // (`Strategy.X()` where the class declares `Strategy`)
+                    // is that member, never a same-named type (fix #380).
+                    // An interface-typed member hop (fieldDispatchType) is a
+                    // member hop too (fix #391: `Logger.Write(..)` on Log's
+                    // `ILogger Logger` property is not the class Logger).
+                    let typeQualifiedReceiver = !!(receiverName && tTypes.has(receiverName)) &&
+                        !((fieldHopType || fieldDispatchType) && call.receiverField && !call.receiverIsTypeQualified &&
+                            langTraits(fileEntry.language)?.bareCallReachesMethods);
                     if (typeQualifiedReceiver) {
                         const qualStyle = langTraits(fileEntry.language)?.typeQualifiedCallStyle;
                         if (qualStyle === 'path') typeQualifiedReceiver = !!call.isPathCall;
@@ -4329,7 +5742,8 @@ function findCallers(index, name, options = {}) {
                         // the type's identity (`using BH = Beta.Helper`); a
                         // parser-recorded qualifier (`beta.Helper`, `Beta.Helper`)
                         // is a namespace/package hint for the resolver.
-                        const identity = aliasResolvedFile
+                        const identity = aliasIdentity ? aliasIdentity
+                            : aliasResolvedFile
                             ? (targetDefs2.some(d => d.file === aliasResolvedFile) ? 'target' : 'other')
                             : _resolveReceiverTypeIdentity(index, filePath, receiverName, targetDefs2, call.line,
                                 call.receiverIsTypeQualified ? call.receiverTypeQualifier : undefined);
@@ -4412,16 +5826,34 @@ function findCallers(index, name, options = {}) {
                             // macro-generated impls are invisible to the
                             // index, so the receiver not being a target type
                             // proves nothing. Route visible, never exclude.
-                            const traitVia2 = _traitDeclPinImplementorRoute(
-                                index, fileEntry, pathReceiverSegment, targetDefs2);
-                            if (traitVia2) {
+                            // `Trait::assoc(..)` returned by a member of `impl
+                            // Trait for X` with the trait item's own Self-typed
+                            // return: Self is X (fix #369) - X's member is the
+                            // callee, any other implementation is not.
+                            const selfImplMember = fileEntry.language === 'rust' &&
+                                _traitPathImplMemberRoute(index, filePath, pathReceiverSegment, targetDefs2)
+                                ? _rustTraitPathSelfImplMemberForCaller(index, filePath, call,
+                                    callerSymbol, pathReceiverSegment)
+                                : null;
+                            if (selfImplMember && !targetDefs2.some(d => sameDeclaration(
+                                declarationIdentity(d), declarationIdentity(selfImplMember)))) {
+                                recordExcluded(filePath, call.line, 'path-type-mismatch');
+                                continue;
+                            }
+                            const traitVia2 = !selfImplMember && (_traitDeclPinImplementorRoute(
+                                index, fileEntry, pathReceiverSegment, targetDefs2) ||
+                                _traitPathImplMemberRoute(index, filePath, pathReceiverSegment, targetDefs2));
+                            if (selfImplMember) {
+                                // falls through to scope/import confirmation
+                            } else if (traitVia2) {
                                 routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
                                     dispatchVia: `${pathReceiverSegment} — ${traitVia2} implementor`,
                                 });
                                 continue;
+                            } else {
+                                recordExcluded(filePath, call.line, 'path-type-mismatch');
+                                continue;
                             }
-                            recordExcluded(filePath, call.line, 'path-type-mismatch');
-                            continue;
                         }
                         // Module-qualified path calls (fix #260, clap-measured):
                         // a LOWERCASE path qualifier names a MODULE, and the
@@ -4493,6 +5925,15 @@ function findCallers(index, name, options = {}) {
                                             if (r && index.files.has(r)) _modFiles.push(r);
                                         } catch { /* resolver gap — never exclusion evidence */ }
                                     }
+                                    // Aliased qualifiers (fix #369): `use itertools as
+                                    // it; it::assert_equal(..)` names the crate root
+                                    // through the binding, which neither the import
+                                    // edges' basenames nor the raw path resolve.
+                                    if (_modFiles.length === 0 && fileEntry.language === 'rust') {
+                                        const _qualified = _rustPathQualifierFiles(index, fileEntry,
+                                            filePath, call.receiver, name);
+                                        for (const f of _qualified || []) _modFiles.push(f);
+                                    }
                                     const _targetFiles = new Set(
                                         targetDefs2.map(d => d.file).filter(Boolean));
                                     const _pinnedIn = _modFiles.length > 0 &&
@@ -4556,7 +5997,22 @@ function findCallers(index, name, options = {}) {
                         // receiver physics for method calls and must not demote
                         // them (ripgrep: `convert::string(...)` tripped the
                         // multi-owner check via unrelated `string` methods).
-                        if (!call.moduleOwnedPath && knownDispatchType && !tTypes.has(knownDispatchType)) {
+                        // Blanket extension-trait member whose self-parameter
+                        // bounds the receiver's type satisfies through exactly
+                        // one visible project impl (fix #369): the compiler's
+                        // selection is decided, confirm by receiver type.
+                        const blanketBound = !call.moduleOwnedPath && knownDispatchType &&
+                            !tTypes.has(knownDispatchType) && call.receiverType === knownDispatchType &&
+                            _rustBlanketBoundConfirms(index, fileEntry, filePath, call,
+                                knownDispatchType, targetDefs2);
+                        if (!call.moduleOwnedPath && knownDispatchType && !tTypes.has(knownDispatchType) &&
+                            !blanketBound && fileEntry.language === 'rust' &&
+                            _rustDerefFreeStdReceiverExcludes(index, knownDispatchType, targetDefs2)) {
+                            recordExcluded(filePath, call.line, 'receiver-type-mismatch');
+                            continue;
+                        }
+                        if (!call.moduleOwnedPath && knownDispatchType && !tTypes.has(knownDispatchType) &&
+                            !blanketBound) {
                             routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
                                 dispatchVia: knownDispatchType,
                                 dispatchCandidates: countDispatchCandidates(knownDispatchType),
@@ -4661,11 +6117,94 @@ function findCallers(index, name, options = {}) {
                             if (current) lexicalOwnerTypes.add(current);
                         }
                     }
+                    // fix #367i: a bare call in a top-level class is an
+                    // implicit this-call; with #358 class identity the
+                    // member it reaches is the one declared in the class's
+                    // resolved ancestry. When that declaring class is
+                    // UNRELATED to the target's (neither the same definition
+                    // nor an ancestor it could dispatch from), the call is
+                    // not the target's - unless a static import (Java
+                    // `import static`, C# `using static`) could supply the
+                    // name, which routes it visible instead.
+                    // The parser's own enclosing function must BE the
+                    // indexed caller: a method of an anonymous or local class
+                    // (`new Base() { int g() { return m(); } }`) is not
+                    // indexed, and its bare calls bind that class's members.
+                    const enclosingIsCaller = !!callerSymbol && (!call.enclosingFunction ||
+                        (call.enclosingFunction.name === callerSymbol.name &&
+                         call.enclosingFunction.startLine === callerSymbol.startLine));
+                    if (enclosingClass && lexicalOwnerTypes.size === 1 && enclosingIsCaller) {
+                        const callerClassRef = ownerRefOf(index, callerSymbol);
+                        const declaring = callerClassRef?.key
+                            ? findDeclaringClass(index, callerClassRef, definitions) : null;
+                        if (declaring && !declaring.uncertain &&
+                            relationToTargets(index, declaring.ref, targetDefs2) === 'unrelated') {
+                            // Java static imports bind the member name (or
+                            // `.*`); C# `using static T` has no binding, so any
+                            // using whose last segment names a class that
+                            // declares the member could supply it.
+                            const bound = new Set((fileEntry.importBindings || []).map(im => im.module));
+                            const memberOwners = new Set(definitions.map(d => d.className).filter(Boolean));
+                            const staticImportPossible =
+                                (fileEntry.importBindings || []).some(im => im.name === call.name ||
+                                    String(im.module || '').endsWith('.*')) ||
+                                Object.keys(fileEntry.moduleResolved || {}).some(mod =>
+                                    mod.endsWith('.*') || (!bound.has(mod) &&
+                                        memberOwners.has(mod.split('.').pop())));
+                            if (staticImportPossible) {
+                                routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs, {
+                                    dispatchCandidates: methodOwnerKeys().size,
+                                });
+                            } else {
+                                recordExcluded(filePath, call.line, 'other-definition');
+                            }
+                            continue;
+                        }
+                    }
                     // Nested Java/C# types have lexical access to static
                     // members of every enclosing type. C# partial outer
                     // classes may place that member in another file, but the
                     // namespace+outer-type identity remains compiler-exact.
-                    if ([...lexicalOwnerTypes].some(owner => tTypes.has(owner))) {
+                    // The owner NAME set of the target (target classes and
+                    // their subclasses) must name the same class DEFINITION
+                    // (fix #390): a class spelled like a subclass of the
+                    // target in another package (`org.x.MoneyTest` beside
+                    // `junit.x.MoneyTest extends TestCase`) supplies no
+                    // member, so its bare call binds through a static
+                    // import. An owner identity that cannot be resolved is
+                    // neither confirmation nor exclusion evidence.
+                    let ownerIdentity = 'no';
+                    for (const owner of lexicalOwnerTypes) {
+                        if (!tTypes.has(owner)) continue;
+                        const ownerRef = owner === enclosingClass
+                            ? ownerRefOf(index, callerSymbol)
+                            : resolveClassRef(index, owner, filePath,
+                                { namespace: callerSymbol?.namespace || null });
+                        const descentKey = ownerRef?.key || `?${owner}\0${filePath}`;
+                        let verdict = bareOwnerDescent.get(descentKey);
+                        if (verdict === undefined) {
+                            // Also across the queries of one operation (HOT
+                            // pins every definition of a name in turn).
+                            const opMemo = index._opMemo?.('bareOwnerDescent');
+                            const opKey = opMemo && ownerRef?.key
+                                ? `${ownerRef.key}\0${targetDefs2.map(d => `${d.file}:${d.startLine}`).join('\0')}` : null;
+                            verdict = opKey ? opMemo.get(opKey) : undefined;
+                            if (verdict === undefined) {
+                                verdict = descendsFromTargets(index, ownerRef, targetDefs2);
+                                if (opKey) opMemo.set(opKey, verdict);
+                            }
+                            bareOwnerDescent.set(descentKey, verdict);
+                        }
+                        if (verdict === 'yes') { ownerIdentity = 'yes'; break; }
+                        if (verdict === 'maybe') ownerIdentity = 'maybe';
+                    }
+                    if (ownerIdentity === 'maybe') {
+                        routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs, {
+                            dispatchCandidates: methodOwnerKeys().size,
+                        });
+                        continue;
+                    }
+                    if (ownerIdentity === 'yes') {
                         resolvedBySameClass = true;
                     } else {
                         // C#/Java bare member lookup starts in the enclosing
@@ -4675,15 +6214,29 @@ function findCallers(index, name, options = {}) {
                         const targetKeys = new Set(targetDefs2.map(definition =>
                             `${definition.file}:${definition.startLine}`));
                         const enclosingNamespace = callerSymbol?.namespace || null;
-                        const enclosingOwnsCall = !!enclosingClass && definitions.some(definition =>
-                            !NON_CALLABLE_TYPES.has(definition.type) &&
-                            definition.className === enclosingClass &&
-                            (fileEntry.language !== 'csharp' ||
-                                (definition.namespace || null) === enclosingNamespace) &&
-                            !targetKeys.has(`${definition.file}:${definition.startLine}`) &&
-                            _callArityCompatible(call, [definition], fileEntry.language));
-                        if (enclosingOwnsCall) {
+                        // Owned by the enclosing class DEFINITION (fix #390),
+                        // not by a same-name class of another package.
+                        const enclosingRef = enclosingClass ? ownerRefOf(index, callerSymbol) : null;
+                        let enclosingOwnership = 'no';
+                        for (const definition of enclosingClass ? definitions : []) {
+                            if (NON_CALLABLE_TYPES.has(definition.type) ||
+                                definition.className !== enclosingClass ||
+                                (fileEntry.language === 'csharp' &&
+                                    (definition.namespace || null) !== enclosingNamespace) ||
+                                targetKeys.has(`${definition.file}:${definition.startLine}`) ||
+                                !_callArityCompatible(call, [definition], fileEntry.language)) continue;
+                            const owned = ownedBy(index, definition, enclosingRef);
+                            if (owned === 'yes') { enclosingOwnership = 'yes'; break; }
+                            if (owned === 'maybe') enclosingOwnership = 'maybe';
+                        }
+                        if (enclosingOwnership === 'yes') {
                             recordExcluded(filePath, call.line, 'other-definition');
+                            continue;
+                        }
+                        if (enclosingOwnership === 'maybe') {
+                            routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs, {
+                                dispatchCandidates: methodOwnerKeys().size,
+                            });
                             continue;
                         }
                         const targetFiles = new Set(targetDefs2.map(d => d.file).filter(Boolean));
@@ -4706,6 +6259,67 @@ function findCallers(index, name, options = {}) {
                                 }
                             }
                         }
+                        if (verdict === null) {
+                            // A directive importing a TYPE without an alias
+                            // brings its static members into scope (C#
+                            // `using static N.Util;`: a plain using may only
+                            // name a namespace). One project type supplying
+                            // the member decides the call (fix #390).
+                            let suppliers = usingStaticSuppliers.get(filePath);
+                            if (!suppliers) {
+                                suppliers = new Map();
+                                const owners = new Set();
+                                for (const definition of definitions) {
+                                    if (!NON_CALLABLE_TYPES.has(definition.type) && definition.className &&
+                                        !definition.enclosingType) owners.add(definition.className);
+                                }
+                                const aliased = new Set((fileEntry.importBindings || []).map(im => im.module));
+                                // C#: the `using static` directives in effect,
+                                // resolved from the namespace each is written
+                                // in, plus `global using static` and
+                                // project-file `Static="true"` items (fix #395).
+                                const csharp = fileEntry.language === 'csharp';
+                                const modules = owners.size === 0 ? [] : csharp
+                                    ? csharpUsings(index, filePath).statics
+                                    : new Set(fileEntry.imports || []);
+                                for (const mod of modules) {
+                                    const text = String(mod || '');
+                                    if (!csharp && (aliased.has(text) || !text.includes('.'))) continue;
+                                    if (text.endsWith('.*')) continue;
+                                    const typeName = text.slice(text.lastIndexOf('.') + 1);
+                                    if (!owners.has(typeName)) continue;
+                                    const namespace = text.includes('.') ? text.slice(0, text.lastIndexOf('.')) : '';
+                                    for (const definition of definitions) {
+                                        if (NON_CALLABLE_TYPES.has(definition.type) ||
+                                            definition.className !== typeName || definition.enclosingType ||
+                                            (definition.namespace || '') !== namespace) continue;
+                                        const key = `${definition.file}\0${typeName}`;
+                                        if (!suppliers.has(key)) suppliers.set(key, []);
+                                        suppliers.get(key).push(definition);
+                                    }
+                                }
+                                usingStaticSuppliers.set(filePath, suppliers);
+                            }
+                            if (suppliers.size === 1) {
+                                const supplied = [...suppliers.values()][0];
+                                verdict = supplied.some(definition => targetDefs2.includes(definition))
+                                    ? 'target' : 'other';
+                            } else if (suppliers.size === 0 &&
+                                langTraits(fileEntry.language)?.staticImportsDeclaredOnly &&
+                                callerSymbol && _closedLexicalClassScope(index, callerSymbol)) {
+                                // A C# `using static T` imports the members T
+                                // itself declares, not inherited ones (fix
+                                // #392): no directive's type declares a
+                                // definition of the name, so none is reached.
+                                verdict = 'other';
+                            }
+                        }
+                        // An imported member binds only when no class in
+                        // scope has a member of the name; an external or
+                        // unresolved supertype in scope could (fix #390).
+                        if (verdict === 'target' && callerSymbol && !_closedLexicalClassScope(index, callerSymbol)) {
+                            verdict = 'unknown';
+                        }
                         if (verdict === 'other') {
                             recordExcluded(filePath, call.line, 'other-definition-import');
                             continue;
@@ -4716,6 +6330,59 @@ function findCallers(index, name, options = {}) {
                             });
                             continue;
                         }
+                    }
+                }
+
+                // Impls of one generic trait for one self type are selected
+                // by argument type (fix #384, bytes-measured: `impl
+                // From<Bytes> for Vec<u8>` and `impl From<BytesMut> for
+                // Vec<u8>` both confirmed every `Vec::from(x)`, including
+                // std's `Vec::from(&b"abc"[..])`). Arguments that select
+                // another impl exclude in every mode; undecided sites route
+                // visible under the account contract.
+                let rustImplSelected = false;
+                if (call.isMethod && (!bindingId || receiverBlindBinding) &&
+                    options.targetDefinitions && options.targetDefinitions.length > 0) {
+                    const selection = _rustTraitImplSelection(index, filePath, call,
+                        options.targetDefinitions, definitions);
+                    if (selection?.decision === 'exclude') {
+                        recordExcluded(filePath, call.line, 'overload-mismatch');
+                        continue;
+                    }
+                    if (selection?.decision === 'ambiguous') {
+                        if (collectAccount) {
+                            routeUnverified(filePath, fileEntry, call, 'overload-ambiguous', calledAs, {
+                                dispatchCandidates: selection.candidates,
+                                uncertaintyClass: 'compile-time-dispatch',
+                                dispatchFamily: `${name} trait impls selected by argument type` +
+                                    (selection.external ? ' (plus impls outside the project)' : ''),
+                            });
+                            continue;
+                        }
+                    }
+                    rustImplSelected = selection?.decision === 'confirm';
+                }
+
+                // Method probing by reference layer (fix #392, bytes-measured:
+                // `self.as_ref()` in a `&mut self` method reaches std's
+                // `impl AsRef<U> for &mut T` at the autoref step, before the
+                // project's `impl AsRef<[u8]> for BytesMut`). When the
+                // receiver's layer is known and the target is not found at
+                // the first probe step, an impl for an earlier step's type
+                // may be selected instead: provable only when no such impl
+                // can exist.
+                if (fileEntry.language === 'rust' && call.isMethod && !call.isPathCall &&
+                    options.targetDefinitions && options.targetDefinitions.length === 1) {
+                    const probe = _rustReceiverProbe(index, filePath, call,
+                        options.targetDefinitions[0], callerSymbol);
+                    if (probe === 'unverified') {
+                        if (collectAccount) {
+                            routeUnverified(filePath, fileEntry, call, 'autoref-dispatch', calledAs, {
+                                uncertaintyClass: 'compile-time-dispatch',
+                                dispatchFamily: `${name} method probe (autoref/deref steps)`,
+                            });
+                        }
+                        continue;
                     }
                 }
 
@@ -4733,7 +6400,7 @@ function findCallers(index, name, options = {}) {
                 // type argument even though UCN's closure is name-level).
                 // Go cannot compile same-class same-name siblings; Java runs
                 // its own #205 argKinds discipline (hasArityOverloads).
-                if (collectAccount && call.isMethod && !resolvedBySameClass &&
+                if (collectAccount && call.isMethod && !resolvedBySameClass && !rustImplSelected &&
                     (!bindingId || receiverBlindBinding) &&
                     langTraits(fileEntry.language)?.typeSystem === 'nominal' &&
                     !langTraits(fileEntry.language)?.hasArityOverloads &&
@@ -4751,16 +6418,35 @@ function findCallers(index, name, options = {}) {
                         // families (From impls, generic instantiations) live
                         // in the type's own file.
                         const pinnedFiles = new Set(pinnedCallable.map(d => d.file).filter(Boolean));
+                        // A member of a same-name type declared in another
+                        // scope of the file (a block-local struct beside its
+                        // module-level namesake) is no sibling (fix #389).
+                        const sameOwner = d => _sameOwnerAsAny(index, d, pinnedCallable);
                         const sibling = definitions.find(d =>
                             !NON_CALLABLE_TYPES.has(d.type) &&
                             pinnedClasses.has(d.className || (d.receiver || '').replace(/^\*/, '')) &&
                             pinnedFiles.has(d.file) &&
                             !pinnedKeys.has(`${d.file}:${d.startLine}`) &&
+                            sameOwner(d) &&
                             _callArityCompatible(call, [d], fileEntry.language));
-                        if (sibling) {
+                        // Reference-layer method probing (fix #368): owned
+                        // `Vec<T>` vs `&Vec<T>` impls of one trait are told
+                        // apart by the receiver's declared reference layer.
+                        const probed = sibling && fileEntry.language === 'rust'
+                            ? _rustProbeReferenceSiblings(call, definitions.filter(d =>
+                                !NON_CALLABLE_TYPES.has(d.type) &&
+                                pinnedClasses.has(d.className || (d.receiver || '').replace(/^\*/, '')) &&
+                                pinnedFiles.has(d.file) && sameOwner(d) &&
+                                _callArityCompatible(call, [d], fileEntry.language)))
+                            : null;
+                        if (probed && !pinnedKeys.has(`${probed.file}:${probed.startLine}`)) {
+                            recordExcluded(filePath, call.line, 'reference-impl-other');
+                            continue;
+                        }
+                        if (sibling && !probed) {
                             routeUnverified(filePath, fileEntry, call, 'overload-ambiguous', calledAs, {
                                 dispatchCandidates: definitions.filter(d =>
-                                    !NON_CALLABLE_TYPES.has(d.type) &&
+                                    !NON_CALLABLE_TYPES.has(d.type) && sameOwner(d) &&
                                     pinnedClasses.has(d.className || (d.receiver || '').replace(/^\*/, ''))).length,
                             });
                             continue;
@@ -4793,6 +6479,15 @@ function findCallers(index, name, options = {}) {
                         !recvSubmoduleRel && !call.moduleOwnedPath) {
                         const tTypes = dispatchTargetTypes(targetDefs2);
                         let typeQualifiedReceiver = !!(call.receiver && tTypes.has(call.receiver));
+                        // The qualifying name denotes the type the calling
+                        // module binds it to (fix #384): another module's
+                        // same-name type is not the target's.
+                        if (typeQualifiedReceiver && langTraits(fileEntry.language)?.moduleTypeIdentity &&
+                            _resolveReceiverTypeIdentity(index, filePath, call.receiver, targetDefs2,
+                                call.line) === 'other') {
+                            recordExcluded(filePath, call.line, 'path-type-mismatch');
+                            continue;
+                        }
                         if (typeQualifiedReceiver) resolvedReceiverFacts = {
                             receiverType: call.receiver, receiverTypeSource: 'type-qualified',
                             receiverOrigin: { source: 'type-qualified', site: occurrenceIdentity(fileEntry.relativePath, call) },
@@ -5146,8 +6841,12 @@ function findCallers(index, name, options = {}) {
                             resolvedByExtensionMethod ||
                             call.csharpConstructorExact),
                         hasReceiverEvidence: !!(call.receiver &&
-                            (fileEntry.bindings || []).some(b => b.name === call.receiver)),
+                            _bindingsNamed(index, fileEntry, call.receiver).length > 0),
                         hasImportEvidence: !!bindingId || hasImportLink || !!call.moduleOwnedPath,
+                        ...(includeReach === 'basename' && !bindingId && { includeBasename: true }),
+                        // Pasted / argument-substituted call target of a
+                        // project macro invocation (fix #362).
+                        ...(call.macroExpansion && { macroExpansion: call.macroExpansion }),
                         // The dispatch gates above have already rejected
                         // external contracts, universal methods, wrong arity,
                         // unresolved producer flow, and multi-owner names.
@@ -5200,6 +6899,12 @@ function findCallers(index, name, options = {}) {
     const unverifiedEntries = [];
     let unverifiedEnriched = 0;
 
+    // A caller's line through the operation's split-lines cache (fix #382):
+    // getLine scans from the file start, quadratic over the thousands of
+    // callers a generated file can hold.
+    const lineAt = (filePath, content, line) => (Number.isInteger(line) && line >= 1
+        ? (index._getFileLines(filePath)[line - 1] ?? '') : getLine(content, line));
+
     // Phase 2: Read content only for files with matching calls (eliminates ~98% of file reads)
     for (const [filePath, pending] of pendingByFile) {
         let content = null;
@@ -5217,6 +6922,12 @@ function findCallers(index, name, options = {}) {
             let scored = scoreEdge(evidence);
             let routedTier = _tier;
             let routedReason = _reason;
+            // Expansions under several configuration-dependent definitions
+            // of the macro that disagree about this target (fix #362).
+            if (!routedTier && collectAccount && call.macroExpansion?.ambiguous) {
+                routedTier = TIER.UNVERIFIED;
+                routedReason = 'macro-definition-ambiguous';
+            }
             const migrated = isMethod && !call.isConstructor && !evidence.resolvedBySameClass &&
                 !evidence.typeQualifiedReceiver && !evidence.moduleOwnedPath && !evidence.extensionMethod &&
                 (evidence.hasReceiverType || evidence.resolvedByReceiverHint || evidence.hasSingleOwnerEvidence);
@@ -5264,19 +6975,22 @@ function findCallers(index, name, options = {}) {
                     ...(receiver !== undefined && { receiver }),
                     ...(receiverType && { receiverType }),
                     ...(edgeCalledAs && { calledAs: edgeCalledAs }),
+                    ...(call.macroExpansion && { macroExpansion: _macroSite(call) }),
+                    ...(call.destructuredFrom && { destructured: call.destructuredFrom }),
+                    ...(_spelledByImportAlias(fileEntry, call, edgeCalledAs) && { importAliasSpelling: true }),
                 };
                 if (unverifiedEnriched < unverifiedEnrichLimit) {
                     if (content === null) {
-                        try { content = fs.readFileSync(filePath, 'utf-8'); }
+                        try { content = index._readFile(filePath); }
                         catch (e) {
                             e.message = `caller enrichment read failed: ${e.message}`;
                             throw e;
                         }
                     }
-                    const enclosing = index.findEnclosingFunction(filePath, call.line, true);
+                    const enclosing = index.findEnclosingFunction(filePath, call.line, true, call);
                     unverifiedEntries.push({
                         ...base,
-                        content: getLine(content, call.line),
+                        content: lineAt(filePath, content, call.line),
                         callerName: enclosing ? enclosing.name : null,
                         callerFile: enclosing ? filePath : null,
                         callerStartLine: enclosing ? enclosing.startLine : null,
@@ -5294,6 +7008,10 @@ function findCallers(index, name, options = {}) {
             const tier = collectAccount
                 ? (_evidence && _evidence.typeMismatch ? TIER.UNVERIFIED : tierForResolution(scored.resolution))
                 : undefined;
+            // Every unverified record states why it is not confirmed; a
+            // resolution-tiered candidate carries the missing evidence.
+            const tierReason = tier === TIER.UNVERIFIED
+                ? _unverifiedReasonFor(scored.resolution, _evidence) : null;
             if (enrichedCount >= enrichLimit) {
                 // Push shadow only — no file read needed.
                 shadowEntries.push({
@@ -5307,18 +7025,22 @@ function findCallers(index, name, options = {}) {
                     resolution: scored.resolution,
                     ...(collectAccount && { provenance: scored.provenance }),
                     ...(tier && { tier }),
+                    ...(tierReason && { reason: tierReason }),
                     isMethod: call.isMethod || false,
                     ...(isFunctionReference && { isFunctionReference: true }),
                     ...(isTypeReference && { isTypeReference: true }),
                     ...(receiver !== undefined && { receiver }),
                     ...(receiverType && { receiverType }),
                     ...(edgeCalledAs && { calledAs: edgeCalledAs }),
+                    ...(call.macroExpansion && { macroExpansion: _macroSite(call) }),
+                    ...(call.destructuredFrom && { destructured: call.destructuredFrom }),
+                    ...(_spelledByImportAlias(fileEntry, call, edgeCalledAs) && { importAliasSpelling: true }),
                 });
                 continue;
             }
             // First time we hit this file's enrichment loop — read the file once.
             if (content === null) {
-                try { content = fs.readFileSync(filePath, 'utf-8'); }
+                try { content = index._readFile(filePath); }
                 catch (e) {
                     e.message = `caller enrichment read failed: ${e.message}`;
                     throw e;
@@ -5329,7 +7051,7 @@ function findCallers(index, name, options = {}) {
                 relativePath: fileEntry.relativePath,
                 line: call.line,
                 ...(Number.isInteger(call.column) && { column: call.column }),
-                content: getLine(content, call.line),
+                content: lineAt(filePath, content, call.line),
                 callerName: callerSymbol ? callerSymbol.name : null,
                 callerFile: callerSymbol ? filePath : null,
                 callerStartLine: callerSymbol ? callerSymbol.startLine : null,
@@ -5340,12 +7062,23 @@ function findCallers(index, name, options = {}) {
                 ...(receiver !== undefined && { receiver }),
                 ...(receiverType && { receiverType }),
                 ...(edgeCalledAs && { calledAs: edgeCalledAs }),
+                ...(call.macroExpansion && { macroExpansion: _macroSite(call) }),
+                // A target-typed construction (`HealthInfo h = new(..)`)
+                // spells no name at its site (fix #393).
+                ...(call.targetTyped && { targetTyped: true }),
+                // A name destructured from the member: the member's name is
+                // spelled at the pattern key (fix #397).
+                ...(call.destructuredFrom && { destructured: call.destructuredFrom }),
+                // Spelled by the local alias of an aliased import (`import
+                // { g as f }` then `f()`, fix #397): a rename never edits it.
+                ...(_spelledByImportAlias(fileEntry, call, edgeCalledAs) && { importAliasSpelling: true }),
                 confidence: scored.confidence,
                 evidenceScore: scored.evidenceScore,
                 scoreKind: scored.scoreKind,
                 resolution: scored.resolution,
-                    ...(collectAccount && { provenance: scored.provenance }),
+                ...(collectAccount && { provenance: scored.provenance }),
                 ...(tier && { tier }),
+                ...(tierReason && { reason: tierReason }),
             });
             enrichedCount++;
         }
@@ -5378,6 +7111,57 @@ function findCallers(index, name, options = {}) {
             writable: true,
             configurable: true,
         });
+        // Reflection by name pattern (fix #363): a reflective access whose
+        // member name is built at runtime from literal fragments the target's
+        // name matches (`getattr(self, "_get_%s_permissions" % src)`) is a
+        // possible caller with no name token. Never confirmed - the runtime
+        // part decides - but always visible, so impact/plan see it.
+        const reflectionTargets = (options.targetDefinitions || definitions)
+            .filter(d => !NON_CALLABLE_TYPES.has(d.type) || d.className);
+        const seenReflection = new Set(unverifiedEntries.map(e => `${e.file}:${e.line}`));
+        for (const target of reflectionTargets) {
+            for (const entry of _reflectionPatternReferences(index, target)) {
+                const key = `${entry.file}:${entry.site.line}`;
+                if (seenReflection.has(key)) continue;
+                seenReflection.add(key);
+                let lineText = entry.site.expression;
+                try {
+                    lineText = getLine(index._readFile(entry.file), entry.site.line);
+                } catch (_) { /* keep the recorded expression */ }
+                const enclosing = index.findEnclosingFunction(entry.file, entry.site.line, true);
+                const ranking = scoreEdge({ isUncertain: true });
+                unverifiedEntries.push({
+                    file: entry.file,
+                    relativePath: entry.relativePath,
+                    line: entry.site.line,
+                    confidence: ranking.confidence,
+                    evidenceScore: ranking.evidenceScore,
+                    scoreKind: ranking.scoreKind,
+                    resolution: ranking.resolution,
+                    provenance: ranking.provenance,
+                    tier: TIER.UNVERIFIED,
+                    reason: 'reflection-pattern',
+                    reflectionPattern: entry.pattern,
+                    ...(entry.site.receiver?.kind === 'module' && { reflectionScope: 'module-namespace' }),
+                    isMethod: !!target.className,
+                    content: lineText,
+                    callerName: enclosing ? enclosing.name : null,
+                    callerFile: enclosing ? entry.file : null,
+                    callerStartLine: enclosing ? enclosing.startLine : null,
+                    callerEndLine: enclosing ? enclosing.endLine : null,
+                });
+            }
+        }
+        // A call a macro_rules! transcriber generated (fix #374) is a
+        // template token repeated at every invocation: it is reviewed once,
+        // in the macro template, with the template tokens naming the target.
+        for (const entry of unverifiedEntries) {
+            if (entry.macroExpansion?.origin !== 'template' ||
+                entry.uncertaintyClass === 'runtime-dispatch') continue;
+            entry.uncertaintyClass = 'compile-time-dispatch';
+            entry.dispatchFamily = `${name} macro template`;
+            delete entry.dispatchCandidates;
+        }
         // Retained unverified-tier entries, sorted (relativePath, line) per the
         // output ordering contract.
         unverifiedEntries.sort((a, b) => {
@@ -5446,8 +7230,10 @@ function findCallees(index, definition, options = {}) {
         : definition;
     if (!def) return [];
     if (!def.file) throw new TypeError('findCallees requires a definition with a file');
-    // Lazy-load callsCache from disk if not already populated
-    if (index.loadCallsCache) index.loadCallsCache();
+    // Lazy-load callsCache from disk if not already populated. A run
+    // restricted to known sites (fix #371) reads records through
+    // getCachedCalls, which loads each file's shard on demand.
+    if (index.loadCallsCache && !options.siteStarts) index.loadCallsCache();
 
     try {
         // Get all calls from the file's cache (now includes enclosingFunction)
@@ -5460,8 +7246,10 @@ function findCallees(index, definition, options = {}) {
         // (14-16s on clap). Restrict the resolution loop and local-type scan
         // to this definition's source range. Nested closures deliberately
         // remain in the slice and retain the existing inner-symbol rules.
+        // Annotation element keys (fix #389) name an element of the
+        // annotation type; the annotated declaration makes no call.
         const calls = _callsInDefinitionRange(index, def.file, allCalls,
-            def.startLine, def.endLine).filter(call => !isDataMemberReference(
+            def.startLine, def.endLine).filter(call => !call.annotationElement && !isDataMemberReference(
                 index.files.get(def.file), call, index.symbols.get(call.name) || []));
         // The reachability walk uses the legacy (non-accounting) path and most
         // entry/test symbols contain no calls. Avoid constructing receiver,
@@ -5473,6 +7261,7 @@ function findCallees(index, definition, options = {}) {
         // Get file language for smart method call handling
         const fileEntry = index.files.get(def.file);
         const language = fileEntry?.language;
+        const structuralCallee = langTraits(language)?.typeSystem === 'structural';
 
         // Build list of inner class/struct method ranges to exclude from callee detection.
         // Only class methods are excluded — they are independently addressable symbols.
@@ -5680,8 +7469,25 @@ function findCallees(index, definition, options = {}) {
         };
 
         let siteOrdinal = -1;
+        // `siteStarts` (internal, fix #371): resolve only the call records
+        // starting at these offsets. Every per-site verdict is record-local
+        // (local types, flow maps and fold contexts still see the whole
+        // range), so a restricted run returns exactly those sites' edges.
+        const siteStarts = options.siteStarts || null;
         for (let call of calls) {
             siteOrdinal++;
+            if (siteStarts && !siteStarts.has(call.callStart)) continue;
+            call = _withModuleValueAliasReceiver(index, def.file,
+                _withoutShadowedStdLiteral(index, _destructuredMemberView(call)), structuralCallee);
+            // A local declared with a supertype and never reassigned after
+            // `new T(..)` runs T's member (fix #394; the caller-side twin).
+            if (call.receiverType && call.receiverTypeEvidence?.constructedType) {
+                const exact = _constructedValueType(index, call, call.receiverType);
+                if (exact) {
+                    call = { ...call, receiverType: exact, receiverTypeSource: 'constructor',
+                        receiverTypeEvidence: { ...call.receiverTypeEvidence, source: 'constructor', type: exact } };
+                }
+            }
             const siteId = siteOrdinal;
             siteEvidence.set(siteId, {
                 call,
@@ -5694,7 +7500,12 @@ function findCallees(index, definition, options = {}) {
             if (language === 'csharp') {
                 // fix #353: `Beta.Helper.Widget()` — namespace-qualified type
                 // receiver (see the findCallers twin).
-                const rewritten = _csharpNamespaceQualifiedReceiver(index, call, def);
+                const rewritten = _csharpNamespaceQualifiedReceiver(index, call, def) ||
+                    _csharpTypeRootedPath(index, call, def, def.file) ||
+                    _implicitMemberReceiver(index, call, def);
+                if (rewritten) call = rewritten;
+            } else if (call.receiverIsTypeQualified && langTraits(language)?.bareCallReachesMethods) {
+                const rewritten = _implicitMemberReceiver(index, call, def);
                 if (rewritten) call = rewritten;
             }
             if (language === 'go' && call.isMethod &&
@@ -5719,6 +7530,12 @@ function findCallees(index, definition, options = {}) {
                 }
             }
             // Filter to calls within this function's scope
+            // A macro expansion (fix #374) lays every function it generates
+            // on the invocation's lines: a sibling generated on the same
+            // line is another function, never a nested callback.
+            if (call.macroExpansion && call.enclosingFunction &&
+                call.enclosingFunction.startLine === def.startLine &&
+                call.enclosingFunction.name !== def.name) continue;
             // Method 1: Direct match via enclosingFunction (fast path for direct calls)
             const isDirectMatch = call.enclosingFunction &&
                 call.enclosingFunction.startLine === def.startLine;
@@ -5731,6 +7548,44 @@ function findCallees(index, definition, options = {}) {
 
             if (!isDirectMatch && !isNestedCallback) continue;
             if (calleeAccount) calleeAccount.totalSites++;
+
+            // fix #380: a written generic arity names one type of the name.
+            // Same-name definitions of another arity never receive the edge:
+            // pin the site to the same-arity type (or its constructor), and
+            // a site whose arity no project type of that name has resolves
+            // outside the project.
+            if (!call.bindingId && langTraits(language)?.genericArityIsIdentity) {
+                const candidates = index.symbols.get(call.name) || [];
+                const split = _genericAritySplit(language, call, candidates);
+                if (split && split.related.length > split.matching.length) {
+                    if (split.matching.length === 0) {
+                        const others = candidates.filter(candidate => !split.related.includes(candidate) &&
+                            (!NON_CALLABLE_TYPES.has(candidate.type) || call.isConstructor));
+                        if (others.length === 0) noteSite(siteId, 'external', null, call);
+                        else noteUnverified(siteId, call, 'method-ambiguous');
+                        continue;
+                    }
+                    let pick = null;
+                    const members = call.isConstructor
+                        ? split.matching.filter(candidate => candidate.type === 'constructor')
+                        : split.matching.filter(candidate => !NON_CALLABLE_TYPES.has(candidate.type));
+                    if (call.isConstructor && members.length === 0) {
+                        pick = split.matching.find(candidate => candidate.name === split.site.name &&
+                            _ARITY_TYPE_KINDS.has(candidate.type)) || null;
+                    } else if (members.length === 1) {
+                        pick = members[0];
+                    } else if (members.length > 1) {
+                        const selected = _calleeOverloadSelect(index, call, members, language);
+                        if (selected.match) {
+                            pick = selected.match;
+                        } else {
+                            noteUnverified(siteId, call, 'overload-ambiguous');
+                            continue;
+                        }
+                    }
+                    if (pick?.bindingId) call = { ...call, bindingId: pick.bindingId };
+                }
+            }
 
             if (language === 'python' && call.isMethod && !call.receiverType) {
                 const fixture = _pythonFixtureReceiverType(index, def.file, call);
@@ -5760,6 +7615,10 @@ function findCallees(index, definition, options = {}) {
                 if (item?.type) call = { ...call, receiverType: item.type,
                     receiverTypeSource: 'flow', receiverTypeEvidence: { source: 'flow', ...item },
                     receiverTypeFlowFile: item.fromFile };
+            }
+            if (language === 'rust' && call.isMethod && !call.receiverType && call.receiverValuePath) {
+                const valueType = _rustValuePathReceiverType(index, def.file, call);
+                if (valueType) call = { ...call, ...valueType };
             }
             if (language === 'rust' && call.isMethod &&
                 call.receiver && !call.receiverType &&
@@ -5810,6 +7669,23 @@ function findCallees(index, definition, options = {}) {
                 }
             }
 
+            // `::f(...)` names a global-namespace declaration (fix #393): a
+            // project function in a named namespace no global-scope using
+            // brings in is not it.
+            if (language === 'cpp' && call.globalQualified && !call.isMethod) {
+                const visible = cppIncludeClosure(index, def.file);
+                const reachable = (index.symbols.get(call.name) || []).some(candidate =>
+                    !candidate.className && !candidate.receiver &&
+                    !NON_CALLABLE_TYPES.has(candidate.type) &&
+                    index.files.get(candidate.file)?.language === 'cpp' &&
+                    cppGlobalQualifiedReaches(index, { file: def.file, line: call.line },
+                        cppEffectiveNamespace(index, candidate), call.name, visible) !== 'no');
+                if (!reachable) {
+                    noteSite(siteId, 'external', null, call);
+                    continue;
+                }
+            }
+
             // C# extension methods are statically resolved compiler calls,
             // despite using instance-call syntax. Resolve them before the
             // ordinary receiver-owner path: the receiver type matches the
@@ -5850,6 +7726,43 @@ function findCallees(index, definition, options = {}) {
                         noteUnverified(siteId, call, 'overload-ambiguous');
                     }
                     continue;
+                }
+                // fix #380: an extension whose `this` parameter the
+                // receiver's type ancestry cannot decide stays visible.
+                const possibleExtension = (index.symbols.get(call.name) || []).some(candidate =>
+                    candidate.isExtensionMethod &&
+                    _calleeLanguageCompatible(index, candidate, language) &&
+                    _csharpExtensionCallVerdict(index, def.file, fileEntry, call, [candidate]) === 'possible');
+                if (possibleExtension) {
+                    noteUnverified(siteId, call, 'extension-receiver-unresolved');
+                    continue;
+                }
+            }
+
+            // Type-name denotation (fix #371), the callee half: a written
+            // type name that denotes an external type never resolves to a
+            // same-name project type's member or constructor.
+            {
+                const sameName = () => (index.symbols.get(call.name) || []).filter(candidate =>
+                    _calleeLanguageCompatible(index, candidate, language) &&
+                    (!NON_CALLABLE_TYPES.has(candidate.type) || IDENTITY_TYPE_KINDS.has(candidate.type)));
+                const denotation = externalTypeGate(index, def.file, fileEntry, call, sameName);
+                if (denotation?.verdict === 'exclude') {
+                    noteSite(siteId, 'external', null, call);
+                    continue;
+                }
+                if (denotation?.verdict === 'dispatch' && collectAccount) {
+                    noteUnverified(siteId, call, 'possible-dispatch', {
+                        dispatchVia: `${denotation.via} — impl on the external type`,
+                    });
+                    continue;
+                }
+                if (denotation?.verdict === 'unverified') {
+                    noteUnverified(siteId, call, 'method-ambiguous');
+                    continue;
+                }
+                if (denotation?.verdict === 'strip') {
+                    call = stripExternalReceiverType(call, denotation.via);
                 }
             }
 
@@ -5970,7 +7883,7 @@ function findCallees(index, definition, options = {}) {
                 }
                 if (!hopRoot && call.receiverRoot === 'this' &&
                     langTraits(language)?.typeSystem === 'structural') {
-                    hopRoot = index.findEnclosingFunction(def.file, call.line, true)?.className;
+                    hopRoot = index.findEnclosingFunction(def.file, call.line, true, call)?.className;
                 }
                 if (hopRoot) {
                     fieldHopInfo = fieldHopInfo || {};
@@ -6041,7 +7954,8 @@ function findCallees(index, definition, options = {}) {
             }
 
             if (language === 'csharp' && call.isMethod && fieldHopType) {
-                const extensionCall = { ...call, receiverType: fieldHopType };
+                const extensionCall = { ...call, receiverType: fieldHopType,
+                    ...(fieldHopInfo?.typeTexts && { receiverHopTypeTexts: fieldHopInfo.typeTexts }) };
                 const extensions = (index.symbols.get(call.name) || []).filter(candidate =>
                     _calleeLanguageCompatible(index, candidate, language) &&
                     _csharpExtensionCallMatches(
@@ -6075,6 +7989,16 @@ function findCallees(index, definition, options = {}) {
                     } else {
                         noteUnverified(siteId, call, 'overload-ambiguous');
                     }
+                    continue;
+                }
+                // A platform instance member that may take the arguments
+                // leaves the extension undecided (fix #395).
+                const possibleExtension = (index.symbols.get(call.name) || []).some(candidate =>
+                    candidate.isExtensionMethod &&
+                    _calleeLanguageCompatible(index, candidate, language) &&
+                    _csharpExtensionCallVerdict(index, def.file, fileEntry, extensionCall, [candidate]) === 'possible');
+                if (possibleExtension) {
+                    noteUnverified(siteId, call, 'extension-receiver-unresolved');
                     continue;
                 }
             }
@@ -6153,6 +8077,73 @@ function findCallees(index, definition, options = {}) {
                     noteSite(siteId, 'external', null, call);
                 }
                 continue;
+            }
+
+            // Rust module-path calls (fix #377): the item the module tree
+            // resolves `crate::f` / `super::f` / `self::m::f` / `m::f` to.
+            if (langTraits(language)?.macroInvocationSyntax === 'marked' &&
+                call.isPathCall && call.receiver && !call.isMacro) {
+                const { rustPathModule, rustModuleItems } = require('./rust-modules');
+                const resolvedModule = rustPathModule(index, def.file, call.line, call.receiver);
+                const items = resolvedModule ? rustModuleItems(index, resolvedModule, call.name) : [];
+                // A tuple struct's name is its constructor (fix #389).
+                if (items.length === 1 && (!NON_CALLABLE_TYPES.has(items[0].type) ||
+                    (items[0].type === 'struct' && items[0].valueShape === 'tuple'))) {
+                    const match = items[0];
+                    const record = siteEvidence.get(siteId);
+                    if (record) {
+                        record.call = { ...call, moduleOwnedPath: true };
+                        record.evidence.moduleOwnedPath = true;
+                        record.evidence.hasImportEvidence = true;
+                        // `self::f` / `super::f` are module paths, not receivers.
+                        record.evidence.resolvedBySameClass = false;
+                        record.options = { ...(record.options || {}), sameClass: false };
+                    }
+                    const key = match.bindingId || `${match.file}:${match.startLine}:${call.name}`;
+                    const existing = callees.get(key);
+                    if (existing) {
+                        existing.count += 1;
+                        if (collectAccount) { existing.sites.push(call.line); existing.siteIds.push(siteId); }
+                    } else {
+                        callees.set(key, { name: call.name, bindingId: match.bindingId, count: 1,
+                            ...(collectAccount && { sites: [call.line], siteIds: [siteId] }) });
+                    }
+                    continue;
+                }
+            }
+
+            // C/C++ call syntax that invokes a same-named macro in effect
+            // (fix #377): the callee is the macro, never the function.
+            // When no shadowing macro is in effect (none defined above the
+            // site, the expansion calls the name again, or macro and function
+            // are configuration alternatives), a same-file macro binding is
+            // not the callee either (fix #385); nor is a macro's own name
+            // inside its replacement list, which is never expanded again.
+            let macroBindingsInert = langTraits(language)?.macroInvocationSyntax === 'call' &&
+                def.type === 'macro' && call.name === def.name &&
+                !!(call.inMacroBody || call.inMacroDefinition);
+            if (langTraits(language)?.macroInvocationSyntax === 'call' &&
+                !call.macroExpansion && !call.inMacroDefinition && !call.macroParameter &&
+                !call.isFunctionReference) {
+                const shadow = _cMacroShadowedCall(index, def.file, call);
+                if (shadow === null) macroBindingsInert = true;
+                if (shadow?.macro) {
+                    const match = shadow.macro;
+                    const key = match.bindingId || `${match.file}:${match.startLine}:${call.name}`;
+                    const existing = callees.get(key);
+                    if (existing) {
+                        existing.count += 1;
+                        if (collectAccount) { existing.sites.push(call.line); existing.siteIds.push(siteId); }
+                    } else {
+                        callees.set(key, { name: call.name, bindingId: match.bindingId, count: 1,
+                            ...(collectAccount && { sites: [call.line], siteIds: [siteId] }) });
+                    }
+                    continue;
+                }
+                if (shadow === 'macro' || shadow === 'ambiguous') {
+                    noteUnverified(siteId, call, 'macro-namespace');
+                    continue;
+                }
             }
 
             // Go package-qualified receiver: resolve the import module up
@@ -6325,6 +8316,15 @@ function findCallees(index, definition, options = {}) {
                     // fieldHopType: the declared type of a one-hop field
                     // receiver (fix #231 — tm.service.Save() resolves Save
                     // through the `service *DataService` declaration)
+                    if (!call.receiverType && !fieldHopType && fieldHopInfo?.externalType &&
+                        externalReceiverVerdict(index, language,
+                            (index.symbols.get(call.name) || []).filter(candidate =>
+                                !NON_CALLABLE_TYPES.has(candidate.type) &&
+                                _calleeLanguageCompatible(index, candidate, language)),
+                            fieldHopInfo.externalType) === 'exclude') {
+                        noteSite(siteId, 'external', null, call);
+                        continue;
+                    }
                     if (!call.receiverType && !fieldHopType && fieldHopInfo?.externalVia) {
                         // Provably-external declared field type (fix #268,
                         // chi-measured: `pool *sync.Pool`, `inner
@@ -6339,7 +8339,22 @@ function findCallees(index, definition, options = {}) {
                         }
                         continue;
                     }
-                    const typeName = directReceiverFlow?.type || call.receiverType || fieldHopType;
+                    // An import-renamed annotation (`b: B` from `import { Box
+                    // as B }`, C# `using IntBox = G.Box<int>`) names the
+                    // original type (fix #378, the caller side's twin).
+                    const renamedType = call.receiverType && !directReceiverFlow?.type
+                        ? _importRenamedTypeName(index, call.receiverTypeFlowFile || def.file,
+                            call.receiverType, { withQualifier: true })
+                        : null;
+                    const spelledType = directReceiverFlow?.type || renamedType?.name ||
+                        call.receiverType || fieldHopType;
+                    // Type aliases are the SAME type (#208): resolve the
+                    // alias chain as the caller side does.
+                    const localBase = spelledType && (_aliasBaseAtOrigin(
+                        index, spelledType, call.receiverTypeFlowFile || def.file,
+                        call.receiverTypeFlowFile && call.receiverTypeFlowFile !== def.file
+                            ? undefined : call.line) || spelledType);
+                    const typeName = (localBase && _pureAliasBase(index, localBase)) || localBase;
                     const symbols = index.symbols.get(call.name);
                     const qualifiedType = language === 'go' && call.receiverType
                         ? _goQualifiedReceiverType(index, fileEntry,
@@ -6371,11 +8386,24 @@ function findCallees(index, definition, options = {}) {
                         (call.receiverType
                             ? _resolveFlowTypeOrigin(
                                 index, def.file, typeName,
-                                call.receiverTypeQualifier ||
-                                    call.receiverTypeNamespace)?.fromFile
+                                renamedType?.qualifier ||
+                                    call.receiverTypeQualifier ||
+                                    call.receiverTypeNamespace,
+                                call.receiverTypeEvidence?.line ?? call.line)?.fromFile
                             : null);
+                    // A type name with function-local declarations (fix
+                    // #389) denotes one definition here: the local in scope,
+                    // else the file's module-level one; members of the other
+                    // same-name types are not this receiver's.
+                    const receiverTypeDefinition = typeName && receiverOriginFile
+                        ? _scopedTypeDefinitionAt(index, receiverOriginFile, typeName,
+                            receiverOriginFile === def.file ? call.line : null)
+                        : null;
                     const acceptsReceiverDefinition = symbol =>
                         isCallableRT(symbol) &&
+                        (!receiverTypeDefinition || !ownerDefinitionOf(index, symbol) ||
+                            classKeyOf(index, ownerDefinitionOf(index, symbol)) ===
+                                classKeyOf(index, receiverTypeDefinition)) &&
                         (!qualifiedType?.dir ||
                          (symbol.file &&
                           path.dirname(symbol.file) === qualifiedType.dir)) &&
@@ -6583,7 +8611,8 @@ function findCallees(index, definition, options = {}) {
                         noteSite(siteId, 'external', null, call);
                         continue;
                     }
-                    noteUnverified(siteId, call, typeQual.unverified);
+                    noteUnverified(siteId, call, typeQual.unverified,
+                        typeQual.dispatchVia ? { dispatchVia: typeQual.dispatchVia } : undefined);
                     continue;
                 } else if (langTraits(language)?.methodCallInclusion === 'explicit' && !options.includeMethods) {
                     noteSite(siteId, 'filtered', 'method-calls-excluded', call);
@@ -6765,7 +8794,9 @@ function findCallees(index, definition, options = {}) {
             // qualified imports only), so the route is a structural+Rust
             // change in practice; Java (bareCallReachesMethods) keeps its
             // implicit-this/static-import machinery.
-            if (!call.isMethod && !call.receiver && !call.isConstructor &&
+            // A parser-proven local binding (a nested class or function,
+            // parameter or local) shadows the import (fix #381).
+            if (!call.isMethod && !call.receiver && !call.isConstructor && !call.localShadow &&
                 !langTraits(language)?.bareCallReachesMethods) {
                 const importRoute = _calleeStructuralImportedNameRoute(index, fileEntry, call, language);
                 if (importRoute) {
@@ -6850,7 +8881,15 @@ function findCallees(index, definition, options = {}) {
                 const receiverBlindMethodBinding = call.isMethod &&
                     !_isReservedReceiver(language, call.receiver);
                 let bindings = receiverBlindMethodBinding ? [] :
-                    fileEntry.bindings.filter(b => b.name === call.name);
+                    _arityCompatibleBindings(index, language, call,
+                        _dropOutOfScopeBindings(index, def.file, call.name, call.line,
+                            fileEntry.bindings.filter(b => b.name === call.name)));
+                // A marked macro invocation binds only macros, a call only
+                // fns and values (fix #377).
+                if (langTraits(language)?.macroInvocationSyntax === 'marked') {
+                    bindings = bindings.filter(b => (b.type === 'macro') === !!call.isMacro);
+                }
+                if (macroBindingsInert) bindings = bindings.filter(b => b.type !== 'macro');
                 // For Go, also check sibling files in same directory (same
                 // package scope). dirToFiles is rebuilt on every build and
                 // cache load in canonical path order — the same iteration
@@ -6873,6 +8912,16 @@ function findCallees(index, definition, options = {}) {
                 // re-enter the candidate set.
                 if (call.isConstructor) {
                     bindings = bindings.filter(binding => binding.type !== 'field');
+                    // Nor a method (fix #378, echo-measured: the composite
+                    // literal `Route{Path: "/"}` bound the method `R.Route`):
+                    // a construction names a type or its own constructor
+                    // (`new Foo()` -> Foo.Foo), never another member.
+                    const sameNameSymbols = index.symbols.get(call.name) || [];
+                    bindings = bindings.filter(binding => !sameNameSymbols.some(symbol =>
+                        symbol.bindingId === binding.id &&
+                        !NON_CALLABLE_TYPES.has(symbol.type) &&
+                        (symbol.className || symbol.receiver) &&
+                        String(symbol.className || symbol.receiver).replace(/^\*/, '') !== call.name));
                 }
                 // A bare call can never bind a METHOD def (fix #300, the
                 // caller side's #220(4)/#222(3) filter brought to the callee
@@ -6882,7 +8931,20 @@ function findCallees(index, definition, options = {}) {
                 // a self-edge — the compiler's target is the free fn. Java
                 // (bareCallReachesMethods: implicit-this) keeps its bindings.
                 if (bareKindFiltered) {
-                    bindings = bindings.filter(binding => binding.type !== 'method');
+                    // fix #367a: Go method bindings carry type 'function';
+                    // the symbol's own kind decides.
+                    const sameName = index.symbols.get(call.name) || [];
+                    // fix #377: nor a struct/class FIELD - a callable field
+                    // is invoked through its owner (`(self.f)(x)`, `s.f()`),
+                    // never by its bare name inside a function body.
+                    const fieldMember = binding => binding.type === 'field' &&
+                        !NON_CALLABLE_TYPES.has(def.type) &&
+                        sameName.some(symbol => symbol.bindingId === binding.id &&
+                            (symbol.className || symbol.receiver));
+                    bindings = bindings.filter(binding => binding.type !== 'method' &&
+                        !fieldMember(binding) &&
+                        !sameName.some(symbol => symbol.bindingId === binding.id &&
+                            bareCallCannotDenote(symbol, language)));
                 }
                 // Method call with no binding for the method name:
                 // Different strategies by language family:
@@ -6972,9 +9034,54 @@ function findCallees(index, definition, options = {}) {
                     // then ancestors; if overrides exist, retain the dispatch
                     // set visibly instead of falling through to defs[0].
                     const callSymbols = index.symbols.get(call.name) || [];
-                    const selected = _calleeSelectReceiverMethod(
+                    // fix #395: simple-name lookup finds a local function of
+                    // a function body enclosing the call before any member
+                    // of the class chain.
+                    const localFunctions = callSymbols.filter(symbol =>
+                        symbol.file === def.file && symbol.isNested && !symbol.className &&
+                        symbol.type === 'function' && (() => {
+                            const container = _enclosingFunctionOfDefinition(index, symbol);
+                            return !!container && call.line >= container.startLine &&
+                                call.line <= container.endLine;
+                        })());
+                    if (localFunctions.length > 1) {
+                        noteUnverified(siteId, call, 'binding-ambiguous');
+                        continue;
+                    }
+                    if (localFunctions.length === 1) {
+                        const local = localFunctions[0];
+                        const key = local.bindingId || `${local.file}:${local.startLine}:${local.name}`;
+                        const existing = callees.get(key);
+                        if (existing) {
+                            existing.count += 1;
+                            if (collectAccount) {
+                                existing.sites.push(call.line);
+                                existing.siteIds.push(siteId);
+                            }
+                        } else {
+                            callees.set(key, {
+                                name: call.name,
+                                bindingId: local.bindingId,
+                                count: 1,
+                                ...(collectAccount && { sites: [call.line], siteIds: [siteId] }),
+                            });
+                        }
+                        continue;
+                    }
+                    // fix #390: members of the enclosing class DEFINITION,
+                    // never of a same-name class in another package.
+                    const defOwnerRef = ownerRefOf(index, def);
+                    let selected = _calleeSelectReceiverMethod(
                         index, call, callSymbols, def.className, language,
-                        def.file, symbol => !NON_CALLABLE_TYPES.has(symbol.type));
+                        def.file, symbol => !NON_CALLABLE_TYPES.has(symbol.type) &&
+                            _notForeignSameNameOwner(index, symbol, defOwnerRef));
+                    if (!selected.match && !selected.ambiguous) {
+                        selected = _bareStaticImportCallee(index, def, call, language, fileEntry) || selected;
+                    }
+                    if (selected.none) {
+                        noteSite(siteId, 'excluded', 'other-definition-import', call);
+                        continue;
+                    }
                     if (selected.ambiguous) {
                         noteUnverified(siteId, call, 'overload-ambiguous');
                         continue;
@@ -7049,9 +9156,11 @@ function findCallees(index, definition, options = {}) {
                         // argument shape selects one member of the same-class
                         // family; spraying every overload invents edges and
                         // hides the exact dependency an agent needs.
+                        const defClassRef = ownerRefOf(index, def);
                         const sameClassSyms = (index.symbols.get(call.name) || [])
                             .filter(s => s.className === def.className &&
-                                !NON_CALLABLE_TYPES.has(s.type));
+                                !NON_CALLABLE_TYPES.has(s.type) &&
+                                _notForeignSameNameOwner(index, s, defClassRef));
                         const selected = _calleeOverloadSelect(
                             index, call, sameClassSyms, language);
                         if (selected.ambiguous) {
@@ -7182,12 +9291,16 @@ function findCallees(index, definition, options = {}) {
                         // Try to resolve to a binding in the same class via symbol lookup
                         const callSymbols = index.symbols.get(call.name);
                         if (callSymbols) {
-                            const onClass = (cls) => callSymbols.filter(s => s.className === cls);
+                            // fix #358: owned by the enclosing class DEFINITION.
+                            const defClassRef = ownerRefOf(index, def);
+                            const onClass = (cls) => callSymbols.filter(s => s.className === cls &&
+                                _notForeignSameNameOwner(index, s, defClassRef));
                             const selected = langTraits(language)?.bareCallReachesMethods
                                 ? _calleeSelectReceiverMethod(
                                     index, call, callSymbols, def.className,
                                     language, def.file,
-                                    symbol => !NON_CALLABLE_TYPES.has(symbol.type))
+                                    symbol => !NON_CALLABLE_TYPES.has(symbol.type) &&
+                                        _notForeignSameNameOwner(index, symbol, defClassRef))
                                 : _calleeOverloadSelect(
                                     index, call, onClass(def.className), language);
                             if (selected.ambiguous) {
@@ -7342,6 +9455,11 @@ function findCallees(index, definition, options = {}) {
                     }
                 }
             }
+            // A name-keyed site whose macro binding was set aside resolves
+            // apart from sites of the same name that may invoke the macro.
+            if (macroBindingsInert && !bindingResolved && calleeKey === effectiveName) {
+                calleeKey = `${calleeKey}\0function`;
+            }
             const existing = callees.get(calleeKey);
             if (existing) {
                 existing.count += 1;
@@ -7359,6 +9477,8 @@ function findCallees(index, definition, options = {}) {
                     // kind rule into finalization (fix #300): the resolver
                     // there must never select a method-kind def for them.
                     ...(bareKindFiltered && !bindingResolved && { bareNonMethod: true }),
+                    // ...nor a macro the preprocessor model set aside (fix #385).
+                    ...(macroBindingsInert && !bindingResolved && { macroInert: true }),
                     ...(call.isConstructor && { isConstructor: true }),
                     ...(collectAccount && {
                         sites: [call.line],
@@ -7382,6 +9502,14 @@ function findCallees(index, definition, options = {}) {
                         continue;
                     }
                     let targetClass = attrTypes ? attrTypes.get(call.selfAttribute) : null;
+                    // Type-name denotation (fix #371): `self.timer = Timer(..)`
+                    // under `from threading import Timer` holds the external
+                    // Timer, never a same-name project class.
+                    if (targetClass && (index.symbols.get(targetClass) || []).some(d => IDENTITY_TYPE_KINDS.has(d.type)) &&
+                        externalTypeDenotation(index, def.file, targetClass, null, call.line)) {
+                        noteSite(siteId, 'external', null, call);
+                        continue;
+                    }
                     // Unique method heuristic: if attr type unknown but method exists on exactly one class
                     if (!targetClass) {
                         const methodSyms = index.symbols.get(call.name);
@@ -7401,7 +9529,26 @@ function findCallees(index, definition, options = {}) {
                     const symbols = index.symbols.get(call.name);
                     if (!symbols) { noteUnverified(siteId, call, 'self-attr-unresolved'); continue; }
 
-                    const match = symbols.find(s => s.className === targetClass);
+                    let match = null;
+                    // fix #381: the field's class by DEFINITION (same-name
+                    // classes in other modules, function-local classes out of
+                    // scope never supply the callee), through its resolved
+                    // ancestors.
+                    const fieldRef = attrTypes?.get(call.selfAttribute) === targetClass
+                        ? _pythonFieldClassRef(index, def.file, targetClass, attrTypes, call.selfAttribute, def)
+                        : null;
+                    if (fieldRef) {
+                        const candidates = symbols.filter(s => !NON_CALLABLE_TYPES.has(s.type) &&
+                            _calleeLanguageCompatible(index, s, language));
+                        const declaring = fieldRef.key
+                            ? findDeclaringClass(index, fieldRef, candidates) : null;
+                        if (declaring && !declaring.uncertain && declaring.members.length === 1) {
+                            match = declaring.members[0];
+                        }
+                    } else {
+                        match = symbols.find(s => s.className === targetClass &&
+                            _calleeLanguageCompatible(index, s, language));
+                    }
                     if (!match) { noteUnverified(siteId, call, 'self-attr-unresolved'); continue; }
 
                     const key = match.bindingId || `${targetClass}.${call.name}`;
@@ -7432,6 +9579,7 @@ function findCallees(index, definition, options = {}) {
         // Falls back to walking the inheritance chain if not found in same class
         // Respect includeMethods=false — skip self/this method resolution entirely
         if (selfMethodCalls && def.className && options.includeMethods !== false) {
+            const callerClassRef = ownerRefOf(index, def);
             for (const { call, siteId } of selfMethodCalls) {
                 const symbols = index.symbols.get(call.name);
                 if (!symbols || symbols.length === 0) {
@@ -7445,16 +9593,22 @@ function findCallees(index, definition, options = {}) {
                 // For super().method(), skip same-class — start from parent
                 const parentOnlyReceiver = call.receiver === 'super' ||
                     (call.receiver === 'base' && language === 'csharp');
-                const selectOwner = owner => _calleeOverloadSelect(
+                // fix #358: members are owned by class DEFINITIONS. A same-name
+                // class in another module/package/namespace never contributes
+                // candidates; an unresolved owner stays a candidate (and so
+                // keeps the site ambiguous rather than confirming it).
+                const selectOwner = ref => _calleeOverloadSelect(
                     index,
                     call,
-                    symbols.filter(symbol => symbol.className === owner),
+                    symbols.filter(symbol => !NON_CALLABLE_TYPES.has(symbol.type) &&
+                        ownedBy(index, symbol, ref) !== 'no'),
                     language);
                 let selected = parentOnlyReceiver
                     ? { match: null }
                     : _calleeSelectReceiverMethod(
                         index, call, symbols, def.className, language, def.file,
-                        symbol => !NON_CALLABLE_TYPES.has(symbol.type));
+                        symbol => !NON_CALLABLE_TYPES.has(symbol.type) &&
+                            _notForeignSameNameOwner(index, symbol, callerClassRef));
                 if (selected.ambiguous) {
                     noteUnverified(siteId, call, 'overload-ambiguous');
                     continue;
@@ -7462,16 +9616,18 @@ function findCallees(index, definition, options = {}) {
                 let match = selected.match;
                 let ambiguityClaimed = false;
 
-                // Walk inheritance chain using BFS if not found in same class
-                if (!match) {
-                    const visited = new Set([def.className]);
-                    const defFile = def.file;
-                    const startParents = index._getInheritanceParents(def.className, defFile) || [];
-                    const queue = startParents.map(p => ({ name: p, contextFile: defFile }));
+                // Walk inheritance chain using BFS if not found in same class.
+                // Parents resolve to definitions from the child's own scope
+                // (fix #358); unresolved same-name parents keep every
+                // candidate and therefore surface as ambiguity.
+                if (!match && callerClassRef) {
+                    const visitKey = ref => ref.key || `?${ref.name}`;
+                    const visited = new Set([visitKey(callerClassRef)]);
+                    const queue = [...parentRefsOfClass(index, callerClassRef)];
                     while (queue.length > 0 && !match) {
-                        const { name: current, contextFile } = queue.shift();
-                        if (visited.has(current)) continue;
-                        visited.add(current);
+                        const current = queue.shift();
+                        if (current.external || visited.has(visitKey(current))) continue;
+                        visited.add(visitKey(current));
                         selected = selectOwner(current);
                         if (selected.ambiguous) {
                             noteUnverified(siteId, call, 'overload-ambiguous');
@@ -7481,10 +9637,12 @@ function findCallees(index, definition, options = {}) {
                         }
                         match = selected.match;
                         if (!match) {
-                            const resolvedFile = index._resolveClassFile(current, contextFile);
-                            const grandparents = index._getInheritanceParents(current, resolvedFile) || [];
+                            const grandparents = current.key || current.def
+                                ? parentRefsOfClass(index, current)
+                                : (index._getInheritanceParents(current.name, null) || [])
+                                    .map(name => ({ name, key: null, def: null }));
                             for (const gp of grandparents) {
-                                if (!visited.has(gp)) queue.push({ name: gp, contextFile: resolvedFile });
+                                if (!visited.has(visitKey(gp))) queue.push(gp);
                             }
                         }
                     }
@@ -7500,7 +9658,7 @@ function findCallees(index, definition, options = {}) {
                 // exempt. In contract mode retain the site as possible
                 // dispatch; legacy command behavior remains unchanged.
                 const overrideOwners = !parentOnlyReceiver
-                    ? _descendantOverrideOwners(index, def.className, call.name)
+                    ? _descendantOverrideOwnersForRef(index, callerClassRef, call.name)
                     : new Set();
                 if (collectAccount && overrideOwners.size > 0) {
                     noteUnverified(siteId, call, 'possible-dispatch', {
@@ -7545,7 +9703,7 @@ function findCallees(index, definition, options = {}) {
         const cFamilyVisibleFiles = ['c', 'cpp'].includes(language)
             ? _cppVisibleFiles(index, def.file) : null;
 
-        for (const { name: calleeName, bindingId, count, isConstructor, sites, siteIds, isFunctionReference, bareNonMethod } of callees.values()) {
+        for (const { name: calleeName, bindingId, count, isConstructor, sites, siteIds, isFunctionReference, bareNonMethod, macroInert } of callees.values()) {
             const claimSites = (bucket, reason) => {
                 if (!collectAccount || !siteIds) return;
                 for (let i = 0; i < siteIds.length; i++) {
@@ -7553,15 +9711,40 @@ function findCallees(index, definition, options = {}) {
                 }
             };
             let symbols = index.symbols.get(calleeName);
+            if (symbols && macroInert) symbols = symbols.filter(s => s.type !== 'macro');
             if (symbols && symbols.length > 0 && bareNonMethod) {
                 // fix #300 (#220(4), callee finalization): a bare call's
                 // candidate set never includes METHOD defs — without this the
                 // same-file priority selected the enclosing trait method for
                 // `merge_join_by(self, other, cmp_fn)` inside its own trait
                 // wrapper, fabricating a self-edge over the imported free fn.
-                const nonMethod = symbols.filter(s =>
-                    !(s.className || s.receiver) || NON_CALLABLE_TYPES.has(s.type));
-                if (nonMethod.length > 0) symbols = nonMethod;
+                // fix #367a: when EVERY def of the name is such a member,
+                // the bare name binds outside the project (builtin, global,
+                // external import) - Python `len(self.it)` inside `def len`
+                // is the builtin, never the enclosing method.
+                symbols = symbols.filter(s => !bareCallCannotDenote(s, language));
+                // fix #384: member-assigned candidates a bare name cannot
+                // reach from this function (the caller-side reach rule).
+                if (!bindingId && symbols.some(s => s.memberAssigned)) {
+                    const callerEntry = index.files.get(def.file);
+                    const verdictOf = s => _bareNameMemberVerdict(callerEntry, def.file, calleeName,
+                        def.startLine, def.endLine, [s]);
+                    const maybe = [];
+                    symbols = symbols.filter(s => {
+                        const verdict = s.memberAssigned ? verdictOf(s) : null;
+                        if (verdict === 'maybe') maybe.push(s);
+                        return verdict === null || verdict === 'yes' || verdict === 'global';
+                    });
+                    if (symbols.length === 0 && maybe.length > 0) {
+                        if (collectAccount && siteIds) {
+                            for (const siteId of siteIds) {
+                                noteUnverified(siteId, siteEvidence.get(siteId).call,
+                                    'member-object-unresolved');
+                            }
+                        }
+                        continue;
+                    }
+                }
             }
             if (!symbols || symbols.length === 0) {
                 // Name not in the symbol table — external library, builtin, or
@@ -7581,12 +9764,31 @@ function findCallees(index, definition, options = {}) {
                 const fileLocalStatic = ['c', 'cpp'].includes(candidateLanguage) &&
                     candidate.modifiers?.includes('static') &&
                     !candidate.className && !candidate.receiver;
+                // fix #367b: language-conditional definitions only resolve
+                // for sites compiled as their language.
+                if (candidate.languageBranch && cFamilyVisibleFiles &&
+                    !_languageBranchVisible(index, candidate, def.file,
+                        def.languageBranch ? def : null)) return false;
                 if (!fileLocalStatic || candidate.file === def.file) return true;
                 return cFamilyVisibleFiles?.has(candidate.file);
             });
             if (resolutionSymbols.length === 0) {
                 claimSites('external', null);
                 continue;
+            }
+            // A construction names a type, its constructor or a free
+            // constructor function, never a property, field or method of
+            // another class spelled like the type (fix #393: C# `new
+            // Logger(..)` beside a static `Log.Logger` property).
+            if (isConstructor && !bindingId) {
+                const constructible = resolutionSymbols.filter(s =>
+                    !(s.className || s.receiver) || s.type === 'constructor' ||
+                    IDENTITY_TYPE_KINDS.has(s.type) || s.type === 'record' || s.type === 'type');
+                if (constructible.length === 0) {
+                    claimSites('external', null);
+                    continue;
+                }
+                resolutionSymbols.splice(0, resolutionSymbols.length, ...constructible);
             }
             if (resolutionSymbols.length > 0) {
                 let callee = resolutionSymbols[0];
@@ -7677,6 +9879,27 @@ function findCallees(index, definition, options = {}) {
                     }
                 }
 
+                // C/C++ free functions resolve by linkage (fix #379): a
+                // prototype is not a callee of its own, the call reaches the
+                // definition(s) it declares, and several definitions
+                // (configuration or platform variants) stay link-ambiguous
+                // unless the caller's unit decides, as on the caller side.
+                if (cFamilyVisibleFiles && callee.type === 'function' &&
+                    !callee.className && !callee.receiver) {
+                    const linked = _cFamilyLinkedCallee(index, def, callee, symbols, sites);
+                    if (linked.ambiguous) {
+                        if (collectAccount) {
+                            for (const siteId of siteIds) {
+                                noteUnverified(siteId, siteEvidence.get(siteId).call,
+                                    'link-ambiguous', { dispatchCandidates: linked.candidates });
+                            }
+                            continue;
+                        }
+                    } else if (linked.callee) {
+                        callee = linked.callee;
+                    }
+                }
+
                 // Skip non-callable types (interface, struct, type) as callees.
                 // These appear when local variables shadow symbol names
                 // (e.g., `for _, handler := range handlers { handler(r) }` —
@@ -7717,7 +9940,8 @@ function findCallees(index, definition, options = {}) {
                     const record = siteEvidence.get(site.siteId);
                     const valueReceiver = record.call.isMethod &&
                         !record.call.receiverIsModule && !record.call.receiverModuleSpecifier &&
-                        !record.call.receiverModuleComposition && !record.evidence.typeQualifiedReceiver;
+                        !record.call.receiverModuleComposition && !record.evidence.typeQualifiedReceiver &&
+                        !record.evidence.moduleOwnedPath;
                     const untypedValue = valueReceiver && !record.evidence.hasReceiverType &&
                         !record.evidence.resolvedBySameClass;
                     if (untypedValue && site.provenance.facts.ownerCount === 1) {
@@ -7803,6 +10027,52 @@ function findCallees(index, definition, options = {}) {
         throw e;
     }
     } finally { index._endOp(); }
+}
+
+/**
+ * Class DEFINITION a Python instance field's type name denotes (fix #381).
+ * The name resolves where the typing write sits (`self.x = Channel()` inside
+ * a method that declares a local `class Channel` names that local class; an
+ * import names the imported class; a module-level class the module's own).
+ * Returns null when name identity already is definition identity (one class
+ * of that name, none function-local), otherwise a class reference whose key
+ * is null when the writes disagree or the name cannot be pinned.
+ */
+function _pythonFieldClassRef(index, filePath, typeName, attrTypes, field, callerSymbol) {
+    const info = classDefsNamed(index, typeName);
+    if (info.entries.length === 0 || (info.unique && !info.hasScoped)) return null;
+    const lines = attrTypes?.writeLines?.get(field) ||
+        (Number.isInteger(callerSymbol?.startLine) ? [callerSymbol.startLine] : [null]);
+    let ref = null;
+    for (const line of lines) {
+        const next = _typeRefAt(index, filePath, typeName, Number.isInteger(line) ? line : null);
+        if (!ref) { ref = next; continue; }
+        if (!next.key || next.key !== ref.key) return { name: typeName, key: null, def: null };
+    }
+    return ref;
+}
+
+/**
+ * Class definition a type NAME denotes in `file` at `line` (fix #381), by
+ * the file's own binding of that name: an in-scope function-local class, the
+ * module's own class, or the class its import of that name reaches (never
+ * another import's file). Key null when the name cannot be pinned.
+ */
+function _typeRefAt(index, file, name, line) {
+    const info = classDefsNamed(index, name);
+    const unknown = { name, key: null, def: null };
+    if (info.entries.length === 0) return { ...unknown, external: true };
+    const local = line != null ? _functionLocalTypeInScope(index, file, name, line) : null;
+    if (local) {
+        const hit = info.entries.find(entry => entry.def === local);
+        return hit ? { name, key: hit.key, def: hit.def } : unknown;
+    }
+    const origin = _resolveFlowTypeOrigin(index, file, name, undefined, line);
+    if (!origin?.fromFile) return unknown;
+    const hits = info.entries.filter(entry => entry.def.file === origin.fromFile &&
+        !_isFunctionLocalType(entry.def));
+    if (hits.length === 0 || new Set(hits.map(entry => entry.key)).size !== 1) return unknown;
+    return { name, key: hits[0].key, def: hits[0].def };
 }
 
 /**
@@ -8020,6 +10290,76 @@ function _typeNameFromReturnAnnotation(text) {
  * discipline resolves the name where the annotation lives, not where the
  * consuming call happens to be.
  */
+/**
+ * The declared return type of a definition for value-flow purposes: Rust
+ * impl members carry `returnTypeResolved` when their `Self::Assoc`
+ * projections were substituted from the same impl's associated types
+ * (fix #368); every other definition uses its written annotation.
+ */
+/**
+ * Rust methods named `name` owned by a resolved receiver type
+ * `{ type, fromFile }`: owner-name match, narrowed to the type's defining
+ * directory when several project types share the short name (the #206c
+ * identity discipline). Empty when the identity cannot be pinned.
+ */
+function _rustOwnedMethodDefinitions(index, owner, name) {
+    const norm = value => String(value || '')
+        .replace(/^[*&]\s*/, '').replace(/<.*$/, '').trim();
+    let owned = (index.symbols.get(name) || []).filter(definition =>
+        !NON_CALLABLE_TYPES.has(definition.type) &&
+        norm(definition.className || definition.receiver) === owner.type);
+    const typeDefinitions = (index.symbols.get(owner.type) || [])
+        .filter(definition => _FOLD_TYPE_KINDS.has(definition.type));
+    if (typeDefinitions.length > 1) {
+        if (!owner.fromFile) return [];
+        const dir = path.dirname(owner.fromFile);
+        owned = owned.filter(definition => definition.file === owner.fromFile ||
+            (definition.file && path.dirname(definition.file) === dir));
+    }
+    return owned;
+}
+
+/**
+ * Rust method probing over impls that differ only in the reference layer of
+ * their self type (fix #368): `impl T for Vec<X> { fn m(self) }` and
+ * `impl T for &Vec<X> { fn m(self) }`. The receiver's declared layer
+ * ('owned' / '&' / '&mut') is probed by value, then by `&`, then by `&mut`,
+ * dereferencing one reference layer at a time, and the first step with a
+ * matching method receiver type wins. Returns the one resolved definition,
+ * or null when the layer is unknown, a candidate's shape is not modelled,
+ * or a step matches several definitions (generic instantiations).
+ */
+function _rustProbeReferenceSiblings(call, candidates) {
+    const layer = call.receiverTypeRef ||
+        call.receiverTypeEvidence?.valueRef ||
+        (call.receiverTypeEvidence?.stdLiteral ? 'owned' : null);
+    if (!layer || candidates.length < 2) return null;
+    const receiverLayers = layer === 'owned' ? [] : [layer];
+    const shapes = [];
+    for (const candidate of candidates) {
+        if (!candidate.selfParamKind) return null;
+        const shape = [];
+        if (candidate.selfParamKind !== 'value') shape.push(candidate.selfParamKind);
+        if (candidate.implSelfRef) shape.push(candidate.implSelfRef);
+        shapes.push({ candidate, key: shape.join(' ') });
+    }
+    let current = receiverLayers;
+    for (let hop = 0; hop <= receiverLayers.length; hop++) {
+        for (const step of [current, ['&', ...current], ['&mut', ...current]]) {
+            const key = step.join(' ');
+            const hits = shapes.filter(shape => shape.key === key);
+            if (hits.length === 1) return hits[0].candidate;
+            if (hits.length > 1) return null;
+        }
+        current = current.slice(1);
+    }
+    return null;
+}
+
+function _declaredReturnText(definition) {
+    return definition?.returnTypeResolved || definition?.returnType;
+}
+
 function _buildReturnTypeFlowMap(index, filePath, calls) {
     // File-scoped derivation: the result is independent of the queried
     // definition. A command operation can therefore share it across every
@@ -8040,16 +10380,94 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
         if (opCache) opCache.set(filePath, persistent.map);
         return persistent.map;
     }
+    const map = new ScopedReturnFlowMap(index, filePath, calls);
+    if (opCache) opCache.set(filePath, map);
+    if (persistentCache) {
+        persistentCache.delete(filePath);
+        persistentCache.set(filePath, { calls, map });
+        if (persistentCache.size > CROSS_OPERATION_FLOW_CACHE_LIMIT) {
+            persistentCache.delete(persistentCache.keys().next().value);
+        }
+    }
+    return map;
+}
+
+
+// Return-type flow is computed per (function scope, variable), on first
+// lookup (fix #372). Every flow entry is keyed `${scope}:${name}` by its own
+// call's enclosing function and assigned names, and every lookup keeps only
+// entries preceding the looked-up call, so filling one key from the records
+// that assign it, in record order, yields exactly the entries a whole-file
+// pass would; a producer typed through another variable fills that key on
+// demand. A query that resolves a few sites (audit-async, a restricted
+// findCallees) no longer types every assignment of the file.
+class ScopedReturnFlowMap {
+    constructor(index, filePath, calls) {
+        this._index = index;
+        this._filePath = filePath;
+        this._calls = calls;
+        this._entries = new Map();
+        this._filled = new Set();
+        this._processed = new Set();
+        this._byKey = null;
+        this._foldCtx = null;
+    }
+
+    _ensure(key) {
+        if (this._filled.has(key)) return;
+        this._filled.add(key);
+        if (!this._byKey) {
+            this._byKey = new Map();
+            for (const call of this._calls) {
+                if (!call.assignedTo) continue;
+                const scope = call.enclosingFunction ? `${call.enclosingFunction.startLine}` : '';
+                const names = new Set([call.assignedTo, ...(call.assignedTupleRest || []),
+                    ...(Array.isArray(call.assignedTupleTargets)
+                        ? call.assignedTupleTargets.map(target => target?.name) : [])]);
+                for (const name of names) {
+                    if (!name) continue;
+                    const k = `${scope}:${name}`;
+                    if (!this._byKey.has(k)) this._byKey.set(k, []);
+                    this._byKey.get(k).push(call);
+                }
+            }
+        }
+        const pending = this._byKey.get(key);
+        if (pending) _populateReturnTypeFlowScope(this._index, this._filePath, this._calls, pending, this);
+    }
+
+    get(key) {
+        this._ensure(key);
+        return this._entries.get(key);
+    }
+
+    has(key) {
+        this._ensure(key);
+        return this._entries.has(key);
+    }
+
+    set(key, value) {
+        this._entries.set(key, value);
+        return this;
+    }
+}
+
+function _populateReturnTypeFlowScope(index, filePath, calls, scopeCalls, scoped) {
     const fileEntry = index.files.get(filePath);
     const language = fileEntry?.language;
     const nominal = langTraits(language)?.typeSystem === 'nominal';
-    let map = null;
-    const assignedFoldCtx = {
-        memo: new Map(),
-        visiting: new Set(),
-        records: calls,
-        getFlowMap: () => map,
-    };
+    let map = scoped;
+    // One fold context per file map, as in a whole-file pass: its producer
+    // index spans every record of the file.
+    if (!scoped._foldCtx) {
+        scoped._foldCtx = {
+            memo: new Map(),
+            visiting: new Set(),
+            records: calls,
+            getFlowMap: () => scoped,
+        };
+    }
+    const assignedFoldCtx = scoped._foldCtx;
     // A flow map is nearest-assignment semantics, not "last assignment whose
     // type UCN happened to understand".  Record an explicit tombstone when a
     // call rebinds a variable but its result type cannot be resolved. Without
@@ -8067,7 +10485,8 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
             map.get(key).push({ line: call.line, start: call.callStart, invalidated: true });
         }
     };
-    const routeUnknownAssignment = (call, externalVia, externalConcrete = false) => {
+    const routeUnknownAssignment = (call, externalVia, externalConcrete = false, valueText = null,
+        valueFromFile = null) => {
         const scope = call.enclosingFunction ? `${call.enclosingFunction.startLine}` : '';
         const names = [call.assignedTo, ...(call.assignedTupleRest || [])].filter(Boolean);
         if (names.length === 0) return;
@@ -8080,11 +10499,19 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
                 start: call.callStart,
                 externalVia,
                 ...(externalConcrete && { externalConcrete: true }),
+                // The written value type (fix #393): `->` on it reaches
+                // a std smart pointer's pointee.
+                ...(valueText && { valueText, valueFromFile: valueFromFile || filePath }),
             });
         }
     };
-    for (const call of calls) {
+    for (let call of scopeCalls) {
         if (!call.assignedTo) continue;
+        // Each record is typed once, whichever of its names is asked first
+        // (a nested request may already have taken it).
+        if (scoped._processed.has(call)) continue;
+        scoped._processed.add(call);
+        call = _withoutShadowedStdLiteral(index, call);
         // For-loop iteration provenance (fix #294, flask-measured: `for ep in
         // importlib.metadata.entry_points(...)` — ep.load() confirmed
         // JSONProvider.load via single-owner while ep is an external
@@ -8184,7 +10611,8 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
         // already-supported immediate chained-receiver path.
         if (call.receiverCall ||
             (!nominal && call.isMethod && call.receiverRoot && call.receiverField) ||
-            (nominal && call.isMacro)) {
+            (nominal && call.isMacro) ||
+            (language === 'rust' && _rustPreludeVariantType(index, filePath, call))) {
             let folded = _typeOfCallResultFold(
                 index, fileEntry, filePath, call, assignedFoldCtx);
             // Rust result aliases are commonly imported under a local name
@@ -8235,6 +10663,7 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
                 map.get(key).push({ line: call.line, start: call.callStart,
                     ...(folded.type && { type: folded.type }),
                     ...(folded.fromFile && { fromFile: folded.fromFile }),
+                    ...(folded.stdLiteral && { valueRef: 'owned' }),
                     ...(folded.rustWrapper && { rustWrapper: folded.rustWrapper }),
                     ...(folded.rustReturnDeclaration && { rustReturnDeclaration: folded.rustReturnDeclaration }),
                     ...(folded.moduleProducer && { moduleProducer: folded.moduleProducer }),
@@ -8244,6 +10673,7 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
             }
         }
         let returnType, fromFile, selfClass, returnedFunctionResult, returnDefinition, moduleProducer;
+        let rustClosureOwner;
         const builtinCallReturn = !nominal && language === 'python'
             ? _pythonBuiltinCallReturnType(index, fileEntry, call) : null;
         if (call.localValueCall && call.returnTypeHint) {
@@ -8275,10 +10705,10 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
                 const rustOwner = language === 'rust'
                     ? _rustFlowReceiverOrigin(index, filePath, call.receiverType, call.receiverTypeQualifier)
                     : null;
-                const matches = defs.filter(d => d.className === call.receiverType && d.returnType &&
+                const matches = defs.filter(d => d.className === call.receiverType && _declaredReturnText(d) &&
                     (language !== 'rust' || rustOwner?.fromFile));
-                if (matches.length > 0 && new Set(matches.map(d => d.returnType)).size === 1) {
-                    returnType = matches[0].returnType;
+                if (matches.length > 0 && new Set(matches.map(d => _declaredReturnText(d))).size === 1) {
+                    returnType = _declaredReturnText(matches[0]);
                     fromFile = matches[0].file;
                     selfClass = matches[0].className;
                     returnDefinition = matches[0];
@@ -8329,6 +10759,25 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
                 fromFile = resolved.fromFile;
                 selfClass = call.receiver;
             }
+        } else if (language === 'rust' && call.isMethod && call.receiver &&
+            !call.receiverType && !call.receiverPatternShadow &&
+            call.enclosingFunction?.closureParameterNames?.includes(call.receiver) &&
+            !_lookupReturnTypeFlow(map, call) &&
+            (rustClosureOwner = _rustClosureReceiverType(
+                index, fileEntry, filePath, call, assignedFoldCtx))?.type) {
+            // Closure-parameter receivers (fix #368): the parameter's type
+            // comes from the callee's declared closure bound; the method is
+            // then resolved on that exact owner (identity-pinned when the
+            // type name is shared) and every matching declaration must agree.
+            const owned = _rustOwnedMethodDefinitions(
+                index, rustClosureOwner, call.name);
+            if (owned.length > 0 && owned.every(d => _declaredReturnText(d)) &&
+                new Set(owned.map(d => _declaredReturnText(d))).size === 1) {
+                returnType = _declaredReturnText(owned[0]);
+                fromFile = owned[0].file;
+                selfClass = rustClosureOwner.type;
+                returnDefinition = owned[0];
+            }
         } else if (call.isMethod && call.receiver &&
             !['self', 'this', 'cls'].includes(call.receiver) &&
             _lookupReturnTypeFlow(map, call)) {
@@ -8355,25 +10804,25 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
                 const matches = (index.symbols.get(call.name) || []).filter(d =>
                     (d.className === receiverFlow.type ||
                      (d.receiver && d.receiver.replace(/^\*/, '') === receiverFlow.type)) &&
-                    d.returnType);
-                if (matches.length > 0 && new Set(matches.map(d => d.returnType)).size === 1) {
-                    returnType = matches[0].returnType;
+                    _declaredReturnText(d));
+                if (matches.length > 0 && new Set(matches.map(d => _declaredReturnText(d))).size === 1) {
+                    returnType = _declaredReturnText(matches[0]);
                     fromFile = matches[0].file;
                     selfClass = receiverFlow.type;
                     returnDefinition = matches[0];
                 }
             }
         } else if (call.isMethod && ['self', 'this', 'cls'].includes(call.receiver)) {
-            const enclosing = index.findEnclosingFunction(filePath, call.line, true);
+            const enclosing = index.findEnclosingFunction(filePath, call.line, true, call);
             let cls = enclosing && enclosing.className;
             let ctxFile = filePath;
             const visited = new Set();
             while (cls && !visited.has(cls)) {
                 visited.add(cls);
                 const def = (index.symbols.get(call.name) || [])
-                    .find(d => d.className === cls && d.returnType);
+                    .find(d => d.className === cls && _declaredReturnText(d));
                 if (def) {
-                    returnType = def.returnType;
+                    returnType = _declaredReturnText(def);
                     fromFile = def.file;
                     selfClass = cls;
                     returnDefinition = def;
@@ -8387,6 +10836,13 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
                 cls = next;
             }
         } else if (nominal && call.isMethod && call.isPathCall && call.receiver) {
+            // Type-name denotation (fix #371): `use std::time::Instant;
+            // let t = Instant::now()` produces the external type's value.
+            const externalProducer = externalProducerVia(index, filePath, fileEntry, call);
+            if (externalProducer) {
+                routeUnknownAssignment(call, externalProducer, true);
+                continue;
+            }
             if (language === 'rust') {
                 const producer = _rustModuleProducer(index, fileEntry, filePath, call);
                 if (producer) {
@@ -8454,10 +10910,10 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
                 // untyped). The same rule also covers C++ static factories.
                 const seg = call.receiver.split('::').pop();
                 const matches = (index.symbols.get(call.name) || [])
-                    .filter(d => d.className === seg && d.returnType);
+                    .filter(d => d.className === seg && _declaredReturnText(d));
                 if (matches.length > 0 &&
-                    new Set(matches.map(d => d.returnType)).size === 1) {
-                    returnType = matches[0].returnType;
+                    new Set(matches.map(d => _declaredReturnText(d))).size === 1) {
+                    returnType = _declaredReturnText(matches[0]);
                     fromFile = matches[0].file;
                     selfClass = seg;
                     returnDefinition = matches[0];
@@ -8478,6 +10934,11 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
             // Java static factory: var c = Config.parse(...) — only sound for
             // the static call style; a Go receiver named like a type is a
             // VARIABLE (fix #206 typeQualifiedCallStyle discipline)
+            const externalProducer = externalProducerVia(index, filePath, fileEntry, call);
+            if (externalProducer) {
+                routeUnknownAssignment(call, externalProducer);
+                continue;
+            }
             const matches = (index.symbols.get(call.name) || [])
                 .filter(d => d.className === call.receiver && d.returnType);
             if (matches.length > 0 && new Set(matches.map(d => d.returnType)).size === 1) {
@@ -8591,7 +11052,7 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
             let chosen = null;
             const cppCallerNamespace = language === 'cpp'
                 ? index.findEnclosingFunction(
-                    filePath, call.line, true)?.namespace || null
+                    filePath, call.line, true, call)?.namespace || null
                 : null;
             if (language === 'cpp') {
                 // C++ unqualified lookup is both source-order and include
@@ -8622,6 +11083,12 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
                         ? definition.startLine <= call.line
                         : visibleFiles.has(definition.file)));
                 if (visible.length === 1) chosen = visible[0];
+            } else if (language === 'rust' &&
+                (chosen = _rustFreeFunctionSourceDefs(index, fileEntry, filePath, call)[0] || null)) {
+                // Rust bare call (fix #368): a bare name binds a free
+                // function through lexical scope, `use` bindings or globs,
+                // never a same-named method (`multipeek(it)` vs the
+                // Itertools::multipeek adaptor).
             } else if (nominal && langTraits(language)?.packageScope === 'directory') {
                 // Go: an unqualified call resolves within the package — a
                 // globally-unique def in ANOTHER package is unreachable
@@ -8746,6 +11213,25 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
                 }
             }
         }
+        if (!returnType && language === 'rust' && call.isMethod && !call.isPathCall &&
+            !(call.receiver && ['self', 'Self'].includes(call.receiver))) {
+            // In-scope blanket extension-trait method (fix #369):
+            // `let (t1, t2) = (0..4).tee();` binds Itertools::tee, whose
+            // declaration types each tuple position.
+            const blanket = _rustBlanketTraitMethod(index, fileEntry, filePath, call.name);
+            const receiverOwnsName = blanket && (() => {
+                const owner = _rustRecordReceiverType(index, fileEntry, filePath, call, assignedFoldCtx);
+                return !!owner?.type && (index.symbols.get(call.name) || []).some(definition =>
+                    !NON_CALLABLE_TYPES.has(definition.type) &&
+                    String(definition.className || definition.receiver || '')
+                        .replace(/^[*&]\s*/, '').replace(/<.*$/s, '').trim() === owner.type);
+            })();
+            if (blanket && !receiverOwnsName && blanket.declaration.returnType) {
+                returnType = blanket.declaration.returnType;
+                fromFile = blanket.declaration.file;
+                returnDefinition = blanket.declaration;
+            }
+        }
         if (!returnType) {
             if (!delegatedUnwrapAssignment) invalidateAssignment(call);
             continue;
@@ -8777,9 +11263,12 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
         // LHS position. Record every named target, including assignments
         // whose first position is `_`; treating only element zero left later
         // receivers permanently ambiguous (`route, router := split(...)`).
-        if (language === 'go' && call.assignedTuple &&
+        // Rust tuple patterns (fix #368) use the same positional contract:
+        // `let (left, right, _) = c.split_at(i)` against `(Self, Self, R)`.
+        if ((language === 'go' || language === 'rust') && call.assignedTuple &&
             Array.isArray(call.assignedTupleTargets) &&
-            call.assignedTupleTargets.length > 0) {
+            call.assignedTupleTargets.length > 0 &&
+            !(language === 'rust' && call.assignedUnwrap)) {
             const scope = call.enclosingFunction
                 ? `${call.enclosingFunction.startLine}` : '';
             if (!map) map = new Map();
@@ -8805,7 +11294,7 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
                         : { ...base, invalidated: true });
                     continue;
                 }
-                if (parsed.qualifier) {
+                if (parsed.qualifier && language === 'go') {
                     const producerEntry =
                         index.files.get(fromFile || filePath) || fileEntry;
                     const qualified = _goQualifiedReceiverType(
@@ -8900,7 +11389,7 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
                     routeUnknownAssignment(
                         call,
                         `${parsed.qualifier}::${parsed.name}`,
-                        true);
+                        true, returnType, fromFile || filePath);
                 } else {
                     invalidateAssignment(call);
                 }
@@ -8935,6 +11424,8 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
         if (!map.has(key)) map.set(key, []);
         map.get(key).push({ line: call.line, start: call.callStart, type: typeName,
             ...(entryFromFile && { fromFile: entryFromFile }),
+            // The written C++ value type (fix #393): `->` reads it.
+            ...(language === 'cpp' && { valueText: returnType, valueFromFile: fromFile || filePath }),
             ...(moduleProducer && { moduleProducer }),
             ...(language === 'rust' && returnDefinition && { rustReturnDeclaration: _rustReturnDeclaration(returnDefinition) }),
             ...(language === 'rust' && !call.assignedUnwrap && {
@@ -8946,15 +11437,6 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
                 iteratorItemFromFile,
             }) });
     }
-    if (opCache) opCache.set(filePath, map);
-    if (persistentCache) {
-        persistentCache.delete(filePath);
-        persistentCache.set(filePath, { calls, map });
-        if (persistentCache.size > CROSS_OPERATION_FLOW_CACHE_LIMIT) {
-            persistentCache.delete(persistentCache.keys().next().value);
-        }
-    }
-    return map;
 }
 
 /**
@@ -9027,6 +11509,19 @@ function _innerClassMethodRanges(index, def, fileEntry) {
 /** Nearest preceding flow assignment for this call's receiver (fn scope, then module). */
 function _lookupReturnTypeFlow(map, call) {
     if (!map) return undefined;
+    // C++ `v->m()` (fix #393): the variable's type reaches the member only
+    // through `->`; a variable declared as an object is typed by its
+    // declaration, never by the value that initialized it.
+    if (call.receiverArrow && map._index &&
+        map._index.files.get(map._filePath)?.language === 'cpp') {
+        const index = map._index;
+        if (call.receiverArrowObject) return _cppArrowDeclaredEntry(index, map._filePath, call);
+        return _cppArrowFlowEntry(index, _lookupReturnTypeFlowRaw(map, call));
+    }
+    return _lookupReturnTypeFlowRaw(map, call);
+}
+
+function _lookupReturnTypeFlowRaw(map, call) {
     const fnScope = call.enclosingFunction ? `${call.enclosingFunction.startLine}` : '';
     const lexicalScopes = Array.isArray(call.enclosingFunction?.scopeChain)
         ? [...call.enclosingFunction.scopeChain].reverse().map(String)
@@ -9046,7 +11541,8 @@ function _lookupReturnTypeFlow(map, call) {
         if (!entries) continue;
         let best = null;
         for (const e of entries) {
-            if (precedesCall(e) && laterThan(e, best)) best = e;
+            if (precedesCall(e) && laterThan(e, best) &&
+                (scope !== '' || _fileScopeFlowEntryApplies(map, e, call))) best = e;
         }
         if (best) {
             const binding = call.receiverTypeEvidence?.aliasBinding;
@@ -9059,6 +11555,119 @@ function _lookupReturnTypeFlow(map, call) {
         }
     }
     return undefined;
+}
+
+/**
+ * A local declared with a supertype and never reassigned after `new T(..)`
+ * holds exactly a T (fix #394, parser fact `receiverTypeEvidence.
+ * constructedType`). True when T provably never runs the target: T is not a
+ * target class nor a subclass that inherits the target member, and T names
+ * one type (an external type, or a single project definition).
+ */
+function _constructedValueExcludes(index, call, declaredType, targetTypes) {
+    // No type of that name reaches the target: whichever same-name type the
+    // constructor names, the call never runs it.
+    const constructed = _constructedValueName(call, declaredType);
+    return !!constructed && !targetTypes.has(constructed);
+}
+
+function _constructedValueName(call, declaredType) {
+    const evidence = call.receiverTypeEvidence;
+    const raw = evidence?.constructedType;
+    const simple = text => String(text || '').replace(/<.*$/s, '').replace(/\?$/, '').trim().split('.').pop();
+    if (!raw || simple(evidence.type) !== declaredType) return null;
+    const constructed = simple(raw);
+    return constructed && constructed !== declaredType ? constructed : null;
+}
+
+/** The exact type a supertype-declared, never-reassigned local holds, when
+ * it names one type (an external one, or a single project definition). */
+function _constructedValueType(index, call, declaredType) {
+    const constructed = _constructedValueName(call, declaredType);
+    if (!constructed) return null;
+    const defs = (index.symbols.get(constructed) || []).filter(d => IDENTITY_TYPE_KINDS.has(d.type));
+    return defs.length <= 1 ? constructed : null;
+}
+
+/** Does every ancestor of `ref` resolve to a project definition or to an
+ * external type (no unresolved name on the way)? */
+function _ancestryFullyResolved(index, ref) {
+    if (!ref) return false;
+    const seen = new Set();
+    const queue = [ref];
+    while (queue.length > 0) {
+        const current = queue.shift();
+        const key = current.key || current.name;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        if (seen.size > 64) return false;
+        for (const parent of parentRefsOfClass(index, current)) {
+            if (parent.external) continue;
+            if (!parent.key && !parent.def) return false;
+            queue.push(parent);
+        }
+    }
+    return true;
+}
+
+const _FLOW_CLASS_KINDS = new Set(['class', 'struct', 'interface', 'enum', 'record', 'union', 'trait']);
+const _IMMUTABLE_FIELD_MODIFIERS = new Set(['final', 'readonly', 'const', 'constexpr']);
+
+/**
+ * A flow entry outside every function recorded inside a class body is a
+ * field initializer (fix #394). It types a bare receiver only where the name
+ * denotes that very field (languages whose bare names reach members: the
+ * nearest enclosing class declaring the name, with no superclass in between
+ * that may declare it) and only when the field cannot be reassigned. A
+ * nested class's same-name field, or a mutable field, is typed by its
+ * declaration instead. A true file-scope assignment (a module or package
+ * variable) applies as before.
+ */
+function _fileScopeFlowEntryApplies(map, entry, call) {
+    const index = map._index;
+    const file = map._filePath;
+    const fileEntry = index?.files.get(file);
+    if (!fileEntry) return true;
+    if (!map._classBodyMemo) map._classBodyMemo = new Map();
+    const classes = map._classBodyMemo.get('\0classes') ||
+        (fileEntry.symbols || []).filter(symbol => _FLOW_CLASS_KINDS.has(symbol.type) &&
+            symbol.startLine != null && symbol.endLine != null);
+    map._classBodyMemo.set('\0classes', classes);
+    const innermostAt = line => {
+        let best = null;
+        for (const cls of classes) {
+            if (cls.startLine > line || cls.endLine < line) continue;
+            if (!best || cls.endLine - cls.startLine < best.endLine - best.startLine) best = cls;
+        }
+        return best;
+    };
+    const entryClass = innermostAt(entry.line);
+    if (!entryClass) return true;
+    if (!langTraits(fileEntry.language)?.bareCallReachesMethods) return false;
+    const key = `${entry.line}\0${call.line}\0${call.receiver}`;
+    if (map._classBodyMemo.has(key)) return map._classBodyMemo.get(key);
+    const fields = (index.symbols.get(call.receiver) || []).filter(symbol => symbol.file === file &&
+        (symbol.type === 'field' || symbol.memberType === 'field' || symbol.type === 'property' ||
+            symbol.memberType === 'property' || symbol.type === 'constant'));
+    const declares = (cls) => fields.filter(field => field.className === cls.name &&
+        field.startLine >= cls.startLine && field.startLine <= cls.endLine &&
+        innermostAt(field.startLine) === cls);
+    let applies = false;
+    for (let cls = innermostAt(call.line); cls;) {
+        const own = declares(cls);
+        if (own.length > 0) {
+            applies = cls === entryClass && own.some(field => field.startLine <= entry.line &&
+                (field.endLine ?? field.startLine) >= entry.line &&
+                (field.modifiers || []).some(modifier => _IMMUTABLE_FIELD_MODIFIERS.has(modifier)));
+            break;
+        }
+        // An inherited member of this class would hide the outer one.
+        if (cls.extends || (Array.isArray(cls.implements) && cls.implements.length > 0)) break;
+        cls = classes.filter(outer => outer !== cls && outer.startLine <= cls.startLine &&
+            outer.endLine >= cls.endLine).sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))[0];
+    }
+    map._classBodyMemo.set(key, applies);
+    return applies;
 }
 
 // True when the receiver's NEAREST preceding assignment is a flow tombstone —
@@ -9089,7 +11698,8 @@ function _receiverAssignedUntyped(map, call) {
         if (!entries) continue;
         let best = null;
         for (const e of entries) {
-            if (precedesCall(e) && laterThan(e, best)) best = e;
+            if (precedesCall(e) && laterThan(e, best) &&
+                (scope !== '' || !map._index || _fileScopeFlowEntryApplies(map, e, call))) best = e;
         }
         if (best) return !!best.invalidated;
     }
@@ -9239,7 +11849,8 @@ function _returnTypeNameNominal(text, language, opts = {}) {
         }
     } else if (language === 'rust' && opts.tuple) {
         if (!t.startsWith('(') || !t.endsWith(')')) return undefined;
-        t = (_splitTopLevelGenericArgs(t.slice(1, -1))[0] || '').trim();
+        const position = Number.isInteger(opts.tupleIndex) ? opts.tupleIndex : 0;
+        t = (_splitTopLevelGenericArgs(t.slice(1, -1))[position] || '').trim();
         if (!t) return undefined;
     } else if (opts.tuple) {
         return undefined;
@@ -9286,7 +11897,7 @@ function _returnTypeNameNominal(text, language, opts = {}) {
     // "unresolvable" tombstoned otherwise exact `auto` return flow.
     let qualifier;
     if (language === 'go') {
-        const qm = t.replace(/^\*+/, '').match(/^([A-Za-z_]\w*)\.([A-Za-z_]\w*)$/);
+        const qm = _goStripTypeArguments(t.replace(/^\*+/, '')).match(/^([A-Za-z_]\w*)\.([A-Za-z_]\w*)$/);
         if (qm) qualifier = qm[1];
     } else if (language === 'cpp' || language === 'rust') {
         const stripped = language === 'rust'
@@ -9424,6 +12035,38 @@ function _rustImportedTypeIdentity(index, filePath, localName) {
 }
 
 /**
+ * Whether a Rust type name, as written in `filePath`, can denote the project
+ * type defined in `targetFile` (fix #370). 'no' when the file declares another
+ * type of that name, when a `use` of that name resolves only to other project
+ * files, or when it imports a std/core/alloc path the project cannot shadow;
+ * 'yes' when a binding reaches the target file; otherwise 'unknown'.
+ */
+function rustTypeNameDenotes(index, filePath, name, targetFile) {
+    const fileEntry = index.files.get(filePath);
+    if (fileEntry?.language !== 'rust' || !name) return 'unknown';
+    if (filePath === targetFile) return 'yes';
+    if ((index.symbols.get(name) || []).some(definition => definition.file === filePath &&
+        (IDENTITY_TYPE_KINDS.has(definition.type) || definition.type === 'type'))) return 'no';
+    const bindings = (fileEntry.importBindings || []).filter(binding =>
+        (binding.alias || binding.name) === name && binding.name !== '*' && binding.module);
+    if (bindings.length === 0) return 'unknown';
+    let verdict = 'no';
+    for (const binding of bindings) {
+        const segments = String(binding.module).split('::').filter(Boolean);
+        const original = segments[segments.length - 1] || name;
+        const files = _rustBindingResolvedFiles(index, fileEntry, filePath, binding);
+        if (files.size === 0) {
+            if (!_rustPathIsKnownExternal(index, fileEntry, filePath,
+                segments.slice(0, -1).join('::'), original)) verdict = 'unknown';
+            continue;
+        }
+        if ([...files].some(file => file === targetFile ||
+            _nameBindingReaches(index, file, original, new Set([targetFile])) === 'yes')) return 'yes';
+    }
+    return verdict;
+}
+
+/**
  * Pin a flow type name to its defining file from the PRODUCER's scope
  * (fix #207 — the #206 identity lesson applied to annotations: `Builder` in
  * balancer/base.go means balancer.Builder; resolving it from the consuming
@@ -9466,9 +12109,63 @@ function _rustSameNameAliasOrigin(index, definition, seen = new Set()) {
     return targets.length === 1 ? _rustSameNameAliasOrigin(index, targets[0], seen) : null;
 }
 
-function _resolveFlowTypeOrigin(index, producerFile, typeName, qualifier = undefined) {
+/**
+ * Definitions among `defs` that a Rust file sees through its glob imports
+ * (`use super::*`, `use crate::iter::plumbing::*`) (fix #368): each glob's
+ * module file (inline-module aware) must own the name, re-export it, or
+ * reach its file. Named imports and local items shadow globs and are the
+ * caller's responsibility to check first.
+ */
+function _rustGlobReachableDefs(index, filePath, name, defs) {
+    const opCache = index._rustScopeMemo || (index._rustScopeMemo = new Map());
+    const startsKey = `\x01globs\x00${filePath}`;
+    let starts = opCache?.get(startsKey);
+    if (!starts) {
+        const fileEntry = index.files.get(filePath);
+        const globs = (fileEntry?.importDetails || []).filter(detail =>
+            detail.type === 'use-glob' && detail.module);
+        starts = new Set();
+        const inlineDepthAt = line => (fileEntry.symbols || []).filter(symbol =>
+            symbol.type === 'module' && symbol.startLine < line && symbol.endLine >= line).length;
+        for (const glob of globs) {
+            const start = resolveRustModuleFile(glob.module, filePath, index.root,
+                glob.line != null ? inlineDepthAt(glob.line) : 0);
+            if (start && index.files.has(start)) starts.add(start);
+        }
+        if (opCache) opCache.set(startsKey, starts);
+    }
+    if (starts.size === 0) return [];
+    return defs.filter(definition => [...starts].some(start =>
+        definition.file === start ||
+        _nameBindingReaches(index, start, name, new Set([definition.file])) === 'yes' ||
+        _importReaches(index, start, new Set([definition.file]))));
+}
+
+/**
+ * Does a Rust glob import of filePath bind `name` to one of `defs` by name
+ * (fix #369)? The name-level half of _rustGlobReachableDefs: the glob module
+ * declares it, or its own imports/globs re-bind that exact name there.
+ */
+function _rustGlobNameReaches(index, filePath, name, defs) {
+    const memo = index._rustScopeMemo || (index._rustScopeMemo = new Map());
+    const startsKey = `\x01globs\x00${filePath}`;
+    if (!memo.has(startsKey)) _rustGlobReachableDefs(index, filePath, name, []);
+    const starts = memo.get(startsKey);
+    if (!starts || starts.size === 0) return false;
+    const targets = new Set(defs.map(definition => definition.file).filter(Boolean));
+    return [...starts].some(start => targets.has(start) ||
+        _nameBindingReaches(index, start, name, targets) === 'yes');
+}
+
+function _resolveFlowTypeOrigin(index, producerFile, typeName, qualifier = undefined, line = null) {
+    // A function-local type (fix #381) is the name only inside its scope.
+    if (!qualifier && line != null && _functionLocalTypeInScope(index, producerFile, typeName, line)) {
+        return { fromFile: producerFile };
+    }
     const opCache = index._opFlowTypeOriginCache;
-    const cacheKey = `${producerFile}\x00${typeName}\x00${qualifier || ''}`;
+    const scopedKey = line != null && (index.symbols.get(typeName) || []).some(d =>
+        d.file === producerFile && _isFunctionLocalType(d));
+    const cacheKey = `${producerFile}\x00${typeName}\x00${qualifier || ''}${scopedKey ? '\x00@' : ''}`;
     if (opCache?.has(cacheKey)) return opCache.get(cacheKey);
     const finish = (result) => {
         if (opCache) opCache.set(cacheKey, result);
@@ -9479,6 +12176,10 @@ function _resolveFlowTypeOrigin(index, producerFile, typeName, qualifier = undef
             (d.type === 'type' && d.aliasOf)) && d.file);
     if (typeDefs.length === 0) return finish({ fromFile: producerFile });
     if (qualifier === '<unresolvable>') return finish(null);
+    // Type-name denotation (fix #371): the name as written in the producer's
+    // file denotes an external type there (`use std::fs::File`,
+    // `std::time::Instant`), never the same-name project type.
+    if (externalTypeDenotation(index, producerFile, typeName, qualifier || null)) return finish(null);
     if (qualifier) {
         const fe = index.files.get(producerFile);
         if (fe?.language === 'cpp') {
@@ -9501,6 +12202,12 @@ function _resolveFlowTypeOrigin(index, producerFile, typeName, qualifier = undef
                 return finish({ fromFile: candidates[0].file });
             }
             return finish(null);
+        }
+        // A Java package-qualified spelling (`p.Node`) names one file, like
+        // an import of it (fix #394); an unresolvable package pins nothing.
+        if (fe?.language === 'java' && /^[a-z_]/.test(qualifier)) {
+            const resolved = _resolveJavaPackageImport(index, `${qualifier}.${typeName}`, null);
+            return finish(resolved && typeDefs.some(d => d.file === resolved) ? { fromFile: resolved } : null);
         }
         // Java nested types use a capitalized lexical qualifier
         // (`CodeBlock.Builder`). Resolve that exact owner before package
@@ -9534,6 +12241,29 @@ function _resolveFlowTypeOrigin(index, producerFile, typeName, qualifier = undef
                     _importReaches(index, resolved, new Set([d.file])));
                 if (new Set(reachable.map(d => d.file)).size === 1) {
                     return finish({ fromFile: reachable[0].file });
+                }
+            }
+            // A qualifier rooted at a `use` binding (fix #369): `use
+            // cursive::menu; menu::Tree::new()`. Anchor at the binding's
+            // module files, then pin by the exact name chase or, failing
+            // that, one declaration in the bounded import closure.
+            if (!resolved || !qualifier.includes('::')) {
+                const anchors = [..._rustPathQualifierFiles(index, fe, producerFile,
+                    qualifier, typeName) || []];
+                if (anchors.length > 0) {
+                    const named = typeDefs.filter(d => anchors.some(start => d.file === start ||
+                        _nameBindingReaches(index, start, typeName, new Set([d.file])) === 'yes'));
+                    if (named.length > 0) {
+                        if (new Set(named.map(d => d.file)).size === 1) {
+                            return finish({ fromFile: named[0].file });
+                        }
+                    } else {
+                        const reachable = typeDefs.filter(d => anchors.some(start =>
+                            _importReaches(index, start, new Set([d.file]))));
+                        if (new Set(reachable.map(d => d.file)).size === 1) {
+                            return finish({ fromFile: reachable[0].file });
+                        }
+                    }
                 }
             }
         }
@@ -9573,7 +12303,11 @@ function _resolveFlowTypeOrigin(index, producerFile, typeName, qualifier = undef
         }
         return finish(null);
     }
-    const sameFile = typeDefs.find(d => d.file === producerFile);
+    // With a site line, a function-local type out of scope is not the
+    // file's binding of the name (fix #381); without one the file's own
+    // declarations keep their legacy precedence.
+    const sameFile = typeDefs.find(d => d.file === producerFile &&
+        (line == null || !_isFunctionLocalType(d)));
     if (sameFile) return finish({ fromFile: sameFile.file });
     // An explicit imported name outranks directory proximity. Structural
     // modules commonly contain several same-named classes in sibling files;
@@ -9630,6 +12364,15 @@ function _resolveFlowTypeOrigin(index, producerFile, typeName, qualifier = undef
         // its external or dynamic export surface cannot be resolved.
         return finish(null);
     }
+    // Rust glob imports (fix #368): `use super::*` makes the parent
+    // module's items and imports visible; a unique reachable declaration is
+    // the binding (local items and named imports were checked above).
+    if (producerEntry?.language === 'rust') {
+        const globbed = _rustGlobReachableDefs(index, producerFile, typeName, typeDefs);
+        if (globbed.length > 0 && new Set(globbed.map(d => d.file)).size === 1) {
+            return finish({ fromFile: globbed[0].file });
+        }
+    }
     const dir = path.dirname(producerFile);
     const sameDir = typeDefs.filter(d => path.dirname(d.file) === dir);
     if (sameDir.length === 1) return finish({ fromFile: sameDir[0].file });
@@ -9643,10 +12386,39 @@ function _resolveFlowTypeOrigin(index, producerFile, typeName, qualifier = undef
     // resolution): `use clap::Command` lands the import edge on the crate's
     // lib.rs, not the type's defining file — chase bounded re-export hops
     // (depth 4) and pin only when exactly ONE same-name type is reachable.
-    const reachable = typeDefs.filter(d =>
-        _importReaches(index, producerFile, new Set([d.file])));
+    const reachedFiles = _importReachedAmong(index, producerFile, new Set(typeDefs.map(d => d.file)));
+    const reachable = typeDefs.filter(d => reachedFiles.has(d.file));
     if (reachable.length === 1) return finish({ fromFile: reachable[0].file });
     return finish(null);
+}
+
+/**
+ * Which of `targetFiles` the file reaches within `maxDepth` import hops:
+ * `_importReaches(from, {t})` for every t, from ONE bounded walk (fix #382;
+ * a same-name type declared in thousands of files walked the import graph
+ * once per declaration).
+ */
+function _importReachedAmong(index, fromAbs, targetFiles, maxDepth = 4) {
+    const reached = new Set();
+    if (targetFiles.has(fromAbs)) reached.add(fromAbs);
+    const visited = new Set([fromAbs]);
+    let frontier = [fromAbs];
+    for (let d = 0; d < maxDepth && reached.size < targetFiles.size; d++) {
+        const next = [];
+        for (const f of frontier) {
+            const edges = index.importGraph.get(f);
+            if (!edges) continue;
+            for (const e of edges) {
+                if (visited.has(e)) continue;
+                visited.add(e);
+                if (targetFiles.has(e)) reached.add(e);
+                next.push(e);
+            }
+        }
+        if (next.length === 0) break;
+        frontier = next;
+    }
+    return reached;
 }
 
 /**
@@ -9833,21 +12605,7 @@ function _structuralQualifiedReceiverOrigin(index, fileEntry, qualifier, typeNam
  * Returns null when the receiver names no import (likely a variable).
  */
 function _receiverPackageResolution(index, fileEntry, receiver, targetDefs) {
-    const modules = fileEntry.imports || [];
-    const names = fileEntry.importNames || [];
-    let importModule = null;
-    if (names.length === modules.length) {
-        const i = names.indexOf(receiver);
-        if (i >= 0) importModule = modules[i];
-    }
-    if (!importModule) {
-        importModule = modules.find(mod => {
-            const parts = mod.split('/');
-            const last = parts[parts.length - 1];
-            const pkgName = (/^v\d+$/.test(last) && parts.length > 1) ? parts[parts.length - 2] : last;
-            return pkgName === receiver;
-        }) || null;
-    }
+    const importModule = _receiverImportModule(index, fileEntry, receiver);
     if (!importModule) return null;
     if (!importModule.includes('/')) return { importModule, singleSegment: true, targetInPkg: false };
     const parts = importModule.split('/');
@@ -9909,15 +12667,18 @@ function _receiverPackageResolution(index, fileEntry, receiver, targetDefs) {
  * cannot fool a 'no' (a rename changes the exposed attribute name; re-renames
  * back to the original route through records this chase follows or flags).
  */
-function _nameBindingReaches(index, startAbs, name, targetFiles, maxDepth = 4) {
+function _nameBindingReaches(index, startAbs, name, targetFiles, maxDepth = 4, options = {}) {
     // The same export path is asked once per competing definition and again
     // by caller/callee projections in a composed command. The graph and file
     // surfaces are immutable during an operation, so retain the tri-state
     // verdict beside the existing import-reachability memo. Target identity
     // is part of the key; no answer can leak between pinned definitions.
+    // `exactName` (fix #386): a chain reaches the targets only under the
+    // queried name itself; `export { Other as Widget }` exposes Other.
+    const exactName = options.exactName === true;
     const opCache = index._opImportReachCache;
     const targetKey = [...targetFiles].sort(codeUnitCompare).join('\x00');
-    const cacheKey = `name\x00${maxDepth}\x00${startAbs}\x00${name}\x00${targetKey}`;
+    const cacheKey = `name\x00${maxDepth}\x00${exactName ? 1 : 0}\x00${startAbs}\x00${name}\x00${targetKey}`;
     if (opCache?.has(cacheKey)) return opCache.get(cacheKey);
     const persistentCache = index._nameBindingReachCache;
     if (persistentCache?.has(cacheKey)) {
@@ -9944,7 +12705,7 @@ function _nameBindingReaches(index, startAbs, name, targetFiles, maxDepth = 4) {
     for (let d = 0; d <= maxDepth && frontier.length > 0; d++) {
         const next = [];
         for (const [abs, attr] of frontier) {
-            if (targetFiles.has(abs)) return finish('yes');
+            if (targetFiles.has(abs) && (!exactName || attr === name)) return finish('yes');
             const stateKey = `${abs}\x00${attr}`;
             if (visited.has(stateKey)) continue;
             visited.add(stateKey);
@@ -10019,8 +12780,33 @@ function _nameBindingReaches(index, startAbs, name, targetFiles, maxDepth = 4) {
                 const exposed = [b.name, ...aliases.filter(a => a.original === b.name).map(a => a.local)];
                 if (exposed.includes(attr)) enqueue(b.module, b.name);
             }
+            // Rust glob imports (fix #369): `pub use crate::free::*` exposes
+            // the glob module's names; chase them there. A glob inside an
+            // inline module, or one the resolver cannot place, stays unknown.
+            let unresolvedStar = (fe.importNames || []).includes('*');
+            if (unresolvedStar && fe.language === 'rust') {
+                unresolvedStar = false;
+                for (const detail of (fe.importDetails || [])) {
+                    if (detail.type !== 'use-glob') continue;
+                    const inline = detail.line != null && (fe.symbols || []).some(symbol =>
+                        symbol.type === 'module' && symbol.startLine < detail.line &&
+                        symbol.endLine >= detail.line);
+                    let globFile = null;
+                    if (!inline && detail.module) {
+                        try {
+                            globFile = resolveRustModuleFile(detail.module, abs, index.root);
+                        } catch { globFile = null; }
+                    }
+                    if (globFile && index.files.has(globFile) && globFile !== abs) {
+                        next.push([globFile, attr]);
+                    } else if (!detail.module || inline ||
+                        _unresolvedModuleIsGap(index, detail.module)) {
+                        unresolvedStar = true;
+                    }
+                }
+            }
             // Un-modelable name sources on this file:
-            if ((fe.importNames || []).includes('*')) unknown = true;            // star import
+            if (unresolvedStar) unknown = true;                                  // star import
             if ((fe.moduleAssignedNames || []).includes(attr)) unknown = true;   // module-scope `attr = ...`
             if ((index.symbols.get('__getattr__') || []).some(s => s.file === abs && !s.className)) {
                 unknown = true;                                                  // PEP 562 dynamic attrs
@@ -10596,7 +13382,20 @@ function _unresolvedModuleIsGap(index, module, binding) {
     if (mod.startsWith('.')) return true;
     if (/[()$`{}+\s]/.test(mod)) return true;
     const firstSeg = mod.split(/[./]/).filter(Boolean)[0];
-    return !!(firstSeg && _projectTopLevelNames(index).has(firstSeg));
+    if (firstSeg && _projectTopLevelNames(index).has(firstSeg)) return true;
+    // A bare specifier naming a package of this repository (fix #397) is
+    // the repository's own code even when its manifest points at build
+    // output absent from the checkout: unresolved, never external.
+    const packages = require('./graph-build').jsWorkspacePackagesOf(index);
+    if (packages && packages.size > 0 && !mod.startsWith('/')) {
+        for (let name = mod; name; ) {
+            if (packages.has(name)) return true;
+            const slash = name.lastIndexOf('/');
+            if (slash <= 0) break;
+            name = name.slice(0, slash);
+        }
+    }
+    return false;
 }
 
 const IDENTITY_TYPE_KINDS = new Set(['class', 'struct', 'interface', 'trait', 'enum']);
@@ -10658,6 +13457,10 @@ function _isEnclosingGenericParam(index, filePath, line, typeName) {
     if (!enclosing) return false;
     const own = _genericParamNames(enclosing.generics);
     if (own && own.has(typeName)) return true;
+    // C++ function templates and out-of-line members of class templates
+    // (fix #393): the enclosing `template <...>` head.
+    const heads = _genericParamNames(enclosing.templateParams);
+    if (heads && heads.has(typeName)) return true;
     if (enclosing.className) {
         const classDefs = (index.symbols.get(enclosing.className) || []).filter(d =>
             IDENTITY_TYPE_KINDS.has(d.type) && d.file === filePath);
@@ -10707,6 +13510,187 @@ function _isGenericParamReceiverType(index, filePath, line, typeName) {
     return _isEnclosingGenericParam(index, filePath, line, typeName);
 }
 
+// ── Generic arity as type identity (fix #380) ─────────────────────────────
+// In languages whose generic arity is part of a type's identity (trait
+// `genericArityIsIdentity`: C#), `Outcome`, `Outcome<T>` and
+// `Outcome<T1, T2>` are three unrelated types. A site whose written type
+// fixes the arity (a constructor `new Outcome<T>(..)`, a type-qualified
+// receiver `Outcome.Create()` / `Outcome<int>.Create()`, a receiver whose
+// declared/constructed/cast type is written at the site) names only the
+// same-arity type of that name.
+const _ARITY_TYPE_KINDS = new Set(['class', 'struct', 'interface', 'trait', 'enum', 'record', 'type']);
+const _ARITY_RECEIVER_SOURCES = new Set(['annotation', 'constructor', 'cast']);
+
+function _siteWrittenTypeArity(call) {
+    if (!call) return null;
+    if (call.isConstructor && !call.isMethod && call.name) {
+        return { name: call.name, arity: call.typeArgs || 0 };
+    }
+    if (!call.isMethod) return null;
+    if (call.receiverIsTypeQualified && call.receiver && !/[.:<]/.test(String(call.receiver))) {
+        return { name: call.receiver, arity: call.receiverTypeArgs || 0 };
+    }
+    if (call.receiverType && _ARITY_RECEIVER_SOURCES.has(call.receiverTypeSource)) {
+        return { name: call.receiverType, arity: call.receiverTypeArgs || 0 };
+    }
+    // A declared field/property hop whose declared type spells its arity.
+    if (call.receiverHopType && Number.isInteger(call.receiverHopTypeArgs)) {
+        return { name: call.receiverHopType, arity: call.receiverHopTypeArgs };
+    }
+    return null;
+}
+
+/** Generic arity of a field-hop root (fix #380): the enclosing class for a
+ * `this`-rooted hop, the written type of a declared root; null otherwise. */
+function _fieldHopRootArity(index, filePath, call, language, enclosing) {
+    if (!langTraits(language)?.genericArityIsIdentity) return null;
+    if (call.receiverRoot === 'this') {
+        const owner = enclosing || index.findEnclosingFunction(filePath, call.line, true, call);
+        return owner ? (owner.ownerTypeArity || 0) : null;
+    }
+    return call.receiverRootType ? (call.receiverRootTypeArgs || 0) : null;
+}
+
+/** Arity of the type named `typeName` that `def` is (or is a member of);
+ * null when `def` is neither that type nor one of its members. */
+function _defTypeArityFor(def, typeName) {
+    if (!def || !typeName) return null;
+    if (def.name === typeName && _ARITY_TYPE_KINDS.has(def.type)) return def.typeArity || 0;
+    if (def.className === typeName) return def.ownerTypeArity || 0;
+    return null;
+}
+
+/**
+ * Relation of a site's written type arity to `defs` (same-name candidates):
+ * null when the language or site does not fix an arity, else
+ * { site, related, matching } (defs of/in the named type, and those of the
+ * written arity).
+ */
+// Per definitions array (the symbol table's list for one name): does any
+// definition carry a generic arity? Rebuilt indexes carry new arrays.
+const _genericDefsMemo = new WeakMap();
+function _hasGenericDefs(defs) {
+    if (!Array.isArray(defs)) return false;
+    let known = _genericDefsMemo.get(defs);
+    if (known === undefined) {
+        known = defs.some(def => def.typeArity || def.ownerTypeArity);
+        _genericDefsMemo.set(defs, known);
+    }
+    return known;
+}
+
+function _genericAritySplit(language, call, defs) {
+    if (!langTraits(language)?.genericArityIsIdentity) return null;
+    const site = _siteWrittenTypeArity(call);
+    if (!site) return null;
+    // Every candidate is arity 0 and so is the site: nothing to tell apart.
+    if (site.arity === 0 && !_hasGenericDefs(defs)) return null;
+    const related = [];
+    const matching = [];
+    for (const def of defs || []) {
+        const arity = _defTypeArityFor(def, site.name);
+        if (arity == null) continue;
+        related.push(def);
+        if (arity === site.arity) matching.push(def);
+    }
+    return { site, related, matching };
+}
+
+/** Bindings of a same-name file table that the site's written arity rules out
+ * are dropped (`new Outcome<T>(v)` in the file of `static class Outcome`). */
+function _arityCompatibleBindings(index, language, call, bindings) {
+    if (!bindings || bindings.length === 0 || !langTraits(language)?.genericArityIsIdentity) return bindings;
+    const site = _siteWrittenTypeArity(call);
+    if (!site) return bindings;
+    const defs = index.symbols.get(call.name) || [];
+    return bindings.filter(binding => {
+        const def = defs.find(d => d.bindingId === binding.id) ||
+            defs.find(d => d.startLine === binding.startLine && d.type === binding.type);
+        const arity = _defTypeArityFor(def, site.name);
+        return arity == null || arity === site.arity;
+    });
+}
+
+/**
+ * fix #380 (P0-10): a capitalized bare receiver the parser could not see as a
+ * member of the lexically enclosing type (`Component.Run(x)` in one C#
+ * `partial` part with `Component` declared in another part, a Java
+ * `HELPER.run()` on a constant inherited from a base class in another file)
+ * is a field/property of the enclosing class when its identity or a resolved
+ * ancestor declares one: in languages whose bare names reach members (trait
+ * bareCallReachesMethods: C#, Java) member lookup precedes type lookup.
+ * Returns a this-rooted field-hop record, or null.
+ */
+function _implicitMemberReceiver(index, call, enclosing) {
+    if (!call.isMethod || !call.receiverIsTypeQualified || call.receiverTypeQualifier ||
+        call.receiverTypeArgs || !call.receiver || !enclosing?.className) return null;
+    const receiver = String(call.receiver);
+    if (!/^[A-Za-z_]\w*$/.test(receiver)) return null;
+    const members = (index.symbols.get(receiver) || []).filter(d => d.className &&
+        (d.type === 'field' || d.type === 'property' || d.memberType === 'field' ||
+            d.memberType === 'property') && d.name === receiver);
+    if (members.length === 0) return null;
+    const startRef = ownerRefOf(index, enclosing);
+    if (!startRef) return null;
+    const declaring = findDeclaringClass(index, startRef, members);
+    if (!declaring || declaring.uncertain || declaring.members.length === 0) return null;
+    const { receiverIsTypeQualified, ...rest } = call;
+    void receiverIsTypeQualified;
+    const rootType = startRef.def?.name || enclosing.className;
+    return {
+        ...rest,
+        receiverRoot: 'this',
+        receiverField: receiver,
+        receiverFields: [receiver],
+        receiverRootType: rootType,
+        ...((startRef.def?.namespace || enclosing.namespace) && {
+            receiverRootNamespace: startRef.def?.namespace || enclosing.namespace,
+        }),
+    };
+}
+
+/**
+ * fix #395: `ResilienceContextPool.Shared.Get()` - the parser records a
+ * this-rooted field path (`ResilienceContextPool` is no local). C# simple-name
+ * lookup reaches the members of the enclosing class and its ancestry first,
+ * then the types in scope: when no member of that name is declared there and
+ * the name resolves to one project type from this file, the path is a static
+ * member path from that type. Returns a rewritten record or null.
+ */
+function _csharpTypeRootedPath(index, call, enclosing, filePath) {
+    if (!call.isMethod || call.receiverType || !Array.isArray(call.receiverFields) ||
+        call.receiverFields.length < 2 || call.receiverRoot !== 'this' ||
+        String(call.receiver || '').startsWith('this.')) return null;
+    const first = call.receiverFields[0];
+    if (!/^[A-Z]/.test(first)) return null;
+    const members = (index.symbols.get(first) || []).filter(d => d.className &&
+        (d.type === 'field' || d.type === 'property' || d.memberType === 'field' ||
+            d.memberType === 'property' || d.type === 'event' || d.type === 'constant'));
+    if (members.length > 0) {
+        const startRef = enclosing?.className ? ownerRefOf(index, enclosing) : null;
+        if (!startRef?.key) return null;
+        const declaring = findDeclaringClass(index, startRef, members);
+        if (declaring) return null;
+        // An outer class of a nested one supplies its members too.
+        if (members.some(d => startRef.def && d.className === startRef.def.enclosingType)) return null;
+        if (parentRefsOfClass(index, startRef).some(parent => parent.external || !parent.key)) return null;
+    }
+    const ref = resolveClassRef(index, first, filePath || call.file, { line: call.line });
+    if (!ref?.key || !ref.def) return null;
+    const rest = call.receiverFields.slice(1);
+    const { receiverRootNamespace, receiverRootTypeArgs, ...others } = call;
+    void receiverRootNamespace; void receiverRootTypeArgs;
+    return {
+        ...others,
+        receiverRoot: first,
+        receiverRootType: first,
+        receiverField: rest[rest.length - 1],
+        receiverFields: rest,
+        receiverRootIsType: true,
+        ...(ref.def.namespace && { receiverRootNamespace: ref.def.namespace }),
+    };
+}
+
 /**
  * fix #353: C# namespace-qualified type receivers. `Beta.Helper.Widget()` is
  * recorded by the parser as a this-rooted field hop (Beta is not a local);
@@ -10743,6 +13727,43 @@ function _csharpNamespaceQualifiedReceiver(index, call, enclosing) {
  * package-relative path. Different modules keep distinct prefixes, so
  * same-named packages across a monorepo stay separate.
  */
+/** A type declared inside a function body (lexically scoped, no enclosing type). */
+function _isFunctionLocalType(def) {
+    return def.lexicalScopeStartLine != null && !def.enclosingType;
+}
+
+/** The innermost function-local type `name` visible at `line` of `file`. */
+function _functionLocalTypeInScope(index, file, name, line) {
+    if (!hasFunctionLocalClass(index, name)) return null;
+    let best = null;
+    for (const d of index.symbols.get(name) || []) {
+        if (d.file !== file || !_isFunctionLocalType(d) || !IDENTITY_TYPE_KINDS.has(d.type) ||
+            line < d.lexicalScopeStartLine || line > d.lexicalScopeEndLine) continue;
+        if (!best || (d.lexicalScopeEndLine - d.lexicalScopeStartLine) <
+            (best.lexicalScopeEndLine - best.lexicalScopeStartLine)) best = d;
+    }
+    return best;
+}
+
+/**
+ * The definition a type name denotes in `file` at `line` when the name has
+ * function-local declarations (fix #389): the innermost local in scope,
+ * else the file's single declaration outside any function. null when the
+ * name has no function-local declaration (callers keep their own rules) or
+ * no single definition.
+ */
+function _scopedTypeDefinitionAt(index, file, name, line) {
+    if (!hasFunctionLocalClass(index, name)) return null;
+    const defs = (index.symbols.get(name) || []).filter(d => IDENTITY_TYPE_KINDS.has(d.type));
+    if (!defs.some(_isFunctionLocalType)) return null;
+    if (line != null) {
+        const local = _functionLocalTypeInScope(index, file, name, line);
+        if (local) return local;
+    }
+    const moduleLevel = defs.filter(d => d.file === file && !_isFunctionLocalType(d));
+    return moduleLevel.length === 1 ? moduleLevel[0] : null;
+}
+
 function _sameNominalPackageDir(dirA, dirB, language) {
     if (dirA === dirB) return true;
     if (language !== 'java') return false;
@@ -10755,10 +13776,41 @@ function _sameNominalPackageDir(dirA, dirB, language) {
     return a === norm(dirB);
 }
 
-function _resolveReceiverTypeIdentity(index, filePath, knownType, targetDefs, line, namespaceHint) {
-    const typeDefs = (index.symbols.get(knownType) || []).filter(d => IDENTITY_TYPE_KINDS.has(d.type));
+function _resolveReceiverTypeIdentity(index, filePath, knownType, targetDefs, line, namespaceHint, arity) {
+    let typeDefs = (index.symbols.get(knownType) || []).filter(d => IDENTITY_TYPE_KINDS.has(d.type));
     const fileEntry = index.files.get(filePath);
     const language = fileEntry?.language;
+    // Function-local types (fix #381) are visible only inside their scope:
+    // an in-scope local type shadows every other type of the name, and one
+    // declared elsewhere is never the type a name denotes here.
+    if (typeDefs.some(_isFunctionLocalType)) {
+        const localTypes = typeDefs.filter(_isFunctionLocalType);
+        // A member belongs to a local type by containment, or (a Rust impl
+        // in the type's block) by the impl's own scope (fix #389).
+        const ownedBy = (t, d) => d.file === t.file && t.className === knownType &&
+            ((t.startLine >= d.startLine && t.startLine <= d.endLine) || ownerDefinitionOf(index, t) === d);
+        const ownedByLocal = t => localTypes.some(d => ownedBy(t, d));
+        const inScope = typeDefs.filter(d => _isFunctionLocalType(d) && d.file === filePath &&
+            line != null && line >= d.lexicalScopeStartLine && line <= d.lexicalScopeEndLine);
+        if (inScope.length > 0) {
+            const width = d => d.lexicalScopeEndLine - d.lexicalScopeStartLine;
+            const narrowest = Math.min(...inScope.map(width));
+            const local = inScope.filter(d => width(d) === narrowest);
+            if (local.length !== 1) return 'unknown';
+            return targetDefs.some(t => ownedBy(t, local[0])) ? 'target' : 'other';
+        }
+        typeDefs = typeDefs.filter(d => !_isFunctionLocalType(d));
+        const relevant = targetDefs.filter(t => t.className === knownType);
+        if (relevant.length > 0 && relevant.every(ownedByLocal)) return 'other';
+        targetDefs = targetDefs.filter(t => !ownedByLocal(t));
+        if (typeDefs.length === 0) return 'unknown';
+    }
+    // A known generic arity names only the same-arity types (fix #380).
+    if (Number.isInteger(arity) && langTraits(language)?.genericArityIsIdentity) {
+        typeDefs = typeDefs.filter(d => (d.typeArity || 0) === arity);
+        targetDefs = targetDefs.filter(d => d.className !== knownType || (d.ownerTypeArity || 0) === arity);
+        if (targetDefs.length === 0) return 'other';
+    }
     if (language === 'java' && namespaceHint && /^[A-Z]/.test(namespaceHint)) {
         const nested = typeDefs.filter(d => d.enclosingType === namespaceHint);
         if (nested.length > 0) {
@@ -10791,7 +13843,18 @@ function _resolveReceiverTypeIdentity(index, filePath, knownType, targetDefs, li
             const isTargetType = d => targetDefs.some(t =>
                 t.file === d.file && t.className === knownType &&
                 (t.enclosingType || null) === (d.enclosingType || null));
-            return inOrigin.some(isTargetType) ? 'target' : 'other';
+            if (inOrigin.some(isTargetType)) return 'target';
+            // A same-name subclass (`HelpFormatter.Builder extends
+            // AbstractHelpFormatter.Builder`) runs the member it inherits
+            // (fix #394): decide by the class definition that declares it.
+            if (inOrigin.length === 1 && targetDefs[0]?.name) {
+                const entry = classDefsNamed(index, knownType).entries.find(e => e.def === inOrigin[0]);
+                const declaring = entry && findDeclaringClass(index, { name: knownType, key: entry.key, def: entry.def },
+                    index.symbols.get(targetDefs[0].name) || []);
+                if (declaring?.uncertain) return 'unknown';
+                if (declaring && relationToTargets(index, declaring.ref, targetDefs) === 'same') return 'target';
+            }
+            return 'other';
         }
     }
     if (language === 'csharp') {
@@ -10810,8 +13873,11 @@ function _resolveReceiverTypeIdentity(index, filePath, knownType, targetDefs, li
                     (left.endLine - left.startLine) -
                     (right.endLine - right.startLine))[0]
             : null;
+        // A flow-typed name (no line) was written in its producer's file:
+        // the namespace that file's declarations share (fix #395).
         const callerNamespace =
-            enclosing?.namespace || containingSymbol?.namespace || null;
+            enclosing?.namespace || containingSymbol?.namespace ||
+            (line == null && fileEntry ? siteNamespaceOf(fileEntry, null) : null) || null;
         // An explicitly-qualified annotation names one namespace exactly.
         // An unqualified C# type follows lexical namespace lookup from the
         // current namespace through its enclosing namespace prefixes before
@@ -10853,8 +13919,24 @@ function _resolveReceiverTypeIdentity(index, filePath, knownType, targetDefs, li
     }
     if (typeDefs.length <= 1) return 'target';
     const targetDirs = new Set(targetDefs.map(d => d.file && path.dirname(d.file)).filter(Boolean));
-    const inTargetPkg = (d) => d.file && [...targetDirs].some(dir =>
-        _sameNominalPackageDir(path.dirname(d.file), dir, language));
+    // Where a type's identity is its module (fix #384, bytes-measured:
+    // `bytes_mut.rs`'s own `Shared::init_to_raw` was a confirmed caller of
+    // `bytes.rs`'s `Shared::init_to_raw`, and plan renamed it), a found
+    // declaration is the target type only when it is the target's owner
+    // definition; an unresolved owner keeps the directory rule.
+    // A module that both declares and imports the name holds configuration
+    // alternatives (anyhow `chain.rs`: `use crate::Chain` under one cfg, its
+    // own `struct Chain` under the other): no single definition is the type
+    // there, so the directory rule decides.
+    const importsTypeName = file => (index.files.get(file)?.importBindings || [])
+        .some(binding => (binding.alias || binding.name) === knownType);
+    const ownerTargets = langTraits(language)?.moduleTypeIdentity
+        ? targetDefs.filter(t => t.className === knownType) : [];
+    const ownerDefs = ownerTargets.map(t => ownerRefOf(index, t)?.def || null);
+    const byOwner = ownerDefs.length > 0 && ownerDefs.every(Boolean) &&
+        !ownerTargets.some(t => importsTypeName(t.file));
+    const inTargetPkg = (d) => byOwner && !importsTypeName(d.file) ? ownerDefs.includes(d)
+        : !!(d.file && [...targetDirs].some(dir => _sameNominalPackageDir(path.dirname(d.file), dir, language)));
     // Explicit imports outrank package proximity. This matters in Java files
     // that sit beside `Token.Comment` but import `org.jsoup.nodes.Comment`.
     // A nested type is not a package member and cannot win a bare type lookup.
@@ -10890,8 +13972,23 @@ function _resolveReceiverTypeIdentity(index, filePath, knownType, targetDefs, li
     }
     const callerClass = line != null
         ? index.findEnclosingFunction(filePath, line, true)?.className : null;
+    // C++ class scope sees its nested types before namespace scope, in every
+    // member wherever it is defined (fix #396: `Node* x` in the out-of-line
+    // `SkipList<K, C>::Insert` is SkipList's nested Node, not List's).
+    // Out-of-line template members spell the owner with its arguments.
+    const callerClassBase = callerClass ? String(callerClass).replace(/<.*$/s, '') : null;
+    if (language === 'cpp' && callerClassBase) {
+        const nested = typeDefs.filter(d => d.enclosingType === callerClassBase);
+        if (nested.length > 0) {
+            if (nested.length > 1) return 'unknown';
+            const owners = targetDefs.filter(t => t.className === knownType)
+                .map(t => ownerRefOf(index, t)?.def || null);
+            if (owners.length === 0 || owners.some(owner => !owner)) return 'unknown';
+            return owners.includes(nested[0]) ? 'target' : 'other';
+        }
+    }
     const sameFile = typeDefs.filter(d => d.file === filePath &&
-        (!d.enclosingType || d.enclosingType === callerClass));
+        (!d.enclosingType || d.enclosingType === callerClass || d.enclosingType === callerClassBase));
     if (sameFile.length > 0) return sameFile.some(inTargetPkg) ? 'target' : 'other';
     const callerDir = path.dirname(filePath);
     const sameDir = typeDefs.filter(d => d.file &&
@@ -10948,6 +14045,19 @@ function _scopedSameFileTypeDef(index, name, file, site) {
 }
 
 function _resolveStructuralFlowTypeIdentity(index, originFile, knownType, targetDefs, qualifier, site) {
+    // Function-local classes (fix #381): the name denotes the definition
+    // visible at the site, so decide by class DEFINITION (the local class
+    // shadows module-level and imported classes of the name inside its
+    // function, and is invisible everywhere else).
+    if (!qualifier && site?.file === originFile && site.line != null &&
+        classDefsNamed(index, knownType).hasScoped) {
+        const ref = _typeRefAt(index, originFile, knownType, site.line);
+        if (!ref.key) return 'unknown';
+        const declaring = findDeclaringClass(index, ref, targetDefs);
+        if (declaring && !declaring.uncertain) return 'target';
+        if (!declaring && relationToTargets(index, ref, targetDefs) === 'unrelated') return 'other';
+        return 'unknown';
+    }
     const origin = _resolveFlowTypeOrigin(index, originFile, knownType, qualifier);
     if (!origin?.fromFile) return 'unknown';
     const targetOwners = new Set(targetDefs
@@ -11071,6 +14181,31 @@ function _resolveStructuralFlowTypeIdentity(index, originFile, knownType, target
  * project type whose only same-name members provably belong to another
  * surface (inherent members / other traits — Rust resolves inherent first).
  */
+/**
+ * `Trait::method(args)` names the trait's slot, not a type (fix #368,
+ * rand-measured: `UniformSampler::new(low, high)` inside an impl resolves
+ * to the implementation for the inferred Self). A pinned impl member of
+ * that same project trait is one of its implementations: route visible,
+ * never exclude. Returns the trait name or null.
+ */
+function _traitPathImplMemberRoute(index, filePath, receiverSegment, targetDefs) {
+    const traitDefs = (index.symbols.get(receiverSegment) || []).filter(definition =>
+        definition.type === 'trait' && definition.file);
+    if (traitDefs.length === 0) return null;
+    const origin = _resolveFlowTypeOrigin(index, filePath, receiverSegment);
+    const trait = origin?.fromFile
+        ? traitDefs.find(definition => definition.file === origin.fromFile) : null;
+    if (!trait) return null;
+    for (const target of targetDefs) {
+        const head = String(target.traitName || '').replace(/<.*$/s, '').trim()
+            .split('::').filter(Boolean).pop();
+        if (head !== receiverSegment || !target.file) continue;
+        const targetOrigin = _resolveFlowTypeOrigin(index, target.file, head);
+        if (targetOrigin?.fromFile === trait.file) return receiverSegment;
+    }
+    return null;
+}
+
 function _traitDeclPinImplementorRoute(index, fileEntry, receiverSegment, targetDefs) {
     if (langTraits(fileEntry.language)?.typeQualifiedCallStyle !== 'path') return null;
     let traitName = null;
@@ -11130,12 +14265,10 @@ function _isAncestorOfTargetClass(index, typeName, targetDefs) {
 }
 
 /**
- * Do two classes share a project descendant (Python #202b guard)? With
- * multiple inheritance, `self.method()` inside Mixin dispatches through
- * type(self).__mro__ — a class C(Target, Mixin) looks the method up on
- * Target BEFORE Mixin, so a sibling-class exclusion is only sound when no
- * project class inherits from both sides. Conservative: any common
- * descendant keeps the edge regardless of MRO order.
+ * Name-level transitive descendants of a class (used where only a type NAME
+ * is known, e.g. receiver types). Same-class self/this resolution uses the
+ * definition-level walk in class-identity.js (descendantKeys /
+ * shareDescendant, the Python #202b MRO guard).
  */
 function _collectDescendants(index, className, cap = 256) {
     const out = new Set([className]);
@@ -11165,22 +14298,35 @@ function _descendantOverrideOwners(index, className, methodName) {
     return owners;
 }
 
-function _shareProjectDescendant(index, className, targetClasses) {
-    if (!targetClasses || targetClasses.size === 0) return false;
-    const mine = _collectDescendants(index, className);
-    for (const t of targetClasses) {
-        const theirs = _collectDescendants(index, t);
-        // matchedClass BELOW the target: every descendant's MRO finds the
-        // matched override before the target (subclass precedes superclass
-        // in C3) — the target def is unreachable from this site, exclusion
-        // stands. Not an MRO trap.
-        if (theirs.has(className)) continue;
-        for (const d of theirs) {
-            if (mine.has(d)) return true;
+/**
+ * Definition-identity variant of _descendantOverrideOwners (fix #358): only
+ * overrides on true descendants of THIS class definition count, not on
+ * descendants of an unrelated same-name class. Falls back to the name-level
+ * answer (conservative, demote-only) when the class is unresolved.
+ */
+function _descendantOverrideOwnersForRef(index, ref, methodName) {
+    const keys = ref && descendantKeys(index, ref);
+    if (!keys) return ref ? _descendantOverrideOwners(index, ref.name, methodName) : new Set();
+    const owners = new Set();
+    for (const d of (index.symbols.get(methodName) || [])) {
+        if (NON_CALLABLE_TYPES.has(d.type)) continue;
+        const own = ownerRefOf(index, d);
+        if (!own || own.key === ref.key) continue;
+        if (own.key ? keys.has(own.key) : false) owners.add(own.name);
+    }
+    if (keys.size > 1) {
+        // Unresolved owners of a descendant NAME stay conservative.
+        const descNames = new Set();
+        for (const k of keys) if (k !== ref.key) descNames.add(k.slice(k.lastIndexOf('|') + 1).replace(/^name:/, ''));
+        for (const d of (index.symbols.get(methodName) || [])) {
+            if (NON_CALLABLE_TYPES.has(d.type)) continue;
+            const own = ownerRefOf(index, d);
+            if (own && !own.key && descNames.has(own.name)) owners.add(own.name);
         }
     }
-    return false;
+    return owners;
 }
+
 
 /**
  * Resolve a one-hop field receiver to the field's DECLARED type (fix #202):
@@ -11191,6 +14337,36 @@ function _shareProjectDescendant(index, className, targetClasses) {
  * classes disagree, or the type is a trait/interface (dynamic dispatch —
  * a trait-typed field is not evidence against any implementor).
  */
+const C_FAMILY_PARAM_KEYS = new WeakMap();
+
+/**
+ * The callable identity group of `targetDefs` among `definitions`. A pure
+ * function of both: memoized per operation by the definitions list and the
+ * targets' identities (fix #396: a receiver-typed site of a many-overload
+ * name asked it for every candidate, each a scan of every definition).
+ */
+function _closeCallableIdentityGroup(index, targetDefs, definitions) {
+    // Small families are cheaper to close than to key (fix #396: the memo
+    // is for many-overload names).
+    const memo = index.isProvenanceFactIndex || !Array.isArray(definitions) || definitions.length < 8
+        ? null : index._opMemo?.('callableIdentityGroup', () => new WeakMap());
+    if (!memo || !Array.isArray(definitions) || !Array.isArray(targetDefs)) {
+        return _closeCallableIdentityGroupUncached(index, targetDefs, definitions);
+    }
+    let byTargets = memo.get(definitions);
+    if (!byTargets) {
+        byTargets = new Map();
+        memo.set(definitions, byTargets);
+    }
+    const key = targetDefs.map(d => `${d.file}\0${d.startLine}\0${d.name}\0${d.type}\0${d.className || ''}`).join('\u0001');
+    const cached = byTargets.get(key);
+    // The group must hold the caller's own target objects.
+    if (cached && cached.targets.every((target, i) => target === targetDefs[i])) return cached.group;
+    const group = _closeCallableIdentityGroupUncached(index, targetDefs, definitions);
+    byTargets.set(key, { targets: [...targetDefs], group });
+    return group;
+}
+
 /**
  * Overload-signature identity (fix #265, zustand-measured): TS overload
  * signatures and their implementation — and Python @overload stubs and their
@@ -11203,7 +14379,7 @@ function _shareProjectDescendant(index, className, targetClasses) {
  * signature member and never closes. `definitions` is the same-name def list,
  * so the group key needs no name component.
  */
-function _closeCallableIdentityGroup(index, targetDefs, definitions) {
+function _closeCallableIdentityGroupUncached(index, targetDefs, definitions) {
     const keyOf = (d) => `${d.file}\0${d.className || ''}\0${d.isNested ? 1 : 0}`;
     const groups = new Map();
     for (const d of definitions) {
@@ -11219,6 +14395,29 @@ function _closeCallableIdentityGroup(index, targetDefs, definitions) {
         const group = groups.get(keyOf(t));
         if (!group || group.length <= 1 || !group.some(d => d.isSignature)) continue;
         for (const d of group) {
+            if (targetDefs.includes(d) || (expanded && expanded.includes(d))) continue;
+            if (!expanded) expanded = [...targetDefs];
+            expanded.push(d);
+        }
+    }
+
+    // Accessor pairs (fix #397, koa-measured): a getter and a setter of one
+    // name on one owner (the same class, or the same object literal) are
+    // ONE property; renaming the setter alone left the getter behind.
+    const accessorKey = (d) => {
+        const kind = String(d.memberType || '');
+        if (!/(?:^|\s)(?:get|set)$/.test(kind)) return null;
+        const scope = /\bstatic\b/.test(kind) ? 'static' : 'instance';
+        const owner = d.className
+            ? `class:${d.className}:${d.enclosingType || ''}:${d.lexicalScopeStartLine || ''}`
+            : (d.objectLiteralLine ? `object:${d.objectLiteralLine}` : null);
+        return owner ? `${d.file}\0${owner}\0${scope}` : null;
+    };
+    for (const t of targetDefs) {
+        const key = accessorKey(t);
+        if (!key) continue;
+        for (const d of definitions) {
+            if (d === t || d.name !== t.name || accessorKey(d) !== key) continue;
             if (targetDefs.includes(d) || (expanded && expanded.includes(d))) continue;
             if (!expanded) expanded = [...targetDefs];
             expanded.push(d);
@@ -11256,15 +14455,33 @@ function _closeCallableIdentityGroup(index, targetDefs, definitions) {
     // and a resolved include edge from the implementation to the declaration
     // are all required. A static header declaration is per-translation-unit
     // identity and therefore never closes across files.
-    const cFamilyLanguage = d => index.files.get(d.file)?.language;
+    // One file-table read per file (fix #396: under the provenance facade
+    // each read is a recorded lookup).
+    const languageByFile = new Map();
+    const cFamilyLanguage = d => {
+        if (languageByFile.has(d.file)) return languageByFile.get(d.file);
+        const language = index.files.get(d.file)?.language;
+        languageByFile.set(d.file, language);
+        return language;
+    };
     const cFamilyParamKey = d => {
+        // A pure function of the definition (fix #396: recomputed for every
+        // pair of the closure).
+        if (C_FAMILY_PARAM_KEYS.has(d)) return C_FAMILY_PARAM_KEYS.get(d);
+        const key = cFamilyParamKeyUncached(d);
+        C_FAMILY_PARAM_KEYS.set(d, key);
+        return key;
+    };
+    const cFamilyParamKeyUncached = d => {
         if (!Array.isArray(d.paramsStructured)) return null;
         return d.paramsStructured.map(param => {
             if (param.variadic) return '...';
-            let type = String(param.type || '').replace(/\s+/g, ' ').trim();
+            // An unnamed parameter's display name is its type (fix #393).
+            let type = String(param.type || (param.unnamed ? param.name : '') || '')
+                .replace(/\s+/g, ' ').trim();
             if (!type) return null;
             // Parameter names are not part of a C/C++ function type.
-            if (param.name) {
+            if (param.name && !param.unnamed) {
                 const escaped = String(param.name)
                     .replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
                 type = type.replace(
@@ -11282,8 +14499,16 @@ function _closeCallableIdentityGroup(index, targetDefs, definitions) {
     const sameOwner = (left, right) =>
         normalizedOwner(left) === normalizedOwner(right) &&
         (left.namespace || '') === (right.namespace || '');
+    const includeMemo = index.isProvenanceFactIndex ? null : index._opMemo?.('identityIncludesDeclaration');
     const includesDeclaration = (implementation, declaration) => {
         if (implementation.file === declaration.file) return true;
+        const memoKey = `${implementation.file}\0${declaration.file}`;
+        if (includeMemo?.has(memoKey)) return includeMemo.get(memoKey);
+        const reached = includesDeclarationUncached(implementation, declaration);
+        includeMemo?.set(memoKey, reached);
+        return reached;
+    };
+    const includesDeclarationUncached = (implementation, declaration) => {
         const declarationRel = declaration.relativePath ||
             path.relative(index.root, declaration.file);
         const target = path.join(index.root, declarationRel);
@@ -11301,13 +14526,62 @@ function _closeCallableIdentityGroup(index, targetDefs, definitions) {
         }
         return false;
     };
+    // Free functions are one entity per LINKAGE (fix #379): every
+    // external-linkage declaration of a name in the program, including a
+    // local forward declaration in another file that includes nothing, refers
+    // to the external definition (several external definitions are platform
+    // variants the link verdict keeps ambiguous). A prototype is never a
+    // call target of its own. C has no overloading, so the name is the
+    // identity; C++ adds the parameter types. Internal linkage (`static`) is
+    // one entity only inside its file, where a `static` forward declaration
+    // announces the definition that follows.
+    const isFreeFunction = d => !d.className && !d.receiver &&
+        !NON_CALLABLE_TYPES.has(d.type);
+    const internalLinkage = d => d.modifiers?.includes('static');
+    const addToGroup = candidate => {
+        if (targetDefs.includes(candidate) ||
+            (expanded && expanded.includes(candidate))) return;
+        if (!expanded) expanded = [...targetDefs];
+        expanded.push(candidate);
+    };
+    for (const target of targetDefs) {
+        const language = cFamilyLanguage(target);
+        if (!['c', 'cpp'].includes(language) || !isFreeFunction(target)) continue;
+        const overloads = langTraits(language)?.hasArityOverloads;
+        const targetParamKey = overloads ? cFamilyParamKey(target) : '';
+        if (targetParamKey === null) continue;
+        const compatible = candidate => candidate !== target &&
+            isFreeFunction(candidate) &&
+            cFamilyLanguage(candidate) === language &&
+            (candidate.languageBranch || null) === (target.languageBranch || null) &&
+            (language === 'cpp'
+                ? cppEffectiveNamespace(index, candidate) === cppEffectiveNamespace(index, target)
+                : sameOwner(target, candidate)) &&
+            (!overloads || cFamilyParamKey(candidate) === targetParamKey);
+        if (internalLinkage(target)) {
+            for (const candidate of definitions) {
+                if (!compatible(candidate) || candidate.file !== target.file ||
+                    candidate.isSignature === target.isSignature) continue;
+                const declaration = target.isSignature ? target : candidate;
+                if (internalLinkage(declaration)) addToGroup(candidate);
+            }
+            continue;
+        }
+        for (const candidate of definitions) {
+            if (!compatible(candidate) || internalLinkage(candidate)) continue;
+            // A definition pinned: every external prototype. A prototype
+            // pinned: every external declaration and definition.
+            if (!candidate.isSignature && !target.isSignature) continue;
+            addToGroup(candidate);
+        }
+    }
     for (const target of targetDefs) {
         const language = cFamilyLanguage(target);
         const targetHasInternalLinkage =
             target.modifiers?.includes('static') &&
             !target.className && !target.receiver;
         if (!['c', 'cpp'].includes(language) ||
-            targetHasInternalLinkage) continue;
+            targetHasInternalLinkage || isFreeFunction(target)) continue;
         const targetParamKey = cFamilyParamKey(target);
         if (targetParamKey === null) continue;
         for (const candidate of definitions) {
@@ -11372,6 +14646,294 @@ function _closeCallableIdentityGroup(index, targetDefs, definitions) {
  * disagree across modules; once an import pins one module, that module's
  * alias is compiler identity and can safely participate in exclusion.
  */
+/**
+ * The ORIGINAL type name a file-level import rename binds (fix #378):
+ * C# `using IntBox = G.Box<int>;` (alias of a constructed generic: the
+ * generic's name), TS `import { Box as B }`, Rust `use crate::Wrap as W;`,
+ * Python `from a import Box as B`. A type annotation spelled with the local
+ * name denotes the original type; without the translation a receiver typed
+ * by the rename matched no project type and a nominal language excluded it.
+ * Null when the file binds no rename of this name.
+ */
+/**
+ * Drop file bindings whose definition is lexically scoped (a function-local
+ * type, class or function) to a range that does not contain the reference
+ * line (fix #378): such a definition is invisible there, so the name resolves
+ * as if the file did not bind it.
+ */
+function _dropOutOfScopeBindings(index, file, name, line, bindings) {
+    if (!bindings || bindings.length === 0 || line == null) return bindings;
+    const scoped = _lexicallyScopedDefinitionsByLine(index, name, file);
+    if (scoped.size === 0) return bindings.slice();
+    const kept = bindings.filter(binding => {
+        const def = scoped.get(binding.startLine);
+        return !def || (line >= def.lexicalScopeStartLine && line <= def.lexicalScopeEndLine);
+    });
+    // The innermost function-local declaration in scope shadows the file's
+    // outer declarations of the name (fix #389: a local class beside its
+    // module-level namesake).
+    const width = binding => {
+        const def = scoped.get(binding.startLine);
+        return def && !def.enclosingType ? def.lexicalScopeEndLine - def.lexicalScopeStartLine : null;
+    };
+    const localWidths = kept.map(width).filter(value => value != null);
+    if (localWidths.length === 0) return kept;
+    const narrowest = Math.min(...localWidths);
+    return kept.filter(binding => {
+        const def = scoped.get(binding.startLine);
+        return def && (def.enclosingType || width(binding) === narrowest);
+    });
+}
+
+/**
+ * A file's lexically scoped definitions of a name by start line (the first
+ * one per line), per operation (fix #382).
+ */
+function _lexicallyScopedDefinitionsByLine(index, name, file) {
+    const inFile = definitionsInFile(index, name, file);
+    const memo = index._opMemo?.('scopedDefinitionsByLine', () => new WeakMap());
+    let byLine = memo?.get(inFile);
+    if (!byLine) {
+        byLine = new Map();
+        for (const d of inFile) {
+            if (d.lexicalScopeStartLine != null && !byLine.has(d.startLine)) byLine.set(d.startLine, d);
+        }
+        memo?.set(inFile, byLine);
+    }
+    return byLine;
+}
+
+/**
+ * The class a module-level value alias names (fix #389): `Alias = Box`
+ * (Python, bound once at module scope) or `const Alias = Box` (JS/TS) makes
+ * `Alias` in an annotation or a constructor call denote Box. The alias is
+ * found where the name is bound for `file`: the file itself, or the module
+ * its import of the name resolves to (re-exports followed); the target is
+ * resolved in the alias's own module and must be a project class.
+ * Returns { type, fromFile } or null.
+ */
+function _moduleValueAliasType(index, file, name, qualifier = null, depth = 0) {
+    if (!file || !name || depth > 4) return null;
+    const fileEntry = index.files.get(file);
+    if (!fileEntry) return null;
+    const moduleFileOf = (entry, module) => {
+        const rel = module != null ? entry.moduleResolved?.[module] : null;
+        return rel ? (path.isAbsolute(rel) ? rel : path.join(index.root, rel)) : null;
+    };
+    if (qualifier) {
+        // `models.Alias`: the qualifier is a module the file imports.
+        const head = String(qualifier).split('.')[0];
+        const files = new Set();
+        const direct = moduleFileOf(fileEntry, qualifier);
+        if (direct) files.add(direct);
+        for (const binding of fileEntry.importBindings || []) {
+            if ((binding.alias || binding.name) !== head) continue;
+            // `from pkg import models` binds the submodule when one exists (#224).
+            const resolved = moduleFileOf(fileEntry, `${binding.module}.${binding.name}`) ||
+                moduleFileOf(fileEntry, binding.module);
+            if (resolved) files.add(resolved);
+        }
+        if (files.size !== 1) return null;
+        return _moduleValueAliasType(index, [...files][0], name, null, depth + 1);
+    }
+    // A declaration of the name in this module is the name itself.
+    if ((index.symbols.get(name) || []).some(d => d.file === file &&
+        (IDENTITY_TYPE_KINDS.has(d.type) || d.type === 'type'))) return null;
+    const alias = (fileEntry.moduleValueAliases || []).find(entry => entry.name === name);
+    if (alias) {
+        const classOfTarget = (target) => {
+            const parts = String(target).split('.');
+            const targetName = parts.pop();
+            const targetQualifier = parts.length > 0 ? parts.join('.') : undefined;
+            const chained = _moduleValueAliasType(index, file, targetName, targetQualifier, depth + 1);
+            if (chained) return chained;
+            const typeDefs = (index.symbols.get(targetName) || []).filter(d => IDENTITY_TYPE_KINDS.has(d.type));
+            if (typeDefs.length === 0) return null;
+            const origin = _resolveFlowTypeOrigin(index, file, targetName, targetQualifier);
+            if (!origin?.fromFile || !typeDefs.some(d => d.file === origin.fromFile)) return null;
+            return { type: targetName, fromFile: origin.fromFile };
+        };
+        if (!Array.isArray(alias.alternatives)) return classOfTarget(alias.target);
+        // Bound on several module-level paths (fix #392): the alias names a
+        // class only when every binding site names the same one.
+        let agreed = null;
+        for (const alternative of alias.alternatives) {
+            let resolved = null;
+            if (alternative.target) {
+                resolved = classOfTarget(alternative.target);
+            } else if (alternative.module && alternative.imported) {
+                const target = moduleFileOf(fileEntry, alternative.module);
+                if (target && target !== file) {
+                    const declares = (index.symbols.get(alternative.imported) || []).some(d =>
+                        d.file === target && IDENTITY_TYPE_KINDS.has(d.type));
+                    resolved = declares ? { type: alternative.imported, fromFile: target }
+                        : _moduleValueAliasType(index, target, alternative.imported, null, depth + 1);
+                }
+            }
+            if (!resolved) return null;
+            if (agreed && (agreed.type !== resolved.type || agreed.fromFile !== resolved.fromFile)) return null;
+            agreed = resolved;
+        }
+        return agreed;
+    }
+    // Imported: follow the binding (and re-exports) to the defining module.
+    const links = [
+        ...(fileEntry.importBindings || []).filter(binding => (binding.alias || binding.name) === name &&
+            binding.name && binding.name !== '*' && binding.kind !== 'namespace' && binding.kind !== 'default')
+            .map(binding => ({ module: binding.module, importedName: binding.name })),
+        ...(fileEntry.exportDetails || []).filter(detail => detail.type === 're-export' && detail.source &&
+            (detail.alias || detail.name) === name && detail.name !== '*')
+            .map(detail => ({ module: detail.source, importedName: detail.name })),
+    ];
+    if (links.length !== 1) return null;
+    const target = moduleFileOf(fileEntry, links[0].module);
+    if (!target || target === file) return null;
+    return _moduleValueAliasType(index, target, links[0].importedName, null, depth + 1);
+}
+
+/**
+ * Alias names that may denote the target class (fix #392): module value
+ * aliases whose target spelling (or a chained alias) ends in `name`. Each
+ * call site still resolves its alias through `_moduleValueAliasType`.
+ */
+function _classValueAliasSurfaces(index, name, targets) {
+    const surfaces = new Set();
+    if (!targets.some(d => IDENTITY_TYPE_KINDS.has(d.type))) return surfaces;
+    if (!targets.some(d => langTraits(index.files.get(d.file)?.language)?.typeSystem === 'structural')) {
+        return surfaces;
+    }
+    if (_moduleValueAliasNames(index).size === 0) return surfaces;
+    // Alias names by the terminal name each binding site spells (per op).
+    const compute = () => {
+        const bySpelled = new Map();
+        for (const [, entry] of index.files) {
+            for (const alias of entry.moduleValueAliases || []) {
+                const spelled = [alias.target, ...(alias.alternatives || []).map(alt => alt.target || alt.imported)]
+                    .filter(Boolean).map(target => String(target).split('.').pop());
+                for (const target of new Set(spelled)) {
+                    if (!bySpelled.has(target)) bySpelled.set(target, new Set());
+                    bySpelled.get(target).add(alias.name);
+                }
+            }
+        }
+        return bySpelled;
+    };
+    const memo = index._opMemo?.('classValueAliasSpellings', () => ({ map: compute() }));
+    const bySpelled = memo ? memo.map : compute();
+    const names = new Set([name]);
+    let frontier = [name];
+    for (let round = 0; round < 4 && frontier.length > 0; round++) {
+        const next = [];
+        for (const spelled of frontier) {
+            for (const aliasName of bySpelled.get(spelled) || []) {
+                if (!names.has(aliasName)) { names.add(aliasName); next.push(aliasName); }
+            }
+        }
+        frontier = next;
+    }
+    names.delete(name);
+    return names;
+}
+
+/** Names some module binds as a value alias (per operation, fix #389). */
+function _moduleValueAliasNames(index) {
+    const compute = () => {
+        const names = new Set();
+        for (const [, entry] of index.files) {
+            for (const alias of entry.moduleValueAliases || []) names.add(alias.name);
+        }
+        return names;
+    };
+    const memo = index._opMemo?.('moduleValueAliasNames', () => ({ names: compute() }));
+    return memo ? memo.names : compute();
+}
+
+/**
+ * A call whose receiver type is written as a module value alias of a class
+ * (fix #389: `x: Alias` / `Alias()` / `new Alias()` after `Alias = Box`)
+ * receives a Box, typed where the alias was bound.
+ */
+function _withModuleValueAliasReceiver(index, filePath, call, structural) {
+    if (!structural || !call.receiverType || typeof call.receiverType !== 'string') return call;
+    if (!_moduleValueAliasNames(index).has(call.receiverType)) return call;
+    const alias = _moduleValueAliasType(index, call.receiverTypeFlowFile || filePath, call.receiverType,
+        call.receiverTypeFlowFile ? null : call.receiverTypeQualifier);
+    if (!alias) return call;
+    return {
+        ...call,
+        receiverType: alias.type,
+        receiverTypeFlowFile: alias.fromFile,
+        receiverTypeQualifier: undefined,
+        receiverTypeAlias: call.receiverType,
+    };
+}
+
+function _importRenamedTypeName(index, file, typeName, options = {}) {
+    const fileEntry = file ? index.files.get(file) : null;
+    if (!fileEntry || !typeName) return null;
+    // A type of that name declared in the file itself shadows imports.
+    if ((index.symbols.get(typeName) || []).some(d => d.file === file &&
+        (d.type === 'type' || IDENTITY_TYPE_KINDS.has(d.type)))) return null;
+    let original = null;
+    let qualifier;
+    for (const binding of fileEntry.importBindings || []) {
+        if (binding.alias === typeName && binding.name && binding.name !== typeName) {
+            original = binding.name;
+        } else if (!binding.alias && binding.kind === 'using' && binding.name === typeName) {
+            // C# alias directive: the module is the aliased type.
+            const head = String(binding.module || '').split('<', 1)[0].trim();
+            const segments = head.split(/::|\./);
+            const last = segments.pop();
+            if (last && last !== typeName) {
+                original = last;
+                if (segments.length > 0) qualifier = segments.join('.');
+            }
+        }
+        if (original) break;
+    }
+    if (!original) {
+        const rename = (fileEntry.importAliases || []).find(a =>
+            a && a.local === typeName && a.original && a.original !== typeName);
+        if (rename) original = String(rename.original).split(/::|\./).pop();
+    }
+    if (!original) return null;
+    if (options.withQualifier) return { name: original, qualifier };
+    return original;
+}
+
+/**
+ * fix #396: the class a C++ alias names where it is written: name lookup
+ * from the site (namespaces, using-directives, include closure) finds the
+ * declarations of `typeName`; when they are all aliases of one class, the
+ * receiver's type is that class. Same-name aliases in namespaces the site
+ * cannot see (`myjson::Value` beside `rapidjson::Value`) do not count.
+ */
+function _cppVisibleAliasBase(index, typeName, originFile, originLine) {
+    if (!typeName || !originFile || originLine == null ||
+        index.files.get(originFile)?.language !== 'cpp') return null;
+    // Only a name some declaration aliases can resolve to another class.
+    if (!(index.symbols.get(typeName) || []).some(definition => definition.type === 'type' && definition.aliasOf)) {
+        return null;
+    }
+    const { includeClosure, namespaceAt, resolveQualifier } = require('./cpp-scope');
+    let found;
+    try {
+        found = resolveQualifier(index, {
+            file: originFile, line: originLine,
+            namespace: namespaceAt(index, originFile, originLine), className: null,
+        }, typeName, includeClosure(index, originFile), 0, { declarations: true });
+    } catch {
+        return null;
+    }
+    const declarations = found?.kind === 'type' ? found.declarations || [] : [];
+    if (declarations.length === 0 ||
+        declarations.some(definition => definition.type !== 'type' || !definition.aliasOf)) return null;
+    const bases = new Set(declarations.map(definition => _normalizedAliasBase(index, definition)));
+    if (bases.size !== 1) return null;
+    const base = [...bases][0];
+    return base && base !== typeName ? base : null;
+}
+
 function _aliasBaseAtOrigin(index, typeName, originFile, originLine = null) {
     if (!typeName || !originFile) return null;
     let current = typeName;
@@ -11405,6 +14967,13 @@ function _aliasBaseAtOrigin(index, typeName, originFile, originLine = null) {
         if (localDefs.some(d => d.type !== 'type' || !d.aliasOf)) {
             return current === typeName ? null : current;
         }
+        // An alias of a type the language cannot name as a class (a
+        // dependent member type) is no identity (fix #393).
+        if (localDefs.some(d => {
+            const language = index.files.get(d.file)?.language;
+            return langTraits(language)?.typeSystem === 'nominal' &&
+                !_normalizeFieldTypeName(d.aliasOf, language);
+        })) return null;
         const bases = new Set(localDefs.map(d =>
             _normalizedAliasBase(index, d)));
         if (bases.size !== 1) return null;
@@ -11416,11 +14985,40 @@ function _aliasBaseAtOrigin(index, typeName, originFile, originLine = null) {
     return current;
 }
 
+/**
+ * A type name whose every declaration is an alias in ONE file, with
+ * disagreeing bases: configuration-gated variants (`#[cfg]`, `#if`), so the
+ * name has no single identity (fix #368).
+ */
+function _isConfigurationVariantAlias(index, typeName) {
+    const defs = (index.symbols.get(typeName) || []).filter(definition =>
+        definition.type === 'type' || IDENTITY_TYPE_KINDS.has(definition.type));
+    if (defs.length < 2 || defs.some(definition => definition.type !== 'type' || !definition.aliasOf)) {
+        return false;
+    }
+    if (new Set(defs.map(definition => definition.file)).size !== 1) return false;
+    return new Set(defs.map(definition => _normalizedAliasBase(index, definition))).size > 1;
+}
+
 function _normalizedAliasBase(index, definition) {
     const raw = definition?.aliasOf;
     if (!raw) return raw;
-    const language = index.files.get(definition.file)?.language;
-    return _normalizeFieldTypeName(raw, language) || raw;
+    const fileEntry = index.files.get(definition.file);
+    const language = fileEntry?.language;
+    const base = _normalizeFieldTypeName(raw, language) || raw;
+    // A package-qualified Go alias (`type X = pkg.Base`, fix #378) is the
+    // project type only when the qualifier's import resolves to the package
+    // declaring it; otherwise it names the external `pkg.Base`, whose
+    // qualified spelling matches no project type.
+    if (definition.aliasQualifier && language === 'go') {
+        const resolved = _goQualifiedReceiverType(index, fileEntry, definition.aliasQualifier, base);
+        if (resolved?.kind !== 'project' || !(index.symbols.get(base) || []).some(d =>
+            d.file && path.dirname(d.file) === resolved.dir &&
+            (d.type === 'type' || IDENTITY_TYPE_KINDS.has(d.type)))) {
+            return `${definition.aliasQualifier}.${base}`;
+        }
+    }
+    return base;
 }
 
 /**
@@ -11439,6 +15037,10 @@ function _pureAliasBase(index, typeName) {
         let base = null;
         for (const d of defs) {
             if (d.type !== 'type' && !IDENTITY_TYPE_KINDS.has(d.type)) continue;
+            // A type declared in a function body is visible only in its
+            // block (fix #396: a test's local `typedef ns::StringBuffer
+            // StringBuffer;` is no second StringBuffer for the project).
+            if (_isFunctionLocalType(d)) continue;
             if (d.type === 'type' && d.aliasOf) {
                 const normalized = _normalizedAliasBase(index, d);
                 if (base === null) base = normalized;
@@ -11454,6 +15056,228 @@ function _pureAliasBase(index, typeName) {
         current = base;
     }
     return current;
+}
+
+/**
+ * Does a type name resolve, through its aliases, to a written type the
+ * language cannot name as a class (fix #393): a dependent member type
+ * (`template <..> using conditional_t = typename std::conditional<..>::type`,
+ * the value of `buffered_context<Char>`), a function type? Such a name is
+ * decided per instantiation or has no members: never evidence for or
+ * against a class. Nominal languages (their receiver mismatch excludes).
+ */
+function _aliasChainOpaque(index, typeName) {
+    let current = typeName;
+    const seen = new Set();
+    for (let hop = 0; hop < 4 && current && !seen.has(current); hop++) {
+        seen.add(current);
+        const defs = (index.symbols.get(current) || []).filter(d =>
+            d.type === 'type' || IDENTITY_TYPE_KINDS.has(d.type));
+        if (defs.length === 0 || defs.some(d => d.type !== 'type' || !d.aliasOf)) return false;
+        let next = null;
+        for (const d of defs) {
+            const language = index.files.get(d.file)?.language;
+            if (langTraits(language)?.typeSystem !== 'nominal') return false;
+            const normalized = _normalizeFieldTypeName(d.aliasOf, language);
+            if (!normalized) return true;
+            if (next && next !== normalized) return false;
+            next = normalized;
+        }
+        current = next;
+    }
+    return false;
+}
+
+/** Are two members declared in parts of ONE partial type (fix #393)? */
+function _samePartialOwner(index, a, b) {
+    const ownerA = ownerDefinitionOf(index, a);
+    const ownerB = ownerDefinitionOf(index, b);
+    if (!ownerA || !ownerB) return false;
+    const partial = def => Array.isArray(def.modifiers) && def.modifiers.includes('partial');
+    return partial(ownerA) && partial(ownerB) && classKeyOf(index, ownerA) === classKeyOf(index, ownerB);
+}
+
+// C++ standard smart pointers: `->` on one yields its first template
+// argument (fix #393). std::weak_ptr has no operator->.
+const _CPP_SMART_POINTERS = new Set(['unique_ptr', 'shared_ptr', 'auto_ptr']);
+
+/**
+ * The raw written type a C++ type name denotes when every project
+ * declaration of it is an alias agreeing on one target (`using App_p =
+ * std::shared_ptr<App>`), chased through alias-of-alias; null when the name
+ * is not purely an alias or the aliases disagree.
+ */
+function _cppAliasTargetText(index, typeName) {
+    let current = typeName;
+    let text = null;
+    const seen = new Set();
+    for (let hop = 0; hop < 4 && current && !seen.has(current); hop++) {
+        seen.add(current);
+        const defs = (index.symbols.get(current) || []).filter(d =>
+            d.type === 'type' || IDENTITY_TYPE_KINDS.has(d.type) || d.type === 'union');
+        if (defs.length === 0) return text;
+        if (defs.some(d => d.type !== 'type' || !d.aliasOf)) return text;
+        const targets = new Set(defs.map(d => String(d.aliasOf).replace(/\s+/g, ' ').trim()));
+        if (targets.size !== 1) return null;
+        text = [...targets][0];
+        const head = text.replace(/\b(?:const|volatile|typename|class|struct)\b/g, '').trim();
+        if (!/^[A-Za-z_]\w*$/.test(head)) return text;
+        current = head;
+    }
+    return text;
+}
+
+/**
+ * The class a C++ `v->m()` reaches when `v` holds a value of type
+ * `typeName` (fix #393): `->` applies the class's operator->. A standard
+ * smart pointer (possibly behind a project alias) yields its pointee, a
+ * project class its operator->'s pointee type; an alias to a pointer type
+ * its pointee. Anything else (an iterator, an external class, an operator->
+ * of unknown result) is not decidable: null.
+ */
+function _cppArrowObjectPointee(index, typeName, rawText = null) {
+    if (rawText != null || !typeName) return _cppArrowObjectPointeeAt(index, typeName, rawText, 0);
+    const memo = index._opMemo?.('cppArrowObjectPointee');
+    if (memo?.has(typeName)) return memo.get(typeName);
+    const result = _cppArrowObjectPointeeAt(index, typeName, null, 0);
+    memo?.set(typeName, result);
+    return result;
+}
+
+function _cppArrowObjectPointeeAt(index, typeName, rawText, depth) {
+    if ((!typeName && rawText == null) || depth > 4) return null;
+    const text = rawText != null ? rawText : _cppAliasTargetText(index, typeName);
+    if (text != null) {
+        let t = String(text).replace(/\b(?:const|volatile|typename|class|struct)\b/g, '').trim();
+        if (/\*\s*$/.test(t)) {
+            // An alias to a pointer type: `->` dereferences it.
+            t = t.replace(/\*\s*$/, '').trim();
+            if (/[*&]/.test(t)) return null;
+            return _normalizeFieldTypeName(t, 'cpp');
+        }
+        if (/&\s*$/.test(t)) t = t.replace(/&+\s*$/, '').trim();
+        const generic = t.match(/^(?:::\s*)?(?:std\s*::\s*)?([A-Za-z_]\w*)\s*<(.*)>$/s);
+        if (generic && _CPP_SMART_POINTERS.has(generic[1]) &&
+            /^(?:::\s*)?std\s*::/.test(t)) {
+            const args = _splitTopLevelGenericArgs(generic[2]);
+            const pointee = String(args[0] || '').trim();
+            if (!pointee || /[*&]/.test(pointee)) return null;
+            return _normalizeFieldTypeName(pointee, 'cpp');
+        }
+        const head = _normalizeFieldTypeName(t, 'cpp');
+        if (!head || head === typeName) return null;
+        return _cppArrowObjectPointeeAt(index, head, null, depth + 1);
+    }
+    // A project class: its own (or a project base's) operator->.
+    const classes = (index.symbols.get(typeName) || []).filter(d =>
+        IDENTITY_TYPE_KINDS.has(d.type) || d.type === 'union');
+    if (classes.length === 0) return null;
+    const operators = (index.symbols.get('operator->') || []).filter(d =>
+        d.className === typeName && d.returnType);
+    const returns = new Set(operators.map(d => String(d.returnType).replace(/\s+/g, ' ').trim()));
+    if (returns.size !== 1) return null;
+    const returned = [...returns][0].replace(/\b(?:const|volatile)\b/g, '').trim();
+    if (!/\*\s*$/.test(returned)) return null;
+    return _normalizeFieldTypeName(returned.replace(/\*\s*$/, ''), 'cpp');
+}
+
+/** Does a project class of this name (or a project base) declare operator->? */
+function _cppClassHasArrowOperator(index, typeName) {
+    const memo = index._opMemo?.('cppClassHasArrowOperator');
+    if (memo?.has(typeName)) return memo.get(typeName);
+    const result = _cppClassHasArrowOperatorUncached(index, typeName);
+    memo?.set(typeName, result);
+    return result;
+}
+
+function _cppClassHasArrowOperatorUncached(index, typeName) {
+    const seen = new Set();
+    let level = [typeName];
+    for (let hop = 0; hop < 16 && level.length > 0; hop++) {
+        for (const owner of level) seen.add(owner);
+        if ((index.symbols.get('operator->') || []).some(d => level.includes(d.className))) return true;
+        level = [...new Set(level.flatMap(owner => index._getInheritanceParents?.(owner) || []))]
+            .filter(owner => owner && !seen.has(owner));
+    }
+    return false;
+}
+
+/**
+ * A return-flow entry read through `->` (fix #393): the flow types the
+ * VARIABLE, `->` reaches what it points at. A project class type without an
+ * operator-> in its project hierarchy was a pointer (the code compiles), so
+ * it keeps its type; an alias resolves through its target; a class with an
+ * operator->, an external value (a smart pointer returned by value) or
+ * anything undecidable gives no receiver type.
+ */
+function _cppArrowFlowEntry(index, entry) {
+    if (!entry || entry.invalidated) return entry;
+    // An external value (a smart pointer or iterator returned by value)
+    // reaches some type through its operator->: demote-only provenance,
+    // never the concrete external type itself.
+    if (entry.externalVia) {
+        // A std smart pointer returned by value: its pointee, when the
+        // written type names a project class.
+        if (entry.valueText) {
+            const pointee = _cppArrowObjectPointee(index, null, entry.valueText);
+            const origin = pointee && _resolveFlowTypeOrigin(index, entry.valueFromFile || '', pointee);
+            if (origin?.fromFile) {
+                return { line: entry.line, start: entry.start, type: pointee,
+                    fromFile: origin.fromFile, arrowThrough: entry.externalVia };
+            }
+        }
+        if (!entry.externalConcrete) return entry;
+        const { externalConcrete, ...rest } = entry;
+        return rest;
+    }
+    if (!entry.type) return undefined;
+    const typeName = entry.type;
+    if (entry.valueText) {
+        // The producer's written type decides: a pointer is dereferenced
+        // (the normalized type is its pointee), an object goes through its
+        // operator->.
+        const written = String(entry.valueText).replace(/\b(?:const|volatile)\b/g, '').trim();
+        if (/\*\s*$/.test(written)) return entry;
+        const pointee = _cppArrowObjectPointee(index, null, entry.valueText);
+        if (!pointee) return undefined;
+        if (pointee === typeName) return entry;
+        const origin = _resolveFlowTypeOrigin(index, entry.valueFromFile || entry.fromFile || '', pointee);
+        if (!origin?.fromFile) return undefined;
+        return { line: entry.line, start: entry.start, type: pointee,
+            fromFile: origin.fromFile, arrowThrough: typeName };
+    }
+    const aliasText = _cppAliasTargetText(index, typeName);
+    let pointee;
+    if (aliasText != null) {
+        pointee = _cppArrowObjectPointee(index, typeName, aliasText);
+    } else if ((index.symbols.get(typeName) || []).some(d =>
+        IDENTITY_TYPE_KINDS.has(d.type) || d.type === 'union')) {
+        if (_cppClassHasArrowOperator(index, typeName)) return undefined;
+        return entry;
+    }
+    if (!pointee) return undefined;
+    if (pointee === typeName) return entry;
+    const aliasFile = (index.symbols.get(typeName) || []).find(d => d.type === 'type' && d.file)?.file;
+    const origin = _resolveFlowTypeOrigin(index, aliasFile || entry.fromFile || '', pointee);
+    if (!origin?.fromFile) return undefined;
+    return { line: entry.line, start: entry.start, type: pointee,
+        fromFile: origin.fromFile, arrowThrough: typeName };
+}
+
+/**
+ * The receiver of a C++ `v->m()` whose `v` is declared as an object of a
+ * named type (fix #393): what that type's operator-> yields, as a flow
+ * entry preceding every use (the declaration governs), or undefined.
+ */
+function _cppArrowDeclaredEntry(index, filePath, call) {
+    const declared = call.receiverArrowObject;
+    const pointee = _cppArrowObjectPointee(index, declared);
+    if (!pointee) return undefined;
+    const aliasFile = (index.symbols.get(declared) || []).find(d => d.type === 'type' && d.file)?.file;
+    const origin = _resolveFlowTypeOrigin(index, aliasFile || filePath, pointee);
+    if (!origin?.fromFile) return undefined;
+    return { line: call.receiverArrowObjectLine || 0, start: call.receiverArrowObjectAt ?? -1,
+        type: pointee, fromFile: origin.fromFile, arrowThrough: declared };
 }
 
 /**
@@ -11615,7 +15439,7 @@ function _pythonExternalFieldFlow(index, file, call) {
         ? call.receiverField : call.receiver?.startsWith('self.') && call.receiver.split('.').length === 2
         ? call.receiver.slice(5) : null;
     if (!field || call.receiverFlowInvalidated) return null;
-    const enclosing = index.findEnclosingFunction(file, call.line, true);
+    const enclosing = index.findEnclosingFunction(file, call.line, true, call);
     if (!enclosing?.className) return null;
     const owner = (index.symbols.get(enclosing.className) || []).filter(d => d.file === file && d.type === 'class');
     if (owner.length !== 1) return null;
@@ -11780,7 +15604,10 @@ function _calleeStructuralModuleRoute(index, fileEntry, call, language) {
 
 function _calleeStructuralImportedNameRoute(index, fileEntry, call, language) {
     let lookupName = call.resolvedName || call.name;
-    let bindings = (fileEntry?.importBindings || []).filter(b => b.name === lookupName);
+    // An aliased import binds its local name only (fix #397): `import { g
+    // as f }` never binds `g` in the file.
+    let bindings = (fileEntry?.importBindings || []).filter(b => b.name === lookupName &&
+        (!b.alias || b.alias === call.name || call.resolvedName));
     if (call.resolvedName && bindings.some(b => b.alias)) {
         const paired = bindings.filter(b => b.alias === call.name);
         if (paired.length > 0) bindings = paired;
@@ -11896,6 +15723,9 @@ function _calleeExportDefinitions(index, startAbs, exposedName, language, call, 
                 const localNames = new Set([attr]);
                 for (const detail of localDetails) {
                     if (detail.localName) localNames.add(detail.localName);
+                    // `export { getBB as INTERNAL_getBB }` exposes the local
+                    // `getBB` under the alias (fix #397).
+                    else if (detail.alias && detail.name) localNames.add(detail.name);
                 }
                 for (const localName of localNames) {
                     for (const d of (index.symbols.get(localName) || [])) {
@@ -11993,20 +15823,33 @@ function _calleeGoPackageMatch(index, call, importModule) {
 }
 
 function selectProvenanceOverload(index, call, candidates, language) {
-    const remaining = new Set(candidates);
-    const slots = [];
-    for (const definition of candidates) {
-        if (!remaining.has(definition)) continue;
-        const group = _closeCallableIdentityGroup(index, [definition], candidates);
-        const representative = group.find(d => !d.isSignature && !d.isDeclaration) || definition;
-        slots.push(representative);
-        for (const member of group) remaining.delete(member);
+    // The slots depend only on the candidate set: one decomposition per
+    // operation (fix #396: every receiver-typed site of a many-overload
+    // name recomputed it, a quadratic identity closure per site).
+    const memo = index.isProvenanceFactIndex ? null : index._opMemo?.('provenanceOverloadSlots', () => new Map());
+    const key = memo ? candidates.map(d => `${d.file}\0${d.startLine}\0${d.name}\0${d.type}`).join('\u0001') : null;
+    let slots = memo?.get(key);
+    if (!slots) {
+        const remaining = new Set(candidates);
+        slots = [];
+        for (const definition of candidates) {
+            if (!remaining.has(definition)) continue;
+            const group = _closeCallableIdentityGroup(index, [definition], candidates);
+            const representative = group.find(d => !d.isSignature && !d.isDeclaration) || definition;
+            slots.push(representative);
+            for (const member of group) remaining.delete(member);
+        }
+        memo?.set(key, slots);
     }
     return _calleeOverloadSelect(index, call, slots, language);
 }
 
 function _calleeOverloadSelect(index, call, matches, language) {
     if (matches.length === 0) return { match: null };
+    if (matches.ownerAmbiguous) {
+        const selected = _calleeOverloadSelect(index, call, [...matches], language);
+        return selected.match ? { ambiguous: true } : selected;
+    }
     if (call.argCount == null || call.argSpread) {
         return matches.length === 1 ? { match: matches[0] } : { ambiguous: true };
     }
@@ -12046,19 +15889,19 @@ function _calleeOverloadSelect(index, call, matches, language) {
  * inherited `BaseWriter.WriteValue(Guid?)`.
  */
 function _calleeReceiverMethodGroup(index, symbols, typeName, language, contextFile,
-    accepts = () => true) {
+    accepts = () => true, line = null) {
     if (!typeName) return [];
     const family = [];
     const seenTypes = new Set();
     const seenSignatures = new Set();
-    let frontier = [typeName];
+    let frontier = [{ owner: typeName, context: contextFile, line }];
     let hops = 0;
+    let ownerAmbiguous = false;
     while (frontier.length > 0 && hops++ < 32) {
         const next = [];
-        for (const owner of frontier) {
-            if (!owner || seenTypes.has(owner)) continue;
-            seenTypes.add(owner);
-            const declared = (symbols || []).filter(symbol =>
+        for (const { owner, context, line: at } of frontier) {
+            if (!owner) continue;
+            let declared = (symbols || []).filter(symbol =>
                 accepts(symbol) &&
                 // Explicit C# interface implementations are absent from the
                 // class's ordinary lookup surface. Interface-typed calls are
@@ -12067,9 +15910,37 @@ function _calleeReceiverMethodGroup(index, symbols, typeName, language, contextF
                 !(language === 'csharp' && symbol.explicitInterface) &&
                 (symbol.className === owner ||
                  (symbol.receiver && symbol.receiver.replace(/^\*/, '') === owner)));
+            // Owner identity before overload fit (fix #394): members of
+            // several same-name types (a class of another package, another
+            // class's nested type) are narrowed to the type the name denotes
+            // where it is written; one that cannot be told apart makes the
+            // group ambiguous, never a better-fitting overload's owner.
+            let ownerRef = null;
+            const named = classDefsNamed(index, owner);
+            if (!named.unique) {
+                const ownerKeys = new Set(declared.map(symbol => ownerRefOf(index, symbol)?.key || null));
+                if (ownerKeys.size > 1) {
+                    const ref = context
+                        ? resolveClassRef(index, owner, context, Number.isInteger(at) ? { line: at } : {}) : null;
+                    if (ref?.key && ownerKeys.has(ref.key)) {
+                        ownerRef = ref;
+                        declared = declared.filter(symbol => ownerRefOf(index, symbol)?.key === ref.key);
+                    } else {
+                        ownerAmbiguous = true;
+                    }
+                } else if (ownerKeys.size === 1 && declared.length > 0) {
+                    const key = [...ownerKeys][0];
+                    if (key) ownerRef = { key, def: ownerDefinitionOf(index, declared[0]) };
+                }
+            }
+            const visitKey = ownerRef ? ownerRef.key : owner;
+            if (seenTypes.has(visitKey)) continue;
+            seenTypes.add(visitKey);
             for (const definition of declared) {
+                // A method's own type-parameter count is part of its
+                // signature (fix #393: C# `M(ct)` beside `M<T>(ct)`).
                 const signature = Array.isArray(definition.paramsStructured)
-                    ? definition.paramsStructured
+                    ? `${_methodTypeParameterCount(definition)}|` + definition.paramsStructured
                         .filter(param => !param?.extensionReceiver)
                         .map(param => {
                             const type = _overloadTypeIdentity(param?.type || '');
@@ -12082,13 +15953,16 @@ function _calleeReceiverMethodGroup(index, symbols, typeName, language, contextF
                 family.push(definition);
             }
 
-            const resolvedFile = index._resolveClassFile?.(owner, contextFile) ||
-                contextFile;
+            const resolvedFile = ownerRef?.def?.file || index._resolveClassFile?.(owner, context) ||
+                context;
             const parents = index._getInheritanceParents?.(owner, resolvedFile);
-            if (parents) next.push(...parents);
+            if (parents) next.push(...parents.map(parent => ({ owner: parent, context: resolvedFile })));
         }
         frontier = next;
     }
+    // Members of several same-name types the site cannot tell apart: no
+    // overload fit selects among them.
+    if (ownerAmbiguous) family.ownerAmbiguous = true;
     return family;
 }
 
@@ -12099,7 +15973,7 @@ function _calleeSelectReceiverMethod(index, call, symbols, typeName, language,
             index,
             call,
             _calleeReceiverMethodGroup(
-                index, symbols, typeName, language, contextFile, accepts),
+                index, symbols, typeName, language, contextFile, accepts, call?.line),
             language);
     }
     const onOwner = owner => (symbols || []).filter(symbol =>
@@ -12137,13 +16011,472 @@ function _calleeSelectReceiverMethod(index, call, symbols, typeName, language,
     return selected;
 }
 
+/**
+ * The classes in lexical scope of a member (its owner, then the enclosing
+ * types), each resolved to its definition, when every one of them has a
+ * closed, resolved project ancestry (fix #390); null otherwise. Only then can
+ * the project index prove that no class in scope has a member of a name: an
+ * external or unresolved supertype could supply it.
+ */
+function _closedLexicalClassScope(index, member) {
+    const memo = index._opMemo?.('closedLexicalClassScope', () => new WeakMap());
+    if (memo?.has(member)) return memo.get(member);
+    const result = _closedLexicalClassScopeUncached(index, member);
+    memo?.set(member, result);
+    return result;
+}
+
+function _closedLexicalClassScopeUncached(index, member) {
+    const scopeRefs = [];
+    let owner = ownerRefOf(index, member);
+    const seenOwners = new Set();
+    while (owner) {
+        if (!owner.key || !owner.def || seenOwners.has(owner.key)) return null;
+        seenOwners.add(owner.key);
+        scopeRefs.push(owner);
+        const outer = owner.def.enclosingType;
+        owner = outer ? resolveClassRef(index, outer, owner.def.file,
+            { namespace: owner.def.namespace || null }) : null;
+    }
+    for (const ref of scopeRefs) {
+        const visited = new Set([ref.key]);
+        const queue = [...parentRefsOfClass(index, ref)];
+        while (queue.length > 0) {
+            const parent = queue.shift();
+            if (parent.external || !parent.key) return null;
+            if (visited.has(parent.key)) continue;
+            visited.add(parent.key);
+            queue.push(...parentRefsOfClass(index, parent));
+        }
+    }
+    return scopeRefs;
+}
+
+/**
+ * A bare call no class in scope declares, bound by a static import (fix
+ * #390). Java looks a simple method name up in the enclosing classes (own
+ * and inherited members) first; only when none has a member of that name do
+ * single-static-import and static-import-on-demand declarations apply. The
+ * lookup is exact only when every class in scope has a closed, resolved
+ * project ancestry (an external or unresolved supertype could supply the
+ * member) and the name is not a member of the universal supertype.
+ * @returns {{match?: object, ambiguous?: boolean}|null} null when the rule
+ *   does not decide the call.
+ */
+function _bareStaticImportCallee(index, def, call, language, fileEntry) {
+    const traits = langTraits(language);
+    if (!traits?.bareCallReachesMethods || !def?.className || !fileEntry) return null;
+    if (traits.universalSupertypeMembers &&
+        Object.prototype.hasOwnProperty.call(traits.universalSupertypeMembers, call.name)) return null;
+    const callSymbols = index.symbols.get(call.name) || [];
+    const callable = symbol => !NON_CALLABLE_TYPES.has(symbol.type);
+    // Member groups each import could supply, in precedence order: a
+    // single-static-import naming the member (Java), then on-demand static
+    // imports (`import static a.B.*`) and directives importing a TYPE
+    // without an alias (C# `using static N.Util;`, global ones included:
+    // a plain using may only name a namespace).
+    const single = [];
+    const onDemand = [];
+    const aliased = new Set();
+    for (const binding of fileEntry.importBindings || []) {
+        const module = String(binding.module || '');
+        if (binding.kind !== 'static') { aliased.add(module); continue; }
+        const rel = fileEntry.moduleResolved?.[module];
+        const segments = module.replace(/\.\*$/, '').split('.');
+        if (binding.name === call.name) {
+            if (!rel) return null;
+            const file = path.join(index.root, rel);
+            const typeName = segments[segments.length - 2];
+            const members = callSymbols.filter(symbol => callable(symbol) &&
+                symbol.file === file && symbol.className === typeName);
+            if (members.length === 0) return null;
+            single.push(members);
+        } else if (module.endsWith('.*')) {
+            if (!rel) continue;
+            const file = path.join(index.root, rel);
+            const typeName = segments[segments.length - 1];
+            const members = callSymbols.filter(symbol => callable(symbol) &&
+                symbol.file === file && symbol.className === typeName);
+            if (members.length > 0) onDemand.push(members);
+        }
+    }
+    // C#: the `using static` directives in effect (file, global, project
+    // file), each resolved from its namespace (fix #395).
+    const csharp = language === 'csharp';
+    const directives = csharp ? csharpUsings(index, def.file).statics : new Set(fileEntry.imports || []);
+    for (const directive of directives) {
+        const module = String(directive || '');
+        if (module.endsWith('.*') || (!csharp && (aliased.has(module) || !module.includes('.')))) continue;
+        const typeName = module.slice(module.lastIndexOf('.') + 1);
+        const namespace = module.includes('.') ? module.slice(0, module.lastIndexOf('.')) : '';
+        const members = callSymbols.filter(symbol => callable(symbol) &&
+            symbol.className === typeName && !symbol.enclosingType &&
+            (symbol.namespace || '') === namespace);
+        if (members.length > 0) onDemand.push(members);
+    }
+    const groups = single.length > 0 ? single : onDemand;
+    if (groups.length === 0 && !traits.staticImportsDeclaredOnly) return null;
+    const scopeRefs = _closedLexicalClassScope(index, def);
+    if (!scopeRefs) return null;
+    for (const ref of scopeRefs) {
+        if (findDeclaringClass(index, ref, callSymbols)) return null;
+    }
+    // No class in scope and no directive's type declares the name: a C#
+    // `using static` never reaches an inherited member (fix #392).
+    if (groups.length === 0) return callSymbols.some(callable) ? { none: true } : null;
+    if (groups.length > 1) return { ambiguous: true };
+    return _calleeOverloadSelect(index, call, groups[0], language);
+}
+
+/**
+ * fix #391: classes that lexically enclose the class definition `owner`
+ * (the one holding `enclosing` in `filePath`). C++ unqualified lookup from a
+ * member of a nested class continues into the enclosing classes, so
+ * `create<T>(..)` in `union json_value` nested in `basic_json` names
+ * basic_json's static `create`. Innermost first; [] when the definition is
+ * not found in the file.
+ */
+function _cppEnclosingClassNames(index, filePath, owner, enclosing) {
+    const fileEntry = index.files.get(filePath);
+    if (!fileEntry || !owner) return [];
+    const line = enclosing?.startLine;
+    const types = (fileEntry.symbols || []).filter(symbol =>
+        (IDENTITY_TYPE_KINDS.has(symbol.type) || symbol.type === 'type') && !symbol.aliasOf);
+    const inner = types
+        .filter(symbol => symbol.name === owner && (!line || (symbol.startLine <= line && symbol.endLine >= line)))
+        .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))[0];
+    if (!inner) return [];
+    return types
+        .filter(symbol => symbol !== inner && symbol.startLine <= inner.startLine &&
+            symbol.endLine >= inner.endLine &&
+            (symbol.startLine < inner.startLine || symbol.endLine > inner.endLine))
+        .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))
+        .map(symbol => symbol.name);
+}
+
+/**
+ * fix #396: is `bound` a `static` free-function declaration in another file
+ * that a pinned `static` definition's file includes (the same function in
+ * that translation unit)?
+ */
+function _headerStaticDeclarationOfUnit(index, bound, targetDefs) {
+    if (!bound?.isSignature || bound.className || bound.receiver ||
+        !bound.modifiers?.includes('static') ||
+        !langTraits(index.files.get(bound.file)?.language)?.textualIncludes) return false;
+    return targetDefs.some(target => !target.isSignature && target.file !== bound.file &&
+        !target.className && !target.receiver && target.modifiers?.includes('static') &&
+        _textualIncludeClosures(index, target.file).all.has(bound.file));
+}
+
+/**
+ * fix #396: how a bare C++ call to a class member resolves from the function
+ * `enclosing` (in `siteFile`): `unreachable` (no class whose members the
+ * call can name), `dispatch` / `static-other` (an override below the member
+ * the class's lookup finds, see _cppImplicitThisVerdict), or `reach`, with
+ * the declaring class when the lookup settled it.
+ */
+function _cppMemberSiteVerdict(index, siteFile, enclosing, cppTargets, definitions) {
+    // One verdict per enclosing function and target set in an operation:
+    // the bare calls of one body share their class lookup.
+    const memo = enclosing && typeof enclosing === 'object' && !index.isProvenanceFactIndex
+        ? index._opMemo?.('cppMemberSiteVerdict', () => new WeakMap()) : null;
+    if (!memo) return _cppMemberSiteVerdictUncached(index, siteFile, enclosing, cppTargets, definitions);
+    let byEnclosing = memo.get(cppTargets);
+    if (!byEnclosing) {
+        byEnclosing = new WeakMap();
+        memo.set(cppTargets, byEnclosing);
+    }
+    let verdict = byEnclosing.get(enclosing);
+    if (!verdict) {
+        verdict = _cppMemberSiteVerdictUncached(index, siteFile, enclosing, cppTargets, definitions);
+        byEnclosing.set(enclosing, verdict);
+    }
+    return verdict;
+}
+
+function _cppMemberSiteVerdictUncached(index, siteFile, enclosing, cppTargets, definitions) {
+    const memberOwnerOf = definition => definition.className ||
+        (definition.type === 'type' && definition.enclosingType) || null;
+    // Out-of-line template members name their owner with template arguments
+    // (`base_sink<M>::flush`).
+    const ownerOf = owner => owner && String(owner).replace(/<.*>$/s, '');
+    const targetOwners = new Set(cppTargets
+        .map(definition => ownerOf(memberOwnerOf(definition)))
+        .filter(Boolean));
+    // A friend function body is in its befriending class's lexical scope
+    // (fix #391).
+    const enclosingOwner = ownerOf(enclosing?.className || enclosing?.friendOf);
+    // Implicit this reaches the owner's own members, inherited ones (the
+    // target owner is an ancestor of the enclosing class, fix #379), and
+    // overrides in descendants (the enclosing class is an ancestor).
+    const ownerCanReachTarget = enclosingOwner &&
+        (targetOwners.has(enclosingOwner) ||
+         _isAncestorOfTargetClass(index, enclosingOwner, cppTargets) ||
+         [...targetOwners].some(owner => _isAncestorOfTargetClass(
+             index, owner, [{ ...enclosing, className: enclosingOwner }])) ||
+         _cppEnclosingClassNames(index, siteFile, enclosingOwner, enclosing)
+             .some(owner => targetOwners.has(owner)));
+    if (!ownerCanReachTarget && !enclosingOwner && Array.isArray(enclosing?.generatedByMacro?.args)) {
+        // A body a namespace-scope macro invocation wraps (`M(Fixture, Name)
+        // { .. }`) may be expanded as a member of a class an argument names
+        // (a test fixture subclass): its bare calls may name members of that
+        // class and its ancestors. Visible, never excluded.
+        const scope = enclosing.generatedByMacro.args.find(arg =>
+            targetOwners.has(arg) || [...targetOwners].some(owner =>
+                _isAncestorOfTargetClass(index, owner, [{ className: arg, file: siteFile }])));
+        if (scope) return { kind: 'generated-scope', via: scope };
+    }
+    if (!ownerCanReachTarget) return { kind: 'unreachable' };
+    // Implicit this names the member the enclosing class's own lookup finds;
+    // an override below it is reached only by virtual dispatch.
+    const implicitThis = enclosing?.className && !enclosing.friendOf
+        ? _cppImplicitThisVerdict(index, enclosing, definitions, cppTargets) : null;
+    return { kind: implicitThis?.kind || 'reach', declaring: implicitThis?.declaring || null };
+}
+
+// Bounds of the expansion-site search for a macro body's call (fix #396).
+const MACRO_BODY_SITE_FILES = 256;
+const MACRO_BODY_SITES = 512;
+
+/**
+ * fix #396: the site verdicts of a C++ call spelled in a macro replacement
+ * list: one per project invocation of the macro, following invocations
+ * written in other macros' replacement lists to their own invocations.
+ * [] when the project never invokes it; null when the sites cannot be
+ * enumerated (bounds, unreadable files, a macro symbol not found).
+ */
+function _cppMacroBodySiteVerdicts(index, filePath, call, cppTargets, definitions) {
+    const sites = _macroInvocationSites(index, filePath, call.enclosingFunction);
+    if (sites === null) return null;
+    const verdicts = [];
+    for (const site of sites) {
+        const enclosing = index.findEnclosingFunction(site.file, site.line, true);
+        verdicts.push(_cppMemberSiteVerdict(index, site.file, enclosing, cppTargets, definitions));
+    }
+    return verdicts;
+}
+
+/**
+ * Invocation lines of the macro whose definition `macroHead` names
+ * ({ name, startLine } in `filePath`), outside directive lines, in the
+ * defining file and every file that includes it; invocations inside other
+ * macros' replacement lists stand for those macros' own invocations.
+ * Memoized per operation. null when unbounded or unreadable.
+ */
+function _macroInvocationSites(index, filePath, macroHead) {
+    const memo = index._opMemo?.('macroInvocationSites', () => new Map());
+    const key = `${filePath}\0${macroHead.name}\0${macroHead.startLine}`;
+    if (memo?.has(key)) return memo.get(key);
+    const result = _macroInvocationSitesUncached(index, filePath, macroHead);
+    memo?.set(key, result);
+    return result;
+}
+
+function _macroInvocationSitesUncached(index, filePath, macroHead) {
+    const { codeTokens } = require('./macro-expansion');
+    const sites = [];
+    const seenSites = new Set();
+    const visited = new Set();
+    const queue = [{ file: filePath, name: macroHead.name, startLine: macroHead.startLine }];
+    while (queue.length > 0) {
+        const macro = queue.shift();
+        const macroKey = `${macro.file}\0${macro.name}\0${macro.startLine}`;
+        if (visited.has(macroKey)) continue;
+        visited.add(macroKey);
+        const symbol = (index.symbols.get(macro.name) || []).find(definition =>
+            definition.type === 'macro' && definition.file === macro.file &&
+            definition.startLine === macro.startLine);
+        if (!symbol) return null;
+        const functionLike = Array.isArray(symbol.ppParams);
+        // The defining file and every file whose #include closure reaches it.
+        const files = [macro.file];
+        const seenFiles = new Set(files);
+        for (let i = 0; i < files.length; i++) {
+            for (const importer of index.exportGraph?.get(files[i]) || []) {
+                if (seenFiles.has(importer)) continue;
+                seenFiles.add(importer);
+                files.push(importer);
+            }
+            if (files.length > MACRO_BODY_SITE_FILES) return null;
+        }
+        files.sort(codeUnitCompare);
+        for (const file of files) {
+            const entry = index.files.get(file);
+            if (!langTraits(entry?.language)?.textualIncludes) continue;
+            // Replacement lists of this file that invoke the macro.
+            for (const other of entry.symbols || []) {
+                if (other.type !== 'macro' || typeof other.ppBody !== 'string' ||
+                    (other.name === macro.name && other.startLine === macro.startLine)) continue;
+                const tokens = other.ppBody.split(' ');
+                const at = tokens.indexOf(macro.name);
+                if (at < 0 || (functionLike && tokens[at + 1] !== '(')) continue;
+                queue.push({ file, name: other.name, startLine: other.startLine });
+            }
+            let content;
+            try {
+                content = index._readFile(file);
+            } catch {
+                return null;
+            }
+            if (!content.includes(macro.name)) continue;
+            const tokens = codeTokens(content, content.split('\n'));
+            let line = 1;
+            let offset = 0;
+            for (let i = 0; i < tokens.length; i++) {
+                const token = tokens[i];
+                if (token.v !== macro.name) continue;
+                if (functionLike && tokens[i + 1]?.v !== '(') continue;
+                // Same-file invocations above the definition expand another
+                // definition (or none).
+                while (offset < token.start) {
+                    if (content.charCodeAt(offset) === 10) line++;
+                    offset++;
+                }
+                if (file === macro.file && line < macro.startLine) continue;
+                const siteKey = `${file}\0${line}`;
+                if (seenSites.has(siteKey)) continue;
+                seenSites.add(siteKey);
+                sites.push({ file, line });
+                if (sites.length > MACRO_BODY_SITES) return null;
+            }
+        }
+    }
+    return sites;
+}
+
+/**
+ * fix #396: C++ implicit `this->m()` inside a member of class E is class
+ * member lookup from E: the nearest class in E's resolved ancestry (E
+ * itself first) that declares `m` owns the call. Returns null when the
+ * lookup cannot be settled (unresolved caller class, uncertain ancestry, no
+ * declaring class). Otherwise `{ declaring }` plus a verdict for targets
+ * that override the looked-up member in a descendant: `dispatch` when the
+ * member is virtual there (the override is reached only at run time),
+ * `static-other` when it is not (the call binds the looked-up member).
+ */
+function _cppImplicitThisVerdict(index, enclosing, definitions, targets) {
+    const callerRef = ownerRefOf(index, enclosing);
+    if (!callerRef?.key) return null;
+    const declaring = findDeclaringClass(index, callerRef, definitions);
+    if (!declaring || declaring.uncertain || !declaring.ref?.key) return null;
+    if (!declaring.members.some(member => !NON_CALLABLE_TYPES.has(member.type))) {
+        return { declaring: declaring.ref };
+    }
+    const callableTargets = targets.filter(target =>
+        !NON_CALLABLE_TYPES.has(target.type) && target.className);
+    if (callableTargets.length === 0 || callableTargets.length !== targets.length ||
+        relationToTargets(index, declaring.ref, callableTargets) !== 'ancestor') {
+        return { declaring: declaring.ref };
+    }
+    return {
+        declaring: declaring.ref,
+        kind: _dispatchCapableSupertype(index, 'cpp', declaring.ref.name, callableTargets, definitions)
+            ? 'dispatch' : 'static-other',
+    };
+}
+
 function _preferFixedArityOverloads(index, call, applicable, language) {
-    const fixed = applicable.filter(definition =>
+    const isFixed = definition =>
         !Array.isArray(definition.paramsStructured) ||
         !definition.paramsStructured.some(param => param?.rest) ||
         (language === 'csharp' &&
-         _csharpParamsNormalFormApplicable(index, call, definition)));
-    return fixed.length > 0 ? fixed : applicable;
+         _csharpParamsNormalFormApplicable(index, call, definition));
+    const fixed = applicable.filter(isFixed);
+    if (fixed.length === 0 || fixed.length === applicable.length) return applicable;
+    // Variable-arity candidates leave the race only when a fixed-arity one
+    // is PROVABLY applicable (fix #391): an argument of unknown type could
+    // fit none of the fixed-arity parameters, and then the varargs
+    // candidate is the one the compiler binds.
+    const proven = fixed.filter(definition =>
+        _overloadProvablyApplicable(index, call, definition, applicable, language));
+    if (proven.length === 0) return applicable;
+    // Java: fixed arity is an earlier phase (JLS 15.12.2). C#: the expanded
+    // form loses only on a tie of parameter types (the better conversion
+    // decides first, C# 12.6.4.3), so a `params string[]` candidate still
+    // competes with F(object) for a string argument.
+    if (language !== 'csharp') return fixed;
+    const tied = variadic => proven.some(definition => {
+        for (let i = 0; i < call.argCount; i++) {
+            if (_javaParamTypeIdentity(index, definition, i, call) !==
+                _javaParamTypeIdentity(index, variadic, i, call)) return false;
+        }
+        return true;
+    });
+    return applicable.filter(definition => isFixed(definition) || !tied(definition));
+}
+
+/**
+ * fix #391: whether the arguments PROVE `definition` applicable where it
+ * differs from the other candidates. Positions where every candidate
+ * declares the same parameter type cannot decide between them (a program
+ * that compiles satisfies them for all), so only the distinguishing
+ * positions need an argument whose static type provably converts to
+ * `definition`'s parameter. An argument of unknown type there leaves the
+ * choice open: overload resolution with unknown argument types is
+ * ambiguous, never assigned to the more specific or fixed-arity candidate.
+ */
+function _overloadProvablyApplicable(index, call, definition, candidates, language) {
+    const argCount = call.argCount;
+    if (!Number.isInteger(argCount)) return false;
+    const kinds = Array.isArray(call.argKinds) ? call.argKinds : [];
+    for (let i = 0; i < argCount; i++) {
+        const param = _javaParamAt(definition, i, call);
+        const identity = _javaParamTypeIdentity(index, definition, i, call);
+        const distinguishing = candidates.some(other => other !== definition &&
+            _javaParamTypeIdentity(index, other, i, call) !== identity);
+        if (!distinguishing) continue;
+        if (!_argProvablyConverts(index, kinds[i], param, language)) return false;
+    }
+    return true;
+}
+
+/**
+ * fix #391: the argument kind's static type provably converts to the
+ * parameter: the parameter is `object`/`Object`/`dynamic`, or the argument
+ * type is known and equal to it, a literal of an accepting kind, or a type
+ * whose platform or project ancestry reaches it. Unknown argument types and
+ * unknown relationships are not proof.
+ */
+function _argProvablyConverts(index, kind, param, language) {
+    if (!param?.type) return false;
+    const rawBare = String(param.type).replace(/<.*$/s, '').trim()
+        .replace(/\.\.\.$/, '').replace(/\?$/, '').replace(/(?:\[\])+$/, '')
+        .split('.').pop();
+    const bare = CSHARP_OVERLOAD_ALIASES.get(rawBare) || rawBare;
+    const arrayParam = /\[\]\??$|\.\.\.$/.test(String(param.type).trim()) && !param.rest;
+    if (!arrayParam && (bare === 'Object' || bare === 'dynamic')) return true;
+    if (!kind || kind === 'expr' || _isLambdaKind(kind)) return false;
+    if (kind === 'null') return !JAVA_PRIMITIVES.has(bare);
+    if (JAVA_KIND_TYPES[kind]) return !arrayParam && JAVA_KIND_TYPES[kind].includes(bare);
+    // `X.class` is a java.lang.Class: its declared supertypes.
+    if (kind.startsWith('class:')) {
+        return !arrayParam && ['Class', 'Type', 'Serializable', 'GenericDeclaration',
+            'AnnotatedElement'].includes(bare);
+    }
+    const staticType = _javaStaticTypeForKind(index, kind);
+    if (!staticType) return false;
+    const expected = param.rest
+        ? String(param.type).trim().replace(/\.\.\.$/, '').replace(/\[\]\??$/, '')
+        : String(param.type).trim();
+    if (language === 'csharp') {
+        const assignable = _csharpKnownTypeAssignable(staticType, expected);
+        if (assignable !== null) return assignable;
+    }
+    const actualSimple = String(staticType).replace(/<.*$/s, '').replace(/\?$/, '').split('.').pop();
+    const actual = CSHARP_OVERLOAD_ALIASES.get(actualSimple) || actualSimple;
+    const expectedBare = _overloadTypeIdentity(expected.replace(/<.*$/s, '').replace(/\?/g, ''))
+        .split('.').pop();
+    if (actual === expectedBare) return true;
+    if (language === 'java' && JAVA_PRIMITIVES.has(actual) && JAVA_KIND_TYPES[actual]) {
+        return JAVA_KIND_TYPES[actual].includes(expectedBare);
+    }
+    if (String(staticType).endsWith('[]') !== expected.replace(/\?$/, '').endsWith('[]')) return false;
+    const platform = _javaPlatformAssignable(staticType, expectedBare);
+    if (platform !== null) return platform;
+    const actualDefs = (index.symbols.get(actual) || [])
+        .filter(d => ['class', 'interface', 'enum', 'struct', 'record'].includes(d.type));
+    if (actualDefs.length === 0) return false;
+    return _isDispatchAncestor(index, expectedBare, [{ className: actual, file: actualDefs[0].file }]);
 }
 
 // C# `params T[]` methods participate in the normal fixed-arity phase when
@@ -12257,8 +16590,37 @@ function _goIndexedReceiverType(index, filePath, call) {
     return candidates.size === 1 ? [...candidates.values()][0] : null;
 }
 
+/**
+ * A name's typed field and accessor definitions, in symbol-table order, and
+ * the same list grouped by declaring class; per operation (fix #382): every
+ * field hop filtered all same-name definitions (kubernetes declares `Spec`
+ * on thousands of types).
+ */
+function _typedFieldDefinitions(index, defs) {
+    const memo = index._opMemo?.('typedFieldDefinitions', () => new WeakMap());
+    let result = memo?.get(defs);
+    if (result) return result;
+    const isAccessor = (d) => d.type === 'get' || d.memberType === 'get' ||
+        d.type === 'property' || d.memberType === 'property';
+    const fields = defs.filter(d =>
+        ((d.type === 'field' || d.memberType === 'field' || d.memberType === 'private field') && d.fieldType) ||
+        (isAccessor(d) && (d.returnType || d.fieldType)));
+    const byClass = new Map();
+    for (const d of fields) {
+        let list = byClass.get(d.className);
+        if (!list) {
+            list = [];
+            byClass.set(d.className, list);
+        }
+        list.push(d);
+    }
+    result = { fields, byClass };
+    memo?.set(defs, result);
+    return result;
+}
+
 function _declaredFieldType(
-    index, rootType, fieldName, language, info = null, rootNamespace = undefined
+    index, rootType, fieldName, language, info = null, rootNamespace = undefined, rootArity = null
 ) {
     const defs = index.symbols.get(fieldName) || [];
     if (defs.length === 0 && language !== 'python') return null;
@@ -12270,12 +16632,15 @@ function _declaredFieldType(
     // is what the member-access expression evaluates to (value position).
     const isAccessor = (d) => d.type === 'get' || d.memberType === 'get' ||
         d.type === 'property' || d.memberType === 'property';
-    const fields = defs.filter(d =>
-        ((d.type === 'field' || d.memberType === 'field' || d.memberType === 'private field') && d.fieldType) ||
-        (isAccessor(d) && (d.returnType || d.fieldType)));
-    let onType = fields.filter(d => d.className === rootType &&
-        (language !== 'csharp' || !rootNamespace ||
-            (d.namespace || null) === rootNamespace));
+    const { fields, byClass } = _typedFieldDefinitions(index, defs);
+    let onType = (byClass.get(rootType) || []).filter(d =>
+        language !== 'csharp' || !rootNamespace ||
+            (d.namespace || null) === rootNamespace);
+    // A root of known generic arity owns only its own fields (fix #380):
+    // `BridgeComponent<T>.Strategy` is not `BridgeComponent.Strategy`.
+    if (rootArity != null && onType.length > 0) {
+        onType = onType.filter(d => (d.ownerTypeArity || 0) === rootArity);
+    }
     // Fields and accessors are inherited. Resolve the nearest declaring
     // ancestor level; sibling bases at the same level must later normalize
     // to one type or the existing agreement guard rejects the hop.
@@ -12368,6 +16733,26 @@ function _declaredFieldType(
             index,
             originFile: f.file,
         });
+        // Type-name denotation (fix #371): the declared type is written in
+        // the FIELD's file. `fd: File` under `use std::fs::File`, a
+        // `self.timer = Timer(..)` attribute under `from threading import
+        // Timer`, `symbol: backtrace::BacktraceSymbol` name external types,
+        // never the same-name project type. Demote-only, like Go above.
+        if (f.file && localType) {
+            const written = _returnTypeNameNominal(String(rawText), language);
+            if (written?.name === localType) {
+                const external = externalTypeDenotation(index, f.file, localType,
+                    written.qualifier || null, f.startLine);
+                if (external && external.certain !== false && (index.symbols.get(external.original) || [])
+                    .some(d => IDENTITY_TYPE_KINDS.has(d.type))) {
+                    if (info) {
+                        info.externalVia = external.via;
+                        info.externalType = external.original;
+                    }
+                    return null;
+                }
+            }
+        }
         const importedIdentity = language === 'rust' && f.file && localType
             ? _rustImportedTypeIdentity(index, f.file, localType) : null;
         const t = importedIdentity?.type || localType;
@@ -12376,6 +16761,18 @@ function _declaredFieldType(
     }
     if (normalized.size !== 1) return null; // same-named classes disagree
     let typeName = [...normalized][0];
+    // An alias to a type with no class identity (fix #393).
+    if (_aliasChainOpaque(index, typeName)) return null;
+    if (info && langTraits(language)?.genericArityIsIdentity) {
+        const arities = new Set(onType.map(f => genericArityOf(
+            isAccessor(f) ? (f.returnType || f.fieldType) : f.fieldType)));
+        if (arities.size === 1 && Number.isInteger([...arities][0])) info.typeArgs = [...arities][0];
+        // The declared types as written, type arguments included (fix #395):
+        // same-name owners may declare the field with different arguments.
+        const texts = new Set(onType.map(f => String((isAccessor(f) ? (f.returnType || f.fieldType) : f.fieldType) || '')
+            .replace(/\s+/g, '')));
+        if (![...texts].some(text => !text)) info.typeTexts = [...texts].sort(codeUnitCompare);
+    }
     // Pure-alias heads resolve to their base (fix #265 — the #208 identity
     // for declared types): `store: StoreMap` where `type StoreMap = Map<...>`
     // types the field as Map, which the trust gate can judge (builtin →
@@ -12416,6 +16813,18 @@ function _declaredFieldType(
         }
         if (complete && origins.size === 1) {
             info.fromFile = [...origins][0];
+            // fix #380: a C# field type resolved in the FIELD's file (its own
+            // usings, the declaring partial part's) names the namespace of
+            // the type it resolved to - never the root object's namespace.
+            if (language === 'csharp') {
+                const resolvedNamespaces = new Set((index.symbols.get(typeName) || [])
+                    .filter(d => d.file === info.fromFile && _ARITY_TYPE_KINDS.has(d.type))
+                    .map(d => d.namespace || ''));
+                if (resolvedNamespaces.size === 1) {
+                    const ns = [...resolvedNamespaces][0];
+                    if (ns) info.namespace = ns;
+                }
+            }
         }
         if (language === 'java' && namespaces.size === 1) {
             // Preserve nested-type identity (`Code.Builder`) independently
@@ -12440,14 +16849,22 @@ function _declaredFieldType(
 }
 
 function _declaredFieldPathType(
-    index, rootType, fieldNames, language, info, rootNamespace
+    index, rootType, fieldNames, language, info, rootNamespace, rootArity
 ) {
     let currentType = rootType;
+    // fix #380: in languages whose generic arity is type identity, each hop
+    // selects the fields of the owner with the arity the previous hop's
+    // declared type spells; the terminal arity is reported as info.typeArgs.
+    let currentArity = langTraits(language)?.genericArityIsIdentity &&
+        Number.isInteger(rootArity) ? rootArity : null;
     for (let i = 0; i < fieldNames.length; i++) {
+        const hopInfo = info || (currentArity != null ? {} : null);
+        if (hopInfo) { delete hopInfo.typeArgs; delete hopInfo.typeTexts; }
         currentType = _declaredFieldType(
-            index, currentType, fieldNames[i], language, info,
-            i === 0 ? rootNamespace : undefined);
+            index, currentType, fieldNames[i], language, hopInfo,
+            i === 0 ? rootNamespace : undefined, currentArity);
         if (!currentType) return null;
+        currentArity = hopInfo && Number.isInteger(hopInfo.typeArgs) ? hopInfo.typeArgs : null;
     }
     return currentType;
 }
@@ -12549,7 +16966,572 @@ function _pythonDeclaredIterablePathItems(index, rootType, fieldNames) {
  * could hold a same-named function via `this.cb = cb`, the #218c
  * member-alias family).
  */
+/**
+ * fix #367a: a definition that a bare (receiver-less) call in `language`
+ * can never denote. Languages without implicit-this (`bareCallReachesMethods`
+ * false) resolve bare names in lexical/module/builtin scope, which never
+ * contains class, impl or receiver members. Structural function EXPRESSIONS
+ * assigned to a member (`Foo.prototype.bar = function bar() {}`) stay
+ * nameable: a named function expression binds its own name in its body.
+ */
+/**
+ * The function whose body declares `def` (a nested fn item), or null for a
+ * module-level or member definition (fix #377).
+ */
+const _definitionContainerMemo = new WeakMap();
+function _enclosingFunctionOfDefinition(index, def) {
+    if (!def?.file || def.className || def.receiver) return null;
+    if (_definitionContainerMemo.has(def)) return _definitionContainerMemo.get(def);
+    const container = _enclosingFunctionOfDefinitionUncached(index, def);
+    _definitionContainerMemo.set(def, container);
+    return container;
+}
+
+function _enclosingFunctionOfDefinitionUncached(index, def) {
+    const entry = index.files.get(def.file);
+    let best = null;
+    for (const symbol of entry?.symbols || []) {
+        if (!['function', 'method', 'constructor'].includes(symbol.type)) continue;
+        if (symbol.startLine === def.startLine && symbol.name === def.name) continue;
+        if (symbol.startLine > def.startLine || symbol.endLine < def.endLine) continue;
+        if (!best || symbol.startLine >= best.startLine) best = symbol;
+    }
+    return best ? { file: def.file, startLine: best.startLine, endLine: best.endLine } : null;
+}
+
+/**
+ * Rust module-path call ownership (fix #377): 'target' when the qualifier
+ * resolves through the module tree to a module whose only item of this name
+ * is a pinned definition, 'other' when that module declares the name as a
+ * different item, null when the tree cannot decide (use aliases, extern
+ * crates, types, re-exports, cfg alternatives).
+ */
+function _rustModulePathRoute(index, filePath, call, name, targets) {
+    const { rustPathModule, rustModuleItems } = require('./rust-modules');
+    const resolved = rustPathModule(index, filePath, call.line, call.receiver);
+    if (!resolved) return null;
+    const items = rustModuleItems(index, resolved, name);
+    if (items.length === 0) return null;
+    const pinned = items.filter(item => targets.some(target =>
+        sameDeclaration(declarationIdentity(item), declarationIdentity(target))));
+    if (pinned.length === 0) return 'other';
+    return items.length === 1 ? 'target' : null;
+}
+
+/**
+ * Does a C/C++ call-syntax site invoke a function-like (or object-like)
+ * macro of the same name (fix #377)? 'macro' when every definition in effect
+ * is reached through the same file or a proven include and its replacement
+ * list never spells the name again; 'ambiguous' when some alternative
+ * reaches the function, a replacement list is unknown, or the include edge
+ * is basename-resolved; null when no macro of the name is in effect.
+ */
+function _cMacroShadowedCall(index, filePath, call) {
+    const sameName = index.symbols.get(call.name);
+    if (!sameName || !sameName.some(def => def.type === 'macro')) return null;
+    const { macroDefinitionsAt, macroBodyTokens } = require('./macro-expansion');
+    const scope = macroDefinitionsAt(index, filePath, call.line, call.name);
+    if (!scope) return null;
+    // A header that declares the function and defines the macro holds them
+    // as configuration alternatives (`#ifdef X int f(int); #else #define
+    // f(a) 0 #endif`): the site binds the function wherever it exists.
+    const namesakes = (index.symbols.get(call.name) || []).filter(def => def.type !== 'macro');
+    if (scope.defs.some(macro => namesakes.some(def => def.file === macro.file))) return null;
+    let reaches = 0;
+    let unknown = false;
+    for (const def of scope.defs) {
+        const tokens = macroBodyTokens(index, def);
+        const verdict = tokens ? _macroExpansionCallsName(def, tokens, call.name) : 'unknown';
+        if (verdict === true) reaches++;
+        else if (verdict !== false) unknown = true;
+    }
+    if (reaches === scope.defs.length) return null;
+    if (reaches > 0 || unknown || scope.defs.some(def => def.ppConditional)) return 'ambiguous';
+    if (scope.reach === 'include') {
+        const { strong } = _textualIncludeClosures(index, filePath);
+        if (!scope.defs.every(def => strong.has(def.file))) return 'ambiguous';
+    }
+    return scope.defs.length === 1 ? { macro: scope.defs[0] } : 'macro';
+}
+
+/**
+ * Does the expansion of a macro invoked as `NAME(...)` call the function
+ * NAME (fix #385)? A replacement list's own name is never expanded again
+ * (C11 6.10.3.4p2), so `#define f(x) f(x)` and `#define f(x) (f)(x, __LINE__)`
+ * call the function f; an object-like `#define f f` leaves the site's own
+ * `(...)` after it. true when the list spells NAME in call position, false
+ * when it never spells NAME, 'unknown' when it spells NAME otherwise (a
+ * reference such as `g(f)`: the site then may not call f at all).
+ */
+function _macroExpansionCallsName(def, tokens, name) {
+    let spelled = false;
+    for (let i = 0; i < tokens.length; i++) {
+        const token = tokens[i];
+        if (token.k !== 'id' || token.v !== name) continue;
+        spelled = true;
+        const next = tokens[i + 1];
+        if (next?.v === '(') return true;
+        if (tokens[i - 1]?.v === '(' && next?.v === ')' && tokens[i + 2]?.v === '(') return true;
+        if (!def.functionLike && !next) return true;
+    }
+    return spelled ? 'unknown' : false;
+}
+
+function bareCallCannotDenote(def, language) {
+    const traits = langTraits(language);
+    if (!traits || traits.bareCallReachesMethods) return false;
+    if (!def || NON_CALLABLE_TYPES.has(def.type)) return false;
+    if (!(def.className || def.receiver)) return false;
+    if (traits.typeSystem === 'structural' && def.type === 'function') return false;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Impls of one generic trait for one self type, selected by argument type
+// (fix #384): `impl From<Bytes> for Vec<u8>` and `impl From<BytesMut> for
+// Vec<u8>` are two candidates of every `Vec::from(x)`; the argument's type
+// picks one, and an out-of-project trait (`From`) has more impls UCN cannot
+// see (std's `From<&[u8]> for Vec<u8>`, the reflexive `From<T> for T`).
+// ---------------------------------------------------------------------------
+
+const RUST_INT_TYPES = new Set(['i8', 'i16', 'i32', 'i64', 'i128', 'isize',
+    'u8', 'u16', 'u32', 'u64', 'u128', 'usize']);
+const RUST_FLOAT_TYPES = new Set(['f32', 'f64']);
+
+function _rustTraitBase(traitName) {
+    return String(traitName || '').replace(/<.*$/s, '').split('::').pop().trim();
+}
+
+function _rustGenericNames(text) {
+    const names = new Set();
+    const inner = String(text || '').trim().replace(/^<|>$/g, '');
+    let depth = 0;
+    let start = 0;
+    for (let i = 0; i <= inner.length; i++) {
+        const ch = inner[i];
+        if (ch === '<' || ch === '(' || ch === '[') depth++;
+        else if (ch === '>' || ch === ')' || ch === ']') depth--;
+        else if ((ch === ',' || i === inner.length) && depth === 0) {
+            const part = inner.slice(start, i).trim().replace(/^const\s+/, '');
+            const match = part.match(/^([A-Za-z_]\w*)/);
+            if (match) names.add(match[1]);
+            start = i + 1;
+        }
+    }
+    return names;
+}
+
+/** Original name of a type spelled through a `use ... as Alias` of the file. */
+function _rustTypeOriginal(index, file, name) {
+    const entry = index.files.get(file);
+    for (const binding of entry?.importBindings || []) {
+        if (binding?.alias === name && binding.name && binding.name !== '*') {
+            return String(binding.name).split('::').pop();
+        }
+    }
+    return name;
+}
+
+/** A declared type as { refs, base, exact }; null for generic/opaque types. */
+function _rustTypeShape(index, text, def, typeParams) {
+    let t = String(text || '').replace(/'[A-Za-z_]\w*\s*/g, '')
+        .replace(/&\s*mut\s+/g, '&mut ').replace(/\s+/g, ' ').trim();
+    let refs = '';
+    for (;;) {
+        if (t.startsWith('&mut ')) { refs += '&mut '; t = t.slice(5).trim(); continue; }
+        if (t.startsWith('&')) { refs += '&'; t = t.slice(1).trim(); continue; }
+        break;
+    }
+    if (!t) return null;
+    if (t.startsWith('[')) {
+        const element = t.slice(1).replace(/[;\]].*$/s, '').trim();
+        const known = element && !typeParams.has(element) && /^[A-Za-z_][\w:]*$/.test(element)
+            ? element.split('::').pop() : null;
+        const kind = t.includes(';') ? '#array' : '#slice';
+        return { refs, base: known ? `${kind}:${known}` : kind, exact: !!known };
+    }
+    if (/^(?:impl|dyn)\b|^[(*!_]|^fn\b/.test(t)) return null;
+    const open = t.indexOf('<');
+    let base = (open >= 0 ? t.slice(0, open) : t).split('::').pop().trim();
+    let exact = open < 0;
+    if (base === 'Self') {
+        base = def.className || '';
+        exact = exact && !(def.ownerSelfArgs && def.ownerSelfArgs.length > 0);
+    }
+    if (!base || typeParams.has(base)) return null;
+    return { refs, base: _rustTypeOriginal(index, def.file, base), exact };
+}
+
+/** Descriptor from the parser (languages/rust.js rustArgTypesOfNode). */
+function _rustArgShape(index, filePath, descriptor) {
+    if (!descriptor) return null;
+    let t = String(descriptor);
+    let refs = '';
+    for (;;) {
+        if (t.startsWith('&mut ')) { refs += '&mut '; t = t.slice(5); continue; }
+        if (t.startsWith('&')) { refs += '&'; t = t.slice(1); continue; }
+        break;
+    }
+    if (t.startsWith('?')) {
+        const base = _rustProducedType(index, filePath, Number(t.slice(1)));
+        return base ? { refs, base: _rustTypeOriginal(index, filePath, base) } : null;
+    }
+    if (t === '#int' || t === '#float') return { refs, literal: t };
+    return { refs, base: t.startsWith('#') ? t : _rustTypeOriginal(index, filePath, t) };
+}
+
+/**
+ * The type a local bound from a path call (`let b = Bytes::from(v)`) holds:
+ * the owner type when every project definition of that associated function
+ * on that owner declares it (or Self) as its result; null otherwise.
+ */
+function _rustProducedType(index, filePath, start) {
+    if (!Number.isInteger(start)) return null;
+    const memo = index._opMemo?.('rustProducedType');
+    const key = `${filePath}\0${start}`;
+    if (memo?.has(key)) return memo.get(key);
+    let result = null;
+    const calls = getCachedCalls(index, filePath) || [];
+    const macro = calls.find(call => call.callStart === start && call.isMacro);
+    const producer = macro ? null : calls.find(call => call.callStart === start && call.isPathCall && call.receiver);
+    if (macro) {
+        result = _rustStdMacroResultType(index, filePath, macro)?.type || null;
+    } else if (producer) {
+        const owner = String(producer.receiver).split('::').pop();
+        const defs = (index.symbols.get(producer.name) || []).filter(d =>
+            !NON_CALLABLE_TYPES.has(d.type) && (d.className === owner ||
+                String(d.receiver || '').replace(/^\*/, '') === owner));
+        if (defs.length > 0 && defs.every(d => {
+            const shape = _rustTypeShape(index, d.returnType, d, new Set());
+            return shape && !shape.refs && shape.base === owner;
+        })) result = owner;
+    }
+    memo?.set(key, result);
+    return result;
+}
+
+function _rustArgParamVerdict(index, arg, param) {
+    if (!arg || !param) return 'unknown';
+    if (arg.refs !== param.refs) return 'mismatch';
+    if (arg.literal === '#int' || arg.literal === '#float') {
+        const numeric = arg.literal === '#int' ? RUST_INT_TYPES : RUST_FLOAT_TYPES;
+        return numeric.has(param.base) ? 'unknown' : 'mismatch';
+    }
+    // Slices and arrays: `#slice` / `#array`, with `:elem` when known.
+    const [argKind, argElem] = String(arg.base).split(':');
+    const [paramKind, paramElem] = String(param.base).split(':');
+    const sequence = kind => kind === '#slice' || kind === '#array';
+    if (sequence(argKind) || sequence(paramKind)) {
+        if (!sequence(argKind) || !sequence(paramKind)) return 'mismatch';
+        if (argElem && paramElem && argElem !== paramElem) return 'mismatch';
+        if (argKind !== paramKind) return argKind === '#array' && paramKind === '#slice' ? 'unknown' : 'mismatch';
+        return argElem && paramElem ? 'exact' : 'match';
+    }
+    if (arg.base === param.base) return param.exact ? 'exact' : 'match';
+    // A project type alias may name either type.
+    const aliased = name => (index.symbols.get(name) || []).some(d => d.aliasOf || d.type === 'type');
+    if (aliased(arg.base) || aliased(param.base)) return 'unknown';
+    return 'nominal-mismatch';
+}
+
+/**
+ * How argument types select among the impls of the target's generic trait
+ * for its self type at one call: null when not applicable; 'exclude' when
+ * the arguments select another impl; 'confirm' when they select the target;
+ * 'ambiguous' (with candidates) when they cannot decide.
+ */
+function _rustTraitImplSelection(index, filePath, call, targetDefs, definitions) {
+    const targets = targetDefs.filter(d => !NON_CALLABLE_TYPES.has(d.type));
+    if (targets.length !== 1 || !call.isMethod) return null;
+    const target = targets[0];
+    if (!target.traitImpl || !String(target.traitName || '').includes('<')) return null;
+    const language = index.files.get(target.file)?.language;
+    // The impl family and the trait's origin depend only on the target
+    // (one computation per operation).
+    const memo = index._opMemo?.('rustTraitImplFamily');
+    let family = memo?.get(target);
+    if (!family) {
+        const traitBase = _rustTraitBase(target.traitName);
+        const selfKey = def => {
+            const ref = ownerRefOf(index, def);
+            return ref?.key || `${ref?.external ? 'external' : 'name'}:${def.className || ''}`;
+        };
+        const targetSelf = selfKey(target);
+        family = {
+            members: definitions.filter(d => !NON_CALLABLE_TYPES.has(d.type) && d.traitImpl &&
+                _rustTraitBase(d.traitName) === traitBase && selfKey(d) === targetSelf),
+            // Loaded on first use: most operations never select trait impls.
+            externalTrait: require('./contract-membership').rustProjectTraits(
+                index, target.traitName, target.file, target.startLine).length === 0,
+        };
+        memo?.set(target, family);
+    }
+    const externalTrait = family.externalTrait;
+    const siblings = family.members.filter(d => d === target || _callArityCompatible(call, [d], language));
+    if (siblings.length <= 1 && !externalTrait) return null;
+    const args = Array.isArray(call.argTypes) ? call.argTypes : [];
+    const verdictOf = def => {
+        const ps = Array.isArray(def.paramsStructured) ? def.paramsStructured : [];
+        const selfParam = ps[0] && /^(?:&\s*)?(?:mut\s+)?self$/.test(
+            String(ps[0].name || '').replace(/'[A-Za-z_]\w*\s*/g, '').trim());
+        const params = selfParam ? ps.slice(1) : ps;
+        const callArgs = selfParam && call.isPathCall ? args.slice(1) : args;
+        const typeParams = new Set([..._rustGenericNames(def.ownerGenerics), ..._rustGenericNames(def.generics)]);
+        let verdict = 'exact';
+        for (let i = 0; i < params.length; i++) {
+            const v = _rustArgParamVerdict(index, _rustArgShape(index, filePath, callArgs[i]),
+                _rustTypeShape(index, params[i]?.type, def, typeParams));
+            if (v === 'mismatch' || v === 'nominal-mismatch') return v;
+            if (v === 'unknown') verdict = 'unknown';
+            else if (v === 'match' && verdict === 'exact') verdict = 'match';
+        }
+        return params.length === 0 ? 'unknown' : verdict;
+    };
+    const own = verdictOf(target);
+    if (own === 'mismatch') return { decision: 'exclude' };
+    const others = siblings.filter(d => d !== target).map(verdictOf);
+    if (own !== 'exact' && others.includes('exact')) return { decision: 'exclude' };
+    const othersOut = others.every(v => v === 'mismatch' || v === 'nominal-mismatch');
+    // An out-of-project trait reaches a project type through blanket impls
+    // only, and the one that accepts a concrete argument type is the
+    // reflexive `From<T> for T`: a base-level match (`Vec` against
+    // `Vec<u8>`) whose argument is not the self type itself selects the
+    // project impl. An out-of-project self type (`Vec`, `String`) has
+    // impls UCN cannot see, so only an exact match confirms there.
+    const projectSelf = !!ownerRefOf(index, target)?.key;
+    const reflexive = args.some(desc => _rustArgShape(index, filePath, desc)?.base === target.className);
+    if (othersOut && (own === 'exact' ||
+        (own === 'match' && (!externalTrait || (projectSelf && !reflexive))))) {
+        return { decision: 'confirm' };
+    }
+    if (othersOut && own === 'unknown' && !externalTrait) return null;
+    return {
+        decision: 'ambiguous',
+        candidates: siblings.length - others.filter(v => v === 'mismatch' || v === 'nominal-mismatch').length,
+        external: externalTrait,
+    };
+}
+
+/**
+ * Rust method probing by reference layer (fix #392). The probe visits the
+ * receiver type R, then &R and &mut R, then the dereferenced type T and &T,
+ * &mut T; the first step with a method of the name wins. The target member
+ * (self kind k in an impl for T) sits at the step whose type is its self
+ * type S. Returns 'unverified' when an earlier step can hold another impl of
+ * the name: a trait outside the project on a reference step (std implements
+ * AsRef, Iterator, Display, ... for `&T`/`&mut T`), or a project impl of a
+ * trait with the method for T or a reference to it. null: no decision (the
+ * layer is unknown, the target is found first, or nothing can intervene).
+ */
+function _rustReceiverProbe(index, filePath, call, target, callerSymbol) {
+    if (!target || !target.className || !target.selfParamKind || target.implSelfRef) return null;
+    const layerOf = kind => (kind === '&' || kind === '&mut') ? kind : kind === 'value' || kind === 'owned' ? '' : null;
+    let receiverLayer = null;
+    if (call.receiver === 'self') {
+        if (!callerSymbol || callerSymbol.className !== target.className || !callerSymbol.selfParamKind) return null;
+        const callerRef = ownerRefOf(index, callerSymbol);
+        const targetRef = ownerRefOf(index, target);
+        if (!callerRef?.key || callerRef.key !== targetRef?.key) return null;
+        if (callerSymbol.implSelfRef) {
+            // `impl Tr for &T { fn m(self) }`: self is &T.
+            if (callerSymbol.selfParamKind !== 'value') return null;
+            receiverLayer = callerSymbol.implSelfRef;
+        } else {
+            receiverLayer = layerOf(callerSymbol.selfParamKind);
+        }
+    } else if (call.receiverType === target.className && call.receiverTypeRef) {
+        receiverLayer = layerOf(call.receiverTypeRef);
+    }
+    if (receiverLayer == null) return null;
+    const targetLayer = layerOf(target.selfParamKind);
+    if (targetLayer == null || targetLayer === receiverLayer) return null;
+    // `&T` cannot reach a `&mut self` member.
+    if (receiverLayer === '&' && targetLayer === '&mut') return null;
+    // Steps before the target's: reference steps (a layer on R, or &T before
+    // &mut T from an owned R) and owned T.
+    const referenceSteps = receiverLayer !== '' || targetLayer === '&mut';
+    const name = target.name;
+    const targetRef = ownerRefOf(index, target);
+    if (target.traitImpl && referenceSteps) {
+        const memo = index._opMemo?.('rustProbeExternalTrait', () => new Map());
+        let external = memo?.get(target);
+        if (external === undefined) {
+            external = require('./contract-membership').rustProjectTraits(
+                index, target.traitName, target.file, target.startLine).length === 0;
+            memo?.set(target, external);
+        }
+        if (external) return 'unverified';
+    }
+    // Project impls at earlier steps of a typed receiver are probed by layer
+    // where the receiver is typed (fix #368); `self` receivers are decided
+    // here.
+    if (call.receiver !== 'self') return null;
+    for (const member of index.symbols.get(name) || []) {
+        if (member === target || NON_CALLABLE_TYPES.has(member.type) || !member.className) continue;
+        if (!member.traitImpl && !member.implSelfRef) continue;
+        const generic = _rustGenericNames(member.ownerGenerics).has(member.className);
+        const memberRef = generic ? null : ownerRefOf(index, member);
+        const sameSelf = !generic && (targetRef?.key
+            ? memberRef?.key === targetRef.key : member.className === target.className);
+        if (!sameSelf && !generic) continue;
+        // An impl for a reference to T (or a blanket impl over references)
+        // holds a reference step; another trait's member for T holds the
+        // owned or reference step of its own self kind.
+        if (member.implSelfRef && referenceSteps) return 'unverified';
+        if (sameSelf && !member.implSelfRef && member.traitImpl) {
+            const memberLayer = layerOf(member.selfParamKind);
+            if (memberLayer === receiverLayer || referenceSteps ||
+                memberLayer === '') return 'unverified';
+        }
+        if (generic && member.traitImpl && !member.implSelfRef) {
+            // A blanket impl for every T also sits at T's own steps.
+            return 'unverified';
+        }
+    }
+    return null;
+}
+
+/**
+ * Callee side of the argument-type selection (fix #384): among one type's
+ * project impl members of generic traits, the one the call's arguments
+ * select ({ match }), none of them ({ none }: an impl outside the project),
+ * or { ambiguous }. null when the group is not such a family.
+ */
+function _rustImplGroupSelect(index, file, call, group) {
+    if (group.length === 0 || !group.every(s => s.traitImpl && String(s.traitName || '').includes('<'))) {
+        return null;
+    }
+    const definitions = index.symbols.get(call.name) || [];
+    const confirmed = [];
+    const viable = [];
+    let undecided = false;
+    for (const member of group) {
+        const selection = _rustTraitImplSelection(index, file, call, [member], definitions);
+        if (selection?.decision === 'exclude') continue;
+        viable.push(member);
+        if (selection?.decision === 'confirm') confirmed.push(member);
+        else if (selection) undecided = true;
+    }
+    if (confirmed.length === 1) return { match: confirmed[0] };
+    if (viable.length === 0) return { none: true };
+    if (viable.length === 1 && !undecided) return { match: viable[0] };
+    return { ambiguous: true };
+}
+
+/**
+ * The line of the declaration a JS local shadow names (fix #397): the parser
+ * stores it as `localShadow` (-1 for a parameter, catch or loop binding);
+ * other languages record `true` (0 here: no line).
+ */
+function _shadowLineOf(call) {
+    return typeof call.localShadow === 'number' ? call.localShadow : 0;
+}
+
+/**
+ * A bare name bound by an object pattern reads the member of the pattern's
+ * source (fix #397, immer-measured): `const { run } = make(); run()` is the
+ * member access `make().run`, `function f({ run }) { run() }` reads it from
+ * the argument. The parser records the property key and the source's
+ * receiver facts (`destructured`); this view presents the site as that
+ * member call so every receiver rule (typing, return flow, dispatch,
+ * module receivers) decides it. `destructuredFrom` keeps the pattern
+ * position: a rename edits the pattern key, never the local name.
+ */
+const _destructuredViews = new WeakMap();
+function _destructuredMemberView(call) {
+    const destructured = call.destructured;
+    if (!destructured) return call;
+    let view = _destructuredViews.get(call);
+    if (view) return view;
+    view = { ...call };
+    delete view.destructured;
+    delete view.localShadow;
+    delete view.moduleLocalBinding;
+    delete view.resolvedName;
+    delete view.resolvedNames;
+    Object.assign(view, destructured.receiver);
+    view.name = destructured.key;
+    view.isMethod = true;
+    view.destructuredFrom = { key: destructured.key, line: destructured.line, column: destructured.column,
+        ...(destructured.shorthand && { shorthand: true }), local: call.name, source: destructured.source };
+    _destructuredViews.set(call, view);
+    return view;
+}
+
+/**
+ * A bare site spelled by the local name of an aliased import whose imported
+ * name differs (`import { g as f }` then `f()`; `const f = require('m').g`):
+ * the spelling is the importer's own binding, kept by a rename of the
+ * definition behind it (fix #397). Rename surfaces with another spelling
+ * already carry `calledAs`.
+ */
+const _importAliasLocalsMemo = new WeakMap();
+function _spelledByImportAlias(fileEntry, call, calledAs) {
+    if (calledAs || call.isMethod || call.receiver || call.resolvedName) return false;
+    const bindings = fileEntry.importBindings;
+    if (!bindings || bindings.length === 0) return false;
+    let locals = _importAliasLocalsMemo.get(bindings);
+    if (!locals) {
+        locals = new Set();
+        for (const binding of bindings) {
+            if (binding?.alias && binding.alias !== binding.name) locals.add(binding.alias);
+        }
+        _importAliasLocalsMemo.set(bindings, locals);
+    }
+    return locals.has(call.name);
+}
+
+/** Whether the file binds `name` through an import (or a star import that may). */
+function _fileImportBindsName(fileEntry, name) {
+    if (!fileEntry) return true;
+    if ((fileEntry.importNames || []).includes('*')) return true;
+    return (fileEntry.importBindings || []).some(binding => binding && binding.name !== '*' &&
+        (binding.name === name || binding.alias === name));
+}
+
+/**
+ * Bare-name reach of member-assigned callables (fix #384). A member
+ * assignment (`req.setTimeout = () => {}`, `exports.f = function () {}`,
+ * prototype and object-literal members) creates no lexical name, so a bare
+ * name that has no lexical or import binding at the site resolves to the
+ * global scope. It reaches such a member only when the member's object is the
+ * global object (`globalThis.f = ...`), or from inside the member's own
+ * self-named function expression. `enclosing` is the site's line range.
+ * Returns 'yes' (reachable here), 'global' (a global member of another
+ * file), 'maybe' (the object may be the global object), 'no', or null when
+ * a target is not a member assignment or the name is import-bound.
+ */
+function _bareNameMemberVerdict(fileEntry, filePath, name, startLine, endLine, targetDefs) {
+    if (targetDefs.length === 0 || !targetDefs.every(d => d.memberAssigned)) return null;
+    if (_fileImportBindsName(fileEntry, name)) return null;
+    let verdict = 'no';
+    for (const d of targetDefs) {
+        if (d.selfNamed && d.file === filePath &&
+            startLine >= d.startLine && endLine <= d.endLine) return 'yes';
+        if (d.assignedObject === 'global') {
+            if (d.file === filePath) return 'yes';
+            verdict = 'global';
+        } else if (d.assignedObject !== 'object' && verdict === 'no') {
+            verdict = 'maybe';
+        }
+    }
+    return verdict;
+}
+
 function _nonCallableFieldMember(index, typeName, name, language) {
+    // A pure function of the index within an operation (fix #382).
+    const memo = index._opMemo?.('nonCallableFieldMember');
+    if (!memo) return _nonCallableFieldMemberUncached(index, typeName, name, language);
+    const key = `${typeName}\0${name}\0${language}`;
+    let verdict = memo.get(key);
+    if (verdict === undefined) {
+        verdict = _nonCallableFieldMemberUncached(index, typeName, name, language);
+        memo.set(key, verdict);
+    }
+    return verdict;
+}
+
+function _nonCallableFieldMemberUncached(index, typeName, name, language) {
     const defs = index.symbols.get(name);
     if (!defs || defs.length === 0) return false;
     const onType = defs.filter(d => d.className === typeName ||
@@ -12573,6 +17555,40 @@ function _nonCallableFieldMember(index, typeName, name, language) {
         }
     }
     return true;
+}
+
+/** The import a package-qualified receiver names in a file, or null. */
+function _receiverImportModule(index, fileEntry, receiver) {
+    // Per file and receiver name within an operation (fix #382).
+    const memo = index._opMemo?.('receiverImportModule', () => new WeakMap());
+    let byReceiver = memo ? memo.get(fileEntry) : null;
+    if (byReceiver) {
+        const hit = byReceiver.get(receiver);
+        if (hit !== undefined) return hit;
+    }
+    const modules = fileEntry.imports || [];
+    const names = fileEntry.importNames || [];
+    let importModule = null;
+    if (names.length === modules.length) {
+        const i = names.indexOf(receiver);
+        if (i >= 0) importModule = modules[i];
+    }
+    if (!importModule) {
+        importModule = modules.find(mod => {
+            const parts = mod.split('/');
+            const last = parts[parts.length - 1];
+            const pkgName = (/^v\d+$/.test(last) && parts.length > 1) ? parts[parts.length - 2] : last;
+            return pkgName === receiver;
+        }) || null;
+    }
+    if (memo) {
+        if (!byReceiver) {
+            byReceiver = new Map();
+            memo.set(fileEntry, byReceiver);
+        }
+        byReceiver.set(receiver, importModule);
+    }
+    return importModule;
 }
 
 /**
@@ -12626,6 +17642,19 @@ function _qualifiedStaticOwnerFiles(index, fileEntry, call, typeName, language, 
         if (!bindsReceiver) continue;
         const rel = fileEntry.moduleResolved && fileEntry.moduleResolved[b.module];
         if (rel) files.add(path.join(index.root, rel));
+    }
+    // C# (fix #395): an unqualified type name is the one class definition
+    // the file's namespaces and using directives resolve (partial parts
+    // included), when several same-name types exist.
+    if (files.size === 0 && language === 'csharp' && def?.file &&
+        new Set(typeDefs.map(d => d.namespace || '')).size > 1) {
+        const arity = call.receiverIsTypeQualified ? (call.receiverTypeArgs || 0) : undefined;
+        const ref = resolveClassRef(index, typeName, def.file, { line: call.line, arity });
+        if (ref?.key) {
+            for (const entry of classDefsNamed(index, typeName).entries) {
+                if (entry.key === ref.key && entry.def.file) files.add(entry.def.file);
+            }
+        }
     }
     return files.size > 0 ? files : null;
 }
@@ -12681,9 +17710,57 @@ function _namespaceContainedDef(index, fileEntry, callFileAbs, receiverName, cal
     return null;
 }
 
+/**
+ * The impl member a `Trait::assoc(..)` path call binds when Self is the
+ * enclosing impl's self type (fix #369): the call is the value the enclosing
+ * fn returns (tail or `return`), that fn is a member of an impl of the same
+ * trait, and both declarations return the same Self-mentioning type text.
+ * Returns the one member of that impl named like the call, else null.
+ */
+/**
+ * Caller-side twin of _rustTraitPathSelfImplMember (fix #369): the trait's
+ * declaration member named like the call, then the enclosing impl member.
+ */
+function _rustTraitPathSelfImplMemberForCaller(index, filePath, call, callerSymbol, traitName) {
+    if (!call.returnPosition || !callerSymbol?.traitImpl) return null;
+    const traitDefs = (index.symbols.get(traitName) || []).filter(definition =>
+        definition.type === 'trait' && definition.file);
+    const origin = _resolveFlowTypeOrigin(index, filePath, traitName);
+    const trait = origin?.fromFile ? traitDefs.find(d => d.file === origin.fromFile) : null;
+    if (!trait) return null;
+    const declarations = (index.symbols.get(call.name) || []).filter(definition =>
+        definition.className === traitName && !definition.traitImpl && definition.file === trait.file &&
+        definition.startLine >= trait.startLine && definition.endLine <= trait.endLine);
+    if (declarations.length !== 1) return null;
+    return _rustTraitPathSelfImplMember(index, callerSymbol, call, declarations[0], traitName);
+}
+
+function _rustTraitPathSelfImplMember(index, def, call, traitMember, traitName) {
+    if (!call.returnPosition || !def?.traitImpl) return null;
+    const norm = text => String(text || '').replace(/<.*$/s, '').trim().split('::').pop();
+    if (norm(def.traitName) !== traitName) return null;
+    const flat = text => String(text || '').replace(/\s+/g, '');
+    const want = flat(traitMember.returnType);
+    if (!want || !/\bSelf\b/.test(want) || flat(def.returnType) !== want) return null;
+    const owner = def.className || def.receiver;
+    if (!owner) return null;
+    const members = (index.symbols.get(call.name) || []).filter(d =>
+        d.traitImpl && norm(d.traitName) === traitName && d.file === def.file &&
+        (d.className || d.receiver) === owner &&
+        !NON_CALLABLE_TYPES.has(d.type) &&
+        _sameImplBlock(index, def, d));
+    return members.length === 1 ? members[0] : null;
+}
+
+function _sameImplBlock(index, a, b) {
+    const impls = (index.files.get(a.file)?.symbols || []).filter(s =>
+        s.type === 'impl' && s.startLine <= a.startLine && s.endLine >= a.endLine);
+    return impls.some(impl => impl.startLine <= b.startLine && impl.endLine >= b.endLine);
+}
+
 function _calleeTypeQualifiedReceiver(index, def, fileEntry, call, language) {
     let receiver = call.receiver;
-    if (!receiver) return null;
+    if (!receiver || call.receiverIsChainRoot) return null;
     const traits = langTraits(language);
     const style = traits?.typeQualifiedCallStyle;
     if (style === 'path' && !call.isPathCall) return null;
@@ -12766,6 +17843,14 @@ function _calleeTypeQualifiedReceiver(index, def, fileEntry, call, language) {
             if (_isGenericParamReceiverType(index, def.file, call.line, receiver)) {
                 return { unverified: 'method-ambiguous' };
             }
+            // Project impls of generic traits for an out-of-project type
+            // (`impl From<Bytes> for Vec<u8>`): the arguments decide
+            // whether `Vec::from(x)` is one of them (fix #384).
+            const impls = (index.symbols.get(call.name) || []).filter(s =>
+                s.traitImpl && s.className === receiver && !NON_CALLABLE_TYPES.has(s.type));
+            const selected = _rustImplGroupSelect(index, def.file, call, impls);
+            if (selected?.match) return { match: selected.match, typeName: receiver };
+            if (selected?.ambiguous) return { unverified: 'overload-ambiguous' };
             return { external: true };
         }
         if ((language === 'java' || language === 'csharp') &&
@@ -12807,16 +17892,23 @@ function _calleeTypeQualifiedReceiver(index, def, fileEntry, call, language) {
         !ownerFiles) {
         return { unverified: 'method-ambiguous' };
     }
-    const symbols = ownerFiles
+    // A written generic arity names one type of the name (fix #380):
+    // `Outcome.Create()` never selects `Outcome<T>.Create`.
+    const siteArity = traits?.genericArityIsIdentity && call.receiverIsTypeQualified
+        ? (call.receiverTypeArgs || 0) : null;
+    const symbols = (ownerFiles
         ? allSymbols.filter(s => !candidateTypes.includes(s.className) || ownerFiles.has(s.file))
-        : allSymbols;
+        : allSymbols).filter(s => siteArity == null || !candidateTypes.includes(s.className) ||
+            (s.ownerTypeArity || 0) === siteArity);
     if (language === 'java' || language === 'csharp') {
         // Class-qualified Java/C# calls see the compiler member group on the
         // qualifier. The helper handles inherited slots and C# name hiding.
-        const family = candidateTypes.flatMap(typeName =>
+        const groups = candidateTypes.map(typeName =>
             _calleeReceiverMethodGroup(
                 index, symbols, typeName, language, def.file,
-                symbol => isCallable(symbol) && symbol.type === 'static'));
+                symbol => isCallable(symbol) && symbol.type === 'static', call.line));
+        const family = groups.flat();
+        if (groups.some(group => group.ownerAmbiguous)) family.ownerAmbiguous = true;
         const selected = _calleeOverloadSelect(index, call, family, language);
         if (selected.ambiguous) return { unverified: 'overload-ambiguous' };
         if (selected.match) {
@@ -12834,13 +17926,24 @@ function _calleeTypeQualifiedReceiver(index, def, fileEntry, call, language) {
             };
         }
     }
-    const selectOn = (tn) => _calleeOverloadSelect(index, call, symbols.filter(s => isCallable(s) &&
-        (s.className === tn || (s.receiver && s.receiver.replace(/^\*/, '') === tn))), language);
+    const selectOn = (tn) => {
+        const group = symbols.filter(s => isCallable(s) &&
+            (s.className === tn || (s.receiver && s.receiver.replace(/^\*/, '') === tn)));
+        // Impls of one generic trait for this type: the arguments select
+        // (fix #384); none selected means an impl outside the project.
+        const implSelected = style === 'path' ? _rustImplGroupSelect(index, def.file, call, group) : null;
+        if (implSelected) {
+            return implSelected.match ? { match: implSelected.match }
+                : implSelected.ambiguous ? { ambiguous: true } : { match: null, external: true };
+        }
+        return _calleeOverloadSelect(index, call, group, language);
+    };
     let match = null;
     let matchedType = null;
     for (const tn of candidateTypes) {
         const selected = selectOn(tn);
         if (selected.ambiguous) return { unverified: 'overload-ambiguous' };
+        if (selected.external) return { external: true };
         match = selected.match;
         if (match) { matchedType = tn; break; }
     }
@@ -12856,6 +17959,18 @@ function _calleeTypeQualifiedReceiver(index, def, fileEntry, call, language) {
             }
             if (match) break;
         }
+    }
+    if (match && style === 'path' && !match.traitImpl &&
+        typeDefs.some(d => d.type === 'trait')) {
+        // `Trait::assoc(..)` names the trait, not Self (fix #369, rand-
+        // measured): rustc selects the implementation Self infers. The one
+        // shape settled here is a value the enclosing trait-impl fn returns
+        // with the same declared type as the trait item (`-> Result<Self,
+        // Error>` both): Self is that impl's self type, and the call binds
+        // its member. Otherwise the implementation stays one trait family.
+        const selfImpl = _rustTraitPathSelfImplMember(index, def, call, match, matchedType);
+        if (selfImpl) return { match: selfImpl, typeName: selfImpl.className || selfImpl.receiver };
+        return { unverified: 'possible-dispatch', dispatchVia: matchedType };
     }
     if (match) return { match, typeName: matchedType };
     // A project type that does not define the method: a trait/interface
@@ -12955,6 +18070,17 @@ function _calleeReceiverTypeRoute(index, call, localTypes, language, scopeRef = 
     const defs = (index.symbols.get(call.name) || []).filter(d =>
         !NON_CALLABLE_TYPES.has(d.type) && d.className &&
         _calleeLanguageCompatible(index, d, language));
+    // A function-local class of the name (fix #381): decide by the class
+    // DEFINITION the name denotes at the call site.
+    if (scopeRef?.file && scopeRef.line != null && head === raw &&
+        classDefsNamed(index, head).hasScoped) {
+        const ref = _typeRefAt(index, scopeRef.file, head, scopeRef.line);
+        const declaring = ref.key ? findDeclaringClass(index, ref, defs) : null;
+        if (declaring && !declaring.uncertain && declaring.members.length === 1) {
+            return { resolve: declaring.members[0] };
+        }
+        return { uncertain: true };
+    }
     let matches = defs.filter(d => d.className === head || d.className === norm);
     if (matches.length === 0 && defs.length > 0) {
         const ancestors = _receiverTypeAncestors(index, head, 6, scopeRef);
@@ -13129,40 +18255,398 @@ function _csharpTypeIdentity(raw) {
 }
 
 /**
- * Exact C# extension-method evidence for the bound `receiver.Ext(args)` form.
- * The first `this` parameter must match the parser-known receiver type, and
- * the declaring namespace/type must be in lexical scope. Unknown receiver
- * types and global-using gaps abstain.
+ * C# assignability of `actualType` to `expectedType` (type identities, bare
+ * names): 'yes' through project heritage and the known platform bases,
+ * 'no' when the actual type's ancestry is fully known (project types all
+ * the way up) or the expected type is a project type an external type cannot
+ * derive from, 'unknown' otherwise (fix #380).
  */
-function _csharpExtensionCallMatches(index, filePath, fileEntry, call, targetDefs) {
-    if (!call.receiverType || !Array.isArray(targetDefs) ||
-        targetDefs.length === 0) return false;
-    const actualType = _csharpTypeIdentity(call.receiverType);
-    if (!actualType) return false;
-    const enclosing = index.findEnclosingFunction(filePath, call.line, true);
+function _csharpAssignability(index, actualType, expectedType) {
+    if (!actualType || !expectedType) return 'unknown';
+    if (expectedType === 'Object' || expectedType === 'object') return 'yes';
+    if (_csharpTypeAssignable(index, actualType, expectedType)) return 'yes';
+    const isProjectType = name => (index.symbols.get(name) || []).some(d =>
+        _ARITY_TYPE_KINDS.has(d.type) && index.files.get(d.file)?.language === 'csharp');
+    if (!isProjectType(actualType)) return isProjectType(expectedType) ? 'no' : 'unknown';
+    // Every ancestor of a project type is known only when each is itself a
+    // project type; an external base may derive from anything.
+    const seen = new Set();
+    const queue = [actualType];
+    while (queue.length > 0 && seen.size < 128) {
+        const current = queue.shift();
+        if (seen.has(current)) continue;
+        seen.add(current);
+        if (!isProjectType(current)) return 'unknown';
+        const parents = [...(index._getInheritanceParents?.(current) || [])]
+            .map(parent => typeof parent === 'string' ? parent : parent?.name);
+        for (const definition of index.symbols.get(current) || []) {
+            if (!_ARITY_TYPE_KINDS.has(definition.type)) continue;
+            for (const implemented of definition.implements || []) parents.push(_csharpTypeIdentity(implemented));
+            if (definition.extends) {
+                for (const base of splitParentList(definition.extends)) parents.push(_csharpTypeIdentity(base));
+            }
+        }
+        for (const parent of parents) if (parent && !seen.has(parent)) queue.push(parent);
+    }
+    return 'no';
+}
+
+/** Is the static class declaring extension `def` in scope at the call? The
+ * declaring namespace must be the caller's namespace or one enclosing it, or
+ * be imported by a using directive (file, `using static`, global usings). */
+function _csharpExtensionInScope(index, filePath, fileEntry, call, def) {
+    if (def.file === filePath) return true;
+    const namespace = def.namespace || null;
+    if (!namespace) return true; // global namespace: visible everywhere
+    const enclosing = index.findEnclosingFunction(filePath, call.line, true, call);
     const callerNamespace = enclosing?.namespace || null;
-    const imports = new Set(fileEntry.imports || []);
-    return targetDefs.some(def => {
-        if (!def.isExtensionMethod || !Array.isArray(def.paramsStructured)) {
-            return false;
-        }
+    if (callerNamespace && (callerNamespace === namespace || callerNamespace.startsWith(`${namespace}.`))) {
+        return true;
+    }
+    // Directives resolved from the namespace each is written in (fix #395);
+    // `using static T` brings T's extension methods.
+    const scope = csharpUsings(index, filePath);
+    return scope.namespaces.has(namespace) ||
+        (!!def.className && scope.statics.has(`${namespace}.${def.className}`));
+}
+
+/**
+ * C# extension-method verdict for the bound `receiver.Ext(args)` form
+ * (fix #380): 'match' when the receiver's type satisfies the declaration's
+ * `this` parameter (directly, through project heritage, or through the
+ * constraints of a method type parameter) and the declaring class is in
+ * scope; 'possible' when the receiver type's ancestry cannot decide it;
+ * 'no' when an instance method of that name on the receiver's project type
+ * wins (instance members take precedence over extensions) or the receiver
+ * type provably does not qualify; null when no extension target applies.
+ */
+function _csharpExtensionCallVerdict(index, filePath, fileEntry, call, targetDefs, opts = {}) {
+    if (!call.receiverType || !Array.isArray(targetDefs) || targetDefs.length === 0) return null;
+    const actualType = _csharpTypeIdentity(call.receiverType);
+    if (!actualType) return null;
+    // The receiver's written type with its type arguments (fix #395), when a
+    // declaration, construction or declared field spells it (a field may be
+    // declared by several same-name owners: every spelling must agree).
+    const receiverTexts = call.receiverHopTypeTexts ||
+        (call.receiverTypeEvidence && _csharpTypeIdentity(call.receiverTypeEvidence.type) === actualType
+            ? [call.receiverTypeEvidence.type] : null);
+    let verdict = null;
+    for (const def of targetDefs) {
+        if (!def.isExtensionMethod || !Array.isArray(def.paramsStructured)) continue;
         const receiver = def.paramsStructured[0];
-        const expectedType = receiver?.extensionReceiver
-            ? _csharpTypeIdentity(receiver.type) : null;
-        const assignable = !!expectedType &&
-            _csharpTypeAssignable(index, actualType, expectedType);
-        if (!assignable) {
-            return false;
+        if (!receiver?.extensionReceiver) continue;
+        if (!_csharpExtensionInScope(index, filePath, fileEntry, call, def) ||
+            (!opts.receiverOnly && !_callArityCompatible(call, [def], 'csharp'))) {
+            verdict = verdict || 'no';
+            continue;
         }
-        const namespace = def.namespace || null;
-        const inScope = def.file === filePath ||
-            namespace === callerNamespace ||
-            (namespace && imports.has(namespace)) ||
-            (namespace && def.className &&
-                imports.has(`${namespace}.${def.className}`));
-        return !!inScope &&
-            _callArityCompatible(call, [def], 'csharp');
+        let fit;
+        if (receiver.typeParameter) {
+            const constraints = (receiver.constraints || []).map(_csharpTypeIdentity).filter(Boolean);
+            const results = constraints.map(constraint => _csharpAssignability(index, actualType, constraint));
+            fit = results.includes('no') ? 'no' : results.includes('unknown') ? 'unknown' : 'yes';
+        } else {
+            fit = _csharpAssignability(index, actualType, _csharpTypeIdentity(receiver.type));
+            // `this List<Transformer>` never takes a `List<string>` (fix
+            // #395): type arguments convert only by identity, or by
+            // reference variance an invariant class never has.
+            if (fit !== 'no' && receiverTexts?.length > 0) {
+                const fits = receiverTexts.map(text => _csharpReceiverArgumentFit(index, text, receiver.type, def));
+                if (fits.every(args => args === 'no')) fit = 'no';
+                else if (fits.some(args => args === 'no' || args === 'unknown') && fit === 'yes') fit = 'unknown';
+                // Type arguments the receiver fixes (`List<string>` for
+                // `this List<T>`) type the other parameters (fix #395):
+                // `TryAdd<T>(this List<T>, T)` never takes a `string[]`.
+                if (fit !== 'no' && !opts.receiverOnly &&
+                    _csharpReceiverInferredParamsReject(index, receiverTexts, receiver.type, def, call)) {
+                    fit = 'no';
+                }
+            }
+        }
+        if (fit === 'yes') { verdict = 'match'; break; }
+        verdict = fit === 'unknown' ? 'possible' : (verdict || 'no');
+    }
+    if (verdict !== 'possible' && verdict !== 'match') return verdict;
+    if (opts.receiverOnly) return verdict;
+    // Instance methods win: an applicable same-name instance member on the
+    // receiver's project type (or a project ancestor) takes the call.
+    const instance = (index.symbols.get(call.name) || []).some(d => !d.isExtensionMethod &&
+        d.className && !NON_CALLABLE_TYPES.has(d.type) &&
+        (d.className === actualType || _isAncestorOfTargetClass(index, d.className, [{ className: actualType }])) &&
+        _callArityCompatible(call, [d], 'csharp'));
+    if (instance) return 'no';
+    // Platform instance members win the same way (fix #395): `List<T>`
+    // declares `Add(T)`, `object` declares `ToString()`. A member that may
+    // take the arguments leaves the call undecided; one that provably takes
+    // them owns it.
+    const platforms = (receiverTexts?.length > 0 ? receiverTexts : [null]).map(text =>
+        _csharpPlatformInstanceVerdict(index, actualType, text, call));
+    if (platforms.every(platform => platform === 'applies')) return 'no';
+    if (platforms.some(platform => platform)) return 'possible';
+    return verdict;
+}
+
+// Instance methods of platform types the engine types receivers with (fix
+// #395), by type identity: member name -> parameter lists. `T` is the
+// element type argument, `K`/`V` a dictionary's key and value, `*` any
+// argument. Types whose members are not listed are not decided here.
+const _CSHARP_COLLECTION_MEMBERS = {
+    Add: [['T']], Clear: [[]], Contains: [['T']], CopyTo: [['*', '*'], ['*'], ['*', '*', '*', '*']], Remove: [['T']],
+};
+const _CSHARP_LIST_MEMBERS = {
+    ..._CSHARP_COLLECTION_MEMBERS,
+    IndexOf: [['T'], ['T', '*'], ['T', '*', '*']], Insert: [['*', 'T']], RemoveAt: [['*']],
+};
+const _CSHARP_PLATFORM_INSTANCE_MEMBERS = new Map([
+    ['ICollection', _CSHARP_COLLECTION_MEMBERS],
+    ['IList', _CSHARP_LIST_MEMBERS],
+    ['Collection', _CSHARP_LIST_MEMBERS],
+    ['List', {
+        ..._CSHARP_LIST_MEMBERS,
+        AddRange: [['*']], AsReadOnly: [[]], BinarySearch: [['T'], ['T', '*'], ['*', '*', 'T', '*']],
+        ConvertAll: [['*']], EnsureCapacity: [['*']], Exists: [['*']], Find: [['*']], FindAll: [['*']],
+        FindIndex: [['*'], ['*', '*'], ['*', '*', '*']], FindLast: [['*']],
+        FindLastIndex: [['*'], ['*', '*'], ['*', '*', '*']], ForEach: [['*']], GetRange: [['*', '*']],
+        InsertRange: [['*', '*']], LastIndexOf: [['T'], ['T', '*'], ['T', '*', '*']], RemoveAll: [['*']],
+        RemoveRange: [['*', '*']], Reverse: [[], ['*', '*']], Slice: [['*', '*']],
+        Sort: [[], ['*'], ['*', '*', '*']], ToArray: [[]], TrimExcess: [[]], TrueForAll: [['*']],
+    }],
+    ['HashSet', {
+        ..._CSHARP_COLLECTION_MEMBERS,
+        EnsureCapacity: [['*']], ExceptWith: [['*']], IntersectWith: [['*']], IsProperSubsetOf: [['*']],
+        IsProperSupersetOf: [['*']], IsSubsetOf: [['*']], IsSupersetOf: [['*']], Overlaps: [['*']],
+        RemoveWhere: [['*']], SetEquals: [['*']], SymmetricExceptWith: [['*']], TrimExcess: [[]],
+        TryGetValue: [['T', '*']], UnionWith: [['*']],
+    }],
+    ['IDictionary', {
+        Add: [['K', 'V'], ['*']], Clear: [[]], Contains: [['*']], ContainsKey: [['K']], CopyTo: [['*', '*']],
+        Remove: [['K'], ['*']], TryGetValue: [['K', '*']],
+    }],
+    ['Dictionary', {
+        Add: [['K', 'V'], ['*']], Clear: [[]], Contains: [['*']], ContainsKey: [['K']], ContainsValue: [['V']],
+        CopyTo: [['*', '*']], EnsureCapacity: [['*']], Remove: [['K'], ['K', '*'], ['*']], TrimExcess: [[], ['*']],
+        TryAdd: [['K', 'V']], TryGetValue: [['K', '*']],
+    }],
+]);
+
+/**
+ * Does an instance method of a platform receiver type take the call before
+ * any extension (fix #395)? 'applies' when a listed member provably takes
+ * the arguments (or an `object` member of that arity exists), 'maybe' when
+ * one may, null when none can (or the type's members are not listed).
+ */
+function _csharpPlatformInstanceVerdict(index, actualType, receiverText, call) {
+    const universal = langTraits('csharp')?.universalSupertypeMembers;
+    if (universal && Object.prototype.hasOwnProperty.call(universal, call.name) &&
+        (call.argCount == null || call.argCount === universal[call.name])) return 'applies';
+    const members = _CSHARP_PLATFORM_INSTANCE_MEMBERS.get(actualType);
+    const shapes = members && Object.prototype.hasOwnProperty.call(members, call.name) ? members[call.name] : null;
+    if (!shapes) return null;
+    // Explicit type arguments (`Add<string>(..)`) bind only a generic
+    // method; the listed members are not generic, ConvertAll aside.
+    if (call.methodTypeArgs > 0 && call.name !== 'ConvertAll') return null;
+    const args = receiverText ? _csharpTypeArgsOf(receiverText) : null;
+    const slot = { T: args?.length === 1 ? args[0] : null, K: args?.length === 2 ? args[0] : null,
+        V: args?.length === 2 ? args[1] : null };
+    let result = null;
+    for (const shape of shapes) {
+        if (call.argCount != null && shape.length !== call.argCount) continue;
+        let certain = call.argCount != null;
+        let possible = true;
+        shape.forEach((param, i) => {
+            const kind = call.argKinds?.[i];
+            const type = param === '*' ? null : slot[param];
+            if (!type) { if (param !== '*') certain = false; return; }
+            if (!_javaArgKindMatches(index, kind, type, 'csharp')) possible = false;
+            else if (!_argProvablyConverts(index, kind, { type }, 'csharp')) certain = false;
+        });
+        if (!possible) continue;
+        if (certain) return 'applies';
+        result = 'maybe';
+    }
+    return result;
+}
+
+/** Type arguments of a C# type text (`List<string>` -> ['string']); [] for
+ * none. */
+function _csharpTypeArgsOf(text) {
+    const match = /<(.*)>\s*\??\s*(?:\[\s*\])*\s*$/s.exec(String(text || '').trim());
+    return match ? _splitTopLevelGenericArgs(match[1]).map(arg => arg.trim()) : [];
+}
+
+// Element-typed collections: each maps its one type argument to the same
+// element type of the collection interfaces it implements.
+const _CSHARP_ELEMENT_COLLECTIONS = new Set(['List', 'HashSet', 'Collection', 'IList', 'ICollection',
+    'IEnumerable', 'IReadOnlyList', 'IReadOnlyCollection', 'ISet', 'IReadOnlySet', 'Queue', 'Stack',
+    'LinkedList', 'SortedSet', 'ReadOnlyCollection']);
+// Platform generic types with invariant type parameters: classes, structs
+// and the collection interfaces declared without `in`/`out`.
+const _CSHARP_INVARIANT_HEADS = new Set(['List', 'HashSet', 'Dictionary', 'SortedDictionary', 'SortedList',
+    'Collection', 'Queue', 'Stack', 'LinkedList', 'SortedSet', 'ReadOnlyCollection', 'ConcurrentDictionary',
+    'ConcurrentBag', 'ConcurrentQueue', 'ConcurrentStack', 'KeyValuePair', 'Nullable', 'Lazy', 'Task',
+    'ValueTask', 'IList', 'ICollection', 'IDictionary', 'ISet', 'IReadOnlyDictionary']);
+// Platform interfaces whose one type parameter is covariant (`out T`).
+const _CSHARP_COVARIANT_HEADS = new Set(['IEnumerable', 'IReadOnlyList', 'IReadOnlyCollection',
+    'IQueryable', 'IOrderedEnumerable', 'IOrderedQueryable', 'IEnumerator', 'IAsyncEnumerable']);
+const _CSHARP_VALUE_KEYWORDS = new Set(['int', 'long', 'short', 'byte', 'sbyte', 'uint', 'ulong', 'ushort',
+    'bool', 'char', 'double', 'float', 'decimal', 'nint', 'nuint']);
+
+/**
+ * Can a receiver of written type `actualText` take an extension's `this`
+ * parameter of written type `expectedText`, by their type arguments (fix
+ * #395)? 'yes', 'no' (an argument that converts under no variance: a value
+ * type, or an external type against a project type), 'unknown' (variance
+ * or an unreadable argument), null when the two types' arguments do not
+ * correspond.
+ */
+/**
+ * Can project type `actual` convert to project type `expected` (fix #395)?
+ * Only through its project ancestry: an external ancestor never derives from
+ * or implements a project type, so it ends the walk.
+ */
+function _csharpProjectTypeReaches(index, actual, expected) {
+    const isProjectType = name => (index.symbols.get(name) || []).some(d =>
+        _ARITY_TYPE_KINDS.has(d.type) && index.files.get(d.file)?.language === 'csharp');
+    const seen = new Set();
+    const queue = [actual];
+    while (queue.length > 0 && seen.size < 256) {
+        const current = queue.shift();
+        if (!current || seen.has(current)) continue;
+        seen.add(current);
+        if (current === expected) return true;
+        if (!isProjectType(current)) continue;
+        for (const parent of index._getInheritanceParents?.(current) || []) {
+            const name = typeof parent === 'string' ? parent : parent?.name;
+            if (name && !seen.has(name)) queue.push(_csharpTypeIdentity(name));
+        }
+        for (const definition of index.symbols.get(current) || []) {
+            if (!_ARITY_TYPE_KINDS.has(definition.type)) continue;
+            for (const implemented of definition.implements || []) queue.push(_csharpTypeIdentity(implemented));
+            if (definition.extends) {
+                for (const base of splitParentList(definition.extends)) queue.push(_csharpTypeIdentity(base));
+            }
+        }
+    }
+    return false;
+}
+
+/**
+ * Does every receiver spelling fix the extension's type parameters so that
+ * some argument provably cannot take its parameter (fix #395)? The `this`
+ * parameter's type arguments that are bare method type parameters bind to
+ * the receiver's written arguments (`this List<T>` with a `List<string>`
+ * receiver binds T = string); each other parameter mentioning a bound
+ * parameter is checked against the call's argument kind.
+ */
+function _csharpReceiverInferredParamsReject(index, receiverTexts, thisType, def, call) {
+    if (!Array.isArray(call.argKinds) || call.argKinds.length === 0) return false;
+    const typeParams = new Set(String(def.generics || '').replace(/^<|>$/g, '').split(',')
+        .map(g => g.replace(/^(?:in|out)\s+/, '').trim()).filter(Boolean));
+    if (typeParams.size === 0) return false;
+    const params = (def.paramsStructured || []).slice(1);
+    return receiverTexts.every(text => {
+        const actualArgs = _csharpTypeArgsOf(text);
+        const expectedArgs = _csharpTypeArgsOf(thisType);
+        if (_csharpTypeIdentity(text) !== _csharpTypeIdentity(thisType) ||
+            actualArgs.length === 0 || actualArgs.length !== expectedArgs.length) return false;
+        const bound = new Map();
+        expectedArgs.forEach((arg, i) => {
+            const name = arg.replace(/\s+/g, '');
+            if (typeParams.has(name) && actualArgs[i]) bound.set(name, actualArgs[i].trim());
+        });
+        if (bound.size === 0) return false;
+        return params.some((param, i) => {
+            const kind = call.argKinds[i];
+            if (!param?.type || param.rest || !kind || kind === 'expr') return false;
+            let substituted = String(param.type);
+            for (const [name, value] of bound) {
+                substituted = substituted.replace(new RegExp(`\\b${name}\\b`, 'g'), value);
+            }
+            if (substituted === param.type) return false;
+            return !_javaArgKindMatches(index, kind, substituted, 'csharp');
+        });
     });
+}
+
+function _csharpReceiverArgumentFit(index, actualText, expectedText, def) {
+    const actualHead = _csharpTypeIdentity(actualText);
+    const expectedHead = _csharpTypeIdentity(expectedText);
+    const actualArgs = _csharpTypeArgsOf(actualText);
+    const expectedArgs = _csharpTypeArgsOf(expectedText);
+    if (expectedArgs.length === 0) return null;
+    // `generics` is the written parameter list (`<TValue, TKey>`).
+    const typeParams = new Set(String(def.generics || '').replace(/^<|>$/g, '').split(',')
+        .map(g => g.replace(/^(?:in|out)\s+/, '').trim()).filter(Boolean));
+    const isProjectType = name => (index.symbols.get(name) || []).some(d =>
+        _ARITY_TYPE_KINDS.has(d.type) && index.files.get(d.file)?.language === 'csharp');
+    const normalize = text => String(text).replace(/\s+/g, '').replace(/^global::/, '').replace(/\?$/, '');
+    const corresponding = actualArgs.length > 0 && (actualHead === expectedHead
+        ? actualArgs.length === expectedArgs.length
+        : actualArgs.length === 1 && expectedArgs.length === 1 &&
+            _CSHARP_ELEMENT_COLLECTIONS.has(actualHead) && _CSHARP_ELEMENT_COLLECTIONS.has(expectedHead));
+    if (!corresponding) {
+        // An external type's supertypes are external types instantiated from
+        // its own type arguments: a project type argument of the expected
+        // type (`List<Transformer>`) must come from the actual type's
+        // arguments (`DbSet<Customer>` never converts to it).
+        if (actualHead === expectedHead || isProjectType(actualHead)) return null;
+        const actualIds = [];
+        const collect = list => {
+            for (const arg of list) {
+                const id = _csharpTypeIdentity(arg);
+                if (id) actualIds.push(id);
+                collect(_csharpTypeArgsOf(arg));
+            }
+        };
+        collect(actualArgs);
+        for (const arg of expectedArgs) {
+            const expected = normalize(arg);
+            const id = _csharpTypeIdentity(expected);
+            if (typeParams.has(expected) || !id || !isProjectType(id)) continue;
+            if (!actualIds.some(actual => actual === id ||
+                (isProjectType(actual) && _csharpProjectTypeReaches(index, actual, id)))) return 'no';
+        }
+        return null;
+    }
+    // Variance applies to interface type parameters only: classes and
+    // structs (platform or project) take identical type arguments.
+    const invariantHead = _CSHARP_INVARIANT_HEADS.has(expectedHead) ||
+        (index.symbols.get(expectedHead) || []).some(d => ['class', 'struct', 'record'].includes(d.type) &&
+            index.files.get(d.file)?.language === 'csharp');
+    let result = 'yes';
+    for (let i = 0; i < expectedArgs.length; i++) {
+        const expected = normalize(expectedArgs[i]);
+        const actual = normalize(actualArgs[i]);
+        if (typeParams.has(expected) || expected === actual) continue;
+        const expectedId = _csharpTypeIdentity(expected);
+        const actualId = _csharpTypeIdentity(actual);
+        if (!expectedId || !actualId) { result = 'unknown'; continue; }
+        if (expectedId === actualId) {
+            // One generic head: its own arguments decide.
+            const nested = _csharpReceiverArgumentFit(index, actual, expected, def);
+            if (nested === 'no') return 'no';
+            if (nested === 'unknown') result = 'unknown';
+            continue;
+        }
+        if (invariantHead) return 'no';
+        // Variance converts reference types only; an external type never
+        // derives from a project type.
+        if (_CSHARP_VALUE_KEYWORDS.has(actual) || _CSHARP_VALUE_KEYWORDS.has(actualId)) return 'no';
+        if (isProjectType(expectedId)) {
+            if (!isProjectType(actualId) || !_csharpProjectTypeReaches(index, actualId, expectedId)) return 'no';
+            // A covariant platform interface (`IEnumerable<out T>`) takes a
+            // reference type that reaches the argument.
+            if (_CSHARP_COVARIANT_HEADS.has(expectedHead) && expectedArgs.length === 1 &&
+                (index.symbols.get(actualId) || []).every(d => !['struct', 'enum'].includes(d.type) &&
+                    !(d.modifiers || []).includes('struct'))) continue;
+        }
+        result = 'unknown';
+    }
+    return result;
+}
+
+function _csharpExtensionCallMatches(index, filePath, fileEntry, call, targetDefs) {
+    return _csharpExtensionCallVerdict(index, filePath, fileEntry, call, targetDefs) === 'match';
 }
 
 /**
@@ -13184,8 +18668,10 @@ function _callArityCompatible(call, targetDefs, language) {
         if (NON_CALLABLE_TYPES.has(def.type)) return true;
         const ps = def.paramsStructured;
         if (!Array.isArray(ps)) return true;
+        // `&'a mut self` carries a lifetime (fix #369).
         const hasExplicitSelf = !!(ps[0] && selfNames.has(
-            String(ps[0].name || '').replace(/&|mut\s*/g, '').trim()));
+            String(ps[0].name || '').replace(/'[A-Za-z_]\w*\s*/g, '')
+                .replace(/&|mut\s*/g, '').trim()));
         const boundExtension = !!(def.isExtensionMethod && call.isMethod &&
             call.receiver !== def.className);
         const params = ps.filter((p, i) =>
@@ -13227,13 +18713,27 @@ const JAVA_PRIMITIVES = new Set(['int', 'long', 'short', 'byte', 'char', 'float'
 const CSHARP_OVERLOAD_ALIASES = new Map([
     ['string', 'String'], ['string?', 'String'],
     ['bool', 'boolean'], ['object', 'Object'], ['object?', 'Object'],
-    ['sbyte', 'byte'], ['nint', 'long'],
+    // C# sbyte and byte are distinct types (fix #393: `M(sbyte)` beside
+    // `M(byte)`); CSHARP_NUMERIC_WIDENING carries each one's conversions.
+    ['nint', 'long'],
 ]);
+// Generic interfaces a one-dimensional array implements for its element.
+const CSHARP_ARRAY_INTERFACES = new Set(['IEnumerable', 'ICollection', 'IList', 'IReadOnlyCollection',
+    'IReadOnlyList']);
 const CSHARP_CLOSED_TYPES = new Set([
     'String', 'boolean', 'sbyte', 'byte', 'short', 'ushort', 'int', 'uint',
     'long', 'ulong', 'char', 'float', 'double', 'decimal',
     'Guid', 'DateTime', 'DateTimeOffset', 'TimeSpan', 'Uri', 'BigInteger',
 ]);
+// Closed platform types by kind: `?` on a value type is Nullable<T>, on a
+// reference type a nullability annotation (fix #391).
+const CSHARP_REFERENCE_TYPES = new Set(['String', 'Object', 'Uri']);
+const CSHARP_STRING_SUPERTYPES = new Set([
+    'Object', 'String', 'IComparable', 'IConvertible', 'IEquatable', 'IEnumerable',
+    'ICloneable', 'IParsable', 'ISpanParsable',
+]);
+const CSHARP_VALUE_TYPES = new Set([...CSHARP_CLOSED_TYPES]
+    .filter(type => !CSHARP_REFERENCE_TYPES.has(type)));
 const CSHARP_NUMERIC_WIDENING = new Map([
     ['sbyte', new Set(['short', 'int', 'long', 'float', 'double', 'decimal'])],
     ['byte', new Set(['short', 'ushort', 'int', 'uint', 'long', 'ulong',
@@ -13327,6 +18827,18 @@ const JAVA_PLATFORM_FIELD_TYPES = new Map([
 // Exact subset of C# implicit conversions for compiler-owned closed types.
 // Returns null when user-defined conversions or external ancestry could
 // matter. A false verdict is therefore exclusion-grade evidence.
+// Whether a C# type name denotes a value type: a closed platform value type
+// or a project struct/enum (fix #391). Unknown types are not value types
+// here, so `?` on them never disproves a conversion.
+function _csharpIsValueType(index, name) {
+    const simple = String(name || '').replace(/<.*$/s, '').split('.').pop();
+    const alias = CSHARP_OVERLOAD_ALIASES.get(simple) || simple;
+    if (CSHARP_VALUE_TYPES.has(alias)) return true;
+    const defs = (index.symbols.get(simple) || [])
+        .filter(d => ['class', 'interface', 'enum', 'struct', 'record'].includes(d.type));
+    return defs.length > 0 && defs.every(d => d.type === 'enum' || d.type === 'struct');
+}
+
 function _csharpKnownTypeAssignable(actualRaw, expectedRaw) {
     const actualText = String(actualRaw || '').trim().replace(/^global::/, '');
     const expectedText = String(expectedRaw || '').trim().replace(/^global::/, '')
@@ -13340,8 +18852,22 @@ function _csharpKnownTypeAssignable(actualRaw, expectedRaw) {
     const expected = normalize(expectedText);
     if (!actual || !expected) return null;
     if (expected === 'Object') return true;
+    // System.Action / System.Func of different arities are distinct sealed
+    // delegate types (fix #391): a delegate value converts only to its own
+    // shape (`configure` typed Action<B, C> never binds Action<B>).
+    const delegateName = actual.replace(/<.*$/s, '').split('.').pop();
+    if ((delegateName === 'Action' || delegateName === 'Func') &&
+        expected.replace(/<.*$/s, '').split('.').pop() === delegateName &&
+        _genericArgumentCount(actualText) !== _genericArgumentCount(expectedText)) {
+        return false;
+    }
     if (actual === expected) {
-        return !actualNullable || expectedNullable;
+        if (!actualNullable || expectedNullable) return true;
+        // `T?` to `T`: Nullable<T> has no implicit conversion for a value
+        // type; on a reference type `?` is only a nullability annotation
+        // (fix #391: `ValidateToken(JToken? item)` binds ValidateToken(JToken)).
+        if (CSHARP_VALUE_TYPES.has(actual)) return false;
+        return CSHARP_REFERENCE_TYPES.has(actual) ? true : null;
     }
     // `object` is the top of C#'s reference-type lattice. A statically typed
     // object value cannot implicitly downcast to a narrower class/interface;
@@ -13352,7 +18878,21 @@ function _csharpKnownTypeAssignable(actualRaw, expectedRaw) {
     const actualArray = actual.endsWith('[]');
     const expectedArray = expected.endsWith('[]');
     if (actualArray || expectedArray) {
-        if (actualArray && !expectedArray) return expected === 'Object';
+        if (actualArray && !expectedArray) {
+            // A one-dimensional array implements the collection interfaces
+            // of its element type (fix #395: `string[]` to
+            // `IEnumerable<string>`); the generic ones take the element type
+            // or, for the covariant read-only ones, a reference supertype.
+            const head = expected.replace(/<.*$/s, '').split('.').pop();
+            if (['Object', 'Array', 'IEnumerable', 'ICollection', 'IList', 'ICloneable',
+                'IStructuralComparable', 'IStructuralEquatable'].includes(head) && !expected.includes('<')) return true;
+            if (!CSHARP_ARRAY_INTERFACES.has(head) || _genericArgumentCount(expectedText) !== 1) return false;
+            const element = normalize(actualText.replace(/\[\s*\]\s*\??\s*$/, ''));
+            const wanted = normalize(String(_splitTopLevelGenericArgs(expectedText.slice(expectedText.indexOf('<') + 1,
+                expectedText.lastIndexOf('>')))[0] || ''));
+            if (!element || !wanted) return null;
+            return element === wanted ? true : null;
+        }
         if (!actualArray) return false;
         const actualElement = actual.slice(0, -2);
         const expectedElement = expected.slice(0, -2);
@@ -13366,7 +18906,12 @@ function _csharpKnownTypeAssignable(actualRaw, expectedRaw) {
         return null;
     }
 
-    if (actualNullable && !expectedNullable) return false;
+    if (actualNullable && !expectedNullable && CSHARP_VALUE_TYPES.has(actual)) return false;
+    // System.String is sealed: it converts to its own declared supertypes
+    // only (fix #391: a string argument never binds an Exception parameter).
+    if (actual === 'String') {
+        return CSHARP_STRING_SUPERTYPES.has(expected.replace(/<.*$/s, '').split('.').pop());
+    }
     const actualKnown = CSHARP_CLOSED_TYPES.has(actual);
     const expectedKnown = CSHARP_CLOSED_TYPES.has(expected);
     if (!actualKnown || !expectedKnown) return null;
@@ -13442,6 +18987,28 @@ const JAVA_PLATFORM_SUPERTYPES = new Map([
         'javax.lang.model.type.TypeMirror']],
     ['javax.lang.model.type.UnionType', ['javax.lang.model.type.TypeMirror']],
     ['javax.lang.model.type.WildcardType', ['javax.lang.model.type.TypeMirror']],
+    // JDK collections (fix #391): their declared supertypes, so a
+    // `new LinkedHashMap<>()` argument proves a Map parameter applicable.
+    ...[
+        ['ArrayList', ['List', 'Collection', 'Iterable', 'RandomAccess', 'AbstractList',
+            'AbstractCollection', 'SequencedCollection', 'Cloneable', 'Serializable']],
+        ['LinkedList', ['List', 'Deque', 'Queue', 'Collection', 'Iterable', 'AbstractSequentialList',
+            'AbstractList', 'AbstractCollection', 'SequencedCollection', 'Cloneable', 'Serializable']],
+        ['ArrayDeque', ['Deque', 'Queue', 'Collection', 'Iterable', 'AbstractCollection',
+            'SequencedCollection', 'Cloneable', 'Serializable']],
+        ['HashMap', ['Map', 'AbstractMap', 'Cloneable', 'Serializable']],
+        ['LinkedHashMap', ['HashMap', 'Map', 'SequencedMap', 'AbstractMap', 'Cloneable', 'Serializable']],
+        ['TreeMap', ['NavigableMap', 'SortedMap', 'SequencedMap', 'Map', 'AbstractMap', 'Cloneable',
+            'Serializable']],
+        ['HashSet', ['Set', 'Collection', 'Iterable', 'AbstractSet', 'AbstractCollection', 'Cloneable',
+            'Serializable']],
+        ['LinkedHashSet', ['HashSet', 'SequencedSet', 'SequencedCollection', 'Set', 'Collection', 'Iterable',
+            'AbstractSet', 'AbstractCollection', 'Cloneable', 'Serializable']],
+        ['TreeSet', ['NavigableSet', 'SortedSet', 'SequencedSet', 'SequencedCollection', 'Set', 'Collection',
+            'Iterable', 'AbstractSet', 'AbstractCollection', 'Cloneable', 'Serializable']],
+    ].map(([type, supertypes]) => [`java.util.${type}`, supertypes.map(name =>
+        (name === 'Iterable' || name === 'Cloneable' ? `java.lang.${name}`
+            : name === 'Serializable' ? 'java.io.Serializable' : `java.util.${name}`))]),
 ]);
 
 function _javaPlatformAssignable(actualType, expectedSimple) {
@@ -13469,18 +19036,20 @@ function _javaCallReturnType(index, kind) {
     return _javaCallReturnInfo(index, kind)?.type || null;
 }
 
-function _javaCallReturnInfo(index, kind) {
+function _javaCallReturnInfo(index, kind, contextFile = null) {
     if (kind?.startsWith('chain:')) {
         const parts = kind.slice('chain:'.length).split('#');
         let owner = parts.shift();
         if (!owner || parts.length === 0) return null;
         let ownerFile;
         let info;
+        let context = contextFile;
         for (const method of parts) {
-            info = _javaOwnerMethodReturnInfo(index, owner, method, ownerFile);
+            info = _javaOwnerMethodReturnInfo(index, owner, method, ownerFile, context);
             if (!info) return null;
             owner = info.type;
             ownerFile = info.fromFile;
+            context = info.fromFile || null;
         }
         return info;
     }
@@ -13495,7 +19064,7 @@ function _javaCallReturnInfo(index, kind) {
         const definitions = (index.symbols.get(method) || []).filter(definition =>
             definition.className === ownerSimple && definition.returnType);
         if (definitions.length === 0) {
-            return _javaOwnerMethodReturnInfo(index, owner, method);
+            return _javaOwnerMethodReturnInfo(index, owner, method, undefined, contextFile);
         }
         const argKinds = kindsEncoded
             ? kindsEncoded.split(',').map(value => decodeURIComponent(value))
@@ -13514,7 +19083,7 @@ function _javaCallReturnInfo(index, kind) {
     const parts = kind.split(':');
     const owner = parts[1];
     const method = parts.slice(2).join(':');
-    return _javaOwnerMethodReturnInfo(index, owner, method);
+    return _javaOwnerMethodReturnInfo(index, owner, method, undefined, contextFile);
 }
 
 function _javaDefinitionReturnInfo(index, definition) {
@@ -13536,7 +19105,7 @@ function _javaDefinitionReturnInfo(index, definition) {
         : null;
 }
 
-function _javaOwnerMethodReturnInfo(index, owner, method, ownerFile) {
+function _javaOwnerMethodReturnInfo(index, owner, method, ownerFile, contextFile = null) {
     const ownerSimple = owner.split('.').pop();
     const platformReturn = JAVA_PLATFORM_METHOD_RETURNS.get(`${owner}#${method}`);
     if (platformReturn) return { type: platformReturn, platform: true };
@@ -13549,6 +19118,12 @@ function _javaOwnerMethodReturnInfo(index, owner, method, ownerFile) {
     if (ownerFile) {
         const pinned = definitions.filter(d => d.file === ownerFile);
         if (pinned.length > 0) definitions = pinned;
+    } else if (contextFile && definitions.length > 1 && !classDefsNamed(index, ownerSimple).unique) {
+        // The owner the name denotes where the call is written (fix #394):
+        // `A.builder()` in package p is p.A's builder, never q.A's.
+        const ref = resolveClassRef(index, ownerSimple, contextFile);
+        const owned = ref.key ? definitions.filter(d => ownerRefOf(index, d)?.key === ref.key) : [];
+        if (owned.length > 0) definitions = owned;
     }
     const returns = new Map();
     for (const d of definitions) {
@@ -13572,6 +19147,18 @@ function _javaOwnerMethodReturnInfo(index, owner, method, ownerFile) {
     // signature is usable; ambiguity remains visible.
     if (returns.size === 1) {
         const [type, files] = [...returns.entries()][0];
+        if (files.size > 1 && !type.includes('.')) {
+            // One spelling in several declaring files names one type only
+            // when each file resolves it to the same class definition (fix
+            // #394): `Builder` in p/A.java and q/A.java are two nested types.
+            const simple = type.replace(/\[\]$/, '');
+            if (!classDefsNamed(index, simple).unique) {
+                const refs = [...files].map(file => resolveClassRef(index, simple, file));
+                const keys = new Set(refs.map(ref => ref.key));
+                if (keys.size !== 1 || (keys.has(null) && !refs.every(ref => ref.external))) return null;
+                return { type, fromFile: [...files].sort(codeUnitCompare)[0] };
+            }
+        }
         const fromFile = files.size === 1 ? [...files][0] : undefined;
         return { type, ...(fromFile && { fromFile }) };
     }
@@ -13580,7 +19167,7 @@ function _javaOwnerMethodReturnInfo(index, owner, method, ownerFile) {
 }
 
 function _javaStaticTypeForKind(index, kind) {
-    if (!kind || kind === 'expr' || kind === 'lambda' || kind === 'null') return null;
+    if (!kind || kind === 'expr' || _isLambdaKind(kind) || kind === 'null') return null;
     if (kind.startsWith('element:')) {
         const container = _javaStaticTypeForKind(index, kind.slice('element:'.length));
         return container?.endsWith('[]') ? container.slice(0, -2) : null;
@@ -13614,8 +19201,26 @@ function _javaStaticTypeForKind(index, kind) {
     return null;
 }
 
+// Pure string normalization, called for every parameter/argument pair the
+// overload discipline compares: memoized (bounded).
+const _overloadTypeIdentityMemo = new Map();
+
 function _overloadTypeIdentity(raw) {
+    const key = typeof raw === 'string' ? raw : String(raw || '');
+    let hit = _overloadTypeIdentityMemo.get(key);
+    if (hit === undefined) {
+        if (_overloadTypeIdentityMemo.size >= 65536) _overloadTypeIdentityMemo.clear();
+        hit = _overloadTypeIdentityUncached(key);
+        _overloadTypeIdentityMemo.set(key, hit);
+    }
+    return hit;
+}
+
+function _overloadTypeIdentityUncached(raw) {
     let type = String(raw || '').trim().replace(/^global::/, '');
+    // An array is a reference type: `T[]?` is only a nullability annotation
+    // (fix #391: `params object?[]?`), as is `?` on reference elements.
+    type = type.replace(/\]\?$/, ']').replace(/^(object|string)\?(?=\[)/, '$1');
     const arrays = type.match(/(?:\[\])+$/)?.[0] || '';
     if (arrays) type = type.slice(0, -arrays.length);
     const parts = type.split('.');
@@ -13706,18 +19311,206 @@ function _csharpGenericMemberType(owner, fieldName) {
     return _csharpCollectionElementType(type);
 }
 
+// Lambda argument kinds (fix #391): `lambda` (parameter count unknown:
+// method references, `delegate { }`) or `lambda:N`.
+function _isLambdaKind(kind) {
+    return kind === 'lambda' || (typeof kind === 'string' && kind.startsWith('lambda:'));
+}
+
+function _lambdaKindArity(kind) {
+    if (typeof kind !== 'string' || !kind.startsWith('lambda:')) return null;
+    const arity = Number(kind.slice('lambda:'.length));
+    return Number.isInteger(arity) && arity >= 0 ? arity : null;
+}
+
+// Standard delegate / functional-interface types whose parameter count is
+// fixed by the platform (fix #391). Action/Func are generic in the count.
+const CSHARP_FIXED_DELEGATE_ARITY = new Map([
+    ['Predicate', 1], ['Converter', 1], ['Comparison', 2], ['EventHandler', 2],
+    ['ThreadStart', 0], ['AsyncCallback', 1], ['WaitCallback', 1],
+    ['TimerCallback', 1], ['ParameterizedThreadStart', 1],
+]);
+const JAVA_FUNCTIONAL_ARITY = new Map([
+    ['Runnable', 0], ['Callable', 0], ['Supplier', 0], ['BooleanSupplier', 0],
+    ['IntSupplier', 0], ['LongSupplier', 0], ['DoubleSupplier', 0],
+    ['Consumer', 1], ['Function', 1], ['Predicate', 1], ['UnaryOperator', 1],
+    ['IntFunction', 1], ['LongFunction', 1], ['DoubleFunction', 1],
+    ['ToIntFunction', 1], ['ToLongFunction', 1], ['ToDoubleFunction', 1],
+    ['IntPredicate', 1], ['LongPredicate', 1], ['DoublePredicate', 1],
+    ['IntConsumer', 1], ['LongConsumer', 1], ['DoubleConsumer', 1],
+    ['IntUnaryOperator', 1], ['LongUnaryOperator', 1], ['DoubleUnaryOperator', 1],
+    ['BiConsumer', 2], ['BiFunction', 2], ['BiPredicate', 2], ['BinaryOperator', 2],
+    ['Comparator', 2], ['ObjIntConsumer', 2], ['ObjLongConsumer', 2],
+    ['ObjDoubleConsumer', 2], ['ToIntBiFunction', 2], ['ToLongBiFunction', 2],
+    ['ToDoubleBiFunction', 2], ['IntBinaryOperator', 2], ['LongBinaryOperator', 2],
+    ['DoubleBinaryOperator', 2],
+]);
+
+// Top-level generic arguments of a written type (`Func<A, B<C, D>>` -> 2).
+function _genericArgumentCount(text) {
+    const open = text.indexOf('<');
+    if (open < 0) return 0;
+    let depth = 0;
+    let count = 1;
+    for (let i = open; i < text.length; i++) {
+        const ch = text[i];
+        if (ch === '<' || ch === '(' || ch === '[') depth++;
+        else if (ch === '>' || ch === ')' || ch === ']') depth--;
+        else if (ch === ',' && depth === 1) count++;
+        if (depth === 0) break;
+    }
+    return count;
+}
+
+// The parameter count of a delegate / functional-interface parameter type
+// the platform fixes, or null (project delegate types, other interfaces, and
+// any name the project declares itself).
+function _delegateParameterCount(index, paramType, language) {
+    const text = String(paramType || '').trim().replace(/\?$/, '');
+    const bare = text.replace(/<.*$/s, '').trim().split('.').pop();
+    const projectTypes = (index.symbols.get(bare) || []).filter(d => NON_CALLABLE_TYPES.has(d.type));
+    if (projectTypes.length > 0) {
+        const own = projectTypes.filter(d => index.files.get(d.file)?.language === language);
+        // A declaration of the name in the call's language decides; one in
+        // another language is not this type.
+        if (own.length > 0) return _projectFunctionalArity(index, own, text, language);
+        if (projectTypes.some(d => !d.file)) return null;
+    }
+    if (language === 'csharp') {
+        if (bare === 'Expression' && text.includes('<')) {
+            const inner = text.slice(text.indexOf('<') + 1, text.lastIndexOf('>'));
+            return _delegateParameterCount(index, inner, language);
+        }
+        if (bare === 'Action') return _genericArgumentCount(text);
+        if (bare === 'Func') {
+            const count = _genericArgumentCount(text);
+            return count > 0 ? count - 1 : null;
+        }
+        return CSHARP_FIXED_DELEGATE_ARITY.get(bare) ?? null;
+    }
+    if (language === 'java') return JAVA_FUNCTIONAL_ARITY.get(bare) ?? null;
+    return null;
+}
+
+/**
+ * The parameter count of a project-declared delegate (C#) or functional
+ * interface (Java: an interface whose closure over project super-interfaces
+ * declares exactly one abstract method), the count a lambda converting to
+ * it must have (fix #393). Every declaration of the name (of the written
+ * generic arity, C#) must agree; anything undecidable (an external
+ * super-interface, several abstract methods, a class) is null.
+ */
+function _projectFunctionalArity(index, defs, text, language) {
+    if (language === 'csharp') {
+        const written = _genericArgumentCount(text);
+        const sameArity = defs.filter(d => (d.typeArity || 0) === written);
+        if (sameArity.length === 0 || sameArity.some(d => d.type !== 'type' || !Number.isInteger(d.delegateParams))) {
+            return null;
+        }
+        const counts = new Set(sameArity.map(d => d.delegateParams));
+        return counts.size === 1 ? [...counts][0] : null;
+    }
+    if (language !== 'java') return null;
+    if (defs.some(d => d.type !== 'interface')) return null;
+    const counts = new Set();
+    for (const def of defs) {
+        const count = _javaFunctionalInterfaceArity(index, def);
+        if (count == null) return null;
+        counts.add(count);
+    }
+    return counts.size === 1 ? [...counts][0] : null;
+}
+
+// Public Object methods an interface may redeclare without adding an
+// abstract method (JLS 9.8).
+const _JAVA_OBJECT_METHOD_ARITY = new Map([['equals', 1], ['hashCode', 0], ['toString', 0]]);
+
+function _javaFunctionalInterfaceArity(index, root) {
+    const abstract = new Map(); // name -> Set(arity)
+    const seen = new Set();
+    const queue = [root];
+    while (queue.length > 0) {
+        const iface = queue.shift();
+        const key = `${iface.file}:${iface.startLine}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        if (seen.size > 32) return null;
+        for (const member of index.files.get(iface.file)?.symbols || []) {
+            if (member.className !== iface.name || NON_CALLABLE_TYPES.has(member.type) ||
+                member.startLine < iface.startLine || member.endLine > iface.endLine) continue;
+            const modifiers = member.modifiers || [];
+            if (modifiers.includes('default') || modifiers.includes('static') ||
+                modifiers.includes('private')) continue;
+            const arity = Array.isArray(member.paramsStructured) ? member.paramsStructured.length : null;
+            if (arity == null) return null;
+            if (_JAVA_OBJECT_METHOD_ARITY.get(member.name) === arity) continue;
+            if (!abstract.has(member.name)) abstract.set(member.name, new Set());
+            abstract.get(member.name).add(arity);
+        }
+        for (const parent of iface.extends ? [].concat(iface.extends) : []) {
+            const name = String(parent).replace(/<.*$/s, '').trim().split('.').pop();
+            const parents = (index.symbols.get(name) || []).filter(d => d.type === 'interface');
+            // An external super-interface may declare abstract methods too.
+            if (parents.length !== 1) return null;
+            queue.push(parents[0]);
+        }
+    }
+    if (abstract.size !== 1) return null;
+    const arities = [...abstract.values()][0];
+    return arities.size === 1 ? [...arities][0] : null;
+}
+
 /**
  * Can an argument of static kind `kind` (from the Java parser's argKinds)
  * bind a parameter declared as `paramType`? Unknown kinds ('expr',
  * 'lambda'), unknown/generic param types, and unresolvable hierarchies all
  * match — a mismatch must be provable to count.
  */
-function _javaArgKindMatches(index, kind, paramType, language) {
-    if (!kind || kind === 'expr' || kind === 'lambda') return true;
+/**
+ * Does the simple type name a parameter of `owner` spells denote a project
+ * type in the owner's file: a single-type import that resolves into the
+ * project, or (with no import of the name) a project type of the owner's
+ * own package? Reads only recorded index facts (overload witnesses replay
+ * this selector).
+ */
+function _javaParamTypeIsProject(index, bare, owner, expectedDefs) {
+    const entry = owner?.file ? index.files.get(owner.file) : null;
+    if (!entry) return false;
+    const imports = (entry.importBindings || []).filter(binding => binding.name === bare);
+    if (imports.length > 0) return imports.every(binding => !!entry.moduleResolved?.[binding.module]);
+    return !!owner.namespace && expectedDefs.some(definition => definition.namespace === owner.namespace);
+}
+
+function _javaArgKindMatches(index, kind, paramType, language, typeParams = null, paramOwner = null) {
+    if (!kind || kind === 'expr') return true;
     if (!paramType) return true;
     const rawBare = String(paramType).replace(/<.*$/s, '').trim()
         .replace(/\.\.\.$/, '').replace(/\[\]$/, '').split('.').pop();
     const bare = CSHARP_OVERLOAD_ALIASES.get(rawBare) || rawBare;
+    // A declared type parameter (`T? argument` in `AgainstNull<T>`) is
+    // inferred from the argument: no argument type disproves it (fix #391).
+    if (typeParams?.has(bare.replace(/\?$/, ''))) return true;
+    if (_isLambdaKind(kind)) {
+        // A lambda converts only to a delegate / functional-interface type
+        // (fix #391): never to a string, a primitive or closed value type,
+        // or an array (C# CS1660, Java "not a functional interface"), and
+        // in Java never to Object. A C# lambda with a natural type also
+        // converts to object/Delegate, so those stay possible there.
+        const text = String(paramType).trim();
+        if (bare === 'Object' || bare === 'dynamic') return language !== 'java';
+        if (bare === 'String' || JAVA_PRIMITIVES.has(bare) || CSHARP_CLOSED_TYPES.has(bare) ||
+            /\[\]\??$|\.\.\.$/.test(text)) return false;
+        // Its parameter count must equal the target's (C# 10.7.1, JLS
+        // 15.27.3) where the target's parameter count is known.
+        const lambdaArity = _lambdaKindArity(kind);
+        const targetArity = lambdaArity === null ? null
+            : _delegateParameterCount(index, paramType, language);
+        return targetArity === null || targetArity === lambdaArity;
+    }
+    if (language === 'java') {
+        const arrays = _javaArrayArgMatches(index, kind, paramType, typeParams);
+        if (arrays !== null) return arrays;
+    }
     if (!bare || bare === 'Object') return true;
     if (/^[A-Z][0-9]?$/.test(bare)) return true; // generic type variable (T, E, K1...)
     if (kind === 'null') return !JAVA_PRIMITIVES.has(bare);
@@ -13750,9 +19543,11 @@ function _javaArgKindMatches(index, kind, paramType, language) {
             .replace(/\[\]$/, '').split('.').pop();
         // C# Nullable<T> has no implicit conversion to T. This is complete
         // compiler evidence for value-type overloads such as Guid? vs Guid;
-        // the reverse conversion is valid.
+        // the reverse conversion is valid. On a reference type `?` is a
+        // nullability annotation (fix #391): only a value type is denied.
         if (actualNullable && !expectedNullable &&
-            actualNullableBase === expectedNullableBase) {
+            actualNullableBase === expectedNullableBase &&
+            (language !== 'csharp' || _csharpIsValueType(index, actualNullableBase))) {
             return false;
         }
         if (!actualNullable && expectedNullable &&
@@ -13815,6 +19610,12 @@ function _javaArgKindMatches(index, kind, paramType, language) {
             const valueAncestry = JAVA_PLATFORM_VALUE_ANCESTRY.get(tSimple);
             if (valueAncestry) return valueAncestry.includes(bare);
         }
+        // Java has no user-defined conversions: a value of a type the
+        // project does not declare is never a subtype of a project type
+        // (fix #394: a `List<Option>` argument never binds `Options`).
+        if (language === 'java' && paramOwner && tDefs.length === 0 && expectedDefs.length > 0 &&
+            !/^[A-Z][0-9]?$/.test(tSimple) && !String(paramType).includes('.') &&
+            _javaParamTypeIsProject(index, bare, paramOwner, expectedDefs)) return false;
         if (tDefs.length === 0) return true; // external arg type — unknowable
         const asTarget = [{ className: tSimple, file: tDefs[0].file }];
         if (_isDispatchAncestor(index, bare, asTarget)) return true;
@@ -13825,6 +19626,74 @@ function _javaArgKindMatches(index, kind, paramType, language) {
     const allowed = JAVA_KIND_TYPES[kind];
     if (!allowed) return true;
     return allowed.includes(bare);
+}
+
+/** Trailing array dimensions of a written type (`Map<K, V[]>[][]` -> 2). */
+function _writtenArrayDims(typeText) {
+    const text = String(typeText || '');
+    if (!text.includes('[')) return 0;
+    let outer = '';
+    let depth = 0;
+    for (const ch of text) {
+        if (ch === '<') depth++;
+        else if (ch === '>') depth--;
+        else if (depth === 0) outer += ch;
+    }
+    const trailing = outer.trim().match(/(?:\[\s*\]\s*)+$/);
+    return trailing ? (trailing[0].match(/\[/g) || []).length : 0;
+}
+
+// Types every Java array converts to (JLS 4.10.3).
+const JAVA_ARRAY_SUPERTYPES = new Set(['Object', 'Cloneable', 'Serializable']);
+
+/**
+ * Java argument/parameter array shape (fix #394): the parser keeps array
+ * dimensions on argument kinds, so a known non-array type never binds an
+ * array parameter (`isEmpty(Object[])` does not take a String) and an array
+ * binds a non-array parameter only through Object, Cloneable or
+ * Serializable. Arrays of references are covariant (JLS 10.10); arrays of
+ * primitives convert only to themselves. Null when the shapes do not
+ * decide (the element comparison continues), true/false when they do.
+ */
+function _javaArrayArgMatches(index, kind, paramType, typeParams) {
+    if (typeof kind !== 'string') return null;
+    const written = String(paramType).trim();
+    // Neither side spells an array: shapes cannot decide.
+    if (!written.includes('[') && !kind.includes('[')) return null;
+    if (/\.\.\.$/.test(written)) return null; // varargs: element positions
+    const expectedDims = _writtenArrayDims(written);
+    const expectedElement = written.replace(/(?:\[\s*\]\s*)+$/, '').replace(/<.*$/s, '').trim();
+    const expectedSimple = expectedElement.split('.').pop();
+    if (kind === 'null') return expectedDims > 0 ? true : null;
+    let actual = null;
+    if (JAVA_KIND_TYPES[kind]) actual = kind;
+    else if (kind.startsWith('class:')) actual = 'java.lang.Class';
+    else if (kind.startsWith('type:') || kind.startsWith('new:') || kind.startsWith('cast:')) {
+        actual = kind.slice(kind.indexOf(':') + 1);
+    }
+    if (actual === null) return null;
+    const actualDims = _writtenArrayDims(actual);
+    const actualElement = actual.replace(/(?:\[\s*\]\s*)+$/, '').trim();
+    const actualSimple = actualElement.replace(/<.*$/s, '').split('.').pop();
+    // A type variable may stand for an array type.
+    if (/^[A-Z][0-9]?$/.test(actualSimple) || typeParams?.has(actualSimple)) return null;
+    if (/^[A-Z][0-9]?$/.test(expectedSimple) || typeParams?.has(expectedSimple)) {
+        return actualDims >= expectedDims ? null : false;
+    }
+    if (actualDims === 0 && expectedDims === 0) return null;
+    if (actualDims < expectedDims) return false;
+    if (actualDims > expectedDims) {
+        // The extra levels make the argument an array where the parameter
+        // expects its element type.
+        return expectedDims === 0 || !JAVA_PRIMITIVES.has(actualSimple)
+            ? JAVA_ARRAY_SUPERTYPES.has(expectedSimple) : false;
+    }
+    // Same dimensions: primitive element types must be identical; reference
+    // element types compare as ordinary assignments.
+    if (JAVA_PRIMITIVES.has(actualSimple) || JAVA_PRIMITIVES.has(expectedSimple)) {
+        return actualSimple === expectedSimple;
+    }
+    return _javaArgKindMatches(index, `type:${actualElement}`, expectedElement, 'java', typeParams);
 }
 
 function _cppTypeCategory(index, type) {
@@ -13927,7 +19796,13 @@ function _cppArgKindMatches(index, kind, paramType) {
         if (expected.kind === 'format-string' || expected.kind === 'string') {
             return !expected.encoding || expected.encoding === encoding;
         }
-        if (['locale', 'style', 'number', 'bool', 'character', 'pointer']
+        // A string literal decays to a pointer to its characters: a pointer
+        // parameter rejects it only when it points to a known other type (a
+        // project class, a number type). A pointee named by an alias or a
+        // template's member type (`const Ch*`) may be the character type
+        // (fix #396).
+        if (expected.kind === 'pointer') return !_cppPointeeRejectsCharacters(index, expected.head);
+        if (['locale', 'style', 'number', 'bool', 'character']
             .includes(expected.kind)) {
             return false;
         }
@@ -13967,11 +19842,17 @@ function _cppArgKindMatches(index, kind, paramType) {
         kind.startsWith('bcall:')) {
         const actualType = kind.slice(kind.indexOf(':') + 1);
         const actual = _cppTypeCategory(index, actualType);
-        if (actual.head && expected.head && actual.head === expected.head) return true;
         const closed = new Set([
             'format-string', 'string', 'locale', 'style',
             'number', 'bool', 'character',
         ]);
+        // One spelled head is one type unless the declarators part them: a
+        // `char*` (a C string) never converts to a `char` or back (fix #393).
+        if (actual.head && expected.head && actual.head === expected.head &&
+            !(closed.has(actual.kind) && closed.has(expected.kind) &&
+                actual.kind !== expected.kind)) {
+            return true;
+        }
         if (closed.has(actual.kind) && closed.has(expected.kind)) {
             if (actual.kind !== expected.kind) {
                 // std::locale converts to fmt::locale_ref by contract.
@@ -13988,7 +19869,35 @@ function _cppArgKindMatches(index, kind, paramType) {
     return true;
 }
 
+/**
+ * fix #396: does a pointer parameter whose pointee is spelled `head` provably
+ * refuse a character pointer? Number types and project classes do; `void`,
+ * aliases and names the project does not declare as classes may not.
+ */
+function _cppPointeeRejectsCharacters(index, head) {
+    if (!head || head === 'void') return false;
+    if (['short', 'int', 'long', 'float', 'double', 'size_t', 'ptrdiff_t', 'bool',
+        'int8_t', 'int16_t', 'int32_t', 'int64_t', 'uint8_t', 'uint16_t', 'uint32_t', 'uint64_t']
+        .includes(head)) return true;
+    const defs = index.symbols.get(head) || [];
+    return defs.length > 0 && defs.every(d => IDENTITY_TYPE_KINDS.has(d.type) && d.type !== 'type');
+}
+
 /** Is overload `def` applicable to this call's static argument shape? */
+// The argument count alone fits the parameter list (fix #391).
+function _overloadArityFits(call, def) {
+    const rawParams = def.paramsStructured;
+    const boundExtension = !!(def.isExtensionMethod && call.isMethod &&
+        call.receiver !== def.className);
+    const ps = boundExtension && Array.isArray(rawParams)
+        ? rawParams.slice(1)
+        : rawParams;
+    if (!Array.isArray(ps) || !Number.isInteger(call.argCount)) return true;
+    const min = ps.filter(p => p && !p.optional && p.default === undefined && !p.rest).length;
+    return call.argCount >= min &&
+        (ps.some(p => p && p.rest) || call.argCount <= ps.length);
+}
+
 function _overloadApplicable(index, call, def) {
     const rawParams = def.paramsStructured;
     const boundExtension = !!(def.isExtensionMethod && call.isMethod &&
@@ -14001,18 +19910,85 @@ function _overloadApplicable(index, call, def) {
     const min = ps.filter(p => p && !p.optional && p.default === undefined && !p.rest).length;
     if (call.argCount < min) return false;
     if (!hasRest && call.argCount > ps.length) return false;
+    const language = def.file && index.files.get(def.file)?.language;
+    // Explicit method type arguments (`M<string>(..)`, `obj.<T>m()`) name a
+    // generic method of that many type parameters (fix #391). Where generic
+    // arity is part of identity (C#) a non-generic method takes none; Java
+    // ignores them on a non-generic method (JLS 15.12.2.1).
+    if (call.methodTypeArgs > 0 && language) {
+        const declared = _methodTypeParameterCount(def);
+        if (declared > 0 ? declared !== call.methodTypeArgs
+            : langTraits(language)?.genericArityIsIdentity) return false;
+    }
+    // Without explicit type arguments a C# generic method is applicable only
+    // when inference from the arguments fixes every type parameter (fix
+    // #393): one no parameter type mentions is never inferred.
+    if (!(call.methodTypeArgs > 0) && language &&
+        langTraits(language)?.typeArgumentsFromArgumentsOnly &&
+        _methodTypeParameterCount(def) > 0) {
+        const own = _methodTypeParameterNames(def);
+        // Every parameter infers, the extension receiver's `this` one too.
+        const written = (Array.isArray(rawParams) ? rawParams : ps).map(p => String(p?.type || '')).join(' ');
+        for (const typeParam of own) {
+            if (!new RegExp(`(^|[^A-Za-z0-9_])${typeParam}([^A-Za-z0-9_]|$)`).test(written)) return false;
+        }
+    }
     const kinds = call.argKinds;
     if (!Array.isArray(kinds)) return true;
-    const language = def.file && index.files.get(def.file)?.language;
+    const typeParams = language === 'cpp' ? null : _declaredTypeParameterNames(def);
     for (let i = 0; i < kinds.length && i < ps.length; i++) {
         const p = ps[i];
         if (!p || p.rest) break;
         const matches = language === 'cpp'
             ? _cppArgKindMatches(index, kinds[i], p.type)
-            : _javaArgKindMatches(index, kinds[i], p.type, language);
+            : _javaArgKindMatches(index, kinds[i], p.type, language, typeParams, def);
         if (!matches) return false;
     }
     return true;
+}
+
+// Type parameter names a method or its owner declares (`<T, TResult>`),
+// as recorded in `generics` / `ownerGenerics` (fix #391).
+function _declaredTypeParameterNames(def) {
+    const names = new Set();
+    for (const text of [def?.generics, def?.ownerGenerics]) {
+        const inner = String(text || '').trim().replace(/^<|>$/g, '');
+        if (!inner) continue;
+        let depth = 0;
+        let part = '';
+        const flush = () => {
+            const name = part.trim().replace(/^(?:in|out)\s+/, '').match(/^[A-Za-z_]\w*/)?.[0];
+            if (name) names.add(name);
+            part = '';
+        };
+        for (const ch of inner) {
+            if (ch === '<') depth++;
+            else if (ch === '>') depth--;
+            if (ch === ',' && depth === 0) flush();
+            else part += ch;
+        }
+        flush();
+    }
+    return names;
+}
+
+// Number of type parameters a method declares (`<T, U>` as recorded).
+/** The method's own type parameter names (`<TResult, TState>`), not its owner's. */
+function _methodTypeParameterNames(def) {
+    return _declaredTypeParameterNames({ generics: def?.generics });
+}
+
+function _methodTypeParameterCount(def) {
+    const text = String(def?.generics || '').trim();
+    if (!text.startsWith('<')) return 0;
+    let depth = 0;
+    let count = 1;
+    for (const ch of text) {
+        if (ch === '<') depth++;
+        else if (ch === '>') depth--;
+        else if (ch === ',' && depth === 1) count++;
+    }
+    return count;
 }
 
 function _javaBareParamType(param) {
@@ -14038,6 +20014,11 @@ function _javaParamTypeIdentity(index, def, position, call = null) {
     if (!param?.type) return null;
     let type = String(param.type).replace(/<.*$/s, '').trim()
         .replace(/\.\.\.$/, '');
+    // A C# `params T[]` argument in the expanded form binds T (fix #391).
+    if (param.rest && call && type.endsWith('[]') &&
+        !_csharpParamsNormalFormApplicable(index, call, def)) {
+        type = type.slice(0, -2);
+    }
     if (!type || type.includes('.')) return type || null;
     const fileEntry = def?.file && index.files.get(def.file);
     const imported = (fileEntry?.importBindings || [])
@@ -14112,7 +20093,10 @@ function _javaMostSpecificOverload(index, applicable, call, language) {
         const best = Math.max(...ranked.map(item => item.exact));
         if (best > 0) {
             const winners = ranked.filter(item => item.exact === best);
-            if (winners.length === 1) return winners[0].definition;
+            if (winners.length === 1 && _overloadProvablyApplicable(
+                index, call, winners[0].definition, applicable, language)) {
+                return winners[0].definition;
+            }
         }
     }
     // JLS 15.12.2 phase discipline (fix #299D): when EVERY argument's static
@@ -14184,7 +20168,11 @@ function _javaMostSpecificOverload(index, applicable, call, language) {
         return strict;
     };
     const winners = applicable.filter(a => applicable.every(b => a === b || dominates(a, b)));
-    return winners.length === 1 ? winners[0] : null;
+    // The most specific candidate wins only when it is applicable: an
+    // argument of unknown type may fit only the less specific one (fix #391).
+    return winners.length === 1 &&
+        _overloadProvablyApplicable(index, call, winners[0], applicable, language)
+        ? winners[0] : null;
 }
 
 /**
@@ -14220,6 +20208,387 @@ function _cppVisibleFiles(index, callerFile) {
     }
     index._cppVisibleFilesCache.set(callerFile, visible);
     return visible;
+}
+
+/**
+ * Transitive #include closures of a translation unit: `strong` follows only
+ * include edges the resolver proved (relative, include directories, compile
+ * database); `all` also follows basename-resolved edges (graph-build
+ * `includeFallback`). Memoized per build.
+ */
+/**
+ * Reason string for a candidate tiered unverified by its resolution rather
+ * than routed with an explicit reason: it names the evidence that is missing.
+ */
+function _unverifiedReasonFor(resolution, evidence) {
+    if (evidence?.typeMismatch) return 'receiver-type-mismatch';
+    switch (resolution) {
+        case 'single-owner': return 'single-owner';
+        case 'possible-dispatch': return 'possible-dispatch';
+        case 'method-ambiguous': return 'method-ambiguous';
+        case 'uncertain': return 'uncertain-receiver';
+        case 'name-only':
+            return evidence?.isFunctionReference ? 'reference-without-scope-evidence'
+                : 'no-scope-evidence';
+        default: return resolution || 'no-scope-evidence';
+    }
+}
+
+/** Caller-entry view of a macro-expanded call record (fix #362). */
+function _macroSite(call) {
+    return {
+        macro: call.macroExpansion.macro,
+        origin: call.macroExpansion.origin,
+        ...(call.macroExpansion.ambiguous && { ambiguous: true }),
+    };
+}
+
+function _textualIncludeClosures(index, file) {
+    if (!index._textualIncludeClosureCache) {
+        Object.defineProperty(index, '_textualIncludeClosureCache', {
+            value: new Map(),
+            configurable: true,
+        });
+    }
+    const cached = index._textualIncludeClosureCache.get(file);
+    if (cached) return cached;
+    const weakEdges = current => {
+        const entry = index.files.get(current);
+        const fallback = entry?.includeFallback;
+        if (!fallback) return null;
+        const strong = new Set();
+        const weak = new Set();
+        for (const [spec, relative] of Object.entries(entry.moduleResolved || {})) {
+            const target = path.join(index.root, relative);
+            if (fallback[spec]) weak.add(target);
+            else strong.add(target);
+        }
+        for (const target of strong) weak.delete(target);
+        return weak;
+    };
+    const walk = followWeak => {
+        const visible = new Set([file]);
+        const queue = [file];
+        while (queue.length > 0) {
+            const current = queue.shift();
+            const weak = followWeak ? null : weakEdges(current);
+            for (const imported of index.importGraph?.get(current) || []) {
+                if (visible.has(imported) || weak?.has(imported)) continue;
+                visible.add(imported);
+                queue.push(imported);
+            }
+        }
+        return visible;
+    };
+    const all = walk(true);
+    let hasWeak = false;
+    for (const visited of all) {
+        if (index.files.get(visited)?.includeFallback) {
+            hasWeak = true;
+            break;
+        }
+    }
+    const result = { all, strong: hasWeak ? walk(false) : all };
+    index._textualIncludeClosureCache.set(file, result);
+    return result;
+}
+
+/** 'strong' | 'basename' | null: how a target file is reached from a TU. */
+function _textualIncludeReach(index, callerFile, targetFiles) {
+    const { strong, all } = _textualIncludeClosures(index, callerFile);
+    let weak = false;
+    for (const target of targetFiles) {
+        if (target === callerFile) continue;
+        if (strong.has(target)) return 'strong';
+        if (all.has(target)) weak = true;
+    }
+    return weak ? 'basename' : null;
+}
+
+/** Parameter-type key of a C/C++ function (names stripped). */
+/**
+ * The type alias a path qualifier names in `filePath`'s scope:
+ * { definition } when exactly one alias definition is in scope (declared in
+ * the file, or in the file an import binding of the name resolves to),
+ * { unresolved: true } when the name has alias definitions in the project
+ * but none can be pinned from this file (glob imports, re-exports), null
+ * when the name is not an alias at all.
+ */
+/**
+ * Identity of a path qualifier that names a type alias: 'target' when the
+ * alias in scope (or the C++ qualifier resolution) reaches a target type,
+ * 'other' when it provably names a different type, 'unknown' when the
+ * alias cannot be pinned, null when the qualifier is not an alias.
+ */
+function _pathQualifierAliasIdentity(index, filePath, fileEntry, segment, targetTypes,
+    targetDefs, cppQualifierClasses, qualifier) {
+    if (fileEntry.language === 'cpp') {
+        return cppQualifierClasses?.some(classDef => targetTypes.has(classDef.name))
+            ? 'target' : null;
+    }
+    // `use path::Type as Local;` renames a type import: Local names Type.
+    for (const binding of fileEntry.importBindings || []) {
+        if (!binding.alias || binding.alias !== segment) continue;
+        const original = String(binding.module || '').split(/::|\./).pop();
+        if (!original || original === segment) continue;
+        const relative = fileEntry.moduleResolved?.[binding.module];
+        if (!targetTypes.has(original)) {
+            // A rename of a DIFFERENT project type is positive evidence.
+            const resolvedFile = relative ? path.join(index.root, relative) : null;
+            return resolvedFile && (index.symbols.get(original) || []).some(definition =>
+                IDENTITY_TYPE_KINDS.has(definition.type) && definition.file === resolvedFile)
+                ? 'other' : null;
+        }
+        if (relative) {
+            const resolvedFile = path.join(index.root, relative);
+            return targetDefs.some(definition => definition.file === resolvedFile) ? 'target' : 'other';
+        }
+        return _resolveReceiverTypeIdentity(index, filePath, original, targetDefs);
+    }
+    const alias = _pathAliasInScope(index, filePath, fileEntry, segment, qualifier);
+    if (!alias) return null;
+    if (alias.unresolved) return 'unknown';
+    const base = String(_normalizedAliasBase(index, alias.definition) || '')
+        .replace(/<.*$/, '').split(/::|\./).pop();
+    if (!base || !targetTypes.has(base)) return null;
+    return _resolveReceiverTypeIdentity(index, alias.definition.file, base, targetDefs,
+        alias.definition.startLine);
+}
+
+function _pathAliasInScope(index, filePath, fileEntry, name, qualifier) {
+    const aliases = (index.symbols.get(name) || []).filter(definition =>
+        definition.type === 'type' && definition.aliasOf);
+    if (aliases.length === 0) return null;
+    // `module::Alias` names the alias declared in that module's file.
+    const segments = String(qualifier || '').split('::').filter(Boolean);
+    if (segments.length > 1) {
+        const module = segments[segments.length - 2];
+        const moduleFile = definition => {
+            const base = path.basename(definition.file).replace(/\.[^.]+$/, '');
+            return ['mod', 'lib', 'index', '__init__'].includes(base)
+                ? path.basename(path.dirname(definition.file)) : base;
+        };
+        const owned = aliases.filter(definition => moduleFile(definition) === module);
+        if (owned.length === 1) return { definition: owned[0] };
+        if (owned.length > 1) return { unresolved: true };
+    }
+    const inFile = aliases.filter(definition => definition.file === filePath);
+    if (inFile.length === 1) return { definition: inFile[0] };
+    if (inFile.length > 1) return { unresolved: true };
+    const files = new Set();
+    for (const binding of fileEntry.importBindings || []) {
+        if ((binding.alias || binding.name) !== name) continue;
+        const relative = fileEntry.moduleResolved?.[binding.module];
+        if (relative) files.add(path.join(index.root, relative));
+    }
+    const imported = aliases.filter(definition => files.has(definition.file));
+    if (imported.length === 1) return { definition: imported[0] };
+    // A real type of the same name in scope shadows nothing here: the
+    // ordinary type-name identity handles it.
+    if ((index.symbols.get(name) || []).some(definition => IDENTITY_TYPE_KINDS.has(definition.type))) {
+        return null;
+    }
+    return { unresolved: true };
+}
+
+// A definition's parameter-type signature, kept per definition object (the
+// overload discipline asks for it for every candidate at every site).
+const C_FAMILY_SIGNATURE_KEYS = new WeakMap();
+
+function _cFamilySignatureKey(definition) {
+    if (definition && typeof definition === 'object') {
+        const cached = C_FAMILY_SIGNATURE_KEYS.get(definition);
+        if (cached !== undefined) return cached;
+        const key = _cFamilySignatureKeyUncached(definition);
+        C_FAMILY_SIGNATURE_KEYS.set(definition, key);
+        return key;
+    }
+    return _cFamilySignatureKeyUncached(definition);
+}
+
+function _cFamilySignatureKeyUncached(definition) {
+    if (!Array.isArray(definition.paramsStructured)) return String(definition.params ?? '?');
+    return definition.paramsStructured.map(param => {
+        if (param.variadic || param.rest) return '...';
+        // An unnamed parameter's display name is its type (fix #393).
+        let type = String(param.type || (param.unnamed ? param.name : '') || '')
+            .replace(/\s+/g, ' ').trim();
+        if (param.name && !param.unnamed) {
+            const escaped = String(param.name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            type = type.replace(new RegExp(`\\b${escaped}\\b(?=\\s*(?:\\[[^\\]]*\\])?\\s*$)`), '')
+                .replace(/\s+/g, ' ').trim();
+        }
+        return type.replace(/\s*([*&,[\]()])\s*/g, '$1');
+    }).join('\0');
+}
+
+/** Source files the compile database compiles (null without a database). */
+function _compiledTranslationUnits(index) {
+    if (index._compiledTranslationUnits !== undefined) return index._compiledTranslationUnits;
+    const { findCompilationDatabase, loadCompilationDatabase } =
+        require('./compilation-database');
+    const database = loadCompilationDatabase(
+        findCompilationDatabase(index.root, index.root));
+    const units = database ? new Set(database.entries.map(entry => path.resolve(entry.file))) : null;
+    Object.defineProperty(index, '_compiledTranslationUnits', {
+        value: units, configurable: true, writable: true,
+    });
+    return units;
+}
+
+/**
+ * Which external-linkage definition does a free-function call in
+ * `callerFile` link against? null = no competing definition (ordinary
+ * evidence applies), 'other' = the caller's translation unit defines a
+ * competing definition, { ambiguous, candidates } = several definitions
+ * remain and no source evidence separates them.
+ */
+/**
+ * fix #367b: languages a file is compiled as. A source file is its own
+ * language; a header is compiled as every language of the translation units
+ * that include it (reverse include closure), or its own parse language when
+ * nothing in the project includes it.
+ */
+function _translationUnitLanguages(index, file) {
+    if (!index._translationUnitLanguageCache) {
+        Object.defineProperty(index, '_translationUnitLanguageCache', {
+            value: new Map(),
+            configurable: true,
+        });
+    }
+    const cached = index._translationUnitLanguageCache.get(file);
+    if (cached) return cached;
+    const own = index.files.get(file)?.language;
+    const languages = new Set();
+    if (_isCppHeader(file)) {
+        const seen = new Set([file]);
+        const queue = [file];
+        while (queue.length > 0) {
+            const current = queue.shift();
+            for (const includer of index.exportGraph?.get(current) || []) {
+                if (seen.has(includer)) continue;
+                seen.add(includer);
+                const language = index.files.get(includer)?.language;
+                if (!langTraits(language)?.textualIncludes) continue;
+                if (_isCppHeader(includer)) queue.push(includer);
+                else languages.add(language);
+            }
+        }
+    }
+    if (languages.size === 0 && own) languages.add(own);
+    index._translationUnitLanguageCache.set(file, languages);
+    return languages;
+}
+
+/**
+ * fix #367b: whether a language-conditional definition (`languageBranch`,
+ * e.g. a C++-only overload under `#ifdef __cplusplus`) is compiled into the
+ * call site's translation units. A call recorded inside such a branch is
+ * compiled only as that branch's language.
+ */
+function _languageBranchVisible(index, definition, callerFile, call = null) {
+    if (!definition?.languageBranch) return true;
+    if (call?.languageBranch) return call.languageBranch === definition.languageBranch;
+    return _translationUnitLanguages(index, callerFile).has(definition.languageBranch);
+}
+
+function _textualLinkVerdict(index, callerFile, targetDefs, definitions, callLine = null) {
+    const callable = targetDefs.filter(definition => !NON_CALLABLE_TYPES.has(definition.type));
+    if (callable.length === 0 ||
+        callable.some(definition => definition.className || definition.receiver)) return null;
+    const targetKeys = new Set(callable.map(definition => `${definition.file}:${definition.startLine}`));
+    const bodies = callable.filter(definition => !definition.isSignature);
+    if (bodies.length === 0) return null;
+    const { all } = _textualIncludeClosures(index, callerFile);
+    const inUnit = definition => definition.file === callerFile || all.has(definition.file);
+    const internal = definition => definition.modifiers?.includes('static');
+    // Only a definition of the SAME function competes at link time: a
+    // function definition (a same-name macro is a preprocessor substitution
+    // handled by the macro-shadowing rules) with the same namespace and, in
+    // languages with overloading, the same parameter types; a template is a
+    // different entity from a non-template of the same name.
+    const overloads = langTraits(index.files.get(bodies[0].file)?.language)?.hasArityOverloads;
+    const signature = definition => [
+        cppEffectiveNamespace(index, definition),
+        definition.templateDependent ? 'template' : '',
+        overloads ? _cFamilySignatureKey(definition) : '',
+    ].join('\0');
+    const targetSignatures = new Set(bodies.map(signature));
+    const alternatives = definitions.filter(definition =>
+        definition.type === 'function' &&
+        _languageBranchVisible(index, definition, callerFile) &&
+        !definition.isSignature && !definition.className && !definition.receiver &&
+        !targetKeys.has(`${definition.file}:${definition.startLine}`) &&
+        langTraits(index.files.get(definition.file)?.language)?.textualIncludes &&
+        targetSignatures.has(signature(definition)) &&
+        // Internal linkage is visible only inside its own translation unit.
+        (!internal(definition) || inUnit(definition)));
+    if (alternatives.length === 0) return null;
+    // A definition under a preprocessor conditional (fix #379: hiredis
+    // `static inline hi_realloc` under `#ifndef _WIN32` in alloc.h, the
+    // extern one in alloc.c under `#ifdef _WIN32`) is in the unit only in
+    // some configurations, so it decides the call only when the call sits in
+    // the same branch of the same file.
+    const decidesUnit = definition => inUnit(definition) && (!definition.ppBranch ||
+        (callLine != null && definition.file === callerFile &&
+            definition.ppBranch[0] <= callLine && callLine <= definition.ppBranch[1]));
+    const targetInUnit = bodies.some(inUnit);
+    const alternativeInUnit = alternatives.some(inUnit);
+    const targetDecides = bodies.some(decidesUnit);
+    const alternativeDecides = alternatives.some(decidesUnit);
+    if (targetDecides && !alternativeInUnit) return null;
+    if (alternativeDecides && !targetInUnit) return 'other';
+    const units = _compiledTranslationUnits(index);
+    if (units && units.has(path.resolve(callerFile))) {
+        const targetBuilt = bodies.some(definition => units.has(path.resolve(definition.file)));
+        const alternativeBuilt = alternatives.some(definition =>
+            units.has(path.resolve(definition.file)));
+        if (targetBuilt && !alternativeBuilt) return null;
+        if (alternativeBuilt && !targetBuilt) return 'other';
+    }
+    return { ambiguous: true, candidates: bodies.length + alternatives.length };
+}
+
+/**
+ * fix #379: the definition a C/C++ free-function call made from `caller`
+ * reaches, starting from the ranked candidate `callee` (possibly a
+ * prototype). Returns { callee } (the definition, or the unchanged callee
+ * when the project defines no body), or { ambiguous, candidates } when
+ * several definitions remain and the caller's unit does not decide.
+ */
+function _cFamilyLinkedCallee(index, caller, callee, symbols, lines) {
+    const group = _closeCallableIdentityGroup(index, [callee], symbols);
+    const bodies = group.filter(definition => !definition.isSignature);
+    const verdictFor = target => {
+        let verdict;
+        for (const line of lines || [null]) {
+            const next = _textualLinkVerdict(index, caller.file,
+                _closeCallableIdentityGroup(index, [target], symbols), symbols, line);
+            const key = next && next.ambiguous ? 'ambiguous' : next;
+            const previous = verdict && verdict.ambiguous ? 'ambiguous' : verdict;
+            if (verdict !== undefined && key !== previous) {
+                return { ambiguous: true, candidates: 2 };
+            }
+            verdict = next;
+        }
+        return verdict;
+    };
+    if (bodies.length === 0) return { callee };
+    const first = bodies.includes(callee) ? callee : bodies[0];
+    const verdict = verdictFor(first);
+    if (verdict === null || verdict === undefined) return { callee: first };
+    if (verdict === 'other') {
+        const alternatives = symbols.filter(definition =>
+            definition.type === 'function' && !definition.isSignature &&
+            !definition.className && !definition.receiver && !group.includes(definition) &&
+            (!definition.modifiers?.includes('static') || definition.file === caller.file ||
+                _cppVisibleFiles(index, caller.file).has(definition.file)));
+        for (const alternative of alternatives) {
+            if (verdictFor(alternative) === null) return { callee: alternative };
+        }
+        return { ambiguous: true, candidates: alternatives.length + bodies.length };
+    }
+    return verdict;
 }
 
 function _cppTargetVisibleFrom(index, callerFile, targetDefs) {
@@ -14275,58 +20644,138 @@ function _cppTargetVisibility(index, callerFile, targetDefs) {
     // closed compiler universe. Never turn that resolver gap into exclusion
     // evidence. External standard/library headers do not affect project
     // target visibility.
-    const projectFiles = [...index.files.values()].map(entry =>
-        String(entry.relativePath || '').replaceAll(path.sep, '/'));
+    // Every project path and each of its suffixes after a `/` (one Set per
+    // index state, kept in the verdict cache so rebuilds clear it): an
+    // include spelling names a project file exactly when it is one of them.
+    const suffixKey = '\0project-path-suffixes';
+    let projectSuffixes = index._cppTargetVisibilityCache.get(suffixKey);
+    if (!projectSuffixes) {
+        projectSuffixes = new Set();
+        for (const entry of index.files.values()) {
+            const relative = String(entry.relativePath || '').replaceAll(path.sep, '/');
+            projectSuffixes.add(relative);
+            for (let slash = relative.indexOf('/'); slash >= 0; slash = relative.indexOf('/', slash + 1)) {
+                projectSuffixes.add(relative.slice(slash + 1));
+            }
+        }
+        index._cppTargetVisibilityCache.set(suffixKey, projectSuffixes);
+    }
     for (const file of visible) {
-        const entry = index.files.get(file);
-        if (!entry) continue;
-        const resolved = entry.moduleResolved || {};
-        for (const rawImport of entry.imports || []) {
-            const specifier = String(rawImport || '').replaceAll('\\', '/');
-            if (!specifier || Object.hasOwn(resolved, rawImport)) continue;
-            const normalized = specifier.replace(/^\.\//, '').replace(/^\/+/, '');
-            const projectLike = projectFiles.some(relative =>
-                    relative === normalized ||
-                    relative.endsWith(`/${normalized}`)) ||
+        // Whether this file has an unresolved project-like include is a
+        // property of the file alone.
+        const fileKey = `\0unresolved-project-include\0${file}`;
+        let unresolvedProjectInclude = index._cppTargetVisibilityCache.get(fileKey);
+        if (unresolvedProjectInclude === undefined) {
+            unresolvedProjectInclude = false;
+            const entry = index.files.get(file);
+            const resolved = entry?.moduleResolved || {};
+            for (const rawImport of entry?.imports || []) {
+                const specifier = String(rawImport || '').replaceAll('\\', '/');
+                if (!specifier || Object.hasOwn(resolved, rawImport)) continue;
+                const normalized = specifier.replace(/^\.\//, '').replace(/^\/+/, '');
                 // A missing sibling generated header (`config.h`) can still
                 // include the target. Namespaced unresolved paths
                 // (`absl/types/any.h`) with no indexed suffix are external
                 // package surfaces, like unresolved package imports in the
                 // other language adapters.
-                (specifier.startsWith('.') && !normalized.includes('/'));
-            if (projectLike) return finish('unknown');
+                if (projectSuffixes.has(normalized) ||
+                    (specifier.startsWith('.') && !normalized.includes('/'))) {
+                    unresolvedProjectInclude = true;
+                    break;
+                }
+            }
+            index._cppTargetVisibilityCache.set(fileKey, unresolvedProjectInclude);
         }
+        if (unresolvedProjectInclude) return finish('unknown');
     }
     return finish('no');
 }
 
-function _cppPathReceiverNamesType(index, receiver) {
-    if (!receiver) return false;
-    const cacheKey = String(receiver);
-    if (index._opCppPathReceiverTypeCache?.has(cacheKey)) {
-        return index._opCppPathReceiverTypeCache.get(cacheKey);
+/**
+ * Decide a C++ path call `Q::f(...)` against the pinned targets from what Q
+ * resolves to (core/cpp-scope.js). Returns { exclude: reason } only on a
+ * positive resolution that rules the targets out, { unverified: reason }
+ * when Q cannot be resolved for a member target (or the target's own kind
+ * is unproven), and { kind } to let the ordinary pipeline continue.
+ */
+function _cppPathQualifierVerdict(index, callerFile, call, targetDefs) {
+    const callable = targetDefs.filter(definition => !NON_CALLABLE_TYPES.has(definition.type));
+    if (callable.length === 0) return { kind: 'none' };
+    const members = callable.filter(definition => definition.className);
+    const allMembers = members.length === callable.length;
+    const noMembers = members.length === 0;
+    if (call.qualifierTemplateParam) {
+        return noMembers ? { kind: 'dependent' } : { unverified: 'dependent-qualifier' };
     }
-    // Remove template arguments before selecting the terminal path segment;
-    // nested qualifiers inside `<...>` must not be mistaken for the owner.
-    let plain = '';
-    let depth = 0;
-    for (const character of String(receiver)) {
-        if (character === '<') {
-            depth++;
-            continue;
-        }
-        if (character === '>') {
-            depth = Math.max(0, depth - 1);
-            continue;
-        }
-        if (depth === 0) plain += character;
+    const enclosing = index.findEnclosingFunction(callerFile, call.line, true, call);
+    const context = {
+        file: callerFile,
+        line: call.line,
+        namespace: enclosing ? cppEffectiveNamespace(index, enclosing) : undefined,
+        className: enclosing?.className || null,
+    };
+    const resolved = resolveCppQualifier(index, context, call.receiver,
+        _cppVisibleFiles(index, callerFile));
+    if (resolved.kind === 'namespace') {
+        return allMembers ? { exclude: 'method-kind-mismatch' } : { kind: 'namespace' };
     }
-    const name = plain.split('::').filter(Boolean).pop();
-    const result = !!(name && (index.symbols.get(name) || []).some(definition =>
-        IDENTITY_TYPE_KINDS.has(definition.type) ||
-        (definition.type === 'type' && definition.aliasOf)));
-    index._opCppPathReceiverTypeCache?.set(cacheKey, result);
-    return result;
+    if (resolved.kind !== 'type') {
+        return allMembers ? { unverified: 'unresolved-qualifier' } : { kind: 'unknown' };
+    }
+    // A type path never names a namespace-scope function.
+    if (noMembers) return { exclude: 'method-kind-mismatch' };
+    if (!allMembers) return { kind: 'type' };
+    const reach = _cppQualifiedClassesReachTargets(index, resolved.classes, members);
+    if (reach === 'yes') return { kind: 'type', classes: resolved.classes };
+    if (reach === 'maybe' || !resolved.visible) return { unverified: 'unresolved-qualifier' };
+    return { exclude: 'receiver-type-mismatch' };
+}
+
+/**
+ * Can `R::f` reach a pinned member? A qualified call binds statically in R
+ * or in one of R's bases, so R must BE a target owner or derive from one.
+ */
+function _cppQualifiedClassesReachTargets(index, classDefs, members) {
+    const owners = members.map(member => ownerRefOf(index, member)).filter(Boolean);
+    if (owners.length === 0) return 'maybe';
+    let maybe = false;
+    for (const classDef of classDefs) {
+        // The identity key a class DEFINITION carries in every other
+        // consumer (the name key when the name has one identity).
+        const entry = classDefsNamed(index, classDef.name).entries
+            .find(candidate => candidate.def === classDef);
+        const start = {
+            name: classDef.name,
+            key: entry?.key || classKeyOf(index, classDef),
+            def: classDef,
+        };
+        const queue = [start];
+        const seen = new Set();
+        while (queue.length > 0) {
+            const ref = queue.shift();
+            const visitKey = ref.key || `?${ref.name}`;
+            if (seen.has(visitKey) || seen.size > 256) continue;
+            seen.add(visitKey);
+            for (const owner of owners) {
+                if (owner.name !== ref.name) continue;
+                if (owner.key && ref.key) {
+                    if (owner.key === ref.key) return 'yes';
+                } else {
+                    maybe = true;
+                }
+            }
+            for (const parent of parentRefsOfClass(index, ref)) {
+                if (parent.external) continue;
+                if (!parent.key && !parent.def) {
+                    // An unresolved base can be the target owner.
+                    if (owners.some(owner => owner.name === parent.name)) maybe = true;
+                    continue;
+                }
+                queue.push(parent);
+            }
+        }
+    }
+    return maybe ? 'maybe' : 'no';
 }
 
 function _cppQualifiedPathOwnsTarget(index, callerFile, call, targetDefs) {
@@ -14476,10 +20925,39 @@ function _cppMacroTargetDisposition(index, callerFile, call, targetDefs) {
     return qualified ? { kind: 'qualified', qualifier: qualified } : null;
 }
 
+/**
+ * fix #387: an unqualified call inside a C++ template member binds (by the
+ * receiver-blind name table) a member of its own class, while the target is
+ * an inherited member of another class that the class brings in with a
+ * using-declaration naming a template specialization (`using
+ * detail::buffer<T>::append;`). Unqualified lookup never searches a
+ * dependent base; the using-declaration is itself dependent, so overload
+ * resolution among the class's own and the inherited members happens at
+ * instantiation.
+ */
+function _cppDependentUsingOverload(index, filePath, call, boundDef, targetDefs) {
+    if (!boundDef?.className || !call.name) return false;
+    if (!targetDefs.some(target => target.className && target.className !== boundDef.className &&
+        _isAncestorOfTargetClass(index, target.className, [boundDef]))) {
+        return false;
+    }
+    const callerSymbol = index.findEnclosingFunction(filePath, call.line, true, call);
+    if (!callerSymbol?.templateDependent || callerSymbol.className !== boundDef.className) return false;
+    const usings = index.files.get(boundDef.file)?.cppUsings || [];
+    return usings.some(using => using.kind === 'declaration' && using.name === call.name &&
+        using.scopeStartLine != null && using.scopeStartLine <= boundDef.startLine &&
+        boundDef.startLine <= using.scopeEndLine &&
+        String(using.target || '').split('::').slice(0, -1).some(segment => segment.includes('<')));
+}
+
 function _overloadDiscipline(index, call, targetDefs, definitions, callerFile) {
     const targetOwners = new Set(targetDefs.map(d => d.className).filter(Boolean));
     const targetLanguage = targetDefs[0]?.file && index.files.get(targetDefs[0].file)?.language;
     const sameOwnerIdentity = (d) => {
+        // A member of a same-name class declared in another scope (a
+        // function-local class beside its module-level namesake) never
+        // overloads the pin (fix #389).
+        if (!_sameOwnerAsAny(index, d, targetDefs)) return false;
         if (targetLanguage === 'java') {
             return targetDefs.some(t =>
                 t.className === d.className && t.file && d.file &&
@@ -14490,11 +20968,39 @@ function _overloadDiscipline(index, call, targetDefs, definitions, callerFile) {
             return targetDefs.some(t =>
                 t.className === d.className &&
                 (t.namespace || null) === (d.namespace || null) &&
+                // Generic arity is part of the owner's identity (fix #380).
+                (t.ownerTypeArity || 0) === (d.ownerTypeArity || 0) &&
                 (t.explicitInterface || null) ===
                     (d.explicitInterface || null));
         }
+        if (targetLanguage === 'cpp' && d.enclosingType &&
+            !targetDefs.some(t => t.className === d.className &&
+                (!t.enclosingType || t.enclosingType === d.enclosingType))) {
+            // Nested classes of two enclosing classes (`SkipList::Node`,
+            // `List::Node`) are two classes (fix #396).
+            return false;
+        }
+        if (implicitOwnerKey) {
+            // An implicit-this call reaches the members of its enclosing
+            // class DEFINITION (fix #385; #358 identity), never those of a
+            // same-name class defined elsewhere: spdlog's two
+            // `details::tcp_client` definitions (tcp_client.h and
+            // tcp_client-windows.h, chosen by `#ifdef _WIN32` at the include
+            // site) do not overload each other's members. An owner that does
+            // not resolve to one definition stays in the family.
+            const own = ownerRefOf(index, d)?.key;
+            return !own || own === implicitOwnerKey;
+        }
         return true;
     };
+    let implicitOwnerKey = null;
+    if ((targetLanguage === 'cpp' || targetLanguage === 'c') && callerFile &&
+        !call.receiver && !call.isMethod && !call.isPathCall) {
+        const callerSymbol = index.findEnclosingFunction(callerFile, call.line, true, call);
+        if (callerSymbol?.className && targetOwners.has(callerSymbol.className)) {
+            implicitOwnerKey = ownerRefOf(index, callerSymbol)?.key || null;
+        }
+    }
     const pinnedKeys = new Set(targetDefs.map(d =>
         `${d.file}:${d.startLine}`));
     let family;
@@ -14526,6 +21032,11 @@ function _overloadDiscipline(index, call, targetDefs, definitions, callerFile) {
             d.className && targetOwners.has(d.className) &&
             sameOwnerIdentity(d));
     }
+    // Configuration alternatives of a pinned definition are the pinned item
+    // in another build configuration, never a sibling overload (fix #385).
+    family = family.filter(definition =>
+        pinnedKeys.has(`${definition.file}:${definition.startLine}`) ||
+        !targetDefs.some(target => _isConfigurationAlternative(index, definition, target)));
     if (targetLanguage === 'cpp' && call.explicitTemplateCall) {
         // `f<T>(...)` cannot select a non-template overload. The tree-sitter
         // call record carries this compiler-visible distinction so explicit
@@ -14544,8 +21055,16 @@ function _overloadDiscipline(index, call, targetDefs, definitions, callerFile) {
     // annotated overload", not the pinned one (the #205 jdtls lesson).
     // Identical type signatures in an ancestor are the OVERRIDE SLOT the pin
     // occupies — the same virtual method, never a sibling.
+    // A C# nullable annotation on a reference type (`string?`) is not part
+    // of the signature: `WriteComment(string)` overrides
+    // `WriteComment(string? text)` (fix #391); `int?` stays Nullable<int>.
+    const sigType = (text) => {
+        const compact = String(text ?? '').replace(/\s+/g, '');
+        return targetLanguage === 'csharp' && compact.endsWith('?') &&
+            !_csharpIsValueType(index, compact.slice(0, -1)) ? compact.slice(0, -1) : compact;
+    };
     const typeSig = (d) => Array.isArray(d.paramsStructured)
-        ? d.paramsStructured.map(p => String(p?.type ?? '').replace(/\s+/g, '')).join(',')
+        ? d.paramsStructured.map(p => sigType(p?.type)).join(',')
         : null;
     // C/C++ declarations and implementations are already closed into
     // `targetDefs` by _closeCallableIdentityGroup using opposite signature
@@ -14617,7 +21136,17 @@ function _overloadDiscipline(index, call, targetDefs, definitions, callerFile) {
         }
     }
     let applicable = family.filter(d => _overloadApplicable(index, call, d));
-    if (applicable.length === 0) return null; // shape fits nothing we model — no claim
+    if (applicable.length === 0) {
+        // The argument TYPES fit none of the owner's overloads, the pinned
+        // one included (fix #391): the call binds something the family does
+        // not hold (a C# extension method of another static class, a Java
+        // static import), or the model misread its arguments. Either way it
+        // is not evidence for the pin, and not proof against it: visible.
+        // An argument COUNT no overload accepts keeps the arity verdict.
+        return (targetLanguage === 'java' || targetLanguage === 'csharp') &&
+            family.some(d => _overloadArityFits(call, d))
+            ? { ambiguous: true, candidates: 0 } : null;
+    }
     if (targetLanguage === 'java' || targetLanguage === 'csharp') {
         applicable = _preferFixedArityOverloads(
             index, call, applicable, targetLanguage);
@@ -14808,6 +21337,9 @@ function _buildTargetTypeSet(index, targetDefs, definitions) {
             ].filter(Boolean);
             for (const owner of owners) {
                 targetTypes.add(owner);
+                // A Rust impl `for [T]` is the primitive slice owner; slice
+                // receivers carry the canonical name 'slice' (fix #368).
+                if (_isGenericSliceOwner(td, owner)) targetTypes.add('slice');
                 const origin = _resolveFlowTypeOrigin(index, td.file, owner);
                 targetTypeOrigins.push({
                     name: owner,
@@ -14914,6 +21446,8 @@ function _buildTargetTypeSet(index, targetDefs, definitions) {
                 let pure = true;
                 for (const d of defs) {
                     if (d.type !== 'type' && !IDENTITY_TYPE_KINDS.has(d.type)) continue;
+                    // Visible only in its block (fix #396, as in _pureAliasBase).
+                    if (_isFunctionLocalType(d)) continue;
                     if (d.type === 'type' && d.aliasOf) {
                         const normalized = _normalizedAliasBase(index, d);
                         if (base === null) base = normalized;
@@ -15079,14 +21613,39 @@ function _isDispatchContractType(index, typeName) {
  * decision only (possible-dispatch vs excluded), never exclusion evidence.
  */
 function _isDispatchAncestor(index, typeName, targetDefs) {
-    const visited = new Set();
-    const queue = [];
+    const starts = [];
     for (const td of targetDefs) {
         const cls = td.className || (td.receiver && td.receiver.replace(/^\*/, ''));
-        if (cls) queue.push({ name: cls, file: td.file });
+        if (cls) starts.push({ name: cls, file: td.file });
     }
-    while (queue.length > 0) {
-        const { name, file } = queue.shift();
+    // Within an operation the whole closure is computed once per start list
+    // and every later question is a set lookup (fix #382): an exact HOT
+    // ranking asks it for each same-name owner of every refined candidate.
+    const memo = index._opMemo?.('dispatchAncestors');
+    if (memo) {
+        const key = starts.map(start => `${start.name}\u0001${start.file}`).join('\u0002');
+        let ancestors = memo.get(key);
+        if (!ancestors) {
+            ancestors = _dispatchAncestorClosure(index, starts, null);
+            memo.set(key, ancestors);
+        }
+        return ancestors.has(typeName);
+    }
+    return _dispatchAncestorClosure(index, starts, typeName) === true;
+}
+
+/**
+ * Breadth-first walk up extends edges and implements records from `starts`.
+ * With a `stopAt` name, returns true as soon as it is a parent (else false);
+ * without one, returns the set of every parent name the walk meets, so
+ * `set.has(name)` answers exactly what the stopping walk would.
+ */
+function _dispatchAncestorClosure(index, starts, stopAt) {
+    const visited = new Set();
+    const met = stopAt === null ? new Set() : null;
+    const queue = starts.slice();
+    for (let head = 0; head < queue.length; head++) {
+        const { name, file } = queue[head];
         if (visited.has(name)) continue;
         visited.add(name);
         const parents = [
@@ -15094,14 +21653,251 @@ function _isDispatchAncestor(index, typeName, targetDefs) {
             ..._implementsParents(index, name),
         ];
         for (const parent of parents) {
-            if (parent === typeName) return true;
+            if (met) met.add(parent);
+            else if (parent === stopAt) return true;
             if (!visited.has(parent)) {
                 const parentFile = index._resolveClassFile ? index._resolveClassFile(parent, file) : file;
                 queue.push({ name: parent, file: parentFile });
             }
         }
     }
-    return false;
+    return met || false;
+}
+
+/**
+ * Files holding a name's definitions that satisfy `accepts` (all when null),
+ * memoized per operation under `kind` (fix #382): findCallers asked this per
+ * call record, a scan of every same-name definition each time.
+ */
+function _definitionFileSet(index, name, kind, accepts) {
+    const definitions = index.symbols.get(name) || [];
+    const collect = () => {
+        const files = new Set();
+        for (const d of definitions) {
+            if (d.file && (!accepts || accepts(d))) files.add(d.file);
+        }
+        return files;
+    };
+    const memo = index._opMemo?.(`definitionFiles:${kind}`, () => new WeakMap());
+    if (!memo) return collect();
+    let files = memo.get(definitions);
+    if (!files) {
+        files = collect();
+        memo.set(definitions, files);
+    }
+    return files;
+}
+
+/** The first of a name's definitions carrying `bindingId` (per-operation index). */
+/**
+ * Configuration alternatives (fix #376 for plan, #385 for callers): in a
+ * language where one scope cannot repeat a definition except under
+ * conditional compilation (traits.conditionalDefinitions: Rust `#[cfg]`,
+ * C/C++/C# `#if`), two definitions of one name, owner and signature in one
+ * file are the SAME item in two build configurations. A call binds the item;
+ * which body depends on the configuration, never on which of them a
+ * receiver-blind name table happened to list first.
+ */
+function _isConfigurationAlternative(index, a, b) {
+    if (!a || !b || a === b || a.file !== b.file || a.name !== b.name) return false;
+    const style = langTraits(index.files.get(a.file)?.language)?.conditionalDefinitions;
+    if (!style) return false;
+    if (a.isSignature || b.isSignature || a.type === 'macro' || b.type === 'macro') return false;
+    if (NON_CALLABLE_TYPES.has(a.type) || NON_CALLABLE_TYPES.has(b.type)) return false;
+    if ((a.className || null) !== (b.className || null) ||
+        (a.receiver || null) !== (b.receiver || null) ||
+        (a.traitName || null) !== (b.traitName || null) ||
+        (a.namespace || null) !== (b.namespace || null) ||
+        // An explicit interface implementation beside a same-signature
+        // member is a second member, never an alternative (fix #395).
+        (a.explicitInterface || null) !== (b.explicitInterface || null)) return false;
+    if (a.startLine === b.startLine && a.endLine === b.endLine) return false;
+    // Members of two class DEFINITIONS of one name (C# `Visitor<T, R>` and
+    // `Visitor<T>` in one file) are two items (fix #390).
+    if ((a.className || a.receiver) && distinctOwnerDefinitions(index, a, b)) return false;
+    if (_cFamilySignatureKey(a) !== _cFamilySignatureKey(b)) return false;
+    // One item has one full owner path (fix #395): `TestA.Destination` and
+    // `TestB.Destination` are two nested types, whatever their names.
+    if (!_sameOwnerPath(index, a, b)) return false;
+    // C/C++ record the preprocessor branch of a definition: one of the two
+    // must sit in a conditional branch the other does not share (two
+    // constrained templates with one parameter list are overloads).
+    if (langTraits(index.files.get(a.file)?.language)?.textualIncludes) {
+        if (!a.ppBranch && !b.ppBranch) return false;
+        if (a.ppBranch && b.ppBranch && a.ppBranch[0] === b.ppBranch[0] &&
+            a.ppBranch[1] === b.ppBranch[1]) return false;
+        return true;
+    }
+    if (style !== 'attribute') return true;
+    const hasCfg = d => (d.attributesWithArgs || []).some(attr => attr.name === 'cfg') ||
+        (d.modifiers || []).includes('cfg');
+    return hasCfg(a) || hasCfg(b);
+}
+
+/**
+ * The names of the declarations enclosing `def` in its file (types, impl
+ * blocks, modules, functions), outermost first (fix #395): the full owner
+ * path configuration alternatives must share. Names, not definitions, so
+ * `#if A class Outer { class In } #else class Outer { class In } #endif`
+ * still holds one `Outer.In`.
+ */
+const _ownerPathMemo = new WeakMap();
+function _ownerNamePath(index, def) {
+    let cached = _ownerPathMemo.get(def);
+    if (cached !== undefined) return cached;
+    const symbols = index.files.get(def.file)?.symbols || [];
+    const enclosing = [];
+    for (const symbol of symbols) {
+        if (symbol === def || symbol.startLine == null || symbol.endLine == null) continue;
+        if (symbol.startLine > def.startLine || symbol.endLine < def.endLine) continue;
+        if (symbol.startLine === def.startLine && symbol.endLine === def.endLine) continue;
+        enclosing.push(symbol);
+    }
+    enclosing.sort((x, y) => (x.startLine - y.startLine) || (y.endLine - x.endLine));
+    cached = enclosing.map(symbol => symbol.name).join('\0');
+    _ownerPathMemo.set(def, cached);
+    return cached;
+}
+
+function _sameOwnerPath(index, a, b) {
+    return _ownerNamePath(index, a) === _ownerNamePath(index, b);
+}
+
+/**
+ * Conditional-branch path of every line of a C/C++ file: for each line, the
+ * `chain:branch` of each enclosing `#if` chain (`#if`/`#ifdef`/`#ifndef`
+ * opens a chain, `#elif`/`#else` start its next branch). Directive lines are
+ * read as the preprocessor reads them.
+ */
+function _preprocessorBranchPaths(index, file) {
+    const memo = index._opMemo?.('ppBranchPaths', () => new Map());
+    if (memo?.has(file)) return memo.get(file);
+    let lines;
+    try { lines = index._getFileLines(file); } catch { lines = null; }
+    let paths = null;
+    if (lines) {
+        paths = new Array(lines.length);
+        const stack = [];
+        let chains = 0;
+        for (let row = 0; row < lines.length; row++) {
+            const match = /^\s*#\s*(if|ifdef|ifndef|elif|elifdef|elifndef|else|endif)\b/.exec(lines[row]);
+            if (match) {
+                const kind = match[1];
+                if (kind === 'if' || kind === 'ifdef' || kind === 'ifndef') stack.push({ chain: chains++, branch: 0 });
+                else if (kind === 'endif') stack.pop();
+                else if (stack.length > 0) stack[stack.length - 1].branch++;
+            }
+            paths[row] = stack.map(frame => `${frame.chain}:${frame.branch}`);
+        }
+    }
+    memo?.set(file, paths);
+    return paths;
+}
+
+/**
+ * Are two C/C++ files configuration alternatives (fix #385)? True when some
+ * project file includes both in different branches of one `#if` chain
+ * (`#ifdef _WIN32 #include "client-windows.h" #else #include "client.h"`):
+ * no translation unit sees both, so same-named definitions in them are one
+ * entity in two build configurations.
+ */
+function _configurationAlternativeFiles(index, fileA, fileB) {
+    if (!fileA || !fileB || fileA === fileB) return false;
+    const memo = index._opMemo?.('configurationAlternativeFiles', () => new Map());
+    const key = fileA < fileB ? `${fileA}\0${fileB}` : `${fileB}\0${fileA}`;
+    if (memo?.has(key)) return memo.get(key);
+    let result = false;
+    const includersA = index.exportGraph?.get(fileA) || new Set();
+    for (const includer of index.exportGraph?.get(fileB) || []) {
+        if (!includersA.has(includer)) continue;
+        const entry = index.files.get(includer);
+        const lineOf = target => {
+            const rel = path.relative(index.root, target);
+            const detail = (entry?.importDetails || []).find(d => Number.isInteger(d.line) &&
+                (entry.moduleResolved?.[d.module] === rel ||
+                    path.resolve(path.dirname(includer), d.module) === target));
+            return detail?.line;
+        };
+        const lineA = lineOf(fileA);
+        const lineB = lineOf(fileB);
+        const paths = lineA && lineB ? _preprocessorBranchPaths(index, includer) : null;
+        if (!paths) continue;
+        const branchesA = new Map(paths[lineA - 1].map(step => step.split(':')));
+        if (paths[lineB - 1].some(step => {
+            const [chain, branch] = step.split(':');
+            return branchesA.has(chain) && branchesA.get(chain) !== branch;
+        })) {
+            result = true;
+            break;
+        }
+    }
+    memo?.set(key, result);
+    return result;
+}
+
+/**
+ * A member of a same-named class defined in a configuration-alternative
+ * file (fix #385): same name, class, namespace and signature.
+ */
+function _isCrossFileConfigurationMember(index, a, b) {
+    if (!a || !b || a === b || a.file === b.file || a.name !== b.name) return false;
+    if (!a.className || a.className !== b.className ||
+        (a.namespace || null) !== (b.namespace || null)) return false;
+    if (!langTraits(index.files.get(a.file)?.language)?.textualIncludes) return false;
+    if (NON_CALLABLE_TYPES.has(a.type) || NON_CALLABLE_TYPES.has(b.type)) return false;
+    if (_cFamilySignatureKey(a) !== _cFamilySignatureKey(b)) return false;
+    return _configurationAlternativeFiles(index, a.file, b.file);
+}
+
+/**
+ * A same-file C/C++ macro binding that carries no identity for a call site
+ * (fix #385): the preprocessor model already decided the site reaches a
+ * function (no macro in effect, the macro's expansion calls the name again,
+ * or the file holds macro and function as configuration alternatives), a
+ * macro's own name inside its replacement list is never expanded again, and
+ * a function-like macro name without `(` is not an invocation.
+ */
+function _cMacroBindingInert(index, filePath, call, bound) {
+    if (bound?.type !== 'macro') return false;
+    if (langTraits(index.files.get(filePath)?.language)?.macroInvocationSyntax !== 'call') return false;
+    if (call.macroExpansion || call.macroParameter) return false;
+    if (call.inMacroBody || call.inMacroDefinition) {
+        const enclosing = call.enclosingFunction;
+        return !!(enclosing?.isMacro && enclosing.name === call.name &&
+            bound.file === filePath && bound.startLine === enclosing.startLine);
+    }
+    if (call.isFunctionReference) return !!bound.functionLike;
+    return _cMacroShadowedCall(index, filePath, call) === null;
+}
+
+/**
+ * The binding a C/C++ call site holds once an inert macro binding is set
+ * aside: a same-file function binding of the name (a pinned one first), or
+ * none (the site then resolves through the include closure).
+ */
+function _cFunctionBindingForMacroSite(index, fileEntry, name, targetBindingIds) {
+    const symbols = index.symbols.get(name) || [];
+    const functionBindings = (fileEntry?.bindings || []).filter(binding => binding.name === name &&
+        binding.type !== 'macro' &&
+        symbols.some(symbol => symbol.bindingId === binding.id && symbol.type !== 'macro'));
+    return (functionBindings.find(binding => targetBindingIds.has(binding.id)) ||
+        functionBindings[0])?.id ?? null;
+}
+
+function _definitionByBindingId(index, name, bindingId) {
+    const definitions = index.symbols.get(name) || [];
+    const memo = bindingId == null ? null
+        : index._opMemo?.('definitionByBindingId', () => new WeakMap());
+    if (!memo) return definitions.find(d => d.bindingId === bindingId);
+    let byId = memo.get(definitions);
+    if (!byId) {
+        byId = new Map();
+        for (const d of definitions) {
+            if (d.bindingId !== undefined && !byId.has(d.bindingId)) byId.set(d.bindingId, d);
+        }
+        memo.set(definitions, byId);
+    }
+    return byId.get(bindingId);
 }
 
 /** Interface/trait names a class declares it implements (generics stripped). */
@@ -15127,6 +21923,23 @@ function _implementsParents(index, className) {
  * owner count. Display/routing enrichment only ("1 of N implementations").
  */
 function _countDispatchCandidates(index, via, definitions) {
+    // A pure function of (definitions, via) within an operation (fix #382).
+    const memo = index._opMemo?.('dispatchCandidates', () => new WeakMap());
+    if (!memo) return _countDispatchCandidatesUncached(index, via, definitions);
+    let byVia = memo.get(definitions);
+    if (!byVia) {
+        byVia = new Map();
+        memo.set(definitions, byVia);
+    }
+    let count = byVia.get(via);
+    if (count === undefined) {
+        count = _countDispatchCandidatesUncached(index, via, definitions);
+        byVia.set(via, count);
+    }
+    return count;
+}
+
+function _countDispatchCandidatesUncached(index, via, definitions) {
     const ownerFiles = new Map(); // owner type -> defining file
     for (const d of definitions) {
         if (NON_CALLABLE_TYPES.has(d.type)) continue;
@@ -15293,6 +22106,28 @@ function _javaNestedTypeQualifier(raw) {
  *   go:   `*ignore.Ig` → Ig; slices/maps/chans/funcs → null
  *   java: `java.util.List<Foo>` → List; arrays → null
  */
+/**
+ * `Box[T]` / `pkg.Box[K, V]` -> `Box` / `pkg.Box` (fix #378): an
+ * instantiation has its generic type's identity and method set. Only a
+ * type-argument list that closes at the very end of the text is stripped
+ * (`map[string]Box[int]` keeps its shape and normalizes to nothing).
+ */
+function _goStripTypeArguments(text) {
+    const open = text.indexOf('[');
+    if (open <= 0 || !text.endsWith(']') ||
+        !/^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(text.slice(0, open))) {
+        return text;
+    }
+    let depth = 0;
+    for (let i = open; i < text.length; i++) {
+        if (text[i] === '[') depth++;
+        else if (text[i] === ']' && --depth === 0) {
+            return i === text.length - 1 ? text.slice(0, open) : text;
+        }
+    }
+    return text;
+}
+
 function _normalizeFieldTypeName(raw, language, options = {}) {
     let t = String(raw).trim();
     if (language === 'rust') {
@@ -15302,6 +22137,18 @@ function _normalizeFieldTypeName(raw, language, options = {}) {
             t = t.replace(/^&+\s*/, '').replace(/^'[A-Za-z_][A-Za-z0-9_]*\s*/, '').replace(/^mut\s+/, '');
         } while (t !== prev);
         if (/^(dyn|impl)\b/.test(t)) return null;
+        // `&'a [T]` is the primitive slice (fix #369): canonical 'slice', the
+        // same name annotated slice receivers carry. Arrays abstain.
+        if (/^\[/.test(t)) {
+            let depth = 0;
+            for (let i = 0; i < t.length; i++) {
+                const ch = t[i];
+                if (ch === '[' || ch === '<' || ch === '(') depth++;
+                else if (ch === ']' || ch === '>' || ch === ')') depth--;
+                else if (ch === ';' && depth === 1) return null;
+            }
+            return t.endsWith(']') ? 'slice' : null;
+        }
         const m = t.match(/^([A-Za-z_][A-Za-z0-9_]*(?:\s*::\s*[A-Za-z_][A-Za-z0-9_]*)*)\s*(?:<(.*)>)?$/s);
         if (!m) return null;
         const base = m[1].split('::').pop().trim();
@@ -15311,7 +22158,7 @@ function _normalizeFieldTypeName(raw, language, options = {}) {
         return base;
     }
     if (language === 'go') {
-        t = t.replace(/^\*+/, '');
+        t = _goStripTypeArguments(t.replace(/^\*+/, ''));
         const m = t.match(/^([A-Za-z_][A-Za-z0-9_]*)(?:\.([A-Za-z_][A-Za-z0-9_]*))?$/);
         if (!m) return null;
         return m[2] || m[1];
@@ -15319,6 +22166,9 @@ function _normalizeFieldTypeName(raw, language, options = {}) {
     if (language === 'cpp') {
         t = t.replace(/\b(const|volatile|class|struct|typename)\b/g, '').trim();
         t = t.replace(/[*&]+/g, '').trim();
+        // A global qualifier (`::nlohmann::json_pointer<T>`, fix #393) names
+        // the same type.
+        t = t.replace(/^::\s*/, '');
         const match = t.match(/^([A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*)\s*(?:<.*>)?$/s);
         if (!match) return null;
         return match[1].split('::').pop().trim();
@@ -15494,6 +22344,26 @@ function _goBuiltinChainedReceiverType(index, fileEntry, filePath, call) {
     return { type, fromFile: origin.fromFile };
 }
 
+/**
+ * C/C++ free-function candidates that are ONE callable (fix #391): a
+ * definition with its prototypes and friend declarations is one linkage
+ * entity (`_closeCallableIdentityGroup`, fix #379), so a producer named by
+ * them has one return type. Returns the definition when the candidates are
+ * exactly that entity, else null (two definitions stay two callables).
+ */
+function _cFamilySingleCallable(index, candidates) {
+    if (candidates.length < 2) return null;
+    const language = definition => index.files.get(definition.file)?.language;
+    if (!candidates.every(definition =>
+        language(definition) === 'c' || language(definition) === 'cpp')) {
+        return null;
+    }
+    const bodies = candidates.filter(definition => !definition.isSignature);
+    if (bodies.length !== 1 || !bodies[0].returnType) return null;
+    const group = new Set(_closeCallableIdentityGroup(index, bodies, candidates));
+    return candidates.every(definition => group.has(definition)) ? bodies[0] : null;
+}
+
 function _nominalChainedReceiverType(index, call, fileEntry, filePath) {
     const language = fileEntry.language;
     const defs = (index.symbols.get(call.receiverCall) || [])
@@ -15525,7 +22395,7 @@ function _nominalChainedReceiverType(index, call, fileEntry, filePath) {
         // reach methods (Java), a bare producer is this.getConfig() — the
         // enclosing class's own method wins.
         if (langTraits(language)?.bareCallReachesMethods) {
-            const enclosing = index.findEnclosingFunction(filePath, call.line, true);
+            const enclosing = index.findEnclosingFunction(filePath, call.line, true, call);
             if (enclosing?.className) {
                 const sameClass = defs.find(d => d.className === enclosing.className && d.returnType);
                 if (sameClass) {
@@ -15550,6 +22420,7 @@ function _nominalChainedReceiverType(index, call, fileEntry, filePath) {
         } else {
             const sameFile = cands.filter(d => d.file === filePath);
             if (sameFile.length === 1) chosen = sameFile[0];
+            else chosen = _cFamilySingleCallable(index, cands);
         }
         if (!chosen || !chosen.returnType) return null;
         producer = chosen;
@@ -15810,6 +22681,51 @@ function _structuralReturnedReceiverType(index, receiverText, fromFile, fieldNam
  * method; `Self`/`this` return annotations resolve to the RECEIVER's type
  * (dynamic-Self semantics — sound because the chain's static type is T).
  */
+/**
+ * The trait member a Rust method call resolves to when the receiver type
+ * `typeName` has no inherent or impl member of that name (fix #368): every
+ * trait the type implements (its `impl Trait for Type` blocks, identity-
+ * narrowed like the owner lookup) is resolved from the impl's file, and the
+ * trait's own declaration of `methodName` is the contract. Several traits
+ * providing the name is ambiguous (Rust would require disambiguation) and
+ * yields [].
+ */
+function _rustTraitProvidedMethods(index, typeName, fromFile, methodName) {
+    const norm = value => String(value || '').replace(/<.*$/s, '').trim()
+        .split('::').filter(Boolean).pop() || '';
+    let impls = (index.symbols.get(typeName) || []).filter(definition =>
+        definition.type === 'impl' && definition.traitName && definition.file);
+    if (impls.length === 0) return [];
+    const typeDefinitions = (index.symbols.get(typeName) || [])
+        .filter(definition => _FOLD_TYPE_KINDS.has(definition.type));
+    if (typeDefinitions.length > 1) {
+        if (!fromFile) return [];
+        const dir = path.dirname(fromFile);
+        impls = impls.filter(definition => definition.file === fromFile ||
+            path.dirname(definition.file) === dir);
+    }
+    const found = new Map();
+    for (const impl of impls) {
+        const traitName = norm(impl.traitName);
+        if (!traitName) continue;
+        const members = (index.symbols.get(methodName) || []).filter(definition =>
+            !NON_CALLABLE_TYPES.has(definition.type) &&
+            definition.className === traitName && definition.file);
+        if (members.length === 0) continue;
+        const traitQualifier = String(impl.traitName).replace(/<.*$/s, '').trim()
+            .split('::').slice(0, -1).join('::') || undefined;
+        const origin = _resolveFlowTypeOrigin(index, impl.file, traitName, traitQualifier);
+        if (!origin?.fromFile) return [];
+        const pinned = members.filter(definition => definition.file === origin.fromFile);
+        if (pinned.length !== 1) {
+            if (pinned.length > 1) return [];
+            continue;
+        }
+        found.set(`${pinned[0].file}:${pinned[0].startLine}`, pinned[0]);
+    }
+    return found.size === 1 ? [...found.values()] : [];
+}
+
 function _methodReturnOnType(index, typeName, fromFile, methodName, language, opts = {}) {
     const nominal = langTraits(language)?.typeSystem === 'nominal';
     const norm = s => (s || '').replace(/^\*/, '').replace(/\[.*$/, '').replace(/<.*$/, '');
@@ -15837,6 +22753,13 @@ function _methodReturnOnType(index, typeName, fromFile, methodName, language, op
             owned = owned.filter(d => d.file === fromFile);
         }
     }
+    if (owned.length === 0 && language === 'rust') {
+        // Trait-provided methods (fix #368): `(0..8).into_par_iter()
+        // .chunks(2)` resolves `chunks` on the range iterator through the
+        // traits that type implements. The trait declaration's signature is
+        // the static contract (`fn chunks(self, n) -> Chunks<Self>`).
+        owned = _rustTraitProvidedMethods(index, typeName, fromFile, methodName);
+    }
     if (owned.length === 0) {
         // Inheritance walk: resolve on a declared ancestor; Self/this still
         // resolve to the RECEIVER's type (passed through selfType).
@@ -15855,14 +22778,14 @@ function _methodReturnOnType(index, typeName, fromFile, methodName, language, op
     }
     const selfType = opts.selfType || typeName;
     if (nominal) {
-        if (!owned.every(d => d.returnType)) return null;
-        if (new Set(owned.map(d => d.returnType)).size !== 1) return null;
+        if (!owned.every(d => _declaredReturnText(d))) return null;
+        if (new Set(owned.map(d => _declaredReturnText(d))).size !== 1) return null;
         const def = owned[0];
-        const parsed = _returnTypeNameNominal(def.returnType, language, { selfClass: selfType });
+        const parsed = _returnTypeNameNominal(_declaredReturnText(def), language, { selfClass: selfType });
         if (!parsed) return null;
         const origin = _resolveFlowTypeOrigin(index, def.file || opts.filePath, parsed.name, parsed.qualifier);
         const wrappers = language === 'rust' ? owned.map(candidate =>
-            _rustReturnWrapper(index, candidate.returnType, candidate.file || opts.filePath,
+            _rustReturnWrapper(index, _declaredReturnText(candidate), candidate.file || opts.filePath,
                 selfType, candidate, [], true)) : [];
         // Identical annotation text in different impl files can bind different
         // aliases. Every possible producer must agree on the payload identity.
@@ -15986,10 +22909,51 @@ function _rustMacroDefinitions(index, fileEntry, filePath, record) {
  * constructor/builder value. Every reachable non-diverging definition must
  * agree; cfg alternatives ending in compile_error! cannot produce a value.
  */
+/**
+ * Standard-library constructor macros whose value type is fixed by the
+ * language's std (fix #368): `vec![..]` is always a `Vec`. Only when the
+ * project declares no macro of that name anywhere and no type of the result
+ * name, and the invocation is unqualified or `std::`/`alloc::`-qualified.
+ */
+const _RUST_STD_CONSTRUCTOR_MACROS = new Map([['vec', 'Vec']]);
+
+function _rustStdMacroResultType(index, filePath, record) {
+    const type = _RUST_STD_CONSTRUCTOR_MACROS.get(record.name);
+    if (!type) return null;
+    if (record.receiver && !['std', 'alloc', 'std::vec', 'alloc::vec']
+        .includes(String(record.receiver))) return null;
+    const projectMacro = (index.symbols.get(record.name) || [])
+        .some(definition => definition.type === 'macro');
+    const projectType = (index.symbols.get(type) || [])
+        .some(definition => IDENTITY_TYPE_KINDS.has(definition.type));
+    if (projectMacro || projectType) return null;
+    return { type, fromFile: filePath, stdLiteral: true };
+}
+
+/**
+ * Prelude enum variants construct their std enum (fix #368): `Some(x)` is
+ * an `Option`, `Ok(x)` / `Err(e)` a `Result` - unless the project declares
+ * that name or the enum name itself.
+ */
+const _RUST_PRELUDE_VARIANTS = new Map([['Some', 'Option'], ['Ok', 'Result'], ['Err', 'Result']]);
+
+function _rustPreludeVariantType(index, filePath, record) {
+    if (record.isMethod || record.receiver || record.isMacro || record.localShadow) return null;
+    const type = _RUST_PRELUDE_VARIANTS.get(record.name);
+    if (!type) return null;
+    if ((index.symbols.get(record.name) || []).length > 0) return null;
+    if ((index.symbols.get(type) || []).some(definition =>
+        IDENTITY_TYPE_KINDS.has(definition.type))) return null;
+    const fileEntry = index.files.get(filePath);
+    if ((fileEntry?.importBindings || []).some(binding =>
+        (binding.alias || binding.name) === record.name)) return null;
+    return { type, fromFile: filePath, stdLiteral: true };
+}
+
 function _rustMacroCallResultType(index, fileEntry, filePath, record) {
     if (fileEntry.language !== 'rust') return null;
     const definitions = _rustMacroDefinitions(index, fileEntry, filePath, record);
-    if (definitions.length === 0) return null;
+    if (definitions.length === 0) return _rustStdMacroResultType(index, filePath, record);
     if (definitions.some(definition =>
         !definition.returnType && !definition.macroNeverReturns)) {
         return null;
@@ -16046,17 +23010,34 @@ function _rustModuleProducer(index, fileEntry, filePath, call) {
         : resolveRustImport(specifier, filePath, index.root);
     if (!destination || !index.files.has(destination) || destination === filePath) return null;
     const base = path.basename(destination, '.rs');
-    if ((base === 'mod' ? path.basename(path.dirname(destination)) : base) !== terminal) return null;
-    const candidates = (index.symbols.get(call.name) || []).filter(d => d.file === destination &&
-        !NON_CALLABLE_TYPES.has(d.type) && !d.className && !d.receiver && !d.namespace);
+    // A single-segment specifier naming a crate (`cursive::default()` from the
+    // package's own examples, `use itertools as it; it::f()`) resolves to the
+    // crate root file, whose basename is lib/main (fix #369).
+    const crateRoot = !specifier.includes('::') && (base === 'lib' || base === 'main') &&
+        resolveRustModuleFile(specifier, filePath, index.root) === destination;
+    if (!crateRoot &&
+        (base === 'mod' ? path.basename(path.dirname(destination)) : base) !== terminal) return null;
+    const free = (index.symbols.get(call.name) || []).filter(d =>
+        !NON_CALLABLE_TYPES.has(d.type) && !d.className && !d.receiver && !d.namespace && d.file);
+    let candidates = free.filter(d => d.file === destination);
+    let reexported = false;
+    if (candidates.length === 0 && crateRoot) {
+        // A crate root re-exports its items (`pub use crate::repeatn::
+        // repeat_n;`, `pub use crate::free::*`): follow the exact name (fix #369).
+        candidates = free.filter(d => _nameBindingReaches(index, destination, call.name,
+            new Set([d.file])) === 'yes');
+        reexported = candidates.length === 1;
+    }
     if (candidates.length !== 1 || !candidates[0].returnType) return null;
     const definition = candidates[0];
-    if ((index.files.get(destination).symbols || []).some(d => d.type === 'module' &&
+    if ((index.files.get(definition.file).symbols || []).some(d => d.type === 'module' &&
         d.startLine < definition.startLine && d.endLine >= definition.endLine)) return null;
     return { definition, facts: {
         call: { file: fileEntry.relativePath, line: call.line, start: call.callStart,
             end: call.callEnd, receiver: call.receiver, name: call.name },
-        binding: binding || null, module: { specifier, file: path.relative(index.root, destination) },
+        binding: binding || null, module: { specifier, file: path.relative(index.root, destination),
+            ...(crateRoot && { crateRoot: true }),
+            ...(reexported && { reexportedFrom: path.relative(index.root, definition.file) }) },
         declaration: { ...declarationIdentity(definition), returnType: definition.returnType },
     } };
 }
@@ -16180,7 +23161,54 @@ const _RUST_ITERATOR_ITEM_CALLBACKS = new Set([
     'inspect', 'map', 'map_while', 'position', 'skip_while', 'take_while',
 ]);
 
+/**
+ * A receiver typed by language syntax as a standard-library type (fix #368:
+ * Rust range expressions are `std::ops::Range*`) names that std type, never a
+ * same-named project declaration. When the project declares a type with the
+ * same short name, the short-name identity machinery could conflate the two,
+ * so the literal typing is withdrawn and the receiver stays untyped.
+ */
+function _withoutShadowedStdLiteral(index, call) {
+    if (!call || !call.receiverTypeStd || !call.receiverType) return call;
+    const shadowed = (index.symbols.get(call.receiverType) || [])
+        .some(definition => IDENTITY_TYPE_KINDS.has(definition.type));
+    if (!shadowed) return call;
+    const { receiverType, receiverTypeSource, receiverTypeEvidence, receiverTypeStd, ...rest } = call;
+    return rest;
+}
+
+/**
+ * `impl<T> Trait for [T]`: a slice owner whose element is the impl's own
+ * type parameter, so every slice receiver can reach it (fix #368).
+ */
+function _isGenericSliceOwner(definition, owner) {
+    const match = /^\[\s*([A-Za-z_][A-Za-z0-9_]*)\s*\]$/.exec(String(owner || ''));
+    return !!match && !!_genericParamNames(definition?.ownerGenerics)?.has(match[1]);
+}
+
+/**
+ * A slice-typed receiver ('slice') cannot tell `impl X for [u8]` from
+ * `impl X for [i32]`; against such concrete-element slice owners the
+ * receiver stays untyped (fix #368).
+ */
+function _withoutAmbiguousSliceType(call, targetDefs) {
+    if (!call?.receiverTypeStd || !['slice', 'tuple'].includes(call.receiverType)) return call;
+    const ambiguous = targetDefs.some(definition => {
+        const owners = [definition.className, definition.receiver].filter(Boolean).map(String);
+        if (call.receiverType === 'tuple') {
+            // Tuple impls (`impl<A, B> T for (A, B)`) have no nominal owner.
+            return owners.some(owner => /^&?\s*\(/.test(owner));
+        }
+        return owners.some(owner => /^&?\s*\[/.test(owner) &&
+            !_isGenericSliceOwner(definition, owner));
+    });
+    if (!ambiguous) return call;
+    const { receiverType, receiverTypeSource, receiverTypeEvidence, receiverTypeStd, ...rest } = call;
+    return rest;
+}
+
 function _rustRecordReceiverType(index, fileEntry, filePath, record, ctx) {
+    record = _withoutShadowedStdLiteral(index, record);
     if (record.receiver === 'self') {
         const enclosing = index.findEnclosingFunction(filePath, record.line, true);
         if (enclosing?.className) {
@@ -16375,6 +23403,893 @@ function _rustIteratorOutputItemType(index, fileEntry, filePath, source, ctx, vi
     return items[0];
 }
 
+/**
+ * Project free functions a Rust plain or module-path call binds to (fix
+ * #368), resolved through the caller's own scope: a same-file definition,
+ * a `use` binding (incl. re-export chains), a glob import, or the explicit
+ * module path (`crate::f`, `rayon_core::f`, `super::f`). Returns [] unless
+ * exactly one defining file is reached; an unresolvable call binds nothing.
+ */
+/**
+ * Module files a Rust path qualifier names (fix #369): the qualifier's first
+ * segment resolves through this file's `use` / `extern crate` bindings first
+ * (`use itertools as it; it::f()`, `use crate::a::b; b::f()`), else as a
+ * scope-rooted or package path (`crate::m`, `super::m`, `pkg::m` from the
+ * package's own tests/examples). The item lives in the module's own file (or
+ * is re-exported from it); `module::name` may instead land on a child module
+ * file of the same name, so every anchor is returned. null = the qualifier
+ * is ambiguous in this file (several bindings of the first segment).
+ */
+function _rustPathQualifierFiles(index, fileEntry, filePath, receiver, name) {
+    const parts = String(receiver || '').split('::').filter(Boolean);
+    if (parts.length === 0) return new Set();
+    const root = parts[0];
+    const bindings = (fileEntry.importBindings || []).filter(binding =>
+        (binding.alias || binding.name) === root && binding.name !== '*');
+    if (bindings.length > 1) return null;
+    const specifier = bindings[0]
+        ? [bindings[0].module, ...parts.slice(1)].join('::')
+        : parts.join('::');
+    const starts = new Set();
+    const relative = fileEntry.moduleResolved?.[specifier];
+    if (relative) starts.add(path.resolve(index.root, relative));
+    try {
+        const own = resolveRustModuleFile(specifier, filePath, index.root);
+        if (own && index.files.has(own)) starts.add(own);
+        if (name) {
+            const item = resolveRustImport(`${specifier}::${name}`, filePath, index.root);
+            if (item && index.files.has(item)) starts.add(item);
+        }
+    } catch { /* resolver gap: no anchor */ }
+    return starts;
+}
+
+/**
+ * Is the project trait `traitDef` in scope in filePath (fix #369)? Rust
+ * method resolution only considers traits in scope: declared in this file,
+ * named by a `use` binding (including `as _`) that reaches the declaration,
+ * or reached through a glob import. Unknown is false.
+ */
+function _rustTraitInScope(index, fileEntry, filePath, traitDef) {
+    const memo = index._rustScopeMemo || (index._rustScopeMemo = new Map());
+    const key = `\x01traitScope\x00${filePath}\x00${traitDef.file}:${traitDef.startLine}`;
+    if (memo.has(key)) return memo.get(key);
+    let inScope = traitDef.file === filePath;
+    if (!inScope) {
+        const target = new Set([traitDef.file]);
+        for (const binding of (fileEntry.importBindings || [])) {
+            if (binding.name !== traitDef.name) continue;
+            for (const start of _rustBindingResolvedFiles(index, fileEntry, filePath, binding)) {
+                if (start === traitDef.file ||
+                    _nameBindingReaches(index, start, traitDef.name, target) === 'yes') {
+                    inScope = true;
+                    break;
+                }
+            }
+            if (inScope) break;
+        }
+    }
+    if (!inScope) {
+        inScope = _rustGlobReachableDefs(index, filePath, traitDef.name, [traitDef]).length > 0;
+    }
+    memo.set(key, inScope);
+    return inScope;
+}
+
+/**
+ * Blanket impls of a project trait (`impl<T: Bound> Trait for T`), each with
+ * the declared bounds of its self parameter, memoized per index. Keyed by the
+ * trait declaration; an impl whose trait name resolves elsewhere is not one.
+ */
+function _rustBlanketImpls(index, traitDef) {
+    const memo = index._rustScopeMemo || (index._rustScopeMemo = new Map());
+    const key = `\x01blanket\x00${traitDef.file}:${traitDef.startLine}`;
+    if (memo.has(key)) return memo.get(key);
+    const out = [];
+    for (const [selfName, defs] of index.symbols) {
+        for (const impl of defs) {
+            if (impl.type !== 'impl' || !impl.traitName || !impl.generics) continue;
+            const traitText = String(impl.traitName).replace(/<.*$/s, '').trim();
+            if (traitText.split('::').pop() !== traitDef.name) continue;
+            const params = _genericParamNames(impl.generics);
+            if (!params?.has(selfName)) continue;
+            const qualifier = traitText.includes('::')
+                ? traitText.split('::').slice(0, -1).join('::') : undefined;
+            const origin = _resolveFlowTypeOrigin(index, impl.file, traitDef.name, qualifier);
+            if (origin?.fromFile !== traitDef.file) continue;
+            out.push(impl);
+        }
+    }
+    memo.set(key, out);
+    return out;
+}
+
+/**
+ * The extension-trait method a method call named `name` binds when the
+ * receiver's type owns no project method of that name (fix #369): every
+ * project method definition of the name belongs to ONE project trait, as its
+ * declaration member or a member of its blanket impls; that trait has a
+ * blanket impl and is in scope in the calling file. rustc then resolves the
+ * call to that trait method (an applicable second trait would be an
+ * ambiguity error); the one alternative outside the index is an inherent
+ * method of an external receiver type. Returns { declaration, traitDef } or
+ * null.
+ */
+function _rustBlanketTraitMethod(index, fileEntry, filePath, name) {
+    if (fileEntry?.language !== 'rust') return null;
+    const memo = index._rustScopeMemo || (index._rustScopeMemo = new Map());
+    const key = `\x01blanketMethod\x00${filePath}\x00${name}`;
+    if (memo.has(key)) return memo.get(key);
+    const finish = value => { memo.set(key, value); return value; };
+    const methods = (index.symbols.get(name) || []).filter(definition =>
+        !NON_CALLABLE_TYPES.has(definition.type) &&
+        (definition.className || definition.receiver) &&
+        index.files.get(definition.file)?.language === 'rust');
+    if (methods.length === 0) return finish(null);
+    const declarations = methods.filter(definition => !definition.traitImpl);
+    if (declarations.length !== 1) return finish(null);
+    const declaration = declarations[0];
+    const traitDefs = (index.symbols.get(declaration.className) || []).filter(definition =>
+        definition.type === 'trait' && definition.file === declaration.file &&
+        definition.startLine <= declaration.startLine && definition.endLine >= declaration.endLine);
+    if (traitDefs.length !== 1) return finish(null);
+    const traitDef = traitDefs[0];
+    const others = methods.filter(definition => definition !== declaration);
+    if (others.some(definition => {
+        const traitText = String(definition.traitName || '').replace(/<.*$/s, '').trim();
+        return traitText.split('::').pop() !== traitDef.name ||
+            !_definitionHasGenericOwner(definition);
+    })) return finish(null);
+    if (_rustBlanketImpls(index, traitDef).length === 0) return finish(null);
+    if (!_rustTraitInScope(index, fileEntry, filePath, traitDef)) return finish(null);
+    return finish({ declaration, traitDef });
+}
+
+/**
+ * Result type of a method call that binds an in-scope blanket extension-trait
+ * method (fix #369): `v.iter().cloned().tuples()` is `Tuples<Self, T>`. A
+ * `Self` result needs the receiver's type; an unknown receiver stays null.
+ */
+function _rustBlanketTraitResult(index, fileEntry, filePath, name, receiver) {
+    const resolved = _rustBlanketTraitMethod(index, fileEntry, filePath, name);
+    if (!resolved) return null;
+    const { declaration, traitDef } = resolved;
+    const parsed = _returnTypeNameNominal(declaration.returnType, 'rust',
+        receiver?.type ? { selfClass: receiver.type } : {});
+    if (!parsed?.name) return null;
+    if (receiver?.type && parsed.name === receiver.type) {
+        return { type: receiver.type, ...(receiver.fromFile && { fromFile: receiver.fromFile }),
+            blanketTrait: { trait: traitDef.name, method: declaration.bindingId } };
+    }
+    if (/^[A-Z][A-Z0-9]?$/.test(parsed.name) || parsed.name === 'Self') return null;
+    const origin = _resolveFlowTypeOrigin(index, declaration.file, parsed.name, parsed.qualifier);
+    if (!origin?.fromFile) return null;
+    // Only a project type result is identity; std/external heads stay open.
+    if (!(index.symbols.get(parsed.name) || []).some(definition =>
+        _FOLD_TYPE_KINDS.has(definition.type) && definition.file === origin.fromFile)) return null;
+    return { type: parsed.name, fromFile: origin.fromFile,
+        blanketTrait: { trait: traitDef.name, method: declaration.bindingId } };
+}
+
+/**
+ * Project impls of trait `traitName` whose self type is `typeName` at the
+ * reference layer `ref` ('owned' / '&' / '&mut'), memoized per index. Slice
+ * impls (`for &'a mut [T]`) are keyed by the canonical receiver name 'slice'.
+ */
+function _rustImplsOfTraitFor(index, typeName, ref, traitName) {
+    const memo = index._rustScopeMemo || (index._rustScopeMemo = new Map());
+    let byKey = memo.get('\x01implsFor');
+    if (!byKey) {
+        byKey = new Map();
+        for (const [name, defs] of index.symbols) {
+            for (const impl of defs) {
+                if (impl.type !== 'impl' || !impl.traitName) continue;
+                if (impl.blanketSelfBounds) continue;
+                const trait = String(impl.traitName).replace(/<.*$/s, '').trim().split('::').pop();
+                let owner = name;
+                if (/\[/.test(owner)) {
+                    if (/;/.test(owner)) continue; // arrays unsize; abstain
+                    owner = 'slice';
+                }
+                owner = owner.replace(/^&('\w+\s*)?(mut\s+)?/, '').replace(/<.*$/s, '').trim();
+                const key = `${owner}\x00${impl.implSelfRef || 'owned'}\x00${trait}`;
+                if (!byKey.has(key)) byKey.set(key, []);
+                byKey.get(key).push(impl);
+            }
+        }
+        memo.set('\x01implsFor', byKey);
+    }
+    return byKey.get(`${typeName}\x00${ref}\x00${traitName}`) || [];
+}
+
+/**
+ * Does a method call on a receiver of known type bind the blanket-impl
+ * member `m` of an in-scope project trait (fix #369)? rayon's
+ * `impl<'a, I: 'a + ?Sized> IntoParallelRefMutIterator<'a> for I where
+ * &'a mut I: IntoParallelIterator` gives `v.par_iter_mut()` on `v: Vec<T>`
+ * exactly when the where-clause holds for I = Vec<T>. Confirmed only when
+ * the call's name belongs to that one trait (declaration + blanket members),
+ * the trait is in scope, the trait has exactly one blanket impl, and each of
+ * its self-parameter bounds is satisfied by exactly one visible project impl
+ * for the receiver's type at that reference layer. Upstream bounds
+ * (`Send`, `Sized`) cannot be checked and withhold confirmation, except the
+ * implicit `Sized`-family markers that every sized type satisfies.
+ */
+function _rustBlanketBoundConfirms(index, fileEntry, filePath, call, receiverType, targetDefs) {
+    if (!receiverType || fileEntry?.language !== 'rust' || !call.isMethod || call.isPathCall) return false;
+    const resolved = _rustBlanketTraitMethod(index, fileEntry, filePath, call.name);
+    if (!resolved) return false;
+    const { declaration, traitDef } = resolved;
+    const members = new Set([declaration]);
+    for (const definition of index.symbols.get(call.name) || []) {
+        if (definition.traitImpl && _definitionHasGenericOwner(definition)) members.add(definition);
+    }
+    if (!targetDefs.every(target => members.has(target))) return false;
+    if ((index.symbols.get(call.name) || []).some(definition =>
+        !NON_CALLABLE_TYPES.has(definition.type) && !members.has(definition) &&
+        String(definition.className || definition.receiver || '')
+            .replace(/^[*&]\s*/, '').replace(/<.*$/s, '').trim() === receiverType)) return false;
+    const blankets = _rustBlanketImpls(index, traitDef);
+    if (blankets.length !== 1 || !Array.isArray(blankets[0].blanketSelfBounds)) return false;
+    let checked = 0;
+    for (const { ref, traits } of blankets[0].blanketSelfBounds) {
+        for (const trait of traits) {
+            if (trait === 'Sized') continue;
+            const projectTrait = (index.symbols.get(trait) || []).some(definition =>
+                definition.type === 'trait');
+            if (!projectTrait) return false;
+            if (_rustImplsOfTraitFor(index, receiverType, ref, trait).length !== 1) return false;
+            checked++;
+        }
+    }
+    return checked > 0;
+}
+
+/**
+ * The file a qualified Rust path's final item lives in (fix #369): the first
+ * segment is substituted through this file's `use` binding, then the module
+ * segments are walked through child modules, re-export bindings and globs.
+ */
+function _rustQualifiedPathFile(index, fileEntry, filePath, receiver, name) {
+    const parts = String(receiver || '').split('::').filter(Boolean);
+    if (parts.length === 0 || ['Self', 'self'].includes(parts[0])) return null;
+    const bindings = (fileEntry.importBindings || []).filter(binding =>
+        (binding.alias || binding.name) === parts[0] && binding.name !== '*');
+    if (bindings.length > 1) return null;
+    const spec = [...(bindings[0] ? [bindings[0].module] : [parts[0]]), ...parts.slice(1), name]
+        .join('::');
+    return _rustWalkUsePath(index, filePath, spec);
+}
+
+/**
+ * Can a single-element annotation `@Marker(x)` set the pinned element
+ * (fix #389)? 'target' when the annotation type the site names is the
+ * target's owner, 'unknown' when it may be, null when it is not.
+ */
+function _annotationShorthandReaches(index, filePath, call, targets) {
+    if (!targets.some(target => target.className === call.receiverType)) return null;
+    const identity = _resolveReceiverTypeIdentity(index, filePath, call.receiverType,
+        targets, call.line, call.receiverTypeQualifier);
+    return identity === 'other' ? null : identity;
+}
+
+/** Is `d` owned by the same class definition as some pinned target (fix #389)? */
+function _sameOwnerAsAny(index, d, targets) {
+    return !targets.every(target => distinctOwnerDefinitions(index, d, target));
+}
+
+/**
+ * Should a Rust typed receiver be pinned to the flow file its type resolves
+ * in? A block-local type in scope is decided at the call's own line
+ * (fix #389), never through a flow file that drops the line.
+ */
+function _rustPinsReceiverFlowFile(index, filePath, call, origin, typeLine) {
+    if (!origin?.fromFile) return false;
+    return !(origin.fromFile === filePath && !call.receiverTypeQualifier &&
+        _functionLocalTypeInScope(index, filePath, call.receiverType, typeLine));
+}
+
+/**
+ * Type a Rust constructor call makes (fix #389): a tuple struct `T(1)` /
+ * `Self(1)` / `m::T(1)` or a tuple variant `E::Tup(2)`. Most producers are
+ * functions: only a name some struct or variant carries is resolved.
+ */
+function _rustConstructorCallType(index, filePath, record) {
+    if (record.isMacro || record.localShadow || (record.isMethod && !record.isPathCall)) return null;
+    if (record.name !== 'Self') {
+        const items = _rustValueItemsNamed(index, record.name);
+        if (items.structs.length === 0 && items.variants.length === 0) return null;
+    }
+    const constructed = !record.isMethod && !record.receiver
+        ? _rustValuePathType(index, filePath, record.name, 'call', record.line)
+        : record.isPathCall && record.receiver
+            ? _rustValuePathType(index, filePath, `${record.receiver}::${record.name}`, 'call', record.line)
+            : null;
+    return constructed ? { type: constructed.type, fromFile: constructed.fromFile } : null;
+}
+
+/** Receiver-type fields of a call whose receiver is a Rust value path. */
+function _rustValuePathReceiverType(index, filePath, call) {
+    const valueType = _rustValuePathType(index, filePath, call.receiverValuePath,
+        call.receiverValueKind || 'value', call.line);
+    if (!valueType) return null;
+    return {
+        receiverType: valueType.type,
+        receiverTypeSource: 'flow',
+        receiverTypeEvidence: { source: 'flow', type: valueType.type, fromFile: valueType.fromFile,
+            valuePath: call.receiverValuePath },
+        // A type declared in this file resolves at the call's own line (a
+        // block item shadows the module's namesake).
+        ...(valueType.fromFile !== filePath && { receiverTypeFlowFile: valueType.fromFile }),
+    };
+}
+
+/**
+ * Type of a Rust value path (fix #369 variants, fix #389 structs): the value
+ * a path names in this file's value namespace, when it names a type's value.
+ * `kind` is how the path is used: 'value' (`S.m()`, `E::Unit.m()`), 'call'
+ * (a constructor call `T(1)`, `E::Tup(2)`, `Self(3)`) or 'struct' (a struct
+ * expression `P { .. }`, `E::Rec { .. }`).
+ *   - a unit struct (`struct S;`) names its value, a tuple struct its
+ *     constructor, any struct its struct expression;
+ *   - a variant names a value of its enum (unit variant / tuple variant /
+ *     any variant), through `E::V`, `Self::V`, or a `use E::V` / `use E::*`
+ *     binding of the bare name;
+ *   - `m::S` / `crate::m::T` name the item S / T of that module.
+ * The bare name is resolved by Rust scoping only: block items in scope,
+ * module items of the file, `use` bindings and globs. A fn of that name in
+ * scope, several candidates, consts/statics and unresolved paths are null.
+ * Returns { type, fromFile, definition } or null.
+ */
+/**
+ * The value-namespace items of a name (fix #389): its structs, variants and
+ * free functions, grouped once per operation (a name like `new` has hundreds
+ * of definitions and every `T::new(..)` producer asks).
+ */
+function _rustValueItemsNamed(index, name) {
+    const compute = () => {
+        const items = { structs: [], variants: [], functions: [], consts: [] };
+        for (const d of index.symbols.get(name) || []) {
+            if (d.type === 'struct') items.structs.push(d);
+            else if (d.type === 'variant') items.variants.push(d);
+            else if (d.type === 'state' && d.valueType) items.consts.push(d);
+            else if (!NON_CALLABLE_TYPES.has(d.type) && !d.className && !d.receiver) items.functions.push(d);
+        }
+        return items;
+    };
+    const memo = index._opMemo?.('rustValueItems', () => new Map());
+    if (!memo) return compute();
+    let items = memo.get(name);
+    if (!items) { items = compute(); memo.set(name, items); }
+    return items;
+}
+
+/**
+ * Type of a Rust const/static item named by a value path (fix #392):
+ * `FLAGS.iter()` receives the item's declared type. The item resolves by
+ * Rust scoping (this file's item, else the `use` binding or module path that
+ * names it); its declared type resolves in the item's own file and must be a
+ * project struct, enum or union.
+ */
+function _rustConstItemType(index, filePath, segments, line, consts) {
+    const name = segments[segments.length - 1];
+    const qualifier = segments.length > 1 ? segments.slice(0, -1).join('::') : undefined;
+    let item = null;
+    if (!qualifier) {
+        const local = consts.filter(d => d.file === filePath);
+        if (local.length > 1) return null;
+        item = local[0] || null;
+    }
+    if (!item) {
+        const origin = _resolveFlowTypeOrigin(index, filePath, name, qualifier, line);
+        if (!origin?.fromFile) return null;
+        const inFile = consts.filter(d => d.file === origin.fromFile);
+        if (inFile.length !== 1) return null;
+        item = inFile[0];
+    }
+    const typeSegments = String(item.valueType).split('::').filter(Boolean);
+    const typeName = typeSegments.pop();
+    const typeQualifier = typeSegments.length > 0 ? typeSegments.join('::') : undefined;
+    const origin = _resolveFlowTypeOrigin(index, item.file, typeName, typeQualifier, item.startLine);
+    if (!origin?.fromFile) return null;
+    const defs = (index.symbols.get(typeName) || []).filter(d =>
+        (d.type === 'struct' || d.type === 'enum' || d.type === 'union') && d.file === origin.fromFile &&
+        !_isFunctionLocalType(d));
+    if (defs.length !== 1) return null;
+    return { type: typeName, fromFile: defs[0].file, definition: defs[0] };
+}
+
+function _rustValuePathType(index, filePath, valuePath, kind, line) {
+    const segments = String(valuePath || '').split('::').filter(Boolean);
+    if (segments.length === 0) return null;
+    // Only a struct or a variant of the name (or `Self` itself) can make the
+    // path a value, or a const/static item with a declared type (fix #392).
+    const selfOnly = segments.length === 1 && segments[0] === 'Self';
+    const last = selfOnly ? null : _rustValueItemsNamed(index, segments[segments.length - 1]);
+    if (last && last.structs.length === 0 && last.variants.length === 0) {
+        return kind === 'value' && last.consts.length > 0
+            ? _rustConstItemType(index, filePath, segments, line, last.consts) : null;
+    }
+    const fits = (definition) => {
+        if (kind === 'struct') return definition.type === 'struct' || definition.type === 'variant';
+        return definition.valueShape === (kind === 'call' ? 'tuple' : 'unit');
+    };
+    const enclosingType = () => {
+        const enclosing = index.findEnclosingFunction(filePath, line, true);
+        return enclosing?.className || String(enclosing?.receiver || '').replace(/^[*&]\s*/, '') || null;
+    };
+    // The definition a type name resolves to from this file at `line`.
+    const typeDefinition = (name, qualifier, kinds) => {
+        const origin = _resolveFlowTypeOrigin(index, filePath, name, qualifier, line);
+        if (!origin?.fromFile) return null;
+        const candidates = (index.symbols.get(name) || []).filter(definition =>
+            kinds.has(definition.type) && definition.file === origin.fromFile);
+        const local = !qualifier && origin.fromFile === filePath
+            ? _functionLocalTypeInScope(index, filePath, name, line) : null;
+        if (local) return kinds.has(local.type) ? local : null;
+        const moduleLevel = candidates.filter(definition => !_isFunctionLocalType(definition));
+        return moduleLevel.length === 1 ? moduleLevel[0] : null;
+    };
+    const variantOf = (enumDef, variant) => _rustValueItemsNamed(index, variant).variants.find(definition =>
+        definition.className === enumDef.name && definition.file === enumDef.file && fits(definition));
+    const STRUCT_KINDS = new Set(['struct']);
+    const ENUM_KINDS = new Set(['enum']);
+
+    if (segments.length > 1) {
+        const item = segments.pop();
+        let owner = segments.pop();
+        if (owner === 'Self') owner = enclosingType();
+        if (!owner) return null;
+        const qualifier = segments.length > 0 ? segments.join('::') : undefined;
+        const enumDef = typeDefinition(owner, qualifier, ENUM_KINDS);
+        if (enumDef) {
+            return variantOf(enumDef, item) ? { type: owner, fromFile: enumDef.file, definition: enumDef } : null;
+        }
+        // A module path: `m::S`, `crate::m::T(..)`.
+        if ((index.symbols.get(owner) || []).some(definition => IDENTITY_TYPE_KINDS.has(definition.type) &&
+            definition.file === filePath)) return null; // an associated item of a type
+        const structDef = typeDefinition(item, [...segments, owner].join('::'), STRUCT_KINDS);
+        return structDef && fits(structDef) ? { type: item, fromFile: structDef.file, definition: structDef } : null;
+    }
+
+    let name = segments[0];
+    if (name === 'Self') {
+        const self = enclosingType();
+        if (!self) return null;
+        const structDef = typeDefinition(self, undefined, STRUCT_KINDS);
+        return structDef && fits(structDef) ? { type: self, fromFile: structDef.file, definition: structDef } : null;
+    }
+    const fileEntry = index.files.get(filePath);
+    if (!fileEntry) return null;
+    const named = _rustValueItemsNamed(index, name);
+    // A function of the name in scope owns the value namespace.
+    if (kind !== 'struct' && named.functions.some(definition =>
+        definition.file === filePath || (fileEntry.importBindings || []).some(binding =>
+            (binding.alias || binding.name) === name))) return null;
+    const results = [];
+    // A struct of the name in scope: block item, module item, `use`, glob.
+    const structs = named.structs;
+    if (structs.length > 0) {
+        const inScope = structs.some(definition => definition.file === filePath) ||
+            (fileEntry.importBindings || []).some(binding => (binding.alias || binding.name) === name) ||
+            _rustGlobNameReaches(index, filePath, name, structs);
+        const structDef = inScope ? typeDefinition(name, undefined, STRUCT_KINDS) : null;
+        if (structDef && fits(structDef)) results.push({ type: name, fromFile: structDef.file, definition: structDef });
+        else if (inScope) return null;
+    }
+    // A variant brought into scope by `use E::V` or `use E::*`.
+    const variants = named.variants;
+    if (variants.length > 0) {
+        const enumPaths = [];
+        for (const binding of fileEntry.importBindings || []) {
+            if ((binding.alias || binding.name) !== name || binding.name !== name) continue;
+            const parts = String(binding.module || '').split('::');
+            if (parts.pop() === name && parts.length > 0) enumPaths.push(parts);
+        }
+        for (const detail of fileEntry.importDetails || []) {
+            if (detail.type !== 'use-glob' || !detail.module) continue;
+            enumPaths.push(String(detail.module).split('::'));
+        }
+        for (const parts of enumPaths) {
+            const owner = parts[parts.length - 1] === 'Self' ? enclosingType() : parts[parts.length - 1];
+            if (!owner || !variants.some(definition => definition.className === owner)) continue;
+            const qualifier = parts.length > 1 ? parts.slice(0, -1).join('::') : undefined;
+            const enumDef = typeDefinition(owner, qualifier, ENUM_KINDS);
+            if (enumDef && variantOf(enumDef, name)) {
+                results.push({ type: owner, fromFile: enumDef.file, definition: enumDef });
+            }
+        }
+    }
+    const distinct = new Set(results.map(result => result.definition));
+    return distinct.size === 1 ? results[0] : null;
+}
+
+/**
+ * Language-level Rust types whose values never auto-deref into another type
+ * a project could own methods on (fix #369): primitives, slices, `str`,
+ * tuples, and the std collections/enums whose Deref target (if any) is
+ * itself one of these (`Vec<T>` -> `[T]`, `String` -> `str`). Smart pointers
+ * (Box/Rc/Arc/Cow/Ref/RefMut/Pin/guards) deref to their argument and are not
+ * listed.
+ */
+/**
+ * std methods whose result, on every deref-free std receiver that has them,
+ * is itself a deref-free std value (fix #369): iterator adaptors (labelled
+ * 'Iterator'), Option- and Result-returning lookups. Methods that can hand
+ * back an element or `Self` (unwrap, expect, clone, into, index, pop_front
+ * of a project element...) are deliberately absent.
+ */
+const _RUST_STD_ITERATOR_METHODS = new Set([
+    'iter', 'iter_mut', 'into_iter', 'chars', 'char_indices', 'bytes', 'lines',
+    'split', 'rsplit', 'splitn', 'split_whitespace', 'split_terminator', 'windows',
+    'chunks', 'chunks_exact', 'rchunks', 'keys', 'values', 'values_mut', 'drain',
+    'enumerate', 'zip', 'rev', 'skip', 'take', 'skip_while', 'take_while', 'filter',
+    'map', 'filter_map', 'flat_map', 'flatten', 'cloned', 'copied', 'peekable',
+    'step_by', 'chain', 'cycle', 'fuse', 'inspect', 'scan', 'map_while',
+]);
+const _RUST_STD_OPTION_METHODS = new Set([
+    'get', 'get_mut', 'first', 'last', 'first_mut', 'last_mut', 'ok', 'err',
+    'next', 'next_back', 'nth', 'find', 'position', 'rposition', 'max', 'min',
+    'max_by_key', 'min_by_key', 'max_by', 'min_by', 'checked_sub', 'checked_add',
+]);
+
+/**
+ * Result of a std method on a deref-free std receiver (fix #369): a std
+ * iterator adaptor or Option, provided no project definition of the name
+ * could bind for that receiver (an impl for the receiver type, a generic or
+ * blanket owner, or a trait declaration). null otherwise.
+ */
+function _rustStdMethodResult(index, receiverType, name) {
+    if (!_RUST_DEREF_FREE_STD.has(receiverType) && receiverType !== 'Iterator') return null;
+    // Primitive scalars have their own `max`/`min` (Ord) returning Self;
+    // only container, text and iterator receivers take these contracts.
+    const scalar = /^([iu](8|16|32|64|128|size)|f32|f64|bool|char)$/.test(receiverType);
+    const type = scalar
+        ? (/^checked_/.test(name) ? 'Option' : null)
+        : _RUST_STD_ITERATOR_METHODS.has(name) ? 'Iterator'
+            : _RUST_STD_OPTION_METHODS.has(name) ? 'Option' : null;
+    if (!type) return null;
+    for (const shadow of [receiverType, type]) {
+        if ((index.symbols.get(shadow) || []).some(definition =>
+            IDENTITY_TYPE_KINDS.has(definition.type) || definition.type === 'type' ||
+            definition.type === 'trait')) return null;
+    }
+    const mayBind = (index.symbols.get(name) || []).some(definition => {
+        if (NON_CALLABLE_TYPES.has(definition.type)) return false;
+        const owner = String(definition.className || definition.receiver || '')
+            .replace(/^[*&]\s*/, '').replace(/<.*$/s, '').trim();
+        if (!owner) return false; // free functions are not methods
+        if (_definitionHasGenericOwner(definition)) return true;
+        if (owner === receiverType || owner === 'slice' || owner === 'str' || /^[[(&]/.test(owner)) return true;
+        const ownerDefs = index.symbols.get(owner) || [];
+        if (ownerDefs.some(type => type.type === 'trait')) return true;
+        return !ownerDefs.some(type => ['struct', 'enum', 'union'].includes(type.type));
+    });
+    return mayBind ? null : { type, stdResult: true };
+}
+
+const _RUST_DEREF_FREE_STD = new Set([
+    'slice', 'str', 'tuple', 'bool', 'char',
+    'i8', 'i16', 'i32', 'i64', 'i128', 'isize', 'u8', 'u16', 'u32', 'u64', 'u128', 'usize', 'f32', 'f64',
+    'Vec', 'VecDeque', 'LinkedList', 'BinaryHeap', 'HashMap', 'HashSet', 'BTreeMap', 'BTreeSet',
+    'String', 'Option', 'Result',
+    'Range', 'RangeInclusive', 'RangeFrom', 'RangeTo', 'RangeToInclusive', 'RangeFull',
+]);
+
+/**
+ * A receiver whose type is a deref-free std/primitive type (no project type
+ * of that name) cannot call a method whose owner is a concrete project
+ * struct/enum: method probing only visits the receiver type, its reference
+ * layers and its (std) deref targets (fix #369). Trait declarations,
+ * blanket/generic impl members and impls on std types stay with the
+ * existing dispatch physics.
+ */
+function _rustDerefFreeStdReceiverExcludes(index, receiverType, targetDefs) {
+    if (!_RUST_DEREF_FREE_STD.has(receiverType) && receiverType !== 'Iterator') return false;
+    if ((index.symbols.get(receiverType) || []).some(definition =>
+        IDENTITY_TYPE_KINDS.has(definition.type) || definition.type === 'type')) return false;
+    const callable = targetDefs.filter(definition => !NON_CALLABLE_TYPES.has(definition.type));
+    if (callable.length === 0 || callable.length !== targetDefs.length) return false;
+    return callable.every(definition => {
+        const owner = String(definition.className || definition.receiver || '')
+            .replace(/^[*&]\s*/, '').replace(/<.*$/s, '').trim();
+        if (!owner || owner === receiverType || _RUST_DEREF_FREE_STD.has(owner)) return false;
+        if (_definitionHasGenericOwner(definition)) return false;
+        const ownerDefs = (index.symbols.get(owner) || []).filter(type =>
+            IDENTITY_TYPE_KINDS.has(type.type) || type.type === 'type' || type.type === 'trait');
+        return ownerDefs.length > 0 && ownerDefs.every(type =>
+            ['struct', 'enum', 'union'].includes(type.type) &&
+            (!definition.file || index.files.get(type.file)?.language === 'rust'));
+    });
+}
+
+function _rustFreeFunctionSourceDefs(index, fileEntry, filePath, source) {
+    if (!source?.name || source.localShadow) return [];
+    const candidates = (index.symbols.get(source.name) || []).filter(definition =>
+        definition.type === 'function' && definition.file &&
+        !definition.className && !definition.receiver &&
+        index.files.get(definition.file)?.language === 'rust');
+    if (candidates.length === 0) return [];
+    const unique = list => new Set(list.map(definition => definition.file)).size === 1
+        ? list : [];
+    const reachedFrom = starts => candidates.filter(definition => [...starts].some(start =>
+        definition.file === start ||
+        _nameBindingReaches(index, start, source.name, new Set([definition.file])) === 'yes'));
+    if (source.isPathCall && source.receiver) {
+        const starts = _rustPathQualifierFiles(index, fileEntry, filePath,
+            source.receiver, source.name);
+        if (!starts || starts.size === 0) return [];
+        return unique(reachedFrom(starts));
+    }
+    // Plain call. A same-file definition is the lexical binding (nested
+    // modules inside the file are separate scopes and abstain).
+    const sameFile = candidates.filter(definition => definition.file === filePath);
+    if (sameFile.length > 0) {
+        const nestedModule = definition => (fileEntry.symbols || []).some(symbol =>
+            symbol.type === 'module' && symbol.startLine < definition.startLine &&
+            symbol.endLine >= definition.endLine);
+        return sameFile.length === 1 && !nestedModule(sameFile[0]) ? sameFile : [];
+    }
+    const named = (fileEntry.importBindings || []).filter(binding =>
+        (binding.alias || binding.name) === source.name);
+    if (named.length > 0) {
+        const starts = new Set();
+        for (const binding of named) {
+            for (const start of _rustBindingResolvedFiles(index, fileEntry, filePath, binding)) {
+                starts.add(start);
+            }
+        }
+        return unique(reachedFrom(starts));
+    }
+    return unique(_rustGlobReachableDefs(index, filePath, source.name, candidates));
+}
+
+/**
+ * Ordered type-parameter names of a generics text (`<'f, C, const N: usize,
+ * U>` -> ['C', 'N', 'U']): lifetimes are skipped, const parameters keep
+ * their position (impl self-type arguments align positionally).
+ */
+const _orderedTypeParamsCache = new Map();
+function _orderedTypeParams(genericsText) {
+    if (!genericsText || typeof genericsText !== 'string') return null;
+    if (_orderedTypeParamsCache.has(genericsText)) return _orderedTypeParamsCache.get(genericsText);
+    const names = _orderedTypeParamsUncached(genericsText);
+    if (_orderedTypeParamsCache.size > 4096) _orderedTypeParamsCache.clear();
+    _orderedTypeParamsCache.set(genericsText, names);
+    return names;
+}
+
+function _orderedTypeParamsUncached(genericsText) {
+    const inner = genericsText.trim().replace(/^[<[]/, '').replace(/[>\]]$/, '');
+    const parts = [];
+    let depth = 0, start = 0;
+    for (let i = 0; i < inner.length; i++) {
+        const ch = inner[i];
+        if (ch === '<' || ch === '[' || ch === '(') depth++;
+        else if (ch === '>' || ch === ']' || ch === ')') depth--;
+        else if (ch === ',' && depth === 0) { parts.push(inner.slice(start, i)); start = i + 1; }
+    }
+    parts.push(inner.slice(start));
+    const names = [];
+    for (let part of parts) {
+        part = part.trim();
+        if (!part || part.startsWith("'")) continue;
+        const m = part.replace(/^const\s+/, '').match(/^([A-Za-z_][A-Za-z0-9_]*)/);
+        names.push(m ? m[1] : null);
+    }
+    return names;
+}
+
+/**
+ * A Rust receiver whose static type is a generic parameter of the enclosing
+ * function or impl (fix #368): a parameter/local annotated `P`, or a
+ * `self.field` whose declared field type is the struct parameter that the
+ * enclosing impl instantiates with its own parameter (`struct W<C> { base: C }`
+ * + `impl<C: Consumer> .. for W<C>`). Returns { param, bounds } with the
+ * declared trait bounds (possibly empty), or null when the receiver is not
+ * such a parameter or its declaration is not visible.
+ */
+function _rustGenericBoundReceiver(index, filePath, call) {
+    // `self` inside a trait's own method body (fix #369) is the generic
+    // `Self: Trait`, bounded by the trait and its declared supertraits.
+    if (call.receiver === 'self' && !call.receiverField && !call.receiverType) {
+        const enclosing = index.findEnclosingFunction(filePath, call.line, true, call);
+        if (enclosing?.className && !enclosing.traitImpl) {
+            const trait = (index.symbols.get(enclosing.className) || []).find(definition =>
+                definition.type === 'trait' && definition.file === filePath &&
+                definition.startLine <= enclosing.startLine && definition.endLine >= enclosing.endLine);
+            if (trait) {
+                return { param: 'Self', bounds: [trait.name, ...(trait.supertraits || [])],
+                    declaredOn: 'trait' };
+            }
+        }
+        return null;
+    }
+    const annotated = call.receiverType && call.receiver && call.receiver !== 'self' &&
+        !call.receiverField && call.receiverTypeSource === 'annotation';
+    const selfField = !call.receiverType && call.receiverRoot === 'self' && call.receiverField;
+    if (!annotated && !selfField) return null;
+    const enclosing = index.findEnclosingFunction(filePath, call.line, true, call);
+    if (!enclosing) return null;
+    if (annotated && !(enclosing.generics || enclosing.ownerGenerics)) return null;
+    let param = null;
+    if (call.receiverType && call.receiver && call.receiver !== 'self' &&
+        !call.receiverField &&
+        (!call.receiverTypeFlowFile || call.receiverTypeFlowFile === filePath) &&
+        call.receiverTypeSource === 'annotation') {
+        param = call.receiverType;
+    } else if (!call.receiverType && call.receiverRoot === 'self' && call.receiverField &&
+        !(Array.isArray(call.receiverFields) && call.receiverFields.length > 1) &&
+        enclosing.className && Array.isArray(enclosing.ownerSelfArgs)) {
+        const fields = (index.symbols.get(call.receiverField) || []).filter(definition =>
+            definition.type === 'field' && definition.className === enclosing.className &&
+            definition.file === filePath && definition.fieldType);
+        if (fields.length !== 1) return null;
+        const fieldType = String(fields[0].fieldType).trim();
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(fieldType)) return null;
+        const structParams = _orderedTypeParams(fields[0].ownerGenerics);
+        const position = structParams ? structParams.indexOf(fieldType) : -1;
+        if (position < 0) return null;
+        const argument = String(enclosing.ownerSelfArgs[position] || '').trim();
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(argument)) return null;
+        param = argument;
+    }
+    if (!param) return null;
+    const own = _orderedTypeParams(enclosing.generics) || [];
+    if (own.includes(param)) {
+        return { param, bounds: enclosing.genericBounds?.[param] || [], declaredOn: 'function' };
+    }
+    const owner = _orderedTypeParams(enclosing.ownerGenerics) || [];
+    if (owner.includes(param) && Array.isArray(enclosing.ownerSelfArgs)) {
+        return { param, bounds: enclosing.ownerGenericBounds?.[param] || [], declaredOn: 'impl' };
+    }
+    return null;
+}
+
+/**
+ * Project trait identities reachable from a set of bound names through
+ * declared supertraits, resolved from `fromFile`. `complete` is false when a
+ * name that matches a project trait cannot be pinned to one declaration.
+ * Names with no project trait declaration are upstream traits: an upstream
+ * crate cannot name this project's traits, so they add nothing.
+ */
+function _rustTraitClosure(index, fromFile, names) {
+    const keys = new Map();
+    let complete = true;
+    const pending = names.map(name => ({ name, fromFile }));
+    while (pending.length > 0 && keys.size < 64) {
+        const { name, fromFile: origin } = pending.pop();
+        const traits = (index.symbols.get(name) || []).filter(definition =>
+            definition.type === 'trait' && definition.file);
+        if (traits.length === 0) continue;
+        const resolved = _resolveFlowTypeOrigin(index, origin, name);
+        const trait = resolved?.fromFile
+            ? traits.filter(definition => definition.file === resolved.fromFile)
+            : [];
+        if (trait.length !== 1) {
+            complete = false;
+            continue;
+        }
+        const key = `${trait[0].file}\0${name}`;
+        if (keys.has(key)) continue;
+        keys.set(key, name);
+        for (const parent of trait[0].supertraits || []) {
+            pending.push({ name: parent, fromFile: trait[0].file });
+        }
+    }
+    return { keys, complete };
+}
+
+/**
+ * Where can a call on a generic-bounded Rust receiver dispatch? Rust has no
+ * implementation inheritance, so `recv.m()` with `recv: C, C: Consumer`
+ * resolves to the method slot of a trait in C's bound closure and reaches a
+ * concrete impl member only through that trait. Returns
+ *   { via }     - the pinned impl member fills a slot of a bound trait
+ *                 (possible dispatch: one of that trait's implementations);
+ *   { exclude } - every pinned definition is a concrete impl member of a
+ *                 trait outside the closure, or an inherent method, and the
+ *                 closure is fully resolved;
+ *   null        - anything else (trait declarations, blanket impls, unknown
+ *                 traits) stays with the existing receiver physics.
+ */
+function _rustGenericBoundDispatchVerdict(index, filePath, bound, targetDefs) {
+    const opCache = index._rustScopeMemo || (index._rustScopeMemo = new Map());
+    const cacheKey = opCache ? `\x01bound\x00${filePath}\x00${bound.bounds.join(',')}\x00` +
+        targetDefs.map(definition => `${definition.file}:${definition.startLine}`).join('|') : null;
+    if (cacheKey && opCache.has(cacheKey)) return opCache.get(cacheKey);
+    const verdict = _rustGenericBoundDispatchVerdictUncached(index, filePath, bound, targetDefs);
+    if (opCache.size > 50000) opCache.clear();
+    opCache.set(cacheKey, verdict);
+    return verdict;
+}
+
+function _rustGenericBoundDispatchVerdictUncached(index, filePath, bound, targetDefs) {
+    const targets = targetDefs.filter(definition =>
+        !NON_CALLABLE_TYPES.has(definition.type) && definition.file &&
+        (definition.className || definition.receiver));
+    if (targets.length === 0 || targets.length !== targetDefs.filter(definition =>
+        !NON_CALLABLE_TYPES.has(definition.type)).length) return null;
+    if (targets.some(definition => _definitionHasGenericOwner(definition))) return null;
+    // Trait declaration members keep the existing trait-slot physics.
+    if (targets.some(definition => (index.symbols.get(definition.className) || [])
+        .some(type => type.type === 'trait' && type.file === definition.file))) return null;
+    const closure = _rustTraitClosure(index, filePath, bound.bounds);
+    let via = null;
+    let upstream = false;
+    let allOutside = true;
+    for (const target of targets) {
+        if (!target.traitName) continue; // inherent member: unreachable through a bound
+        const head = String(target.traitName).replace(/<.*$/s, '').trim()
+            .split('::').filter(Boolean).pop();
+        const traitDefs = (index.symbols.get(head) || []).filter(definition =>
+            definition.type === 'trait' && definition.file);
+        if (traitDefs.length === 0) {
+            // Upstream trait (fix #369): its supertrait graph is invisible,
+            // except that a bound naming the SAME upstream trait fills the
+            // target's slot (`I: Iterator` reaching `impl Iterator for Tee`):
+            // one external-contract family. Any other upstream relation
+            // stays unknown.
+            if (bound.bounds.some(name => String(name).replace(/<.*$/s, '').trim()
+                .split('::').filter(Boolean).pop() === head &&
+                !(index.symbols.get(head) || []).some(definition => definition.type === 'trait'))) {
+                via = via || head;
+                upstream = true;
+                allOutside = false;
+                continue;
+            }
+            return null;
+        }
+        const origin = _resolveFlowTypeOrigin(index, target.file, head);
+        const pinned = origin?.fromFile
+            ? traitDefs.filter(definition => definition.file === origin.fromFile) : [];
+        if (pinned.length !== 1) return null;
+        if (closure.keys.has(`${pinned[0].file}\0${head}`)) {
+            via = via || head;
+            allOutside = false;
+        }
+    }
+    if (via) return { via, ...(upstream && { externalContract: true }) };
+    if (allOutside && closure.complete) return { exclude: true };
+    return null;
+}
+
+/**
+ * Rust method lookup through auto-deref (fix #369): the receiver type itself
+ * when it owns a method named `name` (or when lookup cannot proceed), else
+ * its project Deref target, repeated. Every type definition of the wrapper
+ * must agree on one target, and no blanket-impl trait may supply the name at
+ * the wrapper step (a trait method on the wrapper wins before deref).
+ * Returns { type, fromFile } of the step that owns the name, the input when
+ * the wrapper has no Deref target, or null when a step is ambiguous.
+ */
+function _rustDerefMethodOwner(index, receiver, name) {
+    let current = receiver;
+    const seen = new Set();
+    for (let hop = 0; hop < 4; hop++) {
+        if (_rustOwnedMethodDefinitions(index, current, name).length > 0) return current;
+        const typeDefs = (index.symbols.get(current.type) || [])
+            .filter(definition => IDENTITY_TYPE_KINDS.has(definition.type) &&
+                (!current.fromFile || definition.file === current.fromFile));
+        if (typeDefs.length === 0 || !typeDefs.every(definition => definition.derefTarget)) {
+            return current;
+        }
+        const targets = new Set(typeDefs.map(definition =>
+            String(definition.derefTarget).replace(/<.*$/, '').split('::').pop().trim()));
+        if (targets.size !== 1) return null;
+        const blanket = (index.symbols.get(name) || []).some(definition =>
+            !NON_CALLABLE_TYPES.has(definition.type) && _definitionHasGenericOwner(definition));
+        if (blanket) return null;
+        const target = [...targets][0];
+        if (!target || seen.has(target)) return null;
+        seen.add(current.type);
+        const origin = _resolveFlowTypeOrigin(index, typeDefs[0].file, target);
+        if (!origin?.fromFile) return null;
+        current = { type: target, fromFile: origin.fromFile };
+    }
+    return null;
+}
+
 function _rustClosureReceiverType(index, fileEntry, filePath, call, ctx) {
     if (fileEntry.language !== 'rust' || !call.receiver) return null;
     const closure = call.enclosingFunction;
@@ -16385,11 +24300,21 @@ function _rustClosureReceiverType(index, fileEntry, filePath, call, ctx) {
         closure.closureSourceCallEnd == null) {
         return null;
     }
-    const sourceRecords = ctx.records.filter(record =>
-        record.name === closure.closureSourceCall &&
-        record.callStart === closure.closureSourceCallStart &&
-        record.callEnd === closure.closureSourceCallEnd &&
-        !!record.isMethod === !!closure.closureSourceCallIsMethod);
+    if (!ctx.closureSourceIndex) {
+        ctx.closureSourceIndex = new Map();
+        for (const record of ctx.records) {
+            if (record.callStart == null || record.callEnd == null) continue;
+            const key = `${record.callStart}:${record.callEnd}`;
+            let group = ctx.closureSourceIndex.get(key);
+            if (!group) ctx.closureSourceIndex.set(key, group = []);
+            group.push(record);
+        }
+    }
+    const sourceRecords = (ctx.closureSourceIndex.get(
+        `${closure.closureSourceCallStart}:${closure.closureSourceCallEnd}`) || [])
+        .filter(record =>
+            record.name === closure.closureSourceCall &&
+            !!record.isMethod === !!closure.closureSourceCallIsMethod);
     if (sourceRecords.length !== 1) return null;
     const source = sourceRecords[0];
     const iteratorParameter = _rustIteratorClosureParameterType(
@@ -16431,51 +24356,102 @@ function _rustClosureReceiverType(index, fileEntry, filePath, call, ctx) {
         }
     }
 
-    let receiver = null;
-    const sourceFlow = source.receiver
-        ? _lookupReturnTypeFlow(ctx.getFlowMap(), source)
-        : null;
-    if (sourceFlow?.type) {
-        receiver = {
-            type: sourceFlow.type,
-            ...(sourceFlow.fromFile && { fromFile: sourceFlow.fromFile }),
-        };
-    }
-    if (!receiver && source.receiverType && !source.receiverIsChainRoot) {
-        const origin = _resolveFlowTypeOrigin(
-            index, filePath, source.receiverType, source.receiverTypeQualifier);
-        if (origin?.fromFile) {
-            receiver = { type: source.receiverType, fromFile: origin.fromFile };
-        }
-    }
-    if (!receiver && source.receiverCall) {
-        receiver = _foldChainedReceiverType(
-            index, fileEntry, filePath, source, ctx);
-    }
-    if ((!receiver || !receiver.type) && source.receiver &&
-        !source.receiverIsChainRoot && !source.receiverPatternShadow) {
-        const flow = _lookupReturnTypeFlow(ctx.getFlowMap(), source);
-        if (flow?.type) receiver = {
-            type: flow.type,
-            ...(flow.fromFile && { fromFile: flow.fromFile }),
-        };
-    }
-    if (!receiver?.type) return null;
-
     const norm = value => String(value || '')
         .replace(/^[*&]\s*/, '').replace(/<.*$/, '').trim();
-    let definitions = (index.symbols.get(source.name) || []).filter(definition =>
-        !NON_CALLABLE_TYPES.has(definition.type) &&
-        norm(definition.className || definition.receiver) === receiver.type &&
-        definition.callbackParamTypes);
-    const typeDefinitions = (index.symbols.get(receiver.type) || [])
-        .filter(definition => _FOLD_TYPE_KINDS.has(definition.type));
-    if (typeDefinitions.length > 1) {
-        if (!receiver.fromFile) return null;
-        const dir = path.dirname(receiver.fromFile);
-        definitions = definitions.filter(definition =>
-            definition.file === receiver.fromFile ||
-            path.dirname(definition.file) === dir);
+    let definitions;
+    let receiver = null;
+    const freeSource = !source.isMethod ||
+        (source.isPathCall && source.receiver &&
+            !/^[A-Z]/.test(String(source.receiver).split('::').pop()));
+    if (freeSource) {
+        // Closure passed to a free function (fix #368):
+        // `join_context(|a| a.migrated(), ...)` / `crate::broadcast(|ctx| ..)`
+        // where the parameter is bounded `A: FnOnce(FnContext) -> R`. The
+        // callee must resolve to ONE project function through the caller's
+        // own scope (same file, a `use` binding, a glob import, or the
+        // explicit module path) before its declared bound types anything.
+        definitions = _rustFreeFunctionSourceDefs(index, fileEntry, filePath, source)
+            .filter(definition => definition.callbackParamTypes);
+    } else {
+        const sourceFlow = source.receiver
+            ? _lookupReturnTypeFlow(ctx.getFlowMap(), source)
+            : null;
+        if (sourceFlow?.type) {
+            receiver = {
+                type: sourceFlow.type,
+                ...(sourceFlow.fromFile && { fromFile: sourceFlow.fromFile }),
+            };
+        }
+        if (!receiver && source.receiverType && !source.receiverIsChainRoot) {
+            const origin = _resolveFlowTypeOrigin(
+                index, filePath, source.receiverType, source.receiverTypeQualifier);
+            if (origin?.fromFile) {
+                receiver = { type: source.receiverType, fromFile: origin.fromFile };
+            }
+        }
+        if (!receiver && source.receiverCall) {
+            receiver = _foldChainedReceiverType(
+                index, fileEntry, filePath, source, ctx);
+        }
+        if ((!receiver || !receiver.type) && source.receiver &&
+            !source.receiverIsChainRoot && !source.receiverPatternShadow) {
+            const flow = _lookupReturnTypeFlow(ctx.getFlowMap(), source);
+            if (flow?.type) receiver = {
+                type: flow.type,
+                ...(flow.fromFile && { fromFile: flow.fromFile }),
+            };
+        }
+        // A receiver that is itself a closure parameter
+        // (`scope(|s| s.spawn_broadcast(|_, ctx| ctx.index()))`) resolves
+        // through its own source call first (bounded nesting).
+        if ((!receiver || !receiver.type) && source.receiver &&
+            source !== call &&
+            source.enclosingFunction?.closureParameterNames?.includes(source.receiver) &&
+            (ctx.closureDepth || 0) < 8) {
+            ctx.closureDepth = (ctx.closureDepth || 0) + 1;
+            try {
+                receiver = _rustClosureReceiverType(index, fileEntry, filePath, source, ctx);
+            } finally {
+                ctx.closureDepth--;
+            }
+        }
+        if (source.isPathCall && source.receiver && (!receiver || !receiver.type)) {
+            // `Type::assoc(|x| ..)`: the path names the owner type.
+            const segments = String(source.receiver).split('::').filter(Boolean);
+            const type = segments.pop();
+            const origin = type && type !== 'Self'
+                ? _resolveFlowTypeOrigin(index, filePath, type,
+                    segments.length > 0 ? segments.join('::') : undefined)
+                : null;
+            if (origin?.fromFile) receiver = { type, fromFile: origin.fromFile };
+        }
+        if ((!receiver || !receiver.type) && source.receiver === 'self') {
+            // `self.set_on_pre_event(.., |s| s.quit())` inside the impl.
+            const enclosing = index.findEnclosingFunction(filePath, source.line, true);
+            const origin = enclosing?.className
+                ? _resolveFlowTypeOrigin(index, filePath, enclosing.className) : null;
+            if (origin?.fromFile) receiver = { type: enclosing.className, fromFile: origin.fromFile };
+        }
+        if (!receiver?.type) return null;
+
+        // Auto-deref (fix #369): a wrapper type that owns no method of the
+        // name resolves it on its Deref target (`CursiveRunnable: Deref<
+        // Target = Cursive>`; `siv.set_on_pre_event(|s| ..)`).
+        receiver = _rustDerefMethodOwner(index, receiver, source.name);
+        if (!receiver) return null;
+        definitions = (index.symbols.get(source.name) || []).filter(definition =>
+            !NON_CALLABLE_TYPES.has(definition.type) &&
+            norm(definition.className || definition.receiver) === receiver.type &&
+            definition.callbackParamTypes);
+        const typeDefinitions = (index.symbols.get(receiver.type) || [])
+            .filter(definition => _FOLD_TYPE_KINDS.has(definition.type));
+        if (typeDefinitions.length > 1) {
+            if (!receiver.fromFile) return null;
+            const dir = path.dirname(receiver.fromFile);
+            definitions = definitions.filter(definition =>
+                definition.file === receiver.fromFile ||
+                path.dirname(definition.file) === dir);
+        }
     }
     if (definitions.length === 0) return null;
 
@@ -16485,6 +24461,7 @@ function _rustClosureReceiverType(index, fileEntry, filePath, call, ctx) {
             closure.closureArgumentIndex];
         const type = list && list[parameterIndex];
         if (!type) return null;
+        if (type === 'Self' && !receiver?.type) return null;
         callbackTypes.push({ definition, type: type === 'Self' ? receiver.type : type });
     }
     if (new Set(callbackTypes.map(item => item.type)).size !== 1) return null;
@@ -16561,6 +24538,12 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
     if (record.isMacro) {
         return _rustMacroCallResultType(index, fileEntry, filePath, record);
     }
+    if (language === 'rust') {
+        const variant = _rustPreludeVariantType(index, filePath, record);
+        if (variant) return variant;
+        const constructed = _rustConstructorCallType(index, filePath, record);
+        if (constructed) return constructed;
+    }
 
     // Structural constructor expression: `Environment().getattr(...)`.
     // Python/JS class calls are plain call records rather than nominal
@@ -16580,6 +24563,13 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
                 return { type: name, fromFile: origin.fromFile,
                     exactConstructor: true };
             }
+        }
+        // A module value alias of a class (fix #392): `Alias().m()`
+        // constructs the class the alias names where it is bound.
+        if (!record.localShadow && callableDefs.length === 0 && typeDefs.length === 0 &&
+            _moduleValueAliasNames(index).has(name)) {
+            const aliased = _moduleValueAliasType(index, filePath, name);
+            if (aliased) return { type: aliased.type, fromFile: aliased.fromFile, exactConstructor: true };
         }
     }
 
@@ -16617,6 +24607,12 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
         if (!seg || !/^[A-Z]/.test(seg)) return null;
         if (/^[A-Z][A-Z0-9]?$/.test(seg)) return null; // generic-param convention (#220)
         const qual = segs.length > 0 ? segs.join('::') : undefined;
+        const external = externalTypeDenotation(index, filePath, seg, qual || null, record.line);
+        if (external && external.certain !== false &&
+            (index.symbols.get(external.original) || []).some(d => IDENTITY_TYPE_KINDS.has(d.type))) {
+            // Same physics as a std-qualified producer (`std::fs::File::open`).
+            return { externalVia: `${external.via}::${name}`, externalConcrete: true };
+        }
         const origin = _resolveFlowTypeOrigin(index, filePath, seg, qual);
         if (!origin) return null;
         return _methodReturnOnType(index, seg, origin.fromFile, name, language,
@@ -16627,6 +24623,12 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
     if (nominal && record.isMethod && record.receiver && !record.receiverIsChainRoot &&
         traits?.typeQualifiedCallStyle === 'static' && /^[A-Z]/.test(record.receiver) &&
         !/^[A-Z][A-Z0-9]?$/.test(record.receiver)) {
+        const external = externalTypeDenotation(index, filePath, record.receiver,
+            record.receiverTypeQualifier || null, record.line);
+        if (external && external.certain !== false &&
+            (index.symbols.get(external.original) || []).some(d => IDENTITY_TYPE_KINDS.has(d.type))) {
+            return { externalVia: `${external.via}.${name}` };
+        }
         const r = _methodReturnOnType(index, record.receiver, undefined, name, language,
             { filePath, consumerAwaited });
         if (r) return r;
@@ -16762,6 +24764,12 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
                 ...(origin?.fromFile && { fromFile: origin.fromFile }),
             };
         }
+        if (!rt && record.receiverField && record.receiverRoot && language === 'csharp') {
+            // A static member path from a type (fix #395).
+            const typeRooted = _csharpTypeRootedPath(index, record,
+                index.findEnclosingFunction(filePath, record.line, true, record), filePath);
+            if (typeRooted) record = typeRooted;
+        }
         if (!rt && record.receiverField && record.receiverRoot) {
             let rootType = record.receiverRootType;
             let rootFromFile;
@@ -16822,6 +24830,11 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
                 }
             }
         }
+        if (!rt && language === 'rust' && record.receiverValuePath) {
+            const valueType = _rustValuePathType(index, filePath, record.receiverValuePath,
+                record.receiverValueKind || 'value', record.line);
+            if (valueType) rt = { type: valueType.type, fromFile: valueType.fromFile };
+        }
         if (!rt && record.receiverCall && (!record.receiver || record.receiverIsChainRoot)) {
             rt = _foldChainedReceiverType(index, fileEntry, filePath, record, ctx);
         }
@@ -16848,8 +24861,19 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
                 const builtinReturn = _builtinMethodReturnType(language, rt.type, name);
                 if (builtinReturn) return { type: builtinReturn };
             }
-            return _methodReturnOnType(index, rt.type, rt.fromFile, name, language,
+            const owned = _methodReturnOnType(index, rt.type, rt.fromFile, name, language,
                 { filePath, consumerAwaited, selfTypeText: rt.typeText });
+            if (owned || language !== 'rust') return owned;
+            const stdResult = _rustStdMethodResult(index, rt.type, name);
+            if (stdResult) return stdResult;
+            if ((index.symbols.get(name) || []).some(definition =>
+                !NON_CALLABLE_TYPES.has(definition.type) &&
+                String(definition.className || definition.receiver || '')
+                    .replace(/^[*&]\s*/, '').replace(/<.*$/s, '').trim() === rt.type)) return null;
+            return _rustBlanketTraitResult(index, fileEntry, filePath, name, rt);
+        }
+        if (language === 'rust') {
+            return _rustBlanketTraitResult(index, fileEntry, filePath, name, null);
         }
         if (nominal) return null;
         // One-hop agreement (the #207/#219 discipline, one level deeper):
@@ -16916,6 +24940,7 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
     } else {
         const sameFile = defs.filter(d => d.file === filePath);
         if (sameFile.length === 1) chosen = sameFile[0];
+        else chosen = _cFamilySingleCallable(index, defs);
     }
     if (!chosen) return null;
     // An expression-bodied arrow returns its expression by construction.
@@ -17060,6 +25085,7 @@ function _foldChainedReceiverType(index, fileEntry, filePath, call, ctx) {
         ...(results.every(r => r.exactConstructor) && {
             exactConstructor: true,
         }),
+        ...(results.every(r => r.stdLiteral) && { stdLiteral: true }),
     };
     if (call.receiverFields?.length) {
         const fieldInfo = {};
@@ -17201,4 +25227,5 @@ function findCallbackUsages(index, name) {
     return usages;
 }
 
-module.exports = { isProvenanceBuiltinReceiver, provenanceParameterIdentity: _overloadTypeIdentity, selectProvenanceOverload, _unresolvedModuleIsGap, _importReaches, _sameNominalPackageDir, getCachedCalls, findCallers, findCallees, getInstanceAttributeTypes, findCallbackUsages, _nameBindingReaches, _moduleAttributeBindingReaches, _declaredFieldType, _projectTopLevelNames, _callArityCompatible, _closeCallableIdentityGroup, _overloadDiscipline, _overloadApplicable };
+module.exports = { rustTypeNameDenotes, _textualIncludeClosures, _textualLinkVerdict, isProvenanceBuiltinReceiver, provenanceParameterIdentity: _overloadTypeIdentity, selectProvenanceOverload, _unresolvedModuleIsGap, _importReaches, _sameNominalPackageDir, getCachedCalls, findCallers, findCallees, getInstanceAttributeTypes, findCallbackUsages, _nameBindingReaches, _moduleAttributeBindingReaches, _declaredFieldType, _projectTopLevelNames, _callArityCompatible, _closeCallableIdentityGroup, _overloadDiscipline, _overloadApplicable, _buildReturnTypeFlowMap, _cFamilySignatureKey,
+    _isConfigurationAlternative, _isCrossFileConfigurationMember, _configurationAlternativeFiles, _sameOwnerPath };

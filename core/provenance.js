@@ -1,5 +1,10 @@
 'use strict';
 
+// A source offset. Facts produced inside a Rust macro expansion (fix #374)
+// carry fractional offsets within the invocation: positions without a
+// source token of their own, still ordered and paired.
+const isOffset = value => Number.isFinite(value) && value >= 0;
+
 const { codeUnitCompare } = require('./shared');
 
 const TYPE_SOURCE_RULES = Object.freeze({
@@ -29,21 +34,35 @@ function declarationIdentity(definition) {
     };
 }
 
-function identityKey(identity) {
-    if (!identity || !identity.file || !Number.isInteger(identity.startLine) ||
-        !identity.name || !identity.kind) return null;
-    return JSON.stringify([
-        identity.file, identity.startLine, identity.endLine ?? null,
-        identity.name, identity.kind, identity.className || null,
-        identity.namespace || null, identity.enclosingType || null,
-        identity.lexicalScopeStartLine || null, identity.lexicalScopeEndLine || null,
-        identity.bindingId || null,
-    ]);
+function validIdentity(identity) {
+    return !!identity && !!identity.file && Number.isInteger(identity.startLine) &&
+        !!identity.name && !!identity.kind;
 }
 
+/**
+ * A declaration identity's key, or null when the identity is incomplete.
+ * Fields are joined with NUL (no path, name or kind contains one); an
+ * absent optional field is the empty string.
+ */
+function identityKey(identity) {
+    if (!validIdentity(identity)) return null;
+    return `${identity.file}\0${identity.startLine}\0${identity.endLine ?? ''}\0${identity.name}\0` +
+        `${identity.kind}\0${identity.className || ''}\0${identity.namespace || ''}\0` +
+        `${identity.enclosingType || ''}\0${identity.lexicalScopeStartLine || ''}\0` +
+        `${identity.lexicalScopeEndLine || ''}\0${identity.bindingId || ''}`;
+}
+
+/** Do two complete identities name one declaration (field by field)? */
 function sameDeclaration(left, right) {
-    const key = identityKey(left);
-    return key !== null && key === identityKey(right);
+    if (!validIdentity(left) || !validIdentity(right)) return false;
+    return left.file === right.file && left.startLine === right.startLine &&
+        (left.endLine ?? null) === (right.endLine ?? null) && left.name === right.name &&
+        left.kind === right.kind && (left.className || null) === (right.className || null) &&
+        (left.namespace || null) === (right.namespace || null) &&
+        (left.enclosingType || null) === (right.enclosingType || null) &&
+        (left.lexicalScopeStartLine || null) === (right.lexicalScopeStartLine || null) &&
+        (left.lexicalScopeEndLine || null) === (right.lexicalScopeEndLine || null) &&
+        (left.bindingId || null) === (right.bindingId || null);
 }
 
 function propertyReadMember(members) {
@@ -65,13 +84,13 @@ function validateConfirmation(provenance, target, invalidCall = false) {
     const verdictFor = declaration => targets.some(t => sameDeclaration(t, declaration))
         ? { verdict: 'establishes-target' }
         : { verdict: 'establishes-other', declaration };
-    if (!targets.length || targets.some(t => !identityKey(t))) return incomplete('missing-target-identity');
+    if (!targets.length || targets.some(t => !validIdentity(t))) return incomplete('missing-target-identity');
     if (facts.receiverOrigin?.externalFactory) {
         const factory = facts.receiverOrigin.externalFactory;
         const empty = value => Array.isArray(value) && !value.length;
-        const span = origin => Number.isInteger(origin?.start) && Number.isInteger(origin?.end) && origin.end > origin.start;
+        const span = origin => isOffset(origin?.start) && isOffset(origin?.end) && origin.end > origin.start;
         if (facts.language !== 'python' || facts.receiverTypeSource !== 'flow' ||
-            !identityKey(factory.owner) || !identityKey(factory.enclosing) ||
+            !validIdentity(factory.owner) || !validIdentity(factory.enclosing) ||
             factory.owner.file !== facts.site?.file || factory.enclosing.file !== factory.owner.file ||
             factory.enclosing.className !== factory.owner.name || !factory.field ||
             facts.site.line < factory.enclosing.startLine || facts.site.line > factory.enclosing.endLine ||
@@ -108,7 +127,7 @@ function validateConfirmation(provenance, target, invalidCall = false) {
             !['annotation', 'constructor', 'flow'].includes(binding.origin?.source) ||
             (binding.referenceAnnotation && (binding.origin.source !== 'annotation' ||
                 !binding.referenceAnnotation.trim().startsWith('&'))) ||
-            !Number.isInteger(binding.assignment?.start) || !Number.isInteger(binding.assignment?.end)) {
+            !isOffset(binding.assignment?.start) || !isOffset(binding.assignment?.end)) {
             return incomplete('invalid-copied-receiver-binding');
         }
     }
@@ -140,9 +159,10 @@ function validateConfirmation(provenance, target, invalidCall = false) {
         const producer = facts.receiverOrigin.moduleProducer;
         const call = producer.call, declaration = producer.declaration;
         if (facts.language !== 'rust' || !call?.receiver || !call.name || !call.file ||
-            !Number.isInteger(call.start) || !Number.isInteger(call.end) ||
-            !identityKey(declaration) || declaration.className || !declaration.returnType ||
-            declaration.name !== call.name || declaration.file !== producer.module?.file) {
+            !isOffset(call.start) || !isOffset(call.end) ||
+            !validIdentity(declaration) || declaration.className || !declaration.returnType ||
+            declaration.name !== call.name ||
+            declaration.file !== (producer.module?.reexportedFrom || producer.module?.file)) {
             return incomplete('invalid-module-producer-declaration');
         }
         const segments = call.receiver.split('::');
@@ -153,8 +173,12 @@ function validateConfirmation(provenance, target, invalidCall = false) {
         const specifier = binding ? [binding.module, ...segments.slice(1)].join('::') : call.receiver;
         const fileParts = producer.module.file.split('/');
         const base = fileParts.pop().replace(/\.rs$/, '');
+        // A crate-name specifier (`cursive::default()`) owns the crate root
+        // file, whose basename is lib/main (fix #369).
+        const crateRoot = producer.module.crateRoot === true && !specifier.includes('::') &&
+            (base === 'lib' || base === 'main');
         if (specifier !== producer.module.specifier ||
-            specifier.split('::').at(-1) !== (base === 'mod' ? fileParts.pop() : base)) {
+            (!crateRoot && specifier.split('::').at(-1) !== (base === 'mod' ? fileParts.pop() : base))) {
             return inconsistent('module-producer-path-mismatch');
         }
     }
@@ -198,8 +222,8 @@ function validateConfirmation(provenance, target, invalidCall = false) {
                 pattern.contract?.kind === (pattern.variant === 'Some' ? 'Option' : 'Result') &&
                 Array.isArray(pattern.shadowDeclarations) && !pattern.shadowDeclarations.length &&
                 Array.isArray(pattern.shadowBindings) && !pattern.shadowBindings.length &&
-                (pattern.source?.variable || (Number.isInteger(pattern.source?.start) &&
-                    Number.isInteger(pattern.source?.end) && pattern.source.end > pattern.source.start))
+                (pattern.source?.variable || (isOffset(pattern.source?.start) &&
+                    isOffset(pattern.source?.end) && pattern.source.end > pattern.source.start))
             : ['unwrap', 'expect'].includes(unwrap.method);
         if (facts.language !== 'rust' || !validProjection ||
             !require('./rust-result-flow').validateRustWrapperContract(unwrap.contract)) {
@@ -222,7 +246,7 @@ function validateConfirmation(provenance, target, invalidCall = false) {
     }
     if (facts.lookup) {
         const { receiver, steps, selected } = facts.lookup;
-        if (!identityKey(receiver) || !identityKey(selected) || !Array.isArray(steps) || !steps.length) {
+        if (!validIdentity(receiver) || !validIdentity(selected) || !Array.isArray(steps) || !steps.length) {
             return incomplete('missing-receiver-lookup');
         }
         if (!sameDeclaration(receiver, steps[0].owner)) return inconsistent('lookup-origin-mismatch');
@@ -240,19 +264,19 @@ function validateConfirmation(provenance, target, invalidCall = false) {
         let resolvedAlias = typeDeclaration;
         for (const alias of aliases) {
             if (!sameDeclaration(alias.declaration, resolvedAlias) ||
-                !alias.aliasOf || !alias.name || !identityKey(alias.target)) return inconsistent('receiver-alias-chain-mismatch');
+                !alias.aliasOf || !alias.name || !validIdentity(alias.target)) return inconsistent('receiver-alias-chain-mismatch');
             const head = String(alias.aliasOf).replace(/^[*&\s]+/, '').split(/[<[]/, 1)[0].trim().split(/::|\./).pop();
             if (head !== alias.name.split(/::|\./).pop() || head !== alias.target.name) return inconsistent('receiver-alias-target-mismatch');
             resolvedAlias = alias.target;
         }
         if (!sameDeclaration(resolvedAlias, receiver)) return inconsistent('receiver-alias-end-mismatch');
         const bound = facts.receiverGenericBound;
-        if (bound && (!identityKey(bound.declaration) || bound.parameter !== facts.receiverType ||
+        if (bound && (!validIdentity(bound.declaration) || bound.parameter !== facts.receiverType ||
             !bound.bounds?.includes(typeDeclaration.name) || !sameDeclaration(bound.selected, typeDeclaration))) {
             return inconsistent('receiver-generic-bound-mismatch');
         }
         const castThis = facts.receiverCastThis;
-        if (castThis && (!identityKey(castThis.enclosing) ||
+        if (castThis && (!validIdentity(castThis.enclosing) ||
             castThis.enclosing.className !== receiver.name || castThis.enclosing.file !== receiver.file ||
             castThis.interfaceType !== facts.receiverType)) return inconsistent('receiver-this-cast-mismatch');
         const overload = facts.lookup.overload;
@@ -262,9 +286,18 @@ function validateConfirmation(provenance, target, invalidCall = false) {
             return inconsistent('selected-member-outside-overload-group');
         }
         const ambiguousOverload = overload?.outcome === 'ambiguous';
+        const configurationItem = !overload && Array.isArray(facts.lookup.configurationItem)
+            ? facts.lookup.configurationItem : null;
+        if (configurationItem && configurationItem.some(item => !validIdentity(item))) {
+            return incomplete('missing-configuration-item');
+        }
+        // Every same-name member of the declaring class, the arguments
+        // choosing none (fix #396): the callee is one of them.
+        const memberSet = !overload && !configurationItem && facts.lookup.memberSet === true;
+        let memberSetMembers = null;
         for (let i = 0; i < steps.length; i++) {
             const step = steps[i];
-            if (!identityKey(step.owner) || !Array.isArray(step.members) || !Array.isArray(step.parents)) {
+            if (!validIdentity(step.owner) || !Array.isArray(step.members) || !Array.isArray(step.parents)) {
                 return incomplete('missing-member-lookup-facts');
             }
             const named = step.members.filter(member => member.name === selected.name);
@@ -279,6 +312,19 @@ function validateConfirmation(provenance, target, invalidCall = false) {
                 if (!step.parents.some(parent => sameDeclaration(parent, steps[i + 1].owner))) {
                     return inconsistent('unproven-inheritance-hop');
                 }
+            } else if (configurationItem) {
+                // One member in several build configurations: the witness
+                // names exactly the step's same-name members.
+                if (named.length !== configurationItem.length ||
+                    !named.every(member => configurationItem.some(item => sameDeclaration(item, member))) ||
+                    !configurationItem.some(item => sameDeclaration(item, selected))) {
+                    return inconsistent('configuration-item-mismatch');
+                }
+            } else if (memberSet) {
+                if (named.length < 2 || !named.some(member => sameDeclaration(member, selected))) {
+                    return inconsistent('member-set-mismatch');
+                }
+                memberSetMembers = named;
             } else if (!overload && (named.length !== 1 || !sameDeclaration(named[0], selected))) {
                 const propertyRead = facts.valueReference && step.propertyRead &&
                     sameDeclaration(propertyReadMember(named), selected);
@@ -300,6 +346,12 @@ function validateConfirmation(provenance, target, invalidCall = false) {
         if (facts.receiverOrigin.source !== facts.receiverTypeSource) {
             return inconsistent('receiver-source-mismatch');
         }
+        if (memberSetMembers) {
+            if (targets.some(target => memberSetMembers.some(member => sameDeclaration(target, member)))) {
+                return incomplete('ambiguous-or-missing-member');
+            }
+            return { verdict: 'establishes-other', declarations: memberSetMembers };
+        }
         if (ambiguousOverload) {
             // Every overload is known, but the argument shape cannot choose
             // one. This proves no particular target. It can still establish
@@ -310,10 +362,15 @@ function validateConfirmation(provenance, target, invalidCall = false) {
             }
             return { verdict: 'establishes-other', declarations };
         }
+        if (configurationItem) {
+            return targets.some(target => configurationItem.some(item => sameDeclaration(target, item)))
+                ? { verdict: 'establishes-target' }
+                : { verdict: 'establishes-other', declarations: configurationItem };
+        }
         return verdictFor(selected);
     }
     if (facts.binding) {
-        if (!identityKey(facts.binding.declaration) || !facts.binding.referenceId ||
+        if (!validIdentity(facts.binding.declaration) || !facts.binding.referenceId ||
             facts.binding.referenceId !== facts.binding.declaration.bindingId) {
             return incomplete('missing-binding-witness');
         }
@@ -350,7 +407,7 @@ function validateConfirmation(provenance, target, invalidCall = false) {
             }
         }
         const last = chain.at(-1);
-        if (!identityKey(last.declaration) || last.declaration.file !== last.toFile ||
+        if (!validIdentity(last.declaration) || last.declaration.file !== last.toFile ||
             last.declaration.name !== last.importedName) return incomplete('missing-import-declaration');
         return verdictFor(last.declaration);
     }
@@ -385,9 +442,26 @@ function createProvenance(evidence, resolution) {
     if (evidence.moduleOwnedPath) rules.push('module-owned');
     if (evidence.hasBindingId) rules.push('binding');
     if (evidence.hasSingleOwnerEvidence) rules.push('single-owner');
-    if (evidence.hasImportEvidence) rules.push(facts.importChain ? 'import-chain' : 'import-supported');
+    if (evidence.hasImportEvidence) {
+        // A C/C++ include closure that needs a basename-resolved include
+        // edge (no compile database or include path proves it) is the
+        // weaker include evidence (fix #361).
+        rules.push(evidence.includeBasename ? 'include-basename'
+            : facts.importChain ? 'import-chain' : 'import-supported');
+    }
     if (evidence.hasReceiverEvidence) rules.push('receiver-binding');
     if (evidence.hasSamePackageEvidence) rules.push('same-package');
+    // A call target produced by expanding a project macro invocation
+    // (fix #362) leads the rule list: the name exists only after token
+    // substitution, whatever scope evidence then bound it.
+    if (evidence.macroExpansion) {
+        rules.unshift('macro-expansion');
+        facts.macroExpansion = {
+            macro: evidence.macroExpansion.macro,
+            definition: evidence.macroExpansion.definition,
+            origin: evidence.macroExpansion.origin,
+        };
+    }
     if (!rules.length) rules.push(evidence.reason || resolution || 'unknown');
     const provenance = { rule: rules[0], rules: [...new Set(rules)], facts };
     if (facts.targets?.length) {
@@ -418,6 +492,6 @@ function summarizeProvenance(sites) {
 }
 
 module.exports = {
-    TYPE_SOURCE_RULES, declarationIdentity, identityKey, sameDeclaration, propertyReadMember,
+    TYPE_SOURCE_RULES, declarationIdentity, identityKey, validIdentity, sameDeclaration, propertyReadMember,
     validateConfirmation, validateCallMismatch, createProvenance, summarizeProvenance,
 };

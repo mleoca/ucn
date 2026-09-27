@@ -136,12 +136,12 @@ function check(index, options = {}) {
             });
             continue;
         }
-        let verifyResult;
-        try {
-            verifyResult = index.verify(fn.name, { file: filePath, line: fn.startLine });
-        } catch (e) {
-            verifyResult = null;
-        }
+        // The base revision decides which call sites the changed
+        // declaration bound before (fix #394). An exception inside verify is
+        // an internal error, never a silently skipped check.
+        const verifyResult = index.verify(fn.name, {
+            file: filePath, line: fn.startLine, base: options.staged ? 'HEAD' : (options.base || 'HEAD'),
+        });
         // Note: verify() returns `mismatches` as a COUNT and `mismatchDetails` as the array.
         const mismatches = verifyResult && Array.isArray(verifyResult.mismatchDetails)
             ? verifyResult.mismatchDetails
@@ -152,22 +152,22 @@ function check(index, options = {}) {
         let callers = Array.isArray(fn.callers) ? fn.callers : [];
         let unverifiedCallers = Array.isArray(fn.unverifiedCallers) ? fn.unverifiedCallers : [];
         let account = fn.account || null;
+        // An exception here is an internal error, never a silent orphan claim
+        // (fix #394).
         if (callers.length === 0 && fn._kind === 'added') {
-            try {
-                const definitions = (index.symbols.get(fn.name) || []).filter(d =>
-                    (d.relativePath === filePath || d.file === fn.filePath) &&
-                    (!fn.startLine || d.startLine === fn.startLine));
-                const raw = index.findCallers(fn.name, {
-                    includeMethods: true,
-                    collectAccount: true,
-                    targetDefinitions: definitions.length > 0 ? definitions : undefined,
-                }) || [];
-                callers = raw.filter(c => c.tier !== 'unverified');
-                unverifiedCallers = raw.filter(c => c.tier === 'unverified')
-                    .concat(raw.unverifiedEntries || []);
-                account = composeAccount(index, fn.name, raw);
-                unverifiedCallers = unverifiedCallers.concat(callNotResolvedEntries(index, account));
-            } catch (e) { /* skip */ }
+            const definitions = (index.symbols.get(fn.name) || []).filter(d =>
+                (d.relativePath === filePath || d.file === fn.filePath) &&
+                (!fn.startLine || d.startLine === fn.startLine));
+            const raw = index.findCallers(fn.name, {
+                includeMethods: true,
+                collectAccount: true,
+                targetDefinitions: definitions.length > 0 ? definitions : undefined,
+            }) || [];
+            callers = raw.filter(c => c.tier !== 'unverified');
+            unverifiedCallers = raw.filter(c => c.tier === 'unverified')
+                .concat(raw.unverifiedEntries || []);
+            account = composeAccount(index, fn.name, raw);
+            unverifiedCallers = unverifiedCallers.concat(callNotResolvedEntries(index, account));
         }
 
         const item = {
@@ -189,14 +189,8 @@ function check(index, options = {}) {
         // would be the exact silent-drop the contract forbids).
         if (item.kind === 'added' && callers.length === 0 && unverifiedCallers.length === 0) {
             // Check entry points: if the symbol is a known entry-point pattern, not orphan
-            let isEntry = false;
-            try {
-                const ep = require('./entrypoints');
-                if (typeof ep.detectEntrypoints === 'function') {
-                    const eps = ep.detectEntrypoints(index) || [];
-                    isEntry = eps.some(e => e.name === fn.name && (e.file === filePath || e.relativePath === filePath));
-                }
-            } catch (e) { /* skip */ }
+            const eps = require('./entrypoints').detectEntrypoints(index) || [];
+            const isEntry = eps.some(e => e.name === fn.name && (e.file === filePath || e.relativePath === filePath));
             item.orphan = !isEntry;
         }
 
@@ -229,17 +223,15 @@ function check(index, options = {}) {
     let testFiles = [];
     let testCount = 0;
     for (const fn of changed.slice(0, 10)) {
-        try {
-            const t = index.affectedTests(fn.name, { depth: 2 });
-            if (t && t.testFiles) {
-                for (const tf of t.testFiles) {
-                    if (!testFiles.find(x => x.file === tf.file)) {
-                        testFiles.push(tf);
-                        testCount += tf.testCount || 0;
-                    }
+        const t = index.affectedTests(fn.name, { depth: 2 });
+        if (t && t.testFiles) {
+            for (const tf of t.testFiles) {
+                if (!testFiles.find(x => x.file === tf.file)) {
+                    testFiles.push(tf);
+                    testCount += tf.testCount || 0;
                 }
             }
-        } catch (e) { /* skip */ }
+        }
     }
 
     // Action items

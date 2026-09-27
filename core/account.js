@@ -69,6 +69,7 @@ const UNSUPPORTED_SITE_TEXT_MAX = 160;
  *   fileCount: number,                  // files (indexed + unparsed + unsupported) with >= 1 matching line
  *   perFile: Map<string, number[]>,     // absPath -> sorted 1-indexed line numbers (indexed files only)
  *   unparsed: { fileCount: number, lines: number, files: string[] },  // relative paths
+ *   recovered: { fileCount, lines, files, sites },  // matched lines inside parse-error recovery regions (subset of perFile)
  *   unsupported: { fileCount: number, lines: number, files: string[],
  *                  languages: Object<string, number>,
  *                  sites: Array<{file: string, line: number, text: string}>,
@@ -125,11 +126,39 @@ function computeGroundSet(index, name) {
         ? index.discoveryIssues.map(issue => ({ ...issue })) : [];
     unreadableFiles.sort();
 
+    // fix #367e: ground lines inside a parser-recovery region of an indexed
+    // file. They are classified like any other line, but from a partially
+    // parsed tree - disclosed, never silently trusted.
+    const recovered = { fileCount: 0, lines: 0, files: [], sites: [] };
+    for (const [filePath, matchedLines] of perFile) {
+        const regions = index.files.get(filePath)?.parseErrorRegions;
+        if (!regions || regions.length === 0) continue;
+        let inFile = 0;
+        let r = 0;
+        for (const line of matchedLines) {
+            while (r < regions.length && regions[r][1] < line) r++;
+            if (r < regions.length && regions[r][0] <= line) {
+                inFile++;
+                if (recovered.sites.length < 10) {
+                    recovered.sites.push({ file: path.relative(index.root, filePath), line });
+                }
+            }
+        }
+        if (inFile > 0) {
+            recovered.fileCount++;
+            recovered.lines += inFile;
+            recovered.files.push(path.relative(index.root, filePath));
+        }
+    }
+    recovered.files.sort(codeUnitCompare);
+    recovered.sites.sort((a, b) => codeUnitCompare(a.file, b.file) || a.line - b.line);
+
     const result = {
         total: total + unparsed.lines + unsupported.lines,
         fileCount: fileCount + unparsed.fileCount + unsupported.fileCount,
         perFile,
         unparsed,
+        recovered,
         unsupported,
         unreadableFiles,
         skippedSources,
@@ -473,6 +502,7 @@ function buildAccount(index, name, parts) {
                     line: e.line, reason: e.reason, provenance: e.provenance })) }),
         },
         unparsed: groundSet.unparsed,
+        ...(groundSet.recovered?.lines > 0 && { recovered: groundSet.recovered }),
         unsupported,
         unreadableFiles: groundSet.unreadableFiles,
         skippedSources: groundSet.skippedSources || [],
