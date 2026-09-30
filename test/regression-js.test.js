@@ -11117,6 +11117,26 @@ describe('fix #384: a bare name reaches a member-assigned callable only through 
     });
 });
 
+describe('fix #398: redundant type import and export aliases', () => {
+    it('renames identical aliases through a re-export chain and keeps distinct local names', () => {
+        const { applyRenamePlan } = require('./helpers');
+        const files = {
+            'model.ts': 'export class Widget {}\n',
+            'barrel.ts': "export { Widget as Widget } from './model';\n",
+            'use.ts': "import { Widget as Widget, Widget as Local } from './barrel';\nconst x: Widget = new Widget();\nconst y: Local = new Local();\nexport { Widget as Widget };\n",
+        };
+        const dir = tmp(files);
+        try {
+            const { execute } = require('../core/execute');
+            const r = execute(idx(dir), 'plan', { name: 'Widget', file: 'model.ts', renameTo: 'Gadget' });
+            assert.ok(r.ok, r.error);
+            const { contents, reviews } = applyRenamePlan(dir, r.result);
+            assert.deepEqual(reviews, []);
+            for (const [file, content] of Object.entries(files)) assert.equal(contents[file], content.replaceAll('Widget', 'Gadget'));
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #386: renaming a type edits every reference to it', () => {
     const { applyRenamePlan } = require('./helpers');
     const files = {

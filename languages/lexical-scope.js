@@ -265,6 +265,15 @@ function pyScopeBindings(scopeNode, body, name, isFunction) {
                 note(first?.type === 'type' ? first.namedChild(0) : first, 'binding');
                 return false;
             }
+            case 'call': case 'attribute': case 'subscript':
+            case 'binary_operator': case 'boolean_operator': case 'comparison_operator':
+            case 'unary_operator': case 'not_operator': case 'conditional_expression':
+            case 'list': case 'set': case 'dictionary':
+            case 'string': case 'concatenated_string':
+                // Expressions bind in this scope only through a walrus.
+                // Skip their often-large value trees; the text check is only
+                // a prefilter, and the AST walk still decides every binding.
+                return node.text.includes(':=');
             default:
                 return true;
         }
@@ -272,7 +281,7 @@ function pyScopeBindings(scopeNode, body, name, isFunction) {
     return info;
 
     function scanWalrus(root) {
-        if (!root) return;
+        if (!root || !root.text.includes(':=')) return;
         traverseTree(root, inner => {
             if (inner.type === 'function_definition' || inner.type === 'class_definition') return false;
             if (inner.type === 'named_expression') note(inner.childForFieldName('name'), 'binding');

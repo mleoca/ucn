@@ -283,7 +283,7 @@ function classifyJs(node) {
     if (JS_TYPE_DECLS.has(parent.type) && field === 'name') return { role: 'decl', declNode: parent };
     switch (parent.type) {
         case 'import_specifier':
-            if (field === 'alias') return skip('import-alias');
+            if (field === 'alias' && parent.childForFieldName('name')?.text !== node.text) return skip('import-alias');
             if (parent.childForFieldName('alias')) {
                 return { role: 'import', importNode: parent, aliased: true };
             }
@@ -291,7 +291,7 @@ function classifyJs(node) {
         case 'import_clause': case 'namespace_import':
             return skip('import-local');
         case 'export_specifier': {
-            if (field === 'alias') return skip('export-alias');
+            if (field === 'alias' && parent.childForFieldName('name')?.text !== node.text) return skip('export-alias');
             const statement = ancestor(node, new Set(['export_statement']));
             if (statement?.childForFieldName('source')) return { role: 'import', importNode: parent, reexport: true };
             return { role: 'value', exportLocal: true };
@@ -415,7 +415,17 @@ function classifyPython(node) {
             return { role: 'value' };
         }
         case 'aliased_import':
-            if (field === 'alias') return skip('import-alias');
+            if (field === 'alias') {
+                // `from m import X as X` explicitly re-exports X. Both
+                // spellings follow the declaration; a distinct local alias
+                // remains the caller's binding.
+                const from = parent.parent;
+                if (from?.type === 'import_from_statement' &&
+                    parent.childForFieldName('name')?.text === node.text) {
+                    return { role: 'import', moduleText: from.childForFieldName('module_name')?.text || '' };
+                }
+                return skip('import-alias');
+            }
             break;
         case 'as_pattern_target': case 'named_expression':
             if (parent.type === 'as_pattern_target' || field === 'name') return skip('variable', { binding: true });
@@ -521,9 +531,14 @@ function classifyRust(node) {
             }
             return inUse ? { role: 'import', useHead: true } : { role: 'value' };
         }
-        case 'use_as_clause':
-            if (field === 'alias') return skip('import-alias');
+        case 'use_as_clause': {
+            if (field === 'alias') {
+                const path = parent.childForFieldName('path');
+                const original = path?.type === 'scoped_identifier' ? path.childForFieldName('name') : path;
+                return original?.text === node.text ? { role: 'import', original } : skip('import-alias');
+            }
             return { role: 'import' };
+        }
         case 'use_list': {
             const scoped = parent.parent?.type === 'scoped_use_list' ? parent.parent : null;
             return { role: 'import', qualifier: scoped?.childForFieldName('path') || null, inList: true };
@@ -1754,7 +1769,8 @@ class TypeReferenceResolver {
 
     resolveQualified(file, line, qualifierNode, qualifierText, tok) {
         const text = qualifierText != null ? qualifierText : textOf(qualifierNode);
-        const site = (this.family === 'c' || this.family === 'csharp') && this.siteNode ? `\0${this.siteNode.startIndex}` : '';
+        const site = (this.family === 'c' || this.family === 'csharp' || this.family === 'python') && this.siteNode
+            ? `\0${this.siteNode.startIndex}` : '';
         const key = `q\0${file}\0${line}\0${text}\0${tok.role}${site}`;
         if (this.memo.has(key)) return this.memo.get(key);
         let result;
@@ -1774,8 +1790,8 @@ class TypeReferenceResolver {
             case 'js': case 'python': {
                 const { _moduleAttributeBindingReaches } = require('./callers');
                 let receiver = text;
-                if (this.family === 'python' && receiver.includes('.')) {
-                    const verdict = this.pythonDottedModule(file, entry, receiver);
+                if (this.family === 'python') {
+                    const verdict = this.pythonModuleAttribute(file, receiver, qualifierNode);
                     if (verdict) return verdict;
                 }
                 if (!/^[A-Za-z_$][\w$]*$/.test(receiver)) {
@@ -1864,15 +1880,126 @@ class TypeReferenceResolver {
         return { verdict: 'unknown', reason: 'module-attribute' };
     }
 
-    pythonDottedModule(file, entry, receiver) {
-        const head = receiver.split('.')[0];
-        const moduleBinding = (entry.importBindings || []).some(b => b.name === head && b.kind === 'import' && !b.alias);
-        if (!moduleBinding) return null;
-        const moduleFile = this.moduleFile(entry, receiver);
-        if (!moduleFile) return { verdict: 'unknown', reason: 'module-attribute' };
-        const reach = this.chase(moduleFile, this.name);
-        return reach === 'yes' ? { verdict: 'yes' } : reach === 'no' ? { verdict: 'no', reason: 'other-module' }
-            : { verdict: 'unknown', reason: 'module-attribute' };
+    pythonModuleAttribute(file, receiver, node) {
+        const modules = this.pythonModulePath(file, receiver);
+        if (!modules) return null; // An ordinary value or nested class.
+        if (node) {
+            let head = node;
+            while (head?.type === 'attribute') head = head.childForFieldName('object');
+            if (head?.type !== 'identifier') return { verdict: 'unknown', reason: 'module-attribute' };
+            if (!this._pythonScopes) this._pythonScopes = new Map();
+            if (!this._pythonScopes.has(file)) this._pythonScopes.set(file, new Map());
+            const { referenceScope } = require('../languages/lexical-scope');
+            // A local may hold the imported module, but its spelling alone
+            // cannot prove that. Never reuse a module import through a shadow.
+            if (referenceScope(head, 'python', this._pythonScopes.get(file)) !== 'module') {
+                return { verdict: 'unknown', reason: 'module-receiver-shadow' };
+            }
+        }
+        if (modules.unknown) return { verdict: 'unknown', reason: 'module-attribute' };
+        if (modules.files.length === 0) return { verdict: 'no', reason: 'external-module' };
+        return this.combine(modules.files.map(start => {
+            const reach = this.chase(start, this.name);
+            return reach === 'yes' ? { verdict: 'yes' }
+                : reach === 'no' ? { verdict: 'no', reason: 'other-module' }
+                    : { verdict: 'unknown', reason: 'module-attribute' };
+        }));
+    }
+
+    /** Resolve module objects through local import names and package
+     * attributes. Work only with indexed files, and memoize the path walk:
+     * every occurrence of `alias.sub.Type` shares this evidence. */
+    pythonModulePath(file, receiver, seen = new Set()) {
+        const key = `py-module\0${file}\0${receiver}`;
+        if (this.memo.has(key)) return this.memo.get(key);
+        if (seen.has(key) || seen.size >= 16) return { files: [], unknown: true };
+        const next = new Set(seen).add(key);
+        const entry = this.index.files.get(file);
+        if (!entry) return { files: [], unknown: true };
+        const [head, ...tail] = receiver.split('.');
+        const named = (entry.importBindings || []).filter(b => (b.alias || b.name) === head);
+        const bindings = named.filter(b =>
+            !(entry.symbols || []).some(s => s.startLine <= b.line && s.endLine >= b.line));
+        if (bindings.length === 0) return named.length ? { files: [], unknown: true } : null;
+        const files = new Set();
+        let unknown = (entry.moduleAssignedNames || []).includes(head) ||
+            (entry.symbols || []).some(s => s.name === head && !s.className &&
+                s.lexicalScopeStartLine == null);
+        let bound = false;
+        let external = false;
+        for (const b of bindings) {
+            const module = String(b.module || '');
+            if (b.kind !== 'import') {
+                const parent = this.moduleFile(entry, module);
+                const parentEntry = this.index.files.get(parent);
+                if ((parentEntry?.moduleAssignedNames || []).includes(b.name) ||
+                    (parentEntry?.symbols || []).some(s => s.name === b.name && !s.className &&
+                        s.lexicalScopeStartLine == null)) {
+                    // A from-import reads the package's attribute before
+                    // loading a same-named child module.
+                    bound = true;
+                    unknown = true;
+                    continue;
+                }
+            }
+            const spec = b.kind === 'import' ? module
+                : module.endsWith('.') ? module + b.name : `${module}.${b.name}`;
+            const start = this.moduleFile(entry, spec);
+            if (start) {
+                bound = true;
+                files.add(start);
+            } else if (b.kind === 'import') {
+                bound = true;
+                const { bindingIsExternal } = require('./type-denotation');
+                if (bindingIsExternal(this.index, entry, file, b) !== true) unknown = true;
+                else external = true;
+            } else {
+                // A package can re-export a module imported under another
+                // name. Chase that binding, never a same-spelled disk path.
+                const parent = this.moduleFile(entry, module);
+                const imported = parent && this.pythonModulePath(parent, b.name, next);
+                if (imported) {
+                    bound = true;
+                    unknown ||= imported.unknown;
+                    external ||= imported.files.length === 0 && !imported.unknown;
+                    for (const target of imported.files) files.add(target);
+                } else if (bindings.length > 1) unknown = true;
+            }
+        }
+        if (!bound) return null;
+        unknown ||= external && files.size > 0;
+        let current = [...files];
+        for (const part of tail) {
+            const children = new Set();
+            let externalChild = false;
+            for (const parent of current) {
+                const imported = this.pythonModulePath(parent, part, next);
+                if (imported) {
+                    unknown ||= imported.unknown;
+                    externalChild ||= imported.files.length === 0 && !imported.unknown;
+                    for (const target of imported.files) children.add(target);
+                    continue;
+                }
+                const parentEntry = this.index.files.get(parent);
+                const rebound = (parentEntry?.moduleAssignedNames || []).includes(part) ||
+                    (parentEntry?.symbols || []).some(s => s.name === part) ||
+                    (parentEntry?.importBindings || []).some(b => (b.alias || b.name) === part);
+                // `import pkg.sub` loads sub onto the package object. Its
+                // indexed child is usable unless the package binds that
+                // attribute to a different (or unknown) value.
+                const child = path.basename(parent) === '__init__.py' && !rebound
+                    ? [path.join(path.dirname(parent), part + '.py'),
+                        path.join(path.dirname(parent), part, '__init__.py')]
+                        .find(candidate => this.index.files.has(candidate)) : null;
+                if (child) children.add(child);
+                else unknown = true;
+            }
+            unknown ||= externalChild && children.size > 0;
+            current = [...children];
+        }
+        const result = { files: current, unknown };
+        this.memo.set(key, result);
+        return result;
     }
 
     javaPackages() {
@@ -2782,7 +2909,7 @@ function decideImport(resolver, file, entry, token) {
         }
         case 'rust': {
             if (role.useHead) return { verdict: 'unknown', reason: 'use-path-head' };
-            const qualifier = rustUsePrefix(node);
+            const qualifier = rustUsePrefix(role.original || node);
             if (qualifier == null) return { verdict: 'unknown', reason: 'use-path' };
             if (!qualifier) return { verdict: 'unknown', reason: 'use-path-head' };
             return resolver.resolveRustPath(file, line, qualifier, name, 0);

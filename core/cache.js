@@ -885,7 +885,9 @@ function clearAllCaches() {
 // shorthand properties and import aliases; the index persists the
 // in-repository JS packages (`jsWorkspacePackages`); JS call records carry
 // `uncertain` only when true.
-const CACHE_FORMAT_VERSION = 267;
+// v268 (fix #398): repeated import source names retain every local binding;
+// an alias record applies to one specifier, not all same-name specifiers.
+const CACHE_FORMAT_VERSION = 268;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**

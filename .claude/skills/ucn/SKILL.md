@@ -474,7 +474,11 @@ imports, re-exports and `use` trees (an import alias keeps its local name),
 Python forward-reference strings (`"Widget"`, `Union["Widget"]`, the value
 of `X: TypeAlias = "Widget | None"`), C# doc
 `cref`s, forward declarations and TS declaration merges, and a Go embedded
-field's selectors and literal keys (the field is named after the type). A
+field's selectors and literal keys (the field is named after the type).
+A redundant `X as X` alias in Python, JS/TS or Rust renames both tokens.
+Python module attributes follow aliased imports and nested package paths
+(`from pkg import sub as api; api.inner.Widget`); a shadowed or rebound
+module receiver requires review. A
 same-name type of another module, package, namespace or crate, a local
 binding, a type parameter and a member named like the type stay unchanged
 (so does an object-initializer member, `new Address { Country = .. }`).

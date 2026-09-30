@@ -7465,6 +7465,29 @@ describe('fix #384: impls of one generic trait for one self type are selected by
     });
 });
 
+describe('fix #398: redundant type use aliases', () => {
+    it('renames identical aliases in plain and grouped use paths and keeps distinct aliases', () => {
+        const { applyRenamePlan } = require('./helpers');
+        const files = {
+            'Cargo.toml': '[package]\nname = "alias_test"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/lib.rs': 'pub mod model;\npub mod user;\npub use crate::model::Widget as Widget;\n',
+            'src/model.rs': 'pub struct Widget;\n',
+            'src/user.rs': 'use crate::model::{Widget as Widget};\nuse crate::model::Widget as Local;\npub fn take(x: Widget, y: Local) {}\n',
+        };
+        const dir = tmp(files);
+        try {
+            const { execute } = require('../core/execute');
+            const r = execute(idx(dir), 'plan', { name: 'Widget', file: 'src/model.rs', renameTo: 'Gadget' });
+            assert.ok(r.ok, r.error);
+            const { contents, reviews } = applyRenamePlan(dir, r.result);
+            assert.deepEqual(reviews, []);
+            for (const file of ['src/lib.rs', 'src/model.rs', 'src/user.rs']) {
+                assert.equal(contents[file], files[file].replaceAll('Widget', 'Gadget'));
+            }
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #386: renaming a type edits every reference to it', () => {
     const { applyRenamePlan } = require('./helpers');
     const files = {

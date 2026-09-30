@@ -8076,3 +8076,134 @@ describe('fix #393: Python type renames through TypeAlias strings and optional i
         } finally { rm(dir); }
     });
 });
+
+describe('fix #398: Python type renames through re-exports and module aliases', () => {
+    const { applyRenamePlan } = require('./helpers');
+
+    it('renames both tokens of an explicit re-export while preserving distinct aliases', () => {
+        const files = {
+            'pkg/model.py': 'class Widget:\n    pass\n',
+            'pkg/__init__.py': 'from .model import Widget as Widget, Widget as Local\nx: Widget = Widget()\ny: Local = Local()\n',
+            'use.py': 'import pkg\nfrom pkg import Widget as Widget\nx: Widget = pkg.Widget()\ny = pkg.Local()\n',
+            'other.py': 'from elsewhere import Widget as Widget\nx = Widget()\n',
+        };
+        const dir = tmp(files);
+        try {
+            const r = execute(idx(dir), 'plan', { name: 'Widget', file: 'pkg/model.py', renameTo: 'Gadget' });
+            assert.ok(r.ok, r.error);
+            const { contents, reviews } = applyRenamePlan(dir, r.result);
+            assert.deepEqual(reviews, []);
+            assert.equal(contents['pkg/__init__.py'], files['pkg/__init__.py'].replaceAll('Widget', 'Gadget'));
+            assert.equal(contents['use.py'], files['use.py'].replaceAll('Widget', 'Gadget'));
+            assert.ok(!contents['other.py']);
+        } finally { rm(dir); }
+    });
+
+    it('follows aliased submodules, nested package attributes and re-exported modules', () => {
+        const files = {
+            'pkg/__init__.py': 'from . import models as public\n',
+            'pkg/models/__init__.py': 'from . import fields\n',
+            'pkg/models/fields.py': 'class Widget:\n    pass\n',
+            'pkg/client.py': 'from . import models as api\nx: api.fields.Widget = api.fields.Widget()\n',
+            'use.py': [
+                'from pkg.models import fields as f',
+                'import pkg.models.fields as mf',
+                'import pkg.models.fields',
+                'from pkg import public as api',
+                'x: f.Widget = f.Widget()',
+                'y = mf.Widget()',
+                'z = pkg.models.fields.Widget()',
+                'v = api.fields.Widget()',
+            ].join('\n'),
+            'other.py': 'import decimal as f\nx = f.Widget()\n',
+        };
+        const dir = tmp(files);
+        try {
+            const r = execute(idx(dir), 'plan', { name: 'Widget', file: 'pkg/models/fields.py', renameTo: 'Gadget' });
+            assert.ok(r.ok, r.error);
+            const { contents, reviews } = applyRenamePlan(dir, r.result);
+            assert.deepEqual(reviews, []);
+            for (const file of ['use.py', 'pkg/client.py']) {
+                assert.equal(contents[file], files[file].replaceAll('Widget', 'Gadget'));
+            }
+            assert.ok(!contents['other.py']);
+        } finally { rm(dir); }
+    });
+
+    it('reviews shadowed module receivers and ambiguous bindings at their own tokens', () => {
+        const files = {
+            'pkg/__init__.py': '',
+            'pkg/model.py': 'class Widget:\n    pass\n',
+            'use.py': [
+                'from pkg import model as m',
+                'value = (m.Widget, lambda m: m.Widget)',
+                'def use(m):',
+                '    return m.Widget()',
+                'def imported():',
+                '    from other import model as m',
+                '    return m.Widget()',
+            ].join('\n'),
+            'rebound.py': 'from pkg import model as m\nm = object()\nx = m.Widget\n',
+            'mixed.py': 'from pkg import model as m\nfrom unknown import model as m\nx = m.Widget\n',
+            'mixed_modules.py': 'import pkg.model as m\nimport decimal as m\nx = m.Widget\n',
+            'other/__init__.py': 'import decimal as model\n',
+            'mixed_nested.py': 'import pkg as p\nimport other as p\nx = p.model.Widget\n',
+            'local.py': 'def load():\n    from pkg import model as m\n    return m.Widget()\n',
+        };
+        const dir = tmp(files);
+        try {
+            const r = execute(idx(dir), 'plan', { name: 'Widget', file: 'pkg/model.py', renameTo: 'Gadget' });
+            assert.ok(r.ok, r.error);
+            const { contents, reviews } = applyRenamePlan(dir, r.result);
+            assert.match(contents['use.py'], /value = \(m.Gadget, lambda m: m.Widget\)/);
+            for (const site of ['use.py:2', 'use.py:4', 'use.py:7', 'rebound.py:3', 'mixed.py:3',
+                'mixed_modules.py:3', 'mixed_nested.py:3', 'local.py:3']) {
+                assert.ok(reviews.includes(site), `review ${site}: ${reviews}`);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('keeps expression bindings and nested lambda scopes when checking module shadows', () => {
+        const expressions = [
+            'consume((m := object()))',
+            '[(m := object())]',
+            '{"key": (m := object())}',
+            'f"{(m := object())}"',
+            '(m := object()) or other',
+            '[(m := object()) for x in values]',
+        ];
+        const files = {
+            'pkg/__init__.py': '',
+            'pkg/model.py': 'class Widget:\n    pass\n',
+            'clean.py': 'from pkg import model as m\ndef use():\n    consume(lambda: (m := object()), "m := text")\n    return m.Widget()\n',
+            'with_binding.py': 'from pkg import model as m\ndef use():\n    with (manager() as m,):\n        pass\n    return m.Widget()\n',
+        };
+        for (let i = 0; i < expressions.length; i++) {
+            files[`shadow${i}.py`] = `from pkg import model as m\ndef use():\n    ${expressions[i]}\n    return m.Widget()\n`;
+        }
+        const dir = tmp(files);
+        try {
+            const r = execute(idx(dir), 'plan', { name: 'Widget', file: 'pkg/model.py', renameTo: 'Gadget' });
+            assert.ok(r.ok, r.error);
+            const { contents, reviews } = applyRenamePlan(dir, r.result);
+            assert.match(contents['clean.py'], /return m.Gadget\(\)/);
+            assert.ok(reviews.includes('with_binding.py:5'));
+            for (let i = 0; i < expressions.length; i++) assert.ok(reviews.includes(`shadow${i}.py:4`));
+        } finally { rm(dir); }
+    });
+
+    it('does not mistake an exported value for a same-named child module', () => {
+        const dir = tmp({
+            'pkg/__init__.py': 'class model:\n    Widget = int\n',
+            'pkg/model.py': 'class Widget:\n    pass\n',
+            'use.py': 'from pkg import model as m\nx = m.Widget()\n',
+        });
+        try {
+            const r = execute(idx(dir), 'plan', { name: 'Widget', file: 'pkg/model.py', renameTo: 'Gadget' });
+            assert.ok(r.ok, r.error);
+            const { contents, reviews } = applyRenamePlan(dir, r.result);
+            assert.ok(reviews.includes('use.py:2'));
+            assert.ok(!contents['use.py']?.includes('m.Gadget'));
+        } finally { rm(dir); }
+    });
+});

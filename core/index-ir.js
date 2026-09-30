@@ -9,15 +9,32 @@
  */
 
 function createImportBindings(imports) {
-    return imports.flatMap(item => (item.names || [])
+    return imports.flatMap(item => {
+        const names = item.names || [];
+        let renames;
+        if (item.renames?.length) {
+            const sourceNames = new Set(names);
+            renames = new Map();
+            // Reverse once so each per-name stack pops in source order.
+            for (let i = item.renames.length - 1; i >= 0; i--) {
+                const rename = item.renames[i];
+                const spelling = sourceNames.has(rename.original) ? rename.original : rename.local;
+                if (!renames.has(spelling)) renames.set(spelling, []);
+                renames.get(spelling).push(rename);
+            }
+        }
+        return names
         .filter(name => name && name !== '*' && name !== '_' && name !== '.')
         .map(name => {
             // A rename may be recorded under its original name (Python
             // `from m import a as b` lists 'a') or under its local alias
             // (Rust `use m::a as b` lists 'b', fix #357); both yield the
             // binding {name: original, alias: local}.
-            const rename = (item.renames || []).find(candidate =>
-                candidate.original === name || candidate.local === name);
+            // Each rename belongs to one import specifier. Reusing it for
+            // every repeated source name loses the unaliased binding in
+            // `import { A, A as B }`. A local spelling is used only when
+            // this record does not also list the original spelling (Rust).
+            const rename = renames?.get(name)?.pop();
             return {
                 name: rename ? rename.original : name,
                 module: item.module,
@@ -29,7 +46,8 @@ function createImportBindings(imports) {
                 ...(item.dynamic && { dynamic: true }),
                 ...(item.namespace && { namespace: item.namespace }),
             };
-        }));
+        });
+    });
 }
 
 function createFileEntryFromIR({

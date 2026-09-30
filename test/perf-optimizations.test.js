@@ -1536,6 +1536,7 @@ describe('index reliability: parallel build equals sequential build', () => {
         // *WithArgs missing from build-worker's addSymbol): the snapshot
         // guard only catches a drop when the fixture PRODUCES the field.
         spec['rich0.ts'] = [
+            'import { Imported as Imported, Imported as Local } from "./imported";',
             'export type AliasT = BaseT;',
             'export class BaseT {',
             '  cache: Map<string, number> = new Map();',
@@ -1548,6 +1549,7 @@ describe('index reliability: parallel build equals sequential build', () => {
             'export function evidence(b: BaseT) { const c = new BaseT(); b.load("a"); c.load("c"); }',
         ].join('\n');
         spec['rich1.py'] = [
+            'from imported import Imported as Imported, Imported as Local',
             'from flask import Flask',
             'app = Flask(__name__)',
             '@app.route("/things")',
@@ -1623,6 +1625,8 @@ describe('index reliability: parallel build equals sequential build', () => {
             '        name = f"_get_{src}_perms"',
             '        return getattr(self, name)(u)',
         ].join('\n');
+        spec['imported.ts'] = 'export class Imported {}';
+        spec['imported.py'] = 'class Imported:\n    pass';
         const dir = tmp(spec);
         try {
             const seq = new ProjectIndex(dir);
@@ -1637,6 +1641,11 @@ describe('index reliability: parallel build equals sequential build', () => {
                 'the parity fixture must actually produce a reflection pattern');
             assert.strictEqual(indexSnapshot(par), indexSnapshot(seq),
                 'parallel and sequential builds must produce identical indexes');
+            for (const file of ['rich0.ts', 'rich1.py']) {
+                const bindings = par.files.get(path.join(dir, file)).importBindings
+                    .filter(b => b.name === 'Imported').map(b => b.alias || b.name).sort();
+                assert.deepEqual(bindings, ['Imported', 'Local'], 'each import specifier keeps its binding');
+            }
         } finally { rm(dir); }
     });
 
