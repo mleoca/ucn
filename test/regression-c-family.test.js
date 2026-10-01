@@ -34,6 +34,33 @@ describe('C-family recovery resource and ordering contracts', () => {
     });
 });
 
+describe('fix #398: indexed C/C++ bindings preserve lexical precedence', () => {
+    for (const language of ['c', 'cpp']) {
+        it(`${language}: chooses the narrowest visible binding after its declaration`, () => {
+            const code = [
+                'struct Global* item;',
+                'void use(struct Outer* item) {',
+                '  item->run();',
+                '  {',
+                '    item->run();',
+                '    struct Inner* item = 0;',
+                '    item->run();',
+                '    item->run();',
+                '  }',
+                '  item->run();',
+                '}',
+                'void other(struct Other* item) { item->run(); }',
+                'void global_use() { item->run(); }',
+            ].join('\n');
+            const calls = getLanguageAdapter(language).findCalls(code, getParser(language))
+                .filter(call => call.name === 'run');
+            assert.deepEqual(calls.map(call => call.receiverType), [
+                'Outer', 'Outer', 'Inner', 'Inner', 'Outer', 'Other', 'Global',
+            ]);
+        });
+    }
+});
+
 describe('C language support', () => {
     it('extracts includes, structs, functions, parameters, and calls', () => {
         const code = [

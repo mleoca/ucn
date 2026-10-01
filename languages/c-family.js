@@ -1334,13 +1334,20 @@ function macroTypeRanges(tree, code, evidence = null) {
     ])).values()];
 }
 
+const parseErrorCounts = new WeakMap();
 function countParseErrors(node) {
+    // Recovery compares the same immutable trees across several rounds.
+    // Clean subtrees contribute nothing; error-bearing nodes retain their
+    // count so another comparison does not cross the native boundary again.
+    if (!node.hasError && node.type !== 'ERROR') return 0;
+    const known = parseErrorCounts.get(node);
+    if (known !== undefined) return known;
     let count = node.type === 'ERROR' ? 1 : 0;
-    for (let i = 0; i < node.childCount; i++) {
-        const child = node.child(i);
+    for (const child of node.children) {
         if (child.isMissing) count++;
         else if (child.hasError || child.type === 'ERROR') count += countParseErrors(child);
     }
+    parseErrorCounts.set(node, count);
     return count;
 }
 
@@ -5265,19 +5272,25 @@ function buildVariableTypes(tree) {
                 [candidate.declarator]);
         }
     }
+    // Bindings are complete before call extraction. Partition by spelling
+    // once: every argument and receiver lookup otherwise scans all locals
+    // in the translation unit, including unrelated functions.
+    const bindingsByName = new Map();
+    for (const binding of bindings) {
+        let named = bindingsByName.get(binding.name);
+        if (!named) { named = []; bindingsByName.set(binding.name, named); }
+        named.push(binding);
+    }
+    for (const named of bindingsByName.values()) {
+        named.sort((a, b) => (a.scopeEnd - a.scopeStart) - (b.scopeEnd - b.scopeStart) ||
+            b.declaredAt - a.declaredAt);
+    }
     const resolveBinding = (name, atNode) => {
         if (!name || !atNode) return undefined;
         const at = atNode.startIndex;
-        const candidates = bindings.filter(binding =>
-            binding.name === name &&
+        return bindingsByName.get(name)?.find(binding =>
             binding.scopeStart <= at && at < binding.scopeEnd &&
             binding.declaredAt <= at);
-        candidates.sort((a, b) => {
-            const aSpan = a.scopeEnd - a.scopeStart;
-            const bSpan = b.scopeEnd - b.scopeStart;
-            return aSpan - bSpan || b.declaredAt - a.declaredAt;
-        });
-        return candidates[0];
     };
     return {
         get: (name, atNode) => resolveBinding(name, atNode)?.type,
