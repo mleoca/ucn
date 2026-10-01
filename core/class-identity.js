@@ -49,6 +49,7 @@ function _state(index) {
             owners: new WeakMap(),
             resolved: new Map(),
             parents: new Map(),
+            modules: new Map(),
             // fix #365: target-independent derivations repeated for every
             // same-name definition a caller query pins (stats --hot / repo).
             declaring: new WeakMap(), // definitions array -> Map<refKey|mode, result>
@@ -642,7 +643,23 @@ function _resolveQualifiedParent(index, parentName, contextFile, childRef) {
     const traits = langTraits(fileEntry.language);
     let hit = null;
     if (traits?.typeSystem === 'structural') {
-        const binding = (fileEntry.importBindings || []).find(b => b.name === pieces[0]);
+        if (fileEntry.language === 'python') {
+            const { pythonModulePath, pythonModuleScope, pythonModuleTypes } = require('./python-modules');
+            const memo = _state(index).modules;
+            if (!pythonModuleScope(index, contextFile, qualifier, childRef.def, memo)) return unknown;
+            const modules = pythonModulePath(index, contextFile, qualifier, memo);
+            if (!modules || modules.unknown) return unknown;
+            if (modules.files.length === 0) return { ...unknown, external: true };
+            const visible = entries.filter(e => !_functionLocal(e.def));
+            const matches = modules.files.map(file => {
+                const definitions = new Set(pythonModuleTypes(index, file, terminal, visible.map(e => e.def)));
+                return _single(visible.filter(e => definitions.has(e.def)));
+            });
+            hit = matches[0];
+            if (!hit || matches.some(match => match?.key !== hit.key)) return unknown;
+            return { name: terminal, key: hit.key, def: hit.def };
+        }
+        const binding = (fileEntry.importBindings || []).find(b => (b.alias || b.name) === pieces[0]);
         const specs = [];
         if (binding) {
             specs.push(binding.module);
@@ -982,6 +999,7 @@ module.exports = {
     classKeyOf,
     classDefsNamed,
     resolveClassRef,
+    resolveQualifiedClassRef: _resolveQualifiedParent,
     ownerRefOf,
     ownerDefinitionOf,
     distinctOwnerDefinitions,

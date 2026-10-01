@@ -8207,3 +8207,89 @@ describe('fix #398: Python type renames through re-exports and module aliases', 
         } finally { rm(dir); }
     });
 });
+
+describe('fix #398: inherited members through qualified Python bases', () => {
+    const files = {
+        'pkg/__init__.py': 'from .child import Context\n',
+        'pkg/base/__init__.py': 'from .core import Context\n',
+        'pkg/base/core.py': 'class Context:\n    def fetch(self): return 1\n',
+        'pkg/child.py': 'from pkg import base as api\nclass Context(api.Context): pass\n',
+        'pkg/deep.py': 'from . import base as api\nclass Deep(api.Context): pass\nclass Override(api.Context):\n    def fetch(self): return 2\n',
+        'other.py': 'class Context:\n    def fetch(self): return 3\n',
+        'use.py': [
+            'import pkg',
+            'from pkg import deep as d',
+            'from pkg.base import core as c',
+            'import other',
+            'def same(x: pkg.Context): return x.fetch()',
+            'def deep(x: d.Deep): return x.fetch()',
+            'def override(x: d.Override): return x.fetch()',
+            'def unrelated(x: other.Context): return x.fetch()',
+            'def ancestor(x: c.Context): return x.fetch()',
+            'def nested(x: "pkg.base.core.Context"): return x.fetch()',
+        ].join('\n'),
+    };
+    const query = (index, file) => {
+        const r = execute(index, 'context', { name: 'fetch', file });
+        assert.ok(r.ok, r.error);
+        assert.ok(r.result.meta.account.conserved);
+        return r.result;
+    };
+    const sites = result => result.callers.map(c => `${c.relativePath}:${c.line}`);
+
+    it('keeps virtual self calls unverified when a local subclass overrides through a module alias', () => {
+        const dir = tmp({
+            'pkg/__init__.py': 'from .base import Consumer\n',
+            'pkg/base.py': 'class Consumer:\n    def fetch(self): return 1\n',
+            'pkg/compat.py': 'from . import base\nclass Consumer(base.Consumer):\n    def fetch(self): return 2\n    def drain(self): return self.fetch()\n',
+            'use.py': 'from pkg import compat\ndef use():\n    class Local(compat.Consumer):\n        def fetch(self): return 3\n    return Local().drain()\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'drain', file: 'pkg/compat.py' });
+            assert.ok(r.ok, r.error);
+            assert.ok(!r.result.callees.some(c => c.name === 'fetch'));
+            assert.ok(r.result.unverifiedCallees.some(c => c.name === 'fetch' && c.reason === 'possible-dispatch'));
+            const local = query(index, 'use.py');
+            assert.ok(local.unverifiedCallers.some(c => c.relativePath === 'pkg/compat.py' && c.line === 4));
+        } finally { rm(dir); }
+    });
+
+    it('resolves imported submodules before the containing package and preserves overrides', () => {
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const base = query(index, 'pkg/base/core.py');
+            assert.deepEqual(sites(base), ['use.py:5', 'use.py:6', 'use.py:9', 'use.py:10']);
+            assert.ok(base.meta.account.excluded.byReason['receiver-type-mismatch'].sample.some(s => s.line === 7));
+            const override = query(index, 'pkg/deep.py');
+            assert.deepEqual(sites(override), ['use.py:7']);
+            assert.ok(override.unverifiedCallers.some(c => c.line === 9 && c.reason === 'possible-dispatch'));
+            assert.deepEqual(sites(query(index, 'other.py')), ['use.py:8']);
+        } finally { rm(dir); }
+    });
+
+    it('leaves shadowed, rebound, local and conflicting module bindings unverified', () => {
+        const dir = tmp({ ...files,
+            'shadow.py': 'from pkg import base as api\ndef make(api):\n    class Local(api.Context): pass\n    x = Local()\n    return x.fetch()\n',
+            'local.py': 'def make():\n    from pkg import base as api\n    class Local(api.Context): pass\n    return Local().fetch()\n',
+            'rebound.py': 'from pkg import base as api\napi = object()\nclass Rebound(api.Context): pass\ndef use(x: Rebound): return x.fetch()\n',
+            'mixed.py': 'from pkg import base as api\nimport decimal as api\nclass Mixed(api.Context): pass\ndef use(x: Mixed): return x.fetch()\n',
+            'constructor.py': 'from pkg import base as api\ndef use(api):\n    x = api.Context()\n    return x.fetch()\n',
+            'nested.py': 'from pkg import base as api\ndef outer(api):\n    def inner(x: api.Context): return x.fetch()\n',
+        });
+        try {
+            const index = idx(dir);
+            const result = query(index, 'pkg/base/core.py');
+            for (const file of ['shadow.py', 'local.py', 'rebound.py', 'mixed.py', 'constructor.py', 'nested.py']) {
+                assert.ok(!sites(result).some(s => s.startsWith(file + ':')), `must not confirm ${file}`);
+                assert.ok(result.unverifiedCallers.some(c => c.relativePath === file), `must retain ${file}`);
+            }
+            const { classDefsNamed, parentRefsOf } = require('../core/class-identity');
+            for (const entry of classDefsNamed(index, 'Local').entries) {
+                const parents = parentRefsOf(index, { name: 'Local', key: entry.key, def: entry.def });
+                assert.ok(parents.every(p => !p.key), 'a shadowed or local import cannot pin the parent');
+            }
+        } finally { rm(dir); }
+    });
+});

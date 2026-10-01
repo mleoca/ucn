@@ -1142,11 +1142,12 @@ function rustSelfFieldBinding(identNode) {
 /**
  * Where a bare name reference resolves (see the file header).
  * `memo` is a Map shared by the references of one name in one tree.
+ * An explicit `name` asks about a binding in a container node's scope,
+ * for example the root of a qualified type in a Python string annotation.
  */
-function referenceScope(node, language, memo = new Map()) {
+function referenceScope(node, language, memo = new Map(), name = node?.text) {
     const family = familyOf(language);
     if (!family || !node) return null;
-    const name = node.text;
     try {
         switch (family) {
             case 'python': return pythonReferenceScope(node, name, memo);

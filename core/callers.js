@@ -27,7 +27,7 @@ const {
     ownerRefOf, ownerNameOf, ownedBy, findDeclaringClass, relationToTargets,
     shareDescendant: shareClassDescendant, parentRefsOf: parentRefsOfClass,
     descendantKeys, classKeyOf, classDefsNamed, distinctOwnerDefinitions, ownerDefinitionOf,
-    hasFunctionLocalClass, descendsFromTargets, resolveClassRef,
+    hasFunctionLocalClass, descendsFromTargets, resolveClassRef, resolveQualifiedClassRef,
 } = require('./class-identity');
 const { resolveQualifier: resolveCppQualifier, effectiveNamespace: cppEffectiveNamespace,
     globalQualifiedReaches: cppGlobalQualifiedReaches, includeClosure: cppIncludeClosure } =
@@ -1832,7 +1832,8 @@ function findCallers(index, name, options = {}) {
                 if (call.isMethod && call.receiverType && call.receiverTypeQualifier &&
                     langTraits(fileEntry.language)?.typeSystem === 'structural') {
                     const origin = _structuralQualifiedReceiverOrigin(
-                        index, fileEntry, call.receiverTypeQualifier, call.receiverType);
+                        index, fileEntry, call.receiverTypeQualifier, call.receiverType,
+                        call.receiverTypeEvidence);
                     if (origin?.kind === 'project') {
                         call = { ...call, receiverTypeFlowFile: origin.fromFile };
                     } else if (origin?.kind === 'external') {
@@ -12274,6 +12275,18 @@ function _resolveFlowTypeOrigin(index, producerFile, typeName, qualifier = undef
         // bounded file-level closure as fallback (the #277 rails). An
         // unresolvable qualifier is 'unknown', never proximity-guessed.
         if (fe && ['python', 'javascript', 'typescript', 'tsx'].includes(fe.language)) {
+            if (fe.language === 'python') {
+                const { pythonModulePath, pythonModuleTypes } = require('./python-modules');
+                const modules = pythonModulePath(index, producerFile, qualifier, opCache);
+                if (!modules || modules.unknown || modules.files.length === 0) return finish(null);
+                const origins = modules.files.map(start => {
+                    const named = pythonModuleTypes(index, start, typeName,
+                        typeDefs.filter(d => !_isFunctionLocalType(d)));
+                    return new Set(named.map(d => d.file)).size === 1 ? named[0].file : null;
+                });
+                return finish(origins[0] && origins.every(file => file === origins[0])
+                    ? { fromFile: origins[0] } : null);
+            }
             const resolvedRels = new Set();
             const direct = fe.moduleResolved?.[qualifier];
             if (direct) resolvedRels.add(direct);
@@ -12548,10 +12561,27 @@ function _receiverTypeTrustedForExclusion(index, typeName) {
  * an external module or a project-looking resolver gap is explicit routing
  * evidence, never confirmation evidence.
  */
-function _structuralQualifiedReceiverOrigin(index, fileEntry, qualifier, typeName) {
+function _structuralQualifiedReceiverOrigin(index, fileEntry, qualifier, typeName, site) {
+    if (fileEntry.language === 'python') {
+        const { pythonModulePath, pythonModuleScope } = require('./python-modules');
+        const file = path.join(index.root, fileEntry.relativePath);
+        const modules = pythonModulePath(index, file, qualifier, index._opFlowTypeOriginCache);
+        if (modules) {
+            const via = `${qualifier}.${typeName}`;
+            if (modules.unknown || !pythonModuleScope(index, file, qualifier,
+                site, index._opFlowTypeOriginCache)) return { kind: 'unknown', via };
+            if (modules.files.length === 0) return { kind: 'external', via };
+            const origin = _resolveFlowTypeOrigin(index, file, typeName, qualifier);
+            // Keep the module where the name was read as the provenance
+            // origin. Jumping straight to its declaration would erase an
+            // unmodeled wildcard export from the independent witness check.
+            return origin ? { kind: 'project', via, fromFile: modules.files[0] }
+                : { kind: 'unknown', via };
+        }
+    }
     const qualifierRoot = String(qualifier).split('.')[0];
     const bindings = (fileEntry.importBindings || []).filter(b =>
-        b.name === qualifier || b.name === qualifierRoot);
+        (b.alias || b.name) === qualifier || (b.alias || b.name) === qualifierRoot);
     if (bindings.length === 0) return { kind: 'unknown', via: `${qualifier}.${typeName}` };
     let projectish = false;
     for (const binding of bindings) {
@@ -14106,7 +14136,15 @@ function _resolveStructuralFlowTypeIdentity(index, originFile, knownType, target
     // module file, while export details recover the source-side type name for
     // `export { Internal as PublicBase }`. Keeping both pieces prevents
     // same-named classes in other files from being conflated.
-    const parentOrigin = (parent, childFile) => {
+    const parentOrigin = (parent, childFile, child) => {
+        if (parent.includes('.')) {
+            const defs = classDefsNamed(index, child.name).entries.filter(e =>
+                e.def.file === childFile && (child.defStartLine == null || e.def.startLine === child.defStartLine));
+            if (defs.length !== 1) return { name: parent.split('.').pop() };
+            const ref = resolveQualifiedClassRef(index, parent, childFile,
+                { name: child.name, key: defs[0].key, def: defs[0].def });
+            return { name: ref.name, file: ref.def?.file, external: ref.external };
+        }
         const fe = index.files.get(childFile);
         if (fe) {
             const alias = (fe.importAliases || []).find(a => a.local === parent);
@@ -14155,7 +14193,7 @@ function _resolveStructuralFlowTypeIdentity(index, originFile, knownType, target
             ? (index._getInheritanceParentsAt?.(cur.name, cur.file, cur.defStartLine) || [])
             : (index._getInheritanceParents(cur.name, cur.file) || []);
         for (const parent of parents) {
-            const edge = parentOrigin(parent, cur.file);
+            const edge = parentOrigin(parent, cur.file, cur);
             const verdict = ownerIdentity(edge.name, edge.file);
             if (verdict === 'target') return 'target';
             if (verdict === 'unknown') sawUnresolved = true;
@@ -14246,19 +14284,28 @@ function _isAncestorOfTargetClass(index, typeName, targetDefs) {
     const queue = [];
     for (const td of targetDefs) {
         const cls = td.className || (td.receiver && td.receiver.replace(/^\*/, ''));
-        if (cls) queue.push({ name: cls, file: td.file });
+        if (cls) queue.push({ name: cls, file: td.file, ref: ownerRefOf(index, td) });
     }
     while (queue.length > 0) {
-        const { name, file } = queue.shift();
-        if (visited.has(name)) continue;
-        visited.add(name);
+        const { name, file, ref } = queue.shift();
+        const key = ref?.key || `${file || ''}\0${name}`;
+        if (visited.has(key)) continue;
+        visited.add(key);
+        // The declared base can be qualified (`api.Base`) even though the
+        // receiver annotation records the terminal name. Follow its class
+        // identity before the legacy name-only fallback for unknown owners.
+        if (ref?.key || ref?.def) {
+            for (const parent of parentRefsOfClass(index, ref)) {
+                if (parent.name === typeName) return true;
+                if (!parent.external) queue.push({ name: parent.name, file: parent.def?.file, ref: parent });
+            }
+            continue;
+        }
         const parents = index._getInheritanceParents(name, file) || [];
         for (const parent of parents) {
             if (parent === typeName) return true;
-            if (!visited.has(parent)) {
-                const parentFile = index._resolveClassFile ? index._resolveClassFile(parent, file) : file;
-                queue.push({ name: parent, file: parentFile });
-            }
+            const parentFile = index._resolveClassFile ? index._resolveClassFile(parent, file) : file;
+            queue.push({ name: parent, file: parentFile });
         }
     }
     return false;

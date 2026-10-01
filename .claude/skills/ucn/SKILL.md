@@ -221,6 +221,10 @@ target token); Java `pkg.Type.method()` and C# `Ns.Type.Method()` /
 `using T = Ns.Type; T.Method()` pick the type the qualifier names when several
 same-name types exist. A qualifier the resolver cannot place stays visible as
 `method-ambiguous`, never confirmed by first-definition order.
+Python qualified bases and receiver annotations follow the imported module,
+including aliased submodules and nested package paths. Inherited calls keep
+their declaring class; a shadowed or rebound module stays unverified, and a
+base-typed receiver can still dispatch to a subclass override.
 
 Type aliases and import renames are the same type on both the caller and callee
 side: a receiver annotated with Go `type IntFlag = FlagBase[int]`, TS

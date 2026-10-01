@@ -11827,3 +11827,31 @@ describe('fix #397: JS/TS binding identity, renames and in-process clients', () 
         } finally { rm(dir); }
     });
 });
+
+describe('fix #398: module-qualified structural inheritance', () => {
+    for (const ext of ['js', 'ts', 'tsx']) {
+        it(`${ext}: inherited calls keep their owner and overrides intercept`, () => {
+            const dir = tmp({
+                [`base.${ext}`]: 'export class Context { fetch() { return 1; } }\n',
+                [`child.${ext}`]: "import * as api from './base';\nexport class Child extends api.Context {}\nexport class Override extends api.Context { fetch() { return 2; } }\n",
+                [`other.${ext}`]: 'export class Context { fetch() { return 3; } }\n',
+                [`use.${ext}`]: [
+                    "import { Child, Override } from './child';",
+                    "import { Context as Other } from './other';",
+                    'export function use() { return new Child().fetch(); }',
+                    'export function override() { return new Override().fetch(); }',
+                    'export function other() { return new Other().fetch(); }',
+                ].join('\n'),
+            });
+            try {
+                const index = idx(dir);
+                for (const [file, line] of [['base', 3], ['child', 4], ['other', 5]]) {
+                    const r = execute(index, 'context', { name: 'fetch', file: `${file}.${ext}` });
+                    assert.ok(r.ok, r.error);
+                    assert.deepEqual(r.result.callers.map(c => c.line), [line]);
+                    assert.ok(r.result.meta.account.conserved);
+                }
+            } finally { rm(dir); }
+        });
+    }
+});
