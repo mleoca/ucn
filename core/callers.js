@@ -557,9 +557,21 @@ function findCallers(index, name, options = {}) {
     // suppliers of the name depend only on the query.
     const bareOwnerDescent = new Map();
     const usingStaticSuppliers = new Map();
-    const dispatchTargetTypes = (targetDefs) => {
+    const dispatchTargetTypes = (targetDefs, file, call) => {
         if (!_dispatchTargetTypes) _dispatchTargetTypes = _buildTargetTypeSet(index, targetDefs, definitions);
-        return _dispatchTargetTypes;
+        let types = _dispatchTargetTypes;
+        // The name-level subtype closure cannot tell apart local classes
+        // with the same spelling. An override in another function must not
+        // hide the member this particular local class inherits.
+        for (const name of new Set([call?.receiver, call?.receiverType])) {
+            if (!name || types.has(name) || !file ||
+                !_functionLocalTypeInScope(index, file, name, call.line)) continue;
+            if (_resolveReceiverTypeIdentity(index, file, name, targetDefs, call.line) === 'target') {
+                if (types === _dispatchTargetTypes) types = new Set(types);
+                types.add(name);
+            }
+        }
+        return types;
     };
     let _methodOwnerKeys = null;
     const methodOwnerKey = (definition) => {
@@ -1566,6 +1578,12 @@ function findCallers(index, name, options = {}) {
                     call = { ...call, receiverType: undefined,
                         receiverTypeStdlibModule: undefined };
                 }
+                const shadowedClassReceiver = structuralLanguage &&
+                    _unprovenLocalClassReceiver(index, fileEntry, filePath, call);
+                if (shadowedClassReceiver) {
+                    routeUnverified(filePath, fileEntry, shadowedClassReceiver, 'ambiguous-binding', calledAs);
+                    continue;
+                }
 
                 // Return-type flow: an untyped method receiver may be a
                 // variable assigned from a call with a known return annotation
@@ -2316,7 +2334,7 @@ function findCallers(index, name, options = {}) {
                             // non-overriding subtypes incl. Go embedding) before
                             // disposing: a reference through a promoting outer
                             // type or a type alias IS the target's method.
-                            if (!dispatchTargetTypes(cbTargetDefs).has(call.receiverType)) {
+                            if (!dispatchTargetTypes(cbTargetDefs, filePath, call).has(call.receiverType)) {
                                 // A method VALUE binds at the receiver's static
                                 // type: a typed receiver that is neither the
                                 // target type nor below it denotes ANOTHER
@@ -2384,7 +2402,7 @@ function findCallers(index, name, options = {}) {
                             }
                         }
                         if (collectAccount) {
-                            const cbTypes = dispatchTargetTypes(cbTargetDefs);
+                            const cbTypes = dispatchTargetTypes(cbTargetDefs, filePath, call);
                             const cbTypeQualified = call.receiver && cbTypes.has(call.receiver);
                             const cbTypedMatch = call.receiverType && cbTypes.has(call.receiverType);
                             const cbAllTypeTargets = cbTargetDefs.length > 0 &&
@@ -2966,7 +2984,7 @@ function findCallers(index, name, options = {}) {
                     const callerSymbol = index.findEnclosingFunction(filePath, call.line, true, call) ||
                         { file: filePath };
                     const qualifiedTargetDefs = options.targetDefinitions || definitions;
-                    if (call.receiverIsTypeQualified) {
+                    if (call.receiverIsTypeQualified && !hasFunctionLocalClass(index, call.receiver)) {
                         const targetOwners = new Set(qualifiedTargetDefs
                             .map(d => d.className).filter(Boolean));
                         const reachableOwners = new Set([call.receiver]);
@@ -3054,7 +3072,7 @@ function findCallers(index, name, options = {}) {
                             if (targetClass) {
                                 targetClass = _pureAliasBase(index, targetClass) || targetClass;
                                 const tDefs = options.targetDefinitions || definitions;
-                                const compatibleTypes = dispatchTargetTypes(tDefs);
+                                const compatibleTypes = dispatchTargetTypes(tDefs, filePath, call);
                                 // fix #381: the field's class by DEFINITION.
                                 // A same-name class the file cannot see
                                 // (another module's, a function-local one
@@ -4704,7 +4722,7 @@ function findCallers(index, name, options = {}) {
                     // Target type set: target classes + non-overriding subtypes
                     // (a Child receiver calling an inherited Base method IS a
                     // caller of Base.method). Memoized — fixed per query.
-                    const targetTypes = dispatchTargetTypes(targetDefs);
+                    const targetTypes = dispatchTargetTypes(targetDefs, filePath, call);
                     if (targetTypes.size > 0) {
                         // Use inferred receiverType when available (Go/Java/Rust parameter type tracking)
                         // Generic type parameters are not type identity in
@@ -5641,7 +5659,7 @@ function findCallers(index, name, options = {}) {
                     !resolvedBySameClass && !resolvedByExtensionMethod &&
                     !receiverTypeValidated && !nominalInferredMatch &&
                     langTraits(fileEntry.language)?.typeSystem === 'nominal') {
-                    const tTypes = dispatchTargetTypes(targetDefs2);
+                    const tTypes = dispatchTargetTypes(targetDefs2, filePath, call);
                     // `use X as Y` import rename (fix #222b, ripgrep-measured:
                     // `use ContextSeparator as Separator; Separator::disabled()`
                     // — the alias names the TARGET type locally): judge path
@@ -6099,7 +6117,7 @@ function findCallers(index, name, options = {}) {
                         recordExcluded(filePath, call.line, 'arity-mismatch');
                         continue;
                     }
-                    const tTypes = dispatchTargetTypes(targetDefs2);
+                    const tTypes = dispatchTargetTypes(targetDefs2, filePath, call);
                     const enclosingClass = callerSymbol && callerSymbol.className;
                     const lexicalOwnerTypes = new Set(
                         enclosingClass ? [enclosingClass] : []);
@@ -6478,7 +6496,7 @@ function findCallers(index, name, options = {}) {
                     // receivers (fix #224) are module receivers too.
                     if (call.isMethod && !call.receiverIsModule &&
                         !recvSubmoduleRel && !call.moduleOwnedPath) {
-                        const tTypes = dispatchTargetTypes(targetDefs2);
+                        const tTypes = dispatchTargetTypes(targetDefs2, filePath, call);
                         let typeQualifiedReceiver = !!(call.receiver && tTypes.has(call.receiver));
                         // The qualifying name denotes the type the calling
                         // module binds it to (fix #384): another module's
@@ -7498,6 +7516,15 @@ function findCallees(index, definition, options = {}) {
                 },
                 options: { sameClass: !!call.receiver && _isReservedReceiver(language, call.receiver) },
             });
+            const shadowedClassReceiver = structuralCallee &&
+                _unprovenLocalClassReceiver(index, fileEntry, def.file, call);
+            if (shadowedClassReceiver) {
+                const evidence = siteEvidence.get(siteId);
+                evidence.call = shadowedClassReceiver;
+                evidence.evidence.hasReceiverType = false;
+                noteUnverified(siteId, shadowedClassReceiver, 'ambiguous-binding');
+                continue;
+            }
             if (language === 'csharp') {
                 // fix #353: `Beta.Helper.Widget()` — namespace-qualified type
                 // receiver (see the findCallers twin).
@@ -8416,7 +8443,9 @@ function findCallees(index, definition, options = {}) {
                                 path.dirname(receiverOriginFile)));
                     const sel = _calleeSelectReceiverMethod(
                         index, call, symbols || [], typeName, language, def.file,
-                        acceptsReceiverDefinition);
+                        acceptsReceiverDefinition, receiverOriginFile && {
+                            fromFile: receiverOriginFile, definition: receiverTypeDefinition,
+                        });
                     if (sel.ambiguous) {
                         noteUnverified(siteId, call, 'overload-ambiguous');
                         continue;
@@ -8526,16 +8555,18 @@ function findCallees(index, definition, options = {}) {
                         const symbols = index.symbols.get(call.name);
                         const isCallableCh = (s) => !NON_CALLABLE_TYPES.has(s.type) ||
                             (s.type === 'field' && s.fieldType && /^func\b/.test(s.fieldType));
+                        const scopedConstructor = chained.exactConstructor &&
+                            classDefsNamed(index, chained.type).hasScoped;
                         const acceptsChainedDefinition = symbol =>
                             isCallableCh(symbol) &&
-                            (!chained.fromFile || !symbol.file ||
+                            (scopedConstructor || !chained.fromFile || !symbol.file ||
                              ((language === 'java' || language === 'csharp')
                                  ? symbol.file === chained.fromFile
                                  : path.dirname(symbol.file) ===
                                     path.dirname(chained.fromFile)));
                         const sel = _calleeSelectReceiverMethod(
                             index, call, symbols || [], chained.type, language,
-                            def.file, acceptsChainedDefinition);
+                            def.file, acceptsChainedDefinition, chained);
                         if (sel.match) {
                             const match = sel.match;
                             // A direct constructor expression fixes the
@@ -10100,6 +10131,7 @@ function getInstanceAttributeTypes(index, filePath, className) {
             const parser = getParser('python');
             const fileEntry = index.files.get(filePath);
             fileCache = langModule.findInstanceAttributeTypes(content, parser, {
+                tree: index._getParsedTree(filePath, content, 'python'),
                 resolveTypeAliasMembers(typeName) {
                     const owner = _resolveFlowTypeOrigin(
                         index, filePath, typeName);
@@ -13827,7 +13859,21 @@ function _resolveReceiverTypeIdentity(index, filePath, knownType, targetDefs, li
             const narrowest = Math.min(...inScope.map(width));
             const local = inScope.filter(d => width(d) === narrowest);
             if (local.length !== 1) return 'unknown';
-            return targetDefs.some(t => ownedBy(t, local[0])) ? 'target' : 'other';
+            if (targetDefs.some(t => ownedBy(t, local[0]))) return 'target';
+            // A local subclass names inherited members too. Resolve the
+            // first declaring class, including overriding members, before
+            // treating a different owner as an unrelated type. Type queries
+            // also use this helper and must keep exact definition identity.
+            if (targetDefs.length > 0 && targetDefs.every(t =>
+                t.className && !NON_CALLABLE_TYPES.has(t.type) && t.name === targetDefs[0].name)) {
+                const entry = classDefsNamed(index, knownType).entries.find(e => e.def === local[0]);
+                const declaring = entry && findDeclaringClass(index,
+                    { name: knownType, key: entry.key, def: entry.def },
+                    index.symbols.get(targetDefs[0].name) || []);
+                if (declaring?.uncertain) return 'unknown';
+                if (declaring && relationToTargets(index, declaring.ref, targetDefs) === 'same') return 'target';
+            }
+            return 'other';
         }
         typeDefs = typeDefs.filter(d => !_isFunctionLocalType(d));
         const relevant = targetDefs.filter(t => t.className === knownType);
@@ -14083,8 +14129,11 @@ function _resolveStructuralFlowTypeIdentity(index, originFile, knownType, target
         classDefsNamed(index, knownType).hasScoped) {
         const ref = _typeRefAt(index, originFile, knownType, site.line);
         if (!ref.key) return 'unknown';
-        const declaring = findDeclaringClass(index, ref, targetDefs);
-        if (declaring && !declaring.uncertain) return 'target';
+        const declaring = findDeclaringClass(index, ref,
+            index.symbols.get(targetDefs[0]?.name) || targetDefs);
+        if (declaring && !declaring.uncertain) {
+            return relationToTargets(index, declaring.ref, targetDefs) === 'same' ? 'target' : 'other';
+        }
         if (!declaring && relationToTargets(index, ref, targetDefs) === 'unrelated') return 'other';
         return 'unknown';
     }
@@ -15946,7 +15995,7 @@ function _calleeReceiverMethodGroup(index, symbols, typeName, language, contextF
     let ownerAmbiguous = false;
     while (frontier.length > 0 && hops++ < 32) {
         const next = [];
-        for (const { owner, context, line: at } of frontier) {
+        for (const { owner, context, line: at, ref: inheritedRef } of frontier) {
             if (!owner) continue;
             let declared = (symbols || []).filter(symbol =>
                 accepts(symbol) &&
@@ -15962,9 +16011,16 @@ function _calleeReceiverMethodGroup(index, symbols, typeName, language, contextF
             // class's nested type) are narrowed to the type the name denotes
             // where it is written; one that cannot be told apart makes the
             // group ambiguous, never a better-fitting overload's owner.
-            let ownerRef = null;
+            let ownerRef = inheritedRef || null;
             const named = classDefsNamed(index, owner);
-            if (!named.unique) {
+            if (ownerRef || (named.hasScoped && context && Number.isInteger(at))) {
+                ownerRef ||= resolveClassRef(index, owner, context, { line: at });
+                if (ownerRef?.key) {
+                    declared = declared.filter(symbol => ownerRefOf(index, symbol)?.key === ownerRef.key);
+                } else {
+                    ownerAmbiguous = true;
+                }
+            } else if (!named.unique) {
                 const ownerKeys = new Set(declared.map(symbol => ownerRefOf(index, symbol)?.key || null));
                 if (ownerKeys.size > 1) {
                     const ref = context
@@ -16002,8 +16058,14 @@ function _calleeReceiverMethodGroup(index, symbols, typeName, language, contextF
 
             const resolvedFile = ownerRef?.def?.file || index._resolveClassFile?.(owner, context) ||
                 context;
-            const parents = index._getInheritanceParents?.(owner, resolvedFile);
-            if (parents) next.push(...parents.map(parent => ({ owner: parent, context: resolvedFile })));
+            if (ownerRef?.key) {
+                next.push(...parentRefsOfClass(index, ownerRef).filter(parent => !parent.external)
+                    .map(parent => ({ owner: parent.name, context: parent.def?.file || resolvedFile,
+                        line: parent.def?.startLine, ref: parent })));
+            } else {
+                const parents = index._getInheritanceParents?.(owner, resolvedFile);
+                if (parents) next.push(...parents.map(parent => ({ owner: parent, context: resolvedFile })));
+            }
         }
         frontier = next;
     }
@@ -16014,7 +16076,7 @@ function _calleeReceiverMethodGroup(index, symbols, typeName, language, contextF
 }
 
 function _calleeSelectReceiverMethod(index, call, symbols, typeName, language,
-    contextFile, accepts = () => true) {
+    contextFile, accepts = () => true, typeOrigin = null) {
     if (language === 'java' || language === 'csharp') {
         return _calleeOverloadSelect(
             index,
@@ -16022,6 +16084,20 @@ function _calleeSelectReceiverMethod(index, call, symbols, typeName, language,
             _calleeReceiverMethodGroup(
                 index, symbols, typeName, language, contextFile, accepts, call?.line),
             language);
+    }
+    if (classDefsNamed(index, typeName).hasScoped) {
+        // A returned/field type is bound where it originated. Re-resolving
+        // its bare name at the consumer can pick an unrelated local class
+        // (or fail when the caller imported only its producer).
+        const origin = typeOrigin?.definition;
+        const ref = origin ? { name: typeName, key: classKeyOf(index, origin), def: origin }
+            : resolveClassRef(index, typeName, typeOrigin?.fromFile || contextFile,
+                { line: typeOrigin?.fromFile ? 0 : call?.line });
+        const declaring = ref.key && findDeclaringClass(index, ref, (symbols || []).filter(accepts));
+        if (!ref.key || declaring?.uncertain) return { ambiguous: true };
+        // Name lookup precedes arity: a local override hides its base even
+        // if its signature no longer accepts the call's arguments.
+        return _calleeOverloadSelect(index, call, declaring?.members || [], language);
     }
     const onOwner = owner => (symbols || []).filter(symbol =>
         accepts(symbol) &&
@@ -17947,6 +18023,12 @@ function _calleeTypeQualifiedReceiver(index, def, fileEntry, call, language) {
         ? allSymbols.filter(s => !candidateTypes.includes(s.className) || ownerFiles.has(s.file))
         : allSymbols).filter(s => siteArity == null || !candidateTypes.includes(s.className) ||
             (s.ownerTypeArity || 0) === siteArity);
+    if (language !== 'java' && language !== 'csharp' && classDefsNamed(index, receiver).hasScoped) {
+        const selected = _calleeSelectReceiverMethod(
+            index, call, symbols, receiver, language, def.file, isCallable);
+        return selected.match ? { match: selected.match, typeName: receiver }
+            : { unverified: selected.ambiguous ? 'overload-ambiguous' : 'uncertain-receiver' };
+    }
     if (language === 'java' || language === 'csharp') {
         // Class-qualified Java/C# calls see the compiler member group on the
         // qualifier. The helper handles inherited slots and C# name hiding.
@@ -24576,6 +24658,81 @@ function _returnedCallRecord(ctx, start, end, current) {
     return matches.length === 1 ? matches[0] : null;
 }
 
+// Parsed trees are immutable and held by the index's bounded tree cache.
+// Keep lexical facts with that tree across queries; replacement/eviction
+// naturally retires them without retaining source files or index instances.
+const _localClassBindingMemos = new WeakMap();
+
+/** A local constructor must name the class binding, not a parameter or
+ * assignment that shadows a same-named class in its lexical scope. */
+function _localClassReferenceBinds(index, fileEntry, file, start, name, definition) {
+    if (!Number.isInteger(start)) return false;
+    let ownedTree;
+    try {
+        const content = index._readFile(file);
+        const tree = index._getParsedTree(file, content, fileEntry.language) ||
+            (ownedTree = require('../languages').safeParse(getParser(fileEntry.language), content));
+        if (!tree) return false;
+        let memo = _localClassBindingMemos.get(tree);
+        if (!memo) {
+            memo = { scopes: new Map(), bindings: new Map() };
+            _localClassBindingMemos.set(tree, memo);
+        }
+        const key = `${start}:${name}:${definition.nameLine || definition.startLine}`;
+        if (memo.bindings.has(key)) return memo.bindings.get(key);
+        const finish = value => { memo.bindings.set(key, value); return value; };
+        let node = tree?.rootNode.descendantForIndex(start);
+        if (node?.text !== name) {
+            for (let owner = node?.parent; owner && owner.startIndex === start; owner = owner.parent) {
+                const value = owner.childForFieldName('right') || owner.childForFieldName('value');
+                if (value?.type === 'call' || value?.type === 'new_expression') {
+                    node = value.childForFieldName('function') || value.childForFieldName('constructor');
+                    break;
+                }
+            }
+        }
+        // A constructor's evidence begins at `new`, while a bare Python
+        // call or static qualifier begins at the identifier itself.
+        if (node?.type === 'new') node = node.parent?.childForFieldName('constructor');
+        if (node?.text !== name && ['attribute', 'member_expression'].includes(node?.parent?.type)) {
+            node = node.parent.childForFieldName('object');
+        }
+        if (!node || node.text !== name) return finish(false);
+        const scope = require('../languages/lexical-scope').referenceScope(
+            node, fileEntry.language, memo.scopes, name, { includeClasses: true });
+        return finish(scope?.defRows?.length === 1 &&
+            scope.defRows[0] + 1 === (definition.nameLine || definition.startLine));
+    } finally {
+        ownedTree?.delete?.();
+    }
+}
+
+function _localConstructorBinding(index, fileEntry, file, record, definition) {
+    return _localClassReferenceBinds(index, fileEntry, file,
+        record.callSite?.start, record.name, definition);
+}
+
+/** Syntax such as `new Local().m()` or `Local.m()` names the local class
+ * only when its identifier still binds that declaration. A nearer parameter
+ * or assignment can replace the constructor value without declaring a type. */
+function _unprovenLocalClassReceiver(index, fileEntry, file, call) {
+    if (!call.isMethod || call.receiverTypeQualifier) return false;
+    const constructed = call.receiverTypeSource === 'constructor';
+    const name = constructed ? call.receiverType : !call.receiverType && call.receiver;
+    if (!name) return false;
+    const local = _functionLocalTypeInScope(index, file, name,
+        constructed ? call.receiverTypeEvidence?.line || call.line : call.line);
+    if (!local) return false;
+    const start = constructed ? call.receiverTypeEvidence?.start : call.callSite?.start ?? call.callStart;
+    if (_localClassReferenceBinds(index, fileEntry, file, start, name, local)) return null;
+    // Neither the type name nor the qualifier spelling is a declaration
+    // witness once a value binding shadows it. Do not attach that false
+    // proof to the unverified entry either.
+    return { ...call, receiver: undefined, receiverType: undefined,
+        receiverTypeSource: undefined, receiverTypeEvidence: undefined,
+        receiverTypeFlowFile: undefined, receiverIsTypeQualified: undefined };
+}
+
 function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, consumerAwaited) {
     const language = fileEntry.language;
     const traits = langTraits(language);
@@ -24604,9 +24761,15 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
             IDENTITY_TYPE_KINDS.has(definition.type) && definition.file);
         const callableDefs = named.filter(definition =>
             !NON_CALLABLE_TYPES.has(definition.type));
-        if (typeDefs.length === 1 && callableDefs.length === 0) {
-            const origin = _resolveFlowTypeOrigin(index, filePath, name);
-            if (origin?.fromFile === typeDefs[0].file) {
+        const local = _functionLocalTypeInScope(index, filePath, name, record.line);
+        if (local) {
+            return _localConstructorBinding(index, fileEntry, filePath, record, local)
+                ? { type: name, fromFile: filePath, definition: local, exactConstructor: true } : null;
+        }
+        const moduleTypes = typeDefs.filter(definition => !_isFunctionLocalType(definition));
+        if (!record.localShadow && moduleTypes.length === 1 && callableDefs.length === 0) {
+            const origin = _resolveFlowTypeOrigin(index, filePath, name, undefined, record.line);
+            if (origin?.fromFile === moduleTypes[0].file) {
                 return { type: name, fromFile: origin.fromFile,
                     exactConstructor: true };
             }
@@ -25128,6 +25291,9 @@ function _foldChainedReceiverType(index, fileEntry, filePath, call, ctx) {
         }),
         ...(fromFiles.size === 1 && results[0].fromFile && {
             fromFile: results[0].fromFile,
+        }),
+        ...(results[0].definition && results.every(r => r.definition === results[0].definition) && {
+            definition: results[0].definition,
         }),
         ...(results.every(r => r.exactConstructor) && {
             exactConstructor: true,

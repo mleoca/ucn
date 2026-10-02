@@ -150,7 +150,7 @@ function pyCaptureNames(pattern, out) {
  * Bindings of `name` in one Python function/class body (not nested scopes,
  * but walrus targets inside comprehensions bind here).
  */
-function pyScopeBindings(scopeNode, body, name, isFunction) {
+function pyScopeBindings(scopeNode, body, name, isFunction, includeClasses = false) {
     const info = { bound: false, defRows: [], other: false, import: false,
         global: false, nonlocal: false, starImport: false };
     const note = (node, kind) => {
@@ -180,7 +180,7 @@ function pyScopeBindings(scopeNode, body, name, isFunction) {
                 }
                 return false;
             case 'class_definition':
-                note(node.childForFieldName('name'), 'binding');
+                note(node.childForFieldName('name'), includeClasses ? 'def' : 'binding');
                 return false;
             case 'lambda':
                 scanWalrus(node.childForFieldName('parameters'));
@@ -296,7 +296,7 @@ function pyVerdict(info) {
     return { local: true, defRows: info.defRows.slice() };
 }
 
-function pythonReferenceScope(node, name, memo) {
+function pythonReferenceScope(node, name, memo, includeClasses) {
     const parent = node.parent;
     if (!parent) return 'unknown';
     if (parent.type === 'keyword_argument' && sameNode(parent.childForFieldName('name'), node)) return 'none';
@@ -310,7 +310,7 @@ function pythonReferenceScope(node, name, memo) {
             case 'function_definition': {
                 const body = scope.childForFieldName('body');
                 if (!sameNode(body, child)) continue; // defaults, annotations: enclosing scope
-                const info = memoGet(memo, scope, name, () => pyScopeBindings(scope, body, name, true));
+                const info = memoGet(memo, scope, name, () => pyScopeBindings(scope, body, name, true, includeClasses));
                 if (info.starImport) return 'unknown';
                 if (info.global) {
                     // A function that assigns a `global` name rebinds the module
@@ -338,7 +338,7 @@ function pythonReferenceScope(node, name, memo) {
                 const body = scope.childForFieldName('body');
                 if (!sameNode(body, child)) continue; // bases, keywords: enclosing scope
                 if (crossedFunction) continue; // methods do not see the class body
-                const info = memoGet(memo, scope, name, () => pyScopeBindings(scope, body, name, false));
+                const info = memoGet(memo, scope, name, () => pyScopeBindings(scope, body, name, false, includeClasses));
                 // A class body reads its own dict first and falls back to
                 // globals, in statement order: a name it also binds is unknown.
                 if (info.bound || info.starImport) return 'unknown';
@@ -400,7 +400,7 @@ function jsPatternNames(pattern, out) {
     }
 }
 
-function jsDeclarationNames(statement, name, note) {
+function jsDeclarationNames(statement, name, note, includeClasses) {
     let decl = statement;
     if (decl.type === 'export_statement') decl = decl.childForFieldName('declaration') || decl;
     switch (decl.type) {
@@ -408,6 +408,10 @@ function jsDeclarationNames(statement, name, note) {
             if (decl.childForFieldName('name')?.text === name) note(decl.childForFieldName('name'), 'def');
             return;
         case 'class_declaration': case 'abstract_class_declaration':
+            if (decl.childForFieldName('name')?.text === name) {
+                note(decl.childForFieldName('name'), includeClasses ? 'def' : 'binding');
+            }
+            return;
         case 'enum_declaration': case 'internal_module': case 'module':
             if (decl.childForFieldName('name')?.text === name) note(decl.childForFieldName('name'), 'binding');
             return;
@@ -425,7 +429,8 @@ function jsDeclarationNames(statement, name, note) {
                     const fnValue = nameNode?.type === 'identifier' && value &&
                         (value.type === 'arrow_function' || value.type === 'function_expression' ||
                             value.type === 'function');
-                    note(n, fnValue ? 'def' : 'binding');
+                    const classValue = includeClasses && nameNode?.type === 'identifier' && value?.type === 'class';
+                    note(n, fnValue || classValue ? 'def' : 'binding');
                 }
             }
             return;
@@ -442,7 +447,7 @@ function jsDeclarationNames(statement, name, note) {
     }
 }
 
-function jsBlockBindings(block, name) {
+function jsBlockBindings(block, name, includeClasses) {
     const info = { bound: false, defRows: [], other: false, import: false };
     const note = (node, kind) => {
         if (!node || node.text !== name) return;
@@ -454,7 +459,25 @@ function jsBlockBindings(block, name) {
     const statements = block.type === 'switch_body'
         ? namedChildrenOf(block).flatMap(c => namedChildrenOf(c))
         : namedChildrenOf(block);
-    for (const statement of statements) jsDeclarationNames(statement, name, note);
+    for (const statement of statements) jsDeclarationNames(statement, name, note, includeClasses);
+    if (includeClasses) {
+        // A class declaration is a mutable value binding in JavaScript.
+        // Reassignment prevents using its declaration as constructor proof.
+        // Ordinary scope queries still report only lexical declarations.
+        traverseTree(block, node => {
+            if (!sameNode(node, block) && (JS_FUNCTIONS.has(node.type) ||
+                node.type === 'class_body')) return false;
+            const target = ['assignment_expression', 'augmented_assignment_expression'].includes(node.type)
+                ? node.childForFieldName('left')
+                : node.type === 'update_expression' ? node.childForFieldName('argument') : null;
+            if (target) {
+                const names = [];
+                jsPatternNames(target, names);
+                for (const n of names) note(n, 'binding');
+            }
+            return true;
+        });
+    }
     return info;
 }
 
@@ -513,7 +536,7 @@ function jsVerdict(info) {
     return { local: true, defRows: info.defRows.slice() };
 }
 
-function jsReferenceScope(node, name, memo) {
+function jsReferenceScope(node, name, memo, includeClasses) {
     if (node.type !== 'identifier' && node.type !== 'shorthand_property_identifier') {
         // Keys, member properties and type names are not variable
         // references. Object shorthand `{ name }` is both key and value:
@@ -552,7 +575,7 @@ function jsReferenceScope(node, name, memo) {
             // The class name is bound inside its own body.
             const own = scope.childForFieldName('name');
             if (own?.text === name && sameNode(scope.childForFieldName('body'), child)) {
-                return { local: true, defRows: null };
+                return { local: true, defRows: includeClasses ? [own.startPosition.row] : null };
             }
             continue;
         }
@@ -576,7 +599,7 @@ function jsReferenceScope(node, name, memo) {
         }
         if (scope.type === 'program') return 'module';
         if (JS_BLOCKS.has(scope.type)) {
-            const info = memoGet(memo, scope, name, () => jsBlockBindings(scope, name));
+            const info = memoGet(memo, scope, name, () => jsBlockBindings(scope, name, includeClasses));
             if (info.bound) return jsVerdict(info);
             continue;
         }
@@ -1144,14 +1167,22 @@ function rustSelfFieldBinding(identNode) {
  * `memo` is a Map shared by the references of one name in one tree.
  * An explicit `name` asks about a binding in a container node's scope,
  * for example the root of a qualified type in a Python string annotation.
+ * `includeClasses` exposes class declaration rows for constructor lookup;
+ * ordinary references retain their function-only definition rows.
  */
-function referenceScope(node, language, memo = new Map(), name = node?.text) {
+function referenceScope(node, language, memo = new Map(), name = node?.text, options = {}) {
     const family = familyOf(language);
     if (!family || !node) return null;
     try {
+        const includeClasses = options.includeClasses === true;
+        if (includeClasses) {
+            let classMemo = memo.get('class-definitions');
+            if (!classMemo) { classMemo = new Map(); memo.set('class-definitions', classMemo); }
+            memo = classMemo;
+        }
         switch (family) {
-            case 'python': return pythonReferenceScope(node, name, memo);
-            case 'js': return jsReferenceScope(node, name, memo);
+            case 'python': return pythonReferenceScope(node, name, memo, includeClasses);
+            case 'js': return jsReferenceScope(node, name, memo, includeClasses);
             case 'go': return goReferenceScope(node, name, memo);
             case 'rust': return rustReferenceScope(node, name, memo);
             case 'c': return cReferenceScope(node, name);

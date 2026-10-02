@@ -18,6 +18,308 @@ const { execute } = require('../core/execute');
 const { computeReachability } = require('../core/entrypoints');
 const { tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR, runCli, runInteractive } = require('./helpers');
 
+describe('fix #398: local subclasses resolve inherited static members by definition', () => {
+    const cases = [
+        ['py', [
+            'class Base:', '    @classmethod', '    def ping(cls): return 1',
+            'class Other:', '    @classmethod', '    def ping(cls): return 2',
+            'def first():', '    class Local(Base): pass', '    return Local.ping()',
+            'def second():', '    class Local(Other): pass', '    return Local.ping()',
+            'def third():', '    class Local(Base):', '        @classmethod',
+            '        def ping(cls, extra=0): return 3', '    return Local.ping()',
+        ]],
+        ...['js', 'ts', 'tsx'].map(ext => [ext, [
+            'class Base { static ping() { return 1 } }',
+            'class Other { static ping() { return 2 } }',
+            'function first() {', '  class Local extends Base {}', '  return Local.ping()', '}',
+            'function second() {', '  class Local extends Other {}', '  return Local.ping()', '}',
+            'function third() {', '  class Local extends Base { static ping(extra = 0) { return 3 } }',
+            '  return Local.ping()', '}',
+        ]]),
+        ['java', [
+            'class Base { static int ping() { return 1; } }',
+            'class Other { static int ping() { return 2; } }',
+            'class Use {',
+            '  int first() {', '    class Local extends Base {}', '    return Local.ping();', '  }',
+            '  int second() {', '    class Local extends Other {}', '    return Local.ping();', '  }',
+            '  int third() {', '    class Local extends Base { static int ping() { return 3; } }',
+            '    return Local.ping();', '  }', '}',
+        ]],
+        ['cpp', [
+            'struct Base { static int ping() { return 1; } };',
+            'struct Other { static int ping() { return 2; } };',
+            'int first() {', '  struct Local : Base {};', '  return Local::ping();', '}',
+            'int second() {', '  struct Local : Other {};', '  return Local::ping();', '}',
+            'int third() {', '  struct Local : Base { static int ping() { return 3; } };',
+            '  return Local::ping();', '}',
+        ]],
+    ];
+    for (const [ext, lines] of cases) {
+        it(`${ext}: distinguishes inherited, unrelated and overriding local members`, () => {
+            const file = `source.${ext}`;
+            const dir = tmp({ [file]: lines.join('\n') + '\n' });
+            try {
+                const index = idx(dir);
+                for (const [owner, caller] of [['Base', 'first'], ['Other', 'second'], ['Local', 'third']]) {
+                    const def = index.symbols.get('ping').find(d => d.className === owner);
+                    assert.ok(def, owner);
+                    const result = execute(index, 'context', { name: `${file}:${def.startLine}:ping` });
+                    assert.ok(result.ok, JSON.stringify(result.error));
+                    assert.deepEqual(result.result.callers.map(c => c.callerName), [caller],
+                        `${owner}: ${JSON.stringify(result.result.callers)}`);
+                    assert.equal(result.result.meta.account.conserved, true);
+                    const called = execute(index, 'context', { name: caller });
+                    assert.ok(called.ok, JSON.stringify(called.error));
+                    assert.deepEqual(called.result.callees.filter(c => c.name === 'ping')
+                        .map(c => c.className), [owner], `${caller} callee`);
+                }
+            } finally { rm(dir); }
+        });
+    }
+});
+
+describe('fix #398: local constructor chains retain lexical class identity', () => {
+    for (const ext of ['py', 'js', 'ts', 'tsx']) {
+        it(`${ext}: separates same-named constructors, overrides and shadowed bindings`, () => {
+            const lines = ext === 'py' ? [
+                'class Base:', '    def ping(self): return 1',
+                'class Other:', '    def ping(self): return 2',
+                'class Local(Base): pass',
+                'def module_use(): return Local().ping()',
+                'def first():', '    class Local(Base): pass', '    return Local().ping()',
+                'def second():', '    class Local(Other): pass', '    return Local().ping()',
+                'def third():', '    class Local(Base):', '        def ping(self, extra=0): return 3',
+                '    return Local().ping()',
+                'def shadows():', '    class Local(Base): pass',
+                '    def parameter(Local): return Local().ping()',
+                '    def assignment(factory):', '        Local = factory', '        return Local().ping()',
+                '    return parameter, assignment',
+                'def rebound(factory):', '    class Local(Base): pass',
+                '    Local = factory', '    return Local().ping()',
+            ] : [
+                'class Base { ping() { return 1 } }',
+                'class Other { ping() { return 2 } }',
+                'class Local extends Base {}',
+                'function module_use() { return new Local().ping() }',
+                'function first() {', '  class Local extends Base {}', '  return new Local().ping()', '}',
+                'function second() {', '  class Local extends Other {}', '  return new Local().ping()', '}',
+                'function third() {', '  class Local extends Base { ping(extra = 0) { return 3 } }',
+                '  return new Local().ping()', '}',
+                'function shadows() {', '  class Local extends Base {}',
+                '  function parameter(Local) { return new Local().ping() }',
+                '  function assignment(factory) {', '    const Local = factory;',
+                '    return new Local().ping()', '  }', '  return [parameter, assignment]', '}',
+                'function rebound(factory) {', '  class Local extends Base {}',
+                '  Local = factory;', '  return new Local().ping()', '}',
+            ];
+            const file = `source.${ext}`;
+            const dir = tmp({ [file]: lines.join('\n') + '\n' });
+            try {
+                const index = idx(dir);
+                for (const [owner, callers] of [
+                    ['Base', ['module_use', 'first']], ['Other', ['second']], ['Local', ['third']],
+                ]) {
+                    const def = index.symbols.get('ping').find(d => d.className === owner);
+                    const result = execute(index, 'context', { name: `${file}:${def.startLine}:ping` });
+                    assert.ok(result.ok, JSON.stringify(result.error));
+                    assert.deepEqual(result.result.callers.map(c => c.callerName), callers, owner);
+                    assert.equal(result.result.meta.account.conserved, true);
+                    for (const caller of callers) {
+                        const called = execute(index, 'context', { name: caller });
+                        assert.ok(called.ok, JSON.stringify(called.error));
+                        assert.deepEqual(called.result.callees.filter(c => c.name === 'ping')
+                            .map(c => c.className), [owner], `${caller} callee`);
+                    }
+                    for (const line of lines.map((text, i) => /Local\(\)\.ping/.test(text) ? i + 1 : 0)
+                        .filter(line => line > lines.findIndex(text => text.includes('function shadows') ||
+                            text.includes('def shadows')))) {
+                        assert.ok(result.result.unverifiedCallers.some(c => c.line === line),
+                            `${owner}: shadowed constructor at ${line} must remain visible`);
+                    }
+                }
+                for (const caller of ['parameter', 'assignment', 'rebound']) {
+                    const called = execute(index, 'context', { name: caller });
+                    assert.ok(called.ok, JSON.stringify(called.error));
+                    assert.ok(!called.result.callees.some(c => c.name === 'ping'), caller);
+                    assert.ok(called.result.unverifiedCallees.some(c => c.name === 'ping'), caller);
+                }
+            } finally { rm(dir); }
+        });
+    }
+});
+
+describe('fix #398: returned class identities keep their defining scope', () => {
+    const cases = [
+        ['py', {
+            'lib.py': 'class Box:\n    def ping(self): return 1\ndef make() -> Box: return Box()\n',
+            'use.py': 'from lib import make\ndef use():\n    class Box:\n        def ping(self): return 2\n    return make().ping()\n',
+        }],
+        ...['js', 'ts', 'tsx'].map(ext => [ext, {
+            [`lib.${ext}`]: 'export class Box { ping() { return 1 } }\n' +
+                (ext === 'js' ? '/** @returns {Box} */\nexport function make() { return new Box() }\n'
+                    : 'export function make(): Box { return new Box() }\n'),
+            [`use.${ext}`]: "import { make } from './lib';\n" +
+                'function use() {\n  class Box { ping() { return 2 } }\n' +
+                '  return make().ping()\n}\n',
+        }]),
+        ['rs', {
+            'lib.rs': 'pub mod model;\nfn use_it() -> i32 {\n    struct Box;\n' +
+                '    impl Box { fn ping(&self) -> i32 { 2 } }\n    model::make().ping()\n}\n',
+            'model.rs': 'pub struct Box;\nimpl Box { pub fn ping(&self) -> i32 { 1 } }\n' +
+                'pub fn make() -> Box { Box }\n',
+        }],
+    ];
+    for (const [ext, files] of cases) {
+        it(`${ext}: a local namesake cannot replace the producer's returned type`, () => {
+            const dir = tmp(files);
+            try {
+                const index = idx(dir);
+                const result = execute(index, 'context', { name: ext === 'rs' ? 'use_it' : 'use' });
+                assert.ok(result.ok, JSON.stringify(result.error));
+                assert.deepEqual(result.result.callees.filter(c => c.name === 'ping')
+                    .map(c => c.relativePath), [ext === 'rs' ? 'model.rs' : `lib.${ext}`]);
+            } finally { rm(dir); }
+        });
+    }
+});
+
+describe('fix #398: Python field ownership survives parsed-tree reuse', () => {
+    it('keeps setup-method assignments and rejects writes from nested functions', () => {
+        const source = [
+            'class Service:', '    def ping(self): return 1',
+            'class Case:', '    def setup_method(self):', '        self.client = Service()',
+            '    def use(self):', '        return self.client.ping()',
+            'class Unknown:', '    def setup_method(self):', '        self.client = Service()',
+            '        def replace(): self.client = factory()',
+            '    def use_unknown(self):', '        return self.client.ping()',
+        ].join('\n') + '\n';
+        const { getParser, safeParse } = require('../languages');
+        const { findInstanceAttributeTypes } = require('../languages/python');
+        const parser = getParser('python');
+        const tree = safeParse(parser, source);
+        const dir = tmp({ 'source.py': source });
+        try {
+            for (const options of [{}, { tree }]) {
+                const fields = findInstanceAttributeTypes(source, parser, options);
+                assert.equal(fields.get('Case')?.get('client'), 'Service');
+                assert.equal(fields.get('Unknown')?.get('client'), undefined);
+            }
+            const index = idx(dir);
+            const result = execute(index, 'context', { name: 'ping' });
+            assert.ok(result.ok, JSON.stringify(result.error));
+            assert.deepEqual(result.result.callers.map(c => c.callerName), ['use']);
+            assert.ok(result.result.unverifiedCallers.some(c => c.callerName === 'use_unknown'));
+        } finally { tree.delete?.(); rm(dir); }
+    });
+});
+
+describe('fix #398: local class qualifiers require their own binding', () => {
+    for (const ext of ['py', 'js', 'ts', 'tsx']) {
+        it(`${ext}: a factory declared inside the class body is a distinct binding`, () => {
+            const code = ext === 'py' ? [
+                'def outer():', '    class Local:',
+                '        def ping(self): return 1',
+                '        @staticmethod', '        def use():',
+                '            def Local(): return factory()',
+                '            return Local().ping()',
+                '    return Local',
+            ] : [
+                'function outer() {', '  class Local {', '    ping() { return 1 }',
+                '    static use() {', '      function Local() { return factory() }',
+                '      return new Local().ping()', '    }', '  }', '  return Local', '}',
+            ];
+            const dir = tmp({ [`source.${ext}`]: code.join('\n') + '\n' });
+            try {
+                const index = idx(dir);
+                const result = execute(index, 'context', { name: 'ping', className: 'Local' });
+                assert.ok(result.ok, JSON.stringify(result.error));
+                assert.deepEqual(result.result.callers, []);
+                assert.equal(result.result.unverifiedCallers.length, 1);
+                const called = execute(index, 'context', { name: 'use', className: 'Local' });
+                assert.ok(called.ok, JSON.stringify(called.error));
+                assert.ok(!called.result.callees.some(c => c.name === 'ping'));
+                assert.ok(called.result.unverifiedCallees.some(c => c.name === 'ping'));
+            } finally { rm(dir); }
+        });
+        it(`${ext}: closures see the class but parameters and assignments do not prove it`, () => {
+            const code = ext === 'py' ? [
+                'class Base:', '    @classmethod', '    def ping(cls): return 1',
+                'def outer():', '    class Local(Base): pass',
+                '    def closure(): return Local.ping()',
+                '    def parameter(Local): return Local.ping()',
+                '    def assignment(factory):', '        Local = factory', '        return Local.ping()',
+                '    return closure, parameter, assignment',
+                'def rebound(factory):', '    class Local(Base): pass',
+                '    Local = factory', '    return Local.ping()',
+            ] : [
+                'class Base { static ping() { return 1 } }',
+                'function outer() {', '  class Local extends Base {}',
+                '  function closure() { return Local.ping() }',
+                '  function parameter(Local) { return Local.ping() }',
+                '  function assignment(factory) { const Local = factory; return Local.ping() }',
+                '  return [closure, parameter, assignment]', '}',
+                'function rebound(factory) {', '  class Local extends Base {}',
+                '  Local = factory;', '  return Local.ping()', '}',
+            ];
+            const dir = tmp({ [`source.${ext}`]: code.join('\n') + '\n' });
+            try {
+                const index = idx(dir);
+                const result = execute(index, 'context', { name: 'ping', className: 'Base' });
+                assert.ok(result.ok, JSON.stringify(result.error));
+                assert.deepEqual(result.result.callers.map(c => c.callerName), ['closure']);
+                assert.deepEqual(result.result.unverifiedCallers.map(c => c.callerName),
+                    ['parameter', 'assignment', 'rebound']);
+                for (const name of ['closure', 'parameter', 'assignment', 'rebound']) {
+                    const called = execute(index, 'context', { name });
+                    assert.ok(called.ok, JSON.stringify(called.error));
+                    assert.equal(called.result.callees.some(c => c.name === 'ping'), name === 'closure', name);
+                    assert.equal(called.result.unverifiedCallees.some(c => c.name === 'ping'), name !== 'closure', name);
+                }
+            } finally { rm(dir); }
+        });
+    }
+    it('isolates class-inclusive lexical memo entries from ordinary function binding queries', () => {
+        const { getParser, safeParse } = require('../languages');
+        const { referenceScope } = require('../languages/lexical-scope');
+        for (const [language, source] of [
+            ['python', 'def outer():\n    class Local: pass\n    return Local()\n'],
+            ['javascript', 'function outer() {\n  class Local {}\n  return new Local()\n}\n'],
+        ]) {
+            const tree = safeParse(getParser(language), source);
+            try {
+                const node = tree.rootNode.descendantForIndex(source.lastIndexOf('Local'));
+                for (const first of [true, false]) {
+                    const memo = new Map();
+                    for (const includeClasses of [first, !first, first]) {
+                        assert.deepEqual(referenceScope(node, language, memo, 'Local', { includeClasses }),
+                            { local: true, defRows: includeClasses ? [1] : null });
+                    }
+                }
+            } finally { tree.delete?.(); }
+        }
+    });
+    it('invalidates constructor binding proofs after a file is rebuilt', () => {
+        const source = 'def outer(factory):\n    class Local:\n        def ping(self): return 1\n' +
+            '    # reassignment\n    return Local().ping()\n';
+        const dir = tmp({ 'source.py': source });
+        try {
+            const index = idx(dir);
+            const run = () => execute(index, 'context', { name: 'ping' }).result;
+            for (let repeat = 0; repeat < 2; repeat++) assert.equal(run().callers.length, 1);
+            fs.writeFileSync(path.join(dir, 'source.py'), source.replace('# reassignment', 'Local = factory'));
+            index.build(null, { quiet: true });
+            for (let repeat = 0; repeat < 2; repeat++) {
+                const result = run();
+                assert.equal(result.callers.length, 0);
+                assert.equal(result.unverifiedCallers.length, 1);
+            }
+            fs.writeFileSync(path.join(dir, 'source.py'), source);
+            index.build(null, { quiet: true });
+            assert.equal(run().callers.length, 1);
+        } finally { rm(dir); }
+    });
+});
+
 describe('Bug: stats symbol count consistency', () => {
     it('total symbols should equal sum of type counts', () => {
         const index = idx(FIXTURES_PATH + '/javascript');

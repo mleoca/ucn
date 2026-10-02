@@ -1090,6 +1090,12 @@ function enclosingPythonClassName(node) {
     return null;
 }
 
+const FIELD_CONTRACT_VALUE_NODES = new Set([
+    'call', 'attribute', 'subscript', 'binary_operator', 'boolean_operator',
+    'comparison_operator', 'list', 'dictionary', 'set', 'tuple', 'string',
+    'concatenated_string', 'parameters', 'decorator',
+]);
+
 function explicitInstanceFieldContracts(tree, parser) {
     const result = new Map();
     const parseCommentType = comment => {
@@ -1103,16 +1109,20 @@ function explicitInstanceFieldContracts(tree, parser) {
         const assignment = statement?.namedChild(0);
         return assignment?.childForFieldName('type') || null;
     };
-    traverseTreeCached(tree.rootNode, node => {
+    traverseTree(tree.rootNode, node => {
+        // Only statements can declare an annotated instance field. Value
+        // expressions and parameter/default/decorator trees contain no
+        // such statements, so do not materialize all their descendants.
+        if (FIELD_CONTRACT_VALUE_NODES.has(node.type)) return false;
         if (node.type !== 'expression_statement') return true;
         const assignment = node.namedChild(0);
-        if (assignment?.type !== 'assignment') return true;
+        if (assignment?.type !== 'assignment') return false;
         const left = assignment.childForFieldName('left');
         if (left?.type !== 'attribute' ||
-            left.childForFieldName('object')?.text !== 'self') return true;
+            left.childForFieldName('object')?.text !== 'self') return false;
         const field = left.childForFieldName('attribute')?.text;
         const className = enclosingPythonClassName(node);
-        if (!field || !className) return true;
+        if (!field || !className) return false;
         let typeNode = assignment.childForFieldName('type');
         if (!typeNode) {
             const parent = node.parent;
@@ -1125,16 +1135,16 @@ function explicitInstanceFieldContracts(tree, parser) {
                 }
             }
         }
-        if (!typeNode) return true;
+        if (!typeNode) return false;
         const type = typeNameFromAnnotation(typeNode);
         const itemTypes = iterableBindingTypes(typeNode);
-        if (!type && itemTypes.length === 0) return true;
+        if (!type && itemTypes.length === 0) return false;
         if (!result.has(className)) result.set(className, new Map());
         result.get(className).set(field, {
             ...(type && { type }),
             ...(itemTypes.length > 0 && { itemTypes }),
         });
-        return true;
+        return false;
     });
     return result;
 }
@@ -3935,7 +3945,7 @@ function findUsagesInCode(code, name, parser, tree, options = {}) {
  * @returns {Map<string, Map<string, string>>} className -> (attrName -> typeName)
  */
 function findInstanceAttributeTypes(code, parser, options = {}) {
-    const tree = parseTree(parser, code);
+    const tree = options.tree || parseTree(parser, code);
     const result = new Map(); // className -> Map(attrName -> typeName)
     const explicitContracts = explicitInstanceFieldContracts(tree, parser);
 
@@ -3985,8 +3995,10 @@ function findInstanceAttributeTypes(code, parser, options = {}) {
         return valueType === narrowedTypes[0] ? valueType : null;
     };
 
-    traverseTreeCached(tree.rootNode, (node) => {
-        if (node.type !== 'class_definition') return true;
+    traverseTree(tree.rootNode, (node) => {
+        if (node.type !== 'class_definition') {
+            return node.type !== 'expression_statement' && !FIELD_CONTRACT_VALUE_NODES.has(node.type);
+        }
 
         const classNameNode = node.childForFieldName('name');
         if (!classNameNode) return true;
@@ -4208,7 +4220,7 @@ function findInstanceAttributeTypes(code, parser, options = {}) {
                 if (!field) return true;
                 let enclosing = assignment.parent;
                 while (enclosing && !['function_definition', 'lambda', 'class_definition'].includes(enclosing.type)) enclosing = enclosing.parent;
-                if (assignment.type !== 'assignment' || enclosing !== member) {
+                if (assignment.type !== 'assignment' || !sameNode(enclosing, member)) {
                     invalidRuntimeFields.add(field);
                     return true;
                 }
@@ -4400,8 +4412,8 @@ function isEntryPoint(symbol) {
 /** Module-level pytest declarations. Decorator ownership is resolved by the
  * index; a decorator merely spelled `fixture` is not sufficient evidence.
  */
-function findPythonModuleEvidence(code, parser) {
-    const tree = parseTree(parser, code), references = [], wildcards = [];
+function findPythonModuleEvidence(code, parser, parsedTree) {
+    const tree = parsedTree || parseTree(parser, code), references = [], wildcards = [];
     traverseTree(tree.rootNode, node => {
         if (node.type === 'identifier' && node.text === '__all__') references.push(node);
         if (node.type === 'import_from_statement' && node.namedChildren.some(child => child.type === 'wildcard_import')) {
@@ -4414,7 +4426,7 @@ function findPythonModuleEvidence(code, parser) {
     let exports = null;
     if (references.length === 1) {
         const name = references[0], assignment = name.parent, value = assignment.childForFieldName('right');
-        if (assignment.type === 'assignment' && assignment.childForFieldName('left') === name &&
+        if (assignment.type === 'assignment' && sameNode(assignment.childForFieldName('left'), name) &&
             assignment.parent?.parent?.type === 'module' && ['list', 'tuple'].includes(value?.type)) {
             const literals = value.namedChildren.map(item => {
                 const content = item.type === 'string' && item.namedChildren.find(child => child.type === 'string_content');
@@ -4428,8 +4440,8 @@ function findPythonModuleEvidence(code, parser) {
     return { exports, wildcards };
 }
 
-function findPytestFunctions(code, parser) {
-    const tree = parseTree(parser, code);
+function findPytestFunctions(code, parser, parsedTree) {
+    const tree = parsedTree || parseTree(parser, code);
     const pathOf = node => {
         if (node?.type === 'identifier') return [node.text];
         if (node?.type !== 'attribute') return null;

@@ -12,7 +12,9 @@ function moduleEvidence(index, file) {
     if (entry?.language !== 'python') return null;
     const cached = moduleMetadata.get(entry);
     if (cached?.hash === entry.hash) return cached.value;
-    const value = getLanguageAdapter('python').findPythonModuleEvidence(index._readFile(file), getParser('python'));
+    const content = index._readFile(file);
+    const value = getLanguageAdapter('python').findPythonModuleEvidence(content, getParser('python'),
+        index._getParsedTree(file, content, 'python'));
     moduleMetadata.set(entry, { hash: entry.hash, value });
     return value;
 }
@@ -59,7 +61,9 @@ function functionsIn(index, file) {
     if (entry?.language !== 'python') return [];
     const cached = metadata.get(entry);
     if (cached?.hash === entry.hash) return cached.functions;
-    const functions = getLanguageAdapter('python').findPytestFunctions(index._readFile(file), getParser('python'));
+    const content = index._readFile(file);
+    const functions = getLanguageAdapter('python').findPytestFunctions(content, getParser('python'),
+        index._getParsedTree(file, content, 'python'));
     metadata.set(entry, { hash: entry.hash, functions });
     return functions;
 }
@@ -87,6 +91,16 @@ function pythonFixtureReceiver(index, file, call, options) {
     const receiver = call.receiver || call.receiverRoot;
     if (!receiver || call.receiverType || call.receiverRootType ||
         call.receiverFlowInvalidated || !/^test_.*\.py$|^.*_test\.py$/.test(path.basename(file))) return null;
+    // Only a module test parameter can satisfy the proof below. Use the
+    // indexed declaration to reject other receivers before parsing every
+    // fixture and test body in this file.
+    const enclosing = call.enclosingFunction;
+    if (!enclosing?.name?.startsWith('test_') ||
+        !(index.symbols.get(enclosing.name) || []).some(definition =>
+            definition.file === file && !definition.className && !definition.isNested &&
+            definition.startLine === enclosing.startLine &&
+            (!Array.isArray(definition.paramsStructured) ||
+                definition.paramsStructured.some(parameter => parameter.name === receiver)))) return null;
     const test = functionsIn(index, file).find(fn => fn.name.startsWith('test_') &&
         fn.startLine <= call.line && fn.endLine >= call.line && !fn.async && !fn.decorators.length);
     const parameter = test?.parameters.find(p => p.name === receiver && p.unchanged);

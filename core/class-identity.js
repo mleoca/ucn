@@ -349,9 +349,15 @@ function ownerRefOf(index, member) {
     if (info.unique) {
         ref = _nameRef(name, info);
     } else {
+        // A Rust impl is outside the type's body. Its lexical scope still
+        // fixes its owner: an impl of a block-local type must not borrow the
+        // module-level namesake's member identity.
+        const scopedOwner = info.hasScoped && ownerDefinitionOf(index, member);
+        const scopedEntry = scopedOwner && info.entries.find(e => e.def === scopedOwner);
         // Lexical containment: the member is declared inside the type body.
-        let best = null;
+        let best = scopedEntry || null;
         for (const e of info.entries) {
+            if (scopedEntry) break;
             const d = e.def;
             if (d.file !== member.file) continue;
             if (d.startLine > member.startLine || d.endLine < member.startLine) continue;
