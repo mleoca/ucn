@@ -263,6 +263,11 @@ function createFileIR({
             conditionalViews: parsed.conditionalViews.map(group => [...group]),
         }),
         ...(parsed.packageName && { packageName: parsed.packageName }),
+        // Go package-level variables with their declared static types (fix #399).
+        ...(parsed.buildConstraint && { buildConstraint: parsed.buildConstraint }),
+        ...(parsed.packageVars?.length > 0 && {
+            packageVars: parsed.packageVars.map(item => ({ ...item, ...(item.origin && { origin: { ...item.origin } }) })),
+        }),
         // Module-level names bound once to another name (fix #389): class
         // aliases when the target resolves to a class.
         ...(parsed.moduleValueAliases?.length > 0 && {

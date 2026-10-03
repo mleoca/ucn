@@ -889,7 +889,10 @@ function clearAllCaches() {
 // an alias record applies to one specifier, not all same-name specifiers.
 // v269 (fix #398F): Python files record `configurationItems` (names bound in
 // one scope only in exclusive `if`/`try`/`match` branches).
-const CACHE_FORMAT_VERSION = 269;
+// v270 (fix #399): Go files record `packageVars` (package-level variables
+// with their declared static types) and their `buildConstraint`; Go method
+// calls on a receiver no scope of the file binds carry `receiverPackageScope`.
+const CACHE_FORMAT_VERSION = 270;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**

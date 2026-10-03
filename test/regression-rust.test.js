@@ -7856,3 +7856,264 @@ describe('fix #397: a field init shorthand keeps its field key when the value is
         } finally { rm(dir); }
     });
 });
+
+describe('fix #399: Rust method probe and configuration-alternative types', () => {
+    const cargo = { 'Cargo.toml': '[package]\nname = "f399"\nversion = "0.1.0"\nedition = "2021"\n\n[features]\nstd = []\n' };
+    const at = entries => (entries || []).map(entry => `${entry.relativePath || entry.file}:${entry.line}`).sort();
+    const calleesAt = (index, name, file, line) => {
+        const ctx = index.context(name, { file, line });
+        return { confirmed: (ctx.callees || []).map(c => `${c.relativePath}:${c.startLine}`).sort(),
+            unverified: (ctx.unverifiedCallees || []).map(c => `${c.name}:${c.reason}`).sort() };
+    };
+
+    it('an inherent method precedes a trait method at one probe step, on both sides', () => {
+        const dir = tmp({
+            ...cargo,
+            'src/lib.rs': [
+                'pub struct E { k: u32 }',                                   // 1
+                'impl E {',                                                  // 2
+                '    pub fn key_mut(&mut self) -> &mut u32 { &mut self.k }', // 3
+                '}',                                                         // 4
+                'pub trait MutKey { fn key_mut(&mut self) -> &mut u32; }',  // 5
+                'impl MutKey for E {',                                       // 6
+                '    fn key_mut(&mut self) -> &mut u32 {',                   // 7
+                '        self.key_mut()',                                    // 8
+                '    }',                                                     // 9
+                '}',                                                         // 10
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(at(index.context('key_mut', { file: 'src/lib.rs', line: 3 }).callers),
+                ['src/lib.rs:8'], 'the inherent method is the callee');
+            const traitCtx = index.context('key_mut', { file: 'src/lib.rs', line: 7 });
+            assert.deepStrictEqual(at(traitCtx.callers), [], 'never also the recursive trait method');
+            assert.deepStrictEqual(at(traitCtx.unverifiedCallers), []);
+            assert.deepStrictEqual(calleesAt(index, 'key_mut', 'src/lib.rs', 7),
+                { confirmed: ['src/lib.rs:3'], unverified: [] });
+        } finally { rm(dir); }
+    });
+
+    it('an owned receiver selects the owned impl before the `&T` impl, on both sides', () => {
+        const dir = tmp({
+            ...cargo,
+            'src/lib.rs': [
+                'pub struct M(Vec<u32>);',                                       // 1
+                'impl IntoIterator for M {',                                     // 2
+                '    type Item = u32;',                                          // 3
+                '    type IntoIter = std::vec::IntoIter<u32>;',                  // 4
+                '    fn into_iter(self) -> Self::IntoIter { self.0.into_iter() }', // 5
+                '}',                                                             // 6
+                "impl<'a> IntoIterator for &'a M {",                             // 7
+                "    type Item = &'a u32;",                                      // 8
+                "    type IntoIter = std::slice::Iter<'a, u32>;",                // 9
+                '    fn into_iter(self) -> Self::IntoIter { self.0.iter() }',     // 10
+                '}',                                                             // 11
+                'impl M {',                                                      // 12
+                '    pub fn consume(self) -> Vec<u32> { self.into_iter().collect() }', // 13
+                '    pub fn walk(&self) -> usize { self.into_iter().count() }',  // 14
+                '}',                                                             // 15
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(at(index.context('into_iter', { file: 'src/lib.rs', line: 5 }).callers),
+                ['src/lib.rs:13']);
+            const byRef = index.context('into_iter', { file: 'src/lib.rs', line: 10 });
+            assert.ok(!at(byRef.callers).includes('src/lib.rs:13'), 'the `&M` impl is not what an owned receiver calls');
+            assert.ok(at(byRef.callers).includes('src/lib.rs:14'), 'a `&self` receiver finds the `&M` impl first');
+            assert.deepStrictEqual(calleesAt(index, 'consume', 'src/lib.rs', 13).confirmed, ['src/lib.rs:5']);
+            assert.deepStrictEqual(calleesAt(index, 'walk', 'src/lib.rs', 14).confirmed, ['src/lib.rs:10']);
+        } finally { rm(dir); }
+    });
+
+    it('a private inherent method of another module or a bound-conditional impl never decides the probe', () => {
+        const dir = tmp({
+            ...cargo,
+            'src/lib.rs': [
+                'pub mod inner {',                                           // 1
+                '    pub struct E { pub k: u32 }',                           // 2
+                '    impl E { fn get(&self) -> u32 { self.k } }',            // 3
+                '}',                                                         // 4
+                'pub trait Get { fn get(&self) -> u32; }',                   // 5
+                'impl Get for inner::E {',                                   // 6
+                '    fn get(&self) -> u32 { 7 }',                            // 7
+                '}',                                                         // 8
+                'pub fn run(e: &inner::E) -> u32 { e.get() }',               // 9
+                'pub struct W<T>(T);',                                       // 10
+                'impl<T: Clone> W<T> { pub fn peek(&self) -> u8 { 1 } }',    // 11
+                'pub trait Peek { fn peek(&self) -> u8; }',                  // 12
+                'impl<T> Peek for W<T> {',                                   // 13
+                '    fn peek(&self) -> u8 { 2 }',                            // 14
+                '}',                                                         // 15
+                'impl<T> W<T> {',                                            // 16
+                '    pub fn look(&self) -> u8 { self.peek() }',              // 17
+                '}',                                                         // 18
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const get = index.context('get', { file: 'src/lib.rs', line: 7 });
+            assert.ok([...at(get.callers), ...at(get.unverifiedCallers)].includes('src/lib.rs:9'),
+                'a private inherent method outside the caller\'s module does not hide the trait method');
+            const peek = index.context('peek', { file: 'src/lib.rs', line: 14 });
+            assert.ok(!at(peek.callers).includes('src/lib.rs:17'), 'never confirmed beside a conditional inherent method');
+            assert.ok(at(peek.unverifiedCallers).includes('src/lib.rs:17'), 'the site stays visible');
+        } finally { rm(dir); }
+    });
+
+    it('raw pointer receivers reach `impl<T> Tr for *const T` members by parameter, cast, std producer and arithmetic', () => {
+        const dir = tmp({
+            ...cargo,
+            'src/lib.rs': [
+                'pub trait Pointer {',                                                   // 1
+                '    fn distance(self, origin: Self) -> usize;',                         // 2
+                '}',                                                                     // 3
+                'impl<T> Pointer for *const T {',                                        // 4
+                '    fn distance(self, origin: *const T) -> usize { 0 }',                // 5
+                '}',                                                                     // 6
+                'impl<T> Pointer for *mut T {',                                          // 7
+                '    fn distance(self, origin: *mut T) -> usize {',                      // 8
+                '        (self as *const T).distance(origin as *const T)',               // 9
+                '    }',                                                                 // 10
+                '}',                                                                     // 11
+                'pub struct Span;',                                                      // 12
+                'impl Span { pub fn distance(&self, o: &Span) -> usize { 1 } }',         // 13
+                'pub unsafe fn run(start: *const u8, end: *const u8, h: &[u8]) -> usize {', // 14
+                '    let a = end.distance(start);',                                      // 15
+                '    let p = h.as_ptr();',                                               // 16
+                '    let q = p.add(h.len());',                                           // 17
+                '    a + q.distance(p)',                                                 // 18
+                '}',                                                                     // 19
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(at(index.context('distance', { file: 'src/lib.rs', line: 5 }).callers),
+                ['src/lib.rs:15', 'src/lib.rs:18', 'src/lib.rs:9']);
+            const ptrMut = index.context('distance', { file: 'src/lib.rs', line: 8 });
+            assert.deepStrictEqual(at(ptrMut.callers), []);
+            assert.deepStrictEqual(at(index.context('distance', { file: 'src/lib.rs', line: 13 }).callers), [],
+                'a raw pointer never reaches a struct method');
+            assert.deepStrictEqual(calleesAt(index, 'distance', 'src/lib.rs', 8).confirmed, ['src/lib.rs:5']);
+        } finally { rm(dir); }
+    });
+
+    it('a module-qualified or glob-imported type path names the type its module declares', () => {
+        const dir = tmp({
+            ...cargo,
+            'src/lib.rs': [
+                'pub mod tests;',                                                 // 1
+                'pub mod other {',                                                // 2
+                '    pub struct Runner;',                                         // 3
+                '    impl Runner { pub fn new(n: usize) -> Runner { Runner } }',  // 4
+                '}',                                                              // 5
+                'pub fn a() { let _ = crate::tests::memchr::Runner::new(1); }',   // 6
+                'pub fn c() { let _ = crate::other::Runner::new(3); }',           // 7
+            ].join('\n') + '\n',
+            'src/tests.rs': 'pub mod memchr;\npub mod substring;\n',
+            'src/tests/memchr.rs': [
+                'pub struct Runner { n: usize }',                                 // 1
+                'impl Runner { pub fn new(n: usize) -> Runner { Runner { n } } }', // 2
+                '#[cfg(test)]',                                                   // 3
+                'mod t {',                                                        // 4
+                '    use super::*;',                                              // 5
+                '    fn x() { let _ = Runner::new(2); }',                         // 6
+                '}',                                                              // 7
+            ].join('\n') + '\n',
+            'src/tests/substring.rs': 'pub struct Runner;\nimpl Runner { pub fn new() -> Runner { Runner } }\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(at(index.context('new', { file: 'src/tests/memchr.rs', line: 2 }).callers),
+                ['src/lib.rs:6', 'src/tests/memchr.rs:6']);
+            assert.deepStrictEqual(at(index.context('new', { file: 'src/lib.rs', line: 4 }).callers), ['src/lib.rs:7']);
+            assert.deepStrictEqual(calleesAt(index, 'c', 'src/lib.rs', 7).confirmed, ['src/lib.rs:4']);
+            assert.deepStrictEqual(calleesAt(index, 'a', 'src/lib.rs', 6).confirmed, ['src/tests/memchr.rs:2']);
+        } finally { rm(dir); }
+    });
+
+    it('a field declared with a module-qualified type follows the module\'s re-export to its declaration', () => {
+        const dir = tmp({
+            ...cargo,
+            'src/lib.rs': 'pub mod map;\npub mod set;\n',
+            'src/map.rs': 'mod iter;\npub use self::iter::Splice;\n',
+            'src/map/iter.rs': 'pub struct Splice { n: usize }\nimpl Splice {\n    pub fn next_back(&mut self) -> usize { self.n }\n}\n',
+            'src/set.rs': 'mod iter;\npub use self::iter::Splice;\n',
+            'src/set/iter.rs': [
+                'pub struct Splice {',                              // 1
+                '    iter: crate::map::Splice,',                    // 2
+                '}',                                                // 3
+                'impl Splice {',                                    // 4
+                '    pub fn next_back(&mut self) -> usize {',       // 5
+                '        self.iter.next_back()',                    // 6
+                '    }',                                            // 7
+                '}',                                                // 8
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(calleesAt(index, 'next_back', 'src/set/iter.rs', 5).confirmed, ['src/map/iter.rs:3']);
+            assert.deepStrictEqual(at(index.context('next_back', { file: 'src/map/iter.rs', line: 3 }).callers),
+                ['src/set/iter.rs:6']);
+            assert.deepStrictEqual(at(index.context('next_back', { file: 'src/set/iter.rs', line: 5 }).callers), []);
+        } finally { rm(dir); }
+    });
+
+    it('`#[cfg]` alternatives of one struct are one type for field-hop and constructed receivers', () => {
+        const dir = tmp({
+            ...cargo,
+            'src/lib.rs': 'pub mod map;\npub mod set;\npub use crate::map::M;\npub use crate::set::S;\n',
+            'src/map.rs': [
+                'mod mutable;',                                         // 1
+                'pub use self::mutable::MutK;',                         // 2
+                '#[cfg(feature = "std")]',                              // 3
+                'pub struct M<K> { pub(crate) k: K }',                  // 4
+                '#[cfg(not(feature = "std"))]',                         // 5
+                'pub struct M<K> { pub(crate) k: K }',                  // 6
+                'impl<K> M<K> {',                                       // 7
+                '    pub fn new(k: K) -> Self { M { k } }',             // 8
+                '}',                                                    // 9
+            ].join('\n') + '\n',
+            'src/map/mutable.rs': [
+                'use super::M;',                                        // 1
+                'pub trait MutK { fn gfm(&mut self) -> usize; }',       // 2
+                'impl<K> MutK for M<K> {',                              // 3
+                '    fn gfm(&mut self) -> usize { 1 }',                 // 4
+                '}',                                                    // 5
+                'impl<K> M<K> {',                                       // 6
+                '    pub fn par_eq(&self, _o: &M<K>) -> bool { true }', // 7
+                '}',                                                    // 8
+            ].join('\n') + '\n',
+            'src/set.rs': [
+                'mod mutable;',                                         // 1
+                'use super::M;',                                        // 2
+                'pub struct S<T> { pub(crate) map: M<T> }',             // 3
+                'pub fn check() -> bool {',                             // 4
+                '    let a = M::new(1);',                               // 5
+                '    let b = M::new(2);',                               // 6
+                '    a.par_eq(&b)',                                     // 7
+                '}',                                                    // 8
+            ].join('\n') + '\n',
+            'src/set/mutable.rs': [
+                'use super::S;',                                        // 1
+                'use crate::map::MutK;',                                // 2
+                'pub trait MutV { fn gfm(&mut self) -> usize; }',       // 3
+                'impl<T> MutV for S<T> {',                              // 4
+                '    fn gfm(&mut self) -> usize { self.map.gfm() }',    // 5
+                '}',                                                    // 6
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(at(index.context('gfm', { file: 'src/map/mutable.rs', line: 4 }).callers),
+                ['src/set/mutable.rs:5']);
+            assert.deepStrictEqual(at(index.context('par_eq', { file: 'src/map/mutable.rs', line: 7 }).callers),
+                ['src/set.rs:7']);
+            const plan = execute(index, 'plan', { name: 'gfm', file: 'src/map/mutable.rs', line: 4, renameTo: 'gfm2' });
+            assert.ok(plan.ok, plan.error);
+            assert.ok(plan.result.changes.some(change => change.file.endsWith('set/mutable.rs') && change.line === 5 &&
+                !change.needsReview), 'the field-hop call is renamed with the method');
+        } finally { rm(dir); }
+    });
+});

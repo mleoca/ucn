@@ -8232,3 +8232,200 @@ describe('fix #392: function references resolve by Go block scoping', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #399: Go dot imports, package-qualified callees, package-level variables', () => {
+    const at = entries => (entries || []).map(entry => `${entry.relativePath || entry.file}:${entry.line}`).sort();
+    const planOf = (index, file, line, name, renameTo) => {
+        const result = execute(index, 'plan', { name, file, line, renameTo });
+        assert.ok(result.ok, result.error);
+        return result.result;
+    };
+
+    it('a type rename edits references through a dot import of its package', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/x\n\ngo 1.21\n',
+            'm/a.go': 'package m\n\ntype Widget struct{ N int }\n\nfunc Make() *Widget { return &Widget{} }\n',
+            'other/o.go': 'package other\n\ntype Widget struct{ N int }\n',
+            'u/u.go': [
+                'package u',                          // 1
+                '',                                   // 2
+                'import (',                           // 3
+                '\t. "example.com/x/m"',              // 4
+                '\t. "github.com/ext/pkg"',           // 5
+                ')',                                  // 6
+                '',                                   // 7
+                'func Use() int {',                   // 8
+                '\tvar w *Widget = Make()',           // 9
+                '\tx := Widget{N: 1}',                // 10
+                '\treturn w.N + x.N + Helper()',      // 11
+                '}',                                  // 12
+            ].join('\n') + '\n',
+            'v/v.go': 'package v\n\nimport . "example.com/x/other"\n\nvar W Widget\n',
+        });
+        try {
+            const index = idx(dir);
+            const plan = planOf(index, 'm/a.go', 3, 'Widget', 'Gadget');
+            const edited = plan.changes.filter(change => change.file === 'u/u.go' && !change.needsReview)
+                .map(change => change.line).sort((a, b) => a - b);
+            assert.deepStrictEqual(edited, [9, 10], JSON.stringify(plan.changes));
+            assert.ok(!plan.changes.some(change => change.file === 'v/v.go'),
+                'a dot import of another package does not name this type');
+            const other = planOf(index, 'other/o.go', 3, 'Widget', 'Gadget');
+            assert.ok(other.changes.some(change => change.file === 'v/v.go' && change.line === 5 && !change.needsReview));
+            assert.ok(!other.changes.some(change => change.file === 'u/u.go'));
+        } finally { rm(dir); }
+    });
+
+    it('a dot import whose package the index cannot resolve leaves the token for review', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/x\n\ngo 1.21\n',
+            'm/a.go': 'package m\n\ntype Widget struct{ N int }\n',
+            'u/u.go': 'package u\n\nimport . "example.com/x/missing"\n\nvar w Widget\n',
+        });
+        try {
+            const plan = planOf(idx(dir), 'm/a.go', 3, 'Widget', 'Gadget');
+            const site = [...plan.changes, ...(plan.reviewItems || [])].find(item => item.file === 'u/u.go' && item.line === 5);
+            assert.ok(site && (site.needsReview || !site.newExpression), JSON.stringify(plan));
+        } finally { rm(dir); }
+    });
+
+    it('a value made by a method of an out-of-project type is decided outside the project', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/x\n\ngo 1.21\n',
+            'a.go': [
+                'package x',                                          // 1
+                '',                                                   // 2
+                'import ext "github.com/other/ext"',                  // 3
+                '',                                                   // 4
+                'type Api struct{}',                                  // 5
+                '',                                                   // 6
+                'func (a Api) Encode(v any) string { return "" }',    // 7
+                '',                                                   // 8
+                'var cfg = ext.Config{Strict: true}.Froze()',         // 9
+                '',                                                   // 10
+                'func F(v any) string { return cfg.Encode(v) }',      // 11
+                '',                                                   // 12
+                'type Core interface{ Encode(v any) string }',        // 13
+                '',                                                   // 14
+                'type Other struct{}',                                // 15
+                '',                                                   // 16
+                'func (o Other) Encode(v any) string { return "" }',  // 17
+                '',                                                   // 18
+                'var API Core = Api{}',                               // 19
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const ctx = index.context('Encode', { file: 'a.go', line: 7 });
+            assert.ok(!at(ctx.callers).includes('a.go:11'));
+            const plan = planOf(index, 'a.go', 7, 'Encode', 'EncodeZ');
+            assert.ok(!plan.changes.some(change => change.line === 11 && !change.needsReview),
+                'an external value\'s method call is never renamed');
+        } finally { rm(dir); }
+    });
+
+    it('`pkg.F()` names the package function, never a same-name method', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/m\n\ngo 1.21\n',
+            'a.go': [
+                'package m',                                                        // 1
+                '',                                                                 // 2
+                'type Entry struct{}',                                              // 3
+                '',                                                                 // 4
+                'func (e *Entry) WithField(k string) *Entry { return e }',          // 5
+                '',                                                                 // 6
+                'func WithField(k string) *Entry { return (&Entry{}).WithField(k) }', // 7
+                '',                                                                 // 8
+                'func (e *Entry) Hook(s string) {}',                                // 9
+                '',                                                                 // 10
+                'var Hook = func(s string) {}',                                     // 11
+            ].join('\n') + '\n',
+            'a_test.go': [
+                'package m_test',                       // 1
+                '',                                     // 2
+                'import (',                             // 3
+                '\t"testing"',                          // 4
+                '',                                     // 5
+                '\t"example.com/m"',                    // 6
+                ')',                                    // 7
+                '',                                     // 8
+                'func TestX(t *testing.T) {',           // 9
+                '\t_ = m.WithField("a")',               // 10
+                '\tm.Hook("b")',                        // 11
+                '}',                                    // 12
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const callees = index.context('TestX', { file: 'a_test.go', line: 9 }).callees || [];
+            assert.deepStrictEqual(callees.map(c => `${c.relativePath}:${c.startLine}`).sort(), ['a.go:11', 'a.go:7']);
+            assert.deepStrictEqual(at(index.context('WithField', { file: 'a.go', line: 5 }).callers), ['a.go:7']);
+            assert.deepStrictEqual(at(index.context('WithField', { file: 'a.go', line: 7 }).callers), ['a_test.go:10']);
+        } finally { rm(dir); }
+    });
+
+    it('a package-level variable types its receivers in every file of the package and through importers', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/x\n\ngo 1.21\n',
+            'v/a.go': [
+                'package v',                          // 1
+                '',                                   // 2
+                'type Tx struct{}',                   // 3
+                '',                                   // 4
+                'func NewTx() *Tx { return &Tx{} }',  // 5
+                '',                                   // 6
+                'func (t *Tx) Do() {}',               // 7
+                '',                                   // 8
+                'type Iface interface{ Do() }',       // 9
+                '',                                   // 10
+                'func Early() { G.Do() }',            // 11
+                '',                                   // 12
+                'var G = NewTx()',                    // 13
+                '',                                   // 14
+                'var D *Tx',                          // 15
+                '',                                   // 16
+                'var L = &Tx{}',                      // 17
+                '',                                   // 18
+                'var I Iface = NewTx()',              // 19
+            ].join('\n') + '\n',
+            'v/c.go': [
+                'package v',                          // 1
+                '',                                   // 2
+                'func F2() {',                        // 3
+                '\tG.Do()',                           // 4
+                '\tD.Do()',                           // 5
+                '\tL.Do()',                           // 6
+                '\tI.Do()',                           // 7
+                '}',                                  // 8
+                '',                                   // 9
+                'type Other struct{}',                // 10
+                '',                                   // 11
+                'func (o *Other) Do() {}',            // 12
+                '',                                   // 13
+                'func F3(G *Other) {',                // 14
+                '\tG.Do()',                           // 15
+                '}',                                  // 16
+            ].join('\n') + '\n',
+            'v/t_test.go': 'package v\n\nvar T = NewTx()\n',
+            'v/d.go': 'package v\n\nfunc F4() { T.Do() }\n',
+            'v/tag_a.go': '//go:build alpha\n\npackage v\n\nvar K = NewTx()\n',
+            'v/tag_b.go': '//go:build beta\n\npackage v\n\nfunc F5() { K.Do() }\n',
+            'u/u.go': 'package u\n\nimport "example.com/x/v"\n\nfunc U() {\n\tv.G.Do()\n\tv.D.Do()\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const ctx = index.context('Do', { file: 'v/a.go', line: 7 });
+            assert.deepStrictEqual(at(ctx.callers),
+                ['u/u.go:6', 'u/u.go:7', 'v/a.go:11', 'v/c.go:4', 'v/c.go:5', 'v/c.go:6']);
+            const unverified = at(ctx.unverifiedCallers);
+            assert.ok(unverified.includes('v/c.go:7'), 'an interface-typed variable stays runtime dispatch');
+            assert.ok(!at(ctx.callers).includes('v/c.go:15'), 'a parameter shadows the package variable');
+            assert.ok(!at(ctx.callers).includes('v/d.go:3'), 'a _test.go variable is not part of the package build');
+            assert.ok(!at(ctx.callers).includes('v/tag_b.go:5'), 'another build configuration\'s variable is not in scope');
+            assert.deepStrictEqual(at(index.context('Do', { file: 'v/c.go', line: 12 }).callers), ['v/c.go:15']);
+            const callees = (index.context('F2', { file: 'v/c.go', line: 3 }).callees || [])
+                .map(c => `${c.relativePath}:${c.startLine}`);
+            assert.deepStrictEqual(callees, ['v/a.go:7']);
+        } finally { rm(dir); }
+    });
+});

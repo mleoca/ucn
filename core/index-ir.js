@@ -126,6 +126,8 @@ function createFileEntryFromIR({
         }),
         ...(Array.isArray(ir.conditionalViews) && { conditionalViews: ir.conditionalViews }),
         ...(ir.packageName && { packageName: ir.packageName }),
+        ...(ir.packageVars?.length > 0 && { packageVars: ir.packageVars }),
+        ...(ir.buildConstraint && { buildConstraint: ir.buildConstraint }),
         ...(ir.moduleValueAliases?.length > 0 && { moduleValueAliases: ir.moduleValueAliases }),
         ...(ir.moduleConstructedValues?.length > 0 && { moduleConstructedValues: ir.moduleConstructedValues }),
         ...(ir.configurationItems?.length > 0 && { configurationItems: ir.configurationItems }),

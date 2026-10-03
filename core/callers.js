@@ -1587,6 +1587,15 @@ function findCallers(index, name, options = {}) {
                     continue;
                 }
 
+                // A package-level variable of another file of the Go package
+                // (or an importer's `pkg.Var`) has one static type (fix #399).
+                if (fileEntry.language === 'go' && call.isMethod && !call.receiverType &&
+                    (call.receiverPackageScope || call.receiverRootIsModule)) {
+                    const typed = _goPackageVarReceiver(index, filePath, fileEntry, call,
+                        collectAccount && !call.isPotentialCallback && !call.isPathCall);
+                    if (typed) call = typed;
+                }
+
                 // Return-type flow: an untyped method receiver may be a
                 // variable assigned from a call with a known return annotation
                 // (response = client.get(...) with Client.get() -> Response).
@@ -5352,8 +5361,11 @@ function findCallers(index, name, options = {}) {
                                 // its type is unknown, identity proves nothing.
                                 if (matchesTarget && call.isPathCall &&
                                     langTraits(fileEntry.language)?.typeQualifiedCallStyle === 'path') {
-                                    const identity = aliasIdentity || _resolveReceiverTypeIdentity(index, filePath,
-                                        receiverSegment, targetDefs, call.line);
+                                    // A module-qualified type path is resolved
+                                    // through the module tree first (fix #399).
+                                    const identity = aliasIdentity ||
+                                        (fileEntry.language === 'rust' && _rustTypePathIdentity(index, filePath, call, targetDefs)) ||
+                                        _resolveReceiverTypeIdentity(index, filePath, receiverSegment, targetDefs, call.line);
                                     if (identity === 'other') {
                                         isUncertain = true;
                                         typeMismatch = true;
@@ -5643,6 +5655,23 @@ function findCallers(index, name, options = {}) {
                         _nameBindingReaches(index, walked, call.name, targetFiles2) === 'yes'))) {
                         importEdgeLink = true;
                     }
+                    // A type path the module tree resolves to the pinned
+                    // member's own type (fix #399): `crate::tests::m::T::new()`.
+                    if (!importEdgeLink && call.isPathCall &&
+                        _rustTypePathIdentity(index, filePath, call, targetDefs2) === 'target') {
+                        importEdgeLink = true;
+                    }
+                }
+                // A type a glob import brings into scope (`use super::*;
+                // IndexMap::new()`, fix #399) names the pinned member's own
+                // type through the module that declares it.
+                if (!importEdgeLink && fileEntry.language === 'rust' && call.isPathCall && call.receiver &&
+                    !String(call.receiver).includes('::')) {
+                    const owners = targetDefs2.filter(d => d.className === call.receiver)
+                        .map(d => ownerRefOf(index, d)?.def).filter(Boolean);
+                    if (owners.length > 0 && _rustGlobNameReaches(index, filePath, call.receiver, owners)) {
+                        importEdgeLink = true;
+                    }
                 }
                 const hasImportLink = importEdgeLink ||
                     (targetFiles2.has(filePath) && !uncertainMethodReceiver);
@@ -5764,6 +5793,11 @@ function findCallers(index, name, options = {}) {
                     }
                     let aliasResolvedFile = null;
                     let aliasIdentity = null;
+                    // A Rust module-qualified type (`crate::tests::memchr::Runner::new(1)`)
+                    // names the type that module declares (fix #399).
+                    if (fileEntry.language === 'rust' && call.isPathCall && tTypes.has(receiverName)) {
+                        aliasIdentity = _rustTypePathIdentity(index, filePath, call, targetDefs2);
+                    }
                     // C++ qualifiers were resolved above (fix #361): a
                     // qualifier that reaches the pinned member's class is
                     // type-qualified evidence under that class's name.
@@ -6484,6 +6518,26 @@ function findCallers(index, name, options = {}) {
                 // can exist.
                 if (fileEntry.language === 'rust' && call.isMethod && !call.isPathCall &&
                     options.targetDefinitions && options.targetDefinitions.length === 1) {
+                    // Inherent methods precede trait methods at one probe
+                    // step, and a member found at an earlier step wins (fix
+                    // #399, indexmap: `self.key_mut()` in the trait impl's
+                    // own `key_mut` is the inherent method; `self.into_iter()`
+                    // on an owned receiver is the owned impl, never `&T`'s).
+                    const probed = _rustMethodProbeVerdict(index, filePath, call.line, call,
+                        options.targetDefinitions[0], callerSymbol);
+                    if (probed?.exclude) {
+                        recordExcluded(filePath, call.line, probed.exclude);
+                        continue;
+                    }
+                    if (probed === 'unverified') {
+                        if (collectAccount) {
+                            routeUnverified(filePath, fileEntry, call, 'autoref-dispatch', calledAs, {
+                                uncertaintyClass: 'compile-time-dispatch',
+                                dispatchFamily: `${name} method probe (autoref/deref steps)`,
+                            });
+                        }
+                        continue;
+                    }
                     const probe = _rustReceiverProbe(index, filePath, call,
                         options.targetDefinitions[0], callerSymbol);
                     if (probe === 'unverified') {
@@ -7598,6 +7652,13 @@ function findCallees(index, definition, options = {}) {
                     call = { ...call, receiverType: exact, receiverTypeSource: 'constructor',
                         receiverTypeEvidence: { ...call.receiverTypeEvidence, source: 'constructor', type: exact } };
                 }
+            }
+            // Go package-level variables declared in another file (fix #399).
+            if (language === 'go' && call.isMethod && !call.receiverType &&
+                (call.receiverPackageScope || call.receiverRootIsModule)) {
+                const typed = _goPackageVarReceiver(index, def.file, fileEntry, call,
+                    collectAccount && !call.isPotentialCallback && !call.isPathCall);
+                if (typed) call = typed;
             }
             const siteId = siteOrdinal;
             siteEvidence.set(siteId, {
@@ -9762,8 +9823,25 @@ function findCallees(index, definition, options = {}) {
                     symbols.filter(symbol => !NON_CALLABLE_TYPES.has(symbol.type) &&
                         ownedBy(index, symbol, ref) !== 'no'),
                     language);
+                // Rust method probe (fix #399): the receiver's reference
+                // layer and inherent-before-trait precedence select one of
+                // the type's same-name members, or leave the site unverified.
+                let rustProbed = null;
+                if (language === 'rust' && call.receiver === 'self' && !parentOnlyReceiver) {
+                    const receiver = _rustCallReceiver(index, call, def);
+                    rustProbed = receiver ? _rustMethodProbeSelect(index, def.file, call.line, receiver, call.name) : null;
+                    if (rustProbed?.ambiguous) {
+                        noteUnverified(siteId, call, 'overload-ambiguous');
+                        continue;
+                    }
+                    if (rustProbed?.match && _rustReceiverProbe(index, def.file, call, rustProbed.match, def) === 'unverified') {
+                        noteUnverified(siteId, call, 'autoref-dispatch');
+                        continue;
+                    }
+                }
                 let selected = parentOnlyReceiver
                     ? { match: null }
+                    : rustProbed?.match ? { match: rustProbed.match }
                     : _calleeSelectReceiverMethod(
                         index, call, symbols, def.className, language, def.file,
                         symbol => !NON_CALLABLE_TYPES.has(symbol.type) &&
@@ -10861,6 +10939,25 @@ function _populateReturnTypeFlowScope(index, filePath, calls, scopeCalls, scoped
         } else if (call.isMethod && call.receiverType &&
             !call.receiverTypeGuessed && call.receiverTypeSource !== 'guess') {
             const defs = index.symbols.get(call.name) || [];
+            // Raw pointer producers on std receivers (fix #399): `let p =
+            // bytes.as_ptr()`, `let q = p.add(n)` hold raw pointers.
+            const pointerResult = language === 'rust' && call.receiverTypeStd
+                ? _rustStdMethodResult(index, call.receiverType, call.name) : null;
+            if (pointerResult && (pointerResult.type === '*const' || pointerResult.type === '*mut')) {
+                const scope = call.enclosingFunction ? `${call.enclosingFunction.startLine}` : '';
+                const key = `${scope}:${call.assignedTo}`;
+                if (!map) map = new Map();
+                if (!map.has(key)) map.set(key, []);
+                map.get(key).push({ line: call.line, start: call.callStart, type: pointerResult.type, stdResult: true });
+                continue;
+            }
+            // A Go method of an out-of-project type (`jsoniter.Config{..}.Froze()`,
+            // fix #399): its result is decided outside the project.
+            if (language === 'go' && call.receiverTypeQualifier &&
+                _goQualifiedReceiverType(index, fileEntry, call.receiverTypeQualifier, call.receiverType)?.kind === 'opaque') {
+                routeUnknownAssignment(call, `${call.receiverTypeQualifier}.${call.receiverType}.${call.name}`);
+                continue;
+            }
             if (nominal) {
                 const rustOwner = language === 'rust'
                     ? _rustFlowReceiverOrigin(index, filePath, call.receiverType, call.receiverTypeQualifier)
@@ -10959,6 +11056,18 @@ function _populateReturnTypeFlowScope(index, filePath, calls, scopeCalls, scoped
                     ...(receiverFlow.externalConcrete && { externalConcrete: true }),
                 });
                 continue;
+            }
+            if (receiverFlow?.stdResult && language === 'rust') {
+                // A raw pointer from a std producer stays a raw pointer
+                // through pointer arithmetic (fix #399).
+                const pointerResult = _rustStdMethodResult(index, receiverFlow.type, call.name);
+                if (pointerResult && (pointerResult.type === '*const' || pointerResult.type === '*mut')) {
+                    const scope = call.enclosingFunction ? `${call.enclosingFunction.startLine}` : '';
+                    const key = `${scope}:${call.assignedTo}`;
+                    if (!map.has(key)) map.set(key, []);
+                    map.get(key).push({ line: call.line, start: call.callStart, type: pointerResult.type, stdResult: true });
+                    continue;
+                }
             }
             if (receiverFlow?.type) {
                 const matches = (index.symbols.get(call.name) || []).filter(d =>
@@ -11681,6 +11790,16 @@ function _lookupReturnTypeFlow(map, call) {
     return _lookupReturnTypeFlowRaw(map, call);
 }
 
+/**
+ * Package-block declarations (Go) are in scope throughout the package,
+ * before and after their text (fix #399): the module-scope assignment of
+ * `var CommandLine = NewFlagSet(..)` types `CommandLine.VarP(..)` above it.
+ */
+function _flowPackageBlock(map) {
+    return !!map._index &&
+        langTraits(map._index.files.get(map._filePath)?.language)?.packageScope === 'directory';
+}
+
 function _lookupReturnTypeFlowRaw(map, call) {
     const fnScope = call.enclosingFunction ? `${call.enclosingFunction.startLine}` : '';
     const lexicalScopes = Array.isArray(call.enclosingFunction?.scopeChain)
@@ -11696,12 +11815,13 @@ function _lookupReturnTypeFlowRaw(map, call) {
             entry.start != null &&
             (best.start == null || entry.start > best.start ||
              (entry.start === best.start && best.invalidated && !entry.invalidated)));
+    const packageBlock = _flowPackageBlock(map);
     for (const scope of [...new Set([...lexicalScopes, ''])]) {
         const entries = map.get(`${scope}:${call.receiver}`);
         if (!entries) continue;
         let best = null;
         for (const e of entries) {
-            if (precedesCall(e) && laterThan(e, best) &&
+            if ((precedesCall(e) || (scope === '' && packageBlock)) && laterThan(e, best) &&
                 (scope !== '' || _fileScopeFlowEntryApplies(map, e, call))) best = e;
         }
         if (best) {
@@ -11853,12 +11973,13 @@ function _receiverAssignedUntyped(map, call) {
             entry.start != null &&
             (best.start == null || entry.start > best.start ||
              (entry.start === best.start && best.invalidated && !entry.invalidated)));
+    const packageBlock = _flowPackageBlock(map);
     for (const scope of [...new Set([...lexicalScopes, ''])]) {
         const entries = map.get(`${scope}:${call.receiver}`);
         if (!entries) continue;
         let best = null;
         for (const e of entries) {
-            if (precedesCall(e) && laterThan(e, best) &&
+            if ((precedesCall(e) || (scope === '' && packageBlock)) && laterThan(e, best) &&
                 (scope !== '' || !map._index || _fileScopeFlowEntryApplies(map, e, call))) best = e;
         }
         if (best) return !!best.invalidated;
@@ -14263,7 +14384,9 @@ function _resolveReceiverTypeIdentity(index, filePath, knownType, targetDefs, li
         }
         return 'unknown';
     }
-    if (typeDefs.length <= 1) return 'target';
+    // One type, or the `#[cfg]`/`#if` alternatives of one type in one scope
+    // (one class identity, fix #399): the name denotes it.
+    if (typeDefs.length <= 1 || new Set(typeDefs.map(d => classKeyOf(index, d))).size === 1) return 'target';
     const targetDirs = new Set(targetDefs.map(d => d.file && path.dirname(d.file)).filter(Boolean));
     // Where a type's identity is its module (fix #384, bytes-measured:
     // `bytes_mut.rs`'s own `Shared::init_to_raw` was a confirmed caller of
@@ -14276,12 +14399,20 @@ function _resolveReceiverTypeIdentity(index, filePath, knownType, targetDefs, li
     // there, so the directory rule decides.
     const importsTypeName = file => (index.files.get(file)?.importBindings || [])
         .some(binding => (binding.alias || binding.name) === knownType);
+    const declaresTypeName = file => typeDefs.some(d => d.file === file);
     const ownerTargets = langTraits(language)?.moduleTypeIdentity
         ? targetDefs.filter(t => t.className === knownType) : [];
     const ownerDefs = ownerTargets.map(t => ownerRefOf(index, t)?.def || null);
+    // A member file that only imports the type (`use super::Map; impl Map`)
+    // still names one definition; only a file that both declares and imports
+    // the name holds alternatives (fix #399).
     const byOwner = ownerDefs.length > 0 && ownerDefs.every(Boolean) &&
-        !ownerTargets.some(t => importsTypeName(t.file));
-    const inTargetPkg = (d) => byOwner && !importsTypeName(d.file) ? ownerDefs.includes(d)
+        !ownerTargets.some(t => importsTypeName(t.file) && declaresTypeName(t.file));
+    // Definitions are compared by class identity, not by declaration: the
+    // `#[cfg]`/`#if` alternatives of one type in one scope share it (fix #399,
+    // indexmap's two `IndexMap` structs; #376/#385 for their members).
+    const ownerKeys = new Set(byOwner ? ownerDefs.map(d => classKeyOf(index, d)) : []);
+    const inTargetPkg = (d) => byOwner && !importsTypeName(d.file) ? ownerKeys.has(classKeyOf(index, d))
         : !!(d.file && [...targetDirs].some(dir => _sameNominalPackageDir(path.dirname(d.file), dir, language)));
     // Explicit imports outrank package proximity. This matters in Java files
     // that sit beside `Token.Comment` but import `org.jsoup.nodes.Comment`.
@@ -16278,9 +16409,23 @@ function _calleeGoPackageMatch(index, call, importModule) {
     // TYPE, never a same-named struct field. Ordinary package calls name
     // callable symbols. Shape-filter before package ranking so the first
     // declaration in the right directory cannot steal another namespace.
+    // A qualified identifier `pkg.F` denotes a package-level declaration;
+    // methods (and interface method specs) belong to a type's method set and
+    // are never named through a package qualifier (fix #399: logrus
+    // `logrus.WithField(..)` resolved to `(*Entry).WithField`).
+    const packageLevel = s => !s.isMethod && !s.className && !s.receiver;
     const symbols = allSymbols.filter(s => call.isConstructor
         ? ['struct', 'class', 'type'].includes(s.type)
-        : !NON_CALLABLE_TYPES.has(s.type));
+        : !NON_CALLABLE_TYPES.has(s.type) && packageLevel(s));
+    const match = _goPackageSymbolMatch(index, symbols, importModule);
+    if (match || call.isConstructor) return match;
+    // A package-level variable holding a function value (`var Hook =
+    // func(..) {..}`) is called through the same qualifier.
+    return _goPackageSymbolMatch(index, allSymbols.filter(s => s.type === 'state' && packageLevel(s)),
+        importModule);
+}
+
+function _goPackageSymbolMatch(index, symbols, importModule) {
     if (symbols.length === 0) return null;
     // Self-module imports (fix #268, cobra-measured — the #220(8) go.mod
     // identity): `import "github.com/spf13/cobra"` from doc/ names the
@@ -16499,10 +16644,17 @@ function _calleeSelectReceiverMethod(index, call, symbols, typeName, language,
         // if its signature no longer accepts the call's arguments.
         return _calleeOverloadSelect(index, call, declaring?.members || [], language);
     }
+    // Rust primitive owners (fix #399, the caller side's canonical names):
+    // `impl<T> X for [T]` serves 'slice' receivers, `impl<T> X for *const T`
+    // '*const' ones.
+    const canonicalStdOwner = language === 'rust' && (typeName === 'slice' || typeName === '*const' || typeName === '*mut');
     const onOwner = owner => (symbols || []).filter(symbol =>
         accepts(symbol) &&
         (symbol.className === owner ||
-         (symbol.receiver && symbol.receiver.replace(/^\*/, '') === owner)));
+         (symbol.receiver && symbol.receiver.replace(/^\*/, '') === owner) ||
+         (canonicalStdOwner && owner === typeName && (owner === 'slice'
+             ? _isGenericSliceOwner(symbol, symbol.className)
+             : _genericRawPointerOwner(symbol, symbol.className) === owner))));
     let selected = _calleeOverloadSelect(
         index, call, onOwner(typeName), language);
     // Nominal lookup and compiler-typed TS/TSX class values inherit methods
@@ -17324,7 +17476,14 @@ function _declaredFieldType(
             });
             const importedIdentity = language === 'rust' && localType
                 ? _rustImportedTypeIdentity(index, field.file, localType) : null;
-            const origin = importedIdentity?.type === typeName
+            // A module-qualified declared type (`iter: crate::map::Splice<..>`)
+            // names the type that module declares (fix #399).
+            const writtenPath = language === 'rust' ? _rustWrittenTypePath(rawText) : null;
+            const treeType = writtenPath ? _rustTypePathDefinition(index, field.file,
+                { receiver: writtenPath, line: field.startLine }) : null;
+            const origin = treeType?.typeName === typeName
+                ? { fromFile: treeType.definitions[0].file }
+                : importedIdentity?.type === typeName
                 ? importedIdentity
                 : _resolveFlowTypeOrigin(
                     index, field.file, typeName, qualifier);
@@ -17539,6 +17698,78 @@ function _rustModulePathRoute(index, filePath, call, name, targets) {
         sameDeclaration(declarationIdentity(item), declarationIdentity(target))));
     if (pinned.length === 0) return 'other';
     return items.length === 1 ? 'target' : null;
+}
+
+/** The path a Rust declared type is written with (`crate::m::T` of `&'a crate::m::T<X>`), or null. */
+function _rustWrittenTypePath(text) {
+    const head = String(text || '').trim().replace(/^(&\s*('[A-Za-z_]\w*\s*)?(mut\s+)?)+/, '')
+        .replace(/<.*$/s, '').trim();
+    return /^[A-Za-z_]\w*(::[A-Za-z_]\w*)+$/.test(head) ? head : null;
+}
+
+/**
+ * The struct/enum/union a module-qualified Rust type path names (fix #399):
+ * `{ typeName, key, definitions }` (one class identity; `#[cfg]`
+ * alternatives share it) or null when the module tree cannot decide.
+ */
+function _rustTypePathDefinition(index, filePath, call) {
+    const receiver = String(call.receiver || '');
+    if (!receiver.includes('::')) return null;
+    const memo = index._opMemo?.('rustTypePathDefinition', () => new Map());
+    const memoKey = `${filePath}\0${call.line}\0${receiver}`;
+    if (memo?.has(memoKey)) return memo.get(memoKey);
+    let result = null;
+    const segments = receiver.split('::')
+        .map(segment => segment.replace(/<.*$/s, '').trim()).filter(Boolean);
+    if (segments.length >= 2) {
+        const typeName = segments[segments.length - 1];
+        const { rustPathModule, rustModuleItems } = require('./rust-modules');
+        const qualifier = segments.slice(0, -1).join('::');
+        const resolved = rustPathModule(index, filePath, call.line, qualifier);
+        const isType = definition => ['struct', 'enum', 'union'].includes(definition.type);
+        let definitions = resolved ? rustModuleItems(index, resolved, typeName).filter(isType) : [];
+        const fileEntry = index.files.get(filePath) || {};
+        // Module files a qualifier names when the tree cannot: a first
+        // segment bound by `use` (`use crate::arch::rabinkarp;
+        // rabinkarp::Finder::new()`, #369's qualifier resolution).
+        const starts = resolved ? null : _rustPathQualifierFiles(index, fileEntry, filePath, qualifier, typeName);
+        if (definitions.length === 0 && starts?.size > 0) {
+            definitions = [...starts].flatMap(start =>
+                rustModuleItems(index, { entries: [{ file: start, chain: [] }] }, typeName).filter(isType));
+        }
+        // A re-export (`pub use self::iter::Splice;` in the named module) is
+        // followed to the file that declares the type.
+        if (definitions.length === 0 && (resolved || starts?.size > 0)) {
+            const walked = resolved ? [_rustQualifiedPathFile(index, fileEntry, filePath, qualifier, typeName)]
+                : [...starts];
+            definitions = (index.symbols.get(typeName) || []).filter(definition =>
+                isType(definition) && definition.lexicalScopeStartLine == null && walked.some(file => file &&
+                    _nameBindingReaches(index, file, typeName, new Set([definition.file])) === 'yes'));
+        }
+        const keys = new Set(definitions.map(definition => classKeyOf(index, definition)));
+        if (keys.size === 1) result = { typeName, key: [...keys][0], definitions };
+    }
+    memo?.set(memoKey, result);
+    return result;
+}
+
+/**
+ * Rust type paths through the module tree (fix #399): `crate::m::T::f()`
+ * names the associated item `f` of the type `T` module `crate::m` declares.
+ * 'target' when that type is every pinned member's owner definition,
+ * 'other' when it is none of theirs, null when the tree cannot decide (a
+ * single-segment path, `use` aliases, re-exports, traits, type aliases).
+ */
+function _rustTypePathIdentity(index, filePath, call, targets) {
+    const typed = _rustTypePathDefinition(index, filePath, call);
+    if (!typed) return null;
+    const { typeName, key } = typed;
+    const owners = targets.filter(target => target.className === typeName)
+        .map(target => ownerRefOf(index, target)?.def || null);
+    if (owners.length === 0 || owners.some(owner => !owner)) return null;
+    const same = owners.map(owner => classKeyOf(index, owner) === key);
+    if (same.every(Boolean)) return 'target';
+    return same.some(Boolean) ? null : 'other';
 }
 
 /**
@@ -17833,6 +18064,212 @@ function _rustTraitImplSelection(index, filePath, call, targetDefs, definitions)
         candidates: siblings.length - others.filter(v => v === 'mismatch' || v === 'nominal-mismatch').length,
         external: externalTrait,
     };
+}
+
+/**
+ * Rust method probe over the project members of one name (fix #399). rustc
+ * tries the receiver expression's type R, then &R and &mut R, then the same
+ * for each type R dereferences to; at each step an applicable inherent
+ * method precedes every trait method, and the first step holding a method
+ * wins (the Reference, "Method call expressions"). A member's receiver type
+ * is its impl's self type (`impl Tr for &T` -> &T) behind the `self`
+ * parameter's layer. Only the steps down to the receiver's own type T are
+ * modeled; later deref targets never precede them.
+ */
+function _rustMemberReceiverLayers(member) {
+    const kind = member?.selfParamKind;
+    if (!kind) return null;
+    const layers = [];
+    if (kind === '&' || kind === '&mut') layers.push(kind);
+    else if (kind !== 'value' && kind !== 'owned') return null;
+    if (member.implSelfRef) layers.push(member.implSelfRef);
+    return layers;
+}
+
+/** Probe step at which a member with receiver `layers` is found, or -1. */
+function _rustProbeStep(layers, receiverLayers) {
+    const key = layers.join(' ');
+    let current = receiverLayers;
+    let step = 0;
+    for (let hop = 0; hop <= receiverLayers.length; hop++) {
+        for (const candidate of [current, ['&', ...current], ['&mut', ...current]]) {
+            if (candidate.join(' ') === key) return step;
+            step++;
+        }
+        current = current.slice(1);
+    }
+    return -1;
+}
+
+/**
+ * Receiver of a Rust method call as the probe sees it: the class identity
+ * key of its type and its reference layers, outermost first. `self` takes
+ * the enclosing member's impl self type and `self` parameter; a typed
+ * receiver its declared reference layer. null when either is unknown.
+ */
+function _rustCallReceiver(index, call, callerSymbol, typedOwner = null) {
+    if (call.receiver === 'self') {
+        if (!callerSymbol?.className || !callerSymbol.selfParamKind) return null;
+        const key = ownerRefOf(index, callerSymbol)?.key;
+        if (!key || _definitionHasGenericOwner(callerSymbol)) return null;
+        const layers = _rustMemberReceiverLayers(callerSymbol);
+        return layers ? { key, layers } : null;
+    }
+    if (!typedOwner || call.receiverType !== typedOwner.className || !call.receiverTypeRef) return null;
+    const key = ownerRefOf(index, typedOwner)?.key;
+    if (!key) return null;
+    const ref = call.receiverTypeRef;
+    if (ref !== 'owned' && ref !== '&' && ref !== '&mut') return null;
+    return { key, layers: ref === 'owned' ? [] : [ref] };
+}
+
+/**
+ * Does an impl block apply to every instantiation of its self type? No
+ * bounds on its generic parameters and every self-type argument one of them
+ * (`impl<'a, K, V> Entry<'a, K, V>`); `impl<K: Hash> M<K>` or `impl M<u8>`
+ * apply conditionally.
+ */
+function _rustImplUnconditional(member) {
+    if (member.ownerGenericBounds && Object.keys(member.ownerGenericBounds).length > 0) return false;
+    const params = _rustGenericNames(member.ownerGenerics);
+    return (member.ownerSelfArgs || []).every(arg => params.has(String(arg).trim()));
+}
+
+/** Project callable members of `name` owned by the type with identity `key`. */
+function _rustProbeMembers(index, name, key) {
+    const memo = index._opMemo?.('rustProbeMembers', () => new Map());
+    const memoKey = `${name}\0${key}`;
+    if (memo?.has(memoKey)) return memo.get(memoKey);
+    const members = (index.symbols.get(name) || []).filter(member =>
+        !NON_CALLABLE_TYPES.has(member.type) && member.className &&
+        index.files.get(member.file)?.language === 'rust' &&
+        !_definitionHasGenericOwner(member) && ownerRefOf(index, member)?.key === key);
+    memo?.set(memoKey, members);
+    return members;
+}
+
+/** Is member C's trait provably in scope at the call site? */
+function _rustMemberTraitInScope(index, member, siteFile) {
+    const traits = require('./contract-membership').rustProjectTraits(
+        index, member.traitName, member.file, member.startLine);
+    if (traits.length !== 1) return false;
+    return _rustTraitInScope(index, index.files.get(siteFile), siteFile, traits[0]);
+}
+
+/**
+ * Caller side: does the probe prove that `target` is not what this call
+ * selects? { exclude } when an applicable visible member sits at an earlier
+ * step, or an applicable inherent method at the trait target's own step;
+ * 'unverified' when a member at those steps may apply (conditional impl,
+ * trait scope unknown, two traits at one step); null when nothing earlier
+ * can intervene among the project's members.
+ */
+function _rustMethodProbeVerdict(index, siteFile, siteLine, call, target, callerSymbol) {
+    if (!target?.className || !target.selfParamKind || _definitionHasGenericOwner(target)) return null;
+    const receiver = _rustCallReceiver(index, call, callerSymbol, target);
+    if (!receiver || receiver.key !== ownerRefOf(index, target)?.key) return null;
+    const targetLayers = _rustMemberReceiverLayers(target);
+    const targetStep = targetLayers ? _rustProbeStep(targetLayers, receiver.layers) : -1;
+    if (targetStep < 0) return null;
+    const { rustItemAccessible } = require('./rust-modules');
+    let unverified = false;
+    for (const member of _rustProbeMembers(index, target.name, receiver.key)) {
+        if (member === target || _isConfigurationAlternative(index, member, target)) continue;
+        const layers = _rustMemberReceiverLayers(member);
+        const step = layers ? _rustProbeStep(layers, receiver.layers) : -1;
+        if (step < 0 || step > targetStep) continue;
+        const inherent = !member.traitImpl;
+        const sameTrait = !inherent && !!target.traitImpl && _rustTraitBase(member.traitName) === _rustTraitBase(target.traitName);
+        if (step === targetStep) {
+            // Two inherent methods at one step are instantiation or
+            // configuration variants; impls of one trait at one step are
+            // chosen by argument type (#384). Neither is decided here.
+            if (!target.traitImpl || sameTrait) continue;
+            if (!inherent) {
+                // Another trait's method at the same step: only one of the
+                // two traits can be in scope in a program that compiles.
+                const projectTrait = require('./contract-membership').rustProjectTraits(
+                    index, member.traitName, member.file, member.startLine).length > 0;
+                if (projectTrait && !_rustMemberTraitInScope(index, member, siteFile)) continue;
+                unverified = true;
+                continue;
+            }
+        }
+        const applies = _rustImplUnconditional(member) && (inherent
+            ? rustItemAccessible(index, member.modifiers, member.file, member.startLine, siteFile, siteLine)
+            : sameTrait || _rustMemberTraitInScope(index, member, siteFile));
+        if (applies) {
+            return { exclude: inherent && step === targetStep ? 'inherent-method-first' : 'reference-impl-other' };
+        }
+        unverified = true;
+    }
+    return unverified ? 'unverified' : null;
+}
+
+/**
+ * Callee side: the project member this call selects among `members` (the
+ * receiver type's members of the name), or null when the probe cannot
+ * decide it. { match, step } when one applicable member holds the first
+ * step that holds any; { ambiguous } for two traits at that step.
+ */
+function _rustMethodProbeSelect(index, siteFile, siteLine, receiver, name) {
+    const members = _rustProbeMembers(index, name, receiver.key);
+    if (members.length === 0) return null;
+    const placed = [];
+    for (const member of members) {
+        const layers = _rustMemberReceiverLayers(member);
+        if (!layers) return null;
+        const step = _rustProbeStep(layers, receiver.layers);
+        if (step >= 0) placed.push({ member, step });
+    }
+    if (placed.length === 0) return null;
+    const first = Math.min(...placed.map(p => p.step));
+    const atFirst = placed.filter(p => p.step === first).map(p => p.member);
+    const distinct = list => list.filter((m, i) => !list.slice(0, i).some(o => _isConfigurationAlternative(index, o, m)));
+    const inherent = distinct(atFirst.filter(m => !m.traitImpl));
+    // Methods the index cannot place: a blanket impl over every type, or a
+    // provided (default) method of a project trait the type implements
+    // without overriding it. Only an inherent method at the receiver's own
+    // step precedes them for certain.
+    const unplaced = () => (index.symbols.get(name) || []).some(member => !NON_CALLABLE_TYPES.has(member.type) &&
+        index.files.get(member.file)?.language === 'rust' && _definitionHasGenericOwner(member)) ||
+        _rustProvidedMethodPossible(index, name, members);
+    if (inherent.length > 0) {
+        const { rustItemAccessible } = require('./rust-modules');
+        if (inherent.length !== 1 || !_rustImplUnconditional(inherent[0]) ||
+            !rustItemAccessible(index, inherent[0].modifiers, inherent[0].file, inherent[0].startLine,
+                siteFile, siteLine)) return null;
+        if (first > 0 && unplaced()) return null;
+        return { match: inherent[0], step: first, inherent: true };
+    }
+    const traits = distinct(atFirst);
+    if (traits.length > 1) {
+        // One trait's impls at one step are chosen by argument type (#384).
+        return new Set(traits.map(member => _rustTraitBase(member.traitName))).size > 1 ? { ambiguous: true } : null;
+    }
+    if (!_rustImplUnconditional(traits[0]) || unplaced()) return null;
+    return { match: traits[0], step: first };
+}
+
+/**
+ * Can the receiver type (whose members of `name` are `members`) take a
+ * provided (default) method `name` from a project trait it implements
+ * without overriding it? Such a method has no impl member for the type, so
+ * the probe cannot place it. Impls are matched by type name: a namesake's
+ * impl only makes the answer more cautious.
+ */
+function _rustProvidedMethodPossible(index, name, members) {
+    const typeName = members[0].className;
+    for (const declaration of index.symbols.get(name) || []) {
+        if (NON_CALLABLE_TYPES.has(declaration.type) || !declaration.className ||
+            index.files.get(declaration.file)?.language !== 'rust') continue;
+        const traitDef = ownerRefOf(index, declaration)?.def;
+        if (traitDef?.type !== 'trait') continue;
+        if (members.some(member => member.traitImpl && _rustTraitBase(member.traitName) === traitDef.name)) continue;
+        if ((index.symbols.get(typeName) || []).some(impl => impl.type === 'impl' && impl.traitName &&
+            _rustTraitBase(impl.traitName) === traitDef.name)) return true;
+    }
+    return false;
 }
 
 /**
@@ -18319,6 +18756,21 @@ function _calleeTypeQualifiedReceiver(index, def, fileEntry, call, language) {
     // provably external even when a project type shares the name; any other
     // qualified name is unpinnable without a module resolver — visible when
     // a project type shares the name, external when none does.
+    // A module-qualified Rust type path (fix #399): the module tree names
+    // the type; path resolution takes its inherent associated item first.
+    if (style === 'path' && receiver.includes('::') && language === 'rust') {
+        const typed = _rustTypePathDefinition(index, def.file, call);
+        if (typed) {
+            const members = (index.symbols.get(call.name) || []).filter(member =>
+                !NON_CALLABLE_TYPES.has(member.type) && member.className === typed.typeName &&
+                ownerRefOf(index, member)?.def && classKeyOf(index, ownerRefOf(index, member).def) === typed.key);
+            const inherent = members.filter(member => !member.traitImpl);
+            const pick = (inherent.length > 0 ? inherent : members).filter((member, i, list) =>
+                !list.slice(0, i).some(other => _isConfigurationAlternative(index, other, member)));
+            if (pick.length === 1) return { match: pick[0], typeName: typed.typeName };
+            if (pick.length > 1) return { unverified: 'overload-ambiguous' };
+        }
+    }
     if (style === 'path' && receiver.includes('::')) {
         const segs = receiver.split('::');
         const lastSeg = segs[segs.length - 1];
@@ -21869,6 +22321,8 @@ function _buildTargetTypeSet(index, targetDefs, definitions) {
                 // A Rust impl `for [T]` is the primitive slice owner; slice
                 // receivers carry the canonical name 'slice' (fix #368).
                 if (_isGenericSliceOwner(td, owner)) targetTypes.add('slice');
+                const rawPointer = _genericRawPointerOwner(td, owner);
+                if (rawPointer) targetTypes.add(rawPointer);
                 const origin = _resolveFlowTypeOrigin(index, td.file, owner);
                 targetTypeOrigins.push({
                     name: owner,
@@ -22125,6 +22579,161 @@ function _goQualifiedReceiverType(index, fileEntry, qualifier, typeName) {
     const defs = (index.symbols.get(typeName) || []).filter(d =>
         d.file && path.dirname(d.file) === dir && IDENTITY_TYPE_KINDS.has(d.type));
     return { kind: 'project', via: `${qualifier}.${typeName}`, importModule, dir, defs };
+}
+
+const _GO_OS = new Set(['aix', 'android', 'darwin', 'dragonfly', 'freebsd', 'hurd', 'illumos', 'ios', 'js',
+    'linux', 'nacl', 'netbsd', 'openbsd', 'plan9', 'solaris', 'wasip1', 'windows', 'zos']);
+const _GO_ARCH = new Set(['386', 'amd64', 'amd64p32', 'arm', 'arm64', 'arm64be', 'armbe', 'loong64', 'mips',
+    'mips64', 'mips64le', 'mips64p32', 'mips64p32le', 'mipsle', 'ppc', 'ppc64', 'ppc64le', 'riscv', 'riscv64',
+    's390', 's390x', 'sparc', 'sparc64', 'wasm']);
+
+/**
+ * The build configurations a Go file belongs to (fix #399): its
+ * `//go:build` expression plus the GOOS/GOARCH its file name implies
+ * (`x_linux.go`, `x_windows_amd64_test.go`); '' when every build compiles it.
+ */
+function _goFileConstraint(index, file) {
+    const tag = index.files.get(file)?.buildConstraint || '';
+    const parts = path.basename(file, '.go').replace(/_test$/, '').split('_');
+    let implied = '';
+    if (parts.length >= 3 && _GO_OS.has(parts[parts.length - 2]) && _GO_ARCH.has(parts[parts.length - 1])) {
+        implied = `${parts[parts.length - 2]}/${parts[parts.length - 1]}`;
+    } else if (parts.length >= 2 && (_GO_OS.has(parts[parts.length - 1]) || _GO_ARCH.has(parts[parts.length - 1]))) {
+        implied = parts[parts.length - 1];
+    }
+    return tag || implied ? `${tag}|${implied}` : '';
+}
+
+/**
+ * Package-level Go variables by package (directory + package clause),
+ * index-lifetime memo (fix #399).
+ */
+function _goPackageVarIndex(index) {
+    const memo = index._rustScopeMemo || (index._rustScopeMemo = new Map());
+    let byPackage = memo.get('\x01goPackageVars');
+    if (byPackage) return byPackage;
+    byPackage = new Map();
+    for (const [file, entry] of index.files) {
+        if (entry.language !== 'go' || !entry.packageVars?.length) continue;
+        const key = `${path.dirname(file)}\0${entry.packageName || ''}`;
+        let vars = byPackage.get(key);
+        if (!vars) byPackage.set(key, vars = new Map());
+        for (const variable of entry.packageVars) {
+            if (!vars.has(variable.name)) vars.set(variable.name, []);
+            vars.get(variable.name).push({ ...variable, file });
+        }
+    }
+    memo.set('\x01goPackageVars', byPackage);
+    return byPackage;
+}
+
+/**
+ * The static type of one package-level variable declaration: its declared
+ * or composite-literal type (a qualified type resolved through the
+ * declaring file's imports), else its initializer's declared result read
+ * from the declaring file's module-scope flow. Returns a flow-shaped entry
+ * { type, fromFile, source, evidence } or { externalVia, externalConcrete },
+ * or null.
+ */
+function _goPackageVarDeclType(index, decl) {
+    const entry = index.files.get(decl.file);
+    if (decl.type) {
+        if (!decl.qualifier) {
+            return { type: decl.type, fromFile: decl.file, source: decl.origin?.source || 'annotation',
+                evidence: decl.origin || { source: 'annotation' } };
+        }
+        const qualified = _goQualifiedReceiverType(index, entry, decl.qualifier, decl.type);
+        if (qualified?.kind === 'project') {
+            const files = [...new Set(qualified.defs.map(d => d.file))].sort(codeUnitCompare);
+            return files.length > 0 ? { type: decl.type, fromFile: files[0], source: decl.origin?.source || 'annotation',
+                evidence: decl.origin || { source: 'annotation' } } : null;
+        }
+        if (qualified?.kind === 'opaque') {
+            return { externalVia: qualified.via,
+                externalConcrete: !!getLanguageAdapter('go')?.isPlatformConcreteType?.(decl.qualifier, decl.type) };
+        }
+        return null;
+    }
+    const flowMap = _buildReturnTypeFlowMap(index, decl.file, getCachedCalls(index, decl.file) || []);
+    const flow = flowMap && _lookupReturnTypeFlowRaw(flowMap,
+        { receiver: decl.name, line: Number.MAX_SAFE_INTEGER, enclosingFunction: null });
+    if (!flow) return null;
+    if (flow.externalVia) return { externalVia: flow.externalVia, externalConcrete: !!flow.externalConcrete };
+    return flow.type ? { type: flow.type, fromFile: flow.fromFile || decl.file, source: 'flow', evidence: flow } : null;
+}
+
+/**
+ * The static type of package-level variable `name` of the Go package at
+ * (dir, packageName) for a receiver in `siteFile` (fix #399). A package's
+ * variable has one static type wherever it is used; build-constrained files
+ * may each declare it, and then every declaration must agree. A `_test.go`
+ * declaration reaches only test files.
+ */
+function _goPackageVarType(index, dir, packageName, name, siteFile) {
+    const vars = _goPackageVarIndex(index).get(`${dir}\0${packageName || ''}`)?.get(name);
+    if (!vars) return null;
+    const siteIsTest = siteFile.endsWith('_test.go');
+    // A file with a build constraint compiles only in its configurations:
+    // its variables never reach a file of another constraint (gin's
+    // `//go:build jsoniter` file declares the `json` a `//go:build go_json`
+    // file's import names); a file every build compiles sees them all, and
+    // the declarations must then agree.
+    const siteConstraint = _goFileConstraint(index, siteFile);
+    const decls = vars.filter(variable => (siteIsTest || !variable.file.endsWith('_test.go')) &&
+        (!siteConstraint || variable.file === siteFile || !_goFileConstraint(index, variable.file) ||
+            _goFileConstraint(index, variable.file) === siteConstraint));
+    if (decls.length === 0) return null;
+    const memo = index._opMemo?.('goPackageVarType', () => new Map());
+    const key = `${dir}\0${packageName || ''}\0${name}\0${siteIsTest ? 1 : 0}\0${siteConstraint}`;
+    if (memo?.has(key)) return memo.get(key);
+    const results = decls.map(decl => _goPackageVarDeclType(index, decl));
+    const first = results[0];
+    const result = first && results.every(r => r && r.type === first.type &&
+        r.fromFile === first.fromFile && r.externalVia === first.externalVia) ? first : null;
+    memo?.set(key, result);
+    return result;
+}
+
+/**
+ * A Go method call whose receiver is a package-level variable declared in
+ * another file of the package (`CommandLine.VarP(..)`, parser fact
+ * `receiverPackageScope`) or an importer's `pkg.Var.M()`, rewritten with the
+ * variable's static type (fix #399). Initializer-typed variables follow the
+ * return-flow gate (`allowFlow`). null when nothing is known.
+ */
+function _goPackageVarReceiver(index, filePath, fileEntry, call, allowFlow) {
+    let dir;
+    let packageName;
+    let name;
+    if (call.receiverPackageScope && call.receiver) {
+        dir = path.dirname(filePath);
+        packageName = fileEntry.packageName;
+        name = call.receiver;
+    } else if (call.receiverRootIsModule && call.receiverRoot && call.receiverField &&
+        /^\p{Lu}/u.test(call.receiverField)) {
+        const binding = (fileEntry.importBindings || []).find(b => (b.alias || b.name) === call.receiverRoot && b.module);
+        const rel = binding && fileEntry.moduleResolved?.[binding.module];
+        if (!rel) return null;
+        dir = path.dirname(path.isAbsolute(rel) ? rel : path.join(index.root, rel));
+        packageName = [...index.files.entries()].find(([file, entry]) => path.dirname(file) === dir &&
+            entry.language === 'go' && !file.endsWith('_test.go') && entry.packageName)?.[1].packageName;
+        name = call.receiverField;
+    } else {
+        return null;
+    }
+    const typed = _goPackageVarType(index, dir, packageName, name, filePath);
+    if (!typed) return null;
+    const moduleRoot = call.receiverRootIsModule ? { receiverRootIsModule: undefined } : {};
+    if (typed.externalVia) {
+        if (!allowFlow || call.receiverRootIsModule) return null;
+        return { ...call, receiverExternalFlow: typed.externalVia,
+            ...(typed.externalConcrete && { receiverExternalConcreteFlow: true }) };
+    }
+    if (typed.source === 'flow' && !allowFlow) return null;
+    return { ...call, ...moduleRoot, receiverType: typed.type, receiverTypeSource: typed.source,
+        receiverTypeEvidence: { ...typed.evidence, source: typed.source, type: typed.type,
+            packageVar: name, file: path.relative(index.root, typed.fromFile) },
+        receiverTypeFlowFile: typed.fromFile };
 }
 
 /** A declared interface/trait receiver names a dispatch contract, not one executable body. */
@@ -22670,6 +23279,10 @@ function _normalizeFieldTypeName(raw, language, options = {}) {
             t = t.replace(/^&+\s*/, '').replace(/^'[A-Za-z_][A-Za-z0-9_]*\s*/, '').replace(/^mut\s+/, '');
         } while (t !== prev);
         if (/^(dyn|impl)\b/.test(t)) return null;
+        // Raw pointers (fix #399): canonical '*const' / '*mut', the names
+        // annotated pointer receivers carry.
+        const rawPointer = /^\*\s*(const|mut)\b/.exec(t);
+        if (rawPointer) return `*${rawPointer[1]}`;
         // `&'a [T]` is the primitive slice (fix #369): canonical 'slice', the
         // same name annotated slice receivers carry. Arrays abstain.
         if (/^\[/.test(t)) {
@@ -23720,17 +24333,32 @@ function _isGenericSliceOwner(definition, owner) {
 }
 
 /**
+ * A Rust impl `for *const T` / `for *mut T` over its own type parameter is
+ * the primitive raw pointer owner; such receivers carry the canonical names
+ * '*const' and '*mut' (fix #399). Returns that name or null.
+ */
+function _genericRawPointerOwner(definition, owner) {
+    const match = /^\*\s*(const|mut)\s+([A-Za-z_][A-Za-z0-9_]*)$/.exec(String(owner || '').trim());
+    return match && _genericParamNames(definition?.ownerGenerics)?.has(match[2]) ? `*${match[1]}` : null;
+}
+
+/**
  * A slice-typed receiver ('slice') cannot tell `impl X for [u8]` from
  * `impl X for [i32]`; against such concrete-element slice owners the
  * receiver stays untyped (fix #368).
  */
 function _withoutAmbiguousSliceType(call, targetDefs) {
-    if (!call?.receiverTypeStd || !['slice', 'tuple'].includes(call.receiverType)) return call;
+    if (!call?.receiverTypeStd || !['slice', 'tuple', '*const', '*mut'].includes(call.receiverType)) return call;
     const ambiguous = targetDefs.some(definition => {
         const owners = [definition.className, definition.receiver].filter(Boolean).map(String);
         if (call.receiverType === 'tuple') {
             // Tuple impls (`impl<A, B> T for (A, B)`) have no nominal owner.
             return owners.some(owner => /^&?\s*\(/.test(owner));
+        }
+        if (call.receiverType !== 'slice') {
+            // `impl X for *const u8` beside `*const i32` (fix #399).
+            return owners.some(owner => /^\*\s*(const|mut)\s/.test(owner.trim()) &&
+                !_genericRawPointerOwner(definition, owner));
         }
         return owners.some(owner => /^&?\s*\[/.test(owner) &&
             !_isGenericSliceOwner(definition, owner));
@@ -24467,6 +25095,28 @@ const _RUST_STD_OPTION_METHODS = new Set([
 ]);
 
 /**
+ * Raw pointer arithmetic and casts keep a raw pointer (fix #399): `p.add(n)`,
+ * `p.sub(n)`, `p.offset(n)` and their wrapping/byte forms are `Self`,
+ * `p.cast::<U>()` keeps the pointer's mutability, `cast_mut`/`cast_const`
+ * switch it. Slices, `str`, `Vec` and `String` hand out their buffer as a
+ * raw pointer (`as_ptr`, `as_mut_ptr`).
+ */
+const _RUST_RAW_POINTER_SELF_METHODS = new Set([
+    'add', 'sub', 'offset', 'wrapping_add', 'wrapping_sub', 'wrapping_offset',
+    'byte_add', 'byte_sub', 'byte_offset', 'wrapping_byte_add', 'wrapping_byte_sub',
+    'wrapping_byte_offset', 'cast',
+]);
+const _RUST_STD_POINTER_PRODUCERS = new Set(['slice', 'str', 'Vec', 'String']);
+const _RUST_STD_POINTER_PRODUCER_METHODS = Object.freeze({ as_ptr: '*const', as_mut_ptr: '*mut' });
+
+function _rustRawPointerMethodResult(receiverType, name) {
+    if (_RUST_RAW_POINTER_SELF_METHODS.has(name)) return receiverType;
+    if (name === 'cast_mut') return '*mut';
+    if (name === 'cast_const') return '*const';
+    return null;
+}
+
+/**
  * Result of a std method on a deref-free std receiver (fix #369): a std
  * iterator adaptor or Option, provided no project definition of the name
  * could bind for that receiver (an impl for the receiver type, a generic or
@@ -24477,10 +25127,14 @@ function _rustStdMethodResult(index, receiverType, name) {
     // Primitive scalars have their own `max`/`min` (Ord) returning Self;
     // only container, text and iterator receivers take these contracts.
     const scalar = /^([iu](8|16|32|64|128|size)|f32|f64|bool|char)$/.test(receiverType);
+    const pointer = receiverType === '*const' || receiverType === '*mut';
     const type = scalar
         ? (/^checked_/.test(name) ? 'Option' : null)
-        : _RUST_STD_ITERATOR_METHODS.has(name) ? 'Iterator'
-            : _RUST_STD_OPTION_METHODS.has(name) ? 'Option' : null;
+        : pointer ? _rustRawPointerMethodResult(receiverType, name)
+            : _RUST_STD_POINTER_PRODUCERS.has(receiverType) && _RUST_STD_POINTER_PRODUCER_METHODS[name]
+                ? _RUST_STD_POINTER_PRODUCER_METHODS[name]
+                : _RUST_STD_ITERATOR_METHODS.has(name) ? 'Iterator'
+                    : _RUST_STD_OPTION_METHODS.has(name) ? 'Option' : null;
     if (!type) return null;
     for (const shadow of [receiverType, type]) {
         if ((index.symbols.get(shadow) || []).some(definition =>
@@ -24502,7 +25156,7 @@ function _rustStdMethodResult(index, receiverType, name) {
 }
 
 const _RUST_DEREF_FREE_STD = new Set([
-    'slice', 'str', 'tuple', 'bool', 'char',
+    'slice', 'str', 'tuple', 'bool', 'char', '*const', '*mut',
     'i8', 'i16', 'i32', 'i64', 'i128', 'isize', 'u8', 'u16', 'u32', 'u64', 'u128', 'usize', 'f32', 'f64',
     'Vec', 'VecDeque', 'LinkedList', 'BinaryHeap', 'HashMap', 'HashSet', 'BTreeMap', 'BTreeSet',
     'String', 'Option', 'Result',

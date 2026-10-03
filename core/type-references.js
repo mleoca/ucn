@@ -1111,10 +1111,40 @@ class TypeReferenceResolver {
         const packageTypes = this.all.filter(d => this.goPackageKey(d.file) === key &&
             d.lexicalScopeStartLine == null && d.name === name);
         if (packageTypes.length > 0) return this.judge(packageTypes);
+        return this.resolveGoDotImports(file, name);
+    }
+
+    /**
+     * A name the file's package does not declare, looked up in the file
+     * block: `import . "p"` declares there every EXPORTED package-level
+     * identifier of p (Go spec, Import declarations). Each dot-imported
+     * project package is searched by its directory (its `_test` files are
+     * never part of the imported package); an out-of-project package cannot
+     * declare a project type; an import path the index could not resolve
+     * that may still be a project package leaves the token undecided.
+     */
+    resolveGoDotImports(file, name) {
         const entry = this.index.files.get(file);
-        const dot = (entry.importBindings || []).some(b => b.name === '.' || b.alias === '.');
-        if (dot) return { verdict: 'unknown', reason: 'dot-import' };
-        return { verdict: 'no', reason: 'other-package' };
+        const dots = (entry?.importDetails || []).filter(detail => detail.type === 'dot-import' && detail.module);
+        if (dots.length === 0 || !/^\p{Lu}/u.test(name)) return { verdict: 'no', reason: 'other-package' };
+        const { bindingIsExternal } = require('./type-denotation');
+        const verdicts = [];
+        for (const detail of dots) {
+            const moduleFile = this.moduleFile(entry, detail.module);
+            if (!moduleFile) {
+                if (bindingIsExternal(this.index, entry, file, { module: detail.module }) !== true) {
+                    verdicts.push({ verdict: 'unknown', reason: 'dot-import' });
+                }
+                continue;
+            }
+            const dir = path.dirname(moduleFile);
+            const types = this.all.filter(d => path.dirname(d.file) === dir && d.lexicalScopeStartLine == null &&
+                !d.file.endsWith('_test.go') &&
+                !String(this.index.files.get(d.file)?.packageName || '').endsWith('_test'));
+            if (types.length > 0) verdicts.push(this.judge(types, 'other-package'));
+        }
+        if (verdicts.length === 0) return { verdict: 'no', reason: 'other-package' };
+        return this.combine(verdicts);
     }
 
     javaFqn(d) {

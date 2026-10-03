@@ -3045,3 +3045,32 @@ describe('fix #397: JS destructured members, local shadows, member values and li
         } finally { rm(dir); }
     });
 });
+
+describe('fix #399: Go package-level variables and package-scope receivers survive workers', () => {
+    const { ProjectIndex } = require('../core/project');
+    const { tmp, rm, indexSnapshot } = require('./helpers');
+
+    it('parallel and sequential builds carry the same facts', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/p\n\ngo 1.21\n',
+            'a.go': 'package p\n\ntype Tx struct{}\n\nfunc (t *Tx) Do() {}\n\nvar G = &Tx{}\n\nvar (\n\tD *Tx\n\tN = 3\n)\n',
+            'b.go': 'package p\n\nfunc F() {\n\tG.Do()\n\tD.Do()\n}\n',
+            'c.go': 'package p\n\nfunc H(G *Tx) { G.Do() }\n',
+        });
+        try {
+            const sequential = new ProjectIndex(dir);
+            sequential.build(null, { quiet: true, workers: 0 });
+            const parallel = new ProjectIndex(dir);
+            parallel.build(null, { quiet: true, workers: 2 });
+            assert.ok(parallel.lastBuildWorkerCount >= 2, `workers: ${parallel.lastBuildWorkerCount}`);
+            assert.strictEqual(indexSnapshot(parallel), indexSnapshot(sequential));
+            const snapshot = indexSnapshot(sequential);
+            for (const fact of ['\\"name\\":\\"G\\"', '\\"name\\":\\"D\\"', '\\"name\\":\\"N\\"',
+                '\\"receiverPackageScope\\":true']) {
+                assert.ok(snapshot.includes(fact), fact);
+            }
+            assert.strictEqual(snapshot.split('\\"receiverPackageScope\\":true').length - 1, 2,
+                'only the receivers no scope of their file binds');
+        } finally { rm(dir); }
+    });
+});

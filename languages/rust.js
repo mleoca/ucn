@@ -1471,6 +1471,19 @@ function rustSliceTypeOf(typeNode) {
     return current?.type === 'array_type' && !current.childForFieldName('length') ? 'slice' : null;
 }
 
+/**
+ * A raw pointer type behind any reference layers (`*const T`, `*mut T`) is a
+ * primitive type (fix #399): its methods are the pointer's inherent methods
+ * and trait impls written `for *const T` / `for *mut T`. Canonical receiver
+ * names '*const' and '*mut'; raw pointers never auto-deref.
+ */
+function rustRawPointerTypeOf(typeNode) {
+    let current = typeNode;
+    while (current?.type === 'reference_type') current = current.childForFieldName('type');
+    if (current?.type !== 'pointer_type') return null;
+    return current.children.some(child => child.type === 'mutable_specifier') ? '*mut' : '*const';
+}
+
 /** Reference layer of a declared type node: 'owned', '&' or '&mut'. */
 function rustTypeRefKind(typeNode) {
     if (typeNode?.type !== 'reference_type') return 'owned';
@@ -3747,8 +3760,12 @@ function findCallsInCode(code, parser) {
                     const patternNode = param.childForFieldName('pattern');
                     retainBoundNames(patternNode);
                     const typeNode = param.childForFieldName('type');
-                    const sliceType = rustSliceTypeOf(typeNode);
-                    const typeName = extractTypeName(typeNode) || sliceType;
+                    const sliceType = rustSliceTypeOf(typeNode) || rustRawPointerTypeOf(typeNode);
+                    // `other: &Self` is the enclosing impl's self type (fix
+                    // #399); in a trait's own methods it is the implementor,
+                    // which no annotation names.
+                    const written = extractTypeName(typeNode);
+                    const typeName = (written === 'Self' ? findEnclosingImplType(param) : written) || sliceType;
                     const qualifier = extractTypeQualifier(typeNode);
                     const iteratorItem = extractRustIteratorItemTypeFromTypeNode(typeNode);
                     const indexElement = patternNode?.type === 'identifier'
@@ -4457,10 +4474,20 @@ function findCallsInCode(code, parser) {
                     const rangeReceiverType = (!receiver && valueNode)
                         ? (rustRangeLiteralType(valueNode) ||
                             (valueNode.type === 'tuple_expression' ? 'tuple' : null)) : null;
+                    // A cast receiver (fix #399): `(p as *const T).m()` has
+                    // exactly the cast's type (a primitive or raw pointer).
+                    let castNode = !receiver ? valueNode : null;
+                    while (castNode?.type === 'parenthesized_expression') castNode = castNode.namedChild(0);
+                    const castTypeNode = castNode?.type === 'type_cast_expression'
+                        ? castNode.childForFieldName('type') : null;
+                    const castReceiverType = castTypeNode
+                        ? (rustRawPointerTypeOf(castTypeNode) ||
+                            (castTypeNode.type === 'primitive_type' ? castTypeNode.text : null))
+                        : null;
                     const literalReceiverType = (!receiver && valueNode)
                         ? (({ string_literal: 'str', raw_string_literal: 'str',
                             char_literal: 'char', boolean_literal: 'bool' })[valueNode.type] ||
-                            rangeReceiverType || undefined)
+                            rangeReceiverType || castReceiverType || undefined)
                         : undefined;
                     // Element receiver (fix #359): `items[i].m()` on a
                     // declared std container dispatches on its element.
@@ -4526,11 +4553,16 @@ function findCallsInCode(code, parser) {
                                 ? { receiverTypeSource: 'literal',
                                     receiverTypeEvidence: typeOrigin('literal', valueNode),
                                     receiverTypeStd: true } : null) ||
+                            (castReceiverType && receiverType === castReceiverType
+                                ? { receiverTypeSource: 'annotation',
+                                    receiverTypeEvidence: typeOrigin('annotation', castTypeNode),
+                                    receiverTypeStd: true } : null) ||
                             { receiverTypeSource: 'unknown' }) }),
                         ...(receiverTypeQualifier && { receiverTypeQualifier }),
                         ...(receiverType && (() => {
                             // `x.clone()` and range literals are owned values.
-                            const kind = receiverViaClone || (rangeReceiverType && receiverType === rangeReceiverType)
+                            const kind = receiverViaClone || (rangeReceiverType && receiverType === rangeReceiverType) ||
+                                (castReceiverType && receiverType === castReceiverType)
                                 ? 'owned'
                                 : (receiver && receiver !== 'self' ? getReceiverRefKind(receiver, node) : undefined);
                             return kind ? { receiverTypeRef: kind } : {};
@@ -4831,8 +4863,9 @@ function findCallsInCode(code, parser) {
                     // Pattern 3: explicit type annotation — let s: Server = ...
                     if (typeAnnotation) {
                         typeName = extractTypeName(typeAnnotation);
-                        if (!typeName && rustSliceTypeOf(typeAnnotation)) {
-                            typeName = rustSliceTypeOf(typeAnnotation);
+                        if (typeName === 'Self') typeName = findEnclosingImplType(typeAnnotation) || null;
+                        if (!typeName && (rustSliceTypeOf(typeAnnotation) || rustRawPointerTypeOf(typeAnnotation))) {
+                            typeName = rustSliceTypeOf(typeAnnotation) || rustRawPointerTypeOf(typeAnnotation);
                             stdLiteral = true;
                         }
                         typeQualifier = extractTypeQualifier(typeAnnotation);

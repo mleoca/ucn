@@ -308,6 +308,9 @@ function indexSnapshot(index) {
             recoveryCandidates: fe.recoveryCandidates || null,
             externalMacroNames: fe.externalMacroNames || null,
             externalMacroKey: fe.externalMacroKey || null,
+            // Go package-level variables (fix #399) come from the worker parse too.
+            packageVars: (fe.packageVars || []).map(variable => JSON.stringify(variable)),
+            buildConstraint: fe.buildConstraint || null,
             bindings: (fe.bindings || []).map(binding => JSON.stringify(Object.fromEntries(
                 Object.entries(binding).sort(([a], [b]) => a.localeCompare(b))))).sort(),
             parseRecovery: !!fe.parseRecovery,

@@ -146,4 +146,40 @@ function rustModuleItems(index, resolved, name) {
     return out;
 }
 
-module.exports = { rustPathModule, rustModuleItems };
+/**
+ * The crate root and module path of a source position (fix #399), or null
+ * for a file that is not Rust.
+ * @returns {{ root: string, segs: string[] }|null}
+ */
+function rustModulePathAt(index, filePath, line) {
+    if (!isRustEntry(index.files.get(filePath))) return null;
+    const tree = moduleTree(index);
+    const own = tree.moduleOf(filePath);
+    return { root: own.root, segs: [...own.segs, ...rustInlineChainAt(tree.inlineByFile.get(filePath) || [], line)] };
+}
+
+/**
+ * Is an item with Rust visibility `modifiers`, declared at (file, line),
+ * accessible at (siteFile, siteLine)? `pub` items are; `pub(crate)` ones
+ * within their crate; private, `pub(self)` and `pub(super)` items within
+ * the module tree under their module (or its parent). `pub(in path)` and
+ * unknown layouts are not provable (false).
+ */
+function rustItemAccessible(index, modifiers, file, line, siteFile, siteLine) {
+    const mods = (modifiers || []).map(m => String(m).replace(/\s+/g, ''));
+    if (mods.includes('pub')) return true;
+    const item = rustModulePathAt(index, file, line);
+    const site = rustModulePathAt(index, siteFile, siteLine);
+    if (!item || !site || item.root !== site.root) return false;
+    if (mods.includes('pub(crate)')) return true;
+    let scope = item.segs;
+    if (mods.includes('pub(super)')) {
+        if (scope.length === 0) return false;
+        scope = scope.slice(0, -1);
+    } else if (mods.some(m => m.startsWith('pub(') && m !== 'pub(self)')) {
+        return false;
+    }
+    return scope.length <= site.segs.length && scope.every((seg, i) => site.segs[i] === seg);
+}
+
+module.exports = { rustPathModule, rustModuleItems, rustModulePathAt, rustItemAccessible };

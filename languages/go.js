@@ -1242,6 +1242,160 @@ function extractTypeConversions(tree) {
     return out;
 }
 
+// Extract the base type name from a type node (strips pointer, qualified, etc.)
+function goTypeNameOf(typeNode) {
+    if (!typeNode) return null;
+    if (typeNode.type === 'type_identifier') return typeNode.text;
+    if (typeNode.type === 'pointer_type') {
+        // *Framework -> Framework
+        for (let i = 0; i < typeNode.namedChildCount; i++) {
+            const r = goTypeNameOf(typeNode.namedChild(i));
+            if (r) return r;
+        }
+    }
+    if (typeNode.type === 'qualified_type') {
+        // pkg.Type -> Type
+        const tn = typeNode.childForFieldName('name');
+        if (tn) return tn.text;
+    }
+    // Box[T] / pkg.Box[T] -> Box: an instantiation has the generic
+    // type's method set (fix #378).
+    if (typeNode.type === 'generic_type') {
+        return goTypeNameOf(typeNode.childForFieldName('type'));
+    }
+    return null;
+}
+
+// Preserve the package qualifier separately from the bare type name.
+// `http.Handler` and a project-local `Handler` are different identities;
+// dropping `http.` lets an unrelated same-named project type steal method
+// dispatch. Pointer wrappers do not change that provenance.
+function goTypeQualifierOf(typeNode) {
+    if (!typeNode) return null;
+    if (typeNode.type === 'pointer_type') {
+        for (let i = 0; i < typeNode.namedChildCount; i++) {
+            const q = goTypeQualifierOf(typeNode.namedChild(i));
+            if (q) return q;
+        }
+    }
+    if (typeNode.type === 'qualified_type') {
+        const pkg = typeNode.childForFieldName('package') || typeNode.namedChild(0);
+        return pkg?.text || null;
+    }
+    if (typeNode.type === 'generic_type') {
+        return goTypeQualifierOf(typeNode.childForFieldName('type'));
+    }
+    return null;
+}
+
+const GO_CONTAINER_TYPE_NODES = new Set(['slice_type', 'map_type', 'array_type']);
+
+/** The var_spec nodes of a top-level `var` declaration (single or grouped). */
+function goVarSpecs(declaration) {
+    const specs = [];
+    for (const child of declaration.namedChildren) {
+        if (child.type === 'var_spec') specs.push(child);
+        else if (child.type === 'var_spec_list') {
+            for (const spec of child.namedChildren) if (spec.type === 'var_spec') specs.push(spec);
+        }
+    }
+    return specs;
+}
+
+/**
+ * Package-level variables of a file (fix #399): every name a top-level
+ * `var` declares, with the static type its declaration states (`var x T`,
+ * `var x = T{..}`, `var x = &T{..}`) and the AST witness. A variable
+ * initialized by a call is typed at query time from the producer's declared
+ * result, in this file (its flow map holds the module-scope assignment).
+ * Package scope is the directory: other files of the package reach these
+ * names unqualified, importers through the package qualifier.
+ */
+function extractPackageVars(rootNode) {
+    const out = [];
+    for (const declaration of rootNode.namedChildren) {
+        if (declaration.type !== 'var_declaration') continue;
+        for (const spec of goVarSpecs(declaration)) {
+            const declaredType = spec.childForFieldName('type');
+            let typeName = null;
+            let qualifier = null;
+            let origin = null;
+            if (declaredType && !GO_CONTAINER_TYPE_NODES.has(declaredType.type)) {
+                typeName = goTypeNameOf(declaredType);
+                qualifier = typeName ? goTypeQualifierOf(declaredType) : null;
+                origin = typeName ? typeOrigin('annotation', declaredType) : null;
+            } else if (!declaredType) {
+                const valueNode = spec.childForFieldName('value');
+                let init = valueNode?.type === 'expression_list' && valueNode.namedChildCount === 1
+                    ? valueNode.namedChild(0) : null;
+                if (init?.type === 'unary_expression') init = init.namedChildCount > 0 ? init.namedChild(0) : null;
+                if (init?.type === 'composite_literal') {
+                    const tn = init.childForFieldName('type');
+                    typeName = goTypeNameOf(tn);
+                    qualifier = typeName ? goTypeQualifierOf(tn) : null;
+                    origin = typeName ? typeOrigin('constructor', init) : null;
+                }
+            }
+            for (const id of spec.namedChildren) {
+                if (id.type !== 'identifier' || id.text === '_') continue;
+                out.push({
+                    name: id.text,
+                    line: id.startPosition.row + 1,
+                    ...(typeName && { type: typeName, origin }),
+                    ...(qualifier && { qualifier }),
+                });
+            }
+        }
+    }
+    return out;
+}
+
+/**
+ * The file's build constraint (fix #399): the `//go:build` expression (or
+ * legacy `// +build` lines) before the package clause, whitespace-normalized;
+ * null for a file every build compiles (file-name GOOS/GOARCH suffixes are
+ * judged from the path at query time).
+ */
+function goBuildConstraint(rootNode) {
+    const legacy = [];
+    for (const node of rootNode.namedChildren) {
+        if (node.type === 'package_clause') break;
+        if (node.type !== 'comment') continue;
+        const text = node.text.trim();
+        const modern = /^\/\/go:build\s+(.+)$/.exec(text);
+        if (modern) return modern[1].replace(/\s+/g, ' ').trim();
+        const old = /^\/\/\s*\+build\s+(.+)$/.exec(text);
+        if (old) legacy.push(old[1].replace(/\s+/g, ' ').trim());
+    }
+    return legacy.length > 0 ? legacy.join(' && ') : null;
+}
+
+/** Names the file declares at package level: vars, consts, types, funcs. */
+function goFileLevelNames(rootNode) {
+    const names = new Set();
+    for (const declaration of rootNode.namedChildren) {
+        if (declaration.type === 'var_declaration') {
+            for (const spec of goVarSpecs(declaration)) {
+                for (const id of spec.namedChildren) if (id.type === 'identifier') names.add(id.text);
+            }
+        } else if (declaration.type === 'const_declaration') {
+            for (const spec of declaration.namedChildren) {
+                if (spec.type !== 'const_spec') continue;
+                for (const id of spec.namedChildren) if (id.type === 'identifier') names.add(id.text);
+            }
+        } else if (declaration.type === 'type_declaration') {
+            for (const spec of declaration.namedChildren) {
+                const nameNode = spec.childForFieldName?.('name');
+                if (nameNode) names.add(nameNode.text);
+            }
+        } else if (declaration.type === 'function_declaration') {
+            const nameNode = declaration.childForFieldName('name');
+            if (nameNode) names.add(nameNode.text);
+        }
+    }
+    return names;
+}
+
 /**
  * Parse a Go file completely
  */
@@ -1286,6 +1440,8 @@ function parse(code, parser) {
         classes,
         stateObjects,
         ...(packageName && { packageName }),
+        packageVars: extractPackageVars(tree.rootNode),
+        ...(goBuildConstraint(tree.rootNode) && { buildConstraint: goBuildConstraint(tree.rootNode) }),
         ...(tree.rootNode.hasError && { parseRecovery: true, parseErrorRegions: parseErrorRegions(tree.rootNode) }),
         typeConversions: extractTypeConversions(tree),
         imports: [],
@@ -1580,51 +1736,8 @@ function findCallsInCode(code, parser, options = {}) {
         return ['function_declaration', 'method_declaration', 'func_literal'].includes(node.type);
     };
 
-    // Extract the base type name from a type node (strips pointer, qualified, etc.)
-    const extractTypeName = (typeNode) => {
-        if (!typeNode) return null;
-        if (typeNode.type === 'type_identifier') return typeNode.text;
-        if (typeNode.type === 'pointer_type') {
-            // *Framework -> Framework
-            for (let i = 0; i < typeNode.namedChildCount; i++) {
-                const r = extractTypeName(typeNode.namedChild(i));
-                if (r) return r;
-            }
-        }
-        if (typeNode.type === 'qualified_type') {
-            // pkg.Type -> Type
-            const tn = typeNode.childForFieldName('name');
-            if (tn) return tn.text;
-        }
-        // Box[T] / pkg.Box[T] -> Box: an instantiation has the generic
-        // type's method set (fix #378).
-        if (typeNode.type === 'generic_type') {
-            return extractTypeName(typeNode.childForFieldName('type'));
-        }
-        return null;
-    };
-
-    // Preserve the package qualifier separately from the bare type name.
-    // `http.Handler` and a project-local `Handler` are different identities;
-    // dropping `http.` lets an unrelated same-named project type steal method
-    // dispatch. Pointer wrappers do not change that provenance.
-    const extractTypeQualifier = (typeNode) => {
-        if (!typeNode) return null;
-        if (typeNode.type === 'pointer_type') {
-            for (let i = 0; i < typeNode.namedChildCount; i++) {
-                const q = extractTypeQualifier(typeNode.namedChild(i));
-                if (q) return q;
-            }
-        }
-        if (typeNode.type === 'qualified_type') {
-            const pkg = typeNode.childForFieldName('package') || typeNode.namedChild(0);
-            return pkg?.text || null;
-        }
-        if (typeNode.type === 'generic_type') {
-            return extractTypeQualifier(typeNode.childForFieldName('type'));
-        }
-        return null;
-    };
+    const extractTypeName = goTypeNameOf;
+    const extractTypeQualifier = goTypeQualifierOf;
 
     // Build type map from function/method parameters and receiver.
     // Also returns funcParamNames: parameter names with function types (func(...) ...)
@@ -2056,9 +2169,20 @@ function findCallsInCode(code, parser, options = {}) {
         }
         return localBindingNames.has(name);
     };
-    const bindingScopeOf = (refNode, name) =>
-        (locallyBound(name) ? lexicalBindingScopeStart(refNode, name) : null);
+    // One climb per reference: receiver typing and the package-scope test
+    // ask the same question of the same node (fix #399).
+    const bindingScopes = new Map();
+    const bindingScopeOf = (refNode, name) => {
+        if (!locallyBound(name)) return null;
+        const key = `${refNode.startIndex}\0${name}`;
+        if (bindingScopes.has(key)) return bindingScopes.get(key);
+        const scope = lexicalBindingScopeStart(refNode, name);
+        bindingScopes.set(key, scope);
+        return scope;
+    };
     const isShadowedByLocal = (refNode, name) => bindingScopeOf(refNode, name) != null;
+    let fileLevelNameSet = null;
+    const fileLevelNames = () => (fileLevelNameSet || (fileLevelNameSet = goFileLevelNames(tree.rootNode)));
     // An identifier operand naming an import that no local binding shadows
     // is a package qualifier: `pkg.Name` then denotes a package-level
     // symbol (function, type, var or const), never a member of a value.
@@ -2600,6 +2724,12 @@ function findCallsInCode(code, parser, options = {}) {
                         ? getReceiverTypeQualifier(receiver, operandNode) : undefined;
                     const receiverIndexedSource = !isPkgCall && receiver && !receiverType
                         ? getIndexedSource(receiver, operandNode) : undefined;
+                    // A receiver no scope of this file binds names a
+                    // package-level declaration of another file of the
+                    // package (fix #399): typed at query time.
+                    const receiverPackageScope = !!(receiver && !isPkgCall && !receiverType &&
+                        !receiverIndexedSource && !fileLevelNames().has(receiver) &&
+                        !isShadowedByLocal(operandNode, receiver));
                     // Composite-literal receiver (fix #298):
                     // (&Kit{...}).Run(...) — compiler-true type, never guessed.
                     if (!receiver && !receiverType) {
@@ -2732,6 +2862,7 @@ function findCallsInCode(code, parser, options = {}) {
                         }),
                         ...(receiverFieldName && { receiverRoot, receiverField: receiverFieldName }),
                         ...(receiverRootIsModule && { receiverRootIsModule: true }),
+                        ...(receiverPackageScope && { receiverPackageScope: true }),
                         ...(receiverFieldName && receiverRootType && { receiverRootType }),
                         ...(receiverFieldName && receiverRootTypeQualifier && { receiverRootTypeQualifier }),
                         ...(receiverFieldName && receiverRootType && receiverRootTypeGuessed && { receiverRootTypeGuessed: true }),
