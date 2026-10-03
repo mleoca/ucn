@@ -9,7 +9,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { detectLanguage, getParser, getLanguageAdapter, langTraits } = require('../languages');
-const { genericArityOf } = require('../languages/utils');
+const { genericArityOf, goPathPackageName } = require('../languages/utils');
 const { isTestFile } = require('./discovery');
 const { NON_CALLABLE_TYPES, isOverrideMarked, codeUnitCompare, isTestPath, CALLABLE_SYMBOL_KINDS,
     isMacroNamespaceDefinition } = require('./shared');
@@ -1034,6 +1034,35 @@ function findCallers(index, name, options = {}) {
         }
         if (union.size > 0) calleeFiles = union;
     }
+    // C# target-typed `new(..)` whose type the call it is an argument of
+    // (or the member it is assigned to) decides (fix #400): records named
+    // `new`, typed here.
+    const csharpTargetTypedQuery = (options.targetDefinitions || definitions).some(d =>
+        CSHARP_CONSTRUCTIBLE_KINDS.has(d.type) && index.files.get(d.file)?.language === 'csharp');
+    // file -> the slot-typed records constructing a type of the name.
+    const csharpTargetTypedByFile = new Map();
+    if (csharpTargetTypedQuery) {
+        const newFiles = index.getCalleeFiles('new');
+        if (newFiles && newFiles.size > 0) {
+            const union = new Set(calleeFiles || []);
+            const nameRe = new RegExp(`(^|[^A-Za-z0-9_])${String(name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^A-Za-z0-9_]|$)`);
+            const keyMemo = new Map();
+            for (const f of [...newFiles].sort(codeUnitCompare)) {
+                const entry = index.files.get(f);
+                if (entry?.language !== 'csharp' || !(entry.targetTypedKeys || []).some(key =>
+                    _csharpTargetTypedKeyMayName(index, key, nameRe, keyMemo))) continue;
+                const fileCalls = getCachedCalls(index, f);
+                const typed = fileCalls ? _csharpTargetTypedViews(index, f, fileCalls, name) : [];
+                if (typed.length === 0) continue;
+                csharpTargetTypedByFile.set(f, typed);
+                union.add(f);
+            }
+            // A null file list already visits every file.
+            if (csharpTargetTypedByFile.size > 0 && calleeFiles) calleeFiles = union;
+        }
+    }
+    const nameBearing = csharpTargetTypedByFile.size > 0 ? index.getCalleeFiles(name) : null;
+    const nameBearingFiles = nameBearing ? new Set(nameBearing) : null;
     // `candidateFiles` (internal, fix #365): the only files whose callers the
     // consumer keeps (stats --hot counts in-scope, non-bundled, and for a
     // production ranking non-test files). Every per-site verdict is
@@ -1063,8 +1092,15 @@ function findCallers(index, name, options = {}) {
             // Only records bearing the name can match below unless an alias
             // surface or a type-qualifier reference can (fix #365): visit
             // those, in record order, instead of every call in the file.
-            const visitCalls = hasAliasSurfaces || targetIsTypeQuery
+            let visitCalls = hasAliasSurfaces || targetIsTypeQuery
                 ? calls : _callsBearingName(index, filePath, calls, name);
+            const typedViews = csharpTargetTypedByFile.get(filePath);
+            if (typedViews) {
+                // A file reached only through such records visits only them.
+                visitCalls = !nameBearingFiles || nameBearingFiles.has(filePath) || hasAliasSurfaces
+                    ? [...visitCalls.filter(call => !(call.name === 'new' && call.targetSlot)), ...typedViews]
+                    : typedViews;
+            }
 
             for (let call of visitCalls) {
                 if (call.destructured) {
@@ -1081,6 +1117,9 @@ function findCallers(index, name, options = {}) {
                     call = _destructuredMemberView(call);
                 }
                 if (isDataMemberReference(fileEntry, call, options.targetDefinitions || definitions)) continue;
+                // A Python attribute read is a method value only through a
+                // class that has the method (fix #400).
+                if (call.memberRead && !_pythonMemberReadIsMethod(index, call)) continue;
                 call = _withoutAmbiguousSliceType(_withoutShadowedStdLiteral(index, call),
                     options.targetDefinitions || definitions);
                 if (structuralLanguage && call.receiverType) {
@@ -1521,7 +1560,28 @@ function findCallers(index, name, options = {}) {
                         continue;
                     }
                 }
-                if (call.isConstructor && fileEntry.language === 'csharp' &&
+                // A target-typed `new(..)` typed by its binding call or
+                // member (fix #400): the parameter's written type denotes the
+                // target where it is written; an undecided overload leaves
+                // the construction possible only.
+                if (call.targetTypedResolved) {
+                    const resolved = call.targetTypedResolved;
+                    if (!resolved.decided) {
+                        routeUnverified(filePath, fileEntry, call, 'overload-ambiguous', calledAs);
+                        continue;
+                    }
+                    const verdicts = resolved.from.map(from =>
+                        _csharpWrittenTypeVerdict(index, options.targetDefinitions || definitions, name, from));
+                    if (verdicts.every(v => v === 'no')) {
+                        recordExcluded(filePath, call.line, 'other-definition-import');
+                        continue;
+                    }
+                    if (!verdicts.every(v => v === 'yes')) {
+                        routeUnverified(filePath, fileEntry, call, 'ambiguous-binding', calledAs);
+                        continue;
+                    }
+                    call = { ...call, csharpConstructorExact: true };
+                } else if (call.isConstructor && fileEntry.language === 'csharp' &&
                     targetIsTypeQuery) {
                     const constructorIdentity = _resolveReceiverTypeIdentity(
                         index,
@@ -1594,6 +1654,10 @@ function findCallers(index, name, options = {}) {
                     const typed = _goPackageVarReceiver(index, filePath, fileEntry, call,
                         collectAccount && !call.isPotentialCallback && !call.isPathCall);
                     if (typed) call = typed;
+                    else if (_goImportQualifierCandidate(index, filePath, fileEntry, call)) {
+                        routeUnverified(filePath, fileEntry, call, 'package-qualifier', calledAs);
+                        continue;
+                    }
                 }
 
                 // Return-type flow: an untyped method receiver may be a
@@ -4499,6 +4563,19 @@ function findCallers(index, name, options = {}) {
                     langTraits(fileEntry.language)?.typeSystem === 'structural' &&
                     targetDefs.length > 0 &&
                     targetDefs.every(d => bareCallCannotDenote(d, fileEntry.language))) {
+                    // An imported module value holding a bound method
+                    // (`from .serialization import loads` where the module
+                    // binds `loads = registry.loads`) calls that method
+                    // through the value: visible like a same-file alias call
+                    // (fix #400), never excluded and never renamed.
+                    const bound = !calledAs && _pythonImportedBoundMethod(index, fileEntry, call.name);
+                    if (bound && targetDefs.some(d => d === bound ||
+                        (d.file === bound.file && d.startLine === bound.startLine))) {
+                        routeUnverified(filePath, fileEntry, call, 'alias-call', calledAs, {
+                            dispatchVia: bound.className,
+                        });
+                        continue;
+                    }
                     recordExcluded(filePath, call.line, 'method-kind-mismatch');
                     continue;
                 }
@@ -7141,6 +7218,8 @@ function findCallers(index, name, options = {}) {
                     ...(receiverType && { receiverType }),
                     ...(edgeCalledAs && { calledAs: edgeCalledAs }),
                     ...(call.macroExpansion && { macroExpansion: _macroSite(call) }),
+                    // A target-typed construction spells no name (fix #400).
+                    ...(call.targetTyped && { targetTyped: true }),
                     ...(call.destructuredFrom && { destructured: call.destructuredFrom }),
                     ...(_spelledByImportAlias(fileEntry, call, edgeCalledAs) && { importAliasSpelling: true }),
                 };
@@ -7653,12 +7732,30 @@ function findCallees(index, definition, options = {}) {
                         receiverTypeEvidence: { ...call.receiverTypeEvidence, source: 'constructor', type: exact } };
                 }
             }
+            if (call.memberRead && !_pythonMemberReadIsMethod(index, call)) continue;
+            // A target-typed `new(..)` whose type its binding call or member
+            // decides (fix #400) constructs that type; undecided, it is a
+            // possible construction of each candidate.
+            let targetTypedUndecided = null;
+            if (language === 'csharp' && call.name === 'new' && call.targetSlot) {
+                // Only project types are callees; an outside type
+                // (`Dictionary<K, V>`) leaves the site as it was, unrecorded.
+                const resolved = _csharpTargetTypedTypes(index, def.file, call);
+                const projectTypes = (resolved?.types || []).filter(type =>
+                    (index.symbols.get(type.name) || []).some(d => !d.className &&
+                        CSHARP_CONSTRUCTIBLE_KINDS.has(d.type) && index.files.get(d.file)?.language === 'csharp'));
+                if (projectTypes.length === 0) continue;
+                call = { ...call, name: projectTypes[0].name };
+                if (!resolved.decided) targetTypedUndecided = projectTypes.map(type => type.name);
+            }
             // Go package-level variables declared in another file (fix #399).
+            let importQualifier = false;
             if (language === 'go' && call.isMethod && !call.receiverType &&
                 (call.receiverPackageScope || call.receiverRootIsModule)) {
                 const typed = _goPackageVarReceiver(index, def.file, fileEntry, call,
                     collectAccount && !call.isPotentialCallback && !call.isPathCall);
                 if (typed) call = typed;
+                else if (_goImportQualifierCandidate(index, def.file, fileEntry, call)) importQualifier = true;
             }
             const siteId = siteOrdinal;
             siteEvidence.set(siteId, {
@@ -7729,6 +7826,14 @@ function findCallees(index, definition, options = {}) {
 
             if (!isDirectMatch && !isNestedCallback) continue;
             if (calleeAccount) calleeAccount.totalSites++;
+            if (importQualifier) {
+                noteUnverified(siteId, call, 'package-qualifier');
+                continue;
+            }
+            if (targetTypedUndecided) {
+                noteUnverified(siteId, call, 'overload-ambiguous', { candidates: targetTypedUndecided });
+                continue;
+            }
 
             // fix #380: a written generic arity names one type of the name.
             // Same-name definitions of another arity never receive the edge:
@@ -8347,9 +8452,7 @@ function findCallees(index, definition, options = {}) {
                 }
                 if (!goImportModule) {
                     goImportModule = goImports.find(mod => {
-                        const parts = mod.split('/');
-                        const last = parts[parts.length - 1];
-                        const pkgName = (/^v\d+$/.test(last) && parts.length > 1) ? parts[parts.length - 2] : last;
+                        const pkgName = goPathPackageName(mod);
                         return pkgName === call.receiver;
                     }) || null;
                 }
@@ -8869,6 +8972,13 @@ function findCallees(index, definition, options = {}) {
             // lets a definition oracle verify the target directly. Keep it
             // visible without presenting it as an exact callee.
             if (call.aliasCall) {
+                noteUnverified(siteId, call, 'alias-call');
+                continue;
+            }
+            // So is a bare call of an imported module value holding a bound
+            // method (fix #400, the caller side's twin).
+            if (language === 'python' && !call.isMethod && !call.receiver && !call.localShadow &&
+                !call.isFunctionReference && _pythonImportedBoundMethod(index, fileEntry, call.name)) {
                 noteUnverified(siteId, call, 'alias-call');
                 continue;
             }
@@ -9726,24 +9836,18 @@ function findCallees(index, definition, options = {}) {
                         noteSite(siteId, 'external', null, call);
                         continue;
                     }
-                    // Unique method heuristic: if attr type unknown but method
-                    // exists on exactly one class DEFINITION (fix #398F:
-                    // kombu's eight transport classes all named `Channel`
-                    // made `self.channel.basic_cancel()` the first one's).
+                    // An attribute whose type the class never states: the
+                    // method's one owning class is a candidate, never a
+                    // confirmed callee (fix #400; #355: name uniqueness is
+                    // not receiver evidence).
                     if (!targetClass) {
                         const methodSyms = index.symbols.get(call.name);
-                        if (methodSyms) {
-                            const classNames = new Set();
-                            for (const s of methodSyms) {
-                                if (s.className) classNames.add(s.className);
-                            }
-                            if (classNames.size === 1) {
-                                const only = classNames.values().next().value;
-                                if (classDefsNamed(index, only).unique) targetClass = only;
-                            }
-                        }
+                        const classNames = new Set((methodSyms || []).filter(s => s.className).map(s => s.className));
+                        const only = classNames.size === 1 ? classNames.values().next().value : null;
+                        noteUnverified(siteId, call, only && classDefsNamed(index, only).unique
+                            ? 'single-owner' : 'self-attr-unresolved');
+                        continue;
                     }
-                    if (!targetClass) { noteUnverified(siteId, call, 'self-attr-unresolved'); continue; }
 
                     // Find method in symbol table where className matches
                     const symbols = index.symbols.get(call.name);
@@ -12733,9 +12837,7 @@ function _qualifiedProducerDefs(index, fileEntry, receiver, defs) {
     }
     if (!importModule) {
         importModule = modules.find(mod => {
-            const parts = mod.split('/');
-            const last = parts[parts.length - 1];
-            const pkgName = (/^v\d+$/.test(last) && parts.length > 1) ? parts[parts.length - 2] : last;
+            const pkgName = goPathPackageName(mod);
             return pkgName === receiver;
         }) || null;
     }
@@ -12757,9 +12859,7 @@ function _qualifiedProducerDefs(index, fileEntry, receiver, defs) {
         if (resolved.length > 0) return resolved;
     }
 
-    const parts = importModule.split('/');
-    const last = parts[parts.length - 1];
-    const pkgSeg = (/^v\d+$/.test(last) && parts.length > 1) ? parts[parts.length - 2] : last;
+    const pkgSeg = goPathPackageName(importModule);
     return defs.filter(d => {
         if (!d.file) return false;
         const dir = path.dirname(d.file);
@@ -12918,9 +13018,7 @@ function _receiverPackageResolution(index, fileEntry, receiver, targetDefs) {
     const importModule = _receiverImportModule(index, fileEntry, receiver);
     if (!importModule) return null;
     if (!importModule.includes('/')) return { importModule, singleSegment: true, targetInPkg: false };
-    const parts = importModule.split('/');
-    const last = parts[parts.length - 1];
-    const pkgSeg = (/^v\d+$/.test(last) && parts.length > 1) ? parts[parts.length - 2] : last;
+    const pkgSeg = goPathPackageName(importModule);
     const targetInPkg = targetDefs.some(d => {
         if (!d.file) return false;
         const dir = path.dirname(d.file);
@@ -13205,6 +13303,69 @@ function _pythonModuleValueRoute(index, abs, fe, attr) {
     if (modules.unknown || modules.files.length > 1) return null;
     if (modules.files.length === 0) return modules.external ? { external: true } : null;
     return { next: [modules.files[0], member] };
+}
+
+/**
+ * Is a Python attribute read assigned to a name (`f = registry.loads`,
+ * parser `memberRead`) a method value (fix #400)? Only when the receiver's
+ * type is a project class that declares or inherits a method of the name;
+ * a read of a data attribute, or through a type that is no project class
+ * (a namedtuple, an outside type), is not a method reference.
+ */
+function _pythonMemberReadIsMethod(index, call) {
+    const info = call.receiverType ? classDefsNamed(index, call.receiverType) : null;
+    if (!info || info.entries.length === 0) return false;
+    const candidates = (index.symbols.get(call.name) || []).filter(d =>
+        d.className && !NON_CALLABLE_TYPES.has(d.type));
+    if (candidates.length === 0) return false;
+    return info.entries.some(entry => !!findDeclaringClass(index,
+        { name: call.receiverType, key: entry.key, def: entry.def }, candidates));
+}
+
+/**
+ * The bound method a Python module-scope name of this file holds through
+ * its import (fix #400): `from pkg.registry import loads` where pkg.registry
+ * binds `loads = registry.loads` (registry = Registry()), followed through
+ * re-imports and plain aliases. null when the name is not imported or its
+ * value is anything else.
+ */
+function _pythonImportedBoundMethod(index, fileEntry, name) {
+    if (fileEntry?.language !== 'python') return null;
+    if (!(fileEntry.importBindings || []).some(b => (b.alias || b.name) === name)) return null;
+    const memo = index._rustScopeMemo || (index._rustScopeMemo = new Map());
+    const key = `\x01pyBoundMethod\0${fileEntry.path}\0${name}`;
+    if (memo.has(key)) return memo.get(key);
+    const result = _pythonImportedBoundMethodUncached(index, fileEntry, name);
+    memo.set(key, result);
+    return result;
+}
+
+function _pythonImportedBoundMethodUncached(index, fileEntry, name) {
+    const binding = _moduleImportBindings(fileEntry).find(b => (b.alias || b.name) === name &&
+        b.module != null && b.name !== '*');
+    if (!binding) return null;
+    const rel = fileEntry.moduleResolved?.[binding.module];
+    if (!rel) return null;
+    let abs = path.isAbsolute(rel) ? rel : path.join(index.root, rel);
+    let attr = binding.name;
+    for (let depth = 0; depth < 8; depth++) {
+        const fe = index.files.get(abs);
+        if (!fe) return null;
+        const route = _pythonModuleValueRoute(index, abs, fe, attr);
+        if (route?.declaration) return route.declaration;
+        if (route?.next) {
+            [abs, attr] = route.next;
+            continue;
+        }
+        // A re-import of the name passes the value on.
+        const reimport = _moduleImportBindings(fe).find(b => (b.alias || b.name) === attr &&
+            b.module != null && b.name !== '*');
+        const next = reimport && fe.moduleResolved?.[reimport.module];
+        if (!next) return null;
+        abs = path.isAbsolute(next) ? next : path.join(index.root, next);
+        attr = reimport.name;
+    }
+    return null;
 }
 
 /**
@@ -15926,9 +16087,7 @@ function _goQualifierNamesImport(index, fieldFile, qualifier) {
     const fe = index.files.get(fieldFile);
     if (!fe || !Array.isArray(fe.imports)) return false;
     return fe.imports.some(mod => {
-        const parts = String(mod).split('/');
-        const last = parts[parts.length - 1];
-        const pkgName = (/^v\d+$/.test(last) && parts.length > 1) ? parts[parts.length - 2] : last;
+        const pkgName = goPathPackageName(mod);
         return pkgName === qualifier;
     });
 }
@@ -18535,9 +18694,7 @@ function _receiverImportModule(index, fileEntry, receiver) {
     }
     if (!importModule) {
         importModule = modules.find(mod => {
-            const parts = mod.split('/');
-            const last = parts[parts.length - 1];
-            const pkgName = (/^v\d+$/.test(last) && parts.length > 1) ? parts[parts.length - 2] : last;
+            const pkgName = goPathPackageName(mod);
             return pkgName === receiver;
         }) || null;
     }
@@ -19453,6 +19610,340 @@ function _csharpPlatformInstanceVerdict(index, actualType, receiverText, call) {
 function _csharpTypeArgsOf(text) {
     const match = /<(.*)>\s*\??\s*(?:\[\s*\])*\s*$/s.exec(String(text || '').trim());
     return match ? _splitTopLevelGenericArgs(match[1]).map(arg => arg.trim()) : [];
+}
+
+const CSHARP_CONSTRUCTIBLE_KINDS = new Set(['class', 'struct', 'record', 'record_struct']);
+
+/**
+ * The file's slot-typed `new(..)` records (fix #400) that may construct a
+ * type named `name`, as constructor records of that name carrying the
+ * resolution (`targetTypedResolved`). A cheap test of the slot's written
+ * types runs first: the resolution reads the binding call's callees.
+ */
+function _csharpTargetTypedViews(index, filePath, calls, name) {
+    const views = [];
+    const nameRe = new RegExp(`(^|[^A-Za-z0-9_])${String(name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^A-Za-z0-9_]|$)`);
+    for (const call of _callsBearingName(index, filePath, calls, 'new')) {
+        if (!call.targetSlot) continue;
+        if (!_csharpTargetTypedMayName(index, filePath, calls, call, nameRe, name)) continue;
+        const resolved = _csharpTargetTypedTypes(index, filePath, call);
+        const match = resolved?.types.filter(type => type.name === name) || [];
+        if (match.length === 0) continue;
+        views.push({ ...call, name, targetTypedResolved: { decided: resolved.decided, from: match } });
+    }
+    return views;
+}
+
+/**
+ * Can a slot key of a file (`targetTypedKeys`: the call or type a C#
+ * `new(..)` is an argument of, that call's receiver member, or the member
+ * it is assigned to) lead to a type named `name` (fix #400)? A callable or
+ * constructor of the key with a parameter type spelling the name, a member
+ * of the key whose type spells it, or a key resolved without a name
+ * (constructor initializers, nested target-typed constructions).
+ */
+function _csharpTargetTypedKeyMayName(index, key, nameRe, memo) {
+    if (key === 'this' || key === 'base' || key === 'new') return true;
+    if (memo.has(key)) return memo.get(key);
+    const result = (index.symbols.get(key) || []).some(d =>
+        (d.fieldType && nameRe.test(String(d.fieldType))) ||
+        (d.paramsStructured || []).some(p => nameRe.test(String(p.type || ''))) ||
+        (d.primaryParams || []).some(p => nameRe.test(String(p.type || ''))));
+    memo.set(key, result);
+    return result;
+}
+
+/**
+ * Does a C# type written at `from` (a parameter or member declaration,
+ * `{ text, file, line }`) denote one of the target types? The language's own
+ * lookup from where the type is written (namespaces, usings, nesting):
+ * 'yes' | 'no' | 'unknown'.
+ */
+function _csharpWrittenTypeVerdict(index, targets, name, from) {
+    const pin = targets.find(d => CSHARP_CONSTRUCTIBLE_KINDS.has(d.type) || d.type === 'interface');
+    if (!pin) return 'unknown';
+    const memo = index._opMemo?.('csWrittenType', () => new Map());
+    const key = `${pin.file}\0${pin.startLine}\0${from.file}\0${from.line}\0${from.text}`;
+    if (memo?.has(key)) return memo.get(key);
+    const { TypeReferenceResolver } = require('./type-references');
+    const resolver = new TypeReferenceResolver(index, pin, name);
+    const written = String(from.text).replace(/<.*$/s, '').trim();
+    const qualifier = written.includes('.') ? written.slice(0, written.lastIndexOf('.')) : null;
+    let verdict;
+    try {
+        verdict = (qualifier
+            ? resolver.resolveQualified(from.file, from.line, null, qualifier, { role: 'type' })
+            : resolver.resolveName(from.file, from.line, name))?.verdict || 'unknown';
+    } catch {
+        verdict = 'unknown';
+    }
+    memo?.set(key, verdict);
+    return verdict;
+}
+
+/** Can the slot of a `new(..)` record name a type spelled `nameRe` at all?
+ * (the declared types it could take mention the name) */
+function _csharpTargetTypedMayName(index, filePath, calls, call, nameRe, name) {
+    // The constructed type is the written type itself; only a collection
+    // receiver's element/key/value type arguments name it from inside.
+    const head = text => text.replace(/\?\s*$/, '').replace(/<.*$/s, '').trim().split('.').pop();
+    return _csharpSlotTypeTexts(index, filePath, calls, call, 0).some(text =>
+        text.receiver ? nameRe.test(text.text) : head(text.text) === name);
+}
+
+/** The written types a slot-typed `new(..)` record could take, read from
+ * declarations alone (no receiver resolution): the parameter its argument
+ * binds in every arity-compatible callable of the owner's name, a member of
+ * the enclosing class, a collection receiver field's type. A cheap superset
+ * of what `_csharpTargetTypedTypes` decides. */
+function _csharpSlotTypeTexts(index, filePath, calls, call, depth) {
+    const slot = call.targetSlot;
+    if (!slot || depth > 4) return [];
+    const fileEntry = index.files.get(filePath);
+    const enclosing = call.enclosingFunction
+        ? (fileEntry?.symbols || []).find(s => s.name === call.enclosingFunction.name &&
+            s.startLine === call.enclosingFunction.startLine)
+        : null;
+    const texts = [];
+    if (slot.kind === 'member') {
+        for (const s of index.symbols.get(slot.member) || []) {
+            if (s.fieldType && (!enclosing?.className || s.className === enclosing.className ||
+                (s.type !== 'field' && s.type !== 'property'))) texts.push({ text: String(s.fieldType) });
+        }
+        // An inherited member: any member of the name (resolution decides).
+        if (texts.length === 0) {
+            for (const s of index.symbols.get(slot.member) || []) if (s.fieldType) texts.push({ text: String(s.fieldType) });
+        }
+        return texts;
+    }
+    const bound = all => {
+        const params = slot.instance && all?.[0]?.extensionReceiver ? all.slice(1) : all;
+        if (!params) return null;
+        const required = params.filter(p => !p.optional && !p.rest).length;
+        const rest = params.length > 0 && params[params.length - 1].rest;
+        if (slot.argCount < required || (!rest && slot.argCount > params.length)) return null;
+        const param = slot.name ? params.find(p => p.name === slot.name)
+            : slot.index < params.length ? params[slot.index] : rest ? params[params.length - 1] : null;
+        return param ? String(param.type || '') : null;
+    };
+    const constructorsOf = typeName => (index.symbols.get(typeName) || []).filter(s =>
+        (s.className === typeName && (s.type === 'constructor' || s.isConstructor)) || s.primaryParams);
+    const fromDefs = defs => {
+        for (const d of defs) {
+            const text = bound(d.primaryParams && !d.className ? d.primaryParams : d.paramsStructured);
+            if (text) texts.push({ text });
+        }
+        return texts;
+    };
+    const typeNamesOf = list => list.filter(t => !t.receiver)
+        .map(t => t.text.replace(/\?$/, '').replace(/<.*$/s, '').trim().split('.').pop());
+    if (slot.owner === 'this' || slot.owner === 'base') {
+        let className = enclosing?.className;
+        if (slot.owner === 'base') {
+            const base = (index.symbols.get(className) || []).find(t => !t.className && t.extends)?.extends;
+            className = base ? String(base).replace(/<.*$/s, '').trim().split('.').pop() : null;
+        }
+        return className ? fromDefs(constructorsOf(className)) : texts;
+    }
+    if (slot.owner === 'creation') {
+        if (slot.ownerName !== 'new') return fromDefs(constructorsOf(slot.ownerName));
+        const outer = calls.find(c => c !== call && c.callSite?.start === slot.ownerStart && c.targetSlot);
+        if (!outer) return texts;
+        for (const typeName of typeNamesOf(_csharpSlotTypeTexts(index, filePath, calls, outer, depth + 1))) {
+            fromDefs(constructorsOf(typeName));
+        }
+        return texts;
+    }
+    fromDefs((index.symbols.get(slot.ownerName) || []).filter(d => d.paramsStructured));
+    if (slot.receiverName) {
+        for (const s of index.symbols.get(slot.receiverName) || []) {
+            if (s.fieldType) texts.push({ text: String(s.fieldType), receiver: true });
+        }
+    }
+    return texts;
+}
+
+/**
+ * The types a C# target-typed `new(..)` may construct when its type is not
+ * written at its position (fix #400). The parser records the slot the
+ * expression fills (`targetSlot`): an argument of a call, a construction or
+ * a constructor initializer, whose type is the parameter type of the
+ * overload the compiler binds, or the value assigned to a member of the
+ * enclosing class, whose type is the member's. Returns
+ * { decided, types: [{ name, text, file, line }] }: `decided` when the
+ * binding target is decided (one confirmed callee, one member, or every
+ * candidate agrees) and names one type; otherwise each candidate's type is
+ * only possible. Null when nothing is known. Memoized for the index.
+ */
+function _csharpTargetTypedTypes(index, filePath, call, depth = 0) {
+    const slot = call?.targetSlot;
+    if (!slot || depth > 4) return null;
+    const memo = index._rustScopeMemo || (index._rustScopeMemo = new Map());
+    const key = `\x01csTargetTyped\0${filePath}\0${call.callSite?.start}`;
+    if (memo.has(key)) return memo.get(key);
+    memo.set(key, null); // a cycle resolves to nothing
+    let result;
+    try {
+        result = _csharpTargetTypedResolve(index, filePath, call, slot, depth);
+    } catch {
+        result = null;
+    }
+    memo.set(key, result);
+    return result;
+}
+
+function _csharpTargetTypedResolve(index, filePath, call, slot, depth) {
+    const fileEntry = index.files.get(filePath);
+    if (!fileEntry) return null;
+    const enclosing = call.enclosingFunction
+        ? (fileEntry.symbols || []).find(s => s.name === call.enclosingFunction.name &&
+            s.startLine === call.enclosingFunction.startLine)
+        : null;
+    // A constructible named type: never an array, tuple, pointer or one of
+    // the declaration's own type parameters.
+    const typeOf = (text, from, typeParams = []) => {
+        const written = String(text || '').trim().replace(/\?$/, '').trim();
+        if (!written || /[[\]()*]/.test(written)) return null;
+        const name = written.replace(/<.*$/s, '').trim().split('.').pop();
+        if (!/^[A-Za-z_]\w*$/.test(name) || typeParams.includes(name)) return null;
+        return { name, text: written, file: from.file, line: from.nameLine || from.startLine };
+    };
+    // The method's and its owner type's type parameters (`GetOrAdd(TKey)` of
+    // a generic class): never a constructible type of their own.
+    const typeParamsOf = d => `${d?.generics || ''} ${d?.ownerGenerics || ''}`.split(/[^A-Za-z0-9_]+/).filter(Boolean);
+    const classTypes = className => className
+        ? (index.symbols.get(className) || []).filter(s => !s.className &&
+            ['class', 'struct', 'record', 'interface'].includes(s.type) &&
+            index.files.get(s.file)?.language === 'csharp')
+        : [];
+    // Declared constructors and a primary constructor (`class C(int a)`,
+    // positional records) of the type.
+    const constructorsOf = className => [
+        ...(index.symbols.get(className) || []).filter(s =>
+            s.className === className && (s.type === 'constructor' || s.isConstructor) &&
+            index.files.get(s.file)?.language === 'csharp'),
+        ...classTypes(className).filter(t => t.primaryParams).map(t => ({
+            name: className, className, file: t.file, startLine: t.startLine, nameLine: t.nameLine,
+            paramsStructured: t.primaryParams, primary: true,
+        })),
+    ];
+    const combine = (entries, decidedTarget) => {
+        const types = [];
+        const seen = new Set();
+        for (const entry of entries) {
+            if (!entry || seen.has(entry.text)) continue;
+            seen.add(entry.text);
+            types.push(entry);
+        }
+        if (types.length === 0) return null;
+        return { decided: decidedTarget && types.length === 1, types };
+    };
+    if (slot.kind === 'member') {
+        // The member of the enclosing class (or a base class) assigned.
+        let className = enclosing?.className;
+        for (let hops = 0; className && hops < 5; hops++) {
+            const members = (index.symbols.get(slot.member) || []).filter(s => s.className === className &&
+                (s.type === 'field' || s.type === 'property') && s.fieldType &&
+                index.files.get(s.file)?.language === 'csharp');
+            if (members.length > 0) {
+                const entries = members.map(m => typeOf(m.fieldType, m));
+                return combine(entries, entries.every(Boolean) && new Set(entries.map(e => e.text)).size === 1);
+            }
+            const base = classTypes(className).map(t => t.extends).find(Boolean);
+            className = base ? String(base).replace(/<.*$/s, '').trim().split('.').pop() : null;
+        }
+        return null;
+    }
+    if (slot.kind !== 'argument') return null;
+    // The parameter a positional or named argument binds in one callable.
+    const paramType = (def, instanceCall) => {
+        let params = def.paramsStructured || [];
+        if ((instanceCall || slot.instance) && params[0]?.extensionReceiver) params = params.slice(1);
+        const required = params.filter(p => !p.optional && !p.rest).length;
+        const rest = params.length > 0 && params[params.length - 1].rest;
+        if (slot.argCount < required || (!rest && slot.argCount > params.length)) return null;
+        const param = slot.name ? params.find(p => p.name === slot.name)
+            : slot.index < params.length ? params[slot.index] : rest ? params[params.length - 1] : null;
+        if (!param) return null;
+        // A positional argument in a `params T[]` slot is an element: `new()`
+        // never constructs the array itself.
+        const type = param.rest && !slot.name ? String(param.type || '').replace(/\[\s*\]$/, '') : param.type;
+        return typeOf(type, def, typeParamsOf(def));
+    };
+    const fromCallables = (defs, decidedTarget, instanceCall) => {
+        const entries = defs.map(def => paramType(def, instanceCall));
+        const usable = entries.filter(Boolean);
+        return combine(usable, decidedTarget && usable.length === entries.length);
+    };
+    if (slot.owner === 'this' || slot.owner === 'base') {
+        let className = enclosing?.className;
+        if (slot.owner === 'base') {
+            const base = classTypes(className).map(t => t.extends).find(Boolean);
+            className = base ? String(base).replace(/<.*$/s, '').trim().split('.').pop() : null;
+        }
+        if (!className) return null;
+        const ctors = constructorsOf(className).filter(d => !(d.file === filePath && enclosing &&
+            d.startLine === enclosing.startLine));
+        return fromCallables(ctors, ctors.length === 1 && classTypes(className).length === 1, false);
+    }
+    const calls = getCachedCalls(index, filePath) || [];
+    const owner = calls.find(c => c !== call && c.callSite?.start === slot.ownerStart);
+    if (!owner) return null;
+    if (slot.owner === 'creation') {
+        let typeNames;
+        let decidedType;
+        if (owner.name === 'new' && owner.targetSlot) {
+            const outer = _csharpTargetTypedTypes(index, filePath, owner, depth + 1);
+            if (!outer) return null;
+            typeNames = outer.types.map(t => t.name);
+            decidedType = outer.decided;
+        } else {
+            typeNames = [owner.name];
+            decidedType = classTypes(owner.name).length === 1;
+        }
+        const ctors = typeNames.flatMap(constructorsOf);
+        return fromCallables(ctors, decidedType && ctors.length === 1, false);
+    }
+    // An instance method of a platform collection the receiver field is
+    // declared with (`List<T>.Add(T)`, `Dictionary<K, V>.TryAdd(K, V)`):
+    // the type's own member takes the call before any extension (#395).
+    if (owner.isMethod && owner.receiverRoot === 'this' && owner.receiverField &&
+        (owner.receiverFields || [owner.receiverField]).length === 1) {
+        const field = (index.symbols.get(owner.receiverField) || []).find(s =>
+            s.className === owner.receiverRootType && (s.type === 'field' || s.type === 'property') && s.fieldType);
+        const text = field ? String(field.fieldType).trim() : '';
+        const head = text.replace(/<.*$/s, '').trim().split('.').pop();
+        const members = field ? _CSHARP_PLATFORM_INSTANCE_MEMBERS.get(head) : null;
+        if (members && !(index.symbols.get(head) || []).some(d => !d.className &&
+            CSHARP_CONSTRUCTIBLE_KINDS.has(d.type))) {
+            const shapes = Object.prototype.hasOwnProperty.call(members, owner.name)
+                ? members[owner.name].filter(shape => shape.length === slot.argCount) : [];
+            if (shapes.length === 0 || slot.name) return null;
+            const args = _csharpTypeArgsOf(text);
+            const slotType = { T: args.length === 1 ? args[0] : null, K: args.length === 2 ? args[0] : null,
+                V: args.length === 2 ? args[1] : null };
+            const entries = shapes.map(shape => shape[slot.index] && shape[slot.index] !== '*'
+                ? typeOf(slotType[shape[slot.index]], field) : null);
+            return combine(entries.filter(Boolean), entries.every(Boolean) && shapes.length === 1);
+        }
+    }
+    if (!enclosing) return null;
+    // The overloads the invocation binds, decided by the callee resolution.
+    const callees = findCallees(index, enclosing, {
+        collectAccount: true, siteStarts: new Set([slot.ownerStart]),
+    }) || [];
+    const instanceCall = !!owner.isMethod;
+    const confirmed = callees.filter(c => c.name === owner.name && c.paramsStructured &&
+        c.tier !== 'unverified');
+    if (confirmed.length > 0) return fromCallables(confirmed, true, instanceCall);
+    const unverified = (callees.unverifiedCallees || []).some(c => c.name === owner.name);
+    if (unverified) {
+        // Undecided: every arity-compatible project callable of the name.
+        const candidates = (index.symbols.get(owner.name) || []).filter(s => s.paramsStructured &&
+            index.files.get(s.file)?.language === 'csharp' && !NON_CALLABLE_TYPES.has(s.type));
+        return fromCallables(candidates, false, instanceCall);
+    }
+    return null;
 }
 
 // Element-typed collections: each maps its one type argument to the same
@@ -22560,10 +23051,7 @@ function _goQualifiedReceiverType(index, fileEntry, qualifier, typeName) {
     }
     if (!importModule) {
         importModule = modules.find(mod => {
-            const parts = String(mod).split('/');
-            const last = parts[parts.length - 1];
-            const packageName = /^v\d+$/.test(last) && parts.length > 1
-                ? parts[parts.length - 2] : last;
+            const packageName = goPathPackageName(mod);
             return packageName === qualifier;
         }) || null;
     }
@@ -22635,8 +23123,27 @@ function _goPackageVarIndex(index) {
  * { type, fromFile, source, evidence } or { externalVia, externalConcrete },
  * or null.
  */
-function _goPackageVarDeclType(index, decl) {
+function _goPackageVarDeclType(index, decl, depth = 0) {
     const entry = index.files.get(decl.file);
+    if (decl.valueFrom) {
+        // `var json = jsoniter.Config` (fix #400): another package's value.
+        // An outside package's value is outside the project; a project
+        // package's variable has that variable's type.
+        const { qualifier, name } = decl.valueFrom;
+        const names = entry?.importNames || [];
+        const modules = entry?.imports || [];
+        const at = names.length === modules.length ? names.indexOf(qualifier) : -1;
+        if (at < 0) return null;
+        const rel = entry.moduleResolved?.[modules[at]];
+        if (!rel) return { externalVia: `${qualifier}.${name}`, externalConcrete: false };
+        if (depth >= 4) return null;
+        const dir = path.dirname(path.isAbsolute(rel) ? rel : path.join(index.root, rel));
+        const target = index.files.get(path.isAbsolute(rel) ? rel : path.join(index.root, rel));
+        const decls = (_goPackageVarIndex(index).get(`${dir}\0${target?.packageName || ''}`)?.get(name) || [])
+            .filter(variable => !variable.file.endsWith('_test.go'));
+        if (decls.length !== 1) return null;
+        return _goPackageVarDeclType(index, decls[0], depth + 1);
+    }
     if (decl.type) {
         if (!decl.qualifier) {
             return { type: decl.type, fromFile: decl.file, source: decl.origin?.source || 'annotation',
@@ -22692,6 +23199,36 @@ function _goPackageVarType(index, dir, packageName, name, siteFile) {
         r.fromFile === first.fromFile && r.externalVia === first.externalVia) ? first : null;
     memo?.set(key, result);
     return result;
+}
+
+/**
+ * Go (fix #400): a method-call receiver no scope of the file binds and no
+ * package-level declaration of its package declares in the file's build
+ * configuration names, in code that compiles, one of the file's imports.
+ * When the file imports an outside package without writing its local name,
+ * that name is the package's own clause, which the import path only
+ * suggests (`github.com/goccy/go-json` declares `package json`): the call may
+ * be that package's function. True when the receiver may name such an
+ * import; the call is then never a confirmed (or renamed) project call.
+ */
+function _goImportQualifierCandidate(index, filePath, fileEntry, call) {
+    if (!call.receiverPackageScope || !call.receiver) return false;
+    const unknownImport = (fileEntry.importDetails || []).some(detail => detail.implicitName &&
+        detail.type === 'import' && !fileEntry.moduleResolved?.[detail.module] &&
+        String(detail.module).split('/')[0].includes('.'));
+    if (!unknownImport) return false;
+    const dir = path.dirname(filePath);
+    const packageName = fileEntry.packageName || '';
+    const siteIsTest = filePath.endsWith('_test.go');
+    const siteConstraint = _goFileConstraint(index, filePath);
+    const visible = file => file === filePath || ((siteIsTest || !file.endsWith('_test.go')) &&
+        (!siteConstraint || !_goFileConstraint(index, file) || _goFileConstraint(index, file) === siteConstraint));
+    const samePackage = file => path.dirname(file) === dir &&
+        (index.files.get(file)?.packageName || '') === packageName;
+    const vars = _goPackageVarIndex(index).get(`${dir}\0${packageName}`)?.get(call.receiver) || [];
+    if (vars.some(variable => visible(variable.file))) return false;
+    return !(index.symbols.get(call.receiver) || []).some(d => d.file && !d.className && !d.receiver &&
+        samePackage(d.file) && visible(d.file));
 }
 
 /**
@@ -26508,4 +27045,5 @@ function findCallbackUsages(index, name) {
 }
 
 module.exports = { rustTypeNameDenotes, _textualIncludeClosures, _textualLinkVerdict, isProvenanceBuiltinReceiver, provenanceParameterIdentity: _overloadTypeIdentity, selectProvenanceOverload, _unresolvedModuleIsGap, _importReaches, _sameNominalPackageDir, getCachedCalls, findCallers, findCallees, getInstanceAttributeTypes, findCallbackUsages, _nameBindingReaches, _moduleAttributeBindingReaches, _declaredFieldType, _projectTopLevelNames, _callArityCompatible, _closeCallableIdentityGroup, _overloadDiscipline, _overloadApplicable, _buildReturnTypeFlowMap, _lookupReturnTypeFlow, _cFamilySignatureKey,
-    _isConfigurationAlternative, _isCrossFileConfigurationMember, _configurationAlternativeFiles, _sameOwnerPath };
+    _isConfigurationAlternative, _isCrossFileConfigurationMember, _configurationAlternativeFiles, _sameOwnerPath,
+    _goFileConstraint };

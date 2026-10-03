@@ -11114,3 +11114,132 @@ describe('fix #397: members of classes deriving from an outside base are its pos
         } finally { rm(dir); }
     });
 });
+
+describe('fix #400: C# target-typed new typed by its call or member', () => {
+    const csharpProject = () => tmp({
+        'App.csproj': '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>',
+        'Pair.cs': [
+            'using System.Collections.Generic;',                                   // 1
+            'namespace App;',                                                      // 2
+            'public readonly record struct TypePair(System.Type Source, System.Type Destination);', // 3
+            'public class Other',                                                  // 4
+            '{',                                                                   // 5
+            '    public Other(int a, int b) { }',                                  // 6
+            '}',                                                                   // 7
+            'public class Base(TypePair pair) { }',                                // 8
+            'public class Mapper : Base',                                          // 9
+            '{',                                                                   // 10
+            '    private readonly List<TypePair> _pairs = new();',                 // 11
+            '    private TypePair _last;',                                         // 12
+            '    public Mapper(System.Type a) : base(new(a, a)) { }',              // 13
+            '    public void DryRun(TypePair pair) { }',                           // 14
+            '    public void Register(TypePair pair, int x) { }',                  // 15
+            '    public void Register(Other other, string x) { }',                 // 16
+            '    public void Ambig(TypePair pair) { }',                            // 17
+            '    public void Ambig(Other other) { }',                              // 18
+            '    public void Use(System.Type a, System.Type b)',                   // 19
+            '    {',                                                               // 20
+            '        DryRun(new(a, b));',                                          // 21
+            '        Register(new(a, b), 1);',                                     // 22
+            '        Register(new(1, 2), "s");',                                   // 23
+            '        Ambig(new(a, b));',                                           // 24
+            '        _pairs.Add(new(a, b));',                                      // 25
+            '        _last = new(b, a);',                                          // 26
+            '        TypePair local;',                                             // 27
+            '        local = new(a, a);',                                          // 28
+            '        var spare = Pick();',                                         // 29
+            '        spare = new(1, 2);',                                          // 30
+            '    }',                                                               // 31
+            '    private TypePair spare;',                                         // 32
+            '    public Other Pick() => null;',                                    // 33
+            '}',                                                                   // 34
+        ].join('\n') + '\n',
+    });
+
+    it('callers of the constructed type: decided slots confirmed, undecided overloads visible', () => {
+        const dir = csharpProject();
+        try {
+            const index = idx(dir);
+            const def = index.symbols.get('TypePair').find(d => d.type === 'record');
+            const callers = index.findCallers('TypePair', { targetDefinitions: [def], collectAccount: true });
+            const confirmed = callers.map(c => c.line).sort((a, b) => a - b);
+            // Line 30 assigns the untyped local `spare`, never the field.
+            assert.deepStrictEqual(confirmed, [13, 21, 22, 25, 26, 28], JSON.stringify(callers.map(c => c.line)));
+            const unverified = (callers.unverifiedEntries || []).map(c => `${c.line}:${c.reason}`);
+            assert.deepStrictEqual(unverified, ['24:overload-ambiguous']);
+            const other = index.symbols.get('Other').find(d => d.type === 'class');
+            const otherCallers = index.findCallers('Other', { targetDefinitions: [other], collectAccount: true });
+            assert.deepStrictEqual(otherCallers.map(c => c.line), [23]);
+            // A rename never edits a target-typed `new(..)` (it spells no
+            // name): neither an edit nor a review candidate.
+            const plan = execute(index, 'plan', { name: 'TypePair', file: 'Pair.cs', line: 3, renameTo: 'TypePairZ' });
+            assert.ok(plan.ok, plan.error);
+            assert.ok(!plan.result.changes.some(c => [21, 22, 24, 25, 26].includes(c.line)), JSON.stringify(plan.result.changes));
+            assert.deepStrictEqual((plan.result.unverifiedSites || []).map(u => u.line), []);
+        } finally { rm(dir); }
+    });
+
+    it('callees of the enclosing method include the constructed type, conserved', () => {
+        const dir = csharpProject();
+        try {
+            const index = idx(dir);
+            const use = index.symbols.get('Use')[0];
+            const callees = index.findCallees(use, { collectAccount: true });
+            const typePair = callees.find(c => c.name === 'TypePair');
+            assert.ok(typePair, JSON.stringify(callees.map(c => c.name)));
+            const unverified = (callees.unverifiedCallees || []).map(c => `${c.name}:${c.reason}`);
+            assert.ok(unverified.includes('TypePair:overload-ambiguous'), JSON.stringify(unverified));
+            const account = callees.calleeAccount;
+            assert.ok(account);
+            assert.strictEqual(account.unaccounted, 0, JSON.stringify(account));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #400: C# generic interface slots by written arity and per instantiation', () => {
+    it('renames every implementation, also of a class implementing the interface twice', () => {
+        const dir = tmp({
+            'App.csproj': '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>',
+            'Resolver.cs': [
+                'namespace App;',                                                        // 1
+                'public interface IResolver<in TSource, TResult>',                       // 2
+                '{',                                                                     // 3
+                '    TResult Resolve(TSource source, int depth);',                       // 4
+                '}',                                                                     // 5
+            ].join('\n') + '\n',
+            'Plain.cs': [
+                'namespace App.Execution;',                                              // 1
+                'public interface IResolver',                                            // 2
+                '{',                                                                     // 3
+                '    object Resolve(object source, int depth);',                         // 4
+                '}',                                                                     // 5
+                'public class PlainResolver : IResolver',                                // 6
+                '{',                                                                     // 7
+                '    public object Resolve(object source, int depth) => source;',        // 8
+                '}',                                                                     // 9
+            ].join('\n') + '\n',
+            'Impl.cs': [
+                'using App.Execution;',                                                  // 1
+                'namespace App;',                                                        // 2
+                'public class A { }',                                                    // 3
+                'public class B { }',                                                    // 4
+                'public class One : IResolver<A, string>',                               // 5
+                '{',                                                                     // 6
+                '    public string Resolve(A source, int depth) => "a";',                // 7
+                '}',                                                                     // 8
+                'public class Both : IResolver<A, string>, IResolver<B, string>',        // 9
+                '{',                                                                     // 10
+                '    public string Resolve(A source, int depth) => "a";',                // 11
+                '    public string Resolve(B source, int depth) => "b";',                // 12
+                '}',                                                                     // 13
+            ].join('\n') + '\n',
+        });
+        try {
+            const result = execute(idx(dir), 'plan', { name: 'Resolve', file: 'Impl.cs', line: 7, renameTo: 'ResolveZ' });
+            assert.ok(result.ok, result.error);
+            const edits = result.result.changes.filter(c => !c.needsReview).map(c => `${c.file}:${c.line}`).sort();
+            assert.deepStrictEqual(edits, ['Impl.cs:11', 'Impl.cs:12', 'Impl.cs:7', 'Resolver.cs:4'],
+                JSON.stringify(result.result.changes));
+        } finally { rm(dir); }
+    });
+});

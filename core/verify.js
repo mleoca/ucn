@@ -1387,13 +1387,15 @@ function computePlanCallSites(index, name, def, options = {}) {
         if (fc !== 0) return fc;
         return (a.line || 0) - (b.line || 0);
     });
+    // A target-typed `new(..)` spells no name (fix #400): a rename never
+    // edits it, so an undecided one is no rename candidate either.
+    const renameRelevant = u => u.macroExpansion?.origin !== 'template' && !u.targetTyped;
     return {
         sites,
-        unverifiedSites: unverified.filter(u => u.macroExpansion?.origin !== 'template')
-            .map(unverifiedSiteShape),
+        unverifiedSites: unverified.filter(renameRelevant).map(unverifiedSiteShape),
         // Plan-only evidence used to promote calls through a compiler-proven
         // Go interface slot. Kept out of the public JSON surface.
-        rawUnverified: unverified.filter(u => u.macroExpansion?.origin !== 'template'),
+        rawUnverified: unverified.filter(renameRelevant),
         account,
         groundSet,
         accountParts,
@@ -2433,6 +2435,36 @@ function goSlotCoversMethodAmbiguity(index, name, slot, raw) {
         slot.memberIdentity.has(`${require('path').resolve(definition.file)}\0${definition.startLine}`));
 }
 
+const IMPORT_STATEMENT_TYPES = new Set(['import_statement', 'import_from_statement',
+    'future_import_statement', 'use_declaration', 'import_declaration', 'using_directive', 'export_statement']);
+
+/** The first line of the import statement holding the token at
+ * line/column (1-based line, 0-based column), or `line` when none does. */
+function importStatementLine(index, filePath, line, column) {
+    const entry = index.files.get(filePath);
+    if (!entry || !Number.isInteger(column)) return line;
+    let tree;
+    try {
+        const content = index._readFile(filePath);
+        tree = index._getParsedTree?.(filePath, content, entry.language) ||
+            safeParse(getParser(entry.language), content);
+    } catch {
+        tree = null;
+    }
+    let node = tree?.rootNode?.descendantForPosition({ row: line - 1, column });
+    while (node && !IMPORT_STATEMENT_TYPES.has(node.type)) node = node.parent;
+    return node ? node.startPosition.row + 1 : line;
+}
+
+/** Is a Go site file compiled under another build constraint than the
+ * pin's file (fix #400)? A file every build compiles is in every
+ * configuration. */
+function goOtherConfiguration(index, pinFile, siteFile) {
+    const { _goFileConstraint } = require('./callers');
+    const site = siteFile ? _goFileConstraint(index, siteFile) : '';
+    return !!site && site !== _goFileConstraint(index, pinFile);
+}
+
 /**
  * fix #396: other external-linkage definitions of a C/C++ free function
  * `def` in other files (same C++ namespace and parameter types, same
@@ -3377,16 +3409,24 @@ function plan(index, name, options = {}) {
         // never imports its own definition, so in the pin's file an import of
         // the name from any other (or unresolvable) module is never this
         // rename's import.
-        const importSourceBindsPin = (filePath, line) => {
+        const importSourceBindsPin = (filePath, line, column = null) => {
             const fileEntry = index.files.get(filePath);
+            // Bindings carry their statement's first line: a token on a later
+            // line of a multi-line import (`import {\n  a,\n} from './m'`,
+            // `from m import (\n    a,\n)`) belongs to that statement (fix #400).
+            const onLine = (fileEntry?.importBindings || []).some(binding => binding.line === line &&
+                (binding.name === name || binding.alias === name));
+            const statementLine = onLine ? line : importStatementLine(index, filePath, line, column);
             const bindings = (fileEntry?.importBindings || []).filter(binding =>
-                binding.line === line && binding.name === name && binding.module);
+                (binding.line === line || binding.line === statementLine) &&
+                binding.name === name && binding.module);
             // The name is only the LOCAL alias of another imported name on
             // this line (`import { g as f }`, `const f = require('m').g`,
             // fix #397): an import alias keeps its local name, and the
             // source-side name is not the renamed definition's.
             if (bindings.length === 0 && (fileEntry?.importBindings || []).some(binding =>
-                binding.line === line && binding.alias === name && binding.name !== name)) return false;
+                (binding.line === line || binding.line === statementLine) &&
+                binding.alias === name && binding.name !== name)) return false;
             if (bindings.length === 0) return true;
             return bindings.some(binding => {
                 const rel = fileEntry.moduleResolved?.[binding.module];
@@ -3424,7 +3464,7 @@ function plan(index, name, options = {}) {
             // import alias keeps its local name.
             if (imp.importAlias) continue;
             if (imp.file && def.file && !importMayBindPin(imp.file)) continue;
-            if (imp.file && !importSourceBindsPin(imp.file, imp.line)) continue;
+            if (imp.file && !importSourceBindsPin(imp.file, imp.line, imp.column)) continue;
             const edit = renameIdentifierTokens(index, imp.file,
                 imp.line, name, imp.file && importKeepsItemName(imp.file, imp.line)
                     ? `${options.renameTo} as ${name}` : options.renameTo);
@@ -4155,8 +4195,14 @@ function plan(index, name, options = {}) {
                         raw.reason === 'possible-dispatch' &&
                         goInterfaceSlot.interfaceNames.has(
                             String(raw.dispatchVia || '').split('.').pop());
+                    // A closed ambiguity holds where its receiver is a
+                    // project value: in a file of another build
+                    // configuration than the pin's, names may resolve to
+                    // other declarations (an import there, a variable here),
+                    // so the site stays a review item (fix #400).
                     const closedAmbiguity = goSlotCoversMethodAmbiguity(
-                        index, name, goInterfaceSlot, raw);
+                        index, name, goInterfaceSlot, raw) &&
+                        !goOtherConfiguration(index, def.file, raw.file);
                     if ((!exactInterfaceReceiver && !closedAmbiguity) ||
                         raw.externalContract) continue;
                     const relativePath = raw.relativePath ||

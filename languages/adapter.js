@@ -73,8 +73,11 @@ function createLanguageAdapter(config) {
         parse(code, parser) {
             return languageModule.parse(code, parser);
         },
-        findCalls(code, parser) {
-            return languageModule.findCallsInCode(code, parser);
+        findCalls(code, parser, options) {
+            // Options carry what the build passes too (Go import names, fix
+            // #400): a query-time re-read must see the same file.
+            return options ? languageModule.findCallsInCode(code, parser, options)
+                : languageModule.findCallsInCode(code, parser);
         },
         findImports(code, parser) {
             return languageModule.findImportsInCode(code, parser);

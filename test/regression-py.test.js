@@ -8834,3 +8834,157 @@ describe('fix #398F: Python configuration items, module values and string annota
         } finally { rm(dir); }
     });
 });
+
+describe('fix #400: module-attribute type references, __all__ entries, self-attribute candidates, bound-method values', () => {
+    const planOf = (index, file, line, name, renameTo) => {
+        const result = execute(index, 'plan', { name, file, line, renameTo });
+        assert.ok(result.ok, result.error);
+        return result.result;
+    };
+    const edits = (plan, file) => plan.changes.filter(c => c.file === file && !c.needsReview)
+        .map(c => `${c.line}:${c.newExpression}`).sort();
+    const reviews = (plan, file) => plan.changes.filter(c => c.file === file && c.needsReview).map(c => c.line).sort();
+
+    it('a type rename edits module-attribute references that denote the type, and __all__ follows the binding', () => {
+        const dir = tmp({
+            'pkg/__init__.py': '',
+            'pkg/message.py': 'class Message:\n    pass\n',
+            'pkg/base.py': 'from pkg.message import Message\n\n__all__ = (\'Message\',)\n',
+            'pkg/other.py': 'class Message:\n    pass\n',
+            'pkg/virtual/__init__.py': 'from .impl import Message\n\n__all__ = (\'Message\',)\n',
+            'pkg/virtual/impl.py': 'from pkg import base\n\n\nclass Message(base.Message):\n    pass\n',
+            'pkg/use.py': [
+                'from . import base',                 // 1
+                'import pkg.base as b',               // 2
+                'from pkg import base as b2',         // 3
+                'from pkg import other',              // 4
+                '',                                   // 5
+                '',                                   // 6
+                'class A(base.Message):',             // 7
+                '    pass',                           // 8
+                '',                                   // 9
+                '',                                   // 10
+                'class B(b.Message, b2.Message):',    // 11
+                '    pass',                           // 12
+                '',                                   // 13
+                '',                                   // 14
+                'class C(other.Message):',            // 15
+                '    pass',                           // 16
+                '',                                   // 17
+                '',                                   // 18
+                'def f(base):',                       // 19
+                '    return base.Message',            // 20
+            ].join('\n') + '\n',
+            'pkg/maybe.py': 'try:\n    from pkg import base\nexcept ImportError:\n    base = None\n\n\nclass D(base.Message):\n    pass\n',
+        });
+        try {
+            const plan = planOf(idx(dir), 'pkg/message.py', 1, 'Message', 'Note');
+            assert.deepStrictEqual(edits(plan, 'pkg/use.py').map(e => e.split(':')[0]), ['11', '7'],
+                JSON.stringify(plan.changes));
+            assert.ok(edits(plan, 'pkg/use.py').some(e => e.includes('b.Note, b2.Note')), JSON.stringify(plan.changes));
+            assert.deepStrictEqual(reviews(plan, 'pkg/use.py'), [20], 'a parameter named like the module is review');
+            assert.deepStrictEqual(edits(plan, 'pkg/virtual/impl.py').map(e => e.split(':')[0]), ['4']);
+            assert.deepStrictEqual(edits(plan, 'pkg/base.py').map(e => e.split(':')[0]).sort(), ['1', '3']);
+            assert.ok(!plan.changes.some(c => c.file === 'pkg/virtual/__init__.py'),
+                '__all__ of a module whose Message is another class is not edited');
+            assert.deepStrictEqual(reviews(plan, 'pkg/maybe.py'), [7], 'a maybe-module receiver is review');
+        } finally { rm(dir); }
+    });
+
+    it('a parenthesized multi-line import of a same-name function from another module is not renamed', () => {
+        const dir = tmp({
+            'pkg/__init__.py': '',
+            'pkg/a.py': 'def helper():\n    return 1\n',
+            'pkg/b.py': 'def helper():\n    return 2\n\n\nOTHER = 3\n',
+            'pkg/c.py': 'from pkg.b import (\n    OTHER,\n    helper,\n)\n\n\ndef f():\n    return helper() + OTHER\n',
+            'pkg/d.py': 'from pkg.a import (\n    helper,\n)\n\n\ndef g():\n    return helper()\n',
+        });
+        try {
+            const plan = planOf(idx(dir), 'pkg/a.py', 1, 'helper', 'helperZ');
+            const files = plan.changes.filter(c => !c.needsReview).map(c => `${c.file}:${c.line}`).sort();
+            assert.deepStrictEqual(files, ['pkg/a.py:1', 'pkg/d.py:2', 'pkg/d.py:7'], JSON.stringify(plan.changes));
+        } finally { rm(dir); }
+    });
+
+    it('a self attribute the class never types gives a single-owner candidate callee, not a confirmed one', () => {
+        const dir = tmp({
+            'pkg/__init__.py': '',
+            'pkg/channel.py': 'class Channel:\n    def basic_cancel(self, tag):\n        return tag\n',
+            'pkg/consumer.py': [
+                'from pkg.channel import Channel',    // 1
+                '',                                   // 2
+                '',                                   // 3
+                'class Typed:',                       // 4
+                '    def __init__(self):',            // 5
+                '        self.channel = Channel()',   // 6
+                '',                                   // 7
+                '    def stop(self):',                // 8
+                '        self.channel.basic_cancel(1)', // 9
+                '',                                   // 10
+                '',                                   // 11
+                'class Untyped:',                     // 12
+                '    def stop(self):',                // 13
+                '        self.channel.basic_cancel(2)', // 14
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const calleesOf = line => {
+                const def = index.symbols.get('stop').find(d => d.startLine === line);
+                const callees = index.findCallees(def, { collectAccount: true });
+                return {
+                    confirmed: callees.map(c => c.name),
+                    unverified: (callees.unverifiedCallees || []).map(c => `${c.name}:${c.reason}`),
+                };
+            };
+            assert.deepStrictEqual(calleesOf(8).confirmed, ['basic_cancel']);
+            const untyped = calleesOf(13);
+            assert.deepStrictEqual(untyped.confirmed, []);
+            assert.deepStrictEqual(untyped.unverified, ['basic_cancel:single-owner']);
+        } finally { rm(dir); }
+    });
+
+    it('a bound method held by a module value: its reads are renamed, its calls stay visible and unrenamed', () => {
+        const dir = tmp({
+            'pkg/__init__.py': '',
+            'pkg/registry.py': [
+                'class Registry:',                    // 1
+                '    def loads(self, data):',         // 2
+                '        return data',                // 3
+                '',                                   // 4
+                '',                                   // 5
+                'class Client:',                      // 6
+                '    def run(self):',                 // 7
+                '        return 1',                   // 8
+                '',                                   // 9
+                '',                                   // 10
+                'registry = Registry()',              // 11
+                'loads = registry.loads',             // 12
+                'run = Client().run',                 // 13
+                '',                                   // 14
+                '',                                   // 15
+                'def use():',                         // 16
+                '    f = registry.loads',             // 17
+                '    return loads(1) + run() + f(2)', // 18
+            ].join('\n') + '\n',
+            'pkg/user.py': 'from pkg.registry import loads\n\n\ndef go():\n    return loads(3)\n',
+        });
+        try {
+            const index = idx(dir);
+            const plan = planOf(index, 'pkg/registry.py', 2, 'loads', 'loadsZ');
+            assert.deepStrictEqual(edits(plan, 'pkg/registry.py'), [
+                '12:loads = registry.loadsZ', '17:f = registry.loadsZ', '2:def loadsZ(self, data):',
+            ], JSON.stringify(plan.changes));
+            assert.ok(!plan.changes.some(c => c.file === 'pkg/user.py'), 'the import names the module value');
+            const unverified = (plan.unverifiedSites || []).map(s => `${s.file}:${s.line}:${s.reason}`).sort();
+            assert.deepStrictEqual(unverified, ['pkg/registry.py:18:alias-call', 'pkg/user.py:5:alias-call']);
+            const run = planOf(index, 'pkg/registry.py', 7, 'run', 'runZ');
+            assert.deepStrictEqual(edits(run, 'pkg/registry.py'), ['13:run = Client().runZ', '7:def runZ(self):']);
+            // The callee side agrees: a visible alias call, never confirmed.
+            const go = index.symbols.get('go')[0];
+            const callees = index.findCallees(go, { collectAccount: true });
+            assert.deepStrictEqual(callees.map(c => c.name), []);
+            assert.deepStrictEqual((callees.unverifiedCallees || []).map(c => `${c.name}:${c.reason}`), ['loads:alias-call']);
+        } finally { rm(dir); }
+    });
+});

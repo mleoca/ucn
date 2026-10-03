@@ -20,6 +20,7 @@ const {
     sameNode,
     parseErrorRegions,
     cachedNodeRange,
+    goPathPackageName,
 } = require('./utils');
 const { PARSE_OPTIONS, safeParse } = require('./index');
 
@@ -803,10 +804,8 @@ function extractTypeConversions(tree) {
         if (!importPath) continue;
         const alias = spec.childForFieldName('name')?.text;
         const segments = importPath.split('/');
-        const last = segments[segments.length - 1];
         // `example.com/mod/v2` imports package `mod`; `gopkg.in/yaml.v3` `yaml`.
-        const conventional = /^v\d+$/.test(last) && segments.length > 1
-            ? segments[segments.length - 2] : last.replace(/\.v\d+$/, '');
+        const conventional = goPathPackageName(importPath);
         const qualifier = alias || conventional;
         if (!qualifier || qualifier === '_' || qualifier === '.') continue;
         importQualifiers.add(qualifier);
@@ -1309,17 +1308,40 @@ function goVarSpecs(declaration) {
  * initialized by a call is typed at query time from the producer's declared
  * result, in this file (its flow map holds the module-scope assignment).
  * Package scope is the directory: other files of the package reach these
- * names unqualified, importers through the package qualifier.
+ * names unqualified, importers through the package qualifier. Constants
+ * are recorded too (`constant: true`, typed only by a written type): a
+ * name the package declares is never an import's name (fix #400).
  */
 function extractPackageVars(rootNode) {
     const out = [];
     for (const declaration of rootNode.namedChildren) {
+        if (declaration.type === 'const_declaration') {
+            for (const spec of declaration.namedChildren) {
+                if (spec.type !== 'const_spec') continue;
+                const declaredType = spec.childForFieldName('type');
+                const typeName = declaredType && !GO_CONTAINER_TYPE_NODES.has(declaredType.type)
+                    ? goTypeNameOf(declaredType) : null;
+                const qualifier = typeName ? goTypeQualifierOf(declaredType) : null;
+                for (const id of spec.namedChildren) {
+                    if (id.type !== 'identifier' || id.text === '_') continue;
+                    out.push({
+                        name: id.text,
+                        line: id.startPosition.row + 1,
+                        constant: true,
+                        ...(typeName && { type: typeName, origin: typeOrigin('annotation', declaredType) }),
+                        ...(qualifier && { qualifier }),
+                    });
+                }
+            }
+            continue;
+        }
         if (declaration.type !== 'var_declaration') continue;
         for (const spec of goVarSpecs(declaration)) {
             const declaredType = spec.childForFieldName('type');
             let typeName = null;
             let qualifier = null;
             let origin = null;
+            let valueFrom = null;
             if (declaredType && !GO_CONTAINER_TYPE_NODES.has(declaredType.type)) {
                 typeName = goTypeNameOf(declaredType);
                 qualifier = typeName ? goTypeQualifierOf(declaredType) : null;
@@ -1334,6 +1356,13 @@ function extractPackageVars(rootNode) {
                     typeName = goTypeNameOf(tn);
                     qualifier = typeName ? goTypeQualifierOf(tn) : null;
                     origin = typeName ? typeOrigin('constructor', init) : null;
+                } else if (init?.type === 'selector_expression' && valueNode.namedChild(0)?.type === 'selector_expression') {
+                    // `var json = jsoniter.ConfigCompatibleWithStandardLibrary`
+                    // (fix #400): the value another package declares; its
+                    // type is that declaration's, decided at query time.
+                    const operand = init.childForFieldName('operand');
+                    const field = init.childForFieldName('field');
+                    if (operand?.type === 'identifier' && field) valueFrom = { qualifier: operand.text, name: field.text };
                 }
             }
             for (const id of spec.namedChildren) {
@@ -1343,6 +1372,7 @@ function extractPackageVars(rootNode) {
                     line: id.startPosition.row + 1,
                     ...(typeName && { type: typeName, origin }),
                     ...(qualifier && { qualifier }),
+                    ...(valueFrom && { valueFrom }),
                 });
             }
         }
@@ -1370,14 +1400,17 @@ function goBuildConstraint(rootNode) {
     return legacy.length > 0 ? legacy.join(' && ') : null;
 }
 
-/** Names the file declares at package level: vars, consts, types, funcs. */
-function goFileLevelNames(rootNode) {
+/** Names the file declares at package level: vars, consts, types, funcs
+ * (only vars when `varsOnly`). */
+function goFileLevelNames(rootNode, varsOnly = false) {
     const names = new Set();
     for (const declaration of rootNode.namedChildren) {
         if (declaration.type === 'var_declaration') {
             for (const spec of goVarSpecs(declaration)) {
                 for (const id of spec.namedChildren) if (id.type === 'identifier') names.add(id.text);
             }
+        } else if (varsOnly) {
+            continue;
         } else if (declaration.type === 'const_declaration') {
             for (const spec of declaration.namedChildren) {
                 if (spec.type !== 'const_spec') continue;
@@ -2183,6 +2216,8 @@ function findCallsInCode(code, parser, options = {}) {
     const isShadowedByLocal = (refNode, name) => bindingScopeOf(refNode, name) != null;
     let fileLevelNameSet = null;
     const fileLevelNames = () => (fileLevelNameSet || (fileLevelNameSet = goFileLevelNames(tree.rootNode)));
+    let fileVarNameSet = null;
+    const fileVarNames = () => (fileVarNameSet || (fileVarNameSet = goFileLevelNames(tree.rootNode, true)));
     // An identifier operand naming an import that no local binding shadows
     // is a package qualifier: `pkg.Name` then denotes a package-level
     // symbol (function, type, var or const), never a member of a value.
@@ -2726,9 +2761,12 @@ function findCallsInCode(code, parser, options = {}) {
                         ? getIndexedSource(receiver, operandNode) : undefined;
                     // A receiver no scope of this file binds names a
                     // package-level declaration of another file of the
-                    // package (fix #399): typed at query time.
+                    // package (fix #399): typed at query time. So is an
+                    // untyped package-level variable of this file, whose
+                    // value may come from another package (fix #400).
                     const receiverPackageScope = !!(receiver && !isPkgCall && !receiverType &&
-                        !receiverIndexedSource && !fileLevelNames().has(receiver) &&
+                        !receiverIndexedSource &&
+                        (!fileLevelNames().has(receiver) || fileVarNames().has(receiver)) &&
                         !isShadowedByLocal(operandNode, receiver));
                     // Composite-literal receiver (fix #298):
                     // (&Kit{...}).Run(...) — compiler-true type, never guessed.
@@ -3368,19 +3406,16 @@ function findImportsInCode(code, parser) {
         if (modulePath) {
             // Package name is last segment of path, skipping Go version suffixes (v2, v3, etc.)
             let pkgName = alias;
-            if (!pkgName) {
-                const parts = modulePath.split('/');
-                // Go convention: if last segment matches /^v\d+$/, use the previous segment
-                // e.g., k8s.io/klog/v2 → klog, github.com/foo/bar/v3 → bar
-                const last = parts[parts.length - 1];
-                pkgName = (/^v\d+$/.test(last) && parts.length > 1) ? parts[parts.length - 2] : last;
-            }
+            if (!pkgName) pkgName = goPathPackageName(modulePath);
             imports.push({
                 module: modulePath,
                 names: [pkgName],
                 type: importType,
                 dynamic,
-                line
+                line,
+                // No written name: the local name is the imported package's
+                // own package clause, which the path only suggests (fix #400).
+                ...(!alias && { implicitName: true }),
             });
         }
     }

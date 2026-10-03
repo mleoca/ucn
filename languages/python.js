@@ -3280,6 +3280,49 @@ function findCallsInTree(code, tree, parser, sink = null) {
                             receiver: objNode?.type === 'identifier' ? objNode.text : null,
                             attr: attrName.text,
                         });
+                        // A bound method read through a typed receiver
+                        // (`loads = registry.loads`, `run = Client().run`,
+                        // fix #400) references the method: a rename edits
+                        // the attribute, never the variable holding it.
+                        let valueType = null;
+                        let valueFields = null;
+                        if (objNode?.type === 'identifier' && !['self', 'cls'].includes(objNode.text) &&
+                            !moduleAliases.has(objNode.text)) {
+                            valueType = localVarTypes.get(objNode.text) || null;
+                            if (valueType) valueFields = localVarTypes.fields(objNode.text, valueType);
+                        } else if (objNode?.type === 'call') {
+                            const ctor = exactConstructorInfo(objNode.childForFieldName('function'));
+                            if (ctor && !ctor.qualifier) {
+                                valueType = ctor.type;
+                                valueFields = { receiverTypeSource: 'constructor',
+                                    receiverTypeEvidence: { ...typeOrigin('constructor', objNode), type: ctor.type } };
+                            }
+                        }
+                        if (valueType) {
+                            // The receiver context a call on it carries.
+                            const recv = objNode.type === 'identifier' ? objNode.text : null;
+                            calls.push({
+                                callSite: typeOrigin('call', attrName),
+                                name: attrName.text,
+                                line: attrName.startPosition.row + 1,
+                                isMethod: true,
+                                ...(recv && { receiver: recv }),
+                                receiverType: valueType,
+                                ...valueFields,
+                                ...(recv && localVarTypeQualifiers.get(recv) && {
+                                    receiverTypeQualifier: localVarTypeQualifiers.get(recv),
+                                }),
+                                ...(recv && localVarStdlibContracts.has(recv) && {
+                                    receiverTypeStdlibModule: localVarStdlibContracts.get(recv),
+                                }),
+                                ...((!recv || constructedReceiverVars.has(recv)) && { receiverConstructed: true }),
+                                ...(recv && withBindingVars.has(recv) && { receiverWithBinding: true }),
+                                ...(recv && isShadowedByLocal(objNode, recv) && { receiverLocalBinding: true }),
+                                isFunctionReference: true,
+                                memberRead: true,
+                                enclosingFunction: getCurrentEnclosingFunction(),
+                            });
+                        }
                     }
                 }
                 // Track partial(fn, ...) aliases: fast_process = partial(process, mode='fast')

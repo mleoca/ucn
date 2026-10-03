@@ -1339,8 +1339,28 @@ function branchClausesExclusive(a, b) {
     return false;
 }
 
+/**
+ * The package name a Go import path suggests when the import writes none,
+ * by the Go tools' convention: the last element, or the one before a major
+ * version suffix (v2 and up: `example.com/mod/v3` is package `mod`; a module
+ * path never ends in /v0 or /v1, so such an element is a directory, and
+ * `k8s.io/api/core/v1` declares package `v1`), without a `go-` prefix and up
+ * to the first character no identifier holds (`github.com/goccy/go-json` is
+ * `json`, `gopkg.in/yaml.v3` `yaml`, `k8s.io/mount-utils` `mount`). Only a
+ * suggestion: the local name is the imported package's own clause (fix #400).
+ */
+function goPathPackageName(modulePath) {
+    const parts = String(modulePath).split('/');
+    let base = parts[parts.length - 1];
+    if (/^v([2-9]|[1-9]\d+)$/.test(base) && parts.length > 1) base = parts[parts.length - 2];
+    if (base.startsWith('go-')) base = base.slice(3);
+    const cut = base.search(/[^\p{L}\p{N}_]/u);
+    return cut > 0 ? base.slice(0, cut) : base;
+}
+
 module.exports = {
     genericArityOf,
+    goPathPackageName,
     parseErrorRegions,
     containsOwnNode,
     nodeTextWithoutComments,

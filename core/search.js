@@ -1443,7 +1443,10 @@ function tests(index, nameOrFile, options = {}) {
             // Fast pre-check: skip if searchTerm doesn't appear in file
             if (!isFilePath && !content.includes(searchTerm) && !linkedRecords) continue;
             if (isFilePath && !linkedRecords && provenFileSites.length === 0) continue;
-            const sourceFileLinked = !sourceFileFilter || sourceFileFilter.has(testPath);
+            // A test importing the name through any chain of re-exports and
+            // renames the caller engine follows is linked too (fix #400).
+            const sourceFileLinked = !sourceFileFilter || sourceFileFilter.has(testPath) ||
+                _importBindingReachesTargets(index, entry, searchTerm, targetDefs);
             // A class-qualified query can still identify a possible test link
             // in source layouts that have no modeled module edge (notably
             // Rust macro/test fixtures). Keep it visibly unverified when the
@@ -1967,6 +1970,23 @@ function _buildSourceFileImporters(index, defs) {
     return importers;
 }
 
+/** Does an import binding of `name` in this file reach a target
+ * definition's file under that name (fix #400)? The caller engine's
+ * name-level export chase. */
+function _importBindingReachesTargets(index, fileEntry, name, targetDefs) {
+    if (!targetDefs || targetDefs.length === 0) return false;
+    const targetFiles = new Set(targetDefs.map(d => d.file).filter(Boolean));
+    const { _nameBindingReaches } = require('./callers');
+    for (const binding of fileEntry.importBindings || []) {
+        if ((binding.alias || binding.name) !== name || binding.module == null) continue;
+        const rel = fileEntry.moduleResolved?.[binding.module];
+        if (!rel) continue;
+        const abs = path.isAbsolute(rel) ? rel : path.join(index.root, rel);
+        if (_nameBindingReaches(index, abs, binding.name, targetFiles, 8, { exactName: true }) === 'yes') return true;
+    }
+    return false;
+}
+
 /**
  * Check if a file re-exports a symbol from a source file.
  * Handles: named re-exports, `module.exports = require(...)` blanket re-exports,
@@ -1997,7 +2017,12 @@ function _fileReExportsSymbol(index, fileEntry, symbolName, sourceAbsPath) {
         !exp.name || exp.type === 'module.exports' || exp.type === 're-export' || exp.type === 'export-all'
     );
     if (hasBlanketExport) return true;
-    return false;
+    // `export * from './m'` re-exports every name of the module it names
+    // (fix #400): it carries the symbol on when that module is the file the
+    // chain came from.
+    return details.some(exp => exp.type === 're-export-all' && exp.source &&
+        fileEntry.moduleResolved?.[exp.source] &&
+        path.join(index.root, fileEntry.moduleResolved[exp.source]) === sourceAbsPath);
 }
 
 /**

@@ -69,7 +69,7 @@ function normalizeSymbol(symbol, family, language, kind, owner = null) {
         'annotationsWithArgs', 'attributesWithArgs', 'nameLine', 'traitImpl',
         'traitName', 'isSignature', 'memberAssigned', 'assignedReceiver', 'assignedObject', 'selfNamed', 'bodyScopedName',
         'registryMember', 'registryContainer', 'registryContainerType', 'objectLiteralLine', 'isConstructor',
-        'isExtensionMethod', 'extensionReceiver', 'explicitInterface',
+        'isExtensionMethod', 'extensionReceiver', 'explicitInterface', 'primaryParams',
         'namespace', 'lexicalScopeStartLine', 'lexicalScopeEndLine',
         'returnTypeQualifier', 'returnTypeResolved', 'supertraits', 'ownerGenericBounds', 'ownerSelfArgs', 'implSelfRef', 'implSelfQualifier', 'blanketSelfBounds', 'selfParamKind', 'macroNeverReturns', 'callbackParamTypes', 'iteratorItemType', 'futureReturn',
         'returnedConcreteType', 'returnedConstructors', 'templateDependent',

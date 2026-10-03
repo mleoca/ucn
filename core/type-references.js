@@ -2313,7 +2313,7 @@ function scanFile(index, resolver, file, entry, language, lineNumbers) {
             mark(node, 'text');
             if (resolver.family === 'csharp' && type === 'comment' && marks) docComments.push(node);
             if (resolver.family === 'python' && type === 'string_content' &&
-                pythonTypeExpressionString(node, entry)) found.push(node);
+                (pythonTypeExpressionString(node, entry) || pythonDunderAllEntry(node, name))) found.push(node);
         }
         return found;
     };
@@ -2371,7 +2371,8 @@ function scanFile(index, resolver, file, entry, language, lineNumbers) {
     const pinLines = new Set([...resolver.group].filter(d => d.file === file && d.type === 'type')
         .map(d => (d.nameLine || d.startLine) - 1));
     const classified = tokens.map(node => {
-        let role = node.type === 'string_content' ? { role: 'string-annotation' } : classify(node, language);
+        let role = node.type !== 'string_content' ? classify(node, language)
+            : pythonDunderAllEntry(node, name) ? { role: 'dunder-all' } : { role: 'string-annotation' };
         if (role.role === 'skip' && (role.why === 'assignment' || role.why === 'variable') &&
             (resolver.family === 'python' || resolver.family === 'js') && pinLines.has(node.startPosition.row)) {
             role = { role: 'pin-binding' };
@@ -2385,7 +2386,7 @@ function scanFile(index, resolver, file, entry, language, lineNumbers) {
     for (const token of classified) {
         const row = token.node.startPosition.row;
         const slot = lineOf(row);
-        if (token.node.type === 'string_content') {
+        if (token.role.role === 'string-annotation') {
             decideStringAnnotation(resolver, file, entry, token.node, slot);
             continue;
         }
@@ -2396,6 +2397,9 @@ function scanFile(index, resolver, file, entry, language, lineNumbers) {
         const decision = decide(resolver, file, entry, token, bindings, typeParams) ||
             { verdict: 'unknown', reason: 'unmodelled-position' };
         resolver.siteNode = null;
+        // An `__all__` entry is a code reference: once edited it is no
+        // longer a text-only review item.
+        if (token.role.role === 'dunder-all') slot.stringAnnotation = true;
         if (decision.verdict === 'yes') slot.edits.push(token.node.startPosition.column);
         else if (decision.verdict === 'unknown') {
             slot.reviews.push({ column: token.node.startPosition.column, reason: decision.reason || 'unresolved' });
@@ -2593,6 +2597,10 @@ function decide(resolver, file, entry, token, bindings, typeParams) {
     switch (role.role) {
         case 'pin-binding':
             return { verdict: 'yes' };
+        case 'dunder-all':
+            // A Python `__all__` entry names the module's own binding of the
+            // name: renamed exactly when that binding is the renamed type.
+            return resolver.resolveName(file, line);
         case 'skip':
             // A declarator the grammar read next to a parse error may be
             // the type itself (`MACRO Widget value` with MACRO taken for
@@ -2890,8 +2898,12 @@ function decideMember(resolver, file, token, bindings) {
     const line = node.startPosition.row + 1;
     if (!receiver) return { verdict: 'unknown', reason: 'member' };
     const family = resolver.family;
-    // Receivers that are values: never a namespace for the type name.
-    const valueReceiver = /^(this|self|super|base|cls)$/.test(receiver.text) ||
+    // Receivers that are values: never a namespace for the type name. The
+    // keyword receivers (`this`, `super`, C# `base`, Rust `self`) are node
+    // types of their own; an identifier spelled like one is an ordinary
+    // name (`from . import base` then `base.Message`, a Go package `base`).
+    // Python's `self`/`cls` parameters are values by convention.
+    const valueReceiver = (family === 'python' && /^(self|cls)$/.test(receiver.text)) ||
         !/^(identifier|scoped_identifier|field_access|attribute|member_expression|package_identifier|member_access_expression|qualified_name|generic_name|scoped_type_identifier|type_identifier)$/.test(receiver.type);
     if (valueReceiver) {
         if (family === 'python' && /^(self|cls)$/.test(receiver.text)) {
@@ -3086,6 +3098,25 @@ function pythonTypeExpressionString(node, entry) {
                 typingName(call.childForFieldName('function'));
         }
         if (!['tuple', 'expression_list', 'list', 'binary_operator', 'parenthesized_expression'].includes(parent.type)) {
+            return false;
+        }
+    }
+    return false;
+}
+
+/** Is this Python string content an entry of the module's `__all__`
+ * (`__all__ = ('A', 'B')`, `__all__ += ['C']`) spelling exactly `name`? */
+function pythonDunderAllEntry(node, name) {
+    const string = node.parent?.type === 'string' ? node.parent : null;
+    if (!string || node.text !== name || string.namedChildCount !== 3) return false;
+    for (let current = string, parent = string.parent; parent; current = parent, parent = parent.parent) {
+        if (parent.type === 'assignment' || parent.type === 'augmented_assignment') {
+            if (!sameNode(parent.childForFieldName('right'), current) ||
+                parent.childForFieldName('left')?.text !== '__all__') return false;
+            // Module scope only: a function's or class's `__all__` is a local.
+            return !ancestor(parent, new Set(['function_definition', 'class_definition', 'lambda']));
+        }
+        if (!['tuple', 'list', 'parenthesized_expression', 'binary_operator', 'expression_list'].includes(parent.type)) {
             return false;
         }
     }

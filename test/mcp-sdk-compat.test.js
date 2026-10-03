@@ -5,7 +5,7 @@ const assert = require('node:assert');
 const path = require('path');
 
 const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
-const { StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js');
+const { StdioClientTransport, getDefaultEnvironment } = require('@modelcontextprotocol/sdk/client/stdio.js');
 const { tmp, rm } = require('./helpers');
 
 const SERVER_PATH = path.join(__dirname, '..', 'mcp', 'server.js');
@@ -17,9 +17,13 @@ describe('official MCP SDK interoperability', () => {
             'index.js': 'function greet(name) { return `hello ${name}`; }\nmodule.exports = { greet };\n',
         });
         const client = new Client({ name: 'ucn-sdk-compat-test', version: '1.0.0' });
+        // The SDK passes only a minimal environment by default; the test
+        // cache root must reach the server so it never writes the user cache
+        // (fix #400).
         const transport = new StdioClientTransport({
             command: process.execPath,
             args: [SERVER_PATH],
+            env: { ...getDefaultEnvironment(), UCN_CACHE_DIR: process.env.UCN_CACHE_DIR },
             stderr: 'pipe',
         });
         try {

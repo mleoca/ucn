@@ -530,12 +530,74 @@ function buildImportGraph(index) {
 
         index.importGraph.set(filePath, importedFiles);
         fileEntry.moduleResolved = moduleResolved;
+        if (langTraits(fileEntry.language)?.hasReceiverPackageCalls) {
+            _applyGoImportNames(index, filePath, fileEntry, moduleResolved, dirToGoFiles);
+        }
         if (Object.keys(includeFallback).length > 0) {
             fileEntry.includeFallback = includeFallback;
         } else {
             delete fileEntry.includeFallback;
         }
     }
+}
+
+/**
+ * The local name of a Go import that writes none is the package clause of
+ * the package it imports, which its path only suggests (fix #400):
+ * `example.com/m/internal/go-utils` may declare `package utils`. For a
+ * project package that clause is known; an outside package keeps the
+ * parser's path-derived name, which no query treats as proof (an
+ * identifier the file does not otherwise bind may name such an import).
+ * The file's call records were read with the parser's names: when the
+ * resolved names differ they are read again on first use (a build's callee
+ * index reads them). The parser's suggestion follows the Go tools'
+ * convention (goPathPackageName), so few project packages need this.
+ */
+function _applyGoImportNames(index, filePath, fileEntry, moduleResolved, dirToGoFiles) {
+    const details = fileEntry.importDetails || [];
+    const names = fileEntry.importNames || [];
+    if (details.length === 0 || names.length !== details.length) return;
+    let next = null;
+    for (let i = 0; i < details.length; i++) {
+        const detail = details[i];
+        let name = detail.names?.[0];
+        if (detail.implicitName && moduleResolved[detail.module]) {
+            const rel = moduleResolved[detail.module];
+            const dir = path.dirname(path.isAbsolute(rel) ? rel : path.join(index.root, rel));
+            const clause = (dirToGoFiles.get(dir) || []).map(file => index.files.get(file))
+                .find(entry => entry?.packageName && !entry.relativePath?.endsWith('_test.go') &&
+                    !entry.packageName.endsWith('_test'))?.packageName;
+            if (clause) name = clause;
+        }
+        if (name && names[i] !== name) {
+            if (!next) next = names.slice();
+            next[i] = name;
+        }
+    }
+    if (!next) return;
+    const changed = new Set();
+    for (let i = 0; i < next.length; i++) {
+        if (next[i] !== names[i]) {
+            if (names[i]) changed.add(names[i]);
+            changed.add(next[i]);
+        }
+    }
+    fileEntry.importNames = next;
+    for (const binding of fileEntry.importBindings || []) {
+        const at = details.findIndex(detail => detail.module === binding.module && detail.line === binding.line);
+        if (at >= 0 && details[at].implicitName) binding.name = next[at];
+    }
+    // An import name is only ever written as a qualifier (`name.X`): records
+    // of a file that never writes one of the changed names are unchanged.
+    let content = '';
+    try { content = index._readFile(filePath); } catch { content = null; }
+    if (content != null && ![...changed].some(name => content.includes(`${name}.`))) return;
+    // Drop the records read with the old names (loading this file's shard
+    // first, so a later shard load cannot bring them back).
+    if (index._callsCachePrepared && !index._callsCacheLoaded) {
+        require('./cache').ensureCallsShardForFile(index, filePath);
+    }
+    if (index.callsCache.delete(filePath)) index.callsCacheDirty = true;
 }
 
 /**

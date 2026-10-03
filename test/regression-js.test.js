@@ -11896,3 +11896,66 @@ describe('fix #398F: tests lists getter reads whose receiver flow proves the own
         } finally { rm(dir); }
     });
 });
+
+describe('fix #400: namespace-import type references and tests through export-all chains', () => {
+    it('a type rename edits references through namespace imports named like keywords of other languages', () => {
+        const dir = tmp({
+            'package.json': '{"name":"ns-types"}',
+            'message.ts': 'export class Message {\n    x = 1;\n}\n',
+            'base.ts': "export { Message } from './message';\n",
+            'use.ts': [
+                "import * as base from './base';",                        // 1
+                "import * as self from './message';",                     // 2
+                '',                                                       // 3
+                'export class A extends base.Message {}',                 // 4
+                'export class B extends self.Message {}',                 // 5
+                'export function f(): base.Message { return new base.Message(); }', // 6
+            ].join('\n') + '\n',
+        });
+        try {
+            const result = execute(idx(dir), 'plan', { name: 'Message', file: 'message.ts', line: 1, renameTo: 'Note' });
+            assert.ok(result.ok, result.error);
+            const use = result.result.changes.filter(c => c.file === 'use.ts' && !c.needsReview)
+                .map(c => `${c.line}:${c.newExpression}`).sort();
+            assert.deepStrictEqual(use, [
+                '4:export class A extends base.Note {}',
+                '5:export class B extends self.Note {}',
+                '6:export function f(): base.Note { return new base.Note(); }',
+            ], JSON.stringify(result.result.changes));
+        } finally { rm(dir); }
+    });
+
+    it('a multi-line import of a same-name function from another module is not renamed', () => {
+        const dir = tmp({
+            'package.json': '{"name":"ml-imports"}',
+            'a.ts': 'export function isLike(x: unknown) { return !!x; }\nexport const useA = () => isLike(1);\n',
+            'b.ts': 'export const isLike = (x: unknown) => x === 1;\nexport const other = 2;\n',
+            'c.ts': "import {\n  other,\n  isLike,\n} from './b';\n\nexport const v = isLike(other);\n",
+            'd.ts': "import {\n  useA,\n  isLike,\n} from './a';\n\nexport const w = isLike(useA());\n",
+        });
+        try {
+            const result = execute(idx(dir), 'plan', { name: 'isLike', file: 'a.ts', line: 1, renameTo: 'isLikeZ' });
+            assert.ok(result.ok, result.error);
+            const files = result.result.changes.filter(c => !c.needsReview).map(c => `${c.file}:${c.line}`).sort();
+            assert.deepStrictEqual(files, ['a.ts:1', 'a.ts:2', 'd.ts:3', 'd.ts:6'], JSON.stringify(result.result.changes));
+        } finally { rm(dir); }
+    });
+
+    it('tests follows `export *` re-export chains to the test importing the package entry', () => {
+        const dir = tmp({
+            'package.json': '{"name":"pkgx","exports":{".":"./src/index.ts","./vanilla":"./src/vanilla.ts"}}',
+            'tsconfig.json': '{"compilerOptions":{"paths":{"pkgx":["./src/index.ts"],"pkgx/*":["./src/*.ts"]}}}',
+            'src/vanilla/store.ts': 'export function createStore() {\n    return {};\n}\n',
+            'src/vanilla.ts': "export { createStore } from './vanilla/store';\n",
+            'src/index.ts': "export * from './vanilla';\n",
+            'tests/entry.test.ts': "import { createStore } from 'pkgx';\n\ntest('x', () => {\n    createStore();\n});\n",
+        });
+        try {
+            const result = execute(idx(dir), 'tests', { name: 'createStore', file: 'src/vanilla/store.ts' });
+            assert.ok(result.ok, result.error);
+            const entry = (result.result || []).find(r => r.file === 'tests/entry.test.ts');
+            assert.ok(entry, JSON.stringify(result.result));
+            assert.ok(entry.matches.some(m => m.line === 1 && m.matchType === 'import'), JSON.stringify(entry.matches));
+        } finally { rm(dir); }
+    });
+});

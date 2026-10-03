@@ -745,10 +745,16 @@ function supertypeRefsOf(index, ref, opts = {}) {
                 parent = _resolveQualifiedParent(index, spelled, decl.file,
                     { name: ref.name, key: ref.key, def: decl });
             } else {
+                // A written generic arity names only the type of that arity
+                // (fix #380): `: IResolver<A, B, C>` never resolves to a
+                // non-generic `IResolver` (fix #400, implements clauses).
+                const arity = langTraits(index.files.get(decl.file)?.language)?.genericArityIsIdentity
+                    ? genericArityOf(raw) : undefined;
                 parent = externalParentDenotation(index, decl.file, bare, decl.startLine) ||
                     resolveClassRef(index, bare, decl.file, {
                         excludeKey: bare === ref.name ? ref.key : null,
                         namespace: decl.namespace || null,
+                        ...(Number.isInteger(arity) && { arity }),
                     });
             }
             const k = parent.key || `?${parent.name}${parent.external ? '!' : ''}`;

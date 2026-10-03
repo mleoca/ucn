@@ -50,6 +50,20 @@ function createImportBindings(imports) {
     });
 }
 
+/** Names a C# slot-typed `new(..)` record depends on: the call or type it
+ * is an argument of, the receiver member of that call, or the member it is
+ * assigned to (fix #400). Null when the file has none. */
+function targetTypedKeysOf(calls) {
+    let keys = null;
+    for (const call of calls || []) {
+        const slot = call?.targetSlot;
+        if (!slot) continue;
+        if (!keys) keys = new Set();
+        for (const key of [slot.ownerName, slot.receiverName, slot.member]) if (key) keys.add(key);
+    }
+    return keys ? [...keys].sort() : null;
+}
+
 function createFileEntryFromIR({
     ir,
     filePath,
@@ -88,6 +102,8 @@ function createFileEntryFromIR({
             ...(item.namespace && { namespace: item.namespace }),
             ...(item.static && { static: true }),
             ...(item.global && { global: true }),
+            // Go (fix #400): the import writes no local name.
+            ...(item.implicitName && { implicitName: true }),
         })),
         globalImports: imports.filter(item => item.global).map(item => item.module),
         importNames: imports.flatMap(item => item.names || []),
@@ -125,6 +141,9 @@ function createFileEntryFromIR({
             languageFeatures: ir.languageFeatures,
         }),
         ...(Array.isArray(ir.conditionalViews) && { conditionalViews: ir.conditionalViews }),
+        // C# target-typed `new(..)` records whose type a call or member
+        // decides (fix #400): the names a query matches before reading them.
+        ...(targetTypedKeysOf(ir.calls) && { targetTypedKeys: targetTypedKeysOf(ir.calls) }),
         ...(ir.packageName && { packageName: ir.packageName }),
         ...(ir.packageVars?.length > 0 && { packageVars: ir.packageVars }),
         ...(ir.buildConstraint && { buildConstraint: ir.buildConstraint }),
@@ -147,7 +166,7 @@ const OPTIONAL_SYMBOL_FIELDS = Object.freeze([
     'annotationsWithArgs', 'attributesWithArgs', 'nameLine', 'traitImpl',
     'traitName', 'isSignature', 'memberAssigned', 'assignedReceiver', 'assignedObject', 'selfNamed', 'bodyScopedName',
     'registryMember', 'registryContainer', 'registryContainerType', 'objectLiteralLine', 'namespace',
-    'isExtensionMethod', 'extensionReceiver', 'explicitInterface',
+    'isExtensionMethod', 'extensionReceiver', 'explicitInterface', 'primaryParams',
     'lexicalScopeStartLine', 'lexicalScopeEndLine',
     'returnTypeQualifier', 'returnTypeResolved', 'supertraits', 'ownerGenericBounds', 'ownerSelfArgs', 'implSelfRef', 'implSelfQualifier', 'blanketSelfBounds', 'selfParamKind', 'macroNeverReturns', 'callbackParamTypes', 'iteratorItemType', 'futureReturn',
     'returnedConcreteType', 'returnedConstructors', 'templateDependent',

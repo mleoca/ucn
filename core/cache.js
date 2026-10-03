@@ -892,7 +892,16 @@ function clearAllCaches() {
 // v270 (fix #399): Go files record `packageVars` (package-level variables
 // with their declared static types) and their `buildConstraint`; Go method
 // calls on a receiver no scope of the file binds carry `receiverPackageScope`.
-const CACHE_FORMAT_VERSION = 270;
+// v271 (fix #400): Go imports that write no local name are marked
+// `implicitName` (a project import's local name is its package clause) and
+// carry the name the Go tools suggest (`go-json` is `json`, `core/v1` `v1`);
+// `packageVars` also record constants and `valueFrom` initializers, and
+// untyped package-level variables of the file carry `receiverPackageScope`.
+// C# target-typed `new(..)` arguments and member assignments are `new`
+// records with a `targetSlot` (files list their `targetTypedKeys`), C# types
+// record `primaryParams`; Python bound-method reads assigned to a name
+// (`loads = registry.loads`) are method-value records.
+const CACHE_FORMAT_VERSION = 271;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**

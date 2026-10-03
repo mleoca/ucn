@@ -725,11 +725,11 @@ function _orderedTypeParams(def) {
 }
 
 /**
- * The type arguments `child` writes for its supertype `parentName`
- * (`: Visitor<TextWriter, bool>` -> ['TextWriter', 'bool'], `extends Base`
- * -> []), null when no single spelling of that base is recorded.
+ * Every distinct argument list `child` writes for `parentName` (a C# class
+ * implementing `I<A>` and `I<B>` writes two), [] for a raw base, null when
+ * none is recorded.
  */
-function _writtenBaseArgs(index, childRef, parentName) {
+function _writtenBaseArgLists(index, childRef, parentName) {
     const { classDefsNamed } = require('./class-identity');
     let decls = childRef.key ? classDefsNamed(index, childRef.name).entries
         .filter(e => e.key === childRef.key).map(e => e.def) : [];
@@ -747,12 +747,16 @@ function _writtenBaseArgs(index, childRef, parentName) {
             spelled.add(text.replace(/\s+/g, ' '));
         }
     }
-    if (spelled.size !== 1) return null;
-    const text = [...spelled][0];
-    const open = text.indexOf('<');
-    if (open < 0) return [];
-    const close = text.lastIndexOf('>');
-    return close > open ? _splitTypeArgs(text.slice(open + 1, close)) : null;
+    if (spelled.size === 0) return null;
+    const lists = [];
+    for (const text of [...spelled].sort()) {
+        const open = text.indexOf('<');
+        if (open < 0) { lists.push([]); continue; }
+        const close = text.lastIndexOf('>');
+        if (close <= open) return null;
+        lists.push(_splitTypeArgs(text.slice(open + 1, close)));
+    }
+    return lists;
 }
 
 /** Replace unqualified identifiers named in `map` inside a type spelling. */
@@ -768,13 +772,26 @@ function _substituteType(text, map) {
  * side is unknown or the counts disagree (a raw base).
  */
 function _baseSubstitution(index, childRef, parentRef) {
+    const all = _baseSubstitutions(index, childRef, parentRef);
+    return all && all.length === 1 ? all[0] : null;
+}
+
+/** One substitution per instantiation the child writes (fix #400: a class
+ * implementing a generic interface twice fills the slot of each); null
+ * when any cannot be read. */
+function _baseSubstitutions(index, childRef, parentRef) {
     const params = _orderedTypeParams(parentRef.def);
     if (!params) return null;
-    const args = _writtenBaseArgs(index, childRef, parentRef.name);
-    if (!args || args.length !== params.length) return null;
-    const map = new Map();
-    params.forEach((param, i) => map.set(param, args[i]));
-    return map;
+    const lists = _writtenBaseArgLists(index, childRef, parentRef.name);
+    if (!lists || lists.length === 0) return null;
+    const maps = [];
+    for (const args of lists) {
+        if (args.length !== params.length) return null;
+        const map = new Map();
+        params.forEach((param, i) => map.set(param, args[i]));
+        maps.push(map);
+    }
+    return maps;
 }
 
 /** A parameter type as dispatch compares it: generic arguments, qualifiers
@@ -1064,12 +1081,22 @@ function hierarchySlotClosure(index, def, startRef = null) {
                 if (!link) continue;
                 downSeen.add(entry.key);
                 let slotTypes = null;
+                let instantiations = null;
                 if (currentEntry.slotTypes && current.def) {
-                    const step = _baseSubstitution(index, childRef, current);
-                    if (step) slotTypes = currentEntry.slotTypes.map(type => _substituteType(type, step));
+                    const steps = _baseSubstitutions(index, childRef, current);
+                    if (steps?.length === 1) {
+                        slotTypes = currentEntry.slotTypes.map(type => _substituteType(type, steps[0]));
+                    } else if (steps?.length > 1) {
+                        instantiations = steps.map(step => currentEntry.slotTypes.map(type => _substituteType(type, step)));
+                    }
                 }
-                let members = _slotMembersOf(index, name, childRef, def, overloads,
-                    slotTypes ? { slotTypes } : null, slotInterfaces);
+                // A class implementing the generic base more than once fills
+                // the slot once per instantiation (fix #400).
+                let members = instantiations
+                    ? [...new Set(instantiations.flatMap(types => _slotMembersOf(index, name, childRef, def,
+                        overloads, { slotTypes: types }, slotInterfaces)))]
+                    : _slotMembersOf(index, name, childRef, def, overloads,
+                        slotTypes ? { slotTypes } : null, slotInterfaces);
                 if (link.viaImplements) members = members.filter(m => memberInClassBody(index, m));
                 // In an interface member's slot a class takes part with a
                 // public member or an explicit implementation only (fix

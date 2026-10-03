@@ -906,9 +906,13 @@ function findClassesInTree(code, tree) {
             for (const member of members) member.ownerTypeArity = typeArity;
         }
         const generics = typeParameterNames(node);
+        // A primary constructor's parameters (`class C(int a)`, positional
+        // records): the constructor the type declares in its header (fix #400).
+        const primaryList = node.namedChildren.find(child => child.type === 'parameter_list');
         classes.push({
             name: nameNode.text,
             type,
+            ...(primaryList && { primaryParams: structuredParams(primaryList) }),
             startLine,
             endLine,
             ...nameLineOf(nameNode, startLine),
@@ -1112,6 +1116,82 @@ function implicitCreationTarget(node) {
             return typeOf(returns);
         }
         if (owner.type === 'constructor_declaration' || TYPE_DECLARATIONS.has(owner.type)) return null;
+    }
+    return null;
+}
+
+/**
+ * Where a target-typed `new(..)` no declaration types sits (fix #400): an
+ * argument of a call, a construction or a constructor initializer (its type
+ * is the parameter type of the overload the compiler picks), or the value
+ * assigned to a member (the member's type). Null elsewhere.
+ */
+function implicitCreationSlot(node) {
+    const parent = node.parent;
+    if (parent?.type === 'argument') {
+        const list = parent.parent;
+        const owner = list?.type === 'argument_list' ? list.parent : null;
+        if (!owner) return null;
+        const args = list.namedChildren.filter(child => child.type === 'argument');
+        const index = args.findIndex(argument => sameNode(argument, parent));
+        const nameNode = parent.childForFieldName('name');
+        let ownerKind;
+        let ownerStart;
+        let ownerName;
+        let receiverName = null;
+        let instance = false;
+        if (owner.type === 'invocation_expression') {
+            const functionNode = owner.childForFieldName('function');
+            const identity = invocationIdentity(functionNode);
+            if (!identity.name) return null;
+            ownerKind = 'invocation';
+            ownerStart = (identity.nameNode || owner).startIndex;
+            ownerName = identity.name;
+            // `x.M(..)`: an extension method's first parameter is `x`.
+            instance = functionNode?.type === 'member_access_expression' ||
+                functionNode?.type === 'conditional_access_expression';
+            // `field.M(..)` / `this.field.M(..)`: the receiver's member name.
+            let receiver = functionNode?.type === 'member_access_expression'
+                ? unwrapReceiverNode(functionNode.childForFieldName('expression')) : null;
+            if (receiver?.type === 'member_access_expression' &&
+                unwrapReceiverNode(receiver.childForFieldName('expression'))?.type === 'this') {
+                receiver = receiver.childForFieldName('name');
+            }
+            if (receiver?.type === 'identifier') receiverName = receiver.text;
+        } else if (owner.type === 'object_creation_expression') {
+            const typeNode = owner.childForFieldName('type');
+            if (!typeNode) return null;
+            ownerKind = 'creation';
+            ownerStart = typeNode.startIndex;
+            ownerName = typeNode.text.replace(/<.*$/s, '').split('.').pop().trim();
+        } else if (owner.type === 'implicit_object_creation_expression') {
+            ownerKind = 'creation';
+            ownerStart = (owner.child(0) || owner).startIndex;
+            ownerName = 'new';
+        } else if (owner.type === 'constructor_initializer') {
+            const keyword = owner.children.find(child => child.type === 'this' || child.type === 'base');
+            if (!keyword) return null;
+            ownerKind = keyword.type;
+            ownerStart = owner.startIndex;
+            ownerName = keyword.type;
+        } else {
+            return null;
+        }
+        return {
+            kind: 'argument', owner: ownerKind, ownerStart, ownerName, index, argCount: args.length,
+            ...(instance && { instance: true }),
+            ...(receiverName && { receiverName }),
+            ...(nameNode && { name: nameNode.text }),
+        };
+    }
+    if (parent?.type === 'assignment_expression' && sameNode(parent.childForFieldName('right'), node) &&
+        parent.children.some(child => child.type === '=')) {
+        const left = parent.childForFieldName('left');
+        if (left?.type === 'identifier') return { kind: 'member', member: left.text };
+        if (left?.type === 'member_access_expression' && left.childForFieldName('expression')?.type === 'this') {
+            const member = left.childForFieldName('name');
+            if (member?.type === 'identifier') return { kind: 'member', member: member.text, this: true };
+        }
     }
     return null;
 }
@@ -2320,8 +2400,39 @@ function findCallsInTree(code, parser, tree, reaches = null) {
             // A target-typed `new(...)` constructs the type its position
             // declares (fix #393): a typed local or field, a property, or
             // the return type of the enclosing member.
-            const typeNode = node.childForFieldName('type') ||
+            let typeNode = node.childForFieldName('type') ||
                 (node.type === 'implicit_object_creation_expression' ? implicitCreationTarget(node) : null);
+            const slot = !typeNode && node.type === 'implicit_object_creation_expression'
+                ? implicitCreationSlot(node) : null;
+            // `x = new(..)` to a local or parameter: its static type (an
+            // untyped local is no member of the class either).
+            const localSlot = slot?.kind === 'member' && !slot.this &&
+                (typesAt(node)?.has(slot.member) || csharpBareNameShadowedByLocal(node, slot.member));
+            if (localSlot) {
+                const local = String(typesAt(node)?.get(slot.member) || '');
+                if (/^[A-Za-z_][\w.]*(<.*>)?\??$/.test(local) && local !== 'dynamic') {
+                    typeNode = { text: local.replace(/\?$/, '') };
+                }
+            }
+            if (!typeNode && slot && !localSlot) {
+                // The type is decided at query time from the overload or
+                // member the slot names (fix #400).
+                const args = callArgs(node, typesAt(node));
+                const siteNode = node.child(0) || node;
+                calls.push({
+                    callSite: typeOrigin('call', siteNode),
+                    name: 'new',
+                    line: siteNode.startPosition.row + 1,
+                    targetTyped: true,
+                    targetSlot: slot,
+                    isMethod: false,
+                    isConstructor: true,
+                    argCount: args.argCount,
+                    ...(args.argKinds && { argKinds: args.argKinds }),
+                    enclosingFunction: enclosingFunctionOf(node),
+                });
+                return true;
+            }
             if (!typeNode) return true;
             const args = callArgs(node, typesAt(node));
             const raw = typeNode.text.replace(/<.*>$/, '');

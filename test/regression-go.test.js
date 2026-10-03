@@ -8429,3 +8429,173 @@ describe('fix #399: Go dot imports, package-qualified callees, package-level var
         } finally { rm(dir); }
     });
 });
+
+describe('fix #400: Go import names by package clause, unknown import names, build configurations', () => {
+    const planOf = (index, file, line, name, renameTo) => {
+        const result = execute(index, 'plan', { name, file, line, renameTo });
+        assert.ok(result.ok, result.error);
+        return result.result;
+    };
+    const callersOf = (index, file, line, name) => {
+        const def = index.symbols.get(name).find(d => d.relativePath === file && d.startLine === line);
+        const callers = index.findCallers(name, { targetDefinitions: [def], collectAccount: true });
+        return {
+            confirmed: callers.map(c => `${c.relativePath}:${c.line}`).sort(),
+            unverified: (callers.unverifiedEntries || []).map(c => `${c.relativePath}:${c.line}:${c.reason}`).sort(),
+        };
+    };
+    const fixture = () => tmp({
+        'go.mod': 'module example.com/fx\n\ngo 1.21\n',
+        'internal/goutils/utils.go': [
+            'package utils',                                   // 1
+            '',                                                // 2
+            'type Box struct{ N int }',                        // 3
+            '',                                                // 4
+            'func Helper() int { return 1 }',                  // 5
+            '',                                                // 6
+            'func (b Box) Size() int { return b.N }',          // 7
+        ].join('\n') + '\n',
+        'app/main.go': [
+            'package app',                                     // 1
+            '',                                                // 2
+            'import (',                                        // 3
+            '\t"example.com/fx/internal/goutils"',             // 4
+            '\t"github.com/json-iterator/go"',                 // 5
+            ')',                                               // 6
+            '',                                                // 7
+            'func Run() int {',                                // 8
+            '\tb := utils.Box{N: 2}',                          // 9
+            '\t_, _ = jsoniter.Marshal(b)',                    // 10
+            '\treturn utils.Helper() + b.Size()',              // 11
+            '}',                                               // 12
+        ].join('\n') + '\n',
+        'codec/api.go': 'package codec\n\ntype API interface {\n\tMarshal(v any) ([]byte, error)\n}\n\nvar Current API\n',
+        'codec/std.go': [
+            '//go:build !go_json && !jsoniter',                // 1
+            '',                                                // 2
+            'package codec',                                   // 3
+            '',                                                // 4
+            'import "encoding/json"',                          // 5
+            '',                                                // 6
+            'type stdAPI struct{}',                            // 7
+            '',                                                // 8
+            'func (stdAPI) Marshal(v any) ([]byte, error) {',  // 9
+            '\treturn json.Marshal(v)',                        // 10
+            '}',                                               // 11
+            '',                                                // 12
+            'func init() { Current = stdAPI{} }',              // 13
+        ].join('\n') + '\n',
+        'codec/gojson.go': [
+            '//go:build go_json',                              // 1
+            '',                                                // 2
+            'package codec',                                   // 3
+            '',                                                // 4
+            'import "github.com/goccy/go-json"',               // 5
+            '',                                                // 6
+            'type goAPI struct{}',                             // 7
+            '',                                                // 8
+            'func (goAPI) Marshal(v any) ([]byte, error) {',   // 9
+            '\treturn json.Marshal(v)',                        // 10
+            '}',                                               // 11
+            '',                                                // 12
+            'func init() { Current = goAPI{} }',               // 13
+        ].join('\n') + '\n',
+        'codec/iter.go': [
+            '//go:build jsoniter',                             // 1
+            '',                                                // 2
+            'package codec',                                   // 3
+            '',                                                // 4
+            'import jsoniter "github.com/json-iterator/go"',   // 5
+            '',                                                // 6
+            'var json = jsoniter.ConfigCompatibleWithStandardLibrary', // 7
+            '',                                                // 8
+            'type iterAPI struct{}',                           // 9
+            '',                                                // 10
+            'func (iterAPI) Marshal(v any) ([]byte, error) {', // 11
+            '\treturn json.Marshal(v)',                        // 12
+            '}',                                               // 13
+            '',                                                // 14
+            'func init() { Current = iterAPI{} }',             // 15
+        ].join('\n') + '\n',
+        'codec/use.go': 'package codec\n\nfunc Use(v any) ([]byte, error) { return Current.Marshal(v) }\n',
+        'codec/extra_linux.go': [
+            'package codec',                                   // 1
+            '',                                                // 2
+            'func callIt(get func() interface{ Marshal(v any) ([]byte, error) }) {', // 3
+            '\tx := get()',                                    // 4
+            '\t_, _ = x.Marshal(1)',                           // 5
+            '}',                                               // 6
+        ].join('\n') + '\n',
+    });
+
+    it('an import that writes no name binds the project package by its package clause', () => {
+        const dir = fixture();
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(callersOf(index, 'internal/goutils/utils.go', 5, 'Helper').confirmed, ['app/main.go:11']);
+            const fn = planOf(index, 'internal/goutils/utils.go', 5, 'Helper', 'HelperZ');
+            assert.ok(fn.changes.some(c => c.file === 'app/main.go' && c.line === 11 && /utils\.HelperZ\(\)/.test(c.newExpression)),
+                JSON.stringify(fn.changes));
+            const type = planOf(index, 'internal/goutils/utils.go', 3, 'Box', 'BoxZ');
+            assert.ok(type.changes.some(c => c.file === 'app/main.go' && c.line === 9 && !c.needsReview &&
+                /utils\.BoxZ\{/.test(c.newExpression)), JSON.stringify(type.changes));
+        } finally { rm(dir); }
+    });
+
+    it('a qualifier that may name an outside import is never confirmed or renamed', () => {
+        const dir = fixture();
+        try {
+            const index = idx(dir);
+            const plan = planOf(index, 'codec/std.go', 9, 'Marshal', 'MarshalZ');
+            const edited = plan.changes.filter(c => !c.needsReview).map(c => `${c.file}:${c.line}`).sort();
+            // The interface slot and its implementations are renamed; the
+            // go-json / jsoniter / encoding/json package calls are not.
+            assert.deepStrictEqual(edited, ['codec/api.go:4', 'codec/gojson.go:9', 'codec/iter.go:11',
+                'codec/std.go:9', 'codec/use.go:3'], JSON.stringify(plan.changes));
+            for (const change of plan.changes.filter(c => c.isDefinition || c.editKind === 'definition')) {
+                assert.ok(!/json\.MarshalZ/.test(change.newExpression || ''), change.newExpression);
+            }
+            const unverified = (plan.unverifiedSites || []).map(s => `${s.file}:${s.line}:${s.reason || ''}`);
+            assert.ok(unverified.some(s => s.startsWith('app/main.go:10:package-qualifier')), JSON.stringify(unverified));
+            const callers = callersOf(index, 'codec/std.go', 9, 'Marshal');
+            assert.ok(!callers.confirmed.some(s => /gojson|iter|main/.test(s)), JSON.stringify(callers));
+            // `json` is the name the Go tools suggest for go-json: an outside
+            // package call, neither confirmed nor a review item.
+            assert.ok(!callers.unverified.some(s => s.startsWith('codec/gojson.go:10:')), JSON.stringify(callers));
+            assert.ok(callers.unverified.includes('app/main.go:10:package-qualifier'), JSON.stringify(callers));
+            assert.ok(callers.unverified.some(s => s.startsWith('codec/iter.go:12:possible-dispatch')), JSON.stringify(callers));
+        } finally { rm(dir); }
+    });
+
+    it('a closed method ambiguity in a file of another build configuration stays a review item', () => {
+        const dir = fixture();
+        try {
+            const plan = planOf(idx(dir), 'codec/std.go', 9, 'Marshal', 'MarshalZ');
+            assert.ok(!plan.changes.some(c => c.file === 'codec/extra_linux.go' && !c.needsReview), JSON.stringify(plan.changes));
+            assert.ok((plan.unverifiedSites || []).some(s => s.file === 'codec/extra_linux.go' && s.line === 5),
+                JSON.stringify(plan.unverifiedSites));
+        } finally { rm(dir); }
+    });
+
+    it('an import that writes no name suggests the name the Go tools assume', () => {
+        const { goPathPackageName } = require('../languages/utils');
+        const names = ['k8s.io/api/core/v1', 'example.com/m/v3', 'gopkg.in/yaml.v3', 'github.com/goccy/go-json',
+            'k8s.io/mount-utils', 'github.com/json-iterator/go', 'fmt', 'net/http'].map(goPathPackageName);
+        assert.deepStrictEqual(names, ['v1', 'm', 'yaml', 'json', 'mount', 'go', 'fmt', 'http']);
+    });
+
+    it('a re-read of a file keeps its import names (package calls stay package calls)', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/fx\n\ngo 1.21\n',
+            'a.go': 'package fx\n\nimport "fmt"\n\nfunc Run() { fmt.Println(1) }\n',
+        });
+        try {
+            const index = idx(dir);
+            const file = path.join(dir, 'a.go');
+            index.callsCache.delete(file);
+            const { getCachedCalls } = require('../core/callers');
+            const call = getCachedCalls(index, file).find(c => c.name === 'Println');
+            assert.strictEqual(call.isMethod, false, JSON.stringify(call));
+        } finally { rm(dir); }
+    });
+});
