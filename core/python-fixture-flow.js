@@ -227,4 +227,4 @@ function validatePythonFixtureBinding(proof, facts) {
             sameDeclaration(previous, facts.receiverTypeDeclaration || facts.receiverResolvedIn);
 }
 
-module.exports = { pythonFixtureReceiver, pythonFixtureType, validatePythonFixtureBinding };
+module.exports = { moduleEvidence, pythonFixtureReceiver, pythonFixtureType, validatePythonFixtureBinding };

@@ -18,6 +18,46 @@ const { execute } = require('../core/execute');
 const { computeReachability } = require('../core/entrypoints');
 const { tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR, runCli, runInteractive } = require('./helpers');
 
+describe('fix #398: async producers require callable identity', () => {
+    for (const ext of ['js', 'ts', 'tsx', 'html']) {
+        it(`${ext}: follows imports and rejects unrelated, nested and imported runtime namesakes`, () => {
+            const code = [
+                "import { load as run } from './other.js';",
+                "import { fetch } from 'external';",
+                "import wait from './later.js';",
+                "import sync from './sync.js';",
+                "import outside from 'external-default';",
+                "import { load as viaBarrel } from './barrel.js';",
+                "import { viaClause, notFn } from './clause.js';",
+                "import readAll from './reader.js';",
+                'async function own() { async function hidden() {} return hidden(); }',
+                'class Service { async method() {} }',
+                'async function use() { call(); hidden(); method(); run(); fetch(); }',
+                'async function defaults() { wait(); sync(); outside(); viaBarrel(); }',
+                'async function exported() { viaClause(); notFn(); readAll(); }',
+            ].join('\n');
+            const dir = tmp({
+                'other.js': 'export async function load() {}\nexport async function call() {}',
+                'later.js': 'export default async function wait() {}',
+                'sync.js': 'export default function wait() {}\nexport async function unrelated() {}',
+                'barrel.js': "export { load } from './other.js';",
+                'clause.js': 'async function viaClause() {}\nconst notFn = () => 1;\nexport { viaClause, notFn };',
+                'reader.js': 'const readAll = async function () {};\nexport default readAll;\nexport async function notFn() {}',
+                [`app.${ext}`]: ext === 'html' ? `<script type="module">\n${code}\n</script>` : code,
+                [`global.${ext}`]: ext === 'html'
+                    ? '<script>async function runtime() { fetch("/api"); }</script>'
+                    : 'async function runtime() { fetch("/api"); }',
+            });
+            try {
+                const result = idx(dir).auditAsync({});
+                assert.deepEqual(result.issues.map(issue => [issue.file, issue.calleeName]),
+                    [[`app.${ext}`, 'run'], [`app.${ext}`, 'viaBarrel'], [`app.${ext}`, 'wait'],
+                        [`app.${ext}`, 'readAll'], [`app.${ext}`, 'viaClause'], [`global.${ext}`, 'fetch']]);
+            } finally { rm(dir); }
+        });
+    }
+});
+
 describe('fix #398: import aliases keep their lexical and module ownership', () => {
     for (const ext of ['py', 'js', 'ts', 'tsx']) {
         it(`${ext}: local imports select their implementation, never the same-file wrapper`, () => {

@@ -2896,17 +2896,8 @@ function auditAsync(index, options = {}) {
         const { getParser, getLanguageAdapter, safeParse } = require('../languages');
         const issues = [];
 
-        // Build a "is this name provably async" lookup from the symbol table.
-        // We accept a global name only if EVERY callable definition with that
-        // name is async — this avoids flagging ambiguous calls like `Map.get()`
-        // where the project also has a `DataService.get()` async method.
-        //
-        // BUT: we ALSO track per-file async-name resolution. JavaScript/Python
-        // module scope means a same-file definition shadows globals, so when
-        // a caller's file contains an async definition with that name, that
-        // definition wins regardless of what other files contain. This is
-        // critical to avoid silent false-negatives caused by name collisions
-        // across files (HIGH-1 fix).
+        // Names select candidate sites. Structural languages then require
+        // lexical or import identity; an unrelated namesake proves nothing.
         // What each async definition's call RETURNS decides the audit
         // (fix #364): coroutines must be awaited; async iterators and async
         // context managers are consumed by `async for` / `async with` and
@@ -2930,6 +2921,8 @@ function auditAsync(index, options = {}) {
             return globalKinds.get(name);
         };
         let skippedUnknown = 0;
+        // Module scopes of imported Python modules, read once per audit.
+        const moduleScopes = new Map();
         const knownAsyncGlobalNames = new Set();
         for (const fileEntry of index.files.values()) {
             for (const name of langTraits(fileEntry.language)?.knownAsyncGlobals || []) knownAsyncGlobalNames.add(name);
@@ -3017,43 +3010,66 @@ function auditAsync(index, options = {}) {
             if (fileEntry?.language === 'rust') return processRustFile(filePath, fileEntry);
             if (!fileEntry || !_AUDIT_ASYNC_LANGS.has(fileEntry.language)) return;
             const language = fileEntry.language;
-            const indexedCalls = language === 'csharp'
-                ? index.getCachedCalls(filePath) || []
-                : [];
 
-            // Collect async functions from the file's symbol list.
-            // Also build a per-file set of names that are async in THIS file —
-            // these win over the global "all-or-nothing" check (HIGH-1 fix).
-            // JS/Python module scope means a same-file def shadows imports of
-            // the same name, so a sync def of `helper` elsewhere in the project
-            // shouldn't make `helper()` ambiguous in a file that defines
-            // `async function helper()` locally.
+            // Collect async functions for enclosing-scope attribution.
             const asyncFns = [];
-            const fileDefs = new Map();
             if (Array.isArray(fileEntry.symbols)) {
                 for (const sym of fileEntry.symbols) {
                     if (!sym || !sym.startLine || !sym.endLine) continue;
                     if (producers.isDefAsync(sym)) asyncFns.push(sym);
-                    if (sym.name && producers.isCallableDef(sym)) {
-                        if (!fileDefs.has(sym.name)) fileDefs.set(sym.name, []);
-                        fileDefs.get(sym.name).push(sym);
-                    }
                 }
             }
             if (asyncFns.length === 0 && language !== 'python') return;
-            // A file none of whose indexed calls names an async producer has
-            // nothing to audit: skip the re-parse (dominant cost on large
-            // repos). Files without call records are parsed as before.
-            if (language !== 'html') {
-                const calls = index.getCachedCalls(filePath);
-                const fileAsync = name => fileDefs.get(name)?.some(producers.isDefAsync);
-                if (Array.isArray(calls) && !calls.some(call => call?.name &&
-                    (knownAsyncGlobalNames.has(call.name) || (asyncCandidateNames.has(call.name) &&
-                        // C# resolves per receiver type: any async def counts.
-                        (language === 'csharp' || fileAsync(call.name) || globalKind(call.name)))))) {
-                    return;
+            const cachedCalls = index.getCachedCalls(filePath);
+            const indexedCalls = Array.isArray(cachedCalls) ? cachedCalls : [];
+
+            // Which calls can reach an async producer. C# resolves member
+            // calls per receiver type, so any async definition's name
+            // counts. A structural bare call reaches one only through this
+            // file's own definitions, an import (by its source name; a
+            // default import by the name its project module exports as
+            // default), a Python star import, or a runtime global.
+            // Structural method calls are never audited (no receiver
+            // evidence).
+            let candidateName;
+            if (language === 'csharp') {
+                candidateName = name => asyncCandidateNames.has(name) || knownAsyncGlobalNames.has(name);
+            } else {
+                // A default import names the definition its project module
+                // exports as default; a module outside the project names none.
+                const defaultExportMayBeAsync = binding => {
+                    const relative = fileEntry.moduleResolved?.[binding.module];
+                    const source = relative ? index.files.get(path.resolve(index.root, relative)) : null;
+                    return (source?.exportDetails || []).some(entry =>
+                        entry.type === 'default' && asyncCandidateNames.has(entry.name));
+                };
+                const importedProducerNames = new Set();
+                for (const binding of fileEntry.importBindings || []) {
+                    if (binding.kind === 'default' ? defaultExportMayBeAsync(binding)
+                        : asyncCandidateNames.has(binding.name)) {
+                        importedProducerNames.add(binding.alias || binding.name);
+                    }
                 }
+                const fileAsyncNames = new Set(asyncFns.map(fn => fn.name));
+                // Text prefilter only: the AST decides what a star import binds.
+                let starImport;
+                const hasStarImport = () => {
+                    if (starImport === undefined) {
+                        try {
+                            starImport = language === 'python' && /\bimport\s+\*/.test(index._readFile(filePath));
+                        } catch (_) { starImport = false; }
+                    }
+                    return starImport;
+                };
+                candidateName = name => knownAsyncGlobalNames.has(name) || importedProducerNames.has(name) ||
+                    (asyncCandidateNames.has(name) && (fileAsyncNames.has(name) || hasStarImport()));
             }
+            const candidateCall = call => !!call?.name && (language === 'csharp' || !call.isMethod) &&
+                candidateName(call.name);
+            // A file none of whose indexed calls can reach an async producer
+            // has nothing to audit: skip the re-parse (dominant cost on large
+            // repos). Files without call records are parsed as before.
+            if (language !== 'html' && Array.isArray(cachedCalls) && !cachedCalls.some(candidateCall)) return;
 
             // Re-parse file to find awaited-vs-not call sites. We use a fresh
             // parse rather than tree cache because we want to walk every
@@ -3081,6 +3097,13 @@ function auditAsync(index, options = {}) {
             const resolveLexical = producers.createLexicalResolver(fileEntry, language);
             // Runtime globals that return promises (`fetch`), bare calls only.
             const knownAsyncGlobals = new Set(langTraits(language)?.knownAsyncGlobals || []);
+            // Imports the imported module's own scope cannot settle resolve
+            // through the engine, once per enclosing callable and only for
+            // candidate sites. A globally unique name is a search candidate,
+            // never producer identity.
+            const producerCallees = producers.createImportedProducerResolver(index, filePath,
+                fileEntry, indexedCalls.filter(candidateCall));
+            let moduleImports = null;
 
             // Walk every call_expression within an async function range.
             const callTypes = new Set([
@@ -3147,7 +3170,7 @@ function auditAsync(index, options = {}) {
                                 endLine: cur.endPosition.row + 1,
                             };
                         }
-                        if (discardedPython) return {
+                        if (discardedPython || langTraits(language)?.storedCoroutines) return {
                             name: cur.childForFieldName('name')?.text || '<anonymous>',
                             startLine: cur.startPosition.row + 1,
                             endLine: cur.endPosition.row + 1,
@@ -3160,9 +3183,8 @@ function auditAsync(index, options = {}) {
             }
 
             // Which definition a call reaches, and what calling it returns.
-            // Lexical scope first (a local def, or a parameter/variable that
-            // shadows every definition), then this file's definitions (a
-            // same-file def shadows imports), then the whole project.
+            // Lexical scope first, then import identity. Unrelated project
+            // definitions cannot turn a builtin or an unbound call async.
             function calleeProducerKind(callNode, calleeName, isMethodCall, line) {
                 if (language === 'csharp') {
                     // C# method identity is nominal. Prefer the indexed
@@ -3201,15 +3223,26 @@ function auditAsync(index, options = {}) {
                     if (receiverDefs.length > 0) return producers.collapseKinds(index, receiverDefs, kindMemo, true);
                     return typeName && isMethodCall && indexed?.receiver !== 'this' ? null : globalKind(calleeName);
                 }
+                let lexical;
                 if (!isMethodCall && resolveLexical) {
-                    const lexical = resolveLexical(callNode, calleeName);
+                    lexical = resolveLexical(callNode, calleeName);
                     if (lexical?.shadowed) return null;
-                    if (lexical?.defs) return producers.collapseKinds(index, lexical.defs, kindMemo, false);
+                    if (lexical?.defs) return producers.collapseKinds(index, lexical.defs, kindMemo, true);
                 }
-                const local = fileDefs.get(calleeName);
-                if (local) return producers.collapseKinds(index, local, kindMemo, false);
-                return globalKind(calleeName) ||
-                    (!isMethodCall && knownAsyncGlobals.has(calleeName) ? 'coroutine' : null);
+                // An import is read in the imported module itself when that
+                // proves the definition; otherwise the engine must establish
+                // the call's target.
+                if (lexical?.imports || lexical?.star) {
+                    moduleImports ||= producers.createModuleImportResolver(index, fileEntry, moduleScopes);
+                    const defs = lexical.star ? moduleImports.star(calleeName, lexical.star)
+                        : moduleImports.fromImports(lexical.imports);
+                    if (defs) return producers.collapseKinds(index, defs, kindMemo, true);
+                    if (lexical.star) return null;
+                }
+                const targets = lexical?.external ? producerCallees(callNode) : [];
+                if (targets.length > 0) return producers.collapseKinds(index, targets, kindMemo, true);
+                return !isMethodCall && !lexical?.external && knownAsyncGlobals.has(calleeName)
+                    ? 'coroutine' : null;
             }
 
             function isAwaited(callNode) {
@@ -3276,8 +3309,7 @@ function auditAsync(index, options = {}) {
                             // Structural method calls (`obj.get()`) need
                             // receiver evidence this audit does not have.
                             const methodBlocked = isMethodCall && language !== 'csharp';
-                            if (calleeName && !methodBlocked && (asyncCandidateNames.has(calleeName) ||
-                                (!isMethodCall && knownAsyncGlobals.has(calleeName))) &&
+                            if (calleeName && !methodBlocked && candidateName(calleeName) &&
                                 (enclosing = nearestAsyncEnclosing(node))) {
                                 const kind = calleeProducerKind(node, calleeName, isMethodCall, line);
                                 if (kind && kind !== 'void' &&
@@ -3315,6 +3347,9 @@ function auditAsync(index, options = {}) {
                                             } else if (flow.kind === 'stored') {
                                                 finding = (langTraits(language)?.storedPromises
                                                     ? storedPromiseMisuse(node, FN_NODE_TYPES) : null) ||
+                                                    (langTraits(language)?.storedCoroutines
+                                                        ? producers.storedCoroutineMisuse(node, flow.holder, flow.binding,
+                                                            FN_NODE_TYPES, language) : null) ||
                                                     (producers.storedValueRead(flow.holder, flow.binding, FN_NODE_TYPES)
                                                         ? null : {});
                                             }

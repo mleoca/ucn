@@ -17,7 +17,8 @@
  *                      callable, or same-name definitions disagree: not audited
  * The callee definition is resolved lexically first (nearest enclosing scope
  * that binds the name: a local def, a parameter, a variable), then by the
- * file's own definitions, then project-wide.
+ * call site's proven import identity. A same-name function elsewhere in the
+ * project is only a candidate, not evidence of an async producer.
  */
 
 const { langTraits } = require('../languages');
@@ -197,14 +198,30 @@ function pythonScopeBindings(scope) {
                     continue;
                 case 'import_statement': case 'import_from_statement':
                 case 'future_import_statement': case 'global_statement':
-                case 'nonlocal_statement':
-                    // Resolved by the file/project definitions, or not ours.
+                case 'nonlocal_statement': {
+                    // Resolved through import identity, or not ours. The
+                    // module a from-import reads is not bound by it.
+                    const source = child.type === 'import_from_statement'
+                        ? child.childForFieldName('module_name') : null;
                     for (const name of child.namedChildren) {
+                        if (source && sameNode(name, source)) continue;
+                        if (name.type === 'wildcard_import') {
+                            // `from m import *` binds whichever names m
+                            // exports; only a module-level one is known.
+                            addBinding(map, '*', { kind: 'external', module: source?.text || null,
+                                topLevel: child.parent?.type === 'module' });
+                            continue;
+                        }
                         const alias = name.childForFieldName('alias') || name.childForFieldName('name') || name;
                         const text = alias.type === 'identifier' ? alias.text : alias.text.split('.')[0];
-                        addBinding(map, text, { kind: 'external' });
+                        // A from-import names the module and the name it reads there.
+                        const imported = source ? (name.type === 'aliased_import'
+                            ? name.childForFieldName('name') : name)?.text : null;
+                        addBinding(map, text, imported
+                            ? { kind: 'external', module: source.text, imported } : { kind: 'external' });
                     }
                     continue;
+                }
                 case 'assignment': case 'augmented_assignment':
                     bindTarget(child.childForFieldName('left'), { kind: 'binding' });
                     break;
@@ -284,9 +301,32 @@ function jsScopeBindings(scope) {
                     }
                 }
                 break;
-            case 'import_statement':
-                // Imported names resolve through file/project definitions.
+            case 'import_statement': {
+                // Each import records the module and the name it reads
+                // there (a default import reads `default`; a namespace
+                // import binds the module object itself).
+                const source = statement.childForFieldName('source');
+                const module = source?.namedChildren.find(part => part.type === 'string_fragment')?.text || null;
+                for (const clause of statement.namedChildren) {
+                    if (clause.type !== 'import_clause') continue;
+                    const bind = (local, imported) => addBinding(map, local.text,
+                        module && imported ? { kind: 'external', module, imported } : { kind: 'external' });
+                    for (const part of clause.namedChildren) {
+                        if (part.type === 'identifier') bind(part, 'default');
+                        else if (part.type === 'named_imports') {
+                            for (const specifier of part.namedChildren) {
+                                if (specifier.type !== 'import_specifier') continue;
+                                const name = specifier.childForFieldName('name');
+                                bind(specifier.childForFieldName('alias') || name, name?.text);
+                            }
+                        } else if (part.type === 'namespace_import') {
+                            const local = part.namedChildren.find(child => child.type === 'identifier');
+                            if (local) bind(local, null);
+                        }
+                    }
+                }
                 break;
+            }
             default:
                 break;
         }
@@ -294,11 +334,37 @@ function jsScopeBindings(scope) {
     return map;
 }
 
+/** Callable symbols of a file, grouped by name. */
+function callableSymbolsByName(fileEntry) {
+    const byName = new Map();
+    for (const symbol of fileEntry?.symbols || []) {
+        if (!symbol?.name || !isCallableDef(symbol)) continue;
+        if (!byName.has(symbol.name)) byName.set(symbol.name, []);
+        byName.get(symbol.name).push(symbol);
+    }
+    return byName;
+}
+
+/** The indexed symbol of a definition whose name token is on `line`. */
+function symbolAtLine(symbolsByName, name, line) {
+    let best = null;
+    for (const symbol of symbolsByName.get(name) || []) {
+        const anchor = symbol.nameLine || symbol.startLine;
+        if (anchor === line) return symbol;
+        if (symbol.startLine <= line && symbol.endLine >= line &&
+            (!best || symbol.startLine > best.startLine)) best = symbol;
+    }
+    return best;
+}
+
 /**
  * Per-file lexical resolver. `resolve(callNode, name)` returns:
  *   { defs: [symbol...] }  the name binds to local definitions
  *   { shadowed: true }     a parameter/variable binds the name (not provably async)
- *   null                   no enclosing scope binds it (use file/project lookup)
+ *   { external: true }     an import or global/nonlocal declaration binds it
+ *                          (`imports`: Python from-imports, when only those bind it)
+ *   { star: [binding...] } only a Python module's `from m import *` can bind it
+ *   null                   no enclosing scope binds it
  */
 function createLexicalResolver(fileEntry, language) {
     const family = LEXICAL_FAMILY[language];
@@ -312,26 +378,14 @@ function createLexicalResolver(fileEntry, language) {
         }
         return map;
     };
-    const symbolsByName = new Map();
-    for (const symbol of fileEntry.symbols || []) {
-        if (!symbol?.name || !isCallableDef(symbol)) continue;
-        if (!symbolsByName.has(symbol.name)) symbolsByName.set(symbol.name, []);
-        symbolsByName.get(symbol.name).push(symbol);
-    }
+    const symbolsByName = callableSymbolsByName(fileEntry);
     const symbolFor = (entry, name) => {
         const nameNode = entry.node.childForFieldName('name');
-        const line = (nameNode || entry.node).startPosition.row + 1;
-        let best = null;
-        for (const symbol of symbolsByName.get(name) || []) {
-            const anchor = symbol.nameLine || symbol.startLine;
-            if (anchor === line) return symbol;
-            if (symbol.startLine <= line && symbol.endLine >= line &&
-                (!best || symbol.startLine > best.startLine)) best = symbol;
-        }
-        return best;
+        return symbolAtLine(symbolsByName, name, (nameNode || entry.node).startPosition.row + 1);
     };
     return function resolve(callNode, name) {
         let passedFunction = false;
+        let star = null;
         for (let scope = callNode.parent; scope; scope = scope.parent) {
             const isScope = family === 'python' ? PY_SCOPES.has(scope.type) : JS_SCOPES.has(scope.type);
             if (!isScope) continue;
@@ -340,19 +394,208 @@ function createLexicalResolver(fileEntry, language) {
             if (family === 'python' && (scope.type === 'function_definition' || scope.type === 'lambda')) {
                 passedFunction = true;
             }
-            const entries = bindingsOf(scope).get(name);
+            const bindings = bindingsOf(scope);
+            if (family === 'python' && scope.type === 'module') star = bindings.get('*') || null;
+            const entries = bindings.get(name);
             if (!entries) continue;
-            if (entries.some(entry => entry.kind === 'external')) return null;
+            if (entries.some(entry => entry.kind === 'external')) {
+                return entries.every(entry => entry.kind === 'external' && entry.imported)
+                    ? { external: true, imports: entries } : { external: true };
+            }
             if (entries.some(entry => entry.kind === 'binding')) return { shadowed: true };
             const defs = [];
             for (const entry of entries) {
                 const symbol = symbolFor(entry, name);
-                if (!symbol) return null;
+                // A local definition the index does not hold still binds
+                // the name: nothing else can be its producer.
+                if (!symbol) return { shadowed: true };
                 defs.push(symbol);
             }
             return { defs };
         }
-        return null;
+        return star ? { star } : null;
+    };
+}
+
+/**
+ * The function definitions an import binds, read from the imported project
+ * module itself (null when that does not prove them):
+ *   fromImports(entries)  the import bindings of one name. Python
+ *                         `from m import f [as g]`: m's module scope must bind f
+ *                         only by function definitions; JS/TS
+ *                         `import { f as g }` / `import g`: m must export f (or
+ *                         its default) by declaring the function. A re-export,
+ *                         alias, value or class is left to the engine.
+ *   star(name, bindings)  a name no scope binds, reached only through the
+ *                         module's `from m import *` imports: m's closed literal
+ *                         `__all__`, or without one every public name m's module
+ *                         scope binds; a source m that star-imports itself and
+ *                         declares no `__all__` exports unknown names. Every source
+ *                         must be an unconditional import of a project module and
+ *                         exactly one may export the name.
+ * Anything else (a builtin, an external or conditional source) is not a
+ * provable producer. `memo` (per source file) may be shared across files.
+ */
+function createModuleImportResolver(index, fileEntry, memo = new Map()) {
+    const path = require('path');
+    const { moduleEvidence } = require('./python-fixture-flow');
+    const moduleOf = module => {
+        const relative = module ? fileEntry.moduleResolved?.[module] : null;
+        const file = relative ? path.resolve(index.root, relative) : null;
+        const entry = file ? index.files.get(file) : null;
+        if (entry?.language !== 'python') return null;
+        if (!memo.has(file)) {
+            let scope = null;
+            try {
+                const tree = index._getParsedTree(file, index._readFile(file), 'python');
+                if (tree) {
+                    const names = new Map();
+                    for (const [name, entries] of pythonScopeBindings(tree.rootNode)) {
+                        names.set(name, {
+                            other: entries.some(binding => binding.kind !== 'def'),
+                            defLines: entries.filter(binding => binding.kind === 'def').map(binding =>
+                                (binding.node.childForFieldName('name') || binding.node).startPosition.row + 1),
+                        });
+                    }
+                    scope = { file, entry, names, exports: moduleEvidence(index, file)?.exports || null };
+                }
+            } catch (_) { scope = null; }
+            memo.set(file, scope);
+        }
+        return memo.get(file);
+    };
+    const definitions = (scope, name) => {
+        const bound = scope.names.get(name);
+        if (!bound || bound.other || bound.defLines.length === 0) return null;
+        const symbols = callableSymbolsByName(scope.entry);
+        const defs = [];
+        for (const line of bound.defLines) {
+            const symbol = symbolAtLine(symbols, name, line);
+            if (!symbol) return null;
+            defs.push(symbol);
+        }
+        return defs;
+    };
+    // 'yes' | 'no' | 'unknown'
+    const exports = (scope, name) => {
+        if (scope.names.has('__all__')) {
+            if (!scope.exports) return 'unknown';
+            return scope.exports.literals.some(literal => literal.value === name) ? 'yes' : 'no';
+        }
+        if (name.startsWith('_')) return 'no';
+        if (scope.names.has(name)) return 'yes';
+        return scope.names.has('*') ? 'unknown' : 'no';
+    };
+    // JS/TS: the module's export of that name must be its own function: an
+    // exported declaration on the export's line, or a name (`export { f }`,
+    // `export default f`) its module scope binds only by function
+    // definitions. Any other export (a re-export, an alias, a value) is
+    // left to the engine.
+    const programScope = (file, entry) => {
+        const key = 'js\0' + file;
+        if (!memo.has(key)) {
+            let names = null;
+            try {
+                const tree = index._getParsedTree(file, index._readFile(file), entry.language);
+                if (tree) names = jsScopeBindings(tree.rootNode);
+            } catch (_) { names = null; }
+            memo.set(key, names);
+        }
+        return memo.get(key);
+    };
+    const exportedDefinitions = binding => {
+        const relative = fileEntry.moduleResolved?.[binding.module];
+        const file = relative ? path.resolve(index.root, relative) : null;
+        const entry = file ? index.files.get(file) : null;
+        if (!entry || LEXICAL_FAMILY[entry.language] !== 'js' || entry.language === 'html') return null;
+        const isDefault = binding.imported === 'default';
+        const exports = (entry.exportDetails || []).filter(detail => !detail.isTypeExport && !detail.source &&
+            (isDefault ? detail.type === 'default' : detail.type === 'named' && !detail.alias && detail.name === binding.imported));
+        if (exports.length === 0) return null;
+        const symbols = callableSymbolsByName(entry);
+        const defs = [];
+        for (const detail of exports) {
+            const declared = (symbols.get(detail.name) || []).filter(symbol =>
+                !symbol.className && (symbol.startLine === detail.line || symbol.nameLine === detail.line));
+            if (declared.length === 1) {
+                defs.push(declared[0]);
+                continue;
+            }
+            if (declared.length > 1) return null;
+            const bound = programScope(file, entry)?.get(detail.name);
+            if (!bound || bound.some(binding => binding.kind !== 'def')) return null;
+            for (const def of bound) {
+                const nameNode = def.node.childForFieldName('name');
+                const symbol = symbolAtLine(symbols, detail.name, (nameNode || def.node).startPosition.row + 1);
+                if (!symbol || symbol.className) return null;
+                defs.push(symbol);
+            }
+        }
+        return defs;
+    };
+    return {
+        fromImports(entries) {
+            const defs = [];
+            for (const binding of entries) {
+                let found;
+                if (LEXICAL_FAMILY[fileEntry.language] === 'python') {
+                    const scope = moduleOf(binding.module);
+                    found = scope && definitions(scope, binding.imported);
+                } else {
+                    found = exportedDefinitions(binding);
+                }
+                if (!found) return null;
+                defs.push(...found);
+            }
+            return defs;
+        },
+        star(name, bindings) {
+            let supplier = null;
+            for (const binding of bindings) {
+                const scope = binding.topLevel ? moduleOf(binding.module) : null;
+                if (!scope) return null;
+                const verdict = exports(scope, name);
+                if (verdict === 'unknown') return null;
+                if (verdict === 'yes') {
+                    if (supplier && supplier !== scope) return null;
+                    supplier = scope;
+                }
+            }
+            return supplier ? definitions(supplier, name) : null;
+        },
+    };
+}
+
+/**
+ * The producers an import-bound bare call reaches: the engine's confirmed
+ * callees at that call site whose evidence establishes the target, from one
+ * restricted findCallees run per enclosing callable (module-level calls run
+ * as a synthetic module owner). A same-name definition the import does not
+ * reach is never borrowed.
+ */
+function createImportedProducerResolver(index, filePath, fileEntry, calls) {
+    const symbols = (fileEntry.symbols || []).filter(isCallableDef);
+    const moduleOwner = { file: filePath, startLine: 1, endLine: Infinity, name: '<module>' };
+    const ownerOf = line => rustSiteOwner(symbols, line) || moduleOwner;
+    const byOwner = new Map();
+    for (const call of calls) {
+        const start = call.callStart ?? call.callSite?.start;
+        if (!Number.isInteger(start)) continue;
+        const owner = ownerOf(call.line);
+        if (!byOwner.has(owner)) byOwner.set(owner, new Set());
+        byOwner.get(owner).add(start);
+    }
+    const memo = new Map();
+    return callNode => {
+        const owner = ownerOf(callNode.startPosition.row + 1);
+        if (!byOwner.has(owner)) return [];
+        if (!memo.has(owner)) {
+            memo.set(owner, index.findCallees(owner, {
+                collectAccount: true, siteStarts: byOwner.get(owner),
+            }) || []);
+        }
+        return memo.get(owner).filter(def => (def.siteProvenance || []).some(site =>
+            site.start === callNode.startIndex && site.provenance?.validation === 'establishes-target'));
     };
 }
 
@@ -443,9 +686,11 @@ const AWAITABLE_MEMBERS = {
     // Promise protocol and Object.prototype members.
     promise: new Set(['then', 'catch', 'finally', 'constructor', 'toString', 'toLocaleString',
         'valueOf', 'hasOwnProperty', 'isPrototypeOf', 'propertyIsEnumerable']),
-    // Coroutine object protocol.
+    // Coroutine object protocol and attributes, and members every object has.
     coroutine: new Set(['send', 'throw', 'close', '__await__', 'cr_await', 'cr_frame',
-        'cr_running', 'cr_code', 'cr_origin', 'cr_suspended']),
+        'cr_running', 'cr_code', 'cr_origin', 'cr_suspended', '__name__', '__qualname__',
+        '__class__', '__doc__', '__repr__', '__str__', '__format__', '__hash__', '__eq__', '__ne__',
+        '__sizeof__', '__dir__', '__reduce__', '__reduce_ex__']),
 };
 
 function fieldIs(parent, field, node) {
@@ -608,10 +853,14 @@ const LOCAL_DECLARATION_PARENTS = new Set([
  * need a declaration or parameter of that name inside the function.
  */
 function assignmentTargetIsLocal(holder, name, language) {
-    let scope = holder.parent;
-    while (scope && !LOCAL_SCOPE_TYPES.has(scope.type)) scope = scope.parent;
-    if (!scope) return false;
     const declaresLocal = !!langTraits(language)?.assignmentDeclaresLocal;
+    let scope = holder.parent;
+    while (scope && !LOCAL_SCOPE_TYPES.has(scope.type)) {
+        // An assignment in a class body sets a class attribute.
+        if (declaresLocal && scope.type === 'class_definition') return false;
+        scope = scope.parent;
+    }
+    if (!scope) return false;
     let declared = false;
     let escapes = false;
     const visit = node => {
@@ -669,6 +918,123 @@ function storedValueRead(holder, name, functionTypes) {
     };
     visit(searchRoot);
     return found;
+}
+
+/**
+ * Python (fix #398): where a local assigned straight from a coroutine call
+ * is used as the coroutine's result. A use counts only where every value the
+ * local can hold there is that coroutine: the assignment is the name's only
+ * binding in the function, or the use lies in the block holding the
+ * assignment (so it ran first), before any later binding, and outside any
+ * loop of that block that rebinds the name. A value chosen by a conditional
+ * or boolean expression, a walrus target, uses inside nested functions,
+ * classes, lambdas and generator expressions (they run later), identity
+ * tests, comparison with None, membership of the coroutine in a container
+ * and formatting the object into a string are not uses of its result.
+ */
+function storedCoroutineMisuse(callNode, holder, name, functionTypes, language) {
+    if (holder.type !== 'assignment') return null;
+    let value = holder.childForFieldName('right');
+    while (value?.type === 'parenthesized_expression' && value.namedChildCount === 1) value = value.namedChild(0);
+    if (!value || !sameNode(value, callNode)) return null;
+    let scope = holder.parent;
+    while (scope && !functionTypes.has(scope.type)) scope = scope.parent;
+    let block = holder.parent;
+    while (block && block.type !== 'block') block = block.parent;
+    if (!scope || !block || scope.type === 'lambda') return null;
+    // A nested function declaring the name nonlocal can rebind it unseen.
+    if (scope.text.includes('nonlocal') && containsNode(scope, node => node.type === 'nonlocal_statement' &&
+        node.namedChildren.some(child => child.text === name))) return null;
+    const { pythonBindingSites } = require('../languages/lexical-scope');
+    const sites = pythonBindingSites(scope, name);
+    const writes = new Set(sites.filter(site => site.startIndex > holder.endIndex).map(site => site.startIndex));
+    const inside = (node, outer) => node.startIndex >= outer.startIndex && node.endIndex <= outer.endIndex;
+    // Parameters, imports and every other binding of the name are sites.
+    const onlyBinding = sites.length === 1;
+    const holds = use => {
+        if (onlyBinding) return true;
+        if (!inside(use, block)) return false;
+        for (let node = use.parent; node && !sameNode(node, block); node = node.parent) {
+            if ((node.type === 'for_statement' || node.type === 'while_statement') &&
+                sites.some(site => inside(site, node))) return false;
+        }
+        return true;
+    };
+    const binds = node => !!node && (node.type === 'identifier' ? node.text === name
+        : STORED_PATTERN_TYPES.has(node.type) && node.namedChildren.some(binds));
+    let stopped = false;
+    let misuse = null;
+    const visit = node => {
+        if (stopped || misuse || node.endIndex <= holder.endIndex) return;
+        if (functionTypes.has(node.type) || node.type === 'class_definition') {
+            if (writes.has(node.childForFieldName('name')?.startIndex)) stopped = true;
+            return;
+        }
+        if (COMPREHENSION_TYPES.has(node.type)) {
+            const clauses = node.namedChildren.filter(child => child.type === 'for_in_clause');
+            // Only the first iterable is evaluated here and now; the rest
+            // runs in the comprehension's own scope (later, for a generator).
+            if (node.type === 'generator_expression' || clauses.some(clause => binds(clause.childForFieldName('left')))) {
+                const right = clauses[0]?.childForFieldName('right');
+                if (right) visit(right);
+                return;
+            }
+        }
+        if ((node.type === 'assignment' || node.type === 'named_expression' || node.type === 'for_statement') &&
+            binds(node.childForFieldName('left') || node.childForFieldName('name'))) {
+            // The right side is evaluated before the name is rebound.
+            const right = node.childForFieldName('right') || node.childForFieldName('value');
+            if (right) visit(right);
+            stopped = true;
+            return;
+        }
+        if (node.type === 'identifier' && node.text === name) {
+            // `v += 1` reads the coroutine before rebinding it.
+            const augmented = node.parent?.type === 'augmented_assignment' && fieldIs(node.parent, 'left', node);
+            if (!augmented && writes.has(node.startIndex)) { stopped = true; return; }
+            if (holds(node) && storedValueUsedAsResult(node, language)) misuse = node;
+            if (augmented) { stopped = true; return; }
+        }
+        for (const child of node.namedChildren) visit(child);
+    };
+    visit(scope.childForFieldName('body') || scope);
+    return misuse ? { line: misuse.startPosition.row + 1, variable: name,
+        originLine: callNode.startPosition.row + 1, reason: 'stored-coroutine-used-as-value' } : null;
+}
+
+const STORED_PATTERN_TYPES = new Set(['tuple_pattern', 'list_pattern', 'pattern_list', 'tuple', 'list',
+    'as_pattern_target', 'list_splat_pattern', 'parenthesized_expression']);
+const COMPREHENSION_TYPES = new Set(['list_comprehension', 'set_comprehension',
+    'dictionary_comprehension', 'generator_expression']);
+
+/** Whether a read of a stored awaitable needs its result (see valueFlow). */
+function storedValueUsedAsResult(node, language) {
+    let use = node;
+    while (use.parent?.type === 'parenthesized_expression') use = use.parent;
+    const parent = use.parent;
+    if (parent?.type === 'interpolation') return false;
+    if (parent?.type === 'comparison_operator') {
+        const operators = parent.children.filter(child => !child.isNamed).map(child => child.text);
+        const operands = parent.namedChildren.filter(child => !sameNode(child, use));
+        if (operators.every(operator => operator === 'is' || operator === 'is not')) return false;
+        if (operators.every(operator => operator === '==' || operator === '!=') &&
+            operands.every(operand => operand.type === 'none')) return false;
+        if (sameNode(parent.namedChild(0), use) && ['in', 'not in'].includes(operators[0])) return false;
+    }
+    if (parent?.type === 'binary_operator' && fieldIs(parent, 'right', use) &&
+        parent.childForFieldName('operator')?.text === '%' &&
+        ['string', 'concatenated_string'].includes(parent.childForFieldName('left')?.type)) return false;
+    return valueFlow(node, language).kind === 'used-as-value';
+}
+
+function containsNode(root, test) {
+    const stack = [root];
+    while (stack.length > 0) {
+        const node = stack.pop();
+        if (test(node)) return true;
+        for (let i = 0; i < node.namedChildCount; i++) stack.push(node.namedChild(i));
+    }
+    return false;
 }
 
 // ── Rust futures (fix #370) ──
@@ -1285,11 +1651,14 @@ module.exports = {
     rustDefFuture,
     valueFlow,
     storedValueRead,
+    storedCoroutineMisuse,
     isCallableDef,
     isDefAsync,
     producerKind,
     collapseKinds,
     createLexicalResolver,
+    createImportedProducerResolver,
+    createModuleImportResolver,
     asyncConsumerRole,
     isDiscardedCall,
     resolveDecorator,

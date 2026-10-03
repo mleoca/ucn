@@ -614,6 +614,8 @@ function formatAuditAsync(result) {
                     ? `${issue.variable} used as its Output; future from ${issue.calleeName}() at line ${issue.originLine} is not awaited`
                 : issue.reason === 'stored-promise-used-as-value'
                 ? `${issue.variable} used as a resolved value; promise from ${issue.calleeName}() at line ${issue.originLine}`
+                : issue.reason === 'stored-coroutine-used-as-value'
+                    ? `${issue.variable} used as a resolved value; coroutine from ${issue.calleeName}() at line ${issue.originLine} is not awaited`
                 : issue.reason === 'async-result-used-as-value'
                     ? `${issue.calleeName}() — result used as a resolved value, not awaited`
                 : issue.reason === 'async-iterator-discarded'
@@ -645,7 +647,7 @@ function formatAuditAsyncJson(result) {
             callerName: i.callerName,
             calleeName: i.calleeName,
             ...(i.reason && { reason: i.reason }),
-            ...(i.reason && i.reason.startsWith('stored-future') && { variable: i.variable, originLine: i.originLine }),
+            ...(i.reason && i.reason.startsWith('stored-') && { variable: i.variable, originLine: i.originLine }),
             ...(i.reason === 'future-unused' && { variable: i.variable }),
         })),
         ...(result.skippedUnknown > 0 && { skippedUnknown: result.skippedUnknown }),

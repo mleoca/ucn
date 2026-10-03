@@ -150,11 +150,12 @@ function pyCaptureNames(pattern, out) {
  * Bindings of `name` in one Python function/class body (not nested scopes,
  * but walrus targets inside comprehensions bind here).
  */
-function pyScopeBindings(scopeNode, body, name, isFunction, includeClasses = false) {
+function pyScopeBindings(scopeNode, body, name, isFunction, includeClasses = false, onBinding) {
     const info = { bound: false, defRows: [], other: false, import: false,
         global: false, nonlocal: false, starImport: false };
     const note = (node, kind) => {
         if (!node || node.text !== name) return;
+        onBinding?.(node, kind);
         info.bound = true;
         if (kind === 'def') info.defRows.push(node.startPosition.row);
         else if (kind === 'import') info.import = true;
@@ -1203,4 +1204,12 @@ function scopeFields(verdict) {
     };
 }
 
-module.exports = { referenceScope, scopeFields, familyOf, rustLetBindingOf, rustSelfFieldBinding };
+/** Declaration tokens binding one name in a Python function's own scope. */
+function pythonBindingSites(scope, name) {
+    const sites = [];
+    pyScopeBindings(scope, scope.childForFieldName('body'), name, true, false,
+        node => sites.push(node));
+    return sites;
+}
+
+module.exports = { referenceScope, scopeFields, familyOf, rustLetBindingOf, rustSelfFieldBinding, pythonBindingSites };

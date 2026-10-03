@@ -7514,7 +7514,7 @@ function findCallees(index, definition, options = {}) {
         const siteStarts = options.siteStarts || null;
         for (let call of calls) {
             siteOrdinal++;
-            if (siteStarts && !siteStarts.has(call.callStart)) continue;
+            if (siteStarts && !siteStarts.has(call.callStart ?? call.callSite?.start)) continue;
             call = _withModuleValueAliasReceiver(index, def.file,
                 _withoutShadowedStdLiteral(index, _destructuredMemberView(call)), structuralCallee);
             // A local declared with a supertype and never reassigned after

@@ -16,6 +16,200 @@ const { ProjectIndex } = require('../core/project');
 const { execute } = require('../core/execute');
 const { tmp, rm, idx, FIXTURES_PATH } = require('./helpers');
 
+describe('fix #398: stored coroutines are checked at their uses', () => {
+    it('proves imported producers without borrowing builtin, unbound or nested namesakes', () => {
+        const dir = tmp({
+            'other.py': [
+                'async def type(value): return value',
+                'async def call(): return 1',
+                'async def load(): return 1',
+            ].join('\n'),
+            'pkg/__init__.py': 'from .impl import load',
+            'pkg/impl.py': 'async def load(): return 1',
+            'reexported.py': ['from pkg import load as again', 'def use():', '    again()'].join('\n'),
+            'app.py': [
+                'from other import load as run',
+                'async def owns_nested():',
+                '    async def hidden(): return 1',
+                '    return hidden()',
+                'class Service:',
+                '    async def method(self): return 1',
+                'def use():',
+                '    name = type(2).__name__',
+                '    call()',
+                '    hidden()',
+                '    method()',
+                '    value = run()',
+                '    return value + 1',
+                'def imported():',
+                '    from other import load',
+                '    load()',
+                'def unbound():',
+                '    load()',
+            ].join('\n'),
+        });
+        try {
+            const result = idx(dir).auditAsync({});
+            assert.deepEqual(result.issues.map(issue => [issue.file, issue.line, issue.calleeName]),
+                [['app.py', 13, 'run'], ['app.py', 16, 'load'], ['reexported.py', 3, 'again']]);
+        } finally { rm(dir); }
+    });
+
+    for (const asynchronous of [true, false]) {
+        it(`${asynchronous ? 'async' : 'sync'} functions distinguish value misuse from coroutine flow`, () => {
+            const bad = {
+                arithmetic: ['return v + 1'],
+                member: ['return v.bit_length()'],
+                condition: ['if v:', '    return 1', 'return 0'],
+                subscript: ['return v[0]'],
+                conditional: ['return 1 if v else 0'],
+                unpack: ['a, b = v', 'return a'],
+                captured_comprehension: ['return [v + 1 for i in range(3)]'],
+                iterated: ['return [i for i in v]'],
+                augmented: ['v += 1', 'return v'],
+                negated: ['return not v'],
+                compared: ['return v == "done"'],
+            };
+            const good = {
+                returned: ['return v'],
+                passed: ['return consume(v)'],
+                container: ['return [v]'],
+                closed: ['v.close()'],
+                protocol: ['return v.cr_running'],
+                identity: ['return v is v'],
+                overwritten: ['v.close()', 'v = 2', 'return v + 1'],
+                loop_binding: ['v.close()', 'for v in [1, 2]:', '    consume(v + 1)'],
+                with_binding: ['v.close()', 'with open("input.txt") as v:', '    return v.read()'],
+                except_binding: ['v.close()', 'try:', '    raise ValueError()', 'except ValueError as v:', '    return v.args'],
+                import_binding: ['v.close()', 'from math import sqrt as v', 'return v(4)'],
+                function_binding: ['v.close()', 'def v(): return 1', 'return v() + 1'],
+                class_binding: ['v.close()', 'class v:', '    pass', 'return v()'],
+                match_binding: ['v.close()', 'match (1, 2):', '    case (v, other):', '        return v + other'],
+                comprehension_binding: ['consume([v + 1 for v in range(3)])', 'return v'],
+                closure_binding: ['def inner(v):', '    return v + 1', 'return v'],
+                loop_rebinding: ['while True:', '    if v:', '        break', '    v = 2'],
+                nonlocal_rebinding: ['def g():', '    nonlocal v', '    v = 2', 'g()', 'return v + 1'],
+                late_generator: ['g = (v + 1 for i in range(3))', 'v = 2', 'return list(g)'],
+                formatted: ['print(f"{v!r}", "%r" % v)', 'return v'],
+                membership: ['return v in [v]'],
+                negated_identity: ['return v is not None', 'return v != None'],
+                coroutine_attribute: ['return v.__qualname__'],
+                class_attribute: ['v.close()', 'class A:', '    w = fetch()', 'return A'],
+                ...(asynchronous ? {
+                    awaited: ['return (await v) + 1'],
+                    resolved_binding: ['v = await v', 'return v + 1'],
+                } : {}),
+            };
+            const lines = ['async def fetch(): return 1', 'def consume(value): return value'];
+            const origins = new Map();
+            for (const [name, statements] of Object.entries({ ...bad, ...good })) {
+                lines.push(`${asynchronous ? 'async ' : ''}def ${name}():`, '    v = fetch()');
+                origins.set(name, lines.length);
+                lines.push(...statements.map(line => '    ' + line), '');
+            }
+            const dir = tmp({ 'app.py': lines.join('\n') });
+            try {
+                const result = idx(dir).auditAsync({});
+                assert.deepEqual(result.issues.map(issue => issue.callerName), Object.keys(bad));
+                for (const issue of result.issues) {
+                    assert.equal(issue.reason, 'stored-coroutine-used-as-value');
+                    assert.equal(issue.variable, 'v');
+                    assert.equal(issue.originLine, origins.get(issue.callerName));
+                    assert.ok(issue.line > issue.originLine);
+                }
+            } finally { rm(dir); }
+        });
+    }
+
+    it('flags a use only where the local holds the coroutine on every path', () => {
+        const dir = tmp({ 'app.py': [
+            'async def fetch(): return 1',
+            'def conditional_value(c):',
+            '    v = fetch() if c else None',
+            '    if v:',
+            '        return v + 1',
+            'def branch_value(c):',
+            '    v = None',
+            '    if c:',
+            '        v = fetch()',
+            '    return v + 1',
+            'def handler_use():',
+            '    try:',
+            '        v = fetch()',
+            '    except Exception:',
+            '        v = 0',
+            '    return v + 1',
+            'def only_binding(c):',
+            '    if c:',
+            '        v = fetch()',
+            '    return v == "done"',
+            'def walrus_value():',
+            '    if (v := fetch()) is not None:',
+            '        return v + 1',
+            'def loop_holder():',
+            '    for i in range(3):',
+            '        v = fetch()',
+            '        if v:',
+            '            return i',
+            'def chained():',
+            '    a = v = fetch()',
+            '    return v * 2, a',
+        ].join('\n') });
+        try {
+            const result = idx(dir).auditAsync({});
+            assert.deepEqual(result.issues.map(issue => [issue.callerName, issue.line, issue.originLine]),
+                [['only_binding', 20, 19], ['loop_holder', 27, 26], ['chained', 31, 30]]);
+        } finally { rm(dir); }
+    });
+
+    it('star imports reach a producer only through the one module that exports it', () => {
+        const dir = tmp({
+            'pkg/__init__.py': '',
+            'pkg/src_all.py': ['__all__ = ["exported"]', 'async def exported(): return 1',
+                'async def hidden(): return 1'].join('\n'),
+            'pkg/src_plain.py': ['async def plain(): return 1', 'async def _private(): return 1',
+                'from pkg.src_all import exported as reexported'].join('\n'),
+            'pkg/src_two.py': 'async def plain(): return 2',
+            'pkg/relative.py': ['from .src_plain import *', 'def use():', '    plain()'].join('\n'),
+            'app.py': ['from pkg.src_all import *', 'from pkg.src_plain import *', 'def use():',
+                '    exported()', '    hidden()', '    plain()', '    _private()', '    reexported()'].join('\n'),
+            'twice.py': ['from pkg.src_plain import *', 'from pkg.src_two import *', 'def use():',
+                '    plain()'].join('\n'),
+            'external.py': ['from os.path import *', 'from pkg.src_plain import *', 'def use():',
+                '    plain()'].join('\n'),
+            'conditional.py': ['try:', '    from pkg.src_plain import *', 'except ImportError:', '    pass',
+                'def use():', '    plain()'].join('\n'),
+        });
+        try {
+            const result = idx(dir).auditAsync({});
+            assert.deepEqual(result.issues.map(issue => [issue.file, issue.line, issue.calleeName]),
+                [['app.py', 4, 'exported'], ['app.py', 6, 'plain'], ['pkg/relative.py', 3, 'plain']]);
+        } finally { rm(dir); }
+    });
+
+    it('reports the call origin and actual use separately for a multiline assignment', () => {
+        const dir = tmp({ 'app.py': [
+            'async def fetch(): return 1',
+            'async def use():',
+            '    value = (',
+            '        fetch()',
+            '    )',
+            '    return value + 1',
+        ].join('\n') });
+        try {
+            const result = idx(dir).auditAsync({});
+            assert.equal(result.issues.length, 1);
+            assert.equal(result.issues[0].line, 6);
+            assert.equal(result.issues[0].originLine, 4);
+            const text = require('../core/output').formatAuditAsync(result);
+            assert.match(text, /value used as a resolved value; coroutine from fetch\(\) at line 4/);
+            const json = JSON.parse(require('../core/output').formatAuditAsyncJson(result));
+            assert.deepEqual(json.issues[0], { file: 'app.py', line: 6, callerName: 'use', calleeName: 'fetch',
+                reason: 'stored-coroutine-used-as-value', variable: 'value', originLine: 4 });
+        } finally { rm(dir); }
+    });
+});
+
 describe('Regression: Python class methods in context', () => {
     it('should show methods for Python classes via className', () => {
         const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-py-class-'));

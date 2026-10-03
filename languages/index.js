@@ -497,6 +497,11 @@ const LANGUAGES = {
             // keyword-only (`*`) and positional-only (`/`) markers (fix #281).
             keywordArguments: true,
             assignmentDeclaresLocal: true,
+            // Calling an async def creates a coroutine object in any scope:
+            // audit-async checks such calls in sync functions too, and
+            // follows a local assigned from the call to the uses that need
+            // its result (fix #398).
+            storedCoroutines: true,
             // Decorators with a known effect on what calling the decorated
             // function returns (fix #364), as resolved qualified names (a
             // trailing `()` marks a decorator factory call). Any other

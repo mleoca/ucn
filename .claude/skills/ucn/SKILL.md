@@ -351,13 +351,21 @@ collection, generator or spread, returned, chosen by a ternary/logical
 expression, or assigned to a field, property or outer variable flows on and is
 not flagged. In JS/TS/HTML it also checks
 captured promises used in arithmetic, conditions, or resolved-value member
-access within the same lexical scope. Awaiting, returning, promise handlers,
-reassignment, and shadowed bindings are distinguished. Producers are classified
+access within the same lexical scope. In Python, coroutine calls in sync
+functions count too, and a local assigned straight from a coroutine call is
+flagged where it is used as the result while every value it can hold there is
+that coroutine (`stored-coroutine-used-as-value`); identity tests, comparison
+with None, string formatting and uses in nested functions are not. Awaiting,
+returning, promise handlers, reassignment, and shadowed bindings are
+distinguished. Producers are classified
 by what a call returns: async generators/iterators (consumed by `async for`,
 `for await`, `await foreach`) and `@asynccontextmanager` factories (entered by
 `async with`) are flagged only when the call is discarded; C# `async void` is
 never flagged; calls to async functions behind an unrecognized decorator are
-counted as not audited. Bare calls resolve through lexical scope first. C#
+counted as not audited. Bare calls resolve through lexical scope, then
+import identity: the imported module's own definitions (Python star imports
+through `__all__` or public names) or an engine-established target. A same-name
+function elsewhere in the project is not a producer. C#
 member calls (`s.SaveAsync()`, `_svc.SaveAsync()`, `this.Local()`,
 `p?.SaveAsync()`) are audited through the receiver's type and its project
 ancestors; a typed receiver that owns none of the async definitions is not.
