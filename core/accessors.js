@@ -1,7 +1,7 @@
 'use strict';
 
 const path = require('path');
-const { codeUnitCompare } = require('./shared');
+const { codeUnitCompare, CALLABLE_SYMBOL_KINDS } = require('./shared');
 const { getParser, safeParse } = require('../languages');
 
 function inheritedAccessor(index, enclosing, name, definition) {
@@ -71,6 +71,57 @@ function receiverlessShape(tree, usage) {
             shorthand: key.type === 'shorthand_property_identifier_pattern' };
     }
     return 'none';
+}
+
+// Source offset of an occurrence (fix #398F): orders it against same-line
+// assignments when its receiver is typed by return-type flow.
+function flowSiteOf(tree, usage) {
+    if (!tree || !Number.isInteger(usage.column)) return null;
+    const node = tree.rootNode.descendantForPosition({ row: usage.line - 1, column: usage.column });
+    return node ? node.startIndex : null;
+}
+
+// The enclosing callable scopes of a line, outermost first, as the parser's
+// call records spell them (`enclosingFunction.scopeChain`): the innermost
+// scope any record of the file reports around the line (anonymous callbacks
+// included), else the indexed callables containing it.
+function scopeChainAt(index, file, line, calls) {
+    let best = null;
+    for (const call of calls || []) {
+        const scope = call.enclosingFunction;
+        if (!scope || scope.startLine > line || scope.endLine < line) continue;
+        if (!best || scope.startLine > best.startLine ||
+            (scope.startLine === best.startLine && scope.endLine < best.endLine)) best = scope;
+    }
+    if (best && Array.isArray(best.scopeChain)) return best.scopeChain;
+    const scopes = (index.files.get(file)?.symbols || []).filter(symbol =>
+        CALLABLE_SYMBOL_KINDS.has(symbol.type) && symbol.startLine <= line && line <= symbol.endLine)
+        .sort((a, b) => a.startLine - b.startLine || b.endLine - a.endLine);
+    return scopes.map(symbol => symbol.startLine);
+}
+
+// A plain local receiver typed by return-type flow (`result =
+// runner.invoke(..)` with `invoke(..) -> Result`), the evidence the caller
+// engine uses for method calls on the same receiver (fix #398F).
+function flowReceiverType(index, ref, flowMaps) {
+    if (!/^[A-Za-z_$][\w$]*$/.test(ref.receiver || '') || ['self', 'cls', 'this'].includes(ref.receiver)) return null;
+    const callers = require('./callers');
+    let state = flowMaps.get(ref.file);
+    if (state === undefined) {
+        const calls = callers.getCachedCalls(index, ref.file);
+        state = calls ? { calls, map: callers._buildReturnTypeFlowMap(index, ref.file, calls) } : null;
+        flowMaps.set(ref.file, state);
+    }
+    const map = state?.map;
+    if (!map) return null;
+    const chain = scopeChainAt(index, ref.file, ref.line, state.calls);
+    const entry = callers._lookupReturnTypeFlow(map, {
+        receiver: ref.receiver, line: ref.line,
+        ...(Number.isInteger(ref.flowSite) && { callStart: ref.flowSite }),
+        enclosingFunction: chain.length ? { startLine: chain[chain.length - 1], scopeChain: chain } : null,
+    });
+    if (!entry?.type || entry.invalidated || !entry.fromFile) return null;
+    return { type: entry.type, fromFile: entry.fromFile };
 }
 
 // Descriptors/properties are consumed through reads and writes, not only
@@ -152,12 +203,16 @@ function findAccessorReferences(index, name, definition, options = {}) {
     const confirmed = [];
     const unverified = [];
     const excluded = [];
+    const flowMaps = new Map();
     // Use the parser's raw occurrence records rather than usages()' public
     // line-oriented inventory. A line can contain two same-spelled member
     // accesses with different receivers; collapsing them by file+line would
     // make a rename edit one token while silently losing the other.
     const refs = [];
     for (const [file, entry] of index.files) {
+        // `files` (fix #398F): a caller that needs one file family (tests)
+        // never parses the rest of the project.
+        if (options.files && !options.files.has(file)) continue;
         if (!index.matchesFilters(entry.relativePath, options)) continue;
         let content;
         let occurrences;
@@ -181,6 +236,7 @@ function findAccessorReferences(index, name, definition, options = {}) {
                 ...usage,
                 ...(shape?.pattern && { patternKey: shape, ...(shape.thisSource && { receiver: 'this' }) }),
                 accessKind: shape?.pattern ? 'read' : accessKind(tree, usage),
+                ...(usage.receiver && { flowSite: flowSiteOf(tree, usage) }),
                 file,
                 relativePath: entry.relativePath,
                 content: lines[usage.line - 1] || '',
@@ -238,6 +294,18 @@ function findAccessorReferences(index, name, definition, options = {}) {
                 callerName: enclosing?.name || null,
                 receiverType,
                 resolution: 'receiver-field-type',
+                tier: 'confirmed',
+            });
+            continue;
+        }
+        const flowed = !receiverType && receiver ? flowReceiverType(index, ref, flowMaps) : null;
+        if (flowed && bareTypeName(flowed.type) === owner &&
+            path.resolve(flowed.fromFile) === path.resolve(definition.file)) {
+            confirmed.push({
+                ...shaped,
+                callerName: enclosing?.name || null,
+                receiverType: flowed.type,
+                resolution: 'receiver-return-flow',
                 tier: 'confirmed',
             });
             continue;

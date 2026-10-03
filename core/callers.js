@@ -22,6 +22,8 @@ const { BUILTIN_RECEIVER_TYPES, isProvenanceBuiltinReceiver } = require('./recei
 const { findGoModule, resolveRustImport, resolveRustModuleFile } = require('./imports');
 const { rustWrapperContract, validateRustWrapperContract } = require('./rust-result-flow');
 const { pythonFixtureReceiver, pythonFixtureType } = require('./python-fixture-flow');
+const { sameConfigurationItem, itemsNamed, moduleItemNamed, siteExcludedAt, sitesReachableAt,
+    DEFINITION_KINDS: CONFIGURATION_DEFINITION_KINDS } = require('./configuration-items');
 const { reflectionPatternReferences: _reflectionPatternReferences } = require('./reflection');
 const {
     ownerRefOf, ownerNameOf, ownedBy, findDeclaringClass, relationToTargets,
@@ -2617,6 +2619,30 @@ function findCallers(index, name, options = {}) {
                     continue;
                 }
 
+                // A bare name bound by a configuration item of its scope
+                // (fix #398F): the call reaches the alternative whose branch
+                // holds it, or the item. A pinned definition alternative is
+                // reached whenever it exists; a pinned definition the item
+                // reaches only through one alternative's import is reached in
+                // that configuration only.
+                if (!call.isMethod && !call.receiver && localNameImports.length === 0 &&
+                    fileEntry.configurationItems &&
+                    langTraits(fileEntry.language)?.conditionalDefinitions === 'branch') {
+                    const itemVerdict = _configurationItemCallVerdict(index, filePath, fileEntry, call,
+                        name, options.targetDefinitions || definitions);
+                    if (itemVerdict?.exclude) {
+                        recordExcluded(filePath, call.line, 'other-definition');
+                        continue;
+                    }
+                    if (itemVerdict?.alternative) {
+                        if (collectAccount) {
+                            routeUnverified(filePath, fileEntry, call, 'configuration-alternative', calledAs);
+                        }
+                        continue;
+                    }
+                    if (itemVerdict?.bindingId) bindingId = itemVerdict.bindingId;
+                }
+
                 // Skip binding resolution for calls with non-self/this/cls receivers:
                 // e.g., analyzer.analyze_instrument() should NOT resolve to a local
                 // standalone function def `analyze_instrument` — they're different symbols.
@@ -2680,6 +2706,11 @@ function findCallers(index, name, options = {}) {
                     }
                     let bindings = _arityCompatibleBindings(index, fileEntry.language, call,
                         _dropOutOfScopeBindings(index, filePath, call.name, call.line, fileBindings));
+                    // A configuration alternative another branch of the
+                    // call's own position excludes is no binding (fix #398F).
+                    if (fileEntry.configurationItems && bindings.length > 0) {
+                        bindings = _dropUnreachableAlternatives(index, filePath, call.line, call.name, bindings);
+                    }
                     // A marked macro invocation binds only macros, a call
                     // only fns and values (fix #377).
                     if (langTraits(fileEntry.language)?.macroInvocationSyntax === 'marked') {
@@ -4200,6 +4231,8 @@ function findCallers(index, name, options = {}) {
                         // resolver gaps) routes 'unknown' and blocks exclusion.
                         let reaches = false;
                         let undetermined = false;
+                        let moduleValue = false;
+                        let configurationReach = false;
                         for (const b of nameBindings) {
                             const rel = fileEntry.moduleResolved && fileEntry.moduleResolved[b.module];
                             if (!rel) {
@@ -4216,9 +4249,11 @@ function findCallers(index, name, options = {}) {
                             const verdict = b.defaultLike
                                 ? _defaultBindingReaches(index, resolvedAbs, tFiles)
                                 : _nameBindingReaches(index, resolvedAbs, b.name, tFiles,
-                                    4, { targetName: name });
+                                    4, { targetName: name, valueVerdict: true, configurationVerdict: true });
                             if (verdict === 'yes') { reaches = true; break; }
                             if (verdict === 'unknown') undetermined = true;
+                            if (verdict === 'value') { undetermined = true; moduleValue = true; }
+                            if (verdict === 'configuration') { undetermined = true; configurationReach = true; }
                         }
                         if (reaches) importChainReachesTarget = true;
                         if (!reaches && !undetermined) {
@@ -4241,6 +4276,28 @@ function findCallers(index, name, options = {}) {
                         if (!reaches && undetermined && collectAccount &&
                             (pairedImportAlias || localImport)) {
                             routeUnverified(filePath, fileEntry, call, 'ambiguous-binding', calledAs);
+                            continue;
+                        }
+                        // The imported name is a value its module assigns
+                        // (fix #398F, kombu `from .serialization import
+                        // loads` where `loads = registry.loads`): the
+                        // importing file's other import edges are no
+                        // evidence about that value.
+                        // The import reaches the targets only through one
+                        // alternative of a configuration item (fix #398F,
+                        // `if WIN: from ._winconsole import f` / `else:
+                        // def f`): the call reaches them in that
+                        // configuration only.
+                        if (!reaches && configurationReach) {
+                            if (collectAccount) {
+                                routeUnverified(filePath, fileEntry, call, 'configuration-alternative', calledAs);
+                            }
+                            continue;
+                        }
+                        if (!reaches && moduleValue) {
+                            if (collectAccount) {
+                                routeUnverified(filePath, fileEntry, call, 'ambiguous-binding', calledAs);
+                            }
                             continue;
                         }
                     }
@@ -4524,6 +4581,7 @@ function findCallers(index, name, options = {}) {
                         let undetermined = recvExportedNamespace?.verdict === 'unknown';
                         let resolvedBindings = recvExportedNamespace ? 1 : 0;
                         let definitiveOtherBindings = recvExportedNamespace?.verdict === 'no' ? 1 : 0;
+                        let configurationOnly = false;
                         for (const b of recvBindings) {
                             // A #224-proven submodule receiver chases from the
                             // SUBMODULE file, never the from-module (fix #294b,
@@ -4556,10 +4614,19 @@ function findCallers(index, name, options = {}) {
                             // assignments) falls back to file-level reach.
                             const ambiguousCjsMember =
                                 _cjsMemberOwnershipAmbiguous(index, resolvedAbs, call.name);
+                            // A module VALUE (fix #398F) is never reached
+                            // through the module's other import edges.
                             const verdict = ambiguousCjsMember
                                 ? 'unknown'
                                 : _nameBindingReaches(index, resolvedAbs, call.name, tFiles,
-                                    4, { targetName: name });
+                                    4, { targetName: name, valueVerdict: true, configurationVerdict: true });
+                            if (verdict === 'configuration') {
+                                // One configuration alternative's import
+                                // (fix #398F).
+                                configurationOnly = true;
+                                undetermined = true;
+                                continue;
+                            }
                             if (verdict === 'yes' ||
                                 (verdict === 'unknown' && !ambiguousCjsMember &&
                                  _importReaches(index, resolvedAbs, tFiles))) {
@@ -4576,6 +4643,12 @@ function findCallers(index, name, options = {}) {
                             if (!undetermined && resolvedBindings > 0 &&
                                 definitiveOtherBindings === resolvedBindings) {
                                 recordExcluded(filePath, call.line, 'other-definition-import');
+                                continue;
+                            }
+                            if (configurationOnly) {
+                                if (collectAccount) {
+                                    routeUnverified(filePath, fileEntry, call, 'configuration-alternative', calledAs);
+                                }
                                 continue;
                             }
                             if (collectAccount) {
@@ -8825,9 +8898,39 @@ function findCallees(index, definition, options = {}) {
                 if (moduleRoute.external) {
                     noteSite(siteId, 'external', null, call);
                 } else {
-                    noteUnverified(siteId, call, 'no-import-link');
+                    noteUnverified(siteId, call, moduleRoute.alternative
+                        ? 'configuration-alternative' : 'no-import-link');
                 }
                 continue;
+            }
+
+            // A bare name bound by a configuration item of its scope (fix
+            // #398F): the alternative whose branch holds the call, every
+            // definition alternative (each is the callee whenever it
+            // exists), or one visible entry when an alternative is an
+            // import (reached in one configuration only).
+            if (!call.isMethod && !call.receiver && !call.isConstructor &&
+                fileEntry?.configurationItems &&
+                langTraits(language)?.conditionalDefinitions === 'branch') {
+                const itemRoute = _calleeConfigurationItemRoute(index, fileEntry, def.file, call);
+                if (itemRoute?.alternative) {
+                    noteUnverified(siteId, call, 'configuration-alternative');
+                    continue;
+                }
+                if (itemRoute?.matches?.length) {
+                    for (const match of itemRoute.matches) {
+                        const key = match.bindingId || `${match.file}:${match.startLine}:${call.name}`;
+                        const existing = callees.get(key);
+                        if (existing) {
+                            existing.count += 1;
+                            if (collectAccount) { existing.sites.push(call.line); existing.siteIds.push(siteId); }
+                        } else {
+                            callees.set(key, { name: match.name, bindingId: match.bindingId, count: 1,
+                                ...(collectAccount && { sites: [call.line], siteIds: [siteId] }) });
+                        }
+                    }
+                    continue;
+                }
             }
 
             // Bare imported-name ownership: `import { process } from './x';
@@ -8866,7 +8969,8 @@ function findCallees(index, definition, options = {}) {
                     } else if (importRoute.external) {
                         noteSite(siteId, 'external', null, call);
                     } else {
-                        noteUnverified(siteId, call, 'ambiguous-binding');
+                        noteUnverified(siteId, call, importRoute.alternative
+                            ? 'configuration-alternative' : 'ambiguous-binding');
                     }
                     continue;
                 }
@@ -9561,7 +9665,10 @@ function findCallees(index, definition, options = {}) {
                         noteSite(siteId, 'external', null, call);
                         continue;
                     }
-                    // Unique method heuristic: if attr type unknown but method exists on exactly one class
+                    // Unique method heuristic: if attr type unknown but method
+                    // exists on exactly one class DEFINITION (fix #398F:
+                    // kombu's eight transport classes all named `Channel`
+                    // made `self.channel.basic_cancel()` the first one's).
                     if (!targetClass) {
                         const methodSyms = index.symbols.get(call.name);
                         if (methodSyms) {
@@ -9570,7 +9677,8 @@ function findCallees(index, definition, options = {}) {
                                 if (s.className) classNames.add(s.className);
                             }
                             if (classNames.size === 1) {
-                                targetClass = classNames.values().next().value;
+                                const only = classNames.values().next().value;
+                                if (classDefsNamed(index, only).unique) targetClass = only;
                             }
                         }
                     }
@@ -12760,7 +12868,7 @@ function _nameBindingReaches(index, startAbs, name, targetFiles, maxDepth = 4, o
     const targetName = exactName ? name : options.targetName;
     const opCache = index._opImportReachCache;
     const targetKey = [...targetFiles].sort(codeUnitCompare).join('\x00');
-    const cacheKey = `name\x00${maxDepth}\x00${exactName ? 1 : 0}\x00${targetName || ''}\x00${startAbs}\x00${name}\x00${targetKey}`;
+    const cacheKey = `name\x00${maxDepth}\x00${exactName ? 1 : 0}\x00${options.valueVerdict ? 1 : 0}${options.configurationVerdict ? 1 : 0}\x00${targetName || ''}\x00${startAbs}\x00${name}\x00${targetKey}`;
     if (opCache?.has(cacheKey)) return opCache.get(cacheKey);
     const persistentCache = index._nameBindingReachCache;
     if (persistentCache?.has(cacheKey)) {
@@ -12782,17 +12890,29 @@ function _nameBindingReaches(index, startAbs, name, targetFiles, maxDepth = 4, o
         return value;
     };
     let unknown = false;
+    let valueOwned = false;
+    let alternativeReach = false;
     const visited = new Set();
-    let frontier = [[startAbs, name]];
+    // The third element marks a path through a configuration alternative
+    // (fix #398F): a module whose binding of the name is one alternative of
+    // a configuration item reaches that import's targets in one
+    // configuration only.
+    let frontier = [[startAbs, name, false]];
     for (let d = 0; d <= maxDepth && frontier.length > 0; d++) {
         const next = [];
-        for (const [abs, attr] of frontier) {
-            if (targetFiles.has(abs) && (!targetName || attr === targetName)) return finish('yes');
-            const stateKey = `${abs}\x00${attr}`;
+        for (const [abs, attr, viaAlternative] of frontier) {
+            if (targetFiles.has(abs) && (!targetName || attr === targetName)) {
+                if (!viaAlternative || !options.configurationVerdict) return finish('yes');
+                alternativeReach = true;
+                continue;
+            }
+            const stateKey = `${abs}\x00${attr}\x00${viaAlternative ? 1 : 0}`;
             if (visited.has(stateKey)) continue;
             visited.add(stateKey);
             const fe = index.files.get(abs);
             if (!fe) { unknown = true; continue; }
+            const hopAlternative = viaAlternative ||
+                (!!fe.configurationItems && !!moduleItemNamed(index, abs, attr));
             if (!exactName && targetName &&
                 (fe.moduleValueAliases || []).some(alias => alias.name === attr)) {
                 const alias = _moduleValueAliasType(index, abs, attr);
@@ -12842,7 +12962,7 @@ function _nameBindingReaches(index, startAbs, name, targetFiles, maxDepth = 4, o
                     if (_unresolvedModuleIsGap(index, module)) unknown = true;
                     return;
                 }
-                next.push([path.join(index.root, rel), nextAttr]);
+                next.push([path.join(index.root, rel), nextAttr, hopAlternative]);
             };
 
             // CJS export surface is assignment-based (`exports.x = require(..).x`,
@@ -12889,7 +13009,7 @@ function _nameBindingReaches(index, startAbs, name, targetFiles, maxDepth = 4, o
                         } catch { globFile = null; }
                     }
                     if (globFile && index.files.has(globFile) && globFile !== abs) {
-                        next.push([globFile, attr]);
+                        next.push([globFile, attr, hopAlternative]);
                     } else if (!detail.module || inline ||
                         _unresolvedModuleIsGap(index, detail.module)) {
                         unresolvedStar = true;
@@ -12898,7 +13018,23 @@ function _nameBindingReaches(index, startAbs, name, targetFiles, maxDepth = 4, o
             }
             // Un-modelable name sources on this file:
             if (unresolvedStar) unknown = true;                                  // star import
-            if ((fe.moduleAssignedNames || []).includes(attr)) unknown = true;   // module-scope `attr = ...`
+            if ((fe.moduleAssignedNames || []).includes(attr)) {                 // module-scope `attr = ...`
+                // A Python module that binds the name only by assignment
+                // owns a VALUE (fix #398F): its own imports of other names
+                // say nothing about it. `loads = registry.loads` is a bound
+                // method of a local object; `loads = _json.loads` is the
+                // submodule's attribute (followed). A value the chase cannot
+                // follow is neither a path to the targets nor a dead end.
+                const route = unresolvedStar ? null : _pythonModuleValueRoute(index, abs, fe, attr);
+                if (route?.next) next.push([...route.next, hopAlternative]);
+                else if (route?.value) valueOwned = true;
+                // A bound method of a module object is that method: no path
+                // to the targets, unless its own file is one (the chase is
+                // by file and name and cannot tell a same-name function of
+                // that file from the method).
+                else if (route?.declaration) { if (targetFiles.has(route.declaration.file)) unknown = true; }
+                else if (!route?.external) unknown = true;
+            }
             if ((index.symbols.get('__getattr__') || []).some(s => s.file === abs && !s.className)) {
                 unknown = true;                                                  // PEP 562 dynamic attrs
             }
@@ -12906,7 +13042,99 @@ function _nameBindingReaches(index, startAbs, name, targetFiles, maxDepth = 4, o
         frontier = next;
     }
     if (frontier.length > 0) unknown = true; // depth exhausted with live paths
+    // 'value' (opt-in, fix #398F): every live path ends at a module-scope
+    // value the chase cannot identify. Callers that know the verdict route
+    // the site visible without file-level import fallbacks; others keep
+    // reading it as 'unknown'.
+    // 'configuration' (opt-in, fix #398F): the targets are reached only
+    // through one alternative of a configuration item.
+    if (alternativeReach) return finish('configuration');
+    if (!unknown && valueOwned) return finish(options.valueVerdict ? 'value' : 'unknown');
     return finish(unknown ? 'unknown' : 'no');
+}
+
+/**
+ * What a Python module's assignment-only binding of `attr` holds (fix
+ * #398F). The module must bind the name by module-scope assignment alone (no
+ * import, def or class of it there):
+ *   { next: [file, name] }  an alias `attr = other` / `attr = mod.other`
+ *                           whose source the chase can follow
+ *   { external: true }      an alias of an attribute of an external module
+ *   { value: true }         any other value (`registry.loads`, `make()`)
+ *   null                    the binding is not modeled (other bindings of
+ *                           the name, alternatives, unresolved modules)
+ */
+function _pythonModuleValueRoute(index, abs, fe, attr) {
+    if (fe.language !== 'python') return null;
+    if (_moduleImportBindings(fe).some(b => (b.alias || b.name) === attr)) return null;
+    if (definitionsInFile(index, attr, abs).some(d => !d.className && !_isFunctionLocalType(d) &&
+        !d.lexicalScopeStartLine)) return null;
+    const aliases = (fe.moduleValueAliases || []).filter(entry => entry.name === attr);
+    if (aliases.length === 0) return { value: true };
+    if (aliases.length > 1 || Array.isArray(aliases[0].alternatives)) return null;
+    const parts = String(aliases[0].target).split('.');
+    if (parts.length === 1) return { next: [abs, parts[0]] };
+    if (parts.length !== 2) return { value: true };
+    const [root, member] = parts;
+    const modules = _pythonModuleBindingFiles(index, fe, root);
+    if (!modules) {
+        const bound = _pythonModuleBoundMethod(index, abs, fe, root, member);
+        return bound ? { declaration: bound } : { value: true };
+    }
+    if (modules.unknown || modules.files.length > 1) return null;
+    if (modules.files.length === 0) return modules.external ? { external: true } : null;
+    return { next: [modules.files[0], member] };
+}
+
+/**
+ * The method a module value alias of a constructed object names (fix
+ * #398F): `registry = Registry()` then `loads = registry.loads` binds the
+ * module attribute to Registry's `loads` (own or inherited, by class
+ * definition), the same receiver identity a typed `registry.loads()` call
+ * has. null when the constructor does not name one project class
+ * definition or the member is not one declared method.
+ */
+function _pythonModuleBoundMethod(index, abs, fe, root, member) {
+    const value = (fe.moduleConstructedValues || []).find(entry => entry.name === root);
+    if (!value || String(value.callee).includes('.')) return null;
+    const ref = _typeRefAt(index, abs, value.callee, value.line);
+    if (!ref?.key) return null;
+    const candidates = (index.symbols.get(member) || []).filter(d =>
+        d.className && !NON_CALLABLE_TYPES.has(d.type) && _calleeLanguageCompatible(index, d, 'python'));
+    if (candidates.length === 0) return null;
+    const declaring = findDeclaringClass(index, ref, candidates);
+    return declaring && !declaring.uncertain && declaring.members.length === 1 ? declaring.members[0] : null;
+}
+
+/**
+ * Module objects a Python module-scope name is bound to by import (fix
+ * #398F): `import a.b as m`, `from pkg import sub [as m]` where sub is a
+ * project submodule. null when the name has no import binding at all (a
+ * local value); `external` when every import of it names an external module.
+ */
+function _pythonModuleBindingFiles(index, fe, name) {
+    const files = new Set();
+    let matched = false, unknown = false, external = false;
+    for (const binding of _moduleImportBindings(fe)) {
+        if ((binding.alias || binding.name) !== name || binding.module == null) continue;
+        matched = true;
+        const module = String(binding.module);
+        const spec = binding.kind === 'import' ? module
+            : module.endsWith('.') ? module + binding.name : `${module}.${binding.name}`;
+        const rel = fe.moduleResolved?.[spec];
+        if (rel) {
+            files.add(path.isAbsolute(rel) ? rel : path.join(index.root, rel));
+        } else if (binding.kind === 'import' ? _unresolvedModuleIsGap(index, module, binding)
+            : (fe.moduleResolved?.[module] || _unresolvedModuleIsGap(index, module, binding))) {
+            // A project module's attribute that is not a submodule is a
+            // value of that module; an unresolved project-ish path is a gap.
+            unknown = true;
+        } else {
+            external = true;
+        }
+    }
+    if (!matched) return null;
+    return { files: [...files], unknown, external: external && files.size === 0 && !unknown };
 }
 
 /**
@@ -14799,6 +15027,124 @@ function _closeCallableIdentityGroupUncached(index, targetDefs, definitions) {
  * line (fix #378): such a definition is invisible there, so the name resolves
  * as if the file did not bind it.
  */
+/**
+ * A bare call's view of the configuration item binding its name (fix
+ * #398F). The item applies when every in-scope declaration binding of the
+ * name is one of its definition sites (a lexical shadow or a later
+ * unconditional rebinding is no item). Returns null (ordinary binding
+ * rules), { exclude } (the pinned alternative's branch excludes the call's
+ * position), { bindingId } (the pinned alternative, reached whenever it
+ * exists), or { alternative } (the pinned definition is reached only
+ * through one alternative's import).
+ */
+function _configurationItemCallVerdict(index, filePath, fileEntry, call, name, targetDefs) {
+    const items = itemsNamed(index, filePath, call.name);
+    if (items.length === 0) return null;
+    const declarationLines = new Set();
+    for (const binding of _dropOutOfScopeBindings(index, filePath, call.name, call.line,
+        _bindingsNamed(index, fileEntry, call.name))) {
+        const symbol = definitionAt(index, call.name, filePath, binding.startLine);
+        if (symbol && (symbol.className || symbol.receiver)) continue;
+        declarationLines.add(binding.startLine);
+    }
+    const item = items.find(candidate => {
+        const lines = new Set(candidate.sites.filter(site =>
+            CONFIGURATION_DEFINITION_KINDS.has(site.kind)).map(site => site.line));
+        if (declarationLines.size === 0) return candidate.scope === 0 && lines.size === 0;
+        return [...declarationLines].every(line => lines.has(line));
+    });
+    if (!item) return null;
+    // A parser-proven local binding of the name (a parameter, an assignment)
+    // shadows any item of an outer scope; only the item of the call's own
+    // function is that binding.
+    if (call.localShadow && item.scope !== call.enclosingFunction?.startLine) return null;
+    const reachable = sitesReachableAt(item, call.line);
+    const siteOf = definition => definition.file === filePath
+        ? item.sites.find(site => CONFIGURATION_DEFINITION_KINDS.has(site.kind) &&
+            site.line === definition.startLine) : null;
+    const pinned = targetDefs.filter(siteOf);
+    if (pinned.length > 0) {
+        const live = pinned.find(definition => reachable.includes(siteOf(definition)));
+        if (!live) return { exclude: true };
+        return live.bindingId ? { bindingId: live.bindingId } : null;
+    }
+    const targetFiles = new Set(targetDefs.map(d => d.file).filter(Boolean));
+    let throughImport = false;
+    for (const site of reachable) {
+        if (site.kind !== 'import') continue;
+        for (const binding of fileEntry.importBindings || []) {
+            if (binding.line !== site.line || binding.kind === 'import' || binding.name === '*' ||
+                (binding.alias || binding.name) !== call.name) continue;
+            const rel = fileEntry.moduleResolved?.[binding.module];
+            if (!rel) continue;
+            const verdict = _nameBindingReaches(index, path.join(index.root, rel), binding.name,
+                targetFiles, 4, { targetName: name, configurationVerdict: true });
+            if (verdict === 'yes' || verdict === 'configuration') throughImport = true;
+        }
+    }
+    if (!throughImport || reachable.length === 1) return null;
+    return { alternative: true };
+}
+
+/**
+ * The callee side of a bare call bound by a configuration item (fix
+ * #398F): null (ordinary routes: no item, or the call's branch leaves only
+ * an import alternative), { matches } (the reachable definition
+ * alternatives) or { alternative } (an import alternative is reachable
+ * beside another alternative).
+ */
+function _calleeConfigurationItemRoute(index, fileEntry, file, call) {
+    const items = itemsNamed(index, file, call.name);
+    if (items.length === 0) return null;
+    const declarationLines = new Set();
+    for (const binding of _dropOutOfScopeBindings(index, file, call.name, call.line,
+        _bindingsNamed(index, fileEntry, call.name))) {
+        const symbol = definitionAt(index, call.name, file, binding.startLine);
+        if (symbol && (symbol.className || symbol.receiver)) continue;
+        declarationLines.add(binding.startLine);
+    }
+    const item = items.find(candidate => {
+        const lines = new Set(candidate.sites.filter(site =>
+            CONFIGURATION_DEFINITION_KINDS.has(site.kind)).map(site => site.line));
+        if (declarationLines.size === 0) return candidate.scope === 0 && lines.size === 0;
+        return [...declarationLines].every(line => lines.has(line));
+    });
+    if (!item) return null;
+    // A parser-proven local binding of the name (a parameter, an assignment)
+    // shadows any item of an outer scope; only the item of the call's own
+    // function is that binding.
+    if (call.localShadow && item.scope !== call.enclosingFunction?.startLine) return null;
+    const reachable = sitesReachableAt(item, call.line);
+    // An import of an outside module is no project callee: only project
+    // imports make an alternative the call reaches in one configuration.
+    const projectImports = reachable.filter(site => site.kind === 'import' &&
+        (fileEntry.importBindings || []).some(binding => binding.line === site.line &&
+            (binding.alias || binding.name) === call.name &&
+            (fileEntry.moduleResolved?.[binding.module] || _unresolvedModuleIsGap(index, binding.module, binding))));
+    const definitions = reachable.filter(site => CONFIGURATION_DEFINITION_KINDS.has(site.kind));
+    if (projectImports.length > 0) {
+        return definitions.length > 0 || projectImports.length > 1 ? { alternative: true } : null;
+    }
+    if (definitions.length === 0) return null;
+    const matches = definitions
+        .map(site => definitionAt(index, call.name, file, site.line))
+        .filter(definition => definition && !NON_CALLABLE_TYPES.has(definition.type) ||
+            definition?.type === 'class');
+    return matches.length > 0 ? { matches } : null;
+}
+
+/**
+ * Declaration bindings a call cannot reach because it sits in another
+ * exclusive branch of their configuration item (fix #398F).
+ */
+function _dropUnreachableAlternatives(index, filePath, line, name, bindings) {
+    const items = itemsNamed(index, filePath, name);
+    if (items.length === 0) return bindings;
+    return bindings.filter(binding => !items.some(item => item.sites.some(site =>
+        CONFIGURATION_DEFINITION_KINDS.has(site.kind) && site.line === binding.startLine &&
+        siteExcludedAt(item, site, line))));
+}
+
 function _dropOutOfScopeBindings(index, file, name, line, bindings) {
     if (!bindings || bindings.length === 0 || line == null) return bindings;
     const scoped = _lexicallyScopedDefinitionsByLine(index, name, file);
@@ -15771,6 +16117,7 @@ function _calleeStructuralBindingRoute(index, fileEntry, call, language, binding
     const matches = new Map();
     let sawProjectish = false;
     let sawUnknown = false;
+    let sawConfiguration = false;
     for (const binding of bindings) {
         // fix #353 (Rust): `use alpha::widget as renamed; renamed()` — the
         // binding's module is the ITEM path; the item is its last segment
@@ -15806,7 +16153,11 @@ function _calleeStructuralBindingRoute(index, fileEntry, call, language, binding
             matches.set(`${d.file}:${d.startLine}`, d);
         }
         if (routed.unknown) sawUnknown = true;
+        if (routed.configuration) sawConfiguration = true;
     }
+    // One of the reached definitions is reached only in one configuration
+    // (fix #398F): the site is one visible configuration-alternative entry.
+    if (matches.size > 0 && sawConfiguration) return { alternative: true };
     if (matches.size > 0) return { matches: [...matches.values()] };
     if (!sawProjectish && !sawUnknown) return { external: true };
     return { unknown: true };
@@ -15820,7 +16171,10 @@ function _calleeExportDefinitions(index, startAbs, exposedName, language, call, 
     const matches = new Map();
     const visited = new Set();
     let unknown = false;
-    let frontier = [[startAbs, exposedName]];
+    // A path through one alternative of a module's configuration item (fix
+    // #398F) reaches its definitions in that configuration only.
+    let configuration = false;
+    let frontier = [[startAbs, exposedName, false]];
     const shapeMatches = d =>
         (language !== 'rust' || !(d.className || d.receiver)) &&
         (!NON_CALLABLE_TYPES.has(d.type) ||
@@ -15830,12 +16184,15 @@ function _calleeExportDefinitions(index, startAbs, exposedName, language, call, 
 
     for (let depth = 0; depth <= 4 && frontier.length > 0; depth++) {
         const next = [];
-        for (const [abs, attr] of frontier) {
+        for (const [abs, attr, viaAlternative] of frontier) {
             const stateKey = `${abs}\x00${attr}`;
             if (visited.has(stateKey)) continue;
             visited.add(stateKey);
             const fe = index.files.get(abs);
             if (!fe) { unknown = true; continue; }
+            const hopAlternative = viaAlternative ||
+                (!!fe.configurationItems && !!moduleItemNamed(index, abs, attr));
+            const matchesBefore = matches.size;
 
             const enqueue = (module, nextAttr) => {
                 const rel = fe.moduleResolved && fe.moduleResolved[module];
@@ -15843,7 +16200,7 @@ function _calleeExportDefinitions(index, startAbs, exposedName, language, call, 
                     if (_unresolvedModuleIsGap(index, module)) unknown = true;
                     return;
                 }
-                next.push([path.join(index.root, rel), nextAttr]);
+                next.push([path.join(index.root, rel), nextAttr, hopAlternative]);
             };
 
             const details = fe.exportDetails || [];
@@ -15906,11 +16263,12 @@ function _calleeExportDefinitions(index, startAbs, exposedName, language, call, 
             if ((fe.importNames || []).includes('*')) unknown = true;
             if ((fe.moduleAssignedNames || []).includes(attr)) unknown = true;
             if ((index.symbols.get('__getattr__') || []).some(s => s.file === abs && !s.className)) unknown = true;
+            if (viaAlternative && matches.size > matchesBefore) configuration = true;
         }
         frontier = next;
     }
     if (frontier.length > 0) unknown = true;
-    return { matches: [...matches.values()], unknown };
+    return { matches: [...matches.values()], unknown, ...(configuration && { configuration }) };
 }
 
 function _calleeGoPackageMatch(index, call, importModule) {
@@ -21873,6 +22231,10 @@ function _isConfigurationAlternative(index, a, b) {
     if (!a || !b || a === b || a.file !== b.file || a.name !== b.name) return false;
     const style = langTraits(index.files.get(a.file)?.language)?.conditionalDefinitions;
     if (!style) return false;
+    // Runtime configuration (fix #398F, Python): alternatives are the
+    // definition sites of one parser-recorded item, whatever their
+    // signatures (no overloads to tell apart).
+    if (style === 'branch') return sameConfigurationItem(index, a, b);
     if (a.isSignature || b.isSignature || a.type === 'macro' || b.type === 'macro') return false;
     if (NON_CALLABLE_TYPES.has(a.type) || NON_CALLABLE_TYPES.has(b.type)) return false;
     if ((a.className || null) !== (b.className || null) ||
@@ -24707,8 +25069,14 @@ const _localClassBindingMemos = new WeakMap();
 
 /** A local constructor must name the class binding, not a parameter or
  * assignment that shadows a same-named class in its lexical scope. */
-function _localClassReferenceBinds(index, fileEntry, file, start, name, definition) {
+function _localClassReferenceBinds(index, fileEntry, file, start, name, definition, recordedRow) {
     if (!Number.isInteger(start)) return false;
+    // The parser records the verdict for references to the file's own
+    // function-local classes (fix #398F): the row of the one class
+    // declaration the name binds there, 0 when it binds anything else.
+    if (Number.isInteger(recordedRow)) {
+        return recordedRow > 0 && recordedRow === (definition.nameLine || definition.startLine);
+    }
     let ownedTree;
     try {
         const content = index._readFile(file);
@@ -24751,7 +25119,7 @@ function _localClassReferenceBinds(index, fileEntry, file, start, name, definiti
 
 function _localConstructorBinding(index, fileEntry, file, record, definition) {
     return _localClassReferenceBinds(index, fileEntry, file,
-        record.callSite?.start, record.name, definition);
+        record.callSite?.start, record.name, definition, record.localClassRow);
 }
 
 /** Syntax such as `new Local().m()` or `Local.m()` names the local class
@@ -24766,7 +25134,10 @@ function _unprovenLocalClassReceiver(index, fileEntry, file, call) {
         constructed ? call.receiverTypeEvidence?.line || call.line : call.line);
     if (!local) return false;
     const start = constructed ? call.receiverTypeEvidence?.start : call.callSite?.start ?? call.callStart;
-    if (_localClassReferenceBinds(index, fileEntry, file, start, name, local)) return null;
+    const recordedRow = constructed
+        ? (call.receiverTypeLocalClassRef?.start === start ? call.receiverTypeLocalClassRef.row : undefined)
+        : call.receiverLocalClassRow;
+    if (_localClassReferenceBinds(index, fileEntry, file, start, name, local, recordedRow)) return null;
     // Neither the type name nor the qualifier spelling is a declaration
     // witness once a value binding shadows it. Do not attach that false
     // proof to the unverified entry either.
@@ -25482,5 +25853,5 @@ function findCallbackUsages(index, name) {
     return usages;
 }
 
-module.exports = { rustTypeNameDenotes, _textualIncludeClosures, _textualLinkVerdict, isProvenanceBuiltinReceiver, provenanceParameterIdentity: _overloadTypeIdentity, selectProvenanceOverload, _unresolvedModuleIsGap, _importReaches, _sameNominalPackageDir, getCachedCalls, findCallers, findCallees, getInstanceAttributeTypes, findCallbackUsages, _nameBindingReaches, _moduleAttributeBindingReaches, _declaredFieldType, _projectTopLevelNames, _callArityCompatible, _closeCallableIdentityGroup, _overloadDiscipline, _overloadApplicable, _buildReturnTypeFlowMap, _cFamilySignatureKey,
+module.exports = { rustTypeNameDenotes, _textualIncludeClosures, _textualLinkVerdict, isProvenanceBuiltinReceiver, provenanceParameterIdentity: _overloadTypeIdentity, selectProvenanceOverload, _unresolvedModuleIsGap, _importReaches, _sameNominalPackageDir, getCachedCalls, findCallers, findCallees, getInstanceAttributeTypes, findCallbackUsages, _nameBindingReaches, _moduleAttributeBindingReaches, _declaredFieldType, _projectTopLevelNames, _callArityCompatible, _closeCallableIdentityGroup, _overloadDiscipline, _overloadApplicable, _buildReturnTypeFlowMap, _lookupReturnTypeFlow, _cFamilySignatureKey,
     _isConfigurationAlternative, _isCrossFileConfigurationMember, _configurationAlternativeFiles, _sameOwnerPath };

@@ -13,6 +13,7 @@ const { isTestFile } = require('./discovery');
 const { detectLanguage, getParser, getLanguageAdapter, langTraits } = require('../languages');
 const { getCachedCalls } = require('./callers');
 const { extractImports } = require('./imports');
+const { isAccessorDefinition, findAccessorReferences } = require('./accessors');
 const isSafeRegex = require('safe-regex2');
 const { RE2JS } = require('re2js');
 const { UcnError } = require('./errors');
@@ -1735,6 +1736,50 @@ function tests(index, nameOrFile, options = {}) {
                 ...(site.resolution && { resolution: site.resolution }),
                 ...(site.reason && { reason: site.reason }),
             });
+        }
+
+        // Accessor targets (fix #398F): a property is consumed by reads and
+        // writes, never call syntax, so the caller supplement above sees
+        // none of `result.stdout`. Test-file accessor references whose
+        // receiver identity the accessor engine proves are test links; the
+        // unverified ones join only for a globally unique name, as above.
+        const accessorDefs = targetDefs.filter(isAccessorDefinition);
+        if (accessorDefs.length > 0) {
+            const testPaths = new Set(testFiles.map(t => t.path));
+            const globallyUnique = index.find(searchTerm, { exact: true }).length === 1;
+            for (const def of accessorDefs) {
+                const refs = findAccessorReferences(index, searchTerm, def, { files: testPaths });
+                if (!refs) continue;
+                const rows = [
+                    ...refs.confirmed.map(r => ({ ...r, tierName: 'confirmed' })),
+                    ...(globallyUnique ? refs.unverified.map(r => ({ ...r, tierName: 'unverified' })) : []),
+                ];
+                for (const ref of rows) {
+                    const info = testInfo.get(ref.absoluteFile);
+                    if (!info) continue;
+                    if (info.testRanges && !lineInRanges(ref.line, info.testRanges)) continue;
+                    if (excludeArr.length > 0 &&
+                        !index.matchesFilters(info.entry.relativePath, { exclude: excludeArr })) continue;
+                    let fileResult = results.find(r => r.file === info.entry.relativePath);
+                    if (!fileResult) {
+                        fileResult = { file: info.entry.relativePath, matches: [] };
+                        results.push(fileResult);
+                    }
+                    const matchType = ref.tierName === 'confirmed' ? 'reference' : 'unverified-reference';
+                    if (fileResult.matches.some(m => m.line === ref.line &&
+                        ['reference', 'unverified-reference', 'call', 'unverified-call'].includes(m.matchType))) continue;
+                    fileResult.matches = fileResult.matches.filter(m =>
+                        !(m.line === ref.line && m.matchType === 'test-case'));
+                    fileResult.matches.push({
+                        line: ref.line,
+                        content: ref.expression,
+                        matchType,
+                        evidenceTier: ref.tierName,
+                        ...(ref.resolution && { resolution: ref.resolution }),
+                        ...(ref.reason && { reason: ref.reason }),
+                    });
+                }
+            }
         }
 
         for (const fileResult of results) {

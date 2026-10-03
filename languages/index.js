@@ -502,6 +502,11 @@ const LANGUAGES = {
             // follows a local assigned from the call to the uses that need
             // its result (fix #398).
             storedCoroutines: true,
+            // A name bound in one scope only in exclusive branches (`if
+            // sys.platform ...: def f` / `else: def f`, `try: from m import
+            // f` / `except ImportError: def f`) is one item with an
+            // alternative per runtime configuration (fix #398F).
+            conditionalDefinitions: 'branch',
             // Decorators with a known effect on what calling the decorated
             // function returns (fix #364), as resolved qualified names (a
             // trailing `()` marks a decorator factory call). Any other

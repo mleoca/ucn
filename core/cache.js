@@ -887,7 +887,9 @@ function clearAllCaches() {
 // `uncertain` only when true.
 // v268 (fix #398): repeated import source names retain every local binding;
 // an alias record applies to one specifier, not all same-name specifiers.
-const CACHE_FORMAT_VERSION = 268;
+// v269 (fix #398F): Python files record `configurationItems` (names bound in
+// one scope only in exclusive `if`/`try`/`match` branches).
+const CACHE_FORMAT_VERSION = 269;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**

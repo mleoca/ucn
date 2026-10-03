@@ -11855,3 +11855,44 @@ describe('fix #398: module-qualified structural inheritance', () => {
         });
     }
 });
+
+describe('fix #398F: tests lists getter reads whose receiver flow proves the owner', () => {
+    it('links a TS getter read through a typed return, never a different receiver', () => {
+        const dir = tmp({
+            'src/testing.ts': [
+                'export class Result {',
+                '    get stdout(): string {',
+                "        return 'out';",
+                '    }',
+                '}',
+                '',
+                'export class Runner {',
+                '    invoke(): Result {',
+                '        return new Result();',
+                '    }',
+                '}',
+            ].join('\n'),
+            'src/other.ts': 'export class Proc {\n    get stdout(): string { return "p"; }\n}\n',
+            'test/run.test.ts': [
+                "import { Runner } from '../src/testing';",
+                "import { Proc } from '../src/other';",
+                '',
+                "it('runs', () => {",
+                '    const runner = new Runner();',
+                '    const result = runner.invoke();',
+                "    expect(result.stdout).toBe('out');",
+                '    const proc = new Proc();',
+                '    expect(proc.stdout).toBe("p");',
+                '});',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'tests', { name: 'src/testing.ts:2:stdout' });
+            assert.ok(r.ok, r.error);
+            const matches = r.result.flatMap(f => f.matches.map(m => `${f.file}:${m.line}:${m.matchType}`));
+            assert.ok(matches.includes('test/run.test.ts:7:reference'), JSON.stringify(matches));
+            assert.ok(!matches.some(m => m.startsWith('test/run.test.ts:9:')), JSON.stringify(matches));
+        } finally { rm(dir); }
+    });
+});

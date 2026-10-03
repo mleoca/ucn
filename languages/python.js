@@ -21,6 +21,8 @@ const {
     sameNode,
     containsOwnNode,
     parseErrorRegions,
+    branchClausesExclusive,
+    getCachedNodeList,
 } = require('./utils');
 
 // A function whose OWN body yields is a generator: calling it returns an
@@ -465,6 +467,15 @@ function pythonModuleValueAliases(root) {
                                 right.text !== left.text) {
                                 bind(left.text, { kind: 'alias', target: right.text,
                                     line: expr.startPosition.row + 1 });
+                            } else if (expr.type === 'assignment' && left?.type === 'identifier' &&
+                                !expr.childForFieldName('type') && right?.type === 'call' &&
+                                right.childForFieldName('function')?.type === 'identifier') {
+                                // `registry = Registry()` (fix #398F): a module value
+                                // built by calling a name, read when an alias names
+                                // one of its attributes.
+                                bind(left.text, { kind: 'constructed',
+                                    callee: right.childForFieldName('function').text,
+                                    line: expr.startPosition.row + 1 });
                             } else {
                                 bindTarget(left);
                             }
@@ -504,10 +515,15 @@ function pythonModuleValueAliases(root) {
         for (const name of statement.namedChildren) declaredGlobal.add(name.text);
     }
     const aliases = [];
+    const constructed = new Map();
     for (const [name, sites] of bindings) {
         if (declaredGlobal.has(name) || sites.some(site => site.kind === 'other')) continue;
+        if (sites.length === 1 && sites[0].kind === 'constructed') {
+            constructed.set(name, { name, callee: sites[0].callee, line: sites[0].line });
+            continue;
+        }
         const assignments = sites.filter(site => site.kind === 'alias');
-        if (assignments.length === 0) continue;
+        if (assignments.length === 0 || sites.some(site => site.kind === 'constructed')) continue;
         if (sites.length === 1) {
             // Bound once (also inside a module-level block, fix #392).
             aliases.push({ name, target: assignments[0].target, line: assignments[0].line });
@@ -521,7 +537,312 @@ function pythonModuleValueAliases(root) {
                 ? { target: site.target } : { module: site.module, imported: site.imported }),
         });
     }
+    // Constructed values an alias reads an attribute of (`loads =
+    // registry.loads`, fix #398F).
+    const roots = new Set(aliases.flatMap(alias => [alias.target, ...(alias.alternatives || [])
+        .map(alternative => alternative.target)]).filter(Boolean)
+        .map(target => String(target).split('.')).filter(parts => parts.length === 2).map(parts => parts[0]));
+    const values = [...roots].filter(root => constructed.has(root)).sort().map(root => constructed.get(root));
+    if (values.length > 0) Object.defineProperty(aliases, 'constructed', { value: values });
     return aliases;
+}
+
+const PY_SCOPE_NODES = new Set(['function_definition', 'class_definition', 'lambda', 'module']);
+const PY_BRANCH_CLAUSES = new Set(['elif_clause', 'else_clause', 'except_clause', 'except_group_clause',
+    'finally_clause', 'case_clause']);
+
+/** Does a statement list (descending compound statements, never into
+ * nested scopes) bind `name`? */
+function pythonClauseBindsName(node, name) {
+    for (const child of node.namedChildren) {
+        switch (child.type) {
+            case 'function_definition':
+            case 'class_definition':
+                if (child.childForFieldName('name')?.text === name) return true;
+                continue;
+            case 'decorated_definition':
+                if (child.childForFieldName('definition')?.childForFieldName('name')?.text === name) return true;
+                continue;
+            case 'import_statement':
+            case 'import_from_statement':
+            case 'expression_statement':
+            case 'delete_statement':
+            case 'for_statement':
+            case 'with_statement':
+                if (child.descendantsOfType('identifier').some(id => id.text === name)) return true;
+                if (child.type === 'for_statement' || child.type === 'with_statement') {
+                    for (const part of child.namedChildren) {
+                        if ((part.type === 'block' || part.type === 'else_clause') && pythonClauseBindsName(part, name)) return true;
+                    }
+                }
+                continue;
+            default:
+                if (child.type === 'block' || child.type.endsWith('_statement') || PY_BRANCH_CLAUSES.has(child.type)) {
+                    if (pythonClauseBindsName(child, name)) return true;
+                }
+        }
+    }
+    return false;
+}
+
+/**
+ * Cheap gate for configuration items: a def, class or import inside a
+ * branch whose statement binds the same name in another clause. Files
+ * without one (nearly all) skip the scope walk.
+ */
+function pythonConfigurationCandidateScopes(root, bindingNodes) {
+    const scopes = new Set();
+    const nodes = bindingNodes || getCachedNodeList(root).nodes.filter(node =>
+        node.type === 'function_definition' || node.type === 'class_definition' ||
+        node.type === 'import_statement' || node.type === 'import_from_statement');
+    for (const node of nodes) {
+        // Directly in a scope body: no branch can hold it.
+        const holder = node.parent?.type === 'decorated_definition' ? node.parent.parent : node.parent;
+        if (holder?.type === 'module' || (holder?.type === 'block' && PY_SCOPE_NODES.has(holder.parent?.type))) continue;
+        let names = null;
+        const start = node.parent?.type === 'decorated_definition' ? node.parent : node;
+        for (let parent = start.parent; parent && !PY_SCOPE_NODES.has(parent.type); parent = parent.parent) {
+            const statement = parent.type === 'block' ? null
+                : ['if_statement', 'try_statement'].includes(parent.type) ? parent
+                    : PY_BRANCH_CLAUSES.has(parent.type) ? (parent.type === 'case_clause' ? parent.parent?.parent : parent.parent)
+                        : null;
+            if (!statement) continue;
+            if (!names) {
+                if (node.type === 'function_definition' || node.type === 'class_definition') {
+                    names = [node.childForFieldName('name')?.text].filter(Boolean);
+                } else {
+                    names = [];
+                    for (const part of node.namedChildren) {
+                        if (part.type === 'aliased_import') names.push(part.childForFieldName('alias')?.text);
+                        else if (part.type === 'dotted_name' && !sameNode(part, node.childForFieldName('module_name'))) {
+                            names.push(node.type === 'import_statement' ? part.namedChild(0)?.text
+                                : part.namedChild(part.namedChildCount - 1)?.text);
+                        }
+                    }
+                    names = names.filter(Boolean);
+                }
+                if (names.length === 0) break;
+            }
+            // Another clause of this statement (or its match body) binding
+            // one of the names.
+            const holder = statement.type === 'match_statement' ? statement.childForFieldName('body') : statement;
+            let found = false;
+            for (const clause of holder?.namedChildren || []) {
+                if (clause.startIndex <= node.startIndex && clause.endIndex >= node.endIndex) continue;
+                if (clause.type !== 'block' && !PY_BRANCH_CLAUSES.has(clause.type)) continue;
+                if (names.some(name => pythonClauseBindsName(clause, name))) { found = true; break; }
+            }
+            if (found) {
+                let scope = statement.parent;
+                while (scope && !PY_SCOPE_NODES.has(scope.type)) scope = scope.parent;
+                if (scope) scopes.add(scope);
+                break;
+            }
+        }
+    }
+    return scopes;
+}
+
+/**
+ * Configuration items (fix #398F): a name bound in one scope (module, class
+ * body or function body) only in mutually exclusive branches of `if` /
+ * `try` / `match` statements - `if sys.platform == "win32": def getchar` /
+ * `else: def getchar`, `try: from ._speedups import f` / `except
+ * ImportError: def f` - is ONE item with an alternative per configuration.
+ * Every binding of the name in that scope must sit in a different exclusive
+ * branch (a later unconditional rebinding, a loop target or a `global` /
+ * `nonlocal` write breaks the item), and one of them must be a def, class or
+ * import. Sites carry their branch path (statement line + clause tag, outer
+ * first); `clauses` holds the line range of every clause of those
+ * statements, so a call inside another branch is placed without the tree.
+ */
+function pythonConfigurationItems(root, bindingNodes = null, reboundNodes = null) {
+    const candidateScopes = pythonConfigurationCandidateScopes(root, bindingNodes);
+    if (candidateScopes.size === 0) return [];
+    const scopes = new Map();   // scope line -> Map(name -> sites)
+    const clauseRanges = new Map(); // statement line -> [[tag, start, end]]
+    const rebound = new Set();  // `global` / `nonlocal` names
+    const lineOf = node => node.startPosition.row + 1;
+    const endOf = node => node.endPosition.row + 1;
+    const add = (scope, name, kind, line, branch) => {
+        if (!name) return;
+        let names = scopes.get(scope);
+        if (!names) scopes.set(scope, names = new Map());
+        if (!names.has(name)) names.set(name, []);
+        names.get(name).push({ kind, line, branch });
+    };
+    const bindTarget = (scope, node, branch) => {
+        if (!node) return;
+        if (node.type === 'identifier') { add(scope, node.text, 'value', lineOf(node), branch); return; }
+        if (['pattern_list', 'tuple_pattern', 'list_pattern', 'tuple', 'list', 'expression_list',
+            'parenthesized_expression', 'list_splat_pattern', 'list_splat', 'as_pattern_target'].includes(node.type)) {
+            for (const child of node.namedChildren) bindTarget(scope, child, branch);
+        }
+    };
+    const noteClauses = (statement, clauses) => {
+        clauseRanges.set(lineOf(statement), clauses.map(([tag, node]) => [tag, lineOf(node), endOf(node)]));
+    };
+    const visitBlock = (block, scope, branch) => {
+        if (!block) return;
+        for (const child of block.namedChildren) visitStatement(child, scope, branch);
+    };
+    const visitStatement = (node, scope, branch) => {
+        switch (node.type) {
+            case 'decorated_definition': {
+                const definition = node.childForFieldName('definition');
+                if (!definition) return;
+                add(scope, definition.childForFieldName('name')?.text,
+                    definition.type === 'class_definition' ? 'class' : 'def', lineOf(node), branch);
+                return;
+            }
+            case 'function_definition':
+            case 'class_definition':
+                add(scope, node.childForFieldName('name')?.text,
+                    node.type === 'class_definition' ? 'class' : 'def', lineOf(node), branch);
+                return;
+            case 'import_statement':
+                for (const part of node.namedChildren) {
+                    if (part.type === 'aliased_import') add(scope, part.childForFieldName('alias')?.text, 'import', lineOf(node), branch);
+                    else if (part.type === 'dotted_name') add(scope, part.namedChild(0)?.text, 'import', lineOf(node), branch);
+                }
+                return;
+            case 'import_from_statement': {
+                const moduleName = node.childForFieldName('module_name');
+                for (const part of node.namedChildren) {
+                    if (moduleName && part.id === moduleName.id) continue;
+                    if (part.type === 'wildcard_import') { add(scope, '*', 'import', lineOf(node), branch); continue; }
+                    const local = part.type === 'aliased_import' ? part.childForFieldName('alias')?.text
+                        : part.type === 'dotted_name' ? part.namedChild(part.namedChildCount - 1)?.text : null;
+                    add(scope, local, 'import', lineOf(node), branch);
+                }
+                return;
+            }
+            case 'global_statement':
+            case 'nonlocal_statement':
+                return;
+            case 'expression_statement':
+                for (let expr of node.namedChildren) {
+                    while (expr?.type === 'assignment' || expr?.type === 'augmented_assignment') {
+                        bindTarget(scope, expr.childForFieldName('left'), branch);
+                        expr = expr.type === 'assignment' ? expr.childForFieldName('right') : null;
+                    }
+                }
+                return;
+            case 'delete_statement':
+                for (const target of node.namedChildren) bindTarget(scope, target, branch);
+                return;
+            case 'if_statement': {
+                const line = lineOf(node);
+                const consequence = node.childForFieldName('consequence');
+                const clauses = consequence ? [['if', consequence]] : [];
+                let elif = 0;
+                for (const alternative of node.childrenForFieldName('alternative')) {
+                    if (alternative.type === 'elif_clause') clauses.push([`elif:${elif++}`, alternative]);
+                    else if (alternative.type === 'else_clause') clauses.push(['else', alternative]);
+                }
+                noteClauses(node, clauses);
+                // `if TYPE_CHECKING:` branches exist for type checkers, not
+                // for one runtime configuration: their names form no item.
+                const typeChecking = /^(?:\w+\.)?TYPE_CHECKING$/.test(node.childForFieldName('condition')?.text || '');
+                for (const [tag, clause] of clauses) {
+                    const block = clause.type === 'block' ? clause
+                        : clause.childForFieldName('consequence') || clause.childForFieldName('body');
+                    visitBlock(block, scope, [...branch, typeChecking ? [line, tag, 'type-checking'] : [line, tag]]);
+                }
+                return;
+            }
+            case 'try_statement': {
+                const line = lineOf(node);
+                const clauses = [];
+                let handler = 0;
+                for (const child of node.namedChildren) {
+                    if (child.type === 'block') clauses.push(['try', child]);
+                    else if (child.type === 'except_clause' || child.type === 'except_group_clause') {
+                        clauses.push([`except:${handler++}`, child]);
+                    } else if (child.type === 'else_clause') clauses.push(['try-else', child]);
+                    else if (child.type === 'finally_clause') clauses.push(['finally', child]);
+                }
+                noteClauses(node, clauses);
+                for (const [tag, clause] of clauses) {
+                    const path = [...branch, [line, tag]];
+                    if (clause.type === 'block') { visitBlock(clause, scope, path); continue; }
+                    for (const target of clause.descendantsOfType('as_pattern_target')) {
+                        if (target.parent?.parent && sameNode(target.parent.parent, clause)) bindTarget(scope, target, path);
+                    }
+                    for (const child of clause.namedChildren) if (child.type === 'block') visitBlock(child, scope, path);
+                }
+                return;
+            }
+            case 'match_statement': {
+                const line = lineOf(node);
+                const body = node.childForFieldName('body');
+                const cases = body ? body.namedChildren.filter(child => child.type === 'case_clause') : [];
+                const clauses = cases.map((clause, i) => [`case:${i}`, clause]);
+                noteClauses(node, clauses);
+                for (const [tag, clause] of clauses) {
+                    for (const child of clause.namedChildren) if (child.type === 'block') visitBlock(child, scope, [...branch, [line, tag]]);
+                }
+                return;
+            }
+            case 'for_statement':
+                bindTarget(scope, node.childForFieldName('left'), branch);
+                // A loop body may run several times or not at all: its
+                // bindings are sequential, never exclusive alternatives.
+                for (const child of node.namedChildren) if (child.type === 'block' || child.type === 'else_clause') visitBlock(child.type === 'block' ? child : child.namedChildren.find(c => c.type === 'block'), scope, [...branch, [lineOf(node), 'loop']]);
+                return;
+            case 'while_statement':
+                for (const child of node.namedChildren) if (child.type === 'block' || child.type === 'else_clause') visitBlock(child.type === 'block' ? child : child.namedChildren.find(c => c.type === 'block'), scope, [...branch, [lineOf(node), 'loop']]);
+                return;
+            case 'with_statement':
+                for (const target of node.descendantsOfType('as_pattern_target')) {
+                    if (target.parent?.parent?.parent && sameNode(target.parent.parent.parent, node.namedChildren[0])) bindTarget(scope, target, branch);
+                }
+                visitBlock(node.childForFieldName('body'), scope, branch);
+                return;
+            default:
+                return;
+        }
+    };
+    // Only the scopes holding a candidate are walked (their own statements;
+    // nested scopes are walked when they are candidates themselves).
+    for (const scope of candidateScopes) {
+        if (scope.type === 'module') { visitBlock(scope, 0, []); continue; }
+        const head = scope.parent?.type === 'decorated_definition' ? scope.parent : scope;
+        visitBlock(scope.childForFieldName('body'), lineOf(head), []);
+    }
+    // A `global` / `nonlocal` write anywhere rebinds the name at run time.
+    for (const node of reboundNodes || getCachedNodeList(root).nodes) {
+        if (node.type !== 'global_statement' && node.type !== 'nonlocal_statement') continue;
+        for (const name of node.namedChildren) if (name.type === 'identifier') rebound.add(name.text);
+    }
+    const exclusive = (a, b) => {
+        for (let k = 0; k < Math.min(a.length, b.length); k++) {
+            if (a[k][0] !== b[k][0]) return false;
+            if (a[k][1] !== b[k][1]) return branchClausesExclusive(a[k][1], b[k][1]);
+        }
+        return false;
+    };
+    const items = [];
+    for (const [scope, names] of scopes) {
+        for (const [name, sites] of names) {
+            if (sites.length < 2 || name === '*' || rebound.has(name)) continue;
+            if (!sites.some(site => site.kind !== 'value')) continue;
+            if (sites.some(site => site.branch.some(step => step.length > 2))) continue;
+            let all = true;
+            for (let i = 0; all && i < sites.length; i++) {
+                for (let j = i + 1; all && j < sites.length; j++) all = exclusive(sites[i].branch, sites[j].branch);
+            }
+            if (!all) continue;
+            const statements = new Set(sites.flatMap(site => site.branch.map(([line]) => line)));
+            items.push({
+                name, scope,
+                sites: sites.map(site => ({ kind: site.kind, line: site.line, branch: site.branch })),
+                clauses: [...statements].sort((a, b) => a - b).map(line => [line, clauseRanges.get(line) || []]),
+            });
+        }
+    }
+    items.sort((a, b) => a.scope - b.scope || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    return items;
 }
 
 // --- End single-pass helpers ---
@@ -839,12 +1160,20 @@ function parse(code, parser) {
     const processedFn = new Set();
     const processedCls = new Set();
 
+    // Binding statements and `global`/`nonlocal` declarations seen by the
+    // one traversal feed the configuration-item gate (fix #398F).
+    const bindingNodes = [];
+    const reboundNodes = [];
     traverseTreeCached(tree.rootNode, (node) => {
         _processFunction(node, functions, processedFn, lines, code);
         _processClass(node, classes, processedCls, lines) ||
             _processTypeAlias(node, classes, processedCls, lines);
         _processState(node, stateObjects, lines);
         _processModuleAssign(node, moduleAssigned);
+        const type = node.type;
+        if (type === 'function_definition' || type === 'class_definition' ||
+            type === 'import_statement' || type === 'import_from_statement') bindingNodes.push(node);
+        else if (type === 'global_statement' || type === 'nonlocal_statement') reboundNodes.push(node);
         return true;
     });
 
@@ -852,6 +1181,7 @@ function parse(code, parser) {
     classes.sort((a, b) => a.startLine - b.startLine);
     stateObjects.sort((a, b) => a.startLine - b.startLine);
     const moduleValueAliases = moduleAssigned.size > 0 ? pythonModuleValueAliases(tree.rootNode) : [];
+    const configurationItems = pythonConfigurationItems(tree.rootNode, bindingNodes, reboundNodes);
 
     return {
         language: 'python',
@@ -859,7 +1189,9 @@ function parse(code, parser) {
         functions,
         classes,
         stateObjects,
-        ...(moduleValueAliases.length > 0 && { moduleValueAliases }),
+        ...(moduleValueAliases.length > 0 && { moduleValueAliases: [...moduleValueAliases] }),
+        ...(moduleValueAliases.constructed && { moduleConstructedValues: moduleValueAliases.constructed }),
+        ...(configurationItems.length > 0 && { configurationItems }),
         ...(tree.rootNode.hasError && { parseRecovery: true, parseErrorRegions: parseErrorRegions(tree.rootNode) }),
         ...(moduleAssigned.size > 0 && { moduleAssignedNames: [...moduleAssigned].sort() }),
         imports: [],
@@ -1975,8 +2307,145 @@ function pythonModuleAliases(tree) {
     return aliases;
 }
 
-function findCallsInCode(code, parser) {
+// Annotation positions whose value Python evaluates as an expression.
+const PY_ANNOTATION_OWNERS = new Set(['typed_parameter', 'typed_default_parameter', 'function_definition', 'assignment']);
+
+/**
+ * String annotations holding calls (fix #398F): `def f(v: "Annotated[int,
+ * typer.Argument()]")`. A forward reference is an expression the runtime
+ * evaluates (`typing.get_type_hints`), so the calls it spells are calls.
+ * Plain one-line string literals only (no prefix, escape or
+ * interpolation); the result lists the byte ranges of their quotes.
+ */
+function annotationStringQuotes(tree) {
+    const quotes = [];
+    for (const holder of getCachedNodeList(tree.rootNode).nodes) {
+        if (holder.type !== 'type') continue;
+        const string = holder.namedChildCount === 1 ? holder.namedChild(0) : null;
+        if (string?.type !== 'string' || string.startPosition.row !== string.endPosition.row) continue;
+        const owner = holder.parent;
+        if (!owner || !PY_ANNOTATION_OWNERS.has(owner.type)) continue;
+        const field = owner.type === 'function_definition' ? 'return_type' : 'type';
+        if (!sameNode(owner.childForFieldName(field), holder)) continue;
+        const parts = string.children;
+        if (parts.length !== 3 || parts[0].type !== 'string_start' || parts[1].type !== 'string_content' ||
+            parts[2].type !== 'string_end') continue;
+        const start = parts[0].text;
+        if (start !== '"' && start !== "'") continue;
+        const content = parts[1];
+        if (content.namedChildCount > 0 || !content.text.includes('(')) continue;
+        quotes.push({ open: parts[0].startIndex, close: parts[2].startIndex,
+            contentStart: content.startIndex, contentEnd: content.endIndex });
+    }
+    return quotes;
+}
+
+/**
+ * References to the file's function-local classes (fix #398F): the row of
+ * the one class declaration the name binds at the call (the receiver's
+ * constructor, a class qualifier, a bare constructor call), or 0 when a
+ * parameter, assignment or second declaration binds it too. Query-time
+ * identity proofs read this instead of parsing the file again.
+ */
+function annotateLocalClassReferences(tree, calls, classNodes) {
+    const names = new Set();
+    for (const definition of classNodes) {
+        if (definition.parent?.type === 'module') continue;
+        for (let parent = definition.parent; parent; parent = parent.parent) {
+            if (parent.type === 'function_definition' || parent.type === 'lambda') {
+                const name = definition.childForFieldName('name')?.text;
+                if (name) names.add(name);
+                break;
+            }
+        }
+    }
+    if (names.size === 0) return;
+    const memo = new Map();
+    const rowAt = (start, name) => {
+        if (!Number.isInteger(start)) return undefined;
+        let node = tree.rootNode.descendantForIndex(start);
+        if (node?.text !== name) {
+            for (let owner = node?.parent; owner && owner.startIndex === start; owner = owner.parent) {
+                const value = owner.childForFieldName('right') || owner.childForFieldName('value');
+                if (value?.type === 'call') {
+                    node = value.childForFieldName('function');
+                    break;
+                }
+            }
+        }
+        if (node?.text !== name && node?.parent?.type === 'attribute') {
+            node = node.parent.childForFieldName('object');
+        }
+        if (!node || node.text !== name) return 0;
+        const scope = referenceScope(node, 'python', memo, name, { includeClasses: true });
+        return scope?.defRows?.length === 1 ? scope.defRows[0] + 1 : 0;
+    };
+    for (const call of calls) {
+        if (!call.isMethod && !call.receiver && names.has(call.name)) {
+            const row = rowAt(call.callSite?.start, call.name);
+            if (row !== undefined) call.localClassRow = row;
+        }
+        if (call.isMethod && call.receiver && !call.receiverType && names.has(call.receiver)) {
+            const row = rowAt(call.callSite?.start ?? call.callStart, call.receiver);
+            if (row !== undefined) call.receiverLocalClassRow = row;
+        }
+        // Kept beside the evidence (never inside it: the evidence object is
+        // a provenance fact), tied to the evidence position it was read at.
+        const evidence = call.receiverTypeEvidence;
+        if (call.receiverTypeSource === 'constructor' && evidence && names.has(call.receiverType)) {
+            const row = rowAt(evidence.start, call.receiverType);
+            if (row !== undefined) call.receiverTypeLocalClassRef = { start: evidence.start, row };
+        }
+    }
+}
+
+function findCallsInCode(code, parser, options = {}) {
     const tree = parseTree(parser, code);
+    const sink = { classNodes: [] };
+    const calls = findCallsInTree(code, tree, parser, sink);
+    annotateLocalClassReferences(tree, calls, sink.classNodes);
+    if (options.stringAnnotations === false || !/(?::|->)\s*["'][^"'\n]*\(/.test(code)) return calls;
+    const quotes = annotationStringQuotes(tree);
+    if (quotes.length === 0) return calls;
+    // The same source with those quotes blanked parses the annotation as
+    // the expression it is, at the same offsets; only calls inside the
+    // blanked strings are taken from it, and only where it parses clean.
+    const chars = code.split('');
+    for (const quote of quotes) {
+        chars[quote.open] = ' ';
+        chars[quote.close] = ' ';
+    }
+    const masked = chars.join('');
+    const maskedTree = parseTree(parser, masked);
+    const clean = quotes.filter(quote => {
+        const node = maskedTree.rootNode.descendantForIndex(quote.contentStart, quote.contentEnd);
+        return node && !node.hasError && !node.isMissing;
+    });
+    if (clean.length === 0) return calls;
+    const inside = call => {
+        const start = call.callSite?.start;
+        return Number.isInteger(start) &&
+            clean.some(quote => start >= quote.contentStart && start < quote.contentEnd);
+    };
+    const extra = findCallsInTree(masked, maskedTree, parser)
+        .filter(inside).map(call => ({ ...call, stringAnnotation: true }));
+    if (extra.length === 0) return calls;
+    const position = call => [call.line, call.callSite?.column ?? call.column ?? 0];
+    const merged = [...calls];
+    for (const call of extra) {
+        const [line, column] = position(call);
+        let at = merged.length;
+        while (at > 0) {
+            const [l, c] = position(merged[at - 1]);
+            if (l < line || (l === line && c <= column)) break;
+            at--;
+        }
+        merged.splice(at, 0, call);
+    }
+    return merged;
+}
+
+function findCallsInTree(code, tree, parser, sink = null) {
     const calls = [];
     const instanceFieldContracts = explicitInstanceFieldContracts(tree, parser);
     // Same-file callable return contracts are a closed type source for loop
@@ -1984,6 +2453,7 @@ function findCallsInCode(code, parser) {
     // `parse_items() -> list[Item]` without guessing about external code.
     const callableIterableTypes = new Map();
     traverseTreeCached(tree.rootNode, node => {
+        if (sink && node.type === 'class_definition') sink.classNodes.push(node);
         if (node.type !== 'function_definition') return true;
         const name = node.childForFieldName('name')?.text;
         const returnType = node.childForFieldName('return_type');
@@ -3805,6 +4275,37 @@ function findExportsInCode(code, parser) {
  */
 function findUsagesInCode(code, name, parser, tree, options = {}) {
     tree = tree || parseTree(parser, code);
+    const usages = findUsagesInTree(code, name, parser, tree, options);
+    // Names inside string annotations that spell calls (fix #398F) are code:
+    // the annotation's expression, parsed from the same source with the
+    // quotes blanked (offsets unchanged).
+    if (!/(?::|->)\s*["'][^"'\n]*\(/.test(code)) return usages;
+    const quotes = annotationStringQuotes(tree).filter(quote =>
+        code.slice(quote.contentStart, quote.contentEnd).includes(name));
+    if (quotes.length === 0) return usages;
+    const chars = code.split('');
+    for (const quote of quotes) {
+        chars[quote.open] = ' ';
+        chars[quote.close] = ' ';
+    }
+    const masked = chars.join('');
+    const maskedTree = parseTree(parser, masked);
+    const ranges = [];
+    for (const quote of quotes) {
+        const node = maskedTree.rootNode.descendantForIndex(quote.contentStart, quote.contentEnd);
+        if (!node || node.hasError || node.isMissing) continue;
+        const start = maskedTree.rootNode.descendantForIndex(quote.contentStart).startPosition;
+        ranges.push({ row: start.row, from: start.column, to: start.column + (quote.contentEnd - quote.contentStart) });
+    }
+    if (ranges.length === 0) return usages;
+    const extra = findUsagesInTree(masked, name, parser, maskedTree, options).filter(usage =>
+        ranges.some(range => usage.line === range.row + 1 && usage.column >= range.from && usage.column < range.to));
+    if (extra.length === 0) return usages;
+    return [...usages, ...extra.map(usage => ({ ...usage, stringAnnotation: true }))]
+        .sort((a, b) => a.line - b.line || a.column - b.column);
+}
+
+function findUsagesInTree(code, name, parser, tree, options = {}) {
     const usages = [];
     const moduleAliases = pythonModuleAliases(tree);
     // Lexical scope verdicts (fix #392) only for refactoring internals.

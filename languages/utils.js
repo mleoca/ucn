@@ -1322,6 +1322,23 @@ function genericArityOf(text) {
     return null;
 }
 
+// Exclusive clauses of one compound statement (fix #398F): `if`/`elif`/
+// `else` and `case` arms never both run; a `try` body and its handlers, two
+// handlers, a handler and the `try` `else` are alternatives. A `try` body and
+// its `else` run in sequence, and `finally` always runs.
+function branchClausesExclusive(a, b) {
+    if (a === b) return false;
+    const kind = tag => tag.split(':')[0];
+    const ka = kind(a), kb = kind(b);
+    const branch = new Set(['if', 'elif', 'else']);
+    if (branch.has(ka) && branch.has(kb)) return true;
+    if (ka === 'case' && kb === 'case') return true;
+    if (ka === 'finally' || kb === 'finally') return false;
+    const pair = new Set([ka, kb]);
+    if (pair.has('except') && (pair.has('try') || pair.has('try-else') || ka === kb)) return true;
+    return false;
+}
+
 module.exports = {
     genericArityOf,
     parseErrorRegions,
@@ -1352,4 +1369,5 @@ module.exports = {
     extractStringArg,
     stripQuotes,
     extractSprintfPrefix,
+    branchClausesExclusive,
 };

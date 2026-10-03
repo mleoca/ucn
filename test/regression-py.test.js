@@ -8487,3 +8487,350 @@ describe('fix #398: inherited members through qualified Python bases', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #398F: Python configuration items, module values and string annotations', () => {
+    const lines = parts => parts.join('\n') + '\n';
+    const callers = (index, name, file, line) => {
+        const r = execute(index, 'context', { name, file, line, includeMethods: true, all: true });
+        assert.ok(r.ok, r.error);
+        assert.ok(r.result.meta.account.conserved);
+        return {
+            confirmed: r.result.callers.map(c => `${c.relativePath}:${c.line}`),
+            unverified: (r.result.unverifiedCallers || []).map(c => `${c.relativePath}:${c.line}:${c.reason}`),
+            excluded: r.result.meta.account.excluded,
+        };
+    };
+    const callees = (index, name, file) => {
+        const def = index.symbols.get(name).find(d => d.relativePath === file);
+        const r = index.findCallees(def, { collectAccount: true, includeMethods: true });
+        return {
+            confirmed: r.map(c => `${c.relativePath}:${c.startLine}`).sort(),
+            unverified: (r.unverifiedCallees || []).map(u => `${u.name}:${u.reason}`),
+        };
+    };
+    const configured = {
+        'pkg/__init__.py': '',
+        'pkg/_speed.py': 'def fast(x):\n    return x * 2\n',
+        'pkg/m.py': lines([
+            'import sys',
+            '',
+            'if sys.platform == "win32":',
+            '    def getchar(echo):',
+            '        return 1',
+            '',
+            '    def raw():',
+            '        return getchar(True)',
+            'else:',
+            '    def getchar(echo):',
+            '        return 2',
+            '',
+            '    def raw():',
+            '        return getchar(False)',
+            '',
+            '',
+            'def use():',
+            '    return getchar(True)',
+            '',
+            '',
+            'try:',
+            '    from pkg._speed import fast',
+            'except ImportError:',
+            '    def fast(x):',
+            '        return x',
+            '',
+            '',
+            'def use_fast():',
+            '    return fast(1)',
+            '',
+            '',
+            'def shadowed(getchar):',
+            '    return getchar(3)',
+        ]),
+        'pkg/n.py': lines([
+            'from pkg.m import getchar, fast',
+            'from pkg import m',
+            '',
+            '',
+            'def a():',
+            '    getchar(1)',
+            '    m.getchar(2)',
+            '    fast(3)',
+            '    m.fast(4)',
+        ]),
+    };
+
+    it('records names bound only in exclusive branches as one item per scope', () => {
+        const dir = tmp({ ...configured,
+            'pkg/seq.py': lines(['def f(): return 1', 'if True:', '    def f(): return 2', 'for i in []:', '    def g(): return 1', 'def g(): return 2']),
+            'pkg/tc.py': lines(['from typing import TYPE_CHECKING', 'if TYPE_CHECKING:', '    from pkg._speed import fast', 'else:', '    def fast(x): return x']),
+            'pkg/loc.py': lines(['def outer(n):', '    if n:', '        def conv(v): return v', '    elif n > 1:', '        def conv(v): return -v', '    else:', '        def conv(v): return 0', '    return conv(n)']),
+        });
+        try {
+            const index = idx(dir);
+            const items = file => (index.files.get(path.join(dir, file)).configurationItems || [])
+                .map(item => `${item.scope}:${item.name}:${item.sites.map(s => `${s.kind}@${s.line}`).join(',')}`);
+            assert.deepStrictEqual(items('pkg/m.py'), ['0:fast:import@22,def@24', '0:getchar:def@4,def@10', '0:raw:def@7,def@13']);
+            assert.deepStrictEqual(items('pkg/seq.py'), [], 'a later or unconditional rebinding is no item');
+            assert.deepStrictEqual(items('pkg/tc.py'), [], 'TYPE_CHECKING branches are no runtime configuration');
+            assert.deepStrictEqual(items('pkg/loc.py'), ['1:conv:def@3,def@5,def@7']);
+        } finally { rm(dir); }
+    });
+
+    it('binds calls to the item: branch calls decide, other calls reach every definition alternative', () => {
+        const dir = tmp(configured);
+        try {
+            const index = idx(dir);
+            const win = callers(index, 'getchar', 'pkg/m.py', 4);
+            assert.deepStrictEqual(win.confirmed, ['pkg/m.py:8', 'pkg/m.py:18', 'pkg/n.py:6', 'pkg/n.py:7']);
+            assert.strictEqual(win.excluded.byReason['other-definition'].count, 1, 'the else branch call');
+            const posix = callers(index, 'getchar', 'pkg/m.py', 10);
+            assert.deepStrictEqual(posix.confirmed, ['pkg/m.py:14', 'pkg/m.py:18', 'pkg/n.py:6', 'pkg/n.py:7']);
+            assert.ok(!win.confirmed.includes('pkg/m.py:33') && !posix.confirmed.includes('pkg/m.py:33'),
+                'a parameter shadows the item');
+            const fallback = callers(index, 'fast', 'pkg/m.py', 24);
+            assert.deepStrictEqual(fallback.confirmed, ['pkg/m.py:29', 'pkg/n.py:8', 'pkg/n.py:9']);
+            const imported = callers(index, 'fast', 'pkg/_speed.py', 1);
+            assert.deepStrictEqual(imported.confirmed, []);
+            assert.deepStrictEqual(imported.unverified, ['pkg/m.py:29:configuration-alternative',
+                'pkg/n.py:8:configuration-alternative', 'pkg/n.py:9:configuration-alternative']);
+        } finally { rm(dir); }
+    });
+
+    it('lists definition alternatives as callees and an import alternative as one visible entry', () => {
+        const dir = tmp(configured);
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(callees(index, 'use', 'pkg/m.py').confirmed, ['pkg/m.py:10', 'pkg/m.py:4']);
+            const raw = index.symbols.get('raw').filter(d => d.relativePath === 'pkg/m.py');
+            assert.deepStrictEqual(raw.map(def => index.findCallees(def, { collectAccount: true })
+                .map(c => c.startLine)), [[4], [10]]);
+            assert.deepStrictEqual(callees(index, 'use_fast', 'pkg/m.py'),
+                { confirmed: [], unverified: ['fast:configuration-alternative'] });
+            const a = callees(index, 'a', 'pkg/n.py');
+            assert.deepStrictEqual(a.confirmed, ['pkg/m.py:10', 'pkg/m.py:4']);
+            assert.ok(a.unverified.includes('fast:configuration-alternative'));
+        } finally { rm(dir); }
+    });
+
+    it('an outside module import alternative is no project callee', () => {
+        const dir = tmp({
+            'codec.py': lines([
+                'try:',
+                '    from ujson import dumps',
+                'except ImportError:',
+                '    def dumps(value):',
+                '        return str(value)',
+                '',
+                'def encode(value):',
+                '    return dumps(value)',
+            ]),
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(callees(index, 'encode', 'codec.py'), { confirmed: ['codec.py:4'], unverified: [] });
+            assert.deepStrictEqual(callers(index, 'dumps', 'codec.py', 4).confirmed, ['codec.py:8']);
+        } finally { rm(dir); }
+    });
+
+    it('renames every alternative and keeps the item name on an import alternative', () => {
+        const dir = tmp(configured);
+        try {
+            const index = idx(dir);
+            const plan = (file, line, name, renameTo) => {
+                const r = execute(index, 'plan', { name, file, line, renameTo });
+                assert.ok(r.ok, r.error);
+                return r.result.changes.filter(c => !c.needsReview).map(c => `${c.file}:${c.line}:${c.newExpression}`);
+            };
+            const all = plan('pkg/m.py', 4, 'getchar', 'gc');
+            for (const expected of ['pkg/m.py:4:def gc(echo):', 'pkg/m.py:10:def gc(echo):', 'pkg/m.py:8:return gc(True)',
+                'pkg/m.py:14:return gc(False)', 'pkg/m.py:18:return gc(True)', 'pkg/n.py:6:gc(1)']) {
+                assert.ok(all.includes(expected), expected);
+            }
+            assert.deepStrictEqual(plan('pkg/_speed.py', 1, 'fast', 'ff').sort(), [
+                'pkg/_speed.py:1:def ff(x):', 'pkg/m.py:22:from pkg._speed import ff as fast']);
+        } finally { rm(dir); }
+    });
+
+    it('a name a module assigns from another value is not confirmed through the module imports', () => {
+        const dir = tmp({
+            'pkg/__init__.py': '',
+            'pkg/codec.py': 'def loads(s):\n    return s\n',
+            'pkg/registry.py': lines([
+                'from pkg import codec as _codec',
+                'import json',
+                '',
+                'class Registry:',
+                '    def loads(self, data):',
+                '        return data',
+                '',
+                'def make_loader():',
+                '    return _codec.loads',
+                '',
+                'registry = Registry()',
+                'loads = registry.loads',
+                'aliased = _codec.loads',
+                'stdlib = json.loads',
+                'built = make_loader()',
+                '',
+                'def register():',
+                '    from pkg import codec',
+                '    return codec',
+            ]),
+            'use.py': lines([
+                'from pkg.registry import loads, aliased, stdlib, built',
+                'from pkg import registry',
+                '',
+                'def run():',
+                '    loads("a")',
+                '    aliased("b")',
+                '    stdlib("c")',
+                '    registry.loads("d")',
+                '    built("e")',
+            ]),
+        });
+        try {
+            const index = idx(dir);
+            const codec = callers(index, 'loads', 'pkg/codec.py', 1);
+            // `loads = registry.loads` is Registry's bound method: another
+            // function's call never; `aliased = _codec.loads` is the
+            // function; `stdlib = json.loads` is the standard library's.
+            assert.ok(!codec.confirmed.includes('use.py:5') && !codec.unverified.some(u => u.startsWith('use.py:5:')),
+                'a bound method of a module object is excluded');
+            assert.strictEqual(codec.excluded.byReason['other-definition-import'].count >= 2, true);
+            assert.ok(!codec.confirmed.includes('use.py:8'));
+            assert.ok(!codec.confirmed.includes('use.py:7'), 'a stdlib alias is never the project function');
+            const aliasedSites = callers(index, 'make_loader', 'pkg/registry.py', 8);
+            assert.deepStrictEqual(aliasedSites.confirmed, ['pkg/registry.py:15']);
+            const built = callers(index, 'loads', 'pkg/codec.py', 1);
+            assert.ok(!built.confirmed.includes('use.py:9'), 'a value a call builds is never confirmed');
+        } finally { rm(dir); }
+    });
+
+    it('parses call-bearing string annotations as expressions: calls, renames and the account', () => {
+        const dir = tmp({
+            'helpers.py': 'def make_default():\n    return 0\n',
+            'mod.py': lines([
+                'from typing import Annotated, List',
+                'import helpers',
+                '',
+                'def cmd(val: "Annotated[int, helpers.make_default()]" = 0):',
+                '    return val',
+                '',
+                'def ret() -> "List[helpers.make_default()]":',
+                '    return []',
+                '',
+                'def broken(val: "Annotated[int, helpers.make_default(]" = 0):',
+                '    return val',
+                '',
+                'value: "Annotated[int, helpers.make_default()]" = 1',
+            ]),
+        });
+        try {
+            const index = idx(dir);
+            const found = callers(index, 'make_default', 'helpers.py', 1);
+            assert.deepStrictEqual(found.confirmed, ['mod.py:4', 'mod.py:7', 'mod.py:13']);
+            const r = execute(index, 'plan', { name: 'make_default', file: 'helpers.py', line: 1, renameTo: 'mk' });
+            assert.ok(r.ok, r.error);
+            const edits = r.result.changes.filter(c => !c.needsReview).map(c => `${c.line}:${c.newExpression}`);
+            assert.ok(edits.includes('4:def cmd(val: "Annotated[int, helpers.mk()]" = 0):'));
+            assert.ok(edits.includes('13:value: "Annotated[int, helpers.mk()]" = 1'));
+            assert.ok(r.result.reviewItems.some(item => item.line === 10 && item.textDependency),
+                'an annotation that does not parse stays a review item');
+            assert.ok(!r.result.reviewItems.some(item => item.line === 4));
+        } finally { rm(dir); }
+    });
+
+    it('records local class bindings at parse time with the verdict the tree gives', () => {
+        const dir = tmp({
+            'pkg/__init__.py': '', 'pkg/schema.py': 'class Schema:\n    def load(self, data):\n        return data\n',
+            'test_a.py': lines([
+                'from pkg.schema import Schema',
+                '',
+                'def test_local():',
+                '    class MySchema(Schema):',
+                '        pass',
+                '    MySchema().load({})',
+                '    s = MySchema()',
+                '    s.load({})',
+                '',
+                'def test_shadow(MySchema):',
+                '    class MySchema(Schema):',
+                '        pass',
+                '    MySchema().load({})',
+            ]),
+        });
+        try {
+            const index = idx(dir);
+            const calls = require('../core/callers').getCachedCalls(index, path.join(dir, 'test_a.py'));
+            const rows = calls.filter(c => c.name === 'MySchema' || c.name === 'load')
+                .map(c => `${c.line}:${c.name}:${c.localClassRow ?? ''}:${c.receiverTypeLocalClassRef?.row ?? ''}`)
+                .sort();
+            // `MySchema().load` is typed through its constructor record; `s`
+            // through the assignment the receiver evidence names.
+            assert.deepStrictEqual(rows, ['13:MySchema:0:', '13:load::', '6:MySchema:4:', '6:load::',
+                '7:MySchema:4:', '8:load::4']);
+            const load = callers(index, 'load', 'pkg/schema.py', 2);
+            assert.deepStrictEqual(load.confirmed, ['test_a.py:6', 'test_a.py:8']);
+            assert.ok(load.unverified.some(u => u.startsWith('test_a.py:13:')), 'a parameter shadow keeps it visible');
+        } finally { rm(dir); }
+    });
+
+    it('self-attribute callees need one owning class definition, not one class name', () => {
+        const dir = tmp({
+            'a/transport.py': 'class Channel:\n    def cancel(self, tag):\n        return tag\n',
+            'b/transport.py': 'class Channel:\n    def cancel(self, tag):\n        return -tag\n',
+            'test_c.py': lines([
+                'from a.transport import Channel',
+                '',
+                'class Base:',
+                '    def setup(self):',
+                '        self.channel = Channel()',
+                '',
+                'class TestCancel(Base):',
+                '    def test_it(self):',
+                '        self.channel.cancel(1)',
+            ]),
+        });
+        try {
+            const index = idx(dir);
+            const r = callees(index, 'test_it', 'test_c.py');
+            assert.ok(!r.confirmed.includes('b/transport.py:2'), 'never the first same-name class');
+            assert.ok(r.unverified.some(u => u.startsWith('cancel:')));
+        } finally { rm(dir); }
+    });
+
+    it('tests lists property reads whose receiver flow proves the owner class', () => {
+        const dir = tmp({
+            'lib/__init__.py': '',
+            'lib/testing.py': lines([
+                'class Result:',
+                '    @property',
+                '    def stdout(self):',
+                '        return "out"',
+                '',
+                'class Runner:',
+                '    def invoke(self) -> Result:',
+                '        return Result()',
+            ]),
+            'tests/test_run.py': lines([
+                'import subprocess',
+                'from lib.testing import Runner',
+                '',
+                'def test_run():',
+                '    runner = Runner()',
+                '    result = runner.invoke()',
+                '    assert "out" in result.stdout',
+                '    proc = subprocess.run(["x"], capture_output=True)',
+                '    assert proc.stdout',
+            ]),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'tests', { name: 'lib/testing.py:2:stdout' });
+            assert.ok(r.ok, r.error);
+            const matches = r.result.flatMap(f => f.matches.map(m => `${f.file}:${m.line}:${m.matchType}`));
+            assert.ok(matches.includes('tests/test_run.py:7:reference'), JSON.stringify(matches));
+            assert.ok(!matches.includes('tests/test_run.py:9:reference'));
+        } finally { rm(dir); }
+    });
+});

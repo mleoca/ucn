@@ -268,6 +268,20 @@ function createFileIR({
         ...(parsed.moduleValueAliases?.length > 0 && {
             moduleValueAliases: parsed.moduleValueAliases.map(item => ({ ...item })),
         }),
+        // Module values built by calling a name that an alias reads an
+        // attribute of (fix #398F).
+        ...(parsed.moduleConstructedValues?.length > 0 && {
+            moduleConstructedValues: parsed.moduleConstructedValues.map(item => ({ ...item })),
+        }),
+        // Python names bound only in exclusive branches (fix #398F): one
+        // item per configuration alternative set.
+        ...(parsed.configurationItems?.length > 0 && {
+            configurationItems: parsed.configurationItems.map(item => ({
+                ...item,
+                sites: item.sites.map(site => ({ ...site, branch: site.branch.map(step => [...step]) })),
+                clauses: item.clauses.map(([line, ranges]) => [line, ranges.map(range => [...range])]),
+            })),
+        }),
         // The byte ranges the C/C++ recovery blanked (fix #387): a query
         // rebuilds the recovered tree with one parse.
         ...(Array.isArray(parsed.recoveryBlanks) && {

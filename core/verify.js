@@ -266,6 +266,13 @@ function callTokenColumn(index, filePath, range, name, line) {
     let node = tree.rootNode.descendantForIndex(range.start, Math.max(range.start, range.end - 1));
     while (node && !(node.startIndex <= range.start && node.endIndex >= range.end)) node = node.parent;
     if (!node) return null;
+    // A call spelled inside a Python string annotation (fix #398F): the
+    // parser read it from the annotation's expression; the range is the
+    // called name inside the string's content.
+    if (node.type === 'string_content' && content.slice(range.start, range.end) === name &&
+        node.startPosition.row === line - 1 && node.endPosition.row === line - 1) {
+        return node.startPosition.column + (range.start - node.startIndex);
+    }
     const isName = n => n && n.text === name && /identifier$/.test(n.type) &&
         n.startPosition.row === line - 1;
     if (isName(node)) return node.startPosition.column;
@@ -3391,8 +3398,21 @@ function plan(index, name, options = {}) {
                 if (!abs && !require('./callers')._unresolvedModuleIsGap(index, binding.module, binding)) return false;
                 if (!abs) return filePath !== def.file;
                 if (abs === filePath) return false;
-                return _nameBindingReaches(index, abs, name, renameTargetFiles) !== 'no';
+                // A module binding the name through one alternative of a
+                // configuration item (fix #398F) keeps its item name: the
+                // importer's token names the item, not the renamed pin.
+                const verdict = _nameBindingReaches(index, abs, name, renameTargetFiles, 4,
+                    { configurationVerdict: true });
+                return verdict !== 'no' && verdict !== 'configuration';
             });
+        };
+        // An unaliased import that is one alternative of a configuration
+        // item in its own scope (fix #398F: `try: from ._speedups import f` /
+        // `except ImportError: def f`) keeps the item's local name.
+        const importKeepsItemName = (filePath, line) => {
+            const { itemsNamed } = require('./configuration-items');
+            return itemsNamed(index, filePath, name).some(item =>
+                item.sites.some(site => site.kind === 'import' && site.line === line));
         };
         for (const imp of importUsages) {
             // Skip if already covered by a call site change in the same file:line
@@ -3406,7 +3426,8 @@ function plan(index, name, options = {}) {
             if (imp.file && def.file && !importMayBindPin(imp.file)) continue;
             if (imp.file && !importSourceBindsPin(imp.file, imp.line)) continue;
             const edit = renameIdentifierTokens(index, imp.file,
-                imp.line, name, options.renameTo);
+                imp.line, name, imp.file && importKeepsItemName(imp.file, imp.line)
+                    ? `${options.renameTo} as ${name}` : options.renameTo);
             const newImport = edit.renamed;
             if (newImport === edit.source) continue;
             changes.push(tagTokenEdit({
@@ -3651,10 +3672,15 @@ function plan(index, name, options = {}) {
             });
         }
         if (conditionalStyle && !def.isSignature) {
-            const { _cFamilySignatureKey, _isCrossFileConfigurationMember, _sameOwnerPath } = require('./callers');
+            const { _cFamilySignatureKey, _isCrossFileConfigurationMember, _sameOwnerPath,
+                _isConfigurationAlternative } = require('./callers');
             const hasCfg = d => (d.attributesWithArgs || []).some(a => a.name === 'cfg') ||
                 (d.modifiers || []).includes('cfg');
             const alternatives = definitions.filter(other => other !== def && ((
+                // Runtime configuration items (fix #398F, Python): the
+                // parser-recorded alternatives of the item, whatever their
+                // parameters.
+                conditionalStyle === 'branch' ? _isConfigurationAlternative(index, def, other) :
                 other.file === def.file && !other.isSignature &&
                 !NON_CALLABLE_TYPES.has(other.type) &&
                 (other.className || null) === (def.className || null) &&
