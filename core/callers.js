@@ -2478,17 +2478,19 @@ function findCallers(index, name, options = {}) {
                     // import of the same module file graph (`from pkg.virt
                     // import Base64`, whose package re-exports a different
                     // Transport) is not evidence for `Transport`.
-                    const cbNamedImport = !cbSameFile && !cbPackageQualified &&
+                    const cbNameBindings = _scopeImportBindings(fileEntry,
+                        (fileEntry.importBindings || []).filter(binding =>
+                            (binding.alias || binding.name) === call.name), call.line);
+                    const cbLocalImport = cbNameBindings.some(binding => binding.deferred &&
+                        !_scopeImportBindings(fileEntry, [binding], 0).length);
+                    const cbNamedImport = (!cbSameFile || cbLocalImport ||
+                        (calledAs && cbNameBindings.some(binding => binding.alias === call.name))) && !cbPackageQualified &&
                         !call.moduleLocalBinding &&
                         langTraits(fileEntry.language)?.typeSystem === 'structural' &&
-                        (fileEntry.importBindings || []).some(binding =>
-                            binding.name !== '*' &&
-                            (binding.alias || binding.name) === call.name);
+                        cbNameBindings.some(binding => binding.name !== '*');
                     if ((collectAccount && !cbSameFile && call.moduleLocalBinding &&
                         langTraits(fileEntry.language)?.typeSystem === 'structural') ||
                         cbNamedImport) {
-                        const cbNameBindings = (fileEntry.importBindings || []).filter(binding =>
-                            binding.name === call.name || binding.alias === call.name);
                         let cbBindingReaches = false;
                         let cbBindingUnknown = cbNameBindings.length === 0;
                         for (const binding of cbNameBindings) {
@@ -2503,7 +2505,8 @@ function findCallers(index, name, options = {}) {
                             const resolvedAbs = path.join(index.root, rel);
                             const verdict = binding.defaultLike
                                 ? _defaultBindingReaches(index, resolvedAbs, cbTargetFiles)
-                                : _nameBindingReaches(index, resolvedAbs, binding.name, cbTargetFiles);
+                                : _nameBindingReaches(index, resolvedAbs, binding.name, cbTargetFiles,
+                                    4, { targetName: name });
                             if (verdict === 'yes') {
                                 cbBindingReaches = true;
                                 break;
@@ -2585,6 +2588,16 @@ function findCallers(index, name, options = {}) {
 
                 // Resolve binding within this file (without mutating cached call objects)
                 let bindingId = call.bindingId;
+                const localNameImports = !call.isMethod && !call.receiver &&
+                    langTraits(fileEntry.language)?.typeSystem === 'structural'
+                    ? _scopeImportBindings(fileEntry, (fileEntry.importBindings || [])
+                        .filter(b => (b.alias || b.name) === call.name), call.line)
+                        .filter(b => b.deferred && !_scopeImportBindings(fileEntry, [b], 0).length)
+                    : [];
+                // A function's import owns its bare name ahead of a module
+                // declaration of that name. Let import ownership decide it;
+                // the file-wide declaration binding is not evidence here.
+                if (localNameImports.length > 0) bindingId = null;
                 let isUncertain = call.uncertain;
                 // Parser-detected lexical shadow (fix #203, hoisted by #222 —
                 // express-measured): a local let/var/param of the same name
@@ -2618,7 +2631,7 @@ function findCallers(index, name, options = {}) {
                     !!(call.receiverRoot || call.receiverField || call.receiverCall ||
                         call.receiverType || call.receiverDeepPath);
                 const skipLocalBinding = (call.receiver && !selfReceivers.has(call.receiver)) ||
-                    indirectStructuralReceiver;
+                    indirectStructuralReceiver || localNameImports.length > 0;
                 if (!bindingId && !skipLocalBinding) {
                     // A bare call cannot bind to a METHOD def where bare names
                     // never reach methods (fix #220, cobra-measured): Go's
@@ -4168,7 +4181,12 @@ function findCallers(index, name, options = {}) {
                     // so the file's import bindings own the name.
                     const samefilePinsOutOfScope = targetDefs.length > 0 &&
                         targetDefs.every(d => d.className);
-                    if (nameBindings.length > 0 && (!tFiles.has(filePath) || samefilePinsOutOfScope)) {
+                    const pairedImportAlias = (call.resolvedName || calledAs) &&
+                        nameBindings.some(b => b.alias === call.name);
+                    const localImport = nameBindings.some(b => b.deferred &&
+                        !_scopeImportBindings(fileEntry, [b], 0).length);
+                    if (nameBindings.length > 0 && (!tFiles.has(filePath) ||
+                        samefilePinsOutOfScope || pairedImportAlias || localImport)) {
                         // Name-level export-chain ownership (fix #217): each
                         // binding is chased by NAME, not by file — `from
                         // .render import render` pins to tests/render.py's own
@@ -4197,7 +4215,8 @@ function findCallers(index, name, options = {}) {
                             const resolvedAbs = path.join(index.root, rel);
                             const verdict = b.defaultLike
                                 ? _defaultBindingReaches(index, resolvedAbs, tFiles)
-                                : _nameBindingReaches(index, resolvedAbs, b.name, tFiles);
+                                : _nameBindingReaches(index, resolvedAbs, b.name, tFiles,
+                                    4, { targetName: name });
                             if (verdict === 'yes') { reaches = true; break; }
                             if (verdict === 'unknown') undetermined = true;
                         }
@@ -4220,8 +4239,7 @@ function findCallers(index, name, options = {}) {
                         // module never provably reaches (hooks.js's unrelated
                         // validate confirmed at scope-match 0.65).
                         if (!reaches && undetermined && collectAccount &&
-                            call.resolvedName && nameBindings.length > 0 &&
-                            nameBindings.every(b => b.alias === call.name)) {
+                            (pairedImportAlias || localImport)) {
                             routeUnverified(filePath, fileEntry, call, 'ambiguous-binding', calledAs);
                             continue;
                         }
@@ -4540,7 +4558,8 @@ function findCallers(index, name, options = {}) {
                                 _cjsMemberOwnershipAmbiguous(index, resolvedAbs, call.name);
                             const verdict = ambiguousCjsMember
                                 ? 'unknown'
-                                : _nameBindingReaches(index, resolvedAbs, call.name, tFiles);
+                                : _nameBindingReaches(index, resolvedAbs, call.name, tFiles,
+                                    4, { targetName: name });
                             if (verdict === 'yes' ||
                                 (verdict === 'unknown' && !ambiguousCjsMember &&
                                  _importReaches(index, resolvedAbs, tFiles))) {
@@ -12738,9 +12757,10 @@ function _nameBindingReaches(index, startAbs, name, targetFiles, maxDepth = 4, o
     // `exactName` (fix #386): a chain reaches the targets only under the
     // queried name itself; `export { Other as Widget }` exposes Other.
     const exactName = options.exactName === true;
+    const targetName = exactName ? name : options.targetName;
     const opCache = index._opImportReachCache;
     const targetKey = [...targetFiles].sort(codeUnitCompare).join('\x00');
-    const cacheKey = `name\x00${maxDepth}\x00${exactName ? 1 : 0}\x00${startAbs}\x00${name}\x00${targetKey}`;
+    const cacheKey = `name\x00${maxDepth}\x00${exactName ? 1 : 0}\x00${targetName || ''}\x00${startAbs}\x00${name}\x00${targetKey}`;
     if (opCache?.has(cacheKey)) return opCache.get(cacheKey);
     const persistentCache = index._nameBindingReachCache;
     if (persistentCache?.has(cacheKey)) {
@@ -12767,12 +12787,17 @@ function _nameBindingReaches(index, startAbs, name, targetFiles, maxDepth = 4, o
     for (let d = 0; d <= maxDepth && frontier.length > 0; d++) {
         const next = [];
         for (const [abs, attr] of frontier) {
-            if (targetFiles.has(abs) && (!exactName || attr === name)) return finish('yes');
+            if (targetFiles.has(abs) && (!targetName || attr === targetName)) return finish('yes');
             const stateKey = `${abs}\x00${attr}`;
             if (visited.has(stateKey)) continue;
             visited.add(stateKey);
             const fe = index.files.get(abs);
             if (!fe) { unknown = true; continue; }
+            if (!exactName && targetName &&
+                (fe.moduleValueAliases || []).some(alias => alias.name === attr)) {
+                const alias = _moduleValueAliasType(index, abs, attr);
+                if (alias?.type === targetName && targetFiles.has(alias.fromFile)) return finish('yes');
+            }
 
             // A concrete local export shadows every transitive dependency of
             // the same spelling. `module.exports = { helper }` in widgets.js
@@ -12788,6 +12813,14 @@ function _nameBindingReaches(index, startAbs, name, targetFiles, maxDepth = 4, o
             // a dead end (fix #292).
             const localExports = (fe.exportDetails || []).filter(e =>
                 !e.source && (e.alias || e.name) === attr);
+            // Public and declaration names can differ in the target module
+            // itself (`export { internal as public }`). That explicit mapping
+            // reaches internal; merely sharing its file with another function
+            // does not. Type-name lookups retain their exact-spelling rule.
+            if (!exactName && targetName && targetFiles.has(abs) &&
+                localExports.some(e => (e.localName || e.name) === targetName)) {
+                return finish('yes');
+            }
             const staticOwner = localExports.some(e => e.localName &&
                 (index.symbols.get(e.localName) || [])
                     .some(definition => definition.file === abs &&
@@ -12832,15 +12865,11 @@ function _nameBindingReaches(index, startAbs, name, targetFiles, maxDepth = 4, o
                     else enqueue(e.source, attr);
                 }
             }
-            // Import bindings of the attr (Python re-export idiom `from .x import
-            // name`, JS import-then-export). importBindings store ORIGINAL names;
-            // importAliases is a flat list (pairing to its import lost), so a
-            // renamed import is followed under BOTH its original and local names —
-            // over-following errs toward 'yes'/'unknown', never toward exclusion.
-            const aliases = fe.importAliases || [];
-            for (const b of (fe.importBindings || [])) {
-                const exposed = [b.name, ...aliases.filter(a => a.original === b.name).map(a => a.local)];
-                if (exposed.includes(attr)) enqueue(b.module, b.name);
+            // A module exposes an import's local name only. A function's
+            // imports are private to that scope, even when their original
+            // names match one of the module's public wrappers.
+            for (const b of _moduleImportBindings(fe)) {
+                if ((b.alias || b.name) === attr) enqueue(b.module, b.name);
             }
             // Rust glob imports (fix #369): `pub use crate::free::*` exposes
             // the glob module's names; chase them there. A glob inside an
@@ -13401,10 +13430,10 @@ function _projectTopLevelNames(index) {
  * binds the name. Bindings without a line (older records) are kept as-is.
  */
 function _scopeImportBindings(fileEntry, bindings, callLine) {
-    if (!bindings || bindings.length < 2 || callLine == null) return bindings;
+    if (!bindings || bindings.length === 0 || callLine == null) return bindings;
     if (!bindings.some(b => b.line != null && b.deferred)) return bindings;
     const scopes = (fileEntry.symbols || []).filter(s =>
-        s.startLine != null && s.endLine != null && s.endLine > s.startLine &&
+        s.startLine != null && s.endLine != null && s.endLine >= s.startLine &&
         CALLABLE_SYMBOL_KINDS.has(s.type));
     const innermost = line => {
         let best = null;
@@ -13417,7 +13446,12 @@ function _scopeImportBindings(fileEntry, bindings, callLine) {
     const local = [];
     const moduleLevel = [];
     for (const b of bindings) {
-        if (b.line == null) { moduleLevel.push(b); continue; }
+        // An eager import is outside every function by parser evidence.
+        // A function beginning on the same line must not absorb it.
+        const typeOnly = b.deferred && (fileEntry.importDetails || []).some(detail =>
+            detail.deferredReason === 'type-only' && detail.module === b.module &&
+            detail.line === b.line && detail.type === b.kind);
+        if (b.line == null || !b.deferred || typeOnly) { moduleLevel.push(b); continue; }
         const scope = innermost(b.line);
         if (!scope) { moduleLevel.push(b); continue; }
         if (callLine < scope.startLine || callLine > scope.endLine) continue;
@@ -13426,6 +13460,14 @@ function _scopeImportBindings(fileEntry, bindings, callLine) {
     if (local.length === 0) return moduleLevel;
     const nearest = Math.min(...local.map(l => l.size));
     return local.filter(l => l.size === nearest).map(l => l.b);
+}
+
+/** Imports visible as module attributes, never function/class locals. */
+function _moduleImportBindings(fileEntry) {
+    const bindings = _scopeImportBindings(fileEntry, fileEntry.importBindings || [], 0);
+    if (fileEntry.language !== 'python') return bindings;
+    return bindings.filter(b => !(fileEntry.symbols || []).some(s =>
+        s.type === 'class' && s.startLine <= b.line && b.line <= s.endLine));
 }
 
 /**
@@ -15712,12 +15754,15 @@ function _calleeStructuralImportedNameRoute(index, fileEntry, call, language) {
     // b; b()`) pairs with exactly the binding carrying that alias, and the
     // exported item is the binding's ORIGINAL name.
     if (bindings.length === 0) {
-        const aliased = (fileEntry?.importBindings || []).filter(b => b.alias === call.name);
+        const aliased = _scopeImportBindings(fileEntry,
+            (fileEntry?.importBindings || []).filter(b => b.alias === call.name), call.line);
         if (aliased.length > 0 && new Set(aliased.map(b => b.name)).size === 1) {
             bindings = aliased;
             lookupName = aliased[0].name;
         }
     }
+    if (bindings.length === 0) return null;
+    bindings = _scopeImportBindings(fileEntry, bindings, call.line);
     if (bindings.length === 0) return null;
     return _calleeStructuralBindingRoute(index, fileEntry, call, language, bindings, lookupName, true);
 }
@@ -15855,11 +15900,8 @@ function _calleeExportDefinitions(index, startAbs, exposedName, language, call, 
                     else enqueue(e.source, attr);
                 }
             }
-            const aliases = fe.importAliases || [];
-            for (const b of (fe.importBindings || [])) {
-                const exposed = [b.alias || b.name,
-                    ...aliases.filter(a => a.original === b.name).map(a => a.local)];
-                if (exposed.includes(attr)) enqueue(b.module, b.name);
+            for (const b of _moduleImportBindings(fe)) {
+                if ((b.alias || b.name) === attr) enqueue(b.module, b.name);
             }
             if ((fe.importNames || []).includes('*')) unknown = true;
             if ((fe.moduleAssignedNames || []).includes(attr)) unknown = true;

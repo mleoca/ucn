@@ -18,6 +18,139 @@ const { execute } = require('../core/execute');
 const { computeReachability } = require('../core/entrypoints');
 const { tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR, runCli, runInteractive } = require('./helpers');
 
+describe('fix #398: import aliases keep their lexical and module ownership', () => {
+    for (const ext of ['py', 'js', 'ts', 'tsx']) {
+        it(`${ext}: local imports select their implementation, never the same-file wrapper`, () => {
+            const python = ext === 'py';
+            const wrapper = python ? [
+                'def ping():', '    from impl import ping as run', '    return run()',
+                'def other():', '    from other import ping as run', '    return run()',
+                'def callback(accept):', '    from impl import ping as run', '    return accept(run)',
+                'def original():', '    from impl import ping', '    return ping()',
+                'def keep(): return ping()',
+                'def different():', '    from impl import pong as run', '    return run()',
+            ] : [
+                'export function ping() {', "  const { ping: run } = require('./impl');", '  return run();', '}',
+                'export function other() {', "  const { ping: run } = require('./other');", '  return run();', '}',
+                'export function callback(accept) {', "  const { ping: run } = require('./impl');", '  return accept(run);', '}',
+                'export function original() {', "  const { ping } = require('./impl');", '  return ping();', '}',
+                'export function keep() { return ping(); }',
+                'export function different() {', "  const { pong: run } = require('./impl');", '  return run();', '}',
+            ];
+            const dir = tmp({
+                [`impl.${ext}`]: python ? 'def ping(): return 1\ndef pong(): return 3\n'
+                    : 'export function ping() { return 1; }\nexport function pong() { return 3; }\n',
+                [`other.${ext}`]: python ? 'def ping(): return 2\n' : 'export function ping() { return 2; }\n',
+                [`wrapper.${ext}`]: wrapper.join('\n') + '\n',
+                [`use.${ext}`]: python
+                    ? 'import wrapper\ndef use():\n    return wrapper.ping()\n'
+                    : "import * as wrapper from './wrapper';\nexport function use() { return wrapper.ping(); }\n",
+            });
+            try {
+                const index = idx(dir);
+                const context = (file, name) => {
+                    const def = index.symbols.get(name).find(d => d.relativePath === `${file}.${ext}`);
+                    const r = execute(index, 'context', {
+                        name: `${file}.${ext}:${def.startLine}:${name}`, includeMethods: true,
+                    });
+                    assert.ok(r.ok, JSON.stringify(r.error));
+                    assert.equal(r.result.meta.account.conserved, true);
+                    return r.result;
+                };
+                assert.deepEqual(context('wrapper', 'ping').callers.map(c => c.callerName).sort(), ['keep', 'use']);
+                assert.deepEqual(context('impl', 'ping').callers.map(c => c.callerName).sort(),
+                    ['callback', 'original', 'ping']);
+                assert.deepEqual(context('other', 'ping').callers.map(c => c.callerName), ['other']);
+                assert.deepEqual(context('impl', 'pong').callers.map(c => c.callerName), ['different']);
+                assert.deepEqual(context('wrapper', 'different').callees.map(c => c.name), ['pong']);
+                for (const [file, name, target] of [
+                    ['wrapper', 'ping', 'impl'], ['wrapper', 'other', 'other'],
+                    ['wrapper', 'original', 'impl'], ['wrapper', 'keep', 'wrapper'], ['use', 'use', 'wrapper'],
+                ]) {
+                    const callees = context(file, name).callees.filter(c => c.name === 'ping');
+                    assert.deepEqual(callees.map(c => c.relativePath), [`${target}.${ext}`], `${file}:${name}`);
+                }
+                // Repeating competing pins cannot leak an import verdict.
+                assert.deepEqual(context('wrapper', 'ping').callers.map(c => c.callerName).sort(), ['keep', 'use']);
+            } finally { rm(dir); }
+        });
+
+        it(`${ext}: a barrel pairs each exported alias with its own import`, () => {
+            const python = ext === 'py';
+            const dir = tmp({
+                [`one.${ext}`]: python ? 'def ping(): return 1\n' : 'export function ping() { return 1; }\n',
+                [`two.${ext}`]: python ? 'def ping(): return 2\n' : 'export function ping() { return 2; }\n',
+                [`barrel.${ext}`]: python
+                    ? 'from one import ping as first\nfrom two import ping as second\n'
+                    : "import { ping as first } from './one';\nimport { ping as second } from './two';\nexport { first, second };\n",
+                [`use.${ext}`]: python
+                    ? 'import barrel\ndef first_use(): return barrel.first()\ndef second_use(): return barrel.second()\n'
+                    : "import * as barrel from './barrel';\nexport function first_use() { return barrel.first(); }\nexport function second_use() { return barrel.second(); }\n",
+            });
+            try {
+                const index = idx(dir);
+                const { _nameBindingReaches } = require('../core/callers');
+                for (const [name, target, other] of [['first', 'one', 'two'], ['second', 'two', 'one']]) {
+                    assert.equal(_nameBindingReaches(index, path.join(dir, `barrel.${ext}`), name,
+                        new Set([path.join(dir, `${target}.${ext}`)])), 'yes');
+                    assert.equal(_nameBindingReaches(index, path.join(dir, `barrel.${ext}`), name,
+                        new Set([path.join(dir, `${other}.${ext}`)])), 'no');
+                    const r = execute(index, 'context', { name: `${name}_use`, includeMethods: true });
+                    assert.ok(r.ok, JSON.stringify(r.error));
+                    assert.deepEqual(r.result.callees.map(c => c.relativePath), [`${target}.${ext}`]);
+                }
+                assert.equal(_nameBindingReaches(index, path.join(dir, `barrel.${ext}`), 'ping',
+                    new Set([path.join(dir, `one.${ext}`), path.join(dir, `two.${ext}`)])), 'no');
+            } finally { rm(dir); }
+        });
+    }
+
+    for (const ext of ['js', 'ts', 'tsx']) {
+        it(`${ext}: module imports remain global beside a same-line local import`, () => {
+            const typed = ext !== 'js';
+            const dir = tmp({
+                [`impl.${ext}`]: 'export function ping() { return 1; }\nexport class Box {}\n',
+                [`barrel.${ext}`]: "import { ping } from './impl'; " +
+                    (typed ? "import type { Box } from './impl'; " : '') +
+                    "export function lazy() { const { ping: f } = require('./impl'); return f(); }\n" +
+                    'export { ping };\n' + (typed ? 'export type { Box };\n' : ''),
+                [`use.${ext}`]: "import * as barrel from './barrel';\n" +
+                    'export function use() { return barrel.ping(); }\n',
+            });
+            try {
+                const index = idx(dir);
+                const r = execute(index, 'context', { name: `impl.${ext}:1:ping`, includeMethods: true });
+                assert.ok(r.ok, JSON.stringify(r.error));
+                assert.deepEqual(r.result.callers.map(c => c.relativePath), [`barrel.${ext}`, `use.${ext}`]);
+                assert.equal(r.result.meta.account.conserved, true);
+                const use = execute(index, 'context', { name: 'use', includeMethods: true });
+                assert.deepEqual(use.result.callees.map(c => c.relativePath), [`impl.${ext}`]);
+                if (typed) {
+                    const { _nameBindingReaches } = require('../core/callers');
+                    assert.equal(_nameBindingReaches(index, path.join(dir, `barrel.${ext}`), 'Box',
+                        new Set([path.join(dir, `impl.${ext}`)]), 4, { exactName: true }), 'yes');
+                }
+            } finally { rm(dir); }
+        });
+    }
+
+    it('Python: class-local imports are not module exports, while conditional module imports survive', () => {
+        const dir = tmp({
+            'impl.py': 'def ping(): return 1\n',
+            'wrapper.py': 'def ping(): return 2\nclass Owner:\n    from impl import ping\n',
+            'conditional.py': 'import sys\nif sys.version_info:\n    from impl import ping\n',
+            'use.py': 'import wrapper\nimport conditional\ndef use():\n    wrapper.ping()\n    conditional.ping()\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'impl.py:1:ping', includeMethods: true });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            assert.deepEqual(r.result.callers.map(c => [c.relativePath, c.line]), [['use.py', 5]]);
+            assert.equal(r.result.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #398: local subclasses resolve inherited static members by definition', () => {
     const cases = [
         ['py', [

@@ -3356,10 +3356,12 @@ function plan(index, name, options = {}) {
         const memberImportable = pinIsMember &&
             !!langTraits(planLang)?.bareCallReachesMethods;
         const importMayBindPin = (file) => {
-            const reach = _nameBindingReaches(index, file, name, renameTargetFiles);
-            if (reach === 'no') return false;
+            // A source-side import token need not be exposed by its importing
+            // file: `from core import transform as xf` binds only `xf` there.
+            // The statement's source module decides ownership below.
             if (!pinIsMember) return true;
-            return memberImportable && reach === 'yes';
+            return memberImportable &&
+                _nameBindingReaches(index, file, name, renameTargetFiles) === 'yes';
         };
         // Import SOURCE identity (fix #376): an import statement's source-side
         // name is edited only when the module it imports from binds the
