@@ -13,7 +13,7 @@ Use UCN to gather compact, auditable code evidence before reading large files or
 2. Pin a symbol with `ucn find <name>`, then pass its `path:line:name` handle to later commands.
 3. Run `ucn show <handle>` for the default summary, callers, and callees. Request extra projections with `--sections=source,tests,types,dependencies,example,related`.
 4. Before a change, run `ucn impact <handle>` and `ucn tests <handle> --depth=3`.
-5. After a signature change, run `ucn check <handle>`. Before committing, run target-less `ucn check`. Both compare a changed declaration with its earlier parameters (`check <handle>` reads them at `HEAD`; target-less `check` at `--base`, default `HEAD`): call sites that bound the old declaration are checked against the new one, and a site that now fits no overload is a mismatch, never an excluded other-target line.
+5. After a signature change, run `ucn check <handle>`. Before committing, run target-less `ucn check`. Both compare a changed declaration with its earlier parameters at `--base` (default `HEAD`): call sites that bound the old declaration are checked against the new one, and a site that now fits no overload is a mismatch, never an excluded other-target line.
 6. Read exact code with `ucn source <handle>` or `ucn source path/to/file:10-30` only when inspection is needed.
 
 Prefer `--json` for automation. Every CLI JSON response uses `{ meta, data }`;

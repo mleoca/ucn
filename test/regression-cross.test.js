@@ -11561,3 +11561,329 @@ describe('fix #402: impact keeps the reason of every unverified caller', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #403: callees use the caller side\'s lexical rule for local shadows and nested items', () => {
+    const calleesOf = (index, file, line, name) => {
+        const def = index.symbols.get(name).find(d => d.relativePath === file && d.startLine === line);
+        assert.ok(def, `${file}:${line}:${name}`);
+        const callees = index.findCallees(def, { collectAccount: true });
+        return {
+            confirmed: callees.map(c => `${c.name}:${c.startLine}@${c.sites.join('/')}`).sort(),
+            unverified: (callees.unverifiedCallees || []).map(u => `${u.name}:${u.reason}`).sort(),
+            excluded: callees.calleeAccount.excluded.byReason,
+            conserved: callees.calleeAccount.conserved,
+        };
+    };
+    const callersOf = (index, file, line, name) => {
+        const def = index.symbols.get(name).find(d => d.relativePath === file && d.startLine === line);
+        assert.ok(def, `${file}:${line}:${name}`);
+        return index.findCallers(name, { targetDefinitions: [def], collectAccount: true })
+            .map(c => `${c.relativePath}:${c.line}`).sort();
+    };
+    const traceDown = (index, handle) => {
+        const r = execute(index, 'trace', { name: handle });
+        assert.ok(r.ok, r.error);
+        const edges = [];
+        const walk = (node, from) => {
+            if (from) edges.push(`${from}->${node.name}:${node.line}`);
+            for (const child of node.children || []) walk(child, `${node.name}:${node.line}`);
+        };
+        walk(r.result.tree, null);
+        return { edges: edges.sort(), account: r.result.treeAccount.callSites };
+    };
+
+    it('JS/TS: a closure calls a helper any enclosing function declares; parameters and locals never do', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'a.js': [
+                'function helper(x) { return x * 2 }',              // 1
+                'export function outer() {',                        // 2
+                '  const helper = (x) => x',                        // 3
+                '  function inner() {',                             // 4
+                '    return helper(1)',                             // 5
+                '  }',                                              // 6
+                '  const arrow = () => helper(2) + later()',        // 7
+                '  function later() { return 3 }',                  // 8
+                '  return inner() + arrow()',                       // 9
+                '}',                                                // 10
+                'export function range(size) {',                    // 11
+                '  const range = size + 1',                         // 12
+                '  return wrap(range)',                             // 13
+                '}',                                                // 14
+                'function wrap(v) { return v }',                    // 15
+                'export function count(cb) {',                      // 16
+                '  cb(function (err, count) { return count })',     // 17
+                '}',                                                // 18
+            ].join('\n') + '\n',
+            'b.ts': [
+                'export function outer2(): number {',               // 1
+                '  function helper2(x: number) { return x }',       // 2
+                '  const inner2 = () => helper2(1)',                // 3
+                '  return inner2()',                                // 4
+                '}',                                                // 5
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const inner = calleesOf(index, 'a.js', 4, 'inner');
+            assert.deepStrictEqual(inner.confirmed, ['helper:3@5'], 'the enclosing function declares helper');
+            assert.ok(inner.conserved);
+            assert.deepStrictEqual(calleesOf(index, 'a.js', 7, 'arrow').confirmed, ['helper:3@7', 'later:8@7'],
+                'an arrow reaches a const and a hoisted function of its enclosing function');
+            assert.deepStrictEqual(callersOf(index, 'a.js', 3, 'helper'), ['a.js:5', 'a.js:7'], 'both sides agree');
+            assert.deepStrictEqual(callersOf(index, 'a.js', 1, 'helper'), []);
+            assert.deepStrictEqual(calleesOf(index, 'b.ts', 3, 'inner2').confirmed, ['helper2:2@3']);
+            const range = calleesOf(index, 'a.js', 11, 'range');
+            assert.deepStrictEqual(range.confirmed, ['wrap:15@13'], 'a local const is not the function itself');
+            assert.strictEqual(range.excluded['local-shadow'], 1);
+            const count = calleesOf(index, 'a.js', 16, 'count');
+            assert.ok(!count.confirmed.some(c => c.startsWith('count:')), 'a callback parameter is not the function');
+            const trace = traceDown(index, 'a.js:2:outer');
+            assert.ok(trace.edges.includes('inner:4->helper:3'), trace.edges.join(', '));
+            assert.ok(trace.edges.includes('arrow:7->helper:3'), trace.edges.join(', '));
+            assert.strictEqual(trace.account.excluded, 0);
+            assert.ok(traceDown(index, 'b.ts:1:outer2').edges.includes('inner2:3->helper2:2'));
+        } finally { rm(dir); }
+    });
+
+    it('Python: a lambda and a nested def reach the enclosing function\'s def on both sides', () => {
+        const dir = tmp({
+            'm.py': [
+                'def helper(x):',                                   // 1
+                '    return x * 2',                                 // 2
+                '',                                                 // 3
+                '',                                                 // 4
+                'def outer():',                                     // 5
+                '    def helper(x):',                               // 6
+                '        return x',                                 // 7
+                '',                                                 // 8
+                '    def inner():',                                 // 9
+                '        return helper(1)',                         // 10
+                '',                                                 // 11
+                '    arrow = lambda: helper(2)',                    // 12
+                '    shadow = lambda helper: helper(3)',            // 13
+                '    return inner() + arrow() + shadow(abs)',       // 14
+                '',                                                 // 15
+                '',                                                 // 16
+                'def other():',                                     // 17
+                '    return helper(4)',                             // 18
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(callersOf(index, 'm.py', 6, 'helper'), ['m.py:10', 'm.py:12'],
+                'a lambda is a function scope: the def its enclosing function binds');
+            assert.deepStrictEqual(callersOf(index, 'm.py', 1, 'helper'), ['m.py:18'],
+                'a lambda parameter shadows both');
+            assert.deepStrictEqual(calleesOf(index, 'm.py', 9, 'inner').confirmed, ['helper:6@10']);
+            const outer = calleesOf(index, 'm.py', 5, 'outer');
+            assert.ok(outer.confirmed.includes('helper:6@10/12'), outer.confirmed.join(', '));
+            assert.ok(!outer.confirmed.some(c => c.startsWith('helper:1')));
+            assert.deepStrictEqual(calleesOf(index, 'm.py', 17, 'other').confirmed, ['helper:1@18']);
+            const trace = traceDown(index, 'm.py:5:outer');
+            assert.ok(trace.edges.includes('inner:9->helper:6'), trace.edges.join(', '));
+        } finally { rm(dir); }
+    });
+
+    it('Rust: a nested fn item is an item of its block, so another function binds the module fn', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "p"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/lib.rs': [
+                'fn helper(x: i32) -> i32 { x * 2 }',               // 1
+                '',                                                 // 2
+                'pub fn outer() -> i32 {',                          // 3
+                '    fn helper(x: i32) -> i32 { x }',               // 4
+                '    let inner = || helper(1);',                    // 5
+                '    inner()',                                      // 6
+                '}',                                                // 7
+                '',                                                 // 8
+                'pub fn later() -> i32 {',                          // 9
+                '    let inner = || helper2(1);',                   // 10
+                '    fn helper2(x: i32) -> i32 { x }',              // 11
+                '    inner()',                                      // 12
+                '}',                                                // 13
+                '',                                                 // 14
+                'pub fn other() -> i32 {',                          // 15
+                '    let inner2 = || helper(3);',                   // 16
+                '    inner2()',                                     // 17
+                '}',                                                // 18
+                '',                                                 // 19
+                'pub fn shadowed() -> i32 {',                       // 20
+                '    let helper = |x: i32| x + 1;',                 // 21
+                '    helper(5)',                                    // 22
+                '}',                                                // 23
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(calleesOf(index, 'src/lib.rs', 3, 'outer').confirmed, ['helper:4@5']);
+            assert.deepStrictEqual(calleesOf(index, 'src/lib.rs', 9, 'later').confirmed, ['helper2:11@10'],
+                'an item is visible before its declaration in its block');
+            const other = calleesOf(index, 'src/lib.rs', 15, 'other');
+            assert.deepStrictEqual(other.confirmed, ['helper:1@16']);
+            assert.deepStrictEqual(other.unverified, []);
+            assert.deepStrictEqual(callersOf(index, 'src/lib.rs', 1, 'helper'), ['src/lib.rs:16']);
+            assert.deepStrictEqual(callersOf(index, 'src/lib.rs', 4, 'helper'), ['src/lib.rs:5']);
+            const shadowed = calleesOf(index, 'src/lib.rs', 20, 'shadowed');
+            assert.deepStrictEqual(shadowed.confirmed, [], 'a let closure shadows the fn');
+            assert.strictEqual(shadowed.excluded['local-shadow'], 1);
+            assert.ok(traceDown(index, 'src/lib.rs:15:other').edges.includes('other:15->helper:1'));
+        } finally { rm(dir); }
+    });
+
+    it('Go, C#, Java and C++ closures keep both sides agreeing', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/p\n\ngo 1.21\n',
+            'a.go': [
+                'package p',                                        // 1
+                '',                                                 // 2
+                'func helper(x int) int { return x * 2 }',          // 3
+                '',                                                 // 4
+                'func Outer() int {',                               // 5
+                '\thelper := func(x int) int { return x }',         // 6
+                '\tinner := func() int { return helper(1) }',       // 7
+                '\treturn inner()',                                 // 8
+                '}',                                                // 9
+                '',                                                 // 10
+                'func Other() int {',                               // 11
+                '\tinner2 := func() int { return helper(3) }',      // 12
+                '\treturn inner2()',                                // 13
+                '}',                                                // 14
+            ].join('\n') + '\n',
+            'A.cs': [
+                'using System;',                                    // 1
+                'class A {',                                        // 2
+                '    static int Helper(int x) => x * 2;',           // 3
+                '    int Outer() {',                                // 4
+                '        int Helper(int x) => x;',                  // 5
+                '        Func<int> inner = () => Helper(1);',       // 6
+                '        return inner();',                          // 7
+                '    }',                                            // 8
+                '    int Other() {',                                // 9
+                '        Func<int> inner2 = () => Helper(3);',      // 10
+                '        return inner2();',                         // 11
+                '    }',                                            // 12
+                '}',                                                // 13
+            ].join('\n') + '\n',
+            'B.java': [
+                'import java.util.function.Supplier;',              // 1
+                'class B {',                                        // 2
+                '    static int helper(int x) { return x * 2; }',   // 3
+                '    int other() {',                                // 4
+                '        Supplier<Integer> s = () -> helper(3);',   // 5
+                '        return s.get();',                          // 6
+                '    }',                                            // 7
+                '}',                                                // 8
+            ].join('\n') + '\n',
+            'c.cpp': [
+                'int helper(int x) { return x * 2; }',              // 1
+                'int outer() {',                                    // 2
+                '    auto helper = [](int x) { return x; };',       // 3
+                '    auto inner = [&]() { return helper(1); };',    // 4
+                '    return inner();',                              // 5
+                '}',                                                // 6
+                'int other() {',                                    // 7
+                '    auto inner2 = []() { return helper(3); };',    // 8
+                '    return inner2();',                             // 9
+                '}',                                                // 10
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(callersOf(index, 'a.go', 3, 'helper'), ['a.go:12']);
+            assert.deepStrictEqual(calleesOf(index, 'a.go', 11, 'Other').confirmed, ['helper:3@12']);
+            assert.deepStrictEqual(calleesOf(index, 'a.go', 5, 'Outer').confirmed, [],
+                'a local func value shadows the package function');
+            assert.deepStrictEqual(callersOf(index, 'A.cs', 5, 'Helper'), ['A.cs:6']);
+            assert.deepStrictEqual(callersOf(index, 'A.cs', 3, 'Helper'), ['A.cs:10']);
+            assert.deepStrictEqual(calleesOf(index, 'A.cs', 4, 'Outer').confirmed, ['Helper:5@6']);
+            assert.deepStrictEqual(calleesOf(index, 'A.cs', 9, 'Other').confirmed, ['Helper:3@10']);
+            assert.deepStrictEqual(callersOf(index, 'B.java', 3, 'helper'), ['B.java:5']);
+            assert.deepStrictEqual(calleesOf(index, 'B.java', 4, 'other').confirmed, ['helper:3@5']);
+            assert.deepStrictEqual(callersOf(index, 'c.cpp', 1, 'helper'), ['c.cpp:8']);
+            assert.deepStrictEqual(calleesOf(index, 'c.cpp', 7, 'other').confirmed, ['helper:1@8']);
+            assert.deepStrictEqual(calleesOf(index, 'c.cpp', 2, 'outer').confirmed, [],
+                'a local lambda shadows the function');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #403: check <symbol> --base compares with the declaration at that ref on every surface', () => {
+    const { execFileSync } = require('child_process');
+    const { McpClient } = require('./helpers');
+    const git = (dir, ...args) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args], { cwd: dir });
+    const setup = () => {
+        const dir = tmp({
+            'src/Util.java': [
+                'class Util {',
+                '    static boolean isEmpty(String s) { return s == null || s.isEmpty(); }',
+                '    static boolean isEmpty(Object[] a) { return a == null || a.length == 0; }',
+                '}',
+            ].join('\n') + '\n',
+            'src/Use.java': [
+                'class Use {',
+                '    boolean a(String s) { return Util.isEmpty(s); }',
+                '    boolean b() { return Util.isEmpty("x"); }',
+                '}',
+            ].join('\n') + '\n',
+        });
+        git(dir, 'init', '-q');
+        git(dir, 'add', '.');
+        git(dir, 'commit', '-qm', 'one');
+        const file = path.join(dir, 'src/Util.java');
+        fs.writeFileSync(file, fs.readFileSync(file, 'utf-8').replace(
+            'isEmpty(String s) { return s == null || s.isEmpty(); }',
+            'isEmpty(String s, boolean strict) { return s == null || (strict && s.isEmpty()); }'));
+        git(dir, 'commit', '-qam', 'two');
+        return dir;
+    };
+
+    it('execute, CLI and interactive read the old declaration at base; staged and unknown refs are refused', () => {
+        const dir = setup();
+        try {
+            const index = idx(dir);
+            const atHead = execute(index, 'check', { name: 'src/Util.java:2:isEmpty' });
+            assert.ok(atHead.ok, atHead.error);
+            assert.strictEqual(atHead.result.mismatches, 0, 'unchanged since HEAD: the sites bind no declaration');
+            assert.ok(!atHead.result.changedSince);
+            const atBase = execute(index, 'check', { name: 'src/Util.java:2:isEmpty', base: 'HEAD~1' });
+            assert.ok(atBase.ok, atBase.error);
+            assert.deepStrictEqual(atBase.result.mismatchDetails.map(m => `${m.file}:${m.line}`).sort(),
+                ['src/Use.java:2', 'src/Use.java:3']);
+            assert.strictEqual(atBase.result.changedSince.base, 'HEAD~1');
+            assert.match(atBase.result.changedSince.signature, /isEmpty \(s: String\)/);
+            const staged = execute(index, 'check', { name: 'src/Util.java:2:isEmpty', staged: true });
+            assert.ok(!staged.ok);
+            assert.match(staged.error, /staged=true only without a symbol target/);
+            const unknown = execute(index, 'check', { name: 'src/Util.java:2:isEmpty', base: 'no-such-ref' });
+            assert.ok(!unknown.ok);
+            assert.match(unknown.error, /Unknown git ref: no-such-ref/);
+            assert.ok(!execute(index, 'impact', { name: 'isEmpty', base: 'HEAD~1' }).ok,
+                'impact keeps symbol and diff scope apart');
+
+            const cli = runCli(dir, 'check', ['src/Util.java:2:isEmpty'], ['--base=HEAD~1', '--no-cache']);
+            assert.match(cli, /Changed since HEAD~1: was static isEmpty \(s: String\)/);
+            assert.match(cli, /2 mismatches/);
+            const repl = runInteractive(dir, ['check src/Util.java:2:isEmpty --base=HEAD~1'], ['--no-cache']);
+            assert.match(repl, /Changed since HEAD~1/);
+        } finally { rm(dir); }
+    });
+
+    it('MCP passes base to the symbol check', async () => {
+        const dir = setup();
+        const client = new McpClient();
+        try {
+            await client.start();
+            await client.initialize();
+            const res = await client.callTool('ucn', {
+                command: 'check', project_dir: dir, name: 'src/Util.java:2:isEmpty', base: 'HEAD~1',
+            });
+            const text = res.result?.content?.map(c => c.text).join('') || '';
+            assert.match(text, /Changed since HEAD~1/);
+            assert.match(text, /2 mismatches/);
+        } finally {
+            client.stop();
+            rm(dir);
+        }
+    });
+});

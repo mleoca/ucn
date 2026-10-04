@@ -909,33 +909,14 @@ function findCallers(index, name, options = {}) {
         options.targetDefinitions || definitions);
     for (const aliasName of valueAliasSurfaces) aliasNames.add(aliasName);
     const hasAliasSurfaces = aliasNames.size > 0;
+    // The local binding shadowing a bare reference reaches the pin only
+    // when it is a pinned definition (the shared lexical rule, fix #403):
+    // `new Helper()` in a closure nested in the function declaring
+    // `function Helper() {}` reaches it, a parameter never does.
     const shadowCanReachPinnedTarget = (filePath, call) => {
         if (call.resolvedName === name || call.resolvedNames?.includes(name)) return true;
-        // The parser names the shadowing binding's line (fix #397): the
-        // shadow is the pinned definition itself when the innermost
-        // same-name definition of the file enclosing that line is a target,
-        // whichever enclosing function of the reference declares it
-        // (`new Helper()` in a closure nested in the function declaring
-        // `function Helper() {}`).
-        // A parameter, catch or loop binding (-1) is never a definition.
-        const shadowLine = _shadowLineOf(call);
-        if (shadowLine) {
-            if (shadowLine < 0) return false;
-            const targets = options.targetDefinitions || definitions;
-            return targets.some(d => d.file === filePath && d.name === call.name &&
-                d.startLine === shadowLine);
-        }
-        // A Python closure binds the name in an enclosing function (fix
-        // #402): the shadow is a target declared directly in that function.
-        if (Number.isInteger(call.localShadowScope)) {
-            return (options.targetDefinitions || definitions).some(d => d.file === filePath &&
-                d.name === call.name && _enclosingFunctionOfDefinition(index, d)?.startLine === call.localShadowScope);
-        }
-        const scope = call.enclosingFunction;
-        return !!scope && (options.targetDefinitions || definitions).some(d =>
-            d.file === filePath && d.name === call.name &&
-            d.startLine >= scope.startLine && d.endLine <= scope.endLine &&
-            d.startLine <= call.line);
+        return (options.targetDefinitions || definitions).some(d =>
+            _localShadowDenotes(index, filePath, call, d));
     };
 
     // Phase 1: Find matching calls without reading file content.
@@ -1111,7 +1092,10 @@ function findCallers(index, name, options = {}) {
         // No record anywhere bears the name (fix #375): a file whose macro
         // expansions' calls are not derived yet is derived only when its
         // expanded text can hold the name; otherwise it has nothing to visit.
-        if (!calleeFiles && !hasAliasSurfaces && !targetIsTypeQuery &&
+        // A type query's records name the type as the call or as its written
+        // qualifier (`T::f()`, `Self` read from the kept impl header): words
+        // of that text too (fix #403).
+        if (!calleeFiles && !hasAliasSurfaces &&
             fileEntry.rustMacroExpansion?.callsPending &&
             !require('./rust-macro-expansion').rustPendingMayBear(fileEntry, name)) continue;
         try {
@@ -1132,7 +1116,17 @@ function findCallers(index, name, options = {}) {
                     : typedViews;
             }
 
+            // A type query visits every record for the type-qualified
+            // spellings; the views below change receiver types only, and
+            // only the receiver rewrites further down change the names a
+            // record matches by. A record that cannot match skips them all
+            // (fix #403: the views ran for every call of every file).
+            const typeQueryOnly = targetIsTypeQuery && !hasAliasSurfaces;
+            const bareReachesMethods = typeQueryOnly && langTraits(fileEntry.language)?.bareCallReachesMethods;
             for (let call of visitCalls) {
+                if (typeQueryOnly && !call.destructured && call.receiver !== name &&
+                    !_callBearsName(call, name) && fileEntry.language !== 'csharp' &&
+                    !(call.receiverIsTypeQualified && bareReachesMethods)) continue;
                 if (call.destructured) {
                     // A destructured name reads a member (fix #397): it
                     // reaches member targets through the member view, and a
@@ -1329,12 +1323,8 @@ function findCallers(index, name, options = {}) {
                 // body (fix #377): a bare call elsewhere names something else.
                 if (!call.receiver && !call.isMethod && pinnedLanguageTargets.length > 0 &&
                     langTraits(fileEntry.language)?.nestedItemsBlockScoped) {
-                    const outside = pinnedLanguageTargets.every(target => {
-                        const container = _enclosingFunctionOfDefinition(index, target);
-                        return container && (container.file !== filePath ||
-                            call.line < container.startLine || call.line > container.endLine) &&
-                            !_containerDeclaresGlobal(index, container, target.name);
-                    });
+                    const outside = pinnedLanguageTargets.every(target =>
+                        _nestedItemOutOfScope(index, filePath, target, call.line));
                     if (outside) {
                         recordExcluded(filePath, call.line, 'other-definition');
                         continue;
@@ -2823,7 +2813,7 @@ function findCallers(index, name, options = {}) {
                         fileBindings = _bindingsNamed(index, fileEntry, call.name).slice();
                     }
                     let bindings = _arityCompatibleBindings(index, fileEntry.language, call,
-                        _dropOutOfScopeBindings(index, filePath, call.name, call.line, fileBindings));
+                        _dropOutOfScopeBindings(index, filePath, call.name, call.line, fileBindings, call));
                     // A configuration alternative another branch of the
                     // call's own position excludes is no binding (fix #398F).
                     if (fileEntry.configurationItems && bindings.length > 0) {
@@ -2924,14 +2914,17 @@ function findCallers(index, name, options = {}) {
                             return owner && (owner.file || filePath) === callerSym.file &&
                                 owner.startLine === callerSym.startLine;
                         }) : [];
-                        // A Python closure's name bound in an enclosing
-                        // function (fix #402) is that function's binding.
-                        const closureOwner = lexicalMatches.length === 0 && Number.isInteger(call.localShadowScope)
-                            ? bindings.filter(b => strictOwner(b)?.startLine === call.localShadowScope) : [];
+                        // The binding the parser's local shadow names (a
+                        // closure's name bound in an enclosing function, fix
+                        // #402; the rule both directions share, fix #403).
+                        const shadowOwner = lexicalMatches.length === 0 && call.localShadow
+                            ? bindings.filter(b => definitionsInFile(index, call.name, filePath).some(d =>
+                                d.startLine === b.startLine && _localShadowDenotes(index, filePath, call, d)))
+                            : [];
                         if (lexicalMatches.length > 0) {
                             bindingId = lexicalMatches[0].binding.id;
-                        } else if (closureOwner.length === 1) {
-                            bindingId = closureOwner[0].id;
+                        } else if (shadowOwner.length === 1) {
+                            bindingId = shadowOwner[0].id;
                         } else if (sameLexicalOwner.length === 1) {
                             bindingId = sameLexicalOwner[0].id;
                         // For implicit same-class calls (Java: execute() means
@@ -8251,15 +8244,12 @@ function findCallees(index, definition, options = {}) {
             // nested class) — is the safe exception and remains eligible for
             // exact same-file resolution below.
             if (call.localShadow && !call.resolvedName && !call.resolvedNames) {
-                // A closure's name bound in an enclosing function (fix #402)
-                // reaches a definition declared directly there.
+                // The shadow reaches a definition only when it is one (the
+                // caller side's lexical rule, fix #403): a closure calls a
+                // helper any enclosing function declares.
                 const localTarget = (index.symbols.get(call.name) || []).some(s =>
-                    s.file === def.file &&
                     (s.type === 'class' || !NON_CALLABLE_TYPES.has(s.type)) &&
-                    (Number.isInteger(call.localShadowScope)
-                        ? _enclosingFunctionOfDefinition(index, s)?.startLine === call.localShadowScope
-                        : s.startLine >= def.startLine && s.endLine <= def.endLine &&
-                            s.startLine <= call.line));
+                    _localShadowDenotes(index, def.file, call, s));
                 if (!localTarget) {
                     noteSite(siteId, 'excluded', 'local-shadow', call);
                     continue;
@@ -9491,7 +9481,7 @@ function findCallees(index, definition, options = {}) {
                 let bindings = receiverBlindMethodBinding ? [] :
                     _arityCompatibleBindings(index, language, call,
                         _dropOutOfScopeBindings(index, def.file, call.name, call.line,
-                            fileEntry.bindings.filter(b => b.name === call.name)));
+                            fileEntry.bindings.filter(b => b.name === call.name), call));
                 // A marked macro invocation binds only macros, a call only
                 // fns and values (fix #377).
                 if (langTraits(language)?.macroInvocationSyntax === 'marked') {
@@ -9938,15 +9928,16 @@ function findCallees(index, definition, options = {}) {
                         // Try to resolve to a binding defined within the parent function's
                         // scope (inner closure). E.g., hookRunnerApplication defines next()
                         // internally — prefer that over other next() in the same file.
-                        // A Python closure's name bound in an enclosing
-                        // function (fix #402) is that function's definition.
-                        const closureBinding = Number.isInteger(call.localShadowScope)
+                        // The binding the parser's local shadow names: a
+                        // closure's name bound in any enclosing function
+                        // (fix #402, the caller side's rule since fix #403).
+                        const shadowBinding = call.localShadow
                             ? bindings.filter(b => {
                                 const sym = (index.symbols.get(effectiveName) || []).find(s =>
                                     s.file === def.file && s.startLine === b.startLine);
-                                return sym && _enclosingFunctionOfDefinition(index, sym)?.startLine === call.localShadowScope;
+                                return sym && _localShadowDenotes(index, def.file, call, sym);
                             }) : [];
-                        const innerBinding = closureBinding.length === 1 ? closureBinding[0] : bindings.find(b =>
+                        const innerBinding = shadowBinding.length === 1 ? shadowBinding[0] : bindings.find(b =>
                             b.startLine > def.startLine && b.startLine <= def.endLine);
                         if (innerBinding) {
                             bindingResolved = innerBinding.id;
@@ -15848,7 +15839,7 @@ function _configurationItemCallVerdict(index, filePath, fileEntry, call, name, t
     if (items.length === 0) return null;
     const declarationLines = new Set();
     for (const binding of _dropOutOfScopeBindings(index, filePath, call.name, call.line,
-        _bindingsNamed(index, fileEntry, call.name))) {
+        _bindingsNamed(index, fileEntry, call.name), call)) {
         const symbol = definitionAt(index, call.name, filePath, binding.startLine);
         if (symbol && (symbol.className || symbol.receiver)) continue;
         declarationLines.add(binding.startLine);
@@ -15904,7 +15895,7 @@ function _calleeConfigurationItemRoute(index, fileEntry, file, call) {
     if (items.length === 0) return null;
     const declarationLines = new Set();
     for (const binding of _dropOutOfScopeBindings(index, file, call.name, call.line,
-        _bindingsNamed(index, fileEntry, call.name))) {
+        _bindingsNamed(index, fileEntry, call.name), call)) {
         const symbol = definitionAt(index, call.name, file, binding.startLine);
         if (symbol && (symbol.className || symbol.receiver)) continue;
         declarationLines.add(binding.startLine);
@@ -15951,8 +15942,20 @@ function _dropUnreachableAlternatives(index, filePath, line, name, bindings) {
         siteExcludedAt(item, site, line))));
 }
 
-function _dropOutOfScopeBindings(index, file, name, line, bindings) {
+function _dropOutOfScopeBindings(index, file, name, line, bindings, call = null) {
     if (!bindings || bindings.length === 0 || line == null) return bindings;
+    // A nested item outside its enclosing function (Rust fn items, Python
+    // defs) is not a binding there, in either direction (fix #403: the
+    // caller side's #377/#402 exclusion, so `other()` calling `helper` beside
+    // `outer() { fn helper() }` binds the module's helper on both sides).
+    // A macro_rules! template token binds at each expansion, not at the
+    // template line.
+    if (!call?.inMacroDefinition && langTraits(index.files.get(file)?.language)?.nestedItemsBlockScoped) {
+        const inFile = definitionsInFile(index, name, file);
+        bindings = bindings.filter(binding => !inFile.some(d => d.startLine === binding.startLine &&
+            !d.className && !d.receiver && _nestedItemOutOfScope(index, file, d, line)));
+        if (bindings.length === 0) return bindings;
+    }
     const scoped = _lexicallyScopedDefinitionsByLine(index, name, file);
     if (scoped.size === 0) return bindings.slice();
     const kept = bindings.filter(binding => {
@@ -18597,8 +18600,9 @@ function _enclosingFunctionOfDefinitionUncached(index, def) {
  * different item, null when the tree cannot decide (use aliases, extern
  * crates, types, re-exports, cfg alternatives).
  */
+let _rustModulesApi = null;
 function _rustModulePathRoute(index, filePath, call, name, targets) {
-    const { rustPathModule, rustModuleItems } = require('./rust-modules');
+    const { rustPathModule, rustModuleItems } = _rustModulesApi || (_rustModulesApi = require('./rust-modules'));
     const resolved = rustPathModule(index, filePath, call.line, call.receiver);
     if (!resolved) return null;
     const items = rustModuleItems(index, resolved, name);
@@ -19294,6 +19298,45 @@ function _rustImplGroupSelect(index, file, call, group) {
  */
 function _shadowLineOf(call) {
     return typeof call.localShadow === 'number' ? call.localShadow : 0;
+}
+
+/**
+ * Whether the local binding that shadows a bare reference is the definition
+ * `d` (fix #403). One lexical rule for both directions: the caller side asks
+ * it of the pinned targets, the callee side of the name's definitions. The
+ * parser records which binding shadows the name: the declaring statement's
+ * line (JS/TS, fix #397; -1 for a parameter, catch or loop binding, never a
+ * definition), the enclosing function a closure binds it in (Python, fix
+ * #402), or only that a local of the reference's own function binds it.
+ * With a line or a scope the reference's own function does not bound the
+ * answer: a closure reaches a declaration of any enclosing function.
+ */
+function _localShadowDenotes(index, filePath, call, d) {
+    if (!d || d.file !== filePath || d.name !== call.name) return false;
+    const shadowLine = _shadowLineOf(call);
+    if (shadowLine) return shadowLine > 0 && d.startLine === shadowLine;
+    if (Number.isInteger(call.localShadowScope)) {
+        return _enclosingFunctionOfDefinition(index, d)?.startLine === call.localShadowScope;
+    }
+    const scope = Number.isInteger(call.enclosingFunction?.endLine)
+        ? call.enclosingFunction
+        : index.findEnclosingFunction(filePath, call.line, true, call);
+    return !!scope && d.startLine >= scope.startLine && d.endLine <= scope.endLine &&
+        d.startLine <= call.line;
+}
+
+/**
+ * A definition nested in a function body that a bare name at `line` of
+ * `filePath` cannot see (fix #377 Rust items, fix #402 Python defs; shared by
+ * both directions in fix #403): the language scopes nested items to their
+ * block and the line lies outside the enclosing function, which does not
+ * declare the name `global`.
+ */
+function _nestedItemOutOfScope(index, filePath, target, line) {
+    const container = _enclosingFunctionOfDefinition(index, target);
+    return !!container && (container.file !== filePath ||
+        line < container.startLine || line > container.endLine) &&
+        !_containerDeclaresGlobal(index, container, target.name);
 }
 
 /**

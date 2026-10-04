@@ -252,8 +252,11 @@ function rustRootIsLocal(index, fileEntry, filePath, root, exceptBinding) {
         (binding.alias || binding.name) === root)) return true;
     if ((index.symbols.get(root) || []).some(definition =>
         definition.file === filePath && definition.type === 'module')) return true;
+    // A sibling module file; the file system is read once per directory
+    // and name while the index lives (fix #403: twice per path per query).
     const dir = path.dirname(filePath);
-    return fs.existsSync(path.join(dir, `${root}.rs`)) || fs.existsSync(path.join(dir, root, 'mod.rs'));
+    return memoized(index, `\x01rsmod\x00${dir}\x00${root}`, () =>
+        fs.existsSync(path.join(dir, `${root}.rs`)) || fs.existsSync(path.join(dir, root, 'mod.rs')));
 }
 
 /** Does a Rust path (`std::fs`, `tokio_util::sync`) name an external crate? */
@@ -278,6 +281,16 @@ function rustPathIsExternal(index, fileEntry, filePath, pathText, exceptBinding)
  * names and anything unmodelled answer false.
  */
 function bindingIsExternal(index, fileEntry, filePath, binding) {
+    // A binding belongs to one file: its verdict is asked per site (fix #403).
+    if (!binding || typeof binding !== 'object') return bindingIsExternalOf(index, fileEntry, filePath, binding);
+    const memo = memoized(index, '\x01binding-external', () => new WeakMap());
+    if (memo.has(binding)) return memo.get(binding);
+    const verdict = bindingIsExternalOf(index, fileEntry, filePath, binding);
+    memo.set(binding, verdict);
+    return verdict;
+}
+
+function bindingIsExternalOf(index, fileEntry, filePath, binding) {
     const module = String(binding?.module || '');
     if (!module || binding.dynamic) return false;
     switch (fileEntry.language) {
@@ -346,7 +359,7 @@ function bindingOriginalName(fileEntry, binding) {
  */
 function externalTypeDenotation(index, filePath, name, qualifier, line, options = {}) {
     if (!name) return null;
-    const scoped = rustScopedLine(index, filePath, line);
+    const scoped = rustScopedLine(index, filePath, line, name);
     // `unscoped`: the site's spelling of the name is unknown (the parser kept
     // only the last segment), so package/namespace scoping cannot apply.
     const unscoped = options.unscoped === true;
@@ -359,8 +372,7 @@ function externalTypeDenotation(index, filePath, name, qualifier, line, options 
         // A local definition of the name decides (shadows imports). Rust
         // items are visible in their own module only: an inline `mod rand
         // { use std::..::AtomicU32; }` does not see the file's own struct.
-        const moduleOf = rustLine => innermostScope((fileEntry.symbols || []).filter(symbol =>
-            symbol.type === 'module' && symbol.endLine > symbol.startLine), rustLine);
+        const moduleOf = rustLine => innermostScope(rustModuleScopes(fileEntry), rustLine);
         const siteModule = language === 'rust' && line != null ? moduleOf(line) : undefined;
         if ((index.symbols.get(name) || []).some(definition => definition.file === filePath &&
             (TYPE_KINDS.has(definition.type) || definition.type === 'type') &&
@@ -715,9 +727,34 @@ function csharpGlobalUsings(index, filePath) {
 
 // Rust `use` declarations are scoped to their module or block: an inline
 // `mod rand { use std::sync::atomic::AtomicU32; }` binds nothing outside it.
+// Both lists are read per site: kept per symbols array (a rebuilt file has a
+// new one).
+const rustScopeLists = new WeakMap();
+function rustScopeListsOf(fileEntry) {
+    const symbols = fileEntry.symbols || [];
+    let lists = rustScopeLists.get(symbols);
+    if (!lists || lists.length !== symbols.length || lists.first !== symbols[0] ||
+        lists.last !== symbols[symbols.length - 1]) {
+        const spanning = symbols.filter(symbol => symbol.endLine > symbol.startLine);
+        lists = {
+            length: symbols.length,
+            first: symbols[0],
+            last: symbols[symbols.length - 1],
+            scopes: spanning.filter(symbol =>
+                symbol.type === 'module' || symbol.type === 'function' || symbol.type === 'method'),
+            modules: spanning.filter(symbol => symbol.type === 'module'),
+        };
+        rustScopeLists.set(symbols, lists);
+    }
+    return lists;
+}
+
 function rustScopes(fileEntry) {
-    return (fileEntry.symbols || []).filter(symbol => symbol.endLine > symbol.startLine &&
-        (symbol.type === 'module' || symbol.type === 'function' || symbol.type === 'method'));
+    return rustScopeListsOf(fileEntry).scopes;
+}
+
+function rustModuleScopes(fileEntry) {
+    return rustScopeListsOf(fileEntry).modules;
 }
 
 function innermostScope(scopes, line) {
@@ -729,11 +766,19 @@ function innermostScope(scopes, line) {
     return best;
 }
 
-/** The site line, when a Rust file has scoped `use` declarations (memo key). */
-function rustScopedLine(index, filePath, line) {
+/** The site line as a memo key part: in a Rust file that declares or
+ * imports the name (its module and the `use` scopes around the site decide);
+ * otherwise the answer is the file's (fix #403: keyed per line, every
+ * `T::new()` site of a file recomputed it). */
+function rustScopedLine(index, filePath, line, name) {
     if (line == null) return null;
     const fileEntry = index.files.get(filePath);
-    return fileEntry?.language === 'rust' ? line : null;
+    if (fileEntry?.language !== 'rust') return null;
+    const declares = (index.symbols.get(name) || []).some(definition => definition.file === filePath &&
+        (TYPE_KINDS.has(definition.type) || definition.type === 'type'));
+    const imports = (fileEntry.importBindings || []).some(binding =>
+        binding.name !== '*' && (binding.alias || binding.name) === name && binding.module);
+    return declares || imports ? line : null;
 }
 
 /** Bindings visible at `line`: those of the innermost enclosing scope that

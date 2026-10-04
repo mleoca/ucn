@@ -307,7 +307,7 @@ const INPUT_SHAPE = {
     default_value: stringParam('Default value for added parameter (plan command)'),
     stack: stringParam('The stack trace text to parse (stacktrace command)'),
     range: stringParam('source line range, e.g. "10-20" or "15"; requires file.'),
-    base: stringParam('impact/check without a symbol: Git ref to diff against (default: HEAD). E.g. "HEAD~3", "main", a commit SHA'),
+    base: stringParam('Git ref (default: HEAD). impact/check without a symbol: diff against it; check with a symbol: compare the declaration with its version there. E.g. "HEAD~3", "main", a commit SHA'),
     staged: booleanParam('impact/check without a symbol: analyze staged changes.'),
     deep: booleanParam('repo: include health and sample the ordinal resolution-evidence profile, not accuracy.'),
     compact: booleanParam('Compact output defaults to true for show/impact and false for usages; set the opposite value to change that command\'s presentation.'),

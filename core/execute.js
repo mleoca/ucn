@@ -480,8 +480,13 @@ function validatePublicParams(command, p) {
     }
     const hasName = typeof p.name === 'string' && p.name.trim() !== '';
     const gitScope = p.staged || (typeof p.base === 'string' && p.base.trim() !== '');
-    if ((command === 'impact' || command === 'check') && hasName && gitScope) {
+    if (command === 'impact' && hasName && gitScope) {
         return `${command} accepts either a symbol target or Git diff scope (base/staged), not both.`;
+    }
+    // `check <symbol>` compares the declaration with its version at base;
+    // staged selects the target-less diff check.
+    if (command === 'check' && hasName && p.staged) {
+        return 'check accepts staged=true only without a symbol target; a symbol target compares with base.';
     }
     if ((command === 'impact' || command === 'check') && p.staged && p.base) {
         return `${command} accepts either staged=true or base, not both.`;
@@ -2245,6 +2250,9 @@ const HANDLERS = {
             // --no-include-methods.
             ...(p.includeMethods !== undefined && { includeMethods: p.includeMethods }),
             ...(p.includeUncertain !== undefined && { includeUncertain: p.includeUncertain }),
+            // The revision whose declaration the call sites were written
+            // against (default HEAD).
+            ...(typeof p.base === 'string' && p.base.trim() && { base: p.base.trim(), checkBaseRef: true }),
         });
         if (result && result.found === false) {
             return { ok: false, error: symbolNotFound(index, p.name, 'Function') };

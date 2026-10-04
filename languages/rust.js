@@ -5631,11 +5631,11 @@ function findUsagesInCode(code, name, parser, tree, options = {}) {
     const sameFileEnumVariant = (enumName, variantName) => {
         if (_enumVariants === null) {
             _enumVariants = new Map();
-            traverseTreeCached(tree.rootNode, (n) => {
-                if (n.type !== 'enum_item') return;
+            // Native type walk: no node list of the whole file (fix #403).
+            for (const n of tree.rootNode.descendantsOfType('enum_item')) {
                 const enName = n.childForFieldName('name')?.text;
                 const body = n.childForFieldName('body');
-                if (!enName || !body) return;
+                if (!enName || !body) continue;
                 let set = _enumVariants.get(enName);
                 if (!set) { set = new Set(); _enumVariants.set(enName, set); }
                 for (let i = 0; i < body.namedChildCount; i++) {
@@ -5645,7 +5645,7 @@ function findUsagesInCode(code, name, parser, tree, options = {}) {
                         if (vn) set.add(vn);
                     }
                 }
-            });
+            }
         }
         return _enumVariants.get(enumName)?.has(variantName) || false;
     };

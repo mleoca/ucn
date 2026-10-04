@@ -138,7 +138,7 @@ and callee answers, and 8,000 cross-command comparisons with zero disagreements.
 The default dead-code audit found zero false-dead results among 9 scored
 claims; 4 additional claims could not be pinned by the oracle and were unscored.
 All ten repositories passed the performance budgets, with steady-state query
-p95 from 4.7 to 106.1 ms. Those timings exclude process startup and indexing;
+p95 from 4.7 to 101.1 ms. Those timings exclude process startup and indexing;
 cold builds and cache loading are measured separately.
 
 The samples are deterministic and stratified by reference activity. Confirmed

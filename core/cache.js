@@ -916,7 +916,9 @@ function clearAllCaches() {
 // a default import beside named or namespace imports is its own `default`
 // import record; JS/TS and Python member-call records mark `awaited` and
 // `passedAsArgument`.
-const CACHE_FORMAT_VERSION = 273;
+// v274 (fix #403): a Python reference inside a lambda whose enclosing def
+// binds the name records that def as its `localShadowScope`.
+const CACHE_FORMAT_VERSION = 274;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**

@@ -1087,6 +1087,24 @@ function startBaseRead(file, base) {
     return { file, out };
 }
 
+/** Throw a UcnError unless `base` names a commit of the repository holding `file`. */
+function assertGitCommit(file, base) {
+    try {
+        execFileSync('git', ['rev-parse', '--show-toplevel'], {
+            cwd: path.dirname(file), stdio: ['ignore', 'pipe', 'ignore'],
+        });
+    } catch (e) {
+        throw new UcnError('Not a git repository. check --base requires git.', { cause: e });
+    }
+    try {
+        execFileSync('git', ['rev-parse', '--verify', '--quiet', '--end-of-options', `${base}^{commit}`], {
+            cwd: path.dirname(file), stdio: ['ignore', 'pipe', 'ignore'],
+        });
+    } catch (e) {
+        throw new UcnError(`Unknown git ref: ${base}`, { cause: e });
+    }
+}
+
 /** The content a background read produced: a string, null (not at base), or undefined (no answer in time). */
 function finishBaseRead(handle, timeoutMs = 15000) {
     const cell = new Int32Array(new SharedArrayBuffer(4));
@@ -1943,6 +1961,10 @@ function verify(index, name, options = {}) {
     // when the sweep excludes a site by parameter fit or leaves one unverified.
     const baseRef = options.base || 'HEAD';
     if (!GIT_REF_FORMAT.test(baseRef)) throw new UcnError(`Invalid git ref format: ${baseRef}`);
+    // A base the user names must be a commit: a misspelled ref would read as
+    // a file absent at base and check nothing against the old declaration
+    // (the target-less check already resolved its base through the diff).
+    if (options.base && options.checkBaseRef) assertGitCommit(def.file, baseRef);
     const baseRead = startBaseRead(def.file, baseRef);
     let sweep;
     try {

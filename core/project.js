@@ -2067,23 +2067,21 @@ class ProjectIndex {
                 if (symbol.type === 'field' || symbol.type === 'property') {
                     continue;
                 }
-                if (!ownedHere(symbol)) continue;
-
                 // Check Go/Rust-style receiver (e.g., func (r *Router) Method())
                 // Also matches Rust associated functions (have receiver but isMethod=false)
-                if (symbol.receiver) {
-                    const receiverBase = symbol.receiver.replace(/^\*/, '');
-                    if (receiverBase === baseTypeName && sameCompilerType(symbol)) {
-                        methods.push(symbol);
-                        continue;
-                    }
-                }
-
+                const receiverMatch = !!symbol.receiver &&
+                    symbol.receiver.replace(/^\*/, '') === baseTypeName;
                 // Check Python/Java/JS-style className (class members)
                 // Must be a method type, not just any symbol with className
-                if (symbol.className === baseTypeName &&
-                    (symbol.isMethod || symbol.type === 'method' || symbol.type === 'constructor') &&
-                    sameCompilerType(symbol)) {
+                const classMatch = symbol.className === baseTypeName &&
+                    (symbol.isMethod || symbol.type === 'method' || symbol.type === 'constructor');
+                // Ownership is resolved for members of the name only.
+                if ((!receiverMatch && !classMatch) || !ownedHere(symbol)) continue;
+                if (receiverMatch && sameCompilerType(symbol)) {
+                    methods.push(symbol);
+                    continue;
+                }
+                if (classMatch && sameCompilerType(symbol)) {
                     methods.push(symbol);
                     continue;
                 }

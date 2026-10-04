@@ -130,7 +130,7 @@ const SCENARIOS = Object.freeze([
         id: 'A04',
         prompt: 'List every literal code usage of chargeCard, including imports and aliases.',
         command: 'usages',
-        params: { name: 'chargeCard', includeTests: true },
+        params: { name: 'chargeCard' },
         assertions: [
             assertion('usages retains the import',
                 doc => doc.data?.some(row => row.usageType === 'import' &&
@@ -371,6 +371,20 @@ const SCENARIOS = Object.freeze([
                 doc => Object.values(doc.data?.health?.blindSpots || {}).every(
                     blindSpot => !blindSpot?.files?.some(
                         file => file.startsWith('tests/')))),
+        ],
+    },
+    {
+        id: 'A21',
+        prompt: 'List every literal code usage of processRefund, test files included.',
+        command: 'usages',
+        params: { name: 'processRefund' },
+        assertions: [
+            assertion('usages lists test-file rows by default',
+                doc => doc.data?.some(row => row.relativePath === 'tests/refund.spec.ts' &&
+                    row.usageType === 'call')),
+            assertion('usages keeps the production call',
+                doc => doc.data?.some(row => row.relativePath === 'src/api/http-surface.ts' &&
+                    row.usageType === 'call')),
         ],
     },
 ]);

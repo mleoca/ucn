@@ -2204,8 +2204,10 @@ function isPythonNameShadowedAt(refNode, name) {
 /**
  * The start line (decorators included) of the enclosing function a closure
  * reference binds `name` in (fix #402): null when the reference's own
- * function (or a comprehension, lambda or loop around it) binds it, or no
- * enclosing function does.
+ * function (or a comprehension or loop around it) binds it, or no enclosing
+ * function does. A lambda is a function of its own (fix #403): the call
+ * records name it as the reference's enclosing function, so a name its
+ * enclosing def binds is a closure name.
  */
 function pythonClosureScopeLine(refNode, name) {
     let first = true;
@@ -2214,6 +2216,7 @@ function pythonClosureScopeLine(refNode, name) {
             const params = parent.childForFieldName('parameters');
             if (params?.namedChildren.some(param => (param.type === 'identifier' ? param
                 : param.childForFieldName('name'))?.text === name)) return null;
+            first = false;
             continue;
         }
         if (PY_COMPREHENSIONS.has(parent.type)) {
