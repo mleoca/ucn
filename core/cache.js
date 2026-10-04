@@ -910,7 +910,13 @@ function clearAllCaches() {
 // target-typed `new(..)` collection elements are typed, argument slots of
 // generic receivers carry `receiverTypeText` (a `~` targetTypedKeys entry);
 // Java `super` calls in enum-constant bodies carry `receiverSuperType`.
-const CACHE_FORMAT_VERSION = 272;
+// v273 (fix #402): Python defs under compound statements of a class body
+// are methods of the class and `Union[X, None]` annotations name X; JS/TS
+// anonymous default exports and member-assigned functions record `isAsync`,
+// a default import beside named or namespace imports is its own `default`
+// import record; JS/TS and Python member-call records mark `awaited` and
+// `passedAsArgument`.
+const CACHE_FORMAT_VERSION = 273;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**

@@ -11418,3 +11418,146 @@ describe('fix #401: C# collection elements, generic receivers, extension receive
         } finally { rm(dir); }
     });
 });
+
+describe('fix #402: tests lists the test sites the caller engine attributes to the target', () => {
+    const testSites = (index, handle) => {
+        const r = execute(index, 'tests', { name: handle });
+        assert.ok(r.ok, JSON.stringify(r.error));
+        return r.result.flatMap(f => f.matches.map(m => `${f.file}:${m.line}:${m.matchType}`)).sort();
+    };
+
+    it('C++: bare calls in TEST_F bodies reach the fixture method, visibly unverified', () => {
+        const dir = tmp({
+            'log_test.cc': [
+                '#include "gtest/gtest.h"',                  // 1
+                'class LogTest : public ::testing::Test {',  // 2
+                ' public:',                                  // 3
+                '  int WrittenBytes() const { return 1; }',  // 4
+                '  int Twice() { return WrittenBytes() * 2; }', // 5
+                '};',                                        // 6
+                '',                                          // 7
+                'TEST_F(LogTest, Marginal) {',               // 8
+                '  ASSERT_EQ(1, WrittenBytes());',           // 9
+                '}',                                         // 10
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(testSites(index, 'log_test.cc:4:WrittenBytes'),
+                ['log_test.cc:5:call', 'log_test.cc:9:unverified-call']);
+        } finally { rm(dir); }
+    });
+
+    it('Java: static-imported and implicit-this calls in test classes are listed', () => {
+        const dir = tmp({
+            'src/test/java/org/x/EventCollector.java': [
+                'package org.x;',                            // 1
+                'public class EventCollector {',             // 2
+                '  public static boolean everyTestRunSuccessful() { return true; }', // 3
+                '}',                                         // 4
+            ].join('\n') + '\n',
+            'src/test/java/org/x/CollectorTest.java': [
+                'package org.x;',                            // 1
+                'import static org.x.EventCollector.everyTestRunSuccessful;', // 2
+                'import org.junit.Test;',                    // 3
+                'public class CollectorTest {',              // 4
+                '  @Test public void a() { boolean b = everyTestRunSuccessful(); }', // 5
+                '  @Test public void b() { boolean c = signatureOfFoo(); }', // 6
+                '  private boolean signatureOfFoo() { return true; }', // 7
+                '}',                                         // 8
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.ok(testSites(index, 'src/test/java/org/x/EventCollector.java:3:everyTestRunSuccessful')
+                .includes('src/test/java/org/x/CollectorTest.java:5:call'));
+            assert.ok(testSites(index, 'src/test/java/org/x/CollectorTest.java:7:signatureOfFoo')
+                .includes('src/test/java/org/x/CollectorTest.java:6:call'));
+        } finally { rm(dir); }
+    });
+
+    it('Python: a rejected token never hides a matching one on its line; fixture receivers count', () => {
+        const dir = tmp({
+            'app/__init__.py': '',
+            'app/svc.py': [
+                'class Service:',                            // 1
+                '    def fetch(self):',                      // 2
+                '        return 1',                          // 3
+                '',                                          // 4
+                '',                                          // 5
+                'class Other:',                              // 6
+                '    def fetch(self):',                      // 7
+                '        return 2',                          // 8
+            ].join('\n') + '\n',
+            'tests/__init__.py': '',
+            'tests/conftest.py': [
+                'import pytest',                             // 1
+                'from app.svc import Service',               // 2
+                '',                                          // 3
+                '',                                          // 4
+                '@pytest.fixture',                           // 5
+                'def svc() -> Service:',                     // 6
+                '    return Service()',                      // 7
+            ].join('\n') + '\n',
+            'tests/test_svc.py': [
+                'from unittest.mock import Mock',            // 1
+                'from app.svc import Service',               // 2
+                '',                                          // 3
+                '',                                          // 4
+                'def test_fetch(svc):',                      // 5
+                '    assert svc.fetch() == 1',               // 6
+                '',                                          // 7
+                '',                                          // 8
+                'class TestRef:',                            // 9
+                '    def setup_method(self):',               // 10
+                '        self.service = Service()',          // 11
+                '        self.conn = Mock()',                // 12
+                '        self.conn.fetch = self.service.fetch', // 13
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const sites = testSites(index, 'app/svc.py:2:fetch');
+            assert.ok(sites.includes('tests/test_svc.py:6:call'), sites.join('\n'));
+            assert.ok(sites.includes('tests/test_svc.py:13:reference'), sites.join('\n'));
+            assert.ok(!testSites(index, 'app/svc.py:7:fetch').includes('tests/test_svc.py:6:call'));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #402: impact keeps the reason of every unverified caller', () => {
+    it('a name-only call the engine tiers unverified carries its reason in impact as in show', () => {
+        const dir = tmp({
+            'Cargo.toml': '[workspace]\nmembers = ["a", "b"]\n',
+            'a/Cargo.toml': '[package]\nname = "a"\nversion = "0.1.0"\n',
+            'b/Cargo.toml': '[package]\nname = "b"\nversion = "0.1.0"\n',
+            'a/tests/one.rs': [
+                'fn m(start: usize) -> usize {',   // 1
+                '    start + 1',                   // 2
+                '}',                               // 3
+                '',                                // 4
+                '#[test]',                         // 5
+                'fn uses() {',                     // 6
+                '    assert_eq!(m(1), 2);',        // 7
+                '}',                               // 8
+            ].join('\n'),
+            'b/tests/two.rs': [
+                '#[test]',                         // 1
+                'fn uses_other() {',               // 2
+                '    assert!(m("").is_empty());',  // 3
+                '}',                               // 4
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const handle = 'a/tests/one.rs:1:m';
+            const show = execute(index, 'show', { name: handle });
+            const impact = execute(index, 'impact', { name: handle });
+            assert.ok(show.ok && impact.ok);
+            const keys = sites => sites.map(s => `${s.relativePath || s.file}:${s.line}:${s.reason || ''}`).sort();
+            assert.deepStrictEqual(keys(show.result.context.unverifiedCallers), ['b/tests/two.rs:3:no-scope-evidence']);
+            assert.deepStrictEqual(keys(impact.result.unverifiedSites), keys(show.result.context.unverifiedCallers));
+            assert.match(output.formatImpact(impact.result), /two\.rs:3 .*\(no-scope-evidence\)/);
+        } finally { rm(dir); }
+    });
+});

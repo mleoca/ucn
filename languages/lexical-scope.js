@@ -1204,6 +1204,71 @@ function scopeFields(verdict) {
     };
 }
 
+/**
+ * The Python scope node whose binding a reference to `name` resolves to
+ * (fix #402): the function, lambda or comprehension that binds it, or the
+ * module; null when that is not decidable (star imports, `global`/`nonlocal`
+ * declarations, a class body that binds it too, non-reference positions).
+ */
+function referenceScopeNode(node, name, memo = new Map()) {
+    const parent = node?.parent;
+    if (!parent) return null;
+    if (parent.type === 'keyword_argument' && sameNode(parent.childForFieldName('name'), node)) return null;
+    if (parent.type === 'attribute' && sameNode(parent.childForFieldName('attribute'), node)) return null;
+    if (parent.type === 'keyword_pattern' && sameNode(parent.namedChild(0), node)) return null;
+    let child = node;
+    let crossedFunction = false;
+    try {
+        for (let scope = parent; scope; child = scope, scope = scope.parent) {
+            switch (scope.type) {
+                case 'function_definition': {
+                    const body = scope.childForFieldName('body');
+                    if (!sameNode(body, child)) continue;
+                    const info = memoGet(memo, scope, name, () => pyScopeBindings(scope, body, name, true));
+                    if (info.starImport || info.global || info.nonlocal) return null;
+                    if (info.bound) return scope;
+                    crossedFunction = true;
+                    continue;
+                }
+                case 'lambda': {
+                    if (!sameNode(scope.childForFieldName('body'), child)) continue;
+                    const names = [];
+                    pyParameterNames(scope.childForFieldName('parameters'), names);
+                    if (names.some(n => n.text === name)) return scope;
+                    crossedFunction = true;
+                    continue;
+                }
+                case 'class_definition': {
+                    const body = scope.childForFieldName('body');
+                    if (!sameNode(body, child) || crossedFunction) continue;
+                    const info = memoGet(memo, scope, name, () => pyScopeBindings(scope, body, name, false));
+                    if (info.bound || info.starImport) return null;
+                    continue;
+                }
+                case 'list_comprehension': case 'set_comprehension':
+                case 'dictionary_comprehension': case 'generator_expression': {
+                    const clauses = namedChildrenOf(scope).filter(c => c.type === 'for_in_clause');
+                    if (within(node, clauses[0]?.childForFieldName('right'))) continue;
+                    for (const clause of clauses) {
+                        const names = [];
+                        pyTargetNames(clause.childForFieldName('left'), names);
+                        if (names.some(n => n.text === name)) return scope;
+                    }
+                    crossedFunction = true;
+                    continue;
+                }
+                case 'module':
+                    return scope;
+                default:
+                    continue;
+            }
+        }
+    } catch {
+        return null;
+    }
+    return null;
+}
+
 /** Declaration tokens binding one name in a Python function's own scope. */
 function pythonBindingSites(scope, name) {
     const sites = [];
@@ -1212,4 +1277,4 @@ function pythonBindingSites(scope, name) {
     return sites;
 }
 
-module.exports = { referenceScope, scopeFields, familyOf, rustLetBindingOf, rustSelfFieldBinding, pythonBindingSites };
+module.exports = { referenceScope, referenceScopeNode, scopeFields, familyOf, rustLetBindingOf, rustSelfFieldBinding, pythonBindingSites };

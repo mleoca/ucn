@@ -67,6 +67,23 @@ function aliasBaseTypeName(typeNode) {
     return null;
 }
 
+/** Whether a call's parent, through parentheses, is of `parentType` (fix #402). */
+function directlyAwaited(node, awaitType) {
+    let parent = node.parent;
+    while (parent?.type === 'parenthesized_expression') parent = parent.parent;
+    return parent?.type === awaitType;
+}
+
+/** Whether a function/arrow node carries the `async` keyword token (fix #402). */
+function hasAsyncToken(node) {
+    for (let i = 0; i < (node?.childCount || 0); i++) {
+        const child = node.child(i);
+        if (child.type === 'async') return true;
+        if (child.isNamed) return false;
+    }
+    return false;
+}
+
 /**
  * Check if function is a generator
  * @param {object} node - Function node
@@ -1160,6 +1177,7 @@ function _processFunction(node, functions, processedRanges, lines) {
                     const paramsStructured = parseStructuredParams(paramsNode, 'javascript');
                     const typeAnno = buildTypeAnnotations(paramsStructured, returnType, lines, startLine, true);
 
+                    const isAsync = hasAsyncToken(rightNode);
                     functions.push({
                         name,
                         params: extractParams(paramsNode),
@@ -1169,7 +1187,8 @@ function _processFunction(node, functions, processedRanges, lines) {
                         indent,
                         isArrow,
                         isGenerator: isGen,
-                        modifiers: isCommonJsDefault ? ['export'] : [],
+                        ...(isAsync && { isAsync }),
+                        modifiers: [...(isCommonJsDefault ? ['export'] : []), ...(isAsync ? ['async'] : [])],
                         // A property-assignment def (Reply.prototype.serialize
                         // = function, exports.h = () => ...) creates NO
                         // lexical name — a bare call in the file can never
@@ -1243,6 +1262,7 @@ function _processFunction(node, functions, processedRanges, lines) {
                     const paramsStructured = parseStructuredParams(paramsNode, 'javascript');
                     const typeAnno = buildTypeAnnotations(paramsStructured, returnType, lines, startLine, true);
 
+                    const isAsync = hasAsyncToken(child);
                     functions.push({
                         name: 'default',
                         params: extractParams(paramsNode),
@@ -1252,7 +1272,8 @@ function _processFunction(node, functions, processedRanges, lines) {
                         indent,
                         isArrow: child.type === 'arrow_function',
                         isGenerator: isGen,
-                        modifiers: ['export', 'default'],
+                        ...(isAsync && { isAsync }),
+                        modifiers: isAsync ? ['export', 'async', 'default'] : ['export', 'default'],
                         ...typeAnno,
                         ...(generics && { generics }),
                         ...(docstring && { docstring })
@@ -4111,6 +4132,10 @@ function findCallsInCode(code, parser) {
                             callStart: node.startIndex,
                             callEnd: node.endIndex,
                             isMethod: true,
+                            // `await x.m()` and `f(x.m())` (fix #402): the
+                            // value is awaited or passed on; audit-async skips them.
+                            ...(directlyAwaited(node, 'await_expression') && { awaited: true }),
+                            ...(directlyAwaited(node, 'arguments') && { passedAsArgument: true }),
                             ...receiverFacts,
                             ...(assignedTo && { assignedTo }),
                             ...assignedIterFields,
@@ -4711,6 +4736,7 @@ function findImportsInCode(code, parser) {
             const names = [];
             const esmRenames = [];
             let importType = 'named';
+            let defaultName = null;
             let typeOnly = hasTypeKeyword(node);
             let specifierCount = 0;
             let typeSpecifierCount = 0;
@@ -4745,9 +4771,11 @@ function findImportsInCode(code, parser) {
                     for (let j = 0; j < child.namedChildCount; j++) {
                         const clauseChild = child.namedChild(j);
                         if (clauseChild.type === 'identifier') {
-                            // Default import: import foo from 'x'
-                            names.push(clauseChild.text);
-                            importType = 'default';
+                            // Default import: import foo from 'x'. Beside
+                            // named or namespace imports it is its own
+                            // record, so its binding stays a default one
+                            // (fix #402).
+                            defaultName = clauseChild.text;
                             hasValueBinding = true;
                         } else if (clauseChild.type === 'named_imports') {
                             // Named imports: import { a, b } from 'x'
@@ -4781,6 +4809,13 @@ function findImportsInCode(code, parser) {
             }
 
             if (modulePath) {
+                if (defaultName && names.length === 0) {
+                    names.push(defaultName);
+                    importType = 'default';
+                } else if (defaultName) {
+                    imports.push({ module: modulePath, names: [defaultName], type: 'default', line,
+                        ...(typeOnly && { deferred: true, deferredReason: 'type-only' }) });
+                }
                 if (names.length === 0) {
                     // Side-effect import: import 'x'
                     importType = 'side-effect';
@@ -4789,9 +4824,11 @@ function findImportsInCode(code, parser) {
                     importType === 'named' && !hasValueBinding) {
                     typeOnly = true;
                 }
-                imports.push({ module: modulePath, names, type: importType, line,
-                    ...(esmRenames.length > 0 && { renames: esmRenames }),
-                    ...(typeOnly && { deferred: true, deferredReason: 'type-only' }) });
+                if (names.length > 0 || !defaultName) {
+                    imports.push({ module: modulePath, names, type: importType, line,
+                        ...(esmRenames.length > 0 && { renames: esmRenames }),
+                        ...(typeOnly && { deferred: true, deferredReason: 'type-only' }) });
+                }
             }
             return true;
         }

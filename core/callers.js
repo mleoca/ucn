@@ -925,6 +925,12 @@ function findCallers(index, name, options = {}) {
             return targets.some(d => d.file === filePath && d.name === call.name &&
                 d.startLine === shadowLine);
         }
+        // A Python closure binds the name in an enclosing function (fix
+        // #402): the shadow is a target declared directly in that function.
+        if (Number.isInteger(call.localShadowScope)) {
+            return (options.targetDefinitions || definitions).some(d => d.file === filePath &&
+                d.name === call.name && _enclosingFunctionOfDefinition(index, d)?.startLine === call.localShadowScope);
+        }
         const scope = call.enclosingFunction;
         return !!scope && (options.targetDefinitions || definitions).some(d =>
             d.file === filePath && d.name === call.name &&
@@ -1326,7 +1332,8 @@ function findCallers(index, name, options = {}) {
                     const outside = pinnedLanguageTargets.every(target => {
                         const container = _enclosingFunctionOfDefinition(index, target);
                         return container && (container.file !== filePath ||
-                            call.line < container.startLine || call.line > container.endLine);
+                            call.line < container.startLine || call.line > container.endLine) &&
+                            !_containerDeclaresGlobal(index, container, target.name);
                     });
                     if (outside) {
                         recordExcluded(filePath, call.line, 'other-definition');
@@ -2917,8 +2924,14 @@ function findCallers(index, name, options = {}) {
                             return owner && (owner.file || filePath) === callerSym.file &&
                                 owner.startLine === callerSym.startLine;
                         }) : [];
+                        // A Python closure's name bound in an enclosing
+                        // function (fix #402) is that function's binding.
+                        const closureOwner = lexicalMatches.length === 0 && Number.isInteger(call.localShadowScope)
+                            ? bindings.filter(b => strictOwner(b)?.startLine === call.localShadowScope) : [];
                         if (lexicalMatches.length > 0) {
                             bindingId = lexicalMatches[0].binding.id;
+                        } else if (closureOwner.length === 1) {
+                            bindingId = closureOwner[0].id;
                         } else if (sameLexicalOwner.length === 1) {
                             bindingId = sameLexicalOwner[0].id;
                         // For implicit same-class calls (Java: execute() means
@@ -3071,6 +3084,9 @@ function findCallers(index, name, options = {}) {
                 // not confirmation evidence, not exclusion evidence. Routed
                 // method-ambiguous under the account contract.
                 let receiverTypeUnresolved = false;
+                // The structural identity walk resolved the receiver's type
+                // name to a class definition other than the target's.
+                let structuralOtherClass = false;
                 // C# extension invocation (`value.Ext(args)`) is a static
                 // method call whose receiver occupies the declaration's
                 // first `this` parameter. Receiver type plus namespace scope
@@ -3217,12 +3233,25 @@ function findCallers(index, name, options = {}) {
                                 continue;
                             }
                         } else {
-                            const attrTypes = getInstanceAttributeTypes(index, filePath, callerSymbol.className);
+                            let attrTypes = getInstanceAttributeTypes(index, filePath, callerSymbol.className);
                             let targetClass = attrTypes?.get(call.selfAttribute);
                             if (!targetClass) {
                                 targetClass = _declaredFieldType(
                                     index, callerSymbol.className,
                                     call.selfAttribute, 'python');
+                            }
+                            // A field a base class sets (fix #402): its type
+                            // name resolves in the declaring class's file.
+                            let fieldFile = filePath;
+                            let inheritedField = null;
+                            if (!targetClass) {
+                                inheritedField = _pythonInheritedField(index,
+                                    ownerRefOf(index, callerSymbol), call.selfAttribute);
+                                if (inheritedField) {
+                                    targetClass = inheritedField.type;
+                                    attrTypes = inheritedField.attrTypes;
+                                    fieldFile = inheritedField.file;
+                                }
                             }
                             if (targetClass) {
                                 targetClass = _pureAliasBase(index, targetClass) || targetClass;
@@ -3233,8 +3262,8 @@ function findCallers(index, name, options = {}) {
                                 // (another module's, a function-local one
                                 // out of scope) never confirms.
                                 const fieldRef = compatibleTypes.has(targetClass)
-                                    ? _pythonFieldClassRef(index, filePath, targetClass,
-                                        attrTypes, call.selfAttribute, callerSymbol)
+                                    ? _pythonFieldClassRef(index, fieldFile, targetClass,
+                                        attrTypes, call.selfAttribute, inheritedField ? null : callerSymbol)
                                     : null;
                                 let fieldVerdict = null;
                                 if (fieldRef) {
@@ -3290,8 +3319,10 @@ function findCallers(index, name, options = {}) {
                                         receiverType: targetClass, receiverTypeSource: 'field',
                                         receiverOrigin: { source: 'field', rootType: callerSymbol.className,
                                             field: call.selfAttribute, scope: declarationIdentity(callerSymbol),
+                                            ...(inheritedField && { inheritedFrom: declarationIdentity(inheritedField.ref.def) }),
                                             ...attrTypes?.origins?.get(call.selfAttribute) },
                                         ...(fieldRef?.key && writeLines?.length && { receiverTypeLine: writeLines[0] }),
+                                        ...(inheritedField && { originFile: inheritedField.file }),
                                     };
                                 } else if (_isAncestorOfTargetClass(index, targetClass, tDefs)) {
                                     // A field declared as a strict ancestor can
@@ -4245,6 +4276,19 @@ function findCallers(index, name, options = {}) {
                     // of another module that is not provably global (#215).
                     bareMaybeMember = memberVerdict === 'maybe';
                     bareGlobalMember = memberVerdict === 'global';
+                    // A global the project assigns in another file (fix
+                    // #402: `globalThis.f = ..` in a test setup module): the
+                    // name is bound at run time, by whichever assignment ran;
+                    // one runtime family per assigned global.
+                    if (bareGlobalMember && collectAccount) {
+                        const assigned = (index.symbols.get(call.name) || []).filter(d =>
+                            d.memberAssigned && d.assignedObject === 'global');
+                        routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
+                            dispatchVia: `global ${call.name} — assigned in project`,
+                            dispatchCandidates: assigned.length,
+                        });
+                        continue;
+                    }
                 }
 
                 // Name-level import shadowing (fix #209, httpx-measured): an
@@ -5186,6 +5230,7 @@ function findCallers(index, name, options = {}) {
                                             });
                                         if (identity === 'other') {
                                             receiverTypeValidated = false;
+                                            structuralOtherClass = true;
                                         } else if (identity === 'unknown') {
                                             receiverTypeValidated = false;
                                             receiverTypeUnresolved = true;
@@ -5212,10 +5257,25 @@ function findCallers(index, name, options = {}) {
                                     receiverTypeValidated = true;
                                 } else if (identity === 'unknown') {
                                     receiverTypeUnresolved = true;
+                                } else if (identity === 'other') {
+                                    structuralOtherClass = true;
                                 }
                             }
+                            // A receiver class the identity walk resolved to
+                            // another definition is an ancestor of the
+                            // target's class only by DEFINITION (fix #402): a
+                            // sibling class sharing an ancestor's name
+                            // (kombu's qpid and virtual `Transport` under
+                            // base `Transport`) cannot dispatch into the target.
+                            const receiverClassRef = structuralOtherClass
+                                ? _structuralReceiverClassRef(index, call.receiverTypeFlowFile || filePath, knownType,
+                                    call.receiverTypeFlowFile ? undefined : call.receiverTypeQualifier,
+                                    (call.receiverTypeFlowFile && call.receiverTypeFlowFile !== filePath)
+                                        ? undefined : { file: filePath, line: call.line })
+                                : null;
                             const matchesTarget = receiverTypeValidated ||
-                                ((structural || viaFieldHop) && _isAncestorOfTargetClass(index, knownType, targetDefs));
+                                ((structural || viaFieldHop) &&
+                                    _isAncestorOfTargetClass(index, knownType, targetDefs, receiverClassRef));
                             // Structural trust gate: a name that is neither a
                             // builtin nor a project class (type alias, interface,
                             // external type) tracks no hierarchy UCN can check —
@@ -8191,11 +8251,15 @@ function findCallees(index, definition, options = {}) {
             // nested class) — is the safe exception and remains eligible for
             // exact same-file resolution below.
             if (call.localShadow && !call.resolvedName && !call.resolvedNames) {
+                // A closure's name bound in an enclosing function (fix #402)
+                // reaches a definition declared directly there.
                 const localTarget = (index.symbols.get(call.name) || []).some(s =>
                     s.file === def.file &&
                     (s.type === 'class' || !NON_CALLABLE_TYPES.has(s.type)) &&
-                    s.startLine >= def.startLine && s.endLine <= def.endLine &&
-                    s.startLine <= call.line);
+                    (Number.isInteger(call.localShadowScope)
+                        ? _enclosingFunctionOfDefinition(index, s)?.startLine === call.localShadowScope
+                        : s.startLine >= def.startLine && s.endLine <= def.endLine &&
+                            s.startLine <= call.line));
                 if (!localTarget) {
                     noteSite(siteId, 'excluded', 'local-shadow', call);
                     continue;
@@ -9874,7 +9938,15 @@ function findCallees(index, definition, options = {}) {
                         // Try to resolve to a binding defined within the parent function's
                         // scope (inner closure). E.g., hookRunnerApplication defines next()
                         // internally — prefer that over other next() in the same file.
-                        const innerBinding = bindings.find(b =>
+                        // A Python closure's name bound in an enclosing
+                        // function (fix #402) is that function's definition.
+                        const closureBinding = Number.isInteger(call.localShadowScope)
+                            ? bindings.filter(b => {
+                                const sym = (index.symbols.get(effectiveName) || []).find(s =>
+                                    s.file === def.file && s.startLine === b.startLine);
+                                return sym && _enclosingFunctionOfDefinition(index, sym)?.startLine === call.localShadowScope;
+                            }) : [];
+                        const innerBinding = closureBinding.length === 1 ? closureBinding[0] : bindings.find(b =>
                             b.startLine > def.startLine && b.startLine <= def.endLine);
                         if (innerBinding) {
                             bindingResolved = innerBinding.id;
@@ -10046,11 +10118,23 @@ function findCallees(index, definition, options = {}) {
                         continue;
                     }
                     let targetClass = attrTypes ? attrTypes.get(call.selfAttribute) : null;
+                    // A field a base class sets (fix #402): typed in, and
+                    // its type name resolved in, the declaring class's file.
+                    let fieldAttrs = attrTypes, fieldFile = def.file, fieldLine = call.line;
+                    if (!targetClass) {
+                        const inherited = _pythonInheritedField(index, ownerRefOf(index, def), call.selfAttribute);
+                        if (inherited) {
+                            targetClass = inherited.type;
+                            fieldAttrs = inherited.attrTypes;
+                            fieldFile = inherited.file;
+                            fieldLine = null;
+                        }
+                    }
                     // Type-name denotation (fix #371): `self.timer = Timer(..)`
                     // under `from threading import Timer` holds the external
                     // Timer, never a same-name project class.
                     if (targetClass && (index.symbols.get(targetClass) || []).some(d => IDENTITY_TYPE_KINDS.has(d.type)) &&
-                        externalTypeDenotation(index, def.file, targetClass, null, call.line)) {
+                        externalTypeDenotation(index, fieldFile, targetClass, null, fieldLine)) {
                         noteSite(siteId, 'external', null, call);
                         continue;
                     }
@@ -10076,8 +10160,9 @@ function findCallees(index, definition, options = {}) {
                     // classes in other modules, function-local classes out of
                     // scope never supply the callee), through its resolved
                     // ancestors.
-                    const fieldRef = attrTypes?.get(call.selfAttribute) === targetClass
-                        ? _pythonFieldClassRef(index, def.file, targetClass, attrTypes, call.selfAttribute, def)
+                    const fieldRef = fieldAttrs?.get(call.selfAttribute) === targetClass
+                        ? _pythonFieldClassRef(index, fieldFile, targetClass, fieldAttrs, call.selfAttribute,
+                            fieldAttrs === attrTypes ? def : null)
                         : null;
                     if (fieldRef) {
                         const candidates = symbols.filter(s => !NON_CALLABLE_TYPES.has(s.type) &&
@@ -10168,6 +10253,29 @@ function findCallees(index, definition, options = {}) {
                         index, call, symbols, def.className, language, def.file,
                         symbol => !NON_CALLABLE_TYPES.has(symbol.type) &&
                             _notForeignSameNameOwner(index, symbol, callerClassRef));
+                if (selected.ambiguous && callerClassRef?.key) {
+                    // Same-class members that are alternatives of one
+                    // configuration item (fix #402: defs under `if` /
+                    // `try` in a Python class body): each is the callee
+                    // whenever it exists, like the caller side's fan-out.
+                    const own = symbols.filter(symbol => !NON_CALLABLE_TYPES.has(symbol.type) &&
+                        ownedBy(index, symbol, callerClassRef) === 'yes');
+                    if (own.length > 1 && own.every(member => member === own[0] ||
+                        _isConfigurationAlternative(index, member, own[0]))) {
+                        for (const member of own) {
+                            const key = member.bindingId || `${member.file}:${member.startLine}:${call.name}`;
+                            const existing = callees.get(key);
+                            if (existing) {
+                                existing.count += 1;
+                                if (collectAccount) { existing.sites.push(call.line); existing.siteIds.push(siteId); }
+                            } else {
+                                callees.set(key, { name: call.name, bindingId: member.bindingId, count: 1,
+                                    ...(collectAccount && { sites: [call.line], siteIds: [siteId] }) });
+                            }
+                        }
+                        continue;
+                    }
+                }
                 if (selected.ambiguous) {
                     noteUnverified(siteId, call, 'overload-ambiguous');
                     continue;
@@ -10729,6 +10837,73 @@ function getInstanceAttributeTypes(index, filePath, className) {
     }
 
     return fileCache.get(className) || null;
+}
+
+/** What one Python class body does to its instance fields (fix #402),
+ * memoized per file entry; null when the class cannot be read. */
+function _pythonClassFieldFacts(index, classDef) {
+    const entry = index.files.get(classDef?.file);
+    if (entry?.language !== 'python') return null;
+    let byFile = index._classFieldFactsCache;
+    if (!byFile) byFile = index._classFieldFactsCache = new WeakMap();
+    let byClass = byFile.get(entry);
+    if (!byClass) { byClass = new Map(); byFile.set(entry, byClass); }
+    const key = `${classDef.name}:${classDef.startLine}`;
+    if (byClass.has(key)) return byClass.get(key);
+    let facts;
+    try {
+        const content = index._readFile(classDef.file);
+        const tree = index._getParsedTree(classDef.file, content, 'python');
+        facts = getLanguageAdapter('python').findClassFieldFacts(tree, classDef.startLine, classDef.name);
+    } catch { facts = null; }
+    byClass.set(key, facts);
+    return facts;
+}
+
+/**
+ * The instance field `field` a Python class inherits (fix #402): `self.x`
+ * set in a base class's `__init__`/methods and read in a subclass. The
+ * classes from `startRef` up to the declaring ancestor must be resolved
+ * project classes that neither write the field (typed or not), declare a
+ * member of its name, nor write fields dynamically; at the first level
+ * holding a typed write every resolved parent writing it must agree, and an
+ * unresolved or outside parent there abstains (it may set the field too).
+ * Returns { type, file, attrTypes, ref } (the declaring class) or null.
+ */
+function _pythonInheritedField(index, startRef, field) {
+    if (!startRef?.key || !startRef.def || !field) return null;
+    const touches = facts => !facts || facts.dynamic || facts.written.has(field) || facts.members.has(field);
+    if (touches(_pythonClassFieldFacts(index, startRef.def))) return null;
+    const seen = new Set([startRef.key]);
+    let level = [startRef];
+    for (let depth = 0; depth < 8 && level.length > 0; depth++) {
+        const parents = [];
+        for (const ref of level) {
+            for (const parent of parentRefsOfClass(index, ref)) {
+                if (!parent.key || !parent.def || parent.external) return null;
+                if (seen.has(parent.key)) continue;
+                seen.add(parent.key);
+                parents.push(parent);
+            }
+        }
+        const found = [];
+        for (const parent of parents) {
+            // Instance attribute maps are keyed by class name per file: a
+            // file holding two classes of that name cannot be told apart.
+            if (classDefsNamed(index, parent.name).entries.filter(e => e.def.file === parent.def.file).length !== 1) return null;
+            const facts = _pythonClassFieldFacts(index, parent.def);
+            if (!facts || facts.dynamic) return null;
+            const attrTypes = getInstanceAttributeTypes(index, parent.def.file, parent.name);
+            const type = attrTypes?.get(field);
+            if (type) found.push({ type, file: parent.def.file, attrTypes, ref: parent });
+            else if (facts.written.has(field) || facts.members.has(field)) return null;
+        }
+        if (found.length > 0) {
+            return new Set(found.map(hit => `${hit.type}\0${hit.file}`)).size === 1 ? found[0] : null;
+        }
+        level = parents;
+    }
+    return null;
 }
 
 /**
@@ -15204,7 +15379,7 @@ function _traitDeclPinImplementorRoute(index, fileEntry, receiverSegment, target
  * the target's class is not evidence against the target — dynamic dispatch
  * may run the target override at that site.
  */
-function _isAncestorOfTargetClass(index, typeName, targetDefs) {
+function _isAncestorOfTargetClass(index, typeName, targetDefs, typeRef = null) {
     const visited = new Set();
     const queue = [];
     for (const td of targetDefs) {
@@ -15221,7 +15396,10 @@ function _isAncestorOfTargetClass(index, typeName, targetDefs) {
         // identity before the legacy name-only fallback for unknown owners.
         if (ref?.key || ref?.def) {
             for (const parent of parentRefsOfClass(index, ref)) {
-                if (parent.name === typeName) return true;
+                // With the type's own definition known (fix #402), a
+                // resolved ancestor is it only by key; an unresolved one may be.
+                if (parent.name === typeName &&
+                    (!typeRef?.key || !parent.key || parent.key === typeRef.key)) return true;
                 if (!parent.external) queue.push({ name: parent.name, file: parent.def?.file, ref: parent });
             }
             continue;
@@ -15234,6 +15412,28 @@ function _isAncestorOfTargetClass(index, typeName, targetDefs) {
         }
     }
     return false;
+}
+
+/**
+ * The class definition a structural receiver's type name denotes where it
+ * was written (fix #402), mirroring _resolveStructuralFlowTypeIdentity's
+ * first step: the function-local class in scope at the site, else the class
+ * of that name declared in the file the name resolves to. Null when it
+ * cannot be pinned.
+ */
+function _structuralReceiverClassRef(index, originFile, knownType, qualifier, site) {
+    const info = classDefsNamed(index, knownType);
+    if (info.entries.length === 0) return null;
+    if (info.unique && !info.hasScoped) return { name: knownType, key: info.entries[0].key, def: info.entries[0].def };
+    if (!qualifier && site?.file === originFile && site.line != null && info.hasScoped) {
+        const ref = _typeRefAt(index, originFile, knownType, site.line);
+        return ref.key ? ref : null;
+    }
+    const origin = _resolveFlowTypeOrigin(index, originFile, knownType, qualifier);
+    if (!origin?.fromFile) return null;
+    const hits = info.entries.filter(entry => entry.def.file === origin.fromFile && !_isFunctionLocalType(entry.def));
+    if (hits.length === 0 || new Set(hits.map(entry => entry.key)).size !== 1) return null;
+    return { name: knownType, key: hits[0].key, def: hits[0].def };
 }
 
 /**
@@ -18010,8 +18210,21 @@ function _declaredFieldType(
             const inferred = [];
             let complete = true;
             for (const owner of owners) {
-                const attrs = getInstanceAttributeTypes(index, owner.file, rootType);
-                const fieldType = attrs?.get(fieldName);
+                let attrs = getInstanceAttributeTypes(index, owner.file, rootType);
+                let fieldType = attrs?.get(fieldName);
+                let fieldFile = owner.file;
+                if (!fieldType && owner.type === 'class') {
+                    // Set by a base class (fix #402); its type name was
+                    // written in the declaring class's file.
+                    const entry = classDefsNamed(index, rootType).entries.find(e => e.def === owner);
+                    const inherited = entry ? _pythonInheritedField(index,
+                        { name: rootType, key: entry.key, def: owner }, fieldName) : null;
+                    if (inherited) {
+                        attrs = inherited.attrTypes;
+                        fieldType = inherited.type;
+                        fieldFile = inherited.file;
+                    }
+                }
                 if (!fieldType) {
                     complete = false;
                     break;
@@ -18021,7 +18234,7 @@ function _declaredFieldType(
                     memberType: 'field',
                     className: rootType,
                     fieldType,
-                    file: owner.file,
+                    file: fieldFile,
                     ...(attrs.origins?.get(fieldName) && { fieldOrigin: attrs.origins.get(fieldName) }),
                 });
             }
@@ -18322,6 +18535,41 @@ function _pythonDeclaredIterablePathItems(index, rootType, fieldNames) {
  * module-level or member definition (fix #377).
  */
 const _definitionContainerMemo = new WeakMap();
+/**
+ * Whether the function at `container` declares `global name` (fix #402:
+ * Python binds a nested def of that name at module scope then).
+ */
+function _containerDeclaresGlobal(index, container, name) {
+    const entry = index.files.get(container.file);
+    if (entry?.language !== 'python') return false;
+    const memo = index._opMemo?.('containerGlobals', () => new Map());
+    const key = `${container.file}\0${container.startLine}\0${name}`;
+    if (memo?.has(key)) return memo.get(key);
+    let declares = true; // unreadable: keep the name reachable
+    try {
+        const tree = index._getParsedTree(container.file, index._readFile(container.file), 'python');
+        const row = container.startLine - 1;
+        let fn = tree?.rootNode.descendantForPosition({ row, column: 0 }, { row, column: 1 << 20 });
+        while (fn && !(fn.type === 'function_definition' && fn.startPosition.row >= row - 64 &&
+            fn.endPosition.row + 1 === container.endLine)) fn = fn.parent;
+        if (fn) {
+            declares = false;
+            const stack = [fn.childForFieldName('body')].filter(Boolean);
+            while (stack.length > 0 && !declares) {
+                const node = stack.pop();
+                if (node.type === 'global_statement') {
+                    declares = node.namedChildren.some(child => child.type === 'identifier' && child.text === name);
+                    continue;
+                }
+                if (node.type === 'function_definition' || node.type === 'class_definition' || node.type === 'lambda') continue;
+                for (let i = node.namedChildCount - 1; i >= 0; i--) stack.push(node.namedChild(i));
+            }
+        }
+    } catch { declares = true; }
+    memo?.set(key, declares);
+    return declares;
+}
+
 function _enclosingFunctionOfDefinition(index, def) {
     if (!def?.file || def.className || def.receiver) return null;
     if (_definitionContainerMemo.has(def)) return _definitionContainerMemo.get(def);

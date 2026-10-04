@@ -11959,3 +11959,251 @@ describe('fix #400: namespace-import type references and tests through export-al
         } finally { rm(dir); }
     });
 });
+
+describe('fix #402: audit-async import chains and typed receivers, default imports, mocha contexts, project globals', () => {
+    const flagged = index => index.auditAsync({}).issues.map(i => `${i.file}:${i.line}:${i.calleeName}`).sort();
+
+    it('audit-async reads imports through re-exports and anonymous default exports', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'm.ts': 'export default async function wait(ms: number): Promise<void> {\n  return\n}\n',
+            'anon.ts': 'export default async (ms: number): Promise<void> => {\n  return\n}\n',
+            'sync.ts': 'export default function now(): number {\n  return 1\n}\n',
+            'named.ts': 'export async function fetchAll(): Promise<number> {\n  return 1\n}\n',
+            'idx.ts': [
+                "export { default } from './m'",
+                "export { default as waitNamed } from './m'",
+                "export { default as nowNamed } from './sync'",
+                "export * from './named'",
+            ].join('\n') + '\n',
+            'cjs.js': 'exports.later = async function later() {\n  return 1\n}\n',
+            'use.ts': [
+                "import later4 from './anon'",           // 1
+                "import viaIdx, { waitNamed, nowNamed, fetchAll } from './idx'", // 2
+                '',                                      // 3
+                'export async function go(): Promise<void> {', // 4
+                '  later4(5)',                           // 5
+                '  viaIdx(1)',                           // 6
+                '  waitNamed(1)',                        // 7
+                '  nowNamed()',                          // 8
+                '  fetchAll()',                          // 9
+                '  await viaIdx(2)',                     // 10
+                '}',                                     // 11
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(flagged(index), [
+                'use.ts:5:later4', 'use.ts:6:viaIdx', 'use.ts:7:waitNamed', 'use.ts:9:fetchAll',
+            ]);
+            const anon = index.symbols.get('default').find(d => d.relativePath === 'anon.ts');
+            assert.strictEqual(anon.isAsync, true);
+            const assigned = index.symbols.get('later').find(d => d.relativePath === 'cjs.js');
+            assert.strictEqual(assigned.isAsync, true, 'a member-assigned async function is async');
+        } finally { rm(dir); }
+    });
+
+    it('audit-async checks method calls on receivers the engine types', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'svc.ts': [
+                'export class Store {',                  // 1
+                '  async fetchAll(): Promise<string[]> {', // 2
+                '    return []',                         // 3
+                '  }',                                   // 4
+                '  async reload(): Promise<void> {',     // 5
+                '    this.fetchAll()',                   // 6
+                '    await this.fetchAll()',             // 7
+                '  }',                                   // 8
+                '}',                                     // 9
+                '',                                      // 10
+                'export async function run(other: any): Promise<void> {', // 11
+                '  const s = new Store()',               // 12
+                '  s.fetchAll()',                        // 13
+                '  await s.fetchAll()',                  // 14
+                '  other.fetchAll()',                    // 15
+                '}',                                     // 16
+            ].join('\n') + '\n',
+            'svc.py': [
+                'class Svc:',                            // 1
+                '    async def run(self):',              // 2
+                '        return 2',                      // 3
+                '',                                      // 4
+                '',                                      // 5
+                'async def main(other):',                // 6
+                '    s = Svc()',                         // 7
+                '    s.run()',                           // 8
+                '    other.run()',                       // 9
+                '    await s.run()',                     // 10
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(flagged(index), ['svc.py:8:run', 'svc.ts:13:fetchAll', 'svc.ts:6:fetchAll']);
+        } finally { rm(dir); }
+    });
+
+    it('awaited and passed-on member calls are recorded as such and never reported', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'svc.ts': [
+                'export class Store {',                  // 1
+                '  async fetchAll(): Promise<number> {',  // 2
+                '    return 1',                          // 3
+                '  }',                                   // 4
+                '}',                                     // 5
+                'declare function track(p: Promise<number>): void', // 6
+                'export async function run(): Promise<void> {', // 7
+                '  const s = new Store()',               // 8
+                '  await (s.fetchAll())',                // 9
+                '  track(s.fetchAll())',                 // 10
+                '}',                                     // 11
+            ].join('\n') + '\n',
+            'svc.py': [
+                'import asyncio',                        // 1
+                '',                                      // 2
+                '',                                      // 3
+                'class Svc:',                            // 4
+                '    async def run(self):',              // 5
+                '        return 2',                      // 6
+                '',                                      // 7
+                '',                                      // 8
+                'async def main():',                     // 9
+                '    s = Svc()',                         // 10
+                '    await s.run()',                     // 11
+                '    asyncio.ensure_future(s.run())',    // 12
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(flagged(index), []);
+            const rows = file => index.getCachedCalls(path.join(dir, file))
+                .filter(c => c.name === (file.endsWith('.ts') ? 'fetchAll' : 'run'))
+                .map(c => `${c.line}:${c.awaited ? 'awaited' : ''}${c.passedAsArgument ? 'argument' : ''}`).sort();
+            assert.deepStrictEqual(rows('svc.ts'), ['10:argument', '9:awaited']);
+            assert.deepStrictEqual(rows('svc.py'), ['11:awaited', '12:argument']);
+        } finally { rm(dir); }
+    });
+
+    it('a default import beside named imports keeps its default binding', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'api.js': 'export default { get() { return 1 } }\nexport function helper() { return 2 }\n',
+            'use.js': "import api, { helper } from './api'\nimport * as ns from './api'\nexport const x = api.get() + helper() + ns.helper()\n",
+        });
+        try {
+            const index = idx(dir);
+            const entry = [...index.files.values()].find(e => e.relativePath === 'use.js');
+            assert.deepStrictEqual(entry.importBindings.map(b => `${b.name}:${b.kind}`),
+                ['api:default', 'helper:named', 'ns:namespace']);
+        } finally { rm(dir); }
+    });
+
+    it('a mocha test reaches the app its suite setup hook stores on the shared context', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'test/app.test.js': [
+                "const express = require('express')",    // 1
+                "const request = require('supertest')",  // 2
+                '',                                      // 3
+                'function createApp () {',               // 4
+                '  const app = express()',               // 5
+                "  app.post('/', (req, res) => res.json(req.body))", // 6
+                '  return app',                          // 7
+                '}',                                     // 8
+                '',                                      // 9
+                'function createOther () {',             // 10
+                '  const other = express()',             // 11
+                "  other.post('/', (req, res) => res.send('o'))", // 12
+                '  return other',                        // 13
+                '}',                                     // 14
+                '',                                      // 15
+                "describe('json', function () {",        // 16
+                "  describe('valid', function () {",     // 17
+                '    before(function () {',              // 18
+                '      this.app = createApp()',          // 19
+                '    })',                                // 20
+                "    it('parses', function (done) {",    // 21
+                "      request(this.app).post('/').expect(200, done)", // 22
+                '    })',                                // 23
+                '  })',                                  // 24
+                "  describe('other', function () {",     // 25
+                '    beforeEach(function () {',          // 26
+                '      this.app = createOther()',        // 27
+                '    })',                                // 28
+                "    describe('nested', function () {", // 29
+                "      it('sends', function (done) {",   // 30
+                "        request(this.app).post('/').expect(200, done)", // 31
+                '      })',                              // 32
+                '    })',                                // 33
+                '  })',                                  // 34
+                "  describe('rewritten', function () {", // 35
+                '    before(function () {',              // 36
+                '      this.app = createApp()',          // 37
+                '    })',                                // 38
+                "    it('swaps', function (done) {",     // 39
+                '      this.app = createOther()',        // 40
+                "      request(this.app).post('/').expect(200, done)", // 41
+                '    })',                                // 42
+                '  })',                                  // 43
+                "  describe('configured', function () {", // 44
+                '    before(function () {',              // 45
+                '      this.app = express()',            // 46
+                "      this.app.use(createApp())",       // 47
+                '    })',                                // 48
+                "    it('mounts', function (done) {",    // 49
+                "      request(this.app).post('/').expect(200, done)", // 50
+                '    })',                                // 51
+                '  })',                                  // 52
+                '})',                                    // 53
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'endpoints', { bridge: true });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const got = (r.result.bridges || []).map(b =>
+                `${b.request.line}->${b.route.line}${b.unscoped ? ' unscoped' : ''}`).sort();
+            // An app configured through the context (`this.app.use(..)`) is
+            // not fully known: its requests keep every match, unscoped.
+            assert.deepStrictEqual(got, ['22->6', '31->12', '41->12 unscoped', '41->6 unscoped',
+                '50->12 unscoped', '50->6 unscoped']);
+        } finally { rm(dir); }
+    });
+
+    it('a call of a global the project assigns elsewhere is one runtime family', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'spec/env/common.js': [
+                'var global = globalThis',               // 1
+                'global.expectTemplate = function (t) {', // 2
+                '  return t',                            // 3
+                '}',                                     // 4
+                'globalThis.direct = function (t) {',    // 5
+                '  return t',                            // 6
+                '}',                                     // 7
+            ].join('\n') + '\n',
+            'spec/basic.js': [
+                "describe('basic', function () {",       // 1
+                "  it('works', function () {",           // 2
+                "    expectTemplate('{{foo}}')",         // 3
+                "    direct('x')",                       // 4
+                '  })',                                  // 5
+                '})',                                    // 6
+            ].join('\n') + '\n',
+            'spec/shadow.js': "const { expectTemplate } = require('./helpers')\nexpectTemplate('x')\n",
+            'spec/helpers.js': 'exports.expectTemplate = function (t) { return t }\n',
+        });
+        try {
+            const index = idx(dir);
+            const def = index.symbols.get('expectTemplate').find(d => d.relativePath === 'spec/env/common.js');
+            const raw = index.findCallers('expectTemplate', { targetDefinitions: [def], collectAccount: true });
+            const rows = (raw.unverifiedEntries || []).map(u =>
+                `${u.relativePath}:${u.line}:${u.reason}:${u.dispatchVia || ''}`);
+            assert.ok(rows.includes('spec/basic.js:3:possible-dispatch:global expectTemplate — assigned in project'),
+                rows.join('\n'));
+            assert.ok(!rows.some(row => row.startsWith('spec/shadow.js:2:possible-dispatch')),
+                'a destructured import binds its own name');
+        } finally { rm(dir); }
+    });
+});

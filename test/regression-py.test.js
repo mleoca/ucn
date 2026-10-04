@@ -8049,9 +8049,13 @@ describe('fix #392: lexical references, decorators, class aliases and in-process
             assert.strictEqual(reviewed('app/deco.py:41:size'), false, 'property');
             assert.strictEqual(reviewed('app/deco.py:45:build'), false, 'staticmethod');
             assert.strictEqual(reviewed('app/deco.py:28:named'), true, 'a registry keyed by __name__');
-            assert.strictEqual(reviewed('tests/conftest.py:5:client'), true, 'a pytest fixture is requested by name');
-            const text = require('../core/output').formatPlan(plan(index, 'tests/conftest.py:5:client'));
-            assert.match(text, /@pytest\.fixture receives client and may bind it by its name/);
+            // fix #402: a pytest fixture is requested by name, and pytest's
+            // own resolution decides which parameters receive it: they are
+            // renamed with it.
+            assert.strictEqual(reviewed('tests/conftest.py:5:client'), false, 'a pytest fixture resolves its requests');
+            const fixturePlan = plan(index, 'tests/conftest.py:5:client');
+            assert.deepStrictEqual(fixturePlan.changes.filter(c => c.file === 'tests/test_a.py' && !c.needsReview)
+                .map(c => c.line).sort(), [1, 2]);
         } finally { rm(dir); }
     });
 
@@ -8795,7 +8799,9 @@ describe('fix #398F: Python configuration items, module values and string annota
             const index = idx(dir);
             const r = callees(index, 'test_it', 'test_c.py');
             assert.ok(!r.confirmed.includes('b/transport.py:2'), 'never the first same-name class');
-            assert.ok(r.unverified.some(u => u.startsWith('cancel:')));
+            // fix #402: the field Base sets is inherited, typed where Base
+            // writes it (the imported a.transport Channel).
+            assert.deepStrictEqual(r.confirmed, ['a/transport.py:2']);
         } finally { rm(dir); }
     });
 
@@ -8985,6 +8991,442 @@ describe('fix #400: module-attribute type references, __all__ entries, self-attr
             const callees = index.findCallees(go, { collectAccount: true });
             assert.deepStrictEqual(callees.map(c => c.name), []);
             assert.deepStrictEqual((callees.unverifiedCallees || []).map(c => `${c.name}:${c.reason}`), ['loads:alias-call']);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #402: class-body compound statements, inherited instance fields, fixture renames, sibling classes', () => {
+    const planOf = (index, file, line, name, renameTo) => {
+        const result = execute(index, 'plan', { name, file, line, renameTo });
+        assert.ok(result.ok, result.error);
+        return result.result;
+    };
+    const edits = (plan, file) => plan.changes.filter(c => c.file === file && !c.needsReview)
+        .map(c => `${c.line}:${c.newExpression}`).sort();
+    const reviewLines = (plan, file) => [...plan.changes, ...(plan.reviewItems || [])]
+        .filter(c => c.file === file && c.needsReview).map(c => c.line).sort((a, b) => a - b);
+    const callersOf = (index, file, line, name) => {
+        const def = index.symbols.get(name).find(d => d.relativePath === file && d.startLine === line);
+        assert.ok(def, `${file}:${line}:${name}`);
+        const raw = index.findCallers(name, { targetDefinitions: [def], collectAccount: true });
+        return {
+            confirmed: raw.map(c => `${c.relativePath}:${c.line}`).sort(),
+            unverified: (raw.unverifiedEntries || []).map(c => `${c.relativePath}:${c.line}:${c.reason}`).sort(),
+        };
+    };
+
+    it('defs under if/try/with/for in a class body are methods of the class', () => {
+        const dir = tmp({
+            'm.py': [
+                'import sys',                          // 1
+                '',                                    // 2
+                '',                                    // 3
+                'class Box:',                          // 4
+                '    if sys.version_info >= (3, 8):',  // 5
+                '        def size(self):',             // 6
+                '            return 1',                // 7
+                '    else:',                           // 8
+                '        def size(self):',             // 9
+                '            return 2',                // 10
+                '',                                    // 11
+                '    try:',                            // 12
+                '        def fast(self):',             // 13
+                '            return 3',                // 14
+                '    except ImportError:',             // 15
+                '        pass',                        // 16
+                '',                                    // 17
+                '    def run(self):',                  // 18
+                '        return self.size() + self.fast()', // 19
+                '',                                    // 20
+                '',                                    // 21
+                'def use():',                          // 22
+                '    def helper():',                   // 23
+                '        return 1',                    // 24
+                '    return Box().size() + helper()',  // 25
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const owners = name => index.symbols.get(name).map(d => `${d.startLine}:${d.type}:${d.className || ''}`);
+            assert.deepStrictEqual(owners('size'), ['6:method:Box', '9:method:Box']);
+            assert.deepStrictEqual(owners('fast'), ['13:method:Box']);
+            assert.deepStrictEqual(owners('helper'), ['23:function:'], 'a def inside a function body stays a function');
+            // Both configuration alternatives are confirmed callees and callers.
+            const run = index.symbols.get('run')[0];
+            const callees = index.findCallees(run, { collectAccount: true }).map(c => `${c.name}:${c.startLine}`).sort();
+            assert.deepStrictEqual(callees, ['fast:13', 'size:6', 'size:9']);
+            assert.deepStrictEqual(callersOf(index, 'm.py', 9, 'size').confirmed, ['m.py:19', 'm.py:25']);
+            const plan = planOf(index, 'm.py', 6, 'size', 'sz');
+            assert.deepStrictEqual(edits(plan, 'm.py'), [
+                '19:return self.sz() + self.fast()', '25:return Box().sz() + helper()', '6:def sz(self):', '9:def sz(self):',
+            ]);
+        } finally { rm(dir); }
+    });
+
+    it('a self attribute a base class types is typed in the subclass, by the declaring class', () => {
+        const dir = tmp({
+            'pkg/__init__.py': '',
+            'pkg/clients.py': [
+                'class Client:',                       // 1
+                '    def send(self, msg):',            // 2
+                '        return msg',                  // 3
+                '',                                    // 4
+                '',                                    // 5
+                'class Other:',                        // 6
+                '    def send(self, msg):',            // 7
+                '        return None',                 // 8
+            ].join('\n') + '\n',
+            'pkg/base.py': [
+                'from pkg.clients import Client',      // 1
+                '',                                    // 2
+                '',                                    // 3
+                'class Base:',                         // 4
+                '    def __init__(self):',             // 5
+                '        self.client = Client()',      // 6
+            ].join('\n') + '\n',
+            'pkg/sub.py': [
+                'from pkg.base import Base',           // 1
+                '',                                    // 2
+                '',                                    // 3
+                'class Sub(Base):',                    // 4
+                '    def run(self):',                  // 5
+                '        return self.client.send(1)',  // 6
+                '',                                    // 7
+                '',                                    // 8
+                'class Deeper(Sub):',                  // 9
+                '    def go(self):',                   // 10
+                '        return self.client.send(2)',  // 11
+                '',                                    // 12
+                '',                                    // 13
+                'def use():',                          // 14
+                '    s = Sub()',                       // 15
+                '    return s.client.send(3)',         // 16
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(callersOf(index, 'pkg/clients.py', 2, 'send').confirmed,
+                ['pkg/sub.py:11', 'pkg/sub.py:16', 'pkg/sub.py:6']);
+            const other = callersOf(index, 'pkg/clients.py', 7, 'send');
+            assert.deepStrictEqual([other.confirmed, other.unverified], [[], []], 'Client is unrelated to Other');
+            const run = index.symbols.get('run')[0];
+            const callees = index.findCallees(run, { collectAccount: true });
+            assert.deepStrictEqual(callees.map(c => `${c.name}:${c.relativePath}:${c.startLine}`), ['send:pkg/clients.py:2']);
+        } finally { rm(dir); }
+    });
+
+    it('an inherited field stays untyped when the path to it writes, declares or may set it', () => {
+        const dir = tmp({
+            'm.py': [
+                'class Client:',                       // 1
+                '    def send(self):',                 // 2
+                '        return 1',                    // 3
+                '',                                    // 4
+                '',                                    // 5
+                'class Other:',                        // 6
+                '    def send(self):',                 // 7
+                '        return 2',                    // 8
+                '',                                    // 9
+                '',                                    // 10
+                'class Base:',                         // 11
+                '    def __init__(self):',             // 12
+                '        self.client = Client()',      // 13
+                '',                                    // 14
+                '',                                    // 15
+                'class Rebinds(Base):',                // 16
+                '    def reset(self, factory):',       // 17
+                '        self.client = factory()',     // 18
+                '',                                    // 19
+                '    def run(self):',                  // 20
+                '        return self.client.send()',   // 21
+                '',                                    // 22
+                '',                                    // 23
+                'class Declares(Base):',               // 24
+                '    @property',                       // 25
+                '    def client(self):',               // 26
+                '        return Other()',              // 27
+                '',                                    // 28
+                '    def run(self):',                  // 29
+                '        return self.client.send()',   // 30
+                '',                                    // 31
+                '',                                    // 32
+                'class Base2:',                        // 33
+                '    def __init__(self):',             // 34
+                '        self.client = Other()',       // 35
+                '',                                    // 36
+                '',                                    // 37
+                'class Both(Base, Base2):',            // 38
+                '    def run(self):',                  // 39
+                '        return self.client.send()',   // 40
+                '',                                    // 41
+                '',                                    // 42
+                'class Dynamic(Base):',                // 43
+                '    def set(self, name, value):',     // 44
+                '        setattr(self, name, value)',  // 45
+                '',                                    // 46
+                '    def run(self):',                  // 47
+                '        return self.client.send()',   // 48
+            ].join('\n') + '\n',
+            'ext.py': [
+                'from somewhere import Mixin',         // 1
+                'from m import Base',                  // 2
+                '',                                    // 3
+                '',                                    // 4
+                'class Outside(Base, Mixin):',         // 5
+                '    def run(self):',                  // 6
+                '        return self.client.send()',   // 7
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const client = callersOf(index, 'm.py', 2, 'send');
+            assert.deepStrictEqual(client.confirmed, [], JSON.stringify(client));
+            for (const line of [21, 30, 40, 48]) {
+                assert.ok(client.unverified.some(u => u.startsWith(`m.py:${line}:`)), `m.py:${line} stays visible`);
+            }
+            assert.ok(client.unverified.some(u => u.startsWith('ext.py:7:')), 'an outside second base may set it');
+        } finally { rm(dir); }
+    });
+
+    it('a structural receiver of a sibling class is not an ancestor by name', () => {
+        const dir = tmp({
+            'pkg/__init__.py': '',
+            'pkg/base.py': [
+                'class Transport:',                    // 1
+                '    def close(self):',                // 2
+                '        return 0',                    // 3
+            ].join('\n') + '\n',
+            'pkg/virtual.py': [
+                'from pkg import base',                // 1
+                '',                                    // 2
+                '',                                    // 3
+                'class Transport(base.Transport):',    // 4
+                '    def close(self):',                // 5
+                '        return 1',                    // 6
+            ].join('\n') + '\n',
+            'pkg/qpid.py': [
+                'from pkg import base',                // 1
+                '',                                    // 2
+                '',                                    // 3
+                'class Transport(base.Transport):',    // 4
+                '    def close(self):',                // 5
+                '        return 2',                    // 6
+            ].join('\n') + '\n',
+            'pkg/use.py': [
+                'from pkg.qpid import Transport',      // 1
+                'from pkg import base',                // 2
+                '',                                    // 3
+                '',                                    // 4
+                'def use(t: base.Transport):',         // 5
+                '    q = Transport()',                 // 6
+                '    q.close()',                       // 7
+                '    t.close()',                       // 8
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const virtual = callersOf(index, 'pkg/virtual.py', 5, 'close');
+            assert.ok(!virtual.unverified.some(u => u.startsWith('pkg/use.py:7:')),
+                `a qpid.Transport cannot run virtual.Transport.close: ${JSON.stringify(virtual)}`);
+            assert.ok(virtual.unverified.some(u => u.startsWith('pkg/use.py:8:possible-dispatch')),
+                'a base.Transport annotation may hold a virtual.Transport');
+            assert.deepStrictEqual(callersOf(index, 'pkg/qpid.py', 5, 'close').confirmed, ['pkg/use.py:7']);
+        } finally { rm(dir); }
+    });
+
+    it('a def nested in a function is reached only inside it; closures see the enclosing locals', () => {
+        const dir = tmp({
+            'm.py': [
+                'def factory(seq):',                   // 1
+                '    def is_valid(idx):',              // 2
+                '        return 0 <= idx < len(seq)',  // 3
+                '',                                    // 4
+                '    return is_valid',                 // 5
+                '',                                    // 6
+                '',                                    // 7
+                'def user(s):',                        // 8
+                '    is_valid = factory(s)',           // 9
+                '',                                    // 10
+                '    def inner(i):',                   // 11
+                '        return is_valid(i)',          // 12
+                '',                                    // 13
+                '    return inner(0) and is_valid(1)', // 14
+                '',                                    // 15
+                '',                                    // 16
+                'def other():',                        // 17
+                '    return is_valid(2)',              // 18
+                '',                                    // 19
+                '',                                    // 20
+                'def installer():',                    // 21
+                '    global helper',                   // 22
+                '',                                    // 23
+                '    def helper():',                   // 24
+                '        return 3',                    // 25
+                '',                                    // 26
+                '',                                    // 27
+                'def use_helper():',                   // 28
+                '    return helper()',                 // 29
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const nested = callersOf(index, 'm.py', 2, 'is_valid');
+            assert.deepStrictEqual([nested.confirmed, nested.unverified], [[], []], JSON.stringify(nested));
+            const plan = planOf(index, 'm.py', 2, 'is_valid', 'valid');
+            assert.deepStrictEqual(edits(plan, 'm.py'), ['2:def valid(idx):', '5:return valid']);
+            assert.deepStrictEqual(callersOf(index, 'm.py', 24, 'helper').confirmed, ['m.py:29'],
+                'a nested def declared global binds the module name');
+        } finally { rm(dir); }
+    });
+
+    it('a closure calls the def its enclosing function declares, on both sides', () => {
+        const dir = tmp({
+            'm.py': [
+                'class Splitter:',                     // 1
+                '    def split(self, s):',             // 2
+                '        def max_col():',              // 3
+                '            return len(s)',           // 4
+                '',                                    // 5
+                '        def more():',                 // 6
+                '            return max_col() > 3',    // 7
+                '',                                    // 8
+                '        return more()',               // 9
+                '',                                    // 10
+                '',                                    // 11
+                'def max_col():',                      // 12
+                '    return 0',                        // 13
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(callersOf(index, 'm.py', 3, 'max_col').confirmed, ['m.py:7']);
+            assert.deepStrictEqual(callersOf(index, 'm.py', 12, 'max_col').confirmed, []);
+            const more = index.symbols.get('more')[0];
+            assert.deepStrictEqual(index.findCallees(more, { collectAccount: true })
+                .map(c => `${c.name}:${c.startLine}`), ['max_col:3']);
+        } finally { rm(dir); }
+    });
+
+    it('renaming a pytest fixture renames the parameters pytest injects it into', () => {
+        const dir = tmp({
+            'tests/__init__.py': '',
+            'tests/conftest.py': [
+                'import pytest',                       // 1
+                '',                                    // 2
+                '',                                    // 3
+                '@pytest.fixture',                     // 4
+                'def client():',                       // 5
+                '    return object()',                 // 6
+                '',                                    // 7
+                '',                                    // 8
+                '@pytest.fixture',                     // 9
+                'def session(client):',                // 10
+                '    return [client]',                 // 11
+            ].join('\n') + '\n',
+            'tests/test_a.py': [
+                'import pytest',                       // 1
+                '',                                    // 2
+                '',                                    // 3
+                'def test_a(client):',                 // 4
+                '    assert client is not None',       // 5
+                '',                                    // 6
+                '',                                    // 7
+                'def test_b(client, tmp_path):',       // 8
+                '    def inner(client):',              // 9
+                '        return client',               // 10
+                '    return [client, inner(1)]',       // 11
+                '',                                    // 12
+                '',                                    // 13
+                'def helper(client):',                 // 14
+                '    return client',                   // 15
+                '',                                    // 16
+                '',                                    // 17
+                '@pytest.mark.parametrize("client", [1, 2])',  // 18
+                'def test_p(client):',                 // 19
+                '    assert client',                   // 20
+                '',                                    // 21
+                '',                                    // 22
+                'class TestK:',                        // 23
+                '    def test_m(self, client):',       // 24
+                '        assert client',               // 25
+            ].join('\n') + '\n',
+            'tests/sub/__init__.py': '',
+            'tests/sub/conftest.py': [
+                'import pytest',                       // 1
+                '',                                    // 2
+                '',                                    // 3
+                '@pytest.fixture',                     // 4
+                'def client(client):',                 // 5
+                '    return client',                   // 6
+            ].join('\n') + '\n',
+            'tests/sub/test_c.py': 'def test_c(client):\n    assert client\n',
+            'tests/other/__init__.py': '',
+            'tests/other/test_d.py': [
+                'import pytest',                       // 1
+                '',                                    // 2
+                '',                                    // 3
+                '@pytest.fixture',                     // 4
+                'def client():',                       // 5
+                '    return 1',                        // 6
+                '',                                    // 7
+                '',                                    // 8
+                'def test_d(client):',                 // 9
+                '    assert client',                   // 10
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const plan = planOf(index, 'tests/conftest.py', 5, 'client', 'api');
+            assert.deepStrictEqual(edits(plan, 'tests/conftest.py'), [
+                '10:def session(api):', '11:return [api]', '5:def api():',
+            ]);
+            assert.deepStrictEqual(edits(plan, 'tests/test_a.py'), [
+                '11:return [api, inner(1)]', '24:def test_m(self, api):', '25:assert api',
+                '4:def test_a(api):', '5:assert api is not None', '8:def test_b(api, tmp_path):',
+            ], 'a nested function and a plain helper keep their own parameter');
+            // The parametrize string is a text dependency, the parameter a
+            // fixture-request review item.
+            assert.deepStrictEqual(reviewLines(plan, 'tests/test_a.py'), [18, 19], 'a parametrized name is reviewed');
+            // The nested conftest's override requests the parent fixture
+            // itself; its own users receive the override.
+            assert.deepStrictEqual(edits(plan, 'tests/sub/conftest.py'), ['5:def client(api):', '6:return api']);
+            assert.deepStrictEqual(edits(plan, 'tests/sub/test_c.py'), []);
+            assert.deepStrictEqual(edits(plan, 'tests/other/test_d.py'), [], 'a module fixture overrides the conftest one');
+            const def = plan.changes.find(c => c.file === 'tests/conftest.py' && c.line === 5);
+            assert.ok(!def.needsReview, 'the fixture binding is resolved, not a review item');
+        } finally { rm(dir); }
+    });
+
+    it('a fixture named by name= keeps its parameters, a plugin fixture lists its requests', () => {
+        const dir = tmp({
+            'tests/conftest.py': [
+                'import pytest',                       // 1
+                '',                                    // 2
+                '',                                    // 3
+                '@pytest.fixture(name="db")',          // 4
+                'def make_db():',                      // 5
+                '    return 1',                        // 6
+            ].join('\n') + '\n',
+            'tests/test_db.py': 'def test_db(db, make_db):\n    assert db\n',
+            'pkg/__init__.py': '',
+            'pkg/fixtures.py': [
+                'import pytest',                       // 1
+                '',                                    // 2
+                '',                                    // 3
+                '@pytest.fixture',                     // 4
+                'def server():',                       // 5
+                '    return 2',                        // 6
+            ].join('\n') + '\n',
+            'tests/test_srv.py': 'def test_srv(server):\n    assert server\n',
+        });
+        try {
+            const index = idx(dir);
+            const aliased = planOf(index, 'tests/conftest.py', 5, 'make_db', 'build_db');
+            assert.deepStrictEqual(edits(aliased, 'tests/test_db.py'), []);
+            assert.deepStrictEqual(reviewLines(aliased, 'tests/test_db.py'), []);
+            const plugin = planOf(index, 'pkg/fixtures.py', 5, 'server', 'srv');
+            assert.deepStrictEqual(edits(plugin, 'tests/test_srv.py'), []);
+            assert.deepStrictEqual(reviewLines(plugin, 'tests/test_srv.py'), [1]);
         } finally { rm(dir); }
     });
 });

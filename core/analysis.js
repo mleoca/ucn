@@ -1098,6 +1098,19 @@ function findTypeReferences(index, name, def, options = {}) {
     };
 }
 
+// The why of an unverified caller (reason, dispatch family, reflection
+// pattern), carried the same way whether the engine tiered the entry in its
+// result list or routed it separately: `show` lists both with it.
+function unverifiedDetail(entry) {
+    return {
+        ...(entry.reason && { reason: entry.reason }),
+        ...(entry.dispatchVia && { dispatchVia: entry.dispatchVia }),
+        ...(entry.dispatchCandidates != null && { dispatchCandidates: entry.dispatchCandidates }),
+        ...(entry.reflectionPattern && { reflectionPattern: entry.reflectionPattern }),
+        ...(entry.reflectionScope && { reflectionScope: entry.reflectionScope }),
+    };
+}
+
 function impact(index, name, options = {}) {
     index._beginOp();
     try {
@@ -1207,6 +1220,7 @@ function impact(index, name, options = {}) {
             ...(c.provenance && { provenance: c.provenance }),
             ...(c.siteProvenance && { siteProvenance: c.siteProvenance }),
             tier: c.tier,
+            ...unverifiedDetail(c),
         }));
         // findCallers already applied binding, receiver, module ownership, and
         // target-definition pinning. Do not second-guess it with a file-level
@@ -1260,6 +1274,7 @@ function impact(index, name, options = {}) {
                 ...(call.provenance && { provenance: call.provenance }),
                 ...(call.siteProvenance && { siteProvenance: call.siteProvenance }),
                 ...(call.tier && { tier: call.tier }),
+                ...unverifiedDetail(call),
                 ...analysis
             });
         }
@@ -1283,11 +1298,7 @@ function impact(index, name, options = {}) {
             ...(u.provenance && { provenance: u.provenance }),
             ...(u.siteProvenance && { siteProvenance: u.siteProvenance }),
             tier: 'unverified',
-            ...(u.reason && { reason: u.reason }),
-            ...(u.dispatchVia && { dispatchVia: u.dispatchVia }),
-            ...(u.dispatchCandidates != null && { dispatchCandidates: u.dispatchCandidates }),
-            ...(u.reflectionPattern && { reflectionPattern: u.reflectionPattern }),
-            ...(u.reflectionScope && { reflectionScope: u.reflectionScope }),
+            ...unverifiedDetail(u),
         });
     }
     unverifiedSites.sort((a, b) => {
@@ -2792,6 +2803,7 @@ function parseDiff(diffText, root) {
 // Languages for which audit-async runs (those with async/await keyword we
 // track). Rust futures are audited separately (processRustFile, fix #370);
 // Go/Java have no awaitable call results.
+const JS_AUDIT_FAMILY = new Set(['javascript', 'typescript', 'tsx']);
 const _AUDIT_ASYNC_LANGS = new Set([
     'javascript', 'typescript', 'tsx', 'python', 'html', 'csharp',
 ]);
@@ -2904,6 +2916,7 @@ function auditAsync(index, options = {}) {
         // only a discarded call is a defect; unknown producers (unresolved
         // decorators, disagreeing same-name definitions) are not audited.
         const producers = require('./async-producers');
+        const isAsyncDef = def => producers.isDefAsync(def);
         const kindMemo = new Map();
         const asyncCandidateNames = new Set();
         for (const [name, defs] of index.symbols) {
@@ -2911,6 +2924,49 @@ function auditAsync(index, options = {}) {
                 asyncCandidateNames.add(name);
             }
         }
+        // Class names (null for free functions) owning an async definition
+        // of a name in a language family (a Python call never reaches a JS
+        // definition), and whether a class name's ancestry or descendants
+        // reach one of them (name level: a prefilter, never identity).
+        const auditFamily = language => (JS_AUDIT_FAMILY.has(language) || language === 'html' ? 'js' : language);
+        const asyncOwners = new Map();
+        const asyncOwnersOf = (name, family) => {
+            const key = `${family}\0${name}`;
+            let owners = asyncOwners.get(key);
+            if (!owners) {
+                owners = new Set((index.symbols.get(name) || [])
+                    .filter(def => producers.isCallableDef(def) && producers.isDefAsync(def) &&
+                        auditFamily(index.files.get(def.file)?.language) === family)
+                    .map(def => def.className || null));
+                asyncOwners.set(key, owners);
+            }
+            return owners;
+        };
+        const familyMemo = new Map();
+        const ownerFamily = owner => {
+            let family = familyMemo.get(owner);
+            if (family) return family;
+            family = new Set([owner]);
+            for (const queue = [owner]; queue.length > 0 && family.size < 256;) {
+                for (const parent of index._getInheritanceParents?.(queue.shift(), null) || []) {
+                    const parentName = typeof parent === 'string' ? parent : parent?.name;
+                    if (parentName && !family.has(parentName)) { family.add(parentName); queue.push(parentName); }
+                }
+            }
+            for (const queue = [owner]; queue.length > 0 && family.size < 512;) {
+                for (const child of index.extendedByGraph?.get(queue.shift()) || []) {
+                    const childName = typeof child === 'string' ? child : child?.name;
+                    if (childName && !family.has(childName)) { family.add(childName); queue.push(childName); }
+                }
+            }
+            familyMemo.set(owner, family);
+            return family;
+        };
+        const ownerFamilyMayOwn = (owner, owners) => {
+            const family = ownerFamily(String(owner).replace(/<.*$/s, '').split('.').pop());
+            for (const candidate of owners) if (candidate && family.has(candidate)) return true;
+            return false;
+        };
         // Project-wide lookup: a sync definition anywhere keeps the name
         // ambiguous (`Map.get()` vs an async `DataService.get()`).
         const globalKinds = new Map();
@@ -3043,13 +3099,36 @@ function auditAsync(index, options = {}) {
                     return (source?.exportDetails || []).some(entry =>
                         entry.type === 'default' && asyncCandidateNames.has(entry.name));
                 };
-                const importedProducerNames = new Set();
-                for (const binding of fileEntry.importBindings || []) {
-                    if (binding.kind === 'default' ? defaultExportMayBeAsync(binding)
-                        : asyncCandidateNames.has(binding.name)) {
-                        importedProducerNames.add(binding.alias || binding.name);
+                // A JS/TS import read through the module's re-exports to the
+                // function it declares (fix #402): `export { default } from`,
+                // `export { f as g } from`, `export * from`.
+                const exportedAsync = binding => {
+                    if (!JS_AUDIT_FAMILY.has(language)) return false;
+                    const relative = fileEntry.moduleResolved?.[binding.module];
+                    if (!relative) return false;
+                    return producers.jsModuleExportReaches(index, path.resolve(index.root, relative),
+                        binding.kind === 'default' ? 'default' : binding.name, isAsyncDef, moduleScopes);
+                };
+                // Decided per local name on first use: only names this file
+                // calls pay for reading re-exports.
+                let bindingsByLocal = null;
+                const importedProducers = new Map();
+                const importedProducerName = name => {
+                    if (importedProducers.has(name)) return importedProducers.get(name);
+                    if (!bindingsByLocal) {
+                        bindingsByLocal = new Map();
+                        for (const binding of fileEntry.importBindings || []) {
+                            const local = binding.alias || binding.name;
+                            if (!bindingsByLocal.has(local)) bindingsByLocal.set(local, []);
+                            bindingsByLocal.get(local).push(binding);
+                        }
                     }
-                }
+                    const producer = (bindingsByLocal.get(name) || []).some(binding =>
+                        (binding.kind === 'default' ? defaultExportMayBeAsync(binding)
+                            : asyncCandidateNames.has(binding.name)) || exportedAsync(binding));
+                    importedProducers.set(name, producer);
+                    return producer;
+                };
                 const fileAsyncNames = new Set(asyncFns.map(fn => fn.name));
                 // Text prefilter only: the AST decides what a star import binds.
                 let starImport;
@@ -3061,11 +3140,57 @@ function auditAsync(index, options = {}) {
                     }
                     return starImport;
                 };
-                candidateName = name => knownAsyncGlobalNames.has(name) || importedProducerNames.has(name) ||
+                candidateName = name => knownAsyncGlobalNames.has(name) || importedProducerName(name) ||
                     (asyncCandidateNames.has(name) && (fileAsyncNames.has(name) || hasStarImport()));
             }
-            const candidateCall = call => !!call?.name && (language === 'csharp' || !call.isMethod) &&
-                candidateName(call.name);
+            // A structural method call is audited when its receiver carries
+            // evidence the engine can resolve (fix #402): a constructed,
+            // annotated or flow-typed receiver, an imported module, or the
+            // enclosing instance (`this.m()`, `self.m()`); the engine's
+            // callee at that site then decides the producer.
+            const selfNames = langTraits(language)?.selfParam || [];
+            // Name-level prefilter (the engine decides identity): an async
+            // definition of the name owned by the receiver's class family, a
+            // module function for a module receiver.
+            let classByFunction = null;
+            const enclosingClassOf = call => {
+                const start = call.enclosingFunction?.startLine;
+                if (!Number.isInteger(start)) return null;
+                if (!classByFunction) {
+                    classByFunction = new Map();
+                    for (const symbol of fileEntry.symbols || []) {
+                        const key = `${symbol.startLine}\0${symbol.name}`;
+                        if (!classByFunction.has(key)) classByFunction.set(key, symbol.className || null);
+                    }
+                }
+                return classByFunction.get(`${start}\0${call.enclosingFunction.name}`) || null;
+            };
+            const typedMethodCall = call => {
+                if (language === 'csharp' || !call.isMethod || call.isPotentialCallback || call.awaited ||
+                    call.passedAsArgument || !asyncCandidateNames.has(call.name)) return false;
+                const owners = asyncOwnersOf(call.name, auditFamily(language));
+                if (owners.size === 0) return false;
+                if (call.receiverIsModule) return owners.has(null);
+                // A field hop (`self.conn.send()`) names no type the record
+                // keeps; it stays unaudited.
+                if (call.selfAttribute || call.receiverField || call.receiverRoot) return false;
+                const owner = call.receiverType || (selfNames.includes(call.receiver) ? enclosingClassOf(call) : null);
+                return !!owner && ownerFamilyMayOwn(owner, owners);
+            };
+            const typedCalls = new Set(indexedCalls.filter(typedMethodCall));
+            const candidateCall = call => !!call?.name && (((language === 'csharp' || !call.isMethod) &&
+                candidateName(call.name)) || typedCalls.has(call));
+            const typedMethodStarts = new Set([...typedCalls]
+                .map(call => call.callStart ?? call.callSite?.start).filter(Number.isInteger));
+            // The record start of a typed method call node: its own start, or
+            // its method name token's (records that keep only the token).
+            const typedMethodStart = callNode => {
+                if (typedMethodStarts.size === 0) return null;
+                if (typedMethodStarts.has(callNode.startIndex)) return callNode.startIndex;
+                const fn = callNode.childForFieldName('function');
+                const token = fn?.childForFieldName('property') || fn?.childForFieldName('attribute');
+                return token && typedMethodStarts.has(token.startIndex) ? token.startIndex : null;
+            };
             // A file none of whose indexed calls can reach an async producer
             // has nothing to audit: skip the re-parse (dominant cost on large
             // repos). Files without call records are parsed as before.
@@ -3239,7 +3364,9 @@ function auditAsync(index, options = {}) {
                     if (defs) return producers.collapseKinds(index, defs, kindMemo, true);
                     if (lexical.star) return null;
                 }
-                const targets = lexical?.external ? producerCallees(callNode) : [];
+                const typedStart = isMethodCall ? typedMethodStart(callNode) : null;
+                const targets = lexical?.external || typedStart != null
+                    ? producerCallees(callNode, typedStart ?? callNode.startIndex) : [];
                 if (targets.length > 0) return producers.collapseKinds(index, targets, kindMemo, true);
                 return !isMethodCall && !lexical?.external && knownAsyncGlobals.has(calleeName)
                     ? 'coroutine' : null;
@@ -3307,9 +3434,17 @@ function auditAsync(index, options = {}) {
                                 calleeName = funcNode.text;
                             }
                             // Structural method calls (`obj.get()`) need
-                            // receiver evidence this audit does not have.
-                            const methodBlocked = isMethodCall && language !== 'csharp';
-                            if (calleeName && !methodBlocked && candidateName(calleeName) &&
+                            // receiver evidence: the engine's callee at a
+                            // typed receiver (fix #402).
+                            const methodBlocked = isMethodCall && language !== 'csharp' &&
+                                typedMethodStart(node) == null;
+                            // An awaited or consumed call reports nothing
+                            // whatever its producer (nor counts as skipped):
+                            // its producer is never resolved.
+                            const typedMember = isMethodCall && language !== 'csharp';
+                            if (calleeName && !methodBlocked &&
+                                (candidateName(calleeName) || typedMember) &&
+                                !isAwaited(node) && !producers.asyncConsumerRole(node) &&
                                 (enclosing = nearestAsyncEnclosing(node))) {
                                 const kind = calleeProducerKind(node, calleeName, isMethodCall, line);
                                 if (kind && kind !== 'void' &&

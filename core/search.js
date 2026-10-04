@@ -1522,9 +1522,12 @@ function tests(index, nameOrFile, options = {}) {
                 // own definition (fix #246).
                 if (localShadow && !usage.receiver && usage.usageType !== 'import') continue;
 
+                // A line is claimed only by a usage that is recorded: two
+                // same-kind tokens on one line (`a.m = b.m`) are judged
+                // separately, so a rejected first token never hides a
+                // matching second one.
                 const lineKey = `${usage.line}:${usage.usageType}`;
                 if (seenLines.has(lineKey)) continue;
-                seenLines.add(lineKey);
 
                 const lineContent = index.getLineContent(testPath, usage.line);
 
@@ -1552,6 +1555,7 @@ function tests(index, nameOrFile, options = {}) {
                     // where the receiver matches the target class.
                     if (!usage.receiver && matchType !== 'unverified-reference') continue;
                     if (!usage.receiver && matchType === 'unverified-reference') {
+                        seenLines.add(lineKey);
                         matches.push({
                             line: usage.line,
                             content: lineContent.trim(),
@@ -1567,6 +1571,7 @@ function tests(index, nameOrFile, options = {}) {
                     }
                 }
 
+                seenLines.add(lineKey);
                 matches.push({
                     line: usage.line,
                     content: lineContent.trim(),
@@ -1699,28 +1704,26 @@ function tests(index, nameOrFile, options = {}) {
             const info = testInfo.get(site.file);
             if (!info) continue;
             if (info.testRanges && !lineInRanges(site.line, info.testRanges)) continue;
-            // For a repeated name, the source-import scope is an additional
-            // identity guard. For a globally unique name, exact-target caller
-            // evidence is stronger than filesystem layout: workspace-level
-            // Rust tests, Go black-box packages, and generated test trees may
-            // exercise a crate/package without importing the defining file.
-            // Unverified sites remain visibly tiered; they are not promoted.
-            if (sourceFileFilter && !globallyUniqueTarget && !sourceFileFilter.has(site.file)) continue;
-            // A bare callback/reference/call can bind a standalone function
-            // with the same name, but it cannot identify a class method
-            // target. Use the parser's call-kind bit rather than requiring a
-            // textual receiver: fluent chains such as `.addStaticBlock(...)`
-            // have a call receiver but no simple receiver identifier. Rust
-            // proc-macro attribute references are handled by the AST usage
-            // branch above as explicitly unverified references.
-            if (className && !site.isMethod) continue;
+            // Every site here was adjudicated against the exact target
+            // definition by the caller engine (fix #402), so neither the file
+            // layout nor the call shape is a second identity test: a test
+            // reaches the target through a fixture-injected or inherited
+            // receiver without importing the defining file, and a
+            // receiver-less call reaches a method through implicit `this`, a
+            // static import, a destructured member or a macro-generated test
+            // body, exactly when the engine says so and in the tier it says.
+            // Unverified sites stay visibly tiered; they are not promoted.
             if (excludeArr.length > 0 &&
                 !index.matchesFilters(info.entry.relativePath, { exclude: excludeArr })) continue;
-            const localSameName = (info.entry.symbols || []).some(s => s.name === searchTerm);
-            const importsTargetName = (info.entry.importBindings || []).some(b => b.name === searchTerm);
-            const explicitlyScopedToLocal = !!options.file && targetDefs.some(d => d.file === site.file);
-            if (localSameName && !importsTargetName && !explicitlyScopedToLocal &&
-                !site.receiver && !site.isMethod) continue;
+            if (site._testEvidenceTier !== 'confirmed') {
+                // An unverified bare call in a test file that defines the
+                // name itself most likely binds that local definition.
+                const localSameName = (info.entry.symbols || []).some(s => s.name === searchTerm);
+                const importsTargetName = (info.entry.importBindings || []).some(b => b.name === searchTerm);
+                const explicitlyScopedToLocal = !!options.file && targetDefs.some(d => d.file === site.file);
+                if (localSameName && !importsTargetName && !explicitlyScopedToLocal &&
+                    !site.receiver && !site.isMethod) continue;
+            }
 
             let fileResult = results.find(r => r.file === info.entry.relativePath);
             if (!fileResult) {

@@ -21,6 +21,7 @@
  * project is only a candidate, not evidence of an async producer.
  */
 
+const path = require('path');
 const { langTraits } = require('../languages');
 const { sameNode } = require('../languages/utils');
 
@@ -417,6 +418,100 @@ function createLexicalResolver(fileEntry, language) {
     };
 }
 
+/** Program-scope bindings of a JS/TS module, memoized in `memo`. */
+function jsProgramScope(index, file, entry, memo) {
+    const key = 'js\0' + file;
+    if (!memo.has(key)) {
+        let names = null;
+        try {
+            const tree = index._getParsedTree(file, index._readFile(file), entry.language);
+            if (tree) names = jsScopeBindings(tree.rootNode);
+        } catch (_) { names = null; }
+        memo.set(key, names);
+    }
+    return memo.get(key);
+}
+
+// A module's export of `name` (`default` for the default export), read
+// through re-exports (`export { f as g } from`, `export { default } from`,
+// `export * from`) to the module that declares the function (fix #402).
+// With `want`, only whether some definition satisfies it is kept: a module
+// with no wanted callable of the exported name answers null unread.
+function jsModuleExportDefinitions(index, file, name, memo = new Map(), depth = 0, seen = new Set(), want = null) {
+    const key = `${file}\0${name}`;
+    if (depth > 8 || seen.has(key)) return null;
+    const memoKey = (want ? 'jswant\0' : 'jsexport\0') + key;
+    if (depth === 0 && memo.has(memoKey)) return memo.get(memoKey);
+    seen.add(key);
+    let result = jsModuleExportDefinitionsUncached(index, file, name, memo, depth, seen, want);
+    // 'absent' (the module exports no such name) only steers `export *`
+    // lookups; callers get null, as for an undecided export.
+    if (depth === 0) {
+        if (result === ABSENT) result = null;
+        memo.set(memoKey, result);
+    }
+    return result;
+}
+const ABSENT = Object.freeze([]);
+
+function jsModuleExportDefinitionsUncached(index, file, name, memo, depth, seen, want) {
+    const entry = file ? index.files.get(file) : null;
+    if (!entry || LEXICAL_FAMILY[entry.language] !== 'js' || entry.language === 'html') return null;
+    const details = (entry.exportDetails || []).filter(detail => !detail.isTypeExport);
+    const isDefault = name === 'default';
+    const local = details.filter(detail => !detail.source &&
+        (isDefault ? detail.type === 'default' : detail.type === 'named' && (detail.alias || detail.name) === name));
+    const forwarded = details.filter(detail => detail.source && detail.type === 're-export' &&
+        (detail.alias || detail.name) === name);
+    const stars = isDefault ? [] : details.filter(detail => detail.source && detail.type === 're-export-all' && !detail.alias);
+    if (forwarded.length > 1 || (forwarded.length === 1 && local.length > 0)) return null;
+    const resolveSource = specifier => {
+        const relative = entry.moduleResolved?.[specifier];
+        return relative ? path.resolve(index.root, relative) : null;
+    };
+    if (forwarded.length === 1) {
+        const source = resolveSource(forwarded[0].source);
+        const defs = source ? jsModuleExportDefinitions(index, source, forwarded[0].name, memo, depth + 1, seen, want) : null;
+        return defs === ABSENT ? null : defs;
+    }
+    if (local.length === 0) {
+        // `export * from` re-exports every named export: exactly one
+        // star source may supply the name.
+        let found = null;
+        for (const star of stars) {
+            const source = resolveSource(star.source);
+            if (!source) return null;
+            const defs = jsModuleExportDefinitions(index, source, name, memo, depth + 1, new Set(seen), want);
+            if (defs === ABSENT) continue;
+            if (!defs || found) return null;
+            found = defs;
+        }
+        return found || ABSENT;
+    }
+    const symbols = callableSymbolsByName(entry);
+    if (want && !local.some(detail => (symbols.get(detail.name) || []).some(want))) return null;
+    const defs = [];
+    for (const detail of local) {
+        const declared = (symbols.get(detail.name) || []).filter(symbol =>
+            !symbol.className && (symbol.startLine === detail.line || symbol.nameLine === detail.line));
+        if (declared.length === 1) {
+            defs.push(declared[0]);
+            continue;
+        }
+        // No callable of that name in the module: no binding can map to one.
+        if (declared.length > 1 || !symbols.has(detail.name)) return null;
+        const bound = jsProgramScope(index, file, entry, memo)?.get(detail.name);
+        if (!bound || bound.some(binding => binding.kind !== 'def')) return null;
+        for (const def of bound) {
+            const nameNode = def.node.childForFieldName('name');
+            const symbol = symbolAtLine(symbols, detail.name, (nameNode || def.node).startPosition.row + 1);
+            if (!symbol || symbol.className) return null;
+            defs.push(symbol);
+        }
+    }
+    return defs;
+}
+
 /**
  * The function definitions an import binds, read from the imported project
  * module itself (null when that does not prove them):
@@ -489,49 +584,12 @@ function createModuleImportResolver(index, fileEntry, memo = new Map()) {
     // JS/TS: the module's export of that name must be its own function: an
     // exported declaration on the export's line, or a name (`export { f }`,
     // `export default f`) its module scope binds only by function
-    // definitions. Any other export (a re-export, an alias, a value) is
-    // left to the engine.
-    const programScope = (file, entry) => {
-        const key = 'js\0' + file;
-        if (!memo.has(key)) {
-            let names = null;
-            try {
-                const tree = index._getParsedTree(file, index._readFile(file), entry.language);
-                if (tree) names = jsScopeBindings(tree.rootNode);
-            } catch (_) { names = null; }
-            memo.set(key, names);
-        }
-        return memo.get(key);
-    };
+    // definitions, read through re-exports (jsModuleExportDefinitions). Any
+    // other export (an alias of a value, a class) is left to the engine.
     const exportedDefinitions = binding => {
         const relative = fileEntry.moduleResolved?.[binding.module];
         const file = relative ? path.resolve(index.root, relative) : null;
-        const entry = file ? index.files.get(file) : null;
-        if (!entry || LEXICAL_FAMILY[entry.language] !== 'js' || entry.language === 'html') return null;
-        const isDefault = binding.imported === 'default';
-        const exports = (entry.exportDetails || []).filter(detail => !detail.isTypeExport && !detail.source &&
-            (isDefault ? detail.type === 'default' : detail.type === 'named' && !detail.alias && detail.name === binding.imported));
-        if (exports.length === 0) return null;
-        const symbols = callableSymbolsByName(entry);
-        const defs = [];
-        for (const detail of exports) {
-            const declared = (symbols.get(detail.name) || []).filter(symbol =>
-                !symbol.className && (symbol.startLine === detail.line || symbol.nameLine === detail.line));
-            if (declared.length === 1) {
-                defs.push(declared[0]);
-                continue;
-            }
-            if (declared.length > 1) return null;
-            const bound = programScope(file, entry)?.get(detail.name);
-            if (!bound || bound.some(binding => binding.kind !== 'def')) return null;
-            for (const def of bound) {
-                const nameNode = def.node.childForFieldName('name');
-                const symbol = symbolAtLine(symbols, detail.name, (nameNode || def.node).startPosition.row + 1);
-                if (!symbol || symbol.className) return null;
-                defs.push(symbol);
-            }
-        }
-        return defs;
+        return file ? jsModuleExportDefinitions(index, file, binding.imported, memo) : null;
     };
     return {
         fromImports(entries) {
@@ -586,7 +644,10 @@ function createImportedProducerResolver(index, filePath, fileEntry, calls) {
         byOwner.get(owner).add(start);
     }
     const memo = new Map();
-    return callNode => {
+    // `start` is the call record's site start: the call node's for most
+    // records, the method name token's for a record that keeps only the
+    // token (Python method calls).
+    return (callNode, start = callNode.startIndex) => {
         const owner = ownerOf(callNode.startPosition.row + 1);
         if (!byOwner.has(owner)) return [];
         if (!memo.has(owner)) {
@@ -595,7 +656,7 @@ function createImportedProducerResolver(index, filePath, fileEntry, calls) {
             }) || []);
         }
         return memo.get(owner).filter(def => (def.siteProvenance || []).some(site =>
-            site.start === callNode.startIndex && site.provenance?.validation === 'establishes-target'));
+            site.start === start && site.provenance?.validation === 'establishes-target'));
     };
 }
 
@@ -1659,6 +1720,9 @@ module.exports = {
     createLexicalResolver,
     createImportedProducerResolver,
     createModuleImportResolver,
+    jsModuleExportDefinitions,
+    jsModuleExportReaches: (index, file, name, want, memo) =>
+        !!jsModuleExportDefinitions(index, file, name, memo, 0, new Set(), want)?.some(want),
     asyncConsumerRole,
     isDiscardedCall,
     resolveDecorator,

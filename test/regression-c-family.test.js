@@ -7043,3 +7043,48 @@ describe('fix #401: C++ name hiding, using-declarations, subscript receivers', (
         } finally { rm(dir); }
     });
 });
+
+describe('fix #402: a typename functional cast in a body keeps the members after it', () => {
+    it('blanks the disambiguator the grammar cannot read in an expression', () => {
+        const dir = tmp({
+            'json.hpp': [
+                'template<typename object_t>',                 // 1
+                'class basic_json {',                          // 2
+                '  public:',                                   // 3
+                '    void push_back(initializer_list_t init)', // 4
+                '    {',                                       // 5
+                '        if (is_object() && init.size() == 2 && (*init.begin())->is_string())', // 6
+                '        {',                                   // 7
+                '            basic_json&& key = init.begin()->moved_or_copied();', // 8
+                '            push_back(typename object_t::value_type(', // 9
+                '                          std::move(key.get_ref<string_t&>()), (init.begin() + 1)->moved_or_copied()));', // 10
+                '        }',                                   // 11
+                '        else',                                // 12
+                '        {',                                   // 13
+                '            push_back(basic_json(init));',    // 14
+                '        }',                                   // 15
+                '    }',                                       // 16
+                '',                                            // 17
+                '    reference operator+=(initializer_list_t init)', // 18
+                '    {',                                       // 19
+                '        push_back(init);',                    // 20
+                '        return *this;',                       // 21
+                '    }',                                       // 22
+                '',                                            // 23
+                '    void update(int j, bool merge = false)',  // 24
+                '    {',                                       // 25
+                '        update(j);',                          // 26
+                '    }',                                       // 27
+                '};',                                          // 28
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'find', { name: 'update', exact: true, file: 'json.hpp' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            assert.deepStrictEqual(r.result.map(d => `${d.startLine}:${d.className}`), ['24:basic_json']);
+            const pushBack = index.symbols.get('push_back');
+            assert.deepStrictEqual(pushBack.map(d => `${d.startLine}-${d.endLine}`), ['4-16']);
+        } finally { rm(dir); }
+    });
+});

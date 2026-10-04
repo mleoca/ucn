@@ -983,6 +983,20 @@ function displacedSpecifiers(error, code) {
     return { names, type, conversion: false, declarator };
 }
 
+/** A dependent type the grammar misread inside a function body (fix
+ * #402): within a parse ERROR, or in the parameters of a function
+ * definition nested in a block (never valid C++). */
+function dependentTypeInBodyError(node) {
+    let misread = false;
+    for (let current = node.parent; current; current = current.parent) {
+        if (current.type === 'ERROR' || current.type === 'function_definition') misread = true;
+        else if (current.type === 'compound_statement') return misread;
+        else if (current.type === 'field_declaration_list' || current.type === 'translation_unit' ||
+            current.type === 'declaration_list') return false;
+    }
+    return false;
+}
+
 function macroTypeRanges(tree, code, evidence = null) {
     const ranges = [];
     const pairs = [];
@@ -1032,6 +1046,15 @@ function macroTypeRanges(tree, code, evidence = null) {
         ranges.push(...errorMacroRanges(node, code, pairs, evidence));
         const statementMacro = statementMacroRange(node, code, evidence);
         if (statementMacro) ranges.push(statementMacro);
+        // `typename Q::T(args)` as an expression (a functional cast to a
+        // dependent type): the grammar has no expression form for it and
+        // drops the statement into an ERROR; without the disambiguator it is
+        // the same construction, which the grammar reads (fix #402).
+        if (treeHasError && node.type === 'dependent_type' && dependentTypeInBodyError(node)) {
+            const keyword = node.child(0);
+            if (keyword?.type === 'typename') ranges.push([keyword.startIndex, keyword.endIndex]);
+            return false;
+        }
         const classAttribute = classAttributeShape(node);
         // A name whose definitions (the file's own, or those its include
         // closure supplies) expand to a removable statement fragment

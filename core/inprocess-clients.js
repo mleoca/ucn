@@ -420,6 +420,119 @@ class PythonClientResolver {
  * app is declared by, followed through imports), through `app.callback()`,
  * `app.listen(..)` and `http.createServer(app)` wrappers.
  */
+// Mocha-style suites share one context object: `this` in a test or hook
+// callback is its suite's context, and a nested suite's context inherits
+// from its parent's (fix #402).
+const SUITE_CALLS = new Set(['describe', 'context', 'suite']);
+const RUNNABLE_CALLS = new Set(['it', 'specify', 'test', 'before', 'beforeEach', 'after', 'afterEach']);
+const SETUP_HOOKS = new Set(['before', 'beforeEach']);
+
+/** `describe` / `it.only` / `before`: the framework name a call is spelled with. */
+function frameworkCallName(call) {
+    const fn = unwrap(field(call, 'function'));
+    if (fn?.type === 'identifier') return fn.text;
+    if (fn?.type === 'member_expression') {
+        const object = unwrap(field(fn, 'object'));
+        const property = field(fn, 'property')?.text;
+        if (object?.type === 'identifier' && (property === 'only' || property === 'skip')) return object.text;
+    }
+    return null;
+}
+
+/** The call a function expression is a direct argument of, with that call's framework name. */
+function callbackCall(fn) {
+    const args = fn?.parent;
+    const call = args?.type === 'arguments' ? args.parent : null;
+    return call?.type === 'call_expression' ? { call, name: frameworkCallName(call) } : null;
+}
+
+const isContextMember = (node, name) => node?.type === 'member_expression' &&
+    unwrap(field(node, 'object'))?.type === 'this' && field(node, 'property')?.text === name;
+
+/**
+ * `this.<name> = value` assignments whose `this` is `fn`'s own; `configured`
+ * when `fn` calls a method of `this.<name>` (`this.app.get('/', ..)`):
+ * routes registered through the context are not in the route inventory.
+ */
+function contextWrites(fn, name) {
+    const out = [];
+    const body = field(fn, 'body');
+    const stack = body ? [body] : [];
+    while (stack.length > 0) {
+        const node = stack.pop();
+        if (node.type === 'function_expression' || node.type === 'function' ||
+            node.type === 'function_declaration' || node.type === 'method_definition' ||
+            node.type === 'class_declaration' || node.type === 'class') continue;
+        if (node.type === 'assignment_expression' || node.type === 'augmented_assignment_expression') {
+            if (isContextMember(unwrap(field(node, 'left')), name)) out.push(node);
+        } else if (node.type === 'call_expression') {
+            const callee = unwrap(field(node, 'function'));
+            if (callee?.type === 'member_expression' && isContextMember(unwrap(field(callee, 'object')), name)) {
+                out.configured = true;
+            }
+        }
+        for (const child of namedChildren(node)) stack.push(child);
+    }
+    return out;
+}
+
+/**
+ * The value `this.<name>` holds in a mocha test or hook callback: the one
+ * `this.<name> = V` of the nearest enclosing suite whose `before` /
+ * `beforeEach` hooks assign it (ancestor suites are reached through context
+ * inheritance). Null when the read is not in such a callback, when no suite
+ * assigns it, when the deciding suite assigns it more than once or anywhere
+ * but its setup hooks (a test or teardown hook writes the shared context).
+ */
+function mochaContextValue(node) {
+    const read = unwrap(node);
+    if (read?.type !== 'member_expression' || unwrap(field(read, 'object'))?.type !== 'this') return null;
+    const name = field(read, 'property')?.type === 'property_identifier' ? field(read, 'property').text : null;
+    if (!name) return null;
+    let fn = read.parent;
+    while (fn && fn.type !== 'function_expression' && fn.type !== 'function') {
+        if (fn.type === 'function_declaration' || fn.type === 'method_definition' || fn.type === 'class_body') return null;
+        fn = fn.parent;
+    }
+    const runnable = callbackCall(fn);
+    if (!runnable || !RUNNABLE_CALLS.has(runnable.name)) return null;
+    // Suites from the innermost outward.
+    let statement = runnable.call.parent;
+    for (let depth = 0; depth < 16; depth++) {
+        const block = statement?.type === 'expression_statement' ? statement.parent : null;
+        const suiteFn = block?.type === 'statement_block' ? block.parent : null;
+        const suite = suiteFn && (suiteFn.type === 'function_expression' || suiteFn.type === 'function' ||
+            suiteFn.type === 'arrow_function') ? callbackCall(suiteFn) : null;
+        if (!suite || !SUITE_CALLS.has(suite.name)) return null;
+        const hookWrites = [];
+        let writes = 0;
+        let configured = false;
+        for (const child of namedChildren(block)) {
+            const call = child.type === 'expression_statement' ? unwrap(namedChildren(child)[0]) : null;
+            const callName = call?.type === 'call_expression' ? frameworkCallName(call) : null;
+            if (!RUNNABLE_CALLS.has(callName)) continue;
+            for (const arg of namedChildren(field(call, 'arguments'))) {
+                if (arg.type !== 'function_expression' && arg.type !== 'function') continue;
+                const found = contextWrites(arg, name);
+                writes += found.length;
+                if (found.configured) configured = true;
+                if (SETUP_HOOKS.has(callName)) hookWrites.push(...found);
+            }
+        }
+        // Every write in the suite's own runnables must be its one setup
+        // hook write (a test or teardown hook may replace the value), and
+        // the app must not be configured through the context.
+        if (writes > 0) {
+            if (configured || hookWrites.length !== 1 || writes !== 1 ||
+                hookWrites[0].type !== 'assignment_expression') return null;
+            return field(hookWrites[0], 'right');
+        }
+        if (configured) return null;
+        statement = suite.call.parent;
+    }
+    return null;
+}
+
 class JsClientResolver {
     constructor(index, sess, graph) {
         this.index = index;
@@ -435,6 +548,9 @@ class JsClientResolver {
         const root = this.sess.root(file);
         const call = root ? routeGraph.locateSpan(root, start, end, 'call_expression') : null;
         let app = call ? namedChildren(field(call, 'arguments')).filter(n => !n.type.endsWith('comment'))[0] : null;
+        // `request(this.app)` in a mocha test: the app a setup hook of its
+        // suite stores on the shared context (fix #402).
+        app = (app && mochaContextValue(app)) || app;
         for (let hops = 0; app && hops < MAX_HOPS; hops++) {
             const value = unwrap(app);
             if (value?.type !== 'call_expression') { app = value; break; }

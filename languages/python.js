@@ -36,6 +36,46 @@ function isPythonGenerator(fnNode) {
 }
 const { PARSE_OPTIONS, safeParse } = require('./index');
 
+// Statements that run in the namespace of the scope holding them: a def
+// under `if`/`try`/`with`/`for`/`while`/`match` in a class body executes in
+// the class namespace and binds a class attribute (a method), exactly like
+// one written directly in the body (fix #402).
+const PY_CLASS_BODY_COMPOUNDS = new Set(['block', 'if_statement', 'elif_clause', 'else_clause',
+    'try_statement', 'except_clause', 'except_group_clause', 'finally_clause', 'with_statement',
+    'for_statement', 'while_statement', 'match_statement', 'case_clause', 'decorated_definition']);
+
+/** The class whose body declares `defNode` (a def or class, decorated or
+ * not), through compound statements; null for any other scope. */
+function pythonClassBodyOwner(defNode) {
+    for (let node = defNode?.parent; node; node = node.parent) {
+        if (node.type === 'class_definition') return node;
+        if (!PY_CLASS_BODY_COMPOUNDS.has(node.type)) return null;
+    }
+    return null;
+}
+
+/** Function definitions a class body declares (decorated ones as their
+ * `decorated_definition`), in source order, through compound statements;
+ * nested functions and classes are not entered. */
+function pythonClassBodyDefs(body) {
+    const out = [];
+    const visit = container => {
+        for (let i = 0; i < container.namedChildCount; i++) {
+            const child = container.namedChild(i);
+            if (child.type === 'function_definition') { out.push(child); continue; }
+            if (child.type === 'decorated_definition') {
+                const definition = child.childForFieldName('definition');
+                if (definition?.type === 'function_definition') out.push(child);
+                continue;
+            }
+            if (child.type === 'class_definition') continue;
+            if (PY_CLASS_BODY_COMPOUNDS.has(child.type)) visit(child);
+        }
+    };
+    if (body) visit(body);
+    return out;
+}
+
 function parseTree(parser, code) {
     return safeParse(parser, code, undefined, PARSE_OPTIONS);
 }
@@ -162,19 +202,9 @@ function _processFunction(node, functions, processedRanges, lines, code) {
         if (processedRanges.has(rangeKey)) return true;
         processedRanges.add(rangeKey);
 
-        // Skip functions that are inside a class (they're extracted as class members)
-        let parent = node.parent;
-        // Handle decorated_definition wrapper
-        if (parent && parent.type === 'decorated_definition') {
-            parent = parent.parent;
-        }
-        // Check if parent is a class body (block inside class_definition)
-        if (parent && parent.type === 'block') {
-            const grandparent = parent.parent;
-            if (grandparent && grandparent.type === 'class_definition') {
-                return true;  // Skip - this is a class method
-            }
-        }
+        // Skip functions a class body declares, directly or under its
+        // compound statements: they're extracted as class members.
+        if (pythonClassBodyOwner(node)) return true;
 
         const nameNode = node.childForFieldName('name');
         const paramsNode = node.childForFieldName('parameters');
@@ -1039,9 +1069,7 @@ function extractClassMembers(classNode, code) {
     const bodyNode = classNode.childForFieldName('body');
     if (!bodyNode) return members;
 
-    for (let i = 0; i < bodyNode.namedChildCount; i++) {
-        const child = bodyNode.namedChild(i);
-
+    for (const child of pythonClassBodyDefs(bodyNode)) {
         let funcNode = child;
         let decoratorStart = null;
         const memberDecorators = [];
@@ -1618,6 +1646,13 @@ function narrowedReceiverType(refNode, receiverName, declaredUnion) {
     return undefined;
 }
 
+/** `Union[Foo, None]` names Foo (fix #402); a union of several types names none. */
+function unionMemberName(node) {
+    const members = (genericTypeParts(node)?.args || []).filter(arg => arg &&
+        arg.type !== 'none' && !(arg.type === 'identifier' && arg.text === 'None'));
+    return members.length === 1 ? typeNameFromExpr(members[0]) : undefined;
+}
+
 function typeNameFromExpr(node) {
     if (!node) return undefined;
     switch (node.type) {
@@ -1642,6 +1677,7 @@ function typeNameFromExpr(node) {
         case 'subscript': {
             // typing.Optional[Foo] parses as subscript when base is dotted
             const base = typeNameFromExpr(node.childForFieldName('value'));
+            if (base === 'Union') return unionMemberName(node);
             if (PY_TYPE_WRAPPERS.has(base)) {
                 return typeNameFromExpr(node.childForFieldName('subscript'));
             }
@@ -1650,6 +1686,7 @@ function typeNameFromExpr(node) {
         case 'generic_type': {
             // Optional[Foo] / Mapping[str, int] in annotation position
             const base = typeNameFromExpr(node.namedChild(0));
+            if (base === 'Union') return unionMemberName(node);
             if (PY_TYPE_WRAPPERS.has(base)) {
                 const params = node.namedChild(1); // type_parameter → type wrappers
                 const firstType = params && params.namedChildCount > 0 ? params.namedChild(0) : null;
@@ -2151,10 +2188,95 @@ function isPythonNameShadowedAt(refNode, name) {
                 }
             }
             const body = parent.childForFieldName('body');
-            return body ? pythonScopeBindsName(body, name) : false;
+            if (body && pythonScopeBindsName(body, name)) {
+                // `global name` makes the function's binding the module's.
+                return !pythonDeclaresScopeName(body, name);
+            }
+            // Unbound here: a nested function reads the enclosing function
+            // scopes (closures) before the module (fix #402); class bodies
+            // are skipped, as Python skips them.
+            if (body && pythonDeclaresScopeName(body, name)) return false;
         }
     }
     return false;
+}
+
+/**
+ * The start line (decorators included) of the enclosing function a closure
+ * reference binds `name` in (fix #402): null when the reference's own
+ * function (or a comprehension, lambda or loop around it) binds it, or no
+ * enclosing function does.
+ */
+function pythonClosureScopeLine(refNode, name) {
+    let first = true;
+    for (let parent = refNode.parent; parent; parent = parent.parent) {
+        if (parent.type === 'lambda') {
+            const params = parent.childForFieldName('parameters');
+            if (params?.namedChildren.some(param => (param.type === 'identifier' ? param
+                : param.childForFieldName('name'))?.text === name)) return null;
+            continue;
+        }
+        if (PY_COMPREHENSIONS.has(parent.type)) {
+            if (parent.namedChildren.some(clause => clause.type === 'for_in_clause' &&
+                pythonTargetBindsName(clause.childForFieldName('left'), name))) return null;
+            continue;
+        }
+        if (parent.type !== 'function_definition' && parent.type !== 'async_function_definition') continue;
+        const params = parent.childForFieldName('parameters');
+        const body = parent.childForFieldName('body');
+        const bindsParam = !!params && params.namedChildren.some(param => {
+            const id = param.type === 'identifier' ? param : (param.childForFieldName('name') || param.namedChild(0));
+            return id?.type === 'identifier' && id.text === name;
+        });
+        if (body && pythonDeclaresScopeName(body, name)) return null;
+        if (bindsParam || (body && pythonScopeBindsName(body, name))) {
+            if (first) return null;
+            const start = parent.parent?.type === 'decorated_definition' ? parent.parent : parent;
+            return start.startPosition.row + 1;
+        }
+        first = false;
+    }
+    return null;
+}
+
+/** Shadow fields of a bare reference: `localShadow`, and the enclosing
+ * function a closure binds it in. */
+function pythonShadowFields(refNode, name) {
+    if (!isPythonNameShadowedAt(refNode, name)) return null;
+    const scope = pythonClosureScopeLine(refNode, name);
+    return scope ? { localShadow: true, localShadowScope: scope } : { localShadow: true };
+}
+
+/** Names a function body declares `global` (not in nested scopes),
+ * memoized per tree and body node (fix #402). */
+const globalNamesByTree = new WeakMap();
+function pythonGlobalNames(body) {
+    let byId = globalNamesByTree.get(body.tree);
+    if (!byId) { byId = new Map(); globalNamesByTree.set(body.tree, byId); }
+    let names = byId.get(body.id);
+    if (names) return names;
+    names = new Set();
+    // Prefilter: no `global` keyword in the body, no declaration.
+    if (body.text.includes('global')) {
+        const stack = [body];
+        while (stack.length > 0) {
+            const node = stack.pop();
+            if (node.type === 'global_statement') {
+                for (const child of node.namedChildren) if (child.type === 'identifier') names.add(child.text);
+                continue;
+            }
+            if (node !== body && (node.type === 'function_definition' || node.type === 'class_definition' ||
+                node.type === 'lambda')) continue;
+            for (let i = node.namedChildCount - 1; i >= 0; i--) stack.push(node.namedChild(i));
+        }
+    }
+    byId.set(body.id, names);
+    return names;
+}
+
+/** Whether a function body declares `global name` (not in nested scopes). */
+function pythonDeclaresScopeName(body, name) {
+    return pythonGlobalNames(body).has(name);
 }
 
 /**
@@ -3513,7 +3635,7 @@ function findCallsInTree(code, tree, parser, sink = null) {
                         ...(argSpread && { argSpread: true }),
                         enclosingFunction,
                         uncertain,
-                        ...(isShadowedByLocal(funcNode, funcNode.text) && { localShadow: true }),
+                        ...pythonShadowFields(funcNode, funcNode.text),
                         ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp }),
                         ...(requestConfig && { requestConfig })
                     });
@@ -3690,6 +3812,8 @@ function findCallsInTree(code, tree, parser, sink = null) {
                     const requestConfig = argCount > 0 ? getRequestConfig(node) : null;
                     const capabilityGuard = receiverCapabilityGuard(
                         node, objNode, attrNode.text);
+                    let awaitParent = node.parent;
+                    while (awaitParent?.type === 'parenthesized_expression') awaitParent = awaitParent.parent;
                     calls.push({
                         callSite: typeOrigin('call', attrNode),
                         name: attrNode.text,
@@ -3698,6 +3822,11 @@ function findCallsInTree(code, tree, parser, sink = null) {
                         // the account's ground set is keyed by the name's line
                         line: attrNode.startPosition.row + 1,
                         isMethod: true,
+                        // `await x.m()` and `f(x.m())` (fix #402): the value
+                        // is awaited or passed on; audit-async skips them.
+                        ...(awaitParent?.type === 'await' && { awaited: true }),
+                        ...((awaitParent?.type === 'argument_list' || awaitParent?.type === 'keyword_argument') &&
+                            { passedAsArgument: true }),
                         receiver,
                         ...(receiverType && { receiverType,
                             ...(narrowedType || comprehensionType ? {
@@ -3803,7 +3932,7 @@ function findCallsInTree(code, tree, parser, sink = null) {
                             isMethod: false,
                             isFunctionReference: true,
                             isPotentialCallback: true,
-                            ...(isShadowedByLocal(arg, arg.text) && { localShadow: true }),
+                            ...pythonShadowFields(arg, arg.text),
                             enclosingFunction
                         });
                     }
@@ -3851,7 +3980,7 @@ function findCallsInTree(code, tree, parser, sink = null) {
                                         isMethod: false,
                                         isFunctionReference: true,
                                         isPotentialCallback: true,
-                                        ...(isShadowedByLocal(val, val.text) && { localShadow: true }),
+                                        ...pythonShadowFields(val, val.text),
                                         enclosingFunction
                                     });
                                 }
@@ -4570,8 +4699,8 @@ function findInstanceAttributeTypes(code, parser, options = {}) {
             if (contract.type) attrTypes.set(field, contract.type);
         }
         const methodReturns = new Map();
-        for (let i = 0; i < body.namedChildCount; i++) {
-            let member = body.namedChild(i);
+        const memberDefs = pythonClassBodyDefs(body);
+        for (let member of memberDefs) {
             if (member.type === 'decorated_definition') {
                 member = Array.from({ length: member.namedChildCount },
                     (_, index) => member.namedChild(index))
@@ -4628,8 +4757,7 @@ function findInstanceAttributeTypes(code, parser, options = {}) {
         }
 
         // Scan __init__ for self.X = ClassName(...) assignments
-        for (let i = 0; i < body.childCount; i++) {
-            let child = body.child(i);
+        for (let child of memberDefs) {
             // Handle decorated_definition wrapper
             if (child.type === 'decorated_definition') {
                 for (let j = 0; j < child.childCount; j++) {
@@ -4743,8 +4871,7 @@ function findInstanceAttributeTypes(code, parser, options = {}) {
         const runtimeFieldWrites = new Map();
         const externalFieldWrites = new Map();
         const invalidRuntimeFields = new Set();
-        for (let i = 0; i < body.namedChildCount; i++) {
-            let member = body.namedChild(i);
+        for (let member of memberDefs) {
             if (member.type === 'decorated_definition') {
                 member = Array.from({ length: member.namedChildCount },
                     (_, index) => member.namedChild(index))
@@ -4862,6 +4989,119 @@ function findInstanceAttributeTypes(code, parser, options = {}) {
     });
 
     return result;
+}
+
+const PY_STORE_CONTAINERS = new Set(['pattern_list', 'tuple_pattern', 'list_pattern', 'tuple', 'list',
+    'parenthesized_expression', 'list_splat_pattern', 'list_splat', 'expression_list']);
+
+/** Whether an attribute node is written (assigned, deleted, a loop or
+ * `with ... as` target), not read. */
+function isPythonStoreTarget(node) {
+    let target = node;
+    while (target.parent && PY_STORE_CONTAINERS.has(target.parent.type)) target = target.parent;
+    const parent = target.parent;
+    if (!parent) return false;
+    switch (parent.type) {
+        case 'assignment':
+        case 'augmented_assignment':
+        case 'for_statement':
+        case 'for_in_clause':
+            return sameNode(parent.childForFieldName('left'), target);
+        case 'as_pattern_target':
+        case 'delete_statement':
+            return true;
+        default:
+            return false;
+    }
+}
+
+/**
+ * What a class body does to its instance fields (fix #402): the class
+ * members it declares (defs, class-level assignments, nested classes,
+ * through compound statements), the fields its methods write on the
+ * instance or class (`self.x = ..`, `cls.x = ..`, augmented, deleted, loop
+ * and `with ... as` targets, nested functions included), and whether it
+ * writes fields dynamically (`setattr(self, ..)`, `self.__dict__`,
+ * `vars(self)`). Null when no class is declared at `line`.
+ */
+function findClassFieldFacts(tree, line, name) {
+    if (!tree) return null;
+    const row = line - 1;
+    let classNode = null;
+    const stack = [tree.rootNode];
+    while (stack.length > 0 && !classNode) {
+        const node = stack.pop();
+        if (node.startPosition.row > row || node.endPosition.row < row) continue;
+        if (node.type === 'class_definition') {
+            const nameNode = node.childForFieldName('name');
+            const start = node.parent?.type === 'decorated_definition' ? node.parent : node;
+            if (nameNode?.text === name && (start.startPosition.row === row || node.startPosition.row === row ||
+                nameNode.startPosition.row === row)) { classNode = node; break; }
+        }
+        for (let i = node.namedChildCount - 1; i >= 0; i--) stack.push(node.namedChild(i));
+    }
+    const body = classNode?.childForFieldName('body');
+    if (!body) return null;
+    const members = new Set();
+    const receivers = new Set(['self', 'cls']);
+    const addTargets = target => {
+        if (!target) return;
+        if (target.type === 'identifier') { members.add(target.text); return; }
+        if (PY_STORE_CONTAINERS.has(target.type)) {
+            for (let i = 0; i < target.namedChildCount; i++) addTargets(target.namedChild(i));
+        }
+    };
+    const visitBody = container => {
+        for (let i = 0; i < container.namedChildCount; i++) {
+            const child = container.namedChild(i);
+            const definition = child.type === 'decorated_definition' ? child.childForFieldName('definition') : child;
+            if (definition?.type === 'function_definition' || definition?.type === 'class_definition') {
+                const declared = definition.childForFieldName('name')?.text;
+                if (declared) members.add(declared);
+                if (definition.type === 'function_definition') {
+                    const params = definition.childForFieldName('parameters');
+                    const first = params?.namedChild(0);
+                    const firstName = first?.type === 'identifier' ? first.text
+                        : (first?.childForFieldName?.('name') || first?.namedChild(0))?.text;
+                    if (firstName) receivers.add(firstName);
+                }
+                continue;
+            }
+            if (child.type === 'expression_statement') {
+                for (let j = 0; j < child.namedChildCount; j++) {
+                    const expression = child.namedChild(j);
+                    if (expression.type === 'assignment' || expression.type === 'augmented_assignment') {
+                        addTargets(expression.childForFieldName('left'));
+                    }
+                }
+                continue;
+            }
+            if (PY_CLASS_BODY_COMPOUNDS.has(child.type)) visitBody(child);
+        }
+    };
+    visitBody(body);
+    const written = new Set();
+    let dynamic = false;
+    const pending = [body];
+    while (pending.length > 0) {
+        const node = pending.pop();
+        if (node.type === 'class_definition') continue;
+        if (node.type === 'attribute') {
+            const object = node.childForFieldName('object');
+            const attribute = node.childForFieldName('attribute');
+            if (object?.type === 'identifier' && receivers.has(object.text) && attribute) {
+                if (attribute.text === '__dict__') dynamic = true;
+                else if (isPythonStoreTarget(node)) written.add(attribute.text);
+            }
+        } else if (node.type === 'call') {
+            const fn = node.childForFieldName('function');
+            const first = node.childForFieldName('arguments')?.namedChild(0);
+            if (fn?.type === 'identifier' && (fn.text === 'setattr' || fn.text === 'vars' ||
+                fn.text === 'delattr') && first?.type === 'identifier' && receivers.has(first.text)) dynamic = true;
+        }
+        for (let i = node.namedChildCount - 1; i >= 0; i--) pending.push(node.namedChild(i));
+    }
+    return { members, written, dynamic };
 }
 
 /**
@@ -5266,6 +5506,7 @@ module.exports = {
     findExportsInCode,
     findUsagesInCode,
     findInstanceAttributeTypes,
+    findClassFieldFacts,
     getBuiltinCallReturnType,
     getBuiltinFieldType,
     findPytestFunctions,

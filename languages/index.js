@@ -507,6 +507,10 @@ const LANGUAGES = {
             // f` / `except ImportError: def f`) is one item with an
             // alternative per runtime configuration (fix #398F).
             conditionalDefinitions: 'branch',
+            // A def inside a function body binds a local of that function: a
+            // bare name outside it never names it (fix #402), unless the
+            // function declares the name `global`.
+            nestedItemsBlockScoped: true,
             // Decorators with a known effect on what calling the decorated
             // function returns (fix #364), as resolved qualified names (a
             // trailing `()` marks a decorator factory call). Any other

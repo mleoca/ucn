@@ -5392,11 +5392,70 @@ function plan(index, name, options = {}) {
             const { nameBindingDecorators } = require('./decorator-binding');
             const decoratorMemo = new Map();
             const decorated = new Set();
+            // A pytest fixture is requested by name (fix #402): the
+            // parameters pytest injects it into are renamed with it, each
+            // with the uses that bind that parameter, and what pytest's
+            // resolution leaves open is listed for review.
+            const fixtureSites = options.renameTo && planLang === 'python'
+                ? require('./pytest-fixtures').fixtureParameterSites(index, def) : null;
+            if (fixtureSites) {
+                for (const site of fixtureSites.edits) {
+                    const rel = path.relative(index.root, site.file);
+                    const edit = renameIdentifierTokens(index, site.file, site.line, name,
+                        options.renameTo, site.byteColumns);
+                    if (edit.renamed === edit.source) continue;
+                    const existing = changes.find(change => change.file === rel && change.line === site.line);
+                    if (existing) {
+                        if (existing.newExpression !== undefined && !existing.needsReview) mergeTokenEdit(existing, edit);
+                        continue;
+                    }
+                    changes.push(tagTokenEdit({
+                        file: rel,
+                        line: site.line,
+                        expression: edit.source,
+                        suggestion: `Update fixture parameter: ${edit.renamed}`,
+                        newExpression: edit.renamed,
+                        editKind: 'reference',
+                    }, edit));
+                }
+                const reasonText = {
+                    'not-collected': 'pytest does not collect this module by default; if it is collected or imported into a test module, the parameter requests the fixture',
+                    'parametrized': 'the parameter is also a parametrize argument name',
+                    'plugin-fixture': 'the fixture is registered as a plugin and no project fixture of this name precedes it here',
+                    'class-fixtures': 'its class declares several fixtures of this name',
+                    'class-binding': 'its class binds the name',
+                    'class-bases': 'its class has bases whose fixtures are not resolved',
+                    'module-binding': 'the module binds the name otherwise than by one fixture definition',
+                    'module-import': 'the module imports the name from elsewhere',
+                    'module-namespace': 'the module may bind the name through a star import or a dynamically named fixture',
+                    'unreadable': 'a module on its fixture lookup path could not be read',
+                };
+                for (const site of fixtureSites.reviews) {
+                    const rel = path.relative(index.root, site.file);
+                    if (reviewItems.some(item => item.file === rel && item.line === site.line)) continue;
+                    reviewItems.push({
+                        file: rel,
+                        line: site.line,
+                        expression: (index.getLineContent(site.file, site.line) || '').trim(),
+                        suggestion: `pytest may inject fixture "${name}" here by name: ` +
+                            `${reasonText[site.reason] || site.reason}; rename the parameter if it requests this fixture`,
+                        needsReview: true,
+                        editKind: 'reference',
+                    });
+                }
+            }
             for (const member of [def, ...contractRootDefs]) {
                 const key = `${member.file}\0${member.startLine}`;
                 if (decorated.has(key)) continue;
                 decorated.add(key);
-                const unproven = nameBindingDecorators(index, member, decoratorMemo);
+                let unproven = nameBindingDecorators(index, member, decoratorMemo);
+                // The fixture pass above settled pytest's name binding.
+                if (fixtureSites && !fixtureSites.dynamic && member === def) {
+                    const fileEntry = index.files.get(member.file);
+                    const vocab = langTraits(planLang)?.callableDecorators || {};
+                    const { resolveDecorator } = require('./async-producers');
+                    unproven = unproven.filter(text => resolveDecorator(text, fileEntry, vocab)?.name !== 'pytest.fixture');
+                }
                 if (unproven.length === 0) continue;
                 // Point at each decorator line the declaration spans.
                 const nameLine = member.nameLine || member.startLine;

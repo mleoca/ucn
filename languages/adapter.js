@@ -19,6 +19,7 @@ const OPTIONAL_HELPERS = Object.freeze([
     'findMacros',
     'findCallbackUsages',
     'findInstanceAttributeTypes',
+    'findClassFieldFacts',
     'findReExports',
     'extractScriptBlocks',
     'buildVirtualJSContent',
