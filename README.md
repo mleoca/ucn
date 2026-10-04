@@ -118,7 +118,7 @@ needs the compiler and tests.
 
 Release gates compare UCN's answers with independent compilers and language
 servers on a ten-repository board of pinned production codebases. The local
-September 6, 2026 evaluation recorded these sampled caller results:
+October 4, 2026 evaluation recorded these sampled caller results:
 
 | Repository | Pinned commit | Oracle | Symbols sampled | Confirmed precision | In-scope recall |
 |---|---|---|---:|---:|---:|
@@ -135,10 +135,10 @@ September 6, 2026 evaluation recorded these sampled caller results:
 
 That evaluation reported zero missing in-scope oracle edges in both caller
 and callee answers, and 8,000 cross-command comparisons with zero disagreements.
-The default dead-code audit found zero false-dead results among 13 scored
-claims; 13 additional claims could not be pinned by the oracle and were unscored.
+The default dead-code audit found zero false-dead results among 9 scored
+claims; 4 additional claims could not be pinned by the oracle and were unscored.
 All ten repositories passed the performance budgets, with steady-state query
-p95 from 4.5 to 76.2 ms. Those timings exclude process startup and indexing;
+p95 from 4.7 to 106.1 ms. Those timings exclude process startup and indexing;
 cold builds and cache loading are measured separately.
 
 The samples are deterministic and stratified by reference activity. Confirmed
