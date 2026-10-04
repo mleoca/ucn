@@ -997,6 +997,30 @@ function findCallers(index, name, options = {}) {
             routeUnverified(filePath, fileEntry, call, 'provenance-incomplete', calledAs, undefined, facts);
         }
     };
+    // A std wrapper step may supply the method (fix #401): the target's own
+    // type behind the wrapper, the wrapper, a blanket or a trait owner can be
+    // what the probe selects there. A target owned by an unrelated concrete
+    // project type keeps the inner type's verdict.
+    const routeDerefAmbiguous = (filePath, fileEntry, call, calledAs) => {
+        const targets = options.targetDefinitions || definitions;
+        const unrelated = targets.every(target => {
+            const owner = String(target.className || target.receiver || '')
+                .replace(/^[*&]\s*/, '').replace(/<.*$/s, '').trim();
+            if (!owner || owner === call.receiverType || _definitionHasGenericOwner(target) ||
+                _RUST_DEREF_WRAPPER_NAMES.has(owner)) return false;
+            return (index.symbols.get(owner) || []).some(type =>
+                ['struct', 'enum', 'union'].includes(type.type)) &&
+                !(index.symbols.get(owner) || []).some(type => type.type === 'trait');
+        });
+        if (unrelated) return false;
+        if (collectAccount) {
+            routeUnverified(filePath, fileEntry, call, 'autoref-dispatch', calledAs, {
+                uncertaintyClass: 'compile-time-dispatch',
+                dispatchFamily: `${name} method probe (autoref/deref steps)`,
+            });
+        }
+        return true;
+    };
     const maxResults = options.maxResults;
     // BUG-H1: when consumers (like `about`) need an accurate truncation header
     // ("showing N of <total>"), they pass needsTotal:true so Phase 1 runs to
@@ -1122,6 +1146,12 @@ function findCallers(index, name, options = {}) {
                 if (call.memberRead && !_pythonMemberReadIsMethod(index, call)) continue;
                 call = _withoutAmbiguousSliceType(_withoutShadowedStdLiteral(index, call),
                     options.targetDefinitions || definitions);
+                if (fileEntry.language === 'rust') call = _rustDerefWrapperView(index, filePath, call);
+                if (call.receiverMacroParam && !call.receiverType && fileEntry.language === 'cpp') {
+                    call = _withCppMacroParamReceiver(index, filePath, call);
+                }
+                // `T v(X());` declares a function when X is a type (fix #401).
+                if (call.declarationReading && _cppNamesType(index, call.name)) continue;
                 if (structuralLanguage && call.receiverType) {
                     call = _withModuleValueAliasReceiver(index, filePath, call, true);
                 }
@@ -1187,6 +1217,7 @@ function findCallers(index, name, options = {}) {
                     }
                 }
 
+                if (call.receiverDerefAmbiguous && routeDerefAmbiguous(filePath, fileEntry, call, calledAs)) continue;
                 const standardWrapper = fileEntry.language === 'rust'
                     ? _rustStandardWrapperMethod(index, filePath, call, calls) : null;
                 if (standardWrapper) {
@@ -1720,6 +1751,10 @@ function findCallers(index, name, options = {}) {
                             receiverTypeGuessed: undefined,
                             receiverFlowInvalidated: false,
                             ...(flowEntry.fromFile && { receiverTypeFlowFile: flowEntry.fromFile }) };
+                        if (flowEntry.derefVia) {
+                            call = _rustDerefWrapperView(index, filePath, call);
+                            if (call.receiverDerefAmbiguous && routeDerefAmbiguous(filePath, fileEntry, call, calledAs)) continue;
+                        }
                     }
                 }
 
@@ -2176,7 +2211,10 @@ function findCallers(index, name, options = {}) {
                 if (fileEntry.language === 'rust' && call.isMethod &&
                     !call.receiverType && call.receiverValuePath) {
                     const valueType = _rustValuePathReceiverType(index, filePath, call);
-                    if (valueType) call = { ...call, ...valueType };
+                    if (valueType) {
+                        call = _rustDerefWrapperView(index, filePath, { ...call, ...valueType });
+                        if (call.receiverDerefAmbiguous && routeDerefAmbiguous(filePath, fileEntry, call, calledAs)) continue;
+                    }
                 }
 
                 // Generic-bounded receivers (fix #368): `self.base.split_at(i)`
@@ -3921,6 +3959,73 @@ function findCallers(index, name, options = {}) {
                     const bound = _definitionByBindingId(index, name, bindingId);
                     if (bound && !_ARITY_TYPE_KINDS.has(bound.type) && bound.type !== 'constructor' &&
                         !bound.isConstructor && bound.className) bindingId = null;
+                }
+                // A member of a class that does not enclose the call is not
+                // in simple-name scope (fix #401, junit4: a nested class's
+                // private `getTestClass()` never answers the outer class's
+                // bare call, which implicit-this lookup gives the inherited
+                // member).
+                if (bindingId && !call.receiver && !call.isMethod && !call.isConstructor &&
+                    langTraits(fileEntry.language)?.bareCallReachesMethods) {
+                    const bound = _definitionByBindingId(index, name, bindingId);
+                    const owner = bound?.className && bound.file === filePath ? ownerDefinitionOf(index, bound) : null;
+                    if (owner && (call.line < owner.startLine || call.line > owner.endLine)) {
+                        // An inherited member stays in scope: a class enclosing
+                        // the call (or one enclosing that class) may descend
+                        // from the member's class.
+                        const caller = index.findEnclosingFunction(filePath, call.line, true, call);
+                        const enclosing = [];
+                        for (let className = caller?.className; className && enclosing.length < 8;) {
+                            enclosing.push(className);
+                            const declaration = (index.symbols.get(className) || []).find(symbol =>
+                                IDENTITY_TYPE_KINDS.has(symbol.type) && symbol.file === filePath &&
+                                symbol.startLine <= call.line && call.line <= symbol.endLine);
+                            className = declaration?.enclosingType || null;
+                        }
+                        const inherited = enclosing.length === 0 || enclosing.some(className => {
+                            const ref = className === caller.className ? ownerRefOf(index, caller)
+                                : resolveClassRef(index, className, filePath);
+                            return !ref?.key || descendsFromTargets(index, ref, [bound]) !== 'no';
+                        });
+                        if (!inherited) bindingId = null;
+                    }
+                }
+                // A bare call in an anonymous class body (fix #401, junit4
+                // `new BlockJUnit4ClassRunner(..) { .. getTestClass() .. }`):
+                // simple-name lookup starts at the anonymous class, so a
+                // member its supertype's ancestry declares wins over the
+                // enclosing classes' members.
+                if (!call.receiver && !call.isMethod && !call.isConstructor && call.anonymousSuperType &&
+                    call.anonymousDeclares && langTraits(fileEntry.language)?.bareCallReachesMethods) {
+                    // The anonymous body's own member (not indexed) is the callee.
+                    recordExcluded(filePath, call.line, 'other-definition');
+                    continue;
+                }
+                if (!call.receiver && !call.isMethod && !call.isConstructor && call.anonymousSuperType &&
+                    langTraits(fileEntry.language)?.bareCallReachesMethods) {
+                    const anonymousRef = call.anonymousSuperType.includes('.')
+                        ? resolveQualifiedClassRef(index, call.anonymousSuperType, filePath, { name: null, key: null })
+                        : resolveClassRef(index, call.anonymousSuperType, filePath);
+                    const declaring = anonymousRef?.key ? findDeclaringClass(index, anonymousRef, definitions) : null;
+                    if (declaring && !declaring.uncertain && declaring.ref?.key &&
+                        declaring.members.some(member => !NON_CALLABLE_TYPES.has(member.type))) {
+                        const relation = relationToTargets(index, declaring.ref,
+                            options.targetDefinitions || definitions);
+                        if (relation === 'unrelated') {
+                            recordExcluded(filePath, call.line, 'other-definition');
+                            continue;
+                        }
+                        if (relation !== 'same') {
+                            if (collectAccount) {
+                                routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
+                                    dispatchVia: declaring.ref.name,
+                                });
+                            }
+                            continue;
+                        }
+                        bindingId = null;
+                        resolvedBySameClass = true;
+                    }
                 }
                 // A C# explicit interface implementation is not in simple-
                 // name scope (fix #395): a file binding of a bare or `this.`
@@ -7723,6 +7828,11 @@ function findCallees(index, definition, options = {}) {
             if (siteStarts && !siteStarts.has(call.callStart ?? call.callSite?.start)) continue;
             call = _withModuleValueAliasReceiver(index, def.file,
                 _withoutShadowedStdLiteral(index, _destructuredMemberView(call)), structuralCallee);
+            if (language === 'rust') call = _rustDerefWrapperView(index, def.file, call);
+            if (call.receiverMacroParam && !call.receiverType && language === 'cpp') {
+                call = _withCppMacroParamReceiver(index, def.file, call);
+            }
+            if (call.declarationReading && _cppNamesType(index, call.name)) continue;
             // A local declared with a supertype and never reassigned after
             // `new T(..)` runs T's member (fix #394; the caller-side twin).
             if (call.receiverType && call.receiverTypeEvidence?.constructedType) {
@@ -7904,7 +8014,17 @@ function findCallees(index, definition, options = {}) {
             }
             if (language === 'rust' && call.isMethod && !call.receiverType && call.receiverValuePath) {
                 const valueType = _rustValuePathReceiverType(index, def.file, call);
-                if (valueType) call = { ...call, ...valueType };
+                if (valueType) call = _rustDerefWrapperView(index, def.file, { ...call, ...valueType });
+            }
+            // A std wrapper step may supply the method (fix #401): a project
+            // member of the name is a candidate, never the decided callee.
+            if (call.receiverDerefAmbiguous) {
+                if ((index.symbols.get(call.name) || []).some(d => !NON_CALLABLE_TYPES.has(d.type))) {
+                    noteUnverified(siteId, call, 'autoref-dispatch');
+                    continue;
+                }
+                const { receiverDerefAmbiguous, ...plain } = call;
+                call = { ...plain, receiverType: receiverDerefAmbiguous };
             }
             if (language === 'rust' && call.isMethod &&
                 call.receiver && !call.receiverType &&
@@ -8107,9 +8227,36 @@ function findCallees(index, definition, options = {}) {
             // `v := New(); v.ReadConfig()`. The compiler-declared return type
             // is stronger than constructor-name guesses and must participate
             // in callee identity just as it already does for callers.
-            const directReceiverFlow = mayNeedDirectReceiverFlow(call)
+            let directReceiverFlow = mayNeedDirectReceiverFlow(call)
                 ? _lookupReturnTypeFlow(flowMap(), call)
                 : undefined;
+            // A flow value behind a std deref wrapper (fix #401).
+            if (directReceiverFlow?.type && directReceiverFlow.derefVia) {
+                const viewed = _rustDerefWrapperView(index, def.file, { ...call,
+                    receiverType: directReceiverFlow.type, receiverTypeSource: 'flow',
+                    receiverTypeEvidence: { source: 'flow', ...directReceiverFlow } });
+                if (viewed.receiverDerefAmbiguous) {
+                    if ((index.symbols.get(call.name) || []).some(d => !NON_CALLABLE_TYPES.has(d.type))) {
+                        noteUnverified(siteId, call, 'autoref-dispatch');
+                    } else {
+                        noteSite(siteId, 'external', null, call);
+                    }
+                    continue;
+                }
+                if (viewed.receiverTypeEvidence?.derefWrapperStep) {
+                    noteSite(siteId, 'external', null, call);
+                    continue;
+                }
+                if (!viewed.receiverType) directReceiverFlow = undefined;
+                else directReceiverFlow = { ...directReceiverFlow, valueRef: 'owned' };
+            }
+            // The flow value's reference layer orders the Rust probe steps
+            // (fix #401), as the caller side reads it from the evidence.
+            if (language === 'rust' && directReceiverFlow?.type && directReceiverFlow.valueRef &&
+                !call.receiverTypeRef) {
+                call = { ...call, receiverTypeEvidence: { ...(call.receiverTypeEvidence || {}),
+                    valueRef: directReceiverFlow.valueRef } };
+            }
             // Caller-side fix #305 twin: a loop element drawn from an
             // untyped identifier/attribute iterable has no class identity.
             // Unique project ownership of the method spelling is not enough
@@ -8697,7 +8844,41 @@ function findCallees(index, definition, options = {}) {
                              ? symbol.file === receiverOriginFile
                              : path.dirname(symbol.file) ===
                                 path.dirname(receiverOriginFile)));
-                    const sel = _calleeSelectReceiverMethod(
+                    // Rust method probe on a typed receiver (fix #401, the
+                    // `self` rule of #399): the receiver's reference layer
+                    // and inherent-before-trait precedence select one of the
+                    // type's same-name members, or leave the site unverified.
+                    let rustTypedProbe = null;
+                    if (language === 'rust' && call.isMethod && !call.isPathCall &&
+                        call.receiver !== 'self' && symbols && (receiverTypeDefinition || receiverOriginFile)) {
+                        const ref = directReceiverFlow?.type ? directReceiverFlow.valueRef
+                            : call.receiverTypeRef || call.receiverTypeEvidence?.valueRef;
+                        // Configuration alternatives of one type share its key.
+                        const named = classDefsNamed(index, typeName);
+                        const typeKeys = new Set((receiverTypeDefinition ? [receiverTypeDefinition]
+                            : (index.symbols.get(typeName) || []).filter(d =>
+                                _FOLD_TYPE_KINDS.has(d.type) && d.file === receiverOriginFile))
+                            .map(d => classKeyOf(index, d)));
+                        const typeKey = named.unique && named.entries.length > 0 ? `name:${typeName}`
+                            : typeKeys.size === 1 ? [...typeKeys][0] : null;
+                        const key = typeKey && symbols.some(symbol => !NON_CALLABLE_TYPES.has(symbol.type) &&
+                            ownerRefOf(index, symbol)?.key === typeKey) ? typeKey : null;
+                        if (key && (ref === 'owned' || ref === '&' || ref === '&mut')) {
+                            rustTypedProbe = _rustMethodProbeSelect(index, def.file, call.line,
+                                { key, layers: ref === 'owned' ? [] : [ref] }, call.name);
+                        }
+                        if (rustTypedProbe?.ambiguous) {
+                            noteUnverified(siteId, call, 'overload-ambiguous');
+                            continue;
+                        }
+                        if (rustTypedProbe?.match && _rustReceiverProbe(index, def.file,
+                            { ...call, receiverType: rustTypedProbe.match.className }, rustTypedProbe.match, def) === 'unverified') {
+                            noteUnverified(siteId, call, 'autoref-dispatch');
+                            continue;
+                        }
+                    }
+                    const sel = rustTypedProbe?.match ? { match: rustTypedProbe.match }
+                        : _calleeSelectReceiverMethod(
                         index, call, symbols || [], typeName, language, def.file,
                         acceptsReceiverDefinition, receiverOriginFile && {
                             fromFile: receiverOriginFile, definition: receiverTypeDefinition,
@@ -9144,6 +9325,43 @@ function findCallees(index, definition, options = {}) {
                             ? 'configuration-alternative' : 'ambiguous-binding');
                     }
                     continue;
+                }
+            }
+
+            // A bare call in an anonymous class or enum-constant body (fix
+            // #401, the caller side's twin): simple-name lookup starts at the
+            // body's supertype; a member the body declares itself is its own.
+            if (!call.isMethod && !call.receiver && !call.isConstructor && call.anonymousSuperType &&
+                langTraits(language)?.bareCallReachesMethods) {
+                if (call.anonymousDeclares) {
+                    noteSite(siteId, 'excluded', 'other-definition', call);
+                    continue;
+                }
+                const anonymousRef = call.anonymousSuperType.includes('.')
+                    ? resolveQualifiedClassRef(index, call.anonymousSuperType, def.file, { name: null, key: null })
+                    : resolveClassRef(index, call.anonymousSuperType, def.file);
+                const named = index.symbols.get(call.name) || [];
+                const declaring = anonymousRef?.key ? findDeclaringClass(index, anonymousRef, named) : null;
+                const members = declaring && !declaring.uncertain && declaring.ref?.key
+                    ? declaring.members.filter(member => !NON_CALLABLE_TYPES.has(member.type)) : [];
+                if (members.length > 0) {
+                    const selected = _calleeOverloadSelect(index, call, members, language);
+                    if (selected.ambiguous) {
+                        noteUnverified(siteId, call, 'overload-ambiguous');
+                        continue;
+                    }
+                    if (selected.match) {
+                        const key = selected.match.bindingId || `${selected.match.className}.${call.name}`;
+                        const existing = callees.get(key);
+                        if (existing) {
+                            existing.count += 1;
+                            if (collectAccount) { existing.sites.push(call.line); existing.siteIds.push(siteId); }
+                        } else {
+                            callees.set(key, { name: call.name, bindingId: selected.match.bindingId, count: 1,
+                                ...(collectAccount && { sites: [call.line], siteIds: [siteId] }) });
+                        }
+                        continue;
+                    }
                 }
             }
 
@@ -10130,6 +10348,18 @@ function findCallees(index, definition, options = {}) {
                     continue;
                 }
                 resolutionSymbols.splice(0, resolutionSymbols.length, ...constructible);
+                // The type the name denotes where it is written (fix #401,
+                // junit4: a single-type import beats a same-package class's
+                // nested namesake), by the language's type-name scoping.
+                if (resolutionSymbols.length > 1 && langTraits(language)?.typeNameScoping) {
+                    const ref = resolveClassRef(index, calleeName, def.file);
+                    if (ref?.def) {
+                        const denoted = resolutionSymbols.filter(s => s === ref.def ||
+                            (s.type === 'constructor' && s.className === calleeName && s.file === ref.def.file &&
+                                s.startLine >= ref.def.startLine && s.endLine <= ref.def.endLine));
+                        if (denoted.length > 0) resolutionSymbols.splice(0, resolutionSymbols.length, ...denoted);
+                    }
+                }
             }
             if (resolutionSymbols.length > 0) {
                 let callee = resolutionSymbols[0];
@@ -10698,6 +10928,30 @@ function _rustProbeReferenceSiblings(call, candidates) {
     return null;
 }
 
+/**
+ * Reference layer of a Rust value a producer's declared return type gives
+ * (fix #401): 'owned', '&' or '&mut'; null when unknown (a deref wrapper,
+ * a raw pointer, `impl`/`dyn`, a tuple, or an unwrapped value that is not a
+ * Result/Option payload).
+ */
+function _rustReturnValueRef(returnType, unwrapped, tuple) {
+    let text = String(returnType || '').trim();
+    if (!text || tuple) return null;
+    if (unwrapped) {
+        const match = /^(?:[A-Za-z_][A-Za-z0-9_]*::)*(Result|Option)\s*<(.*)>$/s.exec(text);
+        if (!match) return null;
+        text = _splitTopLevelGenericArgs(match[2])[0]?.trim() || '';
+        if (!text) return null;
+    }
+    if (text.startsWith('&')) {
+        return /^&\s*(?:'[A-Za-z_][A-Za-z0-9_]*\s+)?mut\b/.test(text) ? '&mut' : '&';
+    }
+    if (/^[*([]/.test(text) || /^(impl|dyn)\b/.test(text)) return null;
+    const head = text.replace(/<.*$/s, '').split('::').pop().trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(head) || _RUST_DEREF_WRAPPER_NAMES.has(head)) return null;
+    return 'owned';
+}
+
 function _declaredReturnText(definition) {
     return definition?.returnTypeResolved || definition?.returnType;
 }
@@ -10854,6 +11108,19 @@ function _populateReturnTypeFlowScope(index, filePath, calls, scopeCalls, scoped
         if (scoped._processed.has(call)) continue;
         scoped._processed.add(call);
         call = _withoutShadowedStdLiteral(index, call);
+        // A std deref wrapper built around a producer (fix #401):
+        // `let v = ManuallyDrop::new(rebuild_vec(..))` holds what the
+        // producer returns, behind the wrapper.
+        if (language === 'rust') {
+            const wrapped = _rustWrapperConstructionFlow(index, fileEntry, filePath, calls, call, assignedFoldCtx);
+            if (wrapped) {
+                const scope = call.enclosingFunction ? `${call.enclosingFunction.startLine}` : '';
+                const key = `${scope}:${call.assignedTo}`;
+                if (!map.has(key)) map.set(key, []);
+                map.get(key).push({ line: call.line, start: call.callStart, ...wrapped });
+                continue;
+            }
+        }
         // For-loop iteration provenance (fix #294, flask-measured: `for ep in
         // importlib.metadata.entry_points(...)` — ep.load() confirmed
         // JSONProvider.load via single-owner while ep is an external
@@ -11801,6 +12068,12 @@ function _populateReturnTypeFlowScope(index, filePath, calls, scopeCalls, scoped
             ...(language === 'cpp' && { valueText: returnType, valueFromFile: fromFile || filePath }),
             ...(moduleProducer && { moduleProducer }),
             ...(language === 'rust' && returnDefinition && { rustReturnDeclaration: _rustReturnDeclaration(returnDefinition) }),
+            // The value's reference layer (fix #401): `-> Self` is owned,
+            // `-> &T` a reference, so the method probe can order the steps.
+            ...(language === 'rust' && (() => {
+                const valueRef = _rustReturnValueRef(returnType, call.assignedUnwrap, call.assignedTuple);
+                return valueRef ? { valueRef } : {};
+            })()),
             ...(language === 'rust' && !call.assignedUnwrap && {
                 rustWrapper: _rustReturnWrapper(index, returnType, fromFile || filePath,
                     selfClass, returnDefinition),
@@ -11891,7 +12164,48 @@ function _lookupReturnTypeFlow(map, call) {
         if (call.receiverArrowObject) return _cppArrowDeclaredEntry(index, map._filePath, call);
         return _cppArrowFlowEntry(index, _lookupReturnTypeFlowRaw(map, call));
     }
+    if (call.receiverSubscriptObject && map._index) {
+        return _cppSubscriptDeclaredEntry(map._index, map._filePath, call);
+    }
     return _lookupReturnTypeFlowRaw(map, call);
+}
+
+/**
+ * The receiver of a C++ `v[k].m()` whose `v` is declared as an object of a
+ * project class (fix #401): what the class's operator[] returns, when every
+ * operator[] it declares returns one project class by value or reference.
+ * A pointer, a template parameter or an undeclared return leaves it untyped.
+ */
+function _cppSubscriptDeclaredEntry(index, filePath, call) {
+    const declared = call.receiverSubscriptObject;
+    const memo = index._opMemo?.('cppSubscriptResult', () => new Map());
+    let result = memo?.get(declared);
+    if (result === undefined) {
+        result = null;
+        const classes = (index.symbols.get(declared) || []).filter(d =>
+            IDENTITY_TYPE_KINDS.has(d.type) && index.files.get(d.file)?.language === 'cpp');
+        const operators = (index.symbols.get('operator[]') || []).filter(d => d.className === declared);
+        if (classes.length > 0 && operators.length > 0 &&
+            operators.every(d => d.returnType && !/\*/.test(String(d.returnType)))) {
+            const heads = new Set(operators.map(d => _normalizeFieldTypeName(
+                String(d.returnType).replace(/\b(?:const|volatile)\b/g, '').trim(), 'cpp')));
+            const head = heads.size === 1 ? [...heads][0] : null;
+            const templateParam = name => [...operators, ...classes].some(d =>
+                (Array.isArray(d.templateParams) ? d.templateParams : []).some(p =>
+                    (typeof p === 'string' ? p : p?.name) === name));
+            if (head && !templateParam(head)) {
+                const origin = _resolveFlowTypeOrigin(index, operators[0].file, head);
+                if (origin?.fromFile && (index.symbols.get(head) || []).some(d =>
+                    IDENTITY_TYPE_KINDS.has(d.type) && d.file === origin.fromFile)) {
+                    result = { type: head, fromFile: origin.fromFile };
+                }
+            }
+        }
+        memo?.set(declared, result);
+    }
+    if (!result) return undefined;
+    return { line: call.receiverSubscriptObjectLine || 0, start: call.receiverSubscriptObjectAt ?? -1,
+        type: result.type, fromFile: result.fromFile, subscriptThrough: declared };
 }
 
 /**
@@ -16673,6 +16987,12 @@ function _calleeOverloadSelect(index, call, matches, language) {
         }
     }
     if (applicable.length === 1) return { match: applicable[0] };
+    // Rust impls of one type that differ in their self reference layer
+    // (fix #401): the receiver's known layer selects by probe step.
+    if (language === 'rust') {
+        const probed = _rustProbeReferenceSiblings(call, applicable);
+        if (probed) return { match: probed };
+    }
     return { ambiguous: true };
 }
 
@@ -17179,6 +17499,185 @@ function _macroInvocationSitesUncached(index, filePath, macroHead) {
 }
 
 /**
+ * The argument token lists of a macro invocation whose name token sits at
+ * `tokens[at]` (followed by `(`): one array of token values per argument,
+ * split at top-level commas. null when the parentheses do not close.
+ */
+function _macroInvocationArgs(tokens, at) {
+    if (tokens[at + 1]?.v !== '(') return null;
+    const args = [[]];
+    let depth = 0;
+    for (let i = at + 2; i < tokens.length; i++) {
+        const v = tokens[i].v;
+        if (v === '(' || v === '[' || v === '{') depth++;
+        else if (v === ')' || v === ']' || v === '}') {
+            if (depth === 0) return v === ')' ? args : null;
+            depth--;
+        } else if (v === ',' && depth === 0) { args.push([]); continue; }
+        args[args.length - 1].push(v);
+    }
+    return null;
+}
+
+/**
+ * The texts a macro parameter takes at every project invocation of the
+ * macro (fix #401): [{ file, line, text }], following invocations written in
+ * other macros' replacement lists to their own invocations (an argument
+ * that is the outer macro's parameter is that parameter's argument there; a
+ * written text is resolved where the outer macro expands). null when the
+ * sites cannot be enumerated or an argument cannot be read.
+ */
+function _macroParameterArgumentSites(index, filePath, macroHead, paramIndex) {
+    const { codeTokens } = require('./macro-expansion');
+    const sites = [];
+    const visited = new Set();
+    const queue = [{ file: filePath, name: macroHead.name, startLine: macroHead.startLine, paramIndex, literal: null }];
+    let scannedFiles = 0;
+    while (queue.length > 0) {
+        const macro = queue.shift();
+        const macroKey = `${macro.file}\0${macro.name}\0${macro.startLine}\0${macro.paramIndex}\0${macro.literal}`;
+        if (visited.has(macroKey)) continue;
+        visited.add(macroKey);
+        if (visited.size > 64) return null;
+        const symbol = (index.symbols.get(macro.name) || []).find(definition =>
+            definition.type === 'macro' && definition.file === macro.file &&
+            definition.startLine === macro.startLine);
+        if (!symbol || !Array.isArray(symbol.ppParams)) return null;
+        const files = [macro.file];
+        const seenFiles = new Set(files);
+        for (let i = 0; i < files.length; i++) {
+            for (const importer of index.exportGraph?.get(files[i]) || []) {
+                if (seenFiles.has(importer)) continue;
+                seenFiles.add(importer);
+                files.push(importer);
+            }
+            if (files.length > MACRO_BODY_SITE_FILES) return null;
+        }
+        files.sort(codeUnitCompare);
+        for (const file of files) {
+            const entry = index.files.get(file);
+            if (!langTraits(entry?.language)?.textualIncludes) continue;
+            for (const other of entry.symbols || []) {
+                if (other.type !== 'macro' || typeof other.ppBody !== 'string' ||
+                    (other.name === macro.name && other.startLine === macro.startLine)) continue;
+                const bodyTokens = other.ppBody.split(' ').map(v => ({ v }));
+                for (let at = bodyTokens.findIndex(t => t.v === macro.name); at >= 0;
+                    at = bodyTokens.findIndex((t, i) => i > at && t.v === macro.name)) {
+                    if (macro.literal != null) {
+                        queue.push({ file, name: other.name, startLine: other.startLine, paramIndex: -1, literal: macro.literal });
+                        continue;
+                    }
+                    const args = _macroInvocationArgs(bodyTokens, at);
+                    const arg = args?.[macro.paramIndex];
+                    if (!arg || arg.length === 0) return null;
+                    const outerParam = arg.length === 1 ? (other.ppParams || []).indexOf(arg[0]) : -1;
+                    queue.push(outerParam >= 0
+                        ? { file, name: other.name, startLine: other.startLine, paramIndex: outerParam, literal: null }
+                        : { file, name: other.name, startLine: other.startLine, paramIndex: -1, literal: arg.join(' ') });
+                }
+            }
+            let content;
+            try {
+                content = index._readFile(file);
+            } catch {
+                return null;
+            }
+            if (!content.includes(macro.name)) continue;
+            if (++scannedFiles > MACRO_BODY_SITE_FILES) return null;
+            const tokens = codeTokens(content, content.split('\n'));
+            let line = 1;
+            let offset = 0;
+            for (let i = 0; i < tokens.length; i++) {
+                const token = tokens[i];
+                if (token.v !== macro.name || tokens[i + 1]?.v !== '(') continue;
+                while (offset < token.start) {
+                    if (content.charCodeAt(offset) === 10) line++;
+                    offset++;
+                }
+                if (file === macro.file && line <= symbol.endLine) continue;
+                let text = macro.literal;
+                if (text == null) {
+                    const args = _macroInvocationArgs(tokens, i);
+                    const arg = args?.[macro.paramIndex];
+                    if (!arg || arg.length === 0) return null;
+                    text = arg.join(' ');
+                }
+                sites.push({ file, line, text });
+                if (sites.length > MACRO_BODY_SITES) return null;
+            }
+        }
+    }
+    return sites;
+}
+
+/**
+ * The class a C++ type spelling written at a site denotes (fix #401): a
+ * project class of that name, through the aliases visible there. null when
+ * the spelling is not a plain (qualified, template-id) type name or does not
+ * name one project class.
+ */
+function _cppTypeAtSite(index, file, line, text) {
+    const spelled = String(text || '')
+        .replace(/\b(?:typename|const|volatile|class|struct)\b/g, ' ')
+        .replace(/<[^]*>/, '').replace(/\s+/g, '').replace(/^::/, '');
+    if (!/^[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*$/.test(spelled)) return null;
+    const name = spelled.split('::').pop();
+    const base = _cppVisibleAliasBase(index, name, file, line) || name;
+    const classes = (index.symbols.get(base) || []).filter(d =>
+        IDENTITY_TYPE_KINDS.has(d.type) && d.type !== 'type' && index.files.get(d.file)?.language === 'cpp');
+    if (classes.length === 0) return null;
+    const files = new Set(classes.map(d => d.file));
+    if (files.size !== 1) return null;
+    return { type: base, fromFile: classes[0].file };
+}
+
+/**
+ * Receiver type of a call in a macro replacement list whose receiver is
+ * declared with a macro parameter as its type (fix #401, rapidjson
+ * `SchemaValidatorType validator(schema); validator.SetValidateFlags(..)`):
+ * the class every project invocation passes for that parameter, or null
+ * when the invocations disagree or one cannot be read.
+ */
+function _cppMacroParamReceiverType(index, filePath, call) {
+    const macroHead = call.enclosingFunction;
+    if (!call.receiverMacroParam || !macroHead?.isMacro) return null;
+    const memo = index._opMemo?.('cppMacroParamType', () => new Map());
+    const key = `${filePath}\0${macroHead.name}\0${macroHead.startLine}\0${call.receiverMacroParam}`;
+    if (memo?.has(key)) return memo.get(key);
+    let result = null;
+    const symbol = (index.symbols.get(macroHead.name) || []).find(definition =>
+        definition.type === 'macro' && definition.file === filePath && definition.startLine === macroHead.startLine);
+    const paramIndex = symbol?.ppParams?.indexOf(call.receiverMacroParam) ?? -1;
+    const sites = paramIndex >= 0 ? _macroParameterArgumentSites(index, filePath, symbol, paramIndex) : null;
+    if (sites && sites.length > 0) {
+        const resolved = sites.map(site => _cppTypeAtSite(index, site.file, site.line, site.text));
+        const keys = new Set(resolved.map(r => r ? `${r.type}\0${r.fromFile}` : null));
+        if (keys.size === 1 && resolved[0]) {
+            result = { type: resolved[0].type, fromFile: resolved[0].fromFile, sites: sites.length };
+        }
+    }
+    memo?.set(key, result);
+    return result;
+}
+
+/** Does a C/C++ project declaration make `name` a type (class or alias)? */
+function _cppNamesType(index, name) {
+    return (index.symbols.get(name) || []).some(d =>
+        (IDENTITY_TYPE_KINDS.has(d.type) || d.type === 'type') && d.file &&
+        ['c', 'cpp'].includes(index.files.get(d.file)?.language));
+}
+
+/** The call with its macro-parameter receiver typed (fix #401), or as is. */
+function _withCppMacroParamReceiver(index, filePath, call) {
+    const typed = _cppMacroParamReceiverType(index, filePath, call);
+    if (!typed) return call;
+    return { ...call, receiverType: typed.type, receiverTypeSource: 'annotation',
+        receiverTypeEvidence: { source: 'annotation', type: typed.type, fromFile: typed.fromFile,
+            macroParameter: call.receiverMacroParam, invocations: typed.sites },
+        ...(typed.fromFile !== filePath && { receiverTypeFlowFile: typed.fromFile }) };
+}
+
+/**
  * fix #396: C++ implicit `this->m()` inside a member of class E is class
  * member lookup from E: the nearest class in E's resolved ancestry (E
  * itself first) that declares `m` owns the call. Returns null when the
@@ -17436,9 +17935,12 @@ function _typedFieldDefinitions(index, defs) {
     if (result) return result;
     const isAccessor = (d) => d.type === 'get' || d.memberType === 'get' ||
         d.type === 'property' || d.memberType === 'property';
-    const fields = defs.filter(d =>
+    // An explicit interface implementation (`I IFace.Prop => ..`, C#) is
+    // reached only through the interface, never by member access on the
+    // class (fix #401).
+    const fields = defs.filter(d => !d.explicitInterface && (
         ((d.type === 'field' || d.memberType === 'field' || d.memberType === 'private field') && d.fieldType) ||
-        (isAccessor(d) && (d.returnType || d.fieldType)));
+        (isAccessor(d) && (d.returnType || d.fieldType))));
     const byClass = new Map();
     for (const d of fields) {
         let list = byClass.get(d.className);
@@ -18274,10 +18776,10 @@ function _rustCallReceiver(index, call, callerSymbol, typedOwner = null) {
         const layers = _rustMemberReceiverLayers(callerSymbol);
         return layers ? { key, layers } : null;
     }
-    if (!typedOwner || call.receiverType !== typedOwner.className || !call.receiverTypeRef) return null;
+    const ref = call.receiverTypeRef || call.receiverTypeEvidence?.valueRef;
+    if (!typedOwner || call.receiverType !== typedOwner.className || !ref) return null;
     const key = ownerRefOf(index, typedOwner)?.key;
     if (!key) return null;
-    const ref = call.receiverTypeRef;
     if (ref !== 'owned' && ref !== '&' && ref !== '&mut') return null;
     return { key, layers: ref === 'owned' ? [] : [ref] };
 }
@@ -18878,6 +19380,11 @@ function _sameImplBlock(index, a, b) {
 function _calleeTypeQualifiedReceiver(index, def, fileEntry, call, language) {
     let receiver = call.receiver;
     if (!receiver || call.receiverIsChainRoot) return null;
+    // A member path rooted at a value (`SourceType.GenericTypeArguments`
+    // the parser rooted at `this`) or an element access (`Members[^1]`)
+    // names no type (fix #401, AutoMapper: C# properties are PascalCase).
+    if (language === 'csharp' && (/[[\]()]/.test(receiver) ||
+        (call.receiverRoot && (call.receiverFields || []).length > 1))) return null;
     const traits = langTraits(language);
     const style = traits?.typeQualifiedCallStyle;
     if (style === 'path' && !call.isPathCall) return null;
@@ -19469,6 +19976,7 @@ function _csharpExtensionCallVerdict(index, filePath, fileEntry, call, targetDef
         (call.receiverTypeEvidence && _csharpTypeIdentity(call.receiverTypeEvidence.type) === actualType
             ? [call.receiverTypeEvidence.type] : null);
     let verdict = null;
+    let matchedReceiver = null;
     for (const def of targetDefs) {
         if (!def.isExtensionMethod || !Array.isArray(def.paramsStructured)) continue;
         const receiver = def.paramsStructured[0];
@@ -19479,10 +19987,26 @@ function _csharpExtensionCallVerdict(index, filePath, fileEntry, call, targetDef
             continue;
         }
         let fit;
+        // A receiver typed by a type parameter in scope at the call (fix
+        // #401, Polly `builder.AddChaosLatency(..)` with `TBuilder builder`)
+        // is any type its constraints admit: it fits when one of them fits,
+        // and is undecided (never excluded) otherwise.
+        const receiverParam = _csharpTypeParameterReceiver(index, filePath, call, actualType);
+        // A type parameter converts to its constraints (and their bases)
+        // only, never to a type derived from them.
+        const fitOf = (actual, expected) => {
+            if (!receiverParam) return _csharpAssignability(index, actual, expected);
+            if (expected === 'object' || expected === 'Object') return 'yes';
+            const viaConstraint = receiverParam.constraints.map(c => _csharpAssignability(index, c, expected));
+            if (viaConstraint.includes('yes')) return 'yes';
+            return viaConstraint.length > 0 && viaConstraint.every(verdict => verdict === 'no') ? 'no' : 'unknown';
+        };
         if (receiver.typeParameter) {
             const constraints = (receiver.constraints || []).map(_csharpTypeIdentity).filter(Boolean);
-            const results = constraints.map(constraint => _csharpAssignability(index, actualType, constraint));
+            const results = constraints.map(constraint => fitOf(actualType, constraint));
             fit = results.includes('no') ? 'no' : results.includes('unknown') ? 'unknown' : 'yes';
+        } else if (receiverParam) {
+            fit = fitOf(actualType, _csharpTypeIdentity(receiver.type));
         } else {
             fit = _csharpAssignability(index, actualType, _csharpTypeIdentity(receiver.type));
             // `this List<Transformer>` never takes a `List<string>` (fix
@@ -19501,7 +20025,7 @@ function _csharpExtensionCallVerdict(index, filePath, fileEntry, call, targetDef
                 }
             }
         }
-        if (fit === 'yes') { verdict = 'match'; break; }
+        if (fit === 'yes') { verdict = 'match'; matchedReceiver = receiver; break; }
         verdict = fit === 'unknown' ? 'possible' : (verdict || 'no');
     }
     if (verdict !== 'possible' && verdict !== 'match') return verdict;
@@ -19521,7 +20045,78 @@ function _csharpExtensionCallVerdict(index, filePath, fileEntry, call, targetDef
         _csharpPlatformInstanceVerdict(index, actualType, text, call));
     if (platforms.every(platform => platform === 'applies')) return 'no';
     if (platforms.some(platform => platform)) return 'possible';
+    // A project receiver type inherits the instance members of an outside
+    // base this engine does not model (fix #401): one of them may be named
+    // like the extension and take the call first.
+    if (verdict === 'match') {
+        // The type the extension is declared for (its `this` type or its
+        // constraints) is vouched for by its author: were it to declare the
+        // name, the extension would never bind it.
+        const vouched = new Set([_csharpTypeIdentity(matchedReceiver?.type),
+            ...(matchedReceiver?.constraints || []).map(_csharpTypeIdentity)].filter(Boolean));
+        if (_csharpInheritsUnmodeledExternal(index, actualType, vouched)) return 'possible';
+    }
     return verdict;
+}
+
+/**
+ * Does a project C# type derive from an outside type whose instance members
+ * are unknown here (fix #401)? `object` and the modelled platform
+ * collections are known; interfaces contribute no implementation members.
+ */
+function _csharpInheritsUnmodeledExternal(index, actualType, vouched = new Set()) {
+    const isProjectType = name => (index.symbols.get(name) || []).some(d =>
+        _ARITY_TYPE_KINDS.has(d.type) && index.files.get(d.file)?.language === 'csharp');
+    if (!isProjectType(actualType)) return false;
+    const seen = new Set();
+    const queue = [actualType];
+    while (queue.length > 0 && seen.size < 64) {
+        const current = queue.shift();
+        if (seen.has(current)) continue;
+        seen.add(current);
+        const definitions = (index.symbols.get(current) || []).filter(d => _ARITY_TYPE_KINDS.has(d.type));
+        if (definitions.length === 0) {
+            if (current === 'object' || current === 'Object' || vouched.has(current) ||
+                _CSHARP_PLATFORM_INSTANCE_MEMBERS.has(current)) continue;
+            return true;
+        }
+        for (const definition of definitions) {
+            if (definition.type === 'interface') continue;
+            // Only the first base-list entry can be a base class; an outside
+            // interface contributes no members to the class's own lookup
+            // (an `I`-prefixed outside name is taken as one, by the platform
+            // naming convention).
+            const bases = definition.extends ? splitParentList(definition.extends) : [];
+            bases.forEach((base, position) => {
+                const name = _csharpTypeIdentity(base);
+                if (!name || seen.has(name)) return;
+                if (!isProjectType(name) && (position > 0 || /^I[A-Z]/.test(name))) return;
+                queue.push(name);
+            });
+        }
+    }
+    return false;
+}
+
+/**
+ * A C# receiver type that names a type parameter of the enclosing method or
+ * type (fix #401): { constraints } (their type identities, possibly none),
+ * or null when the name is no type parameter in scope.
+ */
+function _csharpTypeParameterReceiver(index, filePath, call, actualType) {
+    if (!actualType || call.receiverTypeSource !== 'annotation') return null;
+    const enclosing = index.findEnclosingFunction(filePath, call.line, true, call);
+    if (!enclosing || !_declaredTypeParameterNames(enclosing).has(actualType)) return null;
+    const constraints = new Set();
+    for (const param of enclosing.paramsStructured || []) {
+        if (param?.typeParameter && _csharpTypeIdentity(param.type) === actualType) {
+            for (const constraint of param.constraints || []) {
+                const identity = _csharpTypeIdentity(constraint);
+                if (identity) constraints.add(identity);
+            }
+        }
+    }
+    return { constraints: [...constraints] };
 }
 
 // Instance methods of platform types the engine types receivers with (fix
@@ -19605,6 +20200,21 @@ function _csharpPlatformInstanceVerdict(index, actualType, receiverText, call) {
     return result;
 }
 
+/** Ordered type parameter names of a declaration's `<..>` text. */
+function _genericParamList(text) {
+    const inner = String(text || '').trim().replace(/^<|>$/g, '');
+    const out = [];
+    let depth = 0;
+    let part = '';
+    for (const ch of inner) {
+        if (ch === '<' || ch === '(' || ch === '[') depth++;
+        else if (ch === '>' || ch === ')' || ch === ']') depth--;
+        if (ch === ',' && depth === 0) { out.push(part); part = ''; } else part += ch;
+    }
+    if (part.trim()) out.push(part);
+    return out.map(p => p.trim().replace(/^(?:in|out)\s+/, '').match(/^[A-Za-z_]\w*/)?.[0]).filter(Boolean);
+}
+
 /** Type arguments of a C# type text (`List<string>` -> ['string']); [] for
  * none. */
 function _csharpTypeArgsOf(text) {
@@ -19644,6 +20254,8 @@ function _csharpTargetTypedViews(index, filePath, calls, name) {
  */
 function _csharpTargetTypedKeyMayName(index, key, nameRe, memo) {
     if (key === 'this' || key === 'base' || key === 'new') return true;
+    // A generic receiver's written type: its type arguments may name it.
+    if (key.startsWith('~')) return nameRe.test(key.slice(1));
     if (memo.has(key)) return memo.get(key);
     const result = (index.symbols.get(key) || []).some(d =>
         (d.fieldType && nameRe.test(String(d.fieldType))) ||
@@ -19755,6 +20367,7 @@ function _csharpSlotTypeTexts(index, filePath, calls, call, depth) {
         return texts;
     }
     fromDefs((index.symbols.get(slot.ownerName) || []).filter(d => d.paramsStructured));
+    if (slot.receiverTypeText) texts.push({ text: slot.receiverTypeText, receiver: true });
     if (slot.receiverName) {
         for (const s of index.symbols.get(slot.receiverName) || []) {
             if (s.fieldType) texts.push({ text: String(s.fieldType), receiver: true });
@@ -19855,6 +20468,15 @@ function _csharpTargetTypedResolve(index, filePath, call, slot, depth) {
         return null;
     }
     if (slot.kind !== 'argument') return null;
+    // Type arguments the receiver's written type gives its generic owner
+    // (fix #401: `Box<Item> box; box.Put(new(..))` binds `Put(T)` with T =
+    // Item): owner type name -> { parameter name -> argument text }.
+    let ownerSubstitution = null;
+    const substituted = (def, text) => {
+        const map = ownerSubstitution && def.className === ownerSubstitution.owner ? ownerSubstitution.args : null;
+        const bare = String(text || '').trim();
+        return map && Object.prototype.hasOwnProperty.call(map, bare) ? map[bare] : text;
+    };
     // The parameter a positional or named argument binds in one callable.
     const paramType = (def, instanceCall) => {
         let params = def.paramsStructured || [];
@@ -19867,7 +20489,7 @@ function _csharpTargetTypedResolve(index, filePath, call, slot, depth) {
         if (!param) return null;
         // A positional argument in a `params T[]` slot is an element: `new()`
         // never constructs the array itself.
-        const type = param.rest && !slot.name ? String(param.type || '').replace(/\[\s*\]$/, '') : param.type;
+        const type = substituted(def, param.rest && !slot.name ? String(param.type || '').replace(/\[\s*\]$/, '') : param.type);
         return typeOf(type, def, typeParamsOf(def));
     };
     const fromCallables = (defs, decidedTarget, instanceCall) => {
@@ -19889,6 +20511,21 @@ function _csharpTargetTypedResolve(index, filePath, call, slot, depth) {
     const calls = getCachedCalls(index, filePath) || [];
     const owner = calls.find(c => c !== call && c.callSite?.start === slot.ownerStart);
     if (!owner) return null;
+    if (owner.isMethod && owner.receiverType) {
+        const ownerType = _csharpTypeIdentity(owner.receiverType);
+        const texts = owner.receiverHopTypeTexts?.length > 0 ? owner.receiverHopTypeTexts
+            : owner.receiverTypeEvidence && _csharpTypeIdentity(owner.receiverTypeEvidence.type) === ownerType
+                ? [owner.receiverTypeEvidence.type] : [];
+        const args = texts.length === 1 ? _csharpTypeArgsOf(texts[0]) : [];
+        const generics = (index.symbols.get(ownerType) || []).filter(d => !d.className &&
+            CSHARP_CONSTRUCTIBLE_KINDS.has(d.type) && (d.typeArity || 0) === args.length && d.generics)
+            .map(d => _genericParamList(d.generics));
+        if (args.length > 0 && generics.length > 0 &&
+            generics.every(list => list.join(',') === generics[0].join(',')) && generics[0].length === args.length) {
+            ownerSubstitution = { owner: ownerType,
+                args: Object.fromEntries(generics[0].map((param, i) => [param, args[i]])) };
+        }
+    }
     if (slot.owner === 'creation') {
         let typeNames;
         let decidedType;
@@ -22422,6 +23059,40 @@ function _cppDependentUsingOverload(index, filePath, call, boundDef, targetDefs)
         String(using.target || '').split('::').slice(0, -1).some(segment => segment.includes('<')));
 }
 
+/**
+ * The bases whose members of `name` a C++ class brings into its scope with
+ * a using-declaration in its body (`using Base::name;`, fix #401): a Set of
+ * base names (last qualifier segment, template arguments dropped), empty
+ * when it has none. null when the class definition is not found.
+ */
+function _cppMemberUsingBases(index, className, name, contextFile) {
+    const classes = (index.symbols.get(className) || []).filter(d =>
+        IDENTITY_TYPE_KINDS.has(d.type) && d.file);
+    if (classes.length === 0) return null;
+    const preferred = classes.filter(d => d.file === contextFile);
+    const bases = new Set();
+    for (const definition of preferred.length > 0 ? preferred : classes) {
+        for (const fact of index.files.get(definition.file)?.cppUsings || []) {
+            if (fact.kind !== 'declaration' || fact.name !== name ||
+                fact.scopeStartLine == null || fact.scopeStartLine < definition.startLine ||
+                fact.scopeEndLine > definition.endLine) continue;
+            const qualifier = String(fact.target || '').split('::').filter(Boolean).slice(0, -1);
+            const written = String(qualifier.pop() || '').replace(/<.*$/s, '');
+            if (!written) continue;
+            // The qualifier may be an alias of the base (`using
+            // ValueType::Swap;` with `typedef GenericValue ValueType`); one
+            // that names no project class may be any base: '*'.
+            const classes = (index.symbols.get(written) || []).filter(d => IDENTITY_TYPE_KINDS.has(d.type) && d.type !== 'type');
+            const aliases = (index.symbols.get(written) || []).filter(d => d.type === 'type' && d.aliasOf);
+            const aliasBases = new Set(aliases.map(d => _normalizedAliasBase(index, d)).filter(Boolean));
+            if (classes.length > 0 && aliases.length === 0) bases.add(written);
+            else if (classes.length === 0 && aliasBases.size === 1) bases.add([...aliasBases][0]);
+            else bases.add('*');
+        }
+    }
+    return bases;
+}
+
 function _overloadDiscipline(index, call, targetDefs, definitions, callerFile) {
     const targetOwners = new Set(targetDefs.map(d => d.className).filter(Boolean));
     const targetLanguage = targetDefs[0]?.file && index.files.get(targetDefs[0].file)?.language;
@@ -22558,14 +23229,25 @@ function _overloadDiscipline(index, call, targetDefs, definitions, callerFile) {
     const pinFile = targetDefs.find(d => d.file)?.file;
     const seenCls = new Set(targetOwners);
     const queue = [...targetOwners];
+    // C++ name hiding (fix #401): a class that declares a member of the name
+    // hides every base member of that name, except those a `using
+    // Base::name;` in its body brings in; lookup reaches a base only through
+    // classes that declare none.
+    const cppHiding = targetLanguage === 'cpp';
+    const declaresName = cls => definitions.some(d => !NON_CALLABLE_TYPES.has(d.type) &&
+        d.className === cls && (targetOwners.has(cls) ? sameOwnerIdentity(d) : true));
     let hops = 0;
     while (queue.length > 0 && hops++ < 32) {
         const cls = queue.pop();
         const parents = index._getInheritanceParents?.(cls, pinFile);
         if (!parents) continue;
+        const usingBases = cppHiding && declaresName(cls)
+            ? _cppMemberUsingBases(index, cls, call.name, pinFile) : null;
         for (const p of parents) {
             const pName = typeof p === 'string' ? p : p?.name;
             if (!pName || seenCls.has(pName)) continue;
+            if (usingBases && !usingBases.has('*') &&
+                !usingBases.has(String(pName).replace(/<.*$/s, '').split('::').pop())) continue;
             seenCls.add(pName);
             queue.push(pName);
             for (const d of definitions) {
@@ -24861,6 +25543,187 @@ function _withoutShadowedStdLiteral(index, call) {
 }
 
 /**
+ * Std deref wrappers (fix #401). A method call on `Arc<Store>` probes the
+ * wrapper's own steps first (its inherent methods and the std traits it
+ * implements), then dereferences to Store. `_RUST_DEREF_WRAPPER_METHODS`
+ * lists the names a wrapper step may supply: blanket and derive-style
+ * std traits every wrapper may carry, plus each wrapper's own extras
+ * (forwarding Iterator/io/Future/Error/Fn impls of the smart pointers,
+ * Pin's and Cow's inherent methods). `_RUST_DEREF_WRAPPER_FIRST` lists
+ * names the wrapper step provably supplies (prelude trait, unconditional
+ * impl or inherent method).
+ */
+const _RUST_DEREF_WRAPPER_NAMES = new Set(['Box', 'Rc', 'Arc', 'ManuallyDrop', 'LazyLock',
+    'LazyCell', 'Ref', 'RefMut', 'MutexGuard', 'RwLockReadGuard', 'RwLockWriteGuard',
+    'ReentrantLockGuard', 'AssertUnwindSafe', 'Cow', 'Pin']);
+const _RUST_WRAPPER_COMMON_METHODS = ['clone', 'clone_from', 'eq', 'ne', 'partial_cmp', 'lt', 'le',
+    'gt', 'ge', 'cmp', 'max', 'min', 'clamp', 'hash', 'hash_slice', 'fmt', 'as_ref', 'as_mut',
+    'borrow', 'borrow_mut', 'deref', 'deref_mut', 'drop', 'into', 'try_into', 'type_id',
+    'to_owned', 'clone_into', 'to_string'];
+const _RUST_SMART_POINTER_METHODS = [
+    // Iterator / DoubleEndedIterator / ExactSizeIterator / IntoIterator
+    'next', 'size_hint', 'count', 'last', 'advance_by', 'nth', 'step_by', 'chain', 'zip',
+    'intersperse', 'map', 'for_each', 'filter', 'filter_map', 'enumerate', 'peekable',
+    'skip_while', 'take_while', 'map_while', 'skip', 'take', 'scan', 'flat_map', 'flatten',
+    'fuse', 'inspect', 'by_ref', 'collect', 'partition', 'try_fold', 'try_for_each', 'fold',
+    'reduce', 'try_reduce', 'all', 'any', 'find', 'find_map', 'try_find', 'position',
+    'rposition', 'max_by_key', 'max_by', 'min_by_key', 'min_by', 'rev', 'unzip', 'copied',
+    'cloned', 'cycle', 'sum', 'product', 'cmp_by', 'partial_cmp_by', 'eq_by', 'is_sorted',
+    'is_sorted_by', 'is_sorted_by_key', 'next_chunk', 'map_windows', 'next_back', 'nth_back',
+    'rfold', 'rfind', 'try_rfold', 'advance_back_by', 'len', 'is_empty', 'into_iter',
+    // Read / Write / BufRead / Seek
+    'read', 'read_vectored', 'read_to_end', 'read_to_string', 'read_exact', 'read_buf',
+    'read_buf_exact', 'bytes', 'write', 'write_vectored', 'write_all', 'write_all_vectored',
+    'write_fmt', 'flush', 'seek', 'rewind', 'stream_len', 'stream_position', 'seek_relative',
+    'fill_buf', 'consume', 'read_until', 'read_line', 'split', 'lines', 'has_data_left',
+    'skip_until',
+    // Future / AsyncIterator / Error / Fn* / Hasher / Any
+    'poll', 'into_future', 'poll_next', 'source', 'description', 'cause', 'provide', 'call',
+    'call_mut', 'call_once', 'finish', 'write_u8', 'write_u16', 'write_u32', 'write_u64',
+    'write_u128', 'write_usize', 'write_i8', 'write_i16', 'write_i32', 'write_i64',
+    'write_i128', 'write_isize', 'write_str', 'write_length_prefix', 'downcast',
+    'downcast_ref', 'downcast_mut', 'wake', 'wake_by_ref'];
+const _RUST_DEREF_WRAPPER_METHODS = (() => {
+    const common = new Set(_RUST_WRAPPER_COMMON_METHODS);
+    const smart = new Set([..._RUST_WRAPPER_COMMON_METHODS, ..._RUST_SMART_POINTER_METHODS]);
+    const table = new Map();
+    for (const name of _RUST_DEREF_WRAPPER_NAMES) table.set(name, common);
+    for (const name of ['Box', 'Rc', 'Arc']) table.set(name, smart);
+    table.set('Pin', new Set([..._RUST_WRAPPER_COMMON_METHODS, 'set', 'get_ref', 'get_mut',
+        'into_ref', 'get_unchecked_mut', 'map_unchecked', 'map_unchecked_mut', 'as_deref_mut',
+        'poll', 'into_future', 'poll_next', 'next', 'size_hint']));
+    table.set('Cow', new Set([..._RUST_WRAPPER_COMMON_METHODS, 'is_borrowed', 'is_owned',
+        'to_mut', 'into_owned', 'add', 'add_assign']));
+    table.set('AssertUnwindSafe', new Set([..._RUST_WRAPPER_COMMON_METHODS, 'call_once',
+        'poll', 'into_future', 'poll_next']));
+    return table;
+})();
+const _RUST_DEREF_WRAPPER_FIRST = new Map([
+    ['Rc', new Set(['clone', 'as_ref'])], ['Arc', new Set(['clone', 'as_ref'])],
+    ['Box', new Set(['as_ref', 'as_mut'])], ['Pin', new Set(['as_ref'])],
+]);
+
+/**
+ * The std wrapper a written wrapper path denotes in `filePath` (its std
+ * name), or null when the name may be a project type or another crate's:
+ * a std-rooted qualifier, an import binding of std/core/alloc, or the
+ * prelude `Box` (no binding and no project type of the name).
+ */
+function _rustStdWrapperDenoted(index, filePath, written, line) {
+    const segments = String(written || '').split('::').filter(Boolean);
+    const name = segments.pop();
+    if (!name || !_RUST_DEREF_WRAPPER_NAMES.has(name)) return null;
+    const qualifier = segments.length > 0 ? segments.join('::') : null;
+    const memo = index._opMemo?.('rustStdWrapper', () => new Map());
+    const key = `${filePath}\0${written}\0${line ?? ''}`;
+    if (memo?.has(key)) return memo.get(key);
+    const compute = () => {
+        const stdRoot = text => ['std', 'core', 'alloc'].includes(String(text || '').replace(/^::/, '').split('::')[0]);
+        const denotation = require('./type-denotation').externalTypeDenotation(
+            index, filePath, name, qualifier, line);
+        if (denotation) {
+            return stdRoot(denotation.via) && _RUST_DEREF_WRAPPER_NAMES.has(denotation.original)
+                ? denotation.original : null;
+        }
+        if (name !== 'Box' || qualifier) return null;
+        if ((index.symbols.get('Box') || []).some(definition =>
+            IDENTITY_TYPE_KINDS.has(definition.type) || definition.type === 'type')) return null;
+        const fileEntry = index.files.get(filePath);
+        if ((fileEntry?.importBindings || []).some(binding => (binding.alias || binding.name) === 'Box')) return null;
+        return 'Box';
+    };
+    const value = compute();
+    memo?.set(key, value);
+    return value;
+}
+
+/**
+ * A receiver typed through std deref wrappers (fix #401; the parser records
+ * the wrapper chain on the evidence, `derefVia`). Target-independent view:
+ *   - a wrapper name that is not provably std's: the receiver is that type,
+ *     as written (a static's type is unknown);
+ *   - a name the first wrapper step provably supplies (`rc.clone()`): the
+ *     receiver is the wrapper (an outside type);
+ *   - a name a wrapper step may supply (std traits, project impls on the
+ *     wrapper, blanket impls): the target type with `receiverDerefAmbiguous`;
+ *   - otherwise the target type, probed as a place of it.
+ */
+function _rustDerefWrapperView(index, filePath, call) {
+    const evidence = call?.receiverTypeEvidence;
+    const via = evidence?.derefVia;
+    if (!Array.isArray(via) || via.length === 0 || !call.receiverType) return call;
+    const { derefVia, derefFile, ...rest } = evidence;
+    const denotationFile = derefFile || filePath;
+    const line = derefFile && derefFile !== filePath ? undefined : evidence.line ?? call.line;
+    // `=Name` is a wrapper the construction implies (`Box::pin` makes a Pin).
+    const wrappers = via.map(written => String(written).startsWith('=') ? String(written).slice(1)
+        : _rustStdWrapperDenoted(index, denotationFile, written, line));
+    if (wrappers.some(wrapper => !wrapper)) {
+        if (derefFile) {
+            const { receiverType, receiverTypeSource, receiverTypeEvidence, receiverTypeRef,
+                receiverTypeFlowFile, ...untyped } = call;
+            return untyped;
+        }
+        const segments = String(via[0]).split('::').filter(Boolean);
+        const name = segments.pop();
+        const { receiverTypeRef, receiverTypeQualifier, ...outer } = call;
+        return { ...outer, receiverType: name,
+            ...(segments.length > 0 && { receiverTypeQualifier: segments.join('::') }),
+            receiverTypeEvidence: { ...rest, type: name } };
+    }
+    const resolved = { ...rest, derefWrappers: wrappers };
+    const name = call.name;
+    const definitions = index.symbols.get(name) || [];
+    const ownerOf = definition => String(definition.className || definition.receiver || '')
+        .replace(/^[*&]\s*/, '').replace(/<.*$/s, '').trim();
+    for (const wrapper of wrappers) {
+        const projectStep = definitions.some(definition => !NON_CALLABLE_TYPES.has(definition.type) &&
+            (ownerOf(definition) === wrapper || _definitionHasGenericOwner(definition) ||
+                (index.symbols.get(wrapper) || []).some(impl => impl.type === 'impl' && impl.traitName &&
+                    _rustTraitBase(impl.traitName) === ownerOf(definition))));
+        if (!projectStep && _RUST_DEREF_WRAPPER_FIRST.get(wrapper)?.has(name)) {
+            const { receiverTypeRef, receiverTypeQualifier, receiverTypeFlowFile, ...outer } = call;
+            return { ...outer, receiverType: wrapper, receiverTypeSource: call.receiverTypeSource,
+                receiverTypeEvidence: { ...resolved, type: wrapper, derefWrapperStep: true } };
+        }
+        if (projectStep || _RUST_DEREF_WRAPPER_METHODS.get(wrapper)?.has(name)) {
+            return { ...call, receiverTypeEvidence: resolved, receiverDerefAmbiguous: wrapper };
+        }
+    }
+    return { ...call, receiverTypeEvidence: resolved };
+}
+
+/**
+ * Flow entry for `let v = W::new(producer(..))` with W a std deref wrapper
+ * (fix #401): the producer's folded result type behind W. null when the
+ * record is no such construction or the producer's type is unknown.
+ */
+function _rustWrapperConstructionFlow(index, fileEntry, filePath, calls, call, ctx) {
+    if (!call.isPathCall || !call.receiver || call.argCount !== 1 ||
+        call.assignedUnwrap || call.assignedTuple || call.assignedIter) return null;
+    const wrapper = String(call.receiver).split('::').pop();
+    const constructs = call.name === 'new' && ['Box', 'Rc', 'Arc', 'ManuallyDrop'].includes(wrapper);
+    const pins = call.name === 'pin' && ['Box', 'Rc', 'Arc'].includes(wrapper);
+    if (!constructs && !pins) return null;
+    if (!_rustStdWrapperDenoted(index, filePath, call.receiver, call.line)) return null;
+    // The argument's own producer: the outermost record inside the call.
+    let producer = null;
+    for (const record of calls) {
+        if (record === call || record.callStart == null || record.callStart <= call.callStart ||
+            record.callEnd >= call.callEnd || record.valueConsumed !== 'argument') continue;
+        if (!producer || (record.callStart <= producer.callStart && record.callEnd >= producer.callEnd)) {
+            producer = record;
+        }
+    }
+    if (!producer || producer.assignedTo) return null;
+    const folded = _typeOfCallResultFold(index, fileEntry, filePath, producer, ctx);
+    if (!folded?.type || folded.externalVia) return null;
+    return { type: folded.type, ...(folded.fromFile && { fromFile: folded.fromFile }),
+        ...(folded.stdLiteral && { stdLiteral: true }), valueRef: 'owned',
+        derefVia: pins ? ['=Pin', call.receiver] : [call.receiver] };
+}
+
+/**
  * `impl<T> Trait for [T]`: a slice owner whose element is the impl's own
  * type parameter, so every slice receiver can reach it (fix #368).
  */
@@ -24885,9 +25748,11 @@ function _genericRawPointerOwner(definition, owner) {
  * receiver stays untyped (fix #368).
  */
 function _withoutAmbiguousSliceType(call, targetDefs) {
-    if (!call?.receiverTypeStd || !['slice', 'tuple', '*const', '*mut'].includes(call.receiverType)) return call;
+    if (!call?.receiverTypeStd || !['slice', 'array', 'tuple', '*const', '*mut'].includes(call.receiverType)) return call;
     const ambiguous = targetDefs.some(definition => {
         const owners = [definition.className, definition.receiver].filter(Boolean).map(String);
+        // An array unsizes to every slice and array owner (fix #401).
+        if (call.receiverType === 'array') return owners.some(owner => /^&?\s*\[/.test(owner));
         if (call.receiverType === 'tuple') {
             // Tuple impls (`impl<A, B> T for (A, B)`) have no nominal owner.
             return owners.some(owner => /^&?\s*\(/.test(owner));
@@ -25415,7 +26280,11 @@ function _rustValuePathReceiverType(index, filePath, call) {
         receiverType: valueType.type,
         receiverTypeSource: 'flow',
         receiverTypeEvidence: { source: 'flow', type: valueType.type, fromFile: valueType.fromFile,
-            valuePath: call.receiverValuePath },
+            valuePath: call.receiverValuePath,
+            // A static behind a std deref wrapper (fix #401): the wrapper
+            // names resolve in the item's file.
+            ...(valueType.derefVia && { derefVia: valueType.derefVia, derefFile: valueType.derefFile }) },
+        ...(valueType.derefVia && { receiverTypeRef: 'owned' }),
         // A type declared in this file resolves at the call's own line (a
         // block item shadows the module's namesake).
         ...(valueType.fromFile !== filePath && { receiverTypeFlowFile: valueType.fromFile }),
@@ -25494,7 +26363,8 @@ function _rustConstItemType(index, filePath, segments, line, consts) {
         (d.type === 'struct' || d.type === 'enum' || d.type === 'union') && d.file === origin.fromFile &&
         !_isFunctionLocalType(d));
     if (defs.length !== 1) return null;
-    return { type: typeName, fromFile: defs[0].file, definition: defs[0] };
+    return { type: typeName, fromFile: defs[0].file, definition: defs[0],
+        ...(item.valueDerefVia && { derefVia: item.valueDerefVia, derefFile: item.file }) };
 }
 
 function _rustValuePathType(index, filePath, valuePath, kind, line) {
@@ -25693,7 +26563,7 @@ function _rustStdMethodResult(index, receiverType, name) {
 }
 
 const _RUST_DEREF_FREE_STD = new Set([
-    'slice', 'str', 'tuple', 'bool', 'char', '*const', '*mut',
+    'slice', 'array', 'str', 'tuple', 'bool', 'char', '*const', '*mut',
     'i8', 'i16', 'i32', 'i64', 'i128', 'isize', 'u8', 'u16', 'u32', 'u64', 'u128', 'usize', 'f32', 'f64',
     'Vec', 'VecDeque', 'LinkedList', 'BinaryHeap', 'HashMap', 'HashSet', 'BTreeMap', 'BTreeSet',
     'String', 'Option', 'Result',
@@ -27044,6 +27914,6 @@ function findCallbackUsages(index, name) {
     return usages;
 }
 
-module.exports = { rustTypeNameDenotes, _textualIncludeClosures, _textualLinkVerdict, isProvenanceBuiltinReceiver, provenanceParameterIdentity: _overloadTypeIdentity, selectProvenanceOverload, _unresolvedModuleIsGap, _importReaches, _sameNominalPackageDir, getCachedCalls, findCallers, findCallees, getInstanceAttributeTypes, findCallbackUsages, _nameBindingReaches, _moduleAttributeBindingReaches, _declaredFieldType, _projectTopLevelNames, _callArityCompatible, _closeCallableIdentityGroup, _overloadDiscipline, _overloadApplicable, _buildReturnTypeFlowMap, _lookupReturnTypeFlow, _cFamilySignatureKey,
+module.exports = { _cppMemberUsingBases, rustTypeNameDenotes, _textualIncludeClosures, _textualLinkVerdict, isProvenanceBuiltinReceiver, provenanceParameterIdentity: _overloadTypeIdentity, selectProvenanceOverload, _unresolvedModuleIsGap, _importReaches, _sameNominalPackageDir, getCachedCalls, findCallers, findCallees, getInstanceAttributeTypes, findCallbackUsages, _nameBindingReaches, _moduleAttributeBindingReaches, _declaredFieldType, _projectTopLevelNames, _callArityCompatible, _closeCallableIdentityGroup, _overloadDiscipline, _overloadApplicable, _buildReturnTypeFlowMap, _lookupReturnTypeFlow, _cFamilySignatureKey,
     _isConfigurationAlternative, _isCrossFileConfigurationMember, _configurationAlternativeFiles, _sameOwnerPath,
     _goFileConstraint };

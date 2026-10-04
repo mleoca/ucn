@@ -1202,10 +1202,46 @@ function findCallsInCode(code, parser) {
     // The base type of the anonymous class whose body holds `node`, when the
     // nearest class body is an anonymous one (`new StrBuilder() { .. }`):
     // `super` there names that type (fix #394).
+    // Does the anonymous (or enum-constant) body around `node` declare a
+    // method of this name itself (fix #401)?
+    const anonymousBodyDeclares = (node, name) => {
+        for (let p = node.parent; p; p = p.parent) {
+            if (p.type === 'class_body') {
+                return p.namedChildren.some(member => member.type === 'method_declaration' &&
+                    member.childForFieldName('name')?.text === name);
+            }
+            if (JAVA_TYPE_DECLARATIONS.has(p.type)) return false;
+        }
+        return false;
+    };
+    // The anonymous body's supertype as written, qualifier kept (fix #401).
+    const anonymousSuperTypeText = (node) => {
+        for (let p = node.parent; p; p = p.parent) {
+            if (p.type === 'class_body') {
+                const owner = p.parent;
+                if (owner?.type === 'enum_constant') {
+                    const enumDeclaration = owner.parent?.parent;
+                    return enumDeclaration?.type === 'enum_declaration'
+                        ? enumDeclaration.childForFieldName('name')?.text || null : null;
+                }
+                const typeNode = owner?.type === 'object_creation_expression' ? owner.childForFieldName('type') : null;
+                return typeNode ? typeNode.text.replace(/<[^]*$/, '').replace(/\s+/g, '') || null : null;
+            }
+            if (JAVA_TYPE_DECLARATIONS.has(p.type)) return null;
+        }
+        return null;
+    };
     const anonymousSuperType = (node) => {
         for (let p = node.parent; p; p = p.parent) {
             if (p.type === 'class_body') {
                 const owner = p.parent;
+                // An enum constant's body is an anonymous subclass of its
+                // enum (fix #401): `super.m()` there is the enum's member.
+                if (owner?.type === 'enum_constant') {
+                    const enumDeclaration = owner.parent?.parent;
+                    return enumDeclaration?.type === 'enum_declaration'
+                        ? enumDeclaration.childForFieldName('name')?.text || null : null;
+                }
                 return owner?.type === 'object_creation_expression'
                     ? extractTypeName(owner.childForFieldName('type')) || null : null;
             }
@@ -1933,6 +1969,11 @@ function findCallsInCode(code, parser) {
                     ...(receiverTypeQualifier && { receiverTypeQualifier }),
                     ...(receiverIsTypeQualified && { receiverIsTypeQualified: true }),
                     ...(receiver === 'super' && anonymousSuperType(node) && { receiverSuperType: anonymousSuperType(node) }),
+                    // A bare call in an anonymous class or enum-constant
+                    // body: its implicit `this` is that body's class (fix
+                    // #401), whose supertype's members come first.
+                    ...(!objNode && anonymousSuperTypeText(node) && { anonymousSuperType: anonymousSuperTypeText(node),
+                        ...(anonymousBodyDeclares(node, nameNode.text) && { anonymousDeclares: true }) }),
                     ...(castReceiverType && { receiverTypeCast: true }),
                     ...(receiverFieldName && { receiverRoot, receiverField: receiverFieldName }),
                     ...(receiverFieldName && receiverRootType && { receiverRootType }),

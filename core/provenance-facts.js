@@ -336,6 +336,27 @@ function confirmationFacts(index, file, call, targets, options = {}) {
             facts.lookupUnsupported = 'external-parent-member';
             return null;
         }
+        // A C++ using-declaration in the class body (`using Base::name;`,
+        // fix #401) brings the base's members of the name into this lookup
+        // set: the arguments choose among both. The witness only states a
+        // member of this class, so a choice it cannot express (a base
+        // member, or no choice) leaves the lookup unproven.
+        if (language === 'cpp' && members.length > 0 && parents.length > 0) {
+            const usingBases = require('./callers')._cppMemberUsingBases(index, owner.name, call.name, owner.file);
+            const brought = usingBases && usingBases.size > 0 ? parents.filter(parent => usingBases.has('*') ||
+                usingBases.has(String(parent.name).replace(/<.*$/s, '').split('::').pop())) : [];
+            if (brought.length > 0) {
+                const baseMembers = brought.flatMap(parent =>
+                    callableMembersOwnedBy(index, call.name, parent.name).filter(d => d.file === parent.file));
+                let choice;
+                try {
+                    choice = options.selectOverload ? options.selectOverload(index, call, [...members, ...baseMembers], language) : null;
+                } catch {
+                    choice = null;
+                }
+                if (!choice?.match || members.length !== 1 || choice.match !== members[0]) return null;
+            }
+        }
         const step = { owner: identity, members: members.map(declarationIdentity), parents: parents.map(declarationIdentity),
             ...(derefTarget && { derefTarget }) };
         const getter = facts.valueReference && propertyReadMember(step.members);

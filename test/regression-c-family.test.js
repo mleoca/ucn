@@ -6527,18 +6527,27 @@ describe('fix #396: C and C++ name lookup, preprocessor model and recovery lefto
         } finally { rm(dir); }
     });
 
-    it('a receiver a replacement list declares with a macro parameter as its type has no type there', () => {
+    it('a receiver a replacement list declares with a macro parameter as its type takes the type each invocation passes', () => {
         const dir = tmp({
             'v.hpp': 'class Validator {\npublic:\n    void SetFlags(unsigned f) { }\n};\nclass Other {\npublic:\n    void SetFlags(unsigned f) { }\n};',
             't.cc': '#include "v.hpp"\n#define CHECK(Validator, \\\n    flags) \\\n{ \\\n    Validator validator; \\\n    validator.SetFlags(flags); \\\n}\nvoid run() {\n    CHECK(Other, 1);\n}',
+            'u.cc': '#include "v.hpp"\n#define BOTH(T) { T t; t.SetFlags(0); }\nvoid a() { BOTH(Other); }\nvoid b() { BOTH(Validator); }',
         });
         try {
             const index = idx(dir);
-            // The parameter is spelled like Validator; the invocation passes Other.
+            // The parameter is spelled like Validator; the one invocation
+            // passes Other (fix #401: typed per invocation).
+            assert.deepEqual(shownOf(index, 'SetFlags', 'v.hpp', 7).confirmed.map(site =>
+                site.split(':').slice(0, 2).join(':')).filter(site => site.startsWith('t.cc')), ['t.cc:6']);
+            const validator = shownOf(index, 'SetFlags', 'v.hpp', 3);
+            assert.ok(!validator.confirmed.some(site => site.startsWith('t.cc')));
+            assert.ok(!validator.unverified.some(site => site.startsWith('t.cc')));
+            // Invocations passing different types leave the call untyped.
             for (const line of [3, 7]) {
                 const shown = shownOf(index, 'SetFlags', 'v.hpp', line);
-                assert.deepEqual(shown.confirmed, []);
-                assert.deepEqual(shown.unverified.map(site => site.split(':').slice(0, 2).join(':')), ['t.cc:6']);
+                assert.ok(!shown.confirmed.some(site => site.startsWith('u.cc')));
+                assert.deepEqual(shown.unverified.map(site => site.split(':').slice(0, 2).join(':'))
+                    .filter(site => site.startsWith('u.cc')), ['u.cc:2']);
             }
         } finally { rm(dir); }
     });
@@ -6900,6 +6909,137 @@ describe('fix #396: C and C++ name lookup, preprocessor model and recovery lefto
             fresh.build(null, { quiet: true });
             assert.ok(loaded.files.get(pool).parseErrorRegions?.length > 0);
             assert.equal(indexSnapshot(loaded), indexSnapshot(fresh));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #401: C++ name hiding, using-declarations, subscript receivers', () => {
+    const lines = (entries) => (entries || []).map(c => c.line).sort((a, b) => a - b);
+    const callersOf = (index, name, file, line) => {
+        const def = index.symbols.get(name).find(d => d.relativePath === file && d.startLine === line);
+        return index.findCallers(name, { targetDefinitions: [def], collectAccount: true, includeMethods: true });
+    };
+
+    it('a derived member hides every base member of its name unless a using-declaration brings them in', () => {
+        const dir = tmp({
+            'hide.cpp': [
+                'struct Base {',                                   // 1
+                '  int ping() { return 1; }',                      // 2
+                '  int both() { return 0; }',                      // 3
+                '};',                                              // 4
+                'struct Derived : Base {',                         // 5
+                '  int ping(int extra = 0) { return extra; }',     // 6
+                '  using Base::both;',                             // 7
+                '  int both(int x) { return x; }',                 // 8
+                '};',                                              // 9
+                'int use1(Derived& d) {',                          // 10
+                '  return d.ping();',                              // 11
+                '}',                                               // 12
+                'int use2(Derived& d) {',                          // 13
+                '  return d.both();',                              // 14
+                '}',                                               // 15
+                'int third() {',                                   // 16
+                '  struct Local : Base { static int ping(int extra = 0) { return 3; } };', // 17
+                '  return Local::ping();',                         // 18
+                '}',                                               // 19
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const derivedPing = callersOf(index, 'ping', 'hide.cpp', 6);
+            assert.deepStrictEqual(lines(derivedPing), [11], 'the default argument makes the derived member the only candidate');
+            assert.deepStrictEqual((derivedPing.unverifiedEntries || []).map(c => c.line), []);
+            const localPing = callersOf(index, 'ping', 'hide.cpp', 17);
+            assert.deepStrictEqual(lines(localPing), [18]);
+            const baseBoth = callersOf(index, 'both', 'hide.cpp', 3);
+            assert.ok([...lines(baseBoth), ...(baseBoth.unverifiedEntries || []).map(c => c.line)].includes(14),
+                'the using-declaration keeps the base member a candidate');
+            assert.ok(!(baseBoth.accountRaw?.excludedEntries || []).some(e => e.line === 14 && e.reason !== 'arity-mismatch'),
+                JSON.stringify(baseBoth.accountRaw));
+        } finally { rm(dir); }
+    });
+
+    it('a bare call in a derived class keeps its inherited base member over a free function', () => {
+        const dir = tmp({
+            'scan.cpp': [
+                'int set(int t) { return t; }',                         // 1
+                'struct Base {',                                        // 2
+                ' protected:',                                          // 3
+                '  void set(const char* b) { }',                        // 4
+                '};',                                                   // 5
+                'struct Derived : Base {',                              // 6
+                '  void fill() { set("x"); }',                          // 7
+                '};',                                                   // 8
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const member = callersOf(index, 'set', 'scan.cpp', 4);
+            assert.deepStrictEqual([...lines(member), ...lines(member.unverifiedEntries)], [7]);
+            assert.deepStrictEqual(lines(callersOf(index, 'set', 'scan.cpp', 1)), [], 'never confirmed for the free function');
+        } finally { rm(dir); }
+    });
+
+    it('a declaration read from a function-like macro invocation is never renamed as a function', () => {
+        const dir = tmp({
+            'annot.h': [
+                '#if defined(__clang__)',
+                '#define THREAD_ANNOTATION_ATTRIBUTE__(x) __attribute__((x))',
+                '#else',
+                '#define THREAD_ANNOTATION_ATTRIBUTE__(x)',
+                '#endif',
+                '#ifndef GUARDED_BY',
+                '#define GUARDED_BY(x) THREAD_ANNOTATION_ATTRIBUTE__(guarded_by(x))',
+                '#endif',
+            ].join('\n') + '\n',
+            'db.cc': '#include "db.h"\nint f() { return 0; }\n',
+            'db.h': [
+                '#include "annot.h"',                          // 1
+                'struct Mutex { };',                           // 2
+                'class DB {',                                  // 3
+                '  Mutex mu_;',                                // 4
+                '  int seed_ GUARDED_BY(mu_);',                // 5
+                '  int count_ GUARDED_BY(mu_);',               // 6
+                '};',                                          // 7
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const def = (index.symbols.get('GUARDED_BY') || []).find(d => d.type !== 'macro');
+            assert.ok(def, 'the conditional attribute macro is read as a member declaration');
+            const plan = execute(index, 'plan', { name: `db.h:${def.startLine}:GUARDED_BY`, renameTo: 'GB2' });
+            assert.ok(plan.ok, JSON.stringify(plan.error));
+            assert.ok((plan.result.changes || []).every(change => change.needsReview),
+                JSON.stringify(plan.result.changes));
+        } finally { rm(dir); }
+    });
+
+    it('`v[k].m()` on a class object takes the type its operator[] returns', () => {
+        const dir = tmp({
+            'sub.cpp': [
+                'namespace js {',                                                      // 1
+                'struct Value {',                                                      // 2
+                '  const char* GetString() const { return ""; }',                      // 3
+                '  Value& operator[](const char* key) { return *this; }',             // 4
+                '};',                                                                  // 5
+                'struct Str { const char* GetString() const { return "s"; } };',       // 6
+                'template <class T> struct Vec { T& operator[](int i); };',            // 7
+                '}',                                                                   // 8
+                'const char* use(js::Value& v, js::Vec<js::Str>& w) {',                // 9
+                '  const char* a = v["x"].GetString();',                               // 10
+                '  const char* b = w[0].GetString();',                                 // 11
+                '  return a ? a : b;',                                                 // 12
+                '}',                                                                   // 13
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const value = callersOf(index, 'GetString', 'sub.cpp', 3);
+            assert.deepStrictEqual(lines(value), [10]);
+            const str = callersOf(index, 'GetString', 'sub.cpp', 6);
+            assert.ok(!lines(str).includes(10), 'the Value subscript never reaches Str');
+            assert.ok(!(value.accountRaw?.excludedEntries || []).some(e => e.line === 11),
+                'a template parameter return types nothing: never excluded');
         } finally { rm(dir); }
     });
 });

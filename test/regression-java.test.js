@@ -5574,3 +5574,142 @@ describe('fix #395: Java method references through this and super', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #401: Java super in enum-constant bodies, nested-class member scope, constructor callees by import', () => {
+    const lines = (entries) => (entries || []).map(c => `${c.relativePath}:${c.line}`).sort();
+
+    it('`super.m()` in an enum constant body is the enum\'s own member', () => {
+        const dir = tmp({
+            'src/p/Op.java': [
+                'package p;',                                          // 1
+                'public enum Op {',                                    // 2
+                '    PLUS {',                                          // 3
+                '        @Override',                                   // 4
+                '        int apply(int a) { return super.apply(a) + 1; }', // 5
+                '    },',                                              // 6
+                '    MINUS;',                                          // 7
+                '    int apply(int a) { return a; }',                  // 8
+                '}',                                                   // 9
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const def = index.symbols.get('apply').find(d => d.startLine === 8);
+            const callers = index.findCallers('apply', { targetDefinitions: [def], collectAccount: true });
+            assert.deepStrictEqual(lines(callers), ['src/p/Op.java:5']);
+        } finally { rm(dir); }
+    });
+
+    it('`Iface.super.m()` is the named superinterface\'s default method', () => {
+        const dir = tmp({
+            'src/p/Greeter.java': 'package p;\npublic interface Greeter {\n    default String greet() { return "hi"; }\n}\n',
+            'src/p/Polite.java': 'package p;\npublic interface Polite {\n    default String greet() { return "hello"; }\n}\n',
+            'src/p/Both.java': [
+                'package p;',                                                            // 1
+                'public class Both implements Greeter, Polite {',                         // 2
+                '    @Override',                                                          // 3
+                '    public String greet() {',                                            // 4
+                '        return Greeter.super.greet() +',                                 // 5
+                '            Polite.super.greet();',                                      // 6
+                '    }',                                                                  // 7
+                '}',                                                                      // 8
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            for (const [file, line] of [['src/p/Greeter.java', 5], ['src/p/Polite.java', 6]]) {
+                const def = index.symbols.get('greet').find(d => d.relativePath === file);
+                assert.deepStrictEqual(lines(index.findCallers('greet', { targetDefinitions: [def], collectAccount: true })),
+                    [`src/p/Both.java:${line}`]);
+            }
+            const both = index.symbols.get('greet').find(d => d.relativePath === 'src/p/Both.java');
+            assert.deepStrictEqual(lines(index.findCallers('greet', { targetDefinitions: [both], collectAccount: true })), []);
+        } finally { rm(dir); }
+    });
+
+    it("a nested class's member is not in the outer class's simple-name scope", () => {
+        const dir = tmp({
+            'src/p/Base.java': 'package p;\npublic class Base {\n    public String name() { return "b"; }\n}\n',
+            'src/p/Outer.java': [
+                'package p;',                                              // 1
+                'public class Outer extends Base {',                        // 2
+                '    String first() { return name(); }',                    // 3
+                '    class Inner {',                                        // 4
+                '        private String name() { return "i"; }',           // 5
+                '        String second() { return name(); }',               // 6
+                '    }',                                                    // 7
+                '}',                                                        // 8
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const base = index.symbols.get('name').find(d => d.relativePath === 'src/p/Base.java');
+            assert.deepStrictEqual(lines(index.findCallers('name', { targetDefinitions: [base], collectAccount: true })),
+                ['src/p/Outer.java:3']);
+            const inner = index.symbols.get('name').find(d => d.relativePath === 'src/p/Outer.java');
+            assert.deepStrictEqual(lines(index.findCallers('name', { targetDefinitions: [inner], collectAccount: true })),
+                ['src/p/Outer.java:6']);
+        } finally { rm(dir); }
+    });
+
+    it('a bare call in an anonymous class body looks up the anonymous supertype first', () => {
+        const dir = tmp({
+            'src/p/Base.java': 'package p;\npublic class Base {\n    public String name() { return "b"; }\n}\n',
+            'src/p/Holder.java': [
+                'package p;',                                                      // 1
+                'public class Holder {',                                           // 2
+                '    private String name() { return "h"; }',                       // 3
+                '    Base make() {',                                               // 4
+                '        return new Base() {',                                     // 5
+                '            String twice() { return name() + name(); }',          // 6
+                '        };',                                                      // 7
+                '    }',                                                           // 8
+                '    String own() { return name(); }',                             // 9
+                '    Base other() {',                                              // 10
+                '        return new Base() {',                                     // 11
+                '            public String name() { return "o"; }',                // 12
+                '            String once() { return name(); }',                    // 13
+                '        };',                                                      // 14
+                '    }',                                                           // 15
+                '}',                                                               // 16
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const base = index.symbols.get('name').find(d => d.relativePath === 'src/p/Base.java');
+            // Line 13 calls the anonymous body's own override.
+            assert.deepStrictEqual(lines(index.findCallers('name', { targetDefinitions: [base], collectAccount: true })),
+                ['src/p/Holder.java:6', 'src/p/Holder.java:6']);
+            const holder = index.symbols.get('name').find(d => d.relativePath === 'src/p/Holder.java');
+            assert.deepStrictEqual(lines(index.findCallers('name', { targetDefinitions: [holder], collectAccount: true })),
+                ['src/p/Holder.java:9']);
+            // The callee side agrees: `make` calls Base.name from the anonymous body.
+            const make = index.symbols.get('make').find(d => d.relativePath === 'src/p/Holder.java');
+            const callees = index.findCallees(make, { collectAccount: true });
+            assert.deepStrictEqual(callees.filter(c => c.name === 'name').map(c => c.relativePath), ['src/p/Base.java']);
+        } finally { rm(dir); }
+    });
+
+    it('a constructor callee is the class the single-type import names, not a same-package nested namesake', () => {
+        const dir = tmp({
+            'src/lib/model/TestClass.java': 'package lib.model;\npublic class TestClass {\n    public TestClass(Class<?> c) { }\n}\n',
+            'src/app/Holder.java': 'package app;\npublic class Holder {\n    public static class TestClass { }\n}\n',
+            'src/app/UseIt.java': [
+                'package app;',                                             // 1
+                'import lib.model.TestClass;',                              // 2
+                'public class UseIt {',                                     // 3
+                '    void run() {',                                         // 4
+                '        TestClass t = new TestClass(UseIt.class);',        // 5
+                '    }',                                                    // 6
+                '}',                                                        // 7
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const run = index.symbols.get('run').find(d => d.relativePath === 'src/app/UseIt.java');
+            const callees = index.findCallees(run, { collectAccount: true });
+            assert.deepStrictEqual(callees.filter(c => c.name === 'TestClass').map(c => c.relativePath),
+                ['src/lib/model/TestClass.java']);
+        } finally { rm(dir); }
+    });
+});

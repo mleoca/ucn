@@ -7645,8 +7645,10 @@ describe('fix #367: evaluation leftovers (bare-call kinds, language branches, fl
             assert.ok(!sites(other.callers).includes('Child.java:5'));
             assert.ok(!sites(other.unverifiedCallers).includes('Child.java:5'),
                 JSON.stringify(sites(other.unverifiedCallers)));
-            assert.ok(sites(other.unverifiedCallers).includes('Child.java:9'),
-                `anonymous subclass of b2.Base stays visible: ${JSON.stringify(sites(other.unverifiedCallers))}`);
+            // fix #401: the anonymous subclass of b2.Base inherits m from
+            // it, so simple-name lookup from its body binds b2.Base.m.
+            assert.ok(sites(other.callers).includes('Child.java:9'),
+                `anonymous subclass of b2.Base: ${JSON.stringify(sites(other.callers))}`);
             const own = show(index, 'com/x/b1/Base.java:3:m');
             assert.ok(sites(own.callers).includes('Child.java:5'), JSON.stringify(sites(own.callers)));
             assert.strictEqual(other.meta.account.conserved, true);
@@ -11240,6 +11242,179 @@ describe('fix #400: C# generic interface slots by written arity and per instanti
             const edits = result.result.changes.filter(c => !c.needsReview).map(c => `${c.file}:${c.line}`).sort();
             assert.deepStrictEqual(edits, ['Impl.cs:11', 'Impl.cs:12', 'Impl.cs:7', 'Resolver.cs:4'],
                 JSON.stringify(result.result.changes));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #401: C# collection elements, generic receivers, extension receivers, aliases and member paths', () => {
+    const csproj = '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>';
+    const lines = (entries) => (entries || []).map(c => c.line).sort((a, b) => a - b);
+
+    it('a target-typed new in a collection initializer, a collection expression or a generic receiver argument constructs the element type', () => {
+        const dir = tmp({
+            'App.csproj': csproj,
+            'A.cs': [
+                'using System.Collections.Generic;',                       // 1
+                'namespace N;',                                            // 2
+                'public class Item { public Item(int v) { } }',            // 3
+                'public class Box<T> { public void Put(T v) { } }',        // 4
+                'public class Use',                                        // 5
+                '{',                                                       // 6
+                '    public void Make()',                                  // 7
+                '    {',                                                   // 8
+                '        var list = new List<Item> { new(1) };',           // 9
+                '        List<Item> more = [new(2)];',                     // 10
+                '        Item[] arr = [new(3)];',                          // 11
+                '        var map = new Dictionary<Item, int> { { new(4), 1 } };', // 12
+                '        var box = new Box<Item>();',                      // 13
+                '        box.Put(new(5));',                                // 14
+                '        var names = new List<string> { new("x") };',      // 15
+                '    }',                                                   // 16
+                '}',                                                       // 17
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const def = index.symbols.get('Item').find(d => d.type === 'class');
+            const callers = index.findCallers('Item', { targetDefinitions: [def], collectAccount: true });
+            assert.deepStrictEqual(lines(callers), [9, 10, 11, 12, 14], JSON.stringify(callers.map(c => c.line)));
+            assert.deepStrictEqual((callers.unverifiedEntries || []).map(c => c.line), []);
+        } finally { rm(dir); }
+    });
+
+    it('a receiver typed by a constrained type parameter takes the extension its constraint fits', () => {
+        const dir = tmp({
+            'App.csproj': csproj,
+            'B.cs': [
+                'namespace N;',                                                        // 1
+                'public class Builder { }',                                            // 2
+                'public class Options { }',                                            // 3
+                'public static class Ext',                                             // 4
+                '{',                                                                   // 5
+                '    public static T Add<T>(this T b, int rate) where T : Builder',    // 6
+                '        => b.Add(new Options());',                                    // 7
+                '    public static T Add<T>(this T b, Options o) where T : Builder => b;', // 8
+                '}',                                                                   // 9
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const def = index.symbols.get('Add').find(d => d.startLine === 8);
+            const callers = index.findCallers('Add', { targetDefinitions: [def], collectAccount: true });
+            assert.deepStrictEqual(lines(callers), [7]);
+        } finally { rm(dir); }
+    });
+
+    it('a project receiver deriving from an outside class may have the extension shadowed: visible, not confirmed', () => {
+        const dir = tmp({
+            'App.csproj': csproj,
+            'C.cs': [
+                'namespace N;',                                                // 1
+                'public class MyStream : System.IO.MemoryStream { }',          // 2
+                'public class Plain { }',                                      // 3
+                'public static class Ext',                                     // 4
+                '{',                                                           // 5
+                '    public static int Peek(this MyStream s) => 1;',           // 6
+                '    public static int Look(this Plain p) => 1;',              // 7
+                '}',                                                           // 8
+                'public class Use',                                            // 9
+                '{',                                                           // 10
+                '    public void Run(MyStream s, Plain p)',                    // 11
+                '    {',                                                       // 12
+                '        s.Peek();',                                           // 13
+                '        p.Look();',                                           // 14
+                '    }',                                                       // 15
+                '}',                                                           // 16
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const peek = index.findCallers('Peek', { targetDefinitions: index.symbols.get('Peek'), collectAccount: true });
+            assert.deepStrictEqual(lines(peek), []);
+            assert.deepStrictEqual((peek.unverifiedEntries || []).map(c => c.line), [13]);
+            const look = index.findCallers('Look', { targetDefinitions: index.symbols.get('Look'), collectAccount: true });
+            assert.deepStrictEqual(lines(look), [14]);
+        } finally { rm(dir); }
+    });
+
+    it('an alias of an enclosing alias names the type; an extern alias qualifier is never resolved to a project type', () => {
+        const dir = tmp({
+            'App.csproj': csproj,
+            'T.cs': 'namespace Lib.Core {\npublic class Widget { public void Spin() { } }\n}\n',
+            'U.cs': [
+                'extern alias Old;',                                                    // 1
+                'using LC = Lib.Core;',                                                 // 2
+                'namespace App {',                                                      // 3
+                'using W2 = LC.Widget;',                                                // 4
+                'public class User {',                                                  // 5
+                '    public void Go(W2 b, Old::Lib.Core.Widget c) {',                   // 6
+                '        b.Spin();',                                                    // 7
+                '        c.Spin();',                                                    // 8
+                '    }',                                                                // 9
+                '}',                                                                    // 10
+                '}',                                                                    // 11
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const spin = index.findCallers('Spin', { targetDefinitions: index.symbols.get('Spin'), collectAccount: true });
+            assert.deepStrictEqual(lines(spin), [7]);
+            assert.deepStrictEqual((spin.unverifiedEntries || []).map(c => c.line), [8]);
+            assert.ok(!(spin.accountRaw?.excludedEntries || []).length, JSON.stringify(spin.accountRaw));
+            const plan = execute(index, 'plan', { name: 'Widget', file: 'T.cs', line: 2, renameTo: 'Gadget' });
+            assert.ok(plan.ok, plan.error);
+            const at6 = plan.result.changes.find(c => c.file.endsWith('U.cs') && c.line === 6);
+            assert.ok(at6?.needsReview, `the extern-alias token is a review item: ${JSON.stringify(plan.result.changes)}`);
+        } finally { rm(dir); }
+    });
+
+    it('a PascalCase member path or element access is a value, not a type qualifier', () => {
+        const dir = tmp({
+            'App.csproj': csproj,
+            'M.cs': [
+                'using System.Reflection;',                                                     // 1
+                'namespace N;',                                                                 // 2
+                'public static class Helpers',                                                  // 3
+                '{',                                                                            // 4
+                '    public static System.Type MemberType(this MemberInfo m) => null;',         // 5
+                '}',                                                                            // 6
+                'public class Map',                                                             // 7
+                '{',                                                                            // 8
+                '    public MemberInfo[] Members { get; set; }',                                // 9
+                '    public System.Type Last() => Members[^1].MemberType();',                   // 10
+                '}',                                                                            // 11
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const last = index.symbols.get('Last')[0];
+            const callees = index.findCallees(last, { collectAccount: true });
+            const shown = [...callees.map(c => c.name), ...(callees.unverifiedCallees || []).map(c => c.name)];
+            assert.ok(shown.includes('MemberType'), JSON.stringify(callees.calleeAccount));
+        } finally { rm(dir); }
+    });
+
+    it('a field hop never takes the type of an explicit interface implementation', () => {
+        const dir = tmp({
+            'App.csproj': csproj,
+            'P.cs': [
+                'namespace N;',                                                            // 1
+                'public interface IPart { }',                                              // 2
+                'public class Part : IPart { public string Message() => ""; }',            // 3
+                'public interface IHolder { IPart Component { get; } }',                   // 4
+                'public class Holder : IHolder',                                           // 5
+                '{',                                                                       // 6
+                '    public Part Component { get; }',                                      // 7
+                '    IPart IHolder.Component => Component;',                               // 8
+                '    public string Text() => Component.Message();',                        // 9
+                '}',                                                                       // 10
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const text = index.symbols.get('Text')[0];
+            const callees = index.findCallees(text, { collectAccount: true });
+            assert.deepStrictEqual(callees.filter(c => c.name === 'Message').map(c => c.startLine), [3]);
         } finally { rm(dir); }
     });
 });

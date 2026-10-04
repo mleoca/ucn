@@ -295,8 +295,9 @@ function bindingIsExternal(index, fileEntry, filePath, binding) {
         }
         case 'csharp': {
             // An alias target resolves from the namespace the directive sits
-            // in (fix #395).
-            const target = csharpResolveUsingName(index, module, binding.namespace);
+            // in (fix #395), through an alias of an enclosing scope (#401).
+            const target = csharpResolveUsingName(index,
+                csharpAliasExpandedModule(fileEntry, binding), binding.namespace);
             if (!target.includes('.') || hasProjectNamespacePrefix(index, 'csharp', target)) return false;
             return standardRooted('csharp', target) ? true : 'unresolved';
         }
@@ -546,6 +547,26 @@ function csharpResolveUsingName(index, written, enclosing) {
     return text;
 }
 
+/**
+ * A using alias directive's written target with a leading alias declared in
+ * an enclosing scope substituted (fix #401): `using W = LC.Widget;` inside
+ * `namespace App` after a compilation-unit `using LC = Lib.Core;`.
+ */
+function csharpAliasExpandedModule(fileEntry, binding) {
+    let module = String(binding?.module || '');
+    const scope = binding?.namespace || '';
+    for (let hop = 0; hop < 4; hop++) {
+        const [head, ...rest] = module.split('.');
+        const outer = (fileEntry?.importBindings || []).find(other => other !== binding &&
+            other.kind === 'using' && other.name === head && other.module &&
+            (other.namespace || '') !== scope &&
+            ((other.namespace || '') === '' || scope.startsWith(`${other.namespace}.`)));
+        if (!outer || rest.length === 0) break;
+        module = [outer.module, ...rest].join('.');
+    }
+    return module;
+}
+
 /** A directive record's target with its generic arguments removed. */
 function csharpUsingTarget(text) {
     return String(text || '').replace(/<.*$/s, '');
@@ -555,7 +576,11 @@ function csharpAddDirective(scope, index, { module, names, static: isStatic, nam
     const target = csharpUsingTarget(csharpResolveUsingName(index, module, namespace));
     if (!target) return;
     const alias = (names || []).find(name => name && name !== '*');
-    if (alias) scope.aliases.set(alias, target);
+    if (alias) {
+        scope.aliases.set(alias, target);
+        if (!scope.aliasScopes) scope.aliasScopes = new Map();
+        scope.aliasScopes.set(alias, namespace || '');
+    }
     else if (isStatic) scope.statics.add(target);
     else scope.namespaces.add(target);
 }
@@ -593,8 +618,32 @@ function csharpUsings(index, filePath) {
             if (item === null) { scope.unreadable = true; continue; }
             csharpAddDirective(scope, index, item);
         }
+        csharpExpandAliasTargets(scope);
         return scope;
     });
+}
+
+/**
+ * A using alias's target may begin with an alias declared in an enclosing
+ * scope (fix #401: `using LC = Lib.Core;` in the compilation unit, then
+ * `namespace App { using W = LC.Widget; }`). Aliases of the same body never
+ * see each other (C# spec, using alias directives).
+ */
+function csharpExpandAliasTargets(scope) {
+    const scopes = scope.aliasScopes;
+    if (!scopes || scope.aliases.size < 2) return;
+    const encloses = (outer, inner) => outer !== inner && (outer === '' || inner.startsWith(`${outer}.`));
+    for (let pass = 0; pass < 4; pass++) {
+        let changed = false;
+        for (const [alias, target] of scope.aliases) {
+            const [head, ...rest] = String(target).split('.');
+            if (head === alias || !scope.aliases.has(head)) continue;
+            if (!encloses(scopes.get(head) ?? '', scopes.get(alias) ?? '')) continue;
+            scope.aliases.set(alias, [scope.aliases.get(head), ...rest].join('.'));
+            changed = true;
+        }
+        if (!changed) break;
+    }
 }
 
 /** The directory whose `.git` marks the repository holding `dir`, or null. */

@@ -446,6 +446,29 @@ function externalContractOf(index, def) {
                 line: def.nameLine || def.startLine }],
         };
     }
+    // A "callable" spelled like a function-like macro in effect where it is
+    // declared (fix #401: `T field GUARDED_BY(mu);` read as a member
+    // `GUARDED_BY` returning T, in a language whose macros use call syntax):
+    // the declaration is the macro's invocation, so there is no function of
+    // that name to rename.
+    if (def && !NON_CALLABLE_TYPES.has(def.type) && def.file &&
+        langTraits(index.files.get(def.file)?.language)?.macroInvocationSyntax === 'call') {
+        const macros = (index.symbols.get(def.name) || []).filter(d => d.type === 'macro' && Array.isArray(d.ppParams));
+        if (macros.length > 0) {
+            const visible = require('./cpp-scope').includeClosure(index, def.file);
+            const inEffect = macros.filter(macro => visible.has(macro.file) &&
+                (macro.file !== def.file || macro.startLine < (def.nameLine || def.startLine)));
+            if (inEffect.length > 0) {
+                return {
+                    certainty: 'definite',
+                    via: [`${inEffect[0].relativePath || _rel(index, inEffect[0].file)}:${inEffect[0].startLine}`],
+                    reason: 'macro-invocation',
+                    sites: [{ file: def.file, relativePath: def.relativePath || _rel(index, def.file),
+                        line: def.nameLine || def.startLine }],
+                };
+            }
+        }
+    }
     // A compiler-required type (fix #380): its full name is fixed by the
     // language, so renaming it withdraws the feature's lowering target.
     if (def && !def.className && CLASS_KINDS.has(def.type) && protocolTypeOf(index, def)) {

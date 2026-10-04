@@ -64,6 +64,22 @@ function tokenTreeMayDeclareItem(tokenTree) {
     return false;
 }
 
+/**
+ * Item bodies of item-position macro invocations that declare functions
+ * (fix #401): the byte- and line-preserving recovery parse and the token
+ * tree content ranges whose parse holds at least one `fn` with a body. Calls
+ * in those ranges are read from the recovered items. null when none.
+ */
+function rustMacroItemCallRecovery(code, parser) {
+    // The declaration trees are memoized on the code: the call extractor and
+    // the declaration extractors share one recovery parse.
+    const declaration = declarationTrees(code, parser);
+    if (declaration.macroCallRecovery === undefined) {
+        declaration.macroCallRecovery = buildMacroItemRecoveryTree(code, parser, declaration.primary)?.callRecovery || null;
+    }
+    return declaration.macroCallRecovery;
+}
+
 function buildMacroItemRecoveryTree(code, parser, tree) {
     const ranges = [];
     traverseTreeCached(tree.rootNode, node => {
@@ -91,16 +107,23 @@ function buildMacroItemRecoveryTree(code, parser, tree) {
     const recovered = parseTree(parser, masked.join(''));
     let itemCount = 0;
     const declarationNameStarts = new Set();
+    const callRanges = new Set();
     traverseTreeCached(recovered.rootNode, node => {
         if (MACRO_ITEM_NODES.has(node.type)) {
             itemCount++;
             const name = node.childForFieldName('name');
             if (name) declarationNameStarts.add(name.startIndex);
+            if (node.type === 'function_item' && node.childForFieldName('body')) {
+                const range = ranges.find(([start, end]) => node.startIndex >= start && node.endIndex <= end);
+                if (range) callRanges.add(range);
+            }
         }
         return true;
     });
     if (itemCount === 0) return null;
-    return { tree: recovered, itemCount, declarationNameStarts };
+    const callRecovery = callRanges.size > 0
+        ? { tree: recovered, ranges: [...callRanges].sort((a, b) => a[0] - b[0]) } : null;
+    return { tree: recovered, itemCount, declarationNameStarts, callRecovery };
 }
 
 /**
@@ -120,6 +143,7 @@ function declarationTrees(code, parser) {
         macroItemRecovery: !!macro,
         macroItemCount: macro?.itemCount || 0,
         macroDeclarationNameStarts: macro?.declarationNameStarts || new Set(),
+        macroCallRecovery: macro?.callRecovery || null,
     };
     lastDeclarationParser = parser;
     lastDeclarationCode = code;
@@ -155,6 +179,10 @@ function primeDeclarationTrees(code, parser, tree) {
         macroItemRecovery: false,
         macroItemCount: 0,
         macroDeclarationNameStarts: new Set(),
+        // An expansion may hand items to an outside macro (`quickcheck! {
+        // fn .. }`, fix #401): their calls are read from the item parse,
+        // computed when calls are extracted.
+        macroCallRecovery: undefined,
     };
 }
 
@@ -1352,13 +1380,18 @@ function _processState(node, objects, lines) {
                 // a generic wrapper (`Lazy<T>`, `Mutex<T>`) owns the methods
                 // or derefs to its argument. A `static mut` is never typed.
                 let typeNode = node.childForFieldName('type');
+                // A std deref wrapper (`LazyLock<Store>`, fix #401) receives
+                // as its target; the chain is recorded for the query.
+                const deref = rustStdDerefChain(typeNode);
+                if (deref) typeNode = deref.inner;
                 while (typeNode?.type === 'reference_type') typeNode = typeNode.childForFieldName('type');
                 const mutable = node.type === 'static_item' &&
                     node.children.some(child => child.type === 'mutable_specifier');
                 const plain = typeNode && (typeNode.type === 'type_identifier' ||
                     typeNode.type === 'scoped_type_identifier');
                 objects.push({ name, startLine, endLine,
-                    ...(plain && !mutable && { valueType: typeNode.text }) });
+                    ...(plain && !mutable && { valueType: typeNode.text,
+                        ...(deref && { valueDerefVia: deref.via }) }) });
             }
         }
         return true;
@@ -1482,6 +1515,77 @@ function rustRawPointerTypeOf(typeNode) {
     while (current?.type === 'reference_type') current = current.childForFieldName('type');
     if (current?.type !== 'pointer_type') return null;
     return current.children.some(child => child.type === 'mutable_specifier') ? '*mut' : '*const';
+}
+
+/**
+ * Standard-library wrappers whose `Deref::Target` is their (first) type
+ * argument (fix #401): smart pointers, `ManuallyDrop`, lazy cells, `RefCell`
+ * borrow guards, lock guards, `AssertUnwindSafe`, `Cow` (Target = its
+ * borrowed form) and `Pin<P>` (Target = P's own target). Method probing
+ * visits the wrapper first, then its target. Only the written name is
+ * recorded here; the query checks that it denotes the std type.
+ */
+const RUST_STD_DEREF_WRAPPERS = new Set(['Box', 'Rc', 'Arc', 'ManuallyDrop', 'LazyLock',
+    'LazyCell', 'Ref', 'RefMut', 'MutexGuard', 'RwLockReadGuard', 'RwLockWriteGuard',
+    'ReentrantLockGuard', 'AssertUnwindSafe', 'Cow', 'Pin']);
+
+/**
+ * The std deref wrappers a declared type is written with, outermost first,
+ * and the type they deref to: `&Arc<Store>` -> { via: ['Arc'], inner:
+ * Store }, `Pin<Box<T>>` -> via ['Pin', 'Box']. null when the outermost
+ * named type is not such a wrapper.
+ */
+function rustStdDerefChain(typeNode) {
+    let current = typeNode;
+    const via = [];
+    for (let hop = 0; hop < 6; hop++) {
+        while (current?.type === 'reference_type') current = current.childForFieldName('type');
+        if (current?.type !== 'generic_type') break;
+        const head = current.childForFieldName('type') || current.namedChild(0);
+        const name = head?.type === 'type_identifier' ? head.text
+            : head?.type === 'scoped_type_identifier' ? head.childForFieldName('name')?.text : null;
+        if (!name || !RUST_STD_DEREF_WRAPPERS.has(name)) break;
+        const argsNode = current.childForFieldName('type_arguments') ||
+            current.namedChildren.find(child => child.type === 'type_arguments');
+        const args = (argsNode?.namedChildren || []).filter(child =>
+            child.type !== 'lifetime' && !child.type.endsWith('comment'));
+        if (args.length === 0) break;
+        via.push(head.text.replace(/\s+/g, ''));
+        current = args[0];
+    }
+    return via.length > 0 ? { via, inner: current } : null;
+}
+
+/** Is `name` a type parameter declared by an item enclosing `node`? */
+function rustTypeParamInScope(node, name) {
+    for (let parent = node?.parent; parent; parent = parent.parent) {
+        if (!['function_item', 'impl_item', 'trait_item', 'struct_item', 'enum_item',
+            'function_signature_item'].includes(parent.type)) continue;
+        const params = parent.childForFieldName('type_parameters');
+        for (const param of params?.namedChildren || []) {
+            const nameNode = param.type === 'type_identifier' ? param
+                : param.childForFieldName('name') || param.namedChildren.find(child => child.type === 'type_identifier');
+            if (nameNode?.text === name) return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * A declared type behind std deref wrappers (fix #401): the target's type
+ * name and the wrapper chain, or null. A target that is a type parameter
+ * of an enclosing item (`Box<T>`) has no name: { via, typeName: null }.
+ */
+function rustDerefTypedName(typeNode) {
+    const chain = rustStdDerefChain(typeNode);
+    if (!chain) return null;
+    const written = extractTypeName(chain.inner);
+    // A slice or raw pointer target (`Box<[u8]>`) has its canonical name.
+    const primitive = !written ? rustSliceTypeOf(chain.inner) || rustRawPointerTypeOf(chain.inner) : null;
+    const typeName = primitive || (written === 'Self' ? findEnclosingImplType(chain.inner) || null
+        : written && !rustTypeParamInScope(chain.inner, written) ? written : null);
+    return { via: chain.via, typeName, inner: chain.inner, ...(primitive && { std: true }),
+        outerRef: rustTypeRefKind(typeNode) };
 }
 
 /** Reference layer of a declared type node: 'owned', '&' or '&mut'. */
@@ -2336,6 +2440,12 @@ function rustKnownArgNameType(name, atNode, getReceiverType, isPatternShadow, to
     if (!type || !fields) return null;
     const source = fields.receiverTypeSource;
     const evidence = fields.receiverTypeEvidence;
+    // A value behind a std wrapper is passed as the wrapper itself (fix #401).
+    if (Array.isArray(evidence?.derefVia) && evidence.derefVia.length > 0) {
+        const wrapper = String(evidence.derefVia[0]).replace(/^=/, '').split('::').pop();
+        const outer = evidence.derefOuterRef || 'owned';
+        return (outer === '&' ? '&' : outer === '&mut' ? '&mut ' : '') + wrapper;
+    }
     if (source === 'guess') {
         return evidence?.nodeType === 'call_expression' && Number.isInteger(evidence.start)
             ? `?${evidence.start}` : null;
@@ -3759,12 +3869,17 @@ function findCallsInCode(code, parser) {
                 if (param.type === 'parameter') {
                     const patternNode = param.childForFieldName('pattern');
                     retainBoundNames(patternNode);
-                    const typeNode = param.childForFieldName('type');
+                    const declaredType = param.childForFieldName('type');
+                    // `p: Arc<Store>` receives as its Deref target (fix
+                    // #401); the wrapper chain rides on the evidence.
+                    const deref = rustDerefTypedName(declaredType);
+                    if (deref && !deref.typeName) continue;
+                    const typeNode = deref ? deref.inner : declaredType;
                     const sliceType = rustSliceTypeOf(typeNode) || rustRawPointerTypeOf(typeNode);
                     // `other: &Self` is the enclosing impl's self type (fix
                     // #399); in a trait's own methods it is the implementor,
                     // which no annotation names.
-                    const written = extractTypeName(typeNode);
+                    const written = deref ? deref.typeName : extractTypeName(typeNode);
                     const typeName = (written === 'Self' ? findEnclosingImplType(param) : written) || sliceType;
                     const qualifier = extractTypeQualifier(typeNode);
                     const iteratorItem = extractRustIteratorItemTypeFromTypeNode(typeNode);
@@ -3775,10 +3890,12 @@ function findCallsInCode(code, parser) {
                         // Pattern can be identifier or _
                         const name = patternNode.type === 'identifier' ? patternNode.text : null;
                         if (name) {
-                            typeMap.set(name, typeName, 'annotation', param);
+                            typeMap.set(name, typeName, deref
+                                ? { ...typeOrigin('annotation', param), derefVia: deref.via, derefOuterRef: deref.outerRef }
+                                : 'annotation', param);
                             typeMap.annotationTexts.set(name, typeNode.text);
                             typeMap.refKinds.set(name, rustTypeRefKind(typeNode));
-                            if (sliceType && typeName === sliceType) typeMap.stdTypes.add(name);
+                            if ((sliceType && typeName === sliceType) || deref?.std) typeMap.stdTypes.add(name);
                             if (qualifier) typeMap.qualifiers.set(name, qualifier);
                             if (iteratorItem) typeMap.iteratorItems.set(name, iteratorItem);
                         }
@@ -3880,14 +3997,20 @@ function findCallsInCode(code, parser) {
         if (atNode && patternShadowsAt(atNode, varName)) return undefined;
         const flow = flowEventAt(atNode, varName);
         if (flow?.type) {
-            const { until, ...origin } = flow;
+            const { until, letStart, ...origin } = flow;
             return evidence ? { receiverTypeSource: 'flow',
                 receiverTypeEvidence: { ...typeOrigin('flow', atNode), ...origin,
                     ...(Number.isFinite(until) && { until }) },
                 ...(flow.qualifier && { receiverTypeQualifier: flow.qualifier }) } : flow.type;
         }
+        // An untyped `let` in scope hides the outer binding's type.
+        const shadowedBy = flow && flow.letStart != null ? flow : null;
         for (let i = functionStack.length - 1; i >= 0; i--) {
             const typeMap = scopeTypes.get(functionStack[i].startLine);
+            if (typeMap?.has(varName) && shadowedBy) {
+                const start = typeMap.origins.get(varName)?.start;
+                if (!(start >= shadowedBy.letStart && start <= shadowedBy.at)) return undefined;
+            }
             if (typeMap?.has(varName)) return evidence ? { ...typeMap.fields(varName),
                 ...(typeMap.qualifiers?.has(varName) && { receiverTypeQualifier: typeMap.qualifiers.get(varName) }),
                 ...(typeMap.refKinds?.has(varName) && { receiverTypeRef: typeMap.refKinds.get(varName) }),
@@ -3922,6 +4045,97 @@ function findCallsInCode(code, parser) {
             if (typeMap?.boundNames?.has(varName)) return undefined;
         }
         return undefined;
+    };
+
+    // A std deref wrapper constructed around a typed value (fix #401):
+    // `ManuallyDrop::new(self)`, `Box::new(Store::new())`, `Arc::new(x)`,
+    // `Rc::clone(&rc)`, `Box::pin(f)`, `Pin::new(&mut x)`,
+    // `AssertUnwindSafe(x)`. Returns { via, typeName, qualifier, source }
+    // (typeName null when the wrapped value's type is unknown), or null
+    // when the value is no such construction.
+    const rustStdDerefConstruction = (valueNode, atNode, depth = 0) => {
+        if (depth > 4 || valueNode?.type !== 'call_expression') return null;
+        let fn = valueNode.childForFieldName('function');
+        if (fn?.type === 'generic_function') fn = fn.childForFieldName('function');
+        let wrapper;
+        let method = null;
+        if (fn?.type === 'identifier' && fn.text === 'AssertUnwindSafe') {
+            wrapper = 'AssertUnwindSafe';
+        } else if (fn?.type === 'scoped_identifier') {
+            const pathNode = fn.childForFieldName('path');
+            method = fn.childForFieldName('name')?.text;
+            const head = pathNode?.type === 'generic_type'
+                ? pathNode.childForFieldName('type') || pathNode.namedChild(0) : pathNode;
+            const headName = head?.type === 'identifier' || head?.type === 'type_identifier' ? head.text
+                : head?.type === 'scoped_identifier' || head?.type === 'scoped_type_identifier'
+                    ? head.childForFieldName('name')?.text : null;
+            if (!headName || !RUST_STD_DEREF_WRAPPERS.has(headName)) return null;
+            const constructs = method === 'new' && ['Box', 'Rc', 'Arc', 'ManuallyDrop', 'Pin'].includes(headName);
+            const pins = method === 'pin' && ['Box', 'Rc', 'Arc'].includes(headName);
+            const clones = method === 'clone' && ['Rc', 'Arc'].includes(headName);
+            if (!constructs && !pins && !clones) return null;
+            wrapper = head.text.replace(/\s+/g, '');
+        } else {
+            return null;
+        }
+        const argsNode = valueNode.childForFieldName('arguments');
+        const args = (argsNode?.namedChildren || []).filter(child => !child.type.endsWith('comment'));
+        if (args.length !== 1) return { via: [wrapper], typeName: null };
+        // `Box::pin(x)` makes a `Pin<Box<_>>`: Pin is implied, not written.
+        const outer = method === 'pin' ? ['=Pin', wrapper] : [wrapper];
+        let arg = args[0];
+        let derefArg = false;
+        while (arg?.type === 'reference_expression' || arg?.type === 'parenthesized_expression') {
+            if (arg.type === 'reference_expression') derefArg = true;
+            arg = arg.childForFieldName('value') || arg.namedChild(arg.namedChildCount - 1);
+        }
+        // `Pin::new(&mut x)` and `Rc::clone(&rc)` take a reference: the
+        // result derefs to what the referent derefs to.
+        if ((wrapper.endsWith('Pin') || method === 'clone') && !derefArg) return { via: outer, typeName: null };
+        if (arg?.type === 'self') {
+            const typeName = findEnclosingImplType(arg);
+            return { via: outer, typeName: typeName || null, source: 'constructor' };
+        }
+        if (arg?.type === 'identifier') {
+            const typed = getReceiverType(arg.text, atNode, true);
+            const typeName = getReceiverType(arg.text, atNode);
+            if (!typeName) return { via: outer, typeName: null };
+            const inner = typed?.receiverTypeEvidence?.derefVia || [];
+            // `Rc::clone(&rc)` is the same Rc: its own chain, not one more layer.
+            const via = method === 'clone' ? inner : [...outer, ...inner];
+            if (via.length === 0) return { via: outer, typeName: null };
+            const source = typed?.receiverTypeSource === 'guess' ? 'guess' : 'constructor';
+            const qualifier = getReceiverTypeQualifier(arg.text, atNode);
+            return { via, typeName, ...(qualifier && { qualifier }), source };
+        }
+        if (method === 'clone') return { via: outer, typeName: null };
+        if (arg?.type === 'struct_expression') {
+            const pathText = arg.childForFieldName('name')?.text || '';
+            const segments = pathText.split('::');
+            const typeName = segments.pop();
+            return { via: outer, typeName: /^[A-Z]/.test(typeName || '') ? typeName : null,
+                ...(segments.length > 0 && { qualifier: segments.join('::') }), source: 'constructor' };
+        }
+        if (arg?.type === 'call_expression') {
+            const nested = rustStdDerefConstruction(arg, atNode, depth + 1);
+            if (nested) return { ...nested, via: [...outer, ...nested.via] };
+            const callee = arg.childForFieldName('function');
+            if (callee?.type === 'scoped_identifier') {
+                const segments = callee.text.split('::');
+                const ctor = segments[segments.length - 1];
+                const typeName = segments[segments.length - 2];
+                if (segments.length >= 2 && /^(new|from|default|with_|create|build|open|connect|init)/.test(ctor) &&
+                    /^[A-Z]/.test(typeName || '') && !RUST_STD_DEREF_WRAPPERS.has(typeName)) {
+                    // The prelude's `Vec`/`String` constructors make that
+                    // std type (a project namesake is checked at query time).
+                    const prelude = segments.length === 2 && (typeName === 'Vec' || typeName === 'String');
+                    return { via: outer, typeName,
+                        ...(segments.length > 2 && { qualifier: segments.slice(0, -2).join('::') }),
+                        source: prelude ? 'literal' : 'guess', ...(prelude && { std: true }) };
+                }
+            }
+        }
+        return { via: outer, typeName: null };
     };
 
     const getReceiverIteratorItemType = (varName, atNode) => {
@@ -4161,7 +4375,13 @@ function findCallsInCode(code, parser) {
         };
     };
 
-    traverseTree(tree.rootNode, (node) => {
+    // Item bodies of item-position macros (`quickcheck! { fn p(..) { .. } }`,
+    // fix #401) are parsed as items: their calls are read from that parse,
+    // with their functions' scopes and local types, instead of as tokens.
+    const itemRecovery = rustMacroItemCallRecovery(code, parser);
+    const recoveredTokenTrees = new Set((itemRecovery?.ranges || []).map(([start]) => start - 1));
+
+    const visitNode = (node) => {
         if (BINDING_HOLDERS.has(node.type)) {
             const pattern = node.type === 'closure_parameters' ? node : node.childForFieldName('pattern');
             if (pattern) {
@@ -4207,6 +4427,9 @@ function findCallsInCode(code, parser) {
                     byName.get(pattern.text).push({
                         at: node.endIndex,
                         until,
+                        // A `let` shadows every earlier binding of the name
+                        // (fix #401); only a type this statement sets survives.
+                        ...(node.type === 'let_declaration' && { letStart: node.startIndex }),
                         ...(() => {
                             // Rust assignment preserves a variable's static
                             // type; a fresh `let` may shadow it with another.
@@ -4471,9 +4694,12 @@ function findCallsInCode(code, parser) {
                     // ripgrep-measured): "match:fg:magenta".parse() is
                     // str::parse, never a project method. Numeric literals
                     // stay untyped (i32/u64/f64 ambiguity).
+                    // An array literal (fix #401) is the primitive array
+                    // type 'array': it unsizes to a slice, never derefs.
                     const rangeReceiverType = (!receiver && valueNode)
                         ? (rustRangeLiteralType(valueNode) ||
-                            (valueNode.type === 'tuple_expression' ? 'tuple' : null)) : null;
+                            (valueNode.type === 'tuple_expression' ? 'tuple' : null) ||
+                            (valueNode.type === 'array_expression' ? 'array' : null)) : null;
                     // A cast receiver (fix #399): `(p as *const T).m()` has
                     // exactly the cast's type (a primitive or raw pointer).
                     let castNode = !receiver ? valueNode : null;
@@ -4743,7 +4969,7 @@ function findCallsInCode(code, parser) {
             // call lines on ripgrep — test assertions live in macros).
             for (let i = 0; i < node.childCount; i++) {
                 const child = node.child(i);
-                if (child.type === 'token_tree') {
+                if (child.type === 'token_tree' && !recoveredTokenTrees.has(child.startIndex)) {
                     extractCallsFromTokenTree(
                         child, enclosingFunction, calls, getReceiverType,
                         patternShadowsAt, flowInvalidatedAt, {
@@ -4860,16 +5086,31 @@ function findCallsInCode(code, parser) {
                     let typeName = null;
                     let typeQualifier = null;
                     let stdLiteral = false;
+                    // Std deref wrappers (fix #401): `let a: Arc<Store>`,
+                    // `let m = ManuallyDrop::new(self)` receive as the target.
+                    let derefVia = null;
+                    let derefSource = null;
+                    let derefInnerRef = 'owned';
+                    let derefOuterRef = 'owned';
+                    let derefStd = false;
                     // Pattern 3: explicit type annotation — let s: Server = ...
                     if (typeAnnotation) {
-                        typeName = extractTypeName(typeAnnotation);
+                        const deref = rustDerefTypedName(typeAnnotation);
+                        const declared = deref ? deref.inner : typeAnnotation;
+                        if (deref) {
+                            derefVia = deref.via;
+                            derefInnerRef = rustTypeRefKind(declared);
+                            derefOuterRef = deref.outerRef;
+                            derefStd = !!deref.std;
+                        }
+                        typeName = deref ? deref.typeName : extractTypeName(declared);
                         if (typeName === 'Self') typeName = findEnclosingImplType(typeAnnotation) || null;
-                        if (!typeName && (rustSliceTypeOf(typeAnnotation) || rustRawPointerTypeOf(typeAnnotation))) {
-                            typeName = rustSliceTypeOf(typeAnnotation) || rustRawPointerTypeOf(typeAnnotation);
+                        if (!typeName && !deref && (rustSliceTypeOf(declared) || rustRawPointerTypeOf(declared))) {
+                            typeName = rustSliceTypeOf(declared) || rustRawPointerTypeOf(declared);
                             stdLiteral = true;
                         }
-                        typeQualifier = extractTypeQualifier(typeAnnotation);
-                        const indexElement = rustIndexElement(typeAnnotation);
+                        typeQualifier = extractTypeQualifier(declared);
+                        const indexElement = rustIndexElement(declared);
                         if (indexElement) typeMap.indexElements.set(varName, indexElement);
                         else typeMap.indexElements.delete(varName);
                     } else {
@@ -4888,14 +5129,14 @@ function findCallsInCode(code, parser) {
                             typeQualifier = element.qualifier || null;
                         }
                     }
-                    if (!typeName && valueNode) {
+                    if (!typeName && valueNode && !derefVia) {
                         const rangeType = rustRangeLiteralType(valueNode, true);
                         if (rangeType) {
                             typeName = rangeType;
                             stdLiteral = true;
                         }
                     }
-                    if (!typeName && valueNode) {
+                    if (!typeName && valueNode && !(typeAnnotation && derefVia)) {
                         // Pattern 1: struct expression — let s = Server { ... }
                         if (valueNode.type === 'struct_expression') {
                             const nameNode = valueNode.childForFieldName('name');
@@ -4923,7 +5164,16 @@ function findCallsInCode(code, parser) {
                         // Pattern 2: constructor call — let s = Server::new()
                         else if (valueNode.type === 'call_expression') {
                             const funcNode = valueNode.childForFieldName('function');
-                            if (funcNode?.type === 'scoped_identifier') {
+                            const wrapped = rustStdDerefConstruction(valueNode, node);
+                            if (wrapped) {
+                                if (wrapped.typeName) {
+                                    typeName = wrapped.typeName;
+                                    typeQualifier = wrapped.qualifier || null;
+                                    derefVia = wrapped.via;
+                                    derefSource = wrapped.source;
+                                    derefStd = !!wrapped.std;
+                                }
+                            } else if (funcNode?.type === 'scoped_identifier') {
                                 const pathText = funcNode.text;
                                 const segments = pathText.split('::');
                                 if (segments.length >= 2) {
@@ -4932,6 +5182,11 @@ function findCallsInCode(code, parser) {
                                         typeName = segments[segments.length - 2];
                                         typeQualifier = segments.slice(0, -2).join('::') || null;
                                         if (!typeName || !/^[A-Z]/.test(typeName)) typeName = null;
+                                        // `Self::with_capacity(..)` names the impl's
+                                        // self type (fix #401), never a type `Self`.
+                                        if (typeName === 'Self' && segments.length === 2) {
+                                            typeName = findEnclosingImplType(valueNode) || null;
+                                        }
                                     }
                                 }
                             }
@@ -4940,32 +5195,48 @@ function findCallsInCode(code, parser) {
                     typeMap.refKinds.delete(varName);
                     typeMap.stdTypes.delete(varName);
                     if (typeName) {
-                        typeMap.set(varName, typeName, stdLiteral && !typeAnnotation ? 'literal'
-                            : typeAnnotation || isElementIndex(indexedValue) ? 'annotation' : valueNode?.type === 'call_expression' ? 'guess' : 'constructor', typeAnnotation || valueNode);
+                        const source = stdLiteral && !typeAnnotation ? 'literal'
+                            : typeAnnotation || isElementIndex(indexedValue) ? 'annotation'
+                                : derefSource || (valueNode?.type === 'call_expression' ? 'guess' : 'constructor');
+                        typeMap.set(varName, typeName, derefVia
+                            ? { ...typeOrigin(source, typeAnnotation || valueNode), derefVia, derefOuterRef }
+                            : source, typeAnnotation || valueNode);
                         if (typeQualifier) typeMap.qualifiers.set(varName, typeQualifier);
-                        if (typeAnnotation) {
+                        if (derefVia) {
+                            // The wrapper's target is a place of the inner type.
+                            typeMap.refKinds.set(varName, derefInnerRef);
+                        } else if (typeAnnotation) {
                             typeMap.refKinds.set(varName, rustTypeRefKind(typeAnnotation));
                         } else if (valueNode?.type === 'struct_expression' || stdLiteral) {
                             typeMap.refKinds.set(varName, 'owned');
                         }
-                        if (stdLiteral) typeMap.stdTypes.add(varName);
+                        if (stdLiteral || derefStd) typeMap.stdTypes.add(varName);
                     }
                 }
             }
         }
 
         return true;
-    }, {
-        onLeave: (node) => {
-            if (isFunctionNode(node)) {
-                const leaving = functionStack.pop();
-                if (leaving) {
-                    scopeTypes.delete(leaving.startLine);
-                    scopeFlowEvents.delete(leaving.startLine);
-                }
+    };
+    const leaveNode = (node) => {
+        if (isFunctionNode(node)) {
+            const leaving = functionStack.pop();
+            if (leaving) {
+                scopeTypes.delete(leaving.startLine);
+                scopeFlowEvents.delete(leaving.startLine);
             }
         }
-    });
+    };
+    traverseTree(tree.rootNode, visitNode, { onLeave: leaveNode });
+    if (itemRecovery) {
+        const ranges = itemRecovery.ranges;
+        const inside = node => ranges.some(([start, end]) => node.startIndex >= start && node.endIndex <= end);
+        const overlaps = node => ranges.some(([start, end]) => node.startIndex < end && node.endIndex > start);
+        traverseTree(itemRecovery.tree.rootNode, node => {
+            if (inside(node)) return visitNode(node);
+            return overlaps(node);
+        }, { onLeave: node => { if (inside(node)) leaveNode(node); } });
+    }
 
     const declaration = declarationTrees(code, parser);
     if (!declaration.macroItemRecovery) return calls;

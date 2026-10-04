@@ -5734,6 +5734,26 @@ function enclosingMacroArguments(node) {
     return wrappers;
 }
 
+/**
+ * The name `X` of a parameter `X()` (a type followed by an empty abstract
+ * function declarator) of a function declarator declared in a block (fix
+ * #401): the shape of `T v(X());` that is an object initialized by a call
+ * whenever X is not a type. null for any other parameter.
+ */
+function vexingParseCallName(node) {
+    const list = node.parent;
+    const declarator = list?.type === 'parameter_list' ? list.parent : null;
+    const declaration = declarator?.type === 'function_declarator' ? declarator.parent : null;
+    if (declaration?.type !== 'declaration' || declaration.parent?.type !== 'compound_statement') return null;
+    const typeNode = node.childForFieldName('type');
+    const abstract = node.childForFieldName('declarator');
+    if (typeNode?.type !== 'type_identifier' || abstract?.type !== 'abstract_function_declarator') return null;
+    const params = abstract.childForFieldName('parameters');
+    if (!params || params.namedChildCount !== 0) return null;
+    if (node.namedChildren.some(child => child.type === 'type_qualifier')) return null;
+    return typeNode.text;
+}
+
 function findCallsInTree(code, parser, _options = {}, existingTree = null,
     includeMacroBodies = true) {
     const tree = existingTree || parseTree(parser, code);
@@ -5746,6 +5766,26 @@ function findCallsInTree(code, parser, _options = {}, existingTree = null,
         if (recoveredOperator) {
             calls.push(recoveredOperator);
             return true;
+        }
+        // `ModelDB model(CurrentOptions());` in a block (fix #401): the
+        // grammar reads a function declaration whose parameter is an
+        // unnamed function type; when `CurrentOptions` is no type (decided at
+        // query time) it is a call initializing the object.
+        if (node.type === 'parameter_declaration' && vexingParseCallName(node)) {
+            const nameNode = node.childForFieldName('type');
+            calls.push({
+                name: nameNode.text,
+                line: nameNode.startPosition.row + 1,
+                column: nameNode.startPosition.column,
+                callStart: node.startIndex,
+                callEnd: node.endIndex,
+                isMethod: false,
+                argCount: 0,
+                argKinds: [],
+                enclosingFunction: enclosingFunctionOf(node),
+                declarationReading: true,
+            });
+            return false;
         }
         if (node.type === 'call_expression') {
             if (recoveredExplicitCallOperator(node.parent, variableTypes)) {
@@ -5815,12 +5855,24 @@ function findCallsInTree(code, parser, _options = {}, existingTree = null,
                 : undefined;
             // `items[i].m()` on a declared container/array (fix #359).
             let indexedReceiverType;
+            // `v["x"].m()` on a variable declared as a class object (fix
+            // #401): the receiver is what the class's operator[] returns,
+            // decided at query time from its declarations.
+            let subscriptObject;
             if (!receiverPath && receiverNode?.type === 'subscript_expression' &&
                 !identity.pointerAccess) {
                 const indexedRoot = receiverNode.childForFieldName('argument') ||
                     receiverNode.namedChild(0);
                 if (indexedRoot?.type === 'identifier') {
                     indexedReceiverType = variableTypes.getElement(indexedRoot.text, node);
+                    if (!indexedReceiverType && variableTypes.arrowThroughObject(indexedRoot.text, node)) {
+                        const declared = variableTypes.get(indexedRoot.text, node);
+                        if (declared) {
+                            subscriptObject = { type: declared,
+                                at: variableTypes.evidence(indexedRoot.text, node).receiverTypeEvidence?.start,
+                                line: variableTypes.evidence(indexedRoot.text, node).receiverTypeEvidence?.line };
+                        }
+                    }
                 }
             }
             const assignedTo = assignmentTargetOf(node);
@@ -5866,6 +5918,11 @@ function findCallsInTree(code, parser, _options = {}, existingTree = null,
                     receiverType: indexedReceiverType,
                     receiverTypeSource: 'annotation',
                     receiverTypeEvidence: typeOrigin('annotation', receiverNode),
+                }),
+                ...(!directReceiverType && subscriptObject && {
+                    receiverSubscriptObject: subscriptObject.type,
+                    ...(subscriptObject.at != null && { receiverSubscriptObjectAt: subscriptObject.at }),
+                    ...(subscriptObject.line != null && { receiverSubscriptObjectLine: subscriptObject.line }),
                 }),
                 ...(receiverCall && {
                     receiverCall,
@@ -5980,6 +6037,11 @@ function withoutParameterReceiverTypes(call, parameters) {
         if (key.startsWith('receiverType') || key.startsWith('receiverRootType')) continue;
         out[key] = call[key];
     }
+    // The parameter a receiver is declared with (fix #401): each invocation
+    // of the macro types it with the argument it passes there.
+    if (isParameter(call.receiverType) && !call.receiverField) {
+        out.receiverMacroParam = call.receiverType.replace(/^[\s*&]+|[\s*&]+$/g, '');
+    }
     return out;
 }
 
@@ -6003,10 +6065,12 @@ function markDirectiveBodyCalls(code, calls) {
         if (call.inMacroBody || call.macroExpansion) continue;
         const range = ranges.find(candidate => candidate.startLine < call.line && call.line <= candidate.endLine);
         if (!range || call.enclosingFunction) continue;
-        if (withoutParameterReceiverTypes(call, range.params) !== call) {
+        const stripped = withoutParameterReceiverTypes(call, range.params);
+        if (stripped !== call) {
             for (const key of Object.keys(call)) {
                 if (key.startsWith('receiverType') || key.startsWith('receiverRootType')) delete call[key];
             }
+            if (stripped.receiverMacroParam) call.receiverMacroParam = stripped.receiverMacroParam;
         }
         call.inMacroBody = true;
         if (range.params.has(call.name)) call.macroParameter = true;

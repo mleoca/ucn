@@ -901,7 +901,16 @@ function clearAllCaches() {
 // records with a `targetSlot` (files list their `targetTypedKeys`), C# types
 // record `primaryParams`; Python bound-method reads assigned to a name
 // (`loads = registry.loads`) are method-value records.
-const CACHE_FORMAT_VERSION = 271;
+// v272 (fix #401): Rust receivers typed through std deref wrappers carry the
+// target type with the wrapper chain on their evidence (`derefVia`), statics
+// record `valueDerefVia`, array literal receivers are 'array'; C++ subscript
+// receivers of class objects record `receiverSubscriptObject`, macro-body
+// receivers declared with a macro parameter `receiverMacroParam`, and
+// `T v(X());` initializer calls are `declarationReading` records; C#
+// target-typed `new(..)` collection elements are typed, argument slots of
+// generic receivers carry `receiverTypeText` (a `~` targetTypedKeys entry);
+// Java `super` calls in enum-constant bodies carry `receiverSuperType`.
+const CACHE_FORMAT_VERSION = 272;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**

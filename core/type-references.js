@@ -2003,6 +2003,16 @@ class TypeReferenceResolver {
 
     resolveCSharpQualified(file, line, text, tok) {
         const entry = this.index.files.get(file);
+        // An `extern alias` qualifier (`Old::Lib.Core.Widget`, fix #401)
+        // names an assembly reference: a project namespace of that spelling
+        // may or may not be the assembly's.
+        const externAlias = /^([A-Za-z_]\w*)::/.exec(text);
+        if (externAlias && externAlias[1] !== 'global') {
+            const rest = text.slice(externAlias[0].length).replace(/<.*?>/g, '');
+            const spelled = this.all.some(d => d.name === this.name &&
+                `${d.namespace || ''}${d.enclosingType ? (d.namespace ? '.' : '') + d.enclosingType : ''}` === rest);
+            return spelled ? { verdict: 'unknown', reason: 'extern-alias' } : { verdict: 'no', reason: 'external-namespace' };
+        }
         let qualifier = text.replace(/<.*?>/g, '').replace(/^global::/, '');
         // A using alias names the qualifier's head.
         const head = qualifier.split('.')[0];

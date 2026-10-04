@@ -74,7 +74,7 @@ function normalizeSymbol(symbol, family, language, kind, owner = null) {
         'returnTypeQualifier', 'returnTypeResolved', 'supertraits', 'ownerGenericBounds', 'ownerSelfArgs', 'implSelfRef', 'implSelfQualifier', 'blanketSelfBounds', 'selfParamKind', 'macroNeverReturns', 'callbackParamTypes', 'iteratorItemType', 'futureReturn',
         'returnedConcreteType', 'returnedConstructors', 'templateDependent',
         'returnedCallStart', 'returnedCallEnd',
-        'returnedReceiverPath', 'valueType',
+        'returnedReceiverPath', 'valueType', 'valueDerefVia',
         'isSpecialization',
         'linkage', 'functionLike', 'callableAlias', 'exportedAlias',
         'aliasOwner', 'aliasMember', 'callableTarget', 'macroParamEffects',

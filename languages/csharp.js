@@ -1079,6 +1079,10 @@ function implicitCreationTarget(node) {
     };
     const parent = node.parent;
     if (!parent) return null;
+    // An element of a collection initializer or collection expression (fix
+    // #401): the element type of the collection's written type.
+    const element = collectionElementSlot(node);
+    if (element) return typeOf(collectionElementType(element.collectionType, element.position));
     if (parent.type === 'variable_declarator') {
         const declaration = parent.parent;
         return declaration?.type === 'variable_declaration' ? typeOf(declaration.childForFieldName('type')) : null;
@@ -1116,6 +1120,73 @@ function implicitCreationTarget(node) {
             return typeOf(returns);
         }
         if (owner.type === 'constructor_declaration' || TYPE_DECLARATIONS.has(owner.type)) return null;
+    }
+    return null;
+}
+
+// Collection types whose initializer elements and collection-expression
+// elements are their single type argument (the Add(T) / builder element),
+// and dictionaries whose `{ k, v }` element pairs are their two (fix #401).
+const CSHARP_ELEMENT_COLLECTIONS = new Set(['List', 'IList', 'ICollection', 'IEnumerable',
+    'IReadOnlyList', 'IReadOnlyCollection', 'HashSet', 'ISet', 'IReadOnlySet', 'SortedSet', 'Collection',
+    'ReadOnlyCollection', 'ImmutableArray', 'ImmutableList', 'ImmutableHashSet', 'Span', 'ReadOnlySpan']);
+const CSHARP_PAIR_COLLECTIONS = new Set(['Dictionary', 'SortedDictionary', 'SortedList']);
+
+/**
+ * The collection a target-typed `new(..)` is an element of (fix #401):
+ * `new List<T> { new(..) }`, `new Dictionary<K, V> { { new(..), new(..) } }`
+ * and collection expressions (`List<T> xs = [new(..)]`, parsed as an element
+ * binding by the grammar). { collectionType, position } or null; position is
+ * the index inside a dictionary's `{ k, v }` pair, else 0.
+ */
+function collectionElementSlot(node) {
+    const parent = node.parent;
+    if (!parent) return null;
+    if (parent.type === 'initializer_expression') {
+        const owner = parent.parent;
+        if (owner?.type === 'object_creation_expression') {
+            return { collectionType: owner.childForFieldName('type'), position: -1 };
+        }
+        if (owner?.type === 'initializer_expression' && owner.parent?.type === 'object_creation_expression') {
+            const position = parent.namedChildren.findIndex(child => sameNode(child, node));
+            return { collectionType: owner.parent.childForFieldName('type'), position, pair: true };
+        }
+        return null;
+    }
+    const holder = parent.type === 'argument' ? parent.parent
+        : parent.type === 'collection_expression' ? parent : null;
+    if (!holder || (holder.type !== 'element_binding_expression' && holder.type !== 'collection_expression')) return null;
+    const declarator = holder.parent;
+    if (declarator?.type === 'variable_declarator') {
+        const declaration = declarator.parent;
+        return declaration?.type === 'variable_declaration'
+            ? { collectionType: declaration.childForFieldName('type'), position: -1 } : null;
+    }
+    const value = holder.parent?.type === 'equals_value_clause' ? holder.parent.parent : holder.parent;
+    if (value?.type === 'property_declaration') {
+        return { collectionType: value.childForFieldName('type'), position: -1 };
+    }
+    return null;
+}
+
+/** The element type node of a written collection type, or null. */
+function collectionElementType(typeNode, position) {
+    let current = typeNode;
+    if (current?.type === 'nullable_type') current = current.namedChild(0);
+    if (!current) return null;
+    if (current.type === 'array_type') {
+        return position === -1 && !current.namedChildren.some(child =>
+            child.type === 'array_rank_specifier' && child.text.includes(',')) ? current.namedChild(0) : null;
+    }
+    const generic = current.type === 'generic_name' ? current
+        : current.type === 'qualified_name' && current.namedChildren.at(-1)?.type === 'generic_name'
+            ? current.namedChildren.at(-1) : null;
+    const base = generic?.namedChild(0)?.text;
+    const args = (generic?.namedChildren.find(child => child.type === 'type_argument_list')?.namedChildren || [])
+        .filter(child => !child.type.endsWith('comment'));
+    if (CSHARP_ELEMENT_COLLECTIONS.has(base) && args.length === 1 && position === -1) return args[0];
+    if (CSHARP_PAIR_COLLECTIONS.has(base) && args.length === 2 && (position === 0 || position === 1)) {
+        return args[position];
     }
     return null;
 }
@@ -1671,6 +1742,9 @@ function normalizeReceiverType(raw) {
     if (!raw) return null;
     let value = String(raw).trim().replace(/\?$/, '');
     if (value.endsWith('[]')) return { name: 'Array', namespace: 'System' };
+    // An `extern alias` qualifier names an assembly reference whose types
+    // this index cannot attribute (fix #401): no receiver type.
+    if (/^(?!global::)[A-Za-z_]\w*::/.test(value)) return null;
     value = value.replace(/^global::/, '').replace(/::/g, '.');
     const match = value.match(/^([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*(?:<.*>)?$/s);
     if (!match) return null;
@@ -2404,6 +2478,12 @@ function findCallsInTree(code, parser, tree, reaches = null) {
                 (node.type === 'implicit_object_creation_expression' ? implicitCreationTarget(node) : null);
             const slot = !typeNode && node.type === 'implicit_object_creation_expression'
                 ? implicitCreationSlot(node) : null;
+            // A generic receiver's written type (fix #401): `Box<Item> b;
+            // b.Put(new(..))` binds `Put(T)` with the receiver's T.
+            if (slot?.kind === 'argument' && slot.instance && slot.receiverName) {
+                const receiverText = String(typesAt(node)?.get(slot.receiverName) || '');
+                if (/^[A-Za-z_][\w.]*<.+>$/s.test(receiverText)) slot.receiverTypeText = receiverText;
+            }
             // `x = new(..)` to a local or parameter: its static type (an
             // untyped local is no member of the class either).
             const localSlot = slot?.kind === 'member' && !slot.this &&

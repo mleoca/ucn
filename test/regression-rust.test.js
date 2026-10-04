@@ -8117,3 +8117,228 @@ describe('fix #399: Rust method probe and configuration-alternative types', () =
         } finally { rm(dir); }
     });
 });
+
+describe('fix #401: Rust deref wrappers, owned flow values, array and shadowed receivers', () => {
+    const cargo = { 'Cargo.toml': '[package]\nname = "f401"\nversion = "0.1.0"\nedition = "2021"\n' };
+    const at = entries => (entries || []).map(entry => `${entry.relativePath || entry.file}:${entry.line}`).sort();
+    const calleesAt = (index, name, file, line) => {
+        const ctx = index.context(name, { file, line });
+        return { confirmed: (ctx.callees || []).map(c => `${c.relativePath}:${c.startLine}`).sort(),
+            unverified: (ctx.unverifiedCallees || []).map(c => `${c.name}:${c.reason}`).sort() };
+    };
+    const excluded = (index, name, file, line) => {
+        const result = execute(index, 'context', { name: `${file}:${line}:${name}` });
+        assert.ok(result.ok, JSON.stringify(result.error));
+        return result.result.meta.account.excluded.byReason || {};
+    };
+
+    it('a receiver behind a std deref wrapper reaches its target type, except names the wrapper supplies', () => {
+        const dir = tmp({
+            ...cargo,
+            'src/lib.rs': [
+                'use std::mem::ManuallyDrop;',                               // 1
+                'use std::sync::{Arc, LazyLock};',                           // 2
+                'pub struct Store { n: usize }',                             // 3
+                'impl Store {',                                              // 4
+                '    pub fn new() -> Store { Store { n: 0 } }',              // 5
+                '    pub fn kind(&self) -> usize { self.n }',                // 6
+                '    pub fn clone(&self) -> Store { Store { n: self.n } }',  // 7
+                '    pub fn freeze(self) -> usize {',                        // 8
+                '        let held = ManuallyDrop::new(self);',               // 9
+                '        held.kind()',                                       // 10
+                '    }',                                                     // 11
+                '}',                                                         // 12
+                'static GLOBAL: LazyLock<Store> = LazyLock::new(Store::new);', // 13
+                'fn make() -> Store { Store::new() }',                       // 14
+                'fn bytes() -> Vec<u8> { Vec::new() }',                      // 15
+                'pub fn annotated(p: Arc<Store>, q: &Box<Store>) -> usize {', // 16
+                '    let copy = p.clone();',                                 // 17
+                '    let boxed = q.clone();',                                // 18
+                '    p.kind() + q.kind() + GLOBAL.kind() + copy.kind() + boxed.kind()', // 19
+                '}',                                                         // 20
+                'pub fn produced() -> usize {',                              // 21
+                '    let a = ManuallyDrop::new(make());',                    // 22
+                '    let v = ManuallyDrop::new(bytes());',                   // 23
+                '    a.kind() + v.len()',                                    // 24
+                '}',                                                         // 25
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const kind = index.context('kind', { file: 'src/lib.rs', line: 6 });
+            assert.deepStrictEqual(at(kind.callers),
+                ['src/lib.rs:10', 'src/lib.rs:19', 'src/lib.rs:19', 'src/lib.rs:19', 'src/lib.rs:19',
+                    'src/lib.rs:19', 'src/lib.rs:24'],
+                'ManuallyDrop, Arc and its clone, &Box and its clone, a LazyLock static and a wrapped producer reach Store');
+            assert.ok(!excluded(index, 'kind', 'src/lib.rs', 6)['receiver-type-mismatch'],
+                'no wrapper-typed receiver is excluded');
+            const clone = index.context('clone', { file: 'src/lib.rs', line: 7 });
+            assert.deepStrictEqual(at(clone.callers), [], '`arc.clone()` is the Arc');
+            assert.deepStrictEqual(at(clone.unverifiedCallers), ['src/lib.rs:18'],
+                "Box's conditional Clone may be selected: visible, never confirmed");
+            assert.deepStrictEqual(calleesAt(index, 'freeze', 'src/lib.rs', 8).confirmed, ['src/lib.rs:6']);
+        } finally { rm(dir); }
+    });
+
+    it('a wrapper name the project declares keeps its own type', () => {
+        const dir = tmp({
+            ...cargo,
+            'src/lib.rs': [
+                'pub struct Box<T>(T);',                                     // 1
+                'impl<T> Box<T> { pub fn peek(&self) -> usize { 1 } }',      // 2
+                'pub struct Store;',                                         // 3
+                'impl Store { pub fn peek(&self) -> usize { 0 } }',          // 4
+                'pub fn run(b: Box<Store>) -> usize { b.peek() }',           // 5
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(at(index.context('peek', { file: 'src/lib.rs', line: 4 }).callers), []);
+            assert.ok(excluded(index, 'peek', 'src/lib.rs', 4)['receiver-type-mismatch'],
+                "the project's Box owns the call");
+        } finally { rm(dir); }
+    });
+
+    it('a local typed by a producer returning Self is owned: the owned impl is selected on both sides', () => {
+        const dir = tmp({
+            ...cargo,
+            'src/lib.rs': [
+                'pub struct M(Vec<u32>);',                                       // 1
+                'impl M { pub fn new() -> Self { M(Vec::new()) } }',             // 2
+                'impl IntoIterator for M {',                                     // 3
+                '    type Item = u32;',                                          // 4
+                '    type IntoIter = std::vec::IntoIter<u32>;',                  // 5
+                '    fn into_iter(self) -> Self::IntoIter { self.0.into_iter() }', // 6
+                '}',                                                             // 7
+                "impl<'a> IntoIterator for &'a M {",                             // 8
+                "    type Item = &'a u32;",                                      // 9
+                "    type IntoIter = std::slice::Iter<'a, u32>;",                // 10
+                '    fn into_iter(self) -> Self::IntoIter { self.0.iter() }',     // 11
+                '}',                                                             // 12
+                'pub fn drain() -> usize {',                                     // 13
+                '    let m = M::new();',                                         // 14
+                '    m.into_iter().count()',                                     // 15
+                '}',                                                             // 16
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(at(index.context('into_iter', { file: 'src/lib.rs', line: 6 }).callers),
+                ['src/lib.rs:15']);
+            const byRef = index.context('into_iter', { file: 'src/lib.rs', line: 11 });
+            assert.deepStrictEqual(at(byRef.callers), []);
+            assert.deepStrictEqual(at(byRef.unverifiedCallers), []);
+            assert.deepStrictEqual(calleesAt(index, 'drain', 'src/lib.rs', 13).confirmed,
+                ['src/lib.rs:2', 'src/lib.rs:6']);
+        } finally { rm(dir); }
+    });
+
+    it('`Self::ctor(..)` types the local with the impl type; array literals are arrays', () => {
+        const dir = tmp({
+            ...cargo,
+            'src/lib.rs': [
+                'pub struct S(Vec<u32>);',                                       // 1
+                'impl S { pub fn with_capacity(n: usize) -> Self { S(Vec::with_capacity(n)) } }', // 2
+                'impl Extend<u32> for S {',                                      // 3
+                '    fn extend<I: IntoIterator<Item = u32>>(&mut self, it: I) { for x in it { self.0.push(x); } }', // 4
+                '}',                                                             // 5
+                "impl<'a> Extend<&'a u32> for S {",                              // 6
+                "    fn extend<I: IntoIterator<Item = &'a u32>>(&mut self, it: I) { for x in it { self.0.push(*x); } }", // 7
+                '}',                                                             // 8
+                'impl S {',                                                      // 9
+                '    pub fn build(v: Vec<u32>) -> Self {',                       // 10
+                '        let mut s = Self::with_capacity(v.len());',             // 11
+                '        s.extend(v);',                                          // 12
+                '        s',                                                     // 13
+                '    }',                                                         // 14
+                '    pub fn into_iter(self) -> std::vec::IntoIter<u32> { self.0.into_iter() }', // 15
+                '}',                                                             // 16
+                'pub fn arrays() -> usize { [1u32, 2].into_iter().count() }',    // 17
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const extend = index.context('extend', { file: 'src/lib.rs', line: 4 });
+            assert.deepStrictEqual(at(extend.unverifiedCallers), ['src/lib.rs:12'],
+                'the receiver is S: one of its Extend impls, visible');
+            assert.ok(!excluded(index, 'extend', 'src/lib.rs', 4)['receiver-type-mismatch']);
+            assert.deepStrictEqual(at(index.context('into_iter', { file: 'src/lib.rs', line: 15 }).callers), []);
+            assert.ok(excluded(index, 'into_iter', 'src/lib.rs', 15)['receiver-type-mismatch'],
+                'an array literal never calls a struct method');
+        } finally { rm(dir); }
+    });
+
+    it('calls in the item bodies of an outside macro are read from the items, also when a project macro emits them', () => {
+        const dir = tmp({
+            ...cargo,
+            'src/lib.rs': [
+                'pub struct Map { n: usize }',                                       // 1
+                'impl Map {',                                                        // 2
+                '    pub fn new() -> Map { Map { n: 0 } }',                          // 3
+                '    pub fn insert(&mut self, k: u32) { self.n += k as usize; }',    // 4
+                '}',                                                                 // 5
+                'pub struct Other;',                                                 // 6
+                'impl Other { pub fn insert(&mut self, _k: u32) {} }',              // 7
+            ].join('\n') + '\n',
+            'tests/quick.rs': [
+                'use f401::Map;',                                                    // 1
+                'macro_rules! props {',                                              // 2
+                '    ($(fn $name:ident($($arg:ident : $ty:ty),*) -> $ret:ty { $($code:tt)* })*) => (', // 3
+                '        quickcheck::quickcheck! {',                                 // 4
+                '            $(fn $name($($arg: $ty),*) -> $ret { $($code)* })*',    // 5
+                '        }',                                                         // 6
+                '    )',                                                             // 7
+                '}',                                                                 // 8
+                'props! {',                                                          // 9
+                '    fn contains(insert: Vec<u32>) -> bool {',                       // 10
+                '        let mut map = Map::new();',                                 // 11
+                '        for &key in &insert {',                                     // 12
+                '            map.insert(key);',                                      // 13
+                '        }',                                                         // 14
+                '        true',                                                      // 15
+                '    }',                                                             // 16
+                '}',                                                                 // 17
+                'quickcheck::quickcheck! {',                                         // 18
+                '    fn direct(insert: Vec<u32>) -> bool {',                         // 19
+                '        let mut map = Map::new();',                                 // 20
+                '        map.insert(1);',                                            // 21
+                '        insert.is_empty()',                                         // 22
+                '    }',                                                             // 23
+                '}',                                                                 // 24
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            const insert = index.context('insert', { file: 'src/lib.rs', line: 4 });
+            assert.deepStrictEqual(at(insert.callers), ['tests/quick.rs:13', 'tests/quick.rs:21']);
+            assert.deepStrictEqual(at(insert.unverifiedCallers), []);
+            const direct = index.symbols.get('direct').find(d => d.relativePath === 'tests/quick.rs');
+            const callees = index.findCallees(direct, { collectAccount: true, includeMethods: true });
+            assert.deepStrictEqual(callees.map(c => `${c.name}:${c.startLine}`).sort(), ['insert:4', 'new:3']);
+        } finally { rm(dir); }
+    });
+
+    it('an untyped `let` hides the type of an outer binding of the name', () => {
+        const dir = tmp({
+            ...cargo,
+            'src/lib.rs': [
+                'pub struct Bench;',                                         // 1
+                'impl Bench { pub fn iter<F: FnMut()>(&mut self, mut f: F) { f() } }', // 2
+                'pub struct Bytes;',                                         // 3
+                'impl Bytes { pub fn slice(&self) -> usize { 0 } }',         // 4
+                'fn make() -> Bytes { Bytes }',                              // 5
+                'pub fn bench(b: &mut Bench) {',                             // 6
+                '    b.iter(|| {',                                           // 7
+                '        let b = make();',                                   // 8
+                '        b.slice();',                                        // 9
+                '    })',                                                    // 10
+                '}',                                                         // 11
+            ].join('\n') + '\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(at(index.context('slice', { file: 'src/lib.rs', line: 4 }).callers),
+                ['src/lib.rs:9'], 'the closure-local `b` is the Bytes, not the outer Bench');
+        } finally { rm(dir); }
+    });
+});

@@ -60,6 +60,8 @@ function targetTypedKeysOf(calls) {
         if (!slot) continue;
         if (!keys) keys = new Set();
         for (const key of [slot.ownerName, slot.receiverName, slot.member]) if (key) keys.add(key);
+        // A generic receiver's written type (fix #401) is its own key.
+        if (slot.receiverTypeText) keys.add(`~${slot.receiverTypeText}`);
     }
     return keys ? [...keys].sort() : null;
 }
@@ -171,7 +173,7 @@ const OPTIONAL_SYMBOL_FIELDS = Object.freeze([
     'returnTypeQualifier', 'returnTypeResolved', 'supertraits', 'ownerGenericBounds', 'ownerSelfArgs', 'implSelfRef', 'implSelfQualifier', 'blanketSelfBounds', 'selfParamKind', 'macroNeverReturns', 'callbackParamTypes', 'iteratorItemType', 'futureReturn',
     'returnedConcreteType', 'returnedConstructors', 'templateDependent',
     'returnedCallStart', 'returnedCallEnd',
-    'returnedReceiverPath', 'valueType',
+    'returnedReceiverPath', 'valueType', 'valueDerefVia',
     'isSpecialization',
     'linkage', 'functionLike', 'callableAlias', 'exportedAlias',
     'aliasOwner', 'aliasMember', 'callableTarget', 'macroParamEffects',
