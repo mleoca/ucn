@@ -3049,9 +3049,13 @@ describe('fix #382: discovery keeps tracked files and discloses git failures', (
             ].join('\n') + '\n',
             'pkg/.gitignore': 'local.py\n/anchored.py\n*.tmp.py\n!important.tmp.py\n',
         };
+        // Every input here has one verdict in every git version. A `**` run
+        // that is not a whole path segment changed in git 2.52 (`a**/b`
+        // stopped matching `ab`); those cases are asserted against the
+        // documented semantics in the fix #404 test below.
         const paths = [
             'root-only', 'sub/root-only', 'build', 'sub/build', 'buildfile', 'x.log', 'keep.log',
-            'docs/tmp', 'docs/a/b/tmp', 'ab', 'a/b', 'ax/y/b', 'ay', 'bx', 'b/x', 'gen/drop.py',
+            'docs/tmp', 'docs/a/b/tmp', 'a/b', 'ax/y/b', 'ay', 'bx', 'b/x', 'gen/drop.py',
             'gen/keep', 'deep/re.py', 'deep/other.py', 'sp ace', '#hash', 'CR', '1st.py',
             'az.py', 'dz.py', 'xyz.py', 'x/z.py', 'dir/in.py', 'dir', 'q/any', 'any', 'w*', 'wx',
             'pkg/local.py', 'pkg/sub/local.py', 'pkg/anchored.py', 'pkg/sub/anchored.py',
@@ -3089,7 +3093,7 @@ describe('fix #382: discovery keeps tracked files and discloses git failures', (
                 rules.isIgnored(rel, dirs.has(rel)) !== expected.get(rel));
             assert.deepEqual(mismatches, [], 'every verdict equals git check-ignore');
             // Spot-check the semantics the old flattened patterns got wrong.
-            assert.equal(expected.get('ab'), true, 'git matches a**/b after its literal prefix');
+            assert.equal(expected.get('a/b'), true, 'a**/b matches with an empty star');
             assert.equal(expected.get('bx'), true, 'a bracket holding "/" is still one path segment');
             assert.equal(expected.get('buildfile'), false);
             assert.equal(expected.get('deep/re.py'), true, 'no re-include below an excluded directory');
@@ -3153,5 +3157,51 @@ describe('fix #382: discovery keeps tracked files and discloses git failures', (
             path.relative = original;
             rm(dir);
         }
+    });
+});
+
+// ============================================================================
+// fix #404: a run of asterisks that is not a whole path segment is an ordinary
+// `*`, which never matches '/'. gitignore(5): "Other consecutive asterisks are
+// considered regular asterisks"; wildmatch gives `**` its meaning only when the
+// run starts the pattern or follows '/', and ends it or precedes '/'. Git 2.52
+// applies this to path rules after their literal prefix too (match_pathname
+// hands wildmatch one prefix character; t0008 "** not confused by matching
+// leading prefix": `foo**/bar` ignores foo/bar, not foobar). Older git
+// wildmatched the rest from its own start, so `a**/b` matched `ab` there, so
+// these verdicts are asserted directly, never against the installed git.
+// ============================================================================
+describe('fix #404: a ** run that is not a whole path segment is an ordinary *', () => {
+    const { IgnoreRules } = require('../core/ignore-rules');
+    const verdicts = (content, paths, dirs = new Set()) => {
+        const rules = new IgnoreRules([{ base: '', content }]);
+        return Object.fromEntries(paths.map(rel => [rel, rules.isIgnored(rel, dirs.has(rel))]));
+    };
+
+    it('a**/b is one segment starting with a, then b', () => {
+        assert.deepEqual(verdicts('a**/b\n', ['ab', 'a/b', 'ax/b', 'ax/y/b', 'a/x/b', 'xa/b', 'b']), {
+            'ab': false, 'a/b': true, 'ax/b': true, 'ax/y/b': false, 'a/x/b': false, 'xa/b': false, 'b': false,
+        });
+        assert.deepEqual(verdicts('foo**/bar\n', ['foobar', 'foo/bar']), { 'foobar': false, 'foo/bar': true });
+        assert.deepEqual(verdicts('a**\\/b\n', ['ab', 'ax/b', 'ax/y/b']),
+            { 'ab': false, 'ax/b': true, 'ax/y/b': false }, 'before an escaped slash');
+        assert.deepEqual(verdicts('a/b**c/d\n', ['a/bc/d', 'a/bxc/d', 'a/bx/yc/d']),
+            { 'a/bc/d': true, 'a/bxc/d': true, 'a/bx/yc/d': false }, 'inside a segment');
+    });
+
+    it('a trailing non-segment run matches names, never the paths below them', () => {
+        // `!x/foo/` re-includes the directory: only a direct match could
+        // exclude x/foo/bar, and `x/foo**` is `x/foo*`.
+        assert.deepEqual(verdicts('x/foo**\n!x/foo/\n', ['x/foo', 'x/foobar', 'x/foo/bar'], new Set(['x/foo'])),
+            { 'x/foo': false, 'x/foobar': true, 'x/foo/bar': false });
+    });
+
+    it('whole-segment ** still spans directories', () => {
+        assert.deepEqual(verdicts('**/b\n', ['b', 'x/b', 'x/y/b', 'xb']),
+            { 'b': true, 'x/b': true, 'x/y/b': true, 'xb': false });
+        assert.deepEqual(verdicts('a/**/b\n', ['a/b', 'a/x/y/b', 'ab']),
+            { 'a/b': true, 'a/x/y/b': true, 'ab': false });
+        assert.deepEqual(verdicts('a/**\n', ['a', 'a/x', 'a/x/y', 'ax/y'], new Set(['a'])),
+            { 'a': false, 'a/x': true, 'a/x/y': true, 'ax/y': false });
     });
 });

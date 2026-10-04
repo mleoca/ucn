@@ -13,10 +13,18 @@
  * path below an excluded directory: git cannot re-include a file whose parent
  * directory is excluded.
  *
+ * A run of asterisks is a globstar only as a whole path segment: at the start
+ * before '/', at the end after '/', or between two '/'. Any other run is an
+ * ordinary `*`, which never matches '/' (gitignore(5): "Other consecutive
+ * asterisks are considered regular asterisks"). Path rules match as git 2.52+
+ * does: a rule `a**` then `/b` matches `a/b` and `ax/b`, never `ab` or
+ * `ax/y/b`.
+ *
  * Matching is compiled per scope: literal basenames sit in a map, `*suffix`
- * rules in a list, path rules in buckets by slash depth (without `**` a rule
- * with k slashes can only match a path with k slashes). A query does no path
- * arithmetic per rule; each scope derives the scope-relative path once.
+ * rules in a list, path rules in buckets by slash depth (without a whole-segment
+ * `**` a rule with k slashes can only match a path with k slashes). A query
+ * does no path arithmetic per rule; each scope derives the scope-relative path
+ * once.
  *
  * Not modeled (same as before this module): .git/info/exclude, the user's
  * core.excludesFile, core.ignorecase, and .gitignore files above the project
@@ -128,6 +136,18 @@ function compileBracket(pattern, start) {
 }
 
 /**
+ * Whether the run of asterisks pattern[start, end) is a globstar: wildmatch
+ * gives `**` its special meaning only when the run starts the pattern or
+ * follows '/', and ends it or precedes '/' (or an escaped '/').
+ */
+function isGlobstar(pattern, start, end) {
+    if (end - start < 2) return false;
+    if (start > 0 && pattern[start - 1] !== '/') return false;
+    return end === pattern.length || pattern[end] === '/' ||
+        (pattern[end] === '\\' && pattern[end + 1] === '/');
+}
+
+/**
  * Regex source for a wildmatch pattern with WM_PATHNAME semantics, or null
  * when the pattern can never match (malformed bracket, dangling escape).
  */
@@ -147,12 +167,14 @@ function wildmatchSource(pattern) {
         } else if (ch === '*') {
             let j = i;
             while (j < n && pattern[j] === '*') j++;
-            if (j - i >= 2 && (i === 0 || pattern[i - 1] === '/')) {
+            if (isGlobstar(pattern, i, j)) {
                 if (j === n) { out += '.*'; i = j; continue; }
                 if (pattern[j] === '/') { out += '(?:.*/)?'; i = j + 1; continue; }
-                if (pattern[j] === '\\' && pattern[j + 1] === '/') { out += '.*'; i = j; continue; }
+                out += '.*'; // before an escaped '/'
+                i = j;
+                continue;
             }
-            out += '[^/]*';
+            out += '[^/]*'; // any other run is one `*`
             i = j;
         } else if (ch === '[') {
             const bracket = compileBracket(pattern, i);
@@ -168,8 +190,8 @@ function wildmatchSource(pattern) {
 }
 
 /**
- * Number of '/' a path rule requires (bracket expressions never match '/'),
- * or -1 when `**` may span directories.
+ * Number of '/' a path rule requires (brackets, `?` and `*` never match
+ * '/'), or -1 when a globstar may span directories.
  */
 function slashDepth(pattern) {
     let depth = 0;
@@ -182,19 +204,16 @@ function slashDepth(pattern) {
             const bracket = compileBracket(pattern, i);
             if (!bracket) return -1;
             i = bracket.end - 1;
-        } else if (ch === '*' && pattern[i + 1] === '*') {
-            return -1;
+        } else if (ch === '*') {
+            let j = i + 1;
+            while (j < pattern.length && pattern[j] === '*') j++;
+            if (isGlobstar(pattern, i, j)) return -1;
+            i = j - 1;
         } else if (ch === '/') {
             depth++;
         }
     }
     return depth;
-}
-
-/** Git's simple_length: characters before the first glob-special one. */
-function literalPrefixLength(pattern) {
-    const match = GLOB_SPECIAL.exec(pattern);
-    return match ? match.index : pattern.length;
 }
 
 /** Git's trim_trailing_spaces: unescaped trailing spaces only. */
@@ -254,16 +273,13 @@ function parseRules(content) {
             else rule.regex = new RegExp('^' + source + '$');
         } else {
             // match_pathname compares the literal prefix, then wildmatches
-            // the REST from its own start, so a `**` right after the prefix
-            // counts as leading (`a**/b` matches `ab`, as git does).
-            const prefix = literalPrefixLength(pattern);
-            const source = wildmatchSource(pattern.slice(prefix));
+            // from the prefix's last character (git 2.52+), which equals
+            // wildmatching the whole pattern: a `**` right after the prefix
+            // is no globstar. Before 2.52 git wildmatched the rest from its
+            // own start, so `a**/b` also matched `ab` and `ax/y/b`.
+            const source = wildmatchSource(pattern);
             if (source === null) rule.never = true;
-            else {
-                let literal = '';
-                for (const ch of pattern.slice(0, prefix)) literal += escapeRegexChar(ch);
-                rule.regex = new RegExp('^' + literal + source + '$');
-            }
+            else rule.regex = new RegExp('^' + source + '$');
             rule.depth = slashDepth(pattern);
         }
         rules.push(rule); // never-matching rules keep file-order indices
@@ -283,7 +299,7 @@ class IgnoreScope {
         this.suffixes = [];          // `*literal` basename rules
         this.basenameGlobs = [];     // other basename rules
         this.pathByDepth = new Map(); // slash depth -> path rules
-        this.pathAnyDepth = [];      // path rules with `**`
+        this.pathAnyDepth = [];      // path rules with a globstar
         for (const rule of rules) {
             if (rule.never) continue;
             if (rule.basename) {
