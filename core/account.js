@@ -311,7 +311,7 @@ function classifyGroundLines(index, name, groundSet, claimedKeys) {
         if (!defLinesByFile.has(def.file)) defLinesByFile.set(def.file, new Set());
         defLinesByFile.get(def.file).add(def.startLine);
     }
-    let getCachedCalls = null; // lazy require to avoid cycle at module load
+    let getCachedCallsBearing = null; // lazy require to avoid cycle at module load
 
     for (const [filePath, lineNumbers] of groundSet.perFile) {
         let unclaimed = null;
@@ -324,9 +324,10 @@ function classifyGroundLines(index, name, groundSet, claimedKeys) {
         const fileEntry = index.files.get(filePath);
         const relativePath = fileEntry ? fileEntry.relativePath : path.relative(index.root, filePath);
 
-        // Cheap pass: calls cache + symbol table
-        if (!getCachedCalls) getCachedCalls = require('./callers').getCachedCalls;
-        const cachedCalls = getCachedCalls(index, filePath);
+        // Cheap pass: calls cache + symbol table (only records bearing the
+        // name on unclaimed lines are read below).
+        if (!getCachedCallsBearing) getCachedCallsBearing = require('./callers').getCachedCallsBearing;
+        const cachedCalls = getCachedCallsBearing(index, filePath, name, new Set(unclaimed));
         const callLines = new Set();
         if (Array.isArray(cachedCalls)) {
             for (const c of cachedCalls) {

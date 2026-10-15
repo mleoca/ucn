@@ -843,6 +843,11 @@ function runProjectCommand(rootDir, command, arg) {
         // On cache-hit runs, only re-save if callsCache was mutated OR
         // reachability was computed (MED-1: persists the BFS result so
         // subsequent cold invocations don't repeat the 7-11s tax).
+        // Files whose macro-expansion calls the command derived in part are
+        // derived whole first, so the next invocation reads them persisted.
+        if (flags.cache) {
+            try { index.completeMacroCallDerivations(); } catch (e) { /* best-effort */ }
+        }
         if (flags.cache && (needsCacheSave || index.callsCacheDirty || index.reachabilityDirty || index.computedDispatchDirty || index.macroExpansionDirty)) {
             try { index.saveCache(); } catch (e) { /* best-effort */ }
         }

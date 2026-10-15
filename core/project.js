@@ -2932,6 +2932,14 @@ class ProjectIndex {
     /** Save index to cache file */
     saveCache(cachePath) { return indexCache.saveCache(this, cachePath); }
 
+    /**
+     * Derive whole the Rust files whose macro-expansion calls were derived
+     * in part (fix #405), so a saved cache holds them. Returns the count.
+     */
+    completeMacroCallDerivations() {
+        return this._rustMacroState ? require('./rust-macro-expansion').completeRustMacroCalls(this) : 0;
+    }
+
     /** Load index from cache file */
     /**
      * Build under the cross-process build lock (fix #354) and save the cache.

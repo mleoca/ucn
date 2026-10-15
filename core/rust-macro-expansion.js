@@ -96,6 +96,8 @@ function createState(index, inventory = null) {
         textualMemo: new Map(),
         productive: new Map(),
         hygieneSeq: 0,
+        contexts: new Map(),     // file -> calls-pass context (fix #405)
+        resolved: new Map(),     // invocation -> resolveMacro answer
     };
 }
 
@@ -317,6 +319,13 @@ function lineOffset(state, file, line) {
     return starts[Math.min(Math.max(line - 1, 0), starts.length - 1)];
 }
 
+/** Offset just past `line` (its newline included), or the content's end. */
+function lineEndOffset(state, file, line) {
+    lineOffset(state, file, 1);
+    const starts = state.lineStarts.get(file);
+    return line < starts.length ? starts[line] : (readContent(state, file) || '').length;
+}
+
 function pickLatest(candidates) {
     return candidates.reduce((best, candidate) => (!best || candidate.pos > best.pos ? candidate : best), null);
 }
@@ -327,6 +336,16 @@ function pickLatest(candidates) {
  * in scope).
  */
 function resolveMacro(state, file, offset, line, name, qualifier, dollarCratePackage) {
+    // An invocation's answer is asked again by the pass that expands it
+    // (fix #405: fileMayExpand resolved every invocation first).
+    const key = `${file}\0${offset}\0${line}\0${name}\0${qualifier || ''}\0${dollarCratePackage || ''}`;
+    if (state.resolved.has(key)) return state.resolved.get(key);
+    const result = resolveMacroUncached(state, file, offset, line, name, qualifier, dollarCratePackage);
+    state.resolved.set(key, result);
+    return result;
+}
+
+function resolveMacroUncached(state, file, offset, line, name, qualifier, dollarCratePackage) {
     const all = state.inventory.get(name);
     if (!all || all.length === 0) return null;
     const inPackage = pkgRoot => all.filter(def => packageOf(state, def.file)?.root === pkgRoot);
@@ -949,7 +968,8 @@ function buildSynthetic(content, regions, keep) {
         region.synthStart = text.length;
         text += region.layout.text;
         region.synthEnd = text.length;
-        addSpan(region.synthStart, region.synthEnd);
+        // A stand-in for an expansion another group reads keeps its length.
+        if (!region.blank) addSpan(region.synthStart, region.synthEnd);
         cursor = region.end;
     }
     copy(cursor, content.length);
@@ -1244,24 +1264,13 @@ function macroFact(region, origin) {
 }
 
 /**
- * Expand the project macro invocations of one file. Returns the expansion
- * record, or null when the file invokes no project macro in scope.
+ * The invocations of a file the expansion pass reads, in document order:
+ * project macros in scope that are worth expanding. Invocations without a
+ * context or token tree are recorded blind in `rec`.
  */
-function expandFile(state, filePath, mode = 'symbols') {
-    // Hygiene contexts are numbered per file, so an expansion's renamed
-    // locals do not depend on what else this state expanded before.
-    state.hygieneSeq = 0;
-    const index = state.index;
-    const fileEntry = index.files.get(filePath);
-    const content = readContent(state, filePath);
-    if (!fileEntry || content === null) return null;
-    if (!fileMayExpand(state, filePath)) return { sites: 0, blind: [], used: new Map(), expanded: false };
-    const tree = safeParse(state.parser, content, undefined, PARSE_OPTIONS);
-    const rec = { sites: 0, blind: [], used: new Map(), expanded: false };
-    const regions = [];
-    let lineStarts = null;
-    const invocations = tree.rootNode.descendantsOfType('macro_invocation');
-    for (const node of invocations) {
+function plannedInvocations(state, filePath, content, tree, rec) {
+    const plan = [];
+    for (const node of tree.rootNode.descendantsOfType('macro_invocation')) {
         const id = invocationName(node);
         if (!id || !state.inventory.has(id.name)) continue;
         let inDefinition = false;
@@ -1279,53 +1288,84 @@ function expandFile(state, filePath, mode = 'symbols') {
             context === 'expr')) continue;
         const tokenTree = node.namedChildren.find(child => child.type === 'token_tree');
         if (info.compiled?.passThroughItems && context === 'items' && itemRecoveryPosition(node)) continue;
-        const blind = reason => rec.blind.push({ line, macro: id.name, reason });
-        if (!context) { blind('context'); continue; }
-        if (!tokenTree) { blind('token-error'); continue; }
-        const site = {
-            file: filePath, offset: node.startIndex, line, budget: MAX_OUTPUT_TOKENS,
-            used: rec.used, nestedBlind: [], ambiguous: resolved.ambiguous,
-        };
-        let tokens;
-        try {
-            if (!lineStarts) {
-                lineOffset(state, filePath, 1);
-                lineStarts = state.lineStarts.get(filePath);
-            }
-            const toks = argTokensOf(tokenTree, content, lineStarts);
-            tokens = resolved.alternatives
-                ? expandAlternatives(state, site, resolved, toks, 0, context)
-                : expandTokens(state, site, def, toks, 0);
-        } catch (error) {
-            if (!(error instanceof MacroBlind)) throw error;
-            blind(error.reason);
-            continue;
+        if (!context) { rec.blind.push({ line, macro: id.name, reason: 'context' }); continue; }
+        if (!tokenTree) { rec.blind.push({ line, macro: id.name, reason: 'token-error' }); continue; }
+        plan.push({ node, id, resolved, def, context, tokenTree, line });
+    }
+    return plan;
+}
+
+/** Expand one planned invocation: its region, or null (recorded blind). */
+function expandPlanned(state, filePath, content, item, rec) {
+    const { node, id, resolved, def, context, tokenTree, line } = item;
+    const site = {
+        file: filePath, offset: node.startIndex, line, budget: MAX_OUTPUT_TOKENS,
+        used: rec.used, nestedBlind: [], ambiguous: resolved.ambiguous,
+    };
+    let tokens;
+    try {
+        lineOffset(state, filePath, 1);
+        const toks = argTokensOf(tokenTree, content, state.lineStarts.get(filePath));
+        tokens = resolved.alternatives
+            ? expandAlternatives(state, site, resolved, toks, 0, context)
+            : expandTokens(state, site, def, toks, 0);
+    } catch (error) {
+        if (!(error instanceof MacroBlind)) throw error;
+        rec.blind.push({ line, macro: id.name, reason: error.reason });
+        return null;
+    }
+    for (const nested of site.nestedBlind) rec.blind.push({ line, macro: nested.macro, reason: `nested:${nested.reason}` });
+    renameHygienicLocals(tokens);
+    let body = tokens;
+    if (context === 'expr') body = wrapExpression(tokens);
+    const startLine = line;
+    const endLine = node.endPosition.row + 1;
+    const ancestors = new Set();
+    for (let parent = node.parent; parent; parent = parent.parent) {
+        const nameNode = parent.type === 'impl_item' ? parent.childForFieldName('type')
+            : DECLARATION_TYPES.includes(parent.type) ? parent.childForFieldName('name') : null;
+        if (nameNode) {
+            ancestors.add(`${parent.startPosition.row + 1}\0${parent.type === 'impl_item' ? typeNameOf(nameNode) : nameNode.text}`);
         }
-        for (const nested of site.nestedBlind) rec.blind.push({ line, macro: nested.macro, reason: `nested:${nested.reason}` });
-        renameHygienicLocals(tokens);
-        let body = tokens;
-        if (context === 'expr') body = wrapExpression(tokens);
-        const startLine = line;
-        const endLine = node.endPosition.row + 1;
-        const ancestors = new Set();
-        for (let parent = node.parent; parent; parent = parent.parent) {
-            const nameNode = parent.type === 'impl_item' ? parent.childForFieldName('type')
-                : DECLARATION_TYPES.includes(parent.type) ? parent.childForFieldName('name') : null;
-            if (nameNode) {
-                ancestors.add(`${parent.startPosition.row + 1}\0${parent.type === 'impl_item' ? typeNameOf(nameNode) : nameNode.text}`);
-            }
-        }
-        regions.push({
-            start: node.startIndex, end: node.endIndex, startLine, endLine,
-            macro: id.name, definition: defKey(def), ambiguous: site.ambiguous, ancestors,
-            node, layout: layout(body, startLine, node.startPosition.column, endLine),
-        });
+    }
+    return {
+        start: node.startIndex, end: node.endIndex, startLine, endLine,
+        macro: id.name, definition: defKey(def), ambiguous: site.ambiguous, ancestors,
+        node, layout: layout(body, startLine, node.startPosition.column, endLine),
+    };
+}
+
+/**
+ * Expand the project macro invocations of one file. Returns the expansion
+ * record, or null when the file invokes no project macro in scope.
+ */
+function expandFile(state, filePath, mode = 'symbols') {
+    // Hygiene contexts are numbered per file, so an expansion's renamed
+    // locals do not depend on what else this state expanded before.
+    state.hygieneSeq = 0;
+    const index = state.index;
+    const fileEntry = index.files.get(filePath);
+    const content = readContent(state, filePath);
+    if (!fileEntry || content === null) return null;
+    if (!fileMayExpand(state, filePath)) return { sites: 0, blind: [], used: new Map(), expanded: false };
+    const tree = safeParse(state.parser, content, undefined, PARSE_OPTIONS);
+    const rec = { sites: 0, blind: [], used: new Map(), expanded: false };
+    const regions = [];
+    // Each expansion's hygiene start and expanded length (fix #405): the
+    // calls pass expands one group of units with the same numbering and
+    // the same offsets as a pass over the whole file.
+    const expansions = mode === 'symbols' ? [] : null;
+    for (const item of plannedInvocations(state, filePath, content, tree, rec)) {
+        const hygiene = state.hygieneSeq;
+        const region = expandPlanned(state, filePath, content, item, rec);
+        if (expansions) expansions.push(item.node.startIndex, hygiene, region ? region.layout.text.length : -1);
+        if (region) regions.push(region);
     }
     rec.sites = regions.length;
     if (regions.length === 0) return rec;
     regions.sort((a, b) => a.start - b.start);
     // Every word the expanded text of the calls pass can hold (fix #375).
-    const words = mode === 'symbols' ? expansionWords(content, regions) : null;
+    const words = mode === 'symbols' ? expansionWords(content, regions, tree) : null;
 
     // Parse the expanded file; an expansion that does not parse in its
     // context stays as written (blind), and the rest are parsed again.
@@ -1356,41 +1396,14 @@ function expandFile(state, filePath, mode = 'symbols') {
     if (regions.length === 0) return rec;
 
     const rust = require('../languages/rust');
-    // The expanded file holds no unexpanded item bodies worth recovering
-    // inside its units; the extractors share the included-ranges tree.
-    rust.primeDeclarationTrees(synthetic, state.parser, synthTree);
     const mapper = offsetMapper(regions);
-
-    // Units are re-derived; everything outside them keeps its parse.
-    // (Sorted and disjoint: binary searches.)
-    const unitAtOffset = offset => {
-        let lo = 0;
-        let hi = units.length - 1;
-        while (lo <= hi) {
-            const mid = (lo + hi) >> 1;
-            if (offset < units[mid].start) hi = mid - 1;
-            else if (offset >= units[mid].end) lo = mid + 1;
-            else return units[mid];
-        }
-        return null;
-    };
-    const byLine = (list, line) => {
-        let lo = 0;
-        let hi = list.length - 1;
-        while (lo <= hi) {
-            const mid = (lo + hi) >> 1;
-            if (line < list[mid].startLine) hi = mid - 1;
-            else if (line > list[mid].endLine) lo = mid + 1;
-            else return list[mid];
-        }
-        return null;
-    };
-    const unitAtLine = line => byLine(units, line);
-    const inUnit = record => (Number.isFinite(record.callStart) ? !!unitAtOffset(record.callStart)
-        : !!unitAtLine(record.line));
+    const lookups = unitLookups(units);
     rec.expanded = true;
 
     if (mode === 'symbols') {
+        // The expanded file holds no unexpanded item bodies worth recovering
+        // inside its units; the extractors share the included-ranges tree.
+        rust.primeDeclarationTrees(synthetic, state.parser, synthTree);
         // Declarations of the regions only: the smallest nodes spanning each.
         const spanning = regions.map(region => (region.synthEnd > region.synthStart
             ? synthTree.rootNode.descendantForIndex(region.synthStart, region.synthEnd - 1) : null))
@@ -1406,39 +1419,177 @@ function expandFile(state, filePath, mode = 'symbols') {
         });
         rec.calleeNames = callableNames(regions);
         rec.words = words;
+        rec.expansions = expansions;
         rec.callsPending = true;
         return rec;
     }
 
     // Calls: records of the units from the expanded file, the rest as parsed,
-    // plus the invocations themselves.
+    // plus the invocations themselves (a derivation context, fix #405).
+    rec.context = callsContext(state, filePath, {
+        content, tree, regions, units, synthetic, synthTree, mapper, lookups,
+    });
+    return rec;
+}
+
+/** Binary-search lookups over sorted, disjoint units. */
+function unitLookups(units) {
+    const unitAtOffset = offset => {
+        let lo = 0;
+        let hi = units.length - 1;
+        while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            if (offset < units[mid].start) hi = mid - 1;
+            else if (offset >= units[mid].end) lo = mid + 1;
+            else return units[mid];
+        }
+        return null;
+    };
+    const unitAtLine = line => byLine(units, line);
+    const inUnit = record => (Number.isFinite(record.callStart) ? !!unitAtOffset(record.callStart)
+        : !!unitAtLine(record.line));
+    return { unitAtOffset, unitAtLine, inUnit };
+}
+
+function byLine(list, line) {
+    let lo = 0;
+    let hi = list.length - 1;
+    while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (line < list[mid].startLine) hi = mid - 1;
+        else if (line > list[mid].endLine) lo = mid + 1;
+        else return list[mid];
+    }
+    return null;
+}
+
+// ── Calls pass (fix #405) ─────────────────────────────────────────────────
+//
+// The calls of an expanded file are the parsed records outside its units,
+// the records each unit yields in the expanded file, and the invocations
+// themselves. Units sharing a line form one group (records without a span
+// are placed by line). The extractor keeps no scope across functions, so a
+// group's records do not depend on the other groups: a query that needs
+// the records bearing one name, or those of a line range, reads only the
+// groups that can hold them, and the file's calls are composed, as one pass
+// derives them, when a consumer needs them all. Where the build recorded
+// every expansion's hygiene start and expanded length, a group expands and
+// parses alone with the numbering and the offsets of the whole file;
+// otherwise the file's expansions parse in one pass and each group's
+// records are read from that tree with the other units skipped.
+
+/**
+ * Everything the calls pass of a file shares: its regions, units and their
+ * groups, the expanded file and its tree. Per-group records are added as
+ * groups are read.
+ */
+function callsContext(state, filePath, parts) {
+    const { content, tree, regions, units, synthetic, synthTree, mapper, lookups } = parts;
+    const index = state.index;
+    // Units sharing a line form one group.
+    const groups = groupsOf(units);
+    // Unit spans in the expanded file: a unit starts and ends outside every
+    // region, shifted by the regions before it.
+    const toSynth = offset => {
+        let lo = 0;
+        let hi = regions.length - 1;
+        let before = null;
+        while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            if (regions[mid].end <= offset) { before = regions[mid]; lo = mid + 1; } else hi = mid - 1;
+        }
+        return offset + (before ? before.deltaAfter : 0);
+    };
+    for (const unit of units) {
+        unit.synthStart = toSynth(unit.start);
+        unit.synthEnd = toSynth(unit.end);
+    }
     const cached = index.callsCache.get(filePath);
     const original = cached?.calls || [];
-    const invocationStarts = new Set(regions.map(region => region.start));
-    const calls = original.filter(record => !inUnit(record));
-    const seen = new Set();
     // Records without a source span (struct-literal constructors) are placed
     // by line: one the unexpanded parse also has on that line is ordinary
     // code, any other one on an invocation's lines was generated.
-    const spanless = record => `${record.name}\0${record.line}\0${record.isConstructor ? 1 : 0}`;
     const originalSpanless = new Map();
     for (const record of original) {
-        if (Number.isFinite(record.callStart) || !unitAtLine(record.line)) continue;
-        const key = spanless(record);
+        if (Number.isFinite(record.callStart) || !lookups.unitAtLine(record.line)) continue;
+        const key = spanlessKey(record);
         originalSpanless.set(key, (originalSpanless.get(key) || 0) + 1);
     }
+    const rust = require('../languages/rust');
+    return {
+        filePath, content, tree, regions, units, groups, synthetic, synthTree, mapper, lookups,
+        original, originalSpanless, seen: new Set(),
+        itemRecovery: rust.rustExpandedItemRecovery(synthetic, state.parser, synthTree),
+        // An expanded file whose parse holds an error is read in one pass.
+        groupwise: !synthTree.rootNode.hasError,
+        invocations: new Map(),
+        parser: state.parser,
+        live: true,
+    };
+}
+
+function spanlessKey(record) {
+    return `${record.name}\0${record.line}\0${record.isConstructor ? 1 : 0}`;
+}
+
+/** Read the records of the groups `wanted` (indices) not read yet. */
+function readGroups(ctx, wanted) {
+    let targets = wanted.filter(i => ctx.groups[i].records === null);
+    if (targets.length === 0) return;
+    if (ctx.isolated) {
+        readIsolatedGroups(ctx, targets);
+        ctx.readLookups = null;
+        return;
+    }
+    if (!ctx.groupwise) targets = ctx.groups.map((group, i) => i).filter(i => ctx.groups[i].records === null);
+    const target = new Set(targets);
+    const all = target.size === ctx.groups.filter(group => group.records === null).length &&
+        ctx.groups.every(group => group.records === null);
+    const units = ctx.units;
+    // Nodes inside a unit of another group are not read.
+    const skip = all ? null : node => {
+        const start = node.startIndex;
+        let lo = 0;
+        let hi = units.length - 1;
+        while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            const unit = units[mid];
+            if (start < unit.synthStart) hi = mid - 1;
+            else if (start >= unit.synthEnd) lo = mid + 1;
+            else return node.endIndex <= unit.synthEnd && !target.has(unit.group);
+        }
+        return false;
+    };
+    for (const i of targets) ctx.groups[i].records = [];
+    const rust = require('../languages/rust');
+    const synthCalls = rust.findCallsInCode(ctx.synthetic, ctx.parser, {
+        tree: ctx.synthTree, itemRecovery: ctx.itemRecovery, skip,
+    });
+    mergeRecords(ctx, synthCalls, {
+        mapper: ctx.mapper, lookups: ctx.lookups, regions: ctx.regions, synthTree: ctx.synthTree,
+        originalSpanless: ctx.originalSpanless,
+        accept: unit => target.has(unit.group), push: (unit, call) => ctx.groups[unit.group].records.push(call),
+    });
+}
+
+/**
+ * The records an expanded file's parse yields for the accepted units, with
+ * source offsets, expansion facts, and repeats dropped (`ctx.seen`).
+ */
+function mergeRecords(ctx, synthCalls, { mapper, lookups, regions, synthTree, originalSpanless, accept, push }) {
     const regionOnLine = line => byLine(regions, line);
-    const synthCalls = rust.findCallsInCode(synthetic, state.parser);
     for (const record of synthCalls) {
         const synthStart = record.callStart;
+        let unit;
         if (Number.isFinite(synthStart)) {
             const mapped = mapper.map(synthStart, false);
-            if (!unitAtOffset(Math.floor(mapped))) continue;
-        } else if (!unitAtLine(record.line)) continue;
+            unit = lookups.unitAtOffset(Math.floor(mapped));
+        } else unit = lookups.unitAtLine(record.line);
+        if (!unit || !accept(unit)) continue;
         const call = { ...record };
         let region = Number.isFinite(synthStart) ? mapper.regionAt(synthStart) : null;
         if (!Number.isFinite(synthStart) && regionOnLine(record.line)) {
-            const key = spanless(record);
+            const key = spanlessKey(record);
             const left = originalSpanless.get(key) || 0;
             if (left > 0) originalSpanless.set(key, left - 1);
             else region = regionOnLine(record.line);
@@ -1463,24 +1614,70 @@ function expandFile(state, filePath, mode = 'symbols') {
                 : `t\0${call.name}\0${call.line}\0${call.isMethod ? 1 : 0}\0${call.receiver || ''}\0` +
                     `${call.receiverType || ''}\0${call.receiverRootType || ''}\0${call.receiverField || ''}\0` +
                     `${call.enclosingFunction?.name || ''}\0${call.argCount ?? ''}`;
-            if (seen.has(key)) continue;
-            seen.add(key);
+            if (ctx.seen.has(key)) continue;
+            ctx.seen.add(key);
         }
-        calls.push(call);
+        push(unit, call);
     }
-    // The invocation stays a call of the macro; the value it produces is
-    // the expansion's, so its own value-flow facts are dropped.
-    for (const record of original) {
-        if (!record.isMacro || !invocationStarts.has(record.callStart)) continue;
-        calls.push({
-            name: record.name, line: record.line, callStart: record.callStart, callEnd: record.callEnd,
-            isMethod: false, isMacro: true,
-            ...(record.receiver && { receiver: record.receiver, isPathMacro: true }),
-            ...(record.macroExpr && { macroExpr: true }),
-            enclosingFunction: record.enclosingFunction,
-            macroExpanded: true,
-        });
+}
+
+/**
+ * The invocations stay calls of their macros; the value one produces is the
+ * expansion's, so its own value-flow facts are dropped. Built once per
+ * context (the same records in every view and in the composed calls).
+ */
+function invocationRecords(ctx) {
+    // Expanded invocations: every region (one pass), the regions of the
+    // groups read so far (groups read apart).
+    const starts = new Set();
+    if (ctx.isolated) {
+        for (const group of ctx.groups) for (const start of group.starts || []) starts.add(start);
+    } else {
+        for (const region of ctx.regions) starts.add(region.start);
     }
+    const out = [];
+    for (const record of ctx.original) {
+        if (!record.isMacro || !starts.has(record.callStart)) continue;
+        let invocation = ctx.invocations.get(record);
+        if (!invocation) {
+            invocation = {
+                name: record.name, line: record.line, callStart: record.callStart, callEnd: record.callEnd,
+                isMethod: false, isMacro: true,
+                ...(record.receiver && { receiver: record.receiver, isPathMacro: true }),
+                ...(record.macroExpr && { macroExpr: true }),
+                enclosingFunction: record.enclosingFunction,
+                macroExpanded: true,
+            };
+            ctx.invocations.set(record, invocation);
+        }
+        out.push(invocation);
+    }
+    return out;
+}
+
+/** Whether a parsed record lies in a unit of a group read so far (all units, one pass). */
+function inReadUnit(ctx, record) {
+    if (!ctx.isolated) return ctx.lookups.inUnit(record);
+    if (!ctx.readLookups) {
+        const units = [];
+        for (const group of ctx.groups) if (group.units) units.push(...group.units);
+        units.sort((a, b) => a.start - b.start);
+        ctx.readLookups = unitLookups(units);
+    }
+    return ctx.readLookups.inUnit(record);
+}
+
+/**
+ * The calls of the file: parsed records outside the units, each group's
+ * records, the invocations; stable by line. Installed in the calls cache
+ * with the facts the file entry derives from them.
+ */
+function composeCalls(index, ctx) {
+    readGroups(ctx, ctx.groups.map((group, i) => i));
+    const fileEntry = index.files.get(ctx.filePath);
+    const calls = ctx.original.filter(record => !inReadUnit(ctx, record));
+    for (const group of ctx.groups) for (const record of group.records) calls.push(record);
+    for (const record of invocationRecords(ctx)) calls.push(record);
     // Shapes of generated calls whose value may be lost (audit-async).
     const { openCallShape } = require('../languages/rust-value-flow');
     const shapes = calls.filter(call => call.macroExpansion && call.name && !call.inMacro && !call.valueConsumed)
@@ -1490,16 +1687,16 @@ function expandFile(state, filePath, mode = 'symbols') {
     }
     // Stable by line: records keep document order within a line.
     calls.sort((a, b) => a.line - b.line);
+    const cached = index.callsCache.get(ctx.filePath);
     if (cached) {
-        if (index.calleeIndex) index._removeFromCalleeIndex(filePath, original);
+        if (index.calleeIndex) index._removeFromCalleeIndex(ctx.filePath, ctx.original);
         cached.calls = calls;
-        if (index.calleeIndex) index._addToCalleeIndex(filePath, calls);
+        if (index.calleeIndex) index._addToCalleeIndex(ctx.filePath, calls);
     } else {
-        index.callsCache.set(filePath, { mtime: fileEntry.mtime, hash: fileEntry.hash, calls });
+        index.callsCache.set(ctx.filePath, { mtime: fileEntry.mtime, hash: fileEntry.hash, calls });
     }
     index.callsCacheDirty = true;
-    rec.expanded = true;
-    return rec;
+    return calls;
 }
 
 const CALL_NODES = new Set(['call_expression', 'macro_invocation', 'struct_expression', 'generic_function']);
@@ -1621,11 +1818,12 @@ function callableNames(regions) {
     for (const region of regions) {
         const marks = region.layout.marks;
         for (let i = 0; i < marks.length - 1; i++) {
+            const next = marks[i + 1].leaf.v;
+            if (!(next === '(' || next === '!' || next === '{' ||
+                (next === '::' && marks[i + 2]?.leaf.v === '<'))) continue;
             const leaf = marks[i].leaf;
             if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(leaf.v) || RUST_KEYWORDS.has(leaf.v)) continue;
-            const next = marks[i + 1].leaf.v;
-            if (next === '(' || next === '!' || next === '{' ||
-                (next === '::' && marks[i + 2]?.leaf.v === '<')) names.add(leaf.v);
+            names.add(leaf.v);
         }
     }
     return [...names].sort(codeUnitCompare);
@@ -1634,17 +1832,39 @@ function callableNames(regions) {
 const WORD = /[\p{L}\p{N}_]+/gu;
 const WHOLE_WORD = /^[\p{L}\p{N}_]+$/u;
 
+// Tokens whose text is never an identifier: literals and comments.
+const NON_CODE_TOKENS = ['string_literal', 'raw_string_literal', 'char_literal', 'line_comment', 'block_comment'];
+
 /**
  * The words (identifier-like runs) of the text the calls pass analyzes for
  * these regions: the kept source around them (units and their headers) and
  * every expansion's tokens. A call record derived from that text can bear no
  * other name, so a file whose calls are not derived yet needs deriving only
- * for a name among them (fix #375). Space-separated, sorted.
+ * for a name among them (fix #375). A record's name and written receiver are
+ * identifier tokens, so the text of literals and comments is left out (fix
+ * #405: `"--count"` and `// the count` made a `count` query derive four
+ * test files); kept ranges are whole items and headers, which the calls
+ * pass lexes as the file's own parse did. A file with parse errors is read
+ * whole. Space-separated, sorted.
  */
-function expansionWords(content, regions) {
+function expansionWords(content, regions, tree = null) {
     const words = new Set();
-    for (const [start, end] of analysisUnits(regions, 'calls').keep) {
+    const scan = (start, end) => {
+        if (end <= start) return;
         for (const word of content.slice(start, end).match(WORD) || []) words.add(word);
+    };
+    const nonCode = tree && !tree.rootNode.hasError ? tree.rootNode.descendantsOfType(NON_CODE_TOKENS) : [];
+    let next = 0;
+    for (const [start, end] of analysisUnits(regions, 'calls').keep) {
+        let at = start;
+        while (next < nonCode.length && nonCode[next].endIndex <= at) next++;
+        for (let i = next; i < nonCode.length; i++) {
+            const token = nonCode[i];
+            if (token.startIndex >= end) break;
+            scan(at, Math.min(token.startIndex, end));
+            at = Math.max(at, token.endIndex);
+        }
+        scan(at, end);
     }
     // A record's name is an identifier token (string contents never are;
     // a non-ASCII identifier is a 'punct' leaf).
@@ -1667,6 +1887,35 @@ function rustPendingMayBear(fileEntry, name) {
     if (!words) pendingWordSets.set(rec, words = new Set(rec.words.split(' ')));
     // A raw identifier's token is `r#name`; source text holds both parts.
     return words.has(name) || words.has(String(name).replace(/^r#/, '')) || words.has(`r#${name}`);
+}
+
+const pendingFileLists = new WeakMap(); // operation content cache -> pending file paths
+
+/**
+ * Files whose macro expansions' calls are not derived yet and whose
+ * expanded text can hold one of `names` (fix #405). The callee index lists
+ * such a file under its parsed records' names and its expansions'
+ * callee-position names, but a derived record can bear any word of the
+ * expanded text (`self.view` passed as a value, `Self { .. }` named by its
+ * impl): a query visits these files too, so the files it reads do not
+ * depend on which files earlier queries derived.
+ */
+function rustPendingFilesBearing(index, names) {
+    const scope = index._opContentCache;
+    let files = scope ? pendingFileLists.get(scope) : undefined;
+    if (!files) {
+        files = [];
+        for (const [filePath, fileEntry] of index.files) {
+            if (fileEntry.rustMacroExpansion?.callsPending) files.push(filePath);
+        }
+        if (scope) pendingFileLists.set(scope, files);
+    }
+    const bearing = [];
+    for (const filePath of files) {
+        const fileEntry = index.files.get(filePath);
+        if (names.some(name => rustPendingMayBear(fileEntry, name))) bearing.push(filePath);
+    }
+    return bearing;
 }
 
 function tokenText(tokens) {
@@ -1824,7 +2073,9 @@ function applyRustMacroExpansion(index, pending, options = {}, started = undefin
             ...(rec.blind.length > 0 && { blind: rec.blind.sort((a, b) => a.line - b.line ||
                 codeUnitCompare(a.macro, b.macro) || codeUnitCompare(a.reason, b.reason)) }),
             ...(rec.expanded && { expanded: true }),
-            ...(rec.callsPending && { callsPending: true, calleeNames: rec.calleeNames || [], words: rec.words }),
+            ...(rec.callsPending && {
+                callsPending: true, calleeNames: rec.calleeNames || [], words: rec.words, expansions: rec.expansions,
+            }),
         };
     }
     return touched || false;
@@ -1978,7 +2229,9 @@ function expandForWorker(state, filePath) {
         sites: rec.sites, blind: rec.blind, expanded: rec.expanded,
         usedNames: [...rec.used.values()].map(def => def.name),
         ...(rec.symbols && { symbols: rec.symbols }),
-        ...(rec.callsPending && { callsPending: true, calleeNames: rec.calleeNames, words: rec.words }),
+        ...(rec.callsPending && {
+            callsPending: true, calleeNames: rec.calleeNames, words: rec.words, expansions: rec.expansions,
+        }),
     };
 }
 
@@ -2051,18 +2304,476 @@ function rustExpandedCalls(index, filePath, rawCalls, { materialize = true } = {
     if (!rec?.callsPending || !Array.isArray(rawCalls)) return rawCalls;
     const hints = (rec.calleeNames || []).map(name => ({ name, line: 0, calleeHint: true }));
     if (!materialize) return hints.length > 0 ? rawCalls.concat(hints) : rawCalls;
-    if (!index._rustMacroState) index._rustMacroState = createState(index);
+    const ctx = pendingContext(index, filePath);
     if (index.calleeIndex && hints.length > 0) index._removeFromCalleeIndex(filePath, hints);
     rec.callsPending = false;
     try {
-        expandFile(index._rustMacroState, filePath, 'calls');
+        if (ctx) composeCalls(index, ctx);
     } catch (error) {
         rec.callsPending = true;
         throw error;
     }
+    index._rustMacroState.contexts.delete(filePath);
     delete rec.words;
+    delete rec.expansions;
     index.macroExpansionDirty = true;
     return index.callsCache.get(filePath)?.calls || rawCalls;
+}
+
+// Derivation contexts whose trees are kept (fix #405); a context dropped
+// earlier keeps the records of the groups it read.
+const LIVE_CONTEXTS = 3;
+
+/**
+ * The calls-pass context of a file whose expansion calls are pending, or
+ * null when nothing of it expands (its parsed records stand).
+ */
+function pendingContext(index, filePath) {
+    if (!index._rustMacroState) index._rustMacroState = createState(index);
+    const state = index._rustMacroState;
+    const contexts = state.contexts;
+    let ctx = contexts.get(filePath);
+    if (ctx === null) return null;
+    if (ctx && ctx.live) {
+        contexts.delete(filePath);
+        contexts.set(filePath, ctx);
+        return ctx;
+    }
+    const fresh = buildContext(state, filePath);
+    if (fresh && ctx) {
+        // Rebuilt: the groups the dropped context read keep their records.
+        if (fresh.groups.length !== ctx.groups.length || !!fresh.isolated !== !!ctx.isolated) {
+            throw new Error(`Rust macro expansion context changed: ${filePath}`);
+        }
+        for (let i = 0; i < fresh.groups.length; i++) {
+            const kept = ctx.groups[i];
+            if (!kept.records) continue;
+            Object.assign(fresh.groups[i], { records: kept.records, units: kept.units, starts: kept.starts });
+        }
+        fresh.invocations = ctx.invocations;
+        fresh.seen = ctx.seen;
+    }
+    contexts.delete(filePath);
+    contexts.set(filePath, fresh);
+    if (fresh) {
+        let live = 0;
+        for (const [file, other] of [...contexts].reverse()) {
+            if (!other?.live) continue;
+            if (++live <= LIVE_CONTEXTS || file === filePath) continue;
+            contexts.set(file, releaseContext(other));
+        }
+    }
+    return fresh;
+}
+
+/**
+ * A file's calls-pass context: its groups read apart when the build's
+ * record of its expansions still matches its invocations, else one pass
+ * over the whole file. null when nothing of it expands.
+ */
+function buildContext(state, filePath) {
+    const rec = state.index.files.get(filePath)?.rustMacroExpansion;
+    // Expansions the build could not parse in context are read in one pass
+    // (whose retries can also drop a neighbor).
+    if (Array.isArray(rec?.expansions) && !(rec.blind || []).some(site => site.reason === 'parse-error')) {
+        const isolated = isolatedContext(state, filePath, rec.expansions);
+        if (isolated !== undefined) return isolated;
+    }
+    return expandFile(state, filePath, 'calls')?.context || null;
+}
+
+/** What a dropped context keeps: the records it read. */
+function releaseContext(ctx) {
+    return {
+        isolated: ctx.isolated,
+        groups: ctx.groups.map(group => ({ records: group.records, units: group.units, starts: group.starts })),
+        invocations: ctx.invocations,
+        seen: ctx.seen,
+        live: false,
+    };
+}
+
+/**
+ * A context that reads each group apart (fix #405). The build recorded, for
+ * every invocation it expanded, its hygiene start and its expanded length:
+ * a group expands alone with the numbering and the offsets of a pass over
+ * the whole file, every other expansion standing in as a blank of its
+ * length. undefined when that record no longer matches the file's
+ * invocations or the file has parse errors (one pass reads it), null when
+ * nothing of it expands.
+ */
+function isolatedContext(state, filePath, expansions) {
+    const index = state.index;
+    const content = readContent(state, filePath);
+    if (!index.files.get(filePath) || content === null) return undefined;
+    if (!fileMayExpand(state, filePath)) return null;
+    const tree = safeParse(state.parser, content, undefined, PARSE_OPTIONS);
+    if (tree.rootNode.hasError) return undefined;
+    const plan = plannedInvocations(state, filePath, content, tree, { blind: [] });
+    if (plan.length * 3 !== expansions.length) return undefined;
+    const slots = [];
+    for (let i = 0; i < plan.length; i++) {
+        const item = plan[i];
+        if (item.node.startIndex !== expansions[3 * i]) return undefined;
+        item.hygiene = expansions[3 * i + 1];
+        item.length = expansions[3 * i + 2];
+        if (item.length < 0) continue;
+        slots.push({
+            item, node: item.node, start: item.node.startIndex, end: item.node.endIndex,
+            startLine: item.line, endLine: item.node.endPosition.row + 1,
+        });
+    }
+    if (slots.length === 0) return null;
+    slots.sort((a, b) => a.start - b.start);
+    const { units } = analysisUnits(slots, 'calls');
+    const lookups = unitLookups(units);
+    const groups = groupsOf(units);
+    for (const group of groups) group.slots = [];
+    for (const slot of slots) groups[lookups.unitAtOffset(slot.start).group].slots.push(slot);
+    return {
+        isolated: true, filePath, content, tree, slots, groups,
+        original: index.callsCache.get(filePath)?.calls || [],
+        seen: new Set(), invocations: new Map(), parser: state.parser, state, live: true,
+    };
+}
+
+/** Units sharing a line form one group; units get their group's index. */
+function groupsOf(units) {
+    const groups = [];
+    for (const unit of units) {
+        const last = groups[groups.length - 1];
+        if (last && unit.startLine <= last.endLine) {
+            last.units.push(unit);
+            if (unit.endLine > last.endLine) last.endLine = unit.endLine;
+        } else {
+            groups.push({ units: [unit], startLine: unit.startLine, endLine: unit.endLine, records: null });
+        }
+    }
+    for (let i = 0; i < groups.length; i++) for (const unit of groups[i].units) unit.group = i;
+    return groups;
+}
+
+/**
+ * Read groups of an isolated context. Groups whose expanded text parses
+ * without an error read together as alone (each unit is an item of its
+ * container); otherwise each group is read alone.
+ */
+function readIsolatedGroups(ctx, targets) {
+    if (targets.length === 1) {
+        readIsolatedGroup(ctx, targets[0]);
+        return;
+    }
+    const rec = { blind: [], used: new Map() };
+    const wanted = new Set(targets);
+    const mine = new Set(targets.flatMap(i => ctx.groups[i].slots));
+    const expand = slot => expandSlot(ctx, slot, rec);
+    const live = ctx.slots.filter(slot => mine.has(slot)).map(expand);
+    const keep = analysisUnits(live, 'calls').keep;
+    const extras = ctx.slots.filter(slot => !mine.has(slot) &&
+        keep.some(([start, end]) => slot.start < end && slot.end > start)).map(expand);
+    const expanded = live.concat(extras);
+    const bySlot = new Map(expanded.map(region => [region.slot, region]));
+    const all = ctx.slots.map(slot => bySlot.get(slot) || placeholderOf(ctx, slot));
+    const built = buildSynthetic(ctx.content, all, analysisUnits(expanded, 'calls').keep);
+    const synthTree = parseSynthetic(ctx.parser, built.text, built.spans);
+    if (collectErrorRanges(synthTree.rootNode, []).length > 0) {
+        for (const i of targets) readIsolatedGroup(ctx, i);
+        return;
+    }
+    const units = [];
+    for (const i of targets) {
+        const group = ctx.groups[i];
+        const regions = live.filter(region => region.slot && ctx.groups[i].slots.includes(region.slot));
+        group.units = analysisUnits(regions, 'calls').units;
+        for (const unit of group.units) unit.group = i;
+        group.starts = regions.map(region => region.start);
+        group.records = [];
+        units.push(...group.units);
+    }
+    units.sort((a, b) => a.start - b.start);
+    const lookups = unitLookups(units);
+    const originalSpanless = new Map();
+    for (const record of ctx.original) {
+        if (Number.isFinite(record.callStart) || !lookups.unitAtLine(record.line)) continue;
+        const key = spanlessKey(record);
+        originalSpanless.set(key, (originalSpanless.get(key) || 0) + 1);
+    }
+    const rust = require('../languages/rust');
+    const synthCalls = rust.findCallsInCode(built.text, ctx.parser, {
+        tree: synthTree, itemRecovery: rust.rustExpandedItemRecovery(built.text, ctx.parser, synthTree),
+    });
+    mergeRecords(ctx, synthCalls, {
+        mapper: offsetMapper(all), lookups, regions: live, synthTree, originalSpanless,
+        accept: unit => wanted.has(unit.group), push: (unit, call) => ctx.groups[unit.group].records.push(call),
+    });
+}
+
+/** Expand one invocation of an isolated context as the build did. */
+function expandSlot(ctx, slot, rec) {
+    ctx.state.hygieneSeq = slot.item.hygiene;
+    const region = expandPlanned(ctx.state, ctx.filePath, ctx.content, slot.item, rec);
+    if (!region || region.layout.text.length !== slot.item.length) {
+        throw new Error(`Rust macro expansion at ${ctx.filePath}:${slot.startLine} differs from the build's`);
+    }
+    region.slot = slot;
+    return region;
+}
+
+/** A blank of an expansion's length standing in for it (its newlines kept). */
+function placeholderOf(ctx, slot) {
+    if (!ctx.placeholders) ctx.placeholders = new Map();
+    let region = ctx.placeholders.get(slot);
+    if (!region) {
+        const breaks = slot.endLine - slot.startLine;
+        region = {
+            start: slot.start, end: slot.end, startLine: slot.startLine, endLine: slot.endLine, blank: true,
+            layout: { text: ' '.repeat(slot.item.length - breaks) + '\n'.repeat(breaks), marks: [] },
+        };
+        ctx.placeholders.set(slot, region);
+    }
+    // Its offsets are set by the synthetic it stands in.
+    return { ...region };
+}
+
+/** Read one group of an isolated context: its expansions, parsed alone. */
+function readIsolatedGroup(ctx, gi) {
+    const group = ctx.groups[gi];
+    const rec = { blind: [], used: new Map() };
+    const expand = slot => expandSlot(ctx, slot, rec);
+    const mine = new Set(group.slots);
+    let live = group.slots.map(expand);
+    // Expansions inside the kept headers of this group's units
+    // (`impl T for m!() { .. }`) are part of its text.
+    const headerKeep = analysisUnits(live, 'calls').keep;
+    let extras = ctx.slots.filter(slot => !mine.has(slot) &&
+        headerKeep.some(([start, end]) => slot.start < end && slot.end > start)).map(expand);
+    let synthetic = null;
+    let synthTree = null;
+    let all = null;
+    for (let attempt = 0; live.length > 0 && attempt <= ctx.slots.length; attempt++) {
+        const expanded = live.concat(extras);
+        const bySlot = new Map(expanded.map(region => [region.slot, region]));
+        const dropped = new Set(group.slots.filter(slot => !bySlot.has(slot)));
+        // A dropped expansion stays as written, as in one pass.
+        all = ctx.slots.filter(slot => !dropped.has(slot)).map(slot => bySlot.get(slot) || placeholderOf(ctx, slot));
+        const built = buildSynthetic(ctx.content, all, analysisUnits(expanded, 'calls').keep);
+        synthetic = built.text;
+        synthTree = parseSynthetic(ctx.parser, synthetic, built.spans);
+        const errors = collectErrorRanges(synthTree.rootNode, []);
+        const bad = new Set();
+        for (const [start, end] of errors) {
+            for (const region of expanded) {
+                if (start < region.synthEnd && end > region.synthStart) bad.add(region);
+                else if (start === end && start >= region.synthStart && start <= region.synthEnd) bad.add(region);
+            }
+        }
+        if (bad.size === 0) break;
+        live = live.filter(region => !bad.has(region));
+        extras = extras.filter(region => !bad.has(region));
+    }
+    group.units = live.length > 0 ? analysisUnits(live, 'calls').units : [];
+    group.starts = live.map(region => region.start);
+    group.records = [];
+    if (live.length === 0) return;
+    const lookups = unitLookups(group.units);
+    const mapper = offsetMapper(all);
+    const originalSpanless = new Map();
+    for (const record of ctx.original) {
+        if (Number.isFinite(record.callStart) || !lookups.unitAtLine(record.line)) continue;
+        const key = spanlessKey(record);
+        originalSpanless.set(key, (originalSpanless.get(key) || 0) + 1);
+    }
+    const rust = require('../languages/rust');
+    const synthCalls = rust.findCallsInCode(synthetic, ctx.parser, {
+        tree: synthTree, itemRecovery: rust.rustExpandedItemRecovery(synthetic, ctx.parser, synthTree),
+    });
+    mergeRecords(ctx, synthCalls, {
+        mapper, lookups, regions: live, synthTree, originalSpanless,
+        accept: () => true, push: (unit, call) => group.records.push(call),
+    });
+}
+
+/**
+ * Words the records of an isolated group can bear: its lines and its units'
+ * kept headers in the file (literals and comments left out), the text of
+ * every project macro its expansions can transcribe, and the crate names
+ * `$crate` becomes.
+ */
+function isolatedGroupWords(ctx, group) {
+    if (group.words) return group.words;
+    const state = ctx.state;
+    const words = new Set();
+    const ranges = analysisUnits(group.slots, 'calls').keep.concat([[
+        lineOffset(state, ctx.filePath, group.startLine), lineEndOffset(state, ctx.filePath, group.endLine),
+    ]]).sort((a, b) => a[0] - b[0]);
+    if (!ctx.nonCode) ctx.nonCode = ctx.tree.rootNode.descendantsOfType(NON_CODE_TOKENS);
+    const nonCode = ctx.nonCode;
+    const scan = (start, end) => {
+        if (end <= start) return;
+        for (const word of ctx.content.slice(start, end).match(WORD) || []) words.add(word);
+    };
+    let next = 0;
+    let done = 0;
+    for (const [rangeStart, end] of ranges) {
+        let at = Math.max(rangeStart, done);
+        if (end <= at) continue;
+        while (next < nonCode.length && nonCode[next].endIndex <= at) next++;
+        for (let i = next; i < nonCode.length; i++) {
+            const token = nonCode[i];
+            if (token.startIndex >= end) break;
+            scan(at, Math.min(token.startIndex, end));
+            at = Math.max(at, token.endIndex);
+        }
+        scan(at, end);
+        done = end;
+    }
+    for (const word of [...words]) if (state.inventory.has(word)) addTemplateWords(state, word, words);
+    words.add('crate');
+    group.words = words;
+    return words;
+}
+
+/** Words of every definition of macro `name` and the macros they name, transitively. */
+function addTemplateWords(state, name, words) {
+    if (!state.templateWords) state.templateWords = new Map();
+    let own = state.templateWords.get(name);
+    if (!own) {
+        own = new Set();
+        state.templateWords.set(name, own);
+        const pending = [name];
+        const visited = new Set();
+        while (pending.length > 0) {
+            const next = pending.pop();
+            if (visited.has(next)) continue;
+            visited.add(next);
+            for (const def of state.inventory.get(next) || []) {
+                const content = readContent(state, def.file);
+                if (content === null) continue;
+                const text = content.slice(lineOffset(state, def.file, def.startLine), lineOffset(state, def.file, def.endLine + 1));
+                for (const word of text.match(WORD) || []) {
+                    own.add(word);
+                    if (state.inventory.has(word) && !visited.has(word)) pending.push(word);
+                }
+                const crate = packageOf(state, def.file)?.packageName;
+                if (crate) own.add(crate);
+            }
+        }
+    }
+    for (const word of own) words.add(word);
+}
+
+/**
+ * The records of a file whose expansion calls are pending that a consumer
+ * reading only part of them needs (fix #405), in the order the composed
+ * calls hold them and as the same record objects. `name`: the records
+ * `keep` accepts, each of which must bear the name as one of its own
+ * identifier tokens (its name or written receiver); `lines`: [start, end],
+ * the records on those lines; `lineSet`: the records on any of those lines. Only the groups that can hold such records
+ * are read. undefined when the file's calls are not pending, `name` is not
+ * an identifier, or every group is read (the file's calls are then derived
+ * whole by the caller).
+ */
+const IDENTIFIER = /^(?:r#)?[\p{L}_][\p{L}\p{N}_]*$/u;
+
+function rustPendingRecords(index, filePath, { name = null, keep = null, lines = null, lineSet = null } = {}) {
+    const entry = index.files.get(filePath);
+    if (!entry?.rustMacroExpansion?.callsPending) return undefined;
+    // Hygiene renames locals a transcriber introduces (`x__ucn_h3`): no
+    // source text holds such a name.
+    if (name !== null && (!IDENTIFIER.test(name) || /__ucn_h\d+$/.test(name))) return undefined;
+    const raw = index.callsCache.get(filePath)?.calls;
+    if (!Array.isArray(raw)) return undefined;
+    const matches = record => (!lines || (record.line >= lines[0] && record.line <= lines[1])) &&
+        (!lineSet || lineSet.has(record.line)) && (!keep || keep(record));
+    // No derived record bears a name outside the file's words (#375): the
+    // parsed records then answer, unless one of them bears it.
+    if (name !== null && !rustPendingMayBear(entry, name) && !raw.some(matches)) return [];
+    const ctx = pendingContext(index, filePath);
+    if (!ctx) return raw.filter(matches);
+    // Every group read: the caller derives the file's calls whole.
+    if (ctx.groups.every(group => group.records)) return undefined;
+    const wanted = [];
+    for (let i = 0; i < ctx.groups.length; i++) {
+        const group = ctx.groups[i];
+        if (lines && (group.endLine < lines[0] || group.startLine > lines[1])) continue;
+        if (lineSet && ![...lineSet].some(line => line >= group.startLine && line <= group.endLine)) continue;
+        if (name !== null && !groupMayBear(ctx, group, name)) continue;
+        wanted.push(i);
+    }
+    readGroups(ctx, wanted);
+    if (ctx.groups.every(group => group.records)) return undefined;
+    const out = ctx.original.filter(record => matches(record) && !inReadUnit(ctx, record));
+    for (const i of wanted) for (const record of ctx.groups[i].records) if (matches(record)) out.push(record);
+    for (const record of invocationRecords(ctx)) if (matches(record)) out.push(record);
+    return out.sort((a, b) => a.line - b.line);
+}
+
+/**
+ * Whether a group's records can bear `name`: a word of the group's lines in
+ * the expanded file or of the kept text outside every unit (headers: a
+ * `Self` record bears its impl's type name).
+ */
+function groupMayBear(ctx, group, name) {
+    if (ctx.isolated) return hasWord(isolatedGroupWords(ctx, group), name);
+    if (!ctx.outsideWords) {
+        const words = new Set();
+        let at = 0;
+        for (const unit of ctx.units) {
+            for (const word of ctx.synthetic.slice(at, unit.synthStart).match(WORD) || []) words.add(word);
+            at = Math.max(at, unit.synthEnd);
+        }
+        for (const word of ctx.synthetic.slice(at).match(WORD) || []) words.add(word);
+        ctx.outsideWords = words;
+    }
+    if (hasWord(ctx.outsideWords, name)) return true;
+    if (!group.words) {
+        if (!ctx.synthLineStarts) {
+            const starts = [0];
+            const text = ctx.synthetic;
+            for (let i = text.indexOf('\n'); i >= 0; i = text.indexOf('\n', i + 1)) starts.push(i + 1);
+            ctx.synthLineStarts = starts;
+        }
+        const starts = ctx.synthLineStarts;
+        const from = starts[Math.max(group.startLine - 1, 0)] ?? ctx.synthetic.length;
+        const to = starts[group.endLine] ?? ctx.synthetic.length;
+        group.words = new Set(ctx.synthetic.slice(from, to).match(WORD) || []);
+    }
+    return hasWord(group.words, name);
+}
+
+function hasWord(words, name) {
+    // A raw identifier's token is `r#name`; text holds both parts.
+    return words.has(name) || words.has(String(name).replace(/^r#/, '')) || words.has(`r#${name}`);
+}
+
+/**
+ * Relative paths of the files whose expansion calls are pending with no
+ * part derived yet, sorted.
+ */
+function rustUntouchedPendingFiles(index) {
+    const contexts = index._rustMacroState?.contexts;
+    const out = [];
+    for (const [filePath, entry] of index.files) {
+        if (!entry.rustMacroExpansion?.callsPending) continue;
+        if (contexts?.get(filePath)?.groups?.some(group => group.records)) continue;
+        out.push(entry.relativePath);
+    }
+    return out.sort(codeUnitCompare);
+}
+
+/** Derive whole every file whose expansion calls were derived in part. */
+function completeRustMacroCalls(index) {
+    const contexts = index._rustMacroState?.contexts;
+    if (!contexts || contexts.size === 0) return 0;
+    let done = 0;
+    for (const filePath of [...contexts.keys()].sort(codeUnitCompare)) {
+        if (!index.files.get(filePath)?.rustMacroExpansion?.callsPending) continue;
+        const cached = index.callsCache.get(filePath);
+        if (!cached) continue;
+        rustExpandedCalls(index, filePath, cached.calls);
+        done++;
+    }
+    return done;
 }
 
 /** Derive every pending file's expansion calls (whole-program consumers). */
@@ -2110,4 +2821,8 @@ module.exports = {
     materializeRustMacroCalls,
     rustMacroExpansionSummary,
     rustPendingMayBear,
+    rustPendingFilesBearing,
+    rustPendingRecords,
+    completeRustMacroCalls,
+    rustUntouchedPendingFiles,
 };

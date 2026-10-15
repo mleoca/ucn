@@ -127,6 +127,16 @@ function buildMacroItemRecoveryTree(code, parser, tree) {
 }
 
 /**
+ * The item-body call recovery of an expanded file parsed by the caller
+ * (fix #405): what rustMacroItemCallRecovery computes for it once its
+ * declaration trees are primed with `tree`. Its walk builds the tree's flat
+ * node list, which the call extraction then reads.
+ */
+function rustExpandedItemRecovery(code, parser, tree) {
+    return buildMacroItemRecoveryTree(code, parser, tree)?.callRecovery || null;
+}
+
+/**
  * Rust macro invocation bodies are token trees, even when they contain item
  * declarations verbatim. Reparse only item-position bodies in a byte- and
  * line-preserving synthetic source. The primary AST remains authoritative;
@@ -3737,8 +3747,17 @@ function rustFieldAliasOf(identNode) {
     return null;
 }
 
-function findCallsInCode(code, parser) {
-    const tree = parseTree(parser, code);
+/**
+ * Call records of Rust code. `options` (fix #405, macro-expansion calls):
+ * `tree` - the already parsed tree of `code` (an expanded file parsed with
+ * included ranges), whose item-recovery facts are `itemRecovery` (null when
+ * none); `skip(node)` - nodes whose subtrees are not read (other units of an
+ * expanded file: every scope the extractor keeps is a function's own, so a
+ * unit's records do not depend on its sibling units).
+ */
+function findCallsInCode(code, parser, options = {}) {
+    const tree = options.tree || parseTree(parser, code);
+    const skip = typeof options.skip === 'function' ? options.skip : null;
     const calls = [];
     // Words of every value-binding pattern seen so far in document order
     // (fix #369). A binding shadows a bare call only if it precedes the call,
@@ -4378,7 +4397,7 @@ function findCallsInCode(code, parser) {
     // Item bodies of item-position macros (`quickcheck! { fn p(..) { .. } }`,
     // fix #401) are parsed as items: their calls are read from that parse,
     // with their functions' scopes and local types, instead of as tokens.
-    const itemRecovery = rustMacroItemCallRecovery(code, parser);
+    const itemRecovery = options.tree ? (options.itemRecovery || null) : rustMacroItemCallRecovery(code, parser);
     const recoveredTokenTrees = new Set((itemRecovery?.ranges || []).map(([start]) => start - 1));
 
     const visitNode = (node) => {
@@ -5227,17 +5246,21 @@ function findCallsInCode(code, parser) {
             }
         }
     };
-    traverseTree(tree.rootNode, visitNode, { onLeave: leaveNode });
+    traverseTree(tree.rootNode, skip ? node => (skip(node) ? false : visitNode(node)) : visitNode,
+        { onLeave: leaveNode });
     if (itemRecovery) {
         const ranges = itemRecovery.ranges;
         const inside = node => ranges.some(([start, end]) => node.startIndex >= start && node.endIndex <= end);
         const overlaps = node => ranges.some(([start, end]) => node.startIndex < end && node.endIndex > start);
         traverseTree(itemRecovery.tree.rootNode, node => {
+            if (skip && skip(node)) return false;
             if (inside(node)) return visitNode(node);
             return overlaps(node);
         }, { onLeave: node => { if (inside(node)) leaveNode(node); } });
     }
 
+    // A tree handed in is an expanded file: no unexpanded item bodies.
+    if (options.tree) return calls;
     const declaration = declarationTrees(code, parser);
     if (!declaration.macroItemRecovery) return calls;
     const functions = findFunctions(code, parser);
@@ -5974,6 +5997,7 @@ function isEntryPoint(symbol) {
 
 module.exports = {
     primeDeclarationTrees,
+    rustExpandedItemRecovery,
     parseDeclarationsIn,
     rustMacroInvocationContext,
     findFunctions,

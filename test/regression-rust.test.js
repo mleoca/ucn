@@ -6982,6 +6982,9 @@ describe('fix #374: project macro_rules! invocations are expanded into index fac
             const callers = parallel.findCallers('helper').filter(c => c.relativePath === 'src/m0.rs');
             assert.strictEqual(callers.length, 200);
             assert.ok(callers.every(c => c.callerName === 'case_0'));
+            // The query derived what it read (fix #405); the CLI derives the
+            // rest before saving.
+            parallel.completeMacroCallDerivations();
             assert.ok(!parallel.files.get(m0).rustMacroExpansion.callsPending);
             parallel.saveCache();
             const loaded = new ProjectIndex(dir);
@@ -7160,8 +7163,8 @@ describe('fix #375: macro_rules! expansion is identical in worker threads and in
         try {
             const index = new ProjectIndex(dir);
             index.build(null, { quiet: true, workers: 0 });
-            const pending = () => [...index.files.values()]
-                .filter(entry => entry.rustMacroExpansion?.callsPending).map(entry => entry.relativePath).sort();
+            // Pending files no part of whose calls is derived (fix #405).
+            const pending = () => require('../core/rust-macro-expansion').rustUntouchedPendingFiles(index);
             assert.strictEqual(pending().length, 6);
             assert.deepStrictEqual(index.findCallers('lonely'), []);
             assert.strictEqual(pending().length, 6, 'no expansion can call lonely');
@@ -8389,8 +8392,8 @@ describe('fix #403: a type query derives only the macro expansions whose text ca
             };
             const index = new ProjectIndex(dir);
             index.build(null, { quiet: true, workers: 0 });
-            const pending = () => [...index.files.values()]
-                .filter(entry => entry.rustMacroExpansion?.callsPending).map(entry => entry.relativePath).sort();
+            // Pending files no part of whose calls is derived (fix #405).
+            const pending = () => require('../core/rust-macro-expansion').rustUntouchedPendingFiles(index);
             assert.deepStrictEqual(pending(), ['src/a.rs', 'src/b.rs']);
             const widget = index.symbols.get('Widget').find(d => d.type === 'struct');
             index.findCallers('Widget', { targetDefinitions: [widget], collectAccount: true });
@@ -8401,6 +8404,297 @@ describe('fix #403: a type query derives only the macro expansions whose text ca
             full.build(null, { quiet: true, workers: 0 });
             require('../core/rust-macro-expansion').materializeRustMacroCalls(full);
             assert.strictEqual(gated, answer(full));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #405: macro-expansion calls derive by groups of units, on demand', () => {
+    const rme = () => require('../core/rust-macro-expansion');
+    const { getCachedCalls } = require('../core/callers');
+    const cargo = { 'Cargo.toml': '[package]\nname = "g405"\nversion = "0.1.0"\nedition = "2021"\n' };
+    // Item-position test generators, a fn-body invocation, two invocations
+    // on one line, a `Self { .. }` built by a macro inside an impl, names
+    // that occur only in literals and comments.
+    const files = (count = 2) => {
+        const out = {
+            ...cargo,
+            'src/lib.rs': [
+                '#[macro_export]',
+                'macro_rules! check { ($n:ident, $e:expr) => { #[test] fn $n() { let v = $e; crate::sink(v); crate::sink(v); } }; }',
+                '#[macro_export]',
+                'macro_rules! twice { ($f:ident, $x:expr) => { $f($x); $f($x + 1); }; }',
+                '#[macro_export]',
+                'macro_rules! rebuild { ($($f:ident),*) => { fn rebuilt(&self) -> Self { Self { $($f: self.$f.clone(),)* } } }; }',
+                'pub fn sink(_v: u32) {}',
+                'pub fn helper(x: u32) -> u32 { x }',
+                'pub fn quiet() {}',
+            ].join('\n') + '\n',
+        };
+        for (let f = 0; f < count; f++) {
+            out['src/lib.rs'] += `pub mod m${f};\n`;
+            out[`src/m${f}.rs`] = [
+                'use crate::{helper, sink};',
+                '#[derive(Clone)]',
+                `pub struct Pair${f} { a: u32, b: u32 }`,
+                `impl Pair${f} { rebuild!(a, b); }`,
+                `pub fn run${f}() { twice!(sink, helper(1)); let s = "quiet"; }`,
+                '// quiet is only named here and in a string',
+                `check!(first${f}, helper(${f}));`,
+                `check!(second${f}, helper(2)); check!(third${f}, 3);`,
+                `check!(fourth${f}, crate::helper(4));`,
+            ].join('\n') + '\n';
+        }
+        return out;
+    };
+    const build = dir => { const index = new ProjectIndex(dir); index.build(null, { quiet: true, workers: 0 }); return index; };
+    const rustFiles = index => [...index.files.keys()].filter(f => f.endsWith('.rs')).sort();
+
+    it('a file read group by group in any order composes the calls one pass derives; views are those records', () => {
+        const dir = tmp(files());
+        try {
+            const eager = build(dir);
+            const expected = new Map(rustFiles(eager).map(f => [f, JSON.stringify(getCachedCalls(eager, f))]));
+            const lazy = build(dir);
+            const m0 = path.join(dir, 'src/m0.rs');
+            assert.ok(lazy.files.get(m0).rustMacroExpansion.callsPending);
+            const views = [];
+            const allRead = () => lazy._rustMacroState.contexts.get(m0)?.groups?.every(group => group.records);
+            for (const select of [{ lines: [7, 7] }, { name: 'sink', keep: c => c.name === 'sink' },
+                { lines: [5, 5] }, { name: 'helper', keep: c => c.name === 'helper' },
+                { name: 'Pair0', keep: c => c.name === 'Pair0' || c.receiver === 'Pair0' }, { lines: [1, 9] }]) {
+                const view = rme().rustPendingRecords(lazy, m0, select);
+                // A view that would read the file's last groups hands it back
+                // to be derived whole.
+                if (view === undefined) assert.ok(allRead(), JSON.stringify(select));
+                else views.push([select, view]);
+            }
+            assert.ok(views.length >= 3);
+            const composed = getCachedCalls(lazy, m0);
+            assert.ok(!lazy.files.get(m0).rustMacroExpansion.callsPending);
+            for (const f of rustFiles(lazy)) assert.strictEqual(JSON.stringify(getCachedCalls(lazy, f)), expected.get(f), f);
+            for (const [select, view] of views) {
+                const want = composed.filter(c => (!select.lines || (c.line >= select.lines[0] && c.line <= select.lines[1])) &&
+                    (!select.keep || select.keep(c)));
+                assert.strictEqual(view.length, want.length, JSON.stringify(select));
+                view.forEach((record, i) => assert.ok(record === want[i], `${JSON.stringify(select)} #${i}`));
+            }
+            // The `Self { .. }` a macro builds in an impl bears the impl's type.
+            const other = build(dir);
+            const pair = rme().rustPendingRecords(other, m0, { name: 'Pair0', keep: c => c.name === 'Pair0' });
+            assert.ok((pair || getCachedCalls(other, m0)).some(c => c.name === 'Pair0' && c.line === 4 && c.macroExpansion),
+                JSON.stringify(pair));
+        } finally { rm(dir); }
+    });
+
+    it('queries on a partly derived index answer as on a fully derived one', () => {
+        const dir = tmp(files(3));
+        try {
+            const answer = (index, name) => {
+                const r = execute(index, 'context', { name });
+                assert.ok(r.ok, r.error);
+                const ctx = r.result.context || r.result;
+                return JSON.stringify([(ctx.callers || []).map(c => `${c.relativePath}:${c.line}:${c.callerName}`),
+                    (ctx.unverifiedCallers || []).map(c => `${c.relativePath}:${c.line}:${c.reason}`),
+                    (ctx.callees || []).map(c => `${c.name}:${c.relativePath}:${c.startLine}`),
+                    ctx.meta?.account?.groundTotal, ctx.meta?.account?.confirmed, ctx.meta?.account?.unverified]);
+            };
+            const names = ['src/lib.rs:7:sink', 'src/lib.rs:8:helper', 'src/lib.rs:9:quiet', 'src/m1.rs:7:first1',
+                'src/m2.rs:8:third2', 'src/m0.rs:3:Pair0', 'src/m1.rs:5:run1'];
+            const full = build(dir);
+            rme().materializeRustMacroCalls(full);
+            const expected = names.map(name => answer(full, name));
+            // One fresh index per query, then one index for all of them.
+            names.forEach((name, i) => assert.strictEqual(answer(build(dir), name), expected[i], name));
+            const warm = build(dir);
+            names.forEach((name, i) => assert.strictEqual(answer(warm, name), expected[i], name));
+        } finally { rm(dir); }
+    });
+
+    it('names written only in literals and comments derive nothing', () => {
+        const dir = tmp(files());
+        try {
+            const index = build(dir);
+            const before = rme().rustUntouchedPendingFiles(index);
+            assert.deepStrictEqual(before, ['src/m0.rs', 'src/m1.rs']);
+            const r = execute(index, 'context', { name: 'src/lib.rs:9:quiet' });
+            assert.ok(r.ok, r.error);
+            assert.deepStrictEqual(rme().rustUntouchedPendingFiles(index), before);
+        } finally { rm(dir); }
+    });
+
+    it('a context dropped for memory keeps the records it handed out', () => {
+        const dir = tmp(files(6));
+        try {
+            const eager = build(dir);
+            const lazy = build(dir);
+            const handed = [];
+            for (let f = 0; f < 6; f++) {
+                const file = path.join(dir, `src/m${f}.rs`);
+                handed.push([file, rme().rustPendingRecords(lazy, file, { lines: [7, 7] })]);
+            }
+            // At most a few contexts keep their trees; the rest keep records.
+            const live = [...lazy._rustMacroState.contexts.values()].filter(ctx => ctx?.synthTree).length;
+            assert.ok(live < 6, `live contexts ${live}`);
+            for (const [file, view] of handed) {
+                const composed = getCachedCalls(lazy, file);
+                assert.strictEqual(JSON.stringify(composed), JSON.stringify(getCachedCalls(eager, file)), file);
+                assert.ok(view.length > 0 && view.every(record => composed.includes(record)), file);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('groups read apart with the build-recorded expansions derive what one pass over the file derives', () => {
+        const all = files(3);
+        // A file with a parse error elsewhere is read in one pass.
+        all['src/m2.rs'] += 'fn broken( {\n';
+        const dir = tmp(all);
+        try {
+            const isolated = build(dir);
+            const onePass = build(dir);
+            for (const entry of onePass.files.values()) delete entry.rustMacroExpansion?.expansions;
+            for (const f of rustFiles(isolated).filter(f => /src\/m\d\.rs$/.test(f))) {
+                assert.ok(isolated.files.get(f).rustMacroExpansion.callsPending, f);
+                const view = rme().rustPendingRecords(isolated, f, { name: 'helper', keep: c => c.name === 'helper' });
+                const ctx = isolated._rustMacroState.contexts.get(f);
+                assert.strictEqual(!!ctx.isolated, !f.endsWith('m2.rs'), `${f} read ${ctx.isolated ? 'apart' : 'in one pass'}`);
+                const composed = getCachedCalls(isolated, f);
+                assert.strictEqual(JSON.stringify(composed), JSON.stringify(getCachedCalls(onePass, f)), f);
+                assert.ok(view.every(record => composed.includes(record)), f);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('the CLI derives whole the files a command derived in part before it saves the cache', () => {
+        const dir = tmp(files());
+        try {
+            const { runCli } = require('./helpers');
+            const out = runCli(dir, 'show', ['src/m1.rs:7:first1']);
+            assert.match(out, /first1/);
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loaded.loadCache());
+            const m1 = path.join(dir, 'src/m1.rs');
+            assert.ok(!loaded.files.get(m1).rustMacroExpansion.callsPending, 'the touched file is persisted derived');
+            assert.ok(loaded.files.get(path.join(dir, 'src/m0.rs')).rustMacroExpansion.callsPending, 'an untouched file stays pending');
+            const eager = build(dir);
+            assert.strictEqual(JSON.stringify(getCachedCalls(loaded, m1)), JSON.stringify(getCachedCalls(eager, m1)));
+        } finally { rm(dir); }
+    });
+
+    it('a rebuild after an edit drops part-derived calls and derives the edited file anew', () => {
+        const dir = tmp(files());
+        try {
+            const index = build(dir);
+            const m0 = path.join(dir, 'src/m0.rs');
+            const m1 = path.join(dir, 'src/m1.rs');
+            assert.ok(rme().rustPendingRecords(index, m0, { lines: [7, 7] }).length > 0);
+            assert.ok(rme().rustPendingRecords(index, m1, { lines: [7, 7] }).length > 0);
+            fs.writeFileSync(m1, fs.readFileSync(m1, 'utf8').replace('check!(first1, helper(1));', 'check!(first1, helper(11)); check!(extra1, 5);'));
+            index.build(null, { quiet: true, workers: 0, forceRebuild: true });
+            const fresh = build(dir);
+            for (const f of [m0, m1]) {
+                assert.ok(index.files.get(f).rustMacroExpansion.callsPending, f);
+                const view = rme().rustPendingRecords(index, f, { name: 'helper', keep: c => c.name === 'helper' });
+                const composed = getCachedCalls(index, f);
+                assert.strictEqual(JSON.stringify(composed), JSON.stringify(getCachedCalls(fresh, f)), f);
+                if (view) assert.ok(view.every(record => composed.includes(record)), f);
+            }
+            assert.ok(getCachedCalls(index, m1).some(c => c.enclosingFunction?.name === 'extra1'));
+        } finally { rm(dir); }
+    });
+
+    it('part-derived calls are not persisted; completed ones round-trip through the cache', () => {
+        const dir = tmp(files());
+        try {
+            const index = build(dir);
+            const m0 = path.join(dir, 'src/m0.rs');
+            const view = rme().rustPendingRecords(index, m0, { name: 'helper', keep: c => c.name === 'helper' });
+            assert.ok(view.length > 0);
+            index.saveCache();
+            const reloaded = new ProjectIndex(dir);
+            assert.ok(reloaded.loadCache());
+            assert.ok(reloaded.files.get(m0).rustMacroExpansion.callsPending, 'a part-derived file stays pending');
+            assert.strictEqual(index.completeMacroCallDerivations(), 1);
+            const composed = JSON.stringify(getCachedCalls(index, m0));
+            index.saveCache();
+            const again = new ProjectIndex(dir);
+            assert.ok(again.loadCache());
+            assert.ok(!again.files.get(m0).rustMacroExpansion.callsPending);
+            assert.strictEqual(JSON.stringify(getCachedCalls(again, m0)), composed);
+        } finally { rm(dir); }
+    });
+
+    it('a query visits the pending files whose derived records can bear the name', () => {
+        // `self.val` passed in an expansion is a method-value record named
+        // `val`; `val` is not in callee position, and another file calls a
+        // `val`, so the name's callee-index entry decides which files a
+        // query visits.
+        const dir = tmp({
+            ...cargo,
+            'src/lib.rs': [
+                '#[macro_export]',
+                'macro_rules! inner { ($s:ident . $f:ident) => { pub fn into_inner(self) -> Option<u32> { Some($s.$f) } }; }',
+                'pub mod val;',
+                'pub mod m;',
+                'pub mod k;',
+            ].join('\n') + '\n',
+            'src/val.rs': 'pub fn one() -> u32 { 1 }\n',
+            'src/m.rs': 'pub struct W { val: u32 }\nimpl W { inner!(self.val); }\n',
+            'src/k.rs': 'fn val() {}\npub fn k() { val(); }\n',
+        });
+        try {
+            const m = path.join(dir, 'src/m.rs');
+            const lazy = build(dir);
+            assert.ok(lazy.files.get(m).rustMacroExpansion.callsPending);
+            // The callee index lists k.rs under `val`, not the pending m.rs.
+            assert.ok(lazy.getCalleeFiles('val')?.has(path.join(dir, 'src/k.rs')));
+            assert.ok(!lazy.getCalleeFiles('val').has(m));
+            const full = build(dir);
+            rme().materializeRustMacroCalls(full);
+            assert.ok(getCachedCalls(full, m).some(c => c.name === 'val' && c.isFunctionReference && c.macroExpansion));
+            const answer = index => {
+                const target = index.symbols.get('val').find(d => d.type === 'module');
+                const callers = index.findCallers('val', { targetDefinitions: [target] });
+                return JSON.stringify(callers.map(c => `${c.relativePath}:${c.line}`));
+            };
+            const expected = answer(full);
+            assert.strictEqual(expected, JSON.stringify(['src/m.rs:2']));
+            assert.strictEqual(answer(lazy), expected);
+        } finally { rm(dir); }
+    });
+
+    it('a deleted function\'s remaining sites include pending files whose derived records bear its name', () => {
+        const { execFileSync } = require('child_process');
+        const dir = tmp({
+            ...cargo,
+            'src/lib.rs': [
+                '#[macro_export]',
+                'macro_rules! inner { ($s:ident . $f:ident) => { pub fn into_inner(self) -> Option<u32> { Some($s.$f) } }; }',
+                'pub fn val() -> u32 { 1 }',
+                'pub mod m;',
+            ].join('\n') + '\n',
+            'src/m.rs': 'pub struct W { val: u32 }\nimpl W { inner!(self.val); }\n',
+        });
+        try {
+            const git = (...args) => execFileSync('git', ['-c', 'user.email=test@test.com', '-c', 'user.name=Test', ...args],
+                { cwd: dir, stdio: 'pipe' });
+            git('init', '-q');
+            git('add', '-A');
+            git('commit', '-q', '-m', 'init');
+            const lib = path.join(dir, 'src/lib.rs');
+            fs.writeFileSync(lib, fs.readFileSync(lib, 'utf8').replace('pub fn val() -> u32 { 1 }\n', ''));
+            const remaining = index => {
+                const r = execute(index, 'diffImpact', {});
+                assert.ok(r.ok, r.error);
+                return JSON.stringify((r.result.deletedFunctions || []).map(f =>
+                    [f.name, f.remainingCallSites.map(s => `${s.relativePath}:${s.line}`)]));
+            };
+            const full = build(dir);
+            rme().materializeRustMacroCalls(full);
+            const expected = remaining(full);
+            assert.strictEqual(expected, JSON.stringify([['val', ['src/m.rs:2']]]));
+            const lazy = build(dir);
+            assert.ok(lazy.files.get(path.join(dir, 'src/m.rs')).rustMacroExpansion.callsPending);
+            assert.strictEqual(remaining(lazy), expected);
         } finally { rm(dir); }
     });
 });

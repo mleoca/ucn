@@ -147,6 +147,31 @@ function getCachedCalls(index, filePath, options = {}) {
     return calls === result.calls ? result : { ...result, calls };
 }
 
+/**
+ * Some of the call records of a Rust file whose macro expansions' calls are
+ * not derived yet (fix #405): `{ name, keep }` the records `keep` accepts,
+ * each bearing `name` as its own name or written receiver, or `{ lines }`
+ * the records of a line range; the same records, in the same order, the
+ * file's derived calls hold, deriving only the parts that can hold them.
+ * undefined when the file has no such pending calls (read them whole).
+ */
+function _pendingCallRecords(index, filePath, select) {
+    if (!index.files.get(filePath)?.rustMacroExpansion?.callsPending) return undefined;
+    const raw = _getCachedCallsRaw(index, filePath);
+    if (!Array.isArray(raw)) return undefined;
+    return require('./rust-macro-expansion').rustPendingRecords(index, filePath, select);
+}
+
+/**
+ * Calls of a file for a consumer that reads only the records bearing `name`
+ * (fix #405), on the lines of `lineSet` when given: for a Rust file whose
+ * macro expansions' calls are not derived yet, only those records.
+ */
+function getCachedCallsBearing(index, filePath, name, lineSet = null) {
+    const records = _pendingCallRecords(index, filePath, { name, lineSet, keep: call => _callBearsName(call, name) });
+    return records !== undefined ? records : getCachedCalls(index, filePath);
+}
+
 const _opStatMemos = new WeakMap(); // operation content cache -> Map<filePath, mtimeMs>
 function _opStatMemo(scope) {
     let memo = _opStatMemos.get(scope);
@@ -372,7 +397,13 @@ function _callsBearingName(index, filePath, calls, name) {
     const caches = index._opFindCallersCaches;
     if (!caches) return calls.filter(call => _callBearsName(call, name));
     let memo = caches.callsByName.get(filePath);
+    // A query reads one name per file: the index pays off from a file's
+    // second name in the operation (fix #405).
     if (!memo || memo.calls !== calls) {
+        caches.callsByName.set(filePath, { calls, byName: null });
+        return calls.filter(call => _callBearsName(call, name));
+    }
+    if (!memo.byName) {
         const byName = new Map();
         const add = (key, call) => {
             let list = byName.get(key);
@@ -387,8 +418,7 @@ function _callsBearingName(index, filePath, calls, name) {
                 for (const resolved of call.resolvedNames) if (resolved) add(resolved, call);
             }
         }
-        memo = { calls, byName };
-        caches.callsByName.set(filePath, memo);
+        memo.byName = byName;
     }
     return memo.byName.get(name) || [];
 }
@@ -1045,6 +1075,19 @@ function findCallers(index, name, options = {}) {
         }
         if (union.size > 0) calleeFiles = union;
     }
+    // Files whose macro expansions' calls are not derived yet and whose
+    // expanded text holds the name (fix #405): a derived record can bear a
+    // name the callee index does not list the file under yet. A null file
+    // list already visits every file.
+    if (calleeFiles) {
+        const pending = require('./rust-macro-expansion').rustPendingFilesBearing(index,
+            hasAliasSurfaces ? [name, ...aliasNames] : [name]);
+        if (pending.some(f => !calleeFiles.has(f))) {
+            const union = new Set(calleeFiles);
+            for (const f of pending) union.add(f);
+            calleeFiles = union;
+        }
+    }
     // C# target-typed `new(..)` whose type the call it is an argument of
     // (or the member it is assigned to) decides (fix #400): records named
     // `new`, typed here.
@@ -1099,16 +1142,31 @@ function findCallers(index, name, options = {}) {
             fileEntry.rustMacroExpansion?.callsPending &&
             !require('./rust-macro-expansion').rustPendingMayBear(fileEntry, name)) continue;
         try {
-            const calls = getCachedCalls(index, filePath);
-            if (!calls) continue;
+            const typedViews = csharpTargetTypedByFile.get(filePath);
+            // A record that cannot match below is skipped by the loop's first
+            // test: a file whose macro expansions' calls are not derived yet
+            // derives only what can hold the others (fix #405); its whole
+            // records are derived when a step needs them.
+            const typeQueryBareReaches = targetIsTypeQuery && langTraits(fileEntry.language)?.bareCallReachesMethods;
+            const pendingRecords = hasAliasSurfaces || typedViews ? undefined
+                : _pendingCallRecords(index, filePath, {
+                    name,
+                    keep: targetIsTypeQuery
+                        ? call => !!call.destructured || call.receiver === name || _callBearsName(call, name) ||
+                            !!(call.receiverIsTypeQualified && typeQueryBareReaches)
+                        : call => _callBearsName(call, name),
+                });
+            let calls = pendingRecords === undefined ? getCachedCalls(index, filePath) : null;
+            if (pendingRecords === undefined && !calls) continue;
+            const fileCalls = () => calls || (calls = getCachedCalls(index, filePath) || []);
             const structuralLanguage =
                 langTraits(fileEntry.language)?.typeSystem === 'structural';
             // Only records bearing the name can match below unless an alias
             // surface or a type-qualifier reference can (fix #365): visit
             // those, in record order, instead of every call in the file.
-            let visitCalls = hasAliasSurfaces || targetIsTypeQuery
-                ? calls : _callsBearingName(index, filePath, calls, name);
-            const typedViews = csharpTargetTypedByFile.get(filePath);
+            let visitCalls = pendingRecords !== undefined ? pendingRecords
+                : hasAliasSurfaces || targetIsTypeQuery
+                    ? calls : _callsBearingName(index, filePath, calls, name);
             if (typedViews) {
                 // A file reached only through such records visits only them.
                 visitCalls = !nameBearingFiles || nameBearingFiles.has(filePath) || hasAliasSurfaces
@@ -1219,7 +1277,7 @@ function findCallers(index, name, options = {}) {
 
                 if (call.receiverDerefAmbiguous && routeDerefAmbiguous(filePath, fileEntry, call, calledAs)) continue;
                 const standardWrapper = fileEntry.language === 'rust'
-                    ? _rustStandardWrapperMethod(index, filePath, call, calls) : null;
+                    ? _rustStandardWrapperMethod(index, filePath, call, fileCalls) : null;
                 if (standardWrapper) {
                     const facts = { language: 'rust', site: occurrenceIdentity(fileEntry.relativePath, call),
                         targets: (options.targetDefinitions || definitions).map(declarationIdentity), standardWrapper };
@@ -1715,7 +1773,7 @@ function findCallers(index, name, options = {}) {
                             queryProfile.returnFlowBuilds =
                                 (queryProfile.returnFlowBuilds || 0) + 1;
                         }
-                        flowMap = _buildReturnTypeFlowMap(index, filePath, calls);
+                        flowMap = _buildReturnTypeFlowMap(index, filePath, fileCalls());
                         returnFlowCache.set(filePath, flowMap);
                     }
                     const flowEntry = flowMap && _lookupReturnTypeFlow(flowMap, call);
@@ -1783,7 +1841,7 @@ function findCallers(index, name, options = {}) {
                         index, filePath, call, () => {
                             let flowMap = returnFlowCache.get(filePath);
                             if (flowMap === undefined) {
-                                flowMap = _buildReturnTypeFlowMap(index, filePath, calls);
+                                flowMap = _buildReturnTypeFlowMap(index, filePath, fileCalls());
                                 returnFlowCache.set(filePath, flowMap);
                             }
                             return flowMap;
@@ -1817,7 +1875,7 @@ function findCallers(index, name, options = {}) {
                     if (!rootType && call.receiverIterationRoot) {
                         let flowMap = returnFlowCache.get(filePath);
                         if (flowMap === undefined) {
-                            flowMap = _buildReturnTypeFlowMap(index, filePath, calls);
+                            flowMap = _buildReturnTypeFlowMap(index, filePath, fileCalls());
                             returnFlowCache.set(filePath, flowMap);
                         }
                         const inferred = flowMap && _lookupReturnTypeFlow(flowMap, {
@@ -2047,11 +2105,11 @@ function findCallers(index, name, options = {}) {
                     // from the producer link), one-hop agreement as fallback.
                     let foldCtx = foldCtxCache.get(filePath);
                     if (!foldCtx) {
-                        foldCtx = { memo: new Map(), visiting: new Set(), records: calls,
+                        foldCtx = { memo: new Map(), visiting: new Set(), records: fileCalls(),
                             getFlowMap: () => {
                                 let fm = returnFlowCache.get(filePath);
                                 if (fm === undefined) {
-                                    fm = _buildReturnTypeFlowMap(index, filePath, calls);
+                                    fm = _buildReturnTypeFlowMap(index, filePath, fileCalls());
                                     returnFlowCache.set(filePath, fm);
                                 }
                                 return fm;
@@ -2098,11 +2156,11 @@ function findCallers(index, name, options = {}) {
                     // agreement rule dies on multi-owner `Self` returns.
                     let foldCtx = foldCtxCache.get(filePath);
                     if (!foldCtx) {
-                        foldCtx = { memo: new Map(), visiting: new Set(), records: calls,
+                        foldCtx = { memo: new Map(), visiting: new Set(), records: fileCalls(),
                             getFlowMap: () => {
                                 let fm = returnFlowCache.get(filePath);
                                 if (fm === undefined) {
-                                    fm = _buildReturnTypeFlowMap(index, filePath, calls);
+                                    fm = _buildReturnTypeFlowMap(index, filePath, fileCalls());
                                     returnFlowCache.set(filePath, fm);
                                 }
                                 return fm;
@@ -2142,11 +2200,11 @@ function findCallers(index, name, options = {}) {
                     (call.receiverIterationCall || call.receiverIterationVariable)) {
                     let foldCtx = foldCtxCache.get(filePath);
                     if (!foldCtx) {
-                        foldCtx = { memo: new Map(), visiting: new Set(), records: calls,
+                        foldCtx = { memo: new Map(), visiting: new Set(), records: fileCalls(),
                             getFlowMap: () => {
                                 let fm = returnFlowCache.get(filePath);
                                 if (fm === undefined) {
-                                    fm = _buildReturnTypeFlowMap(index, filePath, calls);
+                                    fm = _buildReturnTypeFlowMap(index, filePath, fileCalls());
                                     returnFlowCache.set(filePath, fm);
                                 }
                                 return fm;
@@ -2177,11 +2235,11 @@ function findCallers(index, name, options = {}) {
                     call.enclosingFunction?.closureSourceCall) {
                     let foldCtx = foldCtxCache.get(filePath);
                     if (!foldCtx) {
-                        foldCtx = { memo: new Map(), visiting: new Set(), records: calls,
+                        foldCtx = { memo: new Map(), visiting: new Set(), records: fileCalls(),
                             getFlowMap: () => {
                                 let fm = returnFlowCache.get(filePath);
                                 if (fm === undefined) {
-                                    fm = _buildReturnTypeFlowMap(index, filePath, calls);
+                                    fm = _buildReturnTypeFlowMap(index, filePath, fileCalls());
                                     returnFlowCache.set(filePath, fm);
                                 }
                                 return fm;
@@ -3540,7 +3598,7 @@ function findCallers(index, name, options = {}) {
                 if (!fieldHopRootType && call.receiverRoot) {
                     let flowMap = returnFlowCache.get(filePath);
                     if (flowMap === undefined) {
-                        flowMap = _buildReturnTypeFlowMap(index, filePath, calls);
+                        flowMap = _buildReturnTypeFlowMap(index, filePath, fileCalls());
                         returnFlowCache.set(filePath, flowMap);
                     }
                     const inferredRoot = flowMap && _lookupReturnTypeFlow(flowMap, {
@@ -6931,7 +6989,7 @@ function findCallers(index, name, options = {}) {
                             }
                             let demoteFlowMap = returnFlowCache.get(filePath);
                             if (demoteFlowMap === undefined) {
-                                demoteFlowMap = _buildReturnTypeFlowMap(index, filePath, calls);
+                                demoteFlowMap = _buildReturnTypeFlowMap(index, filePath, fileCalls());
                                 returnFlowCache.set(filePath, demoteFlowMap);
                             }
                             if (_receiverAssignedUntyped(demoteFlowMap, call)) {
@@ -7639,8 +7697,13 @@ function findCallees(index, definition, options = {}) {
 
     try {
         // Get all calls from the file's cache (now includes enclosingFunction)
-        const allCalls = getCachedCalls(index, def.file);
-        if (!allCalls) return [];
+        // A file whose macro expansions' calls are not derived yet derives
+        // only the parts holding this definition's lines (fix #405); its
+        // whole records are derived when a step needs them.
+        const rangeRecords = _pendingCallRecords(index, def.file, { lines: [def.startLine, def.endLine] });
+        let allCalls = rangeRecords === undefined ? getCachedCalls(index, def.file) : null;
+        if (rangeRecords === undefined && !allCalls) return [];
+        const fileCalls = () => allCalls || (allCalls = getCachedCalls(index, def.file) || []);
 
         // A file can contain hundreds of symbols and thousands of calls.
         // Reachability invokes findCallees once per reachable symbol; scanning
@@ -7650,8 +7713,8 @@ function findCallees(index, definition, options = {}) {
         // remain in the slice and retain the existing inner-symbol rules.
         // Annotation element keys (fix #389) name an element of the
         // annotation type; the annotated declaration makes no call.
-        const calls = _callsInDefinitionRange(index, def.file, allCalls,
-            def.startLine, def.endLine).filter(call => !call.annotationElement && !isDataMemberReference(
+        const calls = (rangeRecords !== undefined ? rangeRecords : _callsInDefinitionRange(index, def.file, allCalls,
+            def.startLine, def.endLine)).filter(call => !call.annotationElement && !isDataMemberReference(
                 index.files.get(def.file), call, index.symbols.get(call.name) || []));
         // The reachability walk uses the legacy (non-accounting) path and most
         // entry/test symbols contain no calls. Avoid constructing receiver,
@@ -7839,7 +7902,7 @@ function findCallees(index, definition, options = {}) {
                     queryProfile.returnFlowBuilds =
                         (queryProfile.returnFlowBuilds || 0) + 1;
                 }
-                _flowMap = _buildReturnTypeFlowMap(index, def.file, allCalls);
+                _flowMap = _buildReturnTypeFlowMap(index, def.file, fileCalls());
             }
             return _flowMap;
         };
@@ -7864,7 +7927,7 @@ function findCallees(index, definition, options = {}) {
                     // the current callee definition. Keep the narrow records
                     // set for ordinary producer indexing, but expose the
                     // already-loaded file records for exact returned spans.
-                    allRecords: allCalls,
+                    get allRecords() { return fileCalls(); },
                     getFlowMap: () => flowMap() };
             }
             return calleeFoldCtx;
@@ -8054,7 +8117,7 @@ function findCallees(index, definition, options = {}) {
                 }
             }
 
-            if (language === 'rust' && _rustStandardWrapperMethod(index, def.file, call, allCalls)) {
+            if (language === 'rust' && _rustStandardWrapperMethod(index, def.file, call, fileCalls)) {
                 noteSite(siteId, 'external', 'standard-wrapper-method', call);
                 continue;
             }
@@ -12626,7 +12689,9 @@ function _rustStandardWrapperMethod(index, file, call, calls) {
     if (!call.isMethod || !call.receiver || call.isPathCall ||
         call.receiverPatternShadow || call.receiverFlowInvalidated ||
         !['unwrap', 'expect'].includes(call.name)) return null;
-    const flow = _lookupReturnTypeFlow(_buildReturnTypeFlowMap(index, file, calls), call);
+    // `calls` may be a function reading the file's records when needed.
+    const records = typeof calls === 'function' ? calls() : calls;
+    const flow = _lookupReturnTypeFlow(_buildReturnTypeFlowMap(index, file, records), call);
     const contract = flow?.rustWrapper;
     if (contract && validateRustWrapperContract(contract, true)) {
         return { method: call.name, receiver: call.receiver, callKind: 'method',
@@ -28205,6 +28270,6 @@ function findCallbackUsages(index, name) {
     return usages;
 }
 
-module.exports = { _cppMemberUsingBases, rustTypeNameDenotes, _textualIncludeClosures, _textualLinkVerdict, isProvenanceBuiltinReceiver, provenanceParameterIdentity: _overloadTypeIdentity, selectProvenanceOverload, _unresolvedModuleIsGap, _importReaches, _sameNominalPackageDir, getCachedCalls, findCallers, findCallees, getInstanceAttributeTypes, findCallbackUsages, _nameBindingReaches, _moduleAttributeBindingReaches, _declaredFieldType, _projectTopLevelNames, _callArityCompatible, _closeCallableIdentityGroup, _overloadDiscipline, _overloadApplicable, _buildReturnTypeFlowMap, _lookupReturnTypeFlow, _cFamilySignatureKey,
+module.exports = { _cppMemberUsingBases, rustTypeNameDenotes, _textualIncludeClosures, _textualLinkVerdict, isProvenanceBuiltinReceiver, provenanceParameterIdentity: _overloadTypeIdentity, selectProvenanceOverload, _unresolvedModuleIsGap, _importReaches, _sameNominalPackageDir, getCachedCalls, getCachedCallsBearing, findCallers, findCallees, getInstanceAttributeTypes, findCallbackUsages, _nameBindingReaches, _moduleAttributeBindingReaches, _declaredFieldType, _projectTopLevelNames, _callArityCompatible, _closeCallableIdentityGroup, _overloadDiscipline, _overloadApplicable, _buildReturnTypeFlowMap, _lookupReturnTypeFlow, _cFamilySignatureKey,
     _isConfigurationAlternative, _isCrossFileConfigurationMember, _configurationAlternativeFiles, _sameOwnerPath,
     _goFileConstraint };

@@ -89,11 +89,24 @@ function moduleTree(index) {
  */
 function rustPathModule(index, filePath, line, qualifier) {
     if (!isRustEntry(index.files.get(filePath)) || !qualifier) return null;
+    const tree = moduleTree(index);
+    const inline = tree.inlineByFile.get(filePath) || [];
+    // A file without inline modules answers the same at every line (fix
+    // #405: path calls asked once per site).
+    if (inline.length > 0) return resolvePathModule(tree, filePath, line, qualifier, inline);
+    const memo = tree.pathMemo || (tree.pathMemo = new Map());
+    const key = `${filePath}\0${qualifier}`;
+    if (memo.has(key)) return memo.get(key);
+    const resolved = resolvePathModule(tree, filePath, line, qualifier, inline);
+    memo.set(key, resolved);
+    return resolved;
+}
+
+function resolvePathModule(tree, filePath, line, qualifier, inline) {
     const segments = String(qualifier).split('::');
     if (segments.some(segment => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(segment))) return null;
-    const tree = moduleTree(index);
     const own = tree.moduleOf(filePath);
-    const current = [...own.segs, ...rustInlineChainAt(tree.inlineByFile.get(filePath) || [], line)];
+    const current = [...own.segs, ...rustInlineChainAt(inline, line)];
     const has = segs => tree.entries.has(`${own.root}\0${segs.join('::')}`);
     let segs;
     let i = 0;

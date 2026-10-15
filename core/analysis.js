@@ -2509,8 +2509,15 @@ function diffImpact(index, options = {}) {
         const { getCachedCalls } = require('./callers');
         for (const del of deletedFunctions) {
             const remaining = [];
-            const calleeFiles = index.getCalleeFiles(del.name);
-            if (calleeFiles) {
+            // A snapshot: deriving a file's macro-expansion calls re-lists it
+            // in the callee index. Files whose expansions' calls are not
+            // derived yet and whose expanded text holds the name join it
+            // (fix #405).
+            const calleeFiles = new Set(index.getCalleeFiles(del.name) || []);
+            for (const f of require('./rust-macro-expansion').rustPendingFilesBearing(index, [del.name])) {
+                calleeFiles.add(f);
+            }
+            if (calleeFiles.size > 0) {
                 for (const f of calleeFiles) {
                     const calls = getCachedCalls(index, f);
                     if (!Array.isArray(calls)) continue;

@@ -918,7 +918,11 @@ function clearAllCaches() {
 // `passedAsArgument`.
 // v274 (fix #403): a Python reference inside a lambda whose enclosing def
 // binds the name records that def as its `localShadowScope`.
-const CACHE_FORMAT_VERSION = 274;
+// v275 (fix #405): a Rust file whose macro-expansion calls are pending
+// records every expansion's hygiene start and expanded length
+// (`rustMacroExpansion.expansions`); its `words` leave out the text of
+// literals and comments.
+const CACHE_FORMAT_VERSION = 275;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**

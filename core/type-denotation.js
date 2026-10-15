@@ -774,11 +774,14 @@ function rustScopedLine(index, filePath, line, name) {
     if (line == null) return null;
     const fileEntry = index.files.get(filePath);
     if (fileEntry?.language !== 'rust') return null;
-    const declares = (index.symbols.get(name) || []).some(definition => definition.file === filePath &&
-        (TYPE_KINDS.has(definition.type) || definition.type === 'type'));
-    const imports = (fileEntry.importBindings || []).some(binding =>
-        binding.name !== '*' && (binding.alias || binding.name) === name && binding.module);
-    return declares || imports ? line : null;
+    // Per file and name (fix #405: every `T::new()` site asked again).
+    const scoped = memoized(index, `scoped\x00${filePath}\x00${name}`, () => {
+        const declares = (index.symbols.get(name) || []).some(definition => definition.file === filePath &&
+            (TYPE_KINDS.has(definition.type) || definition.type === 'type'));
+        return declares || (fileEntry.importBindings || []).some(binding =>
+            binding.name !== '*' && (binding.alias || binding.name) === name && binding.module);
+    });
+    return scoped ? line : null;
 }
 
 /** Bindings visible at `line`: those of the innermost enclosing scope that
