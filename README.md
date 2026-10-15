@@ -1,6 +1,6 @@
 # UCN - Universal Code Navigator
 
-See what code does before you touch it.
+Auditable answers, with every match counted, unsure ones marked and blind spots named.
 
 [![npm](https://img.shields.io/npm/v/ucn)](https://www.npmjs.com/package/ucn)
 [![tests](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/mleoca/0e10a790e16ab61ddd233e05645e203e/raw/ucn-tests.json)](https://github.com/mleoca/ucn/actions/workflows/ci.yml)
@@ -8,7 +8,9 @@ See what code does before you touch it.
 
 If you work with AI Agents, add UCN as a [Skill or MCP tool](#ai-setup). One tool
 gives the agent compact, source-linked answers to caller, impact, and test
-questions, with uncertainty labeled instead of guessed.
+questions, with uncertainty labeled instead of guessed. The answer depends on
+the indexed source, not on who asks: a person at a terminal and an agent over
+MCP receive the same records for the same question.
 
 <img src="assets/readme/ucn-connected-scope.gif" width="736" alt="Conceptual overview of UCN's relationship views, multi-hop exploration, visible uncertainty, index reuse, and refresh after edits. Nodes and timing are illustrative, not a captured query or benchmark.">
 
@@ -103,10 +105,11 @@ Captured findings · [Still image](assets/readme/ucn-evidence-graph.png) · [Dat
 
 The ACCOUNT line reconciles the observed name occurrences: confirmed calls,
 unverified candidates, non-call occurrences, and matches attributed to another
-target. CONTRACT describes the scope of that accounting. Warnings identify
-source the index could not cover. These details survive text truncation for
-an agent's output budget; a budget too small to hold them withholds the answer
-and names the budget that would.
+target. Each occurrence is counted in exactly one category, so the totals can
+be checked line by line rather than taken on trust. CONTRACT describes the
+scope of that accounting. Warnings identify source the index could not cover.
+These details survive text truncation for an agent's output budget; a budget
+too small to hold them withholds the answer and names the budget that would.
 
 An empty result therefore means something specific about the inspected code.
 It cannot establish that reflection, generated code, runtime registration, or
@@ -210,6 +213,8 @@ exits 2, and a successful listing exits 0. `--lines` supports `find`, `show`,
 `usages`, `search`, and `impact`; `show --lines` lists callers by default.
 Use `--json` when the script needs structured fields or a tree result.
 
+Listings are deterministic for a given source tree: a fresh build, a cache
+load, and an incremental rebuild return the same records in the same order.
 Listings have no default row cap. Explicit limits disclose what they omit,
 and a shell-mode character budget fails before writing partial output.
 `source --raw` extracts complete functions and classes unless an explicit
