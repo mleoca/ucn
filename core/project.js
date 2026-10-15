@@ -2620,10 +2620,13 @@ class ProjectIndex {
             if (exact) return returnSymbol ? exact : exact.name;
         }
 
-        // Per-operation cache: avoid rescanning symbols for same (file, line)
-        const cacheKey = filePath + '\0' + lineNum;
+        // Per-operation cache: avoid rescanning symbols for same (file, line),
+        // keyed per file then line (no composed key string per call).
+        let byLine = null;
         if (this._opEnclosingFnCache) {
-            const cached = this._opEnclosingFnCache.get(cacheKey);
+            byLine = this._opEnclosingFnCache.get(filePath);
+            if (!byLine) this._opEnclosingFnCache.set(filePath, byLine = new Map());
+            const cached = byLine.get(lineNum);
             if (cached !== undefined) {
                 return cached === null ? null : (returnSymbol ? cached : cached.name);
             }
@@ -2640,9 +2643,7 @@ class ProjectIndex {
             }
         }
 
-        if (this._opEnclosingFnCache) {
-            this._opEnclosingFnCache.set(cacheKey, best);
-        }
+        if (byLine) byLine.set(lineNum, best);
         return best ? (returnSymbol ? best : best.name) : null;
     }
 

@@ -54,7 +54,74 @@ const RESERVED_RECEIVER_NAMES = new Set([
 ]);
 const CROSS_OPERATION_FLOW_CACHE_LIMIT = 4096;
 
+// The options confirmationFacts reads besides its resolvers; a falsy value
+// reads as absent.
+const _FACT_OPTION_KEYS = ['receiverType', 'receiverTypeSource', 'receiverOrigin', 'originFile', 'bindingId', 'sameClass'];
+
 function _confirmationFacts(index, file, call, targets, options = {}) {
+    // Only the target identities depend on the targets: the facts of a
+    // record are collected once per operation (fix #405b: orientation refines
+    // every definition of a name over the same records, and each refinement
+    // collected them again for every record it excluded or kept). The engine
+    // reaches here with a view of the record built anew per query, so a view
+    // and options equal in every field to ones seen before reuse their facts.
+    const memo = _repeatedQueryMemo(index, 'confirmationFacts');
+    if (!memo) return _confirmationFactsUncached(index, file, call, targets, options);
+    const read = {};
+    for (const key of _FACT_OPTION_KEYS) if (options[key]) read[key] = options[key];
+    if (Number.isInteger(options.receiverTypeLine)) read.receiverTypeLine = options.receiverTypeLine;
+    // Views of one record share its file, line and name.
+    let byLine = memo.get(file);
+    if (!byLine) memo.set(file, byLine = new Map());
+    let byName = byLine.get(call.line);
+    if (!byName) byLine.set(call.line, byName = new Map());
+    let seen = byName.get(call.name);
+    if (!seen) byName.set(call.name, seen = []);
+    for (const entry of seen) {
+        if (_sameRecordValue(entry.call, call, 0) && _sameRecordValue(entry.read, read, 0)) {
+            return { ...entry.facts, targets: targets.map(declarationIdentity) };
+        }
+    }
+    const facts = _confirmationFactsUncached(index, file, call, targets, options);
+    // A copy: a consumer may add its own verdicts to the facts it was given.
+    if (seen.length < 16) seen.push({ call, read, facts: { ...facts } });
+    return facts;
+}
+
+/**
+ * A memo for the current operation once it runs a second caller query (an
+ * orientation ranking, a rename plan): a single query reads each record once
+ * and would only pay for the memo.
+ */
+function _repeatedQueryMemo(index, key) {
+    if (!(index._opFindCallersCaches?.runs > 1)) return null;
+    return index._opMemo?.(key, () => new Map()) || null;
+}
+
+/** Deep equality of two call records or record views (own enumerable fields). */
+function _sameRecordValue(a, b, depth) {
+    if (a === b) return true;
+    if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null || depth > 6) return false;
+    if (Array.isArray(a)) {
+        if (!Array.isArray(b) || a.length !== b.length) return false;
+        for (let i = 0; i < a.length; i++) if (!_sameRecordValue(a[i], b[i], depth + 1)) return false;
+        return true;
+    }
+    // Plain objects only: a Map or Set holds no own enumerable fields.
+    const proto = Object.getPrototypeOf(a);
+    if (Array.isArray(b) || (proto !== Object.prototype && proto !== null) ||
+        Object.getPrototypeOf(b) !== proto) return false;
+    let count = 0;
+    for (const key in a) {
+        if (!Object.hasOwn(a, key)) continue;
+        if (!Object.hasOwn(b, key) || !_sameRecordValue(a[key], b[key], depth + 1)) return false;
+        count++;
+    }
+    for (const key in b) if (Object.hasOwn(b, key)) count--;
+    return count === 0;
+}
+
+function _confirmationFactsUncached(index, file, call, targets, options) {
     return confirmationFacts(index, file, call, targets, {
         ...options,
         selectOverload: selectProvenanceOverload,
@@ -395,13 +462,13 @@ function isDataMemberReference(fileEntry, call, definitions) {
 // loop's largest fixed cost (fix #365).
 function _callsBearingName(index, filePath, calls, name) {
     const caches = index._opFindCallersCaches;
-    if (!caches) return calls.filter(call => _callBearsName(call, name));
+    if (!caches) return _recordsBearing(calls, name);
     let memo = caches.callsByName.get(filePath);
     // A query reads one name per file: the index pays off from a file's
     // second name in the operation (fix #405).
     if (!memo || memo.calls !== calls) {
         caches.callsByName.set(filePath, { calls, byName: null });
-        return calls.filter(call => _callBearsName(call, name));
+        return _recordsBearing(calls, name);
     }
     if (!memo.byName) {
         const byName = new Map();
@@ -441,6 +508,16 @@ function _bindingsNamed(index, fileEntry, name) {
         caches.bindingsByName.set(fileEntry, memo);
     }
     return memo.byName.get(name) || [];
+}
+
+/** The records bearing `name`, in record order (_callBearsName, unrolled). */
+function _recordsBearing(calls, name) {
+    const out = [];
+    for (const call of calls) {
+        if (call && (call.name === name || call.resolvedName === name ||
+            (Array.isArray(call.resolvedNames) && call.resolvedNames.includes(name)))) out.push(call);
+    }
+    return out;
 }
 
 function _callBearsName(call, name) {
@@ -595,7 +672,9 @@ function findCallers(index, name, options = {}) {
         // The name-level subtype closure cannot tell apart local classes
         // with the same spelling. An override in another function must not
         // hide the member this particular local class inherits.
-        for (const name of new Set([call?.receiver, call?.receiverType])) {
+        const receiver = call?.receiver;
+        const receiverType = call?.receiverType;
+        for (const name of receiverType === receiver ? [receiver] : [receiver, receiverType]) {
             if (!name || types.has(name) || !file ||
                 !_functionLocalTypeInScope(index, file, name, call.line)) continue;
             if (_resolveReceiverTypeIdentity(index, file, name, targetDefs, call.line) === 'target') {
@@ -1052,7 +1131,7 @@ function findCallers(index, name, options = {}) {
     // maps per candidate made grpc-go's `repo` cost 40s (1375 calls).
     if (!index._opFindCallersCaches) {
         index._opFindCallersCaches = {
-            localTypeCache: new Map(), // `${filePath}:${startLine}` -> localTypes Map or null
+            localTypeCache: new Map(), // filePath -> startLine -> localTypes Map or null
             returnFlowCache: new Map(), // filePath -> return-type-flow map (see _buildReturnTypeFlowMap)
             foldCtxCache: new Map(), // filePath -> chained-receiver fold context (fix #258)
             pythonIndexedReceiverCache: new Map(),
@@ -1063,6 +1142,9 @@ function findCallers(index, name, options = {}) {
     }
     const { localTypeCache, returnFlowCache, foldCtxCache, pythonIndexedReceiverCache } =
         index._opFindCallersCaches;
+    // Caller queries run so far in this operation: the per-record memos below
+    // pay off once the same records are read again (fix #405b).
+    index._opFindCallersCaches.runs = (index._opFindCallersCaches.runs || 0) + 1;
 
     // Use inverted callee index to skip files that don't contain calls to this name
     let calleeFiles = index.getCalleeFiles(name);
@@ -5479,14 +5561,15 @@ function findCallers(index, name, options = {}) {
                             if (langTraits(fileEntry.language)?.typeSystem === 'nominal') {
                                 const callerSym = index.findEnclosingFunction(filePath, call.line, true, call);
                                 if (callerSym && callerSym.startLine != null && callerSym.endLine != null) {
-                                    const cacheKey = `${filePath}:${callerSym.startLine}`;
-                                    let localTypes = localTypeCache.get(cacheKey);
+                                    let localTypesByLine = localTypeCache.get(filePath);
+                                    if (!localTypesByLine) localTypeCache.set(filePath, localTypesByLine = new Map());
+                                    let localTypes = localTypesByLine.get(callerSym.startLine);
                                     if (localTypes === undefined) {
                                         const callsForFile = getCachedCalls(index, filePath);
                                         localTypes = callsForFile ? _buildTypedLocalTypeMap(index,
                                             { file: filePath, startLine: callerSym.startLine, endLine: callerSym.endLine },
                                             callsForFile) : null;
-                                        localTypeCache.set(cacheKey, localTypes);
+                                        localTypesByLine.set(callerSym.startLine, localTypes);
                                     }
                                     if (localTypes) {
                                         // The inference map re-derives receiver types
@@ -15383,12 +15466,7 @@ function _resolveStructuralFlowTypeIdentity(index, originFile, knownType, target
  * never exclude. Returns the trait name or null.
  */
 function _traitPathImplMemberRoute(index, filePath, receiverSegment, targetDefs) {
-    const traitDefs = (index.symbols.get(receiverSegment) || []).filter(definition =>
-        definition.type === 'trait' && definition.file);
-    if (traitDefs.length === 0) return null;
-    const origin = _resolveFlowTypeOrigin(index, filePath, receiverSegment);
-    const trait = origin?.fromFile
-        ? traitDefs.find(definition => definition.file === origin.fromFile) : null;
+    const trait = _pathTraitDefinition(index, filePath, receiverSegment);
     if (!trait) return null;
     for (const target of targetDefs) {
         const head = String(target.traitName || '').replace(/<.*$/s, '').trim()
@@ -15398,6 +15476,24 @@ function _traitPathImplMemberRoute(index, filePath, receiverSegment, targetDefs)
         if (targetOrigin?.fromFile === trait.file) return receiverSegment;
     }
     return null;
+}
+
+/** The project trait a path segment names from a file, or null; per operation (fix #405b). */
+function _pathTraitDefinition(index, filePath, receiverSegment) {
+    const memo = index._opMemo?.('pathTraitDefinition', () => new Map());
+    let byName = memo?.get(filePath);
+    if (memo && !byName) memo.set(filePath, byName = new Map());
+    const known = byName?.get(receiverSegment);
+    if (known !== undefined) return known;
+    let trait = null;
+    const traitDefs = (index.symbols.get(receiverSegment) || []).filter(definition =>
+        definition.type === 'trait' && definition.file);
+    if (traitDefs.length > 0) {
+        const origin = _resolveFlowTypeOrigin(index, filePath, receiverSegment);
+        trait = (origin?.fromFile ? traitDefs.find(definition => definition.file === origin.fromFile) : null) || null;
+    }
+    byName?.set(receiverSegment, trait);
+    return trait;
 }
 
 function _traitDeclPinImplementorRoute(index, fileEntry, receiverSegment, targetDefs) {
@@ -18226,6 +18322,30 @@ function _typedFieldDefinitions(index, defs) {
 function _declaredFieldType(
     index, rootType, fieldName, language, info = null, rootNamespace = undefined, rootArity = null
 ) {
+    // A pure function of its arguments and the index, plus the facts it
+    // writes into `info`: kept per operation (fix #405b: an exact orientation
+    // ranking asked it again per record of every refinement).
+    const memo = _repeatedQueryMemo(index, 'declaredFieldType');
+    if (!memo) return _declaredFieldTypeUncached(index, rootType, fieldName, language, info, rootNamespace, rootArity);
+    const namespaceKey = rootNamespace === undefined ? '\x01' : rootNamespace === null ? '\x02' : rootNamespace;
+    const key = `${rootType}\0${fieldName}\0${language}\0${namespaceKey}` +
+        `\0${rootArity == null ? '\x01' : rootArity}\0${info ? 1 : 0}`;
+    let known = memo.get(key);
+    if (!known) {
+        const written = info ? {} : null;
+        known = { type: _declaredFieldTypeUncached(index, rootType, fieldName, language, written, rootNamespace, rootArity), written };
+        memo.set(key, known);
+    }
+    if (info && known.written) {
+        for (const field in known.written) {
+            const value = known.written[field];
+            info[field] = Array.isArray(value) ? [...value] : value;
+        }
+    }
+    return known.type;
+}
+
+function _declaredFieldTypeUncached(index, rootType, fieldName, language, info, rootNamespace, rootArity) {
     const defs = index.symbols.get(fieldName) || [];
     if (defs.length === 0 && language !== 'python') return null;
     // 'private field' (JS #-fields, fix #219): equally compiler-true, and
@@ -18667,10 +18787,20 @@ function _enclosingFunctionOfDefinitionUncached(index, def) {
  */
 let _rustModulesApi = null;
 function _rustModulePathRoute(index, filePath, call, name, targets) {
-    const { rustPathModule, rustModuleItems } = _rustModulesApi || (_rustModulesApi = require('./rust-modules'));
-    const resolved = rustPathModule(index, filePath, call.line, call.receiver);
-    if (!resolved) return null;
-    const items = rustModuleItems(index, resolved, name);
+    // The module items a record's qualifier names, kept per record while the
+    // index lives (fix #405b: orientation asked per record for every
+    // definition of the name it refined).
+    const memo = index._rustScopeMemo || (index._rustScopeMemo = new Map());
+    let byRecord = memo.get('\x01pathRouteItems');
+    if (!byRecord) memo.set('\x01pathRouteItems', byRecord = new WeakMap());
+    let known = byRecord.get(call);
+    if (!known || known.name !== name) {
+        const { rustPathModule, rustModuleItems } = _rustModulesApi || (_rustModulesApi = require('./rust-modules'));
+        const resolved = rustPathModule(index, filePath, call.line, call.receiver);
+        known = { name, items: resolved ? rustModuleItems(index, resolved, name) : [] };
+        byRecord.set(call, known);
+    }
+    const items = known.items;
     if (items.length === 0) return null;
     const pinned = items.filter(item => targets.some(target =>
         sameDeclaration(declarationIdentity(item), declarationIdentity(target))));
@@ -22792,10 +22922,9 @@ function _pathQualifierAliasIdentity(index, filePath, fileEntry, segment, target
             ? 'target' : null;
     }
     // `use path::Type as Local;` renames a type import: Local names Type.
-    for (const binding of fileEntry.importBindings || []) {
-        if (!binding.alias || binding.alias !== segment) continue;
-        const original = String(binding.module || '').split(/::|\./).pop();
-        if (!original || original === segment) continue;
+    const renamed = _typeImportRenameOf(fileEntry, segment);
+    if (renamed) {
+        const { binding, original } = renamed;
         const relative = fileEntry.moduleResolved?.[binding.module];
         if (!targetTypes.has(original)) {
             // A rename of a DIFFERENT project type is positive evidence.
@@ -22820,9 +22949,41 @@ function _pathQualifierAliasIdentity(index, filePath, fileEntry, segment, target
         alias.definition.startLine);
 }
 
+/** Type aliases named `name`, per operation (fix #405b: asked per path-call record). */
+function _typeAliasesNamed(index, name) {
+    const definitions = index.symbols.get(name);
+    if (!definitions) return [];
+    const memo = index._opMemo?.('typeAliasesNamed', () => new WeakMap());
+    let aliases = memo?.get(definitions);
+    if (!aliases) {
+        aliases = definitions.filter(definition => definition.type === 'type' && definition.aliasOf);
+        memo?.set(definitions, aliases);
+    }
+    return aliases;
+}
+
+// The first import binding renaming a type to `segment` (`use m::T as L;`),
+// per file entry (fix #405b: asked per path-call record).
+const _TYPE_IMPORT_RENAMES = new WeakMap();
+function _typeImportRenameOf(fileEntry, segment) {
+    let byName = _TYPE_IMPORT_RENAMES.get(fileEntry);
+    if (!byName) _TYPE_IMPORT_RENAMES.set(fileEntry, byName = new Map());
+    let renamed = byName.get(segment);
+    if (renamed !== undefined) return renamed;
+    renamed = null;
+    for (const binding of fileEntry.importBindings || []) {
+        if (!binding.alias || binding.alias !== segment) continue;
+        const original = String(binding.module || '').split(/::|\./).pop();
+        if (!original || original === segment) continue;
+        renamed = { binding, original };
+        break;
+    }
+    byName.set(segment, renamed);
+    return renamed;
+}
+
 function _pathAliasInScope(index, filePath, fileEntry, name, qualifier) {
-    const aliases = (index.symbols.get(name) || []).filter(definition =>
-        definition.type === 'type' && definition.aliasOf);
+    const aliases = _typeAliasesNamed(index, name);
     if (aliases.length === 0) return null;
     // `module::Alias` names the alias declared in that module's file.
     const segments = String(qualifier || '').split('::').filter(Boolean);
@@ -27040,6 +27201,25 @@ function _orderedTypeParamsUncached(genericsText) {
  * such a parameter or its declaration is not visible.
  */
 function _rustGenericBoundReceiver(index, filePath, call) {
+    // Only `self`, a receiver annotated with its type, or a `self.field` can
+    // be one (the shapes _rustGenericBoundReceiverUncached reads).
+    if (!(call.receiver === 'self' && !call.receiverField && !call.receiverType) &&
+        !(call.receiverType && call.receiver && call.receiver !== 'self' && !call.receiverField &&
+            call.receiverTypeSource === 'annotation') &&
+        !(!call.receiverType && call.receiverRoot === 'self' && call.receiverField)) return null;
+    // Per record while the index lives (fix #405b).
+    const memo = index._rustScopeMemo || (index._rustScopeMemo = new Map());
+    let byRecord = memo.get('\x01boundReceiver');
+    if (!byRecord) memo.set('\x01boundReceiver', byRecord = new WeakMap());
+    let bound = byRecord.get(call);
+    if (bound === undefined) {
+        bound = _rustGenericBoundReceiverUncached(index, filePath, call);
+        byRecord.set(call, bound);
+    }
+    return bound;
+}
+
+function _rustGenericBoundReceiverUncached(index, filePath, call) {
     // `self` inside a trait's own method body (fix #369) is the generic
     // `Self: Trait`, bounded by the trait and its declared supertraits.
     if (call.receiver === 'self' && !call.receiverField && !call.receiverType) {
@@ -27104,6 +27284,22 @@ function _rustGenericBoundReceiver(index, filePath, call) {
  * crate cannot name this project's traits, so they add nothing.
  */
 function _rustTraitClosure(index, fromFile, names) {
+    // Per file and bound list while the index lives (fix #405b).
+    const memo = index._rustScopeMemo || (index._rustScopeMemo = new Map());
+    let byFile = memo.get('\x01traitClosure');
+    if (!byFile) memo.set('\x01traitClosure', byFile = new Map());
+    let byNames = byFile.get(fromFile);
+    if (!byNames) byFile.set(fromFile, byNames = new Map());
+    const namesKey = names.join('\0');
+    let closure = byNames.get(namesKey);
+    if (!closure) {
+        closure = _rustTraitClosureUncached(index, fromFile, names);
+        byNames.set(namesKey, closure);
+    }
+    return closure;
+}
+
+function _rustTraitClosureUncached(index, fromFile, names) {
     const keys = new Map();
     let complete = true;
     const pending = names.map(name => ({ name, fromFile }));
@@ -27144,13 +27340,21 @@ function _rustTraitClosure(index, fromFile, names) {
  *                 traits) stays with the existing receiver physics.
  */
 function _rustGenericBoundDispatchVerdict(index, filePath, bound, targetDefs) {
-    const opCache = index._rustScopeMemo || (index._rustScopeMemo = new Map());
-    const cacheKey = opCache ? `\x01bound\x00${filePath}\x00${bound.bounds.join(',')}\x00` +
-        targetDefs.map(definition => `${definition.file}:${definition.startLine}`).join('|') : null;
-    if (cacheKey && opCache.has(cacheKey)) return opCache.get(cacheKey);
-    const verdict = _rustGenericBoundDispatchVerdictUncached(index, filePath, bound, targetDefs);
-    if (opCache.size > 50000) opCache.clear();
-    opCache.set(cacheKey, verdict);
+    // Per target list, file and bound list (fix #405b: no composed key of
+    // absolute paths per record).
+    const memo = index._rustScopeMemo || (index._rustScopeMemo = new Map());
+    let byTargets = memo.get('\x01boundVerdict');
+    if (!byTargets) memo.set('\x01boundVerdict', byTargets = new WeakMap());
+    let byFile = byTargets.get(targetDefs);
+    if (!byFile) byTargets.set(targetDefs, byFile = new Map());
+    let byBounds = byFile.get(filePath);
+    if (!byBounds) byFile.set(filePath, byBounds = new Map());
+    const boundsKey = bound.bounds.join(',');
+    let verdict = byBounds.get(boundsKey);
+    if (verdict === undefined) {
+        verdict = _rustGenericBoundDispatchVerdictUncached(index, filePath, bound, targetDefs);
+        byBounds.set(boundsKey, verdict);
+    }
     return verdict;
 }
 
@@ -27160,29 +27364,25 @@ function _rustGenericBoundDispatchVerdictUncached(index, filePath, bound, target
         (definition.className || definition.receiver));
     if (targets.length === 0 || targets.length !== targetDefs.filter(definition =>
         !NON_CALLABLE_TYPES.has(definition.type)).length) return null;
-    if (targets.some(definition => _definitionHasGenericOwner(definition))) return null;
+    const facts = targets.map(target => _rustBoundTargetFacts(index, target));
+    if (facts.some(fact => fact.genericOwner)) return null;
     // Trait declaration members keep the existing trait-slot physics.
-    if (targets.some(definition => (index.symbols.get(definition.className) || [])
-        .some(type => type.type === 'trait' && type.file === definition.file))) return null;
+    if (facts.some(fact => fact.traitMember)) return null;
     const closure = _rustTraitClosure(index, filePath, bound.bounds);
     let via = null;
     let upstream = false;
     let allOutside = true;
-    for (const target of targets) {
-        if (!target.traitName) continue; // inherent member: unreachable through a bound
-        const head = String(target.traitName).replace(/<.*$/s, '').trim()
-            .split('::').filter(Boolean).pop();
-        const traitDefs = (index.symbols.get(head) || []).filter(definition =>
-            definition.type === 'trait' && definition.file);
-        if (traitDefs.length === 0) {
+    for (const fact of facts) {
+        if (fact.inherent) continue; // inherent member: unreachable through a bound
+        const head = fact.head;
+        if (fact.upstream) {
             // Upstream trait (fix #369): its supertrait graph is invisible,
             // except that a bound naming the SAME upstream trait fills the
             // target's slot (`I: Iterator` reaching `impl Iterator for Tee`):
             // one external-contract family. Any other upstream relation
             // stays unknown.
-            if (bound.bounds.some(name => String(name).replace(/<.*$/s, '').trim()
-                .split('::').filter(Boolean).pop() === head &&
-                !(index.symbols.get(head) || []).some(definition => definition.type === 'trait'))) {
+            if (fact.noProjectTrait && bound.bounds.some(name => String(name).replace(/<.*$/s, '').trim()
+                .split('::').filter(Boolean).pop() === head)) {
                 via = via || head;
                 upstream = true;
                 allOutside = false;
@@ -27190,11 +27390,8 @@ function _rustGenericBoundDispatchVerdictUncached(index, filePath, bound, target
             }
             return null;
         }
-        const origin = _resolveFlowTypeOrigin(index, target.file, head);
-        const pinned = origin?.fromFile
-            ? traitDefs.filter(definition => definition.file === origin.fromFile) : [];
-        if (pinned.length !== 1) return null;
-        if (closure.keys.has(`${pinned[0].file}\0${head}`)) {
+        if (!fact.pinnedKey) return null;
+        if (closure.keys.has(fact.pinnedKey)) {
             via = via || head;
             allOutside = false;
         }
@@ -27202,6 +27399,45 @@ function _rustGenericBoundDispatchVerdictUncached(index, filePath, bound, target
     if (via) return { via, ...(upstream && { externalContract: true }) };
     if (allOutside && closure.complete) return { exclude: true };
     return null;
+}
+
+/**
+ * What the bound verdict reads of one pinned definition, independent of the
+ * site (fix #405b: asked again for every bounded receiver of every
+ * refinement): its owner is generic, it is a trait declaration's member,
+ * an inherent member, a member of an upstream trait, or the key of the one
+ * project trait its impl names.
+ */
+function _rustBoundTargetFacts(index, target) {
+    const memo = index._rustScopeMemo || (index._rustScopeMemo = new Map());
+    let byTarget = memo.get('\x01boundTarget');
+    if (!byTarget) memo.set('\x01boundTarget', byTarget = new WeakMap());
+    let fact = byTarget.get(target);
+    if (fact) return fact;
+    fact = {
+        genericOwner: _definitionHasGenericOwner(target),
+        traitMember: (index.symbols.get(target.className) || [])
+            .some(type => type.type === 'trait' && type.file === target.file),
+    };
+    if (!target.traitName) {
+        fact.inherent = true;
+    } else {
+        const head = String(target.traitName).replace(/<.*$/s, '').trim().split('::').filter(Boolean).pop();
+        fact.head = head;
+        const traitDefs = (index.symbols.get(head) || []).filter(definition =>
+            definition.type === 'trait' && definition.file);
+        if (traitDefs.length === 0) {
+            fact.upstream = true;
+            fact.noProjectTrait = !(index.symbols.get(head) || []).some(definition => definition.type === 'trait');
+        } else {
+            const origin = _resolveFlowTypeOrigin(index, target.file, head);
+            const pinned = origin?.fromFile
+                ? traitDefs.filter(definition => definition.file === origin.fromFile) : [];
+            fact.pinnedKey = pinned.length === 1 ? `${pinned[0].file}\0${head}` : null;
+        }
+    }
+    byTarget.set(target, fact);
+    return fact;
 }
 
 /**

@@ -820,6 +820,9 @@ function flatten(tokens, out = []) {
 
 const MULTI_PUNCT = ['::', '->', '=>', '==', '!=', '<=', '>=', '&&', '||', '+=', '-=', '*=', '/=',
     '%=', '^=', '&=', '|=', '<<', '>>', '..', '//', '/*', '*/'];
+// The two-character joints that start a multi-character punctuation token
+// (a one-character joint, from an empty leaf, starts any that begins with it).
+const MULTI_PUNCT_JOINTS = new Set(MULTI_PUNCT.flatMap(p => [p.slice(0, 2), p[0]]));
 const SPACE_AFTER = new Set([',', ';', ':', '=>', '->', '=', '+', '|', '&&', '||', '==', '!=']);
 const SPACE_BEFORE = new Set(['=>', '->', '=', '+', '{', '==', '!=', '&&', '||']);
 // ASCII letters, digits, '_', quotes (and '#' at a word's end): a leaf that
@@ -851,10 +854,13 @@ function needsSpace(prev, leaf) {
     if (wordEnd && wordStart) return true;
     const a = prev.v;
     const b = leaf.v;
-    if (b === '.' && /^[0-9]/.test(a)) return true;
+    if (b === '.') {
+        const first = String(a).charCodeAt(0);
+        if (first >= 48 && first <= 57) return true;
+    }
     if (!wordEnd && !wordStart) {
         const joint = a.slice(-1) + b[0];
-        if (MULTI_PUNCT.some(p => p.startsWith(joint)) && !(a === '::' || b === '::')) return true;
+        if (MULTI_PUNCT_JOINTS.has(joint) && !(a === '::' || b === '::')) return true;
     }
     if (a === ':' && b === ':') return true;
     if (SPACE_AFTER.has(a) && a !== '::') return !(a === '|' && prev.closer);
@@ -1225,11 +1231,29 @@ const DECLARATION_TYPES = [
     'field_declaration', 'enum_variant', 'associated_type',
 ];
 
-/** (startLine\0name) keys of declarations whose name was produced inside a region. */
-function generatedDeclarations(root, regions) {
+const DECLARATION_TYPE_SET = new Set(DECLARATION_TYPES);
+let declarationWalkTypes = null;
+function declarationWalkTypesOf() {
+    return declarationWalkTypes || (declarationWalkTypes =
+        [...new Set([...DECLARATION_TYPES, ...require('../languages/rust').DECLARATION_NODE_TYPES])]);
+}
+
+/**
+ * (startLine\0name) keys of declarations whose name was produced inside a
+ * region. `within`: the roots spanning the regions and their walked
+ * descendants, when every such declaration lies inside one (else the whole
+ * tree is searched).
+ */
+function generatedDeclarations(root, regions, within = null) {
     const out = new Map();
     if (regions.length === 0) return out;
-    for (const node of root.descendantsOfType(DECLARATION_TYPES)) {
+    const nodes = within
+        ? within.roots.flatMap((spanning, i) => [
+            ...(DECLARATION_TYPE_SET.has(spanning.type) ? [spanning] : []),
+            ...within.walked[i].filter(node => DECLARATION_TYPE_SET.has(node.type)),
+        ])
+        : root.descendantsOfType(DECLARATION_TYPES);
+    for (const node of nodes) {
         const nameNode = node.type === 'impl_item' ? node.childForFieldName('type')
             : node.childForFieldName('name');
         if (!nameNode) continue;
@@ -1268,9 +1292,9 @@ function macroFact(region, origin) {
  * project macros in scope that are worth expanding. Invocations without a
  * context or token tree are recorded blind in `rec`.
  */
-function plannedInvocations(state, filePath, content, tree, rec) {
+function plannedInvocations(state, filePath, content, tree, rec, invocations = null) {
     const plan = [];
-    for (const node of tree.rootNode.descendantsOfType('macro_invocation')) {
+    for (const node of invocations || tree.rootNode.descendantsOfType('macro_invocation')) {
         const id = invocationName(node);
         if (!id || !state.inventory.has(id.name)) continue;
         let inDefinition = false;
@@ -1355,7 +1379,14 @@ function expandFile(state, filePath, mode = 'symbols') {
     // calls pass expands one group of units with the same numbering and
     // the same offsets as a pass over the whole file.
     const expansions = mode === 'symbols' ? [] : null;
-    for (const item of plannedInvocations(state, filePath, content, tree, rec)) {
+    // The symbols pass also needs the file's literals and comments: one
+    // walk lists both (fix #405b).
+    const clean = !tree.rootNode.hasError;
+    const walked = mode === 'symbols' && clean
+        ? tree.rootNode.descendantsOfType(['macro_invocation', ...NON_CODE_TOKENS]) : null;
+    const invocations = walked ? walked.filter(node => node.type === 'macro_invocation') : null;
+    const nonCode = walked ? walked.filter(node => node.type !== 'macro_invocation') : [];
+    for (const item of plannedInvocations(state, filePath, content, tree, rec, invocations)) {
         const hygiene = state.hygieneSeq;
         const region = expandPlanned(state, filePath, content, item, rec);
         if (expansions) expansions.push(item.node.startIndex, hygiene, region ? region.layout.text.length : -1);
@@ -1364,8 +1395,13 @@ function expandFile(state, filePath, mode = 'symbols') {
     rec.sites = regions.length;
     if (regions.length === 0) return rec;
     regions.sort((a, b) => a.start - b.start);
+    // The identifiers each expansion outputs.
+    const outputs = mode === 'symbols' ? regions.map(outputWordsOf) : null;
     // Every word the expanded text of the calls pass can hold (fix #375).
-    const words = mode === 'symbols' ? expansionWords(content, regions, tree) : null;
+    const words = mode === 'symbols' ? expansionWords(content, regions, nonCode, outputs) : null;
+    // What each group of units can bear, read before parsing it (fix #405b).
+    const groups = mode === 'symbols' && !tree.rootNode.hasError
+        ? groupRecords(content, regions, nonCode, outputs) : null;
 
     // Parse the expanded file; an expansion that does not parse in its
     // context stays as written (blind), and the rest are parsed again.
@@ -1414,12 +1450,25 @@ function expandFile(state, filePath, mode = 'symbols') {
             if (last && node.startIndex >= last.startIndex && node.endIndex <= last.endIndex) continue;
             roots.push(node);
         }
-        rec.symbols = generatedSymbols(filePath, rust.parseDeclarationsIn(synthetic, roots), {
-            regions, mapper, generated: generatedDeclarations(synthTree.rootNode, regions),
+        // One walk of each root serves both extractions (fix #405b). In a
+        // file that parses cleanly an expansion stands as whole items,
+        // statements or a wrapped expression, so a declaration named inside
+        // it lies inside the root spanning it; otherwise the whole tree is
+        // searched.
+        const walked = roots.map(root => root.descendantsOfType(declarationWalkTypesOf()));
+        rec.symbols = generatedSymbols(filePath, rust.parseDeclarationsIn(synthetic, roots, {
+            descendants: (root, i) => walked[i],
+        }), {
+            regions, mapper, generated: generatedDeclarations(synthTree.rootNode, regions,
+                tree.rootNode.hasError ? null : { roots, walked }),
         });
         rec.calleeNames = callableNames(regions);
-        rec.words = words;
         rec.expansions = expansions;
+        // Groups as the calls pass reads them apart: only when no expansion
+        // was left blind by a parse error (the pass then reads the file in
+        // one pass, whose groups can differ).
+        rec.words = words;
+        if (groups && !rec.blind.some(site => site.reason === 'parse-error')) rec.groups = groups;
         rec.callsPending = true;
         return rec;
     }
@@ -1847,15 +1896,21 @@ const NON_CODE_TOKENS = ['string_literal', 'raw_string_literal', 'char_literal',
  * pass lexes as the file's own parse did. A file with parse errors is read
  * whole. Space-separated, sorted.
  */
-function expansionWords(content, regions, tree = null) {
+function expansionWords(content, regions, nonCode = [], outputs = regions.map(outputWordsOf)) {
     const words = new Set();
+    scanCodeWords(content, analysisUnits(regions, 'calls').keep, nonCode, words);
+    for (const output of outputs) for (const word of output) words.add(word);
+    return [...words].sort(codeUnitCompare).join(' ');
+}
+
+/** Words of `ranges` (sorted, disjoint) of the source, literals and comments (`nonCode`, sorted) left out. */
+function scanCodeWords(content, ranges, nonCode, words) {
     const scan = (start, end) => {
         if (end <= start) return;
         for (const word of content.slice(start, end).match(WORD) || []) words.add(word);
     };
-    const nonCode = tree && !tree.rootNode.hasError ? tree.rootNode.descendantsOfType(NON_CODE_TOKENS) : [];
     let next = 0;
-    for (const [start, end] of analysisUnits(regions, 'calls').keep) {
+    for (const [start, end] of ranges) {
         let at = start;
         while (next < nonCode.length && nonCode[next].endIndex <= at) next++;
         for (let i = next; i < nonCode.length; i++) {
@@ -1866,15 +1921,77 @@ function expansionWords(content, regions, tree = null) {
         }
         scan(at, end);
     }
-    // A record's name is an identifier token (string contents never are;
-    // a non-ASCII identifier is a 'punct' leaf).
-    for (const region of regions) {
-        for (const mark of region.layout.marks) {
-            const leaf = mark.leaf;
-            if (leaf.k === 'ident' || (leaf.k === 'punct' && WHOLE_WORD.test(leaf.v))) words.add(leaf.v);
-        }
+}
+
+/** The identifier tokens an expansion outputs (a non-ASCII identifier is a 'punct' leaf), once each. */
+function outputWordsOf(region) {
+    const words = new Set();
+    for (const mark of region.layout.marks) {
+        const leaf = mark.leaf;
+        if (leaf.k === 'ident' || (leaf.k === 'punct' && WHOLE_WORD.test(leaf.v))) words.add(leaf.v);
     }
-    return [...words].sort(codeUnitCompare).join(' ');
+    return [...words];
+}
+
+/**
+ * The groups of units the calls pass reads apart (fix #405b), each as
+ * [startLine, endLine, expanded length, words]: the identifiers its
+ * expansions output (with those of any expansion in its kept headers) and
+ * the code of its kept headers outside its units (`Self { .. }` names the
+ * impl's type). A record a group derives in the units' own code is written
+ * there, as the file's parsed record on that line is: the calls pass
+ * consults those for the rest (rustPendingRecords). Expanded length: the
+ * text the group's own expansions add, for the cost of reading it.
+ */
+function groupRecords(content, regions, nonCode, outputs) {
+    const { units } = analysisUnits(regions, 'calls');
+    const groups = groupsOf(units);
+    const lookups = unitLookups(units);
+    const members = groups.map(() => []);
+    const groupOf = regions.map((region, i) => {
+        const group = lookups.unitAtOffset(region.start).group;
+        members[group].push(i);
+        return group;
+    });
+    // Expansions are disjoint and sorted: the first one ending after `at`.
+    const firstEndingAfter = at => {
+        let lo = 0;
+        let hi = regions.length;
+        while (lo < hi) {
+            const mid = (lo + hi) >> 1;
+            if (regions[mid].end <= at) lo = mid + 1; else hi = mid;
+        }
+        return lo;
+    };
+    return groups.map((group, gi) => {
+        const keep = analysisUnits(members[gi].map(i => regions[i]), 'calls').keep;
+        const words = new Set();
+        let length = 0;
+        for (const i of members[gi]) {
+            length += regions[i].layout.text.length;
+            for (const word of outputs[i]) words.add(word);
+        }
+        // Expansions inside its kept headers (`impl T for m!() {..}`).
+        for (const [start, end] of keep) {
+            for (let i = firstEndingAfter(start); i < regions.length && regions[i].start < end; i++) {
+                if (groupOf[i] !== gi) for (const word of outputs[i]) words.add(word);
+            }
+        }
+        // Header code: the kept ranges outside the group's units.
+        const headers = [];
+        for (const [start, end] of keep) {
+            let at = start;
+            for (const unit of group.units) {
+                if (unit.end <= at || unit.start >= end) continue;
+                if (unit.start > at) headers.push([at, unit.start]);
+                at = Math.max(at, unit.end);
+            }
+            if (at < end) headers.push([at, end]);
+        }
+        scanCodeWords(content, headers, nonCode, words);
+        // Insertion order is the expansions' and the text's: deterministic.
+        return [group.startLine, group.endLine, length, [...words].join(' ')];
+    });
 }
 
 /** Whether the derived calls of a file pending derivation can bear `name`. */
@@ -1885,8 +2002,27 @@ function rustPendingMayBear(fileEntry, name) {
     if (typeof rec.words !== 'string') return true;
     let words = pendingWordSets.get(rec);
     if (!words) pendingWordSets.set(rec, words = new Set(rec.words.split(' ')));
-    // A raw identifier's token is `r#name`; source text holds both parts.
-    return words.has(name) || words.has(String(name).replace(/^r#/, '')) || words.has(`r#${name}`);
+    return hasWord(words, name);
+}
+
+/**
+ * Whether a recorded group's word list (space-separated) holds `name`, as
+ * hasWord does for a set (fix #405b: one name is asked per group, so the
+ * list is searched rather than split).
+ */
+function groupHasWord(list, name) {
+    const text = String(name);
+    const bare = text.replace(/^r#/, '');
+    return listHasWord(list, text) || (bare !== text && listHasWord(list, bare)) || listHasWord(list, `r#${text}`);
+}
+
+function listHasWord(list, word) {
+    if (!word) return false;
+    for (let at = list.indexOf(word); at >= 0; at = list.indexOf(word, at + 1)) {
+        const end = at + word.length;
+        if ((at === 0 || list.charCodeAt(at - 1) === 32) && (end === list.length || list.charCodeAt(end) === 32)) return true;
+    }
+    return false;
 }
 
 const pendingFileLists = new WeakMap(); // operation content cache -> pending file paths
@@ -2075,6 +2211,7 @@ function applyRustMacroExpansion(index, pending, options = {}, started = undefin
             ...(rec.expanded && { expanded: true }),
             ...(rec.callsPending && {
                 callsPending: true, calleeNames: rec.calleeNames || [], words: rec.words, expansions: rec.expansions,
+                ...(rec.groups && { groups: rec.groups }),
             }),
         };
     }
@@ -2231,6 +2368,7 @@ function expandForWorker(state, filePath) {
         ...(rec.symbols && { symbols: rec.symbols }),
         ...(rec.callsPending && {
             callsPending: true, calleeNames: rec.calleeNames, words: rec.words, expansions: rec.expansions,
+            ...(rec.groups && { groups: rec.groups }),
         }),
     };
 }
@@ -2304,7 +2442,7 @@ function rustExpandedCalls(index, filePath, rawCalls, { materialize = true } = {
     if (!rec?.callsPending || !Array.isArray(rawCalls)) return rawCalls;
     const hints = (rec.calleeNames || []).map(name => ({ name, line: 0, calleeHint: true }));
     if (!materialize) return hints.length > 0 ? rawCalls.concat(hints) : rawCalls;
-    const ctx = pendingContext(index, filePath);
+    const ctx = pendingContext(index, filePath, { whole: true });
     if (index.calleeIndex && hints.length > 0) index._removeFromCalleeIndex(filePath, hints);
     rec.callsPending = false;
     try {
@@ -2315,6 +2453,7 @@ function rustExpandedCalls(index, filePath, rawCalls, { materialize = true } = {
     }
     index._rustMacroState.contexts.delete(filePath);
     delete rec.words;
+    delete rec.groups;
     delete rec.expansions;
     index.macroExpansionDirty = true;
     return index.callsCache.get(filePath)?.calls || rawCalls;
@@ -2328,7 +2467,7 @@ const LIVE_CONTEXTS = 3;
  * The calls-pass context of a file whose expansion calls are pending, or
  * null when nothing of it expands (its parsed records stand).
  */
-function pendingContext(index, filePath) {
+function pendingContext(index, filePath, { whole = false } = {}) {
     if (!index._rustMacroState) index._rustMacroState = createState(index);
     const state = index._rustMacroState;
     const contexts = state.contexts;
@@ -2339,7 +2478,12 @@ function pendingContext(index, filePath) {
         contexts.set(filePath, ctx);
         return ctx;
     }
-    const fresh = buildContext(state, filePath);
+    // A file derived whole before any part of it was read is read in one
+    // pass (fix #405b): the groups apart cost the same expansions and parse
+    // plus a second plan of the file's invocations.
+    const fresh = whole && ctx === undefined
+        ? expandFile(state, filePath, 'calls')?.context || null
+        : buildContext(state, filePath);
     if (fresh && ctx) {
         // Rebuilt: the groups the dropped context read keep their records.
         if (fresh.groups.length !== ctx.groups.length || !!fresh.isolated !== !!ctx.isolated) {
@@ -2674,6 +2818,9 @@ function addTemplateWords(state, name, words) {
  * whole by the caller).
  */
 const IDENTIFIER = /^(?:r#)?[\p{L}_][\p{L}\p{N}_]*$/u;
+// Tenths of a file's unread expanded text from which a view derives the file
+// whole (fix #405b).
+const WHOLE_FILE_SHARE = 9;
 
 function rustPendingRecords(index, filePath, { name = null, keep = null, lines = null, lineSet = null } = {}) {
     const entry = index.files.get(filePath);
@@ -2688,17 +2835,61 @@ function rustPendingRecords(index, filePath, { name = null, keep = null, lines =
     // No derived record bears a name outside the file's words (#375): the
     // parsed records then answer, unless one of them bears it.
     if (name !== null && !rustPendingMayBear(entry, name) && !raw.some(matches)) return [];
+    // The groups recorded at build (fix #405b) are chosen before anything is
+    // parsed: a group can hold a record `matches` accepts when a word its
+    // expansions output or its headers hold is the name, or when a parsed
+    // record on its lines is accepted (the units' own code is written there).
+    const rec = entry.rustMacroExpansion;
+    const recorded = Array.isArray(rec.groups) ? rec.groups : null;
+    let planned = null;
+    if (recorded) {
+        const read = index._rustMacroState?.contexts?.get(filePath)?.groups || null;
+        const parsedOn = name !== null ? parsedRecordLines(raw, matches) : null;
+        planned = [];
+        let wantedLength = 0;
+        let unreadLength = 0;
+        for (let i = 0; i < recorded.length; i++) {
+            const [startLine, endLine, length] = recorded[i];
+            const unread = !read?.[i]?.records;
+            if (unread) unreadLength += length;
+            if (lines && (endLine < lines[0] || startLine > lines[1])) continue;
+            if (lineSet && ![...lineSet].some(line => line >= startLine && line <= endLine)) continue;
+            if (name !== null && !groupHasWord(recorded[i][3], name) &&
+                !parsedOn.some(line => line >= startLine && line <= endLine)) continue;
+            planned.push(i);
+            if (unread) wantedLength += length;
+        }
+        if (planned.length === 0) {
+            // Every group read: the caller derives the file's calls whole.
+            if (read && read.length > 0 && read.every(group => group.records)) return undefined;
+            // No group can hold one: the accepted records are parsed ones
+            // outside every unit, as the composed calls hold them.
+            return raw.filter(matches).sort((a, b) => a.line - b.line);
+        }
+        // Reading most of the expanded text that is still unread costs more
+        // than deriving the file whole (groups read together cost ~5-10%
+        // over one pass), which then answers every later query of the file:
+        // a cost decision, not a semantic one - either way the records are
+        // the composed calls'.
+        if (wantedLength > 0 && wantedLength * 10 >= unreadLength * WHOLE_FILE_SHARE) return undefined;
+    }
     const ctx = pendingContext(index, filePath);
     if (!ctx) return raw.filter(matches);
     // Every group read: the caller derives the file's calls whole.
     if (ctx.groups.every(group => group.records)) return undefined;
-    const wanted = [];
-    for (let i = 0; i < ctx.groups.length; i++) {
-        const group = ctx.groups[i];
-        if (lines && (group.endLine < lines[0] || group.startLine > lines[1])) continue;
-        if (lineSet && ![...lineSet].some(line => line >= group.startLine && line <= group.endLine)) continue;
-        if (name !== null && !groupMayBear(ctx, group, name)) continue;
-        wanted.push(i);
+    let wanted;
+    if (planned && ctx.groups.length === recorded.length && ctx.groups.every((group, i) =>
+        group.startLine === recorded[i][0] && group.endLine === recorded[i][1])) {
+        wanted = planned;
+    } else {
+        wanted = [];
+        for (let i = 0; i < ctx.groups.length; i++) {
+            const group = ctx.groups[i];
+            if (lines && (group.endLine < lines[0] || group.startLine > lines[1])) continue;
+            if (lineSet && ![...lineSet].some(line => line >= group.startLine && line <= group.endLine)) continue;
+            if (name !== null && !groupMayBear(ctx, group, name)) continue;
+            wanted.push(i);
+        }
     }
     readGroups(ctx, wanted);
     if (ctx.groups.every(group => group.records)) return undefined;
@@ -2739,6 +2930,13 @@ function groupMayBear(ctx, group, name) {
         group.words = new Set(ctx.synthetic.slice(from, to).match(WORD) || []);
     }
     return hasWord(group.words, name);
+}
+
+/** Lines of the parsed records `matches` accepts. */
+function parsedRecordLines(raw, matches) {
+    const out = [];
+    for (const record of raw) if (matches(record)) out.push(record.line);
+    return out;
 }
 
 function hasWord(words, name) {

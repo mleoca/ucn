@@ -277,6 +277,23 @@ function scanUnsupportedFiles(index, name, opts = {}) {
 }
 
 /**
+ * A set of (file, line) keys held per file: `key(file, line)` names one,
+ * and `add`/`has` take a key or a (file, line) pair. Lines compare by their
+ * text, as `${file}:${line}` strings do.
+ */
+class LineKeys {
+    constructor() { this.byFile = new Map(); }
+    key(file, line) { return { file: String(file), line: String(line) }; }
+    add(file, line) {
+        const key = line === undefined ? file : this.key(file, line);
+        let lines = this.byFile.get(key.file);
+        if (!lines) this.byFile.set(key.file, lines = new Set());
+        lines.add(key.line);
+    }
+    has(key) { return this.byFile.get(key.file)?.has(key.line) === true; }
+}
+
+/**
  * Classify ground lines not claimed by engine results.
  *
  * Precedence per line (first match wins):
@@ -289,7 +306,7 @@ function scanUnsupportedFiles(index, name, opts = {}) {
  * @param {object} index - ProjectIndex
  * @param {string} name - Symbol name
  * @param {object} groundSet - from computeGroundSet
- * @param {Set<string>} claimedKeys - `${absPath}:${line}` keys already claimed
+ * @param {LineKeys} claimedKeys - (absPath, line) keys already claimed
  *   (confirmed + unverified + excluded engine lines)
  * @returns {{
  *   nonCall: { imports: number, definitions: number, references: number, unclassifiedText: number, total: number },
@@ -316,7 +333,7 @@ function classifyGroundLines(index, name, groundSet, claimedKeys) {
     for (const [filePath, lineNumbers] of groundSet.perFile) {
         let unclaimed = null;
         for (const line of lineNumbers) {
-            if (claimedKeys.has(`${filePath}:${line}`)) continue;
+            if (claimedKeys.has(claimedKeys.key(filePath, line))) continue;
             (unclaimed || (unclaimed = [])).push(line);
         }
         if (!unclaimed) continue;
@@ -420,18 +437,21 @@ function buildAccount(index, name, parts) {
     const unverifiedEntries = parts.unverifiedEntries || [];
     const excludedEntries = parts.excludedEntries || [];
 
-    const groundKeys = new Set();
+    // (file, line) keys, kept per file (fix #405b: one composed string per
+    // ground line and per entry); a line is keyed by its text, as the
+    // composed `${file}:${line}` keys were.
+    const groundKeys = new LineKeys();
     for (const [filePath, lineNumbers] of groundSet.perFile) {
-        for (const line of lineNumbers) groundKeys.add(`${filePath}:${line}`);
+        for (const line of lineNumbers) groundKeys.add(filePath, line);
     }
 
-    const claimedKeys = new Set();
+    const claimedKeys = new LineKeys();
     const beyondText = { count: 0, sample: [] };
     let confirmed = 0;
     let unverified = 0;
 
     const claim = (entry, bucket) => {
-        const key = `${entry.file}:${entry.line}`;
+        const key = claimedKeys.key(entry.file, entry.line);
         if (claimedKeys.has(key)) return; // one bucket per line; first claim wins
         if (!groundKeys.has(key)) {
             // Engine found a call site grep would miss (alias / indirect name).
@@ -455,7 +475,7 @@ function buildAccount(index, name, parts) {
     const excludedByReason = {};
     let excludedTotal = 0;
     for (const e of excludedEntries) {
-        const key = `${e.file}:${e.line}`;
+        const key = claimedKeys.key(e.file, e.line);
         if (claimedKeys.has(key)) continue;
         claimedKeys.add(key);
         if (!groundKeys.has(key)) continue; // excluded non-ground line: irrelevant to both grep and display

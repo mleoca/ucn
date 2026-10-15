@@ -922,7 +922,10 @@ function clearAllCaches() {
 // records every expansion's hygiene start and expanded length
 // (`rustMacroExpansion.expansions`); its `words` leave out the text of
 // literals and comments.
-const CACHE_FORMAT_VERSION = 275;
+// v276 (fix #405b): a pending Rust file whose expansions the calls pass
+// reads by groups records each group's lines, expanded length and the words
+// its expansions output and its headers hold (`rustMacroExpansion.groups`).
+const CACHE_FORMAT_VERSION = 276;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**

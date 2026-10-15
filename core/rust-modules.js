@@ -91,14 +91,19 @@ function rustPathModule(index, filePath, line, qualifier) {
     if (!isRustEntry(index.files.get(filePath)) || !qualifier) return null;
     const tree = moduleTree(index);
     const inline = tree.inlineByFile.get(filePath) || [];
-    // A file without inline modules answers the same at every line (fix
-    // #405: path calls asked once per site).
-    if (inline.length > 0) return resolvePathModule(tree, filePath, line, qualifier, inline);
+    // The answer depends on the line only through the inline modules around
+    // it (fix #405: path calls asked once per site; fix #405b: files with
+    // inline modules too).
     const memo = tree.pathMemo || (tree.pathMemo = new Map());
-    const key = `${filePath}\0${qualifier}`;
-    if (memo.has(key)) return memo.get(key);
-    const resolved = resolvePathModule(tree, filePath, line, qualifier, inline);
-    memo.set(key, resolved);
+    let byFile = memo.get(filePath);
+    if (!byFile) memo.set(filePath, byFile = new Map());
+    const chain = inline.length > 0 ? rustInlineChainAt(inline, line) : null;
+    const key = chain?.length > 0 ? `${chain.join('::')}\0${qualifier}` : qualifier;
+    let resolved = byFile.get(key);
+    if (resolved === undefined) {
+        resolved = resolvePathModule(tree, filePath, line, qualifier, inline);
+        byFile.set(key, resolved);
+    }
     return resolved;
 }
 

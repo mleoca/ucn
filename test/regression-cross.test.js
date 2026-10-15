@@ -11887,3 +11887,53 @@ describe('fix #403: check <symbol> --base compares with the declaration at that 
         }
     });
 });
+
+describe('fix #405b: repeated refinements in one operation answer as fresh queries', () => {
+    const { findCallers } = require('../core/callers');
+    const { NON_CALLABLE_TYPES } = require('../core/shared');
+    // Every per-record answer orientation keeps for the operation (type-name
+    // denotation, module path items, confirmation facts of record views,
+    // declared field types, generic bounds, path traits and aliases, the
+    // account's line keys) must equal what a fresh query computes.
+    const answer = (index, d) => {
+        const callers = findCallers(index, d.name, { targetDefinitions: [d], includeTests: true, collectAccount: true });
+        return JSON.stringify({
+            callers,
+            unverified: callers.unverifiedEntries || [],
+            // Dropped candidates with their reasons and provenance facts.
+            account: callers.accountRaw || null,
+        });
+    };
+    const key = d => `${d.relativePath}:${d.startLine}:${d.className || ''}:${d.name}:${d.type}`;
+    const callables = index => [...index.symbols.values()].flat()
+        .filter(d => !NON_CALLABLE_TYPES.has(d.type)).sort((a, b) => (key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0));
+    for (const language of ['rust', 'go', 'java', 'python', 'typescript', 'javascript', 'csharp', 'cpp', 'c']) {
+        it(`${language}: every callable, twice in one operation, equals a fresh index per query`, () => {
+            const dir = path.join(FIXTURES_PATH, language);
+            const shared = idx(dir);
+            const all = callables(shared);
+            assert.ok(all.length > 3, language);
+            // A spread of at most 24 definitions, each on a fresh index.
+            const stride = Math.max(1, Math.ceil(all.length / 24));
+            const defs = all.filter((d, i) => i % stride === 0);
+            const fresh = defs.map(d => {
+                const index = idx(dir);
+                const own = callables(index).find(x => key(x) === key(d));
+                index._beginOp();
+                try { return answer(index, own); } finally { index._endOp(); }
+            });
+            // Every definition refined twice in one operation, as orientation
+            // does; the sampled ones are compared.
+            shared._beginOp();
+            try {
+                for (let pass = 0; pass < 2; pass++) {
+                    let next = 0;
+                    for (const d of all) {
+                        const got = answer(shared, d);
+                        if (d === defs[next]) assert.strictEqual(got, fresh[next++], `${language} pass ${pass} ${key(d)}`);
+                    }
+                }
+            } finally { shared._endOp(); }
+        });
+    }
+});

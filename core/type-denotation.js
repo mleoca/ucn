@@ -950,6 +950,30 @@ function projectTypeNamed(index, name) {
 }
 
 /**
+ * The type a call record writes and what it denotes in its file. A record
+ * never changes once its file's calls are read, so the answer is kept per
+ * record object while the index lives (fix #405b: orientation refines every
+ * definition of a name over the same records, and each refinement asked
+ * again per record).
+ */
+function siteDenotation(index, filePath, fileEntry, call) {
+    const memos = memoOf(index);
+    let memo = memos.get('\x01site');
+    if (!memo) memos.set('\x01site', memo = new WeakMap());
+    let site = memo.get(call);
+    if (site === undefined) {
+        const written = siteWrittenType(index, fileEntry, call);
+        site = {
+            written,
+            denotation: written ? externalTypeDenotation(index, filePath, written.name, written.qualifier,
+                call.line, { unscoped: written.unscoped === true }) : null,
+        };
+        memo.set(call, site);
+    }
+    return site;
+}
+
+/**
  * Verdict for a call site against candidate target definitions (the pinned
  * targets on the caller side, every same-name callable on the callee side).
  * Returns null (the gate does not apply) or one of:
@@ -964,10 +988,7 @@ function externalTypeGate(index, filePath, fileEntry, call, targetsOrThunk) {
     // every project type with the method set satisfies; the existing
     // package-qualified physics routes it (possible dispatch).
     if (fileEntry.language === 'go') return null;
-    const written = siteWrittenType(index, fileEntry, call);
-    if (!written) return null;
-    const denotation = externalTypeDenotation(index, filePath, written.name, written.qualifier, call.line,
-        { unscoped: written.unscoped === true });
+    const { written, denotation } = siteDenotation(index, filePath, fileEntry, call);
     if (!denotation) return null;
     const { original, via } = denotation;
     // Only a real collision needs the gate: without a project type of that

@@ -2203,13 +2203,19 @@ const DECLARATION_NODE_TYPES = [
  * extracts them (fix #374: the declarations a macro expansion generates,
  * without walking the rest of the expanded file).
  */
-function parseDeclarationsIn(code, roots) {
+function parseDeclarationsIn(code, roots, { descendants = null } = {}) {
     const lines = code.split('\n');
     const functions = [], classes = [], stateObjects = [];
     const processedFn = new Set(), processedCls = new Set();
-    for (const root of roots) {
+    // `descendants(root, i)`: the root's descendant nodes the caller already
+    // listed (a superset of DECLARATION_NODE_TYPES, in document order).
+    for (let i = 0; i < roots.length; i++) {
+        const root = roots[i];
         const nodes = DECLARATION_NODE_TYPES.includes(root.type) ? [root] : [];
-        for (const node of nodes.concat(root.descendantsOfType(DECLARATION_NODE_TYPES))) {
+        const below = descendants
+            ? descendants(root, i).filter(node => DECLARATION_NODE_TYPES.includes(node.type))
+            : root.descendantsOfType(DECLARATION_NODE_TYPES);
+        for (const node of nodes.concat(below)) {
             _processFunction(node, functions, processedFn, lines, code);
             _processClass(node, classes, processedCls, lines, code);
             _processState(node, stateObjects, lines);
@@ -5997,6 +6003,7 @@ function isEntryPoint(symbol) {
 
 module.exports = {
     primeDeclarationTrees,
+    DECLARATION_NODE_TYPES,
     rustExpandedItemRecovery,
     parseDeclarationsIn,
     rustMacroInvocationContext,
