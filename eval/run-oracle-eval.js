@@ -80,6 +80,8 @@ const {
     evaluateOracleCoverage,
     closeJsTsDeclarationIdentity,
     adjudicateDeferredUnresolved,
+    unscoredProng,
+    expandedDefinitionStatus,
 } = require('./oracle-gate-policy');
 const { tsMorphOracle } = require('./oracles/ts-morph-oracle');
 const { pyrightOracle } = require('./oracles/pyright-oracle');
@@ -404,14 +406,17 @@ async function evaluateRepo(repo, oracle) {
     let oracleBroadReferenceEdges = 0;
     let definitionUnresolvedReferenceEdges = 0;
     let definitionLookupErrors = 0;
-    let configurationGatedUnscored = 0;
+    let unscoredEdges = 0;
     let confirmedConfigurationUnscored = 0;
     let confirmedAbstentionUnscored = 0;
     let unverifiedConfigurationUnscored = 0;
     let unverifiedAbstentionUnscored = 0;
     let sourceStatusErrors = 0;
     let calleeUnscoredSites = 0;
+    const confirmedUnscoredByClass = {};
+    const unverifiedUnscoredByClass = {};
     const sourceStatusCache = new Map();
+    const expandedDefinitionCache = new Map();
 
     const isConfigurationGated = async (file, line) => {
         if (typeof oracle.isConfigurationGated !== 'function') return false;
@@ -427,6 +432,33 @@ async function evaluateRepo(repo, oracle) {
         }
         sourceStatusCache.set(cacheKey, !!gated);
         return !!gated;
+    };
+
+    // Declarations a macro_rules! expansion on this line resolves the name to
+    // (fix #406): the oracle expands the invocation itself. null = the oracle
+    // has no expansion capability or no invocation on the line expands to
+    // text holding the name.
+    const expandedDefinitions = async (file, line, name) => {
+        if (typeof oracle.resolveExpandedDefinition !== 'function') return null;
+        const cacheKey = `${file}:${line}:${name}`;
+        if (expandedDefinitionCache.has(cacheKey)) return expandedDefinitionCache.get(cacheKey);
+        let expanded = null;
+        try {
+            expanded = await oracle.resolveExpandedDefinition(handle, {
+                file: toOracleRel(file), line, name,
+            });
+            if (expanded) {
+                expanded = {
+                    ...expanded,
+                    definitions: (expanded.definitions || []).map(d => d.external
+                        ? { ...d } : { ...d, file: toUcnRel(d.file) }),
+                };
+            }
+        } catch {
+            definitionLookupErrors++;
+        }
+        expandedDefinitionCache.set(cacheKey, expanded);
+        return expanded;
     };
 
     const resolvedDefinitions = async (file, line, name, column) => {
@@ -659,6 +691,30 @@ async function evaluateRepo(repo, oracle) {
                 }
             }
         }
+        // Configuration gating is the oracle's own projection (fix #406): the
+        // edge cannot be scored when the oracle leaves the call line out, or
+        // leaves out the target itself (every identity definition): it then
+        // resolves the call to whatever alternative its configuration has
+        // (Typer `getchar` under `if sys.platform == "win32"`, scored false
+        // on darwin before), or to nothing.
+        let targetGatedMemo = null;
+        const targetConfigurationGated = async () => {
+            if (targetGatedMemo !== null) return targetGatedMemo;
+            const definitions = targetIdentityDefs.length > 0
+                ? targetIdentityDefs.map(d => ({ file: d.relativePath, line: d.nameLine || d.startLine }))
+                : [{ file: sym.file, line: sym.line }];
+            let gated = true;
+            for (const definition of definitions) {
+                if (!await isConfigurationGated(definition.file, definition.line)) {
+                    gated = false;
+                    break;
+                }
+            }
+            targetGatedMemo = gated;
+            return gated;
+        };
+        const edgeConfigurationGated = async c =>
+            await isConfigurationGated(c.file, c.line) || await targetConfigurationGated();
         // UCN models `new Type(...)` as the exact constructor definition
         // when one is indexed, while compiler reference search for a sampled
         // class reports the construction as a use of the class symbol. Both
@@ -763,7 +819,7 @@ async function evaluateRepo(repo, oracle) {
                     relFile, best.line, best.calledAs || sym.name,
                     targetIdentityDefs);
                 if (status === 'target') return 'hit';
-                if (await isConfigurationGated(relFile, best.line)) return 'unscored';
+                if (await edgeConfigurationGated({ file: relFile, line: best.line })) return 'unscored';
                 // 'other' is a positive contradiction — the site provably
                 // calls a different definition, and the selection fails.
                 // 'unresolved' (oracle blindness: `reg: any` receivers,
@@ -914,17 +970,37 @@ async function evaluateRepo(repo, oracle) {
         const edgeHitWithoutDefinition = c => hitKeys.has(key(c.file, c.line)) ||
             (c.usageStyle && anyRefKeys.has(key(c.file, c.line))) ||
             superCtorSite(c);
+        const configurationGatedVerdict = definitionValidated => ({
+            hit: false, scorable: false, definitionValidated, abstention: 'configuration-gated',
+        });
+        const definitionUnresolvedVerdict = {
+            hit: false, scorable: false, definitionValidated: false,
+            abstention: 'definition-unresolved',
+        };
+        // A call a project macro_rules! transcriber generated (fix #374): the
+        // name token lives in the macro definition, and rust-analyzer reports
+        // such expansion references at neither the definition token nor the
+        // invocation. An oracle that expands the invocation itself resolves
+        // the generated occurrences (fix #406); without that capability, or
+        // when an occurrence resolves nowhere, the oracle abstains.
+        // Argument-origin tokens keep their own source position and are
+        // scored normally.
+        const templateExpansionVerdict = async c => {
+            const abstain = { hit: false, scorable: false, definitionValidated: false,
+                abstention: 'macro-template-expansion' };
+            if (typeof oracle.resolveExpandedDefinition !== 'function') return abstain;
+            if (await edgeConfigurationGated(c)) return configurationGatedVerdict(false);
+            const status = expandedDefinitionStatus(
+                await expandedDefinitions(c.file, c.line, c.calledAs || sym.name),
+                definition => definitionMatchesTarget(definition, targetIdentityDefs));
+            if (status === 'target') return { hit: true, scorable: true, definitionValidated: true };
+            if (status === 'other') return { hit: false, scorable: true, definitionValidated: true };
+            return abstain;
+        };
         const edgeMatchesTarget = async c => {
             if (superCtorSite(c)) return { hit: true, scorable: true, definitionValidated: false };
-            // A call a project macro_rules! transcriber generated (fix #374):
-            // the name token lives in the macro definition, and rust-analyzer
-            // reports such expansion references at neither the definition
-            // token nor the invocation (measured on a probe crate). The
-            // compiler oracle cannot score it; argument-origin tokens keep
-            // their own source position and are scored normally.
             if (c.macroOrigin === 'template' && !edgeHitWithoutDefinition(c)) {
-                return { hit: false, scorable: false, definitionValidated: false,
-                    abstention: 'macro-template-expansion' };
+                return templateExpansionVerdict(c);
             }
             if (needsDefinitionAdjudication) {
                 if (oracleMayReachKeys.has(key(c.file, c.line))) {
@@ -935,22 +1011,22 @@ async function evaluateRepo(repo, oracle) {
                     targetIdentityDefs, c.column);
                 if (status === 'target') return { hit: true, scorable: true, definitionValidated: true };
                 const referenceHit = edgeHitWithoutDefinition(c);
-                if (status === 'other' && !referenceHit && await isConfigurationGated(c.file, c.line)) {
-                    return { hit: false, scorable: false, definitionValidated: true,
-                        abstention: 'configuration-gated' };
+                if (status === 'other' && !referenceHit && await edgeConfigurationGated(c)) {
+                    return configurationGatedVerdict(true);
                 }
                 if (status === 'other') return { hit: false, scorable: true, definitionValidated: true };
                 if (status === 'unresolved' &&
                     lineContainsIdentifier(index, c.file, c.line,
                         c.calledAs || sym.name)) {
-                    return { hit: false, scorable: false, definitionValidated: false,
-                        abstention: 'definition-unresolved' };
+                    // Unresolved in code the oracle leaves out is that
+                    // configuration, not an abstention on analyzed code.
+                    if (!referenceHit && await edgeConfigurationGated(c)) {
+                        return configurationGatedVerdict(false);
+                    }
+                    return definitionUnresolvedVerdict;
                 }
                 if (referenceHit) return { hit: true, scorable: true, definitionValidated: false };
-                if (await isConfigurationGated(c.file, c.line)) {
-                    return { hit: false, scorable: false, definitionValidated: false,
-                        abstention: 'configuration-gated' };
-                }
+                if (await edgeConfigurationGated(c)) return configurationGatedVerdict(false);
                 return { hit: false, scorable: true, definitionValidated: false };
             }
             if (edgeHitWithoutDefinition(c)) return { hit: true, scorable: true, definitionValidated: false };
@@ -962,9 +1038,7 @@ async function evaluateRepo(repo, oracle) {
                     return { hit: true, scorable: true, definitionValidated: true };
                 }
                 if (status === 'other') {
-                    if (await isConfigurationGated(c.file, c.line)) {
-                        return { hit: false, scorable: false, definitionValidated: true };
-                    }
+                    if (await edgeConfigurationGated(c)) return configurationGatedVerdict(true);
                     return { hit: false, scorable: true, definitionValidated: true };
                 }
                 // An oracle that cannot resolve an identifier occurrence is
@@ -975,14 +1049,11 @@ async function evaluateRepo(repo, oracle) {
                 if (status === 'unresolved' &&
                     lineContainsIdentifier(index, c.file, c.line,
                         c.calledAs || sym.name)) {
-                    return { hit: false, scorable: false, definitionValidated: false,
-                        abstention: 'definition-unresolved' };
+                    if (await edgeConfigurationGated(c)) return configurationGatedVerdict(false);
+                    return definitionUnresolvedVerdict;
                 }
             }
-            if (await isConfigurationGated(c.file, c.line)) {
-                return { hit: false, scorable: false, definitionValidated: false,
-                    abstention: 'configuration-gated' };
-            }
+            if (await edgeConfigurationGated(c)) return configurationGatedVerdict(false);
             return { hit: false, scorable: true, definitionValidated: false };
         };
         const symbolRuleStats = {};
@@ -1001,17 +1072,19 @@ async function evaluateRepo(repo, oracle) {
             confirmedVerdicts.push(verdict);
             if (verdict.hit && verdict.definitionValidated) definitionValidatedConfirmed++;
             if (!verdict.scorable) {
-                configurationGatedUnscored++;
-                if (verdict.abstention === 'definition-unresolved') {
+                unscoredEdges++;
+                if (unscoredProng(verdict) === 'abstention') {
                     confirmedAbstentionUnscored++;
                 } else {
                     confirmedConfigurationUnscored++;
                 }
+                confirmedUnscoredByClass[verdict.abstention] =
+                    (confirmedUnscoredByClass[verdict.abstention] || 0) + 1;
                 pushSample(confirmedUnscoredSamples, {
                     symbol: sym.name,
                     target: `${sym.file}:${sym.line}`,
                     edge: key(c.file, c.line),
-                    abstention: verdict.abstention || 'oracle-unscored',
+                    abstention: verdict.abstention,
                     text: lineText(index.root, c.file, c.line),
                 }, 100);
             }
@@ -1034,18 +1107,20 @@ async function evaluateRepo(repo, oracle) {
                 if (runtimeDispatch) runtimeDispatchUnscored++;
                 else if (compileTimeDispatch) compileTimeDispatchUnscored++;
                 else actionableUnverifiedUnscored++;
-                configurationGatedUnscored++;
-                if (verdict.abstention === 'definition-unresolved') {
+                unscoredEdges++;
+                if (unscoredProng(verdict) === 'abstention') {
                     unverifiedAbstentionUnscored++;
                 } else {
                     unverifiedConfigurationUnscored++;
                 }
+                unverifiedUnscoredByClass[verdict.abstention] =
+                    (unverifiedUnscoredByClass[verdict.abstention] || 0) + 1;
                 pushSample(unverifiedUnscoredSamples, {
                     symbol: sym.name,
                     target: `${sym.file}:${sym.line}`,
                     edge: key(c.file, c.line),
                     reason: c.reason,
-                    abstention: verdict.abstention || 'oracle-unscored',
+                    abstention: verdict.abstention,
                     text: lineText(index.root, c.file, c.line),
                 }, 100);
                 continue;
@@ -1601,11 +1676,13 @@ async function evaluateRepo(repo, oracle) {
             definitionUnresolvedReferenceEdges + oracleBroadReferenceEdges,
         definitionLookupErrors,
         oracleBroadReferenceEdges,
-        configurationGatedUnscored,
+        unscoredEdges,
         confirmedConfigurationUnscored,
         confirmedAbstentionUnscored,
         unverifiedConfigurationUnscored,
         unverifiedAbstentionUnscored,
+        confirmedUnscoredByClass: sortedCounts(confirmedUnscoredByClass),
+        unverifiedUnscoredByClass: sortedCounts(unverifiedUnscoredByClass),
         sourceStatusErrors,
         calleeUnscoredSites,
         calleeFalsePositiveSamples,
@@ -1647,8 +1724,8 @@ async function evaluateRepo(repo, oracle) {
         .map(([reason, row]) => `${reason}:${row.candidates}`).join(', ');
     if (topReasons) process.stdout.write(`  unverified reasons: ${topReasons}\n`);
     for (const [kind, k] of Object.entries(summary.byKind)) {
-        process.stdout.write(`    ${kind.padEnd(8)} n=${k.sampled} | tier1 ${k.confirmedScored ? pct(k.tier1Precision) : 'n/a'} (${k.confirmedHits}/${k.confirmedScored} scored; ${k.confirmedUnscored} cfg-unscored) | ` +
-            `unverified ${k.unverifiedScored ? pct(k.unverifiedPrecision) : 'n/a'} (${k.unverifiedHits}/${k.unverifiedScored} scored; ${k.unverifiedUnscored} cfg-unscored) | ` +
+        process.stdout.write(`    ${kind.padEnd(8)} n=${k.sampled} | tier1 ${k.confirmedScored ? pct(k.tier1Precision) : 'n/a'} (${k.confirmedHits}/${k.confirmedScored} scored; ${k.confirmedUnscored} unscored) | ` +
+            `unverified ${k.unverifiedScored ? pct(k.unverifiedPrecision) : 'n/a'} (${k.unverifiedHits}/${k.unverifiedScored} scored; ${k.unverifiedUnscored} unscored) | ` +
             `placement ${JSON.stringify(k.oraclePlacement)}\n`);
     }
         process.stdout.write(`  callee arm: precision ${pct(summary.calleePrecision)} (${summary.calleeHits}/${summary.calleeSites}) | ` +
@@ -1665,13 +1742,17 @@ async function evaluateRepo(repo, oracle) {
             `unresolved ${summary.definitionUnresolvedReferenceEdges} | errors ${summary.definitionLookupErrors}\n`);
     }
     if (typeof oracle.isConfigurationGated === 'function' || handle?.definitionLookupWeak) {
+        const classes = counts => {
+            const entries = Object.entries(counts);
+            return entries.length ? ` [${entries.map(([name, n]) => `${name} ${n}`).join(', ')}]` : '';
+        };
         process.stdout.write(`  oracle coverage: ` +
             `${summary.confirmedConfigurationUnscored + summary.confirmedAbstentionUnscored} confirmed edge(s) unscored ` +
             `(${summary.confirmedConfigurationUnscored} configuration, ` +
-            `${summary.confirmedAbstentionUnscored} definition-unresolved), ` +
+            `${summary.confirmedAbstentionUnscored} oracle-abstention)${classes(summary.confirmedUnscoredByClass)}, ` +
             `${summary.unverifiedConfigurationUnscored + summary.unverifiedAbstentionUnscored} unverified edge(s) unscored ` +
             `(${summary.unverifiedConfigurationUnscored} configuration, ` +
-            `${summary.unverifiedAbstentionUnscored} definition-unresolved), ` +
+            `${summary.unverifiedAbstentionUnscored} oracle-abstention)${classes(summary.unverifiedUnscoredByClass)}, ` +
             `${summary.calleeUnscoredSites} callee site(s) unscored | status errors ${summary.sourceStatusErrors}\n`);
     }
     if (summary.missingUnexplained > 0) {
@@ -1732,6 +1813,11 @@ function lineText(root, relFile, line) {
         _lineCache.set(abs, lines);
     }
     return lines && line >= 1 && line <= lines.length ? lines[line - 1].trim() : null;
+}
+
+function sortedCounts(counts) {
+    return Object.fromEntries(Object.entries(counts)
+        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
 }
 
 function pushSample(samples, sample, cap = 30) {
@@ -2017,7 +2103,7 @@ async function main() {
     lines.push('localize precision gaps, such as method-name conflation where import');
     lines.push('evidence confirms the file but not the receiver type.');
     lines.push('');
-    lines.push('| repo | kind | sampled | oracle edges | tier1 precision | tier1 cfg-unscored | unverified precision | unverified cfg-unscored | separation | placement |');
+    lines.push('| repo | kind | sampled | oracle edges | tier1 precision | tier1 unscored | unverified precision | unverified unscored | separation | placement |');
     lines.push('|---|---|---|---|---|---|---|---|---|---|');
     for (const { summary: s } of rollupResults) {
         if (s.error || !s.byKind) continue;
@@ -2051,15 +2137,17 @@ async function main() {
     lines.push('another definition are excluded from this target\'s ground truth.');
     lines.push('Unresolved lookups remain in the conservative reference-search set;');
     lines.push('request errors fail the gate instead of silently weakening it.');
-    lines.push('For Rust, unresolved precision edges inside syn-confirmed `#[cfg]`');
-    lines.push('owners are reported as unscored because one rust-analyzer process');
-    lines.push('cannot activate mutually exclusive feature/platform projections.');
+    lines.push('An edge is configuration-unscored only when the oracle\'s own');
+    lines.push('projection leaves out its call line or its target (inactive `#[cfg]`');
+    lines.push('or preprocessor regions, statically false conditions, files outside');
+    lines.push('every loaded build). Lines the oracle analyzes but cannot resolve,');
+    lines.push('and macro_rules! expansions it cannot expand, are oracle abstentions.');
     lines.push('');
-    lines.push('| repo | confirmed edges validated | unverified edges validated | oracle calls validated | broad-family refs excluded | unresolved refs | lookup errors | cfg-unscored precision edges | cfg-unscored callee sites | source-status errors |');
-    lines.push('|---|---|---|---|---|---|---|---|---|---|');
+    lines.push('| repo | confirmed edges validated | unverified edges validated | oracle calls validated | broad-family refs excluded | unresolved refs | lookup errors | configuration-unscored precision edges | abstention-unscored precision edges | unscored callee sites | source-status errors |');
+    lines.push('|---|---|---|---|---|---|---|---|---|---|---|');
     for (const { summary: s } of rollupResults) {
         if (s.error) continue;
-        lines.push(`| ${s.repo} | ${s.definitionValidatedConfirmed} | ${s.definitionValidatedUnverified} | ${s.definitionValidatedOracleCalls} | ${s.oracleBroadReferenceEdges} | ${s.definitionUnresolvedReferenceEdges} | **${s.definitionLookupErrors}** | ${s.configurationGatedUnscored} | ${s.calleeUnscoredSites} | **${s.sourceStatusErrors}** |`);
+        lines.push(`| ${s.repo} | ${s.definitionValidatedConfirmed} | ${s.definitionValidatedUnverified} | ${s.definitionValidatedOracleCalls} | ${s.oracleBroadReferenceEdges} | ${s.definitionUnresolvedReferenceEdges} | **${s.definitionLookupErrors}** | ${s.confirmedConfigurationUnscored ?? 0} | ${s.confirmedAbstentionUnscored ?? 0} | ${s.calleeUnscoredSites} | **${s.sourceStatusErrors}** |`);
     }
     lines.push('');
     lines.push(...ruleTable(rollupResults));

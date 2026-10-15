@@ -435,3 +435,161 @@ describe('fix #292: deferred unresolved adjudication is gate-bearing on a positi
             { keep: true, gateBearing: false });
     });
 });
+
+describe('fix #406: unscored edges are classified by the oracle\'s own projection', () => {
+    const fs = require('fs');
+    const os = require('os');
+    const {
+        unscoredProng,
+        expandedDefinitionStatus,
+    } = require('../eval/oracle-gate-policy');
+    const {
+        cargoLinkedProjects,
+        projectionStatus,
+        lineOutsideProjection,
+        inlineExpansion,
+        originalLine,
+        wordOffsets,
+    } = require('../eval/oracles/rust-analyzer-oracle');
+    const {
+        staticConditionRanges,
+        STATIC_CONDITION_UNREACHABLE,
+    } = require('../eval/oracles/pyright-oracle');
+
+    it('only configuration-gated verdicts enter the configuration prong', () => {
+        assert.strictEqual(unscoredProng({ scorable: false, abstention: 'configuration-gated' }),
+            'configuration');
+        assert.strictEqual(unscoredProng({ scorable: false, abstention: 'definition-unresolved' }),
+            'abstention');
+        assert.strictEqual(unscoredProng({ scorable: false, abstention: 'macro-template-expansion' }),
+            'abstention');
+        assert.strictEqual(unscoredProng({ scorable: true, hit: true }), null);
+        assert.throws(() => unscoredProng({ scorable: false }), /no abstention class/);
+    });
+
+    it('rand: 80 template abstentions no longer read as configuration gating', () => {
+        // Weekly Eval run 38261618148: 80 macro-template-expansion + 6
+        // definition-unresolved of 317 confirmed edges were tallied 80/6
+        // configuration/abstention (25.24% > 10%).
+        const verdicts = [
+            ...Array(80).fill({ scorable: false, abstention: 'macro-template-expansion' }),
+            ...Array(6).fill({ scorable: false, abstention: 'definition-unresolved' }),
+        ];
+        const abstentions = verdicts.filter(v => unscoredProng(v) === 'abstention').length;
+        const coverage = evaluateOracleCoverage({
+            confirmedEdges: 317,
+            confirmedUnscored: verdicts.length,
+            confirmedAbstentionUnscored: abstentions,
+        }, 0.10);
+        assert.strictEqual(coverage.precisionConfigGatedRatio, 0);
+        assert.deepStrictEqual(coverage.failures, []);
+    });
+
+    it('a macro expansion scores only what the oracle resolved', () => {
+        const target = d => d.file === 'src/u.rs' && d.line === 235;
+        assert.strictEqual(expandedDefinitionStatus(null, target), 'unavailable');
+        assert.strictEqual(expandedDefinitionStatus({
+            definitions: [{ file: 'src/u.rs', line: 235 }, { file: 'src/v.rs', line: 9 }],
+            unresolved: 1,
+        }, target), 'target');
+        assert.strictEqual(expandedDefinitionStatus({
+            definitions: [{ file: 'src/v.rs', line: 9 }], unresolved: 0,
+        }, target), 'other');
+        // An occurrence that resolved nowhere may be the claimed call.
+        assert.strictEqual(expandedDefinitionStatus({
+            definitions: [{ file: 'src/v.rs', line: 9 }], unresolved: 1,
+        }, target), 'unresolved');
+        // A declaration the expansion generated is never the source target.
+        assert.strictEqual(expandedDefinitionStatus({
+            definitions: [{ file: 'src/u.rs', line: 0, generated: true }], unresolved: 0,
+        }, () => true), 'other');
+        assert.strictEqual(expandedDefinitionStatus({
+            definitions: [{ file: '/rustlib/core/simd.rs', line: 3, external: true }], unresolved: 0,
+        }, () => true), 'other');
+    });
+
+    it('rust-analyzer projection: inactive-code ranges and unlinked files only', () => {
+        const status = projectionStatus([
+            { code: 'inactive-code', range: { start: { line: 12 }, end: { line: 13 } } },
+            { code: 'unused_variables', range: { start: { line: 40 }, end: { line: 40 } } },
+        ]);
+        assert.deepStrictEqual(status, { unlinked: false, inactive: [[13, 14]] });
+        assert.strictEqual(lineOutsideProjection(status, 14), true);
+        // An active line is analyzed whatever #[cfg] attributes surround it.
+        assert.strictEqual(lineOutsideProjection(status, 15), false);
+        assert.strictEqual(lineOutsideProjection(status, 41), false);
+        const unlinked = projectionStatus([
+            { code: { value: 'unlinked-file' }, range: { start: { line: 0 }, end: { line: 0 } } },
+        ]);
+        assert.strictEqual(lineOutsideProjection(unlinked, 99), true);
+    });
+
+    it('inlines an expansion in the invocation\'s AST position and maps lines back', () => {
+        const source = 'fn a() {}\nfn main() {\n    t!(x);\n    a();\n}\n';
+        const call = { kind: 'stmt', startLine: 3, startUtf16Col: 4, endLine: 3, endUtf16Col: 9 };
+        const inlined = inlineExpansion(source, call, 'let q = a();\nb(q)');
+        assert.strictEqual(inlined.text,
+            'fn a() {}\nfn main() {\n    {\nlet q = a();\nb(q)\n};\n    a();\n}\n');
+        const [inside] = wordOffsets(inlined.replacement, 'a').map(o => o + inlined.start);
+        assert.strictEqual(originalLine(inlined, inside), null, 'expansion text has no source line');
+        assert.strictEqual(originalLine(inlined, 3), 1, 'before the invocation');
+        assert.strictEqual(originalLine(inlined, inlined.text.indexOf('a();\n}')), 4,
+            'after the invocation, shifted back');
+        assert.match(inlineExpansion(source, { ...call, kind: 'expr' }, 'a()').text, /\(\{\na\(\)\n\}\)/);
+        // An item invocation's span includes its own `;` (helper protocol).
+        assert.strictEqual(inlineExpansion(source,
+            { ...call, kind: 'item', endUtf16Col: 10 }, 'fn g() {}').text,
+        'fn a() {}\nfn main() {\n    \nfn g() {}\n\n    a();\n}\n');
+        assert.strictEqual(inlineExpansion(source, { ...call, kind: 'other' }, 'x'), null);
+        assert.strictEqual(inlineExpansion(source, call, ''), null);
+        assert.deepStrictEqual(wordOffsets('new(renew, new_x, new)', 'new'), [0, 18]);
+    });
+
+    it('links every Cargo workspace under the target, skipping members and build output', () => {
+        const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-406-'));
+        try {
+            for (const dir of ['', 'crates/a', 'benches', 'target/debug/x', '.github/x', 'broken']) {
+                fs.mkdirSync(path.join(root, dir), { recursive: true });
+                fs.writeFileSync(path.join(root, dir, 'Cargo.toml'), '[package]\n');
+            }
+            const manifest = dir => path.join(root, dir, 'Cargo.toml');
+            const queried = [];
+            const metadata = file => {
+                queried.push(path.relative(root, file));
+                if (file === manifest('broken')) throw new Error('failed to parse manifest');
+                if (file === manifest('benches')) {
+                    return { workspaceRoot: path.join(root, 'benches'), memberManifests: [manifest('benches')] };
+                }
+                return { workspaceRoot: root, memberManifests: [manifest(''), manifest('crates/a')] };
+            };
+            const logged = [];
+            const linked = cargoLinkedProjects(root, root, {
+                metadata, log: { write: line => logged.push(line) },
+            });
+            assert.deepStrictEqual(linked, [manifest(''), manifest('benches')]);
+            assert.deepStrictEqual(queried, ['Cargo.toml', 'benches/Cargo.toml', 'broken/Cargo.toml'],
+                'members of a loaded workspace and build output are not queried');
+            assert.ok(logged.some(line => line.includes('broken/Cargo.toml')));
+        } finally {
+            fs.rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it('pyright: only statically false conditions are configuration', () => {
+        const hint = (message, from, to) => ({
+            message, tags: [1], range: { start: { line: from - 1 }, end: { line: to - 1 } },
+        });
+        assert.deepStrictEqual(staticConditionRanges([
+            hint(STATIC_CONDITION_UNREACHABLE, 854, 904),
+            hint('Code is structurally unreachable', 796, 808),
+            hint('Type analysis indicates code is unreachable', 10, 12),
+            hint('"tb" is not accessed', 138, 138),
+            { message: STATIC_CONDITION_UNREACHABLE, range: { start: { line: 1 }, end: { line: 2 } } },
+        ]), [[854, 904]]);
+        // The message is matched against the pinned pyright's own English
+        // localization: a pyright bump that rewords it must fail here.
+        const bundle = fs.readFileSync(
+            require.resolve('pyright/dist/pyright-internal.js'), 'utf8');
+        assert.ok(bundle.includes(`"unreachableCodeCondition":"${STATIC_CONDITION_UNREACHABLE}"`));
+    });
+});

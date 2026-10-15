@@ -18,7 +18,15 @@
  *   async resolveDefinition?(handle, { name, file, line, column? }) -> [{ file, line }],
  *       // optional exact static-target adjudication for reference-search gaps
  *   async isConfigurationGated?(handle, { file, line }) -> boolean,
- *       // optional single-configuration coverage marker (Rust cfg, etc.)
+ *       // optional: true only when the oracle's OWN projection leaves the
+ *       // line out (inactive #[cfg]/#if region, statically false condition,
+ *       // build-constrained or unlinked file), as the server reports it;
+ *       // never a syntactic test of whether the line is conditional
+ *   async resolveExpandedDefinition?(handle, { name, file, line })
+ *       -> { definitions: [{ file, line, external?, generated? }], unresolved } | null,
+ *       // optional: resolve the occurrences of `name` that the macro
+ *       // invocations on the line expand to (the oracle's own expansion);
+ *       // null when no invocation there expands to text holding the name
  *   async dispose?(handle),            // optional graceful teardown (LSP shutdown)
  * }
  */
@@ -48,6 +56,10 @@ function validateOracle(oracle) {
     }
     if (oracle.isConfigurationGated != null && typeof oracle.isConfigurationGated !== 'function') {
         throw new Error('Oracle isConfigurationGated must be a function when provided');
+    }
+    if (oracle.resolveExpandedDefinition != null &&
+        typeof oracle.resolveExpandedDefinition !== 'function') {
+        throw new Error('Oracle resolveExpandedDefinition must be a function when provided');
     }
     if (!Array.isArray(oracle.languages) || oracle.languages.length === 0) {
         throw new Error('Oracle languages must be a non-empty array');

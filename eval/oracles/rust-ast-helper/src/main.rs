@@ -26,11 +26,16 @@
 //          ident-followed-by-(...) inside macro token trees (mirrors UCN's
 //          fix #201 token-tree convention, independently implemented on
 //          proc-macro2 token streams).
-//   {"op": "source_status", "file": rel, "line": n}
-//       -> {"ok": true, "configurationGated": bool}
-//          True when the line is inside a syn-parsed file/item/local carrying
-//          #[cfg(...)]. This exposes rust-analyzer's single-configuration
-//          coverage gaps without pretending they are engine false positives.
+//   {"op": "macro_calls", "file": rel, "line": n}
+//       -> {"ok": true, "calls": [{"kind", "pathLine", "pathUtf16Col",
+//          "startLine", "startUtf16Col", "endLine", "endUtf16Col"}]}
+//          The macro invocations written in source (`name!(..)`,
+//          `name! { .. }`, macro_rules! definitions excluded) whose span
+//          covers the line. kind: item | stmt | expr | other (the AST
+//          position the expansion replaces); path = the macro name token;
+//          end is exclusive, after the closing delimiter (after an item
+//          invocation's own `;`). syn never parses
+//          macro arguments, so every call listed is an outermost one.
 //   {"op": "shutdown"} -> exits.
 //
 // Symbol enumeration walks the prepared root only; classification reads any
@@ -53,7 +58,14 @@ struct FileInfo {
     callee_pos: HashSet<(usize, usize)>,         // (line, charCol 0-based)
     def_pos: HashMap<(usize, usize), String>,    // decl-name positions -> name
     imports: Vec<(usize, usize)>,                // use-item line spans
-    cfg_spans: Vec<(usize, usize)>,              // #[cfg] owner line spans
+    macro_calls: Vec<MacroCall>,                 // source macro invocations
+}
+
+struct MacroCall {
+    kind: &'static str,
+    path: (usize, usize),  // (line, charCol) of the macro name token
+    start: (usize, usize), // first token of the invocation
+    end: (usize, usize),   // after the closing delimiter
 }
 
 struct Collector<'a> {
@@ -61,13 +73,24 @@ struct Collector<'a> {
 }
 
 impl<'a> Collector<'a> {
-    fn mark_cfg<T: Spanned>(&mut self, attrs: &[syn::Attribute], node: &T) {
-        if attrs.iter().any(|a| a.path().is_ident("cfg")) {
-            let span = node.span();
-            self.info
-                .cfg_spans
-                .push((span.start().line, span.end().line));
-        }
+    /// `semi`: an item invocation's own `;`, part of what its expansion
+    /// replaces (a statement keeps its `;` after the block it becomes).
+    fn record_macro_call(&mut self, mac: &syn::Macro, kind: &'static str, semi: Option<&syn::token::Semi>) {
+        let name = match mac.path.segments.last() {
+            Some(seg) => seg.ident.span().start(),
+            None => return,
+        };
+        let start = mac.path.span().start();
+        let end = match semi {
+            Some(token) => token.span.end(),
+            None => mac.delimiter.span().close().end(),
+        };
+        self.info.macro_calls.push(MacroCall {
+            kind,
+            path: (name.line, name.column),
+            start: (start.line, start.column),
+            end: (end.line, end.column),
+        });
     }
 
     fn record(&mut self, decl_line: usize, ident: &proc_macro2::Ident, kind: &'static str) {
@@ -155,58 +178,6 @@ fn fn_decl_line(
 }
 
 impl<'a, 'ast> Visit<'ast> for Collector<'a> {
-    fn visit_item(&mut self, i: &'ast syn::Item) {
-        let attrs: &[syn::Attribute] = match i {
-            syn::Item::Const(x) => &x.attrs,
-            syn::Item::Enum(x) => &x.attrs,
-            syn::Item::ExternCrate(x) => &x.attrs,
-            syn::Item::Fn(x) => &x.attrs,
-            syn::Item::ForeignMod(x) => &x.attrs,
-            syn::Item::Impl(x) => &x.attrs,
-            syn::Item::Macro(x) => &x.attrs,
-            syn::Item::Mod(x) => &x.attrs,
-            syn::Item::Static(x) => &x.attrs,
-            syn::Item::Struct(x) => &x.attrs,
-            syn::Item::Trait(x) => &x.attrs,
-            syn::Item::TraitAlias(x) => &x.attrs,
-            syn::Item::Type(x) => &x.attrs,
-            syn::Item::Union(x) => &x.attrs,
-            syn::Item::Use(x) => &x.attrs,
-            _ => &[],
-        };
-        self.mark_cfg(attrs, i);
-        visit::visit_item(self, i);
-    }
-
-    fn visit_impl_item(&mut self, i: &'ast syn::ImplItem) {
-        let attrs: &[syn::Attribute] = match i {
-            syn::ImplItem::Const(x) => &x.attrs,
-            syn::ImplItem::Fn(x) => &x.attrs,
-            syn::ImplItem::Type(x) => &x.attrs,
-            syn::ImplItem::Macro(x) => &x.attrs,
-            _ => &[],
-        };
-        self.mark_cfg(attrs, i);
-        visit::visit_impl_item(self, i);
-    }
-
-    fn visit_trait_item(&mut self, i: &'ast syn::TraitItem) {
-        let attrs: &[syn::Attribute] = match i {
-            syn::TraitItem::Const(x) => &x.attrs,
-            syn::TraitItem::Fn(x) => &x.attrs,
-            syn::TraitItem::Type(x) => &x.attrs,
-            syn::TraitItem::Macro(x) => &x.attrs,
-            _ => &[],
-        };
-        self.mark_cfg(attrs, i);
-        visit::visit_trait_item(self, i);
-    }
-
-    fn visit_local(&mut self, i: &'ast syn::Local) {
-        self.mark_cfg(&i.attrs, i);
-        visit::visit_local(self, i);
-    }
-
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
         let line = fn_decl_line(Some(&i.vis), None, &i.sig);
         self.record(line, &i.sig.ident, "function");
@@ -250,8 +221,51 @@ impl<'a, 'ast> Visit<'ast> for Collector<'a> {
     fn visit_item_macro(&mut self, i: &'ast syn::ItemMacro) {
         if let Some(ident) = &i.ident {
             self.record_def_only(ident); // macro_rules! name
+        } else {
+            self.record_macro_call(&i.mac, "item", i.semi_token.as_ref());
         }
         visit::visit_item_macro(self, i);
+    }
+
+    fn visit_impl_item_macro(&mut self, i: &'ast syn::ImplItemMacro) {
+        self.record_macro_call(&i.mac, "item", i.semi_token.as_ref());
+        visit::visit_impl_item_macro(self, i);
+    }
+
+    fn visit_trait_item_macro(&mut self, i: &'ast syn::TraitItemMacro) {
+        self.record_macro_call(&i.mac, "item", i.semi_token.as_ref());
+        visit::visit_trait_item_macro(self, i);
+    }
+
+    fn visit_foreign_item_macro(&mut self, i: &'ast syn::ForeignItemMacro) {
+        self.record_macro_call(&i.mac, "item", i.semi_token.as_ref());
+        visit::visit_foreign_item_macro(self, i);
+    }
+
+    fn visit_stmt_macro(&mut self, i: &'ast syn::StmtMacro) {
+        self.record_macro_call(&i.mac, "stmt", None);
+        visit::visit_stmt_macro(self, i);
+    }
+
+    fn visit_expr_macro(&mut self, i: &'ast syn::ExprMacro) {
+        self.record_macro_call(&i.mac, "expr", None);
+        visit::visit_expr_macro(self, i);
+    }
+
+    fn visit_pat(&mut self, p: &'ast syn::Pat) {
+        // syn reads a pattern-position macro as an ExprMacro; it is not an
+        // expression position.
+        if let syn::Pat::Macro(m) = p {
+            self.record_macro_call(&m.mac, "other", None);
+            self.visit_macro(&m.mac);
+            return;
+        }
+        visit::visit_pat(self, p);
+    }
+
+    fn visit_type_macro(&mut self, i: &'ast syn::TypeMacro) {
+        self.record_macro_call(&i.mac, "other", None);
+        visit::visit_type_macro(self, i);
     }
 
     fn visit_item_use(&mut self, i: &'ast syn::ItemUse) {
@@ -300,9 +314,6 @@ impl Server {
                 info.lines = src.split('\n').map(|s| s.to_string()).collect();
                 if let Ok(file) = syn::parse_file(&src) {
                     let mut c = Collector { info: &mut info };
-                    if file.attrs.iter().any(|a| a.path().is_ident("cfg")) {
-                        c.info.cfg_spans.push((1, c.info.lines.len().max(1)));
-                    }
                     c.visit_file(&file);
                 }
                 // parse failure: lines-only info — every ref classifies as
@@ -379,14 +390,28 @@ impl Server {
         json!({"ok": true, "kind": kind})
     }
 
-    fn source_status(&mut self, rel: &str, line: usize) -> Value {
+    fn macro_calls(&mut self, rel: &str, line: usize) -> Value {
         let abs = self.root.join(rel);
         let info = self.analyze(&abs);
-        let configuration_gated = info
-            .cfg_spans
+        let col = |(l, c): (usize, usize)| utf16_col(Self::line_text(info, l), c);
+        let mut calls: Vec<&MacroCall> = info
+            .macro_calls
             .iter()
-            .any(|&(start, end)| line >= start && line <= end);
-        json!({"ok": true, "configurationGated": configuration_gated})
+            .filter(|m| m.start.0 <= line && line <= m.end.0)
+            .collect();
+        calls.sort_by_key(|m| (m.start.0, m.start.1));
+        let calls: Vec<Value> = calls
+            .into_iter()
+            .map(|m| {
+                json!({
+                    "kind": m.kind,
+                    "pathLine": m.path.0, "pathUtf16Col": col(m.path),
+                    "startLine": m.start.0, "startUtf16Col": col(m.start),
+                    "endLine": m.end.0, "endUtf16Col": col(m.end),
+                })
+            })
+            .collect();
+        json!({"ok": true, "calls": calls})
     }
 }
 
@@ -508,8 +533,8 @@ fn main() {
                     get_usize(&req, "utf16_col"),
                     get_str(&req, "name"),
                 ),
-                Some("source_status") => {
-                    server.source_status(get_str(&req, "file"), get_usize(&req, "line"))
+                Some("macro_calls") => {
+                    server.macro_calls(get_str(&req, "file"), get_usize(&req, "line"))
                 }
                 Some("shutdown") => return,
                 _ => json!({"ok": false, "error": "unknown op"}),

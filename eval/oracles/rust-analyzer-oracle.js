@@ -14,6 +14,18 @@
  * is the experimental/serverStatus notification with quiescent=true —
  * requested via the serverStatusNotification client capability.
  *
+ * Projection (fix #406): rust-analyzer discovers only the Cargo workspace at
+ * the root, so a nested workspace (`benches/Cargo.toml` with its own
+ * `[workspace]`, fuzz crates, crates excluded from the root workspace) would
+ * sit outside its projection while UCN indexes it. Every Cargo workspace
+ * under the target is linked explicitly. Configuration status is the
+ * server's own answer (pull diagnostics: `inactive-code` ranges and
+ * `unlinked-file`), never a syntactic `#[cfg]` test: features=all makes most
+ * feature-gated code active, and active code is scored. Calls a project
+ * macro_rules! transcriber generates are resolved through rust-analyzer's own
+ * expansion of the invocation (`rust-analyzer/expandMacro`), inlined in its
+ * in-memory copy of the file.
+ *
  * rust-analyzer resolution: $UCN_EVAL_RUST_ANALYZER, else PATH. Requires a
  * cargo toolchain (also builds/runs the syn helper).
  */
@@ -45,6 +57,7 @@ const rustAnalyzerOracle = {
     async prepare(repoDir) {
         const ra = resolveRustAnalyzer();
         const workspaceRoot = findWorkspaceRoot(repoDir);
+        const linkedProjects = cargoLinkedProjects(repoDir, workspaceRoot);
 
         // Build the helper up front so compile output never races the banner.
         const build = spawnSync('cargo', ['build', '--quiet', '--manifest-path', HELPER_MANIFEST], { stdio: ['ignore', 'ignore', 'inherit'] });
@@ -69,6 +82,9 @@ const rustAnalyzerOracle = {
                     workspace: {
                         didChangeWatchedFiles: { dynamicRegistration: true },
                     },
+                    // Pull diagnostics carry the server's own projection:
+                    // inactive-code ranges and unlinked files.
+                    textDocument: { diagnostic: { dynamicRegistration: false } },
                     experimental: { serverStatusNotification: true },
                 },
                 onNotification: (method, params) => {
@@ -87,6 +103,7 @@ const rustAnalyzerOracle = {
                 // watcher cannot strand VFS readiness at N-1 roots.
                 files: { watcher: 'client' },
                 cargo: { features: 'all', allTargets: true },
+                ...(linkedProjects.length > 1 && { linkedProjects }),
             });
             process.stdout.write('  waiting for rust-analyzer to load the workspace (cargo metadata + build scripts)...\n');
             const status = await quiescent;
@@ -95,8 +112,15 @@ const rustAnalyzerOracle = {
             }
             const version = spawnSync(ra, ['--version'], { stdio: 'pipe' }).stdout?.toString().trim() || 'unknown';
             process.stdout.write(`  ${version} (workspace root ${path.relative(repoDir, workspaceRoot) || '.'})\n`);
+            if (linkedProjects.length > 1) {
+                process.stdout.write(`  linked Cargo workspaces: ${linkedProjects
+                    .map(manifest => path.relative(repoDir, path.dirname(manifest)) || '.').join(', ')}\n`);
+            }
 
-            return { lsp, helper, root: repoDir, workspaceRoot, opened: new Set() };
+            return {
+                lsp, helper, root: repoDir, workspaceRoot, opened: new Set(),
+                versions: new Map(), projection: new Map(), expansions: new Map(),
+            };
         } catch (error) {
             // A prepare failure happens before run-oracle-eval owns a handle,
             // so its normal finally/dispose path cannot help. Close both
@@ -124,10 +148,7 @@ const rustAnalyzerOracle = {
     async findReferences(handle, { name, file, line }) {
         const pos = await handle.helper.request({ op: 'name_position', file, line, name });
         const absFile = path.join(handle.root, file);
-        if (!handle.opened.has(absFile)) {
-            handle.lsp.didOpen(absFile, 'rust', fs.readFileSync(absFile, 'utf-8'));
-            handle.opened.add(absFile);
-        }
+        ensureOpen(handle, absFile);
         const locations = await handle.lsp.request('textDocument/references', {
             textDocument: { uri: pathToUri(absFile) },
             position: { line: pos.line - 1, character: pos.utf16Col },
@@ -160,10 +181,7 @@ const rustAnalyzerOracle = {
      *  UCN precision failures. */
     async resolveDefinition(handle, { name, file, line, column }) {
         const absFile = path.join(handle.root, file);
-        if (!handle.opened.has(absFile)) {
-            handle.lsp.didOpen(absFile, 'rust', fs.readFileSync(absFile, 'utf-8'));
-            handle.opened.add(absFile);
-        }
+        ensureOpen(handle, absFile);
         const sourceLine = fs.readFileSync(absFile, 'utf-8').split('\n')[line - 1] || '';
         const columns = Number.isInteger(column) ? [column] : nameColumns(sourceLine, name);
         const defs = new Map();
@@ -172,33 +190,88 @@ const rustAnalyzerOracle = {
                 textDocument: { uri: pathToUri(absFile) },
                 position: { line: line - 1, character },
             }) || [];
-            for (const loc of Array.isArray(locations) ? locations : [locations]) {
-                const uri = loc.targetUri || loc.uri;
-                const range = loc.targetSelectionRange || loc.targetRange || loc.range;
-                if (!uri || !range) continue;
-                const defAbs = uriToPath(uri);
-                if (!defAbs.startsWith(handle.workspaceRoot + path.sep)) {
-                    defs.set(`external:${defAbs}:${range.start.line + 1}`, {
-                        file: defAbs,
-                        line: range.start.line + 1,
-                        external: true,
-                    });
-                    continue;
-                }
-                const entry = { file: path.relative(handle.root, defAbs), line: range.start.line + 1 };
-                defs.set(`${entry.file}:${entry.line}`, entry);
+            for (const entry of definitionEntries(handle, locations)) {
+                defs.set(entry.external ? `external:${entry.file}:${entry.line}`
+                    : `${entry.file}:${entry.line}`, entry);
             }
         }
         return [...defs.values()];
     },
 
-    /** Whether this source line belongs to an explicitly cfg-gated AST owner.
-     *  rust-analyzer evaluates one target/feature/platform projection at a
-     *  time; unresolved calls in another valid projection are coverage gaps,
-     *  not evidence that UCN invented an edge. */
+    /** Resolve a name a project macro_rules! transcriber generated on this
+     *  line. The line's source invocations are expanded by rust-analyzer
+     *  (recursively), each expansion is inlined in place of its invocation in
+     *  the server's in-memory copy of the file, every occurrence of the name
+     *  inside it is resolved, and the file is restored. Returns null when no
+     *  invocation on the line expands to text holding the name; otherwise
+     *  the resolved declarations and how many occurrences resolved nowhere. */
+    async resolveExpandedDefinition(handle, { name, file, line }) {
+        const cacheKey = `${file}:${line}:${name}`;
+        if (handle.expansions.has(cacheKey)) return handle.expansions.get(cacheKey);
+        const { calls = [] } = await handle.helper.request({ op: 'macro_calls', file, line });
+        const absFile = path.join(handle.root, file);
+        ensureOpen(handle, absFile);
+        const original = fs.readFileSync(absFile, 'utf-8');
+        const definitions = new Map();
+        let occurrences = 0;
+        let unresolved = 0;
+        for (const call of calls) {
+            const expanded = await handle.lsp.request('rust-analyzer/expandMacro', {
+                textDocument: { uri: pathToUri(absFile) },
+                position: { line: call.pathLine - 1, character: call.pathUtf16Col },
+            });
+            const inlined = inlineExpansion(original, call, expanded?.expansion);
+            if (!inlined) continue;
+            const offsets = wordOffsets(inlined.replacement, name)
+                .map(offset => inlined.start + offset);
+            if (offsets.length === 0) continue;
+            setDocumentText(handle, absFile, inlined.text);
+            try {
+                for (const offset of offsets) {
+                    occurrences++;
+                    const locations = await handle.lsp.request('textDocument/definition', {
+                        textDocument: { uri: pathToUri(absFile) },
+                        position: positionAt(inlined.text, offset),
+                    }) || [];
+                    const entries = definitionEntries(handle, locations, {
+                        absFile, inlined,
+                    });
+                    if (entries.length === 0) unresolved++;
+                    for (const entry of entries) {
+                        definitions.set(entry.external ? `external:${entry.file}:${entry.line}`
+                            : `${entry.file}:${entry.line}:${entry.generated ? 'g' : ''}`, entry);
+                    }
+                }
+            } finally {
+                setDocumentText(handle, absFile, original);
+            }
+        }
+        const result = occurrences === 0 ? null
+            : { definitions: [...definitions.values()], unresolved };
+        handle.expansions.set(cacheKey, result);
+        return result;
+    },
+
+    /** Whether rust-analyzer's own projection leaves this line out: inside
+     *  an `inactive-code` range (a `#[cfg]` false for the loaded features and
+     *  host target) or in a file no loaded crate includes (`unlinked-file`).
+     *  A line it analyzes is never configuration-gated, whatever `#[cfg]`
+     *  attributes it carries. */
     async isConfigurationGated(handle, { file, line }) {
-        const status = await handle.helper.request({ op: 'source_status', file, line });
-        return !!status.configurationGated;
+        const absFile = path.join(handle.root, file);
+        let status = handle.projection.get(absFile);
+        if (!status) {
+            ensureOpen(handle, absFile);
+            const report = await handle.lsp.request('textDocument/diagnostic', {
+                textDocument: { uri: pathToUri(absFile) },
+            });
+            if (!report || !Array.isArray(report.items)) {
+                throw new Error(`rust-analyzer returned no diagnostic report for ${file}`);
+            }
+            status = projectionStatus(report.items);
+            handle.projection.set(absFile, status);
+        }
+        return lineOutsideProjection(status, line);
     },
 
     /** Graceful teardown — without LSP shutdown r-a prints a panic backtrace on exit. */
@@ -210,6 +283,214 @@ const rustAnalyzerOracle = {
         } catch (e) { /* gone */ }
     },
 };
+
+function ensureOpen(handle, absFile) {
+    if (handle.opened.has(absFile)) return;
+    handle.lsp.didOpen(absFile, 'rust', fs.readFileSync(absFile, 'utf-8'));
+    handle.opened.add(absFile);
+    handle.versions.set(absFile, 1);
+}
+
+function setDocumentText(handle, absFile, text) {
+    const version = (handle.versions.get(absFile) || 1) + 1;
+    handle.versions.set(absFile, version);
+    handle.lsp.didChange(absFile, version, text);
+}
+
+/** LSP definition locations as {file, line[, external | generated]}. A
+ *  location in the inlined copy of `absFile` maps back to source lines; one
+ *  inside the inlined expansion is a declaration the expansion generated. */
+function definitionEntries(handle, locations, { absFile = null, inlined = null } = {}) {
+    const entries = [];
+    for (const loc of Array.isArray(locations) ? locations : [locations]) {
+        const uri = loc?.targetUri || loc?.uri;
+        const range = loc?.targetSelectionRange || loc?.targetRange || loc?.range;
+        if (!uri || !range) continue;
+        const defAbs = uriToPath(uri);
+        if (!defAbs.startsWith(handle.workspaceRoot + path.sep)) {
+            entries.push({ file: defAbs, line: range.start.line + 1, external: true });
+            continue;
+        }
+        let defLine = range.start.line + 1;
+        if (inlined && defAbs === absFile) {
+            const original = originalLine(inlined, offsetAt(inlined.text, range.start));
+            if (original === null) {
+                // Declared by the expansion itself: never a source definition.
+                entries.push({ file: path.relative(handle.root, defAbs), line: 0, generated: true });
+                continue;
+            }
+            defLine = original;
+        }
+        entries.push({ file: path.relative(handle.root, defAbs), line: defLine });
+    }
+    return entries;
+}
+
+/** The server's projection facts for one file, from its pull diagnostics. */
+function projectionStatus(items) {
+    const inactive = [];
+    let unlinked = false;
+    for (const item of items || []) {
+        const code = typeof item?.code === 'object' ? item.code?.value : item?.code;
+        if (code === 'unlinked-file') unlinked = true;
+        else if (code === 'inactive-code' && item.range) {
+            inactive.push([item.range.start.line + 1, item.range.end.line + 1]);
+        }
+    }
+    return { unlinked, inactive };
+}
+
+function lineOutsideProjection(status, line) {
+    return status.unlinked ||
+        status.inactive.some(([start, end]) => line >= start && line <= end);
+}
+
+/**
+ * Replace one macro invocation with its expansion text. The replacement
+ * keeps the invocation's AST position: items stay items, a statement or
+ * expression becomes a block (an expansion may be several statements).
+ * Positions are 1-based lines and UTF-16 columns (the helper's protocol).
+ */
+function inlineExpansion(original, call, expansion) {
+    if (typeof expansion !== 'string' || expansion.trim() === '') return null;
+    let replacement;
+    if (call.kind === 'item') replacement = `
+${expansion}
+`;
+    else if (call.kind === 'stmt') replacement = `{
+${expansion}
+}`;
+    else if (call.kind === 'expr') replacement = `({
+${expansion}
+})`;
+    else return null;
+    const start = offsetOfPosition(original, call.startLine, call.startUtf16Col);
+    const end = offsetOfPosition(original, call.endLine, call.endUtf16Col);
+    if (start === null || end === null || end < start) return null;
+    return {
+        original,
+        text: original.slice(0, start) + replacement + original.slice(end),
+        start,
+        replacement,
+        removed: end - start,
+    };
+}
+
+/** Source line of an offset in the inlined text; null inside the expansion. */
+function originalLine(inlined, offset) {
+    if (offset === null) return null;
+    const replacementEnd = inlined.start + inlined.replacement.length;
+    if (offset >= inlined.start && offset < replacementEnd) return null;
+    const sourceOffset = offset < inlined.start ? offset
+        : offset - inlined.replacement.length + inlined.removed;
+    return lineOfOffset(inlined.original, sourceOffset);
+}
+
+function offsetOfPosition(text, line, utf16Col) {
+    let offset = 0;
+    for (let current = 1; current < line; current++) {
+        const next = text.indexOf('\n', offset);
+        if (next < 0) return null;
+        offset = next + 1;
+    }
+    return offset + utf16Col <= text.length ? offset + utf16Col : null;
+}
+
+function offsetAt(text, position) {
+    return offsetOfPosition(text, position.line + 1, position.character);
+}
+
+function positionAt(text, offset) {
+    const before = text.slice(0, offset);
+    const line = before.split('\n').length - 1;
+    return { line, character: offset - (before.lastIndexOf('\n') + 1) };
+}
+
+function lineOfOffset(text, offset) {
+    return text.slice(0, offset).split('\n').length;
+}
+
+/** Word-boundary occurrences of `name` (as Rust identifiers) in `text`. */
+function wordOffsets(text, name) {
+    const offsets = [];
+    for (let from = 0; from <= text.length - name.length;) {
+        const at = text.indexOf(name, from);
+        if (at < 0) break;
+        const before = at === 0 ? '' : text[at - 1];
+        const after = text[at + name.length] || '';
+        if (!/[\w]/.test(before) && !/[\w]/.test(after)) offsets.push(at);
+        from = at + name.length;
+    }
+    return offsets;
+}
+
+/**
+ * The Cargo workspaces rust-analyzer must load so its projection covers the
+ * target: the target's own workspace plus every workspace whose manifest
+ * lies under the target and is not a member of an already loaded one
+ * (nested `[workspace]` roots, crates a root workspace excludes). Returns
+ * manifest paths, the target's workspace first; a manifest Cargo cannot read
+ * is reported and left out (rust-analyzer could not load it either).
+ */
+function cargoLinkedProjects(repoDir, workspaceRoot, { metadata = cargoMetadata, log = process.stdout } = {}) {
+    const rootManifest = path.join(workspaceRoot, 'Cargo.toml');
+    const manifests = [rootManifest, ...walkManifests(repoDir)
+        .filter(manifest => manifest !== rootManifest)];
+    const covered = new Set();
+    const linked = [];
+    for (const manifest of manifests) {
+        if (covered.has(manifest) || !fs.existsSync(manifest)) continue;
+        let info;
+        try {
+            info = metadata(manifest);
+        } catch (error) {
+            log.write(`  ⚠ Cargo manifest not loadable, outside the oracle projection: ` +
+                `${path.relative(repoDir, manifest)} (${String(error.message).split('\n')[0]})\n`);
+            continue;
+        }
+        const workspaceManifest = path.join(info.workspaceRoot, 'Cargo.toml');
+        for (const member of info.memberManifests) covered.add(member);
+        covered.add(workspaceManifest);
+        if (!linked.includes(workspaceManifest)) linked.push(workspaceManifest);
+    }
+    return linked;
+}
+
+function cargoMetadata(manifest) {
+    const result = spawnSync('cargo', ['metadata', '--no-deps', '--format-version', '1',
+        '--manifest-path', manifest], { stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 });
+    if (result.status !== 0) {
+        throw new Error(result.stderr?.toString().trim() || `cargo metadata exited ${result.status}`);
+    }
+    const parsed = JSON.parse(result.stdout.toString());
+    const members = new Set(parsed.workspace_members || []);
+    return {
+        workspaceRoot: parsed.workspace_root,
+        memberManifests: (parsed.packages || [])
+            .filter(pkg => members.has(pkg.id))
+            .map(pkg => pkg.manifest_path),
+    };
+}
+
+/** Cargo.toml files under dir, skipping what the syn helper's symbol walk
+ *  skips (hidden directories, build output, vendored and test-data trees). */
+function walkManifests(dir) {
+    const out = [];
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return out; }
+    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    for (const entry of entries) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+            if (entry.name.startsWith('.') || ['target', 'node_modules', 'testdata', 'vendor']
+                .includes(entry.name)) continue;
+            out.push(...walkManifests(full));
+        } else if (entry.name === 'Cargo.toml') {
+            out.push(full);
+        }
+    }
+    return out;
+}
 
 function nameColumns(line, name) {
     const cols = [];
@@ -248,4 +529,12 @@ function findWorkspaceRoot(dir) {
     return nearestManifest || dir;
 }
 
-module.exports = { rustAnalyzerOracle };
+module.exports = {
+    rustAnalyzerOracle,
+    cargoLinkedProjects,
+    projectionStatus,
+    lineOutsideProjection,
+    inlineExpansion,
+    originalLine,
+    wordOffsets,
+};

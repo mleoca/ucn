@@ -12,6 +12,11 @@
  *    detected Python project root so tests/ callers resolve (same universe
  *    rule the jedi oracle learned)
  *
+ * Configuration status (fix #406) is pyright's own reachability: lines it
+ * reports as not analyzed because a condition is statically false for its
+ * configured platform and Python version (`sys.platform`, `os.name`,
+ * `sys.version_info`, `TYPE_CHECKING`), read from its pull diagnostics.
+ *
  * pyright is a devDependency (exact-pinned); never loaded at runtime by UCN.
  */
 
@@ -24,6 +29,12 @@ const { LspClient, pathToUri, uriToPath } = require('./lsp-client');
 const { makeHelperHandle } = require('./jsonl-helper');
 
 const HELPER_PATH = path.join(__dirname, 'jedi-helper.py');
+// pyright's `unreachableCodeCondition` hint in its English localization (the
+// server runs with locale en). Structural (`return`/`raise`) and type-based
+// unreachability are not configuration and are not matched.
+const STATIC_CONDITION_UNREACHABLE =
+    'Code is not analyzed because condition is statically evaluated as false';
+const DIAGNOSTIC_TAG_UNNECESSARY = 1;
 
 const pyrightOracle = {
     name: 'pyright',
@@ -66,6 +77,16 @@ const pyrightOracle = {
                     },
                 },
             },
+            // Pull diagnostics answer with the file's checked diagnostics,
+            // reachability hints included (a pushed set can predate the
+            // check); the Unnecessary tag is what pyright needs to send them.
+            capabilities: {
+                textDocument: {
+                    diagnostic: { dynamicRegistration: true },
+                    publishDiagnostics: { tagSupport: { valueSet: [DIAGNOSTIC_TAG_UNNECESSARY] } },
+                },
+            },
+            env: { ...process.env, VSCODE_NLS_CONFIG: JSON.stringify({ locale: 'en' }) },
         });
         await lsp.initialize(projectRoot);
 
@@ -82,7 +103,7 @@ const pyrightOracle = {
         const version = require('pyright/package.json').version;
         process.stdout.write(`  pyright ${version} (project root ${path.relative(repoDir, projectRoot) || '.'}, ${pyFiles.length} files opened)\n`);
 
-        return { lsp, helper, root: repoDir, projectRoot, opened };
+        return { lsp, helper, root: repoDir, projectRoot, opened, unreachable: new Map() };
     },
 
     /** ast-enumerated defs — same universe/line convention as the jedi oracle. */
@@ -191,11 +212,36 @@ const pyrightOracle = {
         return [...defs.values()];
     },
 
+    /** Whether pyright leaves this line out of its analysis because a
+     *  condition is statically false in its configuration. */
     async isConfigurationGated(handle, { file, line }) {
-        const status = await handle.helper.request({ op: 'source_status', file, line });
-        return !!status.configurationGated;
+        const absFile = path.join(handle.root, file);
+        let ranges = handle.unreachable.get(absFile);
+        if (!ranges) {
+            if (!handle.opened.has(absFile)) {
+                handle.lsp.didOpen(absFile, 'python', fs.readFileSync(absFile, 'utf-8'));
+                handle.opened.add(absFile);
+            }
+            const report = await handle.lsp.request('textDocument/diagnostic', {
+                textDocument: { uri: pathToUri(absFile) },
+            });
+            if (!report || !Array.isArray(report.items)) {
+                throw new Error(`pyright returned no diagnostic report for ${file}`);
+            }
+            ranges = staticConditionRanges(report.items);
+            handle.unreachable.set(absFile, ranges);
+        }
+        return ranges.some(([start, end]) => line >= start && line <= end);
     },
 };
+
+/** 1-based line ranges pyright reports as statically-false-condition code. */
+function staticConditionRanges(items) {
+    return (items || [])
+        .filter(item => (item?.tags || []).includes(DIAGNOSTIC_TAG_UNNECESSARY) &&
+            item.message === STATIC_CONDITION_UNREACHABLE && item.range)
+        .map(item => [item.range.start.line + 1, item.range.end.line + 1]);
+}
 
 function nameColumns(line, name) {
     const cols = [];
@@ -242,4 +288,4 @@ function walkPyFiles(root) {
     return out.sort();
 }
 
-module.exports = { pyrightOracle };
+module.exports = { pyrightOracle, staticConditionRanges, STATIC_CONDITION_UNREACHABLE };

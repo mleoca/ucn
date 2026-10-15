@@ -35,6 +35,8 @@ const SYMBOL_KIND = {
     STRUCT: 23,
 };
 
+const INACTIVE_REGIONS_TIMEOUT_MS = 120000;
+
 const clangdOracle = {
     name: 'clangd',
     languages: ['c', 'cpp'],
@@ -373,9 +375,19 @@ const clangdOracle = {
         return [...definitions.values()];
     },
 
+    /** clangd's own inactive preprocessor regions for the file. clangd
+     *  sends them (possibly empty) after building an opened file's AST, so
+     *  the answer waits for that notification instead of reading "no
+     *  regions" before it arrives (fix #406). */
     async isConfigurationGated(handle, { file, line }) {
         const absFile = canonical(path.join(handle.root, file));
         ensureOpen(handle, absFile);
+        for (let waited = 0; !handle.inactiveRegions.has(absFile); waited += 50) {
+            if (waited >= INACTIVE_REGIONS_TIMEOUT_MS) {
+                throw new Error(`clangd sent no inactive regions for ${file}`);
+            }
+            await new Promise(resolve => setTimeout(resolve, 50));
+        }
         const regions = handle.inactiveRegions.get(absFile) || [];
         const zeroBased = line - 1;
         return regions.some(region =>

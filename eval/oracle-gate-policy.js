@@ -217,13 +217,15 @@ function evaluateOracleCoverage(summary, maxUnscoredRatio) {
     // claim being gated. Report their coverage separately for transparency.
     const precisionUniverse = summary.confirmedEdges || 0;
     const precisionUnscoredRatio = rate(summary.confirmedUnscored || 0, precisionUniverse);
-    // Two abstention classes hide in confirmedUnscored (fix #286g,
-    // flask-measured: 100% of the 27.85% "configuration-unscored" band was
-    // definition-unresolved — pyright cannot type pytest-fixture receivers
-    // that single-owner physics correctly confirms). True configuration
-    // gating (platform/config-invisible code) keeps the hard bound; oracle
-    // ABSTENTION gets a looser 3x ceiling — intrinsic to fixture-heavy
-    // dynamic code, but a runaway still fails loudly.
+    // Two classes hide in confirmedUnscored (fix #286g, flask-measured: 100%
+    // of the 27.85% "configuration-unscored" band was definition-unresolved
+    // — pyright cannot type pytest-fixture receivers that single-owner
+    // physics correctly confirms). True configuration gating (the oracle's
+    // own projection leaves the line or the target out) keeps the hard
+    // bound; oracle ABSTENTION (analyzed but unresolved, or a construct the
+    // oracle cannot report, see unscoredProng) gets a looser 3x ceiling —
+    // intrinsic to fixture-heavy dynamic code, but a runaway still fails
+    // loudly.
     const precisionAbstentionUnscored = summary.confirmedAbstentionUnscored || 0;
     const precisionConfigGatedRatio = rate(
         Math.max(0, (summary.confirmedUnscored || 0) - precisionAbstentionUnscored),
@@ -327,6 +329,43 @@ function closeJsTsDeclarationIdentity(definitions, target) {
  *                   at all, so the edge stays loud in placement without
  *                   hard-gating on a weak oracle's name-match references.
  */
+/**
+ * The coverage prong an unscored edge verdict belongs to (fix #406). Only
+ * 'configuration-gated' — the oracle's own projection leaves out the call
+ * line or the target definition — is configuration; every other class is an
+ * oracle abstention on code it analyzes ('definition-unresolved', or
+ * 'macro-template-expansion': a macro_rules! transcriber's call the oracle
+ * cannot expand or resolve). rand-measured: 80 confirmed template edges were
+ * counted as configuration because anything not 'definition-unresolved'
+ * fell into that prong. A verdict without a class is a harness bug.
+ */
+function unscoredProng(verdict) {
+    if (!verdict || verdict.scorable) return null;
+    if (!verdict.abstention) {
+        throw new Error('unscored oracle verdict carries no abstention class');
+    }
+    return verdict.abstention === 'configuration-gated' ? 'configuration' : 'abstention';
+}
+
+/**
+ * Status of a macro-generated occurrence from the oracle's own expansion
+ * (fix #406): 'target' when an occurrence resolves to the target, 'other'
+ * only when every occurrence resolves and none to the target (a declaration
+ * the expansion itself generated is never the target), 'unresolved' when any
+ * occurrence resolves nowhere (unknown never fails a claim), 'unavailable'
+ * when the oracle produced no expansion holding the name.
+ */
+function expandedDefinitionStatus(expanded, matchesTarget) {
+    if (!expanded) return 'unavailable';
+    const definitions = expanded.definitions || [];
+    if (definitions.some(definition => !definition.external && !definition.generated &&
+        matchesTarget(definition))) {
+        return 'target';
+    }
+    if ((expanded.unresolved || 0) > 0 || definitions.length === 0) return 'unresolved';
+    return 'other';
+}
+
 function adjudicateDeferredUnresolved(status) {
     if (status === 'target') return { keep: true, gateBearing: true };
     if (status === 'other') return { keep: false, bucket: 'broad' };
@@ -343,4 +382,6 @@ module.exports = {
     evaluateOracleCoverage,
     closeJsTsDeclarationIdentity,
     adjudicateDeferredUnresolved,
+    unscoredProng,
+    expandedDefinitionStatus,
 };
