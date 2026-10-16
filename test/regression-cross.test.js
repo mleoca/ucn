@@ -18,6 +18,112 @@ const { execute } = require('../core/execute');
 const { computeReachability } = require('../core/entrypoints');
 const { tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR, runCli, runInteractive } = require('./helpers');
 
+describe('fix #408: slot renames retain every distinct call token on a line', () => {
+    const fixtures = {
+        'm.js': [
+            'class Shape { area() { return 1; } }',
+            'class Sq extends Shape { area() { return 2; } }',
+            'class Other { area() { return 3; } }',
+            'function use() {',
+            '  const s = new Shape(); const q = new Sq(); const o = new Other();',
+            '  return s.area() + q.area() + s.area() + o.area();',
+            '}',
+        ].join('\n'),
+        'm.ts': [
+            'abstract class Shape { abstract area(): number; }',
+            'class Sq extends Shape { area() { return 2; } }',
+            'class Other { area() { return 3; } }',
+            'function use(s: Shape, q: Sq, o: Other) {',
+            '  return s.area() + q.area() + s.area() + o.area();',
+            '}',
+        ].join('\n'),
+        'm.py': [
+            'class Shape:',
+            '    def area(self): return 1',
+            'class Sq(Shape):',
+            '    def area(self): return 2',
+            'class Other:',
+            '    def area(self): return 3',
+            'def use(s: Shape, q: Sq, o: Other):',
+            '    return s.area() + q.area() + s.area() + o.area()',
+        ].join('\n'),
+        'P.java': [
+            'abstract class Shape { abstract int area(); }',
+            'class Sq extends Shape { int area() { return 2; } }',
+            'class Other { int area() { return 3; } }',
+            'class Use { int use(Shape s, Sq q, Other o) {',
+            '  return s.area() + q.area() + s.area() + o.area();',
+            '} }',
+        ].join('\n'),
+        'A.cs': [
+            'abstract class Shape { public abstract int area(); }',
+            'class Sq : Shape { public override int area() => 2; }',
+            'class Other { public int area() => 3; }',
+            'class Use { int use(Shape s, Sq q, Other o) {',
+            '  return s.area() + q.area() + s.area() + o.area();',
+            '} }',
+        ].join('\n'),
+        'm.go': [
+            'package sample',
+            'type Shape interface { area() int }',
+            'type Sq struct{}',
+            'func (Sq) area() int { return 2 }',
+            'type Other struct{}',
+            'func (Other) area() int { return 3 }',
+            'func use(s Shape, q Sq, o Other) int {',
+            '  return s.area() + q.area() + s.area() + o.area()',
+            '}',
+        ].join('\n'),
+        'm.cpp': [
+            'struct Shape { virtual int area() = 0; };',
+            'struct Sq : Shape { int area() override { return 2; } };',
+            'struct Other { int area() { return 3; } };',
+            'int use(Shape &s, Sq &q, Other &o) {',
+            '  return s.area() + q.area() + s.area() + o.area();',
+            '}',
+        ].join('\n'),
+        'src/lib.rs': [
+            'pub trait Shape { fn area(&self) -> i32; }',
+            'pub struct Sq;',
+            'impl Shape for Sq { fn area(&self) -> i32 { 2 } }',
+            'pub struct Other;',
+            'impl Other { fn area(&self) -> i32 { 3 } }',
+            'pub fn use_it(s: &dyn Shape, q: &Sq, o: &Other) -> i32 {',
+            '  s.area() + q.area() + s.area() + o.area()',
+            '}',
+        ].join('\n'),
+    };
+    for (const [file, code] of Object.entries(fixtures)) {
+        it(`${file}: base and override pins edit their whole slot and preserve unrelated calls`, () => {
+            const dir = tmp({ [file]: code,
+                ...(file.endsWith('.rs') && { 'Cargo.toml': '[package]\nname="slots"\nversion="0.1.0"\nedition="2021"\n' }),
+            });
+            try {
+                const index = idx(dir);
+                const line = code.split('\n').findIndex(text => text.includes('s.area() + q.area()')) + 1;
+                const definitions = index.symbols.get('area').filter(def =>
+                    ['Shape', 'Sq'].includes(def.className));
+                assert.ok(definitions.length >= 2);
+                for (const def of definitions) {
+                    const result = execute(index, 'plan', {
+                        name: `${file}:${def.startLine}:area`, renameTo: 'measure',
+                    });
+                    assert.ok(result.ok, result.error);
+                    const edits = result.result.changes.filter(change =>
+                        change.file === file && change.line === line && change.newExpression !== undefined);
+                    assert.strictEqual(edits.length, 1, JSON.stringify(result.result.changes));
+                    assert.ok(!edits[0].needsReview);
+                    // Go's structural interface also joins Other's member.
+                    const expected = code.split('\n')[line - 1].trim()
+                        .replaceAll('s.area()', 's.measure()').replaceAll('q.area()', 'q.measure()')
+                        .replaceAll('o.area()', file.endsWith('.go') ? 'o.measure()' : 'o.area()');
+                    assert.strictEqual(edits[0].newExpression, expected);
+                }
+            } finally { rm(dir); }
+        });
+    }
+});
+
 describe('fix #398: async producers require callable identity', () => {
     for (const ext of ['js', 'ts', 'tsx', 'html']) {
         it(`${ext}: follows imports and rejects unrelated, nested and imported runtime namesakes`, () => {

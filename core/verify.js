@@ -4189,8 +4189,17 @@ function plan(index, name, options = {}) {
             // band with slot attribution. Bounded — a pathological slot
             // discloses the cut instead of sweeping forever.
             const SLOT_SWEEP_CAP = 25;
-            const siteTokenKey = site =>
-                `${site.file}:${site.line}:${Number.isInteger(site.column) ? site.column : '*'}`;
+            const siteTokenKey = site => {
+                // A slot's members can confirm different calls on one line.
+                // Resolve column-less records by their own source range before
+                // deduplicating them, just as the edit pass does.
+                const column = Number.isInteger(site.column) ? site.column
+                    : callTokenColumn(index, site.absoluteFile || site.file,
+                        site.siteRange, name, site.line);
+                const token = Number.isInteger(column) ? column
+                    : site.siteRange ? `${site.siteRange.start}-${site.siteRange.end}` : '*';
+                return `${site.file}:${site.line}:${token}`;
+            };
             const seenSiteTokens = new Set(planCallSites.map(site => siteTokenKey(site)));
             const slotMemberSites = [];
             // Members a macro generated (fix #374) are swept after, and
