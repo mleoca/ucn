@@ -925,7 +925,9 @@ function clearAllCaches() {
 // v276 (fix #405b): a pending Rust file whose expansions the calls pass
 // reads by groups records each group's lines, expanded length and the words
 // its expansions output and its headers hold (`rustMacroExpansion.groups`).
-const CACHE_FORMAT_VERSION = 276;
+// v277: refactoring usages distinguish declarator-name tokens from value
+// references; C# local-function name tokens are definitions.
+const CACHE_FORMAT_VERSION = 277;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**

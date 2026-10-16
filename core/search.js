@@ -339,9 +339,11 @@ function usages(index, name, options = {}) {
                 options.internalEvidence ? { lexicalScopes: true } : undefined);
             if (astUsages !== null) {
                 for (const u of astUsages) {
-                    // Skip if this is a definition line (already added above)
+                    // Public usages groups declaration lines into their definition
+                    // entry. Refactoring needs every other AST token on that line.
                     if (definitions.some(d => d.file === filePath &&
-                        (d.startLine === u.line || d.nameLine === u.line))) {
+                        (d.startLine === u.line || d.nameLine === u.line)) &&
+                        (!options.internalEvidence || u.usageType === 'definition' || u.declarationName)) {
                         continue;
                     }
 

@@ -4751,6 +4751,22 @@ function plan(index, name, options = {}) {
                     continue;
                 }
                 if (existing) {
+                    const uneditedReview = records.some((record, i) => verdicts[i] === 'review' &&
+                        (!Number.isInteger(record.column) || !existing._edit?.columns.includes(record.column)));
+                    // Type lookup decides every token in its later pass,
+                    // including another type token beside this construction.
+                    if (uneditedReview && !isTypeRenamePin(def) && !existing.needsReview) {
+                        changes.push({
+                            file: rel,
+                            line: ref.line,
+                            expression: (ref.content || '').trim(),
+                            suggestion: `Verify this reference resolves to ` +
+                                `${name} at ${def.relativePath || def.file}:` +
+                                `${def.startLine} before renaming`,
+                            needsReview: true,
+                            editKind: 'reference',
+                        });
+                    }
                     // A line another pass already edits (a call beside the
                     // reference) gains the reference tokens.
                     // A member pin's own `this.m` tokens join a bound call's

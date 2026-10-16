@@ -25,6 +25,49 @@ const {
 } = require('../core/cache');
 const { createTempDir, cleanup, tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR } = require('./helpers');
 
+describe('fix #409: persisted usage facts follow their schema version', () => {
+    it('rejects legacy usage records and round-trips declaration-name evidence', () => {
+        const dir = tmp({ 'm.cpp': 'namespace N { int work(int v); }\nint N::work(int v) { return v; }' });
+        try {
+            const file = path.join(dir, 'm.cpp');
+            const index = idx(dir);
+            index._beginOp();
+            try { index._getCachedUsages(file, 'work', { lexicalScopes: true }); }
+            finally { index._endOp(); }
+            const saved = index.saveCache();
+            index.saveUsageCache();
+            const usagePath = path.join(path.dirname(saved), 'usage-results.json');
+            const legacy = JSON.parse(fs.readFileSync(usagePath, 'utf8'));
+            legacy.version = 276;
+            for (const entry of legacy.entries) {
+                for (const usage of entry[4]) delete usage.declarationName;
+            }
+            fs.writeFileSync(usagePath, JSON.stringify(legacy));
+
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loaded.loadCache(), 'the current index remains valid');
+            assert.strictEqual(loaded._usageResultCache.size, 0,
+                'older usage records lack the declaration-name evidence');
+            loaded._beginOp();
+            let fresh;
+            try { fresh = loaded._getCachedUsages(file, 'work', { lexicalScopes: true }); }
+            finally { loaded._endOp(); }
+            assert.ok(fresh.some(usage => usage.line === 2 && usage.declarationName), JSON.stringify(fresh));
+            loaded.saveUsageCache();
+
+            const roundTrip = new ProjectIndex(dir);
+            assert.ok(roundTrip.loadCache());
+            roundTrip._beginOp();
+            try {
+                assert.deepStrictEqual(roundTrip._getCachedUsages(file, 'work', { lexicalScopes: true }), fresh);
+            } finally { roundTrip._endOp(); }
+        } finally {
+            clearProjectCache(dir);
+            rm(dir);
+        }
+    });
+});
+
 describe('Per-user cache placement', () => {
     it('stores the default cache outside the project tree', () => {
         const dir = tmp({

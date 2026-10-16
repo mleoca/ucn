@@ -6496,6 +6496,36 @@ function findImportsInCode(code, parser) {
 
 const CALLEE_WRAPPER_NODES = new Set(['template_method', 'dependent_name', 'field_expression']);
 
+// The name introduced by a declarator, including `A::f`, pointer/array
+// wrappers and data members. Keep this separate from the public usage kind:
+// an explicit instantiation still references a function the index declares
+// elsewhere. Refactoring uses the flag only on indexed declaration lines.
+function isDeclarationNameToken(node) {
+    let current = node;
+    for (let depth = 0; current?.parent && depth < 16; depth++) {
+        const parent = current.parent;
+        if (parent.type === 'qualified_identifier') {
+            if (!sameNode(parent.childForFieldName('name'), current)) return false;
+        } else if (parent.type.endsWith('_declarator')) {
+            const declarator = parent.childForFieldName('declarator') ||
+                (parent.type === 'parenthesized_declarator' && parent.namedChildCount === 1
+                    ? parent.namedChild(0) : null);
+            if (!sameNode(declarator, current)) return false;
+            if (parent.type === 'function_declarator') return true;
+        } else {
+            if (['declaration', 'field_declaration', 'function_definition', 'type_definition',
+                'parameter_declaration', 'optional_parameter_declaration', 'alias_declaration',
+                'enumerator', 'namespace_definition', 'namespace_alias_definition'].includes(parent.type)) {
+                return sameNode(parent.childForFieldName('name'), current) ||
+                    parent.childrenForFieldName('declarator').some(declarator => sameNode(declarator, current));
+            }
+            return false;
+        }
+        current = parent;
+    }
+    return false;
+}
+
 function findUsagesInCode(code, name, parser, existingTree, options = {}) {
     // Usage is the raw literal-name inventory. The literal C/C++ tree retains
     // identifiers from every preprocessor branch and is sufficient for
@@ -6586,6 +6616,8 @@ function findUsagesInCode(code, name, parser, existingTree, options = {}) {
             line: node.startPosition.row + 1,
             column: node.startPosition.column,
             usageType,
+            ...(options.lexicalScopes && usageType === 'reference' &&
+                isDeclarationNameToken(node) && { declarationName: true }),
             ...(receiver && { receiver }),
             ...scope,
         });

@@ -18,6 +18,178 @@ const { execute } = require('../core/execute');
 const { computeReachability } = require('../core/entrypoints');
 const { tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR, runCli, runInteractive } = require('./helpers');
 
+describe('fix #409: references on a declaration line participate in a rename', () => {
+    const fixtures = {
+        'm.js': {
+            code: 'function work() { return 1; } const alias = work;',
+            line: 1,
+            expected: 'function renamed() { return 1; } const alias = renamed;',
+        },
+        'm.ts': {
+            code: 'function work() { return 1; } const alias = work;',
+            line: 1,
+            expected: 'function renamed() { return 1; } const alias = renamed;',
+        },
+        'm.html': {
+            code: '<script>\nfunction work() { return 1; } const alias = work;\n</script>',
+            line: 2,
+            expected: 'function work() { return 1; } const alias = work;',
+            review: true,
+        },
+        'm.py': {
+            code: 'def outer():\n    def work(): return work\n    return work\n',
+            line: 2,
+            expected: 'def renamed(): return renamed',
+        },
+        'A.cs': {
+            code: 'class A {\n  int Outer() {\n    int work(int t = 0) => t + 1; System.Func<int, int> alias = work; return work() + alias(1);\n  }\n}',
+            line: 3,
+            expected: 'int renamed(int t = 0) => t + 1; System.Func<int, int> alias = renamed; return renamed() + alias(1);',
+        },
+        'm.go': {
+            code: 'package sample\nfunc work() int { return 1 }; var alias = work; func use() int { return work() + alias() }',
+            line: 2,
+            expected: 'func renamed() int { return 1 }; var alias = renamed; func use() int { return renamed() + alias() }',
+        },
+        'src/lib.rs': {
+            code: 'pub fn outer() -> i32 {\n  fn work() -> i32 { 1 } let alias = work; work() + alias()\n}',
+            line: 2,
+            expected: 'fn renamed() -> i32 { 1 } let alias = renamed; renamed() + alias()',
+        },
+        'm.c': {
+            code: 'int work(void) { return 1; } int (*alias)(void) = work; int use(void) { return work() + alias(); }',
+            line: 1,
+            expected: 'int renamed(void) { return 1; } int (*alias)(void) = renamed; int use(void) { return renamed() + alias(); }',
+        },
+        'm.cpp': {
+            code: 'int work() { return 1; } int (*alias)() = work; int use() { return work() + alias(); }',
+            line: 1,
+            expected: 'int renamed() { return 1; } int (*alias)() = work; int use() { return renamed() + alias(); }',
+            review: true,
+        },
+        'P.java': {
+            code: 'class P { static int work() { return 1; } static java.util.function.IntSupplier alias = P::work; static int use() { return work() + alias.getAsInt(); } }',
+            line: 1,
+            expected: 'class P { static int renamed() { return 1; } static java.util.function.IntSupplier alias = P::renamed; static int use() { return renamed() + alias.getAsInt(); } }',
+        },
+    };
+    for (const [file, { code, line, expected, review }] of Object.entries(fixtures)) {
+        it(`${file}: a reference beside its declaration is edited or explicitly reviewed`, () => {
+            const dir = tmp({ [file]: code,
+                ...(file.endsWith('.rs') && { 'Cargo.toml': '[package]\nname="inline_refs"\nversion="0.1.0"\nedition="2021"\n' }),
+            });
+            try {
+                const index = idx(dir);
+                assert.deepStrictEqual(index.usages('work').filter(usage => usage.line === line)
+                    .map(usage => usage.usageType), ['definition']);
+                const result = execute(index, 'plan', {
+                    name: `${file}:${line}:work`, renameTo: 'renamed',
+                });
+                assert.ok(result.ok, result.error);
+                const edits = result.result.changes.filter(change =>
+                    change.file === file && change.line === line && change.newExpression !== undefined);
+                assert.strictEqual(edits.length, 1, JSON.stringify(result.result));
+                if (review) {
+                    assert.strictEqual(edits[0].newExpression, expected);
+                    assert.ok(edits[0].needsReview || [...result.result.changes, ...result.result.reviewItems]
+                        .some(item => item.file === file &&
+                        item.line === line && item.editKind === 'reference' && item.needsReview),
+                    JSON.stringify(result.result));
+                    if (file === 'm.cpp') {
+                        assert.strictEqual(result.result.changeSummary.references, 1);
+                        assert.strictEqual(result.result.changeSummary.textReferences, 0);
+                    }
+                    return;
+                }
+                assert.ok(!edits[0].needsReview, JSON.stringify(edits[0]));
+                assert.strictEqual(edits[0].newExpression, expected);
+            } finally { rm(dir); }
+        });
+    }
+    for (const [file, code, expected] of [
+        ['m.js', 'function work(work) { return work; }', 'function renamed(work) { return work; }'],
+        ['m.ts', 'function work(work: number) { return work; }', 'function renamed(work: number) { return work; }'],
+        ['m.py', 'def work(work): return work\n', 'def renamed(work): return work'],
+        ['m.go', 'package sample\nfunc work(work int) int { return work }', 'func renamed(work int) int { return work }'],
+        ['m.c', 'int work(int work) { return work; }', 'int renamed(int work) { return work; }'],
+        ['m.cpp', 'int work(int work) { return work; }', 'int renamed(int work) { return work; }'],
+        ['A.cs', 'class A { int work(int work) => work; }', 'class A { int renamed(int work) => work; }'],
+        ['P.java', 'class P { int work(int work) { return work; } }', 'class P { int renamed(int work) { return work; } }'],
+        ['src/lib.rs', 'fn work(work: i32) -> i32 { work }', 'fn renamed(work: i32) -> i32 { work }'],
+    ]) {
+        it(`${file}: a same-line parameter and its reference keep their spelling`, () => {
+            const dir = tmp({ [file]: code });
+            try {
+                const result = execute(idx(dir), 'plan', { name: 'work', renameTo: 'renamed' });
+                assert.ok(result.ok, result.error);
+                const edits = result.result.changes.filter(change => change.newExpression !== undefined);
+                assert.strictEqual(edits.length, 1, JSON.stringify(result.result));
+                assert.strictEqual(edits[0].newExpression, expected);
+            } finally { rm(dir); }
+        });
+    }
+    it('C: a different member declaration is not a value reference to a function', () => {
+        const dir = tmp({ 'm.c': 'int work(void) { return 1; }\nstruct Other { int work; };\nint (*alias)(void) = work;\n' });
+        try {
+            const result = execute(idx(dir), 'plan', { name: 'm.c:1:work', renameTo: 'renamed' });
+            assert.ok(result.ok, result.error);
+            assert.ok(!result.result.changes.some(change => change.line === 2), JSON.stringify(result.result));
+            assert.ok(!result.result.reviewItems.some(change => change.line === 2), JSON.stringify(result.result));
+            assert.ok(result.result.changes.some(change => change.line === 3 &&
+                change.newExpression === 'int (*alias)(void) = renamed;'), JSON.stringify(result.result));
+        } finally { rm(dir); }
+    });
+    for (const [owner, declarations, bodies] of [
+        ['Box', ['struct Box {', '  int work(int v);', '  int work(const char* v);', '};'],
+            ['int Box::work(int v) { return v; }', 'int Box::work(const char* v) { return 2; }']],
+        ['N', ['namespace N {', '  int work(int v);', '  int work(const char* v);', '}'],
+            ['int N::work(int v) { return v; }', 'int N::work(const char* v) { return 2; }']],
+    ]) {
+        it(`C++: qualified ${owner} declarations preserve unrelated overloads`, () => {
+            const dir = tmp({ 'm.cpp': [...declarations, ...bodies].join('\n') });
+            try {
+                const result = execute(idx(dir), 'plan', { name: 'm.cpp:5:work', renameTo: 'renamed' });
+                assert.ok(result.ok, result.error);
+                const plan = result.result;
+                assert.ok(![...plan.changes, ...plan.reviewItems].some(change =>
+                    [3, 6].includes(change.line)), JSON.stringify(plan));
+                assert.ok(!plan.reviewItems.some(change => [2, 5].includes(change.line)), JSON.stringify(plan));
+                assert.ok(plan.changes.some(change => change.line === 5 &&
+                    change.newExpression === bodies[0].replace('::work(', '::renamed(')), JSON.stringify(plan));
+            } finally { rm(dir); }
+        });
+    }
+    it('C#: a proven constructor token does not also require reference review', () => {
+        const dir = tmp({
+            'A.cs': 'namespace Sample; public class Box {}',
+            'B.cs': 'namespace Sample; class Use { Box Make() => new Box(); }',
+        });
+        try {
+            const result = execute(idx(dir), 'plan', { name: 'A.cs:1:Box', renameTo: 'Renamed' });
+            assert.ok(result.ok, result.error);
+            assert.ok(!result.result.reviewItems.some(change => change.editKind === 'reference'),
+                JSON.stringify(result.result));
+            assert.ok(result.result.changes.some(change => change.file === 'B.cs' &&
+                change.newExpression === 'namespace Sample; class Use { Renamed Make() => new Renamed(); }'),
+            JSON.stringify(result.result));
+        } finally { rm(dir); }
+    });
+    it('C#: mixed type references on a construction line use the type lookup verdict', () => {
+        const dir = tmp({
+            'A.cs': 'namespace Sample;\npublic class Box {\n  public Box(object value = null) {}\n}',
+            'B.cs': 'namespace Sample;\nclass Use {\n  Box Make() {\n    Box value = new Box();\n    return value;\n  }\n}',
+        });
+        try {
+            const result = execute(idx(dir), 'plan', { name: 'A.cs:3:Box', renameTo: 'Renamed' });
+            assert.ok(result.ok, result.error);
+            assert.ok(!result.result.reviewItems.some(change => change.editKind === 'reference'),
+                JSON.stringify(result.result));
+            assert.ok(result.result.changes.some(change => change.file === 'B.cs' && change.line === 4 &&
+                change.newExpression === 'Renamed value = new Renamed();'), JSON.stringify(result.result));
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #408: slot renames retain every distinct call token on a line', () => {
     const fixtures = {
         'm.js': [

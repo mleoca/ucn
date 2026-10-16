@@ -2600,6 +2600,7 @@ function usagesInTree(code, name, parser, tree) {
         const parent = node.parent;
         if (parent) {
             if ((parent.type === 'method_declaration' ||
+                parent.type === 'local_function_statement' ||
                 parent.type === 'constructor_declaration' ||
                 TYPE_DECLARATIONS.has(parent.type) ||
                 parent.type === 'property_declaration' ||
