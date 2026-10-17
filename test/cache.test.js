@@ -25,6 +25,42 @@ const {
 } = require('../core/cache');
 const { createTempDir, cleanup, tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR } = require('./helpers');
 
+describe('fix #412: local function lexical lookup survives cache reload', () => {
+    it('rebuilds type context without persisting member ownership on the local function', () => {
+        const { execute } = require('../core/execute');
+        const dir = tmp({
+            'A.cs': 'namespace Acme;\npartial class Host {\n  static int Helper(int n) => n;\n}',
+            'B.cs': 'namespace Acme;\npartial class Host {\n  static int Run() {\n    return Local();\n    static int Local() { return Helper(1); }\n  }\n}',
+        });
+        try {
+            const snapshot = index => {
+                const context = execute(index, 'context', { name: 'A.cs:3:Helper' });
+                const plan = execute(index, 'plan', { name: 'A.cs:3:Helper', renameTo: 'Renamed' });
+                assert.ok(context.ok, context.error);
+                assert.ok(plan.ok, plan.error);
+                assert.ok(context.result.callers.some(site => site.relativePath === 'B.cs' && site.line === 5));
+                assert.ok(!index.symbols.get('Local')[0].className);
+                return {
+                    callers: context.result.callers.map(site => [site.relativePath, site.line, site.tier, site.resolution]),
+                    account: context.result.meta.account,
+                    changes: plan.result.changes.map(site => [site.file, site.line, site.newExpression, site.needsReview]),
+                };
+            };
+            const index = idx(dir);
+            const expected = snapshot(index);
+            index.saveCache();
+            index.saveUsageCache();
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loaded.loadCache());
+            assert.deepStrictEqual(snapshot(loaded), expected);
+            assert.deepStrictEqual(snapshot(loaded), expected);
+        } finally {
+            clearProjectCache(dir);
+            rm(dir);
+        }
+    });
+});
+
 describe('fix #411: generic usage roles invalidate older usage caches', () => {
     it('reloads terminal names and receivers instead of legacy generic references', () => {
         const dir = tmp({ 'A.cs': [

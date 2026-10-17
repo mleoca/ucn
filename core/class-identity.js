@@ -47,6 +47,8 @@ function _state(index) {
             named: new Map(),
             classKeys: new WeakMap(),
             owners: new WeakMap(),
+            lexicalOwners: new WeakMap(),
+            lexicalTypes: new WeakMap(),
             resolved: new Map(),
             parents: new Map(),
             modules: new Map(),
@@ -371,6 +373,41 @@ function ownerRefOf(index, member) {
         }
     }
     state.owners.set(member, ref);
+    return ref;
+}
+
+/**
+ * A nested callable's lexical type for simple-name lookup (fix #412).
+ * This is not member ownership: a local function stays a function, while
+ * names in its body can reach the surrounding type's members. A nested
+ * type's enclosing type is found by the same containment rule.
+ */
+function lexicalClassRefOf(index, definition) {
+    if (ownerNameOf(definition)) return ownerRefOf(index, definition);
+    if (!definition?.file || (!definition.isNested && !definition.enclosingType)) return null;
+    const entry = index.files.get(definition.file);
+    if (!entry || !langTraits(entry.language)?.bareCallReachesMethods) return null;
+    const state = _state(index);
+    if (state.lexicalOwners.has(definition)) return state.lexicalOwners.get(definition);
+    let types = state.lexicalTypes.get(entry);
+    if (!types) {
+        types = (entry.symbols || []).filter(symbol =>
+            OWNER_CLASS_KINDS.has(symbol.type) && !symbol.aliasOf);
+        state.lexicalTypes.set(entry, types);
+    }
+    const containing = types.filter(type => type !== definition &&
+        type.startLine <= definition.startLine &&
+        type.endLine >= (definition.endLine ?? definition.startLine));
+    const width = type => type.endLine - type.startLine;
+    const narrowest = Math.min(...containing.map(width));
+    const candidates = containing.filter(type => width(type) === narrowest).map(type =>
+        classDefsNamed(index, type.name).entries.find(entry => entry.def === type)).filter(Boolean);
+    const chosen = candidates.length === 1 ? candidates[0] : null;
+    // Equal line ranges can belong to different same-line type bodies.
+    // Keep that ambiguity distinct from an out-of-line type declaration.
+    const ref = chosen ? { name: chosen.def.name, key: chosen.key, def: chosen.def }
+        : containing.length ? { name: null, key: null, def: null } : null;
+    state.lexicalOwners.set(definition, ref);
     return ref;
 }
 
@@ -1013,6 +1050,7 @@ module.exports = {
     resolveClassRef,
     resolveQualifiedClassRef: _resolveQualifiedParent,
     ownerRefOf,
+    lexicalClassRefOf,
     ownerDefinitionOf,
     distinctOwnerDefinitions,
     hasFunctionLocalClass,

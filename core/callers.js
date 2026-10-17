@@ -26,7 +26,7 @@ const { sameConfigurationItem, itemsNamed, moduleItemNamed, siteExcludedAt, site
     DEFINITION_KINDS: CONFIGURATION_DEFINITION_KINDS } = require('./configuration-items');
 const { reflectionPatternReferences: _reflectionPatternReferences } = require('./reflection');
 const {
-    ownerRefOf, ownerNameOf, ownedBy, findDeclaringClass, relationToTargets,
+    ownerRefOf, lexicalClassRefOf, ownerNameOf, ownedBy, findDeclaringClass, relationToTargets,
     shareDescendant: shareClassDescendant, parentRefsOf: parentRefsOfClass,
     descendantKeys, classKeyOf, classDefsNamed, distinctOwnerDefinitions, ownerDefinitionOf,
     hasFunctionLocalClass, descendsFromTargets, resolveClassRef, resolveQualifiedClassRef,
@@ -4129,15 +4129,29 @@ function findCallers(index, name, options = {}) {
                 // private `getTestClass()` never answers the outer class's
                 // bare call, which implicit-this lookup gives the inherited
                 // member).
-                if (bindingId && !call.receiver && !call.isMethod && !call.isConstructor &&
+                if (!call.receiver && !call.isMethod && !call.isConstructor &&
                     langTraits(fileEntry.language)?.bareCallReachesMethods) {
-                    const bound = _definitionByBindingId(index, name, bindingId);
+                    const caller = index.findEnclosingFunction(filePath, call.line, true, call);
+                    let bound = bindingId ? _definitionByBindingId(index, name, bindingId) : null;
+                    if (caller?.isNested && !ownerNameOf(caller) && (!bound || bound.className)) {
+                        const selected = _lexicalMemberSelection(index, caller, call,
+                            fileEntry.language, definitions);
+                        if (selected?.ambiguous) {
+                            routeUnverified(filePath, fileEntry, call,
+                                selected.reason || 'overload-ambiguous', calledAs);
+                            continue;
+                        }
+                        // A file's member-name binding is not a local
+                        // function's lexical lookup. Its enclosing type's
+                        // full overload family decides before file bindings.
+                        bindingId = selected?.match?.bindingId || null;
+                        bound = selected?.match || null;
+                    }
                     const owner = bound?.className && bound.file === filePath ? ownerDefinitionOf(index, bound) : null;
                     if (owner && (call.line < owner.startLine || call.line > owner.endLine)) {
                         // An inherited member stays in scope: a class enclosing
                         // the call (or one enclosing that class) may descend
                         // from the member's class.
-                        const caller = index.findEnclosingFunction(filePath, call.line, true, call);
                         const enclosing = [];
                         for (let className = caller?.className; className && enclosing.length < 8;) {
                             enclosing.push(className);
@@ -4787,6 +4801,7 @@ function findCallers(index, name, options = {}) {
                              index, enclosingOwner, targetDefs) ||
                          [...targetOwners].some(owner => _isAncestorOfTargetClass(
                              index, owner, [{ ...enclosing, className: enclosingOwner }])) ||
+                         _cppLexicalOuterReaches(index, enclosing, targetDefs, definitions) ||
                          _cppEnclosingClassNames(index, filePath, enclosingOwner, enclosing)
                              .some(owner => targetOwners.has(owner)));
                     if (!ownerCanReachTarget) {
@@ -6620,24 +6635,15 @@ function findCallers(index, name, options = {}) {
                         continue;
                     }
                     const tTypes = dispatchTargetTypes(targetDefs2, filePath, call);
-                    const enclosingClass = callerSymbol && callerSymbol.className;
-                    const lexicalOwnerTypes = new Set(
-                        enclosingClass ? [enclosingClass] : []);
-                    if (enclosingClass &&
-                        (fileEntry.language === 'java' ||
-                         fileEntry.language === 'csharp')) {
-                        let current = enclosingClass;
-                        const namespace = callerSymbol?.namespace || null;
-                        while (current) {
-                            const declaration = (index.symbols.get(current) || [])
-                                .find(symbol => IDENTITY_TYPE_KINDS.has(symbol.type) &&
-                                    symbol.file === filePath &&
-                                    (fileEntry.language !== 'csharp' ||
-                                     (symbol.namespace || null) === namespace));
-                            current = declaration?.enclosingType || null;
-                            if (current) lexicalOwnerTypes.add(current);
-                        }
+                    const lexicalOwners = _lexicalClassScope(index, callerSymbol);
+                    if (!lexicalOwners) {
+                        routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs, {
+                            dispatchCandidates: methodOwnerKeys().size,
+                        });
+                        continue;
                     }
+                    const callerClassRef = lexicalOwners[0];
+                    const enclosingClass = callerClassRef?.name;
                     // fix #367i: a bare call in a top-level class is an
                     // implicit this-call; with #358 class identity the
                     // member it reaches is the one declared in the class's
@@ -6654,8 +6660,7 @@ function findCallers(index, name, options = {}) {
                     const enclosingIsCaller = !!callerSymbol && (!call.enclosingFunction ||
                         (call.enclosingFunction.name === callerSymbol.name &&
                          call.enclosingFunction.startLine === callerSymbol.startLine));
-                    if (enclosingClass && lexicalOwnerTypes.size === 1 && enclosingIsCaller) {
-                        const callerClassRef = ownerRefOf(index, callerSymbol);
+                    if (enclosingClass && lexicalOwners.length === 1 && enclosingIsCaller) {
                         const declaring = callerClassRef?.key
                             ? findDeclaringClass(index, callerClassRef, definitions) : null;
                         if (declaring && !declaring.uncertain &&
@@ -6695,13 +6700,9 @@ function findCallers(index, name, options = {}) {
                     // import. An owner identity that cannot be resolved is
                     // neither confirmation nor exclusion evidence.
                     let ownerIdentity = 'no';
-                    for (const owner of lexicalOwnerTypes) {
-                        if (!tTypes.has(owner)) continue;
-                        const ownerRef = owner === enclosingClass
-                            ? ownerRefOf(index, callerSymbol)
-                            : resolveClassRef(index, owner, filePath,
-                                { namespace: callerSymbol?.namespace || null });
-                        const descentKey = ownerRef?.key || `?${owner}\0${filePath}`;
+                    for (const ownerRef of lexicalOwners) {
+                        if (!tTypes.has(ownerRef.name)) continue;
+                        const descentKey = ownerRef.key;
                         let verdict = bareOwnerDescent.get(descentKey);
                         if (verdict === undefined) {
                             // Also across the queries of one operation (HOT
@@ -6734,10 +6735,10 @@ function findCallers(index, name, options = {}) {
                         // to an unrelated pinned class.
                         const targetKeys = new Set(targetDefs2.map(definition =>
                             `${definition.file}:${definition.startLine}`));
-                        const enclosingNamespace = callerSymbol?.namespace || null;
+                        const enclosingNamespace = callerClassRef?.def?.namespace || null;
                         // Owned by the enclosing class DEFINITION (fix #390),
                         // not by a same-name class of another package.
-                        const enclosingRef = enclosingClass ? ownerRefOf(index, callerSymbol) : null;
+                        const enclosingRef = callerClassRef;
                         let enclosingOwnership = 'no';
                         for (const definition of enclosingClass ? definitions : []) {
                             if (NON_CALLABLE_TYPES.has(definition.type) ||
@@ -9770,7 +9771,7 @@ function findCallees(index, definition, options = {}) {
                         }
                     }
                 }
-                if (!call.isMethod && !call.isConstructor && def.className &&
+                if (!call.isMethod && !call.isConstructor && (def.className || def.isNested) &&
                     langTraits(language)?.bareCallReachesMethods) {
                     // A Java bare call in an instance method is implicit-this
                     // even when the defining member is inherited and therefore
@@ -9815,7 +9816,12 @@ function findCallees(index, definition, options = {}) {
                     // fix #390: members of the enclosing class DEFINITION,
                     // never of a same-name class in another package.
                     const defOwnerRef = ownerRefOf(index, def);
-                    let selected = _calleeSelectReceiverMethod(
+                    let receiverClass = def.className;
+                    let selected = { match: null };
+                    if (!def.className) {
+                        selected = _lexicalMemberSelection(index, def, call, language, callSymbols) || selected;
+                        receiverClass = selected.receiverClass;
+                    } else selected = _calleeSelectReceiverMethod(
                         index, call, callSymbols, def.className, language,
                         def.file, symbol => !NON_CALLABLE_TYPES.has(symbol.type) &&
                             _notForeignSameNameOwner(index, symbol, defOwnerRef));
@@ -9827,11 +9833,11 @@ function findCallees(index, definition, options = {}) {
                         continue;
                     }
                     if (selected.ambiguous) {
-                        noteUnverified(siteId, call, 'overload-ambiguous');
+                        noteUnverified(siteId, call, selected.reason || 'overload-ambiguous');
                         continue;
                     }
                     if (selected.match) {
-                        if (routeVirtualOverride(siteId, call, def.className, selected.match)) continue;
+                        if (routeVirtualOverride(siteId, call, receiverClass, selected.match)) continue;
                         const key = selected.match.bindingId ||
                             `${selected.match.className}.${call.name}`;
                         const existing = callees.get(key);
@@ -17373,12 +17379,12 @@ function _calleeOverloadSelect(index, call, matches, language) {
  * inherited `BaseWriter.WriteValue(Guid?)`.
  */
 function _calleeReceiverMethodGroup(index, symbols, typeName, language, contextFile,
-    accepts = () => true, line = null) {
+    accepts = () => true, line = null, initialRef = null) {
     if (!typeName) return [];
     const family = [];
     const seenTypes = new Set();
     const seenSignatures = new Set();
-    let frontier = [{ owner: typeName, context: contextFile, line }];
+    let frontier = [{ owner: typeName, context: contextFile, line, ref: initialRef }];
     let hops = 0;
     let ownerAmbiguous = false;
     while (frontier.length > 0 && hops++ < 32) {
@@ -17466,11 +17472,14 @@ function _calleeReceiverMethodGroup(index, symbols, typeName, language, contextF
 function _calleeSelectReceiverMethod(index, call, symbols, typeName, language,
     contextFile, accepts = () => true, typeOrigin = null) {
     if (language === 'java' || language === 'csharp') {
+        const origin = typeOrigin?.definition;
+        const ref = typeOrigin?.classRef || (origin
+            ? { name: typeName, key: classKeyOf(index, origin), def: origin } : null);
         return _calleeOverloadSelect(
             index,
             call,
             _calleeReceiverMethodGroup(
-                index, symbols, typeName, language, contextFile, accepts, call?.line),
+                index, symbols, typeName, language, contextFile, accepts, call?.line, ref),
             language);
     }
     if (classDefsNamed(index, typeName).hasScoped) {
@@ -17478,9 +17487,9 @@ function _calleeSelectReceiverMethod(index, call, symbols, typeName, language,
         // its bare name at the consumer can pick an unrelated local class
         // (or fail when the caller imported only its producer).
         const origin = typeOrigin?.definition;
-        const ref = origin ? { name: typeName, key: classKeyOf(index, origin), def: origin }
+        const ref = typeOrigin?.classRef || (origin ? { name: typeName, key: classKeyOf(index, origin), def: origin }
             : resolveClassRef(index, typeName, typeOrigin?.fromFile || contextFile,
-                { line: typeOrigin?.fromFile ? 0 : call?.line });
+                { line: typeOrigin?.fromFile ? 0 : call?.line }));
         const declaring = ref.key && findDeclaringClass(index, ref, (symbols || []).filter(accepts));
         if (!ref.key || declaring?.uncertain) return { ambiguous: true };
         // Name lookup precedes arity: a local override hides its base even
@@ -17545,29 +17554,65 @@ function _closedLexicalClassScope(index, member) {
 }
 
 function _closedLexicalClassScopeUncached(index, member) {
-    const scopeRefs = [];
-    let owner = ownerRefOf(index, member);
-    const seenOwners = new Set();
-    while (owner) {
-        if (!owner.key || !owner.def || seenOwners.has(owner.key)) return null;
-        seenOwners.add(owner.key);
-        scopeRefs.push(owner);
-        const outer = owner.def.enclosingType;
-        owner = outer ? resolveClassRef(index, outer, owner.def.file,
-            { namespace: owner.def.namespace || null }) : null;
-    }
+    const scopeRefs = _lexicalClassScope(index, member);
+    if (!scopeRefs) return null;
     for (const ref of scopeRefs) {
         const visited = new Set([ref.key]);
         const queue = [...parentRefsOfClass(index, ref)];
         while (queue.length > 0) {
             const parent = queue.shift();
-            if (parent.external || !parent.key) return null;
+            if (parent.external || !parent.key || !parent.def) return null;
             if (visited.has(parent.key)) continue;
             visited.add(parent.key);
             queue.push(...parentRefsOfClass(index, parent));
         }
     }
     return scopeRefs;
+}
+
+function _lexicalClassScope(index, member) {
+    if (!member || typeof member !== 'object') return [];
+    const memo = index._opMemo?.('lexicalClassScope', () => new WeakMap());
+    if (memo?.has(member)) return memo.get(member);
+    const result = _lexicalClassScopeUncached(index, member);
+    memo?.set(member, result);
+    return result;
+}
+
+function _lexicalClassScopeUncached(index, member) {
+    const scopeRefs = [];
+    let owner = lexicalClassRefOf(index, member);
+    if (!owner && member?.isNested) return null;
+    const seenOwners = new Set();
+    while (owner) {
+        if (!owner.key || !owner.def || seenOwners.has(owner.key)) return null;
+        seenOwners.add(owner.key);
+        scopeRefs.push(owner);
+        const outer = owner.def.enclosingType;
+        if (!outer) break;
+        owner = lexicalClassRefOf(index, owner.def) || resolveClassRef(index, outer, owner.def.file,
+            { namespace: owner.def.namespace || null, line: owner.def.startLine });
+        if (!owner) return null;
+    }
+    return scopeRefs;
+}
+
+/** Simple-name member lookup from a local callable, before static imports. */
+function _lexicalMemberSelection(index, member, call, language, definitions) {
+    const scope = _lexicalClassScope(index, member);
+    if (!scope) return { ambiguous: true, reason: 'method-ambiguous' };
+    for (const ref of scope) {
+        const declaring = findDeclaringClass(index, ref, definitions);
+        if (!declaring) continue;
+        if (declaring.uncertain) return { ambiguous: true, reason: 'method-ambiguous' };
+        const selected = _calleeSelectReceiverMethod(index, call, definitions, ref.name,
+            language, member.file, symbol => !NON_CALLABLE_TYPES.has(symbol.type),
+            { definition: ref.def, classRef: ref });
+        return selected.match || selected.ambiguous
+            ? { ...selected, receiverClass: scope[0]?.name } : { ambiguous: true };
+    }
+    return _closedLexicalClassScope(index, member)
+        ? null : { ambiguous: true, reason: 'method-ambiguous' };
 }
 
 /**
@@ -17583,7 +17628,7 @@ function _closedLexicalClassScopeUncached(index, member) {
  */
 function _bareStaticImportCallee(index, def, call, language, fileEntry) {
     const traits = langTraits(language);
-    if (!traits?.bareCallReachesMethods || !def?.className || !fileEntry) return null;
+    if (!traits?.bareCallReachesMethods || (!def?.className && !def?.isNested) || !fileEntry) return null;
     if (traits.universalSupertypeMembers &&
         Object.prototype.hasOwnProperty.call(traits.universalSupertypeMembers, call.name)) return null;
     const callSymbols = index.symbols.get(call.name) || [];
@@ -17672,6 +17717,23 @@ function _cppEnclosingClassNames(index, filePath, owner, enclosing) {
         .map(symbol => symbol.name);
 }
 
+/** A nested C++ type's enclosing static members, including out-of-line bodies. */
+function _cppLexicalOuterReaches(index, enclosing, targets, definitions) {
+    const scope = _lexicalClassScope(index, enclosing);
+    if (!scope || scope.length < 2) return false;
+    for (let i = 0; i < scope.length; i++) {
+        const declaring = findDeclaringClass(index, scope[i], definitions);
+        if (!declaring) continue;
+        if (i === 0 || declaring.uncertain) return false;
+        // Lookup stops at the first class that declares the name. A nested
+        // class has access to its outer's static members, not an implicit
+        // outer instance, and namesakes in another namespace are unrelated.
+        return targets.some(target => target.className &&
+            target.modifiers?.includes('static') && ownedBy(index, target, declaring.ref) === 'yes');
+    }
+    return false;
+}
+
 /**
  * fix #396: is `bound` a `static` free-function declaration in another file
  * that a pinned `static` definition's file includes (the same function in
@@ -17732,6 +17794,7 @@ function _cppMemberSiteVerdictUncached(index, siteFile, enclosing, cppTargets, d
          _isAncestorOfTargetClass(index, enclosingOwner, cppTargets) ||
          [...targetOwners].some(owner => _isAncestorOfTargetClass(
              index, owner, [{ ...enclosing, className: enclosingOwner }])) ||
+         _cppLexicalOuterReaches(index, enclosing, cppTargets, definitions) ||
          _cppEnclosingClassNames(index, siteFile, enclosingOwner, enclosing)
              .some(owner => targetOwners.has(owner)));
     if (!ownerCanReachTarget && !enclosingOwner && Array.isArray(enclosing?.generatedByMacro?.args)) {

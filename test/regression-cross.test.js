@@ -18,6 +18,268 @@ const { execute } = require('../core/execute');
 const { computeReachability } = require('../core/entrypoints');
 const { tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR, runCli, runInteractive } = require('./helpers');
 
+describe('fix #412: local functions retain lexical type lookup across partial parts', () => {
+    function inspect(files, pin, verify) {
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const context = execute(index, 'context', { name: pin });
+            const plan = execute(index, 'plan', { name: pin, renameTo: 'Renamed' });
+            assert.ok(context.ok, context.error);
+            assert.ok(plan.ok, plan.error);
+            assert.ok(context.result.meta.account.conserved);
+            verify(index, context.result, plan.result);
+        } finally { rm(dir); }
+    }
+    const edits = (plan, file) => plan.changes.filter(change => change.file === file &&
+        change.newExpression !== undefined && !change.needsReview);
+    function calleeContext(index, pin) {
+        const result = execute(index, 'context', { name: pin });
+        assert.ok(result.ok, result.error);
+        assert.ok(result.result.meta.calleeAccount.conserved);
+        return result.result;
+    }
+
+    for (const modifier of ['static ', '']) {
+        it(`C#: a ${modifier || 'capturing '}local function calls the other partial part`, () => {
+            inspect({
+                'A.cs': 'namespace Acme;\npartial class Host {\n  private ' + modifier + 'int Helper(int n) => n;\n}',
+                'B.cs': 'namespace Acme;\npartial class Host {\n  public ' + modifier + 'int Run(int n) {\n    return Local(n);\n    ' + modifier + 'int Local(int value) {\n      return Helper(value);\n    }\n  }\n}',
+            }, 'A.cs:3:Helper', (index, context, plan) => {
+                assert.ok(context.callers.some(site => site.relativePath === 'B.cs' && site.line === 6));
+                assert.ok(edits(plan, 'B.cs').some(change => change.line === 6 && change.newExpression.includes('Renamed(value)')));
+                assert.ok(!(index.symbols.get('Local')[0].className));
+                const local = execute(index, 'context', { name: 'B.cs:5:Local' });
+                assert.ok(local.ok, local.error);
+                assert.ok(local.result.callees.some(callee => callee.name === 'Helper' && callee.relativePath === 'A.cs'));
+            });
+        });
+    }
+    it('C#: nested local functions keep the surrounding partial class scope', () => {
+        inspect({
+            'A.cs': 'namespace Acme;\npartial class Host {\n  static int Helper(int n) => n;\n}',
+            'B.cs': 'namespace Acme;\npartial class Host {\n  static int Run(int n) {\n    return Outer(n);\n    static int Outer(int x) {\n      return Inner(x);\n      static int Inner(int value) {\n        return Helper(value);\n      }\n    }\n  }\n}',
+        }, 'A.cs:3:Helper', (index, context, plan) => {
+            assert.ok(context.callers.some(site => site.relativePath === 'B.cs' && site.line === 8));
+            assert.ok(edits(plan, 'B.cs').some(change => change.line === 8));
+        });
+    });
+    it('C#: a same-name local function still hides the class member', () => {
+        inspect({
+            'A.cs': 'namespace Acme;\npartial class Host {\n  static int Helper(int n) => n;\n}',
+            'B.cs': 'namespace Acme;\npartial class Host {\n  static int Run(int n) {\n    return Local(n);\n    static int Local(int x) {\n      int Helper(int value) => value + 1;\n      return Helper(x);\n    }\n  }\n}',
+        }, 'A.cs:3:Helper', (index, context, plan) => {
+            assert.strictEqual(context.callers.length, 0);
+            assert.ok(!edits(plan, 'B.cs').length);
+        });
+    });
+    it('C#: a delegate parameter still hides the class member', () => {
+        inspect({
+            'A.cs': 'namespace Acme;\npartial class Host {\n  static int Helper(int n) => n;\n}',
+            'B.cs': 'namespace Acme;\npartial class Host {\n  static int Run() {\n    return Local(n => n + 1);\n    static int Local(System.Func<int, int> Helper) {\n      return Helper(1);\n    }\n  }\n}',
+        }, 'A.cs:3:Helper', (index, context, plan) => {
+            assert.strictEqual(context.callers.length, 0);
+            assert.ok(!edits(plan, 'B.cs').length);
+        });
+    });
+    it('C#: namesake partial classes in another namespace own different local calls', () => {
+        inspect({
+            'A.cs': 'namespace First;\npartial class Host {\n  public static int Helper(int n) => n;\n}',
+            'B.cs': 'namespace Second;\npartial class Host {\n  public static int Helper(int n) => n + 1;\n}',
+            'C.cs': 'namespace Second;\npartial class Host {\n  static int Run() {\n    return Local();\n    static int Local() { return Helper(1); }\n  }\n}',
+        }, 'A.cs:3:Helper', (index, context, plan) => {
+            assert.strictEqual(context.callers.length, 0);
+            assert.ok(!edits(plan, 'C.cs').length);
+            const own = execute(index, 'context', { name: 'B.cs:3:Helper' });
+            assert.ok(own.ok, own.error);
+            assert.ok(own.result.callers.some(site => site.relativePath === 'C.cs' && site.line === 5));
+            const local = calleeContext(index, 'C.cs:5:Local');
+            assert.deepStrictEqual(local.callees.map(callee => callee.relativePath), ['B.cs']);
+        });
+    });
+    it('C#: generic arity distinguishes the enclosing partial class', () => {
+        inspect({
+            'A.cs': 'namespace Acme;\npartial class Host {\n  public static int Helper(int n) => n;\n}',
+            'B.cs': 'namespace Acme;\npartial class Host<T> {\n  public static int Helper(int n) => n + 1;\n}',
+            'C.cs': 'namespace Acme;\npartial class Host<T> {\n  static int Run() {\n    return Local();\n    static int Local() { return Helper(1); }\n  }\n}',
+        }, 'A.cs:3:Helper', (index, context, plan) => {
+            assert.strictEqual(context.callers.length, 0);
+            assert.ok(!edits(plan, 'C.cs').length);
+            const own = execute(index, 'context', { name: 'B.cs:3:Helper' });
+            assert.ok(own.ok, own.error);
+            assert.ok(own.result.callers.some(site => site.relativePath === 'C.cs' && site.line === 5));
+            const local = calleeContext(index, 'C.cs:5:Local');
+            assert.deepStrictEqual(local.callees.map(callee => callee.relativePath), ['B.cs']);
+        });
+    });
+    it('C#: a local function can look through its nested type to a partial outer', () => {
+        inspect({
+            'A.cs': 'namespace Acme;\npartial class Outer {\n  static int Helper(int n) => n;\n}',
+            'B.cs': 'namespace Acme;\npartial class Outer {\n  class Inner {\n    static int Run() {\n      return Local();\n      static int Local() { return Helper(1); }\n    }\n  }\n}',
+        }, 'A.cs:3:Helper', (index, context, plan) => {
+            assert.ok(context.callers.some(site => site.relativePath === 'B.cs' && site.line === 6));
+            assert.ok(edits(plan, 'B.cs').some(change => change.line === 6));
+        });
+    });
+    it('C#: the enclosing member takes precedence over a static import', () => {
+        inspect({
+            'A.cs': 'namespace Acme;\npartial class Host {\n  static int Helper(int n) => n;\n}',
+            'B.cs': 'using static Acme.Utility;\nnamespace Acme;\npartial class Host {\n  static int Run() {\n    return Local();\n    static int Local() { return Helper(1); }\n  }\n}',
+            'C.cs': 'namespace Acme;\nstatic class Utility {\n  public static int Helper(int n) => n + 1;\n}',
+        }, 'A.cs:3:Helper', (index, context, plan) => {
+            assert.ok(context.callers.some(site => site.relativePath === 'B.cs' && site.line === 6));
+            assert.ok(edits(plan, 'B.cs').some(change => change.line === 6));
+            const imported = execute(index, 'plan', { name: 'C.cs:3:Helper', renameTo: 'Changed' });
+            assert.ok(imported.ok, imported.error);
+            assert.ok(!edits(imported.result, 'B.cs').some(change => change.line === 6));
+        });
+    });
+    it('C#: ambiguous same-line type ranges leave local calls visible for review', () => {
+        inspect({
+            'A.cs': 'partial class Host { public static int Helper() => 1; }',
+            'B.cs': 'partial class Host { static int Run() { int Local() => Helper(); return Local(); } } class Other { static int Run() { int Local() => Helper(); return Local(); } static int Helper() => 2; }',
+        }, 'A.cs:1:Helper', (index, context, plan) => {
+            assert.ok(context.unverifiedCallers.some(site => site.relativePath === 'B.cs' && site.line === 1));
+            assert.ok(!edits(plan, 'B.cs').length);
+        });
+    });
+    it('C#: another class in the file cannot supply a local function member binding', () => {
+        inspect({
+            'A.cs': 'namespace Acme;\npartial class Host {\n  public static int Helper(int n) => n;\n}',
+            'B.cs': 'namespace Acme;\npartial class Host {\n  static int Run() {\n    return Local();\n    static int Local() { return Helper(1); }\n  }\n}\nclass Other {\n  public static int Helper(int n) => n + 1;\n}',
+        }, 'A.cs:3:Helper', (index, context, plan) => {
+            assert.ok(context.callers.some(site => site.relativePath === 'B.cs' && site.line === 5));
+            assert.ok(edits(plan, 'B.cs').some(change => change.line === 5));
+            const foreign = execute(index, 'plan', { name: 'B.cs:9:Helper', renameTo: 'Changed' });
+            assert.ok(foreign.ok, foreign.error);
+            assert.ok(!edits(foreign.result, 'B.cs').some(change => change.line === 5));
+            const local = calleeContext(index, 'B.cs:5:Local');
+            assert.deepStrictEqual(local.callees.map(callee => callee.relativePath), ['A.cs']);
+        });
+    });
+    it('C#: inherited members remain in a local function lexical scope', () => {
+        inspect({
+            'A.cs': 'namespace Acme;\nclass Base {\n  public static int Helper(int n) => n;\n}',
+            'B.cs': 'namespace Acme;\npartial class Host : Base {}',
+            'C.cs': 'namespace Acme;\npartial class Host {\n  static int Run() {\n    return Local();\n    static int Local() { return Helper(1); }\n  }\n}',
+        }, 'A.cs:3:Helper', (index, context, plan) => {
+            assert.ok(context.callers.some(site => site.relativePath === 'C.cs' && site.line === 5));
+            assert.ok(edits(plan, 'C.cs').some(change => change.line === 5));
+        });
+    });
+    it('C#: unresolved ancestry cannot prove a local call belongs to another owner', () => {
+        inspect({
+            'A.cs': 'namespace Acme;\nclass Other {\n  public static int Helper(int n) => n;\n}',
+            'B.cs': 'using External;\nnamespace Acme;\npartial class Host : UnknownBase {}',
+            'C.cs': 'namespace Acme;\npartial class Host {\n  static int Run() {\n    return Local();\n    static int Local() { return Helper(1); }\n  }\n}',
+        }, 'A.cs:3:Helper', (index, context, plan) => {
+            assert.strictEqual(context.callers.length, 0);
+            assert.ok(context.unverifiedCallers.some(site => site.relativePath === 'C.cs' && site.line === 5));
+            assert.ok(!edits(plan, 'C.cs').some(change => change.line === 5));
+            const local = calleeContext(index, 'C.cs:5:Local');
+            assert.strictEqual(local.callees.length, 0);
+            assert.ok(local.unverifiedCallees.some(site => site.name === 'Helper'));
+        });
+    });
+    it('C#: a local call retains inherited overloads beside the enclosing type member', () => {
+        inspect({
+            'A.cs': 'namespace Acme;\nclass Base {\n  public static int Helper(int n) => n;\n}',
+            'B.cs': 'namespace Acme;\npartial class Host : Base {\n  public static int Helper(string n) => n.Length;\n}',
+            'C.cs': 'namespace Acme;\npartial class Host {\n  static int Run() {\n    return Local();\n    static int Local() { return Helper(1); }\n  }\n}',
+        }, 'A.cs:3:Helper', (index, context, plan) => {
+            const local = calleeContext(index, 'C.cs:5:Local');
+            assert.deepStrictEqual(local.callees.map(callee => callee.relativePath), ['A.cs']);
+            assert.ok(local.callees.every(callee => callee.name === 'Helper'));
+            assert.ok(context.callers.some(site => site.relativePath === 'C.cs' && site.line === 5));
+            assert.ok(edits(plan, 'C.cs').some(change => change.line === 5));
+        });
+    });
+    it('C#: a local function uses a static import only after lexical member lookup', () => {
+        inspect({
+            'A.cs': 'namespace Acme;\nstatic class Utility {\n  public static int Helper(int n) => n;\n}',
+            'B.cs': 'using static Acme.Utility;\nnamespace Acme;\nclass Host {\n  static int Run() {\n    return Local();\n    static int Local() { return Helper(1); }\n  }\n}',
+            'C.cs': 'namespace Acme;\nclass Other {\n  public static int Helper(int n) => n + 1;\n}',
+        }, 'A.cs:3:Helper', (index, context, plan) => {
+            assert.ok(context.callers.some(site => site.relativePath === 'B.cs' && site.line === 6));
+            assert.ok(edits(plan, 'B.cs').some(change => change.line === 6));
+            const local = calleeContext(index, 'B.cs:6:Local');
+            assert.deepStrictEqual(local.callees.map(callee => callee.relativePath), ['A.cs']);
+        });
+    });
+    it('C++: an out-of-line nested type keeps namespace identity', () => {
+        inspect({
+            'a.cpp': 'namespace First {\nstruct Outer {\n  static int Helper(int n) { return n; }\n};\n}',
+            'b.cpp': 'namespace Second {\nstruct Outer {\n  static int Helper(int n) { return n + 1; }\n  struct Inner;\n};\nstruct Outer::Inner {\n  static int Run() { return Helper(1); }\n};\n}',
+        }, 'a.cpp:3:Helper', (index, context, plan) => {
+            assert.strictEqual(context.callers.length, 0);
+            assert.ok(!edits(plan, 'b.cpp').length);
+            const own = execute(index, 'context', { name: 'b.cpp:3:Helper' });
+            assert.ok(own.ok, own.error);
+            // Overload choice can still need review after lexical lookup.
+            assert.ok([...own.result.callers, ...own.result.unverifiedCallers]
+                .some(site => site.relativePath === 'b.cpp' && site.line === 7));
+            const ownPlan = execute(index, 'plan', { name: 'b.cpp:3:Helper', renameTo: 'Renamed' });
+            assert.ok(ownPlan.ok, ownPlan.error);
+            assert.ok([...ownPlan.result.changes, ...ownPlan.result.unverifiedSites]
+                .some(site => site.file === 'b.cpp' && site.line === 7));
+        });
+    });
+    it('C#: a static import cannot take a local call from the enclosing member', () => {
+        inspect({
+            'A.cs': 'namespace Acme;\npartial class Host {\n  static int Helper(int n) => n;\n}',
+            'B.cs': 'using static Acme.Utility;\nnamespace Acme;\npartial class Host {\n  static int Run() {\n    return Local();\n    static int Local() { return Helper(1); }\n  }\n}',
+            'C.cs': 'namespace Acme;\nstatic class Utility {\n  public static int Helper(int n) => n + 1;\n}',
+        }, 'C.cs:3:Helper', (index, context, plan) => {
+            assert.ok(!context.callers.some(site => site.relativePath === 'B.cs' && site.line === 6));
+            assert.ok(!edits(plan, 'B.cs').some(change => change.line === 6));
+        });
+    });
+    it('C++: a nested type member hides its outer member', () => {
+        inspect({
+            'm.cpp': 'struct Outer {\n  static int Helper(int n) { return n; }\n  struct Inner;\n};\nstruct Outer::Inner {\n  static int Helper(int n) { return n + 1; }\n  static int Run() { return Helper(1); }\n};',
+        }, 'm.cpp:2:Helper', (index, context, plan) => {
+            assert.strictEqual(context.callers.length, 0);
+            assert.ok(!edits(plan, 'm.cpp').some(change => change.line === 7));
+        });
+    });
+    it('C++: an enclosing type can supply an inherited static member', () => {
+        inspect({
+            'm.cpp': 'struct Base {\n  static int Helper(int n) { return n; }\n};\nstruct Outer : Base { struct Inner; };\nstruct Outer::Inner {\n  static int Run() { return Helper(1); }\n};',
+        }, 'm.cpp:2:Helper', (index, context, plan) => {
+            assert.ok(context.callers.some(site => site.relativePath === 'm.cpp' && site.line === 6));
+            assert.ok(edits(plan, 'm.cpp').some(change => change.line === 6));
+        });
+    });
+    for (const [file, source, pin, line] of [
+        ['Host.java', 'class Host {\n  static int Helper(int n) { return n; }\n  int Run() {\n    java.util.function.IntUnaryOperator local = n -> Helper(n);\n    return local.applyAsInt(1);\n  }\n}', 'Host.java:2:Helper', 4],
+        ['host.cpp', 'struct Outer {\n  static int Helper(int n) { return n; }\n  struct Inner {\n    static int Run() {\n      auto local = [](int n) { return Helper(n); };\n      return local(1);\n    }\n  };\n};', 'host.cpp:2:Helper', 5],
+        ['host.cpp', 'struct Outer {\n  static int Helper(int n) { return n; }\n  struct Inner;\n};\nstruct Outer::Inner {\n  static int Run() { return Helper(1); }\n};', 'host.cpp:2:Helper', 6],
+    ]) {
+        it(`${file}: enclosing member lookup survives nested callable/type bodies at line ${line}`, () => {
+            inspect({ [file]: source }, pin, (index, context, plan) => {
+                assert.ok(context.callers.some(site => site.relativePath === file && site.line === line));
+                assert.ok(edits(plan, file).some(change => change.line === line));
+            });
+        });
+    }
+    for (const [file, source, pin, line] of [
+        ['m.js', 'function Helper(n) { return n + 1; }\nclass Host {\n  static Helper(n) { return n; }\n  static Run() { function local(n) { return Helper(n); } return local(1); }\n}', 'm.js:3:Helper', 4],
+        ['m.ts', 'function Helper(n: number) { return n + 1; }\nclass Host {\n  static Helper(n: number) { return n; }\n  static Run() { function local(n: number) { return Helper(n); } return local(1); }\n}', 'm.ts:3:Helper', 4],
+        ['m.tsx', 'function Helper(n: number) { return n + 1; }\nclass Host {\n  static Helper(n: number) { return n; }\n  static Run() { function local(n: number) { return Helper(n); } return local(1); }\n}', 'm.tsx:3:Helper', 4],
+        ['m.html', '<script>\nfunction Helper(n) { return n + 1; }\nclass Host {\n  static Helper(n) { return n; }\n  static Run() { function local(n) { return Helper(n); } return local(1); }\n}\n</script>', 'm.html:4:Helper', 5],
+        ['m.py', 'def Helper(n): return n + 1\nclass Host:\n    @staticmethod\n    def Helper(n): return n\n    @staticmethod\n    def Run():\n        def local(n): return Helper(n)\n        return local(1)\n', 'm.py:3:Helper', 7],
+        ['m.go', 'package p\ntype Host struct{}\nfunc (h Host) Helper(n int) int { return n }\nfunc Helper(n int) int { return n+1 }\nfunc Run() int { local := func(n int) int { return Helper(n) }; return local(1) }', 'm.go:3:Helper', 5],
+        ['m.rs', 'fn Helper(n:i32)->i32 {n+1}\nstruct Host;\nimpl Host {\n fn Helper(n:i32)->i32 {n}\n fn Run()->i32 {fn local(n:i32)->i32 {Helper(n)} local(1)}\n}', 'm.rs:4:Helper', 5],
+    ]) {
+        it(`${file}: a bare call in a nested callable keeps its module binding`, () => {
+            inspect({ [file]: source }, pin, (index, context, plan) => {
+                assert.ok(!context.callers.some(site => site.relativePath === file && site.line === line));
+                assert.ok(!edits(plan, file).some(change => change.line === line));
+            });
+        });
+    }
+});
+
 describe('fix #411: generic invocation names retain their expression roles', () => {
     it('C++: namespace lookup preserves later siblings and parents across query orders', () => {
         const { resolveQualifier } = require('../core/cpp-scope');
