@@ -242,6 +242,9 @@ function classifyCSharp(node) {
         case 'alias_qualified_name':
             if (field === 'name') return { role: 'type', qualifier: parent.childForFieldName('alias'), aliasQualified: true };
             return skip('extern-alias');
+        case 'invocation_expression':
+            if (field === 'function') return skip('method-call');
+            break;
         case 'member_access_expression':
             if (field === 'name') return { role: 'member', receiver: parent.childForFieldName('expression') };
             return { role: 'value' };
@@ -2690,7 +2693,8 @@ function decide(resolver, file, entry, token, bindings, typeParams) {
                 if (prefix) return resolver.resolveCFamily(file, line, resolver.name, prefix);
             }
             if (role.qualifier) {
-                return resolver.resolveQualified(file, line, role.qualifier, null, { role: role.role });
+                return resolver.resolveQualified(file, line, role.qualifier,
+                    role.aliasQualified ? textOf(role.qualifier) + '::' : null, { role: role.role });
             }
             if (role.aliasQualified) return { verdict: 'unknown', reason: 'extern-alias' };
             if (role.elaborated && family === 'c') {
@@ -2734,8 +2738,10 @@ function memberShadowOf(resolver, file, node) {
     // members of the enclosing classes first: a method of that name (C#
     // `static LogEvent LogEvent(..)`, a C++ member function) hides the
     // type there (fix #393). A constructor is the class's own name.
-    const invokedAt = node.parent && ((node.parent.type === 'invocation_expression' ||
-        node.parent.type === 'call_expression') && isField(node, 'function'));
+    const invokedName = langTraits(resolver.index.files.get(file)?.language)?.isInvokedName;
+    const invokedAt = invokedName ? invokedName(node, { unqualified: true }) : node.parent &&
+        ((node.parent.type === 'invocation_expression' || node.parent.type === 'call_expression') &&
+            isField(node, 'function'));
     if (invokedAt) {
         const scopeNames = new Set(owners);
         let level = [...owners];
@@ -3224,6 +3230,7 @@ module.exports = {
     csharpAttributeShortSites,
     TYPE_RENAME_KINDS,
     isTypeRenamePin,
+    referenceRole: classify,
     typeReferenceSites,
     TypeReferenceResolver,
     familyOf,

@@ -18,6 +18,275 @@ const { execute } = require('../core/execute');
 const { computeReachability } = require('../core/entrypoints');
 const { tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR, runCli, runInteractive } = require('./helpers');
 
+describe('fix #411: generic invocation names retain their expression roles', () => {
+    it('C++: namespace lookup preserves later siblings and parents across query orders', () => {
+        const { resolveQualifier } = require('../core/cpp-scope');
+        const dir = tmp({
+            'a.cpp': 'namespace alpha { namespace nested { int first() { return 1; } } }',
+            'b.cpp': 'namespace beta { int second() { return 2; } }',
+        });
+        try {
+            for (const names of [
+                ['alpha', 'beta', 'alpha::nested', 'missing', 'alpha', 'beta'],
+                ['missing', 'beta', 'alpha::nested', 'alpha'],
+                ['alpha::nested', 'alpha', 'missing', 'beta'],
+            ]) {
+                const index = idx(dir);
+                const context = { file: path.join(dir, 'a.cpp'), line: 1 };
+                const visible = new Set(index.files.keys());
+                for (const name of names) {
+                    const result = resolveQualifier(index, context, '::' + name, visible);
+                    assert.strictEqual(result.kind, name === 'missing' ? 'unknown' : 'namespace');
+                    if (name !== 'missing') assert.strictEqual(result.resolvedNamespace, name);
+                }
+            }
+        } finally { rm(dir); }
+    });
+
+    function inspect(files, pin, verify) {
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const plan = execute(index, 'plan', { name: pin, renameTo: 'Renamed' });
+            assert.ok(plan.ok, plan.error);
+            verify(plan.result, index);
+        } finally { rm(dir); }
+    }
+    const editAt = (plan, line) => plan.changes.find(change =>
+        change.line === line && change.newExpression !== undefined)?.newExpression;
+
+    for (const access of ['other.Query<int>(1)', 'other?.Query<int>(1)', 'Other.Query<int>(1)']) {
+        it(`C#: a foreign generic invocation stays bound to its receiver: ${access}`, () => {
+            inspect({ 'A.cs': [
+                'class Other { public ' + (access.startsWith('Other') ? 'static ' : '') + 'int Query<T>(int n) => n; }',
+                'class Host { Other other = new();',
+                '  public int Query() => ' + access + ' ?? 0;',
+                '  public int Next() => Query() + (' + access + ' ?? 0);',
+                '}',
+            ].join('\n').replaceAll('other.Query<int>(1) ?? 0', 'other.Query<int>(1)')
+                .replaceAll('Other.Query<int>(1) ?? 0', 'Other.Query<int>(1)') }, 'A.cs:3:Query', plan => {
+                assert.strictEqual(editAt(plan, 3), 'public int Renamed() => ' + access +
+                    (access.includes('?.') ? ' ?? 0;' : ';'));
+                assert.strictEqual(editAt(plan, 4), 'public int Next() => Renamed() + (' + access +
+                    (access.includes('?.') ? ' ?? 0);' : ');'));
+            });
+        });
+    }
+    it('C#: a chained extension call is not an enclosing method group', () => {
+        inspect({ 'A.cs': [
+            'using System.Linq;',
+            'static class Extensions { public static System.Collections.Generic.IEnumerable<int> Query<T>(this Context c, string s) => new[] { 1 }; }',
+            'class Context {}',
+            'class Host { Context db = new();',
+            '  public int Query() { return db.Query<int>("select").First(); }',
+            '}',
+        ].join('\n') }, 'A.cs:5:Query', plan => {
+            assert.strictEqual(editAt(plan, 5), 'public int Renamed() { return db.Query<int>("select").First(); }');
+        });
+    });
+    it('C#: a generic method call is separate from identically named type tokens', () => {
+        inspect({ 'A.cs': [
+            'class Page<T> { public long N; }',
+            'class Db {',
+            '  public Page<T> Page<T>(long n) => new Page<T> { N = n };',
+            '  public Page<T> Next<T>(long n) => Page<T>(n);',
+            '}',
+        ].join('\n') }, 'A.cs:1:Page', plan => {
+            assert.strictEqual(editAt(plan, 3), 'public Renamed<T> Page<T>(long n) => new Renamed<T> { N = n };');
+            assert.strictEqual(editAt(plan, 4), 'public Renamed<T> Next<T>(long n) => Page<T>(n);');
+        });
+    });
+    it('C#: generic method arguments and type qualifiers retain type references', () => {
+        inspect({ 'A.cs': [
+            'class Page<T> { public static int Count => 1; }',
+            'class Db {',
+            '  T Echo<T>(T value) => value;',
+            '  int Page<T>(T value) => 1;',
+            '  object Next() => Echo<Page<int>>(new Page<int>());',
+            '  int Count() => Page<Page<int>>(new Page<int>()) + global::Page<int>.Count;',
+            '}',
+        ].join('\n') }, 'A.cs:1:Page', plan => {
+            assert.strictEqual(editAt(plan, 5), 'object Next() => Echo<Renamed<int>>(new Renamed<int>());');
+            assert.strictEqual(editAt(plan, 6), 'int Count() => Page<Renamed<int>>(new Renamed<int>()) + global::Renamed<int>.Count;');
+        });
+    });
+    for (const expression of ['Query<int>', 'this.Query<int>', 'new System.Func<int, int>(Query<int>)']) {
+        it(`C#: generic method values remain references: ${expression}`, () => {
+            inspect({ 'A.cs': [
+                'class Host {',
+                '  public T Query<T>(T value) => value;',
+                '  System.Func<int, int> Next() => ' + expression + ';',
+                '}',
+            ].join('\n') }, 'A.cs:2:Query', plan => {
+                assert.strictEqual(editAt(plan, 3), 'System.Func<int, int> Next() => ' + expression.replace('Query', 'Renamed') + ';');
+            });
+        });
+    }
+    it('C#: a typed instance generic method value names its receiver class', () => {
+        inspect({ 'A.cs': [
+            'class Host {',
+            '  public T Query<T>(T value) => value;',
+            '  System.Func<int, int> Next(Host other) => other.Query<int>;',
+            '}',
+        ].join('\n') }, 'A.cs:2:Query', plan => {
+            assert.strictEqual(editAt(plan, 3), 'System.Func<int, int> Next(Host other) => other.Renamed<int>;');
+        });
+    });
+    it('C#: an unresolved instance method value is reviewed with its receiver', () => {
+        inspect({ 'A.cs': [
+            'class Host {',
+            '  public T Query<T>(T value) => value;',
+            '  System.Func<int, int> Next<T>(T other) where T : IQuery => other.Query<int>;',
+            '}',
+            'interface IQuery { U Query<U>(U value); }',
+        ].join('\n') }, 'A.cs:2:Query', plan => {
+            assert.ok(!editAt(plan, 3), JSON.stringify(plan));
+            assert.ok([...plan.changes, ...(plan.reviewItems || [])].some(change =>
+                change.line === 3 && change.needsReview), JSON.stringify(plan));
+        });
+    });
+    it('C#: a lowercase class name still qualifies a static generic method value', () => {
+        inspect({ 'A.cs': [
+            'class host {',
+            '  public static T Query<T>(T value) => value;',
+            '  System.Func<int, int> Next() => host.Query<int>;',
+            '}',
+        ].join('\n') }, 'A.cs:2:Query', plan => {
+            assert.strictEqual(editAt(plan, 3), 'System.Func<int, int> Next() => host.Renamed<int>;');
+        });
+    });
+    it('C#: renaming a method preserves same-named types in its generic arguments and return types', () => {
+        inspect({ 'A.cs': [
+            'class Query {}',
+            'class Host {',
+            '  int Query() => 1;',
+            '  T Pass<T>(T value) => value;',
+            '  Query Next() => Pass<Query>(new Query());',
+            '  int Call() => Query();',
+            '}',
+        ].join('\n') }, 'A.cs:3:Query', plan => {
+            assert.ok(!editAt(plan, 5), JSON.stringify(plan));
+            assert.strictEqual(editAt(plan, 6), 'int Call() => Renamed();');
+        });
+    });
+    it('C#: a generic type qualifier resolves an own method in nameof', () => {
+        inspect({ 'A.cs': [
+            'class Host<T> {',
+            '  public void Query() {}',
+            '  string Name() => nameof(Host<T>.Query);',
+            '}',
+        ].join('\n') }, 'A.cs:2:Query', plan => {
+            assert.strictEqual(editAt(plan, 3), 'string Name() => nameof(Host<T>.Renamed);');
+        });
+    });
+    it('C#: a generic type qualifier for another method needs no rename review', () => {
+        inspect({ 'A.cs': [
+            'interface Other<T> { void Query(); }',
+            'class Host {',
+            '  public void Query() {}',
+            '  string Name() => nameof(Other<int>.Query);',
+            '}',
+        ].join('\n') }, 'A.cs:3:Query', plan => {
+            assert.ok(!plan.changes.some(change => change.line === 4), JSON.stringify(plan));
+            assert.ok(!(plan.reviewItems || []).some(change => change.line === 4), JSON.stringify(plan));
+        });
+    });
+    it('C#: arguments, receivers and type arguments are not the invoked name', () => {
+        const { getParser, safeParse, getLanguageAdapter } = require('../languages');
+        const code = 'class Host { void M() { Query.Run<Query>(Query); } }';
+        const parser = getParser('csharp');
+        const tree = safeParse(parser, code);
+        const uses = getLanguageAdapter('csharp').findUsagesInCode(code, 'Query', parser, tree);
+        assert.strictEqual(uses.length, 3);
+        assert.ok(uses.every(usage => usage.usageType === 'reference'), JSON.stringify(uses));
+    });
+    for (const access of ['other.Query<int>(1)', 'other.template Query<int>(1)', 'Other::Query<int>(1)']) {
+        it(`C++: generic call records keep the explicit receiver: ${access}`, () => {
+            const { getParser, safeParse, getLanguageAdapter } = require('../languages');
+            const code = 'struct Host { int M() { return ' + access + '; } };';
+            const parser = getParser('cpp');
+            const tree = safeParse(parser, code);
+            const uses = getLanguageAdapter('cpp').findUsagesInCode(code, 'Query', parser, tree);
+            assert.strictEqual(uses.length, 1);
+            assert.strictEqual(uses[0].usageType, 'call');
+            assert.strictEqual(uses[0].receiver, access.startsWith('Other') ? 'Other' : 'other');
+        });
+    }
+    it('C++: a member template hides a type only in the invoked name', () => {
+        inspect({ 'm.cpp': [
+            'template<class T> struct Page {};',
+            'struct Db {',
+            '  template<class T> ::Page<T> Page(T n) { return {}; }',
+            '  auto Next() { return Page<int>(1); }',
+            '  auto Make() { return ::Page<int>(); }',
+            '};',
+        ].join('\n') }, 'm.cpp:1:Page', plan => {
+            assert.strictEqual(editAt(plan, 3), 'template<class T> ::Renamed<T> Page(T n) { return {}; }');
+            assert.ok(!editAt(plan, 4), JSON.stringify(plan));
+            assert.strictEqual(editAt(plan, 5), 'auto Make() { return ::Renamed<int>(); }');
+        });
+    });
+    for (const expression of ['::api::Query<int>(1)', '::Query<int>(1)']) {
+        it(`C++: a rooted generic callable keeps its terminal name: ${expression}`, () => {
+            const { getParser, safeParse, getLanguageAdapter } = require('../languages');
+            const code = 'int Next() { return ' + expression + '; }';
+            const parser = getParser('cpp');
+            const tree = safeParse(parser, code);
+            const adapter = getLanguageAdapter('cpp');
+            const calls = adapter.findCallsInCode(code, parser, {}, tree);
+            assert.strictEqual(calls.length, 1);
+            assert.strictEqual(calls[0].name, 'Query');
+            assert.strictEqual(calls[0].receiver || null, expression.includes('api') ? '::api' : null);
+            assert.strictEqual(!!calls[0].globalQualified, !expression.includes('api'));
+            const usages = adapter.findUsagesInCode(code, 'Query', parser, tree);
+            assert.strictEqual(usages[0].usageType, 'call');
+        });
+    }
+    it('C++: a rooted namespace reference keeps its qualifier through the outer wrapper', () => {
+        inspect({ 'm.cpp': [
+            'namespace api { int Query(int n) { return n; } }',
+            'namespace inner {',
+            'namespace api { int Query(int n) { return n + 1; } }',
+            'int Next() { return ::api::Query(1); }',
+            '}',
+        ].join('\n') }, 'm.cpp:1:Query', plan => {
+            assert.strictEqual(editAt(plan, 4), 'int Next() { return ::api::Renamed(1); }');
+        });
+    });
+    it('C++: nested parentheses preserve a generic member call at any expression depth', () => {
+        const expression = '('.repeat(40) + 'Page<int>' + ')'.repeat(40) + '(1)';
+        inspect({ 'm.cpp': [
+            'template<class T> struct Page {};',
+            'struct Db {',
+            '  template<class T> static ::Page<T> Page(T) { return {}; }',
+            '  auto Next() { return ' + expression + '; }',
+            '};',
+        ].join('\n') }, 'm.cpp:1:Page', plan => {
+            assert.strictEqual(editAt(plan, 3), 'template<class T> static ::Renamed<T> Page(T) { return {}; }');
+            assert.ok(!editAt(plan, 4), JSON.stringify(plan));
+        });
+    });
+    for (const [language, file, code, calledReceiver] of [
+        ['typescript', 'm.ts', 'class Host { Run() { return other.Run<number>(1); } value() { return other.Run<number>; } }', 'other'],
+        ['tsx', 'm.tsx', 'class Host { Run() { return other.Run<number>(1); } value() { return other.Run<number>; } }', 'other'],
+        ['java', 'Host.java', 'class Host { int Run() { return other.<Integer>Run(1); } }', 'other'],
+        ['rust', 'm.rs', 'struct Host; impl Host { fn Run<T>(v:T)->T {v} } fn use_it(){ let x=Host::Run::<i32>(1); let f=Host::Run::<i32>; }', 'Host'],
+        ['go', 'm.go', 'package p\nfunc Run[T any](v T) T { return v }\nfunc useIt(){ _ = Run[int](1); _ = Run[int] }', null],
+    ]) {
+        it(`${language}: generic calls and method values keep their existing roles`, () => {
+            const { getParser, safeParse, getLanguageAdapter } = require('../languages');
+            const parser = getParser(language);
+            const tree = safeParse(parser, code);
+            assert.ok(!tree.rootNode.hasError, file);
+            const uses = getLanguageAdapter(language).findUsagesInCode(code, 'Run', parser, tree);
+            const calls = uses.filter(usage => usage.usageType === 'call');
+            assert.strictEqual(calls.length, 1, JSON.stringify(uses));
+            assert.strictEqual(calls[0].receiver || null, calledReceiver);
+            if (language !== 'java') assert.strictEqual(uses.filter(usage => usage.usageType === 'reference').length, 1);
+        });
+    }
+});
+
 describe('fix #410: implicit property accesses preserve language binding', () => {
     function inspect(files, pin, verify) {
         const dir = tmp(files);

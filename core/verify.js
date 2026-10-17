@@ -9,7 +9,7 @@ const { detectLanguage, getParser, getLanguageAdapter, safeParse, langTraits } =
 const { sameNode } = require('../languages/utils');
 const { escapeRegExp, codeUnitCompare, NON_CALLABLE_TYPES, isOverrideMarked, isMacroNamespaceDefinition } = require('./shared');
 const { classDefsNamed, distinctOwnerDefinitions } = require('./class-identity');
-const { isTypeRenamePin } = require('./type-references');
+const { isTypeRenamePin, referenceRole } = require('./type-references');
 const { findAccessorReferences, isAccessorDefinition } = require('./accessors');
 const { csharpLocalBinding } = require('../languages/csharp-scope');
 const { validateCallMismatch, declarationIdentity } = require('./provenance');
@@ -5944,7 +5944,8 @@ const CSHARP_TYPE_DECLARATION_NODES = new Set(['class_declaration', 'struct_decl
  */
 function _methodGroupPass(index, name, renameTo, renamedDefs, changes, usages) {
     const pathMod = require('path');
-    const { resolveClassRef, findDeclaringClass, parentRefsOf } = require('./class-identity');
+    const { resolveClassRef, findDeclaringClass, parentRefsOf, relationToTargets } = require('./class-identity');
+    const { externalTypeDenotation } = require('./type-denotation');
     const renamed = new Set(renamedDefs);
     const members = (index.symbols.get(name) || []).filter(d => d.className &&
         !IDENTITY_TYPE_KINDS_FOR_CREF.has(d.type));
@@ -5972,6 +5973,9 @@ function _methodGroupPass(index, name, renameTo, renamedDefs, changes, usages) {
         if (column == null || !tree) return 'review';
         const node = tree.rootNode.descendantForPosition({ row, column });
         if (!node || node.type !== 'identifier' || node.text !== name) return 'review';
+        const position = referenceRole(node, index.files.get(ref.file)?.language);
+        if (position.role === 'unknown') return 'review';
+        if (position.role !== 'value' && position.role !== 'member') return null;
         const types = [];
         let member = null;
         for (let current = node.parent; current; current = current.parent) {
@@ -5981,12 +5985,37 @@ function _methodGroupPass(index, name, renameTo, renamedDefs, changes, usages) {
         if (types.length === 0) return 'review';
         const receiver = ref.receiver || null;
         if (receiver && receiver !== 'this' && receiver !== 'base') {
-            // `Host.Build`: a static method group of the named class.
-            if (!/^[A-Z]/.test(receiver)) return null;
-            const typeRef = resolveClassRef(index, receiver, ref.file, { line: ref.line });
-            if (!typeRef?.key) return typeRef?.external ? null : 'review';
-            return verdictOf(findDeclaringClass(index, typeRef, members)) === 'edit' ? 'edit'
-                : verdictOf(findDeclaringClass(index, typeRef, members)) === 'review' ? 'review' : null;
+            // Typed instance method values and static method groups use
+            // the receiver's lookup, never the enclosing class (fix #411).
+            const typed = ref.receiverType;
+            const written = !typed && langTraits(index.files.get(ref.file)?.language)?.methodGroupReceiver?.(node);
+            if (!typed) {
+                if (!written) return 'review';
+                if (member && csharpLocalBinding(member, node, written.name) !== 'none') return 'review';
+                const receiverMembers = (index.symbols.get(receiver) || []).filter(d => d.className &&
+                    !d.isConstructor && d.type !== 'constructor' && d.className !== receiver &&
+                    !IDENTITY_TYPE_KINDS_FOR_CREF.has(d.type));
+                if (receiverMembers.length > 0) {
+                    for (const type of types) {
+                        const owner = classRefAt(ref.file, type);
+                        if (!owner || findDeclaringClass(index, owner, receiverMembers)) return 'review';
+                    }
+                }
+            }
+            const typeName = typed || written.name;
+            const qualifier = typed ? ref.receiverTypeQualifier : written.qualifier;
+            const arity = typed ? ref.receiverTypeArgs : written.arity;
+            if (externalTypeDenotation(index, ref.file, typeName, qualifier || null, ref.line)) return 'review';
+            const typeRef = resolveClassRef(index, typeName, ref.file, {
+                line: ref.line,
+                ...(qualifier && { namespace: qualifier }),
+                ...(Number.isInteger(arity) && { arity }),
+            });
+            if (!typeRef?.key || !typeRef.def) return 'review';
+            const relation = relationToTargets(index, typeRef, renamedDefs);
+            if (typed && (relation === 'ancestor' || relation === 'maybe')) return 'review';
+            const verdict = verdictOf(findDeclaringClass(index, typeRef, members));
+            return verdict === 'skip' ? null : verdict || (openAncestry(typeRef) ? 'review' : null);
         }
         if (!receiver && member) {
             const local = csharpLocalBinding(member, node, name);
@@ -6018,11 +6047,9 @@ function _methodGroupPass(index, name, renameTo, renamedDefs, changes, usages) {
         trees.set(file, tree);
         return tree;
     };
-    // Only simple names and `this.`/`base.`/type-qualified accesses can name
-    // the method group; other member accesses are never parsed for.
-    const candidateRecord = record => record.usageType === 'reference' && !record.isDefinition &&
-        (!record.receiver || record.receiver === 'this' || record.receiver === 'base' ||
-            /^[A-Z]/.test(String(record.receiver)));
+    // An explicit receiver can name the method too. Unresolved receivers
+    // remain review items instead of falling into simple-name lookup.
+    const candidateRecord = record => record.usageType === 'reference' && !record.isDefinition;
     for (const first of usages) {
         if (first.usageType !== 'reference' || first.isDefinition) continue;
         const abs = first.file;
@@ -6067,7 +6094,7 @@ function _methodGroupPass(index, name, renameTo, renamedDefs, changes, usages) {
                 line: first.line,
                 expression: (first.content || index.getLineContent(abs, first.line) || '').trim(),
                 suggestion: `Verify whether this method group names the renamed ${name} ` +
-                    `(an overload chosen by the delegate type, or a local of that name) and rename it to ${renameTo} if it does`,
+                    `(an unresolved receiver, an overload chosen by the delegate type, or a local of that name) and rename it to ${renameTo} if it does`,
                 needsReview: true,
                 reviewReason: 'method-group',
                 editKind: 'reference',

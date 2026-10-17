@@ -193,23 +193,37 @@ function namespaceAt(index, file, line) {
     return prefix && own ? `${prefix}::${own}` : prefix || own;
 }
 
-function _inventory(index) {
-    const state = _state(index);
-    if (state.inventory) return state.inventory;
-    const namespaces = new Set();
+function* _namespaceInventory(index, namespaces) {
     for (const entry of index.files.values()) {
         if (entry.language !== 'cpp') continue;
         for (const symbol of entry.symbols || []) {
             const namespace = effectiveNamespace(index, symbol);
-            if (!namespace) continue;
+            if (!namespace || namespaces.has(namespace)) continue;
             const parts = namespace.split('::');
             for (let i = 1; i <= parts.length; i++) {
-                namespaces.add(parts.slice(0, i).join('::'));
+                yield parts.slice(0, i).join('::');
             }
         }
     }
-    state.inventory = namespaces;
-    return namespaces;
+}
+
+function _hasNamespace(index, namespace) {
+    const state = _state(index);
+    if (!state.inventory) state.inventory = new Set();
+    if (state.inventory.has(namespace)) return true;
+    if (state.inventoryComplete) return false;
+    if (!state.inventoryScan) state.inventoryScan = _namespaceInventory(index, state.inventory);
+    // A successful lookup needs only the prefix it found. Keep the scan
+    // position so later lookups can discover every remaining namespace.
+    let next;
+    while (!(next = state.inventoryScan.next()).done) {
+        const name = next.value;
+        state.inventory.add(name);
+        if (name === namespace) return true;
+    }
+    state.inventoryComplete = true;
+    state.inventoryScan = null;
+    return false;
 }
 
 /** Remove template argument lists (depth-aware) and whitespace. */
@@ -474,7 +488,7 @@ function resolveQualifier(index, context, spelling, visibleFiles, depth = 0, opt
     }
     if (matched.length === 0) {
         const full = segments.join('::');
-        const scope = scopes.find(candidate => _inventory(index).has(_join(candidate, full)));
+        const scope = scopes.find(candidate => _hasNamespace(index, _join(candidate, full)));
         if (scope !== undefined) {
             // `resolvedNamespace` (fix #393): the namespace the spelling
             // names from this scope (innermost first).

@@ -212,6 +212,9 @@ const STRUCTURAL_TRAITS = {
     // `Func<int> f = Build`): plan renames it by the language's simple-name
     // lookup. Java spells method values apart (`Type::m`).
     methodGroupReferences: false,
+    methodGroupReceiver: null,
+    // AST terminal-name test for invocations wrapped in generic syntax.
+    isInvokedName: null,
     accessorReferenceShape: null,
     accessorTypeSyntax: null,
     // Whether a class may declare a field and a method of one name, so a
@@ -363,6 +366,9 @@ const NOMINAL_TRAITS = {
     docCrefReferences: false,
     // Simple-name method groups (fix #395, C#).
     methodGroupReferences: false,
+    methodGroupReceiver: null,
+    // AST terminal-name test for invocations wrapped in generic syntax.
+    isInvokedName: null,
     accessorReferenceShape: null,
     accessorTypeSyntax: null,
     // A static import of a type brings only the members the type itself
@@ -748,6 +754,7 @@ const LANGUAGES = {
         treeSitterModule: () => require('tree-sitter-cpp'),
         traits: {
             ...NOMINAL_TRAITS,
+            isInvokedName: (node, options) => require('./c-family').isInvokedName(node, options),
             selfParam: ['this'],
             packageScope: 'file',
             hasDynamicImports: false,
@@ -786,6 +793,7 @@ const LANGUAGES = {
         treeSitterModule: () => require('tree-sitter-c-sharp'),
         traits: {
             ...NOMINAL_TRAITS,
+            isInvokedName: (node, options) => require('./csharp').isInvokedName(node, options),
             standardPathRoots: ['System'],
             conditionalDefinitions: 'preprocessor',
             typeNameScoping: 'namespace-usings',
@@ -801,6 +809,7 @@ const LANGUAGES = {
             universalSupertypeMembers: { ToString: 0, Equals: 1, GetHashCode: 0, Finalize: 0 },
             docCrefReferences: true,
             methodGroupReferences: true,
+            methodGroupReceiver: node => require('./csharp').methodGroupReceiver(node),
             accessorReferenceShape: (tree, usage) => require('./csharp').accessorReferenceShape(tree, usage),
             accessorTypeSyntax: text => require('./csharp').accessorTypeSyntax(text),
             staticImportsDeclaredOnly: true,

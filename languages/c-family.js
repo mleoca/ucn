@@ -5558,12 +5558,12 @@ function callIdentity(fnNode) {
         const globalQualified = fnNode.text.startsWith('::') &&
             (!scopeNode || sameNode(scopeNode, rawNameNode));
         if (globalQualified) {
+            const nested = callIdentity(rawNameNode);
             return {
-                name: rawNameNode?.text,
-                nameNode: rawNameNode,
-                isMethod: false,
+                ...nested,
                 isPathCall: true,
-                globalQualified: true,
+                ...(nested.receiver ? { receiver: `::${nested.receiver}` }
+                    : { isMethod: false, globalQualified: true }),
             };
         }
         const nested = rawNameNode?.type === 'template_function' ||
@@ -6494,7 +6494,47 @@ function findImportsInCode(code, parser) {
     } finally { /* cached with the selected tree */ }
 }
 
-const CALLEE_WRAPPER_NODES = new Set(['template_method', 'dependent_name', 'field_expression']);
+// Follow only the terminal name of a template, qualifier or member access.
+// Template arguments and receiver tokens keep their own expression roles.
+function usageNameExpression(node) {
+    let current = node;
+    while (current.parent) {
+        const parent = current.parent;
+        let head;
+        switch (parent.type) {
+            case 'template_function': case 'template_method': case 'template_type':
+            case 'qualified_identifier':
+                head = parent.childForFieldName('name');
+                break;
+            case 'field_expression':
+                head = parent.childForFieldName('field');
+                break;
+            case 'dependent_name': case 'parenthesized_expression':
+                head = parent.namedChildCount === 1 ? parent.namedChild(0) : null;
+                break;
+            default:
+                return current;
+        }
+        if (!sameNode(head, current)) return current;
+        current = parent;
+    }
+    return current;
+}
+
+function invokesNameExpression(expression) {
+    return expression.parent?.type === 'call_expression' &&
+        sameNode(expression.parent.childForFieldName('function'), expression);
+}
+
+function isInvokedName(node, options = {}) {
+    const expression = usageNameExpression(node);
+    if (!invokesNameExpression(expression)) return false;
+    if (options.unqualified) {
+        const identity = callIdentity(expression);
+        if (identity.isMethod || identity.isPathCall) return false;
+    }
+    return true;
+}
 
 // The name introduced by a declarator, including `A::f`, pointer/array
 // wrappers and data members. Keep this separate from the public usage kind:
@@ -6549,27 +6589,9 @@ function findUsagesInCode(code, name, parser, existingTree, options = {}) {
         let receiver = null;
         const parent = node.parent;
         if (parent) {
-            let call = parent.type === 'call_expression'
-                ? parent
-                : parent.parent?.type === 'call_expression' ? parent.parent : null;
-            // `obj.template conv<long>()` nests the member name up to three
-            // levels below the call (fix #378).
-            if (!call && CALLEE_WRAPPER_NODES.has(parent.type)) {
-                let up = parent.parent;
-                for (let depth = 0; up && depth < 3 && CALLEE_WRAPPER_NODES.has(up.type); depth++) {
-                    up = up.parent;
-                }
-                if (up?.type === 'call_expression') call = up;
-            }
-            // Only the callable's terminal name is a call usage. The previous
-            // descendant test also matched receiver identifiers, classifying
-            // `copy.descriptor()` as a call to a free function named `copy`.
-            // callIdentity already unwraps qualified/template/parenthesized
-            // callees while preserving the exact terminal name node.
-            const calledIdentity = call
-                ? callIdentity(call.childForFieldName('function')) : null;
-            if (calledIdentity?.nameNode &&
-                sameNode(calledIdentity.nameNode, node)) {
+            const expression = usageNameExpression(node);
+            const identity = callIdentity(expression);
+            if (invokesNameExpression(expression) && sameNode(identity.nameNode, node)) {
                 usageType = 'call';
             } else if ((parent.type === 'function_declarator' ||
                 parent.type === 'parameter_declaration') &&
@@ -6592,16 +6614,8 @@ function findUsagesInCode(code, name, parser, existingTree, options = {}) {
             } else if (parent.type === 'preproc_include') {
                 usageType = 'import';
             }
-            if (parent.type === 'qualified_identifier' &&
-                sameNode(parent.childForFieldName('name'), node)) {
-                receiver = typeName(parent.childForFieldName('scope') ||
-                    parent.namedChild(0));
-            } else if (parent.type === 'field_expression' &&
-                sameNode(parent.childForFieldName('field'), node)) {
-                const argument = parent.childForFieldName('argument') ||
-                    parent.namedChild(0);
-                receiver = argument?.text || null;
-            }
+            // A generic wrapper does not erase an explicit receiver.
+            if (sameNode(identity.nameNode, node)) receiver = identity.receiver || null;
         }
         // A bare name lexically inside a class method participates in C++
         // member lookup on that class. This is ownership evidence for test
@@ -6891,6 +6905,7 @@ function objectMacroReading(parser, bodies) {
 }
 
 module.exports = {
+    isInvokedName,
     createCFamilyLanguage,
     objectMacroReading,
     withExternalMacros,

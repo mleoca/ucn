@@ -927,7 +927,8 @@ function clearAllCaches() {
 // its expansions output and its headers hold (`rustMacroExpansion.groups`).
 // v277: refactoring usages distinguish declarator-name tokens from value
 // references; C# local-function name tokens are definitions.
-const CACHE_FORMAT_VERSION = 277;
+// v278: generic invocation usages preserve the terminal name and receiver.
+const CACHE_FORMAT_VERSION = 278;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**

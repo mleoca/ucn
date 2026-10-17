@@ -25,6 +25,52 @@ const {
 } = require('../core/cache');
 const { createTempDir, cleanup, tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR } = require('./helpers');
 
+describe('fix #411: generic usage roles invalidate older usage caches', () => {
+    it('reloads terminal names and receivers instead of legacy generic references', () => {
+        const dir = tmp({ 'A.cs': [
+            'class Other { public T Query<T>(T n) => n; }',
+            'class Host {',
+            '  public int Query() => 1;',
+            '  int Next(Other other) => other.Query<int>(Query());',
+            '}',
+        ].join('\n') });
+        try {
+            const file = path.join(dir, 'A.cs');
+            const index = idx(dir);
+            const read = target => {
+                target._beginOp();
+                try { return target._getCachedUsages(file, 'Query', { lexicalScopes: true }); }
+                finally { target._endOp(); }
+            };
+            const expected = read(index);
+            assert.ok(expected.some(usage => usage.line === 4 && usage.usageType === 'call' && usage.receiver === 'other'));
+            const saved = index.saveCache();
+            index.saveUsageCache();
+            const usagePath = path.join(path.dirname(saved), 'usage-results.json');
+            const legacy = JSON.parse(fs.readFileSync(usagePath, 'utf8'));
+            legacy.version = 277;
+            for (const entry of legacy.entries) for (const usage of entry[4]) {
+                if (usage.receiver === 'other') {
+                    usage.usageType = 'reference';
+                    delete usage.receiver;
+                }
+            }
+            fs.writeFileSync(usagePath, JSON.stringify(legacy));
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loaded.loadCache());
+            assert.strictEqual(loaded._usageResultCache.size, 0);
+            assert.deepStrictEqual(read(loaded), expected);
+            loaded.saveUsageCache();
+            const repeated = new ProjectIndex(dir);
+            assert.ok(repeated.loadCache());
+            assert.deepStrictEqual(read(repeated), expected);
+        } finally {
+            clearProjectCache(dir);
+            rm(dir);
+        }
+    });
+});
+
 describe('fix #410: property owner proofs survive a saved usage cache', () => {
     it('recomputes namespace and generic-alias scopes after loading the index', () => {
         const dir = tmp({

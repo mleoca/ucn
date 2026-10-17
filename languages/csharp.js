@@ -2590,6 +2590,48 @@ function findUsagesInCode(code, name, parser, existingTree) {
     return usagesInTree(code, name, parser, existingTree || safeParse(parser, code, undefined, PARSE_OPTIONS));
 }
 
+// Lift only the terminal name, never a receiver or type argument, through
+// the grammar's generic/member wrappers (fix #411).
+function usageNameExpression(node) {
+    let current = node;
+    let parent = current.parent;
+    if (parent?.type === 'generic_name' && sameNode(parent.namedChild(0), current)) {
+        current = parent;
+        parent = current.parent;
+    }
+    if ((parent?.type === 'member_access_expression' || parent?.type === 'member_binding_expression') &&
+        sameNode(parent.childForFieldName('name') || parent.namedChild(0), current)) {
+        current = parent;
+        parent = current.parent;
+        if (current.type === 'member_binding_expression' && parent?.type === 'conditional_access_expression') {
+            current = parent;
+        }
+    }
+    return current;
+}
+
+function methodGroupReceiver(node) {
+    const expression = usageNameExpression(node);
+    const receiver = expression.childForFieldName('expression') || expression.childForFieldName('condition');
+    const type = require('./csharp-scope').namedType(receiver, node);
+    if (!type) return null;
+    const argumentsNode = type.node.parent?.type === 'generic_name'
+        ? type.node.parent.namedChildren.find(child => child.type === 'type_argument_list') : null;
+    return { name: type.name, qualifier: type.qualifierText,
+        arity: argumentsNode?.namedChildCount || 0 };
+}
+
+function invokesNameExpression(expression) {
+    return expression.parent?.type === 'invocation_expression' &&
+        sameNode(expression.parent.childForFieldName('function'), expression);
+}
+
+function isInvokedName(node, options = {}) {
+    const expression = usageNameExpression(node);
+    if (options.unqualified && expression.type !== 'identifier' && expression.type !== 'generic_name') return false;
+    return invokesNameExpression(expression);
+}
+
 function usagesInTree(code, name, parser, tree) {
     const usages = [];
     const variableTypesByScope = buildVariableTypes(tree, parser);
@@ -2597,6 +2639,7 @@ function usagesInTree(code, name, parser, tree) {
         if (!IDENTIFIER_NODES.has(node.type) || node.text !== name) return;
         let usageType = 'reference';
         const parent = node.parent;
+        const expression = usageNameExpression(node);
         if (parent) {
             if ((parent.type === 'method_declaration' ||
                 parent.type === 'local_function_statement' ||
@@ -2608,17 +2651,16 @@ function usagesInTree(code, name, parser, tree) {
                 parent.type === 'variable_declarator') &&
                 (sameNode(parent.childForFieldName('name'), node))) {
                 usageType = 'definition';
-            } else if (parent.type === 'invocation_expression' ||
-                parent.parent?.type === 'invocation_expression') {
+            } else if (invokesNameExpression(expression)) {
                 usageType = 'call';
             } else if (parent.type === 'using_directive') {
                 usageType = 'import';
             }
-            if (parent.type === 'member_access_expression' &&
-                sameNode(parent.childForFieldName('name'), node)) {
-                const receiverNode = parent.childForFieldName('expression') ||
-                    parent.namedChild(0);
-                const receiver = receiverNode?.text;
+            const identity = invocationIdentity(expression);
+            if (identity.receiver) {
+                const receiverNode = expression.childForFieldName('expression') ||
+                    expression.childForFieldName('condition') || expression.namedChild(0);
+                const receiver = identity.receiver;
                 const scopeTypes = variableTypesByScope.get(variableScopeKey(node)) ||
                     variableTypesByScope.get('global');
                 const declared = receiverNode?.type === 'identifier'
@@ -2632,6 +2674,8 @@ function usagesInTree(code, name, parser, tree) {
                     ...(receiver && { receiver }),
                     ...((declared?.name || sameClass) && {
                         receiverType: declared?.name || sameClass,
+                        ...(declared?.namespace && { receiverTypeQualifier: declared.namespace }),
+                        ...(Number.isInteger(declared?.typeArgs) && { receiverTypeArgs: declared.typeArgs }),
                     }),
                 });
                 return true;
@@ -2816,6 +2860,8 @@ function accessorTypeSyntax(text) {
 }
 
 module.exports = {
+    methodGroupReceiver,
+    isInvokedName,
     queryUsingDirectives,
     accessorReferenceShape,
     accessorTypeSyntax,

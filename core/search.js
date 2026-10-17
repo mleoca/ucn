@@ -377,6 +377,11 @@ function usages(index, name, options = {}) {
                         // plan gains precision without changing that surface.
                         ...(options.internalEvidence && {
                             ...(Number.isInteger(u.column) && { column: u.column }),
+                            ...(u.receiverType && {
+                                receiverType: u.receiverType,
+                                ...(u.receiverTypeQualifier && { receiverTypeQualifier: u.receiverTypeQualifier }),
+                                ...(Number.isInteger(u.receiverTypeArgs) && { receiverTypeArgs: u.receiverTypeArgs }),
+                            }),
                             ...(u.receiverIsModule && { receiverIsModule: true }),
                             ...(u.receiverLocalBinding && { receiverLocalBinding: true }),
                             ...(u.namespace && { namespace: u.namespace }),
