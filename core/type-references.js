@@ -991,7 +991,9 @@ class TypeReferenceResolver {
         if (!entry) return { verdict: 'unknown', reason: 'unindexed-file' };
         if (this.family === 'c') return this.resolveCFamily(file, line, name, null);
         if (this.family === 'rust') return this.resolveRustName(file, line, name);
-        const local = this.visibleInFile(file, line, name);
+        // A C# compilation unit can hold several namespace bodies. A type
+        // declared somewhere in the file is not automatically in scope.
+        const local = this.family === 'csharp' ? [] : this.visibleInFile(file, line, name);
         if (local.length > 0) {
             // A module-scope assignment of the name rebinds it, unless that
             // assignment is the type's own declaration (a type alias).
@@ -1189,27 +1191,7 @@ class TypeReferenceResolver {
     csharpSiteNamespace(file, line) {
         const node = this.siteNode && this.siteFile === file && this.siteNode.startPosition.row + 1 === line
             ? this.siteNode : null;
-        if (node) {
-            const parts = [];
-            let root = node;
-            for (let current = node.parent; current; current = current.parent) {
-                if (current.type === 'namespace_declaration') {
-                    const nameNode = current.childForFieldName('name');
-                    if (nameNode) parts.unshift(textOf(nameNode));
-                }
-                root = current;
-            }
-            for (let i = 0; i < root.namedChildCount; i++) {
-                const child = root.namedChild(i);
-                if (child.startIndex > node.startIndex) break;
-                if (child.type === 'file_scoped_namespace_declaration') {
-                    const nameNode = child.childForFieldName('name');
-                    if (nameNode) parts.unshift(textOf(nameNode));
-                    break;
-                }
-            }
-            if (parts.length > 0) return parts.join('.');
-        }
+        if (node) return require('../languages/csharp-scope').usingScopesOf(node).at(-1)?.namespace || '';
         const { siteNamespaceOf } = require('./type-denotation');
         return siteNamespaceOf(this.index.files.get(file), line);
     }
@@ -1226,10 +1208,10 @@ class TypeReferenceResolver {
         const entry = this.index.files.get(file);
         const { csharpUsings } = require('./type-denotation');
         const candidates = this.all.filter(d => d.name === name && !d.enclosingType);
-        const alias = (entry.importBindings || []).some(b => b.name === name && b.kind === 'using');
-        if (alias) return { verdict: 'no', reason: 'using-alias' };
         const site = this.csharpSiteNamespace(file, line);
         if (site === undefined) return { verdict: 'unknown', reason: 'unknown-namespace' };
+        const localNested = this.visibleInFile(file, line, name).filter(d => d.enclosingType);
+        if (localNested.length) return this.judge(localNested);
         // Member types of an enclosing class come first, declared in any
         // `partial` part of it (fix #395: `readonly DepthLimiter _d;` in one
         // part of `partial class PropertyValueConverter`, the nested class
@@ -1250,6 +1232,7 @@ class TypeReferenceResolver {
                 if (members.length > 0) return this.judge(members);
             }
         }
+        const scope = csharpUsings(this.index, file, site, this.siteNode);
         const chain = [];
         for (let parts = site ? site.split('.') : []; parts.length > 0; parts = parts.slice(0, -1)) {
             chain.push(parts.join('.'));
@@ -1257,15 +1240,20 @@ class TypeReferenceResolver {
         chain.push('');
         for (const ns of chain) {
             const here = candidates.filter(d => (d.namespace || '') === ns);
+            const alias = scope.aliases.has(name) && scope.aliasScopes?.get(name) === ns;
+            if (alias && (here.length || scope.ambiguousAliases.has(name))) {
+                return { verdict: 'unknown', reason: 'ambiguous-type' };
+            }
             if (here.length > 0) return this.judge(here);
+            if (alias) return { verdict: 'no', reason: 'using-alias' };
+            // This namespace's imports are considered before its parent's
+            // declarations; using-static directives can provide nested types.
+            const usings = new Set([...scope.namespaces, ...scope.statics].filter(module =>
+                scope.namespaceScopes.get(module)?.has(ns) || scope.staticScopes.get(module)?.has(ns)));
+            const viaUsing = candidates.filter(d => usings.has(d.namespace || '') ||
+                (d.enclosingType && usings.has(`${d.namespace ? d.namespace + '.' : ''}${d.enclosingType}`)));
+            if (viaUsing.length > 0) return this.judge(viaUsing);
         }
-        // Using directives resolved from the namespace each is written in
-        // (fix #395: `namespace FluentValidation; using Results;` names
-        // FluentValidation.Results); `using static` also brings nested types.
-        const scope = csharpUsings(this.index, file);
-        const usings = new Set([...scope.namespaces, ...scope.statics]);
-        const viaUsing = candidates.filter(d => usings.has(d.namespace || ''));
-        if (viaUsing.length > 0) return this.judge(viaUsing);
         if ([...this.group].some(d => d.enclosingType) && this.inheritsFromPinOwner(file)) {
             return { verdict: 'unknown', reason: 'inherited-member-type' };
         }
@@ -2002,7 +1990,6 @@ class TypeReferenceResolver {
     }
 
     resolveCSharpQualified(file, line, text, tok) {
-        const entry = this.index.files.get(file);
         // An `extern alias` qualifier (`Old::Lib.Core.Widget`, fix #401)
         // names an assembly reference: a project namespace of that spelling
         // may or may not be the assembly's.
@@ -2014,13 +2001,15 @@ class TypeReferenceResolver {
             return spelled ? { verdict: 'unknown', reason: 'extern-alias' } : { verdict: 'no', reason: 'external-namespace' };
         }
         let qualifier = text.replace(/<.*?>/g, '').replace(/^global::/, '');
-        // A using alias names the qualifier's head.
+        // A using alias names the qualifier's head in this namespace body.
         const head = qualifier.split('.')[0];
-        const alias = (entry.importBindings || []).find(b => b.name === head && b.kind === 'using' && b.module);
-        if (alias) qualifier = [alias.module, ...qualifier.split('.').slice(1)].join('.');
-        const site = text.startsWith('global::') || alias ? '' : (this.csharpSiteNamespace(file, line) || '');
+        const { csharpUsings } = require('./type-denotation');
+        const namespace = this.csharpSiteNamespace(file, line);
+        if (namespace === undefined) return { verdict: 'unknown', reason: 'unknown-namespace' };
+        const scope = csharpUsings(this.index, file, namespace, this.siteNode);
+        const global = text.startsWith('global::');
         const chain = [];
-        for (let parts = site ? site.split('.') : []; parts.length > 0; parts = parts.slice(0, -1)) {
+        for (let parts = !global && namespace ? namespace.split('.') : []; parts.length > 0; parts = parts.slice(0, -1)) {
             chain.push(parts.join('.'));
         }
         chain.push('');
@@ -2032,8 +2021,20 @@ class TypeReferenceResolver {
                 const prefix = `${d.namespace || ''}${d.enclosingType ? (d.namespace ? '.' : '') + d.enclosingType : ''}`;
                 return prefix === full;
             });
+            const alias = !global && scope.aliasScopes?.get(head) === ns && scope.aliases.get(head);
+            if (alias && (hits.length || scope.ambiguousAliases.has(head))) {
+                return { verdict: 'unknown', reason: 'ambiguous-type' };
+            }
             if (hits.length > 0) return this.judge(hits);
             if (namespaces.has(full)) return { verdict: 'no', reason: 'other-namespace' };
+            if (alias) {
+                if (scope.aliasSyntax.get(head)?.includes('<')) {
+                    return { verdict: 'unknown', reason: 'generic-alias-owner' };
+                }
+                const expanded = [alias, ...qualifier.split('.').slice(1)].join('.');
+                return this.resolveCSharpQualified(file, line, 'global::' + expanded, tok);
+            }
+            if (namespaces.has(ns ? `${ns}.${head}` : head)) return { verdict: 'no', reason: 'other-namespace' };
         }
         const last = qualifier.split('.').pop();
         if (candidates.some(d => d.enclosingType === last)) {

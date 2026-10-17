@@ -18,6 +18,730 @@ const { execute } = require('../core/execute');
 const { computeReachability } = require('../core/entrypoints');
 const { tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR, runCli, runInteractive } = require('./helpers');
 
+describe('fix #410: implicit property accesses preserve language binding', () => {
+    function inspect(files, pin, verify) {
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const impact = execute(index, 'impact', { name: pin });
+            const plan = execute(index, 'plan', { name: pin, renameTo: 'Renamed' });
+            assert.ok(impact.ok, impact.error);
+            assert.ok(plan.ok, plan.error);
+            verify(impact.result, plan.result);
+        } finally { rm(dir); }
+    }
+    const editsAt = (plan, file, line) => plan.changes.filter(change =>
+        change.file === file && change.line === line && change.newExpression !== undefined);
+    const confirmed = impact => (impact.propertyAccesses?.byFile || []).flatMap(group => group.sites);
+
+    it('C#: implicit reads in indexers and compound writes are property dependencies', () => {
+        inspect({ 'A.cs': [
+            'class Account {',
+            '  public decimal Balance { get; private set; }',
+            '  public decimal this[int i] => Balance * i;',
+            '  public void Deposit(decimal amount) { Balance += amount; }',
+            '}',
+        ].join('\n') }, 'A.cs:2:Balance', (impact, plan) => {
+            assert.deepStrictEqual(confirmed(impact).map(site => [site.line, site.accessKind]),
+                [[3, 'read'], [4, 'read/write']]);
+            assert.strictEqual(editsAt(plan, 'A.cs', 3)[0]?.newExpression,
+                'public decimal this[int i] => Renamed * i;');
+            assert.strictEqual(editsAt(plan, 'A.cs', 4)[0]?.newExpression,
+                'public void Deposit(decimal amount) { Renamed += amount; }');
+        });
+    });
+    for (const [name, kind] of [['Size', 'write'], ['Tags', 'read']]) {
+        it(`C#: ${name} initializer keys bind to the initialized object`, () => {
+            inspect({ 'A.cs': [
+                'class Options {',
+                '  public int Size { get; set; }',
+                '  public System.Collections.Generic.List<string> Tags { get; } = new();',
+                '}',
+                'class Use { object Make() => new Options { Size = 3, Tags = { "a" } }; }',
+            ].join('\n') }, `A.cs:${name === 'Size' ? 2 : 3}:${name}`, (impact, plan) => {
+                assert.deepStrictEqual(confirmed(impact).map(site => [site.line, site.accessKind]), [[5, kind]]);
+                assert.strictEqual(editsAt(plan, 'A.cs', 5)[0]?.newExpression,
+                    name === 'Size'
+                        ? 'class Use { object Make() => new Options { Renamed = 3, Tags = { "a" } }; }'
+                        : 'class Use { object Make() => new Options { Size = 3, Renamed = { "a" } }; }');
+            });
+        });
+    }
+    for (const expression of ['Options result = new() { Size = 4 };',
+        'return new() { Size = 4 };']) {
+        it(`C#: a target-typed initializer uses its written target: ${expression}`, () => {
+            inspect({ 'A.cs': [
+                'class Options { public int Size { get; set; } }',
+                'class Use { Options Make() {',
+                '  ' + expression,
+                ...(expression.startsWith('Options') ? ['  return result;'] : []),
+                '} }',
+            ].join('\n') }, 'A.cs:1:Size', (impact, plan) => {
+                assert.ok(confirmed(impact).some(site => site.line === 3), JSON.stringify(impact));
+                assert.strictEqual(editsAt(plan, 'A.cs', 3)[0]?.newExpression, expression.replace('Size', 'Renamed'));
+            });
+        });
+    }
+    it('C#: implicit member lookup sees another partial part and resolved bases', () => {
+        inspect({
+            'A.cs': 'namespace N; partial class Account { public int Size { get; set; } }',
+            'B.cs': 'namespace N; partial class Account { int Read() => Size; }\nclass Child : Account { int Read() => Size; }',
+        }, 'A.cs:1:Size', (impact, plan) => {
+            assert.strictEqual(confirmed(impact).length, 2, JSON.stringify(impact));
+            assert.strictEqual(editsAt(plan, 'B.cs', 1)[0]?.newExpression,
+                'namespace N; partial class Account { int Read() => Renamed; }');
+            assert.strictEqual(editsAt(plan, 'B.cs', 2)[0]?.newExpression,
+                'class Child : Account { int Read() => Renamed; }');
+        });
+    });
+    it('C#: two same-named owners in one file do not share bare references', () => {
+        inspect({ 'A.cs': [
+            'namespace Left { class Box { public int Size { get; set; } int Read() => Size; } }',
+            'namespace Right { class Box { public int Size { get; set; } int Read() => Size; } }',
+        ].join('\n') }, 'A.cs:1:Size', (impact, plan) => {
+            assert.ok(!plan.changes.some(change => change.line === 2), JSON.stringify(plan));
+            assert.strictEqual(editsAt(plan, 'A.cs', 1)[0]?.newExpression,
+                'namespace Left { class Box { public int Renamed { get; set; } int Read() => Renamed; } }');
+        });
+    });
+    it('C#: qualified and aliased initializer types keep unrelated owners', () => {
+        inspect({
+            'A.cs': 'namespace Left; public class Box { public int Size { get; set; } }',
+            'B.cs': 'namespace Right; public class Box { public int Size { get; set; } }',
+            'Use.cs': 'using Alias = Left.Box;\nclass Use {\n  object A() => new Left.Box { Size = 1 };\n  object B() => new Right.Box { Size = 2 };\n  object C() => new Alias { Size = 3 };\n}',
+        }, 'A.cs:1:Size', (impact, plan) => {
+            assert.ok(!plan.changes.some(change => change.file === 'Use.cs' && change.line === 4), JSON.stringify(plan));
+            assert.strictEqual(editsAt(plan, 'Use.cs', 3)[0]?.newExpression,
+                'object A() => new Left.Box { Renamed = 1 };');
+            assert.strictEqual(editsAt(plan, 'Use.cs', 5)[0]?.newExpression,
+                'object C() => new Alias { Renamed = 3 };');
+        });
+    });
+    it('C#: an unproved target-typed initializer remains visible for review', () => {
+        inspect({ 'A.cs': [
+            'class Options { public int Size { get; set; } }',
+            'class Use { void Accept(Options value) {}',
+            '  void Run() => Accept(new() { Size = 4 });',
+            '}',
+        ].join('\n') }, 'A.cs:1:Size', (impact, plan) => {
+            assert.ok(confirmed(impact).some(site => site.line === 3) ||
+                impact.propertyAccesses?.unverifiedSites.some(site => site.line === 3), JSON.stringify(impact));
+            assert.ok(editsAt(plan, 'A.cs', 3).length || plan.changes.some(change =>
+                change.line === 3 && change.needsReview && change.editKind === 'reference'), JSON.stringify(plan));
+        });
+    });
+    for (const [label, member] of [
+        ['parameter', 'int Read(int Size) => Size;'],
+        ['local', 'int Read() { int Size = 1; return Size; }'],
+        ['lambda', 'object Read() => (System.Func<int, int>)(Size => Size);'],
+        ['foreach', 'int Read() { int sum = 0; foreach (var Size in new[] { 1 }) sum += Size; return sum; }'],
+        ['catch', 'object Read() { try { throw new System.Exception(); } catch (System.Exception Size) { return Size; } }'],
+        ['pattern', 'int Read(object item) => item is int Size ? Size : 0;'],
+        ['query', 'object Read() => from Size in new[] { 1 } select Size;'],
+        ['indexer parameter', 'public int this[int Size] => Size;'],
+    ]) {
+        it(`C#: a ${label} binding hides the same-spelled property`, () => {
+            inspect({ 'A.cs': 'using System.Linq;\nclass Box {\n  public int Size { get; set; }\n  ' + member + '\n}' },
+                'A.cs:3:Size', (impact, plan) => {
+                    assert.ok(!plan.changes.some(change => change.line === 4), JSON.stringify(plan));
+                    assert.ok(!confirmed(impact).some(site => site.line === 4), JSON.stringify(impact));
+                });
+        });
+    }
+    it('C#: setter value is local while a getter and this.value use the property', () => {
+        inspect({ 'A.cs': [
+            'class Box {',
+            '  public int value { get; set; }',
+            '  public int Other {',
+            '    get { return value; }',
+            '    set { this.value = value; }',
+            '  }',
+            '}',
+        ].join('\n') }, 'A.cs:2:value', (impact, plan) => {
+            assert.strictEqual(editsAt(plan, 'A.cs', 4)[0]?.newExpression, 'get { return Renamed; }');
+            assert.strictEqual(editsAt(plan, 'A.cs', 5)[0]?.newExpression, 'set { this.Renamed = value; }');
+            assert.strictEqual(confirmed(impact).filter(site => site.line === 5).length, 1);
+        });
+    });
+    it('C#: a primary-constructor parameter supplies an initializer, members supply bodies', () => {
+        inspect({ 'A.cs': [
+            'class Box(int Size) {',
+            '  public int Size { get; set; } = Size;',
+            '  int Read() => Size;',
+            '}',
+        ].join('\n') }, 'A.cs:2:Size', (impact, plan) => {
+            assert.strictEqual(editsAt(plan, 'A.cs', 2)[0]?.newExpression,
+                'public int Renamed { get; set; } = Size;');
+            assert.strictEqual(editsAt(plan, 'A.cs', 3)[0]?.newExpression, 'int Read() => Renamed;');
+        });
+    });
+    it('C#: declaration and both initializer tokens share one exact line edit', () => {
+        const line = 'class Box { public int Size { get; set; } Box Copy() => new Box { Size = Size }; }';
+        inspect({ 'A.cs': line }, 'A.cs:1:Size', (impact, plan) => {
+            assert.strictEqual(editsAt(plan, 'A.cs', 1).length, 1, JSON.stringify(plan));
+            assert.strictEqual(editsAt(plan, 'A.cs', 1)[0].newExpression,
+                'class Box { public int Renamed { get; set; } Box Copy() => new Box { Renamed = Renamed }; }');
+        });
+    });
+    it('C#: anonymous projection names are preserved or explicitly reviewed', () => {
+        inspect({ 'A.cs': 'class Box {\n  public int Size { get; set; }\n  int Read() { var item = new { Size }; return item.Size; }\n}' },
+            'A.cs:2:Size', (impact, plan) => {
+                const concrete = editsAt(plan, 'A.cs', 3);
+                const projectionColumn = '  int Read() { var item = new { Size }; return item.Size; }'.indexOf('Size');
+                const projectionReview = impact.propertyAccesses?.unverifiedSites.some(site =>
+                    site.line === 3 && site.column === projectionColumn && site.reason.includes('inferred'));
+                assert.ok(concrete.some(change => change.newExpression.includes('new { Size = Renamed }')) ||
+                    projectionReview, JSON.stringify({ impact, plan }));
+            });
+    });
+    it('C#: increments read and write the property', () => {
+        inspect({ 'A.cs': 'class Box {\n  public int Size { get; set; }\n  void Change() { Size++; ++Size; }\n}' },
+            'A.cs:2:Size', (impact, plan) => {
+                assert.deepStrictEqual(confirmed(impact).map(site => site.accessKind), ['read/write', 'read/write']);
+                assert.strictEqual(editsAt(plan, 'A.cs', 3)[0]?.newExpression,
+                    'void Change() { Renamed++; ++Renamed; }');
+            });
+    });
+    it('C#: an enclosing static property is visible from a nested type', () => {
+        inspect({ 'A.cs': 'class Outer {\n  public static int Size { get; set; }\n  class Inner { int Read() => Size; }\n}' },
+            'A.cs:2:Size', (impact, plan) => {
+                assert.strictEqual(editsAt(plan, 'A.cs', 3)[0]?.newExpression,
+                    'class Inner { int Read() => Renamed; }');
+            });
+    });
+    it('C#: event accessors bind their own value parameter', () => {
+        inspect({ 'A.cs': [
+            'class Box {',
+            '  public int value { get; set; }',
+            '  System.Action sink;',
+            '  public event System.Action Changed { add { sink += value; } remove { sink -= value; } }',
+            '  int Read() => value;',
+            '}',
+        ].join('\n') }, 'A.cs:2:value', (impact, plan) => {
+            assert.ok(!plan.changes.some(change => change.line === 4), JSON.stringify(plan));
+            assert.strictEqual(editsAt(plan, 'A.cs', 5)[0]?.newExpression, 'int Read() => Renamed;');
+        });
+    });
+    for (const parameterOwner of ['method', 'class']) {
+        it(`C#: a ${parameterOwner} type parameter never borrows a project type's property`, () => {
+            const use = parameterOwner === 'method'
+                ? 'class Use { object Make<Options>() where Options : Other, new() => new Options { Size = 1 }; }'
+                : 'class Use<Options> where Options : Other, new() { object Make() => new Options { Size = 1 }; }';
+            inspect({
+                'A.cs': 'class Options { public int Size { get; set; } }\nclass Other { public int Size { get; set; } }',
+                'Use.cs': use,
+            }, 'A.cs:1:Size', (impact, plan) => {
+                assert.ok(!editsAt(plan, 'Use.cs', 1).length, JSON.stringify(plan));
+                assert.ok(!confirmed(impact).some(site => site.file === 'Use.cs'), JSON.stringify(impact));
+            });
+        });
+    }
+    it('C#: an initializer type follows the usings of its own namespace', () => {
+        inspect({
+            'A.cs': 'namespace Left { public class Box { public int Size { get; set; } } }\nnamespace One { using Left; }\nnamespace Two { using Right; class Use { object Make() => new Box { Size = 1 }; } }',
+            'B.cs': 'namespace Right { public class Box { public int Size { get; set; } } }',
+        }, 'A.cs:1:Size', (impact, plan) => {
+            assert.ok(!editsAt(plan, 'A.cs', 3).length, JSON.stringify(plan));
+            assert.ok(!confirmed(impact).some(site => site.file === 'A.cs' && site.line === 3), JSON.stringify(impact));
+        });
+    });
+    it('C#: a qualifier alias is scoped to the namespace containing the initializer', () => {
+        inspect({
+            'A.cs': 'namespace Left { public class Box { public int Size { get; set; } } }',
+            'B.cs': 'namespace Right { public class Box { public int Size { get; set; } } }',
+            'Use.cs': 'namespace One { using Alias = Left; class Use { object Make() => new Alias.Box { Size = 1 }; } }\nnamespace Two { using Alias = Right; class Use { object Make() => new Alias.Box { Size = 2 }; } }',
+        }, 'A.cs:1:Size', (impact, plan) => {
+            assert.strictEqual(editsAt(plan, 'Use.cs', 1)[0]?.newExpression,
+                'namespace One { using Alias = Left; class Use { object Make() => new Alias.Box { Renamed = 1 }; } }');
+            assert.ok(!editsAt(plan, 'Use.cs', 2).length, JSON.stringify(plan));
+        });
+    });
+    it('C#: a generic owner keeps its separate arity', () => {
+        inspect({ 'A.cs': [
+            'class Box { public int Size { get; set; } int Read() => Size; }',
+            'class Box<T> { public int Size { get; set; } int Read() => Size; }',
+            'class Use { object Make() => new Box<int> { Size = 1 }; }',
+        ].join('\n') }, 'A.cs:1:Size', (impact, plan) => {
+            assert.ok(!editsAt(plan, 'A.cs', 2).length, JSON.stringify(plan));
+            assert.ok(!editsAt(plan, 'A.cs', 3).length, JSON.stringify(plan));
+        });
+    });
+    it('C#: an explicit interface property does not bind bare or initializer names', () => {
+        inspect({ 'A.cs': [
+            'interface I { int Size { get; } }',
+            'class Box : I {',
+            '  int I.Size => 1;',
+            '  public int Size { get; set; }',
+            '  int Read() => Size;',
+            '  Box Make() => new Box { Size = 1 };',
+            '}',
+        ].join('\n') }, 'A.cs:3:Size', (impact, plan) => {
+            assert.ok(!editsAt(plan, 'A.cs', 5).length, JSON.stringify(plan));
+            assert.ok(!editsAt(plan, 'A.cs', 6).length, JSON.stringify(plan));
+        });
+    });
+    it('C#: a nested type hides an outer using alias in an initializer', () => {
+        inspect({ 'A.cs': [
+            'using Options = Other;',
+            'class Other { public int Size { get; set; } }',
+            'class Outer { public class Options { public int Size { get; set; } }',
+            '  object Make() => new Options { Size = 1 };',
+            '}',
+        ].join('\n') }, 'A.cs:3:Size', (impact, plan) => {
+            assert.strictEqual(editsAt(plan, 'A.cs', 4)[0]?.newExpression,
+                'object Make() => new Options { Renamed = 1 };');
+        });
+    });
+    for (const pinLine of [1, 2]) {
+        it(`C#: a closed generic using alias keeps the owner's arity (pin ${pinLine})`, () => {
+            inspect({
+                'A.cs': 'namespace N { public class Box { public int Size { get; set; } }\npublic class Box<T> { public int Size { get; set; } } }',
+                'Use.cs': 'using Alias = N.Box<int>;\nclass Use { object Make() => new Alias { Size = 1 }; }',
+            }, `A.cs:${pinLine}:Size`, (impact, plan) => {
+                if (pinLine === 1) assert.ok(!editsAt(plan, 'Use.cs', 2).length, JSON.stringify(plan));
+                else assert.strictEqual(editsAt(plan, 'Use.cs', 2)[0]?.newExpression,
+                    'class Use { object Make() => new Alias { Renamed = 1 }; }');
+            });
+        });
+    }
+    it('C#: a global alias target is resolved from the global namespace', () => {
+        inspect({
+            'A.cs': 'namespace Left { public class Box { public int Size { get; set; } } }\nnamespace N.Left { public class Box { public int Size { get; set; } } }',
+            'Use.cs': 'namespace N { using Alias = global::Left.Box; class Use { object Make() => new Alias { Size = 1 }; } }',
+        }, 'A.cs:1:Size', (impact, plan) => {
+            assert.strictEqual(editsAt(plan, 'Use.cs', 1)[0]?.newExpression,
+                'namespace N { using Alias = global::Left.Box; class Use { object Make() => new Alias { Renamed = 1 }; } }');
+        });
+    });
+    it('C#: current-namespace imports bind before a global same-named class', () => {
+        inspect({
+            'A.cs': 'public class Box { public int Size { get; set; } }',
+            'B.cs': 'namespace N { public class Box { public int Size { get; set; } } }\nnamespace Use { using N; class Make { object Run() => new Box { Size = 1 }; } }',
+        }, 'A.cs:1:Size', (impact, plan) => {
+            assert.ok(!editsAt(plan, 'B.cs', 2).length, JSON.stringify(plan));
+            assert.ok(!confirmed(impact).some(site => site.file === 'B.cs'), JSON.stringify(impact));
+        });
+    });
+    it('C#: alternative using aliases leave an initializer target for review', () => {
+        inspect({
+            'A.cs': 'namespace Left { public class Box { public int Size { get; set; } } }',
+            'B.cs': 'namespace Right { public class Box { public int Size { get; set; } } }',
+            'Use.cs': '#if MODE\nusing Alias = Left.Box;\n#else\nusing Alias = Right.Box;\n#endif\nclass Use { object Make() => new Alias { Size = 1 }; }',
+        }, 'A.cs:1:Size', (impact, plan) => {
+            assert.ok(!editsAt(plan, 'Use.cs', 6).length, JSON.stringify(plan));
+            assert.ok(impact.propertyAccesses?.unverifiedSites.some(site => site.file === 'Use.cs' && site.line === 6),
+                JSON.stringify(impact));
+        });
+    });
+    it('C#: class renames use the same namespace-scoped type lookup', () => {
+        inspect({
+            'A.cs': 'namespace Left { public class Box {} }\nnamespace One { using Left; }\nnamespace Two { using Right; class Use { Box Make() => new Box(); } }',
+            'B.cs': 'namespace Right { public class Box {} }',
+        }, 'A.cs:1:Box', (impact, plan) => {
+            assert.ok(!editsAt(plan, 'A.cs', 3).length, JSON.stringify(plan));
+        });
+    });
+    it('C#: a property in a foreach source is outside the iteration variable scope', () => {
+        inspect({ 'A.cs': 'class Box {\n  public int[] Size { get; } = new[] { 1 };\n  int Read() { int sum = 0; foreach (var Size in Size) sum += Size; return sum; }\n}' },
+            'A.cs:2:Size', (impact, plan) => {
+                assert.strictEqual(editsAt(plan, 'A.cs', 3)[0]?.newExpression,
+                    'int Read() { int sum = 0; foreach (var Size in Renamed) sum += Size; return sum; }');
+            });
+    });
+    it('C#: a query source precedes its range variable binding', () => {
+        inspect({ 'A.cs': 'using System.Linq;\nclass Box {\n  public int[] Size { get; } = new[] { 1 };\n  object Read() => from Size in Size select Size;\n}' },
+            'A.cs:3:Size', (impact, plan) => {
+                assert.strictEqual(editsAt(plan, 'A.cs', 4)[0]?.newExpression,
+                    'object Read() => from Size in Renamed select Size;');
+            });
+    });
+    for (const query of [
+        'from item in new[] { 1 } join Size in new[] { 1 } on item equals Size select Size',
+        'from item in new[] { 1 } group item by item into Size select Size',
+    ]) {
+        it(`C#: query bindings hide a property: ${query}`, () => {
+            inspect({ 'A.cs': 'using System.Linq;\nclass Box {\n  public int Size { get; set; }\n  object Read() => ' + query + ';\n}' },
+                'A.cs:3:Size', (impact, plan) => {
+                    assert.ok(!plan.changes.some(change => change.line === 4), JSON.stringify(plan));
+                });
+        });
+    }
+    it('C#: deconstructed iteration variables hide the property in their body', () => {
+        inspect({ 'A.cs': 'class Box {\n  public int Size { get; set; }\n  int Read() { int sum = 0; foreach (var (Size, other) in new[] { (1, 2) }) sum += Size; return sum; }\n}' },
+            'A.cs:2:Size', (impact, plan) => {
+                assert.ok(!plan.changes.some(change => change.line === 3), JSON.stringify(plan));
+            });
+    });
+    it('C#: property-pattern keys belong to the matched object', () => {
+        inspect({ 'A.cs': [
+            'class Address { public int Size { get; set; } }',
+            'class Other { public int Size { get; set; } }',
+            'class Box { public Other Address { get; } = new();',
+            '  bool Read() => this is { Address.Size: 1 };',
+            '}',
+        ].join('\n') }, 'A.cs:1:Size', (impact, plan) => {
+            assert.ok(!editsAt(plan, 'A.cs', 4).length, JSON.stringify(plan));
+        });
+    });
+    it('C#: using-static supplies a bare property outside its owner', () => {
+        inspect({ 'A.cs': 'using static N.Box;\nnamespace N { public class Box { public static int Size { get; set; } } }\nclass Use { int Read() => Size; }' },
+            'A.cs:2:Size', (impact, plan) => {
+                assert.strictEqual(editsAt(plan, 'A.cs', 3)[0]?.newExpression, 'class Use { int Read() => Renamed; }');
+            });
+    });
+    for (const local of [false, true]) {
+        it(`C#: top-level ${local ? 'local hides' : 'expression reaches'} a static property`, () => {
+            inspect({ 'A.cs': 'using static Box;\n' + (local ? 'int Size = 2; ' : '') +
+                'System.Console.WriteLine(Size);\nclass Box { public static int Size { get; set; } }' },
+                'A.cs:3:Size', (impact, plan) => {
+                    if (local) assert.ok(!plan.changes.some(change => change.line === 2), JSON.stringify(plan));
+                    else assert.strictEqual(editsAt(plan, 'A.cs', 2)[0]?.newExpression,
+                        'System.Console.WriteLine(Renamed);');
+                });
+        });
+    }
+    it('C#: a namespace alias hides a project-file global alias', () => {
+        inspect({
+            'A.cs': 'namespace Left { public class Box { public int Size { get; set; } } }',
+            'B.cs': 'namespace Right { public class Box { public int Size { get; set; } } }',
+            'Use.cs': 'namespace N { using Alias = Left.Box; class Use { object Make() => new Alias { Size = 1 }; } }',
+            'App.csproj': '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup><ItemGroup><Using Include="Right.Box" Alias="Alias" /></ItemGroup></Project>',
+        }, 'A.cs:1:Size', (impact, plan) => {
+            assert.strictEqual(editsAt(plan, 'Use.cs', 1)[0]?.newExpression,
+                'namespace N { using Alias = Left.Box; class Use { object Make() => new Alias { Renamed = 1 }; } }');
+        });
+    });
+    it('C#: a using alias RHS sees outer aliases rather than aliases in its own body', () => {
+        inspect({
+            'A.cs': 'namespace Left { public class Box { public int Size { get; set; } } }',
+            'B.cs': 'namespace Right { public class Box { public int Size { get; set; } } }',
+            'Use.cs': 'using Alias = Left;\nnamespace N { using Alias = Right; using Item = Alias.Box; class Use { object Make() => new Item { Size = 1 }; } }',
+        }, 'A.cs:1:Size', (impact, plan) => {
+            assert.strictEqual(editsAt(plan, 'Use.cs', 2)[0]?.newExpression,
+                'namespace N { using Alias = Right; using Item = Alias.Box; class Use { object Make() => new Item { Renamed = 1 }; } }');
+        });
+    });
+    it('C#: invoking a delegate-valued property reads that property', () => {
+        inspect({ 'A.cs': [
+            'class Box {',
+            '  public System.Func<int> Size { get; } = () => 1;',
+            '  int Read(Box other) => Size() + other.Size();',
+            '}',
+        ].join('\n') }, 'A.cs:2:Size', (impact, plan) => {
+            assert.deepStrictEqual(confirmed(impact).map(site => site.accessKind), ['read', 'read']);
+            assert.strictEqual(editsAt(plan, 'A.cs', 3)[0]?.newExpression,
+                'int Read(Box other) => Renamed() + other.Renamed();');
+        });
+    });
+    it('C#: initializer keys keep the AST view that owns each conditional body', () => {
+        inspect({ 'A.cs': [
+            'class Options { public int Size { get; set; } }',
+            'class Use {',
+            '  object Make()',
+            '#if MODE',
+            '    => new Options { Size = 1 };',
+            '#else',
+            '    => new Options { Size = 2 };',
+            '#endif',
+            '}',
+        ].join('\n') }, 'A.cs:1:Size', (impact, plan) => {
+            assert.strictEqual(editsAt(plan, 'A.cs', 5)[0]?.newExpression, '=> new Options { Renamed = 1 };');
+            assert.strictEqual(editsAt(plan, 'A.cs', 7)[0]?.newExpression, '=> new Options { Renamed = 2 };');
+        });
+    });
+    for (const alias of [false, true]) {
+        it(`C#: repeated namespace bodies keep their own ${alias ? 'aliases' : 'imports'}`, () => {
+            const type = alias ? 'Alias' : 'Box';
+            const left = alias ? 'using Alias = Left.Box;' : 'using Left;';
+            const right = alias ? 'using Alias = Right.Box;' : 'using Right;';
+            inspect({
+                'A.cs': 'namespace Left { public class Box { public int Size { get; set; } } }',
+                'B.cs': 'namespace Right { public class Box { public int Size { get; set; } } }',
+                'Use.cs': `namespace N { ${left} class First { object Make() => new ${type} { Size = 1 }; } }\nnamespace N { ${right} class Second { object Make() => new ${type} { Size = 2 }; } }`,
+            }, 'A.cs:1:Size', (impact, plan) => {
+                assert.strictEqual(editsAt(plan, 'Use.cs', 1)[0]?.newExpression,
+                    `namespace N { ${left} class First { object Make() => new ${type} { Renamed = 1 }; } }`);
+                assert.ok(!editsAt(plan, 'Use.cs', 2).length, JSON.stringify(plan));
+            });
+        });
+    }
+    for (const source of [
+        'class Base {\n  public virtual int Size => 1;\n  public int Read() => Size;\n}\nclass Box : Base {\n  public override int Size => 2;\n}',
+        'interface Base {\n  int Size { get; }\n  int Read() => Size;\n}\nclass Box : Base {\n  public int Size => 2;\n}',
+    ]) {
+        it(`C#: an implicit ancestor receiver can dispatch to ${source.startsWith('interface') ? 'an implementation' : 'an override'}`, () => {
+            inspect({ 'A.cs': source }, 'A.cs:6:Size', (impact, plan) => {
+                assert.ok(impact.propertyAccesses.unverifiedSites.some(site => site.line === 3), JSON.stringify(impact));
+                assert.ok(!confirmed(impact).some(site => site.line === 3), JSON.stringify(impact));
+            });
+        });
+    }
+    it('C#: an explicitly constructed ancestor does not dispatch to a derived property', () => {
+        inspect({ 'A.cs': [
+            'class Base { public virtual int Size { get; set; } }',
+            'class Box : Base { public override int Size { get; set; } }',
+            'class Use { object Make() => new Base { Size = 1 }; }',
+        ].join('\n') }, 'A.cs:2:Size', (impact, plan) => {
+            assert.ok(!confirmed(impact).some(site => site.line === 3), JSON.stringify(impact));
+            assert.ok(!impact.propertyAccesses.unverifiedSites.some(site => site.line === 3), JSON.stringify(impact));
+        });
+    });
+    it('C#: an interface receiver can reach a member inherited by its implementation', () => {
+        inspect({ 'A.cs': [
+            'interface Source {',
+            '  int Size { get; }',
+            '  int Read() => Size;',
+            '}',
+            'class Box {',
+            '  public int Size => 2;',
+            '}',
+            'class Implementation : Box, Source { }',
+        ].join('\n') }, 'A.cs:6:Size', (impact, plan) => {
+            assert.ok(impact.propertyAccesses.unverifiedSites.some(site => site.line === 3), JSON.stringify(impact));
+            assert.ok(!confirmed(impact).some(site => site.line === 3), JSON.stringify(impact));
+        });
+    });
+    it('C#: an inherited default-interface body keeps its property receiver unverified', () => {
+        inspect({ 'A.cs': [
+            'interface Root { int Size { get; } }',
+            'interface Source : Root {',
+            '  int Read() => Size;',
+            '}',
+            'class Box : Source {',
+            '  public int Size => 2;',
+            '}',
+        ].join('\n') }, 'A.cs:6:Size', (impact, plan) => {
+            assert.ok(impact.propertyAccesses.unverifiedSites.some(site => site.line === 3), JSON.stringify(impact));
+            assert.ok(!confirmed(impact).some(site => site.line === 3), JSON.stringify(impact));
+        });
+    });
+    it('C#: an external ancestor at any depth keeps an unresolved bare property visible', () => {
+        inspect({ 'A.cs': [
+            'class Box {',
+            '  public string Message => "local";',
+            '}',
+            'class Middle : System.Exception { }',
+            'class Use : Middle { string Read() => Message; }',
+        ].join('\n') }, 'A.cs:2:Message', (impact, plan) => {
+            assert.ok(impact.propertyAccesses.unverifiedSites.some(site => site.line === 5), JSON.stringify(impact));
+            assert.ok(!confirmed(impact).some(site => site.line === 5), JSON.stringify(impact));
+        });
+    });
+    for (const delegate of [false, true]) {
+        it(`C#: a conditional ${delegate ? 'delegate property invocation' : 'property access'} is not an implicit enclosing-class member`, () => {
+            inspect({ 'A.cs': [
+                `class Box { public ${delegate ? 'System.Func<int>' : 'int'} Size { get; set; }${delegate ? ' = () => 1;' : ''} }`,
+                'class Use {',
+                `  int? Read(Box box) => box?.Size${delegate ? '()' : ''};`,
+                '}',
+            ].join('\n') }, 'A.cs:1:Size', (impact, plan) => {
+                assert.ok(impact.propertyAccesses.unverifiedSites.some(site => site.line === 3), JSON.stringify(impact));
+                assert.ok(!confirmed(impact).some(site => site.line === 3), JSON.stringify(impact));
+            });
+        });
+    }
+    for (const expression of ['box?.Size = 1', 'box?.Size += 1']) {
+        it(`C#: an unsupported conditional-assignment parse retains an unknown access kind: ${expression}`, () => {
+            inspect({ 'A.cs': [
+                'class Box { public int Size { get; set; } }',
+                'class Use {',
+                `  void Write(Box box) { ${expression}; }`,
+                '}',
+            ].join('\n') }, 'A.cs:1:Size', (impact, plan) => {
+                assert.strictEqual(impact.propertyAccesses.unverifiedSites.find(site => site.line === 3)?.accessKind,
+                    'access', JSON.stringify(impact));
+                assert.ok(impact.account.recovered?.sites.some(site => site.line === 3), JSON.stringify(impact));
+            });
+        });
+    }
+    for (const namespace of ['Outer.Child', 'Other;\nusing Outer']) {
+        it(`C#: conditional file-scoped namespace ${namespace} binds initializer owners`, () => {
+            inspect({
+                'A.cs': 'namespace Outer; public class Box { public int Size { get; set; } }',
+                'Use.cs': `#if MODE\nnamespace ${namespace};\nclass Consumer { object Make() => new Box { Size = 1 }; }\n#endif`,
+            }, 'A.cs:1:Size', (impact, plan) => {
+                const site = confirmed(impact).find(site => site.file === 'Use.cs');
+                assert.ok(site, JSON.stringify(impact));
+                assert.ok(plan.changes.some(change => change.file === 'Use.cs' && !change.needsReview &&
+                    change.newExpression === 'class Consumer { object Make() => new Box { Renamed = 1 }; }'), JSON.stringify(plan));
+            });
+        });
+    }
+    it('C#: conditional file-scoped namespaces keep constructions in a type rename', () => {
+        inspect({
+            'A.cs': 'namespace Outer; public class Box { }',
+            'Use.cs': '#if MODE\nnamespace Outer.Child;\nclass Consumer { object Make() => new Box(); }\n#endif',
+        }, 'A.cs:1:Box', (impact, plan) => {
+            assert.strictEqual(editsAt(plan, 'Use.cs', 3).filter(change => !change.needsReview)[0]?.newExpression,
+                'class Consumer { object Make() => new Renamed(); }');
+        });
+    });
+    for (const [code, pin, expected] of [
+        ['class Box {\n  public static System.Threading.Tasks.Task<int> Task { get; } = System.Threading.Tasks.Task.FromResult(1);\n}',
+            'A.cs:2:Task',
+            'public static System.Threading.Tasks.Task<int> Renamed { get; } = System.Threading.Tasks.Task.FromResult(1);'],
+        ['interface ISource { int Size { get; } }\nclass Box {\n  ISource source;\n  public int Size => source.Size;\n}',
+            'A.cs:4:Size', 'public int Renamed => source.Size;'],
+    ]) {
+        it(`C#: an unresolved access beside ${pin} keeps the concrete declaration edit`, () => {
+            inspect({ 'A.cs': code }, pin, (impact, plan) => {
+                const line = Number(pin.split(':')[1]);
+                const concrete = editsAt(plan, 'A.cs', line).filter(change => !change.needsReview);
+                assert.strictEqual(concrete.length, 1, JSON.stringify(plan));
+                assert.strictEqual(concrete[0].newExpression, expected);
+                assert.ok([...plan.changes, ...plan.reviewItems].some(change =>
+                    change.file === 'A.cs' && change.line === line && change.needsReview), JSON.stringify(plan));
+            });
+        });
+    }
+    for (const [file, code, pin, line, expected] of [
+        ['m.js', 'class Box { get Size() { return 1; } read() { return this.Size; } }', 'm.js:1:Size', 1,
+            'class Box { get Renamed() { return 1; } read() { return this.Renamed; } }'],
+        ['m.ts', 'class Box { get Size(): number { return 1; } read() { return this.Size; } }', 'm.ts:1:Size', 1,
+            'class Box { get Renamed(): number { return 1; } read() { return this.Renamed; } }'],
+        ['m.tsx', 'class Box { get Size(): number { return 1; } read() { return this.Size; } }', 'm.tsx:1:Size', 1,
+            'class Box { get Renamed(): number { return 1; } read() { return this.Renamed; } }'],
+        ['m.html', '<script>\nclass Box { get Size() { return 1; } read() { return this.Size; } }\n</script>', 'm.html:2:Size', 2,
+            'class Box { get Renamed() { return 1; } read() { return this.Renamed; } }'],
+        ['m.py', 'class Box:\n    @property\n    def Size(self) -> int: return self.Size\n', 'm.py:2:Size', 3,
+            'def Renamed(self) -> int: return self.Renamed'],
+    ]) {
+        it(`${file}: a property definition and access retain both edits on one line`, () => {
+            inspect({ [file]: code }, pin, (impact, plan) => {
+                if (file === 'm.html' && !editsAt(plan, file, line).some(change => change.newExpression === expected)) {
+                    assert.ok([...plan.changes, ...plan.reviewItems].some(change => change.needsReview), JSON.stringify(plan));
+                    return;
+                }
+                assert.strictEqual(editsAt(plan, file, line).length, 1, JSON.stringify(plan));
+                assert.strictEqual(editsAt(plan, file, line)[0].newExpression, expected);
+            });
+        });
+    }
+    for (const [file, code, pin, foreignLine] of [
+        ['m.js', 'class Box { get Size() { return 1; } }\nconst Size = 2; function read() { return Size; }', 'm.js:1:Size', 2],
+        ['m.ts', 'class Box { get Size(): number { return 1; } }\nconst Size = 2; function read() { return Size; }', 'm.ts:1:Size', 2],
+        ['m.tsx', 'class Box { get Size(): number { return 1; } }\nconst Size = 2; function read() { return Size; }', 'm.tsx:1:Size', 2],
+        ['m.html', '<script>\nclass Box { get Size() { return 1; } }\nconst Size = 2; function read() { return Size; }\n</script>', 'm.html:2:Size', 3],
+        ['m.py', 'class Box:\n    @property\n    def Size(self): return 1\nSize = 2\ndef read(): return Size\n', 'm.py:2:Size', 5],
+    ]) {
+        it(`${file}: a bare global is not an implicit property read`, () => {
+            inspect({ [file]: code }, pin, (impact, plan) => {
+                assert.ok(!plan.changes.some(change => change.file === file && change.line === foreignLine), JSON.stringify(plan));
+                assert.ok(!confirmed(impact).some(site => site.line === foreignLine), JSON.stringify(impact));
+            });
+        });
+    }
+    it('C#: conditional member bodies keep the access kind from their own AST view', () => {
+        inspect({ 'A.cs': [
+            'class Box {',
+            '  public int Size { get; set; }',
+            '  public void Change()',
+            '#if MODE',
+            '    => Size++;',
+            '#else',
+            '    { Size += 2; }',
+            '#endif',
+            '}',
+        ].join('\n') }, 'A.cs:2:Size', (impact, plan) => {
+            assert.deepStrictEqual(confirmed(impact).map(site => [site.line, site.accessKind]),
+                [[5, 'read/write'], [7, 'read/write']]);
+            assert.strictEqual(editsAt(plan, 'A.cs', 5)[0]?.newExpression, '=> Renamed++;');
+            assert.strictEqual(editsAt(plan, 'A.cs', 7)[0]?.newExpression, '{ Renamed += 2; }');
+        });
+    });
+    it('C#: a local parameter does not hide a conditional member name', () => {
+        inspect({ 'A.cs': [
+            'class Box { public int Size { get; set; } }',
+            'class Use {',
+            '  int? Read(Box box, int Size) => box?.Size + Size;',
+            '}',
+        ].join('\n') }, 'A.cs:1:Size', (impact, plan) => {
+            const sites = impact.propertyAccesses.unverifiedSites.filter(site => site.line === 3);
+            assert.strictEqual(sites.length, 1, JSON.stringify(impact));
+            assert.strictEqual(sites[0].column, 39, JSON.stringify(sites));
+            assert.ok(!confirmed(impact).some(site => site.line === 3), JSON.stringify(impact));
+            assert.deepStrictEqual(editsAt(plan, 'A.cs', 3), []);
+            assert.ok([...plan.changes, ...plan.reviewItems].some(change =>
+                change.line === 3 && change.needsReview), JSON.stringify(plan));
+        });
+    });
+    it('C#: a setter parameter does not hide a conditional member named value', () => {
+        inspect({ 'A.cs': [
+            'class Box { public int value { get; set; } }',
+            'class Use {',
+            '  Box box = new();',
+            '  public int Sink { set { System.Console.WriteLine(box?.value + value); } }',
+            '}',
+        ].join('\n') }, 'A.cs:1:value', (impact, plan) => {
+            const sites = impact.propertyAccesses.unverifiedSites.filter(site => site.line === 4);
+            assert.strictEqual(sites.length, 1, JSON.stringify(impact));
+            assert.strictEqual(sites[0].column, 56, JSON.stringify(sites));
+            assert.ok(!confirmed(impact).some(site => site.line === 4), JSON.stringify(impact));
+            assert.deepStrictEqual(editsAt(plan, 'A.cs', 4), []);
+            assert.ok([...plan.changes, ...plan.reviewItems].some(change =>
+                change.line === 4 && change.needsReview), JSON.stringify(plan));
+        });
+    });
+    it('C#: a backing-field keyword is reviewed independently of the property declaration', () => {
+        inspect({ 'A.cs': [
+            'class Box {',
+            '  public int field { get => field; set => field = value; } = 3;',
+            '  public int Read() => this.field;',
+            '}',
+        ].join('\n') }, 'A.cs:2:field', (impact, plan) => {
+            assert.deepStrictEqual(confirmed(impact).map(site => site.line), [3]);
+            assert.strictEqual(editsAt(plan, 'A.cs', 2).filter(change => !change.needsReview)[0]?.newExpression,
+                'public int Renamed { get => field; set => field = value; } = 3;');
+            assert.ok(impact.propertyAccesses.unverifiedSites.some(site => site.line === 2), JSON.stringify(impact));
+            assert.strictEqual(editsAt(plan, 'A.cs', 3)[0]?.newExpression, 'public int Read() => this.Renamed;');
+        });
+    });
+    it('C#: an expression-bodied property can have its own contextual backing field', () => {
+        inspect({ 'A.cs': [
+            'class Box {',
+            '  public int field { get; set; } = 3;',
+            '  public int Other => field;',
+            '}',
+        ].join('\n') }, 'A.cs:2:field', (impact, plan) => {
+            assert.ok(!confirmed(impact).some(site => site.line === 3), JSON.stringify(impact));
+            assert.ok(impact.propertyAccesses.unverifiedSites.some(site => site.line === 3), JSON.stringify(impact));
+            assert.deepStrictEqual(editsAt(plan, 'A.cs', 3), []);
+        });
+    });
+    it('C#: backing-field context reaches nested lambdas and local functions', () => {
+        inspect({ 'A.cs': [
+            'class Box {',
+            '  public int field { get; set; } = 3;',
+            '  public int Other { get { System.Func<int> read = () => field; int Local() => field; return read() + Local(); } }',
+            '}',
+        ].join('\n') }, 'A.cs:2:field', (impact, plan) => {
+            assert.ok(!confirmed(impact).some(site => site.line === 3), JSON.stringify(impact));
+            assert.strictEqual(impact.propertyAccesses.unverifiedSites.filter(site => site.line === 3).length, 2);
+            assert.deepStrictEqual(editsAt(plan, 'A.cs', 3), []);
+        });
+    });
+    it('C#: field remains an ordinary member name in indexers and event accessors', () => {
+        inspect({ 'A.cs': [
+            'class Box {',
+            '  public int field { get; set; }',
+            '  public int this[int i] => field + i;',
+            '  public event System.Action Changed {',
+            '    add { System.Console.WriteLine(field); }',
+            '    remove { System.Console.WriteLine(field); }',
+            '  }',
+            '}',
+        ].join('\n') }, 'A.cs:2:field', (impact, plan) => {
+            assert.deepStrictEqual(confirmed(impact).map(site => site.line), [3, 5, 6]);
+            assert.strictEqual(editsAt(plan, 'A.cs', 3)[0]?.newExpression,
+                'public int this[int i] => Renamed + i;');
+            assert.strictEqual(editsAt(plan, 'A.cs', 5)[0]?.newExpression,
+                'add { System.Console.WriteLine(Renamed); }');
+            assert.strictEqual(editsAt(plan, 'A.cs', 6)[0]?.newExpression,
+                'remove { System.Console.WriteLine(Renamed); }');
+        });
+    });
+});
+
 describe('fix #409: references on a declaration line participate in a rename', () => {
     const fixtures = {
         'm.js': {

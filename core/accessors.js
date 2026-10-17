@@ -2,7 +2,7 @@
 
 const path = require('path');
 const { codeUnitCompare, CALLABLE_SYMBOL_KINDS } = require('./shared');
-const { getParser, safeParse } = require('../languages');
+const { getParser, safeParse, langTraits } = require('../languages');
 
 function inheritedAccessor(index, enclosing, name, definition) {
     let owner = enclosing?.className;
@@ -30,16 +30,28 @@ function inheritedAccessor(index, enclosing, name, definition) {
     return false;
 }
 
-function accessKind(tree, usage) {
+function accessKind(tree, usage, token = null) {
     if (!tree || !Number.isInteger(usage.column)) return 'access';
-    let node = tree.rootNode.descendantForPosition({ row: usage.line - 1, column: usage.column });
-    if (['attribute', 'member_expression', 'member_access_expression'].includes(node.parent?.type)) node = node.parent;
+    let node = token || tree.rootNode.descendantForPosition({ row: usage.line - 1, column: usage.column });
+    if (!node) return 'access';
+    if (node.tree.rootNode.hasError) {
+        for (let current = node; current; current = current.parent) {
+            if (current.type === 'ERROR') return 'access';
+        }
+    }
+    while (['attribute', 'member_expression', 'member_access_expression', 'member_binding_expression',
+        'conditional_access_expression'].includes(node.parent?.type) &&
+        node.endIndex === node.parent.endIndex && node.startIndex > node.parent.startIndex) node = node.parent;
     const parent = node.parent;
     if (parent?.type === 'update_expression' || parent?.type === 'delete_statement') return parent.type === 'update_expression' ? 'read/write' : 'delete';
+    if (['prefix_unary_expression', 'postfix_unary_expression'].includes(parent?.type) &&
+        parent.children.some(child => child.type === '++' || child.type === '--')) return 'read/write';
     if (['assignment', 'assignment_expression', 'augmented_assignment', 'augmented_assignment_expression'].includes(parent?.type)) {
         const left = parent.childForFieldName('left');
         if (left && left.startIndex === node.startIndex && left.endIndex === node.endIndex) {
-            return parent.type.startsWith('augmented') ? 'read/write' : 'write';
+            const operator = parent.childForFieldName('operator');
+            return parent.type.startsWith('augmented') || (operator && operator.text !== '=')
+                ? 'read/write' : 'write';
         }
     }
     return 'read';
@@ -75,9 +87,9 @@ function receiverlessShape(tree, usage) {
 
 // Source offset of an occurrence (fix #398F): orders it against same-line
 // assignments when its receiver is typed by return-type flow.
-function flowSiteOf(tree, usage) {
+function flowSiteOf(tree, usage, token = null) {
     if (!tree || !Number.isInteger(usage.column)) return null;
-    const node = tree.rootNode.descendantForPosition({ row: usage.line - 1, column: usage.column });
+    const node = token || tree.rootNode.descendantForPosition({ row: usage.line - 1, column: usage.column });
     return node ? node.startIndex : null;
 }
 
@@ -188,6 +200,175 @@ function insideSelectedAccessorBody(index, name, definition, file, line) {
         line <= (candidate.endLine || candidate.startLine));
 }
 
+// Query-time grammar facts identify an implicit member's lexical type;
+// class identities decide which declaration that type actually provides.
+function scopeClassRef(index, file, scope, memo) {
+    const key = `scope\0${file}\0${scope.name}\0${scope.line}\0${scope.namespace}\0${scope.enclosingType}\0${scope.typeArity}`;
+    if (memo.has(key)) return memo.get(key);
+    const { classDefsNamed } = require('./class-identity');
+    const entries = classDefsNamed(index, scope.name).entries.filter(({ def }) =>
+        def.file === file && def.startLine <= scope.line && def.endLine >= scope.line &&
+        (def.namespace || '') === scope.namespace &&
+        (def.enclosingType || '') === scope.enclosingType && (def.typeArity || 0) === scope.typeArity);
+    const ref = new Set(entries.map(entry => entry.key)).size === 1
+        ? { name: scope.name, key: entries[0].key, def: entries[0].def } : null;
+    memo.set(key, ref);
+    return ref;
+}
+
+function writtenClassRef(index, file, line, written, memo) {
+    if (!written) return null;
+    const { classDefsNamed } = require('./class-identity');
+    const { TypeReferenceResolver } = require('./type-references');
+    const key = `${file}\0${line}\0${written.node.startIndex}\0${written.text || written.node.text}\0${written.namespace}`;
+    if (memo.has(key)) return memo.get(key);
+    const traits = langTraits(index.files.get(file)?.language);
+    const resolve = (name, qualifier, siteNode = written.node) => {
+        const entries = classDefsNamed(index, name).entries.filter(entry =>
+            index.files.get(entry.def.file)?.language === index.files.get(file)?.language);
+        const matches = [];
+        let unknown = false;
+        for (const entry of entries) {
+            const resolver = new TypeReferenceResolver(index, entry.def, name);
+            resolver.siteNode = siteNode;
+            resolver.siteFile = file;
+            const verdict = qualifier
+                ? resolver.resolveQualified(file, line, written.qualifier, qualifier, { role: 'type' })
+                : resolver.resolveName(file, line, name);
+            if (verdict.verdict === 'yes') matches.push(entry);
+            else if (verdict.verdict === 'unknown') unknown = true;
+        }
+        const keys = new Set(matches.map(entry => entry.key));
+        return { ref: !unknown && keys.size === 1
+            ? { name, key: matches[0].key, def: matches[0].def } : null, unknown };
+    };
+    let result = resolve(written.name, written.qualifierText);
+    if (!result.ref && !result.unknown && !written.qualifierText && traits.typeNameScoping === 'namespace-usings') {
+        const { csharpUsings } = require('./type-denotation');
+        const scope = csharpUsings(index, file, written.namespace, written.node);
+        const target = scope.aliases.get(written.name);
+        if (target && !scope.ambiguousAliases.has(written.name)) {
+            const text = scope.aliasSyntax.get(written.name) || target;
+            const syntaxKey = 'syntax\0' + text;
+            if (!memo.has(syntaxKey)) memo.set(syntaxKey, traits.accessorTypeSyntax?.(text) || null);
+            const syntax = memo.get(syntaxKey);
+            if (syntax) result = resolve(syntax.name,
+                'global::' + (syntax.qualifierText || '').replace(/^global::/, ''), syntax.node);
+        }
+    }
+    const ref = result.ref;
+    memo.set(key, ref);
+    return ref;
+}
+
+function certainMemberOwner(index, member, memo) {
+    if (memo.has(member)) return memo.get(member);
+    const { classDefsNamed } = require('./class-identity');
+    if (!member.className) return null;
+    const entries = classDefsNamed(index, member.className).entries.filter(({ def }) =>
+        def.file === member.file && def.startLine <= member.startLine && def.endLine >= member.startLine &&
+        (def.namespace || '') === (member.namespace || '') &&
+        (def.typeArity || 0) === (member.ownerTypeArity || 0));
+    const keys = new Set(entries.map(entry => entry.key));
+    const key = keys.size === 1 ? entries[0].key : null;
+    memo.set(member, key);
+    return key;
+}
+
+function shapedAccessorVerdict(index, name, definition, ref, members, typeMemo) {
+    const shape = ref.dependencyShape;
+    if (!['implicit', 'initializer'].includes(shape.kind) || shape.uncertainRole) return 'review';
+    const { findDeclaringClass, supertypeRefsOf, ownerRefOf, shareDescendant } = require('./class-identity');
+    const targetOwner = ownerRefOf(index, definition);
+    if (!targetOwner?.key || certainMemberOwner(index, definition, typeMemo) !== targetOwner.key) return 'review';
+    const contractOwner = owner => ['interface', 'trait'].includes(owner.def?.type);
+    const hierarchyOf = owner => {
+        const key = `hierarchy\0${owner.key}`;
+        if (typeMemo.has(key)) return typeMemo.get(key);
+        const keys = new Set();
+        const queue = [owner];
+        let open = false;
+        while (queue.length) {
+            const current = queue.pop();
+            if (!current.key || current.external) { open = true; continue; }
+            if (keys.has(current.key)) continue;
+            keys.add(current.key);
+            queue.push(...supertypeRefsOf(index, current, { implements: true }));
+        }
+        const result = { keys, open };
+        typeMemo.set(key, result);
+        return result;
+    };
+    const verdictAt = owner => {
+        const declaring = findDeclaringClass(index, owner, members);
+        if (!declaring) {
+            const hierarchy = hierarchyOf(owner);
+            return hierarchy.open || contractOwner(owner) || hierarchy.keys.has(targetOwner.key) ? 'review' : null;
+        }
+        if (declaring.uncertain || declaring.members.some(member =>
+            certainMemberOwner(index, member, typeMemo) !== ownerRefOf(index, member)?.key)) return 'review';
+        if (!declaring.members.includes(definition)) {
+            // An implicit receiver can dispatch through an ancestor or a
+            // shared implementation. A construction names its exact type.
+            if (shape.kind === 'implicit') {
+                const key = `dispatch\0${owner.key}\0${targetOwner.key}`;
+                if (!typeMemo.has(key)) typeMemo.set(key,
+                    hierarchyOf(targetOwner).keys.has(owner.key) || hierarchyOf(targetOwner).open ||
+                    // An interface receiver and a class member can meet in
+                    // an implementation that inherits that member. The
+                    // class-only descendant graph cannot disprove this.
+                    contractOwner(owner) || contractOwner(targetOwner) ||
+                    shareDescendant(index, owner, [definition]));
+                if (typeMemo.get(key)) return 'review';
+            }
+            return 'skip';
+        }
+        const target = ownerRefOf(index, definition);
+        return declaring.members.every(member => isAccessorDefinition(member) &&
+            ownerRefOf(index, member)?.key === target?.key) ? 'edit' : 'review';
+    };
+    if (shape.kind === 'initializer') {
+        const owner = writtenClassRef(index, ref.file, ref.line, shape.type, typeMemo);
+        return owner ? verdictAt(owner) || 'skip' : 'review';
+    }
+    for (const scope of shape.scopes) {
+        const owner = scopeClassRef(index, ref.file, scope, typeMemo);
+        if (!owner) return 'review';
+        const verdict = verdictAt(owner);
+        if (!verdict) continue;
+        if (verdict === 'edit' && shape.inferredName) return 'review';
+        return verdict;
+    }
+    if (langTraits(index.files.get(ref.file)?.language)?.staticImportsDeclaredOnly) {
+        const { csharpUsings } = require('./type-denotation');
+        const scope = csharpUsings(index, ref.file, shape.namespace, shape.node);
+        const traits = langTraits(index.files.get(ref.file)?.language);
+        const namespaces = [];
+        for (let parts = shape.namespace ? shape.namespace.split('.') : []; parts.length; parts = parts.slice(0, -1)) {
+            namespaces.push(parts.join('.'));
+        }
+        namespaces.push('');
+        for (const namespace of namespaces) {
+            const hits = [];
+            let unknown = false;
+            for (const module of scope.statics) {
+                if (!scope.staticScopes.get(module)?.has(namespace)) continue;
+                const type = traits.accessorTypeSyntax?.(scope.staticSyntax.get(module) || module);
+                const owner = type && writtenClassRef(index, ref.file, ref.line, { ...type,
+                    qualifierText: 'global::' + (type.qualifierText || '').replace(/^global::/, '') }, typeMemo);
+                if (!owner) { unknown = true; continue; }
+                hits.push(...members.filter(member => certainMemberOwner(index, member, typeMemo) === owner.key &&
+                    member.modifiers?.includes('static')));
+            }
+            if (unknown) return 'review';
+            if (!hits.length) continue;
+            if (!hits.includes(definition)) return 'skip';
+            return hits.length === 1 && !shape.uncertainRole && !shape.inferredName ? 'edit' : 'review';
+        }
+    }
+    return shape.scopes.length ? 'skip' : 'review';
+}
+
 /**
  * Find reads/writes that may consume a selected accessor. Confirmed entries
  * require receiver identity (`self`/`this` in the owner or a Python instance
@@ -204,6 +385,9 @@ function findAccessorReferences(index, name, definition, options = {}) {
     const unverified = [];
     const excluded = [];
     const flowMaps = new Map();
+    const typeMemo = new Map();
+    const members = (index.symbols.get(name) || []).filter(member => member.className &&
+        !member.explicitInterface && !['class', 'struct', 'interface', 'enum', 'record'].includes(member.type));
     // Use the parser's raw occurrence records rather than usages()' public
     // line-oriented inventory. A line can contain two same-spelled member
     // accesses with different receivers; collapsing them by file+line would
@@ -222,21 +406,27 @@ function findAccessorReferences(index, name, definition, options = {}) {
             occurrences = index._getCachedUsages(file, name);
         } catch { continue; }
         if (!occurrences) continue;
+        const grammarShape = langTraits(entry.language)?.accessorReferenceShape;
+        const candidates = occurrences.filter(usage => usage.usageType === 'reference' ||
+            (grammarShape && usage.usageType === 'call'));
+        if (!candidates.length) continue;
         const parser = getParser(entry.language);
-        const tree = parser ? safeParse(parser, content) : null;
-        const lines = content.split('\n');
-        for (const usage of occurrences) {
-            if (usage.usageType !== 'reference') continue;
+        const tree = parser ? index._getParsedTree?.(file, content, entry.language) || safeParse(parser, content) : null;
+        const lines = index._getFileLines?.(file) || content.split('\n');
+        for (const usage of candidates) {
+            const dependencyShape = grammarShape ? grammarShape(tree, usage) : null;
+            if (dependencyShape === 'none') continue;
             let shape = null;
-            if (!usage.receiver) {
+            if (!usage.receiver && !dependencyShape) {
                 shape = receiverlessShape(tree, usage);
                 if (shape === 'none') continue;
             }
             refs.push({
                 ...usage,
                 ...(shape?.pattern && { patternKey: shape, ...(shape.thisSource && { receiver: 'this' }) }),
-                accessKind: shape?.pattern ? 'read' : accessKind(tree, usage),
-                ...(usage.receiver && { flowSite: flowSiteOf(tree, usage) }),
+                ...(dependencyShape && { dependencyShape }),
+                accessKind: dependencyShape?.accessKind || (shape?.pattern ? 'read' : accessKind(tree, usage, dependencyShape?.node)),
+                ...(usage.receiver && { flowSite: flowSiteOf(tree, usage, dependencyShape?.node) }),
                 file,
                 relativePath: entry.relativePath,
                 content: lines[usage.line - 1] || '',
@@ -257,10 +447,22 @@ function findAccessorReferences(index, name, definition, options = {}) {
             ...(ref.patternKey && { patternKey: { shorthand: !!ref.patternKey.shorthand } }),
         };
 
+        if (ref.dependencyShape && ref.dependencyShape.kind !== 'member') {
+            const verdict = shapedAccessorVerdict(index, name, definition, ref, members, typeMemo);
+            if (verdict === 'edit') confirmed.push({ ...shaped,
+                callerName: index.findEnclosingFunction(ref.file, ref.line, true)?.name || null,
+                resolution: 'member-lookup-accessor', tier: 'confirmed' });
+            else if (verdict === 'skip') excluded.push({ ...shaped, reason: 'other-member-owner' });
+            else unverified.push({ ...shaped,
+                reason: ref.dependencyShape.inferredName ? 'inferred-member-name' : 'member-owner-unresolved',
+                tier: 'unverified' });
+            continue;
+        }
+
         // A backing-store attribute inside the selected getter/setter body
         // often has the same spelling (`self._local.value`). It is not a
         // consumption of the descriptor being queried.
-        if (insideSelectedAccessorBody(index, name, definition, ref.file, ref.line) &&
+        if (!ref.dependencyShape && insideSelectedAccessorBody(index, name, definition, ref.file, ref.line) &&
             !['self', 'cls', 'this'].includes(ref.receiver)) {
             excluded.push({ ...shaped, reason: 'accessor-definition-body' });
             continue;
@@ -331,7 +533,7 @@ function findAccessorReferences(index, name, definition, options = {}) {
         });
     }
 
-    const sort = (a, b) => codeUnitCompare(a.file, b.file) || a.line - b.line;
+    const sort = (a, b) => codeUnitCompare(a.file, b.file) || a.line - b.line || (a.column ?? -1) - (b.column ?? -1);
     confirmed.sort(sort);
     unverified.sort(sort);
     excluded.sort(sort);

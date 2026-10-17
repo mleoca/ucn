@@ -212,6 +212,8 @@ const STRUCTURAL_TRAITS = {
     // `Func<int> f = Build`): plan renames it by the language's simple-name
     // lookup. Java spells method values apart (`Type::m`).
     methodGroupReferences: false,
+    accessorReferenceShape: null,
+    accessorTypeSyntax: null,
     // Whether a class may declare a field and a method of one name, so a
     // paren-less member access (`this.size`) names the field and a method
     // value is spelled apart (`obj::m`, `Type::m`) (fix #390: Java, Rust).
@@ -361,6 +363,8 @@ const NOMINAL_TRAITS = {
     docCrefReferences: false,
     // Simple-name method groups (fix #395, C#).
     methodGroupReferences: false,
+    accessorReferenceShape: null,
+    accessorTypeSyntax: null,
     // A static import of a type brings only the members the type itself
     // declares, never inherited ones (fix #392, C# `using static`). Java's
     // static imports reach inherited static members.
@@ -797,6 +801,8 @@ const LANGUAGES = {
             universalSupertypeMembers: { ToString: 0, Equals: 1, GetHashCode: 0, Finalize: 0 },
             docCrefReferences: true,
             methodGroupReferences: true,
+            accessorReferenceShape: (tree, usage) => require('./csharp').accessorReferenceShape(tree, usage),
+            accessorTypeSyntax: text => require('./csharp').accessorTypeSyntax(text),
             staticImportsDeclaredOnly: true,
             // Pattern-bound members the compiler lowers syntax onto
             // (foreach, await, deconstruction) - invoked with no name token.

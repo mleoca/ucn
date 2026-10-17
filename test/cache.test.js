@@ -25,6 +25,39 @@ const {
 } = require('../core/cache');
 const { createTempDir, cleanup, tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR } = require('./helpers');
 
+describe('fix #410: property owner proofs survive a saved usage cache', () => {
+    it('recomputes namespace and generic-alias scopes after loading the index', () => {
+        const dir = tmp({
+            'A.cs': 'namespace Left; class Box<T> { public int Size { get; set; } int Read() => Size; }',
+            'B.cs': 'namespace Right; class Box<T> { public int Size { get; set; } }',
+            'Use.cs': 'namespace Shared { using Alias = Left.Box<int>; class First { object Make() => new Alias { Size = 1 }; } }\nnamespace Shared { using Alias = Right.Box<int>; class Second { object Make() => new Alias { Size = 2 }; } }',
+        });
+        try {
+            const { execute } = require('../core/execute');
+            const read = index => ({
+                plan: execute(index, 'plan', { name: 'A.cs:1:Size', renameTo: 'Renamed' }),
+                impact: execute(index, 'impact', { name: 'A.cs:1:Size' }),
+            });
+            const index = idx(dir);
+            const fresh = read(index);
+            assert.ok(fresh.plan.ok && fresh.impact.ok, JSON.stringify(fresh));
+            assert.ok(fresh.plan.result.changes.some(change => change.file === 'Use.cs' && change.line === 1 &&
+                change.newExpression === 'namespace Shared { using Alias = Left.Box<int>; class First { object Make() => new Alias { Renamed = 1 }; } }'),
+            JSON.stringify(fresh));
+            assert.ok(!fresh.plan.result.changes.some(change => change.file === 'Use.cs' && change.line === 2), JSON.stringify(fresh));
+            index.saveCache();
+            index.saveUsageCache();
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loaded.loadCache());
+            assert.deepStrictEqual(read(loaded), fresh);
+            assert.deepStrictEqual(read(loaded), fresh, 'repeated warm lookups keep the same scope');
+        } finally {
+            clearProjectCache(dir);
+            rm(dir);
+        }
+    });
+});
+
 describe('fix #409: persisted usage facts follow their schema version', () => {
     it('rejects legacy usage records and round-trips declaration-name evidence', () => {
         const dir = tmp({ 'm.cpp': 'namespace N { int work(int v); }\nint N::work(int v) { return v; }' });

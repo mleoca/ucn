@@ -414,16 +414,7 @@ function namespaceOf(node, tree) {
 // The file-scoped namespace declaration of a compilation unit, also when a
 // conditional wraps the whole file (`#if X` ... `namespace N;` ... `#endif`,
 // fix #391).
-function fileScopedNamespace(root) {
-    for (const child of root?.namedChildren || []) {
-        if (child.type === 'file_scoped_namespace_declaration') return child;
-        if (child.type.startsWith('preproc_')) {
-            const nested = fileScopedNamespace(child);
-            if (nested) return nested;
-        }
-    }
-    return null;
-}
+const { fileScopedNamespace } = require('./csharp-scope');
 
 function modifiersOf(node) {
     return (node.namedChildren || [])
@@ -2547,9 +2538,9 @@ function findImportsInCode(code, parser) {
         .sort((a, b) => a.line - b.line);
 }
 
-function findImportsInTree(tree) {
+function findImportsInTree(tree, queryOnly = false) {
     const imports = [];
-    traverseTreeCached(tree.rootNode, node => {
+    const collect = node => {
         if (node.type !== 'using_directive') return true;
         const nameNode = node.childForFieldName('name');
         const named = node.namedChildren || [];
@@ -2572,9 +2563,17 @@ function findImportsInTree(tree) {
             ...(isGlobal && { global: true }),
             ...(isStatic && { static: true }),
             ...(enclosing && !rooted && { namespace: enclosing }),
+            // csMergeViewItems passes a reach predicate as its second arg.
+            // Only this explicit query mode adds facts; build records keep
+            // their existing persisted shape.
+            ...(queryOnly === true && { rooted,
+                usingScopes: require('./csharp-scope').usingScopesOf(node) }),
         });
         return false;
-    });
+    };
+    if (queryOnly === true) {
+        for (const node of tree.rootNode.descendantsOfType('using_directive')) collect(node);
+    } else traverseTreeCached(tree.rootNode, collect);
     return imports;
 }
 
@@ -2791,7 +2790,35 @@ function exportsOfClasses(classes) {
     return exports;
 }
 
+const scopedUsingsByTree = new WeakMap();
+function queryUsingDirectives(tree) {
+    if (scopedUsingsByTree.has(tree)) return scopedUsingsByTree.get(tree);
+    const views = csViewsByTree.get(tree)?.views;
+    const read = view => findImportsInTree(view, true);
+    const result = views ? csMergeViewItems(views, read, item => item.line) : read(tree);
+    scopedUsingsByTree.set(tree, result);
+    return result;
+}
+
+function accessorReferenceShape(tree, usage) {
+    const views = tree && csViewsByTree.get(tree)?.views;
+    const owner = views?.secondary.find(view => view.owns.has(usage.line - 1));
+    return require('./csharp-scope').accessorReferenceShape(owner?.tree || tree, usage, implicitCreationTarget);
+}
+
+function accessorTypeSyntax(text) {
+    const parser = require('./index').getParser('csharp');
+    const tree = safeParse(parser, `class TypeSlot { ${text} field; }`);
+    if (!tree || tree.rootNode.hasError) return null;
+    const declaration = tree.rootNode.descendantsOfType('variable_declaration')[0];
+    const type = declaration?.childForFieldName('type');
+    return type ? require('./csharp-scope').namedType(type, type) : null;
+}
+
 module.exports = {
+    queryUsingDirectives,
+    accessorReferenceShape,
+    accessorTypeSyntax,
     queryTree,
     queryTreeIsPlain,
     analysisTree: queryTree,

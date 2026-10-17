@@ -584,17 +584,36 @@ function csharpUsingTarget(text) {
     return String(text || '').replace(/<.*$/s, '');
 }
 
-function csharpAddDirective(scope, index, { module, names, static: isStatic, namespace }) {
-    const target = csharpUsingTarget(csharpResolveUsingName(index, module, namespace));
+function csharpAddDirective(scope, index, { module, names, static: isStatic, namespace, lexicalNamespace = namespace, rooted = false }) {
+    const syntax = csharpResolveUsingName(index, module,
+        rooted || String(module || '').startsWith('global::') ? '' : namespace);
+    const target = csharpUsingTarget(syntax);
     if (!target) return;
     const alias = (names || []).find(name => name && name !== '*');
     if (alias) {
+        const at = lexicalNamespace || '';
+        if (!scope.aliasDefinitions.has(alias)) scope.aliasDefinitions.set(alias, []);
+        scope.aliasDefinitions.get(alias).push({ namespace: at, syntax,
+            absolute: rooted || String(module || '').startsWith('global::') });
+        const previous = scope.aliasScopes?.get(alias);
+        // Project-file imports are added after source directives; that order
+        // cannot override a nearer namespace's alias.
+        if (scope.scoped && previous != null && previous.length > at.length) return;
+        if (scope.aliases.has(alias) && previous === at && scope.aliases.get(alias) !== target) {
+            scope.ambiguousAliases.add(alias);
+        } else if (previous !== at) scope.ambiguousAliases.delete(alias);
         scope.aliases.set(alias, target);
+        scope.aliasSyntax.set(alias, syntax);
         if (!scope.aliasScopes) scope.aliasScopes = new Map();
-        scope.aliasScopes.set(alias, namespace || '');
+        scope.aliasScopes.set(alias, at);
+    } else {
+        const values = isStatic ? scope.statics : scope.namespaces;
+        const origins = isStatic ? scope.staticScopes : scope.namespaceScopes;
+        values.add(target);
+        if (isStatic) scope.staticSyntax.set(target, syntax);
+        if (!origins.has(target)) origins.set(target, new Set());
+        origins.get(target).add(lexicalNamespace || '');
     }
-    else if (isStatic) scope.statics.add(target);
-    else scope.namespaces.add(target);
 }
 
 /**
@@ -602,13 +621,19 @@ function csharpAddDirective(scope, index, { module, names, static: isStatic, nam
  * directives (resolved from the namespace each is written in), `global
  * using` directives of every source file, and the <Using> items of the
  * project files above it (`csharpProjectFileUsings`).
- * Returns { namespaces: Set, statics: Set (type names), aliases: Map
- * (alias -> target), unreadable } - unreadable when a project file could not
+ * An optional namespace restricts local directives to that lexical chain;
+ * origins and original alias syntax support positive identity proofs.
+ * Returns namespaces/statics Sets, aliases and origin Maps, and unreadable.
+ * unreadable is true when a project file could not
  * be read (its items are unknown).
  */
-function csharpUsings(index, filePath) {
-    return memoized(index, `\x01cs-usings\x00${filePath}`, () => {
-        const scope = { namespaces: new Set(), statics: new Set(), aliases: new Map(), unreadable: false };
+function csharpUsings(index, filePath, namespace = null, siteNode = null) {
+    const scopes = siteNode ? require('../languages/csharp-scope').usingScopesOf(siteNode) : null;
+    const scopeKey = scopes?.map(scope => `${scope.startIndex}:${scope.endIndex}`).join(',') ?? '*';
+    return memoized(index, `\x01cs-usings\x00${filePath}\x00${namespace ?? '*'}\x00${scopeKey}`, () => {
+        const scope = { namespaces: new Set(), statics: new Set(), aliases: new Map(),
+            ambiguousAliases: new Set(), aliasSyntax: new Map(), aliasDefinitions: new Map(), scoped: namespace != null,
+            namespaceScopes: new Map(), staticScopes: new Map(), staticSyntax: new Map(), unreadable: false };
         const globals = memoized(index, '\x01cs-global-usings', () => {
             const out = [];
             for (const [, entry] of index.files) {
@@ -621,10 +646,25 @@ function csharpUsings(index, filePath) {
         });
         for (const detail of globals) csharpAddDirective(scope, index, detail);
         const fileEntry = index.files.get(filePath);
-        for (const detail of fileEntry?.importDetails || []) {
-            if (detail.type === 'using' && detail.module && !detail.global) {
-                csharpAddDirective(scope, index, detail);
-            }
+        let local = fileEntry?.importDetails || [];
+        if (scopes) {
+            const content = index._readFile(filePath);
+            const language = require('../languages');
+            const parser = language.getParser(fileEntry.language);
+            const adapter = language.getLanguageAdapter(fileEntry.language);
+            const tree = index._getParsedTree(filePath, content, fileEntry.language) ||
+                adapter.queryTree(content, parser, fileEntry);
+            local = adapter.queryUsingDirectives(tree);
+        }
+        for (const detail of local) {
+            if (detail.type !== 'using' || !detail.module || detail.global) continue;
+            if (scopes) {
+                const owner = detail.usingScopes.at(-1);
+                if (owner && !scopes.some(current => current.startIndex === owner.startIndex &&
+                    current.endIndex === owner.endIndex)) continue;
+                csharpAddDirective(scope, index, { ...detail, lexicalNamespace: owner?.namespace || '' });
+            } else if (namespace == null || !detail.namespace || namespace === detail.namespace ||
+                namespace.startsWith(detail.namespace + '.')) csharpAddDirective(scope, index, detail);
         }
         for (const item of csharpProjectFileUsings(index, filePath)) {
             if (item === null) { scope.unreadable = true; continue; }
@@ -643,18 +683,32 @@ function csharpUsings(index, filePath) {
  */
 function csharpExpandAliasTargets(scope) {
     const scopes = scope.aliasScopes;
-    if (!scopes || scope.aliases.size < 2) return;
+    if (!scopes) return;
     const encloses = (outer, inner) => outer !== inner && (outer === '' || inner.startsWith(`${outer}.`));
-    for (let pass = 0; pass < 4; pass++) {
-        let changed = false;
-        for (const [alias, target] of scope.aliases) {
-            const [head, ...rest] = String(target).split('.');
-            if (head === alias || !scope.aliases.has(head)) continue;
-            if (!encloses(scopes.get(head) ?? '', scopes.get(alias) ?? '')) continue;
-            scope.aliases.set(alias, [scope.aliases.get(head), ...rest].join('.'));
-            changed = true;
+    const expand = (definition, seen = new Set()) => {
+        if (definition.absolute) return definition.syntax;
+        if (seen.has(definition) || seen.size >= 16) return null;
+        const [head, ...rest] = definition.syntax.split('.');
+        const outer = (scope.aliasDefinitions.get(head) || []).filter(other =>
+            encloses(other.namespace, definition.namespace));
+        if (!outer.length) return definition.syntax;
+        const nearest = Math.max(...outer.map(other => other.namespace.length));
+        const next = new Set(seen); next.add(definition);
+        const targets = new Set(outer.filter(other => other.namespace.length === nearest)
+            .map(other => expand(other, next)));
+        if (targets.has(null) || targets.size !== 1) return null;
+        return [[...targets][0], ...rest].join('.');
+    };
+    for (const [alias, at] of scopes) {
+        const definitions = (scope.aliasDefinitions.get(alias) || []).filter(definition => definition.namespace === at);
+        const targets = new Set(definitions.map(definition => expand(definition)));
+        if (targets.has(null) || targets.size !== 1) {
+            scope.ambiguousAliases.add(alias);
+            continue;
         }
-        if (!changed) break;
+        const syntax = [...targets][0];
+        scope.aliasSyntax.set(alias, syntax);
+        scope.aliases.set(alias, csharpUsingTarget(syntax));
     }
 }
 

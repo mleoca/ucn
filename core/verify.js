@@ -11,6 +11,7 @@ const { escapeRegExp, codeUnitCompare, NON_CALLABLE_TYPES, isOverrideMarked, isM
 const { classDefsNamed, distinctOwnerDefinitions } = require('./class-identity');
 const { isTypeRenamePin } = require('./type-references');
 const { findAccessorReferences, isAccessorDefinition } = require('./accessors');
+const { csharpLocalBinding } = require('../languages/csharp-scope');
 const { validateCallMismatch, declarationIdentity } = require('./provenance');
 const { UcnError } = require('./errors');
 const { execFileSync, spawn } = require('child_process');
@@ -4858,8 +4859,7 @@ function plan(index, name, options = {}) {
                 const existing = changes.find(change =>
                     change.file === ref.file && change.line === ref.line &&
                     !change.needsReview);
-                if (existing) Object.assign(existing, concrete);
-                else changes.push(concrete);
+                if (!existing || !mergeTokenEdit(existing, edit)) changes.push(tagTokenEdit(concrete, edit));
             }
             const listedAccess = new Set();
             for (const ref of accessorReferences.unverified) {
@@ -4907,8 +4907,11 @@ function plan(index, name, options = {}) {
     const definitionLine = def.nameLine || def.startLine;
     const definitionFile = def.relativePath || def.file;
     const definitionSource = index.getLineContent(def.file, definitionLine).trim();
+    // A property access awaiting review on this line stays a separate item;
+    // the declaration token still has its own certain edit.
     const existingDefinitionLine = changes.find(change =>
-        change.file === definitionFile && change.line === definitionLine);
+        change.file === definitionFile && change.line === definitionLine &&
+        (!options.renameTo || !isAccessorDefinition(def) || !change.needsReview));
     // A definition a macro_rules! transcriber generated (fix #374) is
     // spelled in the macro's template, never at the invocation: the
     // template pass below edits or lists it; the invocation line is only
@@ -5927,78 +5930,6 @@ function _docCrefMemberPass(index, name, renameTo, renamedDefs, changes, reviewI
 
 const CSHARP_TYPE_DECLARATION_NODES = new Set(['class_declaration', 'struct_declaration',
     'record_declaration', 'record_struct_declaration', 'interface_declaration']);
-// Declarations whose `name` field binds a local of the member body.
-const CSHARP_LOCAL_DECLARATION_NODES = new Set(['parameter', 'catch_declaration', 'declaration_pattern',
-    'declaration_expression', 'variable_declarator', 'local_function_statement', 'from_clause',
-    'join_clause', 'query_continuation', 'recursive_pattern', 'var_pattern']);
-
-const CSHARP_BLOCK_SCOPES = new Set(['block', 'switch_section', 'for_statement', 'using_statement',
-    'fixed_statement', 'lambda_expression', 'anonymous_method_expression', 'arrow_expression_clause']);
-
-/**
- * Where C# scopes a local named like the reference (spec 7.7): 'local' when
- * a parameter, local variable, local function, pattern, lambda, foreach,
- * catch or range variable of that name is in scope at `node`, 'none' when
- * no declaration of the member reaches it, 'unknown' for an unmodelled
- * declaration shape.
- */
-function csharpLocalBinding(memberNode, node, name) {
-    const contains = (scope, target) => scope && scope.startIndex <= target.startIndex &&
-        target.endIndex <= scope.endIndex;
-    const nearest = (from, kinds) => {
-        for (let current = from.parent; current && !sameNode(current, memberNode); current = current.parent) {
-            if (kinds.has(current.type)) return current;
-        }
-        return memberNode;
-    };
-    let verdict = 'none';
-    const scopeOf = (declared) => {
-        const parent = declared.parent;
-        switch (parent.type) {
-            case 'parameter': {
-                const owner = parent.parent?.parent;
-                return owner || memberNode;
-            }
-            case 'variable_declarator': case 'local_function_statement':
-            case 'declaration_pattern': case 'declaration_expression': case 'single_variable_designation':
-            case 'recursive_pattern': case 'var_pattern':
-                return nearest(parent, CSHARP_BLOCK_SCOPES);
-            case 'catch_declaration':
-                return parent.parent;
-            case 'foreach_statement':
-                return parent;
-            case 'from_clause': case 'join_clause': case 'let_clause': case 'query_continuation':
-                return nearest(parent, new Set(['query_expression']));
-            default:
-                return null;
-        }
-    };
-    const visit = current => {
-        if (verdict === 'local') return;
-        if ((current.type === 'implicit_parameter' || current.type === 'identifier') && current.text === name &&
-            !sameNode(current, node)) {
-            const parent = current.parent;
-            let declares = current.type === 'implicit_parameter';
-            if (!declares && parent) {
-                declares = (CSHARP_LOCAL_DECLARATION_NODES.has(parent.type) &&
-                    sameNode(parent.childForFieldName('name'), current) && !sameNode(parent, memberNode)) ||
-                    (parent.type === 'foreach_statement' && sameNode(parent.childForFieldName('left'), current)) ||
-                    parent.type === 'single_variable_designation' ||
-                    (parent.type === 'let_clause' && sameNode(parent.namedChild(0), current));
-            }
-            if (declares) {
-                const scope = current.type === 'implicit_parameter' ? parent : scopeOf(current);
-                if (!scope) verdict = 'unknown';
-                else if (contains(scope, node)) verdict = 'local';
-            }
-            return;
-        }
-        for (const child of current.namedChildren || []) visit(child);
-    };
-    for (const child of memberNode.namedChildren || []) visit(child);
-    return verdict;
-}
-
 /**
  * Method groups in a C# member rename (fix #395): a simple name in value
  * position (`new(Build, 4)`, `Changed += OnChanged`, `.Select(Build)`,
