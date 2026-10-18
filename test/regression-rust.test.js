@@ -16,6 +16,366 @@ const { ProjectIndex } = require('../core/project');
 const { execute } = require('../core/execute');
 const { tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR } = require('./helpers');
 
+describe('fix #414: primitive receiver identity survives declared return flow', () => {
+    const cases = [
+        {
+            label: "supplied method chain",
+            owner: "[u8]",
+            expected: "visible",
+            code: [
+                "pub trait AsBytes {",
+                "    fn as_bytes(&self) -> &[u8];",
+                "}",
+                "",
+                "impl AsBytes for str {",
+                "    fn as_bytes(&self) -> &[u8] {",
+                "        <str>::as_bytes(self)",
+                "    }",
+                "}",
+                "",
+                "pub trait Hex {",
+                "    fn hex(&self) -> String;",
+                "}",
+                "",
+                "impl Hex for [u8] {",
+                "    fn hex(&self) -> String {",
+                "        format!(\"{:?}\", self)",
+                "    }",
+                "}",
+                "",
+                "impl Hex for str {",
+                "    fn hex(&self) -> String {",
+                "        self.as_bytes().hex()",
+                "    }",
+                "}",
+            ].join('\n'),
+        },
+        {
+            label: "free chain slice",
+            owner: "[u8]",
+            expected: "visible",
+            code: [
+                "pub trait Hex { fn hex(&self) -> String; }",
+                "impl Hex for [u8] { fn hex(&self) -> String { String::new() } }",
+                "static BYTES: [u8; 1] = [0];",
+                "fn produce() -> &'static [u8] { &BYTES }",
+                "fn run() -> String { produce().hex() }",
+            ].join('\n'),
+        },
+        {
+            label: "stored free slice",
+            owner: "[u8]",
+            expected: "visible",
+            code: [
+                "pub trait Hex { fn hex(&self) -> String; }",
+                "impl Hex for [u8] { fn hex(&self) -> String { String::new() } }",
+                "static BYTES: [u8; 1] = [0];",
+                "fn produce() -> &'static [u8] { &BYTES }",
+                "fn run() -> String { let value=produce(); value.hex() }",
+            ].join('\n'),
+        },
+        {
+            label: "stored method slice",
+            owner: "[u8]",
+            expected: "visible",
+            code: [
+                "pub trait Hex { fn hex(&self) -> String; }",
+                "impl Hex for [u8] { fn hex(&self) -> String { String::new() } }",
+                "static BYTES: [u8; 1] = [0];",
+                "struct Source;",
+                "impl Source { fn produce(&self) -> &'static [u8] { &BYTES } }",
+                "fn run(s:Source) -> String { let value=s.produce(); value.hex() }",
+            ].join('\n'),
+        },
+        {
+            label: "alias slice",
+            owner: "[u8]",
+            expected: "visible",
+            code: [
+                "pub trait Hex { fn hex(&self) -> String; }",
+                "impl Hex for [u8] { fn hex(&self) -> String { String::new() } }",
+                "static BYTES: [u8; 1] = [0];",
+                "type Bytes = [u8];",
+                "fn produce() -> &'static Bytes { &BYTES }",
+                "fn run() -> String { produce().hex() }",
+            ].join('\n'),
+        },
+        {
+            label: "raw pointer",
+            owner: "*constu8",
+            expected: "visible",
+            code: [
+                "pub trait Hex { fn hex(&self) -> String; }",
+                "impl Hex for *const u8 { fn hex(&self) -> String { String::new() } }",
+                "fn produce() -> *const u8 { std::ptr::null() }",
+                "fn run() -> String { produce().hex() }",
+            ].join('\n'),
+        },
+        {
+            label: "annotated slice guard",
+            owner: "[u8]",
+            expected: "visible",
+            code: [
+                "pub trait Hex { fn hex(&self) -> String; }",
+                "impl Hex for [u8] { fn hex(&self) -> String { String::new() } }",
+                "fn run(value: &[u8]) -> String { value.hex() }",
+            ].join('\n'),
+        },
+        {
+            label: "generic slice owner guard",
+            owner: "[T]",
+            expected: "confirmed",
+            code: [
+                "pub trait Hex { fn hex(&self) -> String; }",
+                "impl<T> Hex for [T] { fn hex(&self) -> String { String::new() } }",
+                "static BYTES: [u8; 1] = [0];",
+                "fn produce() -> &'static [u8] { &BYTES }",
+                "fn run() -> String { produce().hex() }",
+            ].join('\n'),
+        },
+        {
+            label: "project slice name guard",
+            owner: "slice",
+            expected: "confirmed",
+            code: [
+                "struct slice;",
+                "impl slice { fn hex(&self) -> String { String::new() } }",
+                "fn produce() -> slice { slice }",
+                "fn run() -> String { produce().hex() }",
+            ].join('\n'),
+        },
+        {
+            label: "unrelated owner guard",
+            owner: "Other",
+            expected: "excluded",
+            code: [
+                "pub trait Hex { fn hex(&self) -> String; }",
+                "impl Hex for [u8] { fn hex(&self) -> String { String::new() } }",
+                "static BYTES: [u8; 1] = [0];",
+                "struct Other;",
+                "impl Other { fn hex(&self) -> String { String::new() } }",
+                "fn produce() -> &'static [u8] { &BYTES }",
+                "fn run() -> String { produce().hex() }",
+            ].join('\n'),
+        },
+        {
+            label: "unwrapped slice",
+            owner: "[u8]",
+            expected: "visible",
+            code: [
+                "pub trait Hex { fn hex(&self) -> String; }",
+                "impl Hex for [u8] { fn hex(&self) -> String { String::new() } }",
+                "static BYTES: [u8; 1] = [0];",
+                "fn produce() -> Option<&'static [u8]> { Some(&BYTES) }",
+                "fn run() -> String { let value=produce().unwrap(); value.hex() }",
+            ].join('\n'),
+        },
+        {
+            label: "tuple slice",
+            owner: "[u8]",
+            expected: "visible",
+            code: [
+                "pub trait Hex { fn hex(&self) -> String; }",
+                "impl Hex for [u8] { fn hex(&self) -> String { String::new() } }",
+                "static BYTES: [u8; 1] = [0];",
+                "fn produce() -> (&'static [u8], usize) { (&BYTES, 0) }",
+                "fn run() -> String { let (value, _)=produce(); value.hex() }",
+            ].join('\n'),
+        },
+        {
+            label: "boxed slice",
+            owner: "[u8]",
+            expected: "visible",
+            code: [
+                "pub trait Hex { fn hex(&self) -> String; }",
+                "impl Hex for [u8] { fn hex(&self) -> String { String::new() } }",
+                "fn produce() -> Box<[u8]> { vec![0].into_boxed_slice() }",
+                "fn run() -> String { produce().hex() }",
+            ].join('\n'),
+        },
+        {
+            label: "str guard",
+            owner: "str",
+            expected: "confirmed",
+            code: [
+                "pub trait Hex { fn hex(&self) -> String; }",
+                "impl Hex for str { fn hex(&self) -> String { String::new() } }",
+                "fn produce() -> &'static str { \"\" }",
+                "fn run() -> String { produce().hex() }",
+            ].join('\n'),
+        },
+        {
+            label: "scalar guard",
+            owner: "u8",
+            expected: "confirmed",
+            code: [
+                "pub trait Hex { fn hex(&self) -> String; }",
+                "impl Hex for u8 { fn hex(&self) -> String { String::new() } }",
+                "fn produce() -> u8 { 0 }",
+                "fn run() -> String { produce().hex() }",
+            ].join('\n'),
+        },
+        {
+            label: "primitive return cannot name a project slice type",
+            owner: "slice",
+            expected: "not-confirmed",
+            code: [
+                "pub trait Hex { fn hex(&self) -> String; }",
+                "impl Hex for [u8] { fn hex(&self) -> String { String::new() } }",
+                "struct slice;",
+                "impl slice { fn hex(&self) -> String { String::new() } }",
+                "static BYTES: [u8; 1] = [0];",
+                "fn produce() -> &'static [u8] { &BYTES }",
+                "fn run() -> String { produce().hex() }",
+            ].join('\n'),
+        },
+        {
+            label: "primitive return stays visible beside a project slice type",
+            owner: "[u8]",
+            expected: "visible",
+            code: [
+                "pub trait Hex { fn hex(&self) -> String; }",
+                "impl Hex for [u8] { fn hex(&self) -> String { String::new() } }",
+                "struct slice;",
+                "impl slice { fn hex(&self) -> String { String::new() } }",
+                "static BYTES: [u8; 1] = [0];",
+                "fn produce() -> &'static [u8] { &BYTES }",
+                "fn run() -> String { produce().hex() }",
+            ].join('\n'),
+        },
+        {
+            label: "stored boxed slice",
+            owner: "[u8]",
+            expected: "visible",
+            code: [
+                "pub trait Hex { fn hex(&self) -> String; }",
+                "impl Hex for [u8] { fn hex(&self) -> String { String::new() } }",
+                "fn produce() -> Box<[u8]> { vec![0].into_boxed_slice() }",
+                "fn run() -> String { let value=produce(); value.hex() }",
+            ].join('\n'),
+        },
+        {
+            label: "pointer from a standard method",
+            owner: "*constu8",
+            expected: "visible",
+            code: [
+                "pub trait Hex { fn hex(&self) -> String; }",
+                "impl Hex for *const u8 { fn hex(&self) -> String { String::new() } }",
+                "fn run(value: &[u8]) -> String { value.as_ptr().hex() }",
+            ].join('\n'),
+        },
+        {
+            label: "stored pointer from a standard method",
+            owner: "*constu8",
+            expected: "visible",
+            code: [
+                "pub trait Hex { fn hex(&self) -> String; }",
+                "impl Hex for *const u8 { fn hex(&self) -> String { String::new() } }",
+                "fn run(value: &[u8]) -> String { let pointer=value.as_ptr(); pointer.hex() }",
+            ].join('\n'),
+        },
+        {
+            label: "generic raw pointer owner guard",
+            owner: "*constT",
+            expected: "confirmed",
+            code: [
+                "pub trait Hex { fn hex(&self) -> String; }",
+                "impl<T> Hex for *const T { fn hex(&self) -> String { String::new() } }",
+                "fn produce() -> *const u8 { std::ptr::null() }",
+                "fn run() -> String { produce().hex() }",
+            ].join('\n'),
+        },
+        {
+            label: "project wrapper keeps its own primitive payload uncertain",
+            owner: "Box",
+            expected: "visible",
+            code: [
+                "pub trait Hex { fn hex(&self) -> String; }",
+                "impl Hex for [u8] { fn hex(&self) -> String { String::new() } }",
+                "struct Box<T: ?Sized + 'static>(&'static T);",
+                "impl Hex for Box<[u8]> { fn hex(&self) -> String { String::new() } }",
+                "static BYTES: [u8; 1] = [0];",
+                "fn produce() -> Box<[u8]> { Box(&BYTES) }",
+                "fn run() -> String { produce().hex() }",
+            ].join('\n'),
+        },
+        {
+            label: "wrapper method keeps primitive dispatch uncertain",
+            name: "clone",
+            owner: "[u8]",
+            expected: "not-confirmed",
+            code: [
+                "pub trait CloneLike { fn clone(&self) -> String; }",
+                "impl CloneLike for [u8] { fn clone(&self) -> String { String::new() } }",
+                "fn produce() -> Box<[u8]> { vec![0].into_boxed_slice() }",
+                "fn run() -> Box<[u8]> { produce().clone() }",
+            ].join('\n'),
+        },
+        {
+            label: "stored wrapper method keeps primitive dispatch uncertain",
+            name: "clone",
+            owner: "[u8]",
+            expected: "not-confirmed",
+            code: [
+                "pub trait CloneLike { fn clone(&self) -> String; }",
+                "impl CloneLike for [u8] { fn clone(&self) -> String { String::new() } }",
+                "fn produce() -> Box<[u8]> { vec![0].into_boxed_slice() }",
+                "fn run() -> Box<[u8]> { let value=produce(); value.clone() }",
+            ].join('\n'),
+        },
+    ];
+    for (const fixture of cases) {
+        it(fixture.label, () => {
+            const dir = tmp({
+                'Cargo.toml': '[package]\nname="primitive_returns"\nversion="0.1.0"\nedition="2021"',
+                'src/lib.rs': fixture.code,
+            });
+            try {
+                const index = idx(dir);
+                const name = fixture.name || 'hex';
+                const definition = (index.symbols.get(name) || []).find(symbol =>
+                    !symbol.isSignature && String(symbol.className).replace(/\s+/g, '') === fixture.owner);
+                assert.ok(definition);
+                const line = fixture.code.split('\n').findLastIndex(text => text.includes(`.${name}(`)) + 1;
+                const pin = `src/lib.rs:${definition.startLine}:${name}`;
+                const context = execute(index, 'context', { name: pin });
+                const plan = execute(index, 'plan', { name: pin, renameTo: 'Renamed' });
+                assert.ok(context.ok, context.error);
+                assert.ok(plan.ok, plan.error);
+                assert.ok(context.result.meta.account.conserved);
+                const confirmed = context.result.callers.some(site => site.line === line);
+                const unverified = context.result.unverifiedCallers.some(site => site.line === line);
+                const automatic = plan.result.changes.some(change => change.line === line &&
+                    change.newExpression !== undefined && !change.needsReview && change.editKind !== 'definition');
+                if (fixture.expected === 'excluded') {
+                    assert.ok(!confirmed && !unverified);
+                    assert.ok(!automatic);
+                } else if (fixture.expected === 'not-confirmed') {
+                    assert.ok(!confirmed);
+                    assert.ok(!automatic);
+                } else {
+                    assert.ok(confirmed || unverified, 'the call must remain visible');
+                    if (fixture.expected === 'confirmed') {
+                        assert.ok(confirmed);
+                        assert.ok(automatic);
+                    } else if (unverified) {
+                        assert.ok(plan.result.unverifiedSites.some(site => site.line === line));
+                        assert.ok(!automatic);
+                    }
+                    const caller = index.findEnclosingFunction(path.join(dir, 'src/lib.rs'), line, true);
+                    assert.ok(caller);
+                    const own = execute(index, 'context', { name: `src/lib.rs:${caller.startLine}:${caller.name}` });
+                    assert.ok(own.ok, own.error);
+                    assert.ok(own.result.meta.calleeAccount.conserved);
+                    assert.ok(own.result.callees.some(callee => callee.name === name) ||
+                        own.result.unverifiedCallees.some(callee => callee.name === name),
+                    'the callee must remain visible');
+                }
+            } finally { rm(dir); }
+        });
+    }
+});
+
 describe('Rust impl owner identity', () => {
     it('normalizes reference impls and nested generic impl heads', () => {
         const dir = tmp({

@@ -1883,16 +1883,16 @@ function findCallers(index, name, options = {}) {
                         // guessed 'CodecRegistry' — the interface — while the
                         // annotation says *DefaultCodecRegistry; the guess
                         // excluded all three true RegisterCodec callers).
-                        call = { ...call, receiverType: flowEntry.type,
-                            receiverTypeSource: 'flow',
-                            receiverTypeEvidence: { source: 'flow', ...flowEntry },
+                        call = { ..._flowReceiverType(index, filePath, call, flowEntry,
+                            options.targetDefinitions || definitions),
                             receiverTypeGuessed: undefined,
                             receiverFlowInvalidated: false,
-                            ...(flowEntry.fromFile && { receiverTypeFlowFile: flowEntry.fromFile }) };
-                        if (flowEntry.derefVia) {
+                        };
+                        if (flowEntry.derefVia && !flowEntry.primitiveType) {
                             call = _rustDerefWrapperView(index, filePath, call);
-                            if (call.receiverDerefAmbiguous && routeDerefAmbiguous(filePath, fileEntry, call, calledAs)) continue;
                         }
+                        if (call.receiverDerefAmbiguous &&
+                            routeDerefAmbiguous(filePath, fileEntry, call, calledAs)) continue;
                     }
                 }
 
@@ -2265,10 +2265,10 @@ function findCallers(index, name, options = {}) {
                             }),
                         };
                     } else if (flowEntry) {
-                        call = { ...call, receiverType: flowEntry.type,
-                            receiverTypeSource: 'flow',
-                            receiverTypeEvidence: { source: 'flow', ...flowEntry },
-                            ...(flowEntry.fromFile && { receiverTypeFlowFile: flowEntry.fromFile }) };
+                        call = _flowReceiverType(index, filePath, call, flowEntry,
+                            options.targetDefinitions || definitions);
+                        if (call.receiverDerefAmbiguous &&
+                            routeDerefAmbiguous(filePath, fileEntry, call, calledAs)) continue;
                     }
                 }
 
@@ -11581,11 +11581,9 @@ function _populateReturnTypeFlowScope(index, filePath, calls, scopeCalls, scoped
                             originFile: definition.file || filePath,
                         });
                     if (!parsed) return null;
-                    const origin = _resolveFlowTypeOrigin(
-                        index, definition.file || filePath,
-                        parsed.name, parsed.qualifier);
+                    const origin = _returnTypeOrigin(index, definition.file || filePath, parsed);
                     return origin
-                        ? { type: parsed.name, fromFile: origin.fromFile }
+                        ? { type: parsed.name, ...(parsed.primitiveType && { primitiveType: parsed.primitiveType }), fromFile: origin.fromFile }
                         : null;
                 });
                 folded = resolved.length > 0 && resolved.every(Boolean) &&
@@ -11602,6 +11600,8 @@ function _populateReturnTypeFlowScope(index, filePath, calls, scopeCalls, scoped
                 if (!map.has(key)) map.set(key, []);
                 map.get(key).push({ line: call.line, start: call.callStart,
                     ...(folded.type && { type: folded.type }),
+                    ...(folded.primitiveType && { primitiveType: folded.primitiveType }),
+                    ...(folded.stdResult && { stdResult: true }),
                     ...(folded.fromFile && { fromFile: folded.fromFile }),
                     ...(folded.stdLiteral && { valueRef: 'owned' }),
                     ...(folded.rustWrapper && { rustWrapper: folded.rustWrapper }),
@@ -12275,16 +12275,15 @@ function _populateReturnTypeFlowScope(index, filePath, calls, scopeCalls, scoped
                         continue;
                     }
                 }
-                const origin = _resolveFlowTypeOrigin(
-                    index, fromFile || filePath, parsed.name, parsed.qualifier);
+                const origin = _returnTypeOrigin(index, fromFile || filePath, parsed);
                 map.get(key).push(origin?.fromFile
-                    ? { ...base, type: parsed.name, fromFile: origin.fromFile }
+                    ? { ...base, type: parsed.name, ...(parsed.primitiveType && { primitiveType: parsed.primitiveType }), fromFile: origin.fromFile }
                     : { ...base, invalidated: true });
             }
             continue;
         }
 
-        let typeName, entryFromFile;
+        let typeName, entryFromFile, primitiveType;
         if (nominal) {
             const parsed = _returnTypeNameNominal(returnType, language, {
                 unwrapped: call.assignedUnwrap,
@@ -12294,6 +12293,7 @@ function _populateReturnTypeFlowScope(index, filePath, calls, scopeCalls, scoped
                 index,
                 originFile: fromFile || filePath,
             });
+            primitiveType = parsed?.primitiveType;
             if (!parsed) {
                 if (iteratorItemType) {
                     const scope = call.enclosingFunction
@@ -12335,7 +12335,7 @@ function _populateReturnTypeFlowScope(index, filePath, calls, scopeCalls, scoped
                     continue;
                 }
             }
-            const origin = _resolveFlowTypeOrigin(index, fromFile || filePath, parsed.name, parsed.qualifier);
+            const origin = _returnTypeOrigin(index, fromFile || filePath, parsed);
             if (!origin) {
                 const wrapper = language === 'rust' && !call.assignedUnwrap &&
                     _rustReturnWrapper(index, returnType, fromFile || filePath, selfClass,
@@ -12394,6 +12394,7 @@ function _populateReturnTypeFlowScope(index, filePath, calls, scopeCalls, scoped
         if (!map) map = new Map();
         if (!map.has(key)) map.set(key, []);
         map.get(key).push({ line: call.line, start: call.callStart, type: typeName,
+            ...(primitiveType && { primitiveType }),
             ...(entryFromFile && { fromFile: entryFromFile }),
             // The written C++ value type (fix #393): `->` reads it.
             ...(language === 'cpp' && { valueText: returnType, valueFromFile: fromFile || filePath }),
@@ -12951,7 +12952,34 @@ function _returnTypeNameNominal(text, language, opts = {}) {
     if (language === 'go' && _GO_FLOW_REJECT.has(norm)) return undefined;
     if (language === 'java' && _JAVA_FLOW_REJECT.has(norm)) return undefined;
     if (language === 'csharp' && _CSHARP_FLOW_REJECT.has(norm)) return undefined;
-    return { name: norm, qualifier };
+    const primitive = getLanguageAdapter(language)?.getPrimitiveTypeInfo?.(t, getParser(language));
+    return { name: norm, qualifier,
+        ...(primitive?.type === norm && { primitiveType: primitive }) };
+}
+
+/** Canonical primitive names are syntax, never project type identifiers. */
+function _returnTypeOrigin(index, file, parsed) {
+    return parsed.primitiveType
+        ? { fromFile: file, primitiveType: parsed.primitiveType }
+        : _resolveFlowTypeOrigin(index, file, parsed.name, parsed.qualifier);
+}
+
+/** Apply the same primitive dispatch view to inferred and annotated values. */
+function _flowReceiverType(index, file, call, flow, targets) {
+    let typed = { ...call, receiverType: flow.type,
+        receiverTypeSource: 'flow', receiverTypeEvidence: { source: 'flow', ...flow },
+        ...(flow.fromFile && { receiverTypeFlowFile: flow.fromFile }) };
+    const primitive = flow.primitiveType || (flow.stdResult ? { type: flow.type } : null);
+    if (!primitive) return typed;
+    typed = { ...typed, receiverTypeStd: true,
+        receiverTypeEvidence: { ...typed.receiverTypeEvidence,
+            ...(primitive.derefVia && {
+                derefVia: [...(flow.derefVia || []), ...primitive.derefVia],
+                derefOuterRef: flow.derefOuterRef || primitive.derefOuterRef,
+                derefFile: flow.fromFile || file,
+            }) } };
+    typed = _rustDerefWrapperView(index, file, typed);
+    return _withoutAmbiguousSliceType(_withoutShadowedStdLiteral(index, typed), targets);
 }
 
 /**
@@ -17484,6 +17512,12 @@ function _calleeReceiverMethodGroup(index, symbols, typeName, language, contextF
 
 function _calleeSelectReceiverMethod(index, call, symbols, typeName, language,
     contextFile, accepts = () => true, typeOrigin = null) {
+    if (typeOrigin?.primitiveType || typeOrigin?.stdResult) {
+        const view = _flowReceiverType(index, contextFile, call,
+            { ...typeOrigin, type: typeName }, symbols || []);
+        if (!view.receiverType || view.receiverDerefAmbiguous) return { ambiguous: true };
+        typeName = view.receiverType;
+    }
     if (language === 'java' || language === 'csharp') {
         const origin = typeOrigin?.definition;
         const ref = typeOrigin?.classRef || (origin
@@ -25368,9 +25402,9 @@ function _nominalChainedReceiverType(index, call, fileEntry, filePath) {
                         selfClass: enclosing.className,
                     });
                     if (!parsedSC) return null;
-                    const originSC = _resolveFlowTypeOrigin(index, sameClass.file || filePath, parsedSC.name, parsedSC.qualifier);
+                    const originSC = _returnTypeOrigin(index, sameClass.file || filePath, parsedSC);
                     if (!originSC) return null;
-                    return { type: parsedSC.name, ...(originSC.fromFile && { fromFile: originSC.fromFile }) };
+                    return { type: parsedSC.name, ...(parsedSC.primitiveType && { primitiveType: parsedSC.primitiveType }), ...(originSC.fromFile && { fromFile: originSC.fromFile }) };
                 }
             }
         }
@@ -25406,9 +25440,9 @@ function _nominalChainedReceiverType(index, call, fileEntry, filePath) {
     }
     const parsed = _returnTypeNameNominal(producer.returnType, language, { selfClass });
     if (!parsed) return null;
-    const origin = _resolveFlowTypeOrigin(index, producer.file || filePath, parsed.name, parsed.qualifier);
+    const origin = _returnTypeOrigin(index, producer.file || filePath, parsed);
     if (!origin) return null;
-    return { type: parsed.name, ...(origin.fromFile && { fromFile: origin.fromFile }) };
+    return { type: parsed.name, ...(parsed.primitiveType && { primitiveType: parsed.primitiveType }), ...(origin.fromFile && { fromFile: origin.fromFile }) };
 }
 
 /**
@@ -25748,7 +25782,7 @@ function _methodReturnOnType(index, typeName, fromFile, methodName, language, op
         const def = owned[0];
         const parsed = _returnTypeNameNominal(_declaredReturnText(def), language, { selfClass: selfType });
         if (!parsed) return null;
-        const origin = _resolveFlowTypeOrigin(index, def.file || opts.filePath, parsed.name, parsed.qualifier);
+        const origin = _returnTypeOrigin(index, def.file || opts.filePath, parsed);
         const wrappers = language === 'rust' ? owned.map(candidate =>
             _rustReturnWrapper(index, _declaredReturnText(candidate), candidate.file || opts.filePath,
                 selfType, candidate, [], true)) : [];
@@ -25758,7 +25792,7 @@ function _methodReturnOnType(index, typeName, fromFile, methodName, language, op
             wrapper.kind === wrappers[0].kind && wrapper.type === wrappers[0].type &&
             wrapper.fromFile === wrappers[0].fromFile) ? wrappers[0] : null;
         if (!origin && !rustWrapper) return null;
-        return { ...(origin && { type: parsed.name }), ...(origin?.fromFile && { fromFile: origin.fromFile }),
+        return { ...(origin && { type: parsed.name, ...(parsed.primitiveType && { primitiveType: parsed.primitiveType }) }), ...(origin?.fromFile && { fromFile: origin.fromFile }),
             ...(language === 'rust' && owned.length === 1 && { rustReturnDeclaration: _rustReturnDeclaration(def) }),
             ...(rustWrapper && { rustWrapper }) };
     }
@@ -26319,6 +26353,8 @@ function _rustWrapperConstructionFlow(index, fileEntry, filePath, calls, call, c
     const folded = _typeOfCallResultFold(index, fileEntry, filePath, producer, ctx);
     if (!folded?.type || folded.externalVia) return null;
     return { type: folded.type, ...(folded.fromFile && { fromFile: folded.fromFile }),
+        ...(folded.primitiveType && { primitiveType: folded.primitiveType }),
+        ...(folded.stdResult && { stdResult: true }),
         ...(folded.stdLiteral && { stdLiteral: true }), valueRef: 'owned',
         derefVia: pins ? ['=Pin', call.receiver] : [call.receiver] };
 }
@@ -26725,12 +26761,12 @@ function _rustBlanketTraitResult(index, fileEntry, filePath, name, receiver) {
             blanketTrait: { trait: traitDef.name, method: declaration.bindingId } };
     }
     if (/^[A-Z][A-Z0-9]?$/.test(parsed.name) || parsed.name === 'Self') return null;
-    const origin = _resolveFlowTypeOrigin(index, declaration.file, parsed.name, parsed.qualifier);
+    const origin = _returnTypeOrigin(index, declaration.file, parsed);
     if (!origin?.fromFile) return null;
     // Only a project type result is identity; std/external heads stay open.
     if (!(index.symbols.get(parsed.name) || []).some(definition =>
         _FOLD_TYPE_KINDS.has(definition.type) && definition.file === origin.fromFile)) return null;
-    return { type: parsed.name, fromFile: origin.fromFile,
+    return { type: parsed.name, ...(parsed.primitiveType && { primitiveType: parsed.primitiveType }), fromFile: origin.fromFile,
         blanketTrait: { trait: traitDef.name, method: declaration.bindingId } };
 }
 
@@ -27950,9 +27986,9 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
         if (module) {
             const producer = module.definition;
             const parsed = _returnTypeNameNominal(producer.returnType, language);
-            const origin = parsed && _resolveFlowTypeOrigin(index, producer.file, parsed.name, parsed.qualifier);
+            const origin = parsed && _returnTypeOrigin(index, producer.file, parsed);
             if (!origin) return null;
-            return { type: parsed.name, fromFile: origin.fromFile, moduleProducer: module.facts,
+            return { type: parsed.name, ...(parsed.primitiveType && { primitiveType: parsed.primitiveType }), fromFile: origin.fromFile, moduleProducer: module.facts,
                 rustReturnDeclaration: _rustReturnDeclaration(producer),
                 rustWrapper: _rustReturnWrapper(index, producer.returnType, producer.file, null, producer) };
         }
@@ -28009,9 +28045,9 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
         const def = inPkg[0];
         const parsed = _returnTypeNameNominal(def.returnType, language, {});
         if (!parsed) return null;
-        const origin = _resolveFlowTypeOrigin(index, def.file || filePath, parsed.name, parsed.qualifier);
+        const origin = _returnTypeOrigin(index, def.file || filePath, parsed);
         if (!origin) return null;
-        return { type: parsed.name, ...(origin.fromFile && { fromFile: origin.fromFile }) };
+        return { type: parsed.name, ...(parsed.primitiveType && { primitiveType: parsed.primitiveType }), ...(origin.fromFile && { fromFile: origin.fromFile }) };
     }
     // Structural module-qualified producer: z.string() — resolve through the
     // file's import bindings (flow-map rails, incl. the #222 externality test).
@@ -28248,9 +28284,9 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
             const selfClass = classes.size === 1 ? [...classes][0] : undefined;
             const parsed = _returnTypeNameNominal(methodDefs[0].returnType, language, { selfClass });
             if (!parsed) return null;
-            const origin = _resolveFlowTypeOrigin(index, methodDefs[0].file || filePath, parsed.name, parsed.qualifier);
+            const origin = _returnTypeOrigin(index, methodDefs[0].file || filePath, parsed);
             if (!origin) return null;
-            return { type: parsed.name, ...(origin.fromFile && { fromFile: origin.fromFile }) };
+            return { type: parsed.name, ...(parsed.primitiveType && { primitiveType: parsed.primitiveType }), ...(origin.fromFile && { fromFile: origin.fromFile }) };
         }
         if (language === 'python' && !consumerAwaited && methodDefs.some(d => d.isAsync)) return null;
         const heads = new Set();
@@ -28335,9 +28371,9 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
         }
         const parsed = _returnTypeNameNominal(chosen.returnType, language, {});
         if (!parsed) return null;
-        const origin = _resolveFlowTypeOrigin(index, chosen.file || filePath, parsed.name, parsed.qualifier);
+        const origin = _returnTypeOrigin(index, chosen.file || filePath, parsed);
         if (!origin) return null;
-        return { type: parsed.name, ...(origin.fromFile && { fromFile: origin.fromFile }),
+        return { type: parsed.name, ...(parsed.primitiveType && { primitiveType: parsed.primitiveType }), ...(origin.fromFile && { fromFile: origin.fromFile }),
             ...(language === 'rust' && chosen.file === filePath && { rustReturnDeclaration: _rustReturnDeclaration(chosen) }) };
     }
     if (language === 'python' && !consumerAwaited && chosen.isAsync) return null;
@@ -28428,10 +28464,14 @@ function _foldChainedReceiverType(index, fileEntry, filePath, call, ctx) {
     }
     if (results.some(r => r.externalVia)) return null;
     if (new Set(results.map(r => r.type)).size !== 1) return null;
+    const primitives = new Set(results.map(r => JSON.stringify(r.primitiveType || null)));
+    if (primitives.size !== 1) return { suppressFallback: true };
     const fromFiles = new Set(results.map(r => r.fromFile));
     const typeTexts = new Set(results.map(r => r.typeText));
     let result = {
         type: results[0].type,
+        ...(results[0].primitiveType && { primitiveType: results[0].primitiveType }),
+        ...(results.every(result => result.stdResult) && { stdResult: true }),
         ...(results.length === 1 && results[0].moduleProducer && {
             moduleProducer: results[0].moduleProducer,
         }),

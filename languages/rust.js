@@ -1527,6 +1527,31 @@ function rustRawPointerTypeOf(typeNode) {
     return current.children.some(child => child.type === 'mutable_specifier') ? '*mut' : '*const';
 }
 
+const primitiveTypeInfoCache = new Map();
+
+/** Primitive identity of a declared type, independent of nominal names. */
+function getPrimitiveTypeInfo(text, parser) {
+    if (typeof text !== 'string' || (!text.includes('[') && !text.includes('*'))) return null;
+    if (primitiveTypeInfoCache.has(text)) return primitiveTypeInfoCache.get(text);
+    const tree = parseTree(parser, `type __ucn_type = ${text};`);
+    const items = tree.rootNode.namedChildren.filter(node => !node.type.endsWith('comment'));
+    const item = items.length === 1 && items[0].type === 'type_item' ? items[0] : null;
+    const declared = !tree.rootNode.hasError && item?.childForFieldName('type');
+    const deref = declared && rustDerefTypedName(declared);
+    const inner = deref?.inner || declared;
+    const type = rustSliceTypeOf(inner) || rustRawPointerTypeOf(inner);
+    const info = type ? Object.freeze({
+        type,
+        ...(deref && { derefVia: Object.freeze([...deref.via]),
+            derefOuterRef: deref.outerRef }),
+    }) : null;
+    if (primitiveTypeInfoCache.size >= 256) {
+        primitiveTypeInfoCache.delete(primitiveTypeInfoCache.keys().next().value);
+    }
+    primitiveTypeInfoCache.set(text, info);
+    return info;
+}
+
 /**
  * Standard-library wrappers whose `Deref::Target` is their (first) type
  * argument (fix #401): smart pointers, `ManuallyDrop`, lazy cells, `RefCell`
@@ -6002,6 +6027,7 @@ function isEntryPoint(symbol) {
 }
 
 module.exports = {
+    getPrimitiveTypeInfo,
     primeDeclarationTrees,
     DECLARATION_NODE_TYPES,
     rustExpandedItemRecovery,

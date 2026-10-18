@@ -18,6 +18,37 @@ const { execute } = require('../core/execute');
 const { computeReachability } = require('../core/entrypoints');
 const { tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR, runCli, runInteractive } = require('./helpers');
 
+describe('fix #414: primitive return metadata keeps other language bindings intact', () => {
+    const cases = [
+        ["C", "m.c", "int pick(int value) { return value; }\nint run(void) { return pick(7); }", "pick", 2],
+        ["C++", "m.cpp", "struct Runner { int render() { return 7; } };\nRunner make() { return Runner{}; }\nint run() { return make().render(); }", "render", 3],
+        ["C#", "m.cs", "class Runner { public int Render() => 7; }\nclass Host { static Runner Make() => new Runner();\nstatic int Run() { return Make().Render(); } }", "Render", 3],
+        ["Java", "Host.java", "class Runner { int render() { return 7; } }\nclass Host { static Runner make() { return new Runner(); }\nstatic int run() { return make().render(); } }", "render", 3],
+        ["Go", "m.go", "package p\ntype Runner struct{}\nfunc (r Runner) Render() int { return 7 }\nfunc makeRunner() Runner { return Runner{} }\nfunc run() int { return makeRunner().Render() }", "Render", 5],
+        ["Python", "m.py", "class Runner:\n def render(self): return 7\ndef make() -> Runner: return Runner()\ndef run(): return make().render()\n", "render", 4],
+        ["TypeScript", "m.ts", "class Runner { render() { return 7; } }\nfunction make(): Runner { return new Runner(); }\nfunction run() { return make().render(); }", "render", 3],
+        ["TSX", "m.tsx", "class Runner { render() { return 7; } }\nfunction make(): Runner { return new Runner(); }\nfunction run() { return make().render(); }", "render", 3],
+        ["JavaScript", "m.js", "class Runner { render() { return 7; } }\n/** @returns {Runner} */\nfunction make() { return new Runner(); }\nfunction run() { return make().render(); }", "render", 4],
+        ["HTML", "m.html", "<script>\nclass Runner { render() { return 7; } }\n/** @returns {Runner} */\nfunction make() { return new Runner(); }\nfunction run() { return make().render(); }\n</script>", "render", 5],
+    ];
+    for (const [label, file, code, name, line] of cases) {
+        it(label, () => {
+            const dir = tmp({ [file]: code });
+            try {
+                const index = idx(dir);
+                const definition = (index.symbols.get(name) || []).find(symbol =>
+                    symbol.relativePath === file && !symbol.isSignature);
+                assert.ok(definition);
+                const result = execute(index, 'context', { name: `${file}:${definition.startLine}:${name}` });
+                assert.ok(result.ok, result.error);
+                assert.ok(result.result.meta.account.conserved);
+                assert.ok(result.result.callers.some(site => site.line === line) ||
+                    result.result.unverifiedCallers.some(site => site.line === line));
+            } finally { rm(dir); }
+        });
+    }
+});
+
 describe('fix #413: conditional namespace imports retain alternative binding identity', () => {
     const header = [
         '#include <cstdlib>',
