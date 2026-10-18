@@ -4400,8 +4400,10 @@ function findCppUsingFacts(tree) {
             if (parent.type === 'namespace_definition' ||
                 parent.type === 'translation_unit') break;
         }
+        const groups = conditionalGroupsOf(node);
         const location = {
             line: node.startPosition.row + 1,
+            ...(groups.length > 0 && { ppGroups: groups }),
             ...(enclosingNamespace(node) && { namespace: enclosingNamespace(node) }),
             ...(block && {
                 scopeStartLine: block.startPosition.row + 1,
@@ -4440,6 +4442,29 @@ function findCppUsingFacts(tree) {
 const PP_CONDITIONAL_TYPES = new Set([
     'preproc_if', 'preproc_ifdef', 'preproc_elif', 'preproc_elifdef', 'preproc_else',
 ]);
+
+/** Original preprocessor groups containing a declaration (fix #413). */
+function conditionalGroupsOf(node) {
+    const groups = [];
+    const seen = new Set();
+    for (let up = node.parent; up; up = up.parent) {
+        if (!PP_CONDITIONAL_TYPES.has(up.type)) continue;
+        let head = up;
+        while (head.parent && PP_CONDITIONAL_TYPES.has(head.parent.type) &&
+            sameNode(head.parent.childForFieldName('alternative'), head)) head = head.parent;
+        if (seen.has(head.startIndex) || isIncludeGuard(head)) continue;
+        seen.add(head.startIndex);
+        const branches = [];
+        for (let arm = head; arm; arm = arm.childForFieldName('alternative')) {
+            const next = arm.childForFieldName('alternative');
+            branches.push([arm.startPosition.row + 1,
+                next ? next.startPosition.row : arm.endPosition.row + 1]);
+        }
+        groups.push({ start: head.startPosition.row + 1,
+            end: head.endPosition.row + 1, branches });
+    }
+    return groups;
+}
 
 /** `#ifndef G` whose first directive is `#define G` and that has no else. */
 function isIncludeGuard(node) {
@@ -6776,7 +6801,14 @@ function parse(code, parser, mode, options = {}) {
         if (mode === 'cpp') {
             const markers = findMacroScopeMarkers(code, tree, lines);
             if (markers.length > 0) result.macroScopeMarkers = markers;
-            const usings = findCppUsingFacts(tree);
+            const primaryUsings = findCppUsingFacts(tree);
+            const originalUsings = literal ? findCppUsingFacts(literal) : primaryUsings;
+            const key = fact => `${fact.line}:${fact.kind}:${fact.target}`;
+            const original = new Map(originalUsings.map(fact => [key(fact), fact]));
+            const usings = mergeExtracted(primaryUsings, originalUsings, key).map(fact => {
+                const groups = original.get(key(fact))?.ppGroups;
+                return groups ? { ...fact, ppGroups: groups } : fact;
+            });
             if (usings.length > 0) result.cppUsings = usings;
         }
         // Adapter-only full-analysis fact: keep the public parse result shape

@@ -25,6 +25,55 @@ const {
 } = require('../core/cache');
 const { createTempDir, cleanup, tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR } = require('./helpers');
 
+describe('fix #413: conditional using facts survive index persistence', () => {
+    it('round-trips the source branches and their unverified callers', () => {
+        const { execute } = require('../core/execute');
+        const dir = tmp({
+            'api.hpp': '#include <cstdlib>\nnamespace library {\n#if MODE\nusing std::abs;\n#else\ninline int abs(int value) { return value; }\n#endif\n}',
+            'use.cpp': '#include "api.hpp"\nint run(int value) { return library::abs(value); }',
+        });
+        try {
+            const read = index => {
+                const facts = index.files.get(path.join(dir, 'api.hpp')).cppUsings;
+                assert.ok(facts.some(fact => fact.name === 'abs' && fact.ppGroups?.length));
+                const result = execute(index, 'context', { name: 'api.hpp:6:abs' });
+                assert.ok(result.ok, result.error);
+                assert.ok(result.result.unverifiedCallers.some(site => site.relativePath === 'use.cpp'));
+                return {
+                    facts,
+                    account: result.result.meta.account,
+                    callers: result.result.callers.map(site => [site.relativePath, site.line]),
+                    unverified: result.result.unverifiedCallers.map(site => [site.relativePath, site.line, site.reason]),
+                };
+            };
+            const index = idx(dir);
+            const before = JSON.parse(JSON.stringify(read(index)));
+            index.saveCache();
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loaded.loadCache());
+            assert.deepStrictEqual(JSON.parse(JSON.stringify(read(loaded))), before);
+        } finally {
+            clearProjectCache(dir);
+            rm(dir);
+        }
+    });
+    it('rejects the preceding format without conditional import groups', () => {
+        const dir = tmp({ 'm.cpp': 'int value() { return 1; }' });
+        try {
+            const index = idx(dir);
+            index.saveCache();
+            const cacheFile = getProjectCachePath(dir);
+            const saved = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+            saved.version = 278;
+            fs.writeFileSync(cacheFile, JSON.stringify(saved));
+            assert.strictEqual(new ProjectIndex(dir).loadCache(), false);
+        } finally {
+            clearProjectCache(dir);
+            rm(dir);
+        }
+    });
+});
+
 describe('fix #412: local function lexical lookup survives cache reload', () => {
     it('rebuilds type context without persisting member ownership on the local function', () => {
         const { execute } = require('../core/execute');

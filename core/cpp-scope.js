@@ -301,6 +301,10 @@ function _usingsInScope(index, context, visibleFiles) {
     const take = (file, fact) => {
         if (file === context.file) {
             if (fact.line > context.line) return;
+            if (fact.ppGroups?.some(group => {
+                const branch = _branchAt(group, context.line);
+                return branch >= 0 && branch !== _branchAt(group, fact.line);
+            })) return;
             if (fact.scopeStartLine != null &&
                 (context.line < fact.scopeStartLine || context.line > fact.scopeEndLine)) return;
         } else if (fact.scopeStartLine != null) {
@@ -321,6 +325,73 @@ function _usingsInScope(index, context, visibleFiles) {
         for (const fact of index.files.get(file)?.cppUsings || []) take(file, fact);
     }
     return out;
+}
+
+function _branchAt(group, line) {
+    return Number.isInteger(line) ? group.branches.findIndex(([start, end]) =>
+        start <= line && line <= end) : -1;
+}
+
+/** An import and a local declaration can bind one name in different builds. */
+function _conditionalImports(index, definition) {
+    if (!definition?.file || definition.className || definition.receiver || definition.enclosingType ||
+        definition.type === 'macro') return [];
+    const facts = index.files.get(definition.file)?.cppUsings;
+    if (!facts?.some(fact => fact.name === definition.name && fact.ppGroups?.length)) return [];
+    const state = _state(index);
+    state.conditionalImports ||= new WeakMap();
+    if (state.conditionalImports.has(definition)) return state.conditionalImports.get(definition);
+    const namespace = effectiveNamespace(index, definition);
+    const out = [];
+    // Qualifier lookup can revisit this declaration through a namespace alias.
+    state.conditionalImports.set(definition, out);
+    for (const raw of facts) {
+        if (!['declaration', 'namespace-alias'].includes(raw.kind) ||
+            raw.name !== definition.name || raw.scopeStartLine != null) continue;
+        const groups = (raw.ppGroups || []).filter(group => {
+            const branch = _branchAt(group, definition.startLine);
+            return branch >= 0 && branch !== _branchAt(group, raw.line);
+        });
+        if (groups.length === 0 || effectiveNamespace(index,
+            { file: definition.file, startLine: raw.line, namespace: raw.namespace }) !== namespace) continue;
+        if (raw.kind === 'namespace-alias') {
+            out.push({ groups });
+            continue;
+        }
+        const fact = _withExpandedTarget(index, { ...raw, file: definition.file });
+        const qualifier = fact.target.replace(/^::/, '').split('::').slice(0, -1).join('::');
+        const supplier = resolveQualifier(index, _factContext(index, fact, definition.file),
+            qualifier, includeClosure(index, definition.file));
+        if (supplier.kind === 'namespace' &&
+            (supplier.resolvedNamespace || supplier.namespace) === namespace) continue;
+        out.push({ groups });
+    }
+    state.conditionalImports.set(definition, out);
+    return out;
+}
+
+/** null: unchanged binding; other: absent here; uncertain: build selects it. */
+function conditionalImportBinding(index, definitions, site) {
+    let affected = false;
+    let allOther = true;
+    for (const definition of definitions) {
+        const imports = _conditionalImports(index, definition);
+        if (imports.length === 0) { allOther = false; continue; }
+        affected = true;
+        let other = false;
+        let unknown = false;
+        for (const item of imports) for (const group of item.groups) {
+            const branch = site.file === definition.file ? _branchAt(group, site.line) : -1;
+            if (branch < 0) unknown = true;
+            else if (branch !== _branchAt(group, definition.startLine)) other = true;
+        }
+        // One known incompatible branch excludes this definition even if
+        // an outer or nested condition remains unknown.
+        if (other) continue;
+        allOther = false;
+        if (!unknown) return null;
+    }
+    return affected ? (allOther ? 'other' : 'uncertain') : null;
 }
 
 /**
@@ -429,9 +500,28 @@ function resolveQualifier(index, context, spelling, visibleFiles, depth = 0, opt
     const introducers = usings.filter(fact =>
         (fact.kind === 'declaration' || fact.kind === 'namespace-alias') &&
         fact.name === segments[0]);
+    if (introducers.some(fact => fact.ppGroups?.length > 0)) {
+        const scopes = new Set(_enclosingPrefixes(contextNamespace));
+        const local = (index.symbols.get(segments[0]) || []).filter(definition =>
+            visibleFiles?.has(definition.file) && scopes.has(effectiveNamespace(index, definition)));
+        if (conditionalImportBinding(index, local, context) === 'uncertain') {
+            return finish({ kind: 'unknown', why: 'configuration-alternative' });
+        }
+    }
     if (introducers.length > 0) {
         const targets = new Set(introducers.map(fact => fact.target));
-        if (targets.size !== 1) return finish({ kind: 'unknown', why: 'ambiguous-using' });
+        if (targets.size !== 1) {
+            // Different namespace aliases leave identity undecided while
+            // still proving the qualifier cannot name a class. A type
+            // alternative keeps even that category uncertain.
+            const scopes = new Set(_enclosingPrefixes(contextNamespace));
+            const localTypes = _typeCandidates(index, segments[0]).some(definition =>
+                visibleFiles?.has(definition.file) && scopes.has(effectiveNamespace(index, definition)));
+            const namespaceOnly = segments.length === 1 && !localTypes &&
+                introducers.every(fact => fact.kind === 'namespace-alias');
+            return finish({ kind: 'unknown', why: 'ambiguous-using',
+                ...(namespaceOnly && { namespaceOnly: true }) });
+        }
         const fact = introducers[0];
         const rewritten = [fact.target, ...segments.slice(1)].join('::');
         return finish(resolveQualifier(index, _factContext(index, fact, origin),
@@ -506,6 +596,9 @@ function resolveQualifier(index, context, spelling, visibleFiles, depth = 0, opt
         return finish({ kind: 'unknown', why: 'not-visible' });
     }
     const chosen = visible.length > 0 ? visible : matched;
+    if (conditionalImportBinding(index, chosen, context)) {
+        return finish({ kind: 'unknown', why: 'configuration-alternative' });
+    }
     if (declarationsOnly) {
         return finish({ kind: 'type', declarations: chosen, visible: visible.length > 0 });
     }
@@ -534,6 +627,7 @@ function resolveQualifier(index, context, spelling, visibleFiles, depth = 0, opt
 }
 
 module.exports = {
+    conditionalImportBinding,
     macroPrefixAt: _macroPrefixAt,
     globalQualifiedReaches,
     resetCppScope,

@@ -32,7 +32,8 @@ const {
     hasFunctionLocalClass, descendsFromTargets, resolveClassRef, resolveQualifiedClassRef,
 } = require('./class-identity');
 const { resolveQualifier: resolveCppQualifier, effectiveNamespace: cppEffectiveNamespace,
-    globalQualifiedReaches: cppGlobalQualifiedReaches, includeClosure: cppIncludeClosure } =
+    globalQualifiedReaches: cppGlobalQualifiedReaches, includeClosure: cppIncludeClosure,
+    conditionalImportBinding: cppConditionalImportBinding } =
     require('./cpp-scope');
 
 /**
@@ -7453,8 +7454,16 @@ function findCallers(index, name, options = {}) {
         for (const { call, fileEntry, callerSymbol, isMethod, isFunctionReference,
             isTypeReference, receiver, receiverType, calledAs, _evidence, _tier,
             _reason, _meta } of pending) {
+            const configuration = cppConditionalImportBinding(index,
+                options.targetDefinitions || definitions, { file: filePath, line: call.line });
+            if (configuration === 'other') {
+                recordExcluded(filePath, call.line, 'configuration-other-branch');
+                continue;
+            }
+            if (configuration === 'uncertain' && !collectAccount) continue;
+            const configurationUncertain = configuration === 'uncertain' && !_tier;
             const evidence = {
-                ...(_evidence || {}),
+                ...(configurationUncertain ? { isUncertain: true } : (_evidence || {})),
                 ...(_reason && { reason: _reason }),
                 facts: _evidence?.facts || _confirmationFacts(index, filePath,
                     call, options.targetDefinitions || definitions, {
@@ -7462,8 +7471,8 @@ function findCallers(index, name, options = {}) {
                     }),
             };
             let scored = scoreEdge(evidence);
-            let routedTier = _tier;
-            let routedReason = _reason;
+            let routedTier = configurationUncertain ? TIER.UNVERIFIED : _tier;
+            let routedReason = configurationUncertain ? 'configuration-alternative' : _reason;
             // Expansions under several configuration-dependent definitions
             // of the macro that disagree about this target (fix #362).
             if (!routedTier && collectAccount && call.macroExpansion?.ambiguous) {
@@ -7511,6 +7520,10 @@ function findCallers(index, name, options = {}) {
                     tier: routedTier,
                     reason: routedReason,
                     ...(_meta || {}),
+                    ...(configurationUncertain && {
+                        uncertaintyClass: 'compile-time-dispatch',
+                        dispatchFamily: `${name} conditional imports`,
+                    }),
                     isMethod: call.isMethod || false,
                     ...(isFunctionReference && { isFunctionReference: true }),
                     ...(isTypeReference && { isTypeReference: true }),
@@ -10713,7 +10726,7 @@ function findCallees(index, definition, options = {}) {
                         if (collectAccount) {
                             for (const siteId of siteIds) {
                                 noteUnverified(siteId, siteEvidence.get(siteId).call,
-                                    'link-ambiguous', { dispatchCandidates: linked.candidates });
+                                    linked.reason || 'link-ambiguous', { dispatchCandidates: linked.candidates });
                             }
                             continue;
                         }
@@ -23188,6 +23201,12 @@ function _textualLinkVerdict(index, callerFile, targetDefs, definitions, callLin
     const targetKeys = new Set(callable.map(definition => `${definition.file}:${definition.startLine}`));
     const bodies = callable.filter(definition => !definition.isSignature);
     if (bodies.length === 0) return null;
+    const configuration = cppConditionalImportBinding(index, bodies,
+        { file: callerFile, line: callLine });
+    if (configuration === 'other') return 'other';
+    if (configuration === 'uncertain') {
+        return { ambiguous: true, candidates: bodies.length + 1, reason: 'configuration-alternative' };
+    }
     const { all } = _textualIncludeClosures(index, callerFile);
     const inUnit = definition => definition.file === callerFile || all.has(definition.file);
     const internal = definition => definition.modifiers?.includes('static');
@@ -23405,6 +23424,7 @@ function _cppPathQualifierVerdict(index, callerFile, call, targetDefs) {
     };
     const resolved = resolveCppQualifier(index, context, call.receiver,
         _cppVisibleFiles(index, callerFile));
+    if (resolved.namespaceOnly && allMembers) return { exclude: 'method-kind-mismatch' };
     if (resolved.kind === 'namespace') {
         return allMembers ? { exclude: 'method-kind-mismatch' } : { kind: 'namespace' };
     }

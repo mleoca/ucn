@@ -2417,8 +2417,9 @@ function cppQualifiedReferenceVerdict(index, ref, def) {
     } catch {
         return 'review';
     }
-    if (!resolved || resolved.kind === 'unknown') return 'review';
     const owner = def.className || (def.receiver ? String(def.receiver).replace(/^\*/, '') : null);
+    if (resolved?.namespaceOnly && owner) return null;
+    if (!resolved || resolved.kind === 'unknown') return 'review';
     if (resolved.kind === 'namespace') {
         if (owner) return null;
         return (resolved.resolvedNamespace || resolved.namespace) === effectiveNamespace(index, def) ? 'edit' : null;
@@ -5635,6 +5636,25 @@ function plan(index, name, options = {}) {
                     reason: review.reason,
                 })),
             };
+        }
+    }
+
+    if (options.renameTo && langTraits(planLang)?.textualIncludes) {
+        const { conditionalImportBinding } = require('./cpp-scope');
+        for (let i = changes.length - 1; i >= 0; i--) {
+            const change = changes[i];
+            if (change.editKind === 'definition' || change.needsReview ||
+                change.newExpression === undefined) continue;
+            const configuration = conditionalImportBinding(index, [def], {
+                file: path.resolve(index.root, change.file), line: change.line,
+            });
+            if (configuration === 'other') changes.splice(i, 1);
+            else if (configuration === 'uncertain') {
+                delete change.newExpression;
+                change.needsReview = true;
+                change.reviewReason = 'configuration-alternative';
+                change.suggestion = 'Build configuration selects this name\'s declaration; review this reference before renaming it';
+            }
         }
     }
 

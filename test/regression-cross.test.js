@@ -18,6 +18,263 @@ const { execute } = require('../core/execute');
 const { computeReachability } = require('../core/entrypoints');
 const { tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR, runCli, runInteractive } = require('./helpers');
 
+describe('fix #413: conditional namespace imports retain alternative binding identity', () => {
+    const header = [
+        '#include <cstdlib>',
+        'namespace library {',
+        '#if defined(USE_NATIVE)',
+        'using std::abs;',
+        'inline int from_import(int value) { return abs(value); }',
+        '#else',
+        'inline int abs(int value) { return value < 0 ? -value : value; }',
+        'inline int from_project(int value) { return abs(value); }',
+        '#endif',
+        '}',
+    ].join('\n');
+    function inspect(files, verify, name = 'abs', declarationFile = 'api.hpp', declarationLine = null) {
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const definition = index.symbols.get(name)?.find(symbol =>
+                symbol.relativePath === declarationFile && !symbol.isSignature && symbol.type !== 'macro' &&
+                (declarationLine === null || symbol.startLine === declarationLine));
+            assert.ok(definition);
+            const pin = `${declarationFile}:${definition.startLine}:${name}`;
+            const context = execute(index, 'context', { name: pin });
+            const plan = execute(index, 'plan', { name: pin, renameTo: 'Renamed' });
+            assert.ok(context.ok, context.error);
+            assert.ok(plan.ok, plan.error);
+            assert.ok(context.result.meta.account.conserved);
+            verify(index, context.result, plan.result);
+        } finally { rm(dir); }
+    }
+    const automatic = (plan, file, line) => plan.changes.some(change =>
+        change.file === file && change.line === line && change.newExpression !== undefined && !change.needsReview);
+
+    it('a qualified call after the conditional is unverified on both sides', () => {
+        inspect({ 'api.hpp': header, 'use.cpp': '#include "api.hpp"\nint run(int value) { return library::abs(value); }' },
+            (index, context, plan) => {
+                assert.ok(!context.callers.some(site => site.relativePath === 'use.cpp'));
+                assert.ok(context.unverifiedCallers.some(site => site.relativePath === 'use.cpp' &&
+                    site.reason === 'configuration-alternative'));
+                assert.ok(!automatic(plan, 'use.cpp', 2));
+                const own = execute(index, 'context', { name: 'use.cpp:2:run' });
+                assert.ok(own.ok, own.error);
+                assert.ok(!own.result.callees.some(callee => callee.name === 'abs'));
+                assert.ok(own.result.unverifiedCallees.some(callee => callee.name === 'abs'));
+                assert.ok(own.result.meta.calleeAccount.conserved);
+            });
+    });
+    it('a call in the declaration branch keeps its project binding', () => {
+        inspect({ 'api.hpp': header, 'use.cpp': '#include "api.hpp"' }, (index, context, plan) => {
+            assert.ok(context.callers.some(site => site.relativePath === 'api.hpp' && site.line === 8));
+            assert.ok(automatic(plan, 'api.hpp', 8));
+        });
+    });
+    it('a declaration-only fallback keeps configuration-dependent callers and callees unverified', () => {
+        const dir = tmp({
+            'api.hpp': '#include <cstdlib>\nnamespace library {\n#if MODE\nusing std::abs;\n#else\nint abs(int value);\n#endif\n}',
+            'use.cpp': '#include "api.hpp"\nint run(int value) { return library::abs(value); }',
+        });
+        try {
+            const index = idx(dir);
+            const target = execute(index, 'context', { name: 'api.hpp:6:abs' });
+            const caller = execute(index, 'context', { name: 'use.cpp:2:run' });
+            const plan = execute(index, 'plan', { name: 'api.hpp:6:abs', renameTo: 'Renamed' });
+            assert.ok(target.ok, target.error);
+            assert.ok(caller.ok, caller.error);
+            assert.ok(plan.ok, plan.error);
+            assert.ok(!target.result.callers.some(site => site.relativePath === 'use.cpp'));
+            assert.ok(target.result.unverifiedCallers.some(site =>
+                site.relativePath === 'use.cpp' && site.reason === 'configuration-alternative'));
+            assert.ok(!caller.result.callees.some(site => site.name === 'abs'));
+            assert.ok(caller.result.unverifiedCallees.some(site => site.name === 'abs'));
+            assert.ok(target.result.meta.account.conserved);
+            assert.ok(caller.result.meta.calleeAccount.conserved);
+            assert.ok(!automatic(plan.result, 'use.cpp', 2));
+        } finally { rm(dir); }
+    });
+    it('a call in the import branch cannot reach the inactive definition', () => {
+        inspect({ 'api.hpp': header, 'use.cpp': '#include "api.hpp"' }, (index, context, plan) => {
+            assert.ok(!context.callers.some(site => site.relativePath === 'api.hpp' && site.line === 5));
+            assert.ok(!context.unverifiedCallers.some(site => site.relativePath === 'api.hpp' && site.line === 5));
+            assert.ok(!automatic(plan, 'api.hpp', 5));
+        });
+    });
+    it('plain caller queries also keep configuration-dependent calls out of the answer', () => {
+        inspect({ 'api.hpp': header, 'use.cpp': '#include "api.hpp"\nint run(int value) { return library::abs(value); }' },
+            (index, context, plan) => {
+                const definition = index.symbols.get('abs')[0];
+                const callers = index.findCallers('abs', { targetDefinitions: [definition] });
+                assert.ok(!callers.some(site => site.relativePath === 'use.cpp'));
+                assert.ok(!callers.some(site => site.relativePath === 'api.hpp' && site.line === 5));
+            });
+    });
+    it('a using-declaration and a bare call retain the imported alternative', () => {
+        inspect({
+            'api.hpp': header,
+            'use.cpp': '#include "api.hpp"\nusing library::abs;\nint run(int value) { return abs(value); }',
+        }, (index, context, plan) => {
+            assert.ok(!automatic(plan, 'use.cpp', 2));
+            assert.ok(!automatic(plan, 'use.cpp', 3));
+            assert.ok(plan.changes.some(change => change.file === 'use.cpp' && change.line === 2 && change.needsReview));
+            assert.ok(context.unverifiedCallers.some(site => site.relativePath === 'use.cpp' && site.line === 3));
+        });
+    });
+    it('a namespace alias preserves the same conditional item', () => {
+        inspect({
+            'api.hpp': header,
+            'use.cpp': '#include "api.hpp"\nnamespace facade = library;\nint run(int value) { return facade::abs(value); }',
+        }, (index, context, plan) => {
+            assert.ok(!context.callers.some(site => site.relativePath === 'use.cpp'));
+            assert.ok(context.unverifiedCallers.some(site => site.relativePath === 'use.cpp'));
+            assert.ok(!automatic(plan, 'use.cpp', 3));
+        });
+    });
+    it('nested groups and an include guard do not erase the outer alternative', () => {
+        const nested = [
+            '#ifndef API_INCLUDED', '#define API_INCLUDED', '#include <cstdlib>', 'namespace library {',
+            '#if OUTER', '#if INNER', 'using std::abs;', '#else', 'using std::abs;', '#endif',
+            '#else', 'inline int abs(int value) { return value; }',
+            'inline int from_project(int value) { return abs(value); }', '#endif', '}', '#endif',
+        ].join('\n');
+        inspect({ 'api.hpp': nested, 'use.cpp': '#include "api.hpp"\nint run(int value) { return library::abs(value); }' },
+            (index, context, plan) => {
+                assert.ok(context.callers.some(site => site.relativePath === 'api.hpp' && site.line === 13));
+                assert.ok(context.unverifiedCallers.some(site => site.relativePath === 'use.cpp'));
+                assert.ok(!automatic(plan, 'use.cpp', 2));
+                const facts = index.files.get(path.join(index.root, 'api.hpp')).cppUsings;
+                assert.ok(facts.every(fact => fact.ppGroups.length === 2));
+            });
+    });
+    it('an unrelated namespace import is not an alternative of the pin', () => {
+        inspect({
+            'api.hpp': '#include <cstdlib>\nnamespace other {\n#if MODE\nusing std::abs;\n#endif\n}\nnamespace library { inline int abs(int value) { return value; } }',
+            'use.cpp': '#include "api.hpp"\nint run(int value) { return library::abs(value); }',
+        }, (index, context, plan) => {
+            assert.ok(context.callers.some(site => site.relativePath === 'use.cpp'));
+            assert.ok(automatic(plan, 'use.cpp', 2));
+        });
+    });
+    it('unconditional imports beside distinct overloads keep their existing lookup', () => {
+        inspect({
+            'api.hpp': '#include <cstdlib>\nnamespace library {\nstruct Box { int value; };\nusing std::abs;\ninline int abs(Box value) { return value.value; }\n}',
+            'use.cpp': '#include "api.hpp"\nint run() { return library::abs(library::Box{7}); }',
+        }, (index, context, plan) => {
+            assert.ok(context.callers.some(site => site.relativePath === 'use.cpp'));
+            assert.ok(automatic(plan, 'use.cpp', 2));
+        });
+    });
+    it('function values outside the conditional are reviewed', () => {
+        inspect({
+            'api.hpp': header,
+            'use.cpp': '#include "api.hpp"\nauto supplier = static_cast<int(*)(int)>(&library::abs);\nint run() { return supplier(7); }',
+        }, (index, context, plan) => {
+            assert.ok(!automatic(plan, 'use.cpp', 2));
+            assert.ok([...plan.changes, ...plan.reviewItems, ...plan.unverifiedSites]
+                .some(site => site.file === 'use.cpp' && site.line === 2 && site.needsReview));
+        });
+    });
+    it('template calls keep the imported standard-library alternative', () => {
+        inspect({
+            'api.hpp': '#include <utility>\nnamespace library {\n#if MODE\nusing std::move;\n#else\ntemplate<class T> T move(T value) { return value; }\n#endif\n}',
+            'use.cpp': '#include "api.hpp"\nint run() { return library::move<int>(7); }',
+        }, (index, context, plan) => {
+            assert.ok(context.unverifiedCallers.some(site => site.relativePath === 'use.cpp'));
+            assert.ok(!automatic(plan, 'use.cpp', 2));
+        }, 'move');
+    });
+    it('recovery preserves using facts from a macro-opened namespace', () => {
+        inspect({
+            'api.hpp': '#include <cstdlib>\n#define OPEN namespace library {\n#define CLOSE }\nOPEN\n#if MODE\nusing std::abs;\n#else\ninline int abs(int value) { return value; }\n#endif\nCLOSE',
+            'use.cpp': '#include "api.hpp"\nint run(int value) { return library::abs(value); }',
+        }, (index, context, plan) => {
+            const entry = index.files.get(path.join(index.root, 'api.hpp'));
+            assert.ok(entry.cppUsings.some(fact => fact.name === 'abs' && fact.ppGroups?.length));
+            assert.ok(context.unverifiedCallers.some(site => site.relativePath === 'use.cpp'));
+            assert.ok(!automatic(plan, 'use.cpp', 2));
+        });
+    });
+    it('a conditional type import cannot make the fallback type rename unconditional', () => {
+        inspect({
+            'api.hpp': '#include <string_view>\nnamespace library {\n#if __cplusplus >= 201703L\nusing std::string_view;\n#else\nstruct string_view {};\n#endif\n}',
+            'use.cpp': '#include "api.hpp"\nlibrary::string_view value;',
+        }, (index, context, plan) => {
+            assert.ok(!automatic(plan, 'use.cpp', 2));
+            assert.ok([...plan.changes, ...plan.reviewItems].some(site =>
+                site.file === 'use.cpp' && site.line === 2 && site.needsReview));
+        }, 'string_view');
+    });
+    it('a project type imported in the other branch remains an alternative', () => {
+        inspect({
+            'api.hpp': 'namespace provider { struct Item {}; }\nnamespace library {\n#if MODE\nusing provider::Item;\n#else\nstruct Item {};\n#endif\nItem outside;\n}',
+        }, (index, context, plan) => {
+            assert.ok(!automatic(plan, 'api.hpp', 8));
+            assert.ok([...plan.changes, ...plan.reviewItems].some(site =>
+                site.file === 'api.hpp' && site.line === 8 && site.needsReview));
+        }, 'Item', 'api.hpp', 6);
+    });
+    it('namespace aliases select their own branch and keep outside uses unverified', () => {
+        inspect({
+            'api.hpp': 'namespace one { struct Item {}; }\nnamespace two { struct Item {}; }\n#if MODE\nnamespace chosen = one;\nchosen::Item first_value;\n#else\nnamespace chosen = two;\nchosen::Item second_value;\n#endif\nchosen::Item outside;',
+        }, (index, context, plan) => {
+            assert.ok(automatic(plan, 'api.hpp', 5));
+            assert.ok(!automatic(plan, 'api.hpp', 8));
+            assert.ok(!automatic(plan, 'api.hpp', 10));
+            const other = execute(index, 'plan', { name: 'api.hpp:2:Item', renameTo: 'Renamed' });
+            assert.ok(other.ok, other.error);
+            assert.ok(automatic(other.result, 'api.hpp', 8));
+            assert.ok(!automatic(other.result, 'api.hpp', 5));
+            assert.ok(!automatic(other.result, 'api.hpp', 10));
+        }, 'Item');
+    });
+    it('alternative namespace aliases cannot call or reference a class member', () => {
+        inspect({
+            'api.hpp': 'struct Host { static int format() { return 7; } };\nnamespace one { int format() { return 1; } }\nnamespace two { int format() { return 2; } }\n#if MODE\nnamespace chosen = one;\n#else\nnamespace chosen = two;\n#endif\nint run() { return chosen::format(); }\nauto callback = &chosen::format;',
+        }, (index, context, plan) => {
+            assert.ok(!context.callers.some(site => site.line === 9));
+            assert.ok(!context.unverifiedCallers.some(site => site.line === 9));
+            assert.ok(!plan.changes.some(site => site.line === 9 || site.line === 10));
+            assert.ok(!plan.unverifiedSites.some(site => site.line === 9 || site.line === 10));
+        }, 'format', 'api.hpp', 1);
+    });
+    it('a namespace alias and a type alias keep the qualifier category uncertain outside their branches', () => {
+        inspect({
+            'api.hpp': 'struct Host { static int format() { return 7; } };\nnamespace one { int format() { return 1; } }\n#if MODE\nnamespace chosen = one;\n#else\nusing chosen = Host;\nint own() { return chosen::format(); }\n#endif\nint run() { return chosen::format(); }',
+        }, (index, context, plan) => {
+            assert.ok(context.callers.some(site => site.line === 7));
+            assert.ok(automatic(plan, 'api.hpp', 7));
+            assert.ok(!context.callers.some(site => site.line === 9));
+            assert.ok(context.unverifiedCallers.some(site => site.line === 9));
+            assert.ok(!automatic(plan, 'api.hpp', 9));
+        }, 'format', 'api.hpp', 1);
+    });
+    for (const [file, code, name, line] of [
+        ['m.c', 'int pickValue(int n) { return n; }\nint run(void) { return pickValue(7); }', 'pickValue', 2],
+        ['m.cpp', 'int pickValue(int n) { return n; }\nint run() { return pickValue(7); }', 'pickValue', 2],
+        ['Host.cs', 'class Host {\nstatic int Pick(int n) => n;\nstatic int Run() { return Pick(7); }\n}', 'Pick', 3],
+        ['Host.java', 'class Host {\nstatic int Pick(int n) { return n; }\nstatic int Run() { return Pick(7); }\n}', 'Pick', 3],
+        ['m.js', 'function pickValue(n) { return n; }\nfunction run() { return pickValue(7); }', 'pickValue', 2],
+        ['m.ts', 'function pickValue(n: number) { return n; }\nfunction run() { return pickValue(7); }', 'pickValue', 2],
+        ['m.tsx', 'function pickValue(n: number) { return n; }\nfunction run() { return pickValue(7); }', 'pickValue', 2],
+        ['m.py', 'def pickValue(n): return n\ndef run(): return pickValue(7)\n', 'pickValue', 2],
+        ['m.go', 'package p\nfunc pickValue(n int) int { return n }\nfunc run() int { return pickValue(7) }', 'pickValue', 3],
+        ['m.rs', 'fn pick_value(n:i32)->i32 {n}\nfn run()->i32 {pick_value(7)}', 'pick_value', 2],
+        ['m.html', '<script>\nfunction pickValue(n) { return n; }\nfunction run() { return pickValue(7); }\n</script>', 'pickValue', 3],
+    ]) {
+        it(`${file}: a declaration without an import alternative keeps its binding`, () => {
+            inspect({ [file]: code }, (index, context, plan) => {
+                assert.ok(context.callers.some(site => site.relativePath === file && site.line === line));
+                if (file === 'm.html') {
+                    // Browser-global names retain their existing name-binding review.
+                    assert.ok(plan.changes.some(change => change.file === file && change.line === line));
+                    assert.ok(!plan.changes.some(change => change.reviewReason === 'configuration-alternative'));
+                } else assert.ok(automatic(plan, file, line));
+            }, name, file);
+        });
+    }
+});
+
 describe('fix #412: local functions retain lexical type lookup across partial parts', () => {
     function inspect(files, pin, verify) {
         const dir = tmp(files);

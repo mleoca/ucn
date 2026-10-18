@@ -146,6 +146,10 @@ Every non-static declaration of a free function (a header prototype or a local f
 
 Recoverable preprocessor branches contribute AST-proven source facts, so a single selected configuration does not silently erase definitions or calls; disagreeing conditional macro identities stay visible as unverified. Members a class declares only in a conditional branch the selected configuration skips are indexed too. In a C/C++ file too large for the configuration sweep, a conditional the parser could not place (in a member-initializer list, an expression, template arguments) or whose branches split a block's braces is read in one configuration.
 
+A C++ namespace-scope name declared in one arm of a preprocessor group and imported by a using-declaration in another arm depends on the build configuration. Calls outside those branches stay unverified `configuration-alternative`; calls inside the project's branch keep their proven binding, and calls inside the import branch do not belong to the project declaration. A rename lists outside calls, using-declarations and value or type references for review.
+
+Alternative namespace aliases keep the qualifier's namespace category even when its identity is unresolved, so their calls cannot reach class members. An alternative that can name a type keeps the qualifier unverified outside its branch.
+
 A same-named class in a header that is only ever included in another branch of the same `#if` chain (`#ifdef _WIN32 #include "client-windows.h" #else #include "client.h"`) is that class in another configuration: calls its own members make are listed unverified `configuration-alternative` for this class's member, and `plan` renames the member in both.
 
 ### Receivers, qualifiers and lookup

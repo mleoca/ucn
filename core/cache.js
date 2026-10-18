@@ -928,7 +928,8 @@ function clearAllCaches() {
 // v277: refactoring usages distinguish declarator-name tokens from value
 // references; C# local-function name tokens are definitions.
 // v278: generic invocation usages preserve the terminal name and receiver.
-const CACHE_FORMAT_VERSION = 278;
+// v279: C++ using facts retain their enclosing preprocessor branch groups.
+const CACHE_FORMAT_VERSION = 279;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 /**
