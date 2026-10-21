@@ -96,6 +96,17 @@ const JAVA_LANG_NOT_SERIALIZABLE = ['Object', 'Runnable', 'AutoCloseable', 'Comp
 
 const STRUCTURAL_TRAITS = {
     typeSystem: 'structural',
+    plainQueryTree: true,
+    physicalCallTokenSyntax: true,
+    scopeAlternativeBindings: false,
+    nameReferenceFamily: 'js',
+    staticValueImportSyntax: null,
+    implicitEnumCaseLabels: false,
+    valuePatternConstants: false,
+    moduleValueLookup: false,
+    typeArgumentValues: null,
+    separateStaticStorage: true,
+    valueScopes: null,
     // A type's identity is its declaring module (a source file or inline
     // module), not the directory (fix #384): two same-name types in two
     // modules of one directory are distinct (JS/TS, Python modules, Rust
@@ -267,6 +278,17 @@ const STRUCTURAL_TRAITS = {
 };
 const NOMINAL_TRAITS = {
     typeSystem: 'nominal',
+    plainQueryTree: true,
+    physicalCallTokenSyntax: true,
+    scopeAlternativeBindings: false,
+    nameReferenceFamily: null,
+    staticValueImportSyntax: null,
+    implicitEnumCaseLabels: false,
+    valuePatternConstants: false,
+    moduleValueLookup: false,
+    typeArgumentValues: null,
+    separateStaticStorage: false,
+    valueScopes: null,
     moduleTypeIdentity: false,
     standardPathRoots: [],
     typeNameScoping: null,
@@ -495,6 +517,8 @@ const LANGUAGES = {
         traits: {
             ...STRUCTURAL_TRAITS,
             selfParam: ['self', 'cls'],
+            nameReferenceFamily: 'python',
+            separateStaticStorage: false,
             // fix #224: `from pkg import name` may bind a SUBMODULE file, not
             // a symbol — graph-build resolves the composed dotted specifier
             // and query code treats such receivers as module receivers. JS
@@ -517,6 +541,7 @@ const LANGUAGES = {
             // f` / `except ImportError: def f`) is one item with an
             // alternative per runtime configuration (fix #398F).
             conditionalDefinitions: 'branch',
+            scopeAlternativeBindings: true,
             // A def inside a function body binds a local of that function: a
             // bare name outside it never names it (fix #402), unless the
             // function declares the name `global`.
@@ -578,6 +603,8 @@ const LANGUAGES = {
             ...NOMINAL_TRAITS,
             selfParam: null,
             packageScope: 'directory',
+            nameReferenceFamily: 'go',
+            closedQueryBodies: ['function_declaration', 'method_declaration', 'func_literal'],
             hasReceiverPackageCalls: true,
             exportVisibility: 'capitalization',
             hasDynamicImports: false,
@@ -602,6 +629,11 @@ const LANGUAGES = {
         traits: {
             ...NOMINAL_TRAITS,
             selfParam: ['self', '&self', '&mut self', 'mut self'],
+            nameReferenceFamily: 'rust',
+            staticEnumReferenceSyntax: true,
+            valuePatternConstants: true,
+            moduleValueLookup: true,
+            typeArgumentValues: 'generic-parameter',
             hasDynamicImports: false,
             moduleTypeIdentity: true,
             // Same-scope definitions of one name are configuration
@@ -649,6 +681,12 @@ const LANGUAGES = {
         traits: {
             ...NOMINAL_TRAITS,
             fieldsAndMethodsSeparate: true,
+            nameReferenceFamily: 'java',
+            staticEnumReferenceSyntax: true,
+            closedQueryBodies: ['method_declaration', 'constructor_declaration',
+                'compact_constructor_declaration', 'lambda_expression'],
+            staticValueImportSyntax: tree => require('./java').staticValueImportSyntax(tree),
+            implicitEnumCaseLabels: true,
             standardPathRoots: ['java', 'javax'],
             typeNameScoping: 'package-on-demand',
             typeNamedSourceFile: true,
@@ -728,6 +766,7 @@ const LANGUAGES = {
             ...NOMINAL_TRAITS,
             selfParam: null,
             packageScope: 'file',
+            nameReferenceFamily: 'c',
             hasDynamicImports: false,
             exportVisibility: 'linkage',
             // Same-signature definitions in one file are `#if` alternatives.
@@ -755,6 +794,8 @@ const LANGUAGES = {
         traits: {
             ...NOMINAL_TRAITS,
             isInvokedName: (node, options) => require('./c-family').isInvokedName(node, options),
+            nameReferenceFamily: 'c',
+            typeArgumentValues: 'ordinary',
             selfParam: ['this'],
             packageScope: 'file',
             hasDynamicImports: false,
@@ -793,7 +834,19 @@ const LANGUAGES = {
         treeSitterModule: () => require('tree-sitter-c-sharp'),
         traits: {
             ...NOMINAL_TRAITS,
+            plainQueryTree: false,
             isInvokedName: (node, options) => require('./csharp').isInvokedName(node, options),
+            nameReferenceFamily: 'csharp',
+            staticEnumReferenceSyntax: true,
+            enumReferenceContext: node => ({
+                scopes: require('./csharp-scope').usingScopesOf(node),
+                directives: require('./csharp').queryUsingDirectives(node.tree),
+            }),
+            closedQueryBodies: ['method_declaration', 'constructor_declaration', 'destructor_declaration',
+                'operator_declaration', 'conversion_operator_declaration', 'local_function_statement',
+                'accessor_declaration', 'lambda_expression', 'anonymous_method_expression'],
+            queryBodyViews: tree => require('./csharp').queryBodyViews(tree),
+            queryBodyTree: (...args) => require('./csharp').queryBodyTree(...args),
             standardPathRoots: ['System'],
             conditionalDefinitions: 'preprocessor',
             typeNameScoping: 'namespace-usings',
@@ -859,6 +912,10 @@ const LANGUAGES = {
         treeSitterModule: () => require('tree-sitter-html'),
         traits: {
             ...STRUCTURAL_TRAITS,
+            // Embedded scripts supply their own parse trees.
+            physicalCallTokenSyntax: false,
+            valueScopes: (content, parser) => require('./html')
+                .extractScriptBlocks(content, parser, { includeScopes: true }),
             selfParam: ['this'],
             storedPromises: true,
             knownAsyncGlobals: ['fetch'],

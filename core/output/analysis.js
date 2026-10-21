@@ -814,8 +814,8 @@ function formatImpact(impact, options = {}) {
     // Summary (confirmed + unverified tiers reported separately)
     const impactUnverified = impact.unverifiedSites || [];
     const unverifiedSuffix = impactUnverified.length > 0 ? ` confirmed + ${impactUnverified.length} unverified` : '';
-    if (impact.propertyAccesses || impact.typeReferences) {
-        const pa = impact.propertyAccesses || impact.typeReferences;
+    if (impact.propertyAccesses || impact.valueAccesses || impact.typeReferences) {
+        const pa = impact.propertyAccesses || impact.valueAccesses || impact.typeReferences;
         const uv = pa.unverifiedCount ? ` + ${pa.unverifiedCount} unverified` : '';
         lines.push(`DEPENDENCY SITES: ${impact.totalDependencySites} confirmed${uv}`);
     }
@@ -891,9 +891,10 @@ function formatImpact(impact, options = {}) {
     }
     if (impactReach.note && !compact) lines.push(impactReach.note);
 
-    if (impact.propertyAccesses) {
-        const access = impact.propertyAccesses;
-        lines.push(`${compact ? '' : '\n'}PROPERTY ACCESS SITES: ${access.confirmedCount} confirmed` +
+    if (impact.propertyAccesses || impact.valueAccesses) {
+        const access = impact.propertyAccesses || impact.valueAccesses;
+        const label = impact.propertyAccesses ? 'PROPERTY' : 'VALUE';
+        lines.push(`${compact ? '' : '\n'}${label} ACCESS SITES: ${access.confirmedCount} confirmed` +
             (access.unverifiedCount ? ` + ${access.unverifiedCount} unverified` : ''));
         for (const group of access.byFile) {
             for (const site of group.sites) {
@@ -903,7 +904,9 @@ function formatImpact(impact, options = {}) {
             }
         }
         if (access.unverifiedSites.length > 0) {
-            lines.push(`${compact ? '' : '\n'}UNVERIFIED PROPERTY ACCESS CANDIDATES (${access.unverifiedSites.length}) — matching attribute syntax, receiver identity unresolved:`);
+            const reason = impact.propertyAccesses ? 'matching attribute syntax, receiver identity unresolved'
+                : 'matching value syntax, binding identity unresolved';
+            lines.push(`${compact ? '' : '\n'}UNVERIFIED ${label} ACCESS CANDIDATES (${access.unverifiedSites.length}) — ${reason}:`);
             for (const site of access.unverifiedSites.slice(0, 10)) {
                 const caller = site.callerName ? ` [${site.callerName}]` : '';
                 const expr = site.expression ? `: ${site.expression.replace(/\s+/g, ' ').slice(0, 100)}` : '';

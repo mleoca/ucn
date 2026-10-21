@@ -120,7 +120,11 @@ describe('5.4.0 independent audit regressions', () => {
             // Removing the default makes the unchanged Svc() call invalid.
             fs.writeFileSync(dir + '/svc.py', before.replace('value: int = 1', 'value: int'));
             let result = execute(idx(dir), 'impact', {}).result;
-            assert.deepEqual(result.symbols.map(s => s.name), ['Svc']);
+            assert.deepEqual(result.symbols.map(s => s.name), ['Svc', 'value']);
+            assert.equal(result.symbols[1].type, 'field');
+            assert.equal(result.symbols[1].className, 'Svc');
+            assert.deepEqual(result.symbols[1].addedLines, [6]);
+            assert.deepEqual(result.symbols[1].deletedLines, [6]);
             assert.deepEqual(result.symbols[0].addedLines, [6]);
             assert.deepEqual(result.symbols[0].deletedLines, [6]);
             assert.equal(cli(dir, 'check').status, 1);

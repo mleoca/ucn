@@ -929,8 +929,53 @@ function clearAllCaches() {
 // references; C# local-function name tokens are definitions.
 // v278: generic invocation usages preserve the terminal name and receiver.
 // v279: C++ using facts retain their enclosing preprocessor branch groups.
-const CACHE_FORMAT_VERSION = 279;
+// v291: Value declarations retain lexical scope and forward-declaration facts;
+// value queries retain source-local shadow/text proofs and lexical block
+// ranges with each parse view's error positions.
+// v292: Python class syntax facts retain members, writes and dynamic stores.
+const CACHE_FORMAT_VERSION = 299;
 const USAGE_CACHE_FILE = 'usage-results.json';
+
+function usageResultKey(index, filePath, name, mode) {
+    const hash = index.files.get(filePath)?.hash || '';
+    return `${filePath}\0${hash}\0${name}${mode ? `\0${mode}` : ''}`;
+}
+
+function usageResultWeight(value, mode) {
+    if (mode.startsWith('call-token-v1:') || mode.startsWith('declaration-token-v1:')) return 128 + value.length * 128;
+    return mode.startsWith('contract-syntax-v1:') || mode.startsWith('usage-text-v1:') || mode.startsWith('enum-syntax-v2:') || mode.startsWith('value-local-v1:') || mode.startsWith('value-bodies-v4:') || mode.startsWith('class-fields-v1:')
+        ? 128 + 2 * Buffer.byteLength(JSON.stringify(value))
+        : 64 + value.length * 40;
+}
+
+/** Read an immutable, source-local analysis result from the shared LRU. */
+function getUsageResult(index, filePath, name, mode = '') {
+    const key = usageResultKey(index, filePath, name, mode);
+    const cached = index._usageResultCache?.get(key);
+    if (!cached) return undefined;
+    index._usageResultCache.delete(key);
+    index._usageResultCache.set(key, cached);
+    return cached.value;
+}
+
+/** Store file-local facts only; project-dependent resolutions do not belong here. */
+function storeUsageResult(index, filePath, name, mode, value) {
+    if (!index._usageResultCache || !Array.isArray(value)) return;
+    const key = usageResultKey(index, filePath, name, mode);
+    const prior = index._usageResultCache.get(key);
+    if (prior) index._usageResultCacheWeight -= prior.weight;
+    const weight = usageResultWeight(value, mode);
+    index._usageResultCache.delete(key);
+    index._usageResultCache.set(key, { value, weight });
+    index._usageResultCacheWeight += weight;
+    index.usageCacheDirty = true;
+    while (index._usageResultCache.size > 4096 || index._usageResultCacheWeight > 16 * 1024 * 1024) {
+        const oldest = index._usageResultCache.entries().next().value;
+        if (!oldest) break;
+        index._usageResultCache.delete(oldest[0]);
+        index._usageResultCacheWeight -= oldest[1].weight;
+    }
+}
 
 /**
  * Persist the small hot-name usage cache independently of index/call shards.
@@ -991,7 +1036,7 @@ function loadUsageCache(index, cacheFile) {
             if (!fileEntry || fileEntry.hash !== fileHash) continue;
             const suffix = mode ? `\0${mode}` : '';
             const key = `${filePath}\0${fileHash}\0${name}${suffix}`;
-            const weight = 64 + value.length * 40;
+            const weight = usageResultWeight(value, mode);
             restored.set(key, { value, weight });
             weightTotal += weight;
             while (restored.size > 4096 || weightTotal > 16 * 1024 * 1024) {
@@ -1132,6 +1177,7 @@ function saveCache(index, cachePath) {
         //      argKinds for overload discipline (stale shapes would silently
         //      disable arity pruning)
         version: CACHE_FORMAT_VERSION,
+        callsGeneration: crypto.randomBytes(16).toString('hex'),
         ucnVersion: UCN_VERSION,  // Invalidate cache when UCN is updated
         configHash,
         discoveryHash,
@@ -1194,6 +1240,7 @@ function saveCache(index, cachePath) {
 
     // PERF-3: atomic write — tmp file + rename so concurrent readers/writers
     // never see a torn JSON. The calls/ shard write below already does this.
+    index._callsGenerationKey = cacheData.callsGeneration;
     const tmpFile = cacheFile + '.tmp';
     fs.writeFileSync(tmpFile, JSON.stringify(cacheData));
     fs.renameSync(tmpFile, cacheFile);
@@ -1258,6 +1305,7 @@ function saveCache(index, cachePath) {
             fs.rmSync(callsDir, { recursive: true, force: true });
         }
         fs.renameSync(callsTmpDir, callsDir);
+        require('./call-name-cache').save(index, callsDir);
 
         // Clean up legacy monolithic file
         const legacyFile = path.join(cacheDir, 'calls-cache.json');
@@ -1408,6 +1456,11 @@ function loadCache(index, cachePath) {
         // Restore optional graphs if present
         // extendsGraph/extendedByGraph are derived below from the rehydrated
         // symbols (fix #342) — never read from the payload.
+
+        index._callsGenerationKey = typeof cacheData.callsGeneration === 'string'
+            ? cacheData.callsGeneration : null;
+        index._callNameCache = null;
+        index._callNameCacheReadGeneration = null;
 
         // Prepare lazy calls cache loading — load manifest but defer shard parsing.
         // Shards are loaded on first getCachedCalls access via ensureCallsCacheLoaded().
@@ -1697,6 +1750,7 @@ function _prepareCallsCache(index, cacheFile) {
                 });
             }
             index._callsCachePrepared = true;
+            index._callNameCacheDir = path.join(cacheDir, 'calls');
             return;
         } catch (e) {
             // Corrupted manifest — fall through
@@ -2118,6 +2172,7 @@ function buildWithLock(index, buildOpts = {}, options = {}) {
 module.exports = {
     buildWithLock,
     saveCache, saveUsageCache, loadCache, loadCallsCache, isCacheStale, ensureCallsCacheLoaded,
+    getUsageResult, storeUsageResult,
     ensureCallsShardForFile,
     getUserCacheRoot, getProjectCacheDir, getProjectCachePath,
     getLegacyProjectCacheDir, migrateLegacyProjectCache, clearProjectCache,

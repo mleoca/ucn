@@ -18,6 +18,1479 @@ const { execute } = require('../core/execute');
 const { computeReachability } = require('../core/entrypoints');
 const { tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR, runCli, runInteractive } = require('./helpers');
 
+describe('fix #415: value rename accounts retain runtime language boundaries', () => {
+    const cases = [
+        ['Account.java', 'class Account {\n int balance=1;\n int read(){return balance;}\n}'],
+        ['Account.cs', 'class Account {\n int balance=1;\n int Read(){return balance;}\n}'],
+        ['account.go', 'package p\ntype Account struct { balance int }\nfunc read(a Account) int { return a.balance }'],
+        ['account.rs', 'struct Account {\n balance:i32,\n}\nfn read(a:Account)->i32 { a.balance }'],
+        ['account.py', 'class Account:\n balance=1\n def read(self):\n  return self.balance'],
+        ['account.js', 'class Account {\n balance=1;\n read(){return this.balance;}\n}'],
+        ['account.ts', 'class Account {\n balance=1;\n read(){return this.balance;}\n}'],
+        ['account.tsx', 'class Account {\n balance=1;\n read(){return this.balance;}\n}'],
+        ['account.html', '<script>\nclass Account {\n balance=1;\n read(){return this.balance;}\n}\n</script>'],
+        ['account.c', 'struct Account {\n int balance;\n};\nint read(struct Account a){return a.balance;}'],
+        ['account.cpp', 'struct Account {\n int balance=1;\n int read(){return balance;}\n};'],
+    ];
+    for (const [file, source] of cases) {
+        it(`${file}: an unrelated language call stays excluded`, () => {
+            const script = /\.(?:js|ts|tsx|html)$/.test(file);
+            const foreign = script ? 'Foreign.java' : 'foreign.js';
+            const dir = tmp({ [file]: source, [foreign]: script
+                ? 'class Foreign {\n static int balance(){return 2;}\n int use(){return balance();}\n}'
+                : 'function balance(){return 2;}\nfunction use(){return balance();}' });
+            try {
+                const index = idx(dir);
+                const def = (index.symbols.get('balance') || []).find(d =>
+                    d.relativePath === file && d.className === 'Account' && !d.isMethod);
+                assert.ok(def);
+                const answer = execute(index, 'plan', {
+                    name: `${file}:${def.startLine}:balance`, renameTo: 'balanceZq',
+                });
+                assert.strictEqual(answer.ok, true);
+                const result = answer.result;
+                assert.strictEqual(result.unverifiedSites.length, 0);
+                assert.strictEqual(result.account.unaccounted, 0);
+                assert.strictEqual(result.account.excluded.byReason['language-boundary']?.count, 1);
+                assert.ok(result.changes.filter(c => c.file === file && c.newExpression &&
+                    !c.needsReview).length >= 2);
+                assert.ok(result.changes.every(c => c.file !== foreign));
+            } finally { rm(dir); }
+        });
+    }
+});
+
+describe('fix #415: value references are concrete edits or explicit review', () => {
+    const cases = [
+        {
+            label: 'Java fields, same-line reads and a parameter shadow', file: 'Account.java', name: 'balance',
+            code: 'class Account {\n int balance;\n int use(Account x) { balance++; this.balance++; return x.balance; }\n int shadow(int balance) { return balance; }\n}',
+            editLines: [3], keepLines: [4],
+        },
+        {
+            label: 'C# fields, typed objects and a parameter shadow', file: 'A.cs', name: 'balance',
+            code: 'class Account {\n public int balance;\n int Use(Account x) { balance++; this.balance++; return x.balance; }\n int Shadow(int balance) { return balance; }\n}',
+            editLines: [3], keepLines: [4],
+        },
+        {
+            label: 'C++ fields, implicit this and pointer receivers', file: 'a.cpp', name: 'balance',
+            code: 'struct Account {\n int balance;\n int use(Account *x) { balance++; this->balance++; return x->balance; }\n int shadow(int balance) { return balance; }\n};',
+            editLines: [3], keepLines: [4],
+        },
+        {
+            label: 'C struct fields preserve an unrelated owner', file: 'a.c', name: 'balance', owner: 'Account',
+            code: 'struct Account { int balance; };\nint use(struct Account *x) { return x->balance; }\nstruct Other { int balance; };\nint other(struct Other *x) { return x->balance; }',
+            editLines: [2], keepLines: [3, 4],
+        },
+        {
+            label: 'Go fields preserve an unrelated owner', file: 'a.go', name: 'Balance', owner: 'Account',
+            code: 'package p\ntype Account struct { Balance int }\nfunc use(x *Account) int { x.Balance++; return x.Balance }\ntype Other struct { Balance int }\nfunc other(x *Other) int { return x.Balance }',
+            editLines: [3], keepLines: [4, 5],
+        },
+        {
+            label: 'Rust fields preserve an unrelated owner', file: 'src/lib.rs', name: 'balance', owner: 'Account',
+            code: 'pub struct Account { pub balance:i32 }\npub fn use_account(x:&mut Account)->i32 { x.balance+=1; x.balance }\npub struct Other { pub balance:i32 }\npub fn other(x:&Other)->i32 { x.balance }',
+            editLines: [2], keepLines: [3, 4],
+        },
+        {
+            label: 'TypeScript annotated receivers and a local shadow', file: 'a.ts', name: 'balance',
+            code: 'class Account {\n balance=0;\n use(x:Account) { this.balance++; return x.balance; }\n shadow(balance:number) { return balance; }\n}',
+            editLines: [3], keepLines: [4],
+        },
+        {
+            label: 'TSX annotated receivers', file: 'a.tsx', name: 'balance',
+            code: 'class Account {\n balance=0;\n use(x:Account) { this.balance++; return x.balance; }\n}',
+            editLines: [3],
+        },
+        {
+            label: 'JavaScript constructor identity', file: 'a.js', name: 'balance',
+            code: 'class Account {\n balance=0;\n use() { return this.balance; }\n}\nconst x=new Account();\nfunction value() { return x.balance; }',
+            editLines: [3, 6],
+        },
+        {
+            label: 'HTML inline-script constructor identity', file: 'a.html', name: 'balance',
+            code: '<script>\nclass Account {\n balance=0;\n use() { return this.balance; }\n}\nconst x=new Account();\nfunction value() { return x.balance; }\n</script>',
+            editLines: [4, 7],
+        },
+        {
+            label: 'Python module values preserve local parameters', file: 'a.py', name: 'LIMIT',
+            code: 'LIMIT=1\ndef use():\n return LIMIT\ndef shadow(LIMIT):\n return LIMIT\n',
+            editLines: [3], keepLines: [4, 5],
+        },
+        {
+            label: 'Go package variables preserve local parameters', file: 'a.go', name: 'Count',
+            code: 'package p\nvar Count int\nfunc use() int { Count++; return Count }\nfunc shadow(Count int) int { return Count }',
+            editLines: [3], keepLines: [4],
+        },
+        {
+            label: 'C file variables preserve local parameters', file: 'a.c', name: 'count',
+            code: 'static int count;\nint use(void) { count++; return count; }\nint shadow(int count) { return count; }',
+            editLines: [2], keepLines: [3],
+        },
+        {
+            label: 'Rust constants preserve parameters in another module', file: 'src/lib.rs', name: 'LIMIT',
+            code: 'pub const LIMIT:i32=1;\npub fn use_value()->i32 { LIMIT }\npub mod other { pub fn shadow(LIMIT:i32)->i32 { LIMIT } }',
+            editLines: [2], keepLines: [3],
+        },
+        {
+            label: 'Rust constant patterns name the constant', file: 'src/lib.rs', name: 'LIMIT',
+            code: 'pub const LIMIT:i32=1;\npub fn is_limit(value:i32)->bool { if let LIMIT=value { true } else { false } }',
+            editLines: [2],
+        },
+        {
+            label: 'Rust irrefutable constant patterns are not parameters', file: 'src/lib.rs', name: 'LIMIT',
+            code: 'pub const LIMIT:()=();\npub fn unit(LIMIT:())->() { LIMIT }',
+            editLines: [2],
+        },
+        {
+            label: 'exported JavaScript constants are indexed', file: 'a.js', name: 'LIMIT',
+            code: 'export const LIMIT=1;\nexport function use() { return LIMIT; }',
+            editLines: [2],
+        },
+        {
+            label: 'exported TypeScript constants are indexed', file: 'a.ts', name: 'LIMIT',
+            code: 'export const LIMIT=1;\nexport function use() { return LIMIT; }',
+            editLines: [2],
+        },
+    ];
+    for (const fixture of cases) {
+        it(fixture.label, () => {
+            const dir = tmp({
+                [fixture.file]: fixture.code,
+                ...(fixture.file.endsWith('.rs') && {
+                    'Cargo.toml': '[package]\nname="value_references"\nversion="0.1.0"\nedition="2021"',
+                }),
+            });
+            try {
+                const index = idx(dir);
+                const def = (index.symbols.get(fixture.name) || []).find(d =>
+                    ['field', 'constant', 'state', 'variant'].includes(d.type) &&
+                    (!fixture.owner || d.className === fixture.owner));
+                assert.ok(def, 'the value declaration must be indexed');
+                const name = `${fixture.file}:${def.startLine}:${fixture.name}`;
+                const plan = execute(index, 'plan', { name, renameTo: 'Renamed' });
+                assert.ok(plan.ok, plan.error);
+                assert.ok(plan.result.account.conserved);
+                assert.ok(plan.result.changes.some(change => change.file === fixture.file &&
+                    change.line === (def.nameLine || def.startLine) && !change.needsReview &&
+                    change.newExpression?.includes('Renamed')), 'the declaration must be renamed');
+                for (const line of fixture.editLines) {
+                    const edit = plan.result.changes.find(change => change.file === fixture.file &&
+                        change.line === line && !change.needsReview && change.newExpression !== undefined);
+                    assert.ok(edit, `line ${line} needs a concrete edit`);
+                    assert.equal(edit.newExpression, fixture.code.split('\n')[line - 1]
+                        .trim().split(fixture.name).join('Renamed'));
+                }
+                for (const line of fixture.keepLines || []) {
+                    assert.ok(!plan.result.changes.some(change => change.file === fixture.file &&
+                        change.line === line && change.newExpression !== undefined),
+                    `line ${line} names another binding`);
+                }
+                const impact = execute(index, 'impact', { name });
+                assert.ok(impact.ok, impact.error);
+                assert.ok(impact.result.account.conserved);
+                assert.ok(impact.result.valueAccesses?.confirmedCount > 0,
+                    'impact must expose a value dependency band');
+            } finally { rm(dir); }
+        });
+    }
+});
+
+describe('fix #415: value scopes, enum paths and runtime identity guards', () => {
+    const cases = [
+    {
+        "label": "Python class fields",
+        "name": "balance",
+        "owner": "Account",
+        "files": {
+            "a.py": "class Account:\n balance: int=0\n def read(self): return self.balance\ndef read(x: Account): return x.balance\nclass Other:\n balance: int=0\ndef other(x: Other): return x.balance\n"
+        },
+        "edits": [
+            [
+                "a.py",
+                2,
+                "Renamed: int=0"
+            ],
+            [
+                "a.py",
+                3,
+                "def read(self): return self.Renamed"
+            ],
+            [
+                "a.py",
+                4,
+                "def read(x: Account): return x.Renamed"
+            ]
+        ],
+        "keeps": [
+            [
+                "a.py",
+                6
+            ],
+            [
+                "a.py",
+                7
+            ]
+        ],
+        "reviews": []
+    },
+    {
+        "label": "Java enum static imports and switch",
+        "name": "RED",
+        "owner": "Color",
+        "files": {
+            "p/Color.java": "package p;\npublic enum Color { RED, GREEN;\n boolean red() { return this==RED; }\n}",
+            "p/Use.java": "package p;\nimport static p.Color.RED;\nclass Use {\n Color red() { return RED; }\n boolean check(Color c) { switch(c) { case RED: return true; default: return false; } }\n Color qualified() { return Color.RED; }\n}"
+        },
+        "edits": [
+            [
+                "p/Color.java",
+                2,
+                "public enum Color { Renamed, GREEN;"
+            ],
+            [
+                "p/Color.java",
+                3,
+                "boolean red() { return this==Renamed; }"
+            ],
+            [
+                "p/Use.java",
+                2,
+                "import static p.Color.Renamed;"
+            ],
+            [
+                "p/Use.java",
+                4,
+                "Color red() { return Renamed; }"
+            ],
+            [
+                "p/Use.java",
+                5,
+                "boolean check(Color c) { switch(c) { case Renamed: return true; default: return false; } }"
+            ],
+            [
+                "p/Use.java",
+                6,
+                "Color qualified() { return Color.Renamed; }"
+            ]
+        ],
+        "keeps": [],
+        "reviews": []
+    },
+    {
+        "label": "C anonymous enum",
+        "name": "RED",
+        "files": {
+            "a.c": "enum { RED, GREEN };\nint value(void) { return RED; }\n"
+        },
+        "edits": [
+            [
+                "a.c",
+                1,
+                "enum { Renamed, GREEN };"
+            ],
+            [
+                "a.c",
+                2,
+                "int value(void) { return Renamed; }"
+            ]
+        ],
+        "keeps": [],
+        "reviews": []
+    },
+    {
+        "label": "C++ scoped enum",
+        "name": "Red",
+        "owner": "Color",
+        "files": {
+            "a.cpp": "enum class Color { Red, Green };\nColor value() { return Color::Red; }\n"
+        },
+        "edits": [
+            [
+                "a.cpp",
+                1,
+                "enum class Color { Renamed, Green };"
+            ],
+            [
+                "a.cpp",
+                2,
+                "Color value() { return Color::Renamed; }"
+            ]
+        ],
+        "keeps": [],
+        "reviews": []
+    },
+    {
+        "label": "C# enum",
+        "name": "Red",
+        "owner": "Color",
+        "files": {
+            "A.cs": "enum Color { Red, Green }\nclass Use { Color Read() { return Color.Red; } }\n"
+        },
+        "edits": [
+            [
+                "A.cs",
+                1,
+                "enum Color { Renamed, Green }"
+            ],
+            [
+                "A.cs",
+                2,
+                "class Use { Color Read() { return Color.Renamed; } }"
+            ]
+        ],
+        "keeps": [],
+        "reviews": []
+    },
+    {
+        "label": "TypeScript enum",
+        "name": "Red",
+        "owner": "Color",
+        "files": {
+            "a.ts": "enum Color { Red, Green }\nfunction read(): Color { return Color.Red; }\n"
+        },
+        "edits": [
+            [
+                "a.ts",
+                1,
+                "enum Color { Renamed, Green }"
+            ],
+            [
+                "a.ts",
+                2,
+                "function read(): Color { return Color.Renamed; }"
+            ]
+        ],
+        "keeps": [],
+        "reviews": []
+    },
+    {
+        "label": "Rust variant",
+        "name": "Red",
+        "owner": "Color",
+        "files": {
+            "src/lib.rs": "pub enum Color { Red, Green }\npub fn read()->Color { Color::Red }\n",
+            "Cargo.toml": "[package]\nname=\"enum_values\"\nversion=\"0.1.0\"\nedition=\"2021\""
+        },
+        "edits": [
+            [
+                "src/lib.rs",
+                1,
+                "pub enum Color { Renamed, Green }"
+            ],
+            [
+                "src/lib.rs",
+                2,
+                "pub fn read()->Color { Color::Renamed }"
+            ]
+        ],
+        "keeps": [],
+        "reviews": []
+    },
+    {
+        "label": "Go constants",
+        "name": "RED",
+        "files": {
+            "a.go": "package p\nconst RED=1\nfunc read() int { return RED }\n"
+        },
+        "edits": [
+            [
+                "a.go",
+                2,
+                "const Renamed=1"
+            ],
+            [
+                "a.go",
+                3,
+                "func read() int { return Renamed }"
+            ]
+        ],
+        "keeps": [],
+        "reviews": []
+    },
+    {
+        "label": "C# initializer owner",
+        "name": "Balance",
+        "owner": "Account",
+        "files": {
+            "A.cs": "class Account { public int Balance; }\nclass Other { public int Balance; }\nclass Use {\n Account One() { return new Account { Balance=3 }; }\n Other Two() { return new Other { Balance=3 }; }\n}"
+        },
+        "edits": [
+            [
+                "A.cs",
+                1,
+                "class Account { public int Renamed; }"
+            ],
+            [
+                "A.cs",
+                4,
+                "Account One() { return new Account { Renamed=3 }; }"
+            ]
+        ],
+        "keeps": [
+            [
+                "A.cs",
+                2
+            ],
+            [
+                "A.cs",
+                5
+            ]
+        ],
+        "reviews": []
+    },
+    {
+        "label": "Java same-line parameter",
+        "name": "balance",
+        "owner": "Account",
+        "files": {
+            "Account.java": "class Account { int balance; int read(int balance) { return balance + this.balance; } }"
+        },
+        "edits": [
+            [
+                "Account.java",
+                1,
+                "class Account { int Renamed; int read(int balance) { return balance + this.Renamed; } }"
+            ]
+        ],
+        "keeps": [],
+        "reviews": []
+    },
+    {
+        "label": "C# same-line parameter",
+        "name": "balance",
+        "owner": "Account",
+        "files": {
+            "A.cs": "class Account { int balance; int Read(int balance) { return balance + this.balance; } }"
+        },
+        "edits": [
+            [
+                "A.cs",
+                1,
+                "class Account { int Renamed; int Read(int balance) { return balance + this.Renamed; } }"
+            ]
+        ],
+        "keeps": [],
+        "reviews": []
+    },
+    {
+        "label": "C++ same-line parameter",
+        "name": "balance",
+        "owner": "Account",
+        "files": {
+            "a.cpp": "struct Account { int balance; int read(int balance) { return balance + this->balance; } };"
+        },
+        "edits": [
+            [
+                "a.cpp",
+                1,
+                "struct Account { int Renamed; int read(int balance) { return balance + this->Renamed; } };"
+            ]
+        ],
+        "keeps": [],
+        "reviews": []
+    },
+    {
+        "label": "reassigned JS receiver",
+        "name": "balance",
+        "owner": "Account",
+        "files": {
+            "a.js": "class Account { balance=1; }\nclass Other { balance=2; }\nlet x=new Account();\nx=new Other();\nfunction value() { return x.balance; }"
+        },
+        "edits": [
+            [
+                "a.js",
+                1,
+                "class Account { Renamed=1; }"
+            ]
+        ],
+        "keeps": [
+            [
+                "a.js",
+                2
+            ]
+        ],
+        "reviews": [
+            [
+                "a.js",
+                5
+            ]
+        ]
+    },
+    {
+        "label": "nested JS this",
+        "name": "balance",
+        "owner": "Account",
+        "files": {
+            "a.js": "class Account {\n balance=1;\n read() { function inner() { return this.balance; }\n const arrow=()=>this.balance; return inner(); }\n}"
+        },
+        "edits": [
+            [
+                "a.js",
+                2,
+                "Renamed=1;"
+            ],
+            [
+                "a.js",
+                4,
+                "const arrow=()=>this.Renamed; return inner(); }"
+            ]
+        ],
+        "keeps": [],
+        "reviews": [
+            [
+                "a.js",
+                3
+            ]
+        ]
+    },
+    {
+        "label": "JS structural hierarchy",
+        "name": "balance",
+        "owner": "Account",
+        "files": {
+            "a.js": "class Account { balance=1; }\nclass Other extends Account { balance=2; }\nfunction value(x) { return x.balance; }"
+        },
+        "edits": [
+            [
+                "a.js",
+                1,
+                "class Account { Renamed=1; }"
+            ]
+        ],
+        "keeps": [],
+        "reviews": [
+            [
+                "a.js",
+                2
+            ],
+            [
+                "a.js",
+                3
+            ]
+        ]
+    },
+    {
+        "label": "JS shorthand globals",
+        "name": "LIMIT",
+        "files": {
+            "a.js": "const LIMIT=1;\nconst obj={LIMIT};\nfunction read() { return LIMIT; }"
+        },
+        "edits": [
+            [
+                "a.js",
+                1,
+                "const Renamed=1;"
+            ],
+            [
+                "a.js",
+                3,
+                "function read() { return Renamed; }"
+            ]
+        ],
+        "keeps": [],
+        "reviews": [
+            [
+                "a.js",
+                2
+            ]
+        ]
+    },
+    {
+        "label": "global class shadow",
+        "name": "count",
+        "files": {
+            "a.cpp": "static int count;\nint read() { return count; }\nstruct Other { int count; int read() { return count; } };"
+        },
+        "edits": [
+            [
+                "a.cpp",
+                1,
+                "static int Renamed;"
+            ],
+            [
+                "a.cpp",
+                2,
+                "int read() { return Renamed; }"
+            ]
+        ],
+        "keeps": [
+            [
+                "a.cpp",
+                3
+            ]
+        ],
+        "reviews": []
+    },
+    {
+        "label": "ordinary Python global",
+        "name": "count",
+        "files": {
+            "a.py": "count=1\ndef read(): return count\n"
+        },
+        "edits": [
+            [
+                "a.py",
+                1,
+                "Renamed=1"
+            ],
+            [
+                "a.py",
+                2,
+                "def read(): return Renamed"
+            ]
+        ],
+        "keeps": [],
+        "reviews": []
+    },
+    {
+        "label": "nested Rust module constant",
+        "name": "limit",
+        "files": {
+            "src/lib.rs": "pub mod data { pub const limit:i32=1; pub fn read()->i32 { limit } }\n",
+            "Cargo.toml": "[package]\nname=\"more_values\"\nversion=\"0.1.0\"\nedition=\"2021\""
+        },
+        "edits": [
+            [
+                "src/lib.rs",
+                1,
+                "pub mod data { pub const Renamed:i32=1; pub fn read()->i32 { Renamed } }"
+            ]
+        ],
+        "keeps": [],
+        "reviews": []
+    },
+    {
+        "label": "C++ namespace global",
+        "name": "count",
+        "files": {
+            "a.cpp": "namespace Data { int count=1; int read(){return count;} }\nint read(){return Data::count;}\n"
+        },
+        "edits": [
+            [
+                "a.cpp",
+                1,
+                "namespace Data { int Renamed=1; int read(){return Renamed;} }"
+            ],
+            [
+                "a.cpp",
+                2,
+                "int read(){return Data::Renamed;}"
+            ]
+        ],
+        "keeps": [],
+        "reviews": []
+    },
+    {
+        "label": "JavaScript local state",
+        "name": "CONFIG",
+        "files": {
+            "a.js": "function read(){const CONFIG={count:1};return CONFIG.count;}\n"
+        },
+        "edits": [
+            [
+                "a.js",
+                1,
+                "function read(){const Renamed={count:1};return Renamed.count;}"
+            ]
+        ],
+        "keeps": [],
+        "reviews": []
+    },
+    {
+        "label": "C# delegate fields",
+        "name": "Balance",
+        "files": {
+            "A.cs": "using System;\nclass Account { public Func<int> Balance;\n int Read(){return Balance();}\n static int Read(Account x){return x.Balance();}\n}\n"
+        },
+        "edits": [
+            [
+                "A.cs",
+                2,
+                "class Account { public Func<int> Renamed;"
+            ],
+            [
+                "A.cs",
+                3,
+                "int Read(){return Renamed();}"
+            ],
+            [
+                "A.cs",
+                4,
+                "static int Read(Account x){return x.Renamed();}"
+            ]
+        ],
+        "keeps": [],
+        "reviews": []
+    },
+    {
+        "label": "Python module reassignments",
+        "name": "LIMIT",
+        "files": {
+            "a.py": "LIMIT=1\nLIMIT=2\ndef read(): return LIMIT\n"
+        },
+        "edits": [
+            [
+                "a.py",
+                1,
+                "Renamed=1"
+            ]
+        ],
+        "keeps": [],
+        "reviews": [
+            [
+                "a.py",
+                2
+            ],
+            [
+                "a.py",
+                3
+            ]
+        ]
+    },
+    {
+        "label": "Java fields keep same-named method invocations",
+        "name": "balance",
+        "owner": "Account",
+        "files": {
+            "Account.java": "class Account {\n int balance;\n int balance(){ return this.balance; }\n int read(){return balance()+this.balance;}\n}"
+        },
+        "edits": [
+            [
+                "Account.java",
+                2,
+                "int Renamed;"
+            ],
+            [
+                "Account.java",
+                3,
+                "int balance(){ return this.Renamed; }"
+            ],
+            [
+                "Account.java",
+                4,
+                "int read(){return balance()+this.Renamed;}"
+            ]
+        ],
+        "keeps": [],
+        "reviews": []
+    },
+    {
+        "label": "JavaScript class storage differs from instance storage",
+        "name": "balance",
+        "owner": "Account",
+        "files": {
+            "a.js": "class Parent { static balance=2; }\nclass Account extends Parent {\n balance=1;\n static read(){return this.balance;}\n read(){return this.balance;}\n}\nconst value=Account.balance;"
+        },
+        "edits": [
+            [
+                "a.js",
+                3,
+                "Renamed=1;"
+            ],
+            [
+                "a.js",
+                5,
+                "read(){return this.Renamed;}"
+            ]
+        ],
+        "keeps": [
+            [
+                "a.js",
+                1
+            ],
+            [
+                "a.js",
+                4
+            ],
+            [
+                "a.js",
+                7
+            ]
+        ],
+        "reviews": []
+    },
+    {
+        "label": "JavaScript same-name static and instance fields",
+        "name": "balance",
+        "owner": "Account",
+        "files": {
+            "a.js": "class Account {\n balance=1;\n static balance=2;\n read(){return this.balance;}\n static read(){return this.balance;}\n}\nconst x=new Account();\nconst value=x.balance+Account.balance;"
+        },
+        "edits": [
+            [
+                "a.js",
+                2,
+                "Renamed=1;"
+            ],
+            [
+                "a.js",
+                4,
+                "read(){return this.Renamed;}"
+            ],
+            [
+                "a.js",
+                8,
+                "const value=x.Renamed+Account.balance;"
+            ]
+        ],
+        "keeps": [
+            [
+                "a.js",
+                3
+            ],
+            [
+                "a.js",
+                5
+            ]
+        ],
+        "reviews": []
+    },
+    {
+        "label": "HTML module bindings remain in their script",
+        "name": "LIMIT",
+        "files": {
+            "a.html": "<script type=\"module\">\nconst LIMIT=1;\nfunction read(){return LIMIT;}\n</script>\n<script type=\"module\">\nconst LIMIT=2;\nfunction other(){return LIMIT;}\n</script>"
+        },
+        "edits": [
+            [
+                "a.html",
+                2,
+                "const Renamed=1;"
+            ],
+            [
+                "a.html",
+                3,
+                "function read(){return Renamed;}"
+            ]
+        ],
+        "keeps": [
+            [
+                "a.html",
+                6
+            ],
+            [
+                "a.html",
+                7
+            ]
+        ],
+        "reviews": []
+    },
+    {
+        "label": "HTML receivers do not borrow a private class from another module",
+        "name": "balance",
+        "owner": "Account",
+        "files": {
+            "a.html": "<script type=\"module\">\nclass Account {balance=1; read(){return this.balance;}}\n</script>\n<script type=\"module\">\nclass Other {balance=2;}\nconst Account=Other;\nconst x=new Account();\nfunction read(){return x.balance;}\n</script>"
+        },
+        "edits": [
+            [
+                "a.html",
+                2,
+                "class Account {Renamed=1; read(){return this.Renamed;}}"
+            ]
+        ],
+        "keeps": [
+            [
+                "a.html",
+                5
+            ]
+        ],
+        "reviews": [
+            [
+                "a.html",
+                8
+            ]
+        ]
+    }
+];
+    for (const fixture of cases) {
+        it(fixture.label, () => {
+            const dir = tmp(fixture.files);
+            try {
+                const index = idx(dir);
+                const definition = (index.symbols.get(fixture.name) || []).find(symbol =>
+                    ['field', 'constant', 'state', 'variant'].includes(symbol.type) &&
+                    (!fixture.owner || symbol.className === fixture.owner));
+                assert.ok(definition, 'the value declaration must be indexed');
+                const name = `${definition.relativePath}:${definition.startLine}:${fixture.name}`;
+                const result = execute(index, 'plan', { name, renameTo: 'Renamed' });
+                assert.ok(result.ok, result.error);
+                assert.ok(result.result.account.conserved);
+                const automatic = result.result.changes.filter(change =>
+                    !change.needsReview && change.newExpression !== undefined);
+                for (const [file, line, expression] of fixture.edits) {
+                    assert.equal(automatic.find(change => change.file === file && change.line === line)
+                        ?.newExpression, expression, `${file}:${line} needs its exact token edits`);
+                }
+                for (const [file, line] of fixture.keeps) {
+                    assert.ok(!automatic.some(change => change.file === file && change.line === line),
+                        `${file}:${line} belongs to another binding`);
+                }
+                for (const [file, line] of fixture.reviews) {
+                    assert.ok(result.result.changes.some(change => change.file === file &&
+                        change.line === line && change.needsReview), `${file}:${line} needs explicit review`);
+                    assert.ok(!automatic.some(change => change.file === file && change.line === line));
+                }
+                const impact = execute(index, 'impact', { name });
+                assert.ok(impact.ok, impact.error);
+                assert.ok(impact.result.account.conserved);
+                const band = impact.result.valueAccesses;
+                assert.ok(band);
+                assert.equal(band.totalCandidates, band.confirmedCount + band.unverifiedCount);
+                for (const [file, line] of fixture.reviews) {
+                    assert.ok(band.unverifiedSites.some(site => site.file === file && site.line === line));
+                }
+                for (const group of band.byFile) {
+                    assert.deepEqual(group.sites, [...group.sites].sort((a, b) =>
+                        a.line - b.line || a.column - b.column));
+                    assert.ok(group.sites.every(site => !('absoluteFile' in site)));
+                }
+            } finally { rm(dir); }
+        });
+    }
+});
+
+describe('fix #415: value declarations and type-like value positions keep their identity', () => {
+    const fixtures = [
+        { label: 'TypeScript anonymous structural member requires review', file: 'a.ts', name: 'value', owner: 'Item',
+            code: 'interface Item {value:number}\ndeclare const x:Item;\nconst y:{value:number}=x;\n', editLines: [1], reviewLines: [3] },
+        { label: 'TypeScript anonymous member does not borrow an enclosing class', file: 'a.ts', name: 'value', owner: 'Item',
+            code: 'interface Item {value:number}\ndeclare const x:Item;\nclass Other {read(){const y:{value:number}=x;return y;}}\n', editLines: [1], reviewLines: [3] },
+        { label: 'Go anonymous structural member requires review', file: 'a.go', name: 'Value', owner: 'Item',
+            code: 'package p\ntype Item struct{Value int}\nfunc read(x Item) {\n var y struct{Value int}=x\n _=y\n}\n', editLines: [2], reviewLines: [4] },
+        { label: 'C anonymous typedef field', file: 'a.c', name: 'balance', owner: 'Account',
+            code: 'typedef struct { int balance; } Account;\nint read(Account *x) { return x->balance; }\n', editLines: [1, 2] },
+        ...['c', 'cpp'].flatMap(extension => [
+            { label: `${extension}: anonymous typedef enum has one value binding`, file: `a.${extension}`, name: 'Red', owner: 'Color',
+                code: 'typedef enum {Red,Green} Color;\nint read(){return Red;}\n', editLines: [1, 2] },
+            { label: `${extension}: named typedef enum retains its member binding`, file: `a.${extension}`, name: 'Red', owner: 'Color',
+                code: 'typedef enum Color {Red,Green} Alias;\nint read(){return Red;}\n', editLines: [1, 2] },
+            { label: `${extension}: block typedef enum retains its member binding`, file: `a.${extension}`, name: 'Red', owner: 'Color',
+                code: 'int read(){\n typedef enum {Red,Green} Color;\n return Red;\n}\n', editLines: [2, 3] },
+        ]),
+        ...['Account&', 'Account&&', 'const Account&'].map(type => ({ label: `C++ ${type} receiver`, file: 'a.cpp', name: 'balance', owner: 'Account',
+            code: `struct Account {int balance;};\nint read(${type} x){return x.balance;}\n`, editLines: [1, 2] })),
+        { label: 'C++ reference fields keep their declaring class', file: 'a.cpp', name: 'balance', owner: 'Account',
+            code: 'struct Account {\n int& balance;\n int read(){return balance;}\n};\nint read(Account& x){return x.balance;}\n', editLines: [2, 3, 5] },
+        { label: 'C tagged typedef field', file: 'a.c', name: 'balance', owner: 'account_s',
+            code: 'typedef struct account_s { int balance; } Account;\nint read(Account *x) { return x->balance; }\n', editLines: [1, 2] },
+        { label: 'C union field', file: 'a.c', name: 'balance', owner: 'Account',
+            code: 'union Account { int balance; };\nint read(union Account *x) { return x->balance; }\n', editLines: [1, 2] },
+        { label: 'C pointer field declarator', file: 'a.c', name: 'balance', owner: 'Account',
+            code: 'struct Account { int *balance; };\nint *read(struct Account *x) { return x->balance; }\n', editLines: [1, 2] },
+        { label: 'C++ pointer field declarator', file: 'a.cpp', name: 'balance', owner: 'Account',
+            code: 'struct Account { int *balance; };\nint *read(Account *x) { return x->balance; }\n', editLines: [1, 2] },
+        { label: 'C++ alias of the field owner', file: 'a.cpp', name: 'balance', owner: 'Account',
+            code: 'struct Account { int balance; };\nusing Alias=Account;\nint read(Alias *x) { return x->balance; }\n', editLines: [1, 3] },
+        { label: 'C++ constant template argument', file: 'a.cpp', name: 'SIZE',
+            code: 'static const int SIZE=3;\ntemplate<int N> int count(){return N;}\nint read() { return count<SIZE>(); }\n', editLines: [1, 3] },
+        { label: 'C++ nested enum values in direct initialization', file: 'a.cpp', name: 'Red', owner: 'TYPE',
+            code: 'struct Token {enum TYPE {Red,Green};Token(TYPE,int) {}};\nvoid read(){int mark=0;Token token(Token::Red,mark);}\n', editLines: [1, 2] },
+        { label: 'C++ enum type qualification in direct initialization', file: 'a.cpp', name: 'Red', owner: 'TYPE',
+            code: 'struct Token {enum TYPE {Red,Green};Token(TYPE,int) {}};\nvoid read(){int mark=0;Token token(Token::TYPE::Red,mark);}\n', editLines: [1, 2] },
+        { label: 'C++ bare enum value in direct initialization', file: 'a.cpp', name: 'Red', owner: 'Color',
+            code: 'enum Color {Red,Green};\nstruct Box {Box(Color) {}};\nvoid read(){Box value(Red);}\n', editLines: [1, 3] },
+        { label: 'C++ scalar direct initialization uses a value', file: 'a.cpp', name: 'LIMIT',
+            code: 'const int LIMIT=3;\nvoid read(){int value(LIMIT);}\n', editLines: [1, 2] },
+        { label: 'C++ namespace value in direct initialization', file: 'a.cpp', name: 'Red', owner: 'Color',
+            code: 'namespace N {enum Color {Red,Green};}\nstruct Box {Box(int,int) {}};\nvoid read(){int mark=0;Box value(N::Red,mark);}\n', editLines: [1, 3] },
+        { label: 'C++ scoped enum in direct initialization', file: 'a.cpp', name: 'Red', owner: 'Color',
+            code: 'enum class Color {Red,Green};\nstruct Box {Box(Color,int) {}};\nvoid read(){int mark=0;Box value(Color::Red,mark);}\n', editLines: [1, 3] },
+        { label: 'C++ pointer direct initialization uses a value', file: 'a.cpp', name: 'PTR',
+            code: 'int source;\nint* const PTR=&source;\nvoid read(){int *value(PTR);}\n', editLines: [2, 3] },
+        { label: 'C++ global enum qualification passes a local namesake', file: 'a.cpp', name: 'Red', owner: 'TYPE',
+            code: 'struct Token {enum TYPE {Red,Green};Token(TYPE) {}};\nnamespace N {\nstruct Token {enum TYPE {Red,Green};};\nvoid read(){::Token value(::Token::Red);}\n}\n', editLines: [1, 4], keepLines: [3] },
+        { label: 'C++ ordinary qualified unscoped enum values', file: 'a.cpp', name: 'Red', owner: 'Color',
+            code: 'enum Color {Red,Green};\nint read(){return Color::Red;}\n', editLines: [1, 2] },
+        { label: 'C++ qualified nested enum values keep their full owner', file: 'a.cpp', name: 'Red', owner: 'Color',
+            code: 'namespace N {struct Outer {enum Color {Red,Green};};}\nint read(){return N::Outer::Color::Red;}\n', editLines: [1, 2] },
+        { label: 'C++ genuine anonymous parameter types keep their namespace', file: 'a.cpp', name: 'Value',
+            code: 'const int Value=1;\nstruct Input {using Value=int;};\nstruct Result {};\nResult read(Input::Value);\n', editLines: [1], keepLines: [2, 4] },
+        { label: 'C++ local type parameters are not initializer values', file: 'a.cpp', name: 'LIMIT',
+            code: 'const int LIMIT=3;\nstruct Box {};\nvoid read(){struct LIMIT {};Box value(LIMIT);}\n', editLines: [1], keepLines: [3] },
+        { label: 'C++ named parameter types are not initializer values', file: 'a.cpp', name: 'Value',
+            code: 'const int Value=1;\nstruct Input {using Value=int;};\nvoid read(Input::Value value);\n', editLines: [1], keepLines: [2, 3] },
+        { label: 'C array extent is a value', file: 'a.c', name: 'SIZE',
+            code: 'enum { SIZE=3 };\nstruct Buffer { char data[SIZE]; };\n', editLines: [1, 2] },
+        { label: 'C++ array extent is a value', file: 'a.cpp', name: 'SIZE',
+            code: 'static const int SIZE=3;\nstruct Buffer { char data[SIZE]; };\n', editLines: [1, 2] },
+        { label: 'C++ sizeof a qualified value', file: 'a.cpp', name: 'SIZE',
+            code: 'namespace A { static const int SIZE=3; }\nint read(){return sizeof(A::SIZE);}\n', editLines: [1, 2] },
+        { label: 'C++ enum template argument', file: 'a.cpp', name: 'Red', owner: 'Color',
+            code: 'enum Color { Red, Green };\ntemplate<Color C> int color(){return C;}\nint read() { return color<Red>(); }\n', editLines: [1, 3] },
+        { label: 'C++ enum value keeps its namespace', file: 'a.cpp', name: 'Red', owner: 'Color',
+            code: 'namespace A { enum Color {Red,Green}; int read(){return Red;} }\nnamespace B { int Red=3; int read(){return Red;} }\n', editLines: [1], keepLines: [2] },
+        { label: 'C++ variable does not steal an enum value', file: 'a.cpp', name: 'Red',
+            code: 'int Red=3; int read(){return Red;}\nnamespace A { enum Color {Red,Green}; int read(){return Red;} }\n', editLines: [1], keepLines: [2] },
+        { label: 'C++ same-named enums keep their namespaces', file: 'a.cpp', name: 'Red', owner: 'Color',
+            code: 'namespace A { enum Color {Red,Green}; int read(){return Red;} }\nnamespace B { enum Shade {Red,Green}; int read(){return Red;} }\n', editLines: [1], keepLines: [2] },
+        { label: 'C++ using directive reaches an enum value', file: 'a.cpp', name: 'Red', owner: 'Color',
+            code: 'namespace A { enum Color {Red,Green}; }\nusing namespace A;\nint read(){return Red;}\n', editLines: [1, 3] },
+        { label: 'C++ block using hides a class enum value', file: 'a.cpp', name: 'Red', owner: 'Other',
+            code: 'namespace N {enum Color {Red};}\nstruct Foo {enum Other {Red};\nint read(){using N::Red;return Red;}\n};\n', editLines: [2], keepLines: [1, 3] },
+        { label: 'C++ block using names its imported enum value', file: 'a.cpp', name: 'Red', owner: 'Color',
+            code: 'namespace N {enum Color {Red};}\nstruct Foo {enum Other {Red};\nint read(){using N::Red;return Red;}\n};\n', editLines: [1, 3], keepLines: [2] },
+        { label: 'C++ using enum hides a class field', file: 'a.cpp', name: 'Red', owner: 'Foo', standard: 'c++20',
+            code: 'namespace N {enum class Color {Red};}\nstruct Foo {int Red;\nint read(){using enum N::Color;return (int)Red;}\n};\n', editLines: [2], keepLines: [1, 3] },
+        { label: 'C++ using enum names its imported member', file: 'a.cpp', name: 'Red', owner: 'Color', standard: 'c++20',
+            code: 'namespace N {enum class Color {Red};}\nstruct Foo {int Red;\nint read(){using enum N::Color;return (int)Red;}\n};\n', editLines: [1, 3], keepLines: [2] },
+        { label: 'C++ inner using hides an outer import', file: 'a.cpp', name: 'Red', owner: 'Color',
+            code: 'namespace A {enum Color {Red};}\nnamespace B {enum Shade {Red};}\nint read(){using A::Red;\n{using B::Red;return Red;}}\n', editLines: [1, 3], keepLines: [2, 4] },
+        { label: 'C++ inner using names its own import', file: 'a.cpp', name: 'Red', owner: 'Shade',
+            code: 'namespace A {enum Color {Red};}\nnamespace B {enum Shade {Red};}\nint read(){using A::Red;\n{using B::Red;return Red;}}\n', editLines: [2, 4], keepLines: [1, 3] },
+        { label: 'C++ enum lookup keeps the complete nested owner', file: 'a.cpp', name: 'Red', owner: 'Color',
+            code: 'int Red=3;\nnamespace N {\nstruct First {struct Inner {enum Color {Red,Green};int read(){return Red;}};};\nstruct Second {struct Inner {int read(){return Red;}};};\n}\n', editLines: [3], keepLines: [1, 4] },
+        { label: 'C++ global lookup passes an unrelated nested enum', file: 'a.cpp', name: 'Red',
+            code: 'int Red=3;\nnamespace N {\nstruct First {struct Inner {enum Color {Red,Green};int read(){return Red;}};};\nstruct Second {struct Inner {int read(){return Red;}};};\n}\n', editLines: [1, 4], keepLines: [3] },
+        { label: 'C++ inherited enum values use the declaring class', file: 'a.cpp', name: 'Red', owner: 'Color',
+            code: 'struct Base {enum Color {Red,Green};};\nstruct Derived:Base {int read(){return Red;}};\nstruct Other {int Red;int read(){return Red;}};\n', editLines: [1, 2], keepLines: [3] },
+        { label: 'C++ lexical outer enum values keep their owner', file: 'a.cpp', name: 'Red', owner: 'Color',
+            code: 'struct Outer {enum Color {Red,Green};struct Inner {int read(){return Red;}};};\n', editLines: [1] },
+        { label: 'C++ enum initializer reads its earlier enumerator', file: 'a.cpp', name: 'Red', owner: 'Color',
+            code: 'enum Color {Red=1,Green=Red+1};\nint read(){return Red;}\n', editLines: [1, 2] },
+        { label: 'C++ scoped enum initializer reads its earlier enumerator', file: 'a.cpp', name: 'Red', owner: 'Color',
+            code: 'enum class Color {Red=1,Green=Red};\nColor read(){return Color::Red;}\n', editLines: [1, 2] },
+        { label: 'C++ enum initializer cannot use a later member as proof', file: 'a.cpp', name: 'Red',
+            code: 'static const int Red=3;\nstruct Outer {\n enum Color {Green=Red,Red};\n};\n', editLines: [1], reviewLines: [3] },
+        { label: 'Java nested type fields keep their enclosing definitions', file: 'A.java', name: 'balance', owner: 'Inner',
+            code: 'class Base {int balance;}\nclass First {static class Inner {int balance;}}\nclass Second {static class Inner extends Base {}}\nclass Use {int read(First.Inner a,Second.Inner b){return a.balance+b.balance;}}\n', editLines: [2], keepLines: [1, 3], exact: [[4, 'class Use {int read(First.Inner a,Second.Inner b){return a.Renamed+b.balance;}}']] },
+        { label: 'C# nested type fields keep their enclosing definitions', file: 'A.cs', name: 'Balance', owner: 'Inner',
+            code: 'class Base {public int Balance;}\nclass First {public class Inner {public int Balance;}}\nclass Second {public class Inner:Base {}}\nclass Use {int Read(First.Inner a,Second.Inner b){return a.Balance+b.Balance;}}\n', editLines: [2], keepLines: [1, 3], exact: [[4, 'class Use {int Read(First.Inner a,Second.Inner b){return a.Renamed+b.Balance;}}']] },
+        { label: 'C++ nested type fields keep their enclosing definitions', file: 'a.cpp', name: 'balance', owner: 'Inner',
+            code: 'struct Base {int balance;};\nstruct First {struct Inner {int balance;};};\nstruct Second {struct Inner:Base {};};\nint read(First::Inner *a,Second::Inner *b){return a->balance+b->balance;}\n', editLines: [2], keepLines: [1, 3], exact: [[4, 'int read(First::Inner *a,Second::Inner *b){return a->Renamed+b->balance;}']] },
+        { label: 'C++ unresolved specialization identity remains review', file: 'a.cpp', name: 'balance', owner: 'Box',
+            code: 'struct Other {int balance;};\ntemplate<class T> struct Box {int balance;};\ntemplate<> struct Box<int>:Other {};\nint read(Box<int>* x){return x->balance;}\n', editLines: [2], keepLines: [1, 3], reviewLines: [4] },
+        { label: 'C++ block enum hides a file variable', file: 'a.cpp', name: 'Red',
+            code: 'int Red=3; int read(){return Red;}\nint local(){enum Shade {Red,Green};return Red;}\n', editLines: [1], keepLines: [2] },
+        { label: 'C block enum hides a file variable', file: 'a.c', name: 'Red',
+            code: 'int Red=3;\nint read(void){enum Color {Red,Green};return Red;}\n', editLines: [1], keepLines: [2] },
+        { label: 'C++ qualified enum template argument', file: 'a.cpp', name: 'Red', owner: 'Color',
+            code: 'enum class Color { Red, Green };\ntemplate<Color C> int color(){return int(C);}\nint read() { return color<Color::Red>(); }\n', editLines: [1, 3] },
+        { label: 'C++ qualified update is a value', file: 'a.cpp', name: 'balance', owner: 'Account',
+            code: 'struct Account { inline static int balance=1; };\nint read(){return ++Account::balance;}\n', editLines: [1, 2] },
+        { label: 'C++ local type keeps its template argument', file: 'a.cpp', name: 'SIZE',
+            code: 'static const int SIZE=3;\ntemplate<class T> int count(){return sizeof(T);}\nint read() { struct SIZE {}; return count<SIZE>(); }\n', editLines: [1], keepLines: [3] },
+        { label: 'C++ type parameter keeps its template argument', file: 'a.cpp', name: 'SIZE',
+            code: 'static const int SIZE=3;\ntemplate<class T> struct Box {};\ntemplate<class SIZE> Box<SIZE> read(){return {};}\n', editLines: [1], keepLines: [3] },
+        { label: 'Java annotation constant declaration', file: 'A.java', name: 'LIMIT', owner: 'A',
+            code: '@interface A { int LIMIT=3; }\nclass Read { int read(){return A.LIMIT;} }\n', editLines: [1, 2] },
+        { label: 'Java loop iterable is a value', file: 'A.java', name: 'VALUES', owner: 'A',
+            code: 'class A {\n static final int[] VALUES=values();\n static int[] values(){return new int[]{1};}\n int read(){int sum=0;for(int value:VALUES)sum+=value;return sum;}\n}\n', editLines: [2, 4] },
+        { label: 'Java lambda expression body is a value', file: 'A.java', name: 'LIMIT', owner: 'A',
+            code: 'class A {\n static final int LIMIT=3;\n java.util.function.IntSupplier read(){return ()->LIMIT;}\n}\n', editLines: [2, 3] },
+        { label: 'Java qualified type keeps its namespace', file: 'A.java', name: 'Token', owner: 'A',
+            code: 'class A {\n static int Token=1;\n static class Token{}\n}\nclass Read { A.Token value; int read(){return A.Token;} }\n', editLines: [2], exact: [[5, 'class Read { A.Token value; int read(){return A.Renamed;} }']], keepLines: [3] },
+        { label: 'Java annotation element names are not enclosing fields', file: 'A.java', name: 'balance', owner: 'Account',
+            code: '@interface Mark {int balance();}\nclass Account {\n static final int balance=1;\n @Mark(balance=balance) int read(){return balance;}\n}\n', editLines: [3], exact: [[4, '@Mark(balance=Renamed) int read(){return Renamed;}']] },
+        { label: 'C# named attribute field ownership requires review', file: 'A.cs', name: 'Balance', owner: 'MarkAttribute',
+            code: 'class MarkAttribute:System.Attribute { public int Balance; }\nclass Account {\n public const int Balance=1;\n [Mark(Balance=Balance)] int Read(){return Balance;}\n}\n', editLines: [1], reviewLines: [4] },
+        { label: 'C# named attribute keys are not enclosing fields', file: 'A.cs', name: 'Balance', owner: 'Account',
+            code: 'class MarkAttribute:System.Attribute { public int Balance; }\nclass Account {\n public const int Balance=1;\n [Mark(Balance=Balance)] int Read(){return Balance;}\n}\n', editLines: [3], reviewLines: [4], manualExact: [[4, '[Mark(Balance=Renamed)] int Read(){return Renamed;}']] },
+        { label: 'Rust const generic argument', file: 'src/lib.rs', name: 'SIZE',
+            code: 'pub const SIZE:usize=3;\npub struct Buffer<const N:usize> { pub data:[u8;N] }\npub type Block=Buffer<SIZE>;\n', editLines: [1, 3] },
+        { label: 'Rust record variant constructions and patterns', file: 'src/lib.rs', name: 'Red', owner: 'Color',
+            code: 'pub enum Color { Red {value:i32},Green }\npub fn read()->Color { Color::Red {value:1} }\npub fn value(c:Color)->i32 {match c {Color::Red {value}=>value,Color::Green=>0}}\n', editLines: [1, 2, 3] },
+        { label: 'Rust function const generic argument', file: 'src/lib.rs', name: 'SIZE',
+            code: 'pub const SIZE:usize=3;\npub fn count<const N:usize>()->usize {N}\npub fn read()->usize {count::<SIZE>()}\n', editLines: [1, 3] },
+        { label: 'Rust function const parameter hides a module constant', file: 'src/lib.rs', name: 'SIZE',
+            code: 'pub const SIZE:usize=3;\npub fn count<const N:usize>()->usize {N}\npub fn read<const SIZE:usize>()->usize {count::<SIZE>()+SIZE}\n', editLines: [1], keepLines: [3] },
+        { label: 'Rust struct const parameter hides a module constant', file: 'src/lib.rs', name: 'SIZE',
+            code: 'pub const SIZE:usize=3;\npub struct Buffer<const N:usize> {pub data:[u8;N]}\npub struct Block<const SIZE:usize> {pub value:Buffer<SIZE>}\n', editLines: [1], keepLines: [3] },
+        { label: 'Rust type argument keeps its namespace', file: 'src/lib.rs', name: 'SIZE',
+            code: 'pub const SIZE:usize=3;\npub type SIZE=i32;\npub struct Buffer<T> { pub data:T }\npub type Block=Buffer<SIZE>;\n', editLines: [1], keepLines: [2, 4] },
+        { label: 'Rust qualified type keeps its namespace', file: 'src/lib.rs', name: 'SIZE',
+            code: 'pub mod a {\n pub const SIZE:usize=3;\n pub type SIZE=i32;\n}\npub type Value=a::SIZE;\npub fn read()->usize {a::SIZE}\n', editLines: [2, 6], keepLines: [3, 5] },
+        { label: 'TypeScript type keeps its namespace', file: 'a.ts', name: 'Token',
+            code: 'export const Token=1;\nexport type Token=number;\nexport const value=Token;\nexport let typed:Token;\n', editLines: [1, 3], keepLines: [2, 4] },
+        ...['js', 'jsx', 'ts', 'tsx', 'html'].flatMap(extension => {
+            const wrap = code => extension === 'html' ? `<script>${code}</script>` : code;
+            return [
+                { label: `${extension}: private fields retain their namespace`, file: `a.${extension}`, name: '#balance', owner: 'Account', expectedName: '#Renamed', runtime: true, expectedOutput: '1 0',
+                    code: wrap('class Account {#balance=1;read(){return this.#balance;}}\nconst x=new Account();\nconsole.log(x.read(),Object.keys(x).length);\n'), editLines: [1] },
+                { label: `${extension}: private field brands follow lexical declarations`, file: `a.${extension}`, name: '#balance', owner: 'Account', expectedName: '#Renamed', runtime: true, expectedOutput: '2',
+                    code: wrap('class Other {#balance=2;read(){const x=new Account();return x.#balance;}}\nclass Account extends Other {#balance=1;}\nconsole.log(new Other().read());\n'), editLines: [2], keepLines: [1] },
+                { label: `${extension}: private base fields keep separate derived brands`, file: `a.${extension}`, name: '#balance', owner: 'Other', expectedName: '#Renamed', runtime: true, expectedOutput: '2',
+                    code: wrap('class Other {#balance=2;read(){const x=new Account();return x.#balance;}}\nclass Account extends Other {#balance=1;}\nconsole.log(new Other().read());\n'), editLines: [1], keepLines: [2] },
+                { label: `${extension}: nested classes reach outer private fields`, file: `a.${extension}`, name: '#balance', owner: 'Outer', expectedName: '#Renamed', runtime: true, expectedOutput: '1',
+                    code: wrap('class Outer {#balance=1;\nmake(){return class Inner {read(x){return x.#balance;}};}}\nconst outer=new Outer();\nconsole.log(new (outer.make())().read(outer));\n'), editLines: [1, 2] },
+                { label: `${extension}: private brand checks name the lexical field`, file: `a.${extension}`, name: '#balance', owner: 'Account', expectedName: '#Renamed', runtime: true, expectedOutput: 'true',
+                    code: wrap('class Account {#balance=1;has(x){return #balance in x;}}\nconsole.log(new Account().has(new Account()));\n'), editLines: [1] },
+            ];
+        }),
+    ];
+    for (const fixture of fixtures) it(fixture.label, () => {
+        const dir = tmp({ [fixture.file]: fixture.code,
+            ...(fixture.file.endsWith('.rs') && { 'Cargo.toml': '[package]\nname="value_positions"\nversion="0.1.0"\nedition="2021"' }) });
+        try {
+            const index = idx(dir);
+            const definition = (index.symbols.get(fixture.name) || []).find(d =>
+                ['field', 'private field', 'constant', 'state', 'variant'].includes(d.type) && (!fixture.owner || d.className === fixture.owner));
+            assert.ok(definition, 'the value must be indexed');
+            const result = execute(index, 'plan', { name: `${fixture.file}:${definition.startLine}:${fixture.name}`,
+                ...(fixture.owner && { className: fixture.owner }), renameTo: 'Renamed' });
+            assert.ok(result.ok, result.error);
+            assert.ok(result.result.account.conserved);
+            if (fixture.expectedName) assert.ok(result.result.after.signature.includes(fixture.expectedName));
+            for (const line of fixture.editLines) {
+                const change = result.result.changes.find(c => c.file === fixture.file && c.line === line && !c.needsReview);
+                assert.equal(change?.newExpression, fixture.code.split('\n')[line - 1].trim().split(fixture.name).join(fixture.expectedName || 'Renamed'));
+            }
+            for (const [line, expected] of fixture.exact || []) {
+                assert.equal(result.result.changes.find(c => c.file === fixture.file && c.line === line && !c.needsReview)?.newExpression, expected);
+            }
+            for (const [line, expected] of fixture.manualExact || []) {
+                assert.equal(result.result.changes.find(c => c.file === fixture.file && c.line === line && c.needsReview)?.newExpression, expected);
+            }
+            for (const line of fixture.reviewLines || []) assert.ok(result.result.changes.some(c =>
+                c.file === fixture.file && c.line === line && c.needsReview), 'the unresolved member owner must be reviewed');
+            for (const line of fixture.keepLines || []) assert.ok(!result.result.changes.some(c =>
+                c.file === fixture.file && c.line === line && c.newExpression !== undefined && !c.needsReview), 'another binding must stay unchanged');
+        } finally { rm(dir); }
+    });
+
+    it('C++ initializer operands are not field declarations', () => {
+        const dir = tmp({ 'a.cpp': 'enum class Info {none,one};\ntemplate<Info info> struct Holder {\n static constexpr auto found_info=info;\n int a=1,b=2; int *pointer;\n};\n' });
+        try {
+            const index = idx(dir);
+            assert.ok(!(index.symbols.get('info') || []).some(d => d.type === 'field'));
+            for (const name of ['found_info', 'a', 'b', 'pointer']) assert.ok((index.symbols.get(name) || []).some(d => d.type === 'field' && d.className === 'Holder'));
+        } finally { rm(dir); }
+    });
+
+    it('C# named attribute property ownership stays unverified', () => {
+        const dir = tmp({ 'A.cs': 'class MarkAttribute:System.Attribute { public int Balance {get;set;} }\nclass Account {\n public const int Balance=1;\n [Mark(Balance=Balance)] int Read(){return Balance;}\n}\n' });
+        try {
+            const result = execute(idx(dir), 'plan', { name: 'A.cs:1:Balance', className: 'MarkAttribute', renameTo: 'Renamed' });
+            assert.ok(result.ok, result.error);
+            assert.ok(result.result.changes.some(change => change.line === 4 && change.needsReview));
+            assert.ok(!result.result.changes.some(change => change.line === 4 && change.newExpression !== undefined && !change.needsReview));
+        } finally { rm(dir); }
+    });
+
+    for (const extension of ['js', 'html']) it(`${extension}: a reassigned class declaration requires review`, () => {
+        const file = `a.${extension}`;
+        const code = 'class Account { balance=1; }\nclass Other {balance=2;}\nAccount=Other;\nconst x=new Account();\nconsole.log(x.balance);';
+        const dir = tmp({ [file]: extension === 'html' ? `<script>\n${code}\n</script>` : code });
+        try {
+            const index = idx(dir);
+            const definition = index.symbols.get('balance').find(d => d.className === 'Account');
+            const result = execute(index, 'plan', { name: `${file}:${definition.startLine}:balance`, renameTo: 'Renamed' });
+            assert.ok(result.ok, result.error);
+            const line = 5 + (extension === 'html' ? 1 : 0);
+            assert.ok(result.result.changes.some(change => change.line === line && change.needsReview));
+            assert.ok(!result.result.changes.some(change => change.line === line && change.newExpression !== undefined && !change.needsReview));
+        } finally { rm(dir); }
+    });
+
+    for (const extension of ['js', 'ts', 'html']) {
+        it(`${extension}: same-line static and instance fields require disambiguation`, () => {
+            const file = `a.${extension}`;
+            const code = 'class Account {static balance=1;balance=2;}';
+            const dir = tmp({ [file]: extension === 'html' ? `<script>${code}</script>` : code });
+            try {
+                const result = execute(idx(dir), 'plan', { name: `${file}:1:balance`, className: 'Account', renameTo: 'Renamed' });
+                assert.equal(result.ok, false);
+                assert.match(result.error, /both a static and an instance field/);
+            } finally { rm(dir); }
+        });
+        for (const source of [
+            'class Account { balance=1; }\nclass Other {balance=2;}\nfunction read(Account){const x=new Account();return x.balance;}\nconsole.log(read(Other));',
+            'let Account=class Account { balance=1; };\nclass Other {balance=2;}\nAccount=Other;\nconst x=new Account();\nconsole.log(x.balance);',
+        ]) it(`${extension}: constructor binding must be stable and unshadowed (${source.includes('function') ? 'parameter' : 'assignment'})`, () => {
+            const file = `a.${extension}`;
+            const dir = tmp({ [file]: extension === 'html' ? `<script>\n${source}\n</script>` : source });
+            try {
+                const index = idx(dir);
+                const definition = index.symbols.get('balance').find(d => d.className === 'Account');
+                const result = execute(index, 'plan', { name: `${file}:${definition.startLine}:balance`, renameTo: 'Renamed' });
+                assert.ok(result.ok, result.error);
+                const at = source.includes('function') ? 3 : 5;
+                const line = at + (extension === 'html' ? 1 : 0);
+                assert.ok(result.result.changes.some(c => c.line === line && c.needsReview));
+                assert.ok(!result.result.changes.some(c => c.line === line && c.newExpression !== undefined && !c.needsReview));
+            } finally { rm(dir); }
+        });
+    }
+    for (const [file, code, name] of [
+        ['a.ts', 'export const Token=1; export type Token=number;', 'Token'],
+        ['src/lib.rs', 'pub const SIZE:usize=3; pub type SIZE=i32;', 'SIZE'],
+    ]) it(`${file}: a same-line type/value handle requires disambiguation`, () => {
+        const dir = tmp({ [file]: code });
+        try {
+            const result = execute(idx(dir), 'plan', { name: `${file}:1:${name}`, renameTo: 'Renamed' });
+            assert.equal(result.ok, false);
+            assert.match(result.error, /both a type and a value/);
+        } finally { rm(dir); }
+    });
+
+    const scopes = [
+        { file: 'a.cpp', name: 'VALUE', code: 'namespace A {const int VALUE=1;}namespace B {const int VALUE=2;}\n' },
+        { file: 'src/lib.rs', name: 'VALUE', code: 'pub mod a {pub const VALUE:usize=1;}pub mod b {pub const VALUE:usize=2;}\n' },
+        ...['js', 'ts', 'html'].map(extension => ({ file: `a.${extension}`, name: 'value', owner: 'Item',
+            code: 'function first(){class Item {value=1;}}function second(){class Item {value=2;}}\n' })),
+        { file: 'A.cs', name: 'Value', owner: 'Item', code: 'class First {public class Item {public int Value;}}class Second {public class Item {public int Value;}}\n' },
+        { file: 'A.java', name: 'value', owner: 'Item', code: 'class First {static class Item {int value;}}class Second {static class Item {int value;}}\n' },
+        { file: 'a.go', name: 'Value', owner: 'Item', code: 'package p\nfunc first(){type Item struct{Value int}};func second(){type Item struct{Value int}}\n' },
+        { file: 'a.c', name: 'value', owner: 'Item', code: 'void first(void){struct Item {int value;};}void second(void){struct Item {int value;};}\n' },
+        { file: 'a.cpp', name: 'value', owner: 'Item', code: 'void first(){struct Item {int value;};}void second(){struct Item {int value;};}\n' },
+        { file: 'src/lib.rs', name: 'value', owner: 'Item', code: 'pub fn first(){struct Item {value:i32}}pub fn second(){struct Item {value:i32}}\n' },
+    ];
+    for (const fixture of scopes) it(`${fixture.file}: same-line value scopes require disambiguation (${fixture.name})`, () => {
+        const code = fixture.file.endsWith('.html') ? `<script>${fixture.code}</script>` : fixture.code;
+        const dir = tmp({ [fixture.file]: code });
+        try {
+            const index = idx(dir);
+            const definition = (index.symbols.get(fixture.name) || []).find(d =>
+                ['field', 'constant', 'state', 'variant'].includes(d.type) && (!fixture.owner || d.className === fixture.owner));
+            assert.ok(definition, 'the value must be indexed');
+            const result = execute(index, 'plan', { name: `${fixture.file}:${definition.startLine}:${fixture.name}`,
+                ...(fixture.owner && { className: fixture.owner }), renameTo: 'Renamed' });
+            assert.equal(result.ok, false);
+            assert.match(result.error, /multiple value declarations in different scopes/);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #415: stored callable values are not confirmed function definitions', () => {
+    const cases = [
+        ['a.js', 'const current = Math.random ?? Date.now;\nfunction read() { return current(); }'],
+        ['a.ts', 'const current = Math.random ?? Date.now;\nfunction read() { return current(); }'],
+        ['a.py', 'current = int if True else float\ndef read(): return current(1)\n'],
+        ['a.go', 'package p\nimport "time"\nvar current = time.Now\nfunc read() { current() }'],
+        ['src/lib.rs', 'static current: fn() = std::thread::yield_now;\nfn read() { current(); }'],
+        ['a.cpp', 'void original() {}\nauto current = &original;\nvoid read() { current(); }'],
+    ];
+    for (const [file, code] of cases) {
+        it(file, () => {
+            const dir = tmp({ [file]: code,
+                ...(file.endsWith('.rs') && { 'Cargo.toml':
+                    '[package]\nname="stored_values"\nversion="0.1.0"\nedition="2021"' }),
+            });
+            try {
+                const index = idx(dir);
+                assert.ok(index.symbols.get('current')?.some(symbol => symbol.type === 'state'));
+                const read = index.symbols.get('read')[0];
+                const result = execute(index, 'context', {
+                    name: `${file}:${read.startLine}:read`,
+                });
+                assert.ok(result.ok, result.error);
+                assert.ok(result.result.meta.calleeAccount.conserved);
+                assert.ok(!result.result.callees.some(callee => callee.type === 'state'),
+                    'storage identity must not fabricate a function definition');
+                assert.ok(result.result.unverifiedCallees.some(callee =>
+                    callee.name === 'current' && callee.reason === 'callable-value'),
+                    'the call through the value remains visible');
+            } finally { rm(dir); }
+        });
+    }
+});
+
+describe('fix #415: forward declarations complete in the consuming translation unit', () => {
+    const forwardFixtures = ['c', 'cpp'].flatMap(extension => [false, true].flatMap(alias =>
+        [false, true].flatMap(decorated => [false, true].map(separate => {
+            const cpp = extension === 'cpp';
+            const type = alias ? 'Shared' : cpp ? 'Worker' : 'struct Worker';
+            const definition = cpp
+                ? 'class Worker {public: int value; int run(){return value;} };'
+                : 'struct Worker {int value;};';
+            const files = {
+                'api.h': '#define RECORD_API\n',
+                'common.h': ['#ifndef COMMON_H', '#define COMMON_H', '#include "api.h"',
+                    cpp ? 'class Worker;' : 'struct Worker;',
+                    ...(alias ? [cpp ? 'using Shared=Worker;' : 'typedef struct Worker Shared;'] : []),
+                    `struct ${decorated ? 'RECORD_API ' : ''}Box { ${type} *next; };`,
+                    '#endif'].join('\n'),
+            };
+            for (const unit of separate ? ['a', 'b'] : ['a']) {
+                files[`${unit}.h`] = '#include "common.h"\n' + definition;
+                files[`${unit}.${extension}`] = `#include "${unit}.h"\n` +
+                    `int read_${unit}(${type} *worker){return worker->value;}\n` +
+                    (cpp ? `int run_${unit}(Box *box){return box->next->run();}\n` : '');
+            }
+            return { label: `${extension}: ${alias ? 'alias' : 'tag'} ${decorated ? 'decorated' : 'plain'} ${separate ? 'separate programs' : 'one program'}`,
+                extension, files, separate };
+        }))));
+    for (const fixture of forwardFixtures) it(fixture.label, () => {
+        const dir = tmp(fixture.files);
+        try {
+            const index = idx(dir);
+            const { declaredFieldOwner } = require('../core/value-references');
+            const forward = (index.symbols.get('Worker') || []).find(d => d.relativePath === 'common.h');
+            assert.ok(forward?.forwardDeclaration, 'an include guard preserves the forward declaration');
+            const field = index.symbols.get('next').find(d => d.type === 'field');
+            index._beginOp();
+            try {
+                // Repeated field reads share one operation, but each unit sees
+                // only the complete class included by that program.
+                for (const unit of fixture.separate ? ['a', 'b', 'a'] : ['a', 'a']) {
+                    const result = declaredFieldOwner(index, field, path.join(dir, `${unit}.${fixture.extension}`));
+                    assert.ok(result.forward);
+                    assert.strictEqual(result.owner?.def.relativePath, `${unit}.h`);
+                    assert.ok(!result.owner.def.forwardDeclaration);
+                }
+            } finally { index._endOp(); }
+            const value = index.symbols.get('value').find(d => d.relativePath === 'a.h');
+            const plan = execute(index, 'plan', { name: `a.h:${value.startLine}:value`, renameTo: 'amount' });
+            assert.ok(plan.ok, plan.error);
+            assert.ok(plan.result.account.conserved);
+            assert.strictEqual(plan.result.totalReviewItems, 0);
+            assert.deepStrictEqual(plan.result.changes.map(c => c.file).sort(), [`a.${fixture.extension}`, 'a.h']);
+            assert.ok(plan.result.changes.every(c => !c.needsReview && c.newExpression.includes('amount')));
+            if (fixture.extension === 'cpp') {
+                const run = index.symbols.get('run').find(d => d.relativePath === 'a.h');
+                const result = execute(index, 'context', { name: `a.h:${run.startLine}:run`, includeMethods: true });
+                assert.ok(result.ok, result.error);
+                assert.ok(result.result.meta.account.conserved);
+                assert.ok(!result.result.callers.some(c => c.relativePath === 'b.cpp'));
+                if (!fixture.separate) {
+                    assert.ok(result.result.callers.some(c => c.relativePath === 'a.cpp' && c.line === 3),
+                        'the complete class proves the pointer-field method call');
+                    assert.strictEqual(result.result.unverifiedCallers.length, 0);
+                }
+            }
+        } finally { rm(dir); }
+    });
+
+    const conditionalFixtures = ['c', 'cpp'].flatMap(extension => [false, true].map(decorated => ({
+        label: `${extension}: conditional body ${decorated ? 'with decoration' : 'without decoration'}`,
+        extension, mode: 'field',
+        code: (decorated ? '#define RECORD_API\n' : '') +
+            'struct Worker;\n#if FEATURE\n' +
+            `struct ${decorated ? 'RECORD_API ' : ''}Worker {int value;};\n` +
+            'int read(struct Worker* x){return x->value;}\n#endif\n' +
+            'struct Other {int value;};\nint other(struct Other* x){return x->value;}\n',
+    }))).concat([false, true].map(decorated => ({
+        label: `cpp: conditional body has complete caller evidence ${decorated ? 'with decoration' : 'without decoration'}`,
+        extension: 'cpp', mode: 'method',
+        code: (decorated ? '#define RECORD_API\n' : '') +
+            'class Worker;\nstruct Holder {Worker* next;};\n#if FEATURE\n' +
+            `class ${decorated ? 'RECORD_API ' : ''}Worker {public: int run(){return 1;}};\n` +
+            'int annotated(Worker* x){return x->run();}\n' +
+            'int constructed(){Worker x;return x.run();}\n' +
+            'int field(Holder* x){return x->next->run();}\n#endif\n' +
+            'class Other {public: int run(){return 2;}};\nint other(Other* x){return x->run();}\n',
+    })));
+    for (const fixture of conditionalFixtures) it(fixture.label, () => {
+        const file = `a.${fixture.extension}`, dir = tmp({ [file]: fixture.code });
+        try {
+            const index = idx(dir);
+            const classes = index.symbols.get('Worker');
+            assert.strictEqual(classes.length, 1, 'a matching declaration is the same class as its conditional body');
+            assert.ok(!classes[0].forwardDeclaration);
+            if (fixture.mode === 'field') {
+                const field = index.symbols.get('value').find(d => d.className === 'Worker');
+                const plan = execute(index, 'plan', { name: `${file}:${field.startLine}:value`, renameTo: 'amount' });
+                assert.ok(plan.ok, plan.error);
+                const readLine = fixture.code.split('\n').findIndex(line => line.startsWith('int read(')) + 1;
+                assert.ok(plan.result.changes.some(c => c.line === readLine && !c.needsReview &&
+                    c.newExpression.includes('x->amount')));
+                assert.ok(plan.result.changes.some(c => c.line === (field.nameLine || field.startLine) &&
+                    c.isDefinition && !c.needsReview && c.newExpression.includes('amount')),
+                'the declaration must have a concrete edit too');
+                assert.ok(plan.result.changes.every(c => !c.needsReview));
+                assert.strictEqual(plan.result.totalReviewItems, 0);
+                assert.ok(plan.result.changes.every(c => !c.expression.includes('Other')));
+            } else {
+                const method = index.symbols.get('run').find(d => d.className === 'Worker');
+                const result = execute(index, 'context', { name: `${file}:${method.startLine}:run`, includeMethods: true });
+                assert.ok(result.ok, result.error);
+                const expected = ['annotated', 'constructed', 'field'].map(name =>
+                    fixture.code.split('\n').findIndex(line => line.startsWith(`int ${name}(`)) + 1);
+                assert.deepStrictEqual(result.result.callers.map(c => c.line), expected);
+                assert.ok(result.result.callers.every(c => c.provenance.validation === 'establishes-target'));
+                assert.strictEqual(result.result.unverifiedCallers.length, 0);
+                const other = index.symbols.get('run').find(d => d.className === 'Other');
+                const foreign = execute(index, 'context', { name: `${file}:${other.startLine}:run`, includeMethods: true });
+                assert.ok(foreign.ok, foreign.error);
+                assert.ok(!foreign.result.callers.some(c => expected.includes(c.line)));
+                assert.strictEqual(foreign.result.unverifiedCallers.length, 0,
+                    'an incomplete redeclaration must not add foreign-type review candidates');
+            }
+        } finally { rm(dir); }
+    });
+
+    it('equivalent conditional member declarations keep one callable identity', () => {
+        const dir = tmp({ 'a.cpp': 'class Worker;\n#if CHOICE\nclass Worker {public:int run(){return 1;}};\n#else\nclass Worker {public:int run(){return 2;}};\n#endif\nint read(Worker*x){return x->run();}\n' });
+        try {
+            const index = idx(dir);
+            assert.strictEqual(index.symbols.get('Worker').length, 2, 'both bodies remain indexed');
+            assert.ok(index.symbols.get('Worker').every(d => !d.forwardDeclaration));
+            const context = execute(index, 'context', { name: 'a.cpp:3:run', includeMethods: true });
+            assert.ok(context.ok, context.error);
+            assert.deepStrictEqual(context.result.callers.map(c => c.line), [7]);
+            const plan = execute(index, 'plan', { name: 'a.cpp:3:run', renameTo: 'render' });
+            assert.ok(plan.ok, plan.error);
+            assert.strictEqual(plan.result.totalReviewItems, 0);
+            assert.deepStrictEqual(plan.result.changes.map(c => c.line).sort((a, b) => a - b), [3, 5, 7]);
+            assert.ok(plan.result.changes.every(c => c.newExpression.includes('render')));
+        } finally { rm(dir); }
+    });
+
+    it('a conditional class/type-alias field binding still needs review', () => {
+        const dir = tmp({ 'a.cpp': 'struct Other{int value;};\n#if CHOICE\nstruct Worker;\nstruct Worker{int value;};\n#else\nusing Worker=Other;\n#endif\nint read(Worker*x){return x->value;}\n' });
+        try {
+            const index = idx(dir);
+            const plan = execute(index, 'plan', { name: 'a.cpp:4:value', renameTo: 'amount' });
+            assert.ok(plan.ok, plan.error);
+            assert.ok(plan.result.changes.some(c => c.line === 8 && c.needsReview));
+            assert.ok(!plan.result.changes.some(c => c.line === 8 && c.newExpression !== undefined && !c.needsReview));
+            assert.ok(!plan.result.changes.some(c => c.line === 1));
+        } finally { rm(dir); }
+    });
+
+    const unresolvedFixtures = [
+        { label: 'conditional class definitions with different member signatures',
+            header: 'class Worker;\nstruct Box {Worker* next;};\n#if CHOICE\nclass Worker {public: int run(){return 1;}};\n#else\nclass Worker {public: int run(int value=0){return value+2;}};\n#endif\n' },
+        { label: 'generic forward declarations',
+            header: 'template<class T> class Worker;\nstruct Box {Worker<int>* next;};\n',
+            body: '#include "a.h"\ntemplate<class T> class Worker {public: int run(){return 1;}};\n' },
+        { label: 'anonymous namespace declarations',
+            header: 'namespace {class Worker;\nstruct Box {Worker* next;};}\n',
+            body: '#include "a.h"\nnamespace {class Worker {public: int run(){return 1;}};}\n' },
+    ];
+    for (const fixture of unresolvedFixtures) it(fixture.label, () => {
+        const dir = tmp({ 'a.h': fixture.header,
+            ...(fixture.body && { 'body.h': fixture.body }),
+            'a.cpp': `#include "${fixture.body ? 'body.h' : 'a.h'}"\nint read(Box* box){return box->next->run();}\n` });
+        try {
+            const index = idx(dir);
+            const method = index.symbols.get('run').find(d => d.type === 'method');
+            const result = execute(index, 'context', { name: `${method.relativePath}:${method.startLine}:run`, includeMethods: true });
+            assert.ok(result.ok, result.error);
+            assert.ok(result.result.meta.account.conserved);
+            assert.strictEqual(result.result.callers.length, 0);
+            assert.ok(result.result.unverifiedCallers.some(c => c.relativePath === 'a.cpp' && c.line === 2),
+                'the unresolved class keeps the call visible for review');
+        } finally { rm(dir); }
+    });
+
+    it('class and struct declarations share a complete C++ class', () => {
+        const dir = tmp({ 'forward.h': 'class Worker;\nstruct Box {Worker* next;};\n',
+            'body.h': '#include "forward.h"\nstruct Worker {int run(){return 1;}};\n',
+            'a.cpp': '#include "body.h"\nint read(Box* box){return box->next->run();}\n' });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', { name: 'body.h:2:run', includeMethods: true });
+            assert.ok(result.ok, result.error);
+            assert.ok(result.result.callers.some(c => c.relativePath === 'a.cpp' && c.line === 2));
+        } finally { rm(dir); }
+    });
+
+    it('a body in another namespace preserves the forward declaration', () => {
+        const dir = tmp({ 'a.cpp': 'namespace A {class Worker;}\nnamespace B {class Worker {};}\nnamespace {class Item;}\nclass Item {};\n' });
+        try {
+            const index = idx(dir);
+            const workers = index.symbols.get('Worker');
+            assert.ok(workers.some(d => d.namespace === 'A' && d.forwardDeclaration));
+            assert.ok(workers.some(d => d.namespace === 'B' && !d.forwardDeclaration));
+            const items = index.symbols.get('Item');
+            assert.ok(items.some(d => d.anonymousNamespace && d.forwardDeclaration));
+            assert.ok(items.some(d => !d.anonymousNamespace && !d.forwardDeclaration));
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #414: primitive return metadata keeps other language bindings intact', () => {
     const cases = [
         ["C", "m.c", "int pick(int value) { return value; }\nint run(void) { return pick(7); }", "pick", 2],

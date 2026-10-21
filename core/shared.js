@@ -148,6 +148,12 @@ function escapeRegExp(text) {
 
 // Symbol types that are not callable (used to filter class/struct/type declarations from call analysis)
 const NON_CALLABLE_TYPES = new Set(['class', 'struct', 'interface', 'type', 'enum', 'trait', 'state', 'impl', 'field']);
+const VALUE_SYMBOL_KINDS = new Set(['field', 'private field', 'constant', 'state', 'variant']);
+
+function isValueDefinition(definition) {
+    return !!definition && !definition.isMethod &&
+        (VALUE_SYMBOL_KINDS.has(definition.type) || VALUE_SYMBOL_KINDS.has(definition.memberType));
+}
 
 /**
  * Every function-shaped symbol kind across the parsers (fix #251 — stats
@@ -501,7 +507,20 @@ function isMacroNamespaceDefinition(def) {
         modifiers.includes('proc_macro_derive');
 }
 
+/** The names the inverted call index records, in first-occurrence order. */
+function calleeNames(calls) {
+    const names = new Set();
+    for (const call of calls || []) {
+        names.add(call.name);
+        if (call.resolvedName) names.add(call.resolvedName);
+        for (const name of call.resolvedNames || []) names.add(name);
+        if (call.receiverIsTypeQualified && call.receiver) names.add(call.receiver);
+    }
+    return names;
+}
+
 module.exports = { literalNameRegex,
+    calleeNames,
     pickBestDefinition,
     addTestExclusions,
     escapeRegExp,
@@ -511,6 +530,7 @@ module.exports = { literalNameRegex,
     classDispatchNames,
     maskBlockComments,
     NON_CALLABLE_TYPES,
+    isValueDefinition,
     CALLABLE_SYMBOL_KINDS,
     formatSymbolHandle,
     parseSymbolHandle,

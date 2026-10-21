@@ -23,7 +23,7 @@
  * Everything is memoized on the index (`_cppScope`) and reset at build/load.
  */
 
-const { codeUnitCompare } = require('./shared');
+const { codeUnitCompare, isValueDefinition } = require('./shared');
 
 const TYPE_KINDS = new Set(['class', 'struct', 'union', 'enum', 'interface']);
 const MAX_ALIAS_HOPS = 8;
@@ -464,6 +464,7 @@ function resolveQualifier(index, context, spelling, visibleFiles, depth = 0, opt
     // for the last segment (a class, or a typedef/alias of that spelling)
     // instead of the classes an alias denotes.
     const declarationsOnly = options.declarations === true;
+    const values = declarationsOnly && options.values === true;
     const plain = stripTemplateArguments(spelling);
     const global = plain.startsWith('::');
     let segments = plain.replace(/^::/, '').split('::').filter(Boolean);
@@ -481,7 +482,7 @@ function resolveQualifier(index, context, spelling, visibleFiles, depth = 0, opt
     if (depth > MAX_ALIAS_HOPS) return { kind: 'unknown', why: 'alias-depth' };
     const origin = context.origin || context.file;
     const cacheKey = `${origin}\0${context.file}\0${context.line}\0${context.className || ''}\0${plain}` +
-        `${declarationsOnly ? '\0d' : ''}${context.namespace != null ? `\0ns:${context.namespace}` : ''}`;
+        `${declarationsOnly ? '\0d' : ''}${values ? `\0v:${options.valueSite?.index ?? ''}` : ''}${context.namespace != null ? `\0ns:${context.namespace}` : ''}`;
     const state = _state(index);
     if (state.resolved.has(cacheKey)) return state.resolved.get(cacheKey);
     const finish = result => {
@@ -556,25 +557,49 @@ function resolveQualifier(index, context, spelling, visibleFiles, depth = 0, opt
             if (!scopes.includes(full)) scopes.push(full);
         }
     }
-    const candidates = _typeCandidates(index, name);
+    const enumScopes = new Map();
+    const candidates = values ? (index.symbols.get(name) || []).filter(definition => {
+        if (!_isCppFile(index, definition.file) || !isValueDefinition(definition)) return false;
+        const info = require('./value-references').enumValueBindingInfo(index, definition);
+        if (info?.scope?.type === 'field_declaration_list') return false;
+        if (!definition.className) return true;
+        const owner = info?.unscoped && require('./class-identity').ownerRefOf(index, definition);
+        if (!owner?.def) return false;
+        const local = info.scope && !['translation_unit', 'field_declaration_list'].includes(info.scope.type);
+        if (local && (options.valueSite?.file !== definition.file ||
+            info.scope.startIndex > options.valueSite.index || info.scope.endIndex <= options.valueSite.index)) return false;
+        enumScopes.set(definition, { definition: owner.def, ...(local && { scope: info.scope }) });
+        return true;
+    })
+        : _typeCandidates(index, name);
     let matched = [];
     // Innermost scope wins (C++ unqualified and qualified lookup both stop
     // at the first scope that declares the name).
     for (const scope of scopes) {
         const want = _join(scope, qualifier);
         matched = candidates.filter(definition => {
-            if (_scopeOf(index, definition) !== want) return false;
+            const declared = enumScopes.get(definition)?.definition || definition;
+            if (_scopeOf(index, declared) !== want) return false;
             // Block-scope aliases are visible only inside their own block.
-            if (definition.lexicalScopeStartLine != null &&
-                definition.lexicalScopeEndLine != null &&
-                !(definition.type === 'type' && definition.enclosingType)) {
-                return definition.file === context.file &&
-                    definition.lexicalScopeStartLine <= context.line &&
-                    context.line <= definition.lexicalScopeEndLine;
+            if (declared.lexicalScopeStartLine != null &&
+                declared.lexicalScopeEndLine != null &&
+                !(declared.type === 'type' && declared.enclosingType)) {
+                return declared.file === context.file &&
+                    declared.lexicalScopeStartLine <= context.line &&
+                    context.line <= declared.lexicalScopeEndLine;
             }
             return true;
         });
         if (matched.length > 0) break;
+    }
+    const localEnums = matched.filter(definition => enumScopes.get(definition)?.scope);
+    if (localEnums.length) {
+        const width = definition => {
+            const scope = enumScopes.get(definition).scope;
+            return scope.endIndex - scope.startIndex;
+        };
+        const closest = Math.min(...localEnums.map(width));
+        matched = localEnums.filter(definition => width(definition) === closest);
     }
     if (matched.length === 0) {
         const full = segments.join('::');
@@ -600,7 +625,7 @@ function resolveQualifier(index, context, spelling, visibleFiles, depth = 0, opt
         return finish({ kind: 'unknown', why: 'configuration-alternative' });
     }
     if (declarationsOnly) {
-        return finish({ kind: 'type', declarations: chosen, visible: visible.length > 0 });
+        return finish({ kind: values ? 'value' : 'type', declarations: chosen, visible: visible.length > 0 });
     }
     const classes = [];
     for (const definition of chosen) {

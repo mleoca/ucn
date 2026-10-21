@@ -692,7 +692,6 @@ function extractAttributesWithArgs(node, codeOrLines) {
 }
 
 // --- Module-scope constants for state object detection ---
-const _STATE_PATTERN = /^([A-Z][A-Z0-9_]+|DEFAULT_[A-Z_]+)$/;
 
 // --- Single-pass helpers: extracted from find* callbacks ---
 
@@ -1377,14 +1376,18 @@ function extractDerefTarget(implNode, traitName) {
  * Returns true if node was matched, false otherwise
  */
 function _processState(node, objects, lines) {
-    // Handle const and static items (only top-level). The declared type
+    // Const and static items have value identity regardless of spelling or
+    // module nesting. Associated items are extracted with their owner.
+    // The declared type
     // (fix #392) types the item when it is a method receiver (`FLAGS.iter()`).
     if (node.type === 'const_item' || node.type === 'static_item') {
-        if (!node.parent || node.parent.type !== 'source_file') return false;
+        for (let scope = node.parent; scope; scope = scope.parent) {
+            if (scope.type === 'impl_item' || scope.type === 'trait_item') return false;
+        }
         const nameNode = node.childForFieldName('name');
         if (nameNode) {
             const name = nameNode.text;
-            if (_STATE_PATTERN.test(name)) {
+            {
                 const { startLine, endLine } = nodeToLocation(node, lines);
                 // Only a plain type path (behind any references) is recorded:
                 // a generic wrapper (`Lazy<T>`, `Mutex<T>`) owns the methods
@@ -1399,7 +1402,7 @@ function _processState(node, objects, lines) {
                     node.children.some(child => child.type === 'mutable_specifier');
                 const plain = typeNode && (typeNode.type === 'type_identifier' ||
                     typeNode.type === 'scoped_type_identifier');
-                objects.push({ name, startLine, endLine,
+                objects.push({ name, startLine, endLine, ...rustBlockItemScope(node),
                     ...(plain && !mutable && { valueType: typeNode.text,
                         ...(deref && { valueDerefVia: deref.via }) }) });
             }

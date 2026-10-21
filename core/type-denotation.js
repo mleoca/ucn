@@ -627,8 +627,8 @@ function csharpAddDirective(scope, index, { module, names, static: isStatic, nam
  * unreadable is true when a project file could not
  * be read (its items are unknown).
  */
-function csharpUsings(index, filePath, namespace = null, siteNode = null) {
-    const scopes = siteNode ? require('../languages/csharp-scope').usingScopesOf(siteNode) : null;
+function csharpUsings(index, filePath, namespace = null, siteNode = null, syntax = null) {
+    const scopes = syntax?.scopes || (siteNode ? require('../languages/csharp-scope').usingScopesOf(siteNode) : null);
     const scopeKey = scopes?.map(scope => `${scope.startIndex}:${scope.endIndex}`).join(',') ?? '*';
     return memoized(index, `\x01cs-usings\x00${filePath}\x00${namespace ?? '*'}\x00${scopeKey}`, () => {
         const scope = { namespaces: new Set(), statics: new Set(), aliases: new Map(),
@@ -647,12 +647,14 @@ function csharpUsings(index, filePath, namespace = null, siteNode = null) {
         for (const detail of globals) csharpAddDirective(scope, index, detail);
         const fileEntry = index.files.get(filePath);
         let local = fileEntry?.importDetails || [];
-        if (scopes) {
+        if (syntax) local = syntax.directives;
+        else if (scopes) {
             const content = index._readFile(filePath);
             const language = require('../languages');
             const parser = language.getParser(fileEntry.language);
             const adapter = language.getLanguageAdapter(fileEntry.language);
-            const tree = index._getParsedTree(filePath, content, fileEntry.language) ||
+            const tree = (require('./query-bodies').isLocalNameTree(siteNode.tree) && siteNode.tree) ||
+                index._getParsedTree(filePath, content, fileEntry.language) ||
                 adapter.queryTree(content, parser, fileEntry);
             local = adapter.queryUsingDirectives(tree);
         }

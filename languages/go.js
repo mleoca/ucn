@@ -467,6 +467,25 @@ function _blockHasIota(constDecl) {
  * Returns true if node was matched, false otherwise
  */
 function _processState(node, objects, lines) {
+    // Package variables and constants are bindings even when unexported.
+    // A grouped specification can declare several names with one value list.
+    if (['const_declaration', 'var_declaration'].includes(node.type) &&
+        node.parent?.type === 'source_file') {
+        const specs = node.namedChildren.flatMap(child => child.type === 'var_spec_list'
+            ? child.namedChildren : [child]);
+        for (const spec of specs) {
+            if (!['const_spec', 'var_spec'].includes(spec.type)) continue;
+            for (let i = 0; i < spec.childCount; i++) {
+                if (spec.fieldNameForChild(i) !== 'name') continue;
+                const name = spec.child(i);
+                if (name.type !== 'identifier' || name.text === '_') continue;
+                objects.push({ name: name.text, startLine: name.startPosition.row + 1,
+                    endLine: spec.endPosition.row + 1,
+                    ...(node.type === 'const_declaration' && { isConst: true }) });
+            }
+        }
+        return true;
+    }
     if (node.type === 'const_declaration') {
         const isIotaBlock = _blockHasIota(node);
         for (let i = 0; i < node.namedChildCount; i++) {

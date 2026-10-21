@@ -7,7 +7,8 @@
 
 const { detectLanguage, getParser, getLanguageAdapter, safeParse, langTraits } = require('../languages');
 const { sameNode } = require('../languages/utils');
-const { escapeRegExp, codeUnitCompare, NON_CALLABLE_TYPES, isOverrideMarked, isMacroNamespaceDefinition } = require('./shared');
+const { escapeRegExp, codeUnitCompare, NON_CALLABLE_TYPES, isOverrideMarked, isMacroNamespaceDefinition,
+    isValueDefinition } = require('./shared');
 const { classDefsNamed, distinctOwnerDefinitions } = require('./class-identity');
 const { isTypeRenamePin, referenceRole } = require('./type-references');
 const { findAccessorReferences, isAccessorDefinition } = require('./accessors');
@@ -151,8 +152,19 @@ function renameIdentifierTokens(index, filePath, lineNumber, oldName, newName,
     let byteColumns = Array.isArray(preferredByteColumns)
         ? preferredByteColumns.filter(Number.isInteger) : [];
     const defNameByteColumns = [];
+    let syntaxDerived = false;
+    let declarationSyntax = null;
+    if (byteColumns.length === 0 && tokenOptions.definitionNameOnly) {
+        declarationSyntax = require('./rename-token-syntax').declarationTokenSyntax(index, absolute,
+            index.files.get(absolute), content, lineNumber, oldName, tokenOptions.definition,
+            preferredByteColumns == null);
+        if (declarationSyntax?.columns) {
+            byteColumns = declarationSyntax.columns;
+            syntaxDerived = true;
+        }
+    }
 
-    if (byteColumns.length === 0) {
+    if (byteColumns.length === 0 && !syntaxDerived) {
         const language = index.files.get(absolute)?.language ||
             detectLanguage(absolute, index.root);
         const parser = language && getParser(language);
@@ -232,6 +244,7 @@ function renameIdentifierTokens(index, filePath, lineNumber, oldName, newName,
     const columns = [...new Set(byteColumns
         .map(column => tokenColumn(sourceLine, column, oldName))
         .filter(Number.isInteger))].sort((a, b) => b - a);
+    if (!syntaxDerived) declarationSyntax?.save(columns);
     if (expectedCallCount != null && columns.length !== expectedCallCount) {
         return { source: sourceLine.trim(), renamed: sourceLine.trim(), count: 0 };
     }
@@ -257,13 +270,20 @@ function callTokenColumn(index, filePath, range, name, line) {
     if (!range || !filePath) return null;
     const absolute = require('path').isAbsolute(filePath)
         ? filePath : require('path').join(index.root, filePath);
-    const language = index.files.get(absolute)?.language;
-    const parser = language && getParser(language);
-    if (!parser) return null;
+    const entry = index.files.get(absolute);
+    const language = entry?.language;
     let content;
     try { content = index._readFile(absolute); } catch { return null; }
-    const tree = index._getParsedTree?.(absolute, content, language) || safeParse(parser, content);
-    if (!tree) return null;
+    return require('./rename-token-syntax').callTokenSyntax(index, absolute, entry,
+        content, range, name, line, () => {
+            const parser = language && getParser(language);
+            const tree = parser &&
+                (index._getParsedTree?.(absolute, content, language) || safeParse(parser, content));
+            return tree ? callTokenColumnInTree(tree, content, range, name, line) : null;
+        });
+}
+
+function callTokenColumnInTree(tree, content, range, name, line) {
     let node = tree.rootNode.descendantForIndex(range.start, Math.max(range.start, range.end - 1));
     while (node && !(node.startIndex <= range.start && node.endIndex >= range.end)) node = node.parent;
     if (!node) return null;
@@ -1337,8 +1357,9 @@ function unverifiedSiteShape(u) {
 }
 
 /**
- * BUG-BW: Build the list of call sites for `plan` using the SAME sweep verify
- * uses. This guarantees plan and verify agree on which sites need updating.
+ * Build callable sites through the same contracted sweep as verify.
+ * Value renames resolve their tokens through the value-binding pass and
+ * carry undecided call-shaped lines in their initial account.
  *
  * @param {object} index - ProjectIndex instance
  * @param {string} name - Function name being refactored
@@ -1346,6 +1367,24 @@ function unverifiedSiteShape(u) {
  * @returns {{ sites: Array, unverifiedSites: Array, account: object }}
  */
 function computePlanCallSites(index, name, def, options = {}) {
+    if (options.valueReferenceRename) {
+        // The value-binding pass settles these source occurrences. Preserve
+        // cross-language exclusions through the full caller sweep when an
+        // unresolved call belongs to another runtime family.
+        const { computeGroundSet, buildAccount } = require('./account');
+        const groundSet = computeGroundSet(index, name);
+        const accountParts = { confirmedEntries: [], unverifiedEntries: [], excludedEntries: [] };
+        const account = buildAccount(index, name, { groundSet, ...accountParts });
+        const { callNotResolvedEntries } = require('./analysis');
+        const candidates = callNotResolvedEntries(index, account);
+        const family = langTraits(index.files.get(def.file)?.language)?.nameReferenceFamily;
+        if (family && candidates.every(site =>
+            langTraits(index.files.get(site.file)?.language)?.nameReferenceFamily === family)) {
+            return { sites: [], unverifiedSites: candidates.map(unverifiedSiteShape),
+                account, groundSet, accountParts, valueReferenceRename: true };
+        }
+        index._opGroundSetCache?.set(name, groundSet);
+    }
     // A plan holds one call-site tree per file across its sweeps (fix #395).
     const ownsTreeCache = !index._treeCache;
     // A rename edits name tokens only; argument analysis (a parse of every
@@ -2568,7 +2607,8 @@ function cExternalReferenceVerdict(index, ref, def, pinIdentity, definitions) {
 function applyTypeReferencePass(index, ctx) {
     const { def, name, renameTo, changes, reviewItems, planUnverified } = ctx;
     const { typeReferenceSites } = require('./type-references');
-    const { files } = typeReferenceSites(index, def, name, ctx.groundSet);
+    const { files } = ctx.referenceSites || typeReferenceSites(index, def, name, ctx.groundSet);
+    const referenceKind = ctx.referenceKind || 'type';
     const decided = new Map(); // rel:line -> { abs, edited }
     const reviewed = new Map(); // rel:line -> { abs, reason }
     const stringEdited = new Set();
@@ -2633,11 +2673,11 @@ function applyTypeReferencePass(index, ctx) {
             if (existing && existing.newExpression !== undefined && !special(existing)) {
                 const prior = existing._edit && existing._edit.rawSource === raw ? existing._edit.columns
                     : renameIdentifierTokens(index, abs, line, name, renameTo).columns || [];
-                const trusted = (existing.isDefinition || existing._evidence) &&
+                const trusted = referenceKind !== 'value' && (existing.isDefinition || existing._evidence) &&
                     !reviewList.some(review => review.reason === 'macro-argument-other-use');
                 const hardUnits = new Set(reviewList.filter(review => review.reason === 'macro-argument-other-use')
                     .map(review => review.unit).filter(Number.isInteger));
-                const keep = trusted ? prior
+                const keep = referenceKind === 'value' ? prior.filter(column => editUnits.includes(column)) : trusted ? prior.filter(column => !skipUnits.has(column))
                     : prior.filter(column => !skipUnits.has(column) && !hardUnits.has(column));
                 const final = new Set([...keep, ...editUnits]);
                 const open = reviewList.filter(review => review.unit == null || !(trusted && final.has(review.unit)));
@@ -2700,7 +2740,7 @@ function applyTypeReferencePass(index, ctx) {
                             file: rel,
                             line,
                             expression: edit.source,
-                            suggestion: `${kind === 'call' ? 'Rename to' : 'Update type reference'}: ${edit.renamed}`,
+                            suggestion: `${kind === 'call' ? 'Rename to' : `Update ${referenceKind} reference`}: ${edit.renamed}`,
                             newExpression: edit.renamed,
                             editKind: kind,
                         });
@@ -2720,7 +2760,7 @@ function applyTypeReferencePass(index, ctx) {
                     file: rel,
                     line,
                     expression: edit.source,
-                    suggestion: `Update type reference: ${edit.renamed}${reviewNote}`,
+                    suggestion: `Update ${referenceKind} reference: ${edit.renamed}${reviewNote}`,
                     newExpression: edit.renamed,
                     editKind: 'reference',
                     ...(!certain && { needsReview: true, reviewReason: reviewList[0].reason }),
@@ -2742,7 +2782,7 @@ function applyTypeReferencePass(index, ctx) {
     // C# applies `XAttribute` as `[X]` (fix #386).
     const { csharpAttributeShortSites } = require('./type-references');
     const suffix = 'Attribute';
-    for (const site of csharpAttributeShortSites(index, def, name)) {
+    for (const site of referenceKind === 'value' ? [] : csharpAttributeShortSites(index, def, name)) {
         if (site.verdict === 'no') continue;
         const short = name.slice(0, -suffix.length);
         const newShort = renameTo.endsWith(suffix) && renameTo.length > suffix.length
@@ -2929,6 +2969,14 @@ function plan(index, name, options = {}) {
 
     const resolved = index.resolveSymbol(name, { file: options.file, className: options.className, line: options.line });
     let def = resolved.def || definitions[0];
+    if (options.renameTo && definitions.some(other => other !== def && other.file === def.file &&
+        (other.nameLine || other.startLine) === (def.nameLine || def.startLine) &&
+        (!options.className || other.className === options.className) &&
+        (isValueDefinition(def) && !def.className && isTypeRenamePin(other) ||
+            isTypeRenamePin(def) && isValueDefinition(other) && !other.className))) {
+        return { found: true, function: name,
+            error: 'This source handle names both a type and a value. Select the member with class_name or put the declarations on separate source lines.' };
+    }
     // A constructor or destructor carries its class's name (Java, C#, C++):
     // renaming it is renaming the class (fix #386).
     // (A C# member can never carry its type's name except the finalizer.)
@@ -2963,8 +3011,10 @@ function plan(index, name, options = {}) {
     // in lock-step by construction. Unverified candidates are NOT planned
     // (they may target another symbol) but stay visible with reasons.
     const { sites: planCallSites, unverifiedSites: planUnverified, account: pinAccount,
-        groundSet: planGroundSet, accountParts: planAccountParts } = computePlanCallSites(index, name, def,
-        { analyzeArgs: !options.renameTo });
+        groundSet: planGroundSet, accountParts: planAccountParts,
+        valueReferenceRename = false } = computePlanCallSites(index, name, def,
+        { analyzeArgs: !options.renameTo,
+            valueReferenceRename: !!options.renameTo && isValueDefinition(def) && !def.macroExpansion });
     let planAccount = pinAccount;
     // Call sites a slot member's sweep contributed to this plan (fix #376):
     // the plan's ACCOUNT is rebuilt over the same sites it lists.
@@ -3404,7 +3454,7 @@ function plan(index, name, options = {}) {
         const usages = index.usages(name, {
             codeOnly: false,
             includeTests: true,
-            internalEvidence: true,
+            internalEvidence: !valueReferenceRename,
         });
         planUsages = usages;
         const importUsages = usages.filter(u => u.usageType === 'import' && !u.isDefinition);
@@ -3861,7 +3911,9 @@ function plan(index, name, options = {}) {
         // alias, and class-body reads of a member are references.
         {
             let adapter = null;
-            try { adapter = getLanguageAdapter(planLang); } catch { adapter = null; }
+            try {
+                if (langTraits(planLang)?.scopeAlternativeBindings !== false) adapter = getLanguageAdapter(planLang);
+            } catch { adapter = null; }
             if (typeof adapter?.findScopeAlternativeBindings === 'function') {
                 let tree = null;
                 try {
@@ -4494,7 +4546,9 @@ function plan(index, name, options = {}) {
         // so those rows surface needsReview instead of a synthesized edit.
         // A NESTED pin's own container is exempt: inside it the pin IS the
         // binder (`return decorator`).
-        {
+        // Value references use the binding pass below, including local
+        // shadows and receivers, rather than the callable reference rules.
+        if (!valueReferenceRename) {
             const fileSymbols = index.files.get(def.file)?.symbols || [];
             const scopeKinds = new Set(['function', 'method', 'constructor',
                 'private', 'get', 'set', 'property', 'classmethod', 'special']);
@@ -5064,6 +5118,25 @@ function plan(index, name, options = {}) {
     // resolve to exactly the renamed declaration is a review item.
     let typePass = null;
     const fileRenames = [];
+    if (options.renameTo && isValueDefinition(def) && planGroundSet && !def.macroExpansion) {
+        const { valueReferenceSites } = require('./value-references');
+        const references = valueReferenceSites(index, def, name, planGroundSet);
+        if (references.ambiguousDeclaration) return { found: true, function: name,
+            error: references.ambiguityReason === 'storage'
+                ? 'This source handle names both a static and an instance field. Put the declarations on separate source lines to select one.'
+                : 'This source handle names multiple value declarations in different scopes. Put the declarations on separate source lines to select one.' };
+        const valueRename = references.privateIdentifier ? `#${options.renameTo}` : options.renameTo;
+        if (references.privateIdentifier) {
+            const at = currentSignature.indexOf(name);
+            if (at >= 0) newSignature = currentSignature.slice(0, at) + valueRename +
+                currentSignature.slice(at + name.length);
+        }
+        typePass = applyTypeReferencePass(index, {
+            def, name, renameTo: valueRename, changes, reviewItems,
+            planUnverified, groundSet: planGroundSet, referenceKind: 'value',
+            referenceSites: references,
+        });
+    }
     if (options.renameTo && isTypeRenamePin(def) && planGroundSet &&
         !def.macroExpansion) {
         typePass = applyTypeReferencePass(index, {

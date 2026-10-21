@@ -801,7 +801,7 @@ const (
         }
     });
 
-    it('does not index unexported iota constants', () => {
+    it('indexes unexported iota constants as package values', () => {
         const dir = tmp({
             'go.mod': 'module test\ngo 1.21',
             'internal.go': `package main
@@ -817,7 +817,8 @@ const (
             const index = idx(dir);
             for (const name of ['red', 'green', 'blue']) {
                 const syms = index.symbols.get(name) || [];
-                assert.strictEqual(syms.length, 0, `Unexported const ${name} should not be indexed`);
+                assert.strictEqual(syms.length, 1, `${name} is a package value`);
+                assert.strictEqual(syms[0].type, 'state');
             }
         } finally {
             rm(dir);
@@ -840,9 +841,10 @@ const internal = 5
             assert.ok(syms.length > 0, 'Exported const MaxRetries should be indexed');
             const timeout = index.symbols.get('Timeout') || [];
             assert.ok(timeout.length > 0, 'Exported const Timeout should be indexed');
-            // Unexported constants should NOT be indexed
+            // Visibility does not remove declarations from the value index.
             const internal = index.symbols.get('internal') || [];
-            assert.strictEqual(internal.length, 0, 'Unexported const should not be indexed');
+            assert.strictEqual(internal.length, 1);
+            assert.strictEqual(internal[0].type, 'state');
         } finally {
             rm(dir);
         }
@@ -1221,7 +1223,7 @@ var SchemeGroupVersion = GroupName + "/" + Version
         }
     });
 
-    it('should NOT index unexported const/var', () => {
+    it('indexes unexported package constants and variables', () => {
         const dir = tmp({
             'go.mod': 'module test\ngo 1.21',
             'internal.go': `package main
@@ -1231,10 +1233,10 @@ var timeout = 30
         });
         try {
             const index = idx(dir);
-            assert.strictEqual((index.symbols.get('maxRetries') || []).length, 0,
-                'unexported const should not be indexed');
-            assert.strictEqual((index.symbols.get('timeout') || []).length, 0,
-                'unexported var should not be indexed');
+            assert.strictEqual(index.symbols.get('maxRetries')?.length, 1);
+            assert.strictEqual(index.symbols.get('maxRetries')[0].type, 'state');
+            assert.strictEqual(index.symbols.get('timeout')?.length, 1);
+            assert.strictEqual(index.symbols.get('timeout')[0].type, 'state');
         } finally {
             rm(dir);
         }

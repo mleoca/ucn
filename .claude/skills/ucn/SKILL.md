@@ -60,6 +60,8 @@ Trust lines close every answer and survive truncation:
 - `WARNING` lists unreadable, unparsed or partially indexed files and unsupported-language occurrence sites with their line text, so nothing text search would show is hidden. `usages` and `tests` carry the same disclosure as a note.
 - `FILTERED` means query options hid evidence. `CALLEE ACCOUNT` and `TREE ACCOUNT` do the same for callees and `trace` trees.
 
+A field, constant, enum member or module value adds `VALUE ACCESS SITES` to `impact`. Its rename plan edits proven references and lists unresolved bindings for review.
+
 A property/getter/setter target adds `PROPERTY ACCESS SITES` to `impact` (reads and writes with access kind; receiver identity confirms, an unresolved receiver stays unverified). A type target adds `TYPE REFERENCE SITES` (confirmed by an import link to the definition's file, or package scope in Go/Java). `DEPENDENCY SITES` counts them; `CALL SITES` stays call-shaped. Target-less `impact` and `check` diff the working tree against `HEAD` (`--staged` for the index), include untracked non-ignored source as whole-file additions, and put classes, interfaces, types and fields in declaration bands; a modified or deleted declaration makes `check` `BLOCKED` until reviewed with the language toolchain.
 
 Numeric evidence values are ordinal ranking weights, not probabilities. An observed-text zero is not a semantic zero or safe-delete proof.

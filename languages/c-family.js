@@ -3448,8 +3448,7 @@ function fieldMembers(node, access, lines) {
     const typeNode = node.childForFieldName('type') ||
         node.namedChildren.find(child => TYPE_NODES.has(child.type));
     const fields = [];
-    for (const child of node.namedChildren || []) {
-        if (!IDENTIFIER_NODES.has(child.type) && child.type !== 'field_declarator') continue;
+    for (const child of node.childrenForFieldName('declarator')) {
         const identity = declaratorIdentity(child);
         if (!identity.name || identity.name === typeNode?.text) continue;
         const { startLine, endLine, indent } = nodeToLocation(child, lines);
@@ -3778,6 +3777,18 @@ function typedefEntries(node, lines) {
     return entries;
 }
 
+function classNamespaceScope(node, named) {
+    const parts = [];
+    let anonymous = false;
+    for (let parent = node.parent; parent; parent = parent.parent) {
+        if (parent.type !== 'namespace_definition') continue;
+        const name = parent.childForFieldName('name');
+        if (name) parts.unshift(name.text);
+        else { parts.unshift('<anonymous>'); anonymous = true; }
+    }
+    return { anonymous, key: anonymous ? `${parts.join('::')}\0${named || ''}` : named || '' };
+}
+
 function findClassesInTree(code, tree, mode, sourceLines = null) {
     const lines = sourceLines || code.split('\n');
     const classes = [];
@@ -3786,7 +3797,7 @@ function findClassesInTree(code, tree, mode, sourceLines = null) {
     // the same name (forward declarations, `struct S` in a parameter or
     // field type position) are references to it, never second definitions.
     const bodiedNames = new Set();
-    const bodylessEntries = new Set();
+    const bodylessEntries = new Map();
     const forwardDeclared = new Set();
     traverseTreeCached(tree.rootNode, node => {
         if (mode === 'cpp' && node.type === 'alias_declaration') {
@@ -3827,24 +3838,43 @@ function findClassesInTree(code, tree, mode, sourceLines = null) {
         const identity = classIdentity(node);
         if (!identity?.name) return true;
         const hasBody = !!node.childForFieldName('body');
+        if (!hasBody) {
+            let container = node.parent;
+            while (container && (PP_CONDITIONAL_TYPES.has(container.type) ||
+                container.type === 'template_declaration')) container = container.parent;
+            if (!['translation_unit', 'declaration_list'].includes(container?.type)) return true;
+        }
+        const outer = identity.enclosingType ? null : mode === 'cpp' ? enclosingClass(node) : null;
+        const enclosingType = identity.enclosingType || outer?.name || null;
+        const namespace = identity.ownerQualifier
+            ? [enclosingNamespace(node), identity.ownerQualifier].filter(Boolean).join('::')
+            : enclosingNamespace(node);
+        const namespaceScope = classNamespaceScope(node, namespace);
+        const localScope = functionLocalClassScope(node);
+        const generics = mode === 'cpp' ? templateParameterNames(node) : null;
+        const branch = conditionalBranchLines(node);
+        const tag = node.type === 'union_specifier' || node.type === 'enum_specifier'
+            ? node.type : 'record';
+        const scopeKey = `${namespaceScope.key}\0${enclosingType || ''}\0${identity.ownerName}` +
+            `\0${generics?.length || 0}\0${tag}\0${localScope.lexicalScopeStartLine || 0}`;
         if (hasBody) {
-            bodiedNames.add(identity.name);
+            // A same-scope declaration denotes this class even when its
+            // body is conditional. Keep every alternative body, without an
+            // extra incomplete class competing with its own definition.
+            bodiedNames.add(scopeKey);
         } else {
-            if (bodiedNames.has(identity.name)) return true;
+            if (bodiedNames.has(scopeKey)) return true;
             // A bodyless specifier is only a DECLARATION at declaration
             // level (`struct S;`); in a type position (`void f(struct S *)`)
             // it is a reference. One entry per opaque forward-declared name.
-            const parentType = node.parent?.type;
-            if (parentType !== 'translation_unit' && parentType !== 'declaration_list') return true;
-            if (forwardDeclared.has(identity.name)) return true;
-            forwardDeclared.add(identity.name);
+            if (forwardDeclared.has(scopeKey)) return true;
+            forwardDeclared.add(scopeKey);
         }
         const key = `${node.startIndex}:${identity.name}`;
         if (seen.has(key)) return false;
         seen.add(key);
         const { startLine, endLine, indent } = nodeToLocation(node, lines);
-        let type = node.type.replace('_specifier', '');
-        if (type === 'union') type = 'type';
+        const type = node.type.replace('_specifier', '');
         const baseClause = node.namedChildren.find(child => child.type === 'base_class_clause');
         const bases = baseClause
             ? baseClause.namedChildren
@@ -3858,17 +3888,15 @@ function findClassesInTree(code, tree, mode, sourceLines = null) {
         // A nested class names its enclosing class (fix #396): lexically
         // (`class A { struct B { .. }; }`) or by its qualified definition
         // (`struct A::B { .. }`, whose outer scopes qualify its namespace).
-        const outer = identity.enclosingType ? null : mode === 'cpp' ? enclosingClass(node) : null;
-        const enclosingType = identity.enclosingType || outer?.name || null;
-        const namespace = identity.ownerQualifier
-            ? [enclosingNamespace(node), identity.ownerQualifier].filter(Boolean).join('::')
-            : enclosingNamespace(node);
         const entry = {
             name: identity.name,
             ...(identity.ownerName !== identity.name && {
                 specialization: identity.ownerName,
             }),
             type,
+            ...(!hasBody && { forwardDeclaration: true }),
+            ...(namespaceScope.anonymous && { anonymousNamespace: true }),
+            ...(branch && { ppBranch: branch }),
             startLine,
             endLine,
             ...(identity.nameNode?.startPosition.row + 1 !== startLine && {
@@ -3881,21 +3909,21 @@ function findClassesInTree(code, tree, mode, sourceLines = null) {
             ...(namespace && { namespace }),
             ...(enclosingType && { enclosingType }),
             ...(bases.length > 0 && { extends: bases.join(', ') }),
-            ...(mode === 'cpp' && templateParameterNames(node) && {
-                generics: templateParameterNames(node),
+            ...(generics && {
+                generics,
             }),
-            ...functionLocalClassScope(node),
+            ...localScope,
             docstring: extractJSDocstring(lines, startLine),
         };
         classes.push(entry);
-        if (!hasBody) bodylessEntries.add(entry);
+        if (!hasBody) bodylessEntries.set(entry, scopeKey);
         return true;
     });
     // A forward declaration can precede its body. Filtering after the single
     // traversal preserves the old "body wins" result without paying a full
     // preliminary tree walk merely to discover future bodied names.
     return classes.filter(entry =>
-        !bodylessEntries.has(entry) || !bodiedNames.has(entry.name));
+        !bodylessEntries.has(entry) || !bodiedNames.has(bodylessEntries.get(entry)));
 }
 
 function findClasses(code, parser, mode) {
@@ -4119,6 +4147,22 @@ function findFunctions(code, parser, mode) {
 
 function findStateObjectsInTree(tree, lines) {
     const states = [];
+    // An unnamed enum without a typedef owner declares values directly
+    // in its enclosing scope. A typedef's members already carry them.
+    traverseTreeCached(tree.rootNode, node => {
+        if (node.type !== 'enum_specifier' || classIdentity(node)) return true;
+        const body = node.childForFieldName('body');
+        for (const member of body?.namedChildren || []) {
+            if (member.type !== 'enumerator') continue;
+            const name = member.childForFieldName('name');
+            if (!name) continue;
+            const { startLine, endLine, indent } = nodeToLocation(name, lines);
+            const namespace = enclosingNamespace(node);
+            states.push({ name: name.text, startLine, endLine, indent,
+                ...(namespace && { namespace }) });
+        }
+        return true;
+    });
     traverseTreeCached(tree.rootNode, node => {
         if (node.type !== 'declaration') return true;
         if (functionDeclarator(node)) return false;
@@ -4139,6 +4183,7 @@ function findStateObjectsInTree(tree, lines) {
                 endLine,
                 indent,
                 modifiers: modifiersOf(node),
+                ...(enclosingNamespace(node) && { namespace: enclosingNamespace(node) }),
             });
         }
         return false;

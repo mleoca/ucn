@@ -6,7 +6,7 @@ const { NON_CALLABLE_TYPES } = require('./shared');
 const { declarationIdentity, identityKey, propertyReadMember } = require('./provenance');
 const { captureOverload, overloadMemberGroup } = require('./provenance-overload');
 const { splitParentList } = require('./graph-build');
-const { distinctOwnerDefinitions } = require('./class-identity');
+const { distinctOwnerDefinitions, completeForwardDeclaration } = require('./class-identity');
 
 const TYPE_KINDS = new Set(['class', 'struct', 'interface', 'trait', 'record', 'enum', 'type', 'impl']);
 const ownerName = definition => definition.className || (definition.receiver || '').replace(/^\*/, '');
@@ -248,19 +248,22 @@ function confirmationFacts(index, file, call, targets, options = {}) {
         if (qualifier && options.resolveType &&
             langTraits(language)?.typeSystem !== 'structural') {
             const definition = options.resolveType(name, context, atLine, qualifier);
-            return definition ? { declaration: definition, chain: [] } : null;
+            return definition ? {
+                declaration: completeForwardDeclaration(index, definition, file), chain: [] } : null;
         }
         const named = namedDeclaration(index, context, name, d =>
             (TYPE_KINDS.has(d.type) && d.type !== 'impl') ||
             (['javascript', 'typescript', 'tsx'].includes(language) &&
                 d.type === 'function' && !d.className &&
                 ['constructor', 'flow'].includes(facts.receiverTypeSource)), atLine);
-        if (named) return named;
+        if (named) return { ...named,
+            declaration: completeForwardDeclaration(index, named.declaration, file) };
         // Nominal package/type lookup is delegated to the engine's language
         // rules, then pinned to a unique declaration in the resolved scope.
         if (langTraits(language)?.typeSystem !== 'structural' && options.resolveType) {
             const definition = options.resolveType(name, context, atLine);
-            if (definition) return { declaration: definition, chain: [] };
+            if (definition) return {
+                declaration: completeForwardDeclaration(index, definition, file), chain: [] };
         }
         return null;
     };

@@ -319,16 +319,27 @@ function fileExports(index, filePath, _visited) {
             (isPythonImplicit && symbol.name && !symbol.name.startsWith('_') && !symbol.className && !symbol.isMethod);
 
         if (isExported) {
+            const variable = symbol.type === 'state' && (fileEntry.exportDetails || [])
+                .find(detail => detail.isVariable && detail.name === symbol.name);
+            const details = (fileEntry.exportDetails || []).filter(detail =>
+                (detail.localName || detail.name) === symbol.name);
+            const defaultLike = detail => detail.type === 'default' ||
+                detail.type === 'module.exports' && detail.defaultLike;
+            const defaultOnly = details.some(defaultLike) &&
+                !details.some(detail => !defaultLike(detail));
             results.push({
                 name: symbol.name,
-                type: symbol.type,
+                type: variable ? 'variable' : symbol.type,
                 file: fileEntry.relativePath,
                 startLine: symbol.startLine,
                 endLine: symbol.endLine,
                 ...(symbol.className && { className: symbol.className }),
                 params: symbol.params,
-                returnType: symbol.returnType,
-                signature: formatExportSignature(index, symbol)
+                returnType: variable ? variable.typeAnnotation || null : symbol.returnType,
+                signature: variable
+                    ? `${variable.declKind} ${variable.name}${variable.typeAnnotation ? ': ' + variable.typeAnnotation : ''}`
+                    : formatExportSignature(index, symbol),
+                ...(defaultOnly && { isDefault: true }),
             });
         }
     }

@@ -142,26 +142,26 @@ function unwrapValueExpression(node) {
 }
 
 /** Names a binding pattern declares (identifiers, shorthand, rest, defaults' targets). */
-function collectPatternNames(pattern, out) {
+function collectPatternNames(pattern, out, withNodes = false) {
     if (!pattern) return;
     if (pattern.type === 'required_parameter' || pattern.type === 'optional_parameter') {
-        collectPatternNames(pattern.childForFieldName('pattern') || pattern.childForFieldName('name'), out);
+        collectPatternNames(pattern.childForFieldName('pattern') || pattern.childForFieldName('name'), out, withNodes);
         return;
     }
     if (pattern.type === 'identifier' || pattern.type === 'shorthand_property_identifier_pattern') {
-        out.push(pattern.text);
+        out.push(withNodes ? pattern : pattern.text);
         return;
     }
     if (pattern.type === 'pair_pattern' || pattern.type === 'pair') {
-        collectPatternNames(pattern.childForFieldName('value'), out);
+        collectPatternNames(pattern.childForFieldName('value'), out, withNodes);
         return;
     }
     if (pattern.type === 'assignment_pattern') {
-        collectPatternNames(pattern.childForFieldName('left') || pattern.childForFieldName('pattern'), out);
+        collectPatternNames(pattern.childForFieldName('left') || pattern.childForFieldName('pattern'), out, withNodes);
         return;
     }
     if (pattern.type === 'type_annotation') return;
-    for (let i = 0; i < pattern.namedChildCount; i++) collectPatternNames(pattern.namedChild(i), out);
+    for (let i = 0; i < pattern.namedChildCount; i++) collectPatternNames(pattern.namedChild(i), out, withNodes);
 }
 
 // Module-level alias: findCallsInCode declares its own one-argument
@@ -1925,13 +1925,50 @@ function _isFactoryCall(node) {
  * Process a node for state object extraction (single-pass helper)
  * Returns true if node was matched, false otherwise
  */
+function moduleStateScope(declaration) {
+    const namespaces = [];
+    for (let scope = declaration.parent; scope; scope = scope.parent) {
+        if (scope.type === 'program') return { namespace: namespaces.reverse().join('.') };
+        if (scope.type === 'export_statement' || scope.type === 'ambient_declaration') continue;
+        if (scope.type === 'internal_module' || scope.type === 'module') {
+            const name = scope.childForFieldName('name');
+            if (!name || name.type === 'string') return null;
+            namespaces.push(name.text);
+            continue;
+        }
+        if (scope.type === 'statement_block' &&
+            ['internal_module', 'module'].includes(scope.parent?.type)) continue;
+        if (FUNCTION_NODE_TYPES.has(scope.type) ||
+            ['class_body', 'class_static_block'].includes(scope.type)) return null;
+        if (declaration.type !== 'variable_declaration') return null;
+    }
+    return null;
+}
+
 function _processState(node, objects, lines) {
     if (node.type === 'lexical_declaration' || node.type === 'variable_declaration') {
+        const moduleScope = moduleStateScope(node);
         for (let i = 0; i < node.namedChildCount; i++) {
             const declarator = node.namedChild(i);
             if (declarator.type === 'variable_declarator') {
                 const nameNode = declarator.childForFieldName('name');
                 const valueNode = declarator.childForFieldName('value');
+
+                const value = unwrapValueExpression(valueNode);
+                if (moduleScope && nameNode && !isImportInitializerNode(valueNode) &&
+                    !['arrow_function', 'function', 'function_expression', 'generator_function',
+                        'class', 'class_declaration'].includes(value?.type)) {
+                    const names = [];
+                    collectPatternNames(nameNode, names, true);
+                    for (const binding of names) {
+                        objects.push({ name: binding.text,
+                            startLine: binding.startPosition.row + 1,
+                            endLine: declarator.endPosition.row + 1,
+                            ...(moduleScope.namespace && { namespace: moduleScope.namespace }),
+                        });
+                    }
+                    continue;
+                }
 
                 if (nameNode && valueNode) {
                     const name = nameNode.text;

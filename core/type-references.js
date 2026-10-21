@@ -146,9 +146,12 @@ function classifyJava(node) {
             break;
         case 'formal_parameter': case 'catch_formal_parameter': case 'spread_parameter':
         case 'enhanced_for_statement': case 'resource': case 'record_pattern_component':
-            if (field === 'name' || node.type === 'identifier') return skip('parameter', { binding: true });
+            if (field === 'name') return skip('parameter', { binding: true });
             break;
-        case 'lambda_expression': case 'inferred_parameters':
+        case 'lambda_expression':
+            if (field === 'parameters') return skip('parameter', { binding: true });
+            break;
+        case 'inferred_parameters':
             return skip('parameter', { binding: true });
         case 'type_parameter':
             return skip('type-parameter', { typeParam: true });
@@ -178,6 +181,9 @@ function classifyJava(node) {
             return { role: 'value' };
         case 'marker_annotation': case 'annotation':
             if (field === 'name') return { role: 'type' };
+            break;
+        case 'element_value_pair':
+            if (field === 'key') return skip('annotation-element');
             break;
         case 'labeled_statement': case 'break_statement': case 'continue_statement':
             return skip('label');
@@ -572,6 +578,9 @@ function classifyRust(node) {
         case 'const_item': case 'static_item':
             if (field === 'name') return skip('constant', { binding: true });
             break;
+        case 'const_parameter':
+            if (field === 'name') return skip('parameter', { binding: true, genericParameter: true });
+            break;
         case 'mod_item':
             return skip('module-name');
         case 'label': case 'loop_label': case 'lifetime':
@@ -679,7 +688,8 @@ function classifyC(node, language) {
             if (node.type === 'field_identifier') return skip('field-name');
             break;
         case 'enumerator':
-            return skip('enumerator');
+            if (field === 'name') return skip('enumerator');
+            break;
         case 'type_parameter_declaration': case 'optional_type_parameter_declaration':
         case 'variadic_type_parameter_declaration':
             // `template <typename T = Widget>`: the default is a reference.
@@ -687,11 +697,17 @@ function classifyC(node, language) {
             return skip('type-parameter', { typeParam: true });
         case 'preproc_def': case 'preproc_function_def': case 'preproc_params':
             return skip('macro-name');
+        case 'reference_declarator':
+            // The C++ grammar gives the referenced declarator no field name.
+            if (sameNode(parent.namedChild(0), node)) {
+                if (node.type === 'identifier') return skip('variable', { binding: true });
+                if (node.type === 'field_identifier') return skip('field-name');
+            }
+            break;
         case 'init_declarator': case 'parameter_declaration': case 'optional_parameter_declaration':
-        case 'pointer_declarator': case 'reference_declarator': case 'array_declarator':
+        case 'pointer_declarator': case 'array_declarator':
         case 'declaration':
-            if (node.type === 'identifier' && (field === 'declarator' || parent.type === 'pointer_declarator' ||
-                parent.type === 'reference_declarator' || parent.type === 'array_declarator')) {
+            if (['identifier', 'field_identifier'].includes(node.type) && field === 'declarator') {
                 return skip('variable', { binding: true });
             }
             break;
@@ -865,6 +881,7 @@ class TypeReferenceResolver {
         this.all = all;
         this.family = family;
         this.language = language;
+        this.declarationKinds = TYPE_DECL_KINDS;
         this.pinFiles = new Set([...group].map(d => d.file));
         this.memo = new Map();
         this._embedders = undefined;
@@ -879,9 +896,14 @@ class TypeReferenceResolver {
      * site is not an identifier token (doc comments).
      */
     siteArity() {
+        if (this.siteSyntax && Number.isInteger(this.siteSyntax.arity)) return this.siteSyntax.arity;
         const node = this.siteNode;
         if (!node || node.type !== 'identifier' || !langTraits(this.language)?.genericArityIsIdentity) return null;
         const parent = node.parent;
+        if (CSHARP_TYPE_DECLS.has(parent?.type) && sameNode(parent.childForFieldName('name'), node)) {
+            const list = parent.namedChildren.find(child => child.type === 'type_parameter_list');
+            return list ? list.namedChildren.filter(child => child.type === 'type_parameter').length : 0;
+        }
         // A constructor or finalizer is named after its class without type
         // arguments (fix #390: `Strategy(..)` inside `class Strategy<T>`):
         // its arity is the enclosing declaration's.
@@ -914,7 +936,7 @@ class TypeReferenceResolver {
     /** Type-like definitions of NAME declared in `file`. */
     fileTypes(file, name = this.name) {
         return (this.index.symbols.get(name) || []).filter(d => d.file === file &&
-            TYPE_DECL_KINDS.has(d.type));
+            this.declarationKinds.has(d.type));
     }
 
     /** Container range of a definition inside its own file (innermost
@@ -1192,6 +1214,9 @@ class TypeReferenceResolver {
      * the namespace of the indexed types around the line.
      */
     csharpSiteNamespace(file, line) {
+        if (this.siteSyntax?.file === file && this.siteSyntax.line === line) {
+            return this.siteSyntax.context.scopes.at(-1)?.namespace || '';
+        }
         const node = this.siteNode && this.siteFile === file && this.siteNode.startPosition.row + 1 === line
             ? this.siteNode : null;
         if (node) return require('../languages/csharp-scope').usingScopesOf(node).at(-1)?.namespace || '';
@@ -1235,7 +1260,7 @@ class TypeReferenceResolver {
                 if (members.length > 0) return this.judge(members);
             }
         }
-        const scope = csharpUsings(this.index, file, site, this.siteNode);
+        const scope = csharpUsings(this.index, file, site, this.siteNode, this.siteSyntax?.context);
         const chain = [];
         for (let parts = site ? site.split('.') : []; parts.length > 0; parts = parts.slice(0, -1)) {
             chain.push(parts.join('.'));
@@ -1422,7 +1447,7 @@ class TypeReferenceResolver {
     rustModuleVerdict(resolved, name, depth) {
         const { rustModuleItems } = require('./rust-modules');
         const verdicts = [];
-        const items = rustModuleItems(this.index, resolved, name).filter(d => TYPE_DECL_KINDS.has(d.type));
+        const items = rustModuleItems(this.index, resolved, name).filter(d => this.declarationKinds.has(d.type));
         if (items.length > 0) verdicts.push(this.judge(items));
         for (const moduleEntry of resolved.entries) {
             const target = this.index.files.get(moduleEntry.file);
@@ -1516,12 +1541,12 @@ class TypeReferenceResolver {
             // names in the ordinary one.
             const tagSite = options.tag != null;
             const candidates = this.all.filter(d => d.name === name &&
-                (tagSite ? !cOrdinaryName(d) : cOrdinaryName(d)));
+                (this.valueReferences || (tagSite ? !cOrdinaryName(d) : cOrdinaryName(d))));
             const seen = candidates.filter(d => d.file === file || visible.has(d.file));
             if (seen.length > 0) return this.judge(seen);
             return { verdict: 'unknown', reason: 'not-in-include-closure' };
         }
-        const spelling = qualifierText ? `${qualifierText}::${name}` : name;
+        const spelling = qualifierText ? `${qualifierText}${qualifierText.endsWith('::') ? '' : '::'}${name}` : name;
         if (qualifierText && this.def.enclosingType) {
             // `Acc<T>::Member` / `Acc<double>::Member` against a member of a
             // specialization: the template arguments pick the class.
@@ -1564,9 +1589,12 @@ class TypeReferenceResolver {
         const site = this.cppSiteContext(file, line);
         const context = { file, line, namespace: site.namespace,
             className: qualifierText && qualifierText.startsWith('::') ? null : site.className };
-        const found = resolveQualifier(this.index, context, spelling, visible, 0, { declarations: true });
+        const found = resolveQualifier(this.index, context, spelling, visible, 0,
+            { declarations: true, values: this.valueReferences === true,
+                ...(this.valueReferences && this.siteNode && { valueSite: {
+                    file: this.siteFile || file, index: this.siteNode.startIndex } }) });
         if (found.kind === 'namespace') return { verdict: 'no', reason: 'namespace' };
-        if (found.kind === 'type') {
+        if (found.kind === 'type' || found.kind === 'value') {
             const declarations = (found.declarations || []).filter(d => !functionLocal(d) || localInScope(d));
             const siblings = this.cppSiblingMembers(declarations);
             if (siblings) {
@@ -2202,8 +2230,7 @@ const PY_ANNOTATION_STOP = new Set(['block', 'module', 'class_definition', 'func
  * Decide every name token on the ground lines of a type rename.
  * @returns {{ files: Map<string, {relativePath, lines: Map<number, {edits: number[], reviews: Array<{column, reason}>, skips: number, text: boolean, tokens: number}>}> }}
  */
-function typeReferenceSites(index, def, name, groundSet) {
-    const resolver = new TypeReferenceResolver(index, def, name);
+function typeReferenceSites(index, def, name, groundSet, resolver = new TypeReferenceResolver(index, def, name)) {
     const files = new Map();
     const perFile = groundSet?.perFile || new Map();
     const sortedFiles = [...perFile.keys()].sort();
@@ -2250,6 +2277,8 @@ function scanFile(index, resolver, file, entry, language, lineNumbers) {
     const name = resolver.name;
     let content;
     try { content = index._readFile(file); } catch { return null; }
+    const local = resolver.readLocalFile?.(file, entry, language, lineNumbers, content);
+    if (local) return local;
     let htmlView = null;
     if (language === 'html') {
         htmlView = htmlScriptView(content, name);
@@ -2258,7 +2287,8 @@ function scanFile(index, resolver, file, entry, language, lineNumbers) {
     const parser = getParser(language);
     if (!parser) return null;
     const tree = htmlView ? safeParse(parser, htmlView.script)
-        : index._getParsedTree?.(file, content, language) || safeParse(parser, content);
+        : (resolver.valueReferences && require('./query-bodies').localQueryTree(index, file, entry, language, name, content)) ||
+            index._getParsedTree?.(file, content, language) || safeParse(parser, content);
     const lines = new Map();
     const lineOf = row => {
         let slot = lines.get(row + 1);
@@ -2325,9 +2355,10 @@ function scanFile(index, resolver, file, entry, language, lineNumbers) {
             // code, read as tokens of their own).
             if (node.namedChildCount !== 0 && !type.includes('comment')) continue;
             mark(node, 'text');
-            if (resolver.family === 'csharp' && type === 'comment' && marks) docComments.push(node);
+            if (!resolver.valueReferences && resolver.family === 'csharp' && type === 'comment' && marks) docComments.push(node);
             if (resolver.family === 'python' && type === 'string_content' &&
-                (pythonTypeExpressionString(node, entry) || pythonDunderAllEntry(node, name))) found.push(node);
+                ((!resolver.valueReferences && pythonTypeExpressionString(node, entry)) ||
+                    pythonDunderAllEntry(node, name))) found.push(node);
         }
         return found;
     };
@@ -2340,8 +2371,14 @@ function scanFile(index, resolver, file, entry, language, lineNumbers) {
     // a persisted blank reads through the recovered tree too.
     const persistedBlanks = resolver.family === 'c' && Array.isArray(entry.recoveryBlanks) &&
         entry.recoveryBlanks.length > 0 ? entry.recoveryBlanks : null;
+    // A decoration can make a record look like a clean function whose
+    // fields look like local declarations. Recover the pinned value's
+    // enclosing header too, using the same blanks the index verified.
+    const valueDeclarationHeader = resolver.valueReferences && persistedBlanks && resolver.def.file === file &&
+        tokens.some(node => node.startPosition.row + 1 === (resolver.def.nameLine || resolver.def.startLine) &&
+            enclosingHeaderHoldsBlank(node, persistedBlanks));
     if (resolver.family === 'c' && ((tree.rootNode.hasError && tokens.some(statementHasError)) ||
-        (persistedBlanks && tokens.some(node => statementHoldsBlank(node, persistedBlanks))))) {
+        (persistedBlanks && tokens.some(node => statementHoldsBlank(node, persistedBlanks))) || valueDeclarationHeader)) {
         // Only when the literal parse breaks around a token: the recovery
         // re-parses the file.
         let module;
@@ -2397,6 +2434,7 @@ function scanFile(index, resolver, file, entry, language, lineNumbers) {
         .map(t => ({ node: t.node, scope: bindingScope(t.node, resolver.family, t.role), role: t.role }));
     const typeParams = classified.filter(t => t.role.role === 'skip' && t.role.typeParam)
         .map(t => ({ node: t.node, scope: typeParamScope(t.node) }));
+    let fileLocalOnly = true;
     for (const token of classified) {
         const row = token.node.startPosition.row;
         const slot = lineOf(row);
@@ -2408,8 +2446,11 @@ function scanFile(index, resolver, file, entry, language, lineNumbers) {
         resolver.siteNode = token.node;
         resolver.siteFile = file;
         // A position no rule decides is a review item, never an edit or a skip.
-        const decision = decide(resolver, file, entry, token, bindings, typeParams) ||
+        const decision = (resolver.decideToken
+            ? resolver.decideToken(file, entry, token, bindings, typeParams)
+            : decide(resolver, file, entry, token, bindings, typeParams)) ||
             { verdict: 'unknown', reason: 'unmodelled-position' };
+        if (!decision.fileLocalOnly) fileLocalOnly = false;
         resolver.siteNode = null;
         // An `__all__` entry is a code reference: once edited it is no
         // longer a text-only review item.
@@ -2423,6 +2464,7 @@ function scanFile(index, resolver, file, entry, language, lineNumbers) {
         }
     }
     for (const comment of docComments) decideDocCrefs(resolver, file, comment, lineOf(comment.startPosition.row));
+    resolver.rememberLocalFile?.(file, lines, fileLocalOnly);
     return lines;
 }
 
@@ -2543,8 +2585,19 @@ function statementHoldsBlank(node, blanks) {
         if (/(declaration|definition|statement)$/.test(current.type)) { statement = current; break; }
     }
     if (!statement) return false;
-    const start = statement.startIndex;
-    const end = statement.endIndex;
+    return rangeHoldsBlank(statement.startIndex, statement.endIndex, blanks);
+}
+
+function enclosingHeaderHoldsBlank(node, blanks) {
+    for (let owner = node.parent; owner; owner = owner.parent) {
+        const body = owner.childForFieldName('body');
+        if (body && body.startIndex <= node.startIndex &&
+            rangeHoldsBlank(owner.startIndex, body.startIndex, blanks)) return true;
+    }
+    return false;
+}
+
+function rangeHoldsBlank(start, end, blanks) {
     let lo = 0;
     let hi = blanks.length;
     while (lo < hi) {
@@ -3231,6 +3284,9 @@ module.exports = {
     TYPE_RENAME_KINDS,
     isTypeRenamePin,
     referenceRole: classify,
+    referenceBindingScope: (node, language, role) => bindingScope(node, familyOf(language), role),
+    referenceTypeParameterScope: typeParamScope,
+    referenceImportVerdict: decideImport,
     typeReferenceSites,
     TypeReferenceResolver,
     familyOf,

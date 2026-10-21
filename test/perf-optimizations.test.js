@@ -3074,3 +3074,36 @@ describe('fix #399: Go package-level variables and package-scope receivers survi
         } finally { rm(dir); }
     });
 });
+
+
+describe('fix #415: reuse the file traversal for class fields', () => {
+    it('keeps the file node list while visiting several class bodies', () => {
+        const { getParser } = require('../languages');
+        const { getCachedNodeList } = require('../languages/utils');
+        const python = require('../languages/python');
+        const code = [
+            'class A:',
+            '    first: int = 1',
+            '    def method(self):',
+            '        local = 2',
+            '        return local',
+            'class B:',
+            '    if ready:',
+            '        second = 3',
+            '    class Nested:',
+            '        third = 4',
+            'class C:',
+            '    fourth = 5',
+            '',
+        ].join('\n');
+        const tree = getParser('python').parse(code);
+        const parser = { parse: () => tree };
+        const original = getCachedNodeList(tree.rootNode).nodes;
+        const result = python.parse(code, parser);
+        assert.deepStrictEqual(result.classes.map(cls => [cls.name,
+            cls.members.filter(member => member.memberType === 'field').map(member => member.name)]),
+        [['A', ['first']], ['B', ['second']], ['Nested', ['third']], ['C', ['fourth']]]);
+        assert.strictEqual(getCachedNodeList(tree.rootNode).nodes, original,
+            'class-body walks reuse the enclosing list instead of evicting it');
+    });
+});

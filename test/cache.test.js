@@ -11,7 +11,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
-const { execSync } = require('child_process');
+const { execSync, execFileSync } = require('child_process');
 
 const { parse, parseFile, detectLanguage } = require('../core/parser');
 const { ProjectIndex, parseDiff } = require('../core/project');
@@ -24,6 +24,1157 @@ const {
     clearProjectCache,
 } = require('../core/cache');
 const { createTempDir, cleanup, tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR } = require('./helpers');
+
+describe('fix #415: persisted call-record names', () => {
+    const plain = value => JSON.parse(JSON.stringify(value));
+    const load = dir => {
+        const index = new ProjectIndex(dir);
+        assert.ok(index.loadCache());
+        return index;
+    };
+    const noise = Object.fromEntries(Array.from({ length: 18 }, (_, n) => [
+        `noise${n}/file.js`, `function extra${n}(){return Math.abs(${n});}`,
+    ]));
+
+    it('loads only candidate shards and preserves the native name and file order', () => {
+        const dir = tmp({ ...noise,
+            'lib/target.js': 'export function target(){return 1;}\nexport class Box {value=1;}',
+            'use/caller.js': 'import {target} from "../lib/target.js";\nexport function use(){return target();}',
+        });
+        try {
+            const index = idx(dir);
+            index.saveCache();
+            const expected = plain(index.findCallers('target', { collectAccount: true }));
+            // The full record path supplies the reference iteration order.
+            const native = load(dir);
+            native.loadCallsCache();
+            native.buildCalleeIndex();
+            const expectedIndex = [...native.calleeIndex].map(([name, files]) => [name, [...files]]);
+            const cached = load(dir);
+            assert.strictEqual(cached.callsCache.size, 0);
+            assert.deepStrictEqual(plain(cached.findCallers('target', { collectAccount: true })), expected);
+            assert.ok(cached.callsCache.size > 0);
+            assert.ok(cached.callsCache.size < cached.files.size, 'unrelated shards remain unread');
+            assert.deepStrictEqual([...cached.calleeIndex].map(([name, files]) => [name, [...files]]), expectedIndex);
+            cached.loadCallsCache();
+            assert.strictEqual(cached.callsCache.size, cached.files.size);
+        } finally { rm(dir); }
+    });
+
+    it('negative names avoid record reads while changed source reaches the normal parser', () => {
+        const dir = tmp({ ...noise,
+            'lib/target.js': 'export function target(){return 1;}\nexport class Box {value=1;}',
+            'use/caller.js': 'import {target} from "../lib/target.js";\nexport function use(){return 1;}',
+        });
+        try {
+            const index = idx(dir);
+            index.saveCache();
+            const absent = load(dir);
+            assert.deepStrictEqual(absent.findCallers('value'), []);
+            assert.strictEqual(absent.callsCache.size, 0, 'a data member has no matching call records');
+            const changed = load(dir), caller = path.join(dir, 'use/caller.js');
+            fs.writeFileSync(caller, 'import {target} from "../lib/target.js";\nexport function use(){return target();}');
+            const time = new Date(Date.now() + 2000);
+            fs.utimesSync(caller, time, time);
+            const result = changed.findCallers('target', { collectAccount: true });
+            assert.ok(result.some(site => site.relativePath === 'use/caller.js' && site.line === 2));
+            assert.ok(changed.callsCache.has(caller));
+        } finally { rm(dir); }
+    });
+
+    it('a fresh in-memory parse wins over older persisted name and call records', () => {
+        const dir = tmp({ ...noise,
+            'lib/target.js': 'export function target(){return 1;}',
+            'use/caller.js': 'import {target} from "../lib/target.js";\nexport function use(){return 1;}',
+        });
+        try {
+            idx(dir).saveCache();
+            const index = load(dir), caller = path.join(dir, 'use/caller.js');
+            fs.writeFileSync(caller, 'import {target} from "../lib/target.js";\nexport function use(){return target();}');
+            const time = new Date(Date.now() + 2000);
+            fs.utimesSync(caller, time, time);
+            assert.ok(index.getCachedCalls(caller).some(call => call.name === 'target'));
+            const fresh = index.callsCache.get(caller);
+            const result = index.findCallers('target', { collectAccount: true });
+            assert.strictEqual(index.callsCache.get(caller), fresh);
+            assert.ok(result.some(site => site.relativePath === 'use/caller.js' && site.line === 2));
+        } finally { rm(dir); }
+    });
+
+    it('missing, malformed and different-generation names fall back to full record lookup', () => {
+        const dir = tmp({ ...noise,
+            'lib/target.js': 'export function target(){return 1;}',
+            'use/caller.js': 'import {target} from "../lib/target.js";\nexport function use(){return target();}',
+        });
+        try {
+            const index = idx(dir);
+            index.saveCache();
+            const expected = plain(index.findCallers('target', { collectAccount: true }));
+            const file = path.join(getProjectCacheDir(dir), 'calls/names.json');
+            assert.ok(fs.existsSync(file));
+            const saved = fs.readFileSync(file, 'utf8');
+            const badId = JSON.parse(saved);
+            badId.files[0][2] = [-1];
+            const generation = JSON.parse(saved);
+            generation.generation += 'different';
+            for (const invalid of [null, '{', JSON.stringify(badId), JSON.stringify(generation)]) {
+                if (invalid === null) fs.rmSync(file, { force: true });
+                else fs.writeFileSync(file, invalid);
+                assert.deepStrictEqual(plain(load(dir).findCallers('target', { collectAccount: true })), expected);
+            }
+        } finally { rm(dir); }
+    });
+
+    for (const extension of ['c', 'cpp']) it(`${extension}: expanded macro names survive a cache reload`, () => {
+        const dir = tmp({
+            'target.h': 'void target(void);\n#define JOIN(N) tar##N()\n',
+            [`target.${extension}`]: '#include "target.h"\nvoid target(void) {}\n',
+            [`caller.${extension}`]: '#include "target.h"\nvoid use(void) { JOIN(get); }\n',
+        });
+        try {
+            const index = idx(dir);
+            const expected = plain(index.findCallers('target', { collectAccount: true }));
+            assert.ok(expected.some(site => site.relativePath === `caller.${extension}`));
+            index.saveCache();
+            assert.deepStrictEqual(plain(load(dir).findCallers('target', { collectAccount: true })), expected);
+        } finally { rm(dir); }
+    });
+
+    it('Rust pending macro calls retain the fresh query visit set', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname="pending_names"\nversion="0.1.0"\nedition="2021"\n',
+            'src/lib.rs': 'macro_rules! caller { ($f:ident) => { pub fn generated() { $f(); } }; }\npub fn target() {}\ncaller!(target);\n',
+        });
+        try {
+            const index = idx(dir);
+            index.saveCache();
+            const first = load(dir), second = load(dir);
+            second.loadCallsCache();
+            second.buildCalleeIndex();
+            const expected = plain(second.findCallers('target', { collectAccount: true }));
+            assert.ok(expected.length > 0);
+            assert.deepStrictEqual(plain(first.findCallers('target', { collectAccount: true })), expected);
+        } finally { rm(dir); }
+    });
+
+    it('Rust materialization invalidates names captured from the previous call array', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname="materialized_names"\nversion="0.1.0"\nedition="2021"\n',
+            'src/lib.rs': '#[macro_export]\nmacro_rules! relay { ($f:path) => { pub fn generated() { let saved = $f; saved(); } }; }\npub fn target() {}\npub fn direct(){target();}\nmod other;\n',
+            'src/other.rs': 'crate::relay!(crate::target);\n',
+        });
+        try {
+            const index = idx(dir), file = path.join(dir, 'src/other.rs');
+            index.saveCache();
+            assert.ok(index.getCalleeFiles('generated')?.has(file), 'pending expansion has a name hint');
+            const raw = index.callsCache.get(file), originalCalls = raw.calls;
+            index.getCachedCalls(file);
+            assert.strictEqual(index.callsCache.get(file), raw, 'materialization keeps the cache entry');
+            assert.notStrictEqual(raw.calls, originalCalls, 'materialization replaces its call array');
+            assert.strictEqual(index.files.get(file).rustMacroExpansion.callsPending, false);
+            assert.strictEqual(index.getCalleeFiles('generated'), null, 'the hint is absent from derived records');
+            index.saveCache();
+            const cached = load(dir);
+            assert.strictEqual(cached.getCalleeFiles('generated'), null, 'a reload uses the current call array');
+        } finally { rm(dir); }
+    });
+
+    it('fact indices bypass the name cache before touching its state', () => {
+        const names = require('../core/call-name-cache');
+        const index = { isProvenanceFactIndex: true };
+        Object.defineProperty(index, '_callNameCache', { get() { throw Error('hidden name cache read'); } });
+        Object.defineProperty(index, 'callsCache', { get() { throw Error('hidden record cache read'); } });
+        assert.strictEqual(names.restore(index), false);
+        assert.strictEqual(names.absent(index, 'unused.js', 'target'), false);
+        names.capture(index, new Map(), 'unused.js', []);
+        names.remember(index, new Map());
+        names.save(index, 'unused');
+        names.load(index, 'unused');
+    });
+});
+
+describe('fix #415: rename-token syntax persistence', () => {
+    it('a cached C# rename reuses positions while preserving the full plan', () => {
+        const dir = tmp({ 'Account.cs': 'class Account {\n public int Run(){return 1;}\n public int Use(){return Run()+this.Run();}\n}' });
+        try {
+            const index = idx(dir);
+            const { execute } = require('../core/execute');
+            const { saveUsageCache } = require('../core/cache');
+            const expected = execute(index, 'plan', { name: 'Account.cs:2:Run', renameTo: 'RunZq' });
+            assert.strictEqual(expected.ok, true);
+            index.saveCache();
+            saveUsageCache(index);
+            const script = `
+                const assert=require('node:assert/strict'),root=${JSON.stringify(PROJECT_DIR)};
+                const {ProjectIndex}=require(root+'/core/project'),{execute}=require(root+'/core/execute');
+                const {LANGUAGES}=require(root+'/languages');
+                const raw=LANGUAGES.csharp.module;let parses=0;
+                LANGUAGES.csharp.module=()=>{const m=raw();return{...m,queryTree(...args){parses++;return m.queryTree(...args);}};};
+                const index=new ProjectIndex(${JSON.stringify(dir)});assert.ok(index.loadCache());
+                const result=execute(index,'plan',{name:'Account.cs:2:Run',renameTo:'RunZq'});
+                process.stdout.write(JSON.stringify({parses,result}));
+            `;
+            const child = JSON.parse(execFileSync(process.execPath, ['-e', script], { cwd: PROJECT_DIR }));
+            assert.deepStrictEqual(child.result, JSON.parse(JSON.stringify(expected)));
+            assert.strictEqual(child.parses, 0, 'saved physical positions avoid rebuilding query views');
+        } finally { rm(dir); }
+    });
+
+    const languages = [
+        ['a.js', '/* é😀 */function ping(){return 1;}function useit(){return ping()+ping();}'],
+        ['a.ts', '/* é😀 */function ping():number{return 1;}function useit(){return ping()+ping();}'],
+        ['a.tsx', '/* é😀 */function ping():number{return 1;}function useit(){return ping()+ping();}'],
+        ['a.py', 'def ping():return 1\ndef useit():\n text="é😀";return ping()+ping()'],
+        ['a.go', 'package p\n/* é😀 */func ping()int{return 1}\nfunc useit()int{text:="é😀";_=text;return ping()+ping()}'],
+        ['a.rs', '/* é😀 */fn ping()->i32{1}fn useit()->i32{ping()+ping()}'],
+        ['A.java', 'class A { /* é😀 */static int ping(){return 1;}int useit(){return ping()+ping();}}'],
+        ['A.cs', 'class A { /* é😀 */static int ping(){return 1;}int useit(){return ping()+ping();}}'],
+        ['a.c', '/* é😀 */int ping(void){return 1;}int useit(void){return ping()+ping();}'],
+        ['a.cpp', '/* é😀 */int ping(){return 1;}int useit(){return ping()+ping();}'],
+        ['a.html', '<!-- é😀 --><script>function ping(){return 1;}function useit(){return ping()+ping();}</script>'],
+        ['Configured.cs', 'interface I { int ping()\n#if DEFAULT_BODY\n{return 1;}\n#else\n;\n#endif\n}\nclass A:I{public int ping(){return 1;}int useit(I other){return other.ping();}}'],
+    ];
+    for (const [file, source] of languages) it(`${file}: saved positions preserve Unicode, ranges and new spellings`, () => {
+        const dir = tmp({ [file]: source });
+        try {
+            const index = idx(dir);
+            const { execute } = require('../core/execute');
+            const { saveUsageCache } = require('../core/cache');
+            const def = index.symbols.get('ping')?.[0]; assert.ok(def);
+            const name = `${file}:${def.startLine}:ping`;
+            const expected = execute(index, 'plan', { name, renameTo: 'pingZq' });
+            assert.strictEqual(expected.ok, true);
+            index.saveCache(); saveUsageCache(index);
+            const script = `
+                const assert=require('node:assert/strict'),root=${JSON.stringify(PROJECT_DIR)};
+                const {ProjectIndex}=require(root+'/core/project'),{execute}=require(root+'/core/execute');
+                const {LANGUAGES}=require(root+'/languages'),dir=${JSON.stringify(dir)},name=${JSON.stringify(name)};
+                const first=new ProjectIndex(dir);assert.ok(first.loadCache());
+                const repeated=execute(first,'plan',{name,renameTo:'pingZq'});
+                assert.deepEqual(JSON.parse(JSON.stringify(repeated)),JSON.parse(require('node:fs').readFileSync(0,'utf8')));
+                const changed=new ProjectIndex(dir);assert.ok(changed.loadCache());
+                const a=execute(changed,'plan',{name,renameTo:'anotherName'});
+                for(const config of Object.values(LANGUAGES))config.traits.physicalCallTokenSyntax=false;
+                const native=new ProjectIndex(dir);assert.ok(native.loadCache());
+                const b=execute(native,'plan',{name,renameTo:'anotherName'});
+                assert.deepEqual(JSON.parse(JSON.stringify(a)),JSON.parse(JSON.stringify(b)));
+            `;
+            execFileSync(process.execPath, ['-e', script], {
+                cwd: PROJECT_DIR, input: JSON.stringify(expected),
+            });
+        } finally { rm(dir); }
+    });
+
+    function fixture(source = 'Run();', language = 'javascript') {
+        const index = new ProjectIndex(PROJECT_DIR);
+        const file = path.join(PROJECT_DIR, 'syntax-fixture.' + language);
+        const entry = { language, hash: crypto.createHash('md5').update(source).digest('hex') };
+        index.files.set(file, entry);
+        index._readFile = () => source;
+        index._beginOp();
+        return { index, file, entry, source, reset() { index._endOp(); index._beginOp(); } };
+    }
+
+    it('same-line call ranges retain distinct physical tokens after an operation', () => {
+        const { callTokenSyntax } = require('../core/rename-token-syntax');
+        const f = fixture('Run(Run());');
+        let derives = 0;
+        const run = (range, column) => callTokenSyntax(f.index, f.file, f.entry,
+            f.source, range, 'Run', 1, () => { derives++; return column; });
+        try {
+            assert.strictEqual(run({ start: 0, end: 10 }, 0), 0);
+            assert.strictEqual(run({ start: 4, end: 9 }, 4), 4);
+            f.reset();
+            assert.strictEqual(run({ start: 4, end: 9 }, 4), 4);
+            assert.strictEqual(run({ start: 0, end: 10 }, 0), 0);
+            assert.strictEqual(derives, 2);
+        } finally { f.index._endOp(); }
+    });
+
+    it('source hashes and parse views invalidate saved call positions', () => {
+        const { callTokenSyntax } = require('../core/rename-token-syntax');
+        const f = fixture();
+        let derives = 0;
+        const run = source => callTokenSyntax(f.index, f.file, f.entry, source,
+            { start: 0, end: 5 }, 'Run', 1, () => { derives++; return 0; });
+        try {
+            run(f.source); f.reset(); run(f.source);
+            assert.strictEqual(derives, 1);
+            f.reset(); f.entry.conditionalViews = [{ start: 1, end: 1 }]; run(f.source);
+            assert.strictEqual(derives, 2, 'a changed source view needs its own native proof');
+            f.reset(); run(f.source + '\n');
+            assert.strictEqual(derives, 3, 'a mismatching source hash is never reused');
+        } finally { f.index._endOp(); }
+    });
+
+    it('malformed, duplicate and misspelled saved positions fall back to native syntax', () => {
+        const { callTokenSyntax } = require('../core/rename-token-syntax');
+        const { storeUsageResult } = require('../core/cache');
+        const f = fixture('Run();Run();'); let derives = 0;
+        const run = () => callTokenSyntax(f.index, f.file, f.entry, f.source,
+            { start: 6, end: 11 }, 'Run', 1, () => { derives++; return 6; });
+        try {
+            run();
+            const key = [...f.index._usageResultCache.keys()][0];
+            const mode = key.split('\0')[3];
+            for (const bad of [[['bad']], [[6, 11, 1, 7]], [[6, 11, 1, 6], [6, 11, 1, 6]], [[6, 11, 1, 0]]]) {
+                storeUsageResult(f.index, f.file, 'Run', mode, bad);
+                f.reset(); assert.strictEqual(run(), 6);
+            }
+            assert.strictEqual(derives, 5);
+        } finally { f.index._endOp(); }
+    });
+
+    it('declaration descriptions are canonical inputs and remain separate from new spellings', () => {
+        const { declarationTokenSyntax } = require('../core/rename-token-syntax');
+        const f = fixture('class C { int Run() => Run(); }', 'csharp');
+        const column = f.source.indexOf('Run'); let derives = 0;
+        const run = (definition, allIdentifiers = true) => {
+            const syntax = declarationTokenSyntax(f.index, f.file, f.entry,
+                f.source, 1, 'Run', definition, allIdentifiers);
+            if (syntax?.columns) return syntax.columns;
+            derives++;
+            const columns = [allIdentifiers ? column : f.source.lastIndexOf('Run')];
+            syntax?.save(columns);
+            return columns;
+        };
+        try {
+            assert.deepStrictEqual(run({ name: 'Run', startLine: 1, type: 'method' }), [column]);
+            f.reset();
+            assert.deepStrictEqual(run({ type: 'method', startLine: 1, name: 'Run' }), [column]);
+            assert.strictEqual(derives, 1, 'object property order does not change identity');
+            f.reset();
+            assert.deepStrictEqual(run({ name: 'Run', startLine: 1, type: 'method' }, false),
+                [f.source.lastIndexOf('Run')]);
+            assert.strictEqual(derives, 2, 'call-only and all-identifier selections stay separate');
+            f.reset(); run({ name: 'Run', startLine: 1, type: 'method', namespace: 'Other' });
+            assert.strictEqual(derives, 3, 'the current declaration description is checked anew');
+        } finally { f.index._endOp(); }
+    });
+
+    it('unknown adapters and provenance snapshots retain their original derivation path', () => {
+        const { callTokenSyntax } = require('../core/rename-token-syntax');
+        for (const [language, fact] of [['unregistered', false], ['javascript', true]]) {
+            const f = fixture('Run();', language); f.index.isProvenanceFactIndex = fact;
+            if (fact) Object.defineProperty(f.index, '_peekParsedTree', {
+                get() { throw new Error('query cache accessed through a provenance snapshot'); },
+            });
+            let derives = 0;
+            try {
+                for (let n = 0; n < 2; n++) callTokenSyntax(f.index, f.file, f.entry,
+                    f.source, { start: 0, end: 5 }, 'Run', 1, () => { derives++; return 0; });
+                assert.strictEqual(derives, 2);
+                assert.strictEqual(f.index._usageResultCache.size, 0);
+            } finally { f.index._endOp(); }
+        }
+    });
+});
+
+describe('fix #415: lexical scope memos preserve declaration positions', () => {
+    const { getParser, safeParse } = require('../languages');
+    const { referenceScope } = require('../languages/lexical-scope');
+    // Both grammars enter the common lexical API through the C adapter.
+    for (const language of ['c', 'cpp']) {
+        it(`${language}: reverse queries retain earlier global and later local bindings`, () => {
+            const source = 'void mark(void);\nvoid use(void){\n mark();\n {\n  mark();\n  int mark=0;\n  mark;\n  {\n   void mark(void);\n   mark();\n  }\n  mark;\n }\n mark();\n}';
+            const expected = ['module', 'module', { local: true, defRows: null },
+                'unknown', { local: true, defRows: null }, 'module'];
+            const memo = new Map();
+            for (const changed of [false, true]) {
+                const tree = safeParse(getParser(language), changed ? source.replace('int mark=0;', 'int other=0;') : source);
+                const nodes = tree.rootNode.descendantsOfType('identifier').filter(node =>
+                    node.text === 'mark' && ['call_expression', 'expression_statement'].includes(node.parent?.type));
+                assert.strictEqual(nodes.length, expected.length);
+                const answers = changed ? expected.map((answer, i) => i === 2 || i === 4 ? 'module' : answer) : expected;
+                for (const order of [[5, 4, 3, 2, 1, 0], [0, 1, 2, 3, 4, 5], [2, 0, 5, 1, 4, 3]]) {
+                    for (const i of order) assert.deepStrictEqual(referenceScope(nodes[i], 'c', memo, 'mark'), answers[i]);
+                }
+            }
+        });
+        it(`${language}: a declaration affects only the later token on the same line`, () => {
+            const tree = safeParse(getParser(language), 'void mark(void); void use(void){ mark(); int mark=0; mark; }');
+            const nodes = tree.rootNode.descendantsOfType('identifier').filter(node =>
+                node.text === 'mark' && ['call_expression', 'expression_statement'].includes(node.parent?.type));
+            assert.strictEqual(nodes.length, 2);
+            const memo = new Map();
+            assert.deepStrictEqual(referenceScope(nodes[1], 'c', memo, 'mark'), { local: true, defRows: null });
+            assert.strictEqual(referenceScope(nodes[0], 'c', memo, 'mark'), 'module');
+            assert.deepStrictEqual(referenceScope(nodes[1], 'c', memo, 'mark'), { local: true, defRows: null });
+        });
+    }
+});
+
+describe('fix #415: contract syntax caches retain current bindings', () => {
+    const contract = require('../core/contract-membership');
+    const fixtures = ['java', 'js', 'ts', 'tsx'].map(ext => ({ ext,
+        base: ext === 'java' ? 'Base.java' : `base.${ext}`,
+        other: ext === 'java' ? 'Other.java' : `other.${ext}`,
+        use: ext === 'java' ? 'Use.java' : `use.${ext}`,
+        baseSource: ext === 'java' ? 'public class Base { public void run(){} }'
+            : 'export class Base { run(){} }',
+        otherSource: ext === 'java' ? 'class Other {}' : 'export class Other {}',
+        inherited: ext === 'java' ? 'class Other extends Base {}'
+            : `import {Base} from './base'; export class Other extends Base {}`,
+        ordinary: ext === 'java' ? 'class Use { void read(Base value){value.run();} }'
+            : `import {Base} from './base'; const value=new Base(); value.run();`,
+        anonymous: ext === 'java' ? 'class Use { Other value=new Other(){public void run(){}}; }'
+            : `import {Other} from './other'; const Value=class extends Other { run(){} };`,
+    }));
+    const readAnonymous = (index, fixture) => {
+        index._beginOp();
+        try {
+            const pin = (index.symbols.get('run') || []).find(d => d.relativePath === fixture.base);
+            assert.ok(pin);
+            const hierarchy = contract.hierarchySlotClosure(index, pin);
+            return contract.anonymousSlotMembers(index, 'run',
+                new Map([[path.join(index.root, fixture.use), new Set([1])]]), hierarchy, pin);
+        } finally { index._endOp(); }
+    };
+    const save = index => { index.saveCache(); index.saveUsageCache(); };
+    for (const fixture of fixtures) {
+        it(`${fixture.ext}: persisted absence avoids repeating an anonymous-member parse`, () => {
+            const dir = tmp({ [fixture.base]: fixture.baseSource, [fixture.use]: fixture.ordinary });
+            try {
+                const index = idx(dir);
+                assert.deepStrictEqual(readAnonymous(index, fixture), []);
+                save(index);
+                const loaded = new ProjectIndex(dir);
+                assert.ok(loaded.loadCache());
+                let parses = 0;
+                const original = loaded._getParsedTree;
+                loaded._getParsedTree = function(file, ...args) {
+                    if (file === path.join(dir, fixture.use)) parses++;
+                    return original.call(this, file, ...args);
+                };
+                assert.deepStrictEqual(readAnonymous(loaded, fixture), []);
+                assert.strictEqual(parses, 0);
+            } finally { rm(dir); }
+        });
+        it(`${fixture.ext}: another file can bring a source member into the slot`, () => {
+            const dir = tmp({ [fixture.base]: fixture.baseSource,
+                [fixture.other]: fixture.otherSource, [fixture.use]: fixture.anonymous });
+            try {
+                const index = idx(dir);
+                assert.deepStrictEqual(readAnonymous(index, fixture), []);
+                save(index);
+                const loaded = new ProjectIndex(dir);
+                assert.ok(loaded.loadCache());
+                fs.writeFileSync(path.join(dir, fixture.other), fixture.inherited);
+                loaded.build(null, { quiet: true });
+                const actual = readAnonymous(loaded, fixture);
+                assert.ok(actual.some(site => site.verdict === 'edit'));
+                const fresh = idx(dir);
+                fresh._usageResultCache = null;
+                assert.deepStrictEqual(actual, readAnonymous(fresh, fixture));
+            } finally { rm(dir); }
+        });
+    }
+    const macroSource = 'macro_rules! forward { () => { fn run(&self){ self.run(); } }; }\nstruct A; impl A { forward!(); }';
+    const readRust = index => {
+        index._beginOp();
+        try { return contract.rustMacroTemplateSites(index, 'run', [path.join(index.root, 'lib.rs')]); }
+        finally { index._endOp(); }
+    };
+    it('Rust: template syntax survives reload without aliasing returned owner objects', () => {
+        const dir = tmp({ 'lib.rs': macroSource });
+        try {
+            const index = idx(dir), expected = readRust(index);
+            assert.ok(expected.some(site => site.shape === 'definition'));
+            assert.ok(expected.some(site => site.shape === 'method-call'));
+            save(index);
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loaded.loadCache());
+            let parses = 0;
+            const original = loaded._getParsedTree;
+            loaded._getParsedTree = function(...args) { parses++; return original.apply(this, args); };
+            const actual = readRust(loaded);
+            assert.deepStrictEqual(actual, expected);
+            assert.strictEqual(parses, 0);
+            actual[0].owners[0].kind = 'changed-by-consumer';
+            assert.deepStrictEqual(readRust(loaded), expected);
+        } finally { rm(dir); }
+    });
+    it('Rust: changed template source invalidates the persisted syntax', () => {
+        const dir = tmp({ 'lib.rs': macroSource });
+        try {
+            const index = idx(dir);
+            readRust(index);
+            save(index);
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loaded.loadCache());
+            fs.writeFileSync(path.join(dir, 'lib.rs'), macroSource.replaceAll('run', 'other'));
+            loaded.build(null, { quiet: true });
+            assert.deepStrictEqual(readRust(loaded), []);
+        } finally { rm(dir); }
+    });
+    it('Rust: malformed template facts use native syntax', () => {
+        const dir = tmp({ 'lib.rs': macroSource });
+        try {
+            const index = idx(dir), expected = readRust(index);
+            save(index);
+            const saved = path.join(getProjectCacheDir(dir), 'usage-results.json');
+            const payload = JSON.parse(fs.readFileSync(saved, 'utf8'));
+            let changed = 0;
+            for (const item of payload.entries) if (item[3].startsWith('contract-syntax-v1:rust-template:')) {
+                item[4] = [{ line: 'invalid' }];
+                changed++;
+            }
+            assert.ok(changed > 0);
+            fs.writeFileSync(saved, JSON.stringify(payload));
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loaded.loadCache());
+            assert.deepStrictEqual(readRust(loaded), expected);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #415: usage text classifications are source-local', () => {
+    const fixtures = [
+        ['sample.js', 'function needle(){}\n// needle\nconst text="needle";\nneedle();'],
+        ['sample.ts', 'function needle():void{}\n// needle\nconst text:string="needle";\nneedle();'],
+        ['sample.py', 'def needle(): pass\n# needle\ntext="needle"\nneedle()'],
+        ['sample.go', 'package sample\nfunc needle(){}\n// needle\nvar text="needle"\nfunc read(){needle()}'],
+        ['sample.rs', 'fn needle(){}\n// needle\nconst TEXT:&str="needle";\nfn read(){needle();}'],
+        ['Sample.java', 'class Sample { static void needle(){}\n// needle\nString text="needle";\nvoid read(){needle();}\n}'],
+        ['sample.cs', 'class Sample { static void needle(){}\n// needle\nstring text="needle";\nvoid Read(){needle();}\n}'],
+        ['sample.c', 'void needle(void){}\n/* needle */\nconst char *text="needle";\nvoid read(void){needle();}'],
+        ['sample.cpp', 'void needle(){}\n/* needle */\nconst char *text="needle";\nvoid read(){needle();}'],
+        ['sample.html', '<div>needle</div>\n<script>function needle(){}\n// needle\nconst text="needle";\nneedle();</script>'],
+    ];
+    const read = (index, options = {}) => JSON.parse(JSON.stringify(index.usages('needle', options)));
+    const save = index => { index.saveCache(); index.saveUsageCache(); };
+    for (const [file, source] of fixtures) {
+        it(`${file}: reload reuses native text decisions with both usage modes`, () => {
+            const dir = tmp({ [file]: source });
+            try {
+                const index = idx(dir);
+                const options = [{}, { internalEvidence: true, context: 2 }, { codeOnly: true }];
+                const expected = options.map(option => read(index, option));
+                assert.ok(expected[0].some(usage => usage.usageType === 'text'));
+                save(index);
+                const loaded = new ProjectIndex(dir);
+                assert.ok(loaded.loadCache());
+                let nativeCalls = 0;
+                const original = loaded.isCommentOrStringAtPosition;
+                loaded.isCommentOrStringAtPosition = function(...args) {
+                    nativeCalls++;
+                    return original.apply(this, args);
+                };
+                options.forEach((option, i) => assert.deepStrictEqual(read(loaded, option), expected[i]));
+                assert.strictEqual(nativeCalls, 0);
+            } finally { rm(dir); }
+        });
+        it(`${file}: changed source invalidates saved text positions`, () => {
+            const dir = tmp({ [file]: source });
+            try {
+                const index = idx(dir);
+                read(index);
+                save(index);
+                const loaded = new ProjectIndex(dir);
+                assert.ok(loaded.loadCache());
+                fs.writeFileSync(path.join(dir, file), source.replaceAll('needle', 'other'));
+                loaded.build(null, { quiet: true });
+                assert.deepStrictEqual(read(loaded), []);
+            } finally { rm(dir); }
+        });
+        it(`${file}: malformed saved text facts use native classification`, () => {
+            const dir = tmp({ [file]: source });
+            try {
+                const index = idx(dir), expected = read(index);
+                save(index);
+                const saved = path.join(getProjectCacheDir(dir), 'usage-results.json');
+                const payload = JSON.parse(fs.readFileSync(saved, 'utf8'));
+                let changed = 0;
+                for (const item of payload.entries) {
+                    if (item[3].startsWith('usage-text-v1:')) {
+                        item[4] = [[1, 0, 'invalid-kind']];
+                        changed++;
+                    }
+                }
+                assert.ok(changed > 0);
+                fs.writeFileSync(saved, JSON.stringify(payload));
+                const loaded = new ProjectIndex(dir);
+                assert.ok(loaded.loadCache());
+                let nativeCalls = 0;
+                const original = loaded.isCommentOrStringAtPosition;
+                loaded.isCommentOrStringAtPosition = function(...args) {
+                    nativeCalls++;
+                    return original.apply(this, args);
+                };
+                assert.deepStrictEqual(read(loaded), expected);
+                assert.ok(nativeCalls > 0);
+            } finally { rm(dir); }
+        });
+    }
+});
+
+describe('fix #415: cached enum syntax resolves current project bindings', () => {
+    const { execute } = require('../core/execute');
+    const cache = require('../core/cache');
+    const fixtures = [
+        { label: 'Java', pin: 'p/Mode.java', consumer: 'u/Use.java', files: {
+            'p/Mode.java': 'package p; public enum Mode { Ready }',
+            'q/Other.java': 'package q; public class Other {}',
+            'u/Use.java': 'package u; import p.*; import q.*; class Use { int read(){return Mode.Ready.ordinal();} }',
+        }, mutate(dir) {
+            fs.writeFileSync(path.join(dir, 'q/Mode.java'), 'package q; public enum Mode { Ready }');
+        }, review: true },
+        { label: 'C#', pin: 'a.cs', consumer: 'use.cs', files: {
+            'a.cs': 'namespace A { public enum Mode { Ready } }',
+            'b.cs': 'namespace B { public enum Mode { Ready } }',
+            'global.cs': 'global using A;',
+            'use.cs': 'namespace App { class Use { int Read(){return (int)Mode.Ready;} } }',
+        }, mutate(dir) {
+            fs.writeFileSync(path.join(dir, 'global.cs'), 'global using B;');
+        } },
+        { label: 'Rust', pin: 'src/p.rs', consumer: 'src/user.rs', files: {
+            'Cargo.toml': '[package]\nname="enum_syntax"\nversion="0.1.0"\nedition="2021"',
+            'src/lib.rs': 'pub mod p; pub mod q; pub mod user; pub use p::Mode;',
+            'src/p.rs': 'pub enum Mode { Ready }',
+            'src/q.rs': 'pub enum Mode { Ready }',
+            'src/user.rs': 'use crate::Mode; pub fn read()->Mode { Mode::Ready }',
+        }, mutate(dir) {
+            fs.writeFileSync(path.join(dir, 'src/lib.rs'), 'pub mod p; pub mod q; pub mod user; pub use q::Mode;');
+        } },
+    ];
+    fixtures.push({ label: 'C# project imports', pin: 'a.cs', consumer: 'use.cs', files: {
+        'a.cs': 'namespace A { public enum Mode { Ready } }',
+        'b.cs': 'namespace B { public enum Mode { Ready } }',
+        'Project.csproj': '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup><ItemGroup><Using Include="A"/></ItemGroup></Project>',
+        'use.cs': 'namespace App { class Use { int Read(){return (int)Mode.Ready;} } }',
+    }, mutate(dir) {
+        fs.writeFileSync(path.join(dir, 'Project.csproj'), this.files['Project.csproj'].replace('Include="A"', 'Include="B"'));
+    } });
+    const read = (index, fixture) => {
+        const def = (index.symbols.get('Ready') || []).find(d => d.relativePath === fixture.pin);
+        assert.ok(def);
+        const answer = execute(index, 'plan', { name: `${fixture.pin}:${def.startLine}:Ready`, renameTo: 'Changed' });
+        assert.ok(answer.ok, answer.error);
+        assert.ok(answer.result.account.conserved);
+        return JSON.parse(JSON.stringify(answer.result));
+    };
+    const save = index => { index.saveCache(); index.saveUsageCache(); };
+    const native = (dir, fixture) => {
+        const index = idx(dir);
+        index._usageResultCache = null;
+        return read(index, fixture);
+    };
+    for (const fixture of fixtures) {
+        it(`${fixture.label}: reload keeps every public value decision`, () => {
+            const dir = tmp(fixture.files), original = cache.getUsageResult;
+            try {
+                const index = idx(dir), expected = read(index, fixture);
+                assert.ok(expected.changes.some(c => c.file === fixture.consumer && c.newExpression && !c.needsReview));
+                save(index);
+                const loaded = new ProjectIndex(dir);
+                assert.ok(loaded.loadCache());
+                let hits = 0;
+                cache.getUsageResult = (...args) => {
+                    const value = original(...args);
+                    if (args[1] === path.join(dir, fixture.consumer) && args[3]?.startsWith('enum-syntax-v2:') &&
+                        value !== undefined) hits++;
+                    return value;
+                };
+                assert.deepStrictEqual(read(loaded, fixture), expected);
+                assert.ok(hits > 0, 'the loaded query reaches the persisted syntax facts');
+            } finally { cache.getUsageResult = original; rm(dir); }
+        });
+        it(`${fixture.label}: changed project bindings are resolved after a syntax hit`, () => {
+            const dir = tmp(fixture.files), original = cache.getUsageResult;
+            try {
+                const index = idx(dir);
+                assert.ok(read(index, fixture).changes.some(c => c.file === fixture.consumer && c.newExpression && !c.needsReview));
+                save(index);
+                const loaded = new ProjectIndex(dir);
+                assert.ok(loaded.loadCache());
+                fixture.mutate(dir);
+                loaded.build(null, { quiet: true });
+                let hits = 0;
+                cache.getUsageResult = (...args) => {
+                    const value = original(...args);
+                    if (args[1] === path.join(dir, fixture.consumer) && args[3]?.startsWith('enum-syntax-v2:') &&
+                        value !== undefined) hits++;
+                    return value;
+                };
+                const answer = read(loaded, fixture);
+                assert.ok(hits > 0, 'unchanged consumer syntax is reused after a different file changes');
+                assert.ok(!answer.changes.some(c => c.file === fixture.consumer && c.newExpression && !c.needsReview));
+                if (fixture.review) assert.ok(answer.changes.some(c => c.file === fixture.consumer && c.needsReview));
+                assert.deepStrictEqual(answer, native(dir, fixture));
+            } finally { cache.getUsageResult = original; rm(dir); }
+        });
+        it(`${fixture.label}: a changed consumer's type parameter cannot borrow an enum`, () => {
+            const dir = tmp(fixture.files), original = cache.getUsageResult;
+            try {
+                const index = idx(dir);
+                read(index, fixture);
+                save(index);
+                const loaded = new ProjectIndex(dir);
+                assert.ok(loaded.loadCache());
+                const shadow = fixture.label === 'Java'
+                    ? 'package u; import p.*; import q.*; class Flags { static final int Ready=1; } class Use { <Mode extends Flags> int read(){return Mode.Ready;} }'
+                    : fixture.label === 'Rust'
+                    ? 'use crate::Mode; pub trait Flags: Sized { const Ready: Self; } pub fn read<Mode:Flags>()->Mode { Mode::Ready }'
+                    : 'namespace App { interface IFlags<T> where T:IFlags<T> { static abstract int Ready {get;} } class Use { int Read<Mode>() where Mode:IFlags<Mode> {return Mode.Ready;} } }';
+                fs.writeFileSync(path.join(dir, fixture.consumer), shadow);
+                loaded.build(null, { quiet: true });
+                let hits = 0;
+                cache.getUsageResult = (...args) => {
+                    const value = original(...args);
+                    if (args[1] === path.join(dir, fixture.consumer) && args[3]?.startsWith('enum-syntax-v2:') &&
+                        value !== undefined) hits++;
+                    return value;
+                };
+                const answer = read(loaded, fixture);
+                assert.strictEqual(hits, 0, 'changed source does not reuse its earlier syntax');
+                assert.ok(!answer.changes.some(c => c.file === fixture.consumer && c.newExpression && !c.needsReview));
+                assert.ok(answer.changes.some(c => c.file === fixture.consumer && c.needsReview));
+                assert.deepStrictEqual(answer, native(dir, fixture));
+                const hash = loaded.files.get(path.join(dir, fixture.consumer)).hash;
+                assert.ok(![...loaded._usageResultCache.keys()].some(key => {
+                    const parts = key.split('\0');
+                    return parts[0] === path.join(dir, fixture.consumer) && parts[1] === hash &&
+                        parts[3]?.startsWith('enum-syntax-v2:');
+                }), 'a type-parameter shadow is not an eligible static enum source form');
+            } finally { cache.getUsageResult = original; rm(dir); }
+        });
+        it(`${fixture.label}: malformed saved syntax falls back to native parsing`, () => {
+            const dir = tmp(fixture.files);
+            try {
+                const index = idx(dir), expected = read(index, fixture);
+                save(index);
+                const file = path.join(getProjectCacheDir(dir), 'usage-results.json');
+                const payload = JSON.parse(fs.readFileSync(file, 'utf8'));
+                let changed = 0;
+                for (const item of payload.entries) {
+                    if (item[0] === fixture.consumer && item[3].startsWith('enum-syntax-v2:')) {
+                        item[4] = [1, [], [{}]];
+                        changed++;
+                    }
+                }
+                assert.ok(changed > 0);
+                fs.writeFileSync(file, JSON.stringify(payload));
+                const loaded = new ProjectIndex(dir);
+                assert.ok(loaded.loadCache());
+                assert.deepStrictEqual(read(loaded, fixture), expected);
+            } finally { rm(dir); }
+        });
+    }
+    for (const fixture of fixtures.slice(0, 3)) {
+        it(`${fixture.label}: cached Unicode syntax preserves exact source columns`, () => {
+            const files = Object.fromEntries(Object.entries(fixture.files).map(([file, source]) =>
+                [file, file.endsWith('.toml') ? source : '/*😀*/ ' + source.replaceAll('Mode', 'Möde')]));
+            const dir = tmp(files);
+            const { EnumReferenceSyntax } = require('../core/enum-reference-syntax');
+            const original = EnumReferenceSyntax.prototype.read;
+            try {
+                const index = idx(dir), expected = read(index, fixture);
+                assert.ok(expected.changes.some(c => c.file === fixture.consumer && c.newExpression && !c.needsReview));
+                save(index);
+                const loaded = new ProjectIndex(dir);
+                assert.ok(loaded.loadCache());
+                let hits = 0;
+                EnumReferenceSyntax.prototype.read = function(file, ...args) {
+                    const result = original.call(this, file, ...args);
+                    if (result && file === path.join(dir, fixture.consumer)) hits++;
+                    return result;
+                };
+                assert.deepStrictEqual(read(loaded, fixture), expected);
+                assert.ok(hits > 0);
+                assert.deepStrictEqual(read(loaded, fixture), native(dir, fixture));
+            } finally { EnumReferenceSyntax.prototype.read = original; rm(dir); }
+        });
+    }
+    it('Rust: cached unresolved Self qualifiers preserve native review reasons', () => {
+        const fixture = fixtures.find(f => f.label === 'Rust');
+        const dir = tmp({ ...fixture.files, 'src/user.rs':
+            'use crate::Mode; impl Mode { pub fn read()->Self { Self::Ready } }' });
+        const { EnumReferenceSyntax } = require('../core/enum-reference-syntax');
+        const original = EnumReferenceSyntax.prototype.read;
+        try {
+            const index = idx(dir), expected = read(index, fixture);
+            assert.ok(expected.changes.some(c => c.file === fixture.consumer && c.needsReview));
+            save(index);
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loaded.loadCache());
+            let hits = 0;
+            EnumReferenceSyntax.prototype.read = function(file, ...args) {
+                const result = original.call(this, file, ...args);
+                if (result && file === path.join(dir, fixture.consumer)) hits++;
+                return result;
+            };
+            assert.deepStrictEqual(read(loaded, fixture), expected);
+            assert.ok(hits > 0);
+            assert.deepStrictEqual(read(loaded, fixture), native(dir, fixture));
+        } finally { EnumReferenceSyntax.prototype.read = original; rm(dir); }
+    });
+    it('C#: cached syntax preserves the namespace of each conditional body', () => {
+        const fixture = fixtures.find(f => f.label === 'C#');
+        const source = '#if FIRST\nnamespace X {\n using A;\n class Use { int Read(){return (int)Mode.Ready;} }\n}\n#else\nnamespace Y {\n using B;\n class Use { int Read(){return (int)Mode.Ready;} }\n}\n#endif';
+        const dir = tmp({ ...fixture.files, 'global.cs': '', 'use.cs': source }), original = cache.getUsageResult;
+        try {
+            const index = idx(dir), expected = read(index, fixture);
+            assert.ok(expected.changes.some(c => c.file === 'use.cs' && c.line === 4 && c.newExpression && !c.needsReview));
+            assert.ok(!expected.changes.some(c => c.file === 'use.cs' && c.line === 9 && c.newExpression));
+            save(index);
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loaded.loadCache());
+            let hits = 0;
+            cache.getUsageResult = (...args) => {
+                const value = original(...args);
+                if (args[1] === path.join(dir, fixture.consumer) && args[3]?.startsWith('enum-syntax-v2:') &&
+                    value !== undefined) hits++;
+                return value;
+            };
+            assert.deepStrictEqual(read(loaded, fixture), expected);
+            assert.ok(hits > 0);
+            assert.deepStrictEqual(read(loaded, fixture), native(dir, fixture));
+        } finally { cache.getUsageResult = original; rm(dir); }
+    });
+    it('Rust: cached macro syntax retains unresolved value review', () => {
+        const fixture = fixtures.find(f => f.label === 'Rust');
+        const files = { ...fixture.files, 'src/user.rs':
+            'use crate::Mode; macro_rules! value { () => { Mode::Ready } } pub fn read()->Mode { value!() }' };
+        const dir = tmp(files), original = cache.getUsageResult;
+        try {
+            const index = idx(dir), expected = read(index, fixture);
+            assert.ok(expected.changes.some(c => c.file === fixture.consumer && c.needsReview));
+            save(index);
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loaded.loadCache());
+            let hits = 0;
+            cache.getUsageResult = (...args) => {
+                const value = original(...args);
+                if (args[1] === path.join(dir, fixture.consumer) && args[3]?.startsWith('enum-syntax-v2:') &&
+                    value !== undefined) hits++;
+                return value;
+            };
+            assert.deepStrictEqual(read(loaded, fixture), expected);
+            assert.ok(hits > 0);
+            assert.deepStrictEqual(read(loaded, fixture), native(dir, fixture));
+        } finally { cache.getUsageResult = original; rm(dir); }
+    });
+    it('C#: a field in another partial part shadows a cached type qualifier', () => {
+        const fixture = fixtures.find(f => f.label === 'C#');
+        const files = { ...fixture.files, 'use.cs': fixture.files['use.cs'].replace('class Use', 'partial class Use') };
+        const dir = tmp(files), original = cache.getUsageResult;
+        try {
+            const index = idx(dir);
+            read(index, fixture);
+            save(index);
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loaded.loadCache());
+            fs.writeFileSync(path.join(dir, 'part.cs'), 'namespace App { class Holder { public int Ready=2; } partial class Use { static Holder Mode=new Holder(); } }');
+            loaded.build(null, { quiet: true });
+            let hits = 0;
+            cache.getUsageResult = (...args) => {
+                const value = original(...args);
+                if (args[1] === path.join(dir, fixture.consumer) && args[3]?.startsWith('enum-syntax-v2:') &&
+                    value !== undefined) hits++;
+                return value;
+            };
+            const answer = read(loaded, fixture);
+            assert.ok(hits > 0);
+            assert.ok(!answer.changes.some(c => c.file === fixture.consumer && c.newExpression && !c.needsReview));
+            assert.deepStrictEqual(answer, native(dir, fixture));
+        } finally { cache.getUsageResult = original; rm(dir); }
+    });
+});
+
+describe('fix #415: persisted class syntax facts preserve fresh field ownership', () => {
+    const { execute } = require('../core/execute');
+    const { formatPublicJson } = require('../core/output/public');
+    const cache = require('../core/cache');
+    const base = 'class Device:\n def ping(self): return 1\nclass Other:\n def ping(self): return 2\n' +
+        'class Parent:\n def __init__(self): self.worker = Device()\n';
+    const child = 'from base import Parent\nclass Child(Parent):\n def run(self): return self.worker.ping()\n';
+    const read = (index, name = 'base.py:2:ping') => {
+        const execution = execute(index, 'context', { name });
+        assert.ok(execution.ok, execution.error);
+        return { result: execution.result, text: formatPublicJson('context', execution.result,
+            { name }, { surface: 'cli', projectRoot: index.root }) };
+    };
+    const save = index => { index.saveCache(); index.saveUsageCache(); };
+
+    it('replays class facts after reload with identical public answers', () => {
+        const dir = tmp({ 'base.py': base, 'child.py': child });
+        const original = cache.getUsageResult;
+        try {
+            const index = idx(dir), before = read(index);
+            assert.strictEqual(before.result.callers.length, 1);
+            save(index);
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loaded.loadCache());
+            let hits = 0;
+            cache.getUsageResult = (...args) => {
+                const value = original(...args);
+                if (args[3]?.startsWith('class-fields-v1:') && value !== undefined) hits++;
+                return value;
+            };
+            assert.strictEqual(read(loaded).text, before.text);
+            assert.ok(hits > 0, 'the loaded query reuses class syntax facts');
+        } finally {
+            cache.getUsageResult = original;
+            rm(dir);
+        }
+    });
+
+    it('invalidates member, write and dynamic-store facts after source edits', () => {
+        for (const addition of [' worker = None\n', ' def change(self): self.worker = None\n',
+            " def change(self): setattr(self, 'worker', None)\n"]) {
+            const dir = tmp({ 'base.py': base, 'child.py': child });
+            try {
+                const index = idx(dir);
+                assert.strictEqual(read(index).result.callers.length, 1);
+                save(index);
+                const loaded = new ProjectIndex(dir);
+                assert.ok(loaded.loadCache());
+                fs.writeFileSync(path.join(dir, 'child.py'), child.replace(' def run', addition + ' def run'));
+                loaded.build(null, { quiet: true });
+                const after = read(loaded);
+                assert.strictEqual(after.result.callers.length, 0, addition);
+                assert.strictEqual(after.text, read(idx(dir)).text, addition);
+            } finally { rm(dir); }
+        }
+    });
+
+    it('reuses unchanged class syntax while resolving changed parent ownership afresh', () => {
+        const dir = tmp({ 'base.py': base, 'child.py': child });
+        const original = cache.getUsageResult;
+        try {
+            const index = idx(dir);
+            assert.strictEqual(read(index).result.callers.length, 1);
+            save(index);
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loaded.loadCache());
+            fs.writeFileSync(path.join(dir, 'base.py'), base.replace('self.worker = Device()', 'self.worker = Other()'));
+            loaded.build(null, { quiet: true });
+            let hits = 0;
+            cache.getUsageResult = (...args) => {
+                const value = original(...args);
+                if (args[1] === path.join(dir, 'child.py') && args[3]?.startsWith('class-fields-v1:') &&
+                    value !== undefined) hits++;
+                return value;
+            };
+            const after = read(loaded);
+            assert.strictEqual(after.result.callers.length, 0);
+            assert.strictEqual(after.text, read(idx(dir)).text);
+            assert.ok(hits > 0, 'unchanged child syntax stays reusable after parent edits');
+            assert.strictEqual(read(loaded, 'base.py:4:ping').result.callers.length, 1);
+        } finally {
+            cache.getUsageResult = original;
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #415: persisted local value proofs preserve fresh rename decisions', () => {
+    const { execute } = require('../core/execute');
+    const cache = require('../core/cache');
+    const proofs = index => [...index._usageResultCache].filter(([key]) =>
+        key.split('\0')[3]?.startsWith('value-local-v1:'));
+    const plan = (index, name) => {
+        const result = execute(index, 'plan', { name, renameTo: 'changed' });
+        assert.ok(result.ok, result.error);
+        assert.ok(result.result.account.conserved);
+        return JSON.parse(JSON.stringify(result));
+    };
+    const fixtures = [
+        ['JavaScript', 'a.js', 'class Counter { count=1; }',
+            'b.js', 'function shadow(count) { return count; }'],
+        ['TypeScript', 'a.ts', 'export class Counter { count:number=1; }',
+            'b.ts', 'function shadow(count:number) { return count; }'],
+        ['TSX', 'a.tsx', 'export class Counter { count:number=1; }',
+            'b.tsx', 'function shadow(count:number) { return count; }'],
+        ['Go', 'a.go', 'package p\nvar count int',
+            'b.go', 'package p\nfunc shadow(count int) int { return count }'],
+        ['Rust', 'src/lib.rs', 'pub struct Counter { pub count:i32 }\npub mod other;',
+            'src/other.rs', 'pub fn shadow(count:i32)->i32 { count }'],
+        ['Java', 'A.java', 'class Counter { int count; }',
+            'B.java', 'class Other { int shadow(int count) { return count; } }'],
+        ['C#', 'A.cs', 'class Counter { public int count; }',
+            'B.cs', 'class Other { int Shadow(int count) { return count; } }'],
+        ['C', 'a.c', 'int count;', 'b.c', 'int shadow(int count) { return count; }'],
+        ['C++', 'a.cpp', 'int count;', 'b.cpp', 'int shadow(int count) { return count; }'],
+    ];
+    for (const [label, file, source, foreign, local] of fixtures) {
+        it(`${label}: reloads local shadows without retaining ownership decisions`, () => {
+            const dir = tmp({ [file]: source, [foreign]: local,
+                ...(label === 'Rust' && { 'Cargo.toml':
+                    '[package]\nname="local_proofs"\nversion="0.1.0"\nedition="2021"' }) });
+            try {
+                const index = idx(dir);
+                const definition = index.symbols.get('count').find(def => def.relativePath === file);
+                const handle = `${file}:${definition.startLine}:count`;
+                const expected = plan(index, handle);
+                assert.ok(expected.result.changes.some(change => change.file === file &&
+                    change.newExpression?.includes('changed')));
+                assert.ok(!expected.result.changes.some(change => change.file === foreign));
+                const stored = proofs(index);
+                assert.strictEqual(stored.length, 1);
+                assert.strictEqual(stored[0][0].split('\0')[0], path.join(dir, foreign));
+                assert.ok(stored[0][1].value.some(record => record[0] === 'reference' &&
+                    record[4] === 'local-binding'));
+                assert.ok(stored[0][1].value.every(record => ['line', 'reference'].includes(record[0])));
+                index.saveCache();
+                index.saveUsageCache();
+                const loaded = new ProjectIndex(dir);
+                assert.ok(loaded.loadCache());
+                assert.deepStrictEqual(proofs(loaded), stored);
+                let hits = 0;
+                const read = cache.getUsageResult;
+                cache.getUsageResult = (...args) => {
+                    const result = read(...args);
+                    if (args[3]?.startsWith('value-local-v1:') && result) hits++;
+                    return result;
+                };
+                try { assert.deepStrictEqual(plan(loaded, handle), expected); }
+                finally { cache.getUsageResult = read; }
+                assert.ok(hits > 0, 'the saved local proof must actually be replayed');
+            } finally { clearProjectCache(dir); rm(dir); }
+        });
+    }
+
+    it('rechecks changed files and turns a previous shadow into an actual global edit', () => {
+        const dir = tmp({ 'a.go': 'package p\nvar count int',
+            'b.go': 'package p\nfunc read(count int) int { return count }' });
+        try {
+            const index = idx(dir);
+            plan(index, 'a.go:2:count');
+            assert.strictEqual(proofs(index).length, 1);
+            fs.writeFileSync(path.join(dir, 'b.go'), 'package p\nfunc read() int { return count }');
+            index.build(null, { quiet: true });
+            const changed = plan(index, 'a.go:2:count');
+            assert.ok(changed.result.changes.some(change => change.file === 'b.go' && change.line === 2 &&
+                change.newExpression === 'func read() int { return changed }' && !change.needsReview));
+            assert.deepStrictEqual(changed, plan(idx(dir), 'a.go:2:count'));
+        } finally { clearProjectCache(dir); rm(dir); }
+    });
+
+    it('reuses only the local shadow when the pinned member changes', () => {
+        const dir = tmp({ 'a.ts': 'export class First { count=1; }',
+            'b.ts': 'export class Second { count=2; }',
+            'local.ts': 'function shadow(count:number) { return count; }' });
+        try {
+            const index = idx(dir);
+            plan(index, 'a.ts:1:count');
+            assert.strictEqual(proofs(index).length, 1);
+            const other = plan(index, 'b.ts:1:count');
+            assert.ok(other.result.changes.some(change => change.file === 'b.ts' &&
+                change.newExpression === 'export class Second { changed=2; }'));
+            assert.ok(!other.result.changes.some(change => change.file === 'a.ts' || change.file === 'local.ts'));
+            assert.deepStrictEqual(other, plan(idx(dir), 'b.ts:1:count'));
+        } finally { clearProjectCache(dir); rm(dir); }
+    });
+
+    it('does not cache extern declarations, global rebinding, imports or positive members as local shadows', () => {
+        const cases = [
+            { files: { 'a.c': 'int count;', 'b.c': 'int read(void) { extern int count; return count; }' }, pin: 'a.c:1:count' },
+            { files: { 'a.py': 'count=1', 'b.py': 'from a import count\ndef read():\n global count\n count=2\n return count' }, pin: 'a.py:1:count' },
+            { files: { 'A.cs': 'class Counter { public int count; }',
+                'B.cs': 'class Other { int Read(Counter x) { return x.count; } }' }, pin: 'A.cs:1:count' },
+            { files: { 'src/lib.rs': 'pub const COUNT:i32=1;\nmod other;',
+                'src/other.rs': 'use crate::COUNT;\npub fn matches(x:i32)->bool { matches!(x, COUNT) }',
+                'Cargo.toml': '[package]\nname="pattern_proofs"\nversion="0.1.0"\nedition="2021"' }, pin: 'src/lib.rs:1:COUNT' },
+        ];
+        for (const fixture of cases) {
+            const dir = tmp(fixture.files);
+            try {
+                const index = idx(dir);
+                plan(index, fixture.pin);
+                assert.strictEqual(proofs(index).length, 0, fixture.pin);
+            } finally { clearProjectCache(dir); rm(dir); }
+        }
+    });
+
+    for (const fixture of [
+        { label: 'Go', file: 'a.go', source: 'package p\ntype Counter struct { count int }', foreign: 'b.go',
+            use: 'package p\r\nfunc noise() string { return "雪😀" }\r\nfunc read(x Counter) int { { text := "雪😀"; _ = text }; return x.count }', pin: 'a.go:2:count' },
+        { label: 'Java', file: 'A.java', source: 'class Counter { int count; }', foreign: 'B.java',
+            use: 'class Other {\r\n String noise() { return "雪😀"; }\r\n int read(Counter x) { { String text="雪😀"; } return x.count; }\r\n}', pin: 'A.java:1:count' },
+        { label: 'C#', file: 'A.cs', source: 'class Counter { public int count; }', foreign: 'B.cs',
+            use: 'class Other {\r\n string Noise() { return "雪😀"; }\r\n int Read(Counter x) { { string text="雪😀"; } return x.count; }\r\n}', pin: 'A.cs:1:count' },
+        { label: 'C# configuration views', file: 'A.cs', source: 'class Counter { public int count; }', foreign: 'B.cs',
+            use: 'interface Other {\n int Read(Counter x)\n#if FEATURE\n { return x.count; }\n#else\n ;\n#endif\n string Noise()\n#if FEATURE\n { return "雪😀"; }\n#else\n ;\n#endif\n}', pin: 'A.cs:1:count', conditional: true },
+        { label: 'C# parse errors', file: 'A.cs', source: 'class Counter { public int count; }', foreign: 'B.cs',
+            use: 'class Other { string Noise() { return "雪😀"; } int Read(Counter x) { return x.count; } }\nclass Broken { void Oops( { } }', pin: 'A.cs:1:count', errors: true },
+    ]) {
+        it(`${fixture.label}: reuses AST body ranges while resolving member ownership afresh`, () => {
+            const dir = tmp({ [fixture.file]: fixture.source, [fixture.foreign]: fixture.use });
+            try {
+                const index = idx(dir);
+                const expected = plan(index, fixture.pin);
+                assert.ok(expected.result.changes.some(change => change.file === fixture.foreign &&
+                    change.newExpression?.includes('x.changed')));
+                index.saveCache();
+                index.saveUsageCache();
+                const loaded = new ProjectIndex(dir);
+                assert.ok(loaded.loadCache());
+                const file = path.join(dir, fixture.foreign), entry = loaded.files.get(file);
+                if (fixture.conditional) assert.ok(entry.conditionalViews?.length);
+                const { localQueryTree, isLocalNameTree } = require('../core/query-bodies');
+                loaded._beginOp();
+                try {
+                    const tree = localQueryTree(loaded, file, entry, entry.language, 'count', fixture.use);
+                    assert.ok(isLocalNameTree(tree), 'the saved AST ranges must produce a private query tree');
+                    if (fixture.errors) assert.ok(tree.rootNode.hasError, 'parse damage stays visible');
+                    assert.ok(tree.rootNode.text.includes('return x.count'));
+                    assert.ok(!tree.rootNode.descendantsOfType(['string_literal', 'interpreted_string_literal'])
+                        .some(node => node.text.includes('雪😀')));
+                    assert.ok(!loaded._opTreeCache.has(file));
+                    assert.ok(!loaded._parsedTreeCache.has(file));
+                    const complete = loaded._getParsedTree(file, fixture.use, entry.language);
+                    assert.ok(complete.rootNode.text.includes('return "雪😀"'), 'another name still reads the complete body');
+                } finally { loaded._endOp(); }
+                const repeated = new ProjectIndex(dir);
+                assert.ok(repeated.loadCache());
+                assert.deepStrictEqual(plan(repeated, fixture.pin), expected);
+            } finally { clearProjectCache(dir); rm(dir); }
+        });
+    }
+
+    it('keeps query-bearing comments and opaque bodies with embedded comment terminators', () => {
+        const use = '/* count */\r\nclass Other { int Noise() { string text="*/"; return 123; } int Read(Counter x) { return x.count; } }';
+        const dir = tmp({ 'A.cs': 'class Counter { public int count; }', 'B.cs': use });
+        try {
+            const index = idx(dir), expected = plan(index, 'A.cs:1:count');
+            index.saveCache();
+            index.saveUsageCache();
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loaded.loadCache());
+            const file = path.join(dir, 'B.cs'), entry = loaded.files.get(file);
+            loaded._beginOp();
+            try {
+                const { localQueryTree, isLocalNameTree } = require('../core/query-bodies');
+                const tree = localQueryTree(loaded, file, entry, entry.language, 'count', use);
+                assert.ok(isLocalNameTree(tree));
+                assert.ok(tree.rootNode.text.includes('/* count */'));
+                assert.ok(!tree.rootNode.descendantsOfType('string_literal').some(node => node.text.includes('*/')));
+            } finally { loaded._endOp(); }
+            assert.deepStrictEqual(plan(loaded, 'A.cs:1:count'), expected);
+        } finally { clearProjectCache(dir); rm(dir); }
+    });
+
+    it('reads changed project-file imports instead of replaying positive member ownership', () => {
+        const project = namespace => `<Project Sdk="Microsoft.NET.Sdk"><ItemGroup><Using Include="${namespace}" /></ItemGroup></Project>`;
+        const dir = tmp({ 'A.cs': 'namespace First { class Counter { public int count; } }',
+            'C.cs': 'namespace Second { class Counter { public int count; } }',
+            'Use.cs': 'class Use { int Read(Counter x) { return x.count; } }', 'p.csproj': project('First') });
+        try {
+            const index = idx(dir), before = plan(index, 'A.cs:1:count');
+            assert.ok(before.result.changes.some(change => change.file === 'Use.cs' &&
+                change.newExpression?.includes('x.changed')));
+            index.saveCache();
+            index.saveUsageCache();
+            fs.writeFileSync(path.join(dir, 'p.csproj'), project('Second'));
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loaded.loadCache(), 'source files have not changed');
+            const after = plan(loaded, 'A.cs:1:count');
+            assert.ok(!after.result.changes.some(change => change.file === 'Use.cs' && change.newExpression));
+            assert.deepStrictEqual(after, plan(idx(dir), 'A.cs:1:count'));
+        } finally { clearProjectCache(dir); rm(dir); }
+    });
+});
 
 describe('fix #413: conditional using facts survive index persistence', () => {
     it('round-trips the source branches and their unverified callers', () => {

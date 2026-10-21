@@ -39,18 +39,24 @@ function accessKind(tree, usage, token = null) {
             if (current.type === 'ERROR') return 'access';
         }
     }
-    while (['attribute', 'member_expression', 'member_access_expression', 'member_binding_expression',
-        'conditional_access_expression'].includes(node.parent?.type) &&
+    while ((MEMBER_ACCESS_TYPES.has(node.parent?.type) ||
+        ['member_binding_expression', 'conditional_access_expression'].includes(node.parent?.type)) &&
         node.endIndex === node.parent.endIndex && node.startIndex > node.parent.startIndex) node = node.parent;
+    if (node.parent?.type === 'expression_list' && node.parent.parent?.type === 'assignment_statement') {
+        node = node.parent;
+    }
     const parent = node.parent;
-    if (parent?.type === 'update_expression' || parent?.type === 'delete_statement') return parent.type === 'update_expression' ? 'read/write' : 'delete';
+    if (['update_expression', 'inc_statement', 'dec_statement'].includes(parent?.type)) return 'read/write';
+    if (parent?.type === 'delete_statement') return 'delete';
     if (['prefix_unary_expression', 'postfix_unary_expression'].includes(parent?.type) &&
         parent.children.some(child => child.type === '++' || child.type === '--')) return 'read/write';
-    if (['assignment', 'assignment_expression', 'augmented_assignment', 'augmented_assignment_expression'].includes(parent?.type)) {
+    if (['assignment', 'assignment_expression', 'augmented_assignment', 'augmented_assignment_expression',
+        'compound_assignment_expr', 'assignment_statement'].includes(parent?.type)) {
         const left = parent.childForFieldName('left');
         if (left && left.startIndex === node.startIndex && left.endIndex === node.endIndex) {
             const operator = parent.childForFieldName('operator');
-            return parent.type.startsWith('augmented') || (operator && operator.text !== '=')
+            return parent.type.startsWith('augmented') || parent.type === 'compound_assignment_expr' ||
+                (operator && operator.text !== '=')
                 ? 'read/write' : 'write';
         }
     }
@@ -544,4 +550,5 @@ module.exports = {
     ACCESSOR_KINDS,
     isAccessorDefinition,
     findAccessorReferences,
+    referenceAccessKind: accessKind,
 };

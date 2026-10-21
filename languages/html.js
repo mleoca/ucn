@@ -25,7 +25,7 @@ const JS_TYPES = new Set([
  * @param {object} htmlParser - tree-sitter parser configured for HTML
  * @returns {Array<{text: string, startRow: number, startCol: number}>}
  */
-function extractScriptBlocks(htmlContent, htmlParser) {
+function extractScriptBlocks(htmlContent, htmlParser, { includeScopes = false } = {}) {
     const { safeParse, getParseOptions } = require('./index');
     const tree = safeParse(htmlParser, htmlContent, undefined, getParseOptions(htmlContent.length));
     const blocks = [];
@@ -81,7 +81,9 @@ function extractScriptBlocks(htmlContent, htmlParser) {
             blocks.push({
                 text: rawText.text,
                 startRow: rawText.startPosition.row,
-                startCol: rawText.startPosition.column
+                startCol: rawText.startPosition.column,
+                ...(includeScopes && { endRow: rawText.endPosition.row,
+                    endCol: rawText.endPosition.column, module: typeValue === 'module' }),
             });
             return; // Don't recurse into script_element children
         }

@@ -1141,6 +1141,21 @@ function hierarchySlotClosure(index, def, startRef = null) {
     return { pinRef, ancestors, descendants, unresolved, external, slotTypesByKey };
 }
 
+function sourceSyntaxRecord(index, file, name, content, kind, positions, accept) {
+    const crypto = require('crypto'), cache = require('./cache');
+    const entry = index.files.get(file);
+    const eligible = entry?.hash && index._usageResultCache && !index.isProvenanceFactIndex &&
+        crypto.createHash('md5').update(content).digest('hex') === entry.hash;
+    const mode = eligible ? `contract-syntax-v1:${kind}:` + crypto.createHash('sha256').update(JSON.stringify([
+        entry.language, entry.conditionalViews, entry.recoveryBlanks, entry.externalMacroKey, positions,
+    ])).digest('hex') : null;
+    const stored = eligible ? cache.getUsageResult(index, file, name, mode) : null;
+    return {
+        value: Array.isArray(stored) && accept(stored) ? stored : null,
+        save(value) { if (eligible) cache.storeUsageResult(index, file, name, mode, value); },
+    };
+}
+
 /**
  * Members of anonymous class bodies that fill the slot (fix #390): a Java
  * `new Listener<T>(..) { void run(..) {} }` or a JS/TS class expression
@@ -1168,12 +1183,16 @@ function anonymousSlotMembers(index, name, perFile, closure, pin) {
         if (!javaLike && !classExpressionLanguage) continue;
         let content;
         try { content = index._readFile(file); } catch { continue; }
+        const lines = [...lineNos].sort((a, b) => a - b);
+        const syntax = sourceSyntaxRecord(index, file, name, content, 'anonymous', lines,
+            value => value.length === 1 && value[0] === 0);
+        if (syntax.value) continue;
         const tree = index._getParsedTree?.(file, content, language);
         if (!tree) continue;
         const namespace = (fileEntry.symbols || []).find(s => s.namespace)?.namespace || null;
-        const lines = [...lineNos].sort((a, b) => a - b);
         const fileLines = index._getFileLines(file);
         const seen = new Set();
+        let hasAnonymousMember = false;
         for (const line of lines) {
             const text = fileLines[line - 1] || '';
             for (let at = text.indexOf(name); at >= 0; at = text.indexOf(name, at + 1)) {
@@ -1201,6 +1220,9 @@ function anonymousSlotMembers(index, name, perFile, closure, pin) {
                     typeText = value ? `${value.text}${extendsClause.namedChildren.find(child => child.type === 'type_arguments')?.text || ''}` : null;
                 } else continue;
                 if (!typeText) continue;
+                // Only syntactic absence is cached. An unbound or external
+                // owner may bind to a project slot after another file changes.
+                hasAnonymousMember = true;
                 const key = `${file}:${nameNode.startIndex}`;
                 if (seen.has(key)) continue;
                 seen.add(key);
@@ -1250,6 +1272,7 @@ function anonymousSlotMembers(index, name, perFile, closure, pin) {
                 out.push({ ...site, verdict: 'edit' });
             }
         }
+        if (!hasAnonymousMember) syntax.save([0]);
     }
     return out;
 }
@@ -2111,6 +2134,14 @@ function rustMacroTemplateSites(index, name, files) {
         // Only files that define a macro can hold template tokens; the
         // AST below decides everything, this only skips needless parses.
         if (!content.includes('macro_rules!')) continue;
+        const syntax = sourceSyntaxRecord(index, file, name, content, 'rust-template', null,
+            validRustTemplateSyntax);
+        if (syntax.value) {
+            for (const fact of syntax.value) sites.push({ file, relativePath: entry.relativePath || file,
+                ...fact, owners: fact.owners.map(owner => ({ ...owner })) });
+            continue;
+        }
+        const siteStart = sites.length;
         const tree = index._getParsedTree?.(file, content, 'rust') || safeParse(parser, content);
         if (!tree) continue;
         const macros = [];
@@ -2122,7 +2153,7 @@ function rustMacroTemplateSites(index, name, files) {
             if (node.type === 'macro_invocation') invocations.push(node);
             for (let i = node.namedChildCount - 1; i >= 0; i--) stack.push(node.namedChild(i));
         }
-        if (macros.length === 0) continue;
+        if (macros.length === 0) { syntax.save([]); continue; }
         const invocationContexts = (macroName) => {
             const contexts = [];
             for (const invocation of invocations) {
@@ -2200,10 +2231,24 @@ function rustMacroTemplateSites(index, name, files) {
             };
             walk(macro, false);
         }
+        syntax.save(sites.slice(siteStart).map(({ file: _file, relativePath: _relativePath, ...fact }) =>
+            ({ ...fact, owners: fact.owners.map(owner => ({ ...owner })) })));
     }
     sites.sort((a, b) => (a.relativePath < b.relativePath ? -1
         : a.relativePath > b.relativePath ? 1 : a.line - b.line || a.column - b.column));
     return sites;
+}
+
+function validRustTemplateSyntax(value) {
+    const optionalString = text => text == null || typeof text === 'string';
+    return value.every(fact => fact && Number.isInteger(fact.line) && fact.line > 0 &&
+        Number.isInteger(fact.column) && fact.column >= 0 &&
+        ['definition', 'method-call', 'path-call', 'call', 'other'].includes(fact.shape) &&
+        optionalString(fact.macroName) && optionalString(fact.enclosingFn) &&
+        optionalString(fact.pathQualifier) && Array.isArray(fact.owners) &&
+        fact.owners.every(owner => owner && ['impl', 'fn-body', 'module'].includes(owner.kind) &&
+            optionalString(owner.trait) && ['line', 'invocationLine'].every(key =>
+                owner[key] == null || Number.isInteger(owner[key]) && owner[key] > 0)));
 }
 
 /**

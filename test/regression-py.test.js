@@ -2433,7 +2433,7 @@ THRESHOLD = 3.14159
         }
     });
 
-    it('should NOT index lowercase or camelCase module-level assignments', () => {
+    it('indexes module assignments independently of their spelling', () => {
         const dir = tmp({
             'requirements.txt': '',
             'config.py': `
@@ -2447,7 +2447,9 @@ x = 1
             const index = idx(dir);
             for (const name of ['my_var', 'someValue', '_private', 'x']) {
                 const defs = index.symbols.get(name);
-                assert.ok(!defs || defs.length === 0, `should NOT index ${name} as a constant`);
+                assert.strictEqual(defs?.length, 1, `${name} is one module value`);
+                assert.strictEqual(defs[0].type, 'state');
+                assert.strictEqual(defs[0].relativePath, 'config.py');
             }
         } finally {
             rm(dir);

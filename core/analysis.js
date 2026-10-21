@@ -14,7 +14,7 @@ const { UcnError } = require('./errors');
 const { parse } = require('./parser');
 const { detectLanguage, langTraits } = require('../languages');
 const { NON_CALLABLE_TYPES, addTestExclusions, countTextBlindspots,
-    codeUnitCompare, formatSymbolHandle } = require('./shared');
+    codeUnitCompare, formatSymbolHandle, isValueDefinition } = require('./shared');
 const { isTestFile } = require('./discovery');
 // Entry-point detection loads on first use (fix #375).
 let entrypointsModule = null;
@@ -1416,6 +1416,10 @@ function impact(index, name, options = {}) {
     // dependents. Same design as the accessor band: a separate band, never
     // fake caller edges (the caller oracle and the account stay call-shaped).
     let typeReferences = findTypeReferences(index, name, def, options);
+    const valueAccesses = isValueDefinition(def)
+        ? require('./value-references').findValueReferences(index, name, def, {
+            includeTests: true, exclude: options.exclude,
+        }) : null;
 
     // Apply top limit if specified (limits total call sites shown)
     const totalBeforeLimit = filteredSites.length;
@@ -1464,6 +1468,8 @@ function impact(index, name, options = {}) {
         ...(propertyAccesses?.unverifiedSites || []).map(site => site.file),
         ...(typeReferences?.byFile || []).map(group => group.file),
         ...(typeReferences?.unverifiedSites || []).map(site => site.file),
+        ...(valueAccesses?.byFile || []).map(group => group.file),
+        ...(valueAccesses?.unverifiedSites || []).map(site => site.file),
     ]);
 
     return {
@@ -1484,6 +1490,11 @@ function impact(index, name, options = {}) {
         ...(typeReferences && {
             typeReferences,
             totalDependencySites: totalBeforeLimit + typeReferences.confirmedCount,
+            affectedFiles: affectedFiles.size,
+        }),
+        ...(valueAccesses && {
+            valueAccesses,
+            totalDependencySites: totalBeforeLimit + valueAccesses.confirmedCount,
             affectedFiles: affectedFiles.size,
         }),
         account: impactAccount,
@@ -2553,7 +2564,7 @@ function diffImpact(index, options = {}) {
         totalCallSites += evidence.totalCallSites || 0;
         totalUnverifiedSites += evidence.unverifiedSites?.length || 0;
         for (const group of evidence.byFile || []) callerFileSet.add(path.resolve(index.root, group.file));
-        const refs = evidence.typeReferences || evidence.propertyAccesses;
+        const refs = evidence.typeReferences || evidence.propertyAccesses || evidence.valueAccesses;
         totalDependencySites += refs?.confirmedCount || 0;
         unverifiedDependencySites += refs?.unverifiedCount || 0;
         for (const group of refs?.byFile || []) dependencyFiles.add(group.file);

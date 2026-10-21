@@ -237,7 +237,7 @@ function csPrimaryBranch(group, lines) {
  * index recorded for this content from `groups` (persisted per file as
  * [branch rows..., end row, primary branch]) without the literal parse.
  */
-function csViewsFromGroups(parser, code, lines, resolved, literalErrors = null) {
+function csViewsFromGroups(parser, code, lines, resolved, literalErrors = null, transform = null) {
     // One view per alternative position: view 0 keeps each group's primary
     // branch, view k its k-th other branch (the primary one when it has no
     // more). A lone `#if` branch is kept in every view.
@@ -265,7 +265,8 @@ function csViewsFromGroups(parser, code, lines, resolved, literalErrors = null) 
         };
     };
     const reparse = source => safeParse(parser, source, undefined, PARSE_OPTIONS);
-    const primaryTree = reparse(viewSource(0).source);
+    const primarySource = viewSource(0).source;
+    const primaryTree = reparse(transform ? transform(primarySource, null) : primarySource);
     if (literalErrors != null && primaryTree.rootNode.hasError &&
         csCountErrors(primaryTree.rootNode) >= literalErrors) return null;
     const secondary = [];
@@ -274,7 +275,7 @@ function csViewsFromGroups(parser, code, lines, resolved, literalErrors = null) 
         // Only rows that hold code are worth a parse.
         const owns = new Set([...view.owns].filter(row => /\w/.test(lines[row])));
         if (owns.size === 0) continue;
-        secondary.push({ tree: reparse(view.source), owns, reaches: csRowReach(owns) });
+        secondary.push({ tree: reparse(transform ? transform(view.source, owns) : view.source), owns, reaches: csRowReach(owns) });
     }
     return {
         primary: { tree: primaryTree },
@@ -359,6 +360,26 @@ function queryTreeIsPlain(code, entry = null) {
     if (!csHasConditional(code)) return true;
     return !!entry?.hash && !Array.isArray(entry.conditionalViews) &&
         crypto.createHash('md5').update(code).digest('hex') === entry.hash;
+}
+
+function queryBodyViews(tree) {
+    const views = tree && csViewsByTree.get(tree)?.views;
+    return views ? [views.primary, ...views.secondary] : [{ tree }];
+}
+
+/** Rebuild every recorded configuration, with a source-local body transform. */
+function queryBodyTree(code, parser, entry, transform) {
+    if (!Array.isArray(entry.conditionalViews)) {
+        const tree = safeParse(parser, transform(code, null), undefined, PARSE_OPTIONS);
+        if (tree) csViewsByTree.set(tree, { code, views: null });
+        return tree;
+    }
+    const lines = code.match(/.*(?:\r\n|\n|\r|$)/g)?.filter(Boolean) || [];
+    const resolved = entry.conditionalViews.map(group => ({ branches: group.slice(0, -2),
+        end: group[group.length - 2], primary: group[group.length - 1] }));
+    const views = csViewsFromGroups(parser, code, lines, resolved, null, transform);
+    for (const view of [views.primary, ...views.secondary]) csViewsByTree.set(view.tree, { code, views });
+    return views.primary.tree;
 }
 
 function namespaceDeclarationName(declaration) {
@@ -2632,9 +2653,47 @@ function isInvokedName(node, options = {}) {
     return invokesNameExpression(expression);
 }
 
+/** Only declarations can give the local-type map a receiver's name. */
+function possibleReceiverBinding(node, name, memo) {
+    const member = csharpEnclosingCallable(node);
+    if (!member || member.hasError) return true;
+    const key = `${member.id}\0${name}`;
+    if (memo.has(key)) return memo.get(key);
+    const text = member.text;
+    let possible = false;
+    for (let at = text.indexOf(name); at >= 0; at = text.indexOf(name, at + name.length)) {
+        const token = member.descendantForIndex(member.startIndex + at, member.startIndex + at + name.length);
+        if (!token || token.text !== name) continue;
+        const parent = token.parent;
+        if (token.type !== 'identifier' || parent?.type !== 'member_access_expression' ||
+            !sameNode(parent.childForFieldName('expression'), token)) {
+            possible = true;
+            break;
+        }
+    }
+    if (!possible) {
+        let rows = memo.get('scope-rows');
+        if (!rows) {
+            rows = new Map();
+            for (const scope of node.tree.rootNode.descendantsOfType([...CALLABLE_SCOPE_NODES])) {
+                if (isControlFlowLocalArtifact(scope)) continue;
+                const row = scope.startPosition.row;
+                rows.set(row, (rows.get(row) || 0) + 1);
+            }
+            memo.set('scope-rows', rows);
+        }
+        // Scopes sharing a declaration row contribute to the same local-type
+        // map, so another callable on that row can carry the binding.
+        if (rows.get(member.startPosition.row) !== 1) possible = true;
+    }
+    memo.set(key, possible);
+    return possible;
+}
+
 function usagesInTree(code, name, parser, tree) {
     const usages = [];
-    const variableTypesByScope = buildVariableTypes(tree, parser);
+    const receiverBindings = new Map();
+    let variableTypesByScope;
     visitNameNodes(tree, code, name, node => {
         if (!IDENTIFIER_NODES.has(node.type) || node.text !== name) return;
         let usageType = 'reference';
@@ -2661,10 +2720,14 @@ function usagesInTree(code, name, parser, tree) {
                 const receiverNode = expression.childForFieldName('expression') ||
                     expression.childForFieldName('condition') || expression.namedChild(0);
                 const receiver = identity.receiver;
-                const scopeTypes = variableTypesByScope.get(variableScopeKey(node)) ||
-                    variableTypesByScope.get('global');
-                const declared = receiverNode?.type === 'identifier'
-                    ? normalizeReceiverType(scopeTypes?.get(receiver)) : null;
+                let declared = null;
+                if (receiverNode?.type === 'identifier' &&
+                    (variableTypesByScope || possibleReceiverBinding(node, receiver, receiverBindings))) {
+                    variableTypesByScope ||= buildVariableTypes(tree, parser);
+                    const scopeTypes = variableTypesByScope.get(variableScopeKey(node)) ||
+                        variableTypesByScope.get('global');
+                    declared = normalizeReceiverType(scopeTypes?.get(receiver));
+                }
                 const sameClass = ['this', 'base'].includes(receiver)
                     ? enclosingClassName(node) : null;
                 usages.push({
@@ -2860,6 +2923,8 @@ function accessorTypeSyntax(text) {
 }
 
 module.exports = {
+    queryBodyViews,
+    queryBodyTree,
     methodGroupReceiver,
     isInvokedName,
     queryUsingDirectives,

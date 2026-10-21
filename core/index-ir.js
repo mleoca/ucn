@@ -181,7 +181,7 @@ const OPTIONAL_SYMBOL_FIELDS = Object.freeze([
     'generatedByMacro',
     'typeArity', 'ownerTypeArity',
     'annotationType', 'valueShape', 'friendOf', 'templateParams', 'delegateParams',
-        'typedefName',
+        'typedefName', 'forwardDeclaration', 'anonymousNamespace', 'specialization',
 ]);
 
 function materializeSymbol(fileEntry, item) {

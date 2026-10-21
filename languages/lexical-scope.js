@@ -854,14 +854,44 @@ function cDeclarationBinds(statement, name) {
     return verdict;
 }
 
-function cReferenceScope(node, name) {
+function cBlockBinding(scope, name, start, memo) {
+    let trees = memo.get('c-block-bindings');
+    if (!trees) { trees = new WeakMap(); memo.set('c-block-bindings', trees); }
+    let blocks = trees.get(scope.tree);
+    if (!blocks) { blocks = new Map(); trees.set(scope.tree, blocks); }
+    let block = blocks.get(scope.id);
+    if (!block) {
+        block = { statements: namedChildrenOf(scope), names: new Map() };
+        blocks.set(scope.id, block);
+    }
+    let state = block.names.get(name);
+    if (!state) { state = { next: 0, bindings: [] }; block.names.set(name, state); }
+    // Extend only through the requested position. Earlier queries can use
+    // this prefix too, without seeing any later declaration.
+    while (state.next < block.statements.length) {
+        const statement = block.statements[state.next];
+        if (statement.startIndex >= start) break;
+        const verdict = cDeclarationBinds(statement, name);
+        if (verdict) state.bindings.push([statement.startIndex, verdict]);
+        state.next++;
+    }
+    let lo = 0, hi = state.bindings.length;
+    while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (state.bindings[mid][0] < start) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo ? state.bindings[lo - 1][1] : null;
+}
+
+function cReferenceScope(node, name, memo) {
     if (node.type !== 'identifier') return 'none';
     const parent = node.parent;
     if (!parent) return 'unknown';
     // The declared name of a variable or parameter is a binding, never a
     // reference to a function of the same spelling.
-    for (let up = parent, child = node; up && C_DECLARATOR_WRAPPERS.has(up.type); child = up, up = up.parent) {
-        if (up.type === 'init_declarator' && !sameNode(up.childForFieldName('declarator'), child)) break;
+    for (let up = parent; up && C_DECLARATOR_WRAPPERS.has(up.type); up = up.parent) {
+        if (!sameNode(cDeclaratorName(up)?.node, node)) break;
         const owner = up.parent;
         if (owner && (owner.type === 'declaration' || owner.type === 'parameter_declaration' ||
             owner.type === 'field_declaration')) return 'none';
@@ -876,12 +906,7 @@ function cReferenceScope(node, name) {
             case 'ERROR':
                 return 'unknown';
             case 'compound_statement': {
-                let bound = null;
-                for (const statement of namedChildrenOf(scope)) {
-                    if (statement.startIndex >= start) break;
-                    const verdict = cDeclarationBinds(statement, name);
-                    if (verdict) bound = verdict;
-                }
+                const bound = cBlockBinding(scope, name, start, memo);
                 if (bound === 'function') return 'unknown';
                 if (bound) return { local: true, defRows: null };
                 continue;
@@ -1186,7 +1211,7 @@ function referenceScope(node, language, memo = new Map(), name = node?.text, opt
             case 'js': return jsReferenceScope(node, name, memo, includeClasses);
             case 'go': return goReferenceScope(node, name, memo);
             case 'rust': return rustReferenceScope(node, name, memo);
-            case 'c': return cReferenceScope(node, name);
+            case 'c': return cReferenceScope(node, name, memo);
             default: return null;
         }
     } catch {

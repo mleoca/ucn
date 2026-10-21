@@ -2421,6 +2421,23 @@ function findExportsInCode(code, parser) {
  * @param {object} [tree] - Pre-parsed tree (per-operation cache); parsed here when absent
  * @returns {Array<{line: number, column: number, usageType: string}>}
  */
+function staticValueImportSyntax(tree) {
+    const imports = [];
+    for (const declaration of tree.rootNode.namedChildren) {
+        if (declaration.type !== 'import_declaration' ||
+            !declaration.children.some(child => child.type === 'static')) continue;
+        const path = declaration.namedChildren.find(child =>
+            child.type === 'scoped_identifier' || child.type === 'identifier');
+        if (!path) continue;
+        const wildcard = declaration.children.some(child => child.text === '*');
+        const member = path.childForFieldName('name');
+        const owner = wildcard ? path : path.childForFieldName('scope');
+        if (owner) imports.push({ member: wildcard ? '*' : member?.text,
+            type: owner, token: wildcard ? null : member });
+    }
+    return imports;
+}
+
 function findUsagesInCode(code, name, parser, tree) {
     tree = tree || parseTree(parser, code);
     const usages = [];
@@ -2574,6 +2591,7 @@ function isEntryPoint(symbol) {
 }
 
 module.exports = {
+    staticValueImportSyntax,
     findFunctions,
     findClasses,
     findStateObjects,

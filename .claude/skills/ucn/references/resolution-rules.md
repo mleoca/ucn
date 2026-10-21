@@ -6,6 +6,18 @@ This is portable AST analysis, not a compiler build; macros, templates, generate
 
 ## Every language
 
+### Value references
+
+Field, constant, enum-member and module-value renames use lexical bindings and declaring class identities. A local of the same name and a proven unrelated member stay unchanged. Typed parameters and explicit constructors can prove a receiver; a reassigned constructor binding stays unverified. Structural inheritance with same-named fields requires review. JS/TS static and instance fields occupy separate storage, so an instance-field rename leaves class-property reads unchanged.
+
+Ordinary JS/TS and Python module assignments, Python class-body fields, unexported Go package values, Rust constants and statics inside modules, and C/C++ anonymous enumerators are indexed as values. Python type aliases keep their type identity. HTML module bindings stay in their own script; classic script bindings share the page scope. Unresolved imports and initialization or pattern keys stay review items rather than automatic substitutions.
+
+Java annotation element names belong to annotation methods. C# named attribute fields and properties require review when their declaring type is unresolved.
+
+Private fields keep their `#` namespace. A private name belongs to its lexical declaring class; a receiver's type and a base class do not transfer that name to another private field. Anonymous structural member declarations stay unverified when their contract relationship is unresolved.
+
+C++ direct-initialization arguments follow their value bindings when the grammar reads them as parameter types. Conflicting or unresolved type/value lookup requires review. Qualified enum values retain the complete declaring path.
+
 ### Type names and type identity
 
 A type name written at a call site (a constructor, `Type::f()` / `Type.f()`, an annotated or constructed receiver, a declared field type, a producer's return type) denotes what that file binds it to: when it names an external type that shares its name with a project type (`use std::fs::File`, `import java.io.File`, `from pathlib import Path`, `import { Server } from 'http'`, `using F = System.IO.File`, `std::mutex`), members of the project type are excluded (`external-receiver`), and a project impl on the external type itself stays unverified `possible-dispatch`.
@@ -143,6 +155,8 @@ A C# target-typed `new(..)` in a collection initializer or collection expression
 C/C++ uses `compile_commands.json` when available to classify headers and resolve include paths; free-function visibility follows the transitive `#include` closure, and a quoted include found only by a unique project basename is weaker evidence (rule `include-basename`). C++ resolution uses namespace ownership, static overload shape (including arrays), and macro-parameter requalification.
 
 ### Declarations, linkage and configurations
+
+C/C++ declarations in the same scope and file share their class body, including a conditional body; alternative bodies remain indexed separately. A plain forward-declared field type completes across files only to one same-scope class or struct visible through the consuming file's include closure. The field's written type resolves in its declaring scope, including a type alias. Separate programs keep their own complete classes; conditional, generic, anonymous-namespace or ambiguous cross-file completions stay unverified.
 
 Every non-static declaration of a free function (a header prototype or a local forward declaration in another file) is the same entity as its external definition, so its calls are the definition's callers and `plan` renames every declaration; a `static` forward declaration joins only its own file's definition. Several external-linkage definitions of one function (platform variants), or definitions in complementary `#if` branches, stay `link-ambiguous` on the caller and callee side unless the caller's own file (in the same branch) or the compile database separates them. A call in a header to a `static` function the header declares binds each including file's own definition: unverified `translation-unit-binding`.
 

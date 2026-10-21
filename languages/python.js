@@ -329,47 +329,33 @@ function pythonFunctionLocalScope(node) {
     return {};
 }
 
-// Module-level state detection patterns
-const _STATE_PATTERN = /^(CONFIG|SETTINGS|[A-Z][A-Z0-9_]+|[A-Z][a-zA-Z]*(?:Config|Settings|Options|State|Store|Context))$/;
-// Pattern for UPPER_CASE constants that may have scalar values (string, number, bool, etc.)
-const _CONSTANT_PATTERN = /^[A-Z][A-Z0-9_]{1,}$/;
-// RHS types that are scalar/simple values (not dict/list which are handled separately)
-const _SCALAR_TYPES = new Set([
-    'string', 'concatenated_string', 'integer', 'float', 'true', 'false', 'none',
-    'unary_operator', 'binary_operator', 'tuple', 'set', 'parenthesized_expression',
-    'call', 'attribute', 'identifier', 'subscript',
-]);
-
 /**
  * Process a node for state object extraction (single-pass helper)
  * Returns true if node was matched, false otherwise
  */
 function _processState(node, objects, lines) {
-    if (node.type === 'expression_statement' && node.parent && node.parent.parent === null) {
-        const child = node.namedChild(0);
-        if (child && child.type === 'assignment') {
-            const leftNode = child.childForFieldName('left');
-            const rightNode = child.childForFieldName('right');
-
-            if (leftNode && leftNode.type === 'identifier' && rightNode) {
-                const name = leftNode.text;
-                const isObject = rightNode.type === 'dictionary';
-                const isArray = rightNode.type === 'list';
-
-                if ((isObject || isArray) && _STATE_PATTERN.test(name)) {
-                    const { startLine, endLine } = nodeToLocation(node, lines);
-                    objects.push({ name, startLine, endLine });
-                    return true;
-                } else if (_CONSTANT_PATTERN.test(name) && _SCALAR_TYPES.has(rightNode.type)) {
-                    // Module-level UPPER_CASE constants with scalar values
-                    const { startLine, endLine } = nodeToLocation(node, lines);
-                    objects.push({ name, startLine, endLine, isConstant: true });
-                    return true;
-                }
-            }
-        }
+    if (node.type !== 'assignment') return false;
+    for (let scope = node.parent; scope; scope = scope.parent) {
+        if (scope.type === 'function_definition' || scope.type === 'lambda' ||
+            scope.type === 'class_definition') return false;
     }
-    return false;
+    if (node.parent?.type === 'expression_statement' &&
+        _processTypeAlias(node.parent, [], new Set(), lines)) return false;
+    const target = node.childForFieldName('left');
+    if (!target) return false;
+    const bindings = [];
+    const collect = pattern => {
+        if (pattern.type === 'identifier') bindings.push(pattern);
+        else if (['pattern_list', 'tuple_pattern', 'list_pattern', 'list_splat_pattern'].includes(pattern.type)) {
+            for (const child of pattern.namedChildren) collect(child);
+        }
+    };
+    collect(target);
+    for (const binding of bindings) {
+        objects.push({ name: binding.text, startLine: binding.startPosition.row + 1,
+            endLine: nodeToLocation(node, lines).endLine });
+    }
+    return bindings.length > 0;
 }
 
 /**
@@ -1068,6 +1054,20 @@ function extractClassMembers(classNode, code) {
     const members = [];
     const bodyNode = classNode.childForFieldName('body');
     if (!bodyNode) return members;
+
+    // A class-body assignment declares an attribute, including an annotated
+    // dataclass field. Function and nested-class bodies have their own owners.
+    traverseTree(bodyNode, node => {
+        if (node.type === 'function_definition' || node.type === 'class_definition') return false;
+        if (node.type !== 'assignment') return true;
+        const name = node.childForFieldName('left');
+        if (name?.type !== 'identifier') return true;
+        const type = node.childForFieldName('type');
+        members.push({ name: name.text, startLine: name.startPosition.row + 1,
+            endLine: node.endPosition.row + 1, memberType: 'field',
+            ...(type && { returnType: type.text }) });
+        return true;
+    });
 
     for (const child of pythonClassBodyDefs(bodyNode)) {
         let funcNode = child;
@@ -5085,10 +5085,13 @@ function findClassFieldFacts(tree, line, name) {
     visitBody(body);
     const written = new Set();
     let dynamic = false;
-    const pending = [body];
-    while (pending.length > 0) {
-        const node = pending.pop();
-        if (node.type === 'class_definition') continue;
+    let nestedClassEnd = -1;
+    for (const node of body.descendantsOfType(['class_definition', 'attribute', 'call'])) {
+        if (node.startIndex < nestedClassEnd) continue;
+        if (node.type === 'class_definition') {
+            nestedClassEnd = node.endIndex;
+            continue;
+        }
         if (node.type === 'attribute') {
             const object = node.childForFieldName('object');
             const attribute = node.childForFieldName('attribute');
@@ -5102,7 +5105,6 @@ function findClassFieldFacts(tree, line, name) {
             if (fn?.type === 'identifier' && (fn.text === 'setattr' || fn.text === 'vars' ||
                 fn.text === 'delattr') && first?.type === 'identifier' && receivers.has(first.text)) dynamic = true;
         }
-        for (let i = node.namedChildCount - 1; i >= 0; i--) pending.push(node.namedChild(i));
     }
     return { members, written, dynamic };
 }

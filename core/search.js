@@ -72,28 +72,28 @@ function appendTextComplements(index, {
         .filter(usage => usage.file === filePath)
         .map(usage => usage.line));
     const pattern = literalNameRegex(name);
+    let syntax;
     for (let idx = 0; idx < lines.length; idx++) {
         const line = lines[idx];
         const match = pattern.exec(line);
         if (!match || represented.has(idx + 1)) continue;
         const lineNum = idx + 1;
-        const commentOrString = index.isCommentOrStringAtPosition(
-            content, lineNum, match.index, filePath);
+        syntax ||= require('./text-usage-syntax').textUsageSyntax(index, filePath, fileEntry, content, name);
+        const textKind = syntax.kind(lineNum, match.index);
         // A literal match that no AST identifier record claimed and that is
         // not inside a comment or string is non-code text: JSX children,
         // HTML markup and attributes, regex bodies. The ACCOUNT counts these
         // lines as other-text; the escape hatch must list them too. A line
         // the AST scan classified and then deliberately dropped (Rust enum
         // variants against a struct pin, #234) is code, not text: skip it.
-        if (!commentOrString &&
-            index.isIdentifierAtPosition(content, lineNum, match.index, filePath, name)) continue;
+        if (textKind === 'identifier') continue;
         const usage = {
             file: filePath,
             relativePath: fileEntry.relativePath,
             line: lineNum,
             content: line,
             usageType: 'text',
-            textKind: commentOrString ? 'comment-or-string' : 'markup-or-text',
+            textKind,
             isDefinition: false,
         };
         if (context > 0) {
@@ -106,6 +106,7 @@ function appendTextComplements(index, {
         }
         usagesList.push(usage);
     }
+    syntax?.save();
 }
 
 /**

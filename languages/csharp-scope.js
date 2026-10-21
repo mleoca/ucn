@@ -118,7 +118,21 @@ function csharpLocalBinding(memberNode, node, name) {
         }
         for (const child of current.namedChildren || []) visit(child);
     };
-    for (const child of memberNode.namedChildren || []) visit(child);
+    // Name lookup needs only this member's occurrences of the identifier.
+    // The AST still decides the token's role and scope; nested types keep
+    // their own bindings, just as in the member walk above.
+    const source = memberNode.text;
+    for (let at = name ? source.indexOf(name) : -1; at >= 0; at = source.indexOf(name, at + name.length)) {
+        let token = memberNode.descendantForIndex(memberNode.startIndex + at,
+            memberNode.startIndex + at + name.length);
+        if (token?.parent?.type === 'implicit_parameter' && token.parent.text === name) token = token.parent;
+        if (!token || !['identifier', 'implicit_parameter'].includes(token.type) || token.text !== name) continue;
+        let nestedType = false;
+        for (let parent = token.parent; parent && !sameNode(parent, memberNode); parent = parent.parent) {
+            if (TYPE_SCOPES.has(parent.type)) { nestedType = true; break; }
+        }
+        if (!nestedType) visit(token);
+    }
     if (bindings.size >= 512) bindings.delete(bindings.keys().next().value);
     bindings.set(cacheKey, facts);
     return bindingVerdict(facts, node);
@@ -314,6 +328,16 @@ function accessorReferenceShape(tree, usage, implicitCreationTarget) {
     if (!node || node.type !== 'identifier') return null;
     const parent = node.parent;
     if (!parent) return 'none';
+    if (parent.type === 'name_equals' || parent.type === 'attribute_argument' && node.nextSibling?.type === '=' ||
+        parent.type === 'assignment_expression' && sameNode(parent.childForFieldName('left'), node) &&
+        parent.parent?.type === 'attribute_argument') {
+        let owner = parent;
+        while (owner && owner.type !== 'attribute' && !TYPE_SCOPES.has(owner.type)) owner = owner.parent;
+        // An attribute's named field/property belongs to the attribute,
+        // never to the class carrying it. Its abbreviated type name and
+        // constructor binding need a separate ownership proof.
+        if (owner?.type === 'attribute') return { kind: 'unresolved', node, uncertainRole: true };
+    }
     let pattern = parent;
     while (pattern?.type === 'member_access_expression') pattern = pattern.parent;
     if (pattern?.type === 'subpattern' && pattern.children.some(child => child.type === ':')) {

@@ -236,6 +236,7 @@ function _pendingCallRecords(index, filePath, select) {
  * macro expansions' calls are not derived yet, only those records.
  */
 function getCachedCallsBearing(index, filePath, name, lineSet = null) {
+    if (require('./call-name-cache').absent(index, filePath, name)) return [];
     const records = _pendingCallRecords(index, filePath, { name, lineSet, keep: call => _callBearsName(call, name) });
     return records !== undefined ? records : getCachedCalls(index, filePath);
 }
@@ -591,8 +592,7 @@ function findCallers(index, name, options = {}) {
     const elapsedProfileMs = started => Number(
         (Number(process.hrtime.bigint() - started) / 1e6).toFixed(3));
     const cacheLoadStarted = queryProfile ? process.hrtime.bigint() : null;
-    // Lazy-load callsCache from disk if not already populated
-    if (index.loadCallsCache) index.loadCallsCache();
+    // Each record consumer loads its own shard on demand.
     if (queryProfile) queryProfile.cacheLoadMs = elapsedProfileMs(cacheLoadStarted);
     const candidateScanStarted = queryProfile ? process.hrtime.bigint() : null;
 
@@ -1224,6 +1224,8 @@ function findCallers(index, name, options = {}) {
         if (!calleeFiles && !hasAliasSurfaces &&
             fileEntry.rustMacroExpansion?.callsPending &&
             !require('./rust-macro-expansion').rustPendingMayBear(fileEntry, name)) continue;
+        if (!hasAliasSurfaces && !targetIsTypeQuery &&
+            require('./call-name-cache').absent(index, filePath, name)) continue;
         try {
             const typedViews = csharpTargetTypedByFile.get(filePath);
             // A record that cannot match below is skipped by the loop's first
@@ -1316,6 +1318,7 @@ function findCallers(index, name, options = {}) {
                 }
                 // Skip if not matching our target name (also check alias resolution)
                 let calledAs = null; // surface name when matched via an import/export rename
+                let valueAliasBinding = false;
                 const typeQualifierReference = targetIsTypeQuery &&
                     call.receiverIsTypeQualified &&
                     call.receiver === name;
@@ -1337,6 +1340,7 @@ function findCallers(index, name, options = {}) {
                             (options.targetDefinitions || definitions).some(d =>
                                 d.file === aliased.fromFile && IDENTITY_TYPE_KINDS.has(d.type))) {
                             calledAs = call.name;
+                            valueAliasBinding = true;
                         }
                     }
                     if (!calledAs) continue;
@@ -2953,6 +2957,14 @@ function findCallers(index, name, options = {}) {
                     } else {
                         fileBindings = _bindingsNamed(index, fileEntry, call.name).slice();
                     }
+                    // A value declaration is the binding through which an
+                    // already resolved callable alias reaches its target.
+                    // Its inventory entry is not a competing callable.
+                    if (!call.isMethod && !call.receiver && calledAs &&
+                        (valueAliasBinding || call.resolvedName === name ||
+                         call.resolvedNames?.includes(name))) {
+                        fileBindings = fileBindings.filter(binding => binding.type !== 'state');
+                    }
                     let bindings = _arityCompatibleBindings(index, fileEntry.language, call,
                         _dropOutOfScopeBindings(index, filePath, call.name, call.line, fileBindings, call));
                     // A configuration alternative another branch of the
@@ -3741,7 +3753,8 @@ function findCallers(index, name, options = {}) {
                         fileEntry.language, hopInfo,
                         call.receiverRootNamespace,
                         fieldHopRootType === call.receiverRootType
-                            ? _fieldHopRootArity(index, filePath, call, fileEntry.language) : null);
+                            ? _fieldHopRootArity(index, filePath, call, fileEntry.language) : null,
+                        filePath);
                     // fix #380: the declared type's arity names one type.
                     if (fieldHopType && Number.isInteger(hopInfo.typeArgs)) {
                         call = { ...call, receiverHopType: fieldHopType, receiverHopTypeArgs: hopInfo.typeArgs,
@@ -7787,10 +7800,7 @@ function findCallees(index, definition, options = {}) {
         : definition;
     if (!def) return [];
     if (!def.file) throw new TypeError('findCallees requires a definition with a file');
-    // Lazy-load callsCache from disk if not already populated. A run
-    // restricted to known sites (fix #371) reads records through
-    // getCachedCalls, which loads each file's shard on demand.
-    if (index.loadCallsCache && !options.siteStarts) index.loadCallsCache();
+    // getCachedCalls loads the definition's shard on demand.
 
     try {
         // Get all calls from the file's cache (now includes enclosingFunction)
@@ -8536,7 +8546,7 @@ function findCallees(index, definition, options = {}) {
                     fieldHopInfo = fieldHopInfo || {};
                     const fields = call.receiverFields || [call.receiverField];
                     fieldHopType = _declaredFieldPathType(index, hopRoot, fields,
-                        language, fieldHopInfo, call.receiverRootNamespace);
+                        language, fieldHopInfo, call.receiverRootNamespace, null, def.file);
                     // Imported Go root types outside this project have no
                     // indexed field table. The attempted field hop is still
                     // owned by that external type and must not fall through
@@ -10535,6 +10545,23 @@ function findCallees(index, definition, options = {}) {
             };
             let symbols = index.symbols.get(calleeName);
             if (symbols && macroInert) symbols = symbols.filter(s => s.type !== 'macro');
+            // A value binding identifies storage, not the function its
+            // runtime value invokes. Keep that call visible without making
+            // the value declaration a confirmed callable definition.
+            const valueBinding = bindingId && symbols?.find(symbol =>
+                symbol.bindingId === bindingId && symbol.type === 'state');
+            const callableBody = valueBinding &&
+                require('./value-references').hasCallableInitializer(index, valueBinding);
+            if (valueBinding && !callableBody) {
+                if (collectAccount && siteIds) {
+                    for (const siteId of siteIds) {
+                        noteUnverified(siteId, siteEvidence.get(siteId).call, 'callable-value');
+                    }
+                }
+                continue;
+            }
+            if (symbols) symbols = symbols.filter(symbol => symbol.type !== 'state' ||
+                symbol === valueBinding && callableBody);
             if (symbols && symbols.length > 0 && bareNonMethod) {
                 // fix #300 (#220(4), callee finalization): a bare call's
                 // candidate set never includes METHOD defs — without this the
@@ -11009,8 +11036,22 @@ function _pythonClassFieldFacts(index, classDef) {
     let facts;
     try {
         const content = index._readFile(classDef.file);
-        const tree = index._getParsedTree(classDef.file, content, 'python');
-        facts = getLanguageAdapter('python').findClassFieldFacts(tree, classDef.startLine, classDef.name);
+        const mode = `class-fields-v1:${classDef.startLine}`;
+        const cacheable = !index.isProvenanceFactIndex && index._usageResultCache && entry.hash &&
+            require('crypto').createHash('md5').update(content).digest('hex') === entry.hash;
+        const cache = cacheable ? require('./cache') : null;
+        const record = cache?.getUsageResult(index, classDef.file, classDef.name, mode);
+        const names = value => Array.isArray(value) && value.every(name =>
+            typeof name === 'string' && name.length > 0);
+        if (Array.isArray(record) && record.length === 3 && names(record[0]) &&
+            names(record[1]) && typeof record[2] === 'boolean') {
+            facts = { members: new Set(record[0]), written: new Set(record[1]), dynamic: record[2] };
+        } else {
+            const tree = index._getParsedTree(classDef.file, content, 'python');
+            facts = getLanguageAdapter('python').findClassFieldFacts(tree, classDef.startLine, classDef.name);
+            if (facts && cache) cache.storeUsageResult(index, classDef.file, classDef.name, mode,
+                [[...facts.members], [...facts.written], facts.dynamic]);
+        }
     } catch { facts = null; }
     byClass.set(key, facts);
     return facts;
@@ -13961,7 +14002,8 @@ function _nameBindingReaches(index, startAbs, name, targetFiles, maxDepth = 4, o
 function _pythonModuleValueRoute(index, abs, fe, attr) {
     if (fe.language !== 'python') return null;
     if (_moduleImportBindings(fe).some(b => (b.alias || b.name) === attr)) return null;
-    if (definitionsInFile(index, attr, abs).some(d => !d.className && !_isFunctionLocalType(d) &&
+    if (definitionsInFile(index, attr, abs).some(d => d.type !== 'state' &&
+        !d.className && !_isFunctionLocalType(d) &&
         !d.lexicalScopeStartLine)) return null;
     const aliases = (fe.moduleValueAliases || []).filter(entry => entry.name === attr);
     if (aliases.length === 0) return { value: true };
@@ -17751,7 +17793,7 @@ function _cppEnclosingClassNames(index, filePath, owner, enclosing) {
     if (!fileEntry || !owner) return [];
     const line = enclosing?.startLine;
     const types = (fileEntry.symbols || []).filter(symbol =>
-        (IDENTITY_TYPE_KINDS.has(symbol.type) || symbol.type === 'type') && !symbol.aliasOf);
+        (IDENTITY_TYPE_KINDS.has(symbol.type) || symbol.type === 'type' || symbol.type === 'union') && !symbol.aliasOf);
     const inner = types
         .filter(symbol => symbol.name === owner && (!line || (symbol.startLine <= line && symbol.endLine >= line)))
         .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))[0];
@@ -18430,20 +18472,21 @@ function _typedFieldDefinitions(index, defs) {
 }
 
 function _declaredFieldType(
-    index, rootType, fieldName, language, info = null, rootNamespace = undefined, rootArity = null
+    index, rootType, fieldName, language, info = null, rootNamespace = undefined, rootArity = null, useFile = null
 ) {
     // A pure function of its arguments and the index, plus the facts it
     // writes into `info`: kept per operation (fix #405b: an exact orientation
     // ranking asked it again per record of every refinement).
     const memo = _repeatedQueryMemo(index, 'declaredFieldType');
-    if (!memo) return _declaredFieldTypeUncached(index, rootType, fieldName, language, info, rootNamespace, rootArity);
+    if (!memo) return _declaredFieldTypeUncached(index, rootType, fieldName, language, info, rootNamespace, rootArity, useFile);
     const namespaceKey = rootNamespace === undefined ? '\x01' : rootNamespace === null ? '\x02' : rootNamespace;
+    const unit = langTraits(language)?.textualIncludes ? useFile || '' : '';
     const key = `${rootType}\0${fieldName}\0${language}\0${namespaceKey}` +
-        `\0${rootArity == null ? '\x01' : rootArity}\0${info ? 1 : 0}`;
+        `\0${rootArity == null ? '\x01' : rootArity}\0${info ? 1 : 0}\0${unit}`;
     let known = memo.get(key);
     if (!known) {
         const written = info ? {} : null;
-        known = { type: _declaredFieldTypeUncached(index, rootType, fieldName, language, written, rootNamespace, rootArity), written };
+        known = { type: _declaredFieldTypeUncached(index, rootType, fieldName, language, written, rootNamespace, rootArity, useFile), written };
         memo.set(key, known);
     }
     if (info && known.written) {
@@ -18455,7 +18498,7 @@ function _declaredFieldType(
     return known.type;
 }
 
-function _declaredFieldTypeUncached(index, rootType, fieldName, language, info, rootNamespace, rootArity) {
+function _declaredFieldTypeUncached(index, rootType, fieldName, language, info, rootNamespace, rootArity, useFile) {
     const defs = index.symbols.get(fieldName) || [];
     if (defs.length === 0 && language !== 'python') return null;
     // 'private field' (JS #-fields, fix #219): equally compiler-true, and
@@ -18543,6 +18586,8 @@ function _declaredFieldTypeUncached(index, rootType, fieldName, language, info, 
     }
     if (onType.length === 0) return null;
     const normalized = new Set();
+    const fieldOwners = new Map();
+    let completedForward = false;
     for (const f of onType) {
         const rawText = isAccessor(f) ? (f.returnType || f.fieldType) : f.fieldType;
         // Qualified declared types resolve through the FIELD-DECLARING file's
@@ -18603,10 +18648,33 @@ function _declaredFieldTypeUncached(index, rootType, fieldName, language, info, 
         const importedIdentity = language === 'rust' && f.file && localType
             ? _rustImportedTypeIdentity(index, f.file, localType) : null;
         const t = importedIdentity?.type || localType;
+        if (t && f.file && langTraits(language)?.textualIncludes) {
+            const head = _pureAliasBase(index, t) || t;
+            const types = index.symbols.get(head) || [];
+            const forward = types.some(d => d.forwardDeclaration);
+            if (forward || types.some(d => d.type === 'type' && d.aliasOf)) {
+                const result = require('./value-references').declaredFieldOwner(index, f, useFile);
+                if (forward || result.forward) {
+                    if (!result.owner || result.owner.def.forwardDeclaration || result.owner.name !== head) return null;
+                    // The downstream field rail pins a type by file and name.
+                    // A file containing namesakes needs a richer scope witness.
+                    const declarations = definitionsInFile(index, head, result.owner.def.file)
+                        .filter(d => IDENTITY_TYPE_KINDS.has(d.type));
+                    if (declarations.length !== 1) return null;
+                    completedForward = true;
+                    fieldOwners.set(f, result.owner);
+                    normalized.add(result.owner.name);
+                    continue;
+                }
+                if (result.owner) fieldOwners.set(f, result.owner);
+            }
+        }
         if (t) normalized.add(t);
         else return null; // any un-normalizable declaration → no evidence
     }
     if (normalized.size !== 1) return null; // same-named classes disagree
+    if (completedForward && (fieldOwners.size !== onType.length ||
+        new Set([...fieldOwners.values()].map(owner => owner.key)).size !== 1)) return null;
     let typeName = [...normalized][0];
     // An alias to a type with no class identity (fix #393).
     if (_aliasChainOpaque(index, typeName)) return null;
@@ -18625,7 +18693,7 @@ function _declaredFieldTypeUncached(index, rootType, fieldName, language, info, 
     // types the field as Map, which the trust gate can judge (builtin →
     // exclusion-grade; a project-class base validates normally). Mixed or
     // disagreeing alias names stay as-is and fail the trust gate downstream.
-    const aliasBase = _pureAliasBase(index, typeName);
+    const aliasBase = completedForward ? null : _pureAliasBase(index, typeName);
     if (aliasBase) typeName = aliasBase;
     if (info) {
         if (onType.length === 1 && onType[0].fieldOrigin) Object.assign(info, onType[0].fieldOrigin);
@@ -18636,6 +18704,12 @@ function _declaredFieldTypeUncached(index, rootType, fieldName, language, info, 
             if (!field.file) {
                 complete = false;
                 break;
+            }
+            if (completedForward) {
+                const owner = fieldOwners.get(field);
+                origins.add(owner.def.file);
+                if (owner.def.namespace) info.namespace = owner.def.namespace;
+                continue;
             }
             const rawText = isAccessor(field)
                 ? (field.returnType || field.fieldType) : field.fieldType;
@@ -18703,7 +18777,7 @@ function _declaredFieldTypeUncached(index, rootType, fieldName, language, info, 
 }
 
 function _declaredFieldPathType(
-    index, rootType, fieldNames, language, info, rootNamespace, rootArity
+    index, rootType, fieldNames, language, info, rootNamespace, rootArity, useFile
 ) {
     let currentType = rootType;
     // fix #380: in languages whose generic arity is type identity, each hop
@@ -18714,9 +18788,13 @@ function _declaredFieldPathType(
     for (let i = 0; i < fieldNames.length; i++) {
         const hopInfo = info || (currentArity != null ? {} : null);
         if (hopInfo) { delete hopInfo.typeArgs; delete hopInfo.typeTexts; }
+        if (hopInfo && langTraits(language)?.textualIncludes) {
+            delete hopInfo.namespace;
+            delete hopInfo.fromFile;
+        }
         currentType = _declaredFieldType(
             index, currentType, fieldNames[i], language, hopInfo,
-            i === 0 ? rootNamespace : undefined, currentArity);
+            i === 0 ? rootNamespace : undefined, currentArity, useFile);
         if (!currentType) return null;
         currentArity = hopInfo && Number.isInteger(hopInfo.typeArgs) ? hopInfo.typeArgs : null;
     }
@@ -23730,6 +23808,15 @@ function _cppMemberUsingBases(index, className, name, contextFile) {
 function _overloadDiscipline(index, call, targetDefs, definitions, callerFile) {
     const targetOwners = new Set(targetDefs.map(d => d.className).filter(Boolean));
     const targetLanguage = targetDefs[0]?.file && index.files.get(targetDefs[0].file)?.language;
+    const keyMemo = !index.isProvenanceFactIndex
+        ? index._opMemo?.('overloadDefinitionKeys', () => new WeakMap()) : null;
+    const pinKey = definition => {
+        const cached = keyMemo?.get(definition);
+        if (cached !== undefined) return cached;
+        const key = `${definition.file}:${definition.startLine}`;
+        keyMemo?.set(definition, key);
+        return key;
+    };
     const sameOwnerIdentity = (d) => {
         // A member of a same-name class declared in another scope (a
         // function-local class beside its module-level namesake) never
@@ -23778,42 +23865,68 @@ function _overloadDiscipline(index, call, targetDefs, definitions, callerFile) {
             implicitOwnerKey = ownerRefOf(index, callerSymbol)?.key || null;
         }
     }
-    const pinnedKeys = new Set(targetDefs.map(d =>
-        `${d.file}:${d.startLine}`));
+    const pinnedKeys = new Set(targetDefs.map(pinKey));
+    // Reuse the declared family within one operation. Argument fit and
+    // inherited additions below still run against each call's own view.
+    const familyMemo = !index.isProvenanceFactIndex && definitions.length >= 8 &&
+        targetDefs[0] && typeof targetDefs[0] === 'object'
+        ? index._opMemo?.('overloadDeclaredFamily', () => ({ byPin: new WeakMap(), count: 0 })) : null;
+    const freeCpp = targetOwners.size === 0 && targetLanguage === 'cpp';
+    const fileKey = freeCpp ? callerFile : null;
+    const pathKey = freeCpp && !!call.isPathCall;
+    const receiverKey = pathKey ? call.receiver : null;
+    const entries = familyMemo?.byPin.get(targetDefs[0]);
+    const cached = entries?.find(entry => entry.definitions === definitions &&
+        entry.length === definitions.length && entry.owner === implicitOwnerKey &&
+        entry.file === fileKey && entry.path === pathKey && entry.receiver === receiverKey &&
+        entry.targets.length === targetDefs.length &&
+        entry.targets.every((target, i) => target === targetDefs[i]));
     let family;
-    if (targetOwners.size === 0 && targetLanguage === 'cpp' && callerFile &&
-        targetDefs.every(d => !d.className && !d.receiver) &&
-        _cppTargetVisibleFrom(index, callerFile, targetDefs)) {
-        const visible = _cppVisibleFiles(index, callerFile);
-        const pathCanName = definition => {
-            if (!call.isPathCall || !call.receiver) return true;
-            const namespace = String(definition.namespace || '');
-            // Missing namespace metadata is not negative evidence: namespace
-            // macros (FMT_BEGIN_NAMESPACE and peers) are intentionally opaque
-            // to the portable tree. A recorded namespace, however, must match
-            // the qualifier's exact/relative namespace identity.
-            if (!namespace) return true;
-            return namespace === call.receiver ||
-                String(call.receiver).endsWith(`::${namespace}`) ||
-                namespace.endsWith(`::${call.receiver}`);
-        };
-        family = definitions.filter(d =>
-            !NON_CALLABLE_TYPES.has(d.type) &&
-            !d.className && !d.receiver &&
-            pathCanName(d) &&
-            (visible.has(d.file) ||
-             pinnedKeys.has(`${d.file}:${d.startLine}`)));
+    if (cached) {
+        family = cached.family.slice();
     } else {
-        if (targetOwners.size === 0) return null;
-        family = definitions.filter(d => !NON_CALLABLE_TYPES.has(d.type) &&
-            d.className && targetOwners.has(d.className) &&
-            sameOwnerIdentity(d));
+        if (targetOwners.size === 0 && targetLanguage === 'cpp' && callerFile &&
+            targetDefs.every(d => !d.className && !d.receiver) &&
+            _cppTargetVisibleFrom(index, callerFile, targetDefs)) {
+            const visible = _cppVisibleFiles(index, callerFile);
+            const pathCanName = definition => {
+                if (!call.isPathCall || !call.receiver) return true;
+                const namespace = String(definition.namespace || '');
+                // Missing namespace metadata is not negative evidence: namespace
+                // macros (FMT_BEGIN_NAMESPACE and peers) are intentionally opaque
+                // to the portable tree. A recorded namespace, however, must match
+                // the qualifier's exact/relative namespace identity.
+                if (!namespace) return true;
+                return namespace === call.receiver ||
+                    String(call.receiver).endsWith(`::${namespace}`) ||
+                    namespace.endsWith(`::${call.receiver}`);
+            };
+            family = definitions.filter(d =>
+                !NON_CALLABLE_TYPES.has(d.type) &&
+                !d.className && !d.receiver &&
+                pathCanName(d) &&
+                (visible.has(d.file) ||
+                 pinnedKeys.has(pinKey(d))));
+        } else {
+            if (targetOwners.size === 0) return null;
+            family = definitions.filter(d => !NON_CALLABLE_TYPES.has(d.type) &&
+                d.className && targetOwners.has(d.className) &&
+                sameOwnerIdentity(d));
+        }
+        // Configuration alternatives of a pinned definition are the pinned item
+        // in another build configuration, never a sibling overload (fix #385).
+        family = family.filter(definition =>
+            pinnedKeys.has(pinKey(definition)) ||
+            !targetDefs.some(target => _isConfigurationAlternative(index, definition, target)));
+        if (familyMemo && familyMemo.count < 512) {
+            const item = { definitions, length: definitions.length, owner: implicitOwnerKey,
+                file: fileKey, path: pathKey, receiver: receiverKey,
+                targets: targetDefs.slice(), family: family.slice() };
+            if (entries) entries.push(item);
+            else familyMemo.byPin.set(targetDefs[0], [item]);
+            familyMemo.count++;
+        }
     }
-    // Configuration alternatives of a pinned definition are the pinned item
-    // in another build configuration, never a sibling overload (fix #385).
-    family = family.filter(definition =>
-        pinnedKeys.has(`${definition.file}:${definition.startLine}`) ||
-        !targetDefs.some(target => _isConfigurationAlternative(index, definition, target)));
     if (targetLanguage === 'cpp' && call.explicitTemplateCall) {
         // `f<T>(...)` cannot select a non-template overload. The tree-sitter
         // call record carries this compiler-visible distinction so explicit
@@ -23840,9 +23953,21 @@ function _overloadDiscipline(index, call, targetDefs, definitions, callerFile) {
         return targetLanguage === 'csharp' && compact.endsWith('?') &&
             !_csharpIsValueType(index, compact.slice(0, -1)) ? compact.slice(0, -1) : compact;
     };
-    const typeSig = (d) => Array.isArray(d.paramsStructured)
-        ? d.paramsStructured.map(p => sigType(p?.type)).join(',')
-        : null;
+    const signatureMemos = !index.isProvenanceFactIndex
+        ? index._opMemo?.('overloadTypeSignatures', () => new Map()) : null;
+    let signatureMemo = signatureMemos?.get(targetLanguage);
+    if (signatureMemos && !signatureMemo) {
+        signatureMemo = new WeakMap();
+        signatureMemos.set(targetLanguage, signatureMemo);
+    }
+    const typeSig = d => {
+        const cached = signatureMemo?.get(d);
+        if (cached !== undefined) return cached;
+        const signature = Array.isArray(d.paramsStructured)
+            ? d.paramsStructured.map(p => sigType(p?.type)).join(',') : null;
+        signatureMemo?.set(d, signature);
+        return signature;
+    };
     // C/C++ declarations and implementations are already closed into
     // `targetDefs` by _closeCallableIdentityGroup using opposite signature
     // roles plus include reachability. Parameter types alone are not enough:
@@ -23895,7 +24020,7 @@ function _overloadDiscipline(index, call, targetDefs, definitions, callerFile) {
     }
     if (targetLanguage === 'cpp' && call.isPathCall && family.length > 0 &&
         !family.some(definition =>
-            pinnedKeys.has(`${definition.file}:${definition.startLine}`))) {
+            pinnedKeys.has(pinKey(definition)))) {
         // The qualifier selects a modeled namespace family that does not
         // contain the pin (`fmt::vformat_to` versus
         // `detail::vformat_to`). This is exact negative identity evidence
@@ -23903,7 +24028,7 @@ function _overloadDiscipline(index, call, targetDefs, definitions, callerFile) {
         return 'other-overload';
     }
     if (family.length <= 1) return null;
-    if (family.every(d => pinnedKeys.has(`${d.file}:${d.startLine}`))) return null;
+    if (family.every(d => pinnedKeys.has(pinKey(d)))) return null;
     // Producer-return argument typing (fix #299B): a bare-identifier
     // producer (`paint(tint(3))`) types its argument position from the
     // project's declared return type — the #199/#207 return-type-flow rail
@@ -23944,20 +24069,20 @@ function _overloadDiscipline(index, call, targetDefs, definitions, callerFile) {
         ? _javaMostSpecificOverload(index, applicable, call, targetLanguage)
         : null;
     if (mostSpecific) {
-        return pinnedKeys.has(`${mostSpecific.file}:${mostSpecific.startLine}`)
+        return pinnedKeys.has(pinKey(mostSpecific))
             ? null : 'other-overload';
     }
-    const pinnedApplicable = applicable.some(d => pinnedKeys.has(`${d.file}:${d.startLine}`));
+    const pinnedApplicable = applicable.some(d => pinnedKeys.has(pinKey(d)));
     if (!pinnedApplicable) return 'other-overload';
     if (applicable.every(d =>
-        pinnedKeys.has(`${d.file}:${d.startLine}`))) {
+        pinnedKeys.has(pinKey(d)))) {
         return null;
     }
     if (applicable.length === 1) return null; // uniquely the pinned overload
     if (targetLanguage === 'cpp') {
         const winner = _cppExactOverloadWinner(call, applicable);
         if (winner) {
-            return pinnedKeys.has(`${winner.file}:${winner.startLine}`)
+            return pinnedKeys.has(pinKey(winner))
                 ? null : 'other-overload';
         }
     }
@@ -28191,7 +28316,7 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
                 const fieldType = _declaredFieldPathType(
                     index, rootType,
                     record.receiverFields || [record.receiverField],
-                    language, fieldInfo, record.receiverRootNamespace);
+                    language, fieldInfo, record.receiverRootNamespace, null, filePath);
                 if (fieldType) {
                     rt = {
                         type: fieldType,
@@ -28493,7 +28618,7 @@ function _foldChainedReceiverType(index, fileEntry, filePath, call, ctx) {
         const fieldInfo = {};
         const fieldType = _declaredFieldPathType(
             index, result.type, call.receiverFields,
-            fileEntry.language, fieldInfo);
+            fileEntry.language, fieldInfo, undefined, null, filePath);
         if (fieldType) {
             result = {
                 type: fieldType,

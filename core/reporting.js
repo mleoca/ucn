@@ -124,6 +124,7 @@ function getStats(index, options = {}) {
         // Ensure the calls cache is fully populated before counting.
         // First-time stats --hot may need to parse files to extract calls;
         // subsequent runs use the persisted calls cache.
+        require('./cache').ensureCallsCacheLoaded(index);
         if (typeof index.buildCalleeIndex === 'function' && !index.calleeIndex) {
             index.buildCalleeIndex();
         }

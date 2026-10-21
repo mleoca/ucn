@@ -19,7 +19,7 @@ const { detectLanguage, getParser, getLanguageAdapter, safeParse, langTraits, PA
 const { validateFileIR } = require('./ir');
 const { createFileEntryFromIR, populateFileEntryFromIR } = require('./index-ir');
 const { getTokenTypeAtPosition } = require('../languages/utils');
-const { escapeRegExp, NON_CALLABLE_TYPES, codeUnitCompare, literalNameRegex } = require('./shared');
+const { escapeRegExp, NON_CALLABLE_TYPES, codeUnitCompare, literalNameRegex, calleeNames } = require('./shared');
 const stacktrace = require('./stacktrace');
 const indexCache = require('./cache');
 // Loaded on first use (fix #375): most commands never reach dead-code
@@ -291,6 +291,13 @@ class ProjectIndex {
      * Returns null when parsing fails or no operation cache is active — callers
      * fall back to parsing themselves.
      */
+    _peekParsedTree(filePath, language) {
+        const cached = this._parsedTreeCache.get(filePath);
+        return cached && cached.language === language &&
+            cached.fileHash === (this.files.get(filePath)?.hash || null)
+            ? cached.tree : null;
+    }
+
     _getParsedTree(filePath, content, language) {
         if (!this._opTreeCache) return null;
         const cached = this._opTreeCache.get(filePath);
@@ -313,7 +320,8 @@ class ProjectIndex {
             const parser = getParser(language);
             // A language may read files through its own view of the source
             // (C# conditional compilation, fix #391); queries read the same.
-            const queryTree = parser && getLanguageAdapter(language)?.queryTree;
+            const queryTree = parser && !langTraits(language)?.plainQueryTree &&
+                getLanguageAdapter(language)?.queryTree;
             tree = !parser ? null : queryTree
                 ? queryTree(content, parser, this.files.get(filePath))
                 : safeParse(parser, content, undefined, PARSE_OPTIONS);
@@ -376,15 +384,10 @@ class ProjectIndex {
             if (cached !== undefined) return cached;
         }
 
-        const fileHash = this.files.get(filePath)?.hash || '';
-        const persistentKey = `${filePath}\0${fileHash}\0${name}${modeSuffix}`;
-        if (this._usageResultCache?.has(persistentKey)) {
-            const cached = this._usageResultCache.get(persistentKey);
-            // Map insertion order is the LRU order.
-            this._usageResultCache.delete(persistentKey);
-            this._usageResultCache.set(persistentKey, cached);
-            if (this._opUsagesCache) this._opUsagesCache.set(cacheKey, cached.value);
-            return cached.value;
+        const cached = indexCache.getUsageResult(this, filePath, name, mode);
+        if (cached !== undefined) {
+            if (this._opUsagesCache) this._opUsagesCache.set(cacheKey, cached);
+            return cached;
         }
 
         // Header language is resolved during indexing from compilation
@@ -421,19 +424,7 @@ class ProjectIndex {
                 this._opUsagesCache.set(cacheKey, usages);
             }
             if (Array.isArray(usages) && this._usageResultCache) {
-                const weight = 64 + usages.length * 40;
-                this._usageResultCache.set(persistentKey, { value: usages, weight });
-                this._usageResultCacheWeight += weight;
-                this.usageCacheDirty = true;
-                const maxEntries = 4096;
-                const maxWeight = 16 * 1024 * 1024;
-                while (this._usageResultCache.size > maxEntries ||
-                    this._usageResultCacheWeight > maxWeight) {
-                    const oldest = this._usageResultCache.entries().next().value;
-                    if (!oldest) break;
-                    this._usageResultCache.delete(oldest[0]);
-                    this._usageResultCacheWeight -= oldest[1].weight;
-                }
+                indexCache.storeUsageResult(this, filePath, name, mode, usages);
             }
             return usages;
         } catch (e) {
@@ -618,6 +609,8 @@ class ProjectIndex {
         }
 
         // Always invalidate caches on rebuild
+        this._callNameCache = null;
+        this._callsGenerationKey = null;
         this._completenessCache = null;
         this._attrTypeCache = null;
         this._computedDispatchBlindspots = null;
@@ -1182,39 +1175,10 @@ class ProjectIndex {
      */
     _addToCalleeIndex(filePath, calls) {
         if (!this.calleeIndex || !calls) return;
-        for (const call of calls) {
-            const name = call.name;
-            if (!this.calleeIndex.has(name)) {
-                this.calleeIndex.set(name, new Set());
-            }
-            this.calleeIndex.get(name).add(filePath);
-            if (call.resolvedName && call.resolvedName !== name) {
-                if (!this.calleeIndex.has(call.resolvedName)) {
-                    this.calleeIndex.set(call.resolvedName, new Set());
-                }
-                this.calleeIndex.get(call.resolvedName).add(filePath);
-            }
-            if (call.resolvedNames) {
-                for (const rn of call.resolvedNames) {
-                    if (rn !== name) {
-                        if (!this.calleeIndex.has(rn)) {
-                            this.calleeIndex.set(rn, new Set());
-                        }
-                        this.calleeIndex.get(rn).add(filePath);
-                    }
-                }
-            }
-            // A compiler-recognized type qualifier is also a semantic use of
-            // the receiver type: `JValue.Compare(...)` references both
-            // JValue and Compare. Index the receiver so class/type queries do
-            // not fall back to a full project scan or leave the occurrence as
-            // an unexplained call-not-resolved line.
-            if (call.receiverIsTypeQualified && call.receiver) {
-                if (!this.calleeIndex.has(call.receiver)) {
-                    this.calleeIndex.set(call.receiver, new Set());
-                }
-                this.calleeIndex.get(call.receiver).add(filePath);
-            }
+        for (const name of calleeNames(calls)) {
+            let files = this.calleeIndex.get(name);
+            if (!files) this.calleeIndex.set(name, files = new Set());
+            files.add(filePath);
         }
     }
 
@@ -1224,23 +1188,11 @@ class ProjectIndex {
      */
     _removeFromCalleeIndex(filePath, calls) {
         if (!this.calleeIndex || !calls) return;
-        for (const call of calls) {
-            const removeName = (n) => {
-                const fileSet = this.calleeIndex.get(n);
-                if (fileSet) {
-                    fileSet.delete(filePath);
-                    if (fileSet.size === 0) this.calleeIndex.delete(n);
-                }
-            };
-            removeName(call.name);
-            if (call.resolvedName && call.resolvedName !== call.name) removeName(call.resolvedName);
-            if (call.resolvedNames) {
-                for (const rn of call.resolvedNames) {
-                    if (rn !== call.name) removeName(rn);
-                }
-            }
-            if (call.receiverIsTypeQualified && call.receiver) {
-                removeName(call.receiver);
+        for (const name of calleeNames(calls)) {
+            const files = this.calleeIndex.get(name);
+            if (files) {
+                files.delete(filePath);
+                if (files.size === 0) this.calleeIndex.delete(name);
             }
         }
     }
@@ -1251,6 +1203,9 @@ class ProjectIndex {
      * Enables O(relevant files) lookup instead of O(all files) scan.
      */
     buildCalleeIndex() {
+        const names = require('./call-name-cache');
+        if (names.restore(this)) return;
+        const collected = new Map();
         const { getCachedCalls } = require('./callers');
         const { ensureCallsCacheLoaded } = require('./cache');
         const { withMacroExpansion } = require('./macro-expansion');
@@ -1263,7 +1218,9 @@ class ProjectIndex {
             const calls = cached ? withMacroExpansion(this, filePath, cached.calls, { materialize: false })
                 : getCachedCalls(this, filePath);
             this._addToCalleeIndex(filePath, calls);
+            names.capture(this, collected, filePath, calls);
         }
+        names.remember(this, collected);
     }
 
     /**

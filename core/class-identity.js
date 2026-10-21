@@ -40,6 +40,32 @@ const OWNER_CLASS_KINDS = new Set([
 const TRANSITIVE_IMPORT_DEPTH = 4;
 const TRANSITIVE_IMPORT_FILE_CAP = 2000;
 
+/** Complete a plain C-family declaration in the consuming translation unit.
+ * A declaration's name alone never selects a definition in another program. */
+function completeForwardDeclaration(index, declaration, useFile) {
+    if (!declaration?.forwardDeclaration || !useFile ||
+        !langTraits(index.files.get(declaration.file)?.language)?.textualIncludes ||
+        declaration.anonymousNamespace || declaration.ppBranch ||
+        declaration.generics?.length || declaration.specialization ||
+        declaration.lexicalScopeStartLine || declaration.typedefName) return declaration;
+    const { includeClosure, effectiveNamespace } = require('./cpp-scope');
+    const visible = includeClosure(index, useFile);
+    if (declaration.file !== useFile && !visible.has(declaration.file)) return declaration;
+    const namespace = effectiveNamespace(index, declaration);
+    const recordKind = kind => ['class', 'struct'].includes(kind) ? 'record' : kind;
+    const providers = (index.symbols.get(declaration.name) || []).filter(candidate =>
+        OWNER_CLASS_KINDS.has(candidate.type) && !candidate.forwardDeclaration &&
+        !candidate.aliasOf && !candidate.typedefName && !candidate.anonymousNamespace &&
+        !candidate.ppBranch && !candidate.generics?.length && !candidate.specialization &&
+        !candidate.lexicalScopeStartLine &&
+        langTraits(index.files.get(candidate.file)?.language)?.textualIncludes &&
+        recordKind(candidate.type) === recordKind(declaration.type) &&
+        (candidate.enclosingType || '') === (declaration.enclosingType || '') &&
+        effectiveNamespace(index, candidate) === namespace &&
+        (candidate.file === useFile || visible.has(candidate.file)));
+    return providers.length === 1 ? providers[0] : declaration;
+}
+
 function _state(index) {
     let state = index._classIdentity;
     if (!state) {
@@ -112,9 +138,13 @@ function classKeyOf(index, def) {
         // the same type-parameter count merge (`partial class P<T>` never
         // joins `partial class P`).
         const arity = def.typeArity ? `|${def.typeArity}` : '';
+        const lexicalScope = _enclosingScopeStart(index, def);
+        // A nested declaration can share every source line with its
+        // enclosing type. The recorded owner still distinguishes its scope.
+        const scope = def.enclosingType ? `${lexicalScope}:${def.enclosingType}` : lexicalScope;
         key = Array.isArray(def.modifiers) && def.modifiers.includes('partial')
             ? `partial|${def.namespace || ''}|${def.enclosingType || ''}|${def.name}${arity}`
-            : `${def.file}|${def.namespace || ''}|${_enclosingScopeStart(index, def)}|${def.name}${arity}`;
+            : `${def.file}|${def.namespace || ''}|${scope}|${def.name}${arity}`;
         state.classKeys.set(def, key);
     }
     return key;
@@ -1047,6 +1077,7 @@ module.exports = {
     ownerNameOf,
     classKeyOf,
     classDefsNamed,
+    completeForwardDeclaration,
     resolveClassRef,
     resolveQualifiedClassRef: _resolveQualifiedParent,
     ownerRefOf,
