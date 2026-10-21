@@ -631,9 +631,18 @@ function classifyC(node, language) {
         case 'qualified_identifier': {
             const scope = parent.childForFieldName('scope');
             if (field === 'name') {
-                const declarator = parent.parent?.type === 'function_declarator' &&
-                    isField(parent, 'declarator');
-                if (declarator && scope && textOf(scope).replace(/<.*$/, '').split('::').pop() === node.text) {
+                let qualified = parent;
+                while (qualified.parent?.type === 'qualified_identifier' && isField(qualified, 'name')) {
+                    qualified = qualified.parent;
+                }
+                const declarator = qualified.parent?.type === 'function_declarator' &&
+                    isField(qualified, 'declarator') ? qualified.parent : null;
+                let declaration = declarator;
+                while (declaration?.parent && (isField(declaration, 'declarator') ||
+                    ['reference_declarator', 'parenthesized_declarator', 'attributed_declarator'].includes(declaration.parent.type))) {
+                    declaration = declaration.parent;
+                }
+                if (declarator && !declaration.childForFieldName('type') && scope) {
                     return { role: 'ctor-qualified', qualifier: scope, qualifiedNode: parent };
                 }
                 return { role: 'type', cppQualified: true };
@@ -656,9 +665,11 @@ function classifyC(node, language) {
             const body = classNode?.childForFieldName('body');
             // `struct List<K>::Node { Node(..) }` names its class by the
             // qualified name's last segment (fix #396).
-            const className = classNode?.childForFieldName('name');
-            const classBase = className?.type === 'qualified_identifier'
-                ? textOf(className).split('::').pop().replace(/<.*$/s, '') : className?.text;
+            let className = classNode?.childForFieldName('name');
+            while (className && (className.type === 'qualified_identifier' || className.type === 'template_type')) {
+                className = className.childForFieldName('name') || className.namedChild(0);
+            }
+            const classBase = className?.text;
             if (classNode && body && contains(body, node) && classBase === node.text) {
                 return { role: 'ctor', classNode };
             }
@@ -2718,12 +2729,17 @@ function decide(resolver, file, entry, token, bindings, typeParams) {
             // the class its qualifier spells.
             const spelled = cppPrefix(node);
             if (spelled == null) return { verdict: 'unknown', reason: 'constructor-owner' };
-            const segments = spelled.split('::');
-            // `Sink<Mutex>::Sink(...)`: template arguments are not part of
-            // the class name the constructor repeats (fix #387).
-            const last = require('./cpp-scope').stripTemplateArguments(segments.pop()).trim();
-            if (last !== resolver.name) return { verdict: 'no', reason: 'other-type' };
-            return resolver.resolveCFamily(file, line, last, segments.length > 0 ? segments.join('::') : null);
+            const { resolveQualifier, includeClosure } = require('./cpp-scope');
+            const site = resolver.cppSiteContext(file, line);
+            // The qualifier may be an alias of the declaring class. Resolve
+            // its type identity, rather than renaming the alias declaration.
+            const owner = resolveQualifier(resolver.index, { file, line,
+                namespace: site.namespace, className: site.className }, spelled,
+            includeClosure(resolver.index, file));
+            if (owner.kind !== 'type') return { verdict: 'unknown', reason: 'constructor-owner' };
+            const verdict = resolver.judge(owner.classes);
+            return verdict.verdict === 'yes' && !owner.visible
+                ? { verdict: 'unknown', reason: 'not-in-include-closure' } : verdict;
         }
         case 'meminit': {
             // A member named like the type is initialized as a member.
@@ -2868,6 +2884,9 @@ function declVerdict(resolver, file, declNode, role = {}, nameLine = null) {
     // annotated or decorated declarations) is matched there first.
     const named = nameLine != null ? resolver.fileTypes(file).filter(d => d.nameLine === nameLine && kindOk(d)) : [];
     if (named.length > 0) return resolver.judge(named);
+    const exact = resolver.fileTypes(file).filter(d => d.nameLine == null && kindOk(d) &&
+        d.startLine === startLine && d.endLine === endLine);
+    if (exact.length > 0) return resolver.judge(exact);
     const defs = resolver.fileTypes(file).filter(d => d.nameLine == null && (d.endLine === endLine ||
         (d.startLine <= startLine + 1 && d.startLine >= startLine - 3 &&
             d.endLine >= endLine - 1 && d.endLine <= endLine + 1)) &&

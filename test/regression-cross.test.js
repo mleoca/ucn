@@ -18,6 +18,210 @@ const { execute } = require('../core/execute');
 const { computeReachability } = require('../core/entrypoints');
 const { tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR, runCli, runInteractive } = require('./helpers');
 
+describe('fix #416: an out-of-class constructor plans its declaring type rename', () => {
+    const cases = [
+        { label: 'a definition after its class body', file: 'main.cpp', files: {
+            'main.cpp': 'class Node {\npublic:\n explicit Node(int);\n ~Node();\n};\nNode::Node(int) {}\nNode::~Node() {}\nint main(){Node n(1);}\n',
+        } },
+        { label: 'a class declared in an included header', file: 'main.cpp', files: {
+            'node.hpp': 'struct Node {\n explicit Node(int);\n};\n',
+            'main.cpp': '#include "node.hpp"\nNode::Node(int) {}\nint main(){Node n(1);}\n',
+        } },
+        { label: 'qualified namesakes in different namespaces', file: 'main.cpp', ownerNamespace: 'first', files: {
+            'node.hpp': 'namespace first { struct Node { explicit Node(int); }; }\nnamespace second { struct Node { explicit Node(int); }; }\n',
+            'main.cpp': '#include "node.hpp"\nfirst::Node::Node(int) {}\nsecond::Node::Node(int) {}\nint main(){first::Node a(1); second::Node b(2);}\n',
+        } },
+        { label: 'a constructor of a class template', file: 'main.cpp', files: {
+            'main.cpp': 'template<class T> struct Node {\n explicit Node(T);\n};\ntemplate<class T> Node<T>::Node(T) {}\nint main(){Node<int> n(1);}\n',
+        } },
+        { label: 'a template header on a separate line', file: 'main.cpp', files: {
+            'main.cpp': 'template<class T>\nstruct Node {\n explicit Node(T);\n};\ntemplate<class T>\nNode<T>::Node(T) {}\nint main(){Node<int> n(1);}\n',
+        } },
+        { label: 'a constructor defined through a type alias', file: 'main.cpp', aliased: true, files: {
+            'main.cpp': 'struct Node {\n explicit Node(int);\n};\nusing Alias = Node;\nAlias::Node(int) {}\nint main(){Alias n(1);}\n',
+        } },
+        { label: 'an inline constructor in a partial specialization', file: 'main.cpp', syntaxConstructor: true,
+            ownerLine: 2, files: {
+                'main.cpp': 'template<class T,int Flag> struct Node;\ntemplate<class T> struct Node<T,1> {\n explicit Node(T) {}\n};\ntemplate<class T> struct Node<T,0> {\n explicit Node(T) {}\n};\nint main(){Node<int,1> a(1);Node<int,0> b(2);}\n',
+            } },
+        { label: 'an indexed constructor inside a macro-decorated class', file: 'main.cpp', files: {
+            'main.cpp': '#define API\nclass API Node {\npublic:\n explicit Node(int) {}\n};\nint main(){Node n(1);}\n',
+        } },
+        { label: 'an out-of-class constructor with an inline decoration macro', file: 'main.cpp', files: {
+            'main.cpp': '#define API inline\nstruct Node {\n explicit Node(int);\n int value_;\n};\nAPI Node::Node(int value) : value_(value) {}\nint main(){Node n(1);}\n',
+        } },
+    ];
+    for (const fixture of cases) {
+        it(fixture.label, () => {
+            const dir = tmp(fixture.files);
+            try {
+                const index = idx(dir);
+                const definitions = index.symbols.get('Node') || [];
+                const ctor = definitions.find(d => (d.type === 'constructor' || fixture.aliased && d.type === 'function' ||
+                    fixture.syntaxConstructor && d.type === 'method') &&
+                    d.relativePath === fixture.file && !d.isSignature &&
+                    (!fixture.ownerNamespace || d.namespace === fixture.ownerNamespace));
+                const owner = definitions.find(d => ['class', 'struct'].includes(d.type) &&
+                    (!fixture.ownerLine || d.startLine === fixture.ownerLine) &&
+                    (!fixture.ownerNamespace || d.namespace === fixture.ownerNamespace));
+                assert.ok(ctor, 'the constructor is indexed');
+                assert.ok(owner, 'the declaring type is indexed');
+                const handle = d => `${d.relativePath}:${d.nameLine || d.startLine}:${d.name}`;
+                const byType = execute(index, 'plan', { name: handle(owner), renameTo: 'Renamed' });
+                const byCtor = execute(index, 'plan', { name: handle(ctor), renameTo: 'Renamed' });
+                assert.strictEqual(byType.ok, true);
+                assert.strictEqual(byCtor.ok, true, byCtor.error);
+                assert.deepStrictEqual(byCtor.result.changes, byType.result.changes);
+                assert.ok(byCtor.result.changes.some(c => c.isDefinition && c.line === owner.startLine &&
+                    c.newExpression?.includes('Renamed')));
+                assert.ok(byCtor.result.changes.every(c => !c.needsReview));
+            } finally { rm(dir); }
+        });
+    }
+
+    it('a parameter naming a project type cannot prove a different constructor owner', () => {
+        const dir = tmp({
+            '.gitignore': 'vendor/\n',
+            'own.hpp': 'namespace own { struct Node {}; }\n',
+            'vendor/foreign.hpp': 'namespace foreign { struct Node { explicit Node(own::Node); }; }\n',
+            'main.cpp': '#include "own.hpp"\n#include "vendor/foreign.hpp"\nforeign::Node::Node(own::Node) {}\n',
+        });
+        try {
+            const index = idx(dir);
+            const ctor = (index.symbols.get('Node') || []).find(d => d.type === 'constructor' &&
+                d.relativePath === 'main.cpp');
+            assert.ok(ctor);
+            const result = execute(index, 'plan', { name: `main.cpp:${ctor.startLine}:Node`, renameTo: 'Renamed' });
+            assert.strictEqual(result.ok, false);
+            assert.match(result.error, /constructor owner could not be resolved/i);
+        } finally { rm(dir); }
+    });
+
+    it('a specialization must declare the constructor in the indexed owner', () => {
+        const dir = tmp({
+            '.gitignore': 'vendor/\n',
+            'node.hpp': 'template<class T> struct Node { explicit Node(T); };\n',
+            'vendor/spec.hpp': 'template<> struct Node<int> { explicit Node(const char*); };\n',
+            'main.cpp': '#include "node.hpp"\n#include "vendor/spec.hpp"\nNode<int>::Node(const char*) {}\nint main(){Node<int> n("one");}\n',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'plan', { name: 'main.cpp:3:Node', renameTo: 'Renamed' });
+            assert.strictEqual(result.ok, false);
+            assert.match(result.error, /constructor owner could not be resolved/i);
+        } finally { rm(dir); }
+    });
+
+    it('a namespace function named like its namespace is not a constructor type reference', () => {
+        const dir = tmp({ 'main.cpp': [
+            'namespace own { struct Node {}; }',
+            'namespace helper { namespace Node { int Node(int value) { return value; } } }',
+            'int use(){ return helper::Node::Node(1); }',
+            '',
+        ].join('\n') });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'plan', { name: 'main.cpp:1:Node', renameTo: 'Renamed' });
+            assert.strictEqual(result.ok, true);
+            assert.deepStrictEqual(result.result.changes.filter(c => c.newExpression && !c.needsReview)
+                .map(c => c.line), [1]);
+        } finally { rm(dir); }
+    });
+
+    it('a return type keeps an alias-qualified ordinary method out of the constructor path', () => {
+        const dir = tmp({ 'main.cpp': [
+            'struct Actual { int Alias(); };',
+            'using Alias = Actual;',
+            'int Alias::Alias(){ return 1; }',
+            'int use(){Actual value; return value.Alias();}',
+            '',
+        ].join('\n') });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'plan', { name: 'main.cpp:3:Alias', renameTo: 'Renamed' });
+            assert.strictEqual(result.ok, true, result.error);
+            const definition = result.result.changes.find(c => c.line === 3 && c.newExpression);
+            assert.ok(definition);
+            assert.strictEqual(definition.newExpression, 'int Alias::Renamed(){ return 1; }');
+            assert.ok(result.result.changes.every(c => !c.newExpression?.includes('struct Renamed')));
+        } finally { rm(dir); }
+    });
+
+    for (const returnType of ['const char*', 'Node&']) {
+        it(`${returnType}: a declarator wrapper preserves an ordinary method rename`, () => {
+            const source = `struct Node {\n ${returnType} get();\n};\n${returnType} Node::get(){ throw 0; }\nint use(Node& node){node.get();return 0;}\n`;
+            const dir = tmp({ 'main.cpp': source });
+            try {
+                const index = idx(dir);
+                const result = execute(index, 'plan', { name: 'main.cpp:4:get', renameTo: 'read' });
+                assert.strictEqual(result.ok, true, result.error);
+                assert.deepStrictEqual(result.result.changes.filter(c => c.newExpression && !c.needsReview)
+                    .map(c => c.line).sort((a, b) => a - b), [2, 4, 5]);
+                assert.ok(result.result.changes.some(c => c.newExpression === `${returnType} Node::read(){ throw 0; }`));
+            } finally { rm(dir); }
+        });
+    }
+
+    for (const fixture of [
+        { file: 'Node.java', code: 'class Node {\n int Node(int x){return x;}\n int use(){return Node(1);}\n}\n' },
+        { file: 'node.js', code: 'class Node {\n Node(x){return x;}\n use(){return this.Node(1);}\n}\n' },
+        { file: 'node.py', code: 'class Node:\n def Node(self,x): return x\n def use(self): return self.Node(1)\n' },
+        { file: 'node.go', code: 'package p\ntype Node struct{}\nfunc(n Node) Node(x int) int{return x}\nfunc use(n Node)int{return n.Node(1)}\n' },
+        { file: 'node.rs', code: 'struct Node;\nimpl Node {\n fn Node(&self,x:i32)->i32{x}\n fn use_it(&self)->i32{self.Node(1)}\n}\n' },
+    ]) {
+        it(`${fixture.file}: an ordinary method named like its owner keeps the type name`, () => {
+            const dir = tmp({ [fixture.file]: fixture.code });
+            try {
+                const index = idx(dir);
+                const member = (index.symbols.get('Node') || []).find(d => d.isMethod && d.type !== 'constructor');
+                assert.ok(member);
+                const result = execute(index, 'plan', { name: `${fixture.file}:${member.startLine}:Node`, renameTo: 'Renamed' });
+                assert.strictEqual(result.ok, true, result.error);
+                assert.ok(result.result.changes.some(c => c.isDefinition && c.newExpression?.includes('Renamed')));
+                assert.ok(result.result.changes.every(c => !c.newExpression ||
+                    !/\b(?:class|struct|type) Renamed\b/.test(c.newExpression)));
+            } finally { rm(dir); }
+        });
+    }
+
+    it('an in-class C# constructor still produces the complete class rename', () => {
+        const dir = tmp({ 'Node.cs': 'class Node {\n public Node(int value){}\n}\nclass Use { Node Build(){return new Node(1);} }\n' });
+        try {
+            const index = idx(dir);
+            const byClass = execute(index, 'plan', { name: 'Node.cs:1:Node', renameTo: 'Renamed' });
+            const byCtor = execute(index, 'plan', { name: 'Node.cs:2:Node', renameTo: 'Renamed' });
+            assert.strictEqual(byClass.ok, true);
+            assert.strictEqual(byCtor.ok, true);
+            assert.deepStrictEqual(byCtor.result.changes, byClass.result.changes);
+        } finally { rm(dir); }
+    });
+
+    const adjacentTypes = [
+        ['Node.java', 'class Left {static class Node {}}\nclass Right {static class Node {}}\n'],
+        ['Node.cs', 'namespace First {class Node {}}\nnamespace Second {class Node {}}\n'],
+        ['node.cpp', 'namespace first {struct Node {};}\nnamespace second {struct Node {};}\n'],
+    ];
+    for (const [file, source] of adjacentTypes) {
+        it(`${file}: a declaration's exact span distinguishes an adjacent namesake`, () => {
+            const dir = tmp({ [file]: source });
+            try {
+                const index = idx(dir);
+                const { isTypeRenamePin } = require('../core/type-references');
+                const definitions = (index.symbols.get('Node') || []).filter(isTypeRenamePin)
+                    .sort((a, b) => a.startLine - b.startLine);
+                assert.strictEqual(definitions.length, 2);
+                const [target, other] = definitions;
+                const result = execute(index, 'plan', { name: `${file}:${target.startLine}:Node`, renameTo: 'Renamed' });
+                assert.strictEqual(result.ok, true);
+                assert.ok(result.result.changes.some(c => c.isDefinition && !c.needsReview &&
+                    c.line === target.startLine && c.newExpression?.includes('Renamed')));
+                assert.ok(!result.result.changes.some(c => !c.needsReview && c.newExpression &&
+                    c.line === other.startLine));
+            } finally { rm(dir); }
+        });
+    }
+});
+
 describe('fix #415: value rename accounts retain runtime language boundaries', () => {
     const cases = [
         ['Account.java', 'class Account {\n int balance=1;\n int read(){return balance;}\n}'],

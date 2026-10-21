@@ -2955,6 +2955,65 @@ function memberAssignmentOwnerScope(index, def) {
     return 'external';
 }
 
+/** A named constructor outside its class body still names that class. */
+function constructorRenameOwner(index, member, requireConstructorSyntax = false) {
+    const owners = classDefsNamed(index, member.name).entries.map(entry => entry.def);
+    const contained = owners.filter(d => d.file === member.file &&
+        d.startLine <= member.startLine && d.endLine >= member.endLine)
+        .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))[0];
+    if (contained && (!requireConstructorSyntax || member.type === 'constructor' ||
+        member.memberType === 'constructor')) return contained;
+    const line = member.nameLine || member.startLine;
+    const token = renameIdentifierTokens(index, member.file, line, member.name, member.name,
+        null, null, { definitionNameOnly: true, definition: member });
+    if (token.columns?.length !== 1) return requireConstructorSyntax ? undefined : null;
+    if (requireConstructorSyntax) {
+        const entry = index.files.get(member.file);
+        const language = entry?.language;
+        const content = index._readFile(member.file);
+        const tree = index._getParsedTree?.(member.file, content, language) || safeParse(getParser(language), content);
+        const position = { row: line - 1, column: token.columns[0] };
+        const isConstructor = candidate => {
+            const node = candidate?.rootNode.descendantForPosition(position);
+            return node && ['ctor', 'ctor-qualified'].includes(referenceRole(node, language).role);
+        };
+        if (!isConstructor(tree)) {
+            // Decoration macros can make a constructor look return-typed.
+            // Read the same recovered declaration that the index verified.
+            const blanks = entry?.recoveryBlanks;
+            if (!blanks?.length) return undefined;
+            const module = require('../languages').LANGUAGES[language]?.module();
+            const fresh = entry.hash && require('crypto').createHash('md5').update(content).digest('hex') === entry.hash;
+            const recovered = module?.recoveredTree?.(content, getParser(language), fresh ? blanks : null);
+            if (!isConstructor(recovered)) return undefined;
+        }
+    }
+    if (contained) return contained;
+    const { typeReferenceSites } = require('./type-references');
+    const ground = { perFile: new Map([[member.file, new Set([line])]]) };
+    const proven = [];
+    for (const candidate of owners) {
+        const sites = typeReferenceSites(index, candidate, candidate.name, ground);
+        const columns = sites.files.get(member.file)?.lines.get(line)?.edits || [];
+        if (!columns.includes(token.columns[0])) continue;
+        // A class template name alone cannot identify an unindexed
+        // specialization's constructor. Its own declaration must agree.
+        const { _cFamilySignatureKey } = require('./callers');
+        const signature = _cFamilySignatureKey(member);
+        const declaredOwner = [...sites.resolver.group].find(owner => !owner.forwardDeclaration &&
+            (index.symbols.get(member.name) || []).some(declaration => declaration !== member &&
+                (declaration.type === 'constructor' || declaration.memberType === 'constructor') &&
+                declaration.file === owner.file && declaration.startLine >= owner.startLine &&
+                declaration.endLine <= owner.endLine && _cFamilySignatureKey(declaration) === signature));
+        if (declaredOwner) proven.push({ def: declaredOwner, group: sites.resolver.group });
+    }
+    if (!proven.length) return null;
+    const first = proven[0];
+    if (proven.some(hit => hit.group.size !== first.group.size ||
+        [...hit.group].some(def => !first.group.has(def)))) return null;
+    return first.def;
+}
+
 function plan(index, name, options = {}) {
     index._beginOp();
     // Every slot member of a rename is swept over the same files: their call
@@ -2980,12 +3039,21 @@ function plan(index, name, options = {}) {
     // A constructor or destructor carries its class's name (Java, C#, C++):
     // renaming it is renaming the class (fix #386).
     // (A C# member can never carry its type's name except the finalizer.)
-    if (options.renameTo && def.className === def.name && !isTypeRenamePin(def) &&
+    const constructorOwnerName = def.className && langTraits(index.files.get(def.file)?.language)?.textualIncludes
+        ? require('./cpp-scope').stripTemplateArguments(def.className).split('::').pop() : def.className;
+    const namedConstructor = constructorOwnerName === def.name && !isTypeRenamePin(def) &&
         (def.type === 'constructor' || def.memberType === 'constructor' ||
-            (def.type === 'method' && index.files.get(def.file)?.language === 'csharp'))) {
-        const owner = definitions.find(d => isTypeRenamePin(d) && d.file === def.file &&
-            d.startLine <= def.startLine && d.endLine >= def.endLine);
-        if (owner) def = owner;
+            (def.type === 'method' && index.files.get(def.file)?.language === 'csharp'));
+    const qualifiedCandidate = def.className && ['function', 'method'].includes(def.type) &&
+        langTraits(index.files.get(def.file)?.language)?.textualIncludes;
+    if (options.renameTo && (namedConstructor || qualifiedCandidate)) {
+        const owner = constructorRenameOwner(index, def, !namedConstructor ||
+            langTraits(index.files.get(def.file)?.language)?.textualIncludes);
+        if (owner !== undefined) {
+            if (!owner) return { found: true, function: name,
+                error: 'The constructor owner could not be resolved. Select the class declaration to plan its rename.' };
+            def = owner;
+        }
     }
     // BUG-BY: enrich types for typed-arrow-fn declarations.
     const arrowTypes = extractArrowTypesFromVarDecl(index, def);
