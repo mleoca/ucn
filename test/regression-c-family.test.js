@@ -7088,3 +7088,25 @@ describe('fix #402: a typename functional cast in a body keeps the members after
         } finally { rm(dir); }
     });
 });
+
+describe('fix #418: the constructor-owner proof is consulted only for members named like a project type', () => {
+    it('a method whose return type a macro writes keeps its ordinary rename', () => {
+        const dir = tmp({ 'main.cpp': '#define RET(t) t\nstruct Store {\n  int count();\n};\nRET(int) Store::count() { return 1; }\nint use(Store& s) { return s.count(); }\n' });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'plan', { name: 'main.cpp:5:count', renameTo: 'total' });
+            assert.strictEqual(result.ok, true, result.error);
+            assert.deepStrictEqual(result.result.changes.filter(c => c.newExpression && !c.needsReview).map(c => c.line).sort(),
+                [3, 5, 6]);
+        } finally { rm(dir); }
+    });
+    it('an alias-qualified constructor still plans its declaring type rename', () => {
+        const dir = tmp({ 'main.cpp': 'struct Node {\n explicit Node(int);\n};\nusing Alias = Node;\nAlias::Node(int) {}\nint main(){Alias n(1);}\n' });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'plan', { name: 'main.cpp:5:Node', renameTo: 'Renamed' });
+            assert.strictEqual(result.ok, true, result.error);
+            assert.ok(result.result.changes.some(c => c.line === 1 && c.newExpression?.includes('struct Renamed')));
+        } finally { rm(dir); }
+    });
+});

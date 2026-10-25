@@ -65,10 +65,9 @@ function typeNameStructure(tree) {
     return JSON.stringify(tokens);
 }
 
-const canonicalSources = new Map();
-const CANONICAL_SOURCE_MAX_BYTES = 8 * 1024 * 1024;
-const CANONICAL_SOURCE_MAX_ENTRIES = 256;
-let canonicalSourceBytes = 0;
+// Verdicts by source text (the text is the key; see core/source-memo.js).
+const canonicalSources = new (require('../core/source-memo').BoundedMap)({ maxEntries: 1024,
+    maxWeight: 32 * 1024 * 1024, weigh: (_verdict, source) => source.length * 2 });
 
 function parseNameSource(parser, source, safeParse) {
     // A NUL is legal literal/comment content, but the grammar cannot read it.
@@ -94,70 +93,68 @@ function parseNameSource(parser, source, safeParse) {
     return tree;
 }
 
+// typeNameStructure(tree) !== null for a source with no character a
+// noncanonical identifier test could reject: an error-free tree (MISSING
+// nodes count as errors) whose literals hold only literal parts. The full
+// token walk serves the other sources (fix #418: it walked every node of
+// every Java file an overload check read).
+function plainStructure(tree, source) {
+    if (!tree || tree.rootNode.hasError) return false;
+    if (noncanonicalIdentifier(source)) return typeNameStructure(tree) !== null;
+    return tree.rootNode.descendantsOfType(['string_literal', 'character_literal'])
+        .every(node => node.namedChildren.every(child => LITERAL_PARTS.has(child.type)));
+}
+
 // The index retains raw-source positions. Its type/name facts are usable
 // when lexical translation preserves the AST's names and structure. Literal
 // contents and comment text do not change Java's static argument types.
-function typeNameSourceCanonical(source) {
+// `parseError` (a value or a function giving it) is whether the index's
+// parse of this same content had errors, when known (fix #418): an
+// error-free source with no escape, no string template and no character an
+// identifier test could reject is canonical without a second parse; a source
+// with errors never is.
+function typeNameSourceCanonical(source, parseError = undefined) {
     if (typeof source !== 'string') return false;
-    if (canonicalSources.has(source)) {
-        const result = canonicalSources.get(source);
-        canonicalSources.delete(source);
-        canonicalSources.set(source, result);
-        return result;
-    }
-    const translated = translateUnicodeEscapes(source);
-    let canonical = false, rawTree = null, translatedTree = null;
-    try {
+    const saved = canonicalSources.get(source);
+    if (saved !== undefined) return saved;
+    const indexed = typeof parseError === 'function' ? parseError() : parseError;
+    let canonical = false;
+    if (indexed === true) canonical = false;
+    else if (indexed === false && !source.includes('\\u') && !source.includes('\\{') &&
+        !noncanonicalIdentifier(source)) canonical = true;
+    else {
+        const translated = translateUnicodeEscapes(source);
         if (translated !== null) {
             const { getParser, safeParse } = require('./index');
             const parser = getParser('java');
-            rawTree = safeParse(parser, source);
-            const before = typeNameStructure(rawTree);
-            if (before !== null) {
-                if (translated === source) canonical = true;
-                else {
-                    translatedTree = parseNameSource(parser, translated, safeParse);
-                    canonical = before === typeNameStructure(translatedTree);
-                }
+            const rawTree = safeParse(parser, source);
+            if (translated === source) canonical = plainStructure(rawTree, source);
+            else {
+                const before = typeNameStructure(rawTree);
+                if (before !== null) canonical = before === typeNameStructure(parseNameSource(parser, translated, safeParse));
             }
         }
-    } finally {
-        translatedTree?.delete?.();
-        rawTree?.delete?.();
     }
-    const bytes = source.length * 2;
-    if (bytes <= CANONICAL_SOURCE_MAX_BYTES) {
-        while (canonicalSources.size >= CANONICAL_SOURCE_MAX_ENTRIES ||
-            canonicalSourceBytes + bytes > CANONICAL_SOURCE_MAX_BYTES) {
-            const oldest = canonicalSources.keys().next().value;
-            canonicalSources.delete(oldest);
-            canonicalSourceBytes -= oldest.length * 2;
-        }
-        canonicalSources.set(source, canonical);
-        canonicalSourceBytes += bytes;
-    }
+    canonicalSources.set(source, canonical);
     return canonical;
 }
 
 function typeNameOwnersAt(source, site) {
     if (!typeNameSourceCanonical(source) || !Number.isInteger(site?.start)) return null;
-    const { getParser, safeParse } = require('./index');
-    const tree = safeParse(getParser('java'), source);
+    const tree = require('../core/source-memo').parsedSource('java', source);
     if (!tree) return null;
-    try {
-        let node = tree.rootNode.descendantForIndex(site.start, site.start + 1);
-        if (!node || node.startPosition.row + 1 !== site.line) return null;
-        const owners = [];
-        for (; node; node = node.parent) {
-            // An anonymous body can inherit type names from its own base.
-            if (node.type === 'class_body' && ['object_creation_expression', 'enum_constant'].includes(node.parent?.type)) return null;
-            if (['class_declaration', 'interface_declaration', 'enum_declaration',
-                'record_declaration', 'annotation_type_declaration'].includes(node.type)) {
-                owners.push({ start: node.startIndex, end: node.endIndex });
-            }
+    let node = tree.rootNode.descendantForIndex(site.start, site.start + 1);
+    if (!node || node.startPosition.row + 1 !== site.line) return null;
+    const owners = [];
+    for (; node; node = node.parent) {
+        // An anonymous body can inherit type names from its own base.
+        if (node.type === 'class_body' && ['object_creation_expression', 'enum_constant'].includes(node.parent?.type)) return null;
+        if (['class_declaration', 'interface_declaration', 'enum_declaration',
+            'record_declaration', 'annotation_type_declaration'].includes(node.type)) {
+            owners.push({ start: node.startIndex, end: node.endIndex });
         }
-        return owners.length ? owners : null;
-    } finally { tree.delete?.(); }
+    }
+    return owners.length ? owners : null;
 }
 
 module.exports = { translateUnicodeEscapes, typeNameSourceCanonical, typeNameOwnersAt };

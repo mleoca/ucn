@@ -1,8 +1,8 @@
 'use strict';
 
-const crypto = require('crypto');
 const { langTraits, getParser, getLanguageAdapter, safeParse } = require('../languages');
 const { getUsageResult, storeUsageResult } = require('./cache');
+const { indexedContent, syntaxMode } = require('./source-memo');
 const localNameTrees = new WeakSet();
 
 /** Bodies whose declarations cannot bind a name outside their own scope. */
@@ -99,10 +99,8 @@ function blankBodies(source, ranges, name) {
 function localQueryTree(index, file, entry, language, name, content) {
     const traits = langTraits(language);
     if (!traits.closedQueryBodies?.length || !entry.hash || !index._usageResultCache ||
-        index.isProvenanceFactIndex || crypto.createHash('md5').update(content).digest('hex') !== entry.hash) return null;
-    const mode = 'value-bodies-v4:' + crypto.createHash('sha256').update(JSON.stringify([
-        language, traits.closedQueryBodies, entry.conditionalViews, entry.recoveryBlanks,
-    ])).digest('hex');
+        index.isProvenanceFactIndex || !indexedContent(index, file, entry, content)) return null;
+    const mode = syntaxMode('valueBodies', [language, traits.closedQueryBodies, entry.conditionalViews, entry.recoveryBlanks]);
     const key = '\x01body-ranges';
     const value = getUsageResult(index, file, key, mode);
     const ranges = readRanges(value, content);

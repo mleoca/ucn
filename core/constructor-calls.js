@@ -4,7 +4,7 @@ const path = require('path');
 const { langTraits } = require('../languages');
 const { ownerDefinitionOf } = require('./class-identity');
 const { declarationIdentity, identityKey, sameDeclaration, validateConfirmation } = require('./provenance');
-const { captureOverload } = require('./provenance-overload');
+const { captureOverload, projectFact } = require('./provenance-overload');
 const { codeUnitCompare, NON_CALLABLE_TYPES } = require('./shared');
 
 const isConstructor = (def, index) => !def?.modifiers?.includes('destructor') &&
@@ -23,9 +23,37 @@ const sameSite = (call, site) => {
 const order = (a, b) => codeUnitCompare(a.relativePath || a.file, b.relativePath || b.file) ||
     a.line - b.line || (position(a).column ?? 0) - (position(b).column ?? 0);
 
+// Call records of one line, in record order (fix #418: every projected site
+// scanned all of its file's records).
+function callsOnLine(index, file, line) {
+    const calls = index.getCachedCalls(file) || [];
+    const memo = index._opMemo?.('constructionCallsByLine', () => new Map());
+    let saved = memo?.get(file);
+    if (!saved || saved.calls !== calls) {
+        const byLine = new Map();
+        for (const call of calls) {
+            let list = byLine.get(call.line);
+            if (!list) byLine.set(call.line, list = []);
+            list.push(call);
+        }
+        saved = { calls, byLine };
+        memo?.set(file, saved);
+    }
+    return saved.byLine.get(line) || [];
+}
+
 function ownMembers(index, owner) {
-    return (index.files.get(owner.file)?.symbols || []).filter(def =>
-        sameDeclaration(declarationIdentity(ownerDefinitionOf(index, def)), declarationIdentity(owner)));
+    // One owner-identity scan of the file per class and operation (fix #418:
+    // every construction site of a class rescanned its whole file). A
+    // witness view records the scan's reads itself.
+    const memo = index.isProvenanceFactIndex ? null : index._opMemo?.('constructorOwnMembers', () => new WeakMap());
+    const saved = memo?.get(owner);
+    const symbols = index.files.get(owner.file)?.symbols || [];
+    if (saved && saved.symbols === symbols) return saved.members;
+    const identity = declarationIdentity(owner);
+    const members = symbols.filter(def => sameDeclaration(declarationIdentity(ownerDefinitionOf(index, def)), identity));
+    memo?.set(owner, { symbols, members });
+    return members;
 }
 
 function ownConstructors(index, owner) { return ownMembers(index, owner).filter(def => isConstructor(def, index)); }
@@ -63,14 +91,23 @@ function constructionAliases(index) {
     return !index.isProvenanceFactIndex && index._opMemo?.('constructionAliases', build) || build();
 }
 
-function constructionTypeCandidates(index, name) {
+// The type names a spelling can reach through the alias dictionary. A
+// witness records this closure as one fact rather than every file the
+// dictionary scans (fix #418: a scan per witness was quadratic).
+function constructionTypeNames(index, name) {
+    const aliases = constructionAliases(index);
     const names = new Set([name]);
     for (let round = 0; round < 12; round++) {
         const size = names.size;
-        for (const current of [...names]) for (const target of constructionAliases(index).get(current) || []) names.add(target);
+        for (const current of [...names]) for (const target of aliases.get(current) || []) names.add(target);
         if (size === names.size) break;
     }
-    return [...names].flatMap(current => index.symbols.get(current) || [])
+    return [...names];
+}
+
+function constructionTypeCandidates(index, name) {
+    return projectFact(index, `construction-type-names:${name}`, live => constructionTypeNames(live, name))
+        .flatMap(current => index.symbols.get(current) || [])
         .filter(def => ['class', 'struct', 'record', 'enum', 'interface'].includes(def.type));
 }
 
@@ -202,21 +239,31 @@ function protocolFacts(index, owner) {
     return facts;
 }
 
-function constructionChoice(index, owner, call, classBinding, targets) {
+// The construction's target-independent evidence: the constructor family,
+// its overload witness and the site's type and name-scope witnesses. A
+// query over several constructors of one class reads each site once per
+// operation (fix #418); every witness is replayed against each target set.
+function constructionEvidence(index, owner, call, classBinding) {
+    const memo = classBinding && typeof classBinding === 'object' && call && typeof call === 'object' &&
+        !index.isProvenanceFactIndex ? index._opMemo?.('constructionEvidence', () => new WeakMap()) : null;
+    let byCall = memo?.get(classBinding);
+    if (memo && !byCall) memo.set(classBinding, byCall = new WeakMap());
+    let byOwner = byCall?.get(call);
+    if (byCall && !byOwner) byCall.set(call, byOwner = new Map());
+    const key = byOwner ? identityKey(declarationIdentity(owner)) : null;
+    if (key !== null && byOwner.has(key)) return byOwner.get(key);
+    const evidence = constructionEvidenceUncached(index, owner, call, classBinding);
+    if (key !== null) byOwner.set(key, evidence);
+    return evidence;
+}
+
+function constructionEvidenceUncached(index, owner, call, classBinding) {
     let members = ownConstructors(index, owner), declaring = owner, hierarchy = null;
     if (!members.length) {
         const inherited = require('./constructor-hierarchy').captureHierarchy(index, owner);
-        if (inherited) {
-            members = inherited.members; declaring = inherited.declaring; hierarchy = inherited.witness;
-        } else {
-            return { reason: 'constructor-inheritance-unresolved', provenance: {
-                rule: 'constructor-call', rules: ['constructor-call'], facts: {
-                    language: index.files.get(owner.file)?.language, site: classBinding?.facts?.site,
-                    targets: (targets || []).map(declarationIdentity),
-                } } };
-        }
+        if (!inherited) return { unresolved: true };
+        members = inherited.members; declaring = inherited.declaring; hierarchy = inherited.witness;
     }
-    targets ||= members;
     const language = index.files.get(owner.file).language;
     const protocol = protocolFacts(index, owner);
     const { selectProvenanceOverload } = require('./callers');
@@ -244,6 +291,20 @@ function constructionChoice(index, owner, call, classBinding, targets) {
             qualifier: call.constructorQualifier || call.receiver || null, functional: !!functional, construction: true,
             localShadow: !!call.localShadow,
         }, owner) : null;
+    return { members, declaring, hierarchy, language, protocol, overload, selected, chosen, nameScope, typeLookup };
+}
+
+function constructionChoice(index, owner, call, classBinding, targets) {
+    const evidence = constructionEvidence(index, owner, call, classBinding);
+    if (evidence.unresolved) {
+        return { reason: 'constructor-inheritance-unresolved', provenance: {
+            rule: 'constructor-call', rules: ['constructor-call'], facts: {
+                language: index.files.get(owner.file)?.language, site: classBinding?.facts?.site,
+                targets: (targets || []).map(declarationIdentity),
+            } } };
+    }
+    const { members, declaring, hierarchy, language, protocol, overload, selected, chosen, nameScope, typeLookup } = evidence;
+    targets ||= members;
     const facts = { language, site: classBinding?.facts?.site, targets: targets.map(declarationIdentity),
         constructorCall: { owner: declarationIdentity(declaring), members: members.map(declarationIdentity),
             ...(hierarchy && { constructedOwner: declarationIdentity(owner), hierarchy }),
@@ -304,9 +365,35 @@ function projectConstructorCalleeSites(index, owner, siteIds, readSite) {
         codeUnitCompare(identityKey(declarationIdentity(a.definition)), identityKey(declarationIdentity(b.definition)))) };
 }
 
+// A class's construction sites, read once per operation for every
+// constructor of the class a query projects (fix #418). Options carrying a
+// profile, statistics or a callback keep their own read.
+function classConstructionCalls(index, owner, options) {
+    const read = () => index.findCallers(owner.name, { ...options, profile: undefined,
+        constructorProjectionSource: true, targetDefinitions: [owner], collectAccount: true,
+        includeMethods: true, needsTotal: true });
+    if (options.profile || options.stats) return read();
+    let key;
+    try {
+        key = identityKey(declarationIdentity(owner)) + '\0' + JSON.stringify(Object.keys(options).sort()
+            .filter(name => name !== 'targetDefinitions' && name !== 'profile')
+            .map(name => [name, options[name]]), (_name, value) => {
+                if (typeof value === 'function' || typeof value === 'symbol' || value && typeof value === 'object' &&
+                    !Array.isArray(value) && Object.getPrototypeOf(value) !== Object.prototype) {
+                    throw new Error('unkeyed option');
+                }
+                return value;
+            });
+    } catch { return read(); }
+    const memo = index._opMemo?.('classConstructionCalls', () => new Map());
+    if (!memo) return read();
+    if (!memo.has(key)) memo.set(key, read());
+    return memo.get(key);
+}
+
 /** Add class constructions to a constructor's ordinary, explicitly named calls. */
 function projectConstructorCallers(index, name, options, result) {
-    if (options.constructorProjectionSource) return result;
+    if (options.constructorProjectionSource || options.constructorProjection === false) return result;
     const targets = options.targetDefinitions || index.symbols.get(name) || [];
     if (!targets.length || !targets.every(def => isConstructor(def, index))) return result;
     const owners = [];
@@ -330,12 +417,10 @@ function projectConstructorCallers(index, name, options, result) {
     const promoted = [], uncertain = [], excluded = [], replaced = new Set();
     for (const owner of owners) {
         const language = index.files.get(owner.file).language;
-        const classCalls = index.findCallers(owner.name, { ...options, profile: undefined,
-            constructorProjectionSource: true, targetDefinitions: [owner], collectAccount: true,
-            includeMethods: true, needsTotal: true });
+        const classCalls = classConstructionCalls(index, owner, options);
         const rows = [...classCalls, ...(classCalls.shadowEntries || []), ...(classCalls.unverifiedEntries || [])];
         for (const site of rows) {
-            let records = (index.getCachedCalls(site.file) || []).filter(call => sameSite(call, site));
+            let records = callsOnLine(index, site.file, site.line).filter(call => sameSite(call, site));
             if (records.length > 1 && records.some(call => call.implicitBase)) records = records.filter(call => call.implicitBase &&
                 call.name === (site.calledAs || owner.name) && constructionAliasBinding(index, site.file, call, [owner]));
             if (records.length !== 1) continue;
@@ -358,7 +443,7 @@ function projectConstructorCallers(index, name, options, result) {
     for (const site of [...result, ...(result.shadowEntries || [])].filter(site => !replaced.has(siteKey(site)))) {
         const language = index.files.get(site.file)?.language;
         const initializer = langTraits(language)?.constructorProtocol?.initializer;
-        const records = (index.getCachedCalls(site.file) || []).filter(call => sameSite(call, site));
+        const records = callsOnLine(index, site.file, site.line).filter(call => sameSite(call, site));
         if (targets.every(target => target.name === initializer) ||
             records.length === 1 && (records[0].isConstructor || records[0].constructorSyntax === 'delegation') &&
                 validateConfirmation(site.provenance, targets.map(declarationIdentity)).verdict === 'establishes-target') {

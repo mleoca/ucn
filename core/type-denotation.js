@@ -45,6 +45,7 @@ const fs = require('fs');
 const path = require('path');
 const { langTraits } = require('../languages');
 const { findCargoRoot, findGoModule } = require('./imports');
+const { projectFact, projectHas } = require('./provenance-overload');
 
 const TYPE_KINDS = new Set(['class', 'struct', 'interface', 'trait', 'enum', 'record', 'union']);
 
@@ -232,15 +233,20 @@ function projectNamespaces(index, language) {
     });
 }
 
+/** Does the project declare namespace/package `name`? A witness records
+ * the answer, never every file the inventory reads (fix #418). */
+function projectNamespaceDeclared(index, language, name) {
+    return projectHas(index, `namespaces:${language}`, name, live => projectNamespaces(live, language));
+}
+
 /** Is some leading dotted prefix of `qualified` (the full path excluded) a
  * namespace/package the project declares? `org.junit.Assert` is project
  * code when `org.junit` is a project package; nested types keep their
  * package prefix (`a.b.Outer.Inner`). */
 function hasProjectNamespacePrefix(index, language, qualified) {
-    const names = projectNamespaces(index, language);
     const segments = String(qualified).split('.');
     for (let i = segments.length - 1; i > 0; i--) {
-        if (names.has(segments.slice(0, i).join('.'))) return true;
+        if (projectNamespaceDeclared(index, language, segments.slice(0, i).join('.'))) return true;
     }
     return false;
 }
@@ -465,7 +471,7 @@ function scopedTypeDenotation(index, fileEntry, filePath, name, line, scoping) {
         }
         if (implicitHas) return { original: name, via: `${implicit.module}.${name}` };
         const external = onDemand.filter(module => !hasProjectNamespacePrefix(index, language, `${module}.${name}`) &&
-            !projectNamespaces(index, language).has(module));
+            !projectNamespaceDeclared(index, language, module));
         if (external.length === 0) return null;
         return { original: name, via: `${external[0]}.*`,
             ...(!external.every(module => standardRooted(language, module)) && { certain: false }) };
@@ -485,7 +491,8 @@ function scopedTypeDenotation(index, fileEntry, filePath, name, line, scoping) {
     // `using static T` also brings T's nested types (already abstained above).
     const usings = new Set([...scope.namespaces, ...scope.statics]);
     if (projectTypes.some(definition => usings.has(definition.namespace))) return null;
-    const external = [...usings].filter(module => !csharpDeclaredNames(index).namespaces.has(module));
+    const external = [...usings].filter(module =>
+        !projectHas(index, 'cs-declared-namespaces', module, live => csharpDeclaredNames(live).namespaces));
     return { original: name, via: external.length > 0 ? `${external.sort()[0]}.${name}` : name };
 }
 
@@ -551,10 +558,12 @@ function csharpResolveUsingName(index, written, enclosing) {
     const text = String(written || '').replace(/\s+/g, '').replace(/^global::/, '');
     if (!enclosing || !text) return text;
     const first = text.split('.')[0].replace(/<.*$/s, '');
-    const { namespaces, types } = csharpDeclaredNames(index);
     for (let parts = String(enclosing).split('.'); parts.length > 0; parts = parts.slice(0, -1)) {
         const candidate = `${parts.join('.')}.${first}`;
-        if (namespaces.has(candidate) || types.has(candidate)) return `${parts.join('.')}.${text}`;
+        if (projectHas(index, 'cs-declared-namespaces', candidate, live => csharpDeclaredNames(live).namespaces) ||
+            projectHas(index, 'cs-declared-types', candidate, live => csharpDeclaredNames(live).types)) {
+            return `${parts.join('.')}.${text}`;
+        }
     }
     return text;
 }
@@ -634,16 +643,16 @@ function csharpUsings(index, filePath, namespace = null, siteNode = null, syntax
         const scope = { namespaces: new Set(), statics: new Set(), aliases: new Map(),
             ambiguousAliases: new Set(), aliasSyntax: new Map(), aliasDefinitions: new Map(), scoped: namespace != null,
             namespaceScopes: new Map(), staticScopes: new Map(), staticSyntax: new Map(), unreadable: false };
-        const globals = memoized(index, '\x01cs-global-usings', () => {
+        const globals = projectFact(index, 'cs-global-usings', live => memoized(live, '\x01cs-global-usings', () => {
             const out = [];
-            for (const [, entry] of index.files) {
+            for (const [, entry] of live.files) {
                 if (entry.language !== 'csharp') continue;
                 for (const detail of entry.importDetails || []) {
                     if (detail.global && detail.module) out.push(detail);
                 }
             }
             return out;
-        });
+        }));
         for (const detail of globals) csharpAddDirective(scope, index, detail);
         const fileEntry = index.files.get(filePath);
         let local = fileEntry?.importDetails || [];
@@ -1226,6 +1235,7 @@ function stripExternalReceiverType(call, via) {
 }
 
 module.exports = {
+    memoizedDerivation: memoized,
     externalTypeDenotation,
     externalReceiverVerdict,
     externalProducerVia,

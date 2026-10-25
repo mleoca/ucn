@@ -2,6 +2,7 @@
 
 const crypto = require('crypto');
 const cache = require('./cache');
+const { indexedContent, parseViewParts, syntaxMode, SYNTAX_FAMILIES } = require('./source-memo');
 const { langTraits } = require('../languages');
 
 /** Cache AST-proved positions only; the caller resolves each binding anew. */
@@ -73,7 +74,8 @@ function declarationTokenSyntax(index, file, entry, content, line, name, definit
         identity = crypto.createHash('sha256').update(description).digest('hex');
     }
     catch { return null; }
-    const mode = state.mode.replace('call-token-v1:', 'declaration-token-v1:') + `:${line}:${identity}`;
+    const mode = state.mode.replace(`${SYNTAX_FAMILIES.callToken.prefix}:`, `${SYNTAX_FAMILIES.declarationToken.prefix}:`) +
+        `:${line}:${identity}`;
     const saved = cache.getUsageResult(index, file, name, mode);
     state.lines ||= content.split('\n');
     const text = state.lines[line - 1] || '';
@@ -98,10 +100,8 @@ function sourceState(index, file, entry, content, tree) {
     // Preserve the existing query-tree LRU and avoid rehashing a hot tree.
     if (!state && tree) return null;
     if (!state || state.content !== content || state.hash !== entry.hash) {
-        const eligible = crypto.createHash('md5').update(content).digest('hex') === entry.hash;
-        const mode = eligible ? 'call-token-v1:' + crypto.createHash('sha256').update(JSON.stringify([
-            entry.language, entry.conditionalViews, entry.recoveryBlanks, entry.externalMacroKey,
-        ])).digest('hex') : null;
+        const eligible = indexedContent(index, file, entry, content);
+        const mode = eligible ? syntaxMode('callToken', parseViewParts(entry)) : null;
         state = { content, hash: entry.hash, mode, names: new Map(), lines: null };
         memo?.set(file, state);
     }

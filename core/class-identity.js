@@ -33,6 +33,7 @@ const path = require('path');
 const { langTraits } = require('../languages');
 const { splitParentList } = require('./graph-build');
 const { genericArityOf } = require('../languages/utils');
+const { symbolsSpanning } = require('./shared');
 
 const OWNER_CLASS_KINDS = new Set([
     'class', 'struct', 'interface', 'trait', 'enum', 'record', 'union',
@@ -117,7 +118,9 @@ function _enclosingScopeStart(index, def) {
     const symbols = fileEntry?.symbols;
     if (!Array.isArray(symbols)) return 0;
     let best = null;
-    for (const s of symbols) {
+    // Only declarations holding the definition's first line can enclose it.
+    const around = def.endLine >= def.startLine ? symbolsSpanning(symbols, def.startLine) : symbols;
+    for (const s of around) {
         if (s === def || s.startLine == null || s.endLine == null) continue;
         if (s.startLine > def.startLine) continue;
         if (s.endLine < def.endLine) continue;

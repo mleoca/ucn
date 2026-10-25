@@ -41,6 +41,25 @@ const path = require('path');
 const { getParser, safeParse, langTraits, LANGUAGES } = require('../languages');
 const { sameNode } = require('../languages/utils');
 const { classKeyOf } = require('./class-identity');
+const { projectHas } = require('./provenance-overload');
+
+/** The namespaces (packages) a language's files declare, with each dotted prefix. */
+function declaredNamespacePrefixes(index, language) {
+    return require('./type-denotation').memoizedDerivation(index, `\x01ns-prefixes\x00${language}`, () => {
+        const namespaces = new Set();
+        for (const entry of index.files.values()) {
+            if (entry.language !== language) continue;
+            for (const s of entry.symbols || []) {
+                if (!s.namespace) continue;
+                const parts = s.namespace.split('.');
+                for (let i = 1; i <= parts.length; i++) namespaces.add(parts.slice(0, i).join('.'));
+            }
+        }
+        return namespaces;
+    });
+}
+const csharpNamespacePrefixes = index => declaredNamespacePrefixes(index, 'csharp');
+const javaPackagePrefixes = index => declaredNamespacePrefixes(index, 'java');
 
 const TYPE_RENAME_KINDS = new Set([
     'class', 'struct', 'interface', 'trait', 'enum', 'record', 'union', 'type',
@@ -1971,21 +1990,9 @@ class TypeReferenceResolver {
         return pythonModulePath(this.index, file, receiver, this.memo);
     }
 
-    javaPackages() {
-        const key = 'java-packages';
-        if (!this.memo.has(key)) {
-            const packages = new Set();
-            for (const entry of this.index.files.values()) {
-                if (entry.language !== 'java') continue;
-                for (const s of entry.symbols || []) {
-                    if (!s.namespace) continue;
-                    const parts = s.namespace.split('.');
-                    for (let i = 1; i <= parts.length; i++) packages.add(parts.slice(0, i).join('.'));
-                }
-            }
-            this.memo.set(key, packages);
-        }
-        return this.memo.get(key);
+    /** Does the project declare Java package `name` or one below it? */
+    javaPackageDeclared(name) {
+        return projectHas(this.index, 'java-package-prefixes', name, javaPackagePrefixes);
     }
 
     resolveJavaQualified(file, line, text, tok) {
@@ -1996,7 +2003,7 @@ class TypeReferenceResolver {
             return prefix === qualifier;
         });
         if (byFqnPrefix.length > 0) return this.judge(byFqnPrefix);
-        if (this.javaPackages().has(qualifier)) return { verdict: 'no', reason: 'other-package' };
+        if (this.javaPackageDeclared(qualifier)) return { verdict: 'no', reason: 'other-package' };
         const last = qualifier.split('.').pop();
         const nested = candidates.filter(d => d.enclosingType === last);
         if (nested.length > 0) {
@@ -2014,21 +2021,9 @@ class TypeReferenceResolver {
         return { verdict: 'unknown', reason: 'qualified-name' };
     }
 
-    csharpNamespaces() {
-        const key = 'cs-namespaces';
-        if (!this.memo.has(key)) {
-            const namespaces = new Set();
-            for (const entry of this.index.files.values()) {
-                if (entry.language !== 'csharp') continue;
-                for (const s of entry.symbols || []) {
-                    if (!s.namespace) continue;
-                    const parts = s.namespace.split('.');
-                    for (let i = 1; i <= parts.length; i++) namespaces.add(parts.slice(0, i).join('.'));
-                }
-            }
-            this.memo.set(key, namespaces);
-        }
-        return this.memo.get(key);
+    /** Does the project declare C# namespace `name` or one below it? */
+    csharpNamespaceDeclared(name) {
+        return projectHas(this.index, 'cs-namespace-prefixes', name, csharpNamespacePrefixes);
     }
 
     resolveCSharpQualified(file, line, text, tok) {
@@ -2056,7 +2051,6 @@ class TypeReferenceResolver {
         }
         chain.push('');
         const candidates = this.all.filter(d => d.name === this.name);
-        const namespaces = this.csharpNamespaces();
         for (const ns of chain) {
             const full = ns ? `${ns}.${qualifier}` : qualifier;
             const hits = candidates.filter(d => {
@@ -2068,7 +2062,7 @@ class TypeReferenceResolver {
                 return { verdict: 'unknown', reason: 'ambiguous-type' };
             }
             if (hits.length > 0) return this.judge(hits);
-            if (namespaces.has(full)) return { verdict: 'no', reason: 'other-namespace' };
+            if (this.csharpNamespaceDeclared(full)) return { verdict: 'no', reason: 'other-namespace' };
             if (alias) {
                 if (scope.aliasSyntax.get(head)?.includes('<')) {
                     return { verdict: 'unknown', reason: 'generic-alias-owner' };
@@ -2076,7 +2070,7 @@ class TypeReferenceResolver {
                 const expanded = [alias, ...qualifier.split('.').slice(1)].join('.');
                 return this.resolveCSharpQualified(file, line, 'global::' + expanded, tok);
             }
-            if (namespaces.has(ns ? `${ns}.${head}` : head)) return { verdict: 'no', reason: 'other-namespace' };
+            if (this.csharpNamespaceDeclared(ns ? `${ns}.${head}` : head)) return { verdict: 'no', reason: 'other-namespace' };
         }
         const last = qualifier.split('.').pop();
         if (candidates.some(d => d.enclosingType === last)) {

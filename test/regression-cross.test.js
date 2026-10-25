@@ -17097,3 +17097,22 @@ describe('fix #417: constructor deletion needs allocation-protocol evidence', ()
         } finally { rm(dir); }
     });
 });
+
+describe('fix #418: construction name scopes read the queried line of a shared parse', () => {
+    const { constructionNameScope } = require('../core/provenance-type');
+    for (const [language, file, source, typeParameter, ordinary] of [
+        ['cpp', 'a.cpp', 'template<class T>\nT make() { return T(); }\nstruct Box {};\nBox other() { return Box(); }\n', [2, 18, 'T'], [4, 21, 'Box']],
+        ['java', 'A.java', 'class A {\n  <T> T make(Class<T> c) { return null; }\n  Box other() { return new Box(); }\n}\nclass Box {}\n', [2, 6, 'T'], [3, 27, 'Box']],
+        ['csharp', 'A.cs', 'class A {\n  T Make<T>() where T : new() { return new T(); }\n  Box Other() { return new Box(); }\n}\nclass Box {}\n', [2, 43, 'T'], [3, 27, 'Box']],
+    ]) {
+        it(`${language}: a type parameter shadows a construction name; other tokens and non-tokens keep their answers`, () => {
+            const index = { files: new Map([[file, { language }]]), _readFile: () => source };
+            const at = ([line, column, name]) => constructionNameScope(index, { file, line, column, name, qualifier: null });
+            assert.strictEqual(at(typeParameter), false, 'the type parameter names the construction');
+            assert.strictEqual(at(ordinary), true, 'a project type is no type parameter');
+            assert.strictEqual(at([ordinary[0], ordinary[1] + 1, ordinary[2]]), null, 'no name token starts there');
+            assert.strictEqual(constructionNameScope(index, { file, line: typeParameter[0], column: typeParameter[1],
+                name: 'X', qualifier: '::Y' }), true, 'a global qualifier never names a type parameter');
+        });
+    }
+});

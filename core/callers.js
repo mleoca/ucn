@@ -5,7 +5,6 @@
  * as the first argument instead of using `this`.
  */
 
-const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { detectLanguage, getParser, getLanguageAdapter, langTraits } = require('../languages');
@@ -242,13 +241,6 @@ function getCachedCallsBearing(index, filePath, name, lineSet = null) {
     return records !== undefined ? records : getCachedCalls(index, filePath);
 }
 
-const _opStatMemos = new WeakMap(); // operation content cache -> Map<filePath, mtimeMs>
-function _opStatMemo(scope) {
-    let memo = _opStatMemos.get(scope);
-    if (!memo) { memo = new Map(); _opStatMemos.set(scope, memo); }
-    return memo;
-}
-
 function _getCachedCallsRaw(index, filePath, options = {}) {
     try {
         // Load this file's persisted records (its directory shard) if the
@@ -262,12 +254,7 @@ function _getCachedCallsRaw(index, filePath, options = {}) {
         // Fast path: check mtime first (stat is much faster than read+hash).
         // One stat per file per operation (fix #365): stats --hot and repo
         // visit the same callee files for hundreds of definitions.
-        const opStats = index._opContentCache ? _opStatMemo(index._opContentCache) : null;
-        let mtime = opStats ? opStats.get(filePath) : undefined;
-        if (mtime === undefined) {
-            mtime = fs.statSync(filePath).mtimeMs;
-            if (opStats) opStats.set(filePath, mtime);
-        }
+        const mtime = require('./source-memo').fileMtime(index, filePath);
 
         if (cached && cached.mtime === mtime) {
             // mtime matches - cache is likely valid
@@ -11154,9 +11141,10 @@ function _pythonClassFieldFacts(index, classDef) {
     let facts;
     try {
         const content = index._readFile(classDef.file);
-        const mode = `class-fields-v1:${classDef.startLine}`;
+        const { indexedContent, SYNTAX_FAMILIES } = require('./source-memo');
+        const mode = `${SYNTAX_FAMILIES.classFields.prefix}:${classDef.startLine}`;
         const cacheable = !index.isProvenanceFactIndex && index._usageResultCache && entry.hash &&
-            require('crypto').createHash('md5').update(content).digest('hex') === entry.hash;
+            indexedContent(index, classDef.file, entry, content);
         const cache = cacheable ? require('./cache') : null;
         const record = cache?.getUsageResult(index, classDef.file, classDef.name, mode);
         const names = value => Array.isArray(value) && value.every(name =>
@@ -14812,12 +14800,25 @@ function _scopeImportBindings(fileEntry, bindings, callLine) {
     return local.filter(l => l.size === nearest).map(l => l.b);
 }
 
-/** Imports visible as module attributes, never function/class locals. */
+/**
+ * Imports visible as module attributes, never function/class locals. A pure
+ * function of the file's bindings, declarations and import details, kept
+ * per bindings list (fix #418: each witness of a Python plan rescanned every
+ * declaration for every binding). The inputs are read on every call.
+ */
+const _moduleImportMemo = new WeakMap();
 function _moduleImportBindings(fileEntry) {
-    const bindings = _scopeImportBindings(fileEntry, fileEntry.importBindings || [], 0);
-    if (fileEntry.language !== 'python') return bindings;
-    return bindings.filter(b => !(fileEntry.symbols || []).some(s =>
+    const source = fileEntry.importBindings, symbols = fileEntry.symbols;
+    const details = fileEntry.importDetails, language = fileEntry.language;
+    const saved = source ? _moduleImportMemo.get(source) : undefined;
+    if (saved && saved.symbols === symbols && saved.details === details && saved.language === language) {
+        return saved.bindings;
+    }
+    let bindings = _scopeImportBindings(fileEntry, source || [], 0);
+    if (language === 'python') bindings = bindings.filter(b => !(symbols || []).some(s =>
         s.type === 'class' && s.startLine <= b.line && b.line <= s.endLine));
+    if (source) _moduleImportMemo.set(source, { symbols, details, language, bindings });
+    return bindings;
 }
 
 /**
@@ -19148,6 +19149,9 @@ function _containerDeclaresGlobal(index, container, name) {
 
 function _enclosingFunctionOfDefinition(index, def) {
     if (!def?.file || def.className || def.receiver) return null;
+    // A witness view records the file read; its declarations may be shared
+    // with other views (fix #418), so a memo cannot answer for it.
+    if (index.isProvenanceFactIndex) return _enclosingFunctionOfDefinitionUncached(index, def);
     if (_definitionContainerMemo.has(def)) return _definitionContainerMemo.get(def);
     const container = _enclosingFunctionOfDefinitionUncached(index, def);
     _definitionContainerMemo.set(def, container);
@@ -22230,10 +22234,9 @@ function _javaClassLiteralReturnInfo(index, definition, file, origin, argKinds) 
         _javaKnownReferenceConversion(index, parameter.type, definition, new Set(['java.lang.Class'])) !== true) return null;
     const start = parameter.type.indexOf('<'), end = parameter.type.lastIndexOf('>');
     if (start < 0 || _splitTopLevelGenericArgs(parameter.type.slice(start + 1, end)).join(',').trim() !== variable) return null;
-    const { safeParse } = require('../languages');
-    const tree = safeParse(getParser('java'), index._readFile(file));
+    const tree = require('./source-memo').parsedSource('java', index._readFile(file));
     if (!tree) return null;
-    try {
+    {
         const site = origin.site;
         let call = tree.rootNode.descendantForIndex(site.start, site.start + 1);
         while (call && !(call.startIndex === site.start && call.endIndex === site.end && call.type === site.nodeType)) call = call.parent;
@@ -22249,7 +22252,7 @@ function _javaClassLiteralReturnInfo(index, definition, file, origin, argKinds) 
         return { type: type.text, fromFile: file, origin: { file, written: type.text,
             site: { source: 'type', line: query.line, column: query.column,
                 start: type.startIndex, end: type.endIndex, nodeType: type.type } } };
-    } finally { tree.delete?.(); }
+    }
 }
 
 function _javaDefinitionReturnInfo(index, definition) {
@@ -22457,6 +22460,13 @@ function _producerReturnMethodGroup(index, owner, method, ownerFile, contextFile
 
 function _javaStaticTypeForKind(index, kind, contextFile = null) {
     if (!kind || kind === 'expr' || _isLambdaKind(kind) || kind === 'null') return null;
+    // One answer per argument kind and file in an operation, shared by every
+    // overload witness that asks (fix #418); a witness records its reads.
+    return require('./provenance-overload').sharedRead(index, `java-static-type\0${kind}\0${contextFile ?? ''}`,
+        view => _javaStaticTypeForKindUncached(view, kind, contextFile));
+}
+
+function _javaStaticTypeForKindUncached(index, kind, contextFile) {
     if (kind.startsWith('element:')) {
         const container = _javaStaticTypeForKind(index, kind.slice('element:'.length), contextFile);
         return container?.endsWith('[]') ? container.slice(0, -2) : null;
@@ -22830,10 +22840,11 @@ function _javaFormalMemberType(index, name, owner) {
 function _typeNamesCanonicalAt(index, writtenFile) {
     if (!writtenFile) return true;
     const file = path.isAbsolute(writtenFile) ? writtenFile : path.resolve(index.root, writtenFile);
-    const canonical = langTraits(index.files.get(file)?.language)?.typeNameSourceCanonical;
+    const language = index.files.get(file)?.language;
+    const canonical = langTraits(language)?.typeNameSourceCanonical;
     if (!canonical) return true;
     if (typeof index._readFile !== 'function') return false;
-    try { return canonical(index._readFile(file)); }
+    try { return require('./source-memo').typeNamesCanonical(index, file, canonical, language); }
     catch (error) {
         if (['ENOENT', 'EACCES', 'EPERM', 'EISDIR', 'ENOTDIR'].includes(error.code)) return false;
         throw error;
@@ -22956,10 +22967,10 @@ function _javaSimplePlatformArgument(index, origin, name) {
 function _javaInfersClassParameter(index, name, owner, origin) {
     const invocation = origin?.invocation;
     if (!owner?.sourceSpan || !invocation?.file || !invocation.site || !name) return false;
-    const { getParser, safeParse } = require('../languages');
-    const declaration = safeParse(getParser('java'), index._readFile(owner.file));
+    const { parsedSource } = require('./source-memo');
+    const declaration = parsedSource('java', index._readFile(owner.file));
     if (!declaration) return false;
-    try {
+    {
         const span = owner.sourceSpan;
         let node = declaration.rootNode.descendantForIndex(span.start, span.start + 1);
         while (node && !(node.startIndex === span.start && node.endIndex === span.end &&
@@ -22973,19 +22984,17 @@ function _javaInfersClassParameter(index, name, owner, origin) {
         const parameters = node.childForFieldName('parameters');
         if (parameters?.namedChildren.filter(p => ['formal_parameter', 'spread_parameter'].includes(p.type)).length !== 1) return false;
         if (parameters?.descendantsOfType('type_identifier').filter(t => t.text === name).length !== 1) return false;
-    } finally { declaration.delete?.(); }
+    }
     const file = path.resolve(index.root, invocation.file), site = invocation.site;
     if (!_typeNamesCanonicalAt(index, file) || !Number.isInteger(site.start) || !Number.isInteger(site.end)) return false;
-    const tree = safeParse(getParser('java'), index._readFile(file));
+    const tree = parsedSource('java', index._readFile(file));
     if (!tree) return false;
-    try {
-        let node = tree.rootNode.descendantForIndex(site.start, site.start + 1);
-        while (node && !(node.startIndex === site.start && node.endIndex === site.end && node.type === site.nodeType)) node = node.parent;
-        while (node && !['method_invocation', 'object_creation_expression', 'explicit_constructor_invocation'].includes(node.type)) node = node.parent;
-        if (!node || node.hasError || node.childForFieldName('type_arguments')?.namedChildCount) return false;
-        return node.type === 'method_invocation' ? node.childForFieldName('name')?.text === owner.name
-            : owner.type === 'constructor';
-    } finally { tree.delete?.(); }
+    let node = tree.rootNode.descendantForIndex(site.start, site.start + 1);
+    while (node && !(node.startIndex === site.start && node.endIndex === site.end && node.type === site.nodeType)) node = node.parent;
+    while (node && !['method_invocation', 'object_creation_expression', 'explicit_constructor_invocation'].includes(node.type)) node = node.parent;
+    if (!node || node.hasError || node.childForFieldName('type_arguments')?.namedChildCount) return false;
+    return node.type === 'method_invocation' ? node.childForFieldName('name')?.text === owner.name
+        : owner.type === 'constructor';
 }
 
 function _javaKnownArgumentConversion(index, kind, paramType, owner, argumentOrigin = null) {
@@ -23576,21 +23585,18 @@ function _javaVariadicArgumentMatches(index, call, kind, type, position, typePar
     if (!entry?.language || !Number.isInteger(site.start) || !Number.isInteger(site.end) || !site.nodeType) return true;
     const source = index._readFile(file);
     if (site.start < 0 || site.end > source.length || site.end <= site.start) return true;
-    const { getParser, safeParse } = require('../languages');
-    const tree = safeParse(getParser(entry.language), source);
+    const tree = require('./source-memo').parsedSource(entry.language, source);
     if (!tree) return true;
-    try {
-        let node = tree.rootNode.descendantForIndex(site.start, site.start + 1);
-        while (node && !(node.startIndex === site.start && node.endIndex === site.end && node.type === site.nodeType)) node = node.parent;
-        while (node && !['method_invocation', 'object_creation_expression', 'explicit_constructor_invocation'].includes(node.type)) node = node.parent;
-        const argument = node?.childForFieldName('arguments')?.namedChildren
-            .filter(child => !child.type.endsWith('comment'))[position];
-        const cast = argument?.type === 'cast_expression' ? argument.childForFieldName('type') : null;
-        if (!cast) return true;
-        return !_javaPlatformProducerIdentity(index, sdk, { file, written: cast.text,
-            site: { start: cast.startIndex, line: cast.startPosition.row + 1 } },
-        sdk.split('.').pop(), sdk.split('.')[0]);
-    } finally { tree.delete?.(); }
+    let node = tree.rootNode.descendantForIndex(site.start, site.start + 1);
+    while (node && !(node.startIndex === site.start && node.endIndex === site.end && node.type === site.nodeType)) node = node.parent;
+    while (node && !['method_invocation', 'object_creation_expression', 'explicit_constructor_invocation'].includes(node.type)) node = node.parent;
+    const argument = node?.childForFieldName('arguments')?.namedChildren
+        .filter(child => !child.type.endsWith('comment'))[position];
+    const cast = argument?.type === 'cast_expression' ? argument.childForFieldName('type') : null;
+    if (!cast) return true;
+    return !_javaPlatformProducerIdentity(index, sdk, { file, written: cast.text,
+        site: { start: cast.startIndex, line: cast.startPosition.row + 1 } },
+    sdk.split('.').pop(), sdk.split('.')[0]);
 }
 
 // A variadic Java declaration also participates before expansion when its
@@ -25808,7 +25814,8 @@ function _isConfigurationAlternative(index, a, b) {
  */
 const _ownerPathMemo = new WeakMap();
 function _ownerNamePath(index, def) {
-    let cached = _ownerPathMemo.get(def);
+    // A witness view records the file read (see _enclosingFunctionOfDefinition).
+    let cached = index.isProvenanceFactIndex ? undefined : _ownerPathMemo.get(def);
     if (cached !== undefined) return cached;
     const symbols = index.files.get(def.file)?.symbols || [];
     const enclosing = [];
@@ -25820,7 +25827,7 @@ function _ownerNamePath(index, def) {
     }
     enclosing.sort((x, y) => (x.startLine - y.startLine) || (y.endLine - x.endLine));
     cached = enclosing.map(symbol => symbol.name).join('\0');
-    _ownerPathMemo.set(def, cached);
+    if (!index.isProvenanceFactIndex) _ownerPathMemo.set(def, cached);
     return cached;
 }
 

@@ -1,9 +1,10 @@
 'use strict';
 
-const { langTraits, getParser, safeParse } = require('../languages');
+const { langTraits, getParser } = require('../languages');
+const { parsedSource } = require('./source-memo');
 const { referenceScope } = require('../languages/lexical-scope');
 const { declarationIdentity, sameDeclaration, identityKey } = require('./provenance');
-const { factIndex } = require('./provenance-overload');
+const { factIndex, sealFacts, replayed, seedReplay } = require('./provenance-overload');
 const { FILE_FIELDS, resolveTypeLookup } = require('./provenance-type');
 
 function basesOf(index, owner, config) {
@@ -11,9 +12,9 @@ function basesOf(index, owner, config) {
     const source = index._readFile(owner.file);
     const content = config.source ? config.source(source, getParser(language)) : source;
     if (content == null) return null;
-    const tree = safeParse(getParser(config.syntaxLanguage || language), content);
+    const tree = parsedSource(config.syntaxLanguage || language, content);
     if (!tree) return null;
-    try {
+    {
         const nodes = tree.rootNode.descendantsOfType(config.classNodes).filter(node =>
             node.childForFieldName('name')?.text === owner.name &&
             node.startPosition.row + 1 >= owner.startLine && node.endPosition.row + 1 === owner.endLine);
@@ -58,7 +59,7 @@ function basesOf(index, owner, config) {
             parents.push(candidates[0]);
         }
         return parents;
-    } finally { tree.delete?.(); }
+    }
 }
 
 function selectHierarchy(index, identity) {
@@ -114,21 +115,29 @@ function captureHierarchy(index, owner) {
         const declaring = (index.symbols.get(result.declaring.name) || []).find(def =>
             sameDeclaration(declarationIdentity(def), declarationIdentity(result.declaring)));
         if (!declaring) return null;
-        return { declaring, members: require('./constructor-calls').ownConstructors(index, declaring),
-            witness: { constructed, reads } };
+        const witness = { constructed, reads: sealFacts(reads) };
+        seedReplay(witness.reads, JSON.stringify(['hierarchy', constructed]), {
+            declaring: declarationIdentity(result.declaring), members: result.members.map(declarationIdentity) });
+        return { declaring, members: require('./constructor-calls').ownConstructors(index, declaring), witness };
     } catch { return null; }
 }
 
 function validateHierarchy(witness, constructed, declaring, members) {
     if (!witness || !sameDeclaration(witness.constructed, constructed)) return false;
-    try {
-        const index = factIndex(witness.reads, undefined, FILE_FIELDS);
-        const result = selectHierarchy(index, constructed);
-        return !!result && !index.hasMissingProvenanceFacts &&
-            sameDeclaration(declarationIdentity(result.declaring), declaring) &&
-            result.members.length === members.length && result.members.every(def =>
-                members.some(member => sameDeclaration(declarationIdentity(def), member)));
-    } catch { return false; }
+    let key;
+    try { key = JSON.stringify(['hierarchy', constructed]); }
+    catch { return false; }
+    const result = replayed(witness.reads, key, () => {
+        try {
+            const index = factIndex(witness.reads, undefined, FILE_FIELDS);
+            const selected = selectHierarchy(index, constructed);
+            return selected && !index.hasMissingProvenanceFacts ? { declaring: declarationIdentity(selected.declaring),
+                members: selected.members.map(declarationIdentity) } : null;
+        } catch { return null; }
+    });
+    return !!result && sameDeclaration(result.declaring, declaring) &&
+        result.members.length === members.length && result.members.every(def =>
+            members.some(member => sameDeclaration(def, member)));
 }
 
 module.exports = { captureHierarchy, validateHierarchy };

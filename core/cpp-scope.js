@@ -23,7 +23,8 @@
  * Everything is memoized on the index (`_cppScope`) and reset at build/load.
  */
 
-const { codeUnitCompare, isValueDefinition } = require('./shared');
+const { codeUnitCompare, isValueDefinition, symbolsSpanning } = require('./shared');
+const { projectFact } = require('./provenance-overload');
 
 const TYPE_KINDS = new Set(['class', 'struct', 'union', 'enum', 'interface']);
 const MAX_ALIAS_HOPS = 8;
@@ -182,8 +183,7 @@ function namespaceAt(index, file, line) {
     let ownSpan = Infinity;
     // The innermost definition containing the line carries the AST
     // namespace of that position.
-    for (const symbol of entry?.symbols || []) {
-        if (symbol.startLine > line || symbol.endLine < line) continue;
+    for (const symbol of symbolsSpanning(entry?.symbols, line)) {
         const span = symbol.endLine - symbol.startLine;
         if (span < ownSpan) {
             ownSpan = span;
@@ -208,6 +208,10 @@ function* _namespaceInventory(index, namespaces) {
 }
 
 function _hasNamespace(index, namespace) {
+    // A witness records the answer, never the project-wide inventory (fix #418).
+    if (index.isProvenanceFactIndex) {
+        return projectFact(index, `cpp-namespace:${namespace}`, live => _hasNamespace(live, namespace));
+    }
     const state = _state(index);
     if (!state.inventory) state.inventory = new Set();
     if (state.inventory.has(namespace)) return true;

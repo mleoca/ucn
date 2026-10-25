@@ -1,15 +1,13 @@
 'use strict';
 
-const crypto = require('crypto');
 const cache = require('./cache');
+const { indexedContent, parseViewParts, syntaxMode } = require('./source-memo');
 
 /** Source positions only; no binding or ownership decisions are retained. */
 function textUsageSyntax(index, file, entry, content, name) {
     const eligible = entry.hash && index._usageResultCache && !index.isProvenanceFactIndex &&
-        crypto.createHash('md5').update(content).digest('hex') === entry.hash;
-    const mode = eligible ? 'usage-text-v1:' + crypto.createHash('sha256').update(JSON.stringify([
-        entry.language, entry.conditionalViews, entry.recoveryBlanks, entry.externalMacroKey,
-    ])).digest('hex') : null;
+        indexedContent(index, file, entry, content);
+    const mode = eligible ? syntaxMode('usageText', parseViewParts(entry)) : null;
     const stored = eligible ? cache.getUsageResult(index, file, name, mode) : null;
     const facts = new Map();
     if (Array.isArray(stored) && stored.every(fact => Array.isArray(fact) && fact.length === 3 &&

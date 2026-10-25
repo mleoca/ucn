@@ -1539,7 +1539,7 @@ function rustRawPointerTypeOf(typeNode) {
     return current.children.some(child => child.type === 'mutable_specifier') ? '*mut' : '*const';
 }
 
-const primitiveTypeInfoCache = new Map();
+const primitiveTypeInfoCache = new (require('../core/source-memo').BoundedMap)({ maxEntries: 256 });
 
 /** Primitive identity of a declared type, independent of nominal names. */
 function getPrimitiveTypeInfo(text, parser) {
@@ -1557,9 +1557,6 @@ function getPrimitiveTypeInfo(text, parser) {
         ...(deref && { derefVia: Object.freeze([...deref.via]),
             derefOuterRef: deref.outerRef }),
     }) : null;
-    if (primitiveTypeInfoCache.size >= 256) {
-        primitiveTypeInfoCache.delete(primitiveTypeInfoCache.keys().next().value);
-    }
     primitiveTypeInfoCache.set(text, info);
     return info;
 }

@@ -9432,3 +9432,38 @@ describe('fix #402: class-body compound statements, inherited instance fields, f
         } finally { rm(dir); }
     });
 });
+
+describe('fix #418: a protocol-blocked initializer rename never lists class constructions', () => {
+    it('the blocked __init__ rename keeps its named calls; a signature plan keeps the constructions', () => {
+        const { tmp, rm, idx } = require('./helpers');
+        const { execute } = require('../core/execute');
+        const dir = tmp({
+            'shapes.py': [
+                'class Base:',
+                '    def __init__(self, v):',
+                '        self.v = v',
+                'class Child(Base):',
+                '    def __init__(self, v):',
+                '        super().__init__(v)',
+                'def build():',
+                '    return Base(1), Child(2)',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const rename = execute(index, 'plan', { name: 'shapes.py:2:__init__', renameTo: 'setup' });
+            assert.strictEqual(rename.ok, true, rename.error);
+            const result = rename.result;
+            const definition = result.changes.find(change => change.line === 2 && change.editKind === 'definition');
+            assert.ok(definition?.needsReview && /protocol member dispatched by name/.test(definition.suggestion));
+            assert.ok(result.changes.some(change => change.line === 6), 'the named super() call stays listed');
+            const listed = [...result.changes, ...(result.reviewItems || []), ...(result.unverifiedSites || [])];
+            assert.ok(!listed.some(site => site.line === 8), 'Base(1) is no call site of a blocked rename');
+            const signature = execute(index, 'plan', { name: 'shapes.py:2:__init__', addParam: 'extra' });
+            assert.strictEqual(signature.ok, true, signature.error);
+            assert.ok([...signature.result.changes, ...(signature.result.unverifiedSites || [])]
+                .some(site => site.line === 8), 'a signature change still reaches the construction');
+        } finally { rm(dir); }
+    });
+});

@@ -1554,7 +1554,7 @@ function findCallsInCode(code, parser) {
         if (!ownerNode) {
             const owner = findEnclosingClassName(node);
             return owner ? { owner, written: owner, site: typeOrigin('call', node),
-                arities: [getCallArgs(node).argCount], methods: [method] } : null;
+                arities: [getCallArgCount(node)], methods: [method] } : null;
         }
         while (ownerNode?.type === 'parenthesized_expression' &&
             ownerNode.namedChildCount === 1) {
@@ -1564,7 +1564,7 @@ function findCallsInCode(code, parser) {
             const parent = methodCallPathOf(ownerNode);
             return parent
                 ? { ...parent, methods: [...parent.methods, method],
-                    arities: [...parent.arities, getCallArgs(node).argCount] }
+                    arities: [...parent.arities, getCallArgCount(node)] }
                 : null;
         }
         let ownerType = null;
@@ -1579,7 +1579,7 @@ function findCallsInCode(code, parser) {
         }
         return ownerType
             ? { owner: qualifyTypeName(ownerType), written: ownerType,
-                site: typeOrigin('call', node), arities: [getCallArgs(node).argCount], methods: [method] }
+                site: typeOrigin('call', node), arities: [getCallArgCount(node)], methods: [method] }
             : null;
     };
     const argKindOf = (arg) => {
@@ -1766,6 +1766,17 @@ function findCallsInCode(code, parser) {
                 return arg.namedChildCount === 1 ? argKindOf(arg.namedChild(0)) : 'expr';
             default: return 'expr';
         }
+    };
+    // The argument count alone: a chain records each hop's arity without
+    // deriving every nested argument's kind again (fix #418).
+    const getCallArgCount = (callNode) => {
+        const argsNode = callNode.childForFieldName('arguments');
+        if (!argsNode) return 0;
+        let count = 0;
+        for (let i = 0; i < argsNode.namedChildCount; i++) {
+            if (!argsNode.namedChild(i).type.endsWith('comment')) count++;
+        }
+        return count;
     };
     const getCallArgs = (callNode) => {
         const argsNode = callNode.childForFieldName('arguments');

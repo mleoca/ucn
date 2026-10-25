@@ -6577,3 +6577,31 @@ describe('fix #401: Java super in enum-constant bodies, nested-class member scop
         } finally { rm(dir); }
     });
 });
+
+describe('fix #418: the indexed parse decides Java type-name canonicality without a second parse', () => {
+    it('a hint from the index agrees with a fresh derivation for every source shape', () => {
+        const modulePath = require.resolve('../languages/java-unicode');
+        const fresh = () => { delete require.cache[modulePath]; return require('../languages/java-unicode'); };
+        const { getParser, safeParse } = require('../languages');
+        const sources = [
+            'class A { int x; }',
+            'class A { String s = "plain"; char c = \'a\'; }',
+            'class \\u0041B { }',
+            'class A { String s = "\\u0022"; }',
+            'class A { void f() { int x = ; } }',
+            'class A { String s = STR."v \\{x}"; }',
+            'class A { String t = """\n  text\n"""; }',
+            'class A​ { }',
+            'class A { /* ​ */ }',
+            'class A { String s = "​"; }',
+            'class A { // \u0007\n }',
+            '',
+        ];
+        const hinted = fresh(), derived = fresh();
+        for (const source of sources) {
+            const parseError = !!safeParse(getParser('java'), source).rootNode.hasError;
+            assert.strictEqual(hinted.typeNameSourceCanonical(source, () => parseError),
+                derived.typeNameSourceCanonical(source), JSON.stringify(source));
+        }
+    });
+});

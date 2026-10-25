@@ -3,6 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const { calleeNames, codeUnitCompare } = require('./shared');
+const { fileMtime } = require('./source-memo');
 const { version } = require('../package.json');
 
 // Call-record names only. Binding, dispatch, aliases and type queries still
@@ -127,7 +128,7 @@ function absent(index, file, name) {
     // Match the raw record cache's mtime rule. Changed source must reach
     // its normal read/hash/reparse path even if its previous names lacked
     // this query. No negative binding or ownership verdict is cached.
-    try { return fs.statSync(file).mtimeMs === item.mtime; } catch (_) { return false; }
+    try { return fileMtime(index, file) === item.mtime; } catch (_) { return false; }
 }
 
 module.exports = { capture, remember, save, load, restore, absent };

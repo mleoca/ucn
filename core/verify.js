@@ -978,6 +978,7 @@ function contractedCallerSweep(index, name, def, options = {}) {
         includeMethods: true,
         targetDefinitions: [def],
         collectAccount: true,
+        ...(options.constructionSites === false && { constructorProjection: false }),
     });
 
     const confirmed = [];
@@ -1404,7 +1405,7 @@ function computePlanCallSites(index, name, def, options = {}) {
     // caller file) serves signature changes (fix #396).
     const analyzeArgs = options.analyzeArgs !== false;
     const { confirmed, unverified, account, groundSet, accountParts } =
-        contractedCallerSweep(index, name, def);
+        contractedCallerSweep(index, name, def, { constructionSites: options.constructionSites });
 
     const sites = [];
     const planLineSeen = new Map(); // 'file:line' -> per-line ordinal (fix #231)
@@ -3013,7 +3014,8 @@ function constructorRenameOwner(index, member, requireConstructorSyntax = false)
         const position = { row: line - 1, column: token.columns[0] };
         const isConstructor = candidate => {
             const node = candidate?.rootNode.descendantForPosition(position);
-            return node && ['ctor', 'ctor-qualified'].includes(referenceRole(node, language).role);
+            // A position outside every name token resolves to the root.
+            return !!node?.parent && ['ctor', 'ctor-qualified'].includes(referenceRole(node, language).role);
         };
         if (!isConstructor(tree)) {
             // Decoration macros can make a constructor look return-typed.
@@ -3082,8 +3084,13 @@ function plan(index, name, options = {}) {
     const namedConstructor = constructorOwnerName === def.name && !isTypeRenamePin(def) &&
         (def.type === 'constructor' || def.memberType === 'constructor' ||
             (def.type === 'method' && index.files.get(def.file)?.language === 'csharp'));
+    // A C/C++ member out of its class can be a constructor or destructor
+    // whose kind the parse could not record (a macro, a specialization, an
+    // alias qualifier). It is named like a project type; any other member is
+    // neither (fix #418: the owner proof ran for every method rename).
     const qualifiedCandidate = def.className && ['function', 'method', 'constructor'].includes(def.type) &&
-        langTraits(index.files.get(def.file)?.language)?.textualIncludes;
+        langTraits(index.files.get(def.file)?.language)?.textualIncludes &&
+        classDefsNamed(index, def.name.startsWith('~') ? def.name.slice(1) : def.name).entries.length > 0;
     const fixedConstructor = def.type === 'constructor' &&
         langTraits(index.files.get(def.file)?.language)?.fixedConstructorName === def.name;
     if (options.renameTo && (namedConstructor || qualifiedCandidate || fixedConstructor)) {
@@ -3120,10 +3127,16 @@ function plan(index, name, options = {}) {
     // run contractedCallerSweep (v4 tiered contract), so plan and verify stay
     // in lock-step by construction. Unverified candidates are NOT planned
     // (they may target another symbol) but stay visible with reasons.
+    // A rename the language's own protocol blocks never edits a class
+    // construction: the class is constructed by name, and the initializer
+    // is reached by the protocol, not by its spelling (fix #418: the sweep
+    // listed every construction as a review item of a blocked rename).
+    const constructionSites = !(options.renameTo && require('./constructor-calls').isConstructor(def, index) &&
+        externalContractOf(index, def)?.reason === 'language-protocol-member');
     const { sites: planCallSites, unverifiedSites: planUnverified, account: pinAccount,
         groundSet: planGroundSet, accountParts: planAccountParts,
         valueReferenceRename = false } = computePlanCallSites(index, name, def,
-        { analyzeArgs: !options.renameTo,
+        { analyzeArgs: !options.renameTo, constructionSites,
             valueReferenceRename: !!options.renameTo && isValueDefinition(def) && !def.macroExpansion });
     let planAccount = pinAccount;
     // Call sites a slot member's sweep contributed to this plan (fix #376):
@@ -3951,7 +3964,7 @@ function plan(index, name, options = {}) {
                         }, edit));
                     }
                 }
-                const sweep = computePlanCallSites(index, name, other, { analyzeArgs: !options.renameTo });
+                const sweep = computePlanCallSites(index, name, other, { analyzeArgs: !options.renameTo, constructionSites });
                 const seen = new Set([...planCallSites, ...alternativeSites].map(site =>
                     `${site.file}:${site.line}:${site.column ?? '*'}`));
                 const lines = new Set([...planCallSites, ...alternativeSites].map(site =>
@@ -4379,7 +4392,7 @@ function plan(index, name, options = {}) {
             const sweptMembers = [...writtenMembers.slice(0, SLOT_SWEEP_CAP),
                 ...generatedMembers.slice(0, SLOT_SWEEP_CAP)];
             for (const memberDef of sweptMembers) {
-                const memberSweep = computePlanCallSites(index, name, memberDef, { analyzeArgs: !options.renameTo });
+                const memberSweep = computePlanCallSites(index, name, memberDef, { analyzeArgs: !options.renameTo, constructionSites });
                 for (const site of memberSweep.sites) {
                     const key = siteTokenKey(site);
                     if (seenSiteTokens.has(key)) continue;

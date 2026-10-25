@@ -241,7 +241,8 @@ class ValueReferenceResolver extends TypeReferenceResolver {
         if (file === this.def.file || this.patternConstant || !entry.hash ||
             !this.index._usageResultCache || this.index.isProvenanceFactIndex) return null;
         const crypto = require('crypto');
-        if (crypto.createHash('md5').update(content).digest('hex') !== entry.hash) return null;
+        const { indexedContent, syntaxMode } = require('./source-memo');
+        if (!indexedContent(this.index, file, entry, content)) return null;
         // Source generations also cover macro definitions in other files.
         // These facts never retain a project-dependent ownership verdict.
         const generation = this.index._opMemo('valueLocalSourceGeneration', () => {
@@ -250,9 +251,8 @@ class ValueReferenceResolver extends TypeReferenceResolver {
                 require('./shared').codeUnitCompare(a[0], b[0]))) hash.update(path + '\0' + source.hash + '\0' + source.language + '\0');
             return hash.update(JSON.stringify(this.index.config)).digest('hex');
         });
-        const view = crypto.createHash('sha256').update(JSON.stringify([generation, language,
-            entry.recoveryBlanks, entry.conditionalViews, entry.externalMacroKey, rows])).digest('hex');
-        const mode = `value-local-v1:${view}`;
+        const mode = syntaxMode('valueLocal', [generation, language,
+            entry.recoveryBlanks, entry.conditionalViews, entry.externalMacroKey, rows]);
         this.localFileModes.set(file, { mode, referenceStart: this.references.length });
         const value = require('./cache').getUsageResult(this.index, file, this.name, mode);
         if (!Array.isArray(value)) return null;

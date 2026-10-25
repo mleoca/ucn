@@ -33,7 +33,10 @@ function bindingVerdict(facts, node) {
 
 function csharpLocalBinding(memberNode, node, name) {
     let bindings = localBindingsByTree.get(memberNode.tree);
-    if (!bindings) { bindings = new Map(); localBindingsByTree.set(memberNode.tree, bindings); }
+    if (!bindings) {
+        bindings = new (require('../core/source-memo').BoundedMap)({ maxEntries: 512 });
+        localBindingsByTree.set(memberNode.tree, bindings);
+    }
     const cacheKey = `${memberNode.id}\0${name}`;
     if (bindings.has(cacheKey)) return bindingVerdict(bindings.get(cacheKey), node);
     const contains = (scope, target) => scope && (scope.ranges
@@ -133,7 +136,6 @@ function csharpLocalBinding(memberNode, node, name) {
         }
         if (!nestedType) visit(token);
     }
-    if (bindings.size >= 512) bindings.delete(bindings.keys().next().value);
     bindings.set(cacheKey, facts);
     return bindingVerdict(facts, node);
 }

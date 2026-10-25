@@ -728,7 +728,7 @@ const LANGUAGES = {
             implicitEnumCaseLabels: true,
             standardPathRoots: ['java', 'javax'],
             typeNameScoping: 'package-on-demand',
-            typeNameSourceCanonical: source => require('./java-unicode').typeNameSourceCanonical(source),
+            typeNameSourceCanonical: (source, parseError) => require('./java-unicode').typeNameSourceCanonical(source, parseError),
             typeNameOwnersAt: (source, site) => require('./java-unicode').typeNameOwnersAt(source, site),
             typeNamedSourceFile: true,
             // The public top-level types of java.lang (JDK 8-21, preview

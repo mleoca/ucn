@@ -1,8 +1,8 @@
 'use strict';
 
-const crypto = require('crypto');
 const { langTraits } = require('../languages');
 const cache = require('./cache');
+const { indexedContent, parseViewParts, syntaxMode } = require('./source-memo');
 const { TypeReferenceResolver } = require('./type-references');
 const { classDefsNamed, findDeclaringClass } = require('./class-identity');
 
@@ -40,11 +40,8 @@ class EnumReferenceSyntax {
         if (file === r.def.file || r.owner?.def?.type !== 'enum' ||
             !langTraits(language)?.staticEnumReferenceSyntax || !entry.hash ||
             !index._usageResultCache || index.isProvenanceFactIndex ||
-            crypto.createHash('md5').update(content).digest('hex') !== entry.hash) return null;
-        const view = crypto.createHash('sha256').update(JSON.stringify([
-            language, entry.conditionalViews, entry.recoveryBlanks, entry.externalMacroKey, rows,
-        ])).digest('hex');
-        const mode = `enum-syntax-v2:${view}`;
+            !indexedContent(index, file, entry, content)) return null;
+        const mode = syntaxMode('enumSyntax', [...parseViewParts(entry, language), rows]);
         this.states.set(file, { valid: true, facts: [], mode });
         const value = cache.getUsageResult(index, file, r.name, mode);
         if (!Array.isArray(value) || value.length !== 3 || value[0] !== 2 ||

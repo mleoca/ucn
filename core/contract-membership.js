@@ -1142,13 +1142,12 @@ function hierarchySlotClosure(index, def, startRef = null) {
 }
 
 function sourceSyntaxRecord(index, file, name, content, kind, positions, accept) {
-    const crypto = require('crypto'), cache = require('./cache');
+    const cache = require('./cache');
+    const { indexedContent, parseViewParts, syntaxMode } = require('./source-memo');
     const entry = index.files.get(file);
     const eligible = entry?.hash && index._usageResultCache && !index.isProvenanceFactIndex &&
-        crypto.createHash('md5').update(content).digest('hex') === entry.hash;
-    const mode = eligible ? `contract-syntax-v1:${kind}:` + crypto.createHash('sha256').update(JSON.stringify([
-        entry.language, entry.conditionalViews, entry.recoveryBlanks, entry.externalMacroKey, positions,
-    ])).digest('hex') : null;
+        indexedContent(index, file, entry, content);
+    const mode = eligible ? syntaxMode('contractSyntax', [...parseViewParts(entry), positions], kind) : null;
     const stored = eligible ? cache.getUsageResult(index, file, name, mode) : null;
     return {
         value: Array.isArray(stored) && accept(stored) ? stored : null,

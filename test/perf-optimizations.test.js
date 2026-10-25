@@ -3107,3 +3107,193 @@ describe('fix #415: reuse the file traversal for class fields', () => {
             'class-body walks reuse the enclosing list instead of evicting it');
     });
 });
+
+describe('fix #418: witnesses share recorded facts, record project facts once and replay once', () => {
+    const { factIndex, captureOverload, validateOverload, provenanceWork, sharedRead } = require('../core/provenance-overload');
+    const { captureTypeLookup, validateTypeLookup } = require('../core/provenance-type');
+    const { declarationIdentity } = require('../core/provenance');
+
+    // One class with two constructors, constructed from every one of N files.
+    function constructionProject(language, n) {
+        const files = {};
+        for (let i = 0; i < n; i++) {
+            if (language === 'java') files[`p${i}/C${i}.java`] = `package p${i};\nimport base.Box;\npublic class C${i} {\n  public C${i}(int v) {}\n  Box make() { return new Box(${i}); }\n  Box other() { return new Box("x${i}"); }\n}\n`;
+            if (language === 'csharp') files[`p${i}/C${i}.cs`] = `using Base;\nnamespace P${i} {\n  public class C${i} {\n    public C${i}(int v) {}\n    Box Make() { return new Box(${i}); }\n    Base.Box Other() { return new Base.Box(${i}); }\n  }\n}\n`;
+            if (language === 'cpp') files[`c${i}.cpp`] = `#include "box.hpp"\nnamespace n${i} {\nstruct C${i} { C${i}(int v) {} };\nBox make${i}() { return Box(${i}); }\nBox* other${i}() { return new Box(${i}); }\n}\n`;
+            if (language === 'python') files[`m${i}.py`] = `from base import Box\nclass C${i}(Box):\n    pass\nAlias${i} = Box\ndef make${i}():\n    return Box(${i})\ndef other${i}():\n    return C${i}(${i})\n`;
+            if (language === 'javascript') files[`m${i}.js`] = `const { Box } = require('./base');\nclass C${i} extends Box {}\nconst Alias${i} = Box;\nfunction make${i}() { return new Box(${i}); }\nfunction other${i}() { return new C${i}(${i}); }\nmodule.exports = { C${i}, make${i}, other${i} };\n`;
+        }
+        if (language === 'java') files['base/Box.java'] = 'package base;\npublic class Box {\n  public Box(int v) {}\n  public Box(String s) {}\n}\n';
+        if (language === 'csharp') files['Base/Box.cs'] = 'namespace Base {\n  public class Box {\n    public Box(int v) {}\n    public Box(string s) {}\n  }\n}\n';
+        if (language === 'cpp') files['box.hpp'] = 'struct Box {\n  Box(int v) {}\n  Box(const char* s) {}\n};\n';
+        if (language === 'python') files['base.py'] = 'class Box:\n    def __init__(self, v):\n        self.v = v\n';
+        if (language === 'javascript') files['base.js'] = 'class Box {\n  constructor(v) { this.v = v; }\n}\nmodule.exports = { Box };\n';
+        return files;
+    }
+
+    function measure(language, n) {
+        const dir = tmp(constructionProject(language, n));
+        try {
+            const index = idx(dir);
+            const name = { python: '__init__', javascript: 'constructor' }[language] || 'Box';
+            const ctor = index.symbols.get(name).find(d => d.className === 'Box');
+            const before = provenanceWork();
+            const callers = index.findCallers(name, { targetDefinitions: [ctor], collectAccount: true });
+            const after = provenanceWork();
+            const rows = [...callers, ...(callers.unverifiedEntries || [])];
+            const bytes = rows.reduce((sum, row) => sum + JSON.stringify(row.provenance || null).length, 0);
+            return { sites: rows.length, confirmed: callers.length, bytesPerSite: bytes / rows.length,
+                encoded: after.encodedNodes - before.encodedNodes, decoded: after.decodedNodes - before.decodedNodes };
+        } finally { rm(dir); }
+    }
+
+    for (const language of ['java', 'csharp', 'cpp', 'python', 'javascript']) {
+        it(`${language}: witness work grows with the construction sites, never with the project each witness could copy`, () => {
+            const small = measure(language, 8), large = measure(language, 16);
+            assert.ok(small.confirmed > 0, 'the fixture binds constructions');
+            assert.strictEqual(large.sites, small.sites * 2, 'twice the files hold twice the sites');
+            // A witness that copied every file (or scanned the project) grew
+            // with N per site: quadratic in total. Shared facts keep it flat.
+            assert.ok(large.bytesPerSite <= small.bytesPerSite * 1.1,
+                `witness bytes per site ${small.bytesPerSite} -> ${large.bytesPerSite}`);
+            assert.ok(large.encoded <= small.encoded * 2.5, `encoded facts ${small.encoded} -> ${large.encoded}`);
+            assert.ok(large.decoded <= small.decoded * 2.5, `decoded facts ${small.decoded} -> ${large.decoded}`);
+        });
+    }
+
+    it('one operation encodes an index value once; its frozen decoded twin rejects writes; a copy replays alone', () => {
+        const dir = tmp({
+            'box.js': 'export class Box {}\n',
+            'use.js': "import { Box } from './box.js';\nconst a = new Box();\nconst b = new Box();\n",
+        });
+        try {
+            const index = idx(dir), owner = index.symbols.get('Box').find(def => def.type === 'class');
+            const file = path.join(dir, 'use.js');
+            const query = line => ({ file, relativePath: 'use.js', line, column: 14, name: 'Box', construction: true });
+            index._beginOp();
+            try {
+                const first = captureTypeLookup(index, query(2), owner);
+                const second = captureTypeLookup(index, query(3), owner);
+                assert.ok(first && second);
+                const shared = Object.keys(first.reads).filter(key => key.endsWith('"symbols"') &&
+                    second.reads[key] === first.reads[key]);
+                assert.ok(shared.length > 0, 'both witnesses hold the same recorded symbol list');
+                assert.ok(Object.isFrozen(first.reads), 'a captured witness is sealed');
+                const view = factIndex(first.reads, undefined, require('../core/provenance-type').FILE_FIELDS);
+                const symbols = view.files.get(file).symbols;
+                assert.ok(Object.isFrozen(symbols) && Object.isFrozen(symbols[0]));
+                assert.strictEqual(Reflect.set(symbols[0], 'name', 'Other'), false, 'a shared fact cannot be written');
+                const replaysBefore = provenanceWork().replays;
+                assert.strictEqual(validateTypeLookup(first, declarationIdentity(owner), { file: 'use.js', line: 2, column: 14 }), true);
+                assert.strictEqual(provenanceWork().replays, replaysBefore, 'the capture answered its own first replay');
+                const copy = JSON.parse(JSON.stringify(first));
+                assert.strictEqual(validateTypeLookup(copy, declarationIdentity(owner), { file: 'use.js', line: 2, column: 14 }), true);
+                assert.ok(provenanceWork().replays > replaysBefore, 'a deserialized copy is replayed in full');
+            } finally { index._endOp(); }
+        } finally { rm(dir); }
+    });
+
+    it('an overload witness answers its first replay; a changed copy replays and is rejected', () => {
+        const dir = tmp({ 'Fixture.java': [
+            'class Local {',
+            ' int choose(String value) { return 1; }',
+            ' int choose(int value) { return 2; }',
+            '}',
+            'class Use { int run(Local value) { return value.choose(1); } }',
+        ].join('\n') });
+        try {
+            const index = idx(dir);
+            const { selectProvenanceOverload } = require('../core/callers');
+            const members = index.symbols.get('choose');
+            const call = index.getCachedCalls(path.join(dir, 'Fixture.java')).find(c => c.name === 'choose');
+            index._beginOp();
+            try {
+                const witness = captureOverload(index, call, members, 'java', selectProvenanceOverload);
+                assert.strictEqual(witness.outcome, 'selected');
+                const before = provenanceWork().replays;
+                assert.strictEqual(validateOverload(witness, members.map(declarationIdentity), witness.selected), true);
+                assert.strictEqual(provenanceWork().replays, before);
+                const changed = structuredClone(witness);
+                changed.call.argKinds = ['string'];
+                assert.strictEqual(validateOverload(changed, members.map(declarationIdentity), witness.selected), false);
+                assert.ok(provenanceWork().replays > before);
+            } finally { index._endOp(); }
+        } finally { rm(dir); }
+    });
+
+    it('a project-wide set is recorded as the answers a witness asked for, never as the files it scans', () => {
+        const dir = tmp({
+            'Lib/Widget.cs': 'namespace Lib.Core { public class Widget {} }\n',
+            'App/Use.cs': 'using Lib.Core;\nnamespace App { class Use { Widget make() { return new Widget(); } } }\n',
+        });
+        try {
+            const index = idx(dir);
+            const { csharpResolveUsingName } = require('../core/type-denotation');
+            const reads = {};
+            index._beginOp();
+            try {
+                const view = factIndex(reads, index, require('../core/provenance-type').FILE_FIELDS);
+                assert.strictEqual(csharpResolveUsingName(view, 'Core.Widget', 'Lib'), 'Lib.Core.Widget');
+            } finally { index._endOp(); }
+            assert.ok(Object.keys(reads).some(key => key.startsWith('fact:cs-declared-namespaces\0')));
+            assert.ok(!Object.keys(reads).some(key => key === 'files.keys' || key.endsWith('"symbols"')),
+                'no file inventory enters the witness');
+            const replay = factIndex(JSON.parse(JSON.stringify(reads)), undefined, require('../core/provenance-type').FILE_FIELDS);
+            assert.strictEqual(csharpResolveUsingName(replay, 'Core.Widget', 'Lib'), 'Lib.Core.Widget');
+        } finally { rm(dir); }
+    });
+
+    it('a shared computation records its reads in every witness that uses it', () => {
+        const live = {
+            files: new Map([['a.java', { language: 'java', symbols: [{ name: 'A', namespace: 'p' }] }]]),
+            _opMemo(key, make) { this.memos ||= new Map(); if (!this.memos.has(key)) this.memos.set(key, make()); return this.memos.get(key); },
+        };
+        const compute = view => view.files.get('a.java').symbols[0].namespace;
+        const first = {}, second = {};
+        assert.strictEqual(sharedRead(factIndex(first, live, ['language', 'symbols']), 'k', compute), 'p');
+        assert.strictEqual(sharedRead(factIndex(second, live, ['language', 'symbols']), 'k', compute), 'p');
+        assert.deepStrictEqual(Object.keys(second).sort(), Object.keys(first).sort(),
+            'the second witness holds the reads of a computation it did not repeat');
+        const replay = factIndex(JSON.parse(JSON.stringify(second)), undefined, ['language', 'symbols']);
+        assert.strictEqual(sharedRead(replay, 'k', compute), 'p');
+        assert.strictEqual(replay.hasMissingProvenanceFacts, false);
+    });
+
+    it('the call-name cache states each file once per operation', () => {
+        const dir = tmp({ 'a.js': 'function a() { return 1; }\n', 'b.js': 'function b() { return a(); }\n' });
+        try {
+            const index = idx(dir);
+            saveCache(index);
+            const loaded = idx(dir);
+            const original = fs.statSync;
+            const counts = new Map();
+            fs.statSync = (file, ...rest) => { counts.set(file, (counts.get(file) || 0) + 1); return original(file, ...rest); };
+            try {
+                loaded._beginOp();
+                try {
+                    for (let i = 0; i < 50; i++) loaded.findCallers(`missing${i}`, {});
+                } finally { loaded._endOp(); }
+            } finally { fs.statSync = original; }
+            for (const [file, count] of counts) {
+                if (file.endsWith('.js')) assert.ok(count <= 1, `${path.basename(file)} stated ${count} times`);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('a symbol span index answers exactly what a scan of the list answers', () => {
+        const { symbolsSpanning } = require('../core/shared');
+        let seed = 418;
+        const next = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+        for (let trial = 0; trial < 300; trial++) {
+            const symbols = Array.from({ length: Math.floor(next() * 40) }, (_, i) => {
+                const start = Math.floor(next() * 40), roll = next();
+                return { i, startLine: roll < 0.04 ? undefined : roll < 0.06 ? null : start,
+                    endLine: roll > 0.97 ? undefined : start + Math.floor(next() * 20) - 2 };
+            });
+            for (let line = -1; line < 65; line++) {
+                const expected = symbols.filter(s => !(s.startLine > line) && !(s.endLine < line));
+                assert.deepStrictEqual(symbolsSpanning(symbols, line).map(s => s.i), expected.map(s => s.i));
+            }
+        }
+    });
+});

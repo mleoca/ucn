@@ -1,7 +1,9 @@
 'use strict';
 
 const { declarationIdentity, sameDeclaration } = require('./provenance');
-const { factIndex } = require('./provenance-overload');
+const { symbolsSpanning } = require('./shared');
+const { factIndex, sealFacts, replayed, seedReplay } = require('./provenance-overload');
+const { BoundedMap, SourceMemo, parsedSource, typeNamesCanonical } = require('./source-memo');
 
 // Type lookup replays the same package, namespace and include rules as a
 // type reference. The witness holds declarations and scope facts, rather
@@ -10,58 +12,71 @@ const FILE_FIELDS = ['language', 'relativePath', 'symbols', 'importBindings', 'm
     'importDetails', 'importAliases', 'exportDetails', 'cppUsings', 'macroScopeMarkers',
     'moduleAssignedNames', 'moduleValueAliases', 'packageName', 'bindings'];
 
-const nameScopes = new Map();
-const NAME_SCOPE_MAX_BYTES = 32 * 1024 * 1024;
-const NAME_SCOPE_MAX_ENTRIES = 256;
-let nameScopeBytes = 0;
-const LOOKUP_MEMO_MAX_BYTES = 32 * 1024 * 1024;
+// Type-parameter scopes of a source, and the name tokens of each line a
+// query asked about, by language. Lines are read from the shared parse on
+// demand (fix #418: a token map of the whole file was built for one site).
+const nameScopes = new SourceMemo({ maxEntries: 256, maxWeight: 32 * 1024 * 1024,
+    weigh: facts => (facts.lines.size * 4 + facts.parameters.length) * 64 });
 const LOOKUP_MEMO_MAX_ENTRIES = 16384;
 const TYPE_PARAMETER_PARENTS = new Set(['type_parameter', 'type_parameters',
     'constrained_type_parameter', 'type_parameter_declaration',
     'optional_type_parameter_declaration', 'variadic_type_parameter_declaration']);
+const NAME_TOKENS = ['identifier', 'type_identifier', 'namespace_identifier',
+    'qualified_identifier', 'scoped_type_identifier', 'qualified_name', 'alias_qualified_name'];
+const NAME_TOKEN_SET = new Set(NAME_TOKENS);
+const atOrigin = point => point.row === 0 && point.column === 0;
 
-function constructionNameScope(index, query) {
-    const { getParser, safeParse } = require('../languages');
+function nameScopeFacts(language, source) {
+    let facts = nameScopes.get(language, source);
+    if (facts !== undefined) return facts;
+    const tree = parsedSource(language, source);
+    if (!tree) return null;
     const { referenceRole, referenceTypeParameterScope } = require('./type-references');
-    const language = index.files.get(query.file)?.language;
-    const source = index._readFile(query.file), key = `${language}\0${source}`;
-    const canonical = require('../languages').langTraits(language)?.typeNameSourceCanonical;
-    if (canonical && !canonical(source)) return null;
-    let facts = nameScopes.get(key);
-    if (facts) {
-        nameScopes.delete(key);
-        nameScopes.set(key, facts);
-    }
-    if (!facts) {
-        const tree = safeParse(getParser(language), source);
-        if (!tree) return null;
-        try {
-            const tokens = tree.rootNode.descendantsOfType(['identifier', 'type_identifier', 'namespace_identifier',
-                'qualified_identifier', 'scoped_type_identifier', 'qualified_name', 'alias_qualified_name']);
-            facts = { sites: new Map(), parameters: [] };
-            for (const node of tokens) {
-                facts.sites.set(`${node.startPosition.row + 1}:${node.startPosition.column}`, [node.startIndex, node.endIndex]);
-                // Only declaration-shaped parents can bind a type parameter.
-                // The classifier still distinguishes its name from bounds and defaults.
-                if (!TYPE_PARAMETER_PARENTS.has(node.parent?.type)) continue;
-                if (!referenceRole(node, language)?.typeParam) continue;
-                const scope = referenceTypeParameterScope(node);
-                if (scope) facts.parameters.push({ name: node.text, start: scope.startIndex, end: scope.endIndex });
-            }
-        } finally { tree.delete?.(); }
-        const bytes = key.length * 2 + (facts.sites.size + facts.parameters.length) * 64;
-        if (bytes <= NAME_SCOPE_MAX_BYTES) {
-            while (nameScopes.size >= NAME_SCOPE_MAX_ENTRIES ||
-                nameScopeBytes + bytes > NAME_SCOPE_MAX_BYTES) {
-                const oldest = nameScopes.keys().next().value, previous = nameScopes.get(oldest);
-                nameScopes.delete(oldest);
-                nameScopeBytes -= oldest.length * 2 + (previous.sites.size + previous.parameters.length) * 64;
-            }
-            nameScopes.set(key, facts);
-            nameScopeBytes += bytes;
+    facts = { lines: new Map(), parameters: [] };
+    // A name token is a declared type parameter only under one of these
+    // declaration-shaped parents; the classifier still distinguishes its
+    // name from bounds and defaults. A zero-width token at the origin is not
+    // a name token of the file (a whole-tree token walk starts there).
+    for (const parent of tree.rootNode.descendantsOfType([...TYPE_PARAMETER_PARENTS])) {
+        for (const node of parent.children) {
+            if (!NAME_TOKEN_SET.has(node.type) || atOrigin(node.endPosition)) continue;
+            if (!referenceRole(node, language)?.typeParam) continue;
+            const scope = referenceTypeParameterScope(node);
+            if (scope) facts.parameters.push({ name: node.text, start: scope.startIndex, end: scope.endIndex });
         }
     }
-    const site = facts.sites.get(`${query.line}:${query.column}`);
+    nameScopes.set(language, source, facts);
+    return facts;
+}
+
+/** The innermost name token starting at (line, column): its source range. */
+function nameTokenAt(facts, language, source, line, column) {
+    let sites = facts.lines.get(line);
+    if (!sites) {
+        const tree = parsedSource(language, source);
+        if (!tree) return null;
+        sites = new Map();
+        // Every node starting on the line, in tree order: the last token at
+        // a column is the innermost one.
+        const from = line > 1 ? { row: line - 2, column: 0xffffffff } : { row: 0, column: 0 };
+        for (const node of tree.rootNode.descendantsOfType(NAME_TOKENS, from, { row: line, column: 0 })) {
+            if (node.startPosition.row === line - 1) sites.set(node.startPosition.column, [node.startIndex, node.endIndex]);
+        }
+        // A file queried at very many lines keeps answering without
+        // retaining every line.
+        if (facts.lines.size < 4096) facts.lines.set(line, sites);
+    }
+    return sites.get(column) || null;
+}
+
+function constructionNameScope(index, query) {
+    const language = index.files.get(query.file)?.language;
+    const source = index._readFile(query.file);
+    const canonical = require('../languages').langTraits(language)?.typeNameSourceCanonical;
+    if (canonical && !typeNamesCanonical(index, query.file, canonical, language)) return null;
+    const facts = nameScopeFacts(language, source);
+    if (!facts) return null;
+    const site = nameTokenAt(facts, language, source, query.line, query.column);
     if (!site) return null;
     const qualifier = query.qualifier || '';
     if (qualifier.startsWith('::') || qualifier.startsWith('global::')) return true;
@@ -72,21 +87,21 @@ function constructionNameScope(index, query) {
 
 function localConstructionBinding(index, query, definition, traits, language) {
     if (query.file !== definition.file || query.name !== definition.name) return false;
-    const { getParser, safeParse } = require('../languages');
+    const { getParser } = require('../languages');
     const config = traits.constructorInheritance;
     const source = index._readFile(query.file);
     const content = config?.source ? config.source(source, getParser(language)) : source;
     const syntax = config?.syntaxLanguage || language;
-    const tree = safeParse(getParser(syntax), content);
+    const tree = parsedSource(syntax, content);
     if (!tree) return false;
-    try {
+    {
         const nodes = tree.rootNode.descendantsOfType('identifier').filter(node => node.text === query.name &&
             node.startPosition.row + 1 === query.line && node.startPosition.column === query.column);
         if (nodes.length !== 1) return false;
         const scope = require('../languages/lexical-scope').referenceScope(nodes[0], syntax, new Map(), query.name,
             { includeClasses: true });
         return !!scope?.local && scope.defRows?.includes(definition.startLine - 1);
-    } finally { tree.delete?.(); }
+    }
 }
 
 // Explicit construction still performs lookup in its enclosing class. The
@@ -96,8 +111,7 @@ function constructionClassAt(index, file, line, column) {
     const { containsCall } = require('./callable-scope');
     let width = Infinity;
     const owners = new Set();
-    for (const definition of index.files.get(file)?.symbols || []) {
-        if (definition.startLine > line || definition.endLine < line) continue;
+    for (const definition of symbolsSpanning(index.files.get(file)?.symbols, line)) {
         const type = ['class', 'struct', 'union', 'enum', 'record'].includes(definition.type);
         const owner = type
             ? [definition.enclosingType, definition.name].filter(Boolean).join('::')
@@ -115,6 +129,18 @@ function constructionClassAt(index, file, line, column) {
 }
 
 function cppConstructionClasses(index, query, resolver = null) {
+    // A construction site is looked up once per operation, whichever query
+    // projects it (fix #418). A witness view records its own lookup.
+    const memo = !query.position && !index.isProvenanceFactIndex
+        ? index._opMemo?.('cppConstructionClasses', () => new Map()) : null;
+    const key = memo ? `${query.file}\0${query.line}\0${query.column ?? ''}\0${query.name}\0${query.qualifier ?? ''}` : null;
+    if (memo?.has(key)) return memo.get(key);
+    const classes = cppConstructionClassesUncached(index, query, resolver);
+    memo?.set(key, classes);
+    return classes;
+}
+
+function cppConstructionClassesUncached(index, query, resolver) {
     const { resolveQualifier, includeClosure, namespaceAt } = require('./cpp-scope');
     const { file, line, name, qualifier } = query;
     let context;
@@ -217,11 +243,12 @@ function constructionDenotes(index, resolver, query, definition, seen = new Set(
 function resolve(index, query, owner) {
     if (query.nameScopeOnly) {
         if (!constructionNameScope(index, query)) return false;
-        const canonical = require('../languages').langTraits(index.files.get(query.file)?.language)?.typeNameSourceCanonical;
+        const language = index.files.get(query.file)?.language;
+        const canonical = require('../languages').langTraits(language)?.typeNameSourceCanonical;
         if (canonical) {
             const file = owner.file === query.relativePath ? query.file
                 : require('path').resolve(index.root, owner.file);
-            if (!canonical(index._readFile(file))) return false;
+            if (!typeNamesCanonical(index, file, canonical, language)) return false;
         }
         return !index.hasMissingProvenanceFacts;
     }
@@ -232,8 +259,10 @@ function resolve(index, query, owner) {
         sameDeclaration(declarationIdentity(def), owner));
     if (!definition) return false;
     const { langTraits } = require('../languages');
-    const canonical = langTraits(index.files.get(definition.file)?.language)?.typeNameSourceCanonical;
-    if (canonical && (!canonical(index._readFile(query.file)) || !canonical(index._readFile(definition.file)))) return false;
+    const definitionLanguage = index.files.get(definition.file)?.language;
+    const canonical = langTraits(definitionLanguage)?.typeNameSourceCanonical;
+    if (canonical && (!typeNamesCanonical(index, query.file, canonical, definitionLanguage) ||
+        !typeNamesCanonical(index, definition.file, canonical, definitionLanguage))) return false;
     // Explicit C++ construction uses its type lookup directly. Building a
     // rename group and an unused ordinary-name answer would read unrelated
     // declarations; functional calls still need their ordinary binding proof.
@@ -244,20 +273,16 @@ function resolve(index, query, owner) {
     const { TypeReferenceResolver } = require('./type-references');
     const resolver = new TypeReferenceResolver(index, definition, owner.name);
     if (Number.isInteger(query.arity)) resolver.siteSyntax = { arity: query.arity };
-    let tree = null;
-    try {
-        if (query.position) {
-            const { getParser, safeParse } = require('../languages');
-            const language = index.files.get(query.file)?.language;
-            tree = safeParse(getParser(language), index._readFile(query.file));
-            const at = query.position;
-            let node = tree?.rootNode.descendantForIndex(at.start);
-            while (node && !(node.startIndex === at.start && node.endIndex === at.end && node.type === at.nodeType)) node = node.parent;
-            if (!node || node.startPosition.row + 1 !== query.line || node.startPosition.column !== query.column) return false;
-            resolver.siteNode = node; resolver.siteFile = query.file;
-        }
-        return resolveAt(index, query, owner, definition, resolver);
-    } finally { tree?.delete?.(); }
+    if (query.position) {
+        const language = index.files.get(query.file)?.language;
+        const tree = parsedSource(language, index._readFile(query.file));
+        const at = query.position;
+        let node = tree?.rootNode.descendantForIndex(at.start);
+        while (node && !(node.startIndex === at.start && node.endIndex === at.end && node.type === at.nodeType)) node = node.parent;
+        if (!node || node.startPosition.row + 1 !== query.line || node.startPosition.column !== query.column) return false;
+        resolver.siteNode = node; resolver.siteFile = query.file;
+    }
+    return resolveAt(index, query, owner, definition, resolver);
 }
 
 function resolveAt(index, query, owner, definition, resolver) {
@@ -293,48 +318,34 @@ function resolveAt(index, query, owner, definition, resolver) {
 }
 
 function captureTypeLookup(index, query, owner) {
-    const reads = {}, identity = declarationIdentity(owner);
+    const identity = declarationIdentity(owner);
     // A rename visits one construction once for each slot member. Its type
     // binding depends on the complete query and the operation's index view.
-    // Replays never use this memo; each witness keeps its recorded raw reads.
-    let memo = !index?.isProvenanceFactIndex && index?._opMemo?.('constructionTypeLookups',
-        () => ({ entries: new Map(), bytes: 0 }));
+    // Every caller owns its witness: the sealed facts are shared, the query
+    // and owner are copies (fix #418: cloning the facts per hit dominated
+    // constructor plans).
+    let memo = index?.isProvenanceFactIndex ? null
+        : index?._opMemo?.('constructionTypeLookups', () => new BoundedMap({ maxEntries: LOOKUP_MEMO_MAX_ENTRIES }));
     let key = null;
     if (memo) {
         try { key = JSON.stringify([query, identity]); }
         catch { memo = null; }
     }
-    let repeated = false;
-    if (memo?.entries.has(key)) {
-        const saved = memo.entries.get(key);
-        memo.entries.delete(key);
-        if (!saved.pending) {
-            memo.entries.set(key, saved);
-            return saved.value === null ? null : globalThis.structuredClone(saved.value);
-        }
-        memo.bytes -= saved.bytes;
-        repeated = true;
+    if (memo?.has(key)) {
+        const saved = memo.get(key);
+        return saved && { query: globalThis.structuredClone(saved.query), owner: { ...saved.owner }, reads: saved.reads };
     }
+    const reads = {};
     let result = null;
     try {
-        if (resolve(factIndex(reads, index, FILE_FIELDS), query, identity)) result = { query, owner: identity, reads };
+        if (resolve(factIndex(reads, index, FILE_FIELDS), query, identity)) {
+            result = { query, owner: identity, reads: sealFacts(reads) };
+            seedReplay(result.reads, JSON.stringify(['type-lookup', query, identity]), true);
+        }
     } catch { /* An unsupported binding keeps its ordinary review result. */ }
     if (memo) {
         try {
-            // Most queries visit a successful binding once. Admit its full
-            // snapshot only when it repeats; negative lookups stay cheap.
-            const pending = result !== null && !repeated;
-            const bytes = key.length * 2 + (pending ? 0 : JSON.stringify(result).length * 2);
-            if (bytes <= LOOKUP_MEMO_MAX_BYTES) {
-                while (memo.entries.size >= LOOKUP_MEMO_MAX_ENTRIES || memo.bytes + bytes > LOOKUP_MEMO_MAX_BYTES) {
-                    const oldest = memo.entries.keys().next().value;
-                    memo.bytes -= memo.entries.get(oldest).bytes;
-                    memo.entries.delete(oldest);
-                }
-                memo.entries.set(key, pending ? { pending: true, bytes }
-                    : { value: globalThis.structuredClone(result), bytes });
-                memo.bytes += bytes;
-            }
+            memo.set(key, result && { query: globalThis.structuredClone(query), owner: { ...identity }, reads: result.reads });
         } catch { /* A non-data extension can still use the uncached path. */ }
     }
     return result;
@@ -345,8 +356,13 @@ function validateTypeLookup(witness, owner, site) {
         witness.query?.relativePath !== site?.file || witness.query.line !== site?.line ||
         witness.query.column !== site?.column) return false;
     if (witness.query.position && (witness.query.position.start !== site.start || witness.query.position.end !== site.end)) return false;
-    try { return resolve(factIndex(witness.reads, undefined, FILE_FIELDS), witness.query, owner); }
+    let key;
+    try { key = JSON.stringify(['type-lookup', witness.query, owner]); }
     catch { return false; }
+    return replayed(witness.reads, key, () => {
+        try { return resolve(factIndex(witness.reads, undefined, FILE_FIELDS), witness.query, owner); }
+        catch { return false; }
+    });
 }
 
 module.exports = { captureTypeLookup, validateTypeLookup, resolveTypeLookup: resolve,

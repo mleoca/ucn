@@ -14,6 +14,7 @@ const {
     classifyUnsupportedSourceFile,
 } = require('./discovery');
 const { codeUnitCompare } = require('./shared');
+const { syntaxWeightKind } = require('./source-memo');
 
 // Read UCN version for cache invalidation
 const UCN_VERSION = require('../package.json').version;
@@ -949,11 +950,12 @@ function usageResultKey(index, filePath, name, mode) {
     return `${filePath}\0${hash}\0${name}${mode ? `\0${mode}` : ''}`;
 }
 
+// A syntax family's stored value weighs what its producer declares
+// (core/source-memo.js SYNTAX_FAMILIES); a usage list weighs its sites.
 function usageResultWeight(value, mode) {
-    if (mode.startsWith('call-token-v1:') || mode.startsWith('declaration-token-v1:')) return 128 + value.length * 128;
-    return mode.startsWith('contract-syntax-v1:') || mode.startsWith('usage-text-v1:') || mode.startsWith('enum-syntax-v2:') || mode.startsWith('value-local-v1:') || mode.startsWith('value-bodies-v4:') || mode.startsWith('class-fields-v1:')
-        ? 128 + 2 * Buffer.byteLength(JSON.stringify(value))
-        : 64 + value.length * 40;
+    const kind = syntaxWeightKind(mode);
+    if (kind === 'rows') return 128 + value.length * 128;
+    return kind === 'json' ? 128 + 2 * Buffer.byteLength(JSON.stringify(value)) : 64 + value.length * 40;
 }
 
 /** Read an immutable, source-local analysis result from the shared LRU. */

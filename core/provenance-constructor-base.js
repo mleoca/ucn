@@ -4,24 +4,19 @@ const { langTraits, getLanguageAdapter, getParser } = require('../languages');
 const { declarationIdentity, sameDeclaration } = require('./provenance');
 const { occurrenceIdentity } = require('./provenance-facts');
 const { captureTypeLookup, validateTypeLookup } = require('./provenance-type');
+const { SourceMemo } = require('./source-memo');
 
-const sourceCalls = new Map();
-const SOURCE_CALL_MAX_BYTES = 32 * 1024 * 1024;
-const SOURCE_CALL_MAX_ENTRIES = 128;
-let sourceCallBytes = 0;
+// Omitted-initializer call syntax of a source, by language.
+const sourceCalls = new SourceMemo({ maxEntries: 128, maxWeight: 32 * 1024 * 1024,
+    weigh: calls => JSON.stringify(calls).length * 2 });
 
 function implicitSourceCalls(language, source) {
     // Cache syntax, never a binding verdict. External macro recovery has an
     // additional input and consultation side effects, so keep that path fresh.
     const reusable = !langTraits(language)?.textualIncludes ||
         !require('../languages/c-family').hasExternalMacroContext();
-    const key = `${language}\0${source}`;
-    if (reusable && sourceCalls.has(key)) {
-        const value = sourceCalls.get(key);
-        sourceCalls.delete(key);
-        sourceCalls.set(key, value);
-        return value.calls;
-    }
+    const saved = reusable ? sourceCalls.get(language, source) : undefined;
+    if (saved) return saved;
     const calls = getLanguageAdapter(language).findCallsInCode(source, getParser(language))
         .filter(call => call.constructorSyntax === 'implicit').map(call => ({
             name: call.name, qualifier: call.constructorQualifier || null,
@@ -29,18 +24,7 @@ function implicitSourceCalls(language, source) {
             base: JSON.stringify(call.implicitBase), enclosing: JSON.stringify(call.enclosingFunction),
             header: call.implicitBase?.header && { ...call.implicitBase.header },
         }));
-    if (reusable) {
-        const bytes = key.length * 2 + JSON.stringify(calls).length * 2;
-        if (bytes <= SOURCE_CALL_MAX_BYTES) {
-            while (sourceCalls.size >= SOURCE_CALL_MAX_ENTRIES || sourceCallBytes + bytes > SOURCE_CALL_MAX_BYTES) {
-                const oldest = sourceCalls.keys().next().value;
-                sourceCallBytes -= sourceCalls.get(oldest).bytes;
-                sourceCalls.delete(oldest);
-            }
-            sourceCalls.set(key, { calls, bytes });
-            sourceCallBytes += bytes;
-        }
-    }
+    if (reusable) sourceCalls.set(language, source, calls);
     return calls;
 }
 

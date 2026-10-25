@@ -519,7 +519,67 @@ function calleeNames(calls) {
     return names;
 }
 
+// Declarations whose line extent holds a line, by symbol list (fix #418:
+// per-site scans of a whole symbol table made construction and namespace
+// lookups quadratic in large files). An index belongs to one list; a list
+// whose length or ends changed gets a new one.
+const SPAN_INDEXES = new WeakMap();
+
+function spanIndexOf(symbols) {
+    const known = SPAN_INDEXES.get(symbols);
+    if (known && known.length === symbols.length && known.first === symbols[0] &&
+        known.last === symbols[symbols.length - 1]) return known;
+    const regular = [], irregular = [];
+    for (let i = 0; i < symbols.length; i++) {
+        const symbol = symbols[i];
+        if (Number.isFinite(symbol?.startLine) && Number.isFinite(symbol?.endLine)) regular.push(i);
+        else irregular.push(i);
+    }
+    regular.sort((a, b) => symbols[a].startLine - symbols[b].startLine || a - b);
+    const starts = regular.map(i => symbols[i].startLine), ends = regular.map(i => symbols[i].endLine);
+    const maxEnd = new Array(regular.length);
+    const build = (lo, hi) => {
+        if (lo >= hi) return -Infinity;
+        const mid = (lo + hi) >> 1;
+        return (maxEnd[mid] = Math.max(ends[mid], build(lo, mid), build(mid + 1, hi)));
+    };
+    build(0, regular.length);
+    const index = { length: symbols.length, first: symbols[0], last: symbols[symbols.length - 1],
+        regular, starts, ends, maxEnd, irregular };
+    SPAN_INDEXES.set(symbols, index);
+    return index;
+}
+
+/**
+ * The symbols of `symbols` whose extent holds `line` (the comparisons
+ * `!(startLine > line) && !(endLine < line)`), in list order.
+ */
+function symbolsSpanning(symbols, line) {
+    if (!Array.isArray(symbols) || symbols.length === 0) return [];
+    const index = spanIndexOf(symbols);
+    const found = [];
+    const visit = (lo, hi) => {
+        if (lo >= hi) return;
+        const mid = (lo + hi) >> 1;
+        if (index.maxEnd[mid] < line) return;
+        visit(lo, mid);
+        if (index.starts[mid] > line) return;
+        if (index.ends[mid] >= line) found.push(index.regular[mid]);
+        visit(mid + 1, hi);
+    };
+    if (Number.isFinite(line)) visit(0, index.regular.length);
+    else for (let i = 0; i < index.regular.length; i++) {
+        if (!(index.starts[i] > line) && !(index.ends[i] < line)) found.push(index.regular[i]);
+    }
+    for (const i of index.irregular) {
+        const symbol = symbols[i];
+        if (!(symbol?.startLine > line) && !(symbol?.endLine < line)) found.push(i);
+    }
+    return found.sort((a, b) => a - b).map(i => symbols[i]);
+}
+
 module.exports = { literalNameRegex,
+    symbolsSpanning,
     calleeNames,
     pickBestDefinition,
     addTestExclusions,
