@@ -4868,7 +4868,7 @@ describe('fix #409: references on a declaration line participate in a rename', (
         'm.html': {
             code: '<script>\nfunction work() { return 1; } const alias = work;\n</script>',
             line: 2,
-            expected: 'function work() { return 1; } const alias = work;',
+            expected: 'function renamed() { return 1; } const alias = work;',
             review: true,
         },
         'm.py': {
@@ -17115,4 +17115,124 @@ describe('fix #418: construction name scopes read the queried line of a shared p
                 name: 'X', qualifier: '::Y' }), true, 'a global qualifier never names a type parameter');
         });
     }
+});
+
+describe('fix #419: C# constructor families, deconstruction locals, nested types and top-level local functions', () => {
+    const { applyRenamePlan } = require('./helpers');
+    const csproj = '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>';
+    const sites = (index, def) => {
+        const callers = index.findCallers(def.name, { targetDefinitions: [def], collectAccount: true });
+        const at = site => `${site.relativePath || path.relative(index.root, site.file)}:${site.line}`;
+        return { confirmed: callers.map(at).sort(), unverified: callers.unverifiedEntries.map(at).sort() };
+    };
+    it('a primary constructor is a member of the family, and no constructor delegates to itself', () => {
+        const dir = tmp({ 'c.csproj': csproj, 'A.cs': [
+            'namespace P;', '', 'public record R(int X)', '{',
+            '    public R(string s) : this(s.Length) { }', '    public R(long l) : this(5) { }', '}', '',
+            'public class C(int x)', '{', '    public C(string s) : this(s.Length) { }', '}', '',
+            'public static class U', '{',
+            '    public static R A() => new R(1);', '    public static R B() => new R("x");',
+            '    public static R D() => new R(7L);', '    public static C E() => new C(2);',
+            '    public static C F() => new C("y");', '}', ''].join('\n') });
+        try {
+            const index = idx(dir);
+            const ctor = (owner, type) => index.symbols.get(owner).find(def => def.type === 'constructor' &&
+                def.paramsStructured?.[0]?.type === type);
+            const ofLong = sites(index, ctor('R', 'long'));
+            assert.deepStrictEqual(ofLong.confirmed, ['A.cs:18']);
+            assert.ok(!ofLong.unverified.includes('A.cs:6'), JSON.stringify(ofLong));
+            assert.ok(!sites(index, ctor('R', 'string')).confirmed.includes('A.cs:16'));
+            const ofC = sites(index, ctor('C', 'string'));
+            assert.deepStrictEqual([ofC.confirmed, ofC.unverified], [['A.cs:20'], []]);
+        } finally { rm(dir); }
+    });
+    it('deconstruction designations are locals that hide the property', () => {
+        const files = { 'c.csproj': csproj, 'A.cs': [
+            'namespace N', '{', '    public class W', '    {', '        public int Size { get; set; }',
+            '        int M1((int, int) t) { if (t is var (Size, b)) return Size; return Size; }',
+            '        int M2((int, int) t) { var ((Size, b), c) = (t, 1); return Size; }',
+            '        int M3((int, int) t) { switch (t) { case var (Size, b): return Size; } return Size; }',
+            '        int M4((int, int) t) => t switch { (1, var b) => Size, var (Size, b) => Size };',
+            '        int M5((int, int) t) { while (t is var (Size, b)) { return Size; } return Size; }',
+            '        int M6(object o) => o switch { int Size when Size > 0 => Size, _ => Size };',
+            '        int M7((int, int) t) { foreach (var (Size, b) in new[] { t }) return Size; return Size; }',
+            '    }', '}', ''].join('\n') };
+        const dir = tmp(files);
+        try {
+            const r = execute(idx(dir), 'plan', { name: 'A.cs:5:Size', renameTo: 'Extent' });
+            assert.ok(r.ok, r.error);
+            const { contents, reviews } = applyRenamePlan(dir, r.result);
+            assert.deepStrictEqual(reviews, []);
+            assert.deepStrictEqual(contents['A.cs'].split('\n').slice(4, 12), [
+                '        public int Extent { get; set; }',
+                '        int M1((int, int) t) { if (t is var (Size, b)) return Size; return Size; }',
+                '        int M2((int, int) t) { var ((Size, b), c) = (t, 1); return Size; }',
+                '        int M3((int, int) t) { switch (t) { case var (Size, b): return Size; } return Extent; }',
+                '        int M4((int, int) t) => t switch { (1, var b) => Extent, var (Size, b) => Size };',
+                '        int M5((int, int) t) { while (t is var (Size, b)) { return Size; } return Extent; }',
+                '        int M6(object o) => o switch { int Size when Size > 0 => Size, _ => Extent };',
+                '        int M7((int, int) t) { foreach (var (Size, b) in new[] { t }) return Size; return Extent; }',
+            ]);
+        } finally { rm(dir); }
+    });
+    it('a nested type named like the property hides it inside the declaring type and its subtypes', () => {
+        const dir = tmp({ 'c.csproj': csproj, 'A.cs': [
+            'namespace N', '{', '    public class Outer', '    {', '        public static int Size { get; set; }',
+            '        public class B { public class Size { } }',
+            '        public class Inner : B { string M() => nameof(Size); }',
+            '        public class Inner2 { public class Size { } string M() => nameof(Size); }',
+            '        public class Inner3 { string M() => nameof(Size) + (Size + 1); }', '    }', '}', ''].join('\n') });
+        try {
+            const r = execute(idx(dir), 'plan', { name: 'A.cs:5:Size', renameTo: 'Renamed' });
+            assert.ok(r.ok, r.error);
+            assert.deepStrictEqual(r.result.changes.map(change => `${change.line}:${change.newExpression}`), [
+                '5:public static int Renamed { get; set; }',
+                '9:public class Inner3 { string M() => nameof(Renamed) + (Renamed + 1); }',
+            ]);
+        } finally { rm(dir); }
+    });
+    it('a local function in top-level statements reaches a static import', () => {
+        const util = 'namespace Acme;\npublic static class Util {\n    public static int Helper(int n) => n;\n}\n';
+        for (const [program, expected] of [
+            ['using static Acme.Util;\n\nint Use() => Helper(2);\nSystem.Console.WriteLine(Use());\n', { confirmed: ['Program.cs:3'], unverified: [] }],
+            // A top-level local function of the name hides the import.
+            ['using static Acme.Util;\n\nint Helper(int n) => n * 10;\nint Use() => Helper(2);\n', { confirmed: [], unverified: [] }],
+            // A project part of the synthesized Program class may declare it.
+            ['using static Acme.Util;\n\nint Use() => Helper(2);\npartial class Program { static int Helper(int n) => n; }\n',
+                { confirmed: [], unverified: ['Program.cs:3'] }],
+        ]) {
+            const dir = tmp({ 'c.csproj': csproj, 'Util.cs': util, 'Program.cs': program });
+            try {
+                const index = idx(dir);
+                const helper = index.symbols.get('Helper').find(def => def.className === 'Util');
+                assert.deepStrictEqual(sites(index, helper), expected, program);
+            } finally { rm(dir); }
+        }
+    });
+});
+
+describe('fix #419: a reference review on a declaration line keeps its own entry', () => {
+    it('HTML: the declaration is renamed and the same-line reference stays a review', () => {
+        const dir = tmp({ 'm.html': '<script>\nfunction work() { return 1; } const alias = work;\n</script>\n' });
+        try {
+            const r = execute(idx(dir), 'plan', { name: 'm.html:2:work', renameTo: 'renamed' });
+            assert.ok(r.ok, r.error);
+            const line = r.result.changes.filter(change => change.line === 2);
+            const definition = line.find(change => change.editKind === 'definition');
+            assert.strictEqual(definition.newExpression, 'function renamed() { return 1; } const alias = work;');
+            assert.ok(!definition.needsReview, JSON.stringify(definition));
+            const review = line.find(change => change.editKind === 'reference');
+            assert.ok(review?.needsReview && review.newExpression === undefined, JSON.stringify(line));
+            assert.match(review.suggestion, /Verify this reference resolves/);
+        } finally { rm(dir); }
+    });
+    it('HTML: a declaration token is renamed in its embedded script', () => {
+        const dir = tmp({ 'm.html': '<div></div>\n<script>\n  function work() { return 1; }\n  const alias = work;\n</script>\n' });
+        try {
+            const r = execute(idx(dir), 'plan', { name: 'm.html:3:work', renameTo: 'renamed' });
+            assert.ok(r.ok, r.error);
+            assert.deepStrictEqual(r.result.changes.map(change => [change.line, change.newExpression, !!change.needsReview]), [
+                [3, 'function renamed() { return 1; }', false], [4, 'const alias = renamed;', false]]);
+        } finally { rm(dir); }
+    });
 });

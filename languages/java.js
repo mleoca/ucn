@@ -375,6 +375,65 @@ const JAVA_TYPE_DECLARATIONS = new Set([
     'class_declaration', 'interface_declaration', 'enum_declaration', 'record_declaration',
     'annotation_type_declaration',
 ]);
+// Type declarations that declare constructors.
+const JAVA_CONSTRUCTOR_OWNER_TYPES = new Set(['class_declaration', 'enum_declaration', 'record_declaration']);
+
+// A parameter type's erasure, read from its AST: type arguments and
+// annotations dropped, array dimensions kept (`T...` is `T[]`).
+function javaErasedType(typeNode) {
+    if (!typeNode) return null;
+    switch (typeNode.type) {
+        case 'generic_type':
+            return javaErasedType(typeNode.namedChildren.find(child =>
+                child.type === 'type_identifier' || child.type === 'scoped_type_identifier'));
+        case 'annotated_type':
+            return javaErasedType(typeNode.namedChildren.find(child =>
+                child.type !== 'marker_annotation' && child.type !== 'annotation'));
+        case 'array_type': {
+            const element = javaErasedType(typeNode.childForFieldName('element'));
+            const dimensions = typeNode.childForFieldName('dimensions');
+            const count = dimensions ? dimensions.children.filter(child => child.type === '[').length : 1;
+            return element && `${element}${'[]'.repeat(count)}`;
+        }
+        case 'scoped_type_identifier':
+            return typeNode.namedChildren.map(javaErasedType).join('.');
+        default:
+            return typeNode.text;
+    }
+}
+
+function javaErasedParameters(paramsNode) {
+    const erased = [];
+    for (const param of paramsNode?.namedChildren || []) {
+        if (param.type !== 'formal_parameter' && param.type !== 'spread_parameter') continue;
+        const typeNode = param.childForFieldName('type') || param.namedChildren.find(child =>
+            child.type !== 'modifiers' && child.type !== 'variable_declarator' && child.type !== 'identifier');
+        const type = javaErasedType(typeNode);
+        if (!type) return null;
+        // `int b[]` writes its dimensions after the name.
+        const dimensions = param.childForFieldName('dimensions');
+        const trailing = dimensions ? '[]'.repeat(dimensions.children.filter(child => child.type === '[').length) : '';
+        erased.push(`${type}${trailing}${param.type === 'spread_parameter' ? '[]' : ''}`);
+    }
+    return erased;
+}
+
+// Does a record's body declare its canonical constructor (JLS 8.10.4)?
+// A compact constructor is canonical; so is a constructor whose parameter
+// types are the component types. An undecidable spelling counts as not
+// canonical: the implicit candidate then shares its signature, which
+// leaves the choice between them open rather than closed.
+function recordDeclaresCanonical(recordNode, paramsNode) {
+    const components = javaErasedParameters(paramsNode);
+    for (const child of recordNode.childForFieldName('body')?.namedChildren || []) {
+        if (child.type === 'compact_constructor_declaration') return true;
+        if (child.type !== 'constructor_declaration' || !components) continue;
+        const declared = javaErasedParameters(child.childForFieldName('parameters'));
+        if (declared && declared.length === components.length &&
+            declared.every((type, at) => type === components[at])) return true;
+    }
+    return false;
+}
 
 function _processClass(node, classes, processedRanges, lines, code) {
     // Only type declarations are processed below: every other node returns
@@ -558,6 +617,12 @@ function _processClass(node, classes, processedRanges, lines, code) {
                 type: 'record',
                 members,
                 modifiers,
+                // The implicit canonical constructor: a constructor the
+                // header declares with no body declaration, like a C#
+                // primary constructor (fix #419).
+                ...(paramsNode && !recordDeclaresCanonical(node, paramsNode) && {
+                    primaryParams: parseStructuredParams(paramsNode, 'java'),
+                }),
                 ...localScope,
                 ...(enclosingTypeName(node) && { enclosingType: enclosingTypeName(node) }),
                 ...(docstring && { docstring }),
@@ -2044,8 +2109,11 @@ function findCallsInCode(code, parser) {
         // Java constructors are named after their class. The record carries
         // that name, and constructor resolution selects its overload.
         if (node.type === 'explicit_constructor_invocation') {
+            // The constructor's own type declaration: a class, enum or
+            // record (a record's non-canonical constructor delegates with
+            // `this(...)`, fix #419).
             let cls = node.parent;
-            while (cls && cls.type !== 'class_declaration' && cls.type !== 'enum_declaration') {
+            while (cls && !JAVA_CONSTRUCTOR_OWNER_TYPES.has(cls.type)) {
                 cls = cls.parent;
             }
             const isSuperCall = node.children.some(c => c.type === 'super');

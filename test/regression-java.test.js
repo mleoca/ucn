@@ -6605,3 +6605,86 @@ describe('fix #418: the indexed parse decides Java type-name canonicality withou
         }
     });
 });
+
+describe('fix #419: record constructors delegate inside the record; a delegation never targets itself', () => {
+    const constructorOf = (index, owner, types) => index.symbols.get(owner).find(def => def.type === 'constructor' &&
+        (def.paramsStructured || []).map(param => param.type).join(',') === types);
+    const callerSites = (index, def) => {
+        const callers = index.findCallers(def.name, { targetDefinitions: [def], collectAccount: true });
+        const at = site => `${site.relativePath || path.relative(index.root, site.file)}:${site.line}`;
+        return {
+            confirmed: callers.map(at).sort(),
+            unverified: callers.unverifiedEntries.map(at).sort(),
+            excluded: callers.accountRaw.excludedEntries.map(site => `${at(site)} ${site.reason}`).sort(),
+        };
+    };
+    it('a nested record delegation names the record, never the enclosing class', () => {
+        const dir = tmp({ 'p/Outer.java': 'package p;\n\npublic class Outer {\n    public Outer(int x) { }\n' +
+            '    public Outer(String s) { }\n\n    public record R(int x) {\n        public R(String s) {\n' +
+            '            this(1);\n        }\n    }\n\n    static Object make() { return new Outer(1); }\n}\n' });
+        try {
+            const index = idx(dir);
+            const call = index.getCachedCalls(path.join(dir, 'p/Outer.java')).find(call => call.ctorDelegation === 'this');
+            assert.strictEqual(call.name, 'R');
+            assert.deepStrictEqual(callerSites(index, constructorOf(index, 'Outer', 'int')).confirmed, ['p/Outer.java:13']);
+            // `this(1)` runs the implicit canonical R(int), never R(String) itself.
+            const own = callerSites(index, constructorOf(index, 'R', 'String'));
+            assert.deepStrictEqual([own.confirmed, own.unverified], [[], []]);
+            assert.deepStrictEqual(own.excluded, ['p/Outer.java:9 constructor-delegation-self']);
+        } finally { rm(dir); }
+    });
+    it('the implicit canonical constructor joins overload selection', () => {
+        const dir = tmp({
+            'p/R.java': 'package p;\n\npublic record R(int x) {\n    public R(String s) { this(s.length()); }\n' +
+                '    public R(long l) { this(5); }\n}\n',
+            'p/U.java': 'package p;\n\npublic class U {\n    static R a() { return new R(1); }\n' +
+                '    static R b() { return new R("x"); }\n    static R c(String q) { return new R(q.length()); }\n' +
+                '    static R d() { return new R(7L); }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(index.symbols.get('R').find(def => def.type === 'record').primaryParams,
+                [{ name: 'x', type: 'int' }]);
+            const ofLong = callerSites(index, constructorOf(index, 'R', 'long'));
+            assert.deepStrictEqual(ofLong.confirmed, ['p/U.java:7']);
+            assert.ok(ofLong.excluded.includes('p/R.java:5 constructor-delegation-self'), ofLong.excluded);
+            assert.ok(ofLong.excluded.includes('p/U.java:4 constructor-overload-other'), ofLong.excluded);
+            const ofString = callerSites(index, constructorOf(index, 'R', 'String'));
+            assert.deepStrictEqual(ofString.confirmed, ['p/U.java:5']);
+            assert.ok(!ofString.confirmed.includes('p/R.java:4') && !ofString.unverified.includes('p/R.java:4'));
+            // A delegation that reaches the header constructor depends on the record.
+            const callees = index.findCallees(constructorOf(index, 'R', 'long'), { collectAccount: true });
+            assert.deepStrictEqual(callees.map(def => `${def.type}:${def.name}`), ['record:R']);
+            // The record's class account stays conserved; its delegations
+            // remain visible as for a class.
+            const show = execute(index, 'show', { name: 'p/R.java:3:R' });
+            assert.ok(show.ok, show.error);
+            const account = show.result.context.meta.account;
+            assert.ok(account.conserved && account.unaccounted === 0, JSON.stringify(account));
+            assert.strictEqual(account.confirmed, 4, JSON.stringify(account));
+        } finally { rm(dir); }
+    });
+    it('a compact canonical constructor receives the record delegations', () => {
+        const dir = tmp({
+            'p/R.java': 'package p;\n\npublic record R(int x) {\n    public R {\n' +
+                '        if (x < 0) throw new IllegalArgumentException();\n    }\n    public R(String s) { this(s.length()); }\n}\n',
+            'p/U.java': 'package p;\n\npublic class U {\n    static R a() { return new R(1); }\n    static R b() { return new R("x"); }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.strictEqual(index.symbols.get('R').find(def => def.type === 'record').primaryParams, undefined);
+            assert.deepStrictEqual(callerSites(index, constructorOf(index, 'R', 'int')).confirmed, ['p/R.java:7', 'p/U.java:4']);
+            assert.deepStrictEqual(callerSites(index, constructorOf(index, 'R', 'String')).confirmed, ['p/U.java:5']);
+        } finally { rm(dir); }
+    });
+    it('a class constructor is never a caller of itself', () => {
+        const dir = tmp({ 'p/K.java': 'package p;\n\npublic class K {\n    public K(int x) { }\n' +
+            '    public K(String s) { this(s.length()); }\n    public K(long l) {\n        this(5);\n    }\n}\n' });
+        try {
+            const index = idx(dir);
+            const own = callerSites(index, constructorOf(index, 'K', 'String'));
+            assert.deepStrictEqual([own.confirmed, own.unverified], [[], []]);
+            assert.deepStrictEqual(callerSites(index, constructorOf(index, 'K', 'int')).confirmed, ['p/K.java:7']);
+        } finally { rm(dir); }
+    });
+});

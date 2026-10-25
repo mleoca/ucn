@@ -6114,8 +6114,11 @@ function findCallers(index, name, options = {}) {
                         // the prototype binds the call.
                         const externC = fileEntry.language === 'cpp' && targetDefs2.length > 0 &&
                             targetDefs2.every(d => d.linkage === 'c');
+                        // A configuration-selected binding keeps its own
+                        // reason, as on the callee side (fix #419).
+                        const linkReason = linkVerdict.reason || (externC ? 'link-variant' : 'link-ambiguous');
                         routeUnverified(filePath, fileEntry, call,
-                            externC ? 'link-variant' : 'link-ambiguous', calledAs, externC ? {
+                            linkReason, calledAs, linkReason === 'link-variant' ? {
                                 uncertaintyClass: 'compile-time-dispatch',
                                 dispatchFamily: `${name} external-linkage implementations`,
                             } : {
@@ -17841,7 +17844,17 @@ function _lexicalClassScope(index, member) {
 function _lexicalClassScopeUncached(index, member) {
     const scopeRefs = [];
     let owner = lexicalClassRefOf(index, member);
-    if (!owner && member?.isNested) return null;
+    if (!owner && member?.isNested) {
+        // A local callable outside every type declaration (C# top-level
+        // statements, fix #419) has no class in lexical scope, unless the
+        // type synthesized for those statements has project parts.
+        const language = index.files.get(member.file)?.language;
+        const synthesized = langTraits(language)?.topLevelStatementsType;
+        if (!synthesized || (index.symbols.get(synthesized) || []).some(def =>
+            ['class', 'struct', 'record'].includes(def.type) && !def.namespace && !def.enclosingType &&
+            index.files.get(def.file)?.language === language)) return null;
+        return scopeRefs;
+    }
     const seenOwners = new Set();
     while (owner) {
         if (!owner.key || !owner.def || seenOwners.has(owner.key)) return null;
@@ -29756,6 +29769,6 @@ function findCallbackUsages(index, name) {
     return usages;
 }
 
-module.exports = { _cppMemberUsingBases, rustTypeNameDenotes, _textualIncludeClosures, _textualLinkVerdict, isProvenanceBuiltinReceiver, provenanceParameterIdentity: _overloadTypeIdentity, selectProvenanceOverload, _unresolvedModuleIsGap, _importReaches, _sameNominalPackageDir, getCachedCalls, getCachedCallsBearing, findCallers, findCallees, getInstanceAttributeTypes, findCallbackUsages, _nameBindingReaches, _moduleAttributeBindingReaches, _declaredFieldType, _projectTopLevelNames, _callArityCompatible, _closeCallableIdentityGroup, _overloadDiscipline, _overloadApplicable, _buildReturnTypeFlowMap, _lookupReturnTypeFlow, _cFamilySignatureKey,
+module.exports = { _cppMemberUsingBases, _cppTargetVisibility, rustTypeNameDenotes, _textualIncludeClosures, _textualLinkVerdict, isProvenanceBuiltinReceiver, provenanceParameterIdentity: _overloadTypeIdentity, selectProvenanceOverload, _unresolvedModuleIsGap, _importReaches, _sameNominalPackageDir, getCachedCalls, getCachedCallsBearing, findCallers, findCallees, getInstanceAttributeTypes, findCallbackUsages, _nameBindingReaches, _moduleAttributeBindingReaches, _declaredFieldType, _projectTopLevelNames, _callArityCompatible, _closeCallableIdentityGroup, _overloadDiscipline, _overloadApplicable, _buildReturnTypeFlowMap, _lookupReturnTypeFlow, _cFamilySignatureKey,
     _isConfigurationAlternative, _isCrossFileConfigurationMember, _configurationAlternativeFiles, _sameOwnerPath,
     _goFileConstraint };

@@ -58,6 +58,49 @@ function ownMembers(index, owner) {
 
 function ownConstructors(index, owner) { return ownMembers(index, owner).filter(def => isConstructor(def, index)); }
 
+// The constructor a type's header declares without a body declaration of
+// its own (fix #419): a C# primary constructor, a Java record's implicit
+// canonical constructor (parser `primaryParams`). It is a member of the
+// constructor family that overload selection can choose, never a target:
+// a construction it receives is a class dependency only. Its identity
+// spans the type's declaration; the binding id keeps it apart from a
+// declared constructor on the same lines.
+const HEADER_CONSTRUCTORS = new WeakMap();
+function headerConstructor(owner, declared) {
+    if (!Array.isArray(owner?.primaryParams) || !declared?.length) return null;
+    const saved = HEADER_CONSTRUCTORS.get(owner);
+    if (saved && saved.params === owner.primaryParams && saved.sibling === declared[0]) return saved.definition;
+    const sibling = declared[0];
+    const definition = {
+        name: owner.name, type: 'constructor', className: owner.name, file: owner.file,
+        relativePath: owner.relativePath, startLine: owner.startLine, endLine: owner.endLine,
+        ...(sibling.namespace && { namespace: sibling.namespace }),
+        ...(sibling.enclosingType && { enclosingType: sibling.enclosingType }),
+        ...(sibling.lexicalScopeStartLine && { lexicalScopeStartLine: sibling.lexicalScopeStartLine,
+            lexicalScopeEndLine: sibling.lexicalScopeEndLine }),
+        params: owner.primaryParams.map(param => [param.type, param.name].filter(Boolean).join(' ')).join(', '),
+        paramsStructured: owner.primaryParams,
+        modifiers: (owner.modifiers || []).filter(modifier => ACCESS_MODIFIERS.has(modifier)),
+        isConstructor: true, headerConstructor: true,
+        bindingId: `${owner.relativePath}:constructor:${owner.startLine}:header`,
+    };
+    HEADER_CONSTRUCTORS.set(owner, { params: owner.primaryParams, sibling, definition });
+    return definition;
+}
+const ACCESS_MODIFIERS = new Set(['public', 'protected', 'private', 'internal']);
+
+// The constructor a `this(...)` delegation runs in: the declared
+// constructor of the owner whose source extent holds the site. A
+// constructor never delegates to itself (Java JLS 8.8.7, C# CS0516, C++
+// [class.base.init]), so it leaves the candidate family (fix #419).
+function delegatingConstructor(declared, call) {
+    const start = call.callStart ?? call.callSite?.start;
+    const holding = declared.filter(def => Number.isFinite(start) && def.sourceSpan
+        ? def.sourceSpan.start <= start && start < def.sourceSpan.end
+        : def.startLine === call.enclosingFunction?.startLine && def.endLine === call.enclosingFunction?.endLine);
+    return holding.length === 1 ? holding[0] : null;
+}
+
 // These spellings only select candidates. Every site must replay the
 // language's value/type binding before it can reach a class definition.
 function constructionAliases(index) {
@@ -258,11 +301,23 @@ function constructionEvidence(index, owner, call, classBinding) {
 }
 
 function constructionEvidenceUncached(index, owner, call, classBinding) {
-    let members = ownConstructors(index, owner), declaring = owner, hierarchy = null;
+    let members = ownConstructors(index, owner), declaring = owner, hierarchy = null, delegating = null;
     if (!members.length) {
         const inherited = require('./constructor-hierarchy').captureHierarchy(index, owner);
         if (!inherited) return { unresolved: true };
         members = inherited.members; declaring = inherited.declaring; hierarchy = inherited.witness;
+    } else {
+        const header = headerConstructor(owner, members);
+        if (call.ctorDelegation === 'this') {
+            // A same-type delegation runs in one of the owner's own
+            // constructors; any other enclosing scope means the site does
+            // not belong to this owner's family.
+            delegating = delegatingConstructor(members, call);
+            if (!delegating) return { unresolved: true, delegation: true };
+            members = members.filter(def => def !== delegating);
+        }
+        if (header) members = [...members, header];
+        if (!members.length) return { unresolved: true, delegation: true, delegating };
     }
     const language = index.files.get(owner.file).language;
     const protocol = protocolFacts(index, owner);
@@ -291,30 +346,47 @@ function constructionEvidenceUncached(index, owner, call, classBinding) {
             qualifier: call.constructorQualifier || call.receiver || null, functional: !!functional, construction: true,
             localShadow: !!call.localShadow,
         }, owner) : null;
-    return { members, declaring, hierarchy, language, protocol, overload, selected, chosen, nameScope, typeLookup };
+    return { members, declaring, hierarchy, delegating, language, protocol, overload, selected, chosen, nameScope, typeLookup };
 }
 
 function constructionChoice(index, owner, call, classBinding, targets) {
     const evidence = constructionEvidence(index, owner, call, classBinding);
     if (evidence.unresolved) {
-        return { reason: 'constructor-inheritance-unresolved', provenance: {
-            rule: 'constructor-call', rules: ['constructor-call'], facts: {
-                language: index.files.get(owner.file)?.language, site: classBinding?.facts?.site,
-                targets: (targets || []).map(declarationIdentity),
-            } } };
+        const facts = { language: index.files.get(owner.file)?.language, site: classBinding?.facts?.site,
+            targets: (targets || []).map(declarationIdentity) };
+        // The delegating constructor is never its own delegation's target,
+        // even when no other member of the family remains (fix #419).
+        if (evidence.delegating) {
+            facts.constructorCall = { owner: declarationIdentity(owner), members: [],
+                delegating: declarationIdentity(evidence.delegating), classBinding,
+                call: { isConstructor: !!call.isConstructor, syntax: call.constructorSyntax || null, delegation: 'this' } };
+            const provenance = { rule: 'constructor-call', rules: ['constructor-call'], facts };
+            if (targets && validateConfirmation(provenance, targets.map(declarationIdentity)).verdict === 'establishes-other') {
+                return { other: true, reason: 'constructor-delegation-self', provenance };
+            }
+        }
+        return { reason: evidence.delegation ? 'constructor-delegation-unresolved' : 'constructor-inheritance-unresolved',
+            provenance: { rule: 'constructor-call', rules: ['constructor-call'], facts } };
     }
-    const { members, declaring, hierarchy, language, protocol, overload, selected, chosen, nameScope, typeLookup } = evidence;
+    const { members, declaring, hierarchy, delegating, language, protocol, overload, selected, chosen, nameScope, typeLookup } = evidence;
     targets ||= members;
     const facts = { language, site: classBinding?.facts?.site, targets: targets.map(declarationIdentity),
         constructorCall: { owner: declarationIdentity(declaring), members: members.map(declarationIdentity),
             ...(hierarchy && { constructedOwner: declarationIdentity(owner), hierarchy }),
+            ...(delegating && { delegating: declarationIdentity(delegating) }),
             classBinding, call: { isConstructor: !!call.isConstructor,
                 isFunctionReference: !!call.isFunctionReference, isPotentialCallback: !!call.isPotentialCallback,
-                syntax: call.constructorSyntax || null },
+                syntax: call.constructorSyntax || null, ...(delegating && { delegation: 'this' }) },
             selected: chosen, overload, protocol, typeLookup, nameScope } };
     const provenance = { rule: 'constructor-call', rules: ['constructor-call'], facts };
-    const checked = chosen && validateConfirmation(provenance, targets.map(declarationIdentity));
-    if (checked?.verdict === 'establishes-other') return { other: true, provenance };
+    let checked = chosen && validateConfirmation(provenance, targets.map(declarationIdentity));
+    if (!chosen && delegating) {
+        const self = validateConfirmation(provenance, targets.map(declarationIdentity));
+        if (self.diagnostic === 'constructor-delegation-self') checked = self;
+    }
+    if (checked?.verdict === 'establishes-other') {
+        return { other: true, ...(checked.diagnostic === 'constructor-delegation-self' && { reason: checked.diagnostic }), provenance };
+    }
     const wrappedClass = langTraits(language)?.decoratorsWrapCallables && owner.decorators?.length;
     const reason = checked?.diagnostic === 'constructor-default-unresolved' ? 'constructor-default-unresolved'
         : checked?.diagnostic === 'unproven-construction-name-scope' ? 'constructor-name-scope-unresolved'
@@ -339,6 +411,9 @@ function projectConstructorCalleeSites(index, owner, siteIds, readSite) {
         const { call, site } = readSite(siteId);
         if (!isConstruction(call, site, language)) { remaining.push(siteId); continue; }
         const choice = constructionChoice(index, owner, call, site.provenance);
+        // The type header's own constructor has no declaration: the site
+        // remains a dependency on the class (fix #419).
+        if (!choice.reason && choice.definition?.headerConstructor) { remaining.push(siteId); continue; }
         if (choice.reason || !choice.definition) {
             // A Python class call still depends on its proven class binding
             // when its allocator/decorator protocol cannot select a body.
@@ -429,7 +504,8 @@ function projectConstructorCallers(index, name, options, result) {
             replaced.add(siteKey(site));
             const choice = constructionChoice(index, owner, call, site.provenance, targets);
             if (choice.other) {
-                excluded.push({ file: site.file, line: site.line, reason: 'constructor-overload-other', provenance: choice.provenance });
+                excluded.push({ file: site.file, line: site.line, reason: choice.reason || 'constructor-overload-other',
+                    provenance: choice.provenance });
                 continue;
             }
             const reason = site.tier === 'unverified' ? site.reason || 'constructor-owner-unresolved' : choice.reason;

@@ -99,6 +99,25 @@ function validateConfirmation(provenance, target, invalidCall = false) {
         const constructor = facts.constructorCall;
         const { owner, members, selected, classBinding, call, overload } = constructor;
         const constructed = constructor.constructedOwner || owner;
+        // A same-type delegation (`this(...)`) runs in one of the owner's
+        // constructors, which is never its target: Java JLS 8.8.7, C#
+        // CS0516, C++ [class.base.init] (fix #419).
+        const delegating = constructor.delegating;
+        if (delegating !== undefined) {
+            const site = facts.site;
+            if (!validIdentity(owner) || !validIdentity(delegating) || call?.delegation !== 'this' ||
+                call.syntax !== 'delegation' || delegating.kind !== 'constructor' ||
+                delegating.className !== owner.name || delegating.file !== owner.file ||
+                delegating.startLine < owner.startLine || delegating.endLine > owner.endLine ||
+                (delegating.namespace || null) !== (owner.namespace || null) ||
+                !site || site.file !== delegating.file || site.line < delegating.startLine || site.line > delegating.endLine ||
+                (members || []).some(member => sameDeclaration(member, delegating))) {
+                return inconsistent('constructor-delegation-mismatch');
+            }
+            if (targets.every(t => sameDeclaration(t, delegating))) {
+                return { verdict: 'establishes-other', declaration: delegating, diagnostic: 'constructor-delegation-self' };
+            }
+        }
         const structural = require('../languages').langTraits(facts.language)?.typeSystem === 'structural';
         if (!validIdentity(owner) || !validIdentity(selected) || !Array.isArray(members) || !members.length ||
             !call || !(call.isConstructor || require('../languages').langTraits(facts.language)?.classesCallableWithoutNew ||

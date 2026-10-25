@@ -267,6 +267,8 @@ function writtenClassRef(index, file, line, written, memo) {
     return ref;
 }
 
+const NESTED_TYPE_KINDS = new Set(['class', 'struct', 'interface', 'enum', 'record', 'type']);
+
 function certainMemberOwner(index, member, memo) {
     if (memo.has(member)) return memo.get(member);
     const { classDefsNamed } = require('./class-identity');
@@ -394,6 +396,18 @@ function findAccessorReferences(index, name, definition, options = {}) {
     const typeMemo = new Map();
     const members = (index.symbols.get(name) || []).filter(member => member.className &&
         !member.explicitInterface && !['class', 'struct', 'interface', 'enum', 'record'].includes(member.type));
+    // A nested type is a member of the type declaring it: where the grammar
+    // reports implicit member shapes (C# simple-name lookup), a nested type
+    // named like the property hides it inside that type (fix #419).
+    if (langTraits(index.files.get(definition.file)?.language)?.accessorReferenceShape) {
+        for (const type of index.symbols.get(name) || []) {
+            if (type.className || !type.enclosingType || !NESTED_TYPE_KINDS.has(type.type)) continue;
+            members.push({ name, type: 'nested-type', nestedType: true, file: type.file,
+                relativePath: type.relativePath, startLine: type.startLine, endLine: type.endLine,
+                className: String(type.enclosingType).split('.').pop(),
+                ...(type.namespace && { namespace: type.namespace }) });
+        }
+    }
     // Use the parser's raw occurrence records rather than usages()' public
     // line-oriented inventory. A line can contain two same-spelled member
     // accesses with different receivers; collapsing them by file+line would

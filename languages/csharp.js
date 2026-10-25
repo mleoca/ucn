@@ -1466,6 +1466,8 @@ function variableScopeKey(node) {
 }
 
 const localBindingFactsByTree = new WeakMap();
+// Nodes whose identifier children can be deconstruction designations.
+const DECONSTRUCTION_PARENTS = new Set(['tuple_pattern', 'parenthesized_variable_designation', 'argument']);
 
 /**
  * Local binding facts of one callable (fix #381): how many times each name
@@ -1496,6 +1498,10 @@ function csharpLocalBindingFacts(fnNode) {
                 }
             } else if (child.type === 'declaration_pattern' || child.type === 'declaration_expression') {
                 declare(child.childForFieldName('name')?.text || child.namedChildren.at(-1)?.text);
+            } else if (child.type === 'identifier' && DECONSTRUCTION_PARENTS.has(node.type) &&
+                require('./csharp-scope').deconstructionRoot(child)) {
+                // `var (a, b) = t;`, `case var (a, b):` (fix #419).
+                declare(child.text);
             } else if (child.type === 'assignment_expression') {
                 const left = child.childForFieldName('left');
                 if (left?.type === 'identifier') facts.assigned.add(left.text);

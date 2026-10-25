@@ -142,6 +142,19 @@ function selfMemberTokenColumns(index, filePath, lineNumber, name) {
     return out;
 }
 
+// The embedded-script tree of a file's content (fix #419), the last few
+// contents kept.
+const EMBEDDED_TREES = new Map();
+function embeddedTree(embedded, parser, content) {
+    if (EMBEDDED_TREES.has(content)) return EMBEDDED_TREES.get(content);
+    const scriptParser = parser && getParser(embedded.language);
+    const source = scriptParser ? embedded.source(content, parser) : null;
+    const tree = source ? safeParse(scriptParser, source) : null;
+    if (EMBEDDED_TREES.size >= 8) EMBEDDED_TREES.delete(EMBEDDED_TREES.keys().next().value);
+    EMBEDDED_TREES.set(content, tree);
+    return tree;
+}
+
 /** Replace only AST identifier tokens on one source line. */
 function renameIdentifierTokens(index, filePath, lineNumber, oldName, newName,
     preferredByteColumns = null, expectedCallCount = null, tokenOptions = {}) {
@@ -168,8 +181,11 @@ function renameIdentifierTokens(index, filePath, lineNumber, oldName, newName,
         const language = index.files.get(absolute)?.language ||
             detectLanguage(absolute, index.root);
         const parser = language && getParser(language);
-        const tree = parser && (index._getParsedTree?.(absolute, content, language) ||
-            safeParse(parser, content));
+        // A file whose code is embedded (HTML scripts) is read in the
+        // script's own syntax, rows and columns kept (fix #419).
+        const embedded = langTraits(language)?.embeddedSyntax;
+        const tree = embedded ? embeddedTree(embedded, parser, content) : parser &&
+            (index._getParsedTree?.(absolute, content, language) || safeParse(parser, content));
         if (tree) {
             const targetRow = lineNumber - 1;
             const stack = [tree.rootNode];
@@ -3187,6 +3203,9 @@ function plan(index, name, options = {}) {
     let operation = null;
     let changes = [];
     const reviewItems = [];
+    // The declarations a rename changes together: the pin and its
+    // configuration alternatives (fix #419).
+    const renameClosure = [def];
     // Contract membership (fix #360): project slot roots the rename closed
     // over, and Go satisfaction sites the closure could not complete.
     const contractRootDefs = [];
@@ -3944,6 +3963,7 @@ function plan(index, name, options = {}) {
                 (!other.isSignature && _isCrossFileConfigurationMember(index, def, other)) ||
                 linkAlternatives.defines.includes(other)));
             const alternativeSites = [];
+            renameClosure.push(...alternatives);
             for (const other of alternatives) {
                 const line = other.nameLine || other.startLine;
                 const rel = other.relativePath || other.file;
@@ -4701,8 +4721,10 @@ function plan(index, name, options = {}) {
             // A prototype and its definition (C/C++ forward declarations,
             // overload signatures) are one callable (fix #396): each binds
             // the name as the pin.
-            const pinIdentity = new Set(require('./callers')._closeCallableIdentityGroup(
-                index, [def], definitions));
+            // Configuration alternatives are one item with the pin too (fix
+            // #419): a reference ambiguous only between them names the item.
+            const pinIdentity = new Set([...require('./callers')._closeCallableIdentityGroup(
+                index, [def], definitions), ...renameClosure]);
             const binders = definitions
                 .filter(candidate => candidate.file === def.file &&
                     !NON_CALLABLE_TYPES.has(candidate.type))
@@ -4977,7 +4999,7 @@ function plan(index, name, options = {}) {
                         editKind: 'reference',
                     }, edit));
                 } else {
-                    changes.push({
+                    const review = {
                         file: rel,
                         line: ref.line,
                         expression: (ref.content || '').trim(),
@@ -4986,7 +5008,14 @@ function plan(index, name, options = {}) {
                             `${def.startLine} before renaming`,
                         needsReview: true,
                         editKind: 'reference',
-                    });
+                    };
+                    // The tokens under review (fix #419): a declaration edit
+                    // of this line that renames them already decides them.
+                    const reviewed = records.map(record => record.column);
+                    if (reviewed.every(Number.isInteger)) {
+                        Object.defineProperty(review, '_reviewColumns', { value: reviewed, enumerable: false });
+                    }
+                    changes.push(review);
                 }
             }
         }
@@ -5090,11 +5119,23 @@ function plan(index, name, options = {}) {
     const definitionLine = def.nameLine || def.startLine;
     const definitionFile = def.relativePath || def.file;
     const definitionSource = index.getLineContent(def.file, definitionLine).trim();
-    // A property access awaiting review on this line stays a separate item;
-    // the declaration token still has its own certain edit.
+    // A reference awaiting review on this line stays a separate item, with
+    // its reason; the declaration token still has its own certain edit
+    // (fix #419: only accessor pins kept it apart). A type rename's own pass
+    // decides every token of its lines.
+    let definitionEdit;
+    const declarationEdit = () => definitionEdit ||= renameIdentifierTokens(index, def.file,
+        definitionLine, name, options.renameTo, null, null, { definitionNameOnly: true, definition: def });
+    const decidedByDeclaration = change => Array.isArray(change._reviewColumns) && (() => {
+        const edit = declarationEdit();
+        return Array.isArray(edit.columns) && change._reviewColumns.every(column =>
+            edit.columns.includes(tokenColumn(edit.rawSource || '', column, name)));
+    })();
+    const separateReview = change => !!options.renameTo && !!change.needsReview &&
+        (isAccessorDefinition(def) || (!isTypeRenamePin(def) && change.editKind === 'reference' &&
+            !change.isDefinition && !decidedByDeclaration(change)));
     const existingDefinitionLine = changes.find(change =>
-        change.file === definitionFile && change.line === definitionLine &&
-        (!options.renameTo || !isAccessorDefinition(def) || !change.needsReview));
+        change.file === definitionFile && change.line === definitionLine && !separateReview(change));
     // A definition a macro_rules! transcriber generated (fix #374) is
     // spelled in the macro's template, never at the invocation: the
     // template pass below edits or lists it; the invocation line is only
@@ -5114,9 +5155,7 @@ function plan(index, name, options = {}) {
         existingDefinitionLine.isDefinition = true;
         existingDefinitionLine.editKind = 'definition';
         if (options.renameTo) {
-            const defEdit = renameIdentifierTokens(index, def.file,
-                definitionLine, name, options.renameTo,
-                null, null, { definitionNameOnly: true, definition: def });
+            const defEdit = declarationEdit();
             // Keep the tokens the line's other edit renames (a recursive or
             // delegating call on the declaration line) (fix #376).
             if (!(existingDefinitionLine.newExpression !== undefined &&
@@ -5135,9 +5174,7 @@ function plan(index, name, options = {}) {
             editKind: 'definition',
         };
         if (options.renameTo) {
-            const defEdit = renameIdentifierTokens(index, def.file,
-                definitionLine, name, options.renameTo,
-                null, null, { definitionNameOnly: true, definition: def });
+            const defEdit = declarationEdit();
             const renamed = defEdit.renamed;
             definitionChange.newExpression = renamed;
             definitionChange.suggestion = `Update definition: ${renamed}`;
@@ -5508,12 +5545,43 @@ function plan(index, name, options = {}) {
         planUnverified.push(...kept);
     }
 
+    // Configuration-dependent C/C++ bindings (fix #413): a site in a known
+    // arm where an imported declaration, not any declaration the rename
+    // changes, binds the name keeps its spelling; the plan's ACCOUNT lists
+    // it as another target (fix #419: never dropped unreported). A site the
+    // build configuration decides is a review item.
+    const configurationOther = [];
+    if (options.renameTo && langTraits(planLang)?.textualIncludes) {
+        const { conditionalImportBinding } = require('./cpp-scope');
+        for (let i = changes.length - 1; i >= 0; i--) {
+            const change = changes[i];
+            if (change.editKind === 'definition' || change.needsReview ||
+                change.newExpression === undefined) continue;
+            // A site in another alternative's branch binds that alternative,
+            // which the rename changes too: 'other' means outside the whole
+            // closure (fix #419).
+            const configuration = conditionalImportBinding(index, renameClosure, {
+                file: path.resolve(index.root, change.file), line: change.line,
+            });
+            if (configuration === 'other') {
+                changes.splice(i, 1);
+                configurationOther.push({ file: path.resolve(index.root, change.file), line: change.line,
+                    reason: 'configuration-other' });
+            } else if (configuration === 'uncertain') {
+                delete change.newExpression;
+                change.needsReview = true;
+                change.reviewReason = 'configuration-alternative';
+                change.suggestion = 'Build configuration selects this name\'s declaration; review this reference before renaming it';
+            }
+        }
+    }
+
     // One source of truth for the plan's ACCOUNT (fix #376): a line the plan
     // edits as a call is confirmed and a line it lists as unverified is
     // unverified, whichever slot member's sweep contributed it; the pin's own
     // exclusions only keep the lines no listed site claims.
     if (options.renameTo && planAccountParts && planGroundSet &&
-        (slotAccountSites.length > 0 || planUnverified.length > 0 || typePass)) {
+        (slotAccountSites.length > 0 || planUnverified.length > 0 || typePass || configurationOther.length > 0)) {
         const pathMod = require('path');
         const absoluteOf = file => (pathMod.isAbsolute(file) ? file : pathMod.join(index.root, file));
         const editedCallLines = new Set(changes.filter(change =>
@@ -5537,10 +5605,12 @@ function plan(index, name, options = {}) {
             }
             return { confirmed, excluded };
         };
+        const otherLines = new Set(configurationOther.filter(entry => !editedCallLines.has(
+            `${relOf(entry.file)}:${entry.line}`)).map(entry => `${entry.file}:${entry.line}`));
         const build = (extra) => buildAccount(index, name, {
             groundSet: planGroundSet,
             confirmedEntries: [
-                ...planAccountParts.confirmedEntries,
+                ...planAccountParts.confirmedEntries.filter(entry => !otherLines.has(`${absoluteOf(entry.file)}:${entry.line}`)),
                 ...slotAccountSites.filter(site => editedCallLines.has(`${site.file}:${site.line}`))
                     .map(site => ({ file: site.absoluteFile || absoluteOf(site.file), line: site.line })),
                 ...extra.confirmed,
@@ -5550,7 +5620,7 @@ function plan(index, name, options = {}) {
                     !typeDecided.has(`${relOf(entry.file)}:${entry.line}`)),
                 ...planUnverified.map(site => ({ file: absoluteOf(site.file), line: site.line })),
             ],
-            excludedEntries: [...extra.excluded, ...planAccountParts.excludedEntries],
+            excludedEntries: [...configurationOther, ...extra.excluded, ...planAccountParts.excludedEntries],
         });
         let extra = typeClaims((typePass?.removed || []).map(site => `${site.file}:${site.line}`));
         planAccount = build(extra);
@@ -5837,25 +5907,6 @@ function plan(index, name, options = {}) {
                     reason: review.reason,
                 })),
             };
-        }
-    }
-
-    if (options.renameTo && langTraits(planLang)?.textualIncludes) {
-        const { conditionalImportBinding } = require('./cpp-scope');
-        for (let i = changes.length - 1; i >= 0; i--) {
-            const change = changes[i];
-            if (change.editKind === 'definition' || change.needsReview ||
-                change.newExpression === undefined) continue;
-            const configuration = conditionalImportBinding(index, [def], {
-                file: path.resolve(index.root, change.file), line: change.line,
-            });
-            if (configuration === 'other') changes.splice(i, 1);
-            else if (configuration === 'uncertain') {
-                delete change.newExpression;
-                change.needsReview = true;
-                change.reviewReason = 'configuration-alternative';
-                change.suggestion = 'Build configuration selects this name\'s declaration; review this reference before renaming it';
-            }
         }
     }
 

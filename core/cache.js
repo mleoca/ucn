@@ -942,7 +942,9 @@ function clearAllCaches() {
 // v305: Java variadic parameters retain their declared array type.
 // v306: Overload witnesses omit absent optional object fields consistently.
 // v307: Overload witnesses capture observed file fields separately.
-const CACHE_FORMAT_VERSION = 307;
+// v308 (fix #419): Java records without a declared canonical constructor
+// carry its parameters (`primaryParams`); record constructors delegate.
+const CACHE_FORMAT_VERSION = 308;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 function usageResultKey(index, filePath, name, mode) {

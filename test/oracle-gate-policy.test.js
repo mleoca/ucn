@@ -32,7 +32,9 @@ describe('fix #417: clangd class adjudication follows an alias construction type
             { kind: 'DeclRef', role: 'expression', range: range(2, 4, 9) }] }, false],
         ['unavailable AST', null, false],
     ]) it(label, async () => {
-        const dir = tmp({ 'n.cpp': 'struct Box {};\nusing Alias=Box;\nAlias(1);\n' });
+        // The oracle opens files by their real path; a symlinked temporary
+        // directory (macOS /var) must not read as an unopened file (fix #419).
+        const dir = require('fs').realpathSync.native(tmp({ 'n.cpp': 'struct Box {};\nusing Alias=Box;\nAlias(1);\n' }));
         try {
             const file = path.join(dir, 'n.cpp'), uri = pathToFileURL(file).href, requests = [];
             const handle = { root: dir, opened: new Set([file]), source: new Map(), astLines: new Map(),

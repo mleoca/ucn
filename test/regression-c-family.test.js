@@ -7110,3 +7110,67 @@ describe('fix #418: the constructor-owner proof is consulted only for members na
         } finally { rm(dir); }
     });
 });
+
+describe('fix #419: configuration alternatives as one rename closure; other translation units; delegation', () => {
+    const arms = [
+        '#include <algorithm>', 'namespace util {', '#if defined(USE_STD)', 'using std::clamp;',
+        'int inStd() { return clamp(0, 0, 0); }', '#elif defined(FAST)', 'int clamp(int v, int lo, int hi) { return v; }',
+        'int inFast() { return clamp(1, 1, 1); }', 'int (*fast)(int, int, int) = &clamp;', '#else',
+        'int clamp(int v, int lo, int hi) { return lo; }', 'int inSlow() { return clamp(2, 2, 2); }', '#endif',
+        'int outside() { return clamp(3, 3, 3); }', '}', ''].join('\n');
+    const plan = (dir, handle) => {
+        const r = execute(idx(dir), 'plan', { name: handle, renameTo: 'clamp2' });
+        assert.ok(r.ok, r.error);
+        return r.result;
+    };
+    const edits = result => result.changes.filter(change => change.newExpression !== undefined && !change.needsReview)
+        .map(change => change.line).sort((a, b) => a - b);
+    const reviews = result => result.changes.filter(change => change.needsReview).map(change => change.line).sort((a, b) => a - b);
+    it('a call in another alternative\'s arm is renamed with that alternative', () => {
+        const dir = tmp({ 'a.cpp': arms });
+        try {
+            for (const handle of ['a.cpp:7:clamp', 'a.cpp:11:clamp']) {
+                const result = plan(dir, handle);
+                assert.deepStrictEqual(edits(result), [7, 8, 11, 12], handle);
+                // The import arm's call keeps its spelling and is reported as
+                // another target; the reference in the FAST arm and the call
+                // after the group are reviews.
+                assert.deepStrictEqual(reviews(result), [4, 9, 14], handle);
+                assert.strictEqual(result.account.excluded.total, 1, JSON.stringify(result.account));
+                assert.ok(result.account.conserved);
+            }
+        } finally { rm(dir); }
+    });
+    it('a translation unit that cannot include the definition binds it by linkage alone', () => {
+        const dir = tmp({
+            'a.cpp': '#include <algorithm>\nnamespace util {\n#if USE_STD\nusing std::clamp;\n#else\n' +
+                'int clamp(int v, int lo, int hi) { return v; }\n#endif\nint outside() { return clamp(7, 8, 9); }\n}\n',
+            'b.cpp': 'namespace util { int clamp(int v, int lo, int hi); }\nint other() { return util::clamp(1, 1, 1); }\n',
+        });
+        try {
+            const index = idx(dir);
+            const context = execute(index, 'context', { name: 'a.cpp:6:clamp' });
+            assert.ok(context.ok, context.error);
+            assert.ok(context.result.callers.some(site => site.relativePath === 'b.cpp' && site.line === 2));
+            assert.deepStrictEqual(context.result.unverifiedCallers.map(site => `${site.relativePath}:${site.line} ${site.reason}`),
+                ['a.cpp:8 configuration-alternative']);
+            const result = plan(dir, 'a.cpp:6:clamp');
+            assert.ok(result.changes.some(change => change.file === 'b.cpp' && change.line === 2 &&
+                change.newExpression === 'int other() { return util::clamp2(1, 1, 1); }' && !change.needsReview));
+        } finally { rm(dir); }
+    });
+    it('C++: a delegating constructor is never its own caller', () => {
+        const dir = tmp({ 'a.cpp': 'struct W {\n    W(int x) {}\n    W(const char* s) : W(1) {}\n    W(long d) : W(static_cast<int>(d)) {}\n};\nW a() { return W(2); }\n' });
+        try {
+            const index = idx(dir);
+            for (const [line, own] of [[3, 3], [4, 4]]) {
+                const target = index.symbols.get('W').find(def => def.type === 'constructor' && def.startLine === line);
+                const callers = index.findCallers('W', { targetDefinitions: [target], collectAccount: true });
+                const all = [...callers, ...callers.unverifiedEntries].map(site => site.line);
+                assert.ok(!all.includes(own), `${line}: ${all}`);
+                assert.ok(callers.accountRaw.excludedEntries.some(entry => entry.line === own &&
+                    entry.reason === 'constructor-delegation-self'), JSON.stringify(callers.accountRaw.excludedEntries));
+            }
+        } finally { rm(dir); }
+    });
+});

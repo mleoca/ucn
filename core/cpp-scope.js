@@ -380,7 +380,14 @@ function conditionalImportBinding(index, definitions, site) {
     let allOther = true;
     for (const definition of definitions) {
         const imports = _conditionalImports(index, definition);
-        if (imports.length === 0) { allOther = false; continue; }
+        // The import alternatives live in the definition's file: a
+        // translation unit that cannot include it reaches the definition
+        // by linkage alone, whatever that file's configuration (fix #419).
+        if (imports.length === 0 || site.file !== definition.file &&
+            require('./callers')._cppTargetVisibility(index, site.file, [definition]) === 'no') {
+            allOther = false;
+            continue;
+        }
         affected = true;
         let other = false;
         let unknown = false;

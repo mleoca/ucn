@@ -917,6 +917,9 @@ const LANGUAGES = {
             hasDynamicImports: false,
             hasArityOverloads: true,
             bareCallReachesMethods: true,
+            // The type the compiler synthesizes for top-level statements: a
+            // local function there has no other class in lexical scope.
+            topLevelStatementsType: 'Program',
             inheritedOverloadSignatures: true,
             typeQualifiedCallStyle: 'static',
             universalSupertype: 'Object',
@@ -975,6 +978,12 @@ const LANGUAGES = {
             ...STRUCTURAL_TRAITS,
             // Embedded scripts supply their own parse trees.
             physicalCallTokenSyntax: false,
+            // The script source with its rows and columns kept, parsed in its
+            // own language where an edit reads tokens (fix #419).
+            embeddedSyntax: { language: 'javascript', source: (content, parser) => {
+                const html = require('./html');
+                return html.buildVirtualJSContent(content, html.extractScriptBlocks(content, parser));
+            } },
             constructorInheritance: { ...STRUCTURAL_TRAITS.constructorInheritance, syntaxLanguage: 'javascript',
                 source: (content, parser) => {
                     const html = require('./html');

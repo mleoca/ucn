@@ -4237,3 +4237,46 @@ describe('fix #354: cross-process build lock', () => {
         }
     });
 });
+
+describe('fix #419: record header constructors survive index persistence', () => {
+    it('round-trips the implicit canonical parameters and the delegation answers', () => {
+        const dir = tmp({
+            'p/R.java': 'package p;\n\npublic record R(int x) {\n    public R(String s) { this(s.length()); }\n    public R(long l) { this(5); }\n}\n',
+            'p/U.java': 'package p;\n\npublic class U {\n    static R a() { return new R(1); }\n    static R d() { return new R(7L); }\n}\n',
+        });
+        try {
+            const read = index => {
+                const record = index.symbols.get('R').find(def => def.type === 'record');
+                const target = index.symbols.get('R').find(def => def.type === 'constructor' && def.params === 'long l');
+                const callers = index.findCallers('R', { targetDefinitions: [target], collectAccount: true });
+                return { header: record.primaryParams, callers: callers.map(site => site.line),
+                    excluded: callers.accountRaw.excludedEntries.map(entry => [entry.line, entry.reason]).sort() };
+            };
+            const index = idx(dir);
+            const before = JSON.parse(JSON.stringify(read(index)));
+            assert.deepStrictEqual(before.header, [{ name: 'x', type: 'int' }]);
+            index.saveCache();
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loaded.loadCache());
+            assert.deepStrictEqual(JSON.parse(JSON.stringify(read(loaded))), before);
+        } finally {
+            clearProjectCache(dir);
+            rm(dir);
+        }
+    });
+    it('rejects the preceding format without record header parameters', () => {
+        const dir = tmp({ 'p/R.java': 'package p;\npublic record R(int x) {}\n' });
+        try {
+            const index = idx(dir);
+            index.saveCache();
+            const cacheFile = getProjectCachePath(dir);
+            const saved = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+            saved.version = 307;
+            fs.writeFileSync(cacheFile, JSON.stringify(saved));
+            assert.strictEqual(new ProjectIndex(dir).loadCache(), false);
+        } finally {
+            clearProjectCache(dir);
+            rm(dir);
+        }
+    });
+});

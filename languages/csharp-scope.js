@@ -8,8 +8,41 @@ const CSHARP_LOCAL_DECLARATION_NODES = new Set(['parameter', 'catch_declaration'
     'declaration_expression', 'variable_declarator', 'local_function_statement', 'from_clause',
     'join_clause', 'query_continuation', 'recursive_pattern', 'var_pattern']);
 
+// A switch expression arm scopes its pattern variables; a while
+// condition's variables are scoped to the statement (fix #419).
 const CSHARP_BLOCK_SCOPES = new Set(['block', 'switch_section', 'for_statement', 'using_statement',
-    'fixed_statement', 'lambda_expression', 'anonymous_method_expression', 'arrow_expression_clause']);
+    'fixed_statement', 'lambda_expression', 'anonymous_method_expression', 'arrow_expression_clause',
+    'switch_expression_arm', 'while_statement']);
+
+/**
+ * The outermost node of a deconstruction designation holding `node`
+ * (fix #419): `var (a, (b, c))` in a declarator, foreach or pattern. The
+ * grammar reads `x is var (a, b)` as an invocation of `x is var`, whose
+ * arguments are then the designations. Null when `node` is no such name.
+ */
+function deconstructionRoot(node) {
+    let current = node, root = null;
+    while (current.parent && (current.parent.type === 'tuple_pattern' ||
+        current.parent.type === 'parenthesized_variable_designation')) {
+        current = current.parent;
+        root = current;
+    }
+    if (root) return root;
+    // `x is var (a, (b, c))`: argument / tuple_expression nesting under the
+    // misread invocation's argument list.
+    current = node;
+    while (current.parent?.type === 'argument' && current.type !== 'argument' &&
+        (current.type === 'identifier' || current.type === 'tuple_expression')) {
+        const argument = current.parent, list = argument.parent;
+        if (list?.type === 'tuple_expression') { current = list; continue; }
+        const call = list?.type === 'argument_list' ? list.parent : null;
+        const callee = call?.type === 'invocation_expression' ? call.childForFieldName('function') : null;
+        if (callee?.type === 'is_expression' && callee.namedChildren.at(-1)?.type === 'implicit_type' &&
+            sameNode(call.childForFieldName('arguments'), list)) return call;
+        return null;
+    }
+    return null;
+}
 
 /**
  * Where C# scopes a local named like the reference (spec 7.6.1): 'local' when
@@ -72,14 +105,17 @@ function csharpLocalBinding(memberNode, node, name) {
                 return parent.parent;
             case 'foreach_statement':
                 return parent.childForFieldName('body');
-            case 'tuple_pattern': {
-                for (let scope = parent.parent; scope; scope = scope.parent) {
-                    if (scope.type === 'foreach_statement' && contains(scope.childForFieldName('left'), declared)) {
-                        return scope.childForFieldName('body');
-                    }
-                    if (sameNode(scope, memberNode)) break;
+            case 'tuple_pattern': case 'parenthesized_variable_designation': case 'argument': {
+                // A deconstruction: the foreach body for its iteration
+                // variables, else the scope of the declaration or pattern
+                // that holds it (fix #419).
+                const root = deconstructionRoot(declared);
+                if (!root) return null;
+                const owner = root.parent;
+                if (owner?.type === 'foreach_statement' && contains(owner.childForFieldName('left'), declared)) {
+                    return owner.childForFieldName('body');
                 }
-                return null;
+                return nearest(root, CSHARP_BLOCK_SCOPES);
             }
             case 'from_clause': case 'let_clause': case 'query_continuation':
                 return queryRange(parent, parent.endIndex);
@@ -111,11 +147,16 @@ function csharpLocalBinding(memberNode, node, name) {
                     (parent.type === 'foreach_statement' && sameNode(parent.childForFieldName('left'), current)) ||
                     parent.type === 'single_variable_designation' ||
                     (parent.type === 'let_clause' && sameNode(parent.namedChild(0), current)) ||
-                    rangeBindingToken(current);
+                    rangeBindingToken(current) || !!deconstructionRoot(current);
             }
             if (declares) {
                 const scope = current.type === 'implicit_parameter' ? parent : scopeOf(current);
                 facts.push({ node: current, scope: snapshot(scope) });
+            } else if (parent && UNMODELED_DESIGNATION.test(parent.type)) {
+                // A same-name token in a pattern shape this lookup does not
+                // model may declare a local: every reference of the member
+                // is then undecided (fix #419).
+                facts.push({ node: current, scope: null });
             }
             return;
         }
@@ -139,6 +180,11 @@ function csharpLocalBinding(memberNode, node, name) {
     bindings.set(cacheKey, facts);
     return bindingVerdict(facts, node);
 }
+
+// Designation nodes: a token directly under one is either a modelled
+// declaration or an undecided one. (A name directly under a subpattern is
+// a member key or a constant, never a declaration.)
+const UNMODELED_DESIGNATION = /_designation$/;
 
 const TYPE_SCOPES = new Set(['class_declaration', 'struct_declaration', 'record_declaration',
     'record_struct_declaration', 'interface_declaration']);
@@ -282,7 +328,9 @@ function declaresToken(node) {
         (parent.type.endsWith('_declaration') || CSHARP_LOCAL_DECLARATION_NODES.has(parent.type))) return true;
     return parent.type === 'implicit_parameter' || parent.type === 'single_variable_designation' ||
         (parent.type === 'foreach_statement' && sameNode(parent.childForFieldName('left'), node)) ||
-        (parent.type === 'let_clause' && sameNode(parent.namedChild(0), node));
+        (parent.type === 'let_clause' && sameNode(parent.namedChild(0), node)) ||
+        // Deconstruction designations declare locals (fix #419).
+        !!deconstructionRoot(node);
 }
 
 // A primary-constructor parameter supplies instance initializers and base
@@ -388,4 +436,4 @@ function accessorReferenceShape(tree, usage, implicitCreationTarget) {
         inferredName: projection };
 }
 
-module.exports = { csharpLocalBinding, accessorReferenceShape, namedType, usingScopesOf, fileScopedNamespace };
+module.exports = { csharpLocalBinding, accessorReferenceShape, namedType, usingScopesOf, fileScopedNamespace, deconstructionRoot };
