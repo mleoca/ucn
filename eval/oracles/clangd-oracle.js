@@ -322,7 +322,7 @@ const clangdOracle = {
         return [...refs.values()];
     },
 
-    async resolveDefinition(handle, { name, file, line, column }) {
+    async resolveDefinition(handle, { name, file, line, column, kind }) {
         const absFile = path.join(handle.root, file);
         ensureOpen(handle, absFile);
         const columns = Number.isInteger(column)
@@ -330,10 +330,17 @@ const clangdOracle = {
             : nameColumns(sourceLine(handle, absFile, line), name);
         const definitions = new Map();
         for (const character of columns) {
-            for (const method of [
+            const methods = [
                 'textDocument/definition',
                 'textDocument/declaration',
-            ]) {
+            ];
+            // An alias construction's definition is its typedef. The
+            // compiler's constructed-type lookup supplies the class identity
+            // when judging a class dependency, including a forward pin.
+            if (kind === 'class' && await constructionTypeAt(handle, absFile, line - 1, character)) {
+                methods.push('textDocument/typeDefinition');
+            }
+            for (const method of methods) {
                 let response;
                 try {
                     response = await handle.lsp.request(method, {
@@ -465,10 +472,7 @@ async function incomingCallSites(handle, absFile, position) {
  * classifies whether that exact reference occupies the callee subtree of a
  * call expression, without lexical or regex inference.
  */
-async function callReferenceInfo(handle, absFile, range, name, {
-    directCalleeOnly = false,
-} = {}) {
-    const line = range.start.line;
+async function lineAst(handle, absFile, line) {
     const cacheKey = `${canonical(absFile)}:${line}`;
     let ast = handle.astLines.get(cacheKey);
     if (ast === undefined) {
@@ -486,16 +490,37 @@ async function callReferenceInfo(handle, absFile, range, name, {
         }
         handle.astLines.set(cacheKey, ast);
     }
+    return ast;
+}
+
+function containsPosition(node, line, column) {
+    if (!node?.range) return true; // Macro-expanded nodes can omit ranges.
+    const { start, end } = node.range;
+    return line >= start.line && line <= end.line &&
+        (line !== start.line || column >= start.character) &&
+        (line !== end.line || column <= end.character);
+}
+
+async function constructionTypeAt(handle, absFile, line, column) {
+    const ast = await lineAst(handle, absFile, line);
+    const visit = node => {
+        if (!node || !containsPosition(node, line, column)) return false;
+        if (['CXXTemporaryObject', 'CXXFunctionalCast', 'CXXNew'].includes(node.kind) &&
+            node.children?.some(child => child.role === 'type' && child.range &&
+                containsPosition(child, line, column))) return true;
+        return (node.children || []).some(visit);
+    };
+    return visit(ast);
+}
+
+async function callReferenceInfo(handle, absFile, range, name, {
+    directCalleeOnly = false,
+} = {}) {
+    const line = range.start.line;
+    const ast = await lineAst(handle, absFile, line);
     if (!ast) return null;
     const column = range.start.character;
-    const containsReference = node => {
-        if (!node?.range) return true; // macro-expanded nodes omit source ranges
-        const start = node.range.start;
-        const end = node.range.end;
-        return line >= start.line && line <= end.line &&
-            (line !== start.line || column >= start.character) &&
-            (line !== end.line || column <= end.character);
-    };
+    const containsReference = node => containsPosition(node, line, column);
     const visitCallee = node => {
         if (!node || !containsReference(node)) return null;
         const dependent = [

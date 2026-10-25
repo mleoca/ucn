@@ -372,7 +372,9 @@ function pythonReferenceScope(node, name, memo, includeClasses) {
 
 const JS_FUNCTIONS = new Set(['function_declaration', 'function_expression', 'function',
     'arrow_function', 'method_definition', 'generator_function',
-    'generator_function_declaration']);
+    'generator_function_declaration', 'function_signature', 'function_type',
+    'constructor_type', 'call_signature', 'construct_signature', 'method_signature',
+    'abstract_method_signature']);
 const JS_BLOCKS = new Set(['statement_block', 'switch_body', 'class_static_block', 'program']);
 
 function jsPatternNames(pattern, out) {

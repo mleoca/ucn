@@ -13,7 +13,157 @@ const {
     evaluateReviewBurden,
     evaluateOracleCoverage,
     closeJsTsDeclarationIdentity,
+    constructorClassEdges,
+    oracleCallerScope,
 } = require('../eval/oracle-gate-policy');
+
+describe('fix #417: clangd class adjudication follows an alias construction type', () => {
+    const { tmp, rm } = require('./helpers');
+    const { pathToFileURL } = require('url');
+    const { clangdOracle } = require('../eval/oracles/clangd-oracle');
+    const range = (line, start, end) => ({ start: { line, character: start }, end: { line, character: end } });
+    for (const [label, ast, expected] of [
+        ...['CXXTemporaryObject', 'CXXFunctionalCast', 'CXXNew'].map(kind => [kind,
+            { kind, range: range(2, 0, 12), children: [{ role: 'type', kind: 'Typedef', range: range(2, 0, 5) }] }, true]),
+        ['ordinary call return type', { kind: 'Call', range: range(2, 0, 12), children: [
+            { kind: 'DeclRef', role: 'expression', range: range(2, 0, 5) }] }, false],
+        ['constructor argument', { kind: 'CXXTemporaryObject', range: range(2, 0, 12), children: [
+            { kind: 'Record', role: 'type', range: range(2, 0, 3) },
+            { kind: 'DeclRef', role: 'expression', range: range(2, 4, 9) }] }, false],
+        ['unavailable AST', null, false],
+    ]) it(label, async () => {
+        const dir = tmp({ 'n.cpp': 'struct Box {};\nusing Alias=Box;\nAlias(1);\n' });
+        try {
+            const file = path.join(dir, 'n.cpp'), uri = pathToFileURL(file).href, requests = [];
+            const handle = { root: dir, opened: new Set([file]), source: new Map(), astLines: new Map(),
+                lsp: { async request(method) {
+                    requests.push(method);
+                    if (method === 'textDocument/ast') return ast;
+                    if (method === 'textDocument/definition') return [{ uri, range: range(1, 6, 11) }];
+                    if (method === 'textDocument/typeDefinition') return [{ uri, range: range(0, 7, 10) }];
+                    return [];
+                } } };
+            const definitions = await clangdOracle.resolveDefinition(handle, { kind: 'class', name: 'Alias',
+                file: 'n.cpp', line: 3, column: label === 'constructor argument' ? 5 : 0 });
+            assert.equal(definitions.some(def => def.file === 'n.cpp' && def.line === 1), expected);
+            assert.equal(requests.includes('textDocument/typeDefinition'), expected);
+            requests.length = 0;
+            await clangdOracle.resolveDefinition(handle, { kind: 'function', name: 'Alias', file: 'n.cpp', line: 3, column: 0 });
+            assert.equal(requests.includes('textDocument/typeDefinition'), false);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #417: oracle caller placement follows the call token and declaration identity', () => {
+    const { tmp, rm, idx } = require('./helpers');
+    const { getCachedCalls } = require('../core/callers');
+    const oracleCall = (file, source, call) => {
+        const column = call.column ?? call.callSite?.column ??
+            (Number.isInteger(call.callStart) ? source.slice(0, call.callStart).split('\n').at(-1).length : undefined);
+        assert.ok(Number.isInteger(column), call.name);
+        return { file, line: call.line, column };
+    };
+    for (const [file, source] of [
+        ['n.js', 'function alpha(){} function beta(){} function left(){alpha()} function right(){beta()}'],
+        ['n.ts', 'function alpha(){} function beta(){} function left(){alpha()} function right(){beta()}'],
+        ['N.java', 'class Scope {static void alpha(){} static void beta(){} static void left(){alpha();} static void right(){beta();}}'],
+        ['N.cs', 'class Scope {static void alpha(){} static void beta(){} static void left(){alpha();} static void right(){beta();}}'],
+        ['n.go', 'package scope\nfunc alpha(){};func beta(){};func left(){alpha()};func right(){beta()}'],
+        ['n.rs', 'fn alpha(){} fn beta(){} fn left(){alpha();} fn right(){beta();}'],
+        ['n.cpp', 'void alpha(){} void beta(){} void left(){alpha();} void right(){beta();}'],
+        ['n.c', 'void alpha(){} void beta(){} void left(){alpha();} void right(){beta();}'],
+    ]) {
+        it(`${file}: sibling scopes on one line cannot share a callee answer`, () => {
+            const dir = tmp({ [file]: source });
+            try {
+                const index = idx(dir), calls = getCachedCalls(index, path.join(dir, file));
+                const scopes = ['alpha', 'beta'].map(name => {
+                    const call = calls.find(call => call.name === name);
+                    assert.ok(call, name);
+                    return oracleCallerScope(index, oracleCall(file, source, call));
+                });
+                assert.deepEqual(scopes.map(scope => scope?.definition.name), ['left', 'right']);
+                assert.notEqual(scopes[0].key, scopes[1].key);
+            } finally { rm(dir); }
+        });
+    }
+    for (const [label, source, expected] of [
+        ['module callback', 'bind({}, "x", function getter(){nested();});', null],
+        ['nested callback', 'function outer(){bind({}, "x", function getter(){nested();});}', 'outer'],
+    ]) {
+        it(`${label}: a call does not belong to its callback argument`, () => {
+            const dir = tmp({ 'n.js': source });
+            try {
+                const index = idx(dir), calls = getCachedCalls(index, path.join(dir, 'n.js'));
+                const at = name => {
+                    const call = calls.find(call => call.name === name);
+                    return oracleCallerScope(index, oracleCall('n.js', source, call));
+                };
+                assert.equal(at('bind')?.definition.name ?? null, expected);
+                assert.equal(at('nested').definition.name, 'getter');
+                if (expected) assert.notEqual(at('bind').key, at('nested').key);
+            } finally { rm(dir); }
+        });
+    }
+});
+
+describe('fix #417: compiler class references retain proven constructor dependencies', () => {
+    const { tmp, rm, idx } = require('./helpers');
+    for (const [file, code] of [
+        ['n.js', 'class Widget {constructor(v){}}\nfunction build(){return new Widget(1);}\n'],
+        ['n.ts', 'class Widget {constructor(v:number){}}\nfunction build(){return new Widget(1);}\n'],
+        ['n.tsx', 'class Widget {constructor(v:number){}}\nfunction build(){return new Widget(1);}\n'],
+        ['n.html', '<script>\nclass Widget {constructor(v){}}\nfunction build(){return new Widget(1);}\n</script>'],
+        ['n.py', 'class Widget:\n def __init__(self,v):pass\ndef build():return Widget(1)\n'],
+    ]) {
+        it(`${file}: a class dependency requires a replayable occurrence proof`, () => {
+            const dir = tmp({ [file]: code });
+            try {
+                const index = idx(dir), target = index.symbols.get('Widget').find(def => def.type === 'class');
+                const edges = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+                const projected = constructorClassEdges(edges, [target]);
+                assert.equal(projected.length, 1);
+                assert.equal(projected[0].name, 'Widget');
+                assert.equal(projected[0].startLine, target.startLine);
+                assert.equal(projected[0].siteProvenance.length, 1);
+                assert.equal(constructorClassEdges(edges, [target], () => true).length, 0);
+                assert.equal(constructorClassEdges(edges, [{ ...target, relativePath: 'other' }]).length, 0);
+                assert.equal(constructorClassEdges(edges, [{ ...target, namespace: 'Other' }]).length, 0);
+                const incomplete = JSON.parse(JSON.stringify(edges));
+                incomplete[0].siteProvenance[0].provenance.facts.constructorCall.typeLookup = null;
+                assert.equal(constructorClassEdges(incomplete, [target]).length, 0);
+                assert.equal(constructorClassEdges([{ ...edges[0], siteProvenance: [] }], [target]).length, 0);
+            } finally { rm(dir); }
+        });
+    }
+    it('shared inherited bodies retain each constructed type at its own sites', () => {
+        const dir = tmp({ 'n.js': 'class Base {constructor(v){}}\nclass Left extends Base {}\nclass Right extends Base {}\nfunction build(){\n new Left(1);\n new Right(2);\n}\n' });
+        try {
+            const index = idx(dir), edges = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+            const targets = ['Left', 'Right'].map(name => index.symbols.get(name).find(def => def.type === 'class'));
+            const projected = constructorClassEdges(edges, targets);
+            assert.deepEqual(projected.map(edge => [edge.name, edge.sites]), [['Left', [5]], ['Right', [6]]]);
+            assert.ok(projected.every(edge => edge.siteProvenance.length === 1));
+        } finally { rm(dir); }
+    });
+    for (const [file, code] of [
+        ['N.cs', 'class Base {public Base(){}}\nclass Child:Base {public Child(){}}\n'],
+        ['N.java', 'class Base {Base(){}}\nclass Child extends Base {Child(){}}\n'],
+        ['n.cpp', 'struct Base {Base(){}};\nstruct Child:Base {Child(){}};\n'],
+    ]) {
+        it(`${file}: an omitted initializer is not a written class reference`, () => {
+            const dir = tmp({ [file]: code });
+            try {
+                const index = idx(dir), target = index.symbols.get('Base').find(def => ['class', 'struct'].includes(def.type));
+                const child = index.symbols.get('Child').find(def => def.type === 'constructor');
+                const edges = index.findCallees(child, { collectAccount: true });
+                assert.ok(edges.some(edge => edge.siteProvenance?.some(site =>
+                    site.provenance?.facts?.constructorCall?.call?.syntax === 'implicit')));
+                assert.equal(constructorClassEdges(edges, [target]).length, 0);
+            } finally { rm(dir); }
+        });
+    }
+});
 
 describe('oracle gate policy', () => {
     it('closes TypeScript overloads and declare methods over one implementation', () => {

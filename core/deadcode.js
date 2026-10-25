@@ -1353,6 +1353,17 @@ function deadcode(index, options = {}) {
             if (langModule.isEntryPoint?.(symbol)) {
                 continue;
             }
+            // A constructor participates in the type's allocation protocol,
+            // including reflective/framework construction and the implicit
+            // initializer that deleting it may introduce. A zero name count
+            // cannot establish that this declaration is independently dead.
+            // Ordinary methods with a constructor-like name remain auditable.
+            if (symbol.type === 'constructor' ||
+                (symbol.className && !classAuditSet.has(symbol.type) &&
+                    langTraits(lang)?.constructorProtocol?.initializer === name)) {
+                excludedRuntimeContract++;
+                continue;
+            }
             // Members the runtime/compiler invokes by name (trait
             // languageProtocolMember): Java serialization callbacks on
             // Serializable types, Python Enum hooks on Enum subclasses, C#
@@ -1413,17 +1424,6 @@ function deadcode(index, options = {}) {
             if (index.calleeIndex.has(name) && !selfRecursiveNames.has(name)) {
                 continue;
             }
-            // Constructor members are invoked through the CLASS name
-            // (fix #239, G2-js-measured: `new Widget()` indexes under
-            // 'Widget' — the member lookup claimed every instantiated
-            // class's constructor dead).
-            if (symbol.className &&
-                (symbol.type === 'constructor' || name === 'constructor' || name === '__init__') &&
-                index.calleeIndex.has(symbol.className) &&
-                !selfRecursiveNames.has(symbol.className)) {
-                continue;
-            }
-
             // Class-kind claims (fix #253a): a class whose member the runtime
             // or a framework invokes is live with zero textual references of
             // the class NAME — `class Main { public static void main }`,

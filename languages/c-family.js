@@ -15,6 +15,7 @@ const {
     traverseTree,
     nodeTextWithoutComments,
     traverseTreeCached,
+    getCachedNodeList,
     nodeToLocation,
     extractJSDocstring,
     visitNameNodes,
@@ -3393,9 +3394,10 @@ function memberFromNode(node, className, access, lines, mode) {
     const identity = declaratorIdentity(declarator);
     if (!identity.name) return null;
     const paramsNode = parameterListOf(declarator);
-    const { startLine, endLine, indent } = nodeToLocation(node, lines);
+    const { startLine, endLine, indent, sourceSpan } = nodeToLocation(node, lines);
+    const ownerName = enclosingClass(node)?.name || className;
     const isConstructor = mode === 'cpp' &&
-        (identity.name === className || identity.name === `~${className}`);
+        (identity.name === ownerName || identity.name === `~${ownerName}`);
     const modifiers = modifiersOf(node, access ? [access] : []);
     if (isConstructor && identity.name.startsWith('~')) modifiers.push('destructor');
     return {
@@ -3406,6 +3408,7 @@ function memberFromNode(node, className, access, lines, mode) {
             (identity.conversionType || returnTypeOf(templatedDeclaration(node))),
         startLine,
         endLine,
+        sourceSpan,
         ...(identity.nameNode?.startPosition.row + 1 !== startLine && {
             nameLine: identity.nameNode.startPosition.row + 1,
         }),
@@ -3451,11 +3454,12 @@ function fieldMembers(node, access, lines) {
     for (const child of node.childrenForFieldName('declarator')) {
         const identity = declaratorIdentity(child);
         if (!identity.name || identity.name === typeNode?.text) continue;
-        const { startLine, endLine, indent } = nodeToLocation(child, lines);
+        const { startLine, endLine, indent, sourceSpan } = nodeToLocation(child, lines);
         fields.push({
             name: identity.name,
             startLine,
             endLine,
+            sourceSpan,
             indent,
             modifiers: access ? [access] : [],
             memberType: 'field',
@@ -3602,11 +3606,12 @@ function classMembers(node, lines, mode) {
                 (child.namedChildren || []).find(candidate =>
                     candidate.type === 'identifier');
             if (nameNode?.text) {
-                const { startLine, endLine, indent } = nodeToLocation(nameNode, lines);
+                const { startLine, endLine, indent, sourceSpan } = nodeToLocation(nameNode, lines);
                 members.push({
                     name: nameNode.text,
                     startLine,
                     endLine,
+                    sourceSpan,
                     indent,
                     modifiers: ['public'],
                     memberType: 'field',
@@ -3749,7 +3754,7 @@ function typedefEntries(node, lines) {
         const identity = declaratorIdentity(child);
         if (!identity.name || RESERVED_TYPE_KEYWORDS.has(identity.name)) continue;
         if (innerIsClass && (!innerClassName || innerClassName === identity.name)) continue;
-        const { startLine, endLine, indent } = nodeToLocation(child, lines);
+        const { startLine, endLine, indent, sourceSpan } = nodeToLocation(child, lines);
         // A function-pointer typedef aliases a function shape, not the return
         // type — record no aliasOf for it.
         const aliasOf = unwrapDeclarator(child)
@@ -3760,6 +3765,7 @@ function typedefEntries(node, lines) {
             type: 'type',
             startLine,
             endLine,
+            sourceSpan,
             ...(identity.nameNode?.startPosition.row + 1 !== startLine && {
                 nameLine: identity.nameNode.startPosition.row + 1,
             }),
@@ -3811,13 +3817,14 @@ function findClassesInTree(code, tree, mode, sourceLines = null) {
                     (child.type === 'type_descriptor' ||
                      TYPE_NODES.has(child.type)));
             if (!nameNode?.text) return false;
-            const { startLine, endLine, indent } =
+            const { startLine, endLine, indent, sourceSpan } =
                 nodeToLocation(node, lines);
             classes.push({
                 name: nameNode.text,
                 type: 'type',
                 startLine,
                 endLine,
+                sourceSpan,
                 indent,
                 modifiers: ['public'],
                 members: [],
@@ -3873,7 +3880,7 @@ function findClassesInTree(code, tree, mode, sourceLines = null) {
         const key = `${node.startIndex}:${identity.name}`;
         if (seen.has(key)) return false;
         seen.add(key);
-        const { startLine, endLine, indent } = nodeToLocation(node, lines);
+        const { startLine, endLine, indent, sourceSpan } = nodeToLocation(node, lines);
         const type = node.type.replace('_specifier', '');
         const baseClause = node.namedChildren.find(child => child.type === 'base_class_clause');
         const bases = baseClause
@@ -3899,6 +3906,7 @@ function findClassesInTree(code, tree, mode, sourceLines = null) {
             ...(branch && { ppBranch: branch }),
             startLine,
             endLine,
+            sourceSpan,
             ...(identity.nameNode?.startPosition.row + 1 !== startLine && {
                 nameLine: identity.nameNode.startPosition.row + 1,
             }),
@@ -3942,6 +3950,7 @@ function findClasses(code, parser, mode) {
 
 function findFunctionsInTree(code, tree, mode, sourceLines = null) {
     const lines = sourceLines || code.split('\n');
+    let constructorDecorations = null;
     const lineStarts = [0];
     for (let index = 0; index < code.length; index++) {
         if (code.charCodeAt(index) === 10) lineStarts.push(index + 1);
@@ -3989,9 +3998,13 @@ function findFunctionsInTree(code, tree, mode, sourceLines = null) {
         const location = nodeToLocation(node, lines);
         const startLine = location.startLine;
         const indent = location.indent;
-        const ownerName = identity.className && identity.className.replace(/<.*>$/s, '');
+        const declaredType = templatedDeclaration(node).childForFieldName('type');
+        const decorationType = mode === 'cpp' && identity.className &&
+            !identity.name.startsWith('operator') && declaredType?.type === 'type_identifier' &&
+            (constructorDecorations ||= new DecorationEvidence(require('./index').getParser(mode), code, tree))
+                .defined(declaredType.text) === 'decoration';
         const isConstructor = mode === 'cpp' && !!identity.className &&
-            (identity.name === ownerName || identity.name === `~${ownerName}`);
+            !identity.name.startsWith('operator') && (!declaredType || decorationType);
         const namespace = [enclosingNamespace(node), identity.className && identity.ownerQualifier]
             .filter(Boolean).join('::');
         const lexicalEnd = functionRangeEnd(
@@ -4000,6 +4013,7 @@ function findFunctionsInTree(code, tree, mode, sourceLines = null) {
             ? location.endLine
             : lineNumberAtIndex(lineStarts, Math.max(0, lexicalEnd - 1));
         const modifiers = modifiersOf(node);
+        if (isConstructor && identity.name.startsWith('~')) modifiers.push('destructor');
         if (friendOf && !modifiers.includes('friend')) modifiers.unshift('friend');
         if (!modifiers.includes('static')) modifiers.push('export');
         const returnedConcreteType = mode === 'cpp' && variableTypes
@@ -4007,6 +4021,8 @@ function findFunctionsInTree(code, tree, mode, sourceLines = null) {
             : null;
         functions.push({
             name: identity.name,
+            sourceSpan: lexicalEnd == null ? location.sourceSpan : { ...location.sourceSpan,
+                end: lexicalEnd, endLine, endColumn: lexicalEnd - lineStarts[endLine - 1] },
             params: paramsNode ? nodeTextWithoutComments(paramsNode).replace(/^\(|\)$/g, '').trim() : '...',
             paramsStructured: structuredParams(paramsNode),
             returnType: isConstructor ? null :
@@ -4156,9 +4172,9 @@ function findStateObjectsInTree(tree, lines) {
             if (member.type !== 'enumerator') continue;
             const name = member.childForFieldName('name');
             if (!name) continue;
-            const { startLine, endLine, indent } = nodeToLocation(name, lines);
+            const { startLine, endLine, indent, sourceSpan } = nodeToLocation(name, lines);
             const namespace = enclosingNamespace(node);
-            states.push({ name: name.text, startLine, endLine, indent,
+            states.push({ name: name.text, startLine, endLine, sourceSpan, indent,
                 ...(namespace && { namespace }) });
         }
         return true;
@@ -4176,11 +4192,12 @@ function findStateObjectsInTree(tree, lines) {
         for (const child of node.namedChildren || []) {
             const identity = declaratorIdentity(child);
             if (!identity.name || TYPE_NODES.has(child.type)) continue;
-            const { startLine, endLine, indent } = nodeToLocation(child, lines);
+            const { startLine, endLine, indent, sourceSpan } = nodeToLocation(child, lines);
             states.push({
                 name: identity.name,
                 startLine,
                 endLine,
+                sourceSpan,
                 indent,
                 modifiers: modifiersOf(node),
                 ...(enclosingNamespace(node) && { namespace: enclosingNamespace(node) }),
@@ -5847,12 +5864,64 @@ function vexingParseCallName(node) {
     return typeNode.text;
 }
 
+function constructorFieldNames(owner) {
+    const fields = new Set();
+    const visit = body => {
+        for (const field of body?.namedChildren || []) {
+            if (field.type !== 'field_declaration' || functionDeclarator(field)) continue;
+            const declarators = field.namedChildren.filter(child =>
+                child.type === 'field_identifier' || child.type.endsWith('declarator'));
+            for (const child of declarators) {
+                const identity = declaratorIdentity(child);
+                if (identity.name) fields.add(identity.name);
+            }
+            const aggregate = field.childForFieldName('type');
+            if (!declarators.length && ['union_specifier', 'struct_specifier'].includes(aggregate?.type) &&
+                !aggregate.childForFieldName('name')) visit(aggregate.childForFieldName('body'));
+        }
+    };
+    visit(owner.childForFieldName('body'));
+    return fields;
+}
+
+function implicitConstructorInfo(node, ownerName, owner) {
+    const declarator = functionDeclarator(node);
+    if (!declarator || declaratorIdentity(declarator).name !== ownerName) return null;
+    const name = declarator.childForFieldName('declarator');
+    if (!name) return null;
+    const { baseSpelling } = require('./constructor-bases');
+    const fields = constructorFieldNames(owner);
+    const initializers = node.namedChildren.find(child => child.type === 'field_initializer_list');
+    const initialized = (initializers?.namedChildren || []).map(child => baseSpelling(child.namedChild(0), '::'))
+        .filter(Boolean).map(entry => ({ ...entry, field: !entry.qualifier && fields.has(entry.name) }));
+    const defaulted = node.namedChildren.some(child => child.type === 'default_method_clause');
+    const parameters = parameterListOf(declarator);
+    return { node, name, initialized,
+        params: parameters ? nodeTextWithoutComments(parameters).replace(/^\(|\)$/g, '').trim() : null,
+        body: node.childForFieldName('body') || (defaulted ? node : null),
+        potential: defaulted,
+        suppressed: node.namedChildren.some(child => child.type === 'delete_method_clause') ||
+            defaulted && parameterListOf(declarator)?.namedChildCount > 0 ||
+            initialized.some(entry => !entry.field && !entry.qualifier && entry.name === ownerName) };
+}
+
+function implicitOwnerScope(node) {
+    const identity = classIdentity(node);
+    const namespace = identity.ownerQualifier
+        ? [enclosingNamespace(node), identity.ownerQualifier].filter(Boolean).join('::') : enclosingNamespace(node);
+    return { namespace, enclosingType: identity.enclosingType || enclosingClass(node)?.name || null,
+        anonymousNamespace: classNamespaceScope(node, namespace).anonymous };
+}
+
 function findCallsInTree(code, parser, _options = {}, existingTree = null,
-    includeMacroBodies = true) {
+    includeMacroBodies = true, mode = 'cpp') {
     const tree = existingTree || parseTree(parser, code);
     const variableTypes = buildVariableTypes(tree);
     const fieldTypes = variableTypes.fieldTypes;
     const calls = [];
+    const implicitConfig = require('./index').langTraits(mode)?.implicitBaseConstruction;
+    const implicitOwners = implicitConfig ? getCachedNodeList(tree.rootNode).nodes
+        .filter(node => implicitConfig.classes.includes(node.type)) : null;
     traverseTreeCached(tree.rootNode, node => {
         const recoveredOperator = recoveredExplicitCallOperator(
             node, variableTypes);
@@ -6076,6 +6145,28 @@ function findCallsInTree(code, parser, _options = {}, existingTree = null,
                 }
             }
         }
+        if (mode === 'cpp' && node.type === 'field_initializer') {
+            let owner = node.parent;
+            while (owner && !['class_specifier', 'struct_specifier', 'union_specifier'].includes(owner.type)) owner = owner.parent;
+            const target = node.namedChild(0), args = node.namedChildren.find(child => child.type === 'argument_list');
+            if (owner && target && args) {
+                const hidden = constructorFieldNames(owner).has(target.text);
+                const self = owner.childForFieldName('name');
+                const bases = owner.namedChildren.find(child => child.type === 'base_class_clause')?.namedChildren || [];
+                const written = [self, ...bases].filter(Boolean).find(type => typeName(type) === typeName(target));
+                if (!hidden && written) {
+                    const values = args.namedChildren.filter(child => !child.type.endsWith('comment'));
+                    const scope = target.childForFieldName('scope') || written.childForFieldName('scope');
+                    calls.push({ name: typeName(target), line: target.startPosition.row + 1,
+                        column: target.startPosition.column, callStart: node.startIndex, callEnd: node.endIndex,
+                        isMethod: false, isConstructor: true, constructorSyntax: 'delegation',
+                        ctorDelegation: sameNode(written, self) ? 'this' : 'super',
+                        ...(scope && { constructorQualifier: scope.text }),
+                        argCount: values.length, argKinds: values.map(arg => staticArgumentKind(arg, variableTypes)),
+                        enclosingFunction: enclosingFunctionOf(node) });
+                }
+            }
+        }
         if (node.type === 'new_expression') {
             const typeNode = node.childForFieldName('type') ||
                 node.namedChildren.find(child => child.type === 'type_identifier' ||
@@ -6090,15 +6181,54 @@ function findCallsInTree(code, parser, _options = {}, existingTree = null,
                     column: typeNode.startPosition.column,
                     isMethod: false,
                     isConstructor: true,
+                    ...(mode === 'cpp' && node.childForFieldName('arguments')?.type === 'initializer_list' && {
+                        constructorSyntax: 'list',
+                    }),
+                    ...(typeNode.childForFieldName('scope') && {
+                        constructorQualifier: typeNode.childForFieldName('scope').text,
+                    }),
                     argCount: args.argCount,
                     argKinds: args.argKinds,
                     enclosingFunction: enclosingFunctionOf(node),
                 });
             }
         }
+        if (mode === 'cpp' && node.type === 'init_declarator' && node.parent?.type === 'declaration') {
+            const declared = node.childForFieldName('declarator');
+            const value = node.childForFieldName('value');
+            const type = node.parent.childForFieldName('type');
+            if (declared?.type === 'identifier' && ['argument_list', 'initializer_list'].includes(value?.type) &&
+                ['type_identifier', 'qualified_identifier', 'template_type'].includes(type?.type)) {
+                const name = typeName(type);
+                const values = value.namedChildren.filter(child => !child.type.endsWith('comment'));
+                if (name) calls.push({
+                    name, line: declared.startPosition.row + 1, column: declared.startPosition.column,
+                    callStart: node.startIndex, callEnd: node.endIndex,
+                    isMethod: false, isConstructor: true,
+                    constructorSyntax: value.type === 'initializer_list' ? 'list' : 'direct',
+                    ...(type.childForFieldName('scope') && { constructorQualifier: type.childForFieldName('scope').text }),
+                    argCount: values.length, argKinds: values.map(arg => staticArgumentKind(arg, variableTypes)),
+                    enclosingFunction: enclosingFunctionOf(node),
+                });
+            }
+        }
+        if (mode === 'cpp' && node.type === 'compound_literal_expression') {
+            const type = node.childForFieldName('type'), value = node.childForFieldName('value');
+            const name = type && typeName(type);
+            if (name && value?.type === 'initializer_list') {
+                const values = value.namedChildren.filter(child => !child.type.endsWith('comment'));
+                calls.push({ name, line: type.startPosition.row + 1, column: type.startPosition.column,
+                    callStart: node.startIndex, callEnd: node.endIndex,
+                    isMethod: false, isConstructor: true, constructorSyntax: 'list',
+                    ...(type.childForFieldName('scope') && { constructorQualifier: type.childForFieldName('scope').text }),
+                    argCount: values.length, argKinds: values.map(arg => staticArgumentKind(arg, variableTypes)),
+                    enclosingFunction: enclosingFunctionOf(node) });
+            }
+        }
         return true;
     });
     if (includeMacroBodies) calls.push(...findMacroBodyCalls(tree, code, parser));
+    calls.push(...require('./constructor-bases').implicitBaseCalls(tree.rootNode, mode, null, implicitOwners));
     return calls;
 }
 
@@ -6203,7 +6333,8 @@ function attributeCallsToLexicalFunctions(calls, functions) {
             b.startLine - a.startLine);
     for (const call of calls) {
         const owner = bodies.find(fn =>
-            fn.startLine <= call.line && call.line <= fn.endLine);
+            fn.startLine <= call.line && call.line <= fn.endLine &&
+            require('../core/callable-scope').containsCall(fn, call) !== false);
         if (!owner) continue;
         call.enclosingFunction = {
             name: owner.name,
@@ -6371,13 +6502,13 @@ function findCallsInCode(code, parser, options = {}, existingTree = null,
     // in preprocessor-configuration conservation.
     if (existingTree) {
         const calls = findCallsInTree(
-            code, parser, options, existingTree, includeMacroBodies);
+            code, parser, options, existingTree, includeMacroBodies, mode);
         const functions = findFunctionsInTree(code, existingTree, mode);
         return markDirectiveBodyCalls(code, attributeCallsToLexicalFunctions(calls, functions));
     }
     const tree = parseTree(parser, code);
     const primary = findCallsInTree(
-        code, parser, options, tree, includeMacroBodies);
+        code, parser, options, tree, includeMacroBodies, mode);
     const literal = literalRecoveryTree(parser, code, tree);
     if (!literal) {
         return markDirectiveBodyCalls(code, attributeCallsToLexicalFunctions(
@@ -6385,7 +6516,7 @@ function findCallsInCode(code, parser, options = {}, existingTree = null,
     }
     try {
         const literalCalls = findCallsInTree(
-            code, parser, options, literal, includeMacroBodies)
+            code, parser, options, literal, includeMacroBodies, mode)
             .map(call => ({ ...call, configurationVariant: true }));
         // Selected-configuration facts retain their stronger evidence.  Only
         // literal-only sites carry configurationVariant and are therefore
@@ -6717,7 +6848,7 @@ function findUsagesInCode(code, name, parser, existingTree, options = {}) {
             .map(usage => `${usage.line}:${usage.column ?? ''}`));
         const macroCalls = findMacroBodyCalls(tree, code, parser, name);
         for (const call of macroCalls) {
-            if (call.name !== name) continue;
+            if (call.name !== name || call.constructorSyntax === 'implicit') continue;
             const key = `${call.line}:${call.column ?? ''}`;
             if (seenCalls.has(key)) continue;
             seenCalls.add(key);
@@ -6780,11 +6911,11 @@ function parse(code, parser, mode, options = {}) {
                 item => `${item.module}:${item.line}:${item.type}`,
             )
             : findImportsInTree(code, tree);
-        const primaryCalls = findCallsInTree(code, parser, {}, tree, true);
+        const primaryCalls = findCallsInTree(code, parser, {}, tree, true, mode);
         const calls = literal
             ? mergeExtracted(
                 primaryCalls,
-                findCallsInTree(code, parser, {}, literal, true)
+                findCallsInTree(code, parser, {}, literal, true, mode)
                     .map(call => ({ ...call, configurationVariant: true })),
                 callIdentityKey,
             )
@@ -6889,7 +7020,7 @@ function languageBranchExtraction(code, mode) {
         return {
             functions: findFunctionsInTree(branch.source, tree, branch.language, lines).map(tag),
             classes,
-            calls: findCallsInTree(branch.source, branchParser, {}, tree, true).map(tag),
+            calls: findCallsInTree(branch.source, branchParser, {}, tree, true, branch.language).map(tag),
         };
     } finally {
         if (isMainThread) tree.delete?.();
@@ -6982,10 +7113,13 @@ function objectMacroReading(parser, bodies) {
 }
 
 module.exports = {
+    implicitOwnerScope,
+    implicitConstructorInfo,
     isInvokedName,
     createCFamilyLanguage,
     objectMacroReading,
     withExternalMacros,
+    hasExternalMacroContext: () => externalMacroContext !== null,
     // Deterministic test seams for the recovery memory/order contracts.
     conditionalRecoverySources,
     mergeExtracted,

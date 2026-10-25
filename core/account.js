@@ -351,7 +351,8 @@ function classifyGroundLines(index, name, groundSet, claimedKeys) {
                 // Unclaimed callback/type references have no invocation
                 // syntax. Let the usage AST classify them as references;
                 // merely entering the candidate cache is not a call fact.
-                if (c.isFunctionReference || c.isTypeReference) continue;
+                // An implicit initializer has no written invocation either.
+                if (c.isFunctionReference || c.isTypeReference || c.constructorSyntax === 'implicit') continue;
                 if (c.name === name || c.resolvedName === name ||
                     (c.resolvedNames && c.resolvedNames.includes(name))) {
                     callLines.add(c.line);

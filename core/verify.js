@@ -9,7 +9,7 @@ const { detectLanguage, getParser, getLanguageAdapter, safeParse, langTraits } =
 const { sameNode } = require('../languages/utils');
 const { escapeRegExp, codeUnitCompare, NON_CALLABLE_TYPES, isOverrideMarked, isMacroNamespaceDefinition,
     isValueDefinition } = require('./shared');
-const { classDefsNamed, distinctOwnerDefinitions } = require('./class-identity');
+const { classDefsNamed, distinctOwnerDefinitions, ownerDefinitionOf } = require('./class-identity');
 const { isTypeRenamePin, referenceRole } = require('./type-references');
 const { findAccessorReferences, isAccessorDefinition } = require('./accessors');
 const { csharpLocalBinding } = require('../languages/csharp-scope');
@@ -874,8 +874,8 @@ function extractArrowTypesFromVarDecl(index, def) {
  * `new Task(id, name)` against 0..0 — a false red on every parameterized
  * constructor, in every language. Sources: indexed constructor members
  * (JS/TS `constructor`, Python `__init__` — emitted with type
- * 'constructor'), or a Java AST walk (constructors are deliberately not
- * indexed as members there). Returns an array of paramsStructured lists —
+ * 'constructor'), or a Java AST walk for an implicit record constructor.
+ * Returns an array of paramsStructured lists —
  * one per constructor overload — or null when the class declares none.
  * @param {object} index - ProjectIndex instance
  * @param {object} def - Resolved definition (any type; non-class returns null)
@@ -885,20 +885,26 @@ function extractArrowTypesFromVarDecl(index, def) {
 function _constructorParamLists(index, def, lang) {
     if (!def || !def.file || !['class', 'struct', 'enum', 'record'].includes(def.type)) return null;
     const lists = [];
+    const { isConstructor } = require('./constructor-calls');
+    const seen = new Set();
+    const append = d => {
+        if (seen.has(d) || !isConstructor(d, index)) return;
+        seen.add(d); lists.push(d.paramsStructured);
+    };
     const endLine = def.endLine != null ? def.endLine : Infinity;
     const inRange = (d) => d.file === def.file &&
         d.startLine >= def.startLine && d.startLine <= endLine &&
         Array.isArray(d.paramsStructured);
     for (const ctorName of ['constructor', '__init__']) {
         for (const d of (index.symbols.get(ctorName) || [])) {
-            if (d.className === def.name && inRange(d)) lists.push(d.paramsStructured);
+            if (d.className === def.name && inRange(d)) append(d);
         }
     }
     // Java constructor members are named after the CLASS (enum-body
     // constructors carry paramsStructured since fix #230).
     for (const d of (index.symbols.get(def.name) || [])) {
         if (d.type === 'constructor' && d.className === def.name && inRange(d)) {
-            lists.push(d.paramsStructured);
+            append(d);
         }
     }
     if (lists.length > 0) return lists;
@@ -1060,7 +1066,8 @@ function contractedCallerSweep(index, name, def, options = {}) {
 // overloads.
 
 // Exclusions whose verdict depends on the pin's declared parameters.
-const SIGNATURE_DEPENDENT_EXCLUSIONS = new Set(['arity-mismatch', 'overload-mismatch', 'generic-arity-mismatch']);
+const SIGNATURE_DEPENDENT_EXCLUSIONS = new Set(['arity-mismatch', 'overload-mismatch', 'generic-arity-mismatch',
+    'constructor-overload-other']);
 
 /** Declared parameter shape (types, optional/default/rest, method type parameters); names ignored. */
 function declaredSignatureKey(symbol) {
@@ -1272,10 +1279,14 @@ function sitesReboundByChange(index, name, def, rawCallers, confirmed, unverifie
     if (dependent.length === 0 && unverified.length === 0) return [];
     const baseChanges = typeof changes === 'function' ? changes() : changes;
     if (!baseChanges || baseChanges.length === 0) return [];
-    const siteKey = site => `${site.file}\0${site.line}`;
+    const lineKey = site => `${site.file}\0${site.line}`;
+    const siteKey = site => {
+        const at = site.provenance?.facts?.site || site.callSite || site;
+        return `${lineKey(site)}\0${at.start != null ? `start:${at.start}` : at.column != null ? `column:${at.column}` : ''}`;
+    };
     const confirmedKeys = new Set(confirmed.map(siteKey));
     const unverifiedKeys = new Set(unverified.map(siteKey));
-    const reasonAt = new Map(excluded.map(entry => [siteKey(entry), entry.reason]));
+    const reasonAt = new Map(excluded.map(entry => [lineKey(entry), entry.reason]));
     const before = callersBeforeChange(index, name, def, baseChanges);
     const { getCachedCalls, _overloadDiscipline, _overloadApplicable } = require('./callers');
     const pins = [...new Set([def, ...baseChanges.map(change => change.def)])];
@@ -1288,11 +1299,13 @@ function sitesReboundByChange(index, name, def, rawCallers, confirmed, unverifie
         // declaration confirmed and the new one leaves unverified or
         // excludes is checked against the new declaration here.
         if (confirmedKeys.has(key) || seen.has(key)) continue;
-        if (unverifiedKeys.has(key) ? boundBefore !== 'confirmed' : !reasonAt.has(key)) continue;
+        if (unverifiedKeys.has(key) ? boundBefore !== 'confirmed' : !reasonAt.has(lineKey(site))) continue;
         seen.add(key);
-        const calls = (getCachedCalls(index, site.file) || []).filter(call =>
-            call.line === site.line && (call.name === name || call.resolvedName === name));
-        const call = calls.find(c => site.column == null || c.column === site.column) || calls[0];
+        const { occurrenceIdentity } = require('./provenance-facts');
+        const calls = (getCachedCalls(index, site.file) || []).filter(call => call.line === site.line &&
+            (call.name === name || call.resolvedName === name || call.name === site.calledAs));
+        const exact = calls.filter(call => siteKey({ ...occurrenceIdentity(site.file, call), file: site.file }) === key);
+        const call = exact.length === 1 ? exact[0] : calls.length === 1 ? calls[0] : null;
         const language = index.files.get(site.file)?.language;
         let rebind = { kind: call ? 'count' : 'unread' };
         if (call && langTraits(language)?.hasArityOverloads && call.argCount != null && !call.argSpread) {
@@ -1323,7 +1336,7 @@ function sitesReboundByChange(index, name, def, rawCallers, confirmed, unverifie
             reason: 'bound-before-change',
             ...(prior?.reason && { priorReason: prior.reason }),
             boundBefore,
-            excludedAs: reasonAt.get(key) || null,
+            excludedAs: reasonAt.get(lineKey(site)) || null,
             ...(unverifiedKeys.has(key) && { stillUnverified: true }),
             rebind,
         });
@@ -1409,6 +1422,7 @@ function computePlanCallSites(index, name, def, options = {}) {
             receiver: c.receiver,
             calledAs: c.calledAs,
             callSite: c.provenance?.facts?.site,
+            constructorSyntax: c.provenance?.facts?.constructorCall?.call?.syntax,
         };
         const siteKey = `${c.file}:${c.line}:${c.calledAs || name}`;
         const occurrence = planLineSeen.get(siteKey) || 0;
@@ -1429,6 +1443,7 @@ function computePlanCallSites(index, name, def, options = {}) {
             expression: (call.content || '').trim(),
             args: analysis.args,
             argCount: analysis.argCount,
+            ...(analysis.implicitConstruction && { implicitConstruction: true }),
             ...(analysis.keywordArgNames && { keywordArgNames: analysis.keywordArgNames }),
             ...(analysis.positionalCount != null && { positionalCount: analysis.positionalCount }),
             ...(c.calledAs && { calledAs: c.calledAs }),
@@ -1509,6 +1524,9 @@ function sharedParsedTree(index, file, content, language) {
 }
 
 function analyzeCallSite(index, call, funcName, occurrence = 0) {
+    if ((call.constructorSyntax || call.provenance?.facts?.constructorCall?.call?.syntax) === 'implicit') {
+        return { args: [], argCount: 0, isMethodCall: false, implicitConstruction: true };
+    }
     try {
         const language = detectLanguage(call.file);
         if (!language) return { args: null, argCount: 0 };
@@ -1547,7 +1565,25 @@ function analyzeCallSite(index, call, funcName, occurrence = 0) {
 
         // Find the call expression at the target line matching funcName
         const spelling = call.calledAs && call.calledAs !== 'bound' ? call.calledAs : funcName;
-        const callNode = findCallNode(tree.rootNode, callTypes, targetRow, spelling, occurrence,
+        const constructionSyntax = call.constructorSyntax || call.provenance?.facts?.constructorCall?.call?.syntax;
+        const constructionShape = langTraits(language)?.constructorArgumentNodes?.[constructionSyntax];
+        const constructionArguments = node => constructionShape?.argsField
+            ? node.childForFieldName(constructionShape.argsField)
+            : node.namedChildren.find(child => child.type === constructionShape?.argsNodeType);
+        let constructionNode = null;
+        if (constructionShape) {
+            const site = call.callSite || call.provenance?.facts?.site;
+            if (site?.start != null) {
+                for (let node = tree.rootNode.descendantForIndex(site.start); node; node = node.parent) {
+                    if (node.type === constructionShape.nodeType && node.startIndex <= site.start &&
+                        node.endIndex >= (site.end ?? site.start) && constructionArguments(node)) {
+                        constructionNode = node;
+                        break;
+                    }
+                }
+            }
+        }
+        const callNode = constructionNode || findCallNode(tree.rootNode, callTypes, targetRow, spelling, occurrence,
             call.callSite || call.provenance?.facts?.site);
         if (!callNode) return { args: null, argCount: 0 };
 
@@ -1575,7 +1611,8 @@ function analyzeCallSite(index, call, funcName, occurrence = 0) {
         // access to the enclosing-function symbol.
         const ctx = classifyCallContext(callNode, language);
 
-        const argsNode = callNode.childForFieldName('arguments');
+        const argsNode = (constructionNode && constructionArguments(constructionNode)) ||
+            callNode.childForFieldName('arguments');
         if (!argsNode) return { args: [], argCount: 0, isMethodCall, ...ctx };
 
         let args = [];
@@ -2038,6 +2075,7 @@ function verify(index, name, options = {}) {
         isMethod: c.isMethod,
         calledAs: c.calledAs,
         callSite: c.provenance?.facts?.site,
+        constructorSyntax: c.provenance?.facts?.constructorCall?.call?.syntax,
         // Preserve receiver identity through the usage-shaped adapter. Go
         // permits a local value to have the same spelling as its type; only
         // a type-qualified call is a method expression with an explicit
@@ -3044,15 +3082,19 @@ function plan(index, name, options = {}) {
     const namedConstructor = constructorOwnerName === def.name && !isTypeRenamePin(def) &&
         (def.type === 'constructor' || def.memberType === 'constructor' ||
             (def.type === 'method' && index.files.get(def.file)?.language === 'csharp'));
-    const qualifiedCandidate = def.className && ['function', 'method'].includes(def.type) &&
+    const qualifiedCandidate = def.className && ['function', 'method', 'constructor'].includes(def.type) &&
         langTraits(index.files.get(def.file)?.language)?.textualIncludes;
-    if (options.renameTo && (namedConstructor || qualifiedCandidate)) {
-        const owner = constructorRenameOwner(index, def, !namedConstructor ||
-            langTraits(index.files.get(def.file)?.language)?.textualIncludes);
+    const fixedConstructor = def.type === 'constructor' &&
+        langTraits(index.files.get(def.file)?.language)?.fixedConstructorName === def.name;
+    if (options.renameTo && (namedConstructor || qualifiedCandidate || fixedConstructor)) {
+        const owner = fixedConstructor ? ownerDefinitionOf(index, def) :
+            constructorRenameOwner(index, def, !namedConstructor ||
+                langTraits(index.files.get(def.file)?.language)?.textualIncludes);
         if (owner !== undefined) {
             if (!owner) return { found: true, function: name,
                 error: 'The constructor owner could not be resolved. Select the class declaration to plan its rename.' };
             def = owner;
+            if (fixedConstructor) name = owner.name;
         }
     }
     // BUG-BY: enrich types for typed-arrow-fn declarations.
@@ -3202,6 +3244,11 @@ function plan(index, name, options = {}) {
                 // metadata, but do not inflate the concrete edit plan with a
                 // no-op entry (UCN5-166).
                 unchangedSites++;
+                continue;
+            } else if (site.implicitConstruction) {
+                reviewItems.push({ file: site.file, line: site.line, expression: site.expression,
+                    suggestion: 'Add an explicit base constructor initializer with the required argument',
+                    needsReview: true, editKind: 'implicit-construction', implicitConstruction: true });
                 continue;
             } else if (options.defaultValue) {
                 suggestion = `Add argument: ${options.defaultValue} (no default parameter values in ${planFileEntry?.language || 'this language'})`;

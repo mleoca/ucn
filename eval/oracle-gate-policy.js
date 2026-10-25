@@ -373,6 +373,43 @@ function adjudicateDeferredUnresolved(status) {
     return { keep: true, gateBearing: false };
 }
 
+// Locate the caller by the oracle token, rather than a callback sharing its
+// line. Same-line declarations also need distinct callee-answer cache keys.
+function oracleCallerScope(index, call) {
+    const file = require('path').resolve(index.root, call.file);
+    const definition = index.findEnclosingFunction(file, call.line, true,
+        { line: call.line, column: call.column });
+    if (!definition) return null;
+    const { declarationIdentity } = require('../core/provenance');
+    return { definition, key: `${file}\0${JSON.stringify(declarationIdentity(definition))}` };
+}
+
+// Compiler class references and a proven initializer body describe the same
+// construction dependency. Project each occurrence separately: two derived
+// types can enter the same inherited initializer from one enclosing function.
+function constructorClassEdges(edges, targets, alreadyExact = () => false) {
+    const { declarationIdentity, sameDeclaration, validateConfirmation } = require('../core/provenance');
+    const projected = [];
+    for (const edge of edges) {
+        if (edge.type !== 'constructor' || alreadyExact(edge)) continue;
+        for (const target of targets) {
+            if (!['class', 'struct', 'record', 'enum'].includes(target.type)) continue;
+            const identity = declarationIdentity(target);
+            const sites = (edge.siteProvenance || []).filter(site => {
+                const proof = site.provenance, call = proof?.facts?.constructorCall;
+                return call && call.call?.syntax !== 'implicit' &&
+                    sameDeclaration(call.constructedOwner || call.owner, identity) &&
+                    validateConfirmation(proof, declarationIdentity(edge)).verdict === 'establishes-target';
+            });
+            if (!sites.length) continue;
+            projected.push({ ...edge, name: target.name, relativePath: target.relativePath,
+                startLine: target.startLine, sites: [...new Set(sites.map(site => site.line))].sort((a, b) => a - b),
+                siteProvenance: sites });
+        }
+    }
+    return projected;
+}
+
 module.exports = {
     PORTABLE_AST_REVIEW_BUDGETS,
     optionalRate,
@@ -384,4 +421,6 @@ module.exports = {
     adjudicateDeferredUnresolved,
     unscoredProng,
     expandedDefinitionStatus,
+    constructorClassEdges,
+    oracleCallerScope,
 };

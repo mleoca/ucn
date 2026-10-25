@@ -2660,7 +2660,7 @@ describe('fix #388: cold-build CPU and wall without answer changes', () => {
         assert.strictEqual(replay.files.get('/p/a.java'), first, 'replay: one object per key');
         assert.deepEqual(first, captured);
         assert.strictEqual(replay.files.has('/p/a.java'), true);
-        assert.throws(() => replay.symbols.get('f'), /Missing overload fact/, 'unrecorded reads still abstain');
+        assert.throws(() => replay.symbols.get('f'), /Missing provenance fact/, 'unrecorded reads still abstain');
     });
 
     it('a sequential build expands macros in place; a parallel build expands in parse workers it kept', () => {

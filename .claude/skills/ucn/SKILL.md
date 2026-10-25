@@ -22,6 +22,8 @@ UCN answers semantic questions about a codebase from a tree-sitter index: where 
 5. After a signature change: `ucn check <handle>`; before committing: target-less `ucn check`. Both compare a changed declaration with its parameters at `--base` (default `HEAD`), so the call sites bound to the old declaration are checked against the new one; a site that fits no remaining overload is a mismatch, never an excluded other-target line.
 6. `ucn source <handle>` or `ucn source path/to/file:10-30` for exact code, only when inspection is needed.
 
+An explicit constructor has its own handle, including Java overloads and compact record constructors. Proven construction calls appear under that handle and supply arguments to `check`. Review unverified construction sites before changing the signature.
+
 ## Choose a command
 
 | Decision | Command |

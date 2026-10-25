@@ -82,6 +82,8 @@ const {
     adjudicateDeferredUnresolved,
     unscoredProng,
     expandedDefinitionStatus,
+    constructorClassEdges,
+    oracleCallerScope,
 } = require('./oracle-gate-policy');
 const { tsMorphOracle } = require('./oracles/ts-morph-oracle');
 const { pyrightOracle } = require('./oracles/pyright-oracle');
@@ -461,14 +463,14 @@ async function evaluateRepo(repo, oracle) {
         return expanded;
     };
 
-    const resolvedDefinitions = async (file, line, name, column) => {
+    const resolvedDefinitions = async (file, line, name, column, kind) => {
         if (typeof oracle.resolveDefinition !== 'function') return [];
-        const cacheKey = `${file}:${line}:${column ?? '*'}:${name}`;
+        const cacheKey = `${file}:${line}:${column ?? '*'}:${name}:${kind || ''}`;
         if (definitionCache.has(cacheKey)) return definitionCache.get(cacheKey);
         let defs = [];
         try {
             defs = await oracle.resolveDefinition(handle, {
-                file: toOracleRel(file), line, name, column,
+                file: toOracleRel(file), line, name, column, kind,
             });
             defs = (defs || []).map(d => d.external
                 ? { ...d }
@@ -494,10 +496,10 @@ async function evaluateRepo(repo, oracle) {
         const defs = await resolvedDefinitions(file, line, name, column);
         return defs.some(d => definitionMatchesTarget(d, targetDef));
     };
-    const definitionStatus = async (file, line, name, targetDef, column) => {
+    const definitionStatus = async (file, line, name, targetDef, column, kind) => {
         if (targetDefinitionList(targetDef).length === 0 ||
             typeof oracle.resolveDefinition !== 'function') return 'unavailable';
-        const defs = await resolvedDefinitions(file, line, name, column);
+        const defs = await resolvedDefinitions(file, line, name, column, kind);
         if (defs.length === 0) return 'unresolved';
         return defs.some(d => definitionMatchesTarget(d, targetDef))
             ? 'target' : 'other';
@@ -1008,7 +1010,7 @@ async function evaluateRepo(repo, oracle) {
                 }
                 const status = await definitionStatus(
                     c.file, c.line, c.calledAs || sym.name,
-                    targetIdentityDefs, c.column);
+                    targetIdentityDefs, c.column, sym.kind);
                 if (status === 'target') return { hit: true, scorable: true, definitionValidated: true };
                 const referenceHit = edgeHitWithoutDefinition(c);
                 if (status === 'other' && !referenceHit && await edgeConfigurationGated(c)) {
@@ -1033,7 +1035,7 @@ async function evaluateRepo(repo, oracle) {
             if (typeof oracle.resolveDefinition === 'function') {
                 const status = await definitionStatus(
                     c.file, c.line, c.calledAs || sym.name,
-                    targetIdentityDefs, c.column);
+                    targetIdentityDefs, c.column, sym.kind);
                 if (status === 'target') {
                     return { hit: true, scorable: true, definitionValidated: true };
                 }
@@ -1248,9 +1250,9 @@ async function evaluateRepo(repo, oracle) {
                     continue;
                 }
                 const absFile = path.join(index.root, oc.file);
-                const encl = index.findEnclosingFunction(absFile, oc.line, true);
-                if (!encl) { placeCallee('moduleLevel'); continue; }
-                const dKey = `${absFile}:${encl.startLine}`;
+                const scope = oracleCallerScope(index, oc);
+                if (!scope) { placeCallee('moduleLevel'); continue; }
+                const { definition: encl, key: dKey } = scope;
                 let ucnCallees = calleeAnswerCache.get(dKey);
                 if (!ucnCallees) {
                     ucnCallees = index.findCallees({ ...encl, file: absFile }, {
@@ -1258,11 +1260,13 @@ async function evaluateRepo(repo, oracle) {
                     });
                     calleeAnswerCache.set(dKey, ucnCallees);
                 }
+                const targetCallees = [...ucnCallees,
+                    ...constructorClassEdges(ucnCallees, targetIdentityDefs, isExactCalleeTargetEdge)];
                 // Precision over D's confirmed edges pinned to THIS symbol —
                 // once per (symbol, D) pair.
                 if (!seenPrecisionDefs.has(dKey)) {
                     seenPrecisionDefs.add(dKey);
-                    for (const e of ucnCallees) {
+                    for (const e of targetCallees) {
                         if (!isExactCalleeTargetEdge(e)) continue;
                         const occurrences = dedupeOccurrences((e.siteProvenance || []).map(site => ({
                             file: oc.file, line: site.line, column: site.column,
@@ -1304,7 +1308,7 @@ async function evaluateRepo(repo, oracle) {
                     }
                 }
                 // Placement of this oracle edge in D's answer
-                const exactEdge = ucnCallees.find(e =>
+                const exactEdge = targetCallees.find(e =>
                     e.sites && e.sites.includes(oc.line) &&
                     isExactCalleeTargetEdge(e));
                 if (exactEdge) { placeCallee('confirmed'); continue; }

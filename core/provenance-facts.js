@@ -217,8 +217,13 @@ function confirmationFacts(index, file, call, targets, options = {}) {
         };
     }
     if (!methodReceiver) {
+        // Explicit construction looks up a type. Its same-named constructor
+        // declarations are members, not competing import bindings.
+        const constructsType = (call.isConstructor || langTraits(language)?.classesCallableWithoutNew) && targets.length > 0 &&
+            targets.every(target => TYPE_KINDS.has(target.type));
         const result = namedDeclaration(index, file, call.resolvedName || call.name,
-            d => !NON_CALLABLE_TYPES.has(d.type) || call.isConstructor, call.line);
+            d => constructsType ? TYPE_KINDS.has(d.type)
+                : !NON_CALLABLE_TYPES.has(d.type) || call.isConstructor, call.line);
         if (result?.chain.length) facts.importChain = result.chain;
     }
     let type = facts.receiverType;
@@ -313,7 +318,7 @@ function confirmationFacts(index, file, call, targets, options = {}) {
         if (visited.has(key) || visited.size >= 16) return null;
         visited.add(key);
         const ownerDefinition = owner.file && TYPE_KINDS.has(owner.type) ? owner : null;
-        const members = callableMembersOwnedBy(index, call.name, owner.name).filter(d => {
+        let members = callableMembersOwnedBy(index, call.name, owner.name).filter(d => {
             // A member of a same-name class declared in another scope of
             // the file is not this owner's member (fix #389).
             if (ownerDefinition && distinctOwnerDefinitions(index, d, ownerDefinition, true)) return false;
@@ -360,7 +365,12 @@ function confirmationFacts(index, file, call, targets, options = {}) {
                 if (!choice?.match || members.length !== 1 || choice.match !== members[0]) return null;
             }
         }
+        const delegation = call.constructorSyntax === 'delegation' && call.receiver === 'super' &&
+            steps.length === 0 && facts.receiverOrigin?.source === 'same-class'
+            ? { enclosing: facts.receiverOrigin.declaration, members: members.map(declarationIdentity) } : null;
+        if (delegation) members = [];
         const step = { owner: identity, members: members.map(declarationIdentity), parents: parents.map(declarationIdentity),
+            ...(delegation && { constructorDelegation: delegation }),
             ...(derefTarget && { derefTarget }) };
         const getter = facts.valueReference && propertyReadMember(step.members);
         if (getter) return { receiver: declarationIdentity(resolved.declaration),

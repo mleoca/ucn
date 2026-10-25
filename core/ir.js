@@ -62,7 +62,7 @@ function normalizeSymbol(symbol, family, language, kind, owner = null) {
         modifiers: [...(symbol.modifiers || [])],
     };
     const passthrough = [
-        'docstring', 'returnedFunctionResult', 'isFunctionVariable', 'paramTypes',
+        'docstring', 'sourceSpan', 'returnedFunctionResult', 'isFunctionVariable', 'paramTypes',
         'isAsync', 'isGenerator', 'generics', 'ownerGenerics', 'genericBounds', 'extends', 'implements', 'indent',
         'isNested', 'enclosingType', 'isMethod', 'memberType', 'fieldType', 'embedded',
         'aliasOf', 'aliasQualifier', 'aliasMembers', 'aliasTypeText', 'aliasTypeParameters', 'aliasTypeDefaults', 'derefTarget', 'decorators', 'decoratorsWithArgs',
@@ -110,9 +110,15 @@ function createFileIR({
     const append = (symbol, family, kind, owner = null) => {
         // Members one macro invocation declares share its lines (fix #385):
         // their own binding ids keep overloads apart.
-        const key = `${owner || symbol.className || ''}\0${symbol.name}\0${kind}\0` +
-            `${symbol.startLine}\0${symbol.endLine}` +
-            (symbol.generatedByMacro ? `\0${symbol.bindingId || ''}` : '');
+        const key = JSON.stringify([
+            owner || symbol.className || '', symbol.name, kind,
+            symbol.startLine, symbol.endLine, symbol.namespace || '',
+            symbol.enclosingType || '', symbol.lexicalScopeStartLine ?? null,
+            symbol.lexicalScopeEndLine ?? null, symbol.anonymousNamespace || false,
+            symbol.typeArity ?? null, symbol.ownerTypeArity ?? null,
+            symbol.params ?? null,
+            symbol.generatedByMacro ? symbol.bindingId || '' : '',
+        ]);
         if (seen.has(key)) return;
         seen.add(key);
         normalizedSymbols.push(normalizeSymbol(symbol, family, language, kind, owner));

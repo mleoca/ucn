@@ -756,7 +756,7 @@ function _processFunction(node, functions, processedRanges, lines, code) {
         const paramsNode = node.childForFieldName('parameters');
 
         if (nameNode) {
-            const { startLine, endLine, indent } = nodeToLocation(node, lines);
+            const { startLine, endLine, indent, sourceSpan } = nodeToLocation(node, lines);
             const text = node.text;
 
             const qualifiers = rustFunctionQualifiers(node);
@@ -797,6 +797,7 @@ function _processFunction(node, functions, processedRanges, lines, code) {
                 ...(callbackParamTypes && { callbackParamTypes }),
                 startLine,
                 endLine,
+                sourceSpan,
                 indent,
                 modifiers,
                 ...(returnType && { returnType }),
@@ -825,7 +826,7 @@ function _processFunction(node, functions, processedRanges, lines, code) {
                     const fName = child.childForFieldName('name');
                     const fParams = child.childForFieldName('parameters');
                     if (fName) {
-                        const { startLine, endLine, indent } = nodeToLocation(child, lines);
+                        const { startLine, endLine, indent, sourceSpan } = nodeToLocation(child, lines);
                         const visibility = extractVisibility(child.text);
                         const returnType = extractReturnType(child);
                         const docstring = extractRustDocstring(lines, startLine);
@@ -842,6 +843,7 @@ function _processFunction(node, functions, processedRanges, lines, code) {
                             ...(iteratorItemType && { iteratorItemType }),
                             startLine,
                             endLine,
+                            sourceSpan,
                             indent,
                             modifiers,
                             ...(returnType && { returnType }),
@@ -1077,7 +1079,7 @@ function _processClass(node, types, processedRanges, lines, code) {
 
         const nameNode = node.childForFieldName('name');
         if (nameNode) {
-            const { startLine, endLine } = nodeToLocation(node, lines);
+            const { startLine, endLine, sourceSpan } = nodeToLocation(node, lines);
             const docstring = extractRustDocstring(lines, startLine);
             const visibility = extractVisibility(node.text);
             const generics = extractGenerics(node);
@@ -1091,6 +1093,7 @@ function _processClass(node, types, processedRanges, lines, code) {
                 name: nameNode.text,
                 startLine,
                 endLine,
+                sourceSpan,
                 type: node.type === 'union_item' ? 'union' : 'struct',
                 members,
                 modifiers,
@@ -1111,7 +1114,7 @@ function _processClass(node, types, processedRanges, lines, code) {
 
         const nameNode = node.childForFieldName('name');
         if (nameNode) {
-            const { startLine, endLine } = nodeToLocation(node, lines);
+            const { startLine, endLine, sourceSpan } = nodeToLocation(node, lines);
             const docstring = extractRustDocstring(lines, startLine);
             const visibility = extractVisibility(node.text);
             const generics = extractGenerics(node);
@@ -1123,6 +1126,7 @@ function _processClass(node, types, processedRanges, lines, code) {
                 name: nameNode.text,
                 startLine,
                 endLine,
+                sourceSpan,
                 type: 'enum',
                 members: extractEnumVariants(node, lines),
                 modifiers,
@@ -1142,7 +1146,7 @@ function _processClass(node, types, processedRanges, lines, code) {
 
         const nameNode = node.childForFieldName('name');
         if (nameNode) {
-            const { startLine, endLine } = nodeToLocation(node, lines);
+            const { startLine, endLine, sourceSpan } = nodeToLocation(node, lines);
             const docstring = extractRustDocstring(lines, startLine);
             const visibility = extractVisibility(node.text);
             const generics = extractGenerics(node);
@@ -1152,6 +1156,7 @@ function _processClass(node, types, processedRanges, lines, code) {
                 name: nameNode.text,
                 startLine,
                 endLine,
+                sourceSpan,
                 type: 'trait',
                 members: extractTraitMembers(node, lines),
                 modifiers: visibility ? [visibility] : [],
@@ -1170,7 +1175,7 @@ function _processClass(node, types, processedRanges, lines, code) {
         if (processedRanges.has(rangeKey)) return true;
         processedRanges.add(rangeKey);
 
-        const { startLine, endLine } = nodeToLocation(node, lines);
+        const { startLine, endLine, sourceSpan } = nodeToLocation(node, lines);
         const implInfo = extractImplInfo(node);
         const docstring = extractRustDocstring(lines, startLine);
         const derefTarget = extractDerefTarget(node, implInfo.traitName);
@@ -1186,6 +1191,7 @@ function _processClass(node, types, processedRanges, lines, code) {
             name: implInfo.name,
             startLine,
             endLine,
+            sourceSpan,
             type: 'impl',
             traitName: implInfo.traitName,
                 ...rustBlockItemScope(node),
@@ -1209,7 +1215,7 @@ function _processClass(node, types, processedRanges, lines, code) {
 
         const nameNode = node.childForFieldName('name');
         if (nameNode) {
-            const { startLine, endLine } = nodeToLocation(node, lines);
+            const { startLine, endLine, sourceSpan } = nodeToLocation(node, lines);
             const docstring = extractRustDocstring(lines, startLine);
             const visibility = extractVisibility(node.text);
             const attributes = extractAttributes(node, lines);
@@ -1220,6 +1226,7 @@ function _processClass(node, types, processedRanges, lines, code) {
                 name: nameNode.text,
                 startLine,
                 endLine,
+                sourceSpan,
                 type: 'module',
                 members: [],
                 modifiers,
@@ -1237,7 +1244,7 @@ function _processClass(node, types, processedRanges, lines, code) {
 
         const nameNode = node.childForFieldName('name');
         if (nameNode) {
-            const { startLine, endLine } = nodeToLocation(node, lines);
+            const { startLine, endLine, sourceSpan } = nodeToLocation(node, lines);
             const docstring = extractRustDocstring(lines, startLine);
             const inferred = _inferMacroReturn(node, nameNode.text);
 
@@ -1264,6 +1271,7 @@ function _processClass(node, types, processedRanges, lines, code) {
                 name: nameNode.text,
                 startLine,
                 endLine,
+                sourceSpan,
                 type: 'macro',
                 members: [],
                 modifiers,
@@ -1293,7 +1301,7 @@ function _processClass(node, types, processedRanges, lines, code) {
 
         const nameNode = node.childForFieldName('name');
         if (nameNode) {
-            const { startLine, endLine } = nodeToLocation(node, lines);
+            const { startLine, endLine, sourceSpan } = nodeToLocation(node, lines);
             const docstring = extractRustDocstring(lines, startLine);
             const visibility = extractVisibility(node.text);
             // `pub type StyledString = SpannedString<Style>;` — the alias IS
@@ -1309,6 +1317,7 @@ function _processClass(node, types, processedRanges, lines, code) {
                 name: nameNode.text,
                 startLine,
                 endLine,
+                sourceSpan,
                 type: 'type',
                 members: [],
                 modifiers: visibility ? [visibility] : [],
@@ -1388,7 +1397,7 @@ function _processState(node, objects, lines) {
         if (nameNode) {
             const name = nameNode.text;
             {
-                const { startLine, endLine } = nodeToLocation(node, lines);
+                const { startLine, endLine, sourceSpan } = nodeToLocation(node, lines);
                 // Only a plain type path (behind any references) is recorded:
                 // a generic wrapper (`Lazy<T>`, `Mutex<T>`) owns the methods
                 // or derefs to its argument. A `static mut` is never typed.
@@ -1402,7 +1411,7 @@ function _processState(node, objects, lines) {
                     node.children.some(child => child.type === 'mutable_specifier');
                 const plain = typeNode && (typeNode.type === 'type_identifier' ||
                     typeNode.type === 'scoped_type_identifier');
-                objects.push({ name, startLine, endLine, ...rustBlockItemScope(node),
+                objects.push({ name, startLine, endLine, sourceSpan, ...rustBlockItemScope(node),
                     ...(plain && !mutable && { valueType: typeNode.text,
                         ...(deref && { valueDerefVia: deref.via }) }) });
             }
@@ -1709,11 +1718,12 @@ function extractStructFields(structNode, codeOrLines) {
             // `self.0.method()` exactly.
             if (field.type === 'visibility_modifier' ||
                 field.type === 'attribute_item') continue;
-            const { startLine, endLine } = nodeToLocation(field, code);
+            const { startLine, endLine, sourceSpan } = nodeToLocation(field, code);
             fields.push({
                 name: String(position++),
                 startLine,
                 endLine,
+                sourceSpan,
                 memberType: 'field',
                 fieldType: field.text,
             });
@@ -1724,7 +1734,7 @@ function extractStructFields(structNode, codeOrLines) {
     for (let i = 0; i < bodyNode.namedChildCount; i++) {
         const field = bodyNode.namedChild(i);
         if (field.type === 'field_declaration') {
-            const { startLine, endLine } = nodeToLocation(field, code);
+            const { startLine, endLine, sourceSpan } = nodeToLocation(field, code);
             const nameNode = field.childForFieldName('name');
             const typeNode = field.childForFieldName('type');
 
@@ -1738,6 +1748,7 @@ function extractStructFields(structNode, codeOrLines) {
                     name: nameNode.text,
                     startLine,
                     endLine,
+                    sourceSpan,
                     memberType: 'field',
                     ...(visibility && { modifiers: [visibility] }),
                     ...(typeNode && { fieldType: typeNode.text })
@@ -1891,7 +1902,7 @@ function extractEnumVariants(enumNode, codeOrLines) {
         if (child.type === 'enum_variant') {
             const nameNode = child.childForFieldName('name');
             if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(child, code);
+                const { startLine, endLine, sourceSpan } = nodeToLocation(child, code);
                 // Check for tuple/struct variant data
                 let params = undefined;
                 // A unit variant names its value, a tuple variant its
@@ -1908,6 +1919,7 @@ function extractEnumVariants(enumNode, codeOrLines) {
                     name: nameNode.text,
                     startLine,
                     endLine,
+                    sourceSpan,
                     memberType: 'variant',
                     ...(params !== undefined && { params }),
                     ...(valueShape && { valueShape }),
@@ -1932,7 +1944,7 @@ function extractTraitMembers(traitNode, codeOrLines) {
         if (child.type === 'function_item' || child.type === 'function_signature_item') {
             const nameNode = child.childForFieldName('name');
             if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(child, code);
+                const { startLine, endLine, sourceSpan } = nodeToLocation(child, code);
                 const paramsNode = child.childForFieldName('parameters');
                 const returnType = extractReturnType(child);
                 const iteratorItemType = extractRustIteratorItemType(child);
@@ -1949,6 +1961,7 @@ function extractTraitMembers(traitNode, codeOrLines) {
                     name: nameNode.text,
                     startLine,
                     endLine,
+                    sourceSpan,
                     memberType: 'method',
                     isMethod: true,
                     ...(qualifiers.async && { isAsync: true }),
@@ -2088,7 +2101,7 @@ function extractImplMembers(implNode, codeOrLines, typeName) {
             const paramsNode = child.childForFieldName('parameters');
 
             if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(child, code);
+                const { startLine, endLine, sourceSpan } = nodeToLocation(child, code);
                 const text = child.text;
                 const returnType = extractReturnType(child);
                 const iteratorItemType = extractRustIteratorItemType(child);
@@ -2138,6 +2151,7 @@ function extractImplMembers(implNode, codeOrLines, typeName) {
                     ...(callbackParamTypes && { callbackParamTypes }),
                     startLine,
                     endLine,
+                    sourceSpan,
                     memberType: 'method',
                     isAsync: qualifiers.async,
                     isMethod: hasSelf,  // Only true methods (with self) — associated functions are false

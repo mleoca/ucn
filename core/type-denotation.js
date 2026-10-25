@@ -653,7 +653,8 @@ function csharpUsings(index, filePath, namespace = null, siteNode = null, syntax
             const language = require('../languages');
             const parser = language.getParser(fileEntry.language);
             const adapter = language.getLanguageAdapter(fileEntry.language);
-            const tree = (require('./query-bodies').isLocalNameTree(siteNode.tree) && siteNode.tree) ||
+            const tree = (index.isProvenanceFactIndex && siteNode.tree) ||
+                (require('./query-bodies').isLocalNameTree(siteNode.tree) && siteNode.tree) ||
                 index._getParsedTree(filePath, content, fileEntry.language) ||
                 adapter.queryTree(content, parser, fileEntry);
             local = adapter.queryUsingDirectives(tree);
@@ -717,8 +718,9 @@ function csharpExpandAliasTargets(scope) {
 /** The directory whose `.git` marks the repository holding `dir`, or null. */
 function gitTopOf(index, dir) {
     return memoized(index, `\x01git-top\x00${dir}`, () => {
+        const sourceFs = index.isProvenanceFactIndex ? index.provenanceFs : fs;
         for (let current = dir; ; current = path.dirname(current)) {
-            try { if (fs.existsSync(path.join(current, '.git'))) return current; } catch { /* keep walking */ }
+            try { if (sourceFs.existsSync(path.join(current, '.git'))) return current; } catch { /* keep walking */ }
             if (current === path.dirname(current)) return null;
         }
     });
@@ -735,6 +737,7 @@ function gitTopOf(index, dir) {
  * null marks a file that could not be read.
  */
 function csharpProjectFileUsings(index, filePath) {
+    const sourceFs = index.isProvenanceFactIndex ? index.provenanceFs : fs;
     const dirs = [];
     const root = path.resolve(index.root);
     let dir = path.dirname(filePath);
@@ -753,12 +756,12 @@ function csharpProjectFileUsings(index, filePath) {
     }
     return dirs.flatMap(current => memoized(index, `\x01cs-proj-usings\x00${current}`, () => {
         let names;
-        try { names = fs.readdirSync(current); } catch { return []; }
+        try { names = sourceFs.readdirSync(current); } catch { return []; }
         const out = [];
         for (const file of names.sort()) {
             if (!/\.csproj$|^Directory\.Build\.(props|targets)$/.test(file)) continue;
             let text;
-            try { text = fs.readFileSync(path.join(current, file), 'utf-8'); } catch { out.push(null); continue; }
+            try { text = sourceFs.readFileSync(path.join(current, file), 'utf-8'); } catch { out.push(null); continue; }
             for (const match of text.matchAll(/<Using\b([^>]*)>/g)) {
                 const include = /\bInclude\s*=\s*"([^"]+)"/.exec(match[1]);
                 if (!include) continue;

@@ -5973,7 +5973,7 @@ describe('fix #286e: annotated module-qualified receiver identity', () => {
 });
 
 describe('fix #286f: nested local class is a resolvable callee', () => {
-    it('Foo("bar") inside the defining function confirms the nested class edge', () => {
+    it('Foo("bar") inside the defining function confirms the nested initializer edge', () => {
         // flask-measured: `class Foo` inside test_custom_tag; the localShadow
         // gate excluded the constructor call local-shadow while the oracle
         // pins the nested class (callee semantic-recall gate failure).
@@ -5988,8 +5988,8 @@ describe('fix #286f: nested local class is a resolvable callee', () => {
                 collectAccount: true, file: 'test_thing.py',
             });
             assert.ok([...callees].some(e =>
-                e.name === 'Foo' && e.relativePath === 'test_thing.py'),
-                `nested class must be a confirmed callee: ${JSON.stringify([...callees].map(e => e.name))}`);
+                e.name === '__init__' && e.className === 'Foo' && e.relativePath === 'test_thing.py'),
+                `nested initializer must be a confirmed callee: ${JSON.stringify([...callees].map(e => e.name))}`);
         } finally { rm(dir); }
     });
 });

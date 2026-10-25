@@ -933,7 +933,15 @@ function clearAllCaches() {
 // value queries retain source-local shadow/text proofs and lexical block
 // ranges with each parse view's error positions.
 // v292: Python class syntax facts retain members, writes and dynamic stores.
-const CACHE_FORMAT_VERSION = 299;
+// v300: Java constructor declarations, construction arguments and delegation
+// records; qualified construction types, declaration source extents and
+// JS/TS assigned value names.
+// v303: Java producer chains retain argument counts for collection contracts.
+// v304: Java receiver producer paths retain their written type and source scope.
+// v305: Java variadic parameters retain their declared array type.
+// v306: Overload witnesses omit absent optional object fields consistently.
+// v307: Overload witnesses capture observed file fields separately.
+const CACHE_FORMAT_VERSION = 307;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 function usageResultKey(index, filePath, name, mode) {

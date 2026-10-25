@@ -123,6 +123,8 @@ const STRUCTURAL_TRAITS = {
     // 'namespace-usings' (C#: enclosing namespaces, then using directives,
     // global usings and project-file <Using> items), or null.
     typeNameScoping: null,
+    typeNameSourceCanonical: null,
+    typeNameOwnersAt: null,
     // Types every file imports on demand without writing it (Java java.lang,
     // JLS 7.3): { module, names }. A project type of the same name in another
     // package is visible only through an import.
@@ -140,6 +142,11 @@ const STRUCTURAL_TRAITS = {
     hasDefaultParams: true,
     allMethodsVirtual: false,
     hasArityOverloads: false,
+    overloadPhases: null,
+    overloadFileSymbols: false,
+    inheritedOverloadSignatures: false,
+    // Interface instance members join lookup after the superclass chain.
+    interfaceMembersInMethodLookup: false,
     // Whether `from pkg import name` can bind a SUBMODULE file as a plain
     // name (fix #224). Python sets true: graph-build resolves the composed
     // dotted specifier and records it in moduleResolved, making the receiver
@@ -176,6 +183,12 @@ const STRUCTURAL_TRAITS = {
     // Whether `Type(...)` constructs a class without a `new` token. Python
     // classes are ordinary callable objects; JS/TS classes require `new`.
     classesCallableWithoutNew: false,
+    hasConstructors: true,
+    fixedConstructorName: 'constructor',
+    constructorArgumentNodes: { delegation: { nodeType: 'call_expression', argsField: 'arguments' } },
+    functionalTypeConstruction: false,
+    constructorInheritance: { order: 'single', classNodes: ['class_declaration', 'class'], headerNode: 'class_heritage' },
+    implicitBaseConstruction: null,
     // Whether a decorator REPLACES the callable it decorates with its own
     // return value (Python/JS decorators, fix #364). What a decorated async
     // function's call returns is then decided by the decorator, not by the
@@ -278,6 +291,10 @@ const STRUCTURAL_TRAITS = {
 };
 const NOMINAL_TRAITS = {
     typeSystem: 'nominal',
+    hasConstructors: false,
+    fixedConstructorName: null,
+    constructorInheritance: null,
+    implicitBaseConstruction: null,
     plainQueryTree: true,
     physicalCallTokenSyntax: true,
     scopeAlternativeBindings: false,
@@ -292,6 +309,8 @@ const NOMINAL_TRAITS = {
     moduleTypeIdentity: false,
     standardPathRoots: [],
     typeNameScoping: null,
+    typeNameSourceCanonical: null,
+    typeNameOwnersAt: null,
     implicitTypeImport: null,
     methodCallInclusion: 'auto',
     packageScope: 'file',
@@ -323,6 +342,10 @@ const NOMINAL_TRAITS = {
     // the caller contract: a pinned overload is only confirmed when the call
     // site provably binds it.
     hasArityOverloads: false,
+    overloadPhases: null,
+    overloadFileSymbols: false,
+    inheritedOverloadSignatures: false,
+    interfaceMembersInMethodLookup: false,
     // What a TYPE-QUALIFIED method call looks like, so a receiver that merely
     // shares the target type's NAME isn't mistaken for the type itself:
     //   'static'      — Type.method() static form, any arity (Java).
@@ -373,6 +396,8 @@ const NOMINAL_TRAITS = {
     // methods — false. Per-language override, not preset-wide.
     memberAccessNeverMethod: false,
     classesCallableWithoutNew: false,
+    constructorArgumentNodes: {},
+    functionalTypeConstruction: false,
     decoratorsWrapCallables: false,
     callableDecorators: null,
     knownAsyncGlobals: null,
@@ -517,6 +542,7 @@ const LANGUAGES = {
         traits: {
             ...STRUCTURAL_TRAITS,
             selfParam: ['self', 'cls'],
+            fixedConstructorName: null,
             nameReferenceFamily: 'python',
             separateStaticStorage: false,
             // fix #224: `from pkg import name` may bind a SUBMODULE file, not
@@ -527,6 +553,10 @@ const LANGUAGES = {
             // `__x` (not a dunder) is name-mangled per class (fix #397).
             privateMemberName: name => /^__/.test(String(name)) && !/__$/.test(String(name)),
             classesCallableWithoutNew: true,
+            constructorInheritance: { order: 'c3', classNodes: ['class_definition'], headerField: 'superclasses', keywordNode: 'keyword_argument' },
+            constructorProtocol: { initializer: '__init__', allocator: '__new__', metaclass: 'metaclass', builtinRoot: 'object',
+                functionNode: 'function_definition', classNode: 'class_definition',
+                headerField: 'superclasses', keywordNode: 'keyword_argument' },
             // Call sites bind by parameter name (f(x=1)); signatures carry
             // keyword-only (`*`) and positional-only (`/`) markers (fix #281).
             keywordArguments: true,
@@ -680,6 +710,15 @@ const LANGUAGES = {
         treeSitterModule: () => require('tree-sitter-java'),
         traits: {
             ...NOMINAL_TRAITS,
+            hasConstructors: true,
+            implicitBaseConstruction: { classes: ['class_declaration'], headerField: 'superclass',
+                constructors: ['constructor_declaration'], delegationNodes: ['explicit_constructor_invocation'],
+                ownerScope: node => require('./java').implicitOwnerScope(node),
+                baseKinds: ['class'], separator: '.' },
+            constructorArgumentNodes: {
+                delegation: { nodeType: 'explicit_constructor_invocation', argsField: 'arguments' },
+                enum: { nodeType: 'enum_constant', argsField: 'arguments' },
+            },
             fieldsAndMethodsSeparate: true,
             nameReferenceFamily: 'java',
             staticEnumReferenceSyntax: true,
@@ -689,6 +728,8 @@ const LANGUAGES = {
             implicitEnumCaseLabels: true,
             standardPathRoots: ['java', 'javax'],
             typeNameScoping: 'package-on-demand',
+            typeNameSourceCanonical: source => require('./java-unicode').typeNameSourceCanonical(source),
+            typeNameOwnersAt: (source, site) => require('./java-unicode').typeNameOwnersAt(source, site),
             typeNamedSourceFile: true,
             // The public top-level types of java.lang (JDK 8-21, preview
             // included): a spec-level list, not project knowledge.
@@ -725,6 +766,10 @@ const LANGUAGES = {
             selfParam: ['this'],
             allMethodsVirtual: true,
             hasArityOverloads: true,
+            overloadPhases: 'strict-loose-variable',
+            overloadFileSymbols: true,
+            inheritedOverloadSignatures: true,
+            interfaceMembersInMethodLookup: true,
             universalSupertype: 'Object',
             universalSupertypeMembers: { toString: 0, equals: 1, hashCode: 0, clone: 0, finalize: 0 },
             // Serialization callbacks and fields the JVM uses reflectively.
@@ -793,6 +838,15 @@ const LANGUAGES = {
         treeSitterModule: () => require('tree-sitter-cpp'),
         traits: {
             ...NOMINAL_TRAITS,
+            hasConstructors: true,
+            implicitBaseConstruction: { classes: ['class_specifier', 'struct_specifier'], headerNode: 'base_class_clause',
+                constructors: ['function_definition', 'field_declaration', 'declaration'], defaultPotential: true,
+                constructorInfo: (...args) => require('./c-family').implicitConstructorInfo(...args),
+                ownerScope: node => require('./c-family').implicitOwnerScope(node),
+                baseKinds: ['class', 'struct'], separator: '::' },
+            functionalTypeConstruction: true,
+            constructorArgumentNodes: { direct: { nodeType: 'init_declarator', argsField: 'value' },
+                delegation: { nodeType: 'field_initializer', argsNodeType: 'argument_list' } },
             isInvokedName: (node, options) => require('./c-family').isInvokedName(node, options),
             nameReferenceFamily: 'c',
             typeArgumentValues: 'ordinary',
@@ -834,6 +888,11 @@ const LANGUAGES = {
         treeSitterModule: () => require('tree-sitter-c-sharp'),
         traits: {
             ...NOMINAL_TRAITS,
+            hasConstructors: true,
+            implicitBaseConstruction: { classes: ['class_declaration', 'record_declaration'], headerNode: 'base_list',
+                constructors: ['constructor_declaration'], delegationNodes: ['constructor_initializer'],
+                ownerScope: node => require('./csharp').implicitOwnerScope(node),
+                firstBaseOnly: true, referenceTypesOnly: true, baseKinds: ['class', 'record'], separator: '.' },
             plainQueryTree: false,
             isInvokedName: (node, options) => require('./csharp').isInvokedName(node, options),
             nameReferenceFamily: 'csharp',
@@ -850,6 +909,7 @@ const LANGUAGES = {
             standardPathRoots: ['System'],
             conditionalDefinitions: 'preprocessor',
             typeNameScoping: 'namespace-usings',
+            constructorArgumentNodes: { delegation: { nodeType: 'constructor_initializer', argsNodeType: 'argument_list' } },
             genericArityIsIdentity: true,
             typeArgumentsFromArgumentsOnly: true,
             selfParam: ['this', 'base'],
@@ -857,6 +917,7 @@ const LANGUAGES = {
             hasDynamicImports: false,
             hasArityOverloads: true,
             bareCallReachesMethods: true,
+            inheritedOverloadSignatures: true,
             typeQualifiedCallStyle: 'static',
             universalSupertype: 'Object',
             universalSupertypeMembers: { ToString: 0, Equals: 1, GetHashCode: 0, Finalize: 0 },
@@ -914,6 +975,11 @@ const LANGUAGES = {
             ...STRUCTURAL_TRAITS,
             // Embedded scripts supply their own parse trees.
             physicalCallTokenSyntax: false,
+            constructorInheritance: { ...STRUCTURAL_TRAITS.constructorInheritance, syntaxLanguage: 'javascript',
+                source: (content, parser) => {
+                    const html = require('./html');
+                    return html.buildVirtualJSContent(content, html.extractScriptBlocks(content, parser));
+                } },
             valueScopes: (content, parser) => require('./html')
                 .extractScriptBlocks(content, parser, { includeScopes: true }),
             selfParam: ['this'],

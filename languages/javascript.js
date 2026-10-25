@@ -449,6 +449,47 @@ function objectPropertyName(nameNode) {
     return null;
 }
 
+// A non-computed method's key has the value of its identifier or string
+// literal. Class constructor identity uses that value, including escapes.
+function classMethodName(node) {
+    const raw = objectPropertyName(node);
+    if (raw == null || !raw.includes('\\')) return raw;
+    const string = node.type === 'string';
+    const escapes = { b: '\b', f: '\f', n: '\n', r: '\r', t: '\t', v: '\v', '0': '\0' };
+    let value = '';
+    for (let at = 0; at < raw.length; at++) {
+        if (raw[at] !== '\\') { value += raw[at]; continue; }
+        const escape = raw[++at];
+        if (escape === undefined) return null;
+        if (escape === 'u' || string && escape === 'x') {
+            const brace = escape === 'u' && raw[at + 1] === '{';
+            const start = at + (brace ? 2 : 1);
+            const end = brace ? raw.indexOf('}', start) : start + (escape === 'u' ? 4 : 2);
+            if (end <= start || end > raw.length) return null;
+            let code = 0;
+            for (let digit = start; digit < end; digit++) {
+                const point = raw.charCodeAt(digit);
+                const hex = point >= 48 && point <= 57 ? point - 48
+                    : point >= 65 && point <= 70 ? point - 55
+                        : point >= 97 && point <= 102 ? point - 87 : -1;
+                if (hex < 0) return null;
+                code = code * 16 + hex;
+                if (code > 0x10ffff) return null;
+            }
+            value += String.fromCodePoint(code);
+            at = brace ? end : end - 1;
+        } else if (!string) return null;
+        else if (escape === '\r' || escape === '\n' || escape === '\u2028' || escape === '\u2029') {
+            if (escape === '\r' && raw[at + 1] === '\n') at++;
+        } else {
+            if (escape >= '0' && escape <= '9' &&
+                (escape !== '0' || raw[at + 1] >= '0' && raw[at + 1] <= '9')) return null;
+            value += Object.hasOwn(escapes, escape) ? escapes[escape] : escape;
+        }
+    }
+    return value;
+}
+
 /**
  * Index function-valued object properties. Module-scope objects are dynamic
  * dispatch surfaces (`HANDLERS[command](...)`); without symbols for their
@@ -486,7 +527,7 @@ function appendObjectFunctionMembers(objectNode, functions, lines, extraFields =
         }
 
         const paramsNode = fnNode.childForFieldName('parameters');
-        const { startLine, endLine, indent } = nodeToLocation(prop, lines);
+        const { startLine, endLine, indent, sourceSpan } = nodeToLocation(prop, lines);
         const returnType = extractReturnType(fnNode);
         const generics = extractGenerics(fnNode);
         const docstring = extractJSDocstring(lines, startLine);
@@ -499,6 +540,7 @@ function appendObjectFunctionMembers(objectNode, functions, lines, extraFields =
             paramsStructured,
             startLine,
             endLine,
+            sourceSpan,
             indent,
             isArrow: fnNode.type === 'arrow_function',
             isGenerator: isGenerator(fnNode),
@@ -852,7 +894,7 @@ function _processFunction(node, functions, processedRanges, lines) {
         const paramsNode = node.childForFieldName('parameters');
 
         if (nameNode) {
-            const { startLine, endLine, indent } = nodeToLocation(node, lines);
+            const { startLine, endLine, indent, sourceSpan } = nodeToLocation(node, lines);
             const returnType = extractReturnType(node);
             const returnedConcreteType = extractReturnedConcreteType(node);
             const generics = extractGenerics(node);
@@ -874,6 +916,7 @@ function _processFunction(node, functions, processedRanges, lines) {
                 paramsStructured,
                 startLine,
                 endLine,
+                sourceSpan,
                 indent,
                 isArrow: false,
                 isGenerator: isGen,
@@ -905,7 +948,7 @@ function _processFunction(node, functions, processedRanges, lines) {
         if (!isBoundValue && nameNode && !processedRanges.has(rangeKey)) {
             processedRanges.add(rangeKey);
             const paramsNode = node.childForFieldName('parameters');
-            const { startLine, endLine, indent } = nodeToLocation(node, lines);
+            const { startLine, endLine, indent, sourceSpan } = nodeToLocation(node, lines);
             const returnType = extractReturnType(node);
             const generics = extractGenerics(node);
             const paramsStructured = parseStructuredParams(paramsNode, 'javascript');
@@ -917,6 +960,7 @@ function _processFunction(node, functions, processedRanges, lines) {
                 paramsStructured,
                 startLine,
                 endLine,
+                sourceSpan,
                 indent,
                 isArrow: false,
                 isGenerator: isGenerator(node),
@@ -945,7 +989,7 @@ function _processFunction(node, functions, processedRanges, lines) {
         const paramsNode = node.childForFieldName('parameters');
 
         if (nameNode) {
-            const { startLine, endLine, indent } = nodeToLocation(node, lines);
+            const { startLine, endLine, indent, sourceSpan } = nodeToLocation(node, lines);
             const returnType = extractReturnType(node);
             const generics = extractGenerics(node);
             const docstring = extractJSDocstring(lines, startLine);
@@ -958,6 +1002,7 @@ function _processFunction(node, functions, processedRanges, lines) {
                 paramsStructured,
                 startLine,
                 endLine,
+                sourceSpan,
                 indent,
                 isArrow: false,
                 isGenerator: false,
@@ -1014,7 +1059,7 @@ function _processFunction(node, functions, processedRanges, lines) {
                             params: extractParams(paramsNode),
                             paramsStructured,
                             startLine,
-                            endLine,
+                            endLine, sourceSpan: nodeToLocation(valueNode, lines).sourceSpan,
                             indent,
                             isArrow,
                             isGenerator: isGen,
@@ -1067,6 +1112,7 @@ function _processFunction(node, functions, processedRanges, lines) {
                                             paramsStructured,
                                             startLine,
                                             endLine,
+                                            sourceSpan: nodeToLocation(innerFn, lines).sourceSpan,
                                             indent,
                                             isArrow: innerFn.type === 'arrow_function',
                                             isGenerator: false,
@@ -1184,6 +1230,7 @@ function _processFunction(node, functions, processedRanges, lines) {
                         paramsStructured,
                         startLine,
                         endLine,
+                        sourceSpan: nodeToLocation(rightNode, lines).sourceSpan,
                         indent,
                         isArrow,
                         isGenerator: isGen,
@@ -1269,6 +1316,7 @@ function _processFunction(node, functions, processedRanges, lines) {
                         paramsStructured,
                         startLine,
                         endLine,
+                        sourceSpan: nodeToLocation(child, lines).sourceSpan,
                         indent,
                         isArrow: child.type === 'arrow_function',
                         isGenerator: isGen,
@@ -1316,7 +1364,7 @@ function _processClass(node, classes, processedRanges, lines) {
     if (node.type === 'class_declaration' || node.type === 'class' || node.type === 'abstract_class_declaration') {
         const nameNode = node.childForFieldName('name');
         if (nameNode) {
-            const { startLine, endLine } = nodeToLocation(node, lines);
+            const { startLine, endLine, sourceSpan } = nodeToLocation(node, lines);
             const members = extractClassMembers(node, lines);
             const docstring = extractJSDocstring(lines, startLine);
             const generics = extractGenerics(node);
@@ -1330,6 +1378,7 @@ function _processClass(node, classes, processedRanges, lines) {
                 name: nameNode.text,
                 startLine,
                 endLine,
+                sourceSpan,
                 type: 'class',
                 members,
                 ...(isAbstract && { modifiers: ['abstract'] }),
@@ -1351,7 +1400,7 @@ function _processClass(node, classes, processedRanges, lines) {
     if (node.type === 'interface_declaration') {
         const nameNode = node.childForFieldName('name');
         if (nameNode) {
-            const { startLine, endLine } = nodeToLocation(node, lines);
+            const { startLine, endLine, sourceSpan } = nodeToLocation(node, lines);
             const docstring = extractJSDocstring(lines, startLine);
             const generics = extractGenerics(node);
             const extendsInfo = extractInterfaceExtends(node);
@@ -1361,6 +1410,7 @@ function _processClass(node, classes, processedRanges, lines) {
                 name: nameNode.text,
                 startLine,
                 endLine,
+                sourceSpan,
                 type: 'interface',
                 members,
                 ...(docstring && { docstring }),
@@ -1375,7 +1425,7 @@ function _processClass(node, classes, processedRanges, lines) {
     if (node.type === 'type_alias_declaration') {
         const nameNode = node.childForFieldName('name');
         if (nameNode) {
-            const { startLine, endLine } = nodeToLocation(node, lines);
+            const { startLine, endLine, sourceSpan } = nodeToLocation(node, lines);
             const docstring = extractJSDocstring(lines, startLine);
             const valueNode = node.childForFieldName('value');
             // `type ZodTypeAny = ZodType<any, any, any>;` — the alias IS the
@@ -1395,6 +1445,7 @@ function _processClass(node, classes, processedRanges, lines) {
                 name: nameNode.text,
                 startLine,
                 endLine,
+                sourceSpan,
                 type: 'type',
                 members,
                 ...(aliasOf && { aliasOf }),
@@ -1408,7 +1459,7 @@ function _processClass(node, classes, processedRanges, lines) {
     if (node.type === 'enum_declaration') {
         const nameNode = node.childForFieldName('name');
         if (nameNode) {
-            const { startLine, endLine } = nodeToLocation(node, lines);
+            const { startLine, endLine, sourceSpan } = nodeToLocation(node, lines);
             const docstring = extractJSDocstring(lines, startLine);
             const members = extractEnumMembers(node, lines);
 
@@ -1416,6 +1467,7 @@ function _processClass(node, classes, processedRanges, lines) {
                 name: nameNode.text,
                 startLine,
                 endLine,
+                sourceSpan,
                 type: 'enum',
                 members,
                 ...(docstring && { docstring })
@@ -1435,13 +1487,14 @@ function _processClass(node, classes, processedRanges, lines) {
         // StoreMutators augmentations). The compiler merges it into the
         // TARGET module — never claimable, never importable by this "name".
         if (nameNode && nameNode.type !== 'string') {
-            const { startLine, endLine } = nodeToLocation(node, lines);
+            const { startLine, endLine, sourceSpan } = nodeToLocation(node, lines);
             const docstring = extractJSDocstring(lines, startLine);
 
             classes.push({
                 name: nameNode.text,
                 startLine,
                 endLine,
+                sourceSpan,
                 type: 'namespace',
                 members: [],
                 ...(docstring && { docstring })
@@ -1578,7 +1631,7 @@ function extractTypeMembers(bodyNode, code) {
             const nameNode = child.childForFieldName('name');
             const paramsNode = child.childForFieldName('parameters');
             if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(child, code);
+                const { startLine, endLine, sourceSpan } = nodeToLocation(child, code);
                 const returnType = extractReturnType(child);
                 const paramsStructured = parseStructuredParams(paramsNode, 'javascript');
                 const typeAnno = buildTypeAnnotations(paramsStructured, returnType, code, startLine, true);
@@ -1588,6 +1641,7 @@ function extractTypeMembers(bodyNode, code) {
                     paramsStructured,
                     startLine,
                     endLine,
+                    sourceSpan,
                     memberType: 'method',
                     isMethod: true,
                     ...typeAnno
@@ -1596,7 +1650,7 @@ function extractTypeMembers(bodyNode, code) {
         } else if (child.type === 'property_signature') {
             const nameNode = child.childForFieldName('name');
             if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(child, code);
+                const { startLine, endLine, sourceSpan } = nodeToLocation(child, code);
                 // Declared property type (fix #219): raw annotation text —
                 // findCallers hops field receivers to it (this._map.has()),
                 // and function-typed properties ((arg) => T) count as
@@ -1607,6 +1661,7 @@ function extractTypeMembers(bodyNode, code) {
                     name: nameNode.text,
                     startLine,
                     endLine,
+                    sourceSpan,
                     memberType: 'field',
                     ...(fieldType && { fieldType })
                 });
@@ -1629,12 +1684,12 @@ function extractEnumMembers(enumNode, code) {
         if (child.type === 'enum_assignment') {
             const nameNode = child.childForFieldName('name');
             if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(child, code);
-                members.push({ name: nameNode.text, startLine, endLine, memberType: 'field' });
+                const { startLine, endLine, sourceSpan } = nodeToLocation(child, code);
+                members.push({ name: nameNode.text, startLine, endLine, sourceSpan, memberType: 'field' });
             }
         } else if (child.type === 'property_identifier') {
-            const { startLine, endLine } = nodeToLocation(child, code);
-            members.push({ name: child.text, startLine, endLine, memberType: 'field' });
+            const { startLine, endLine, sourceSpan } = nodeToLocation(child, code);
+            members.push({ name: child.text, startLine, endLine, sourceSpan, memberType: 'field' });
         }
     }
     return members;
@@ -1657,9 +1712,10 @@ function extractClassMembers(classNode, codeOrLines) {
             const nameNode = child.childForFieldName('name');
             const paramsNode = child.childForFieldName('parameters');
             if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(child, code);
-                let name = nameNode.text;
+                const { startLine, endLine, sourceSpan } = nodeToLocation(child, code);
+                let name = classMethodName(nameNode) === 'constructor' ? 'constructor' : nameNode.text;
                 const text = child.text;
+                const isStatic = child.children.some(part => part.type === 'static');
 
                 // Collect decorators from preceding siblings in the class body
                 const decorators = [];
@@ -1685,7 +1741,7 @@ function extractClassMembers(classNode, codeOrLines) {
                     if (staticMatch) name = staticMatch[1];
                 }
 
-                if (name === 'constructor') {
+                if (name === 'constructor' && !isStatic && nameNode.type !== 'computed_property_name') {
                     memberType = 'constructor';
                 } else if (text.match(/^\s*(?:public\s+|private\s+|protected\s+)?(?:override\s+)?static\s+(?:override\s+)?get\s/)) {
                     memberType = hasOverride ? 'static override get' : 'static get';
@@ -1726,6 +1782,7 @@ function extractClassMembers(classNode, codeOrLines) {
                     paramsStructured,
                     startLine,
                     endLine,
+                    sourceSpan,
                     memberType,
                     ...(accessMatch && { modifiers: [accessMatch[1]] }),
                     isAsync,
@@ -1783,7 +1840,7 @@ function extractClassMembers(classNode, codeOrLines) {
             const nameNode = child.childForFieldName('name');
             const paramsNode = child.childForFieldName('parameters');
             if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(child, code);
+                const { startLine, endLine, sourceSpan } = nodeToLocation(child, code);
                 const returnType = extractReturnType(child);
                 const docstring = extractJSDocstring(code, startLine);
                 const paramsStructured = parseStructuredParams(paramsNode, 'javascript');
@@ -1805,6 +1862,7 @@ function extractClassMembers(classNode, codeOrLines) {
                     paramsStructured,
                     startLine,
                     endLine,
+                    sourceSpan,
                     memberType: 'abstract',
                     isMethod: true,
                     ...typeAnno,
@@ -1818,7 +1876,7 @@ function extractClassMembers(classNode, codeOrLines) {
         if (child.type === 'field_definition' || child.type === 'public_field_definition') {
             const nameNode = child.childForFieldName('name') || child.childForFieldName('property');
             if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(child, code);
+                const { startLine, endLine, sourceSpan } = nodeToLocation(child, code);
                 const name = nameNode.text;
                 // fix #390: a TS decorator is part of the field node; the
                 // name's line is where definition edits go.
@@ -1865,6 +1923,7 @@ function extractClassMembers(classNode, codeOrLines) {
                         paramsStructured,
                         startLine,
                         endLine,
+                        sourceSpan,
                         ...fieldNameLine,
                         memberType: name.startsWith('#') ? 'private' : 'field',
                         ...(isStatic && { modifiers: ['static'] }),
@@ -1892,6 +1951,7 @@ function extractClassMembers(classNode, codeOrLines) {
                         name,
                         startLine,
                         endLine,
+                        sourceSpan,
                         ...fieldNameLine,
                         memberType: name.startsWith('#') ? 'private field' : 'field',
                         ...(isStatic && { modifiers: ['static'] }),
@@ -1976,11 +2036,11 @@ function _processState(node, objects, lines) {
                     const isArray = valueNode.type === 'array';
 
                     if ((isObject || isArray) && _STATE_PATTERN.test(name)) {
-                        const { startLine, endLine } = nodeToLocation(node, lines);
-                        objects.push({ name, startLine, endLine });
+                        const { startLine, endLine, sourceSpan } = nodeToLocation(node, lines);
+                        objects.push({ name, startLine, endLine, sourceSpan });
                     } else if (_isFactoryCall(valueNode) && (_ACTION_PATTERN.test(name) || _STATE_PATTERN.test(name))) {
-                        const { startLine, endLine } = nodeToLocation(node, lines);
-                        objects.push({ name, startLine, endLine });
+                        const { startLine, endLine, sourceSpan } = nodeToLocation(node, lines);
+                        objects.push({ name, startLine, endLine, sourceSpan });
                     }
                 }
             }
@@ -2088,33 +2148,31 @@ function jsModuleValueAliases(root) {
             }
         }
     }
-    if (mutable.length > 0) {
-        // A `let`/`var` alias is the class only while nothing assigns the
-        // name again (fix #392): any write to that identifier anywhere in the
-        // module, or a second declaration, leaves it unbound.
-        const written = new Set();
-        const writeTargets = (node) => {
-            if (!node) return;
-            if (node.type === 'identifier') { written.add(node.text); return; }
-            if (/pattern$/.test(node.type) || node.type === 'pair_pattern' ||
-                node.type === 'shorthand_property_identifier_pattern') {
-                if (node.type === 'shorthand_property_identifier_pattern') written.add(node.text);
-                for (const child of node.namedChildren) writeTargets(child);
-            }
-        };
-        for (const node of root.descendantsOfType(['assignment_expression',
-            'augmented_assignment_expression', 'update_expression', 'for_in_statement'])) {
-            if (node.type === 'update_expression') writeTargets(node.namedChild(0));
-            else if (node.type === 'for_in_statement') {
-                if (!node.childForFieldName('kind')) writeTargets(node.childForFieldName('left'));
-            } else writeTargets(node.childForFieldName('left'));
+    // A `let`/`var` alias is the class only while nothing assigns the
+    // name again (fix #392): any write to that identifier anywhere in the
+    // module, or a second declaration, leaves it unbound.
+    const written = new Set();
+    const writeTargets = (node) => {
+        if (!node) return;
+        if (node.type === 'identifier') { written.add(node.text); return; }
+        if (/pattern$/.test(node.type) || node.type === 'pair_pattern' ||
+            node.type === 'shorthand_property_identifier_pattern') {
+            if (node.type === 'shorthand_property_identifier_pattern') written.add(node.text);
+            for (const child of node.namedChildren) writeTargets(child);
         }
-        for (const alias of mutable) {
-            if (!written.has(alias.name) && declared.get(alias.name) === 1) aliases.push(alias);
-        }
-        aliases.sort((a, b) => a.line - b.line);
+    };
+    for (const node of root.descendantsOfType(['assignment_expression',
+        'augmented_assignment_expression', 'update_expression', 'for_in_statement'])) {
+        if (node.type === 'update_expression') writeTargets(node.namedChild(0));
+        else if (node.type === 'for_in_statement') {
+            if (!node.childForFieldName('kind')) writeTargets(node.childForFieldName('left'));
+        } else writeTargets(node.childForFieldName('left'));
     }
-    return aliases;
+    for (const alias of mutable) {
+        if (!written.has(alias.name) && declared.get(alias.name) === 1) aliases.push(alias);
+    }
+    aliases.sort((a, b) => a.line - b.line);
+    return { aliases, assignedNames: [...written].sort() };
 }
 
 function parse(code, parser) {
@@ -2228,7 +2286,7 @@ function parse(code, parser) {
     classes.sort((a, b) => a.startLine - b.startLine);
     stateObjects.sort((a, b) => a.startLine - b.startLine);
     callableAliases.sort((a, b) => a.startLine - b.startLine);
-    const moduleValueAliases = jsModuleValueAliases(tree.rootNode);
+    const { aliases: moduleValueAliases, assignedNames: moduleAssignedNames } = jsModuleValueAliases(tree.rootNode);
 
     return {
         language: 'javascript',
@@ -2238,6 +2296,7 @@ function parse(code, parser) {
         stateObjects,
         callableAliases,
         ...(moduleValueAliases.length > 0 && { moduleValueAliases }),
+        ...(moduleAssignedNames.length > 0 && { moduleAssignedNames }),
         ...(tree.rootNode.hasError && { parseRecovery: true, parseErrorRegions: parseErrorRegions(tree.rootNode) }),
         imports: [],  // Handled by core/imports.js
         exports: []   // Handled by core/imports.js
@@ -4057,6 +4116,7 @@ function findCallsInCode(code, parser) {
                 // the parent class's constructor definition.
                 calls.push({
                     name: 'constructor',
+                    constructorSyntax: 'delegation',
                     line: node.startPosition.row + 1,
                     callStart: node.startIndex,
                     callEnd: node.endIndex,
@@ -4325,12 +4385,20 @@ function findCallsInCode(code, parser) {
             const ctorNode = node.childForFieldName('constructor');
             if (ctorNode) {
                 const enclosingFunction = getCurrentEnclosingFunction();
+                const args = (node.childForFieldName('arguments')?.namedChildren || [])
+                    .filter(arg => !arg.type.endsWith('comment'));
+                const argumentsShape = {
+                    argCount: args.length,
+                    ...(args.some(arg => arg.type === 'spread_element') && { argSpread: true }),
+                };
 
                 // fix #366: `new Router({ prefix: '/api' })` (koa-router)
                 // carries a constructor mount prefix.
                 const ctorPrefix = hasObjectKeyArg(node, 'prefix');
                 if (ctorNode.type === 'identifier') {
                     calls.push({
+                        callSite: typeOrigin('call', ctorNode),
+                        ...argumentsShape,
                         name: ctorNode.text,
                         line: node.startPosition.row + 1,
                         isMethod: false,
@@ -4344,10 +4412,13 @@ function findCallsInCode(code, parser) {
                     const propNode = ctorNode.childForFieldName('property');
                     if (propNode) {
                         calls.push({
+                            callSite: typeOrigin('call', propNode),
+                            ...argumentsShape,
                             name: propNode.text,
                             line: node.startPosition.row + 1,
                             isMethod: true,
                             isConstructor: true,
+                            ...memberReceiverFacts(ctorNode.childForFieldName('object'), propNode.text),
                             ...(ctorPrefix && { prefixOption: true }),
                             enclosingFunction
                         });

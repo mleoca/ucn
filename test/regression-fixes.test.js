@@ -19,6 +19,132 @@ const { applyOutputBudget } = require('../core/output-budget');
 const { execute } = require('../core/execute');
 const { createTempDir, cleanup, tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR, CLI_PATH, runCli, runInteractive } = require('./helpers');
 
+describe('fix #417: constructor facts survive worker and cache boundaries', () => {
+    it('actual workers, a sequential build and a loaded cache retain constructor identity and call syntax', () => {
+        const files = {
+            'node.js': 'class JsNode {\n constructor(v) {}\n}\nfunction jsBuild(){return new JsNode(1);}\nclass JsChild extends JsNode {}\nfunction inheritedBuild(){return new JsChild(1);}\n',
+            'node.ts': 'class TsNode {\n constructor(v:number) {}\n}\nfunction tsBuild(){return new TsNode(1);}\n',
+            'node.html': '<script>\nclass HtmlNode {\n constructor(v) {}\n}\nfunction htmlBuild(){return new HtmlNode(1);}\n</script>\n',
+            'node.py': 'class PyNode:\n def __init__(self,v): pass\ndef pyBuild(): return PyNode(1)\n',
+            'Node.java': 'class Node {\n @Deprecated\n Node(int v){}\n static Node build(){return new Node(1);}\n}\n',
+            'VarargNode.java': 'class VarargNode {\n VarargNode(int... values){}\n static VarargNode varargBuild(){return new VarargNode(1,2);}\n}\n',
+            'GenericReturn.java': 'class ReturnValue {}\nclass GenericReturnBox {\n GenericReturnBox(ReturnValue value){} GenericReturnBox(Object value){}\n static <Value> Value create(Class<Value> type){return null;}\n static GenericReturnBox genericReturnBuild(){return new GenericReturnBox(create(ReturnValue.class));}\n}\n',
+            'SdkBox.java': 'import java.lang.reflect.Method; import java.util.List; import static java.util.Collections.*;\nclass SdkBox {\n SdkBox(java.lang.reflect.Type value){}\n SdkBox(String value){}\n static SdkBox sdkBuild(Method method){return new SdkBox(method.getGenericReturnType());}\n static SdkBox sdkCollectionBuild(List<Method> methods){return new SdkBox(methods.get(0).getGenericReturnType());}\n}\n',
+            'GenericSdkBox.java': 'import java.io.Closeable;\nclass GenericSdkBox implements Closeable {\n GenericSdkBox(Comparable<Integer> value){}\n GenericSdkBox(Object value){}\n public void close(){}\n static GenericSdkBox genericSdkBuild(){return new GenericSdkBox("x");}\n}\n',
+            'RecordNode.java': 'record RecordNode(int v) {\n RecordNode {}\n static RecordNode build(){return new RecordNode(1);}\n}\n',
+            'EnumNode.java': 'enum EnumNode {\n FIRST(1);\n EnumNode(int v){}\n}\n',
+            'Node.cs': 'class CsNode {\n public CsNode(int v){}\n static CsNode build(){return new CsNode(1);}\n}\n',
+            'node.cpp': 'struct CppNode {\n CppNode(int v){}\n};\nvoid cppBuild(){CppNode n(1);}\nvoid cppList(){CppNode{1};CppNode n{1};new CppNode{1};}\n',
+            'alias.js': 'class Mutable {constructor(v){}}\nMutable=class Replacement {};\nconst Alias=Mutable;\nfunction aliasBuild(){return new Alias(1);}\n',
+            'delegate.cs': 'namespace Ns {class Parent {public Parent(int v){}}\nclass Child:Parent {public Child():base(1){}}}\nclass Use {static Ns.Parent make(){return new Ns.Parent(1);}}\n',
+            'delegate.cpp': 'namespace Ns {struct Parent {Parent(int v){}};struct Child:Parent {Child():Parent(1){}};using Alias=Parent;}\nNs::Parent* make(){return new Ns::Alias(1);}\n',
+            'Implicit.java': 'class Parent {Parent(){}}\nclass Child extends Parent {Child(){}}\n',
+            'implicit.cs': 'namespace A {class Parent {public Parent(){}}class Child:Parent {public Child(){}}}namespace B {class Parent {public Parent(){}}class Child:Parent {public Child(){}}}\n',
+            'implicit.cpp': 'namespace A {struct Parent {Parent(){}};struct Child:Parent {Child(){}};}namespace B {struct Parent {Parent(){}};struct Child:Parent {Child(){}};}\n',
+            'role.js': 'class Role {\n static constructor(v){}\n "\\u0063onstructor"(v){}\n}\nfunction roleBuild(){return new Role(1);}\n',
+            'scope.js': 'function alphaJs(){} function betaJs(){} const leftJs=()=>alphaJs(),rightJs=()=>betaJs();\n',
+            'scope.tsx': 'function alphaTsx(){} function betaTsx(){} function leftTsx(){alphaTsx();} function rightTsx(){betaTsx();}\n',
+            'scope.go': 'package p\nfunc alphaGo(){};func betaGo(){};func leftGo(){alphaGo()};func rightGo(){betaGo()}\n',
+            'scope.rs': 'fn alphaRust(){} fn betaRust(){} fn leftRust(){alphaRust();} fn rightRust(){betaRust();}\n',
+        };
+        for (let n = 0; n < 101; n++) files[`padding/${n}.js`] = `function padding${n}() {}`;
+        const dir = tmp(files);
+        const handles = ['node.js:2:constructor', 'node.ts:2:constructor', 'node.html:3:constructor',
+            'node.py:2:__init__', 'Node.java:2:Node', 'RecordNode.java:2:RecordNode',
+            'EnumNode.java:3:EnumNode', 'SdkBox.java:3:SdkBox', 'GenericSdkBox.java:4:GenericSdkBox', 'VarargNode.java:2:VarargNode', 'Node.cs:2:CsNode', 'node.cpp:2:CppNode', 'role.js:3:constructor'];
+        const snapshot = index => JSON.stringify({
+            symbols: [...index.symbols],
+            aliases: [...index.files].map(([file, entry]) => [file, entry.moduleAssignedNames, entry.moduleValueAliases]),
+            calls: [...index.files.keys()].map(file => [file, index.getCachedCalls(file)]),
+            genericReturn: index.findCallees(index.symbols.get('genericReturnBuild')[0], { collectAccount: true }),
+            answers: handles.map(name => {
+                const context = execute(index, 'context', { name });
+                return { name, context: context.ok ? output.formatContextJson(context.result) : context,
+                    verify: execute(index, 'verify', { name }) };
+            }),
+        });
+        try {
+            const sequential = new ProjectIndex(dir);
+            sequential.build(null, { quiet: true, workers: 0 });
+            const expected = snapshot(sequential);
+            const parallel = new ProjectIndex(dir);
+            parallel.build(null, { quiet: true, workers: 2 });
+            assert.strictEqual(parallel.lastBuildWorkerCount, 2, 'the worker path must actually run');
+            assert.deepStrictEqual(JSON.parse(snapshot(parallel)), JSON.parse(expected));
+            const checkScopes = index => {
+                const variadic = index.symbols.get('VarargNode').find(def => def.type === 'constructor');
+                assert.deepEqual(variadic.paramsStructured, [{ name: 'values', type: 'int[]', rest: true }]);
+                const variadicEdges = index.findCallees(index.symbols.get('varargBuild')[0], { collectAccount: true });
+                assert.deepEqual(variadicEdges.filter(def => def.type === 'constructor').map(def => def.bindingId), [variadic.bindingId]);
+                const { validateConfirmation, declarationIdentity } = require('../core/provenance');
+                for (const edge of variadicEdges) for (const site of edge.siteProvenance || []) assert.equal(
+                    validateConfirmation(JSON.parse(JSON.stringify(site.provenance)), declarationIdentity(variadic)).verdict, 'establishes-target');
+                assert.equal(index.getCachedCalls(path.join(dir, 'node.cpp')).filter(call => call.constructorSyntax === 'list').length, 3);
+                const sdkCall = index.getCachedCalls(path.join(dir, 'SdkBox.java')).find(call => call.isConstructor);
+                const sdkOrigin = JSON.parse(decodeURIComponent(sdkCall.argKinds[0].split('|')[3]));
+                assert.equal(sdkOrigin.written, 'Method');
+                assert.ok(Number.isInteger(sdkOrigin.site.start));
+                const sdkChain = index.getCachedCalls(path.join(dir, 'SdkBox.java')).find(call =>
+                    call.isConstructor && call.argKinds?.[0].startsWith('chain:'));
+                const chainOrigin = JSON.parse(decodeURIComponent(sdkChain.argKinds[0].split('|')[1]));
+                assert.deepEqual(chainOrigin.arities, [1, 0]);
+                const receiverCall = index.getCachedCalls(path.join(dir, 'SdkBox.java')).find(call =>
+                    call.name === 'getGenericReturnType' && call.receiverCallTypePath);
+                assert.ok(receiverCall.receiverCallTypePath.startsWith('callshape:'));
+                const receiverOrigin = JSON.parse(decodeURIComponent(receiverCall.receiverCallTypePath.split('|')[3]));
+                assert.equal(receiverOrigin.written, 'List<Method>');
+                assert.ok(Number.isInteger(receiverOrigin.site.start));
+                const sdkEdges = index.findCallees(index.symbols.get('sdkBuild')[0], { collectAccount: true });
+                assert.deepEqual(sdkEdges.filter(def => def.type === 'constructor').map(def => def.params), ['java.lang.reflect.Type value']);
+                const chainEdges = index.findCallees(index.symbols.get('sdkCollectionBuild')[0], { collectAccount: true });
+                assert.deepEqual(chainEdges.filter(def => def.type === 'constructor').map(def => def.params), ['java.lang.reflect.Type value']);
+                const genericEdges = index.findCallees(index.symbols.get('genericSdkBuild')[0], { collectAccount: true });
+                assert.deepEqual(genericEdges.filter(def => def.type === 'constructor').map(def => def.params), ['Object value']);
+                for (const suffix of ['Js', 'Tsx', 'Go', 'Rust']) {
+                    const def = index.symbols.get(`right${suffix}`)[0];
+                    assert.ok(def.sourceSpan);
+                    assert.deepStrictEqual(index.findCallees(def, { collectAccount: true }).map(callee => callee.name), [`beta${suffix}`]);
+                }
+                for (const file of ['Node.java', 'Node.cs', 'node.cpp', 'node.html', 'node.py']) {
+                    const def = index.files.get(path.join(dir, file)).symbols.find(symbol => symbol.type === 'constructor' || symbol.name === '__init__');
+                    assert.ok(def?.sourceSpan, `${file}: constructor extent retained`);
+                }
+            };
+            checkScopes(sequential);
+            checkScopes(parallel);
+            const javaCtor = parallel.symbols.get('Node').find(def => def.type === 'constructor');
+            assert.ok(javaCtor, 'the Java constructor declaration is indexed');
+            assert.strictEqual(javaCtor.isConstructor, true);
+            assert.ok(javaCtor.annotationsWithArgs.some(annotation => annotation.name === 'Deprecated'));
+            assert.ok(parallel.getCachedCalls(path.join(dir, 'node.cpp')).some(call => call.constructorSyntax === 'direct'));
+            assert.ok(parallel.getCachedCalls(path.join(dir, 'EnumNode.java')).some(call => call.constructorSyntax === 'enum'));
+            assert.ok(parallel.files.get(path.join(dir, 'alias.js')).moduleAssignedNames.includes('Mutable'));
+            for (const file of ['delegate.cs', 'delegate.cpp']) {
+                const calls = parallel.getCachedCalls(path.join(dir, file));
+                assert.ok(calls.some(call => call.constructorSyntax === 'delegation'));
+                assert.ok(calls.some(call => call.constructorQualifier === 'Ns'));
+            }
+            for (const file of ['Implicit.java', 'implicit.cs', 'implicit.cpp']) {
+                const calls = parallel.getCachedCalls(path.join(dir, file));
+                assert.ok(calls.some(call => call.constructorSyntax === 'implicit'));
+                if (file !== 'Implicit.java') {
+                    assert.deepStrictEqual(calls.filter(call => call.implicitBase)
+                        .map(call => call.implicitBase.scope.namespace), ['A', 'B']);
+                    const symbols = parallel.files.get(path.join(dir, file)).symbols;
+                    assert.strictEqual(new Set(symbols.map(def => def.bindingId)).size, symbols.length);
+                }
+            }
+            const roles = parallel.symbols.get('constructor').filter(def => def.className === 'Role');
+            assert.deepStrictEqual(roles.map(def => def.type), ['static', 'constructor']);
+            parallel.saveCache();
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loaded.loadCache());
+            assert.deepStrictEqual(JSON.parse(snapshot(loaded)), JSON.parse(expected));
+            checkScopes(loaded);
+        } finally { rm(dir); }
+    });
+});
+
 // ============================================================================
 // FIX 86-92: MISC CROSS-CUTTING FIXES
 // ============================================================================

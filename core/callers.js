@@ -9,7 +9,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { detectLanguage, getParser, getLanguageAdapter, langTraits } = require('../languages');
-const { genericArityOf, goPathPackageName } = require('../languages/utils');
+const { genericArityOf, hasParameterizedQualifier, goPathPackageName } = require('../languages/utils');
 const { isTestFile } = require('./discovery');
 const { NON_CALLABLE_TYPES, isOverrideMarked, codeUnitCompare, isTestPath, CALLABLE_SYMBOL_KINDS,
     isMacroNamespaceDefinition } = require('./shared');
@@ -28,6 +28,7 @@ const { reflectionPatternReferences: _reflectionPatternReferences } = require('.
 const {
     ownerRefOf, lexicalClassRefOf, ownerNameOf, ownedBy, findDeclaringClass, relationToTargets,
     shareDescendant: shareClassDescendant, parentRefsOf: parentRefsOfClass,
+    supertypeRefsOf: supertypeRefsOfClass,
     descendantKeys, classKeyOf, classDefsNamed, distinctOwnerDefinitions, ownerDefinitionOf,
     hasFunctionLocalClass, descendsFromTargets, resolveClassRef, resolveQualifiedClassRef,
 } = require('./class-identity');
@@ -1018,6 +1019,9 @@ function findCallers(index, name, options = {}) {
     const valueAliasSurfaces = _classValueAliasSurfaces(index, name,
         options.targetDefinitions || definitions);
     for (const aliasName of valueAliasSurfaces) aliasNames.add(aliasName);
+    const constructionAliasSurfaces = require('./constructor-calls').constructionAliasNames(index,
+        options.targetDefinitions || definitions);
+    for (const aliasName of constructionAliasSurfaces) aliasNames.add(aliasName);
     const hasAliasSurfaces = aliasNames.size > 0;
     // The local binding shadowing a bare reference reaches the pin only
     // when it is a pinned definition (the shared lexical rule, fix #403):
@@ -1267,6 +1271,9 @@ function findCallers(index, name, options = {}) {
             const typeQueryOnly = targetIsTypeQuery && !hasAliasSurfaces;
             const bareReachesMethods = typeQueryOnly && langTraits(fileEntry.language)?.bareCallReachesMethods;
             for (let call of visitCalls) {
+                if (langTraits(fileEntry.language)?.inheritedOverloadSignatures) {
+                    call = { ...call, argumentFile: fileEntry.relativePath };
+                }
                 if (typeQueryOnly && !call.destructured && call.receiver !== name &&
                     !_callBearsName(call, name) && fileEntry.language !== 'csharp' &&
                     !(call.receiverIsTypeQualified && bareReachesMethods)) continue;
@@ -1316,6 +1323,11 @@ function findCallers(index, name, options = {}) {
                         index.findEnclosingFunction(filePath, call.line, true, call));
                     if (rewritten) call = rewritten;
                 }
+                if (call.implicitBase && !options.constructorProjectionSource) continue;
+                const constructionAlias = constructionAliasSurfaces.has(call.name) || call.constructorQualifier || call.implicitBase ||
+                    langTraits(fileEntry.language)?.functionalTypeConstruction
+                    ? require('./constructor-calls').constructionAliasBinding(index, filePath, call,
+                        options.targetDefinitions || definitions) : null;
                 // Skip if not matching our target name (also check alias resolution)
                 let calledAs = null; // surface name when matched via an import/export rename
                 let valueAliasBinding = false;
@@ -1342,6 +1354,16 @@ function findCallers(index, name, options = {}) {
                             calledAs = call.name;
                             valueAliasBinding = true;
                         }
+                    }
+                    if (!calledAs && constructionAlias) calledAs = call.name;
+                    if (!calledAs && constructionAliasSurfaces.has(call.name) &&
+                        require('./constructor-calls').constructionAliasPossibilities(index, filePath, call).length) {
+                        const other = require('./constructor-calls').constructionAliasBinding(index, filePath, call);
+                        if (other && validateConfirmation(other.provenance,
+                            (options.targetDefinitions || definitions).map(declarationIdentity)).verdict === 'establishes-other') {
+                            recordExcluded(filePath, call.line, 'constructor-type-other', other.provenance);
+                        } else routeUnverified(filePath, fileEntry, call, 'construction-type-unresolved', call.name);
+                        continue;
                     }
                     if (!calledAs) continue;
                 }
@@ -1439,6 +1461,22 @@ function findCallers(index, name, options = {}) {
                         routeUnverified(filePath, fileEntry, call, 'macro-namespace', calledAs);
                         continue;
                     }
+                }
+
+                if (require('./constructor-calls').constructionTypeParameter(index, filePath, call)) {
+                    routeUnverified(filePath, fileEntry, call, 'constructor-type-parameter', calledAs);
+                    continue;
+                }
+                if (constructionAlias) {
+                    if (!pendingByFile.has(filePath)) pendingByFile.set(filePath, []);
+                    pendingByFile.get(filePath).push({ call, fileEntry, calledAs,
+                        callerSymbol: call.implicitBase
+                            ? require('./provenance-constructor-base').implicitSourceDefinition(index, filePath, call)
+                            : index.findEnclosingFunction(filePath, call.line, true, call),
+                        isMethod: false, receiver: call.receiver,
+                        _evidence: { hasImportEvidence: true, facts: constructionAlias.provenance.facts } });
+                    pendingCount++;
+                    continue;
                 }
 
                 // A type or function declared in a function body (fix #381:
@@ -2026,26 +2064,7 @@ function findCallers(index, name, options = {}) {
                 // ambiguity bands. Project factories additionally carry the
                 // defining file, so same-named nested result types remain
                 // distinct (`OuterA.Builder` vs `OuterB.Builder`).
-                if (collectAccount && fileEntry.language === 'java' &&
-                    call.isMethod && !call.receiverType && call.receiverCallTypePath) {
-                    const returnInfo = _javaCallReturnInfo(
-                        index, call.receiverCallTypePath, filePath);
-                    if (returnInfo?.type) {
-                        call = {
-                            ...call,
-                            receiverType: returnInfo.type.replace(/\[\]$/, '').split('.').pop(),
-                            receiverTypeSource: 'flow',
-                            receiverTypeEvidence: { source: 'flow', ...returnInfo,
-                                producerPath: call.receiverCallTypePath },
-                            ...(returnInfo.fromFile && {
-                                receiverTypeFlowFile: returnInfo.fromFile,
-                            }),
-                            ...(returnInfo.platform && {
-                                receiverTypePlatform: true,
-                            }),
-                        };
-                    }
-                }
+                if (collectAccount) call = _javaReceiverProducerCall(index, call, filePath);
 
                 // Rust annotations are often imported through a crate-root
                 // re-export (`use clap::Command`). Preserve that exact origin
@@ -2393,7 +2412,7 @@ function findCallers(index, name, options = {}) {
                 // ENCLOSING class by construction. Both stay in the calls
                 // cache for deadcode/--unused reachability; `super(...)`
                 // names a DIFFERENT class and keeps its caller edge.
-                if (call.enumConstant || call.ctorDelegation === 'this') {
+                if ((call.enumConstant || call.ctorDelegation === 'this') && !options.constructorProjectionSource) {
                     continue;
                 }
 
@@ -3290,7 +3309,8 @@ function findCallers(index, name, options = {}) {
                     }
                 }
                 if (collectAccount && call.isMethod && !call.receiverType &&
-                    fileEntry.language === 'java' && /^[A-Z]/.test(call.receiver || '')) {
+                    fileEntry.language === 'java' && call.receiverIsTypeQualified &&
+                    /^[A-Z]/.test(call.receiver || '')) {
                     // Java permits inherited static methods to be invoked
                     // through a subclass qualifier. Resolve the complete
                     // receiver-owned overload family (subclass then parents)
@@ -3897,7 +3917,7 @@ function findCallers(index, name, options = {}) {
                 // Resolved separately so the unverified tier can attribute the
                 // edge: "possible-dispatch via <Interface> — 1 of N impls".
                 let fieldDispatchType = null;
-                if (collectAccount && fieldHopType === null &&
+                if (fieldHopType === null &&
                     call.isMethod && !call.receiverType && call.receiverField && fieldHopRootType &&
                     !resolvedBySameClass) {
                     const fields = call.receiverFields || [call.receiverField];
@@ -3905,6 +3925,11 @@ function findCallers(index, name, options = {}) {
                         fieldDispatchType = _declaredFieldInterfaceType(index, fieldHopRootType,
                             call.receiverField, fileEntry.language, call.receiverRootNamespace);
                     }
+                }
+                if (fieldDispatchType && _interfaceFieldExcludesStatic(index, filePath, call,
+                    fieldHopRootType, fieldDispatchType, options.targetDefinitions || definitions)) {
+                    recordExcluded(filePath, call.line, 'static-member-via-interface');
+                    continue;
                 }
                 // A C# explicit interface implementation is reached through
                 // an interface-typed receiver only by dispatch (fix #395):
@@ -7557,7 +7582,7 @@ function findCallers(index, name, options = {}) {
                             throw e;
                         }
                     }
-                    const enclosing = index.findEnclosingFunction(filePath, call.line, true, call);
+                    const enclosing = call.implicitBase ? callerSymbol : index.findEnclosingFunction(filePath, call.line, true, call);
                     unverifiedEntries.push({
                         ...base,
                         content: lineAt(filePath, content, call.line),
@@ -7746,6 +7771,8 @@ function findCallers(index, name, options = {}) {
         });
     }
 
+    require('./constructor-calls').projectConstructorCallers(index, name, options, callers);
+
     if (queryProfile) {
         const countBy = (rows, field) => {
             const counts = {};
@@ -7851,6 +7878,10 @@ function findCallees(index, definition, options = {}) {
             const evidence = { ...record.evidence, ...(reason && { reason }) };
             evidence.facts = _confirmationFacts(index, def.file, call,
                 target ? [target] : (index.symbols.get(call.name) || []), record.options);
+            if (record.constructionBinding) evidence.facts = {
+                ...record.constructionBinding.facts,
+                targets: target ? [declarationIdentity(target)] : record.constructionBinding.facts.targets,
+            };
             // A bindingId synthesized by receiver resolution is not a
             // lexical binding of the method token. Rank the actual site facts.
             if (call.isMethod && !call.receiverIsModule && !call.moduleOwnedPath &&
@@ -7877,8 +7908,8 @@ function findCallees(index, definition, options = {}) {
         // builtin, excluded-with-reason, or display-filtered. The unit is the
         // call RECORD (a line may hold several); siteIds (record ordinals)
         // keep the arithmetic exact when one record yields multiple edges
-        // (same-name overload fan-out). collectAccount-gated: legacy callers
-        // of findCallees (context/about/smart) see byte-identical results.
+        // (same-name overload fan-out). Legacy traversal selects the same
+        // constructor targets and omits the account and evidence fields.
         const collectAccount = !!options.collectAccount;
         const calleeAccount = collectAccount ? {
             totalSites: 0,
@@ -8049,6 +8080,10 @@ function findCallees(index, definition, options = {}) {
         for (let call of calls) {
             siteOrdinal++;
             if (siteStarts && !siteStarts.has(call.callStart ?? call.callSite?.start)) continue;
+            if (langTraits(language)?.inheritedOverloadSignatures) {
+                call = { ...call, argumentFile: index.files.get(def.file)?.relativePath };
+            }
+            if (collectAccount) call = _javaReceiverProducerCall(index, call, def.file, true);
             call = _withModuleValueAliasReceiver(index, def.file,
                 _withoutShadowedStdLiteral(index, _destructuredMemberView(call)), structuralCallee);
             if (language === 'rust') call = _rustDerefWrapperView(index, def.file, call);
@@ -8141,6 +8176,11 @@ function findCallees(index, definition, options = {}) {
                 }
             }
             // Filter to calls within this function's scope
+            if (require('./callable-scope').containsCall(def, call) === false) continue;
+            if (call.implicitBase) {
+                const source = require('./provenance-constructor-base').implicitSourceDefinition(index, def.file, call);
+                if (!source || !sameDeclaration(declarationIdentity(source), declarationIdentity(def))) continue;
+            }
             // A macro expansion (fix #374) lays every function it generates
             // on the invocation's lines: a sibling generated on the same
             // line is another function, never a nested callback.
@@ -8154,7 +8194,9 @@ function findCallees(index, definition, options = {}) {
             // A call is in our scope if it's within our line range AND not inside a named inner symbol
             const isInRange = call.line >= def.startLine && call.line <= def.endLine;
             const isInInnerSymbol = isInRange && innerSymbolRanges.some(
-                ([start, end]) => call.line >= start && call.line <= end);
+                ([start, end, sourceSpan]) => call.line >= start && call.line <= end &&
+                    require('./callable-scope').containsCall({ sourceSpan }, call) !== false);
+            if (isInInnerSymbol) continue;
             const isNestedCallback = isInRange && !isInInnerSymbol && !isDirectMatch;
 
             if (!isDirectMatch && !isNestedCallback) continue;
@@ -8165,6 +8207,43 @@ function findCallees(index, definition, options = {}) {
             }
             if (targetTypedUndecided) {
                 noteUnverified(siteId, call, 'overload-ambiguous', { candidates: targetTypedUndecided });
+                continue;
+            }
+
+            if (require('./constructor-calls').constructionTypeParameter(index, def.file, call)) {
+                noteUnverified(siteId, call, 'constructor-type-parameter');
+                continue;
+            }
+            const constructionAlias = require('./constructor-calls').constructionAliasBinding(index, def.file, call);
+            if (constructionAlias) {
+                const { owner, provenance } = constructionAlias;
+                if (constructionAlias.nonClass) {
+                    noteSite(siteId, 'excluded', 'non-class-base', call);
+                    if (calleeAccount) (calleeAccount.excluded.evidence ||= []).push({
+                        ...occurrenceIdentity(fileEntry.relativePath, call, siteId), provenance,
+                    });
+                    continue;
+                }
+                const record = siteEvidence.get(siteId);
+                record.constructionBinding = provenance;
+                record.call = call;
+                const key = owner.bindingId || `${owner.file}:${owner.startLine}:${owner.name}`;
+                const existing = callees.get(key);
+                if (existing) {
+                    existing.count++; existing.sites.push(call.line); existing.siteIds.push(siteId);
+                } else callees.set(key, { name: owner.name, bindingId: owner.bindingId,
+                    isConstructor: true, count: 1, sites: [call.line], siteIds: [siteId] });
+                continue;
+            }
+            if (call.implicitBase) {
+                if (!require('./constructor-calls').constructionTypeCandidates(index, call.name).length || externalTypeDenotation(index, def.file,
+                    call.name, call.constructorQualifier, call.implicitBase.header.line)) {
+                    noteSite(siteId, 'external', null, call);
+                } else noteUnverified(siteId, call, 'implicit-base-unresolved');
+                continue;
+            }
+            if (require('./constructor-calls').constructionAliasPossibilities(index, def.file, call).length) {
+                noteUnverified(siteId, call, 'construction-type-unresolved');
                 continue;
             }
 
@@ -8336,7 +8415,7 @@ function findCallees(index, definition, options = {}) {
                         const existing = callees.get(key);
                         if (existing) {
                             existing.count += 1;
-                            if (collectAccount) {
+                            {
                                 existing.sites.push(call.line);
                                 existing.siteIds.push(siteId);
                             }
@@ -8345,10 +8424,8 @@ function findCallees(index, definition, options = {}) {
                                 name: call.name,
                                 bindingId: match.bindingId,
                                 count: 1,
-                                ...(collectAccount && {
-                                    sites: [call.line],
-                                    siteIds: [siteId],
-                                }),
+                                sites: [call.line],
+                                siteIds: [siteId],
                             });
                         }
                     } else {
@@ -8628,7 +8705,7 @@ function findCallees(index, definition, options = {}) {
                         const existing = callees.get(key);
                         if (existing) {
                             existing.count += 1;
-                            if (collectAccount) {
+                            {
                                 existing.sites.push(call.line);
                                 existing.siteIds.push(siteId);
                             }
@@ -8637,10 +8714,8 @@ function findCallees(index, definition, options = {}) {
                                 name: call.name,
                                 bindingId: match.bindingId,
                                 count: 1,
-                                ...(collectAccount && {
-                                    sites: [call.line],
-                                    siteIds: [siteId],
-                                }),
+                                sites: [call.line],
+                                siteIds: [siteId],
                             });
                         }
                     } else {
@@ -8714,7 +8789,7 @@ function findCallees(index, definition, options = {}) {
                     const existing = callees.get(key);
                     if (existing) {
                         existing.count += 1;
-                        if (collectAccount) {
+                        {
                             existing.sites.push(call.line);
                             existing.siteIds.push(siteId);
                         }
@@ -8723,7 +8798,7 @@ function findCallees(index, definition, options = {}) {
                             name: call.name,
                             bindingId: match.bindingId,
                             count: 1,
-                            ...(collectAccount && { sites: [call.line], siteIds: [siteId] }),
+                            sites: [call.line], siteIds: [siteId],
                         });
                     }
                 } else if (macroDefs.length > 1) {
@@ -8760,10 +8835,10 @@ function findCallees(index, definition, options = {}) {
                     const existing = callees.get(key);
                     if (existing) {
                         existing.count += 1;
-                        if (collectAccount) { existing.sites.push(call.line); existing.siteIds.push(siteId); }
+                        existing.sites.push(call.line); existing.siteIds.push(siteId);
                     } else {
                         callees.set(key, { name: call.name, bindingId: match.bindingId, count: 1,
-                            ...(collectAccount && { sites: [call.line], siteIds: [siteId] }) });
+                            sites: [call.line], siteIds: [siteId] });
                     }
                     continue;
                 }
@@ -8790,10 +8865,10 @@ function findCallees(index, definition, options = {}) {
                     const existing = callees.get(key);
                     if (existing) {
                         existing.count += 1;
-                        if (collectAccount) { existing.sites.push(call.line); existing.siteIds.push(siteId); }
+                        existing.sites.push(call.line); existing.siteIds.push(siteId);
                     } else {
                         callees.set(key, { name: call.name, bindingId: match.bindingId, count: 1,
-                            ...(collectAccount && { sites: [call.line], siteIds: [siteId] }) });
+                            sites: [call.line], siteIds: [siteId] });
                     }
                     continue;
                 }
@@ -8856,10 +8931,10 @@ function findCallees(index, definition, options = {}) {
                     const existing = callees.get(key);
                     if (existing) {
                         existing.count += 1;
-                        if (collectAccount) { existing.sites.push(call.line); existing.siteIds.push(siteId); }
+                        existing.sites.push(call.line); existing.siteIds.push(siteId);
                     } else {
                         callees.set(key, { name: call.name, bindingId: match.bindingId, count: 1,
-                            ...(collectAccount && { sites: [call.line], siteIds: [siteId] }) });
+                            sites: [call.line], siteIds: [siteId] });
                     }
                 } else {
                     noteSite(siteId, 'external', null, call);
@@ -8939,10 +9014,10 @@ function findCallees(index, definition, options = {}) {
                         const existing = callees.get(key);
                         if (existing) {
                             existing.count += 1;
-                            if (collectAccount) { existing.sites.push(call.line); existing.siteIds.push(siteId); }
+                            existing.sites.push(call.line); existing.siteIds.push(siteId);
                         } else {
                             callees.set(key, { name: call.name, bindingId: match.bindingId, count: 1,
-                                ...(collectAccount && { sites: [call.line], siteIds: [siteId] }) });
+                                sites: [call.line], siteIds: [siteId] });
                         }
                     } else if (_nonCallableFieldMember(index, typeName, call.name, language)) {
                         // The known receiver type declares the name as its own
@@ -9118,10 +9193,10 @@ function findCallees(index, definition, options = {}) {
                         const existing = callees.get(key);
                         if (existing) {
                             existing.count += 1;
-                            if (collectAccount) { existing.sites.push(call.line); existing.siteIds.push(siteId); }
+                            existing.sites.push(call.line); existing.siteIds.push(siteId);
                         } else {
                             callees.set(key, { name: call.name, bindingId: match.bindingId, count: 1,
-                                ...(collectAccount && { sites: [call.line], siteIds: [siteId] }) });
+                                sites: [call.line], siteIds: [siteId] });
                         }
                         continue;
                     }
@@ -9240,10 +9315,10 @@ function findCallees(index, definition, options = {}) {
                             const existing = callees.get(key);
                             if (existing) {
                                 existing.count += 1;
-                                if (collectAccount) { existing.sites.push(call.line); existing.siteIds.push(siteId); }
+                                existing.sites.push(call.line); existing.siteIds.push(siteId);
                             } else {
                                 callees.set(key, { name: call.name, bindingId: match.bindingId, count: 1,
-                                    ...(collectAccount && { sites: [call.line], siteIds: [siteId] }) });
+                                    sites: [call.line], siteIds: [siteId] });
                             }
                             continue;
                         }
@@ -9270,10 +9345,10 @@ function findCallees(index, definition, options = {}) {
                         const existing = callees.get(key);
                         if (existing) {
                             existing.count += 1;
-                            if (collectAccount) { existing.sites.push(call.line); existing.siteIds.push(siteId); }
+                            existing.sites.push(call.line); existing.siteIds.push(siteId);
                         } else {
                             callees.set(key, { name: call.name, bindingId: match.bindingId, count: 1,
-                                ...(collectAccount && { sites: [call.line], siteIds: [siteId] }) });
+                                sites: [call.line], siteIds: [siteId] });
                         }
                         continue;
                     }
@@ -9293,10 +9368,10 @@ function findCallees(index, definition, options = {}) {
                         const existing = callees.get(key);
                         if (existing) {
                             existing.count += 1;
-                            if (collectAccount) { existing.sites.push(call.line); existing.siteIds.push(siteId); }
+                            existing.sites.push(call.line); existing.siteIds.push(siteId);
                         } else {
                             callees.set(key, { name: call.name, bindingId: match.bindingId, count: 1,
-                                ...(collectAccount && { sites: [call.line], siteIds: [siteId] }) });
+                                sites: [call.line], siteIds: [siteId] });
                         }
                         continue;
                     }
@@ -9463,10 +9538,10 @@ function findCallees(index, definition, options = {}) {
                         const existing = callees.get(key);
                         if (existing) {
                             existing.count += 1;
-                            if (collectAccount) { existing.sites.push(call.line); existing.siteIds.push(siteId); }
+                            existing.sites.push(call.line); existing.siteIds.push(siteId);
                         } else {
                             callees.set(key, { name: match.name, bindingId: match.bindingId, count: 1,
-                                ...(collectAccount && { sites: [call.line], siteIds: [siteId] }) });
+                                sites: [call.line], siteIds: [siteId] });
                         }
                     }
                     continue;
@@ -9499,10 +9574,10 @@ function findCallees(index, definition, options = {}) {
                         const existing = callees.get(key);
                         if (existing) {
                             existing.count += 1;
-                            if (collectAccount) { existing.sites.push(call.line); existing.siteIds.push(siteId); }
+                            existing.sites.push(call.line); existing.siteIds.push(siteId);
                         } else {
                             callees.set(key, { name: match.name, bindingId: match.bindingId, count: 1,
-                                ...(collectAccount && { sites: [call.line], siteIds: [siteId] }) });
+                                sites: [call.line], siteIds: [siteId] });
                         }
                     }
                     continue;
@@ -9536,10 +9611,10 @@ function findCallees(index, definition, options = {}) {
                             const existing = callees.get(key);
                             if (existing) {
                                 existing.count += 1;
-                                if (collectAccount) { existing.sites.push(call.line); existing.siteIds.push(siteId); }
+                                existing.sites.push(call.line); existing.siteIds.push(siteId);
                             } else {
                                 callees.set(key, { name: match.name, bindingId: match.bindingId, count: 1,
-                                    ...(collectAccount && { sites: [call.line], siteIds: [siteId] }) });
+                                    sites: [call.line], siteIds: [siteId] });
                             }
                         }
                     } else if (importRoute.external) {
@@ -9579,10 +9654,10 @@ function findCallees(index, definition, options = {}) {
                         const existing = callees.get(key);
                         if (existing) {
                             existing.count += 1;
-                            if (collectAccount) { existing.sites.push(call.line); existing.siteIds.push(siteId); }
+                            existing.sites.push(call.line); existing.siteIds.push(siteId);
                         } else {
                             callees.set(key, { name: call.name, bindingId: selected.match.bindingId, count: 1,
-                                ...(collectAccount && { sites: [call.line], siteIds: [siteId] }) });
+                                sites: [call.line], siteIds: [siteId] });
                         }
                         continue;
                     }
@@ -9714,6 +9789,19 @@ function findCallees(index, definition, options = {}) {
                         !sameName.some(symbol => symbol.bindingId === binding.id &&
                             bareCallCannotDenote(symbol, language)));
                 }
+                if (langTraits(language)?.functionalTypeConstruction && !call.isMethod && !call.receiver) {
+                    const named = index.symbols.get(call.name) || [];
+                    const definitionOf = binding => named.find(symbol => symbol.bindingId === binding.id);
+                    const types = bindings.filter(binding => IDENTITY_TYPE_KINDS.has(definitionOf(binding)?.type));
+                    if (types.length === 1 && bindings.every(binding => types.includes(binding) ||
+                        definitionOf(binding)?.type === 'constructor')) {
+                        // `Type(args)` initializes the type. Its constructor
+                        // declarations do not compete as bare value bindings.
+                        bindings = types;
+                        call = { ...call, isConstructor: true };
+                        siteEvidence.get(siteId).call = call;
+                    }
+                }
                 // Method call with no binding for the method name:
                 // Different strategies by language family:
                 if (bindings.length === 0 && call.isMethod) {
@@ -9822,7 +9910,7 @@ function findCallees(index, definition, options = {}) {
                         const existing = callees.get(key);
                         if (existing) {
                             existing.count += 1;
-                            if (collectAccount) {
+                            {
                                 existing.sites.push(call.line);
                                 existing.siteIds.push(siteId);
                             }
@@ -9831,7 +9919,7 @@ function findCallees(index, definition, options = {}) {
                                 name: call.name,
                                 bindingId: local.bindingId,
                                 count: 1,
-                                ...(collectAccount && { sites: [call.line], siteIds: [siteId] }),
+                                sites: [call.line], siteIds: [siteId],
                             });
                         }
                         continue;
@@ -9866,7 +9954,7 @@ function findCallees(index, definition, options = {}) {
                         const existing = callees.get(key);
                         if (existing) {
                             existing.count += 1;
-                            if (collectAccount) {
+                            {
                                 existing.sites.push(call.line);
                                 existing.siteIds.push(siteId);
                             }
@@ -9875,7 +9963,7 @@ function findCallees(index, definition, options = {}) {
                                 name: call.name,
                                 bindingId: selected.match.bindingId,
                                 count: 1,
-                                ...(collectAccount && { sites: [call.line], siteIds: [siteId] }),
+                                sites: [call.line], siteIds: [siteId],
                             });
                         }
                         continue;
@@ -10020,13 +10108,13 @@ function findCallees(index, definition, options = {}) {
                             const existing = callees.get(ob.id);
                             if (existing) {
                                 existing.count += 1;
-                                if (collectAccount) { existing.sites.push(call.line); existing.siteIds.push(siteId); }
+                                existing.sites.push(call.line); existing.siteIds.push(siteId);
                             } else {
                                 callees.set(ob.id, {
                                     name: effectiveName,
                                     bindingId: ob.id,
                                     count: 1,
-                                    ...(collectAccount && { sites: [call.line], siteIds: [siteId] })
+                                    sites: [call.line], siteIds: [siteId]
                                 });
                             }
                         }
@@ -10196,7 +10284,7 @@ function findCallees(index, definition, options = {}) {
                 !call.receiverModuleComposition && !call.moduleOwnedPath &&
                 !call.isConstructor) continue;
 
-            if (collectAccount) {
+            {
                 const record = siteEvidence.get(siteId);
                 record.call = call;
                 if (bindingResolved && !record.evidence.hasSingleOwnerEvidence) {
@@ -10245,7 +10333,7 @@ function findCallees(index, definition, options = {}) {
             const existing = callees.get(calleeKey);
             if (existing) {
                 existing.count += 1;
-                if (collectAccount) {
+                {
                     existing.sites.push(call.line);
                     existing.siteIds.push(siteId);
                     if (call.isPotentialCallback || call.isFunctionReference) existing.isFunctionReference = true;
@@ -10262,11 +10350,9 @@ function findCallees(index, definition, options = {}) {
                     // ...nor a macro the preprocessor model set aside (fix #385).
                     ...(macroBindingsInert && !bindingResolved && { macroInert: true }),
                     ...(call.isConstructor && { isConstructor: true }),
-                    ...(collectAccount && {
-                        sites: [call.line],
-                        siteIds: [siteId],
-                        ...((call.isPotentialCallback || call.isFunctionReference) && { isFunctionReference: true }),
-                    })
+                    sites: [call.line],
+                    siteIds: [siteId],
+                    ...((call.isPotentialCallback || call.isFunctionReference) && { isFunctionReference: true }),
                 });
             }
         }
@@ -10348,13 +10434,13 @@ function findCallees(index, definition, options = {}) {
                     const existing = callees.get(key);
                     if (existing) {
                         existing.count += 1;
-                        if (collectAccount) { existing.sites.push(call.line); existing.siteIds.push(siteId); }
+                        existing.sites.push(call.line); existing.siteIds.push(siteId);
                     } else {
                         callees.set(key, {
                             name: call.name,
                             bindingId: match.bindingId,
                             count: 1,
-                            ...(collectAccount && { sites: [call.line], siteIds: [siteId] })
+                            sites: [call.line], siteIds: [siteId]
                         });
                     }
                 }
@@ -10433,10 +10519,10 @@ function findCallees(index, definition, options = {}) {
                             const existing = callees.get(key);
                             if (existing) {
                                 existing.count += 1;
-                                if (collectAccount) { existing.sites.push(call.line); existing.siteIds.push(siteId); }
+                                existing.sites.push(call.line); existing.siteIds.push(siteId);
                             } else {
                                 callees.set(key, { name: call.name, bindingId: member.bindingId, count: 1,
-                                    ...(collectAccount && { sites: [call.line], siteIds: [siteId] }) });
+                                    sites: [call.line], siteIds: [siteId] });
                             }
                         }
                         continue;
@@ -10505,13 +10591,13 @@ function findCallees(index, definition, options = {}) {
                 const existing = callees.get(key);
                 if (existing) {
                     existing.count += 1;
-                    if (collectAccount) { existing.sites.push(call.line); existing.siteIds.push(siteId); }
+                    existing.sites.push(call.line); existing.siteIds.push(siteId);
                 } else {
                     callees.set(key, {
                         name: call.name,
                         bindingId: match.bindingId,
                         count: 1,
-                        ...(collectAccount && { sites: [call.line], siteIds: [siteId] })
+                        sites: [call.line], siteIds: [siteId]
                     });
                 }
             }
@@ -10536,7 +10622,9 @@ function findCallees(index, definition, options = {}) {
         const cFamilyVisibleFiles = ['c', 'cpp'].includes(language)
             ? _cppVisibleFiles(index, def.file) : null;
 
-        for (const { name: calleeName, bindingId, count, isConstructor, sites, siteIds, isFunctionReference, bareNonMethod, macroInert } of callees.values()) {
+        for (const group of callees.values()) {
+            const { name: calleeName, bindingId, isConstructor, isFunctionReference, bareNonMethod, macroInert } = group;
+            let { count, sites, siteIds } = group;
             const claimSites = (bucket, reason) => {
                 if (!collectAccount || !siteIds) return;
                 for (let i = 0; i < siteIds.length; i++) {
@@ -10787,6 +10875,36 @@ function findCallees(index, definition, options = {}) {
                     if (calleeFileEntry && isTestFile(calleeFileEntry.relativePath, calleeFileEntry.language)) {
                         claimSites('excluded', 'test-file-no-import-link');
                         continue;
+                    }
+                }
+
+                if (IDENTITY_TYPE_KINDS.has(callee.type)) {
+                    const projected = require('./constructor-calls').projectConstructorCalleeSites(index, callee,
+                        siteIds, siteId => ({ call: siteEvidence.get(siteId).call,
+                            site: provenanceForSite(siteId, callee) }));
+                    if (projected) {
+                        for (const entry of projected.unverified) {
+                            noteUnverified(entry.siteId, entry.call, entry.reason, {}, {
+                                ...provenanceForSite(entry.siteId, callee), provenance: entry.provenance,
+                            });
+                        }
+                        for (const entry of projected.groups) {
+                            const evidence = entry.sites;
+                            for (const site of evidence) noteSite(site.siteId, 'confirmed', null,
+                                siteEvidence.get(site.siteId).call);
+                            const weakest = evidence.reduce((a, b) => a.evidenceScore < b.evidenceScore ? a : b);
+                            result.push({ ...entry.definition, callCount: evidence.length,
+                                weight: index.calculateWeight(evidence.length),
+                                confidence: weakest.confidence, evidenceScore: weakest.evidenceScore,
+                                scoreKind: weakest.scoreKind, resolution: weakest.resolution,
+                                ...(collectAccount && { tier: TIER.CONFIRMED,
+                                    provenance: summarizeProvenance(evidence), siteProvenance: evidence,
+                                    sites: evidence.map(site => site.line).sort((a, b) => a - b) }) });
+                        }
+                        if (!projected.remaining.length) continue;
+                        siteIds = projected.remaining;
+                        sites = siteIds.map(siteId => siteEvidence.get(siteId).call.line);
+                        count = siteIds.length;
                     }
                 }
 
@@ -12502,7 +12620,7 @@ function _innerClassMethodRanges(index, def, fileEntry) {
     if (!ordered) {
         ordered = fileEntry.symbols
             .filter(symbol => !NON_CALLABLE_TYPES.has(symbol.type) && symbol.className)
-            .map(symbol => [symbol.startLine, symbol.endLine])
+            .map(symbol => [symbol.startLine, symbol.endLine, symbol.sourceSpan])
             .sort((a, b) => a[0] - b[0] || a[1] - b[1]);
         index._opInnerSymbolRangesCache?.set(def.file, ordered);
     }
@@ -12516,11 +12634,16 @@ function _innerClassMethodRanges(index, def, fileEntry) {
         }
         return lo;
     };
-    const from = lowerBound(def.startLine + 1);
+    const from = lowerBound(def.startLine);
     const to = lowerBound(def.endLine + 1);
     const ranges = [];
     for (let i = from; i < to; i++) {
-        if (ordered[i][1] <= def.endLine) ranges.push(ordered[i]);
+        const [start, end, span] = ordered[i];
+        if (end > def.endLine) continue;
+        if (span && def.sourceSpan) {
+            if (span.start <= def.sourceSpan.start || span.end > def.sourceSpan.end) continue;
+        } else if (start === def.startLine) continue;
+        ranges.push(ordered[i]);
     }
     return ranges;
 }
@@ -17390,6 +17513,11 @@ function _goPackageSymbolMatch(index, symbols, importModule) {
 }
 
 function selectProvenanceOverload(index, call, candidates, language) {
+    // Braced construction has a separate list-initialization overload phase.
+    // Its element count is not an ordinary constructor argument count.
+    if (call.constructorSyntax === 'list' && candidates.some(def => def.type === 'constructor')) {
+        return { ambiguous: true };
+    }
     // The slots depend only on the candidate set: one decomposition per
     // operation (fix #396: every receiver-typed site of a many-overload
     // name recomputed it, a quadratic identity closure per site).
@@ -17413,6 +17541,20 @@ function selectProvenanceOverload(index, call, candidates, language) {
 
 function _calleeOverloadSelect(index, call, matches, language) {
     if (matches.length === 0) return { match: null };
+    if (langTraits(language)?.typeNameSourceCanonical && call.argumentFile &&
+        (!_typeNamesCanonicalAt(index, call.argumentFile) || matches.some(def => !_typeNamesCanonicalAt(index, def.file)))) {
+        return { ambiguous: true };
+    }
+    if (langTraits(language)?.typeNameScoping === 'package-on-demand' && call.argumentFile && call.argKinds) {
+        const origin = _javaCallArgumentOrigin(call);
+        call = { ...call, argKinds: call.argKinds.map(kind => {
+            const colon = kind?.indexOf(':');
+            if (!['type', 'new', 'cast'].includes(kind?.slice(0, colon))) return kind;
+            const type = kind.slice(colon + 1);
+            return JAVA_FINAL_REFERENCE_TYPES.has(type) && _javaSimplePlatformArgument(index, origin, type)
+                ? `${kind.slice(0, colon + 1)}java.lang.${type}` : kind;
+        }) };
+    }
     if (matches.ownerAmbiguous) {
         const selected = _calleeOverloadSelect(index, call, [...matches], language);
         return selected.match ? { ambiguous: true } : selected;
@@ -17466,13 +17608,18 @@ function _calleeReceiverMethodGroup(index, symbols, typeName, language, contextF
     if (!typeName) return [];
     const family = [];
     const seenTypes = new Set();
-    const seenSignatures = new Set();
+    const seenSignatures = new Map();
+    const inheritedInterfaces = [];
+    const interfaceLookup = langTraits(language)?.interfaceMembersInMethodLookup;
     let frontier = [{ owner: typeName, context: contextFile, line, ref: initialRef }];
     let hops = 0;
     let ownerAmbiguous = false;
-    while (frontier.length > 0 && hops++ < 32) {
+    while ((frontier.length > 0 || inheritedInterfaces.length > 0) && hops++ < 32) {
+        // Java class members win over interface defaults even when the class
+        // declaration is farther up the superclass chain.
+        if (!frontier.length) frontier = inheritedInterfaces.splice(0);
         const next = [];
-        for (const { owner, context, line: at, ref: inheritedRef } of frontier) {
+        for (const { owner, context, line: at, ref: inheritedRef, inheritedInterface } of frontier) {
             if (!owner) continue;
             let declared = (symbols || []).filter(symbol =>
                 accepts(symbol) &&
@@ -17481,6 +17628,8 @@ function _calleeReceiverMethodGroup(index, symbols, typeName, language, contextF
                 // runtime dispatch questions; caller analysis handles the
                 // exact `((IFace)this).M()` special case separately.
                 !(language === 'csharp' && symbol.explicitInterface) &&
+                !(inheritedInterface && (symbol.type === 'static' ||
+                    symbol.modifiers?.some(modifier => modifier === 'private' || modifier === 'static'))) &&
                 (symbol.className === owner ||
                  (symbol.receiver && symbol.receiver.replace(/^\*/, '') === owner)));
             // Owner identity before overload fit (fix #394): members of
@@ -17528,17 +17677,36 @@ function _calleeReceiverMethodGroup(index, symbols, typeName, language, contextF
                         })
                         .join(',')
                     : `${definition.file}:${definition.startLine}`;
-                if (seenSignatures.has(signature)) continue;
-                seenSignatures.add(signature);
+                const previous = seenSignatures.get(signature);
+                if (previous) {
+                    if (!interfaceLookup || ownerDefinitionOf(index, previous)?.type !== 'interface' ||
+                        ownerRef?.def?.type !== 'interface') continue;
+                    // A more specific subinterface supplies its covariant
+                    // declaration. Unrelated or unresolved owners abstain.
+                    if (descendsFromTargets(index, ownerRef, [previous]) === 'yes') {
+                        family[family.indexOf(previous)] = definition;
+                        seenSignatures.set(signature, definition);
+                    } else if (descendsFromTargets(index, ownerRefOf(index, previous), [definition]) !== 'yes') {
+                        ownerAmbiguous = true;
+                    }
+                    continue;
+                }
+                seenSignatures.set(signature, definition);
                 family.push(definition);
             }
 
             const resolvedFile = ownerRef?.def?.file || index._resolveClassFile?.(owner, context) ||
                 context;
             if (ownerRef?.key) {
-                next.push(...parentRefsOfClass(index, ownerRef).filter(parent => !parent.external)
-                    .map(parent => ({ owner: parent.name, context: parent.def?.file || resolvedFile,
-                        line: parent.def?.startLine, ref: parent })));
+                const parents = interfaceLookup
+                    ? supertypeRefsOfClass(index, ownerRef, { implements: true })
+                    : parentRefsOfClass(index, ownerRef);
+                for (const parent of parents.filter(parent => !parent.external)) {
+                    const isInterface = interfaceLookup && parent.def?.type === 'interface';
+                    const destination = isInterface ? inheritedInterfaces : next;
+                    destination.push({ owner: parent.name, context: parent.def?.file || resolvedFile,
+                        line: parent.def?.startLine, ref: parent, inheritedInterface: isInterface });
+                }
             } else {
                 const parents = index._getInheritanceParents?.(owner, resolvedFile);
                 if (parents) next.push(...parents.map(parent => ({ owner: parent, context: resolvedFile })));
@@ -17546,6 +17714,7 @@ function _calleeReceiverMethodGroup(index, symbols, typeName, language, contextF
         }
         frontier = next;
     }
+    if (interfaceLookup && (frontier.length || inheritedInterfaces.length)) ownerAmbiguous = true;
     // Members of several same-name types the site cannot tell apart: no
     // overload fit selects among them.
     if (ownerAmbiguous) family.ownerAmbiguous = true;
@@ -18228,6 +18397,8 @@ function _preferFixedArityOverloads(index, call, applicable, language) {
     const isFixed = definition =>
         !Array.isArray(definition.paramsStructured) ||
         !definition.paramsStructured.some(param => param?.rest) ||
+        (langTraits(language)?.overloadPhases === 'strict-loose-variable' &&
+         _javaVariadicNormalFormPossible(index, call, definition)) ||
         (language === 'csharp' &&
          _csharpParamsNormalFormApplicable(index, call, definition));
     const fixed = applicable.filter(isFixed);
@@ -18269,12 +18440,27 @@ function _overloadProvablyApplicable(index, call, definition, candidates, langua
     if (!Number.isInteger(argCount)) return false;
     const kinds = Array.isArray(call.argKinds) ? call.argKinds : [];
     for (let i = 0; i < argCount; i++) {
-        const param = _javaParamAt(definition, i, call);
+        let param = _javaParamAt(definition, i, call);
         const identity = _javaParamTypeIdentity(index, definition, i, call);
         const distinguishing = candidates.some(other => other !== definition &&
             _javaParamTypeIdentity(index, other, i, call) !== identity);
         if (!distinguishing) continue;
-        if (!_argProvablyConverts(index, kinds[i], param, language)) return false;
+        if (param?.rest && langTraits(language)?.overloadPhases === 'strict-loose-variable') {
+            if (_javaVariadicNormalFormPossible(index, call, definition)) {
+                param = { ...param, rest: false };
+                const actual = _javaStaticTypeForKind(index, kinds[i], call.argumentFile);
+                // Reference arrays need declaration identity and covariance,
+                // which an erased argument kind alone does not establish.
+                if (kinds[i] !== 'null' && !(actual === param.type &&
+                    JAVA_PRIMITIVES.has(String(actual).replace(/(?:\[\])+$/, '')))) return false;
+            } else {
+                const expected = String(param.type || '').replace(/\.\.\.$|\[\]$/, '');
+                if (_javaKnownArgumentConversion(index, kinds[i], expected, definition,
+                    _javaCallArgumentOrigin(call)) !== true) return false;
+                continue;
+            }
+        }
+        if (!_argProvablyConverts(index, kinds[i], param, language, definition, _javaCallArgumentOrigin(call))) return false;
     }
     return true;
 }
@@ -18286,13 +18472,20 @@ function _overloadProvablyApplicable(index, call, definition, candidates, langua
  * whose platform or project ancestry reaches it. Unknown argument types and
  * unknown relationships are not proof.
  */
-function _argProvablyConverts(index, kind, param, language) {
+function _argProvablyConverts(index, kind, param, language, paramOwner = null, argumentOrigin = null) {
     if (!param?.type) return false;
+    if (language === 'csharp' && JAVA_KIND_TYPES[kind] && _csharpGenericInterfaceNeedsReview(param.type)) return false;
     const rawBare = String(param.type).replace(/<.*$/s, '').trim()
         .replace(/\.\.\.$/, '').replace(/\?$/, '').replace(/(?:\[\])+$/, '')
         .split('.').pop();
     const bare = CSHARP_OVERLOAD_ALIASES.get(rawBare) || rawBare;
     const arrayParam = /\[\]\??$|\.\.\.$/.test(String(param.type).trim()) && !param.rest;
+    if (language === 'java' && _declaredTypeParameterNames(paramOwner).has(bare)) return false;
+    if (language === 'java') {
+        const expected = param.rest ? String(param.type).replace(/\.\.\.$|\[\]$/, '') : param.type;
+        const known = _javaKnownArgumentConversion(index, kind, expected, paramOwner, argumentOrigin);
+        if (known !== undefined) return !arrayParam && known === true;
+    }
     if (!arrayParam && (bare === 'Object' || bare === 'dynamic')) return true;
     if (!kind || kind === 'expr' || _isLambdaKind(kind)) return false;
     if (kind === 'null') return !JAVA_PRIMITIVES.has(bare);
@@ -18302,14 +18495,21 @@ function _argProvablyConverts(index, kind, param, language) {
         return !arrayParam && ['Class', 'Type', 'Serializable', 'GenericDeclaration',
             'AnnotatedElement'].includes(bare);
     }
-    const staticType = _javaStaticTypeForKind(index, kind);
+    const staticType = _javaStaticTypeForKind(index, kind, argumentOrigin?.file);
     if (!staticType) return false;
     const expected = param.rest
         ? String(param.type).trim().replace(/\.\.\.$/, '').replace(/\[\]\??$/, '')
         : String(param.type).trim();
+    if (language === 'java') {
+        const known = _javaKnownArgumentConversion(index, `type:${staticType}`, expected, paramOwner,
+            _javaArgumentOrigin(index, kind, argumentOrigin));
+        if (known !== undefined) return known === true;
+        if (String(expected).includes('<')) return false;
+    }
     if (language === 'csharp') {
         const assignable = _csharpKnownTypeAssignable(staticType, expected);
         if (assignable !== null) return assignable;
+        if (String(expected).includes('<')) return false;
     }
     const actualSimple = String(staticType).replace(/<.*$/s, '').replace(/\?$/, '').split('.').pop();
     const actual = CSHARP_OVERLOAD_ALIASES.get(actualSimple) || actualSimple;
@@ -18346,7 +18546,7 @@ function _csharpParamsNormalFormApplicable(index, call, definition) {
     if (call.argCount !== ps.length || ps.length === 0) return false;
     const restIndex = ps.findIndex(param => param?.rest);
     if (restIndex !== ps.length - 1) return false;
-    const actual = _javaStaticTypeForKind(index, call.argKinds[restIndex]);
+    const actual = _javaStaticTypeForKind(index, call.argKinds[restIndex], call.argumentFile);
     const expected = _overloadTypeIdentity(ps[restIndex]?.type);
     return !!actual && !!expected && actual === expected;
 }
@@ -20166,6 +20366,32 @@ function _calleeTypeQualifiedReceiver(index, def, fileEntry, call, language) {
             if (selected?.ambiguous) return { unverified: 'overload-ambiguous' };
             return { external: true };
         }
+        if (style === 'static' && fileEntry.importDetails?.some(detail =>
+            (detail.static || detail.type === 'static') &&
+            (detail.names?.includes(receiver) || detail.names?.includes('*')))) {
+            // A capitalized expression can be a field imported from another
+            // type. A possible value binding cannot prove an external type.
+            const { isValueDefinition, findValueReferences } = require('./value-references');
+            const memo = index._opMemo?.('typeQualifiedValueReferences', () => new WeakMap());
+            for (const value of index.symbols.get(receiver) || []) {
+                if (!isValueDefinition(value)) continue;
+                let files = memo?.get(value);
+                if (!files) { files = new Map(); memo?.set(value, files); }
+                let references = files.get(def.file);
+                if (!references) {
+                    references = findValueReferences(index, receiver, value, { files: new Set([def.file]) });
+                    files.set(def.file, references);
+                }
+                const column = call.column ?? call.callSite?.column;
+                const possible = references && [
+                    ...references.byFile.flatMap(entry => entry.sites), ...references.unverifiedSites,
+                ];
+                if (possible?.some(site => site.line === call.line &&
+                    (column == null || site.column <= column))) {
+                    return { unverified: 'value-receiver-unresolved', dispatchVia: receiver };
+                }
+            }
+        }
         if ((language === 'java' || language === 'csharp') &&
             /[a-z]/.test(receiver) &&
             !_isGenericParamReceiverType(index, def.file, call.line, receiver)) {
@@ -21622,6 +21848,17 @@ function _csharpIsValueType(index, name) {
     return defs.length > 0 && defs.every(d => d.type === 'enum' || d.type === 'struct');
 }
 
+function _csharpGenericInterfaceNeedsReview(expectedRaw) {
+    const expected = String(expectedRaw || '').trim();
+    const target = expected.replace(/<.*$/s, '').split('.').pop();
+    return expected.includes('<') && !/\]\??$/.test(expected) && CSHARP_STRING_SUPERTYPES.has(target);
+}
+
+function _csharpStringGenericNeedsReview(actualRaw, expectedRaw) {
+    const simple = String(actualRaw || '').trim().replace(/\?$/, '').split('.').pop();
+    return (simple === 'string' || simple === 'String') && _csharpGenericInterfaceNeedsReview(expectedRaw);
+}
+
 function _csharpKnownTypeAssignable(actualRaw, expectedRaw) {
     const actualText = String(actualRaw || '').trim().replace(/^global::/, '');
     const expectedText = String(expectedRaw || '').trim().replace(/^global::/, '')
@@ -21690,6 +21927,9 @@ function _csharpKnownTypeAssignable(actualRaw, expectedRaw) {
     }
 
     if (actualNullable && !expectedNullable && CSHARP_VALUE_TYPES.has(actual)) return false;
+    // The interface's type arguments and variance participate in the
+    // conversion. An erased string-interface name cannot establish it.
+    if (_csharpStringGenericNeedsReview(actualRaw, expectedRaw)) return null;
     // System.String is sealed: it converts to its own declared supertypes
     // only (fix #391: a string argument never binds an Exception parameter).
     if (actual === 'String') {
@@ -21728,6 +21968,8 @@ const JAVA_PLATFORM_METHOD_RETURNS = new Map([
     ['java.lang.Class#getDeclaredMethod', 'java.lang.reflect.Method'],
     ['java.lang.Enum#getDeclaringClass', 'java.lang.Class'],
     ['java.lang.reflect.Method#getReturnType', 'java.lang.Class'],
+    ['java.lang.reflect.Constructor#getDeclaringClass', 'java.lang.Class'],
+    ['java.lang.annotation.Annotation#annotationType', 'java.lang.Class'],
     ['java.lang.reflect.Method#getGenericReturnType', 'java.lang.reflect.Type'],
     ['java.lang.reflect.Method#getParameterTypes', 'java.lang.Class[]'],
     ['java.lang.reflect.Method#getGenericParameterTypes', 'java.lang.reflect.Type[]'],
@@ -21751,9 +21993,78 @@ const JAVA_PLATFORM_METHOD_RETURNS = new Map([
     ['javax.lang.model.util.Types#getNullType', 'javax.lang.model.type.NullType'],
 ]);
 
+// Complete inherited member-name surfaces of these JDK contracts. None declares
+// a member type. A contract is usable only after the written supertype has
+// resolved to this qualified SDK identity; an external namesake is unknown.
+const JAVA_PLATFORM_ANCESTOR_MEMBERS = new Map([
+    ['java.lang.Object', new Set(['getClass', 'hashCode', 'equals', 'clone',
+        'toString', 'notify', 'notifyAll', 'wait', 'finalize'])],
+    ['java.lang.Comparable', new Set(['compareTo'])],
+    ['java.lang.Iterable', new Set(['iterator', 'forEach', 'spliterator'])],
+    ['java.lang.AutoCloseable', new Set(['close'])],
+    ['java.io.Closeable', new Set(['close'])],
+    ['java.util.Map.Entry', new Set(['getKey', 'getValue', 'setValue', 'equals', 'hashCode'])],
+    ['java.lang.Runnable', new Set(['run'])],
+    ['java.lang.Cloneable', new Set()],
+    ['java.io.Serializable', new Set()],
+    ['java.nio.file.Path', new Set(['compareTo', 'endsWith', 'equals', 'forEach',
+        'getFileName', 'getFileSystem', 'getName', 'getNameCount', 'getParent',
+        'getRoot', 'hashCode', 'isAbsolute', 'iterator', 'normalize', 'of',
+        'register', 'relativize', 'resolve', 'resolveSibling', 'spliterator',
+        'startsWith', 'subpath', 'toAbsolutePath', 'toFile', 'toRealPath',
+        'toString', 'toUri'])],
+    ['java.nio.file.spi.FileSystemProvider', new Set(['checkAccess', 'clone', 'copy',
+        'createDirectory', 'createLink', 'createSymbolicLink', 'delete', 'deleteIfExists',
+        'equals', 'exists', 'finalize', 'getClass', 'getFileAttributeView', 'getFileStore',
+        'getFileSystem', 'getPath', 'getScheme', 'hashCode', 'installedProviders',
+        'isHidden', 'isSameFile', 'move', 'newAsynchronousFileChannel', 'newByteChannel',
+        'newDirectoryStream', 'newFileChannel', 'newFileSystem', 'newInputStream',
+        'newOutputStream', 'notify', 'notifyAll', 'readAttributes', 'readAttributesIfExists',
+        'readSymbolicLink', 'setAttribute', 'toString', 'wait'])],
+]);
+
+function _javaPlatformSupertypeContract(index, parent, owner) {
+    const entry = owner?.file && index.files.get(owner.file);
+    if (!parent || parent.def || langTraits(entry?.language)?.typeNameScoping !== 'package-on-demand' ||
+        !_typeNamesCanonicalAt(index, owner.file)) return null;
+    const clauses = [...splitParentList(owner.extends || ''),
+        ...(Array.isArray(owner.implements) ? owner.implements : splitParentList(owner.implements || ''))];
+    const written = clauses.map(raw => String(raw).replace(/<.*$/s, '').replace(/\s+/g, ''))
+        .filter(raw => raw.split('.').pop() === parent.name);
+    if (!written.length && parent.name === 'Object' && !owner.extends) {
+        return JAVA_PLATFORM_ANCESTOR_MEMBERS.get('java.lang.Object');
+    }
+    if (written.length !== 1) return null;
+    const parts = written[0].split('.'), root = parts[0];
+    // Recorded project types or type parameters can obscure the first name;
+    // an on-demand import can supply an unindexed namesake. Other unknown
+    // ancestry is still visited by the caller and keeps its result open.
+    if ((index.symbols.get(root) || []).some(def =>
+        ['class', 'interface', 'enum', 'record'].includes(def.type)) ||
+        entry.symbols?.some(def => _declaredTypeParameterNames(def).has(root))) return null;
+    const imports = _javaTypeImports(index, entry, root);
+    let qualified;
+    if (imports.length) {
+        if (imports.some(binding => binding.unknownType) || new Set(imports.map(binding => binding.module)).size !== 1) return null;
+        qualified = [imports[0].module, ...parts.slice(1)].join('.');
+    } else {
+        if (entry.importDetails?.some(detail => detail.names?.includes('*'))) return null;
+        qualified = parts.length === 1 ? `java.lang.${root}` : written[0];
+    }
+    return JAVA_PLATFORM_ANCESTOR_MEMBERS.get(qualified) || null;
+}
+
 const JAVA_PLATFORM_SUPERTYPES = new Map([
-    ['java.lang.Class', ['java.lang.reflect.Type', 'java.io.Serializable',
-        'java.lang.reflect.GenericDeclaration', 'java.lang.reflect.AnnotatedElement']],
+    ['java.lang.reflect.Type', ['java.lang.Object']],
+    ['java.lang.reflect.ParameterizedType', ['java.lang.Object', 'java.lang.reflect.Type']],
+    ['java.lang.reflect.GenericArrayType', ['java.lang.Object', 'java.lang.reflect.Type']],
+    ['java.lang.reflect.TypeVariable', ['java.lang.Object', 'java.lang.reflect.Type',
+        'java.lang.reflect.AnnotatedElement']],
+    ['java.lang.reflect.WildcardType', ['java.lang.Object', 'java.lang.reflect.Type']],
+    ['java.lang.Class', ['java.lang.Object', 'java.lang.reflect.Type', 'java.io.Serializable',
+        'java.lang.reflect.GenericDeclaration', 'java.lang.reflect.AnnotatedElement',
+        'java.lang.invoke.TypeDescriptor.OfField', 'java.lang.invoke.TypeDescriptor',
+        'java.lang.constant.Constable']],
     ['javax.lang.model.type.ArrayType', ['javax.lang.model.type.ReferenceType',
         'javax.lang.model.type.TypeMirror']],
     ['javax.lang.model.type.DeclaredType', ['javax.lang.model.type.ReferenceType',
@@ -21794,6 +22105,15 @@ const JAVA_PLATFORM_SUPERTYPES = new Map([
             : name === 'Serializable' ? 'java.io.Serializable' : `java.util.${name}`))]),
 ]);
 
+const JAVA_MODELED_PLATFORM_TYPES = new Set([
+    ...JAVA_PLATFORM_ANCESTOR_MEMBERS.keys(),
+    ...JAVA_PLATFORM_METHOD_RETURNS.keys()].map(name => name.split('#')[0]));
+for (const type of JAVA_PLATFORM_METHOD_RETURNS.values()) JAVA_MODELED_PLATFORM_TYPES.add(type.replace(/\[\]$/, ''));
+for (const [type, parents] of JAVA_PLATFORM_SUPERTYPES) {
+    JAVA_MODELED_PLATFORM_TYPES.add(type);
+    for (const parent of parents) JAVA_MODELED_PLATFORM_TYPES.add(parent);
+}
+
 function _javaPlatformAssignable(actualType, expectedSimple) {
     if (!actualType?.includes('.')) return null;
     const actualSimple = actualType.split('.').pop();
@@ -21804,62 +22124,84 @@ function _javaPlatformAssignable(actualType, expectedSimple) {
         return ['Type', 'Serializable', 'GenericDeclaration', 'AnnotatedElement',
             'Object'].includes(expectedSimple);
     }
-    // When both sides are in the small modeled platform universe, absence is
-    // a proof of incompatibility. Otherwise portable AST remains undecided.
-    const modeledExpected = new Set([
-        'Type', 'Serializable', 'GenericDeclaration', 'AnnotatedElement',
-        'TypeMirror', 'ReferenceType', 'ArrayType', 'DeclaredType', 'ErrorType',
-        'ExecutableType', 'IntersectionType', 'NoType', 'NullType',
-        'PrimitiveType', 'TypeVariable', 'UnionType', 'WildcardType',
-    ]);
-    return modeledExpected.has(expectedSimple) ? false : null;
+    // An unmodeled actual type may implement any of these interfaces.
+    // Knowing only the expected type cannot disprove the conversion.
+    return null;
 }
 
-function _javaCallReturnType(index, kind) {
-    return _javaCallReturnInfo(index, kind)?.type || null;
+function _javaReceiverProducerCall(index, call, file, projectOnly = false) {
+    if (langTraits(index.files.get(file)?.language)?.typeNameScoping !== 'package-on-demand' ||
+        !call.isMethod || call.receiverType || !call.receiverCallTypePath) return call;
+    const info = _javaCallReturnInfo(index, call.receiverCallTypePath, file);
+    if (!info?.type || projectOnly && !info.fromFile) return call;
+    return { ...call,
+        receiverType: info.type.replace(/\[\]$/, '').split('.').pop(),
+        receiverTypeSource: 'flow',
+        receiverTypeEvidence: { source: 'flow', ...info, producerPath: call.receiverCallTypePath },
+        ...(info.fromFile && { receiverTypeFlowFile: info.fromFile }),
+        ...(info.platform && { receiverTypePlatform: true }),
+    };
+}
+
+function _javaCallReturnType(index, kind, contextFile = null) {
+    return _javaCallReturnInfo(index, kind, contextFile)?.type || null;
 }
 
 function _javaCallReturnInfo(index, kind, contextFile = null) {
+    if (contextFile) contextFile = path.resolve(index.root, contextFile);
     if (kind?.startsWith('chain:')) {
-        const parts = kind.slice('chain:'.length).split('#');
+        const [path, originEncoded] = kind.slice('chain:'.length).split('|');
+        const parts = path.split('#');
+        let origin = _javaProducerOrigin(originEncoded, contextFile);
+        const arities = origin?.arities;
         let owner = parts.shift();
         if (!owner || parts.length === 0) return null;
         let ownerFile;
         let info;
         let context = contextFile;
-        for (const method of parts) {
-            info = _javaOwnerMethodReturnInfo(index, owner, method, ownerFile, context);
+        for (const [position, method] of parts.entries()) {
+            info = _javaOwnerMethodReturnInfo(index, owner, method, ownerFile, context, origin, arities?.[position]);
             if (!info) return null;
             owner = info.type;
             ownerFile = info.fromFile;
-            context = info.fromFile || null;
+            context = info.fromFile || (info.platform ? contextFile : null);
+            origin = info.origin || (info.platform ? { platform: true } : null);
         }
         return info;
     }
     if (kind?.startsWith('callshape:')) {
-        const [ownerEncoded, methodEncoded, kindsEncoded = ''] =
+        const [ownerEncoded, methodEncoded, kindsEncoded = '', originEncoded] =
             kind.slice('callshape:'.length).split('|');
         const owner = decodeURIComponent(ownerEncoded || '');
         const method = decodeURIComponent(methodEncoded || '');
+        const origin = _javaProducerOrigin(originEncoded, contextFile);
         if (!owner || !method) return null;
-        const ownerSimple = owner.replace(/\?$/, '')
-            .replace(/<.*$/s, '').split('.').pop();
-        const definitions = (index.symbols.get(method) || []).filter(definition =>
-            definition.className === ownerSimple && definition.returnType);
-        if (definitions.length === 0) {
-            return _javaOwnerMethodReturnInfo(index, owner, method, undefined, contextFile);
-        }
         const argKinds = kindsEncoded
             ? kindsEncoded.split(',').map(value => decodeURIComponent(value))
             : [];
+        const ownerSimple = owner.replace(/\?$/, '')
+            .replace(/<.*$/s, '').split('.').pop();
+        if (!(index.symbols.get(method) || []).some(def => def.className === ownerSimple && def.returnType)) {
+            const platform = _javaOwnerMethodReturnInfo(index, owner, method, undefined, contextFile, origin, argKinds.length);
+            if (platform?.origin) return platform;
+            if (platform?.platform) return platform;
+        }
+        const definitions = _producerReturnMethodGroup(index, owner, method, undefined, contextFile);
+        if (!definitions) return null;
+        if (definitions.length === 0) {
+            return _javaOwnerMethodReturnInfo(index, owner, method, undefined, contextFile, origin, argKinds.length);
+        }
         const language = definitions[0]?.file
             ? index.files.get(definitions[0].file)?.language : null;
         const selected = _calleeOverloadSelect(index, {
             argCount: argKinds.length,
             argKinds,
+            ...(contextFile && { argumentFile: contextFile }),
+            ...(origin?.site && { callSite: origin.site }),
         }, definitions, language);
         return selected.match
-            ? _javaDefinitionReturnInfo(index, selected.match)
+            ? _javaDefinitionReturnInfo(index, selected.match) ||
+                _javaClassLiteralReturnInfo(index, selected.match, contextFile, origin, argKinds)
             : null;
     }
     if (!kind?.startsWith('call:')) return null;
@@ -21869,11 +22211,57 @@ function _javaCallReturnInfo(index, kind, contextFile = null) {
     return _javaOwnerMethodReturnInfo(index, owner, method, undefined, contextFile);
 }
 
+function _javaProducerOrigin(encoded, file) {
+    if (!encoded || !file) return null;
+    try {
+        const origin = JSON.parse(decodeURIComponent(encoded));
+        return typeof origin?.written === 'string' && origin.site ? { ...origin, file } : null;
+    } catch { return null; }
+}
+
+// The same single-argument Class<T> inference also fixes a method's T return.
+// Preserve the literal type's own source scope; a producer's file cannot
+// supply the identity of a type written by its caller.
+function _javaClassLiteralReturnInfo(index, definition, file, origin, argKinds) {
+    const variable = definition.returnType?.trim(), parameter = definition.paramsStructured?.[0];
+    if (!file || !origin?.site || argKinds.length !== 1 || !argKinds[0]?.startsWith('class:') ||
+        !variable || !parameter?.type || parameter.rest ||
+        !_javaInfersClassParameter(index, variable, definition, { invocation: { file, site: origin.site } }) ||
+        _javaKnownReferenceConversion(index, parameter.type, definition, new Set(['java.lang.Class'])) !== true) return null;
+    const start = parameter.type.indexOf('<'), end = parameter.type.lastIndexOf('>');
+    if (start < 0 || _splitTopLevelGenericArgs(parameter.type.slice(start + 1, end)).join(',').trim() !== variable) return null;
+    const { safeParse } = require('../languages');
+    const tree = safeParse(getParser('java'), index._readFile(file));
+    if (!tree) return null;
+    try {
+        const site = origin.site;
+        let call = tree.rootNode.descendantForIndex(site.start, site.start + 1);
+        while (call && !(call.startIndex === site.start && call.endIndex === site.end && call.type === site.nodeType)) call = call.parent;
+        if (!call || call.type !== 'method_invocation' || call.hasError) return null;
+        const argumentsNode = call.childForFieldName('arguments');
+        if (argumentsNode?.namedChildCount !== 1) return null;
+        const literal = argumentsNode.namedChild(0), type = literal.type === 'class_literal' && literal.namedChild(0);
+        if (!type || !['type_identifier', 'scoped_type_identifier'].includes(type.type)) return null;
+        const parts = type.text.split('.'), name = parts.pop();
+        const query = { file, line: type.startPosition.row + 1, column: type.startPosition.column,
+            name, qualifier: parts.join('.') || null };
+        if (!require('./provenance-type').constructionNameScope(index, query)) return null;
+        return { type: type.text, fromFile: file, origin: { file, written: type.text,
+            site: { source: 'type', line: query.line, column: query.column,
+                start: type.startIndex, end: type.endIndex, nodeType: type.type } } };
+    } finally { tree.delete?.(); }
+}
+
 function _javaDefinitionReturnInfo(index, definition) {
     if (!definition?.returnType) return null;
+    if (hasParameterizedQualifier(definition.returnType)) return null;
     let type = String(definition.returnType).replace(/<.*$/s, '').trim();
     const suffix = type.endsWith('[]') ? '[]' : '';
     if (suffix) type = type.slice(0, -2);
+    const root = type.split('.')[0].replaceAll('[]', '').replaceAll('?', '');
+    if (_declaredTypeParameterNames(definition).has(root)) return null;
+    const qualified = type.includes('.') ? _javaQualifiedReturnType(index, type, definition) : null;
+    if (qualified) type = qualified.type;
     if (!type.includes('.')) {
         const imports = (index.files.get(definition.file)?.importBindings || [])
             .filter(binding => binding.name === type)
@@ -21883,48 +22271,69 @@ function _javaDefinitionReturnInfo(index, definition) {
     }
     return type
         ? { type: `${type}${suffix}`, ...(definition.file && {
-            fromFile: definition.file,
+            fromFile: qualified?.fromFile || definition.file,
         }) }
         : null;
 }
 
-function _javaOwnerMethodReturnInfo(index, owner, method, ownerFile, contextFile = null) {
-    const ownerSimple = owner.split('.').pop();
-    const platformReturn = JAVA_PLATFORM_METHOD_RETURNS.get(`${owner}#${method}`);
-    if (platformReturn) return { type: platformReturn, platform: true };
-    // getClass() is inherited from java.lang.Object by every reference type;
-    // its platform return is exact even when the syntactic receiver is a
-    // project class.
-    if (method === 'getClass') return { type: 'java.lang.Class', platform: true };
-    let definitions = (index.symbols.get(method) || [])
-        .filter(d => d.className === ownerSimple && d.returnType);
-    if (ownerFile) {
-        const pinned = definitions.filter(d => d.file === ownerFile);
-        if (pinned.length > 0) definitions = pinned;
-    } else if (contextFile && definitions.length > 1 && !classDefsNamed(index, ownerSimple).unique) {
-        // The owner the name denotes where the call is written (fix #394):
-        // `A.builder()` in package p is p.A's builder, never q.A's.
-        const ref = resolveClassRef(index, ownerSimple, contextFile);
-        const owned = ref.key ? definitions.filter(d => ownerRefOf(index, d)?.key === ref.key) : [];
-        if (owned.length > 0) definitions = owned;
+function _javaQualifiedReturnType(index, type, definition) {
+    const entry = index.files.get(definition.file), traits = langTraits(entry?.language);
+    if (traits?.typeNameScoping !== 'package-on-demand' || !definition.sourceSpan) return null;
+    const parts = type.split('.'), root = parts.shift();
+    if (traits.standardPathRoots.includes(root)) return null;
+    const rootDefinitions = (index.symbols.get(root) || []).filter(def => IDENTITY_TYPE_KINDS.has(def.type));
+    if (!rootDefinitions.length) return null;
+    if (entry.symbols.some(def => _declaredTypeParameterNames(def).has(root) ||
+        def.name === root && def.lexicalScopeStartLine != null)) return null;
+    const span = definition.sourceSpan;
+    const scopes = _javaArgumentScopes(index, { file: definition.file,
+        site: { start: span.start, line: span.startLine } }, entry);
+    if (!scopes?.length) return null;
+    const member = _javaFormalMemberType(index, root, { ...scopes[0], className: scopes[0].name });
+    if (member.uncertain) return null;
+    const { TypeReferenceResolver } = require('./type-references');
+    const roots = member.definitions?.length ? member.definitions
+        : rootDefinitions.filter(def =>
+            new TypeReferenceResolver(index, def, root)
+                .resolveName(definition.file, span.startLine, root).verdict === 'yes');
+    if (roots.length !== 1) return null;
+    const canonical = def => [def.namespace, def.enclosingType, def.name].filter(Boolean).join('.');
+    const qualified = [canonical(roots[0]), ...parts].join('.');
+    const matches = classDefsNamed(index, parts.at(-1)).entries.filter(entry => canonical(entry.def) === qualified);
+    return matches.length === 1 ? { type: canonical(matches[0].def), fromFile: matches[0].def.file } : null;
+}
+
+function _javaOwnerMethodReturnInfo(index, owner, method, ownerFile, contextFile = null, origin = null, argCount = null) {
+    const sourceFile = (ownerFile || contextFile) && path.resolve(index.root, ownerFile || contextFile);
+    const javaScope = sourceFile && langTraits(index.files.get(sourceFile)?.language)?.typeNameScoping === 'package-on-demand';
+    if (javaScope && langTraits(index.files.get(sourceFile).language).implicitTypeImport.names.has(owner) &&
+        _javaSimplePlatformArgument(index, { ...origin, file: sourceFile }, owner)) {
+        owner = `java.lang.${owner}`;
     }
+    const collection = javaScope && _javaCollectionReturnInfo(index, owner, method,
+        { ...origin, file: sourceFile }, argCount);
+    if (collection) return collection;
+    // Object.getClass() is final and inherited by every reference type.
+    // An overload taking arguments still needs ordinary member lookup.
+    if (method === 'getClass' && javaScope && argCount === 0) {
+        return { type: 'java.lang.Class', platform: true };
+    }
+    const platformReturn = method === 'getClass' ? null
+        : JAVA_PLATFORM_METHOD_RETURNS.get(`${owner}#${method}`);
+    if (platformReturn) {
+        const names = owner.split('.'), name = names.at(-1), root = names[0];
+        if (!javaScope || !_javaPlatformProducerIdentity(index, owner,
+            { ...origin, file: sourceFile }, name, root)) return null;
+        return { type: platformReturn, platform: true };
+    }
+    const definitions = _producerReturnMethodGroup(index, owner, method, ownerFile, contextFile);
+    if (!definitions) return null;
     const returns = new Map();
     for (const d of definitions) {
-            let type = String(d.returnType).replace(/<.*$/s, '').trim();
-            const suffix = type.endsWith('[]') ? '[]' : '';
-            if (suffix) type = type.slice(0, -2);
-            if (!type.includes('.')) {
-                const imports = (index.files.get(d.file)?.importBindings || [])
-                    .filter(binding => binding.name === type)
-                    .map(binding => binding.module)
-                    .filter(Boolean);
-                if (imports.length === 1) type = imports[0];
-            }
-            if (type) {
-                const key = `${type}${suffix}`;
-                if (!returns.has(key)) returns.set(key, new Set());
-                if (d.file) returns.get(key).add(d.file);
-            }
+        const result = _javaDefinitionReturnInfo(index, d);
+        if (!result) return null;
+        if (!returns.has(result.type)) returns.set(result.type, new Set());
+        if (d.file) returns.get(result.type).add(d.file);
     }
     // Project source is the primary authority. Only an agreeing owner-scoped
     // signature is usable; ambiguity remains visible.
@@ -21949,10 +22358,107 @@ function _javaOwnerMethodReturnInfo(index, owner, method, ownerFile, contextFile
     return null;
 }
 
-function _javaStaticTypeForKind(index, kind) {
+function _javaCollectionReturnInfo(index, owner, method, origin, argCount) {
+    if (method !== 'get' || argCount !== 1 || !origin?.written?.includes('<')) return null;
+    const parents = JAVA_PLATFORM_SUPERTYPES.get(owner) || [];
+    const map = owner === 'java.util.Map' || parents.includes('java.util.Map');
+    const list = owner === 'java.util.List' || parents.includes('java.util.List');
+    if (!map && !list || !_javaPlatformProducerIdentity(index, owner, origin, owner.split('.').pop(), owner.split('.')[0])) return null;
+    const args = _splitTopLevelGenericArgs(origin.written.slice(origin.written.indexOf('<') + 1,
+        origin.written.lastIndexOf('>')));
+    const element = args[map ? 1 : 0]?.trim();
+    if (!element || element === '?' || /^\?\s+super\b/.test(element)) return null;
+    const written = element.replace(/^\?\s+extends\s+/, '').trim();
+    if (hasParameterizedQualifier(written)) return null;
+    const erased = written.replace(/<.*$/s, '').trim();
+    const suffix = erased.match(/(?:\[\])+$/)?.[0] || '';
+    const type = suffix ? erased.slice(0, -suffix.length) : erased;
+    const root = type.split('.')[0], entry = index.files.get(origin.file);
+    if (entry.symbols.some(def => _declaredTypeParameterNames(def).has(root))) return null;
+    const imports = _javaTypeImports(index, entry, root);
+    if (imports.some(binding => binding.unknownType)) return null;
+    const candidates = imports.length ? imports.map(binding =>
+        [binding.module, ...type.split('.').slice(1)].join('.'))
+        : type.includes('.') ? [type]
+            : [...(index.symbols.get(type) || []).filter(def =>
+                ['class', 'interface', 'enum', 'record'].includes(def.type))
+                .map(def => [def.namespace, def.enclosingType, def.name].filter(Boolean).join('.')),
+            ...(langTraits(entry.language).implicitTypeImport?.names.has(type) ? [`java.lang.${type}`] : [])];
+    const scopes = _javaArgumentScopes(index, origin, entry);
+    if (!scopes?.length) return null;
+    const resolved = [...new Set(candidates)].filter(candidate => scopes.every(def =>
+        _javaKnownReferenceConversion(index, type, { ...def, className: def.name }, new Set([candidate])) === true));
+    if (resolved.length !== 1) return null;
+    if (!imports.length && type.includes('.') &&
+        !_javaPlatformOriginUnshadowed(index, origin, type.split('.').pop(), root)) return null;
+    return { type: resolved[0] + suffix, fromFile: origin.file,
+        origin: { file: origin.file, written, site: origin.site } };
+}
+
+// An inherited overload can be selected even when the receiver declares a
+// same-named method. A producer's return type must cover that whole lookup
+// family; an unindexed ancestor cannot establish a closed set of returns.
+function _producerReturnMethodGroup(index, owner, method, ownerFile, contextFile) {
+    if (hasParameterizedQualifier(owner)) return null;
+    const ownerSimple = owner.replace(/\?$/, '').replace(/<.*$/s, '').split('.').pop();
+    const symbols = (index.symbols.get(method) || []).filter(def => def.returnType);
+    let definitions = symbols.filter(def => def.className === ownerSimple);
+    if (ownerFile) {
+        const pinned = definitions.filter(d => d.file === ownerFile);
+        if (pinned.length > 0) definitions = pinned;
+    } else if (contextFile && definitions.length > 1 && !classDefsNamed(index, ownerSimple).unique) {
+        // The owner the name denotes where the call is written (fix #394):
+        // `A.builder()` in package p is p.A's builder, never q.A's.
+        const ref = resolveClassRef(index, ownerSimple, contextFile);
+        const owned = ref.key ? definitions.filter(d => ownerRefOf(index, d)?.key === ref.key) : [];
+        if (owned.length > 0) definitions = owned;
+    }
+    const context = (ownerFile || contextFile) && path.resolve(index.root, ownerFile || contextFile);
+    const language = definitions[0]?.file ? index.files.get(definitions[0].file)?.language
+        : context && index.files.get(context)?.language;
+    if (!langTraits(language)?.inheritedOverloadSignatures) return definitions;
+    const named = classDefsNamed(index, ownerSimple);
+    if (named.entries.length === 0 && definitions.length === 0) return [];
+    const written = owner.replace(/\?$/, '').replace(/<.*$/s, '');
+    const qualifier = written.includes('.') ? written.slice(0, written.lastIndexOf('.')) : null;
+    if (context && externalTypeDenotation(index, context, ownerSimple, qualifier)) return null;
+    if (context && langTraits(language)?.typeNameScoping === 'namespace-usings') {
+        const scope = require('./type-denotation').csharpUsings(index, context);
+        const root = written.split('.')[0];
+        // A return-kind records a type spelling, not the alias declaration
+        // or its lexical site. An alias cannot borrow a namesake's methods.
+        if (scope.unreadable || scope.aliases.has(root) || scope.ambiguousAliases.has(root)) return null;
+    }
+    let ref;
+    if (qualifier) {
+        const exact = named.entries.filter(entry =>
+            [entry.def.namespace, entry.def.enclosingType, entry.def.name].filter(Boolean).join('.') === written);
+        if (!exact.length || new Set(exact.map(entry => entry.key)).size !== 1) return null;
+        ref = { name: ownerSimple, key: exact[0].key, def: exact[0].def };
+    } else ref = resolveClassRef(index, ownerSimple, context);
+    if (!ref?.key || !ref.def) return null;
+    const queue = [ref], seen = new Set();
+    while (queue.length) {
+        const current = queue.shift();
+        if (!current?.key || !current.def || current.external) return null;
+        if (seen.has(current.key)) continue;
+        if (seen.size >= 32) return null;
+        seen.add(current.key);
+        for (const parent of supertypeRefsOfClass(index, current, { implements: true })) {
+            const contract = _javaPlatformSupertypeContract(index, parent, current.def);
+            if (contract && !contract.has(method)) continue;
+            queue.push(parent);
+        }
+    }
+    const family = _calleeReceiverMethodGroup(index, symbols, ownerSimple, language, context,
+        () => true, null, ref);
+    return family.ownerAmbiguous ? null : family;
+}
+
+function _javaStaticTypeForKind(index, kind, contextFile = null) {
     if (!kind || kind === 'expr' || _isLambdaKind(kind) || kind === 'null') return null;
     if (kind.startsWith('element:')) {
-        const container = _javaStaticTypeForKind(index, kind.slice('element:'.length));
+        const container = _javaStaticTypeForKind(index, kind.slice('element:'.length), contextFile);
         return container?.endsWith('[]') ? container.slice(0, -2) : null;
     }
     if (kind.startsWith('field:')) {
@@ -21976,7 +22482,7 @@ function _javaStaticTypeForKind(index, kind) {
     if (kind.startsWith('class:')) return 'Class';
     if (kind.startsWith('call:') || kind.startsWith('callshape:') ||
         kind.startsWith('chain:')) {
-        return _javaCallReturnType(index, kind);
+        return _javaCallReturnType(index, kind, contextFile);
     }
     if (kind.startsWith('new:') || kind.startsWith('cast:') || kind.startsWith('type:')) {
         return _overloadTypeIdentity(kind.slice(kind.indexOf(':') + 1));
@@ -22259,14 +22765,370 @@ function _javaFunctionalInterfaceArity(index, root) {
 function _javaParamTypeIsProject(index, bare, owner, expectedDefs) {
     const entry = owner?.file ? index.files.get(owner.file) : null;
     if (!entry) return false;
-    const imports = (entry.importBindings || []).filter(binding => binding.name === bare);
-    if (imports.length > 0) return imports.every(binding => !!entry.moduleResolved?.[binding.module]);
-    return !!owner.namespace && expectedDefs.some(definition => definition.namespace === owner.namespace);
+    const imports = _javaTypeImports(index, entry, bare);
+    if (imports.length > 0) return imports.every(binding => !binding.unknownType && expectedDefs.some(definition =>
+        [definition.namespace, definition.enclosingType, definition.name].filter(Boolean).join('.') === binding.module));
+    return expectedDefs.some(definition => !definition.enclosingType && !definition.lexicalScopeStartLine &&
+        (owner.namespace ? definition.namespace === owner.namespace
+            : !definition.namespace && path.dirname(definition.file) === path.dirname(owner.file)));
 }
 
-function _javaArgKindMatches(index, kind, paramType, language, typeParams = null, paramOwner = null) {
+function _javaTypeImports(index, entry, name) {
+    return (entry?.importBindings || []).filter(binding => binding.name === name).flatMap(binding => {
+        if (binding.kind !== 'static') return [binding];
+        const definitions = (index.symbols.get(name) || []).filter(def =>
+            [def.namespace, def.enclosingType, def.className, def.name].filter(Boolean).join('.') === binding.module);
+        if (definitions.some(def => ['class', 'interface', 'enum', 'record'].includes(def.type))) return [binding];
+        if (definitions.length && definitions.every(def => def.type !== 'constructor')) return [];
+        return [{ ...binding, unknownType: true }];
+    });
+}
+
+// A parameter's type is looked up in its declaring class. Own and inherited
+// member types precede imports (JLS 6.4.1); a missing superclass cannot prove
+// that it supplies no member type. Walk the same definition-based hierarchy
+// as member resolution, including lexically enclosing classes.
+function _javaFormalMemberType(index, name, owner) {
+    if (!owner) return { uncertain: true };
+    const { ownerDefinitionOf, supertypeRefsOf, classKeyOf } = require('./class-identity');
+    let scope = ownerDefinitionOf(index, owner);
+    if (!scope) return { uncertain: true };
+    const named = (index.symbols.get(name) || []).filter(def =>
+        ['class', 'interface', 'enum', 'record'].includes(def.type));
+    const visit = (ref, seen, lexical = false) => {
+        if (!ref?.def || !ref.key || seen.has(ref.key)) return { uncertain: true };
+        seen = new Set(seen).add(ref.key);
+        const def = ref.def;
+        if (lexical && def.name === name) return { definitions: [def] };
+        const own = named.filter(member => member.file === def.file &&
+            (member.namespace || '') === (def.namespace || '') &&
+            member.enclosingType === [def.enclosingType, def.name].filter(Boolean).join('.'));
+        if (own.length) return { definitions: own };
+        const inherited = supertypeRefsOf(index, ref, { implements: true }).map(parent =>
+            _javaPlatformSupertypeContract(index, parent, def)
+                ? {} : visit(parent, seen));
+        return { definitions: inherited.flatMap(result => result.definitions || []),
+            uncertain: inherited.some(result => result.uncertain) };
+    };
+    const visited = new Set();
+    while (scope && !visited.has(scope)) {
+        visited.add(scope);
+        const result = visit({ name: scope.name, key: classKeyOf(index, scope), def: scope }, new Set(), true);
+        if (result.uncertain || result.definitions?.length) return result;
+        if (!scope.enclosingType) break;
+        const parentName = scope.enclosingType.split('.').pop();
+        const parents = (index.symbols.get(parentName) || []).filter(def =>
+            def.file === scope.file && ['class', 'interface', 'enum', 'record'].includes(def.type) &&
+            [def.enclosingType, def.name].filter(Boolean).join('.') === scope.enclosingType &&
+            (def.namespace || '') === (scope.namespace || ''));
+        if (parents.length !== 1) return { uncertain: true };
+        scope = parents[0];
+    }
+    return {};
+}
+
+function _typeNamesCanonicalAt(index, writtenFile) {
+    if (!writtenFile) return true;
+    const file = path.isAbsolute(writtenFile) ? writtenFile : path.resolve(index.root, writtenFile);
+    const canonical = langTraits(index.files.get(file)?.language)?.typeNameSourceCanonical;
+    if (!canonical) return true;
+    if (typeof index._readFile !== 'function') return false;
+    try { return canonical(index._readFile(file)); }
+    catch (error) {
+        if (['ENOENT', 'EACCES', 'EPERM', 'EISDIR', 'ENOTDIR'].includes(error.code)) return false;
+        throw error;
+    }
+}
+
+function _javaArgumentOrigin(index, kind, origin) {
+    if (kind?.startsWith('element:')) return _javaArgumentOrigin(index, kind.slice('element:'.length), origin);
+    if (kind?.startsWith('call:') || kind?.startsWith('callshape:') || kind?.startsWith('chain:')) {
+        const file = typeof origin === 'string' ? origin : origin?.file;
+        const info = _javaCallReturnInfo(index, kind, file && path.resolve(index.root, file));
+        const found = info?.origin || (info?.fromFile ? { file: info.fromFile } : info?.platform ? { platform: true } : null);
+        return found && origin?.invocation ? { ...found, invocation: origin.invocation } : found;
+    }
+    if (kind?.startsWith('field:')) {
+        const parts = kind.slice('field:'.length).split(':'), name = parts.pop();
+        const owner = parts.join(':').replace(/<.*$/s, '').split('.').pop();
+        const fields = (index.symbols.get(name) || []).filter(def => def.className === owner &&
+            (def.type === 'field' || def.memberType === 'field') && def.fieldType);
+        const files = new Set(fields.map(def => def.file));
+        return files.size === 1 ? { file: [...files][0], ...(origin?.invocation && { invocation: origin.invocation }) } : null;
+    }
+    if (kind?.startsWith('fieldpath:')) return null;
+    return typeof origin === 'string' ? { file: origin } : origin;
+}
+
+function _javaCallArgumentOrigin(call) {
+    return { file: call.argumentFile, ...(call.callSite && { site: call.callSite,
+        invocation: { file: call.argumentFile, site: call.callSite } }) };
+}
+
+function _javaArgumentScopes(index, origin, entry) {
+    const types = entry.symbols.filter(def => ['class', 'interface', 'enum', 'record'].includes(def.type));
+    if (!origin?.site) return types;
+    const ownersAt = langTraits(entry.language)?.typeNameOwnersAt;
+    if (!ownersAt) return null;
+    const file = path.resolve(index.root, origin.file);
+    const scopes = ownersAt(index._readFile(file), origin.site);
+    if (!scopes) return null;
+    const owners = scopes.map(scope => types.filter(def => def.sourceSpan?.start === scope.start && def.sourceSpan?.end === scope.end));
+    return owners.every(defs => defs.length === 1) ? owners.map(defs => defs[0]) : null;
+}
+
+// A written java.lang name is a platform name only when its declaring file
+// cannot bind the package root as a type. Prove absence throughout the file:
+// imports, local declarations, type parameters and inherited member types.
+// This deliberately abstains on an unindexed base or an on-demand import.
+function _javaPlatformOriginUnshadowed(index, origin, name, root = 'java') {
+    if (origin?.platform) return true;
+    const writtenFile = typeof origin === 'string' ? origin : origin?.file;
+    if (!writtenFile) return false;
+    const file = path.resolve(index.root, writtenFile), entry = index.files.get(file);
+    if (langTraits(entry?.language)?.typeNameScoping !== 'package-on-demand' || !Array.isArray(entry.symbols)) return false;
+    if (!_typeNamesCanonicalAt(index, file)) return false;
+    const types = entry.symbols.filter(def => ['class', 'interface', 'enum', 'record'].includes(def.type));
+    const packages = new Set(types.map(def => def.namespace || ''));
+    if (packages.size !== 1 || _javaTypeImports(index, entry, root).length ||
+        (entry.importDetails || []).some(detail => detail.names?.includes('*')) ||
+        entry.symbols.some(def => _declaredTypeParameterNames(def).has(root))) return false;
+    const namespace = [...packages][0];
+    if ((index.symbols.get(root) || []).some(def => ['class', 'interface', 'enum', 'record'].includes(def.type) &&
+        (def.file === file || !def.enclosingType && !def.lexicalScopeStartLine &&
+            (namespace ? def.namespace === namespace : !def.namespace)))) return false;
+    if ((index.symbols.get(name) || []).some(def => def.namespace === 'java.lang' && !def.enclosingType &&
+        ['class', 'interface', 'enum', 'record'].includes(def.type))) return false;
+    const scopes = _javaArgumentScopes(index, origin, entry);
+    return !!scopes?.length && scopes.every(def => {
+        const scope = _javaFormalMemberType(index, root, { ...def, className: def.name });
+        return !scope.uncertain && !scope.definitions?.length;
+    });
+}
+
+// A parser-expanded import is resolved by its written type name, rather
+// than by the package root it never spelled. Single-type imports precede
+// wildcard imports, while lexical member types and type parameters win.
+function _javaPlatformProducerIdentity(index, owner, origin, name, packageRoot) {
+    if ((index.symbols.get(owner.split('.').pop()) || []).some(def =>
+        ['class', 'interface', 'enum', 'record'].includes(def.type) &&
+        [def.namespace, def.enclosingType, def.name].filter(Boolean).join('.') === owner)) return false;
+    const written = origin?.written?.replace(/<.*$/s, '').trim();
+    if (!written || written === owner) return _javaPlatformOriginUnshadowed(index, origin, name, packageRoot);
+    const entry = index.files.get(origin.file), root = written.split('.')[0];
+    if (!entry?.symbols || !_typeNamesCanonicalAt(index, origin.file) ||
+        entry.symbols.some(def => _declaredTypeParameterNames(def).has(root)) ||
+        (index.symbols.get(root) || []).some(def => def.file === origin.file &&
+            ['class', 'interface', 'enum', 'record'].includes(def.type))) return false;
+    const imports = _javaTypeImports(index, entry, root);
+    if (!imports.length && written === name && owner === `java.lang.${name}`) {
+        return _javaSimplePlatformArgument(index, origin, name);
+    }
+    if (!imports.length || imports.some(binding => binding.unknownType ||
+        [binding.module, ...written.split('.').slice(1)].join('.') !== owner)) return false;
+    const scopes = _javaArgumentScopes(index, origin, entry);
+    return !!scopes?.length && scopes.every(def => {
+        const member = _javaFormalMemberType(index, root, { ...def, className: def.name });
+        return !member.uncertain && !member.definitions?.length;
+    });
+}
+
+function _javaSimplePlatformArgument(index, origin, name) {
+    const writtenFile = typeof origin === 'string' ? origin : origin?.file;
+    if (!writtenFile) return false;
+    const file = path.resolve(index.root, writtenFile), entry = index.files.get(file);
+    if (!entry?.symbols || !_typeNamesCanonicalAt(index, file)) return false;
+    if (entry.symbols.some(def => _declaredTypeParameterNames(def).has(name))) return false;
+    // A local type may bind the annotation at a different position from the
+    // argument's use. Its spelling is insufficient to establish a JDK type.
+    if ((index.symbols.get(name) || []).some(def => def.file === file &&
+        ['class', 'interface', 'enum', 'record'].includes(def.type))) return false;
+    const imported = _javaTypeImports(index, entry, name);
+    if (!imported.length && (entry.importDetails || []).some(detail => detail.names?.includes('*'))) return false;
+    const scopes = _javaArgumentScopes(index, origin, entry);
+    return !!scopes?.length && scopes.every(def => _javaKnownReferenceConversion(index, name,
+        { ...def, className: def.name }, new Set([`java.lang.${name}`])) === true);
+}
+
+// A single Class<T> parameter and an unbounded method variable fix T from
+// the class argument (including capture). Other parameters, bounds and
+// explicit invocation type arguments require their own constraint proof.
+function _javaInfersClassParameter(index, name, owner, origin) {
+    const invocation = origin?.invocation;
+    if (!owner?.sourceSpan || !invocation?.file || !invocation.site || !name) return false;
+    const { getParser, safeParse } = require('../languages');
+    const declaration = safeParse(getParser('java'), index._readFile(owner.file));
+    if (!declaration) return false;
+    try {
+        const span = owner.sourceSpan;
+        let node = declaration.rootNode.descendantForIndex(span.start, span.start + 1);
+        while (node && !(node.startIndex === span.start && node.endIndex === span.end &&
+            ['method_declaration', 'constructor_declaration'].includes(node.type))) node = node.parent;
+        if (!node || node.hasError) return false;
+        const variables = node.childForFieldName('type_parameters')?.namedChildren || [];
+        if (variables.filter(v => v.type === 'type_parameter').length !== 1) return false;
+        const variable = variables.find(v => v.type === 'type_parameter' &&
+            v.namedChildren.some(child => child.type === 'type_identifier' && child.text === name));
+        if (!variable || variable.namedChildren.some(child => child.type === 'type_bound')) return false;
+        const parameters = node.childForFieldName('parameters');
+        if (parameters?.namedChildren.filter(p => ['formal_parameter', 'spread_parameter'].includes(p.type)).length !== 1) return false;
+        if (parameters?.descendantsOfType('type_identifier').filter(t => t.text === name).length !== 1) return false;
+    } finally { declaration.delete?.(); }
+    const file = path.resolve(index.root, invocation.file), site = invocation.site;
+    if (!_typeNamesCanonicalAt(index, file) || !Number.isInteger(site.start) || !Number.isInteger(site.end)) return false;
+    const tree = safeParse(getParser('java'), index._readFile(file));
+    if (!tree) return false;
+    try {
+        let node = tree.rootNode.descendantForIndex(site.start, site.start + 1);
+        while (node && !(node.startIndex === site.start && node.endIndex === site.end && node.type === site.nodeType)) node = node.parent;
+        while (node && !['method_invocation', 'object_creation_expression', 'explicit_constructor_invocation'].includes(node.type)) node = node.parent;
+        if (!node || node.hasError || node.childForFieldName('type_arguments')?.namedChildCount) return false;
+        return node.type === 'method_invocation' ? node.childForFieldName('name')?.text === owner.name
+            : owner.type === 'constructor';
+    } finally { tree.delete?.(); }
+}
+
+function _javaKnownArgumentConversion(index, kind, paramType, owner, argumentOrigin = null) {
+    if (typeof kind !== 'string') return undefined;
+    if (!_typeNamesCanonicalAt(index, typeof argumentOrigin === 'string' ? argumentOrigin : argumentOrigin?.file)) return null;
+    let literal = JAVA_KIND_TYPES[kind] ? kind : null;
+    let actual = kind.startsWith('class:') ? 'Class' : null;
+    const colon = kind.indexOf(':');
+    if (['type', 'cast', 'new'].includes(kind.slice(0, colon))) {
+        const type = kind.slice(colon + 1);
+        if (_writtenArrayDims(type) > 0) return undefined;
+        const erased = type.replace(/<.*$/s, '');
+        if (JAVA_PRIMITIVES.has(String(paramType).trim()) && !JAVA_PRIMITIVES.has(erased) &&
+            !JAVA_WRAPPER_PRIMITIVES.has(erased.split('.').pop())) {
+            // Only wrapper classes unbox. A concrete class with another
+            // name cannot convert to a primitive, even if its package is
+            // unknown. A type parameter may instead have a wrapper bound.
+            if (argumentOrigin?.platform) return false;
+            const file = typeof argumentOrigin === 'string' ? argumentOrigin : argumentOrigin?.file;
+            const entry = file && index.files.get(path.resolve(index.root, file));
+            const root = erased.split('.')[0];
+            return !entry?.symbols || entry.symbols.some(def => _declaredTypeParameterNames(def).has(root))
+                ? null : false;
+        }
+        if (JAVA_PRIMITIVES.has(erased)) literal = erased;
+        else if (JAVA_FINAL_REFERENCE_TYPES.has(erased)) {
+            if (!_javaSimplePlatformArgument(index, argumentOrigin, erased)) return null;
+            actual = erased;
+        }
+        else if (erased.startsWith('java.lang.') && JAVA_FINAL_REFERENCE_TYPES.has(erased.slice('java.lang.'.length))) {
+            actual = erased.slice('java.lang.'.length);
+            if (!_javaPlatformOriginUnshadowed(index, argumentOrigin, actual)) return null;
+        }
+    }
+    if (!literal && !actual) return undefined;
+    if (actual === 'Class' && String(paramType).includes('<') &&
+        _javaKnownReferenceConversion(index, paramType, owner, new Set(['java.lang.Class'])) === true) {
+        const args = _splitTopLevelGenericArgs(String(paramType).slice(String(paramType).indexOf('<') + 1,
+            String(paramType).lastIndexOf('>')));
+        if (args.length !== 1 || args[0].trim() !== '?' &&
+            !_javaInfersClassParameter(index, args[0].trim(), owner, argumentOrigin)) return null;
+    }
+    const expected = String(paramType).replace(/<.*$/s, '').trim();
+    if (JAVA_PRIMITIVES.has(expected)) {
+        const primitive = literal || JAVA_WRAPPER_PRIMITIVES.get(actual);
+        return !!primitive && !!JAVA_KIND_TYPES[primitive]?.includes(expected);
+    }
+    actual ||= literal === 'string' ? 'String'
+        : [...JAVA_WRAPPER_PRIMITIVES].find(([, primitive]) => primitive === literal)?.[0];
+    const names = new Set([actual, 'Object', ...(JAVA_PLATFORM_VALUE_ANCESTRY.get(actual) || []),
+        ...(literal ? JAVA_KIND_TYPES[literal] : [])].filter(name => name && !JAVA_PRIMITIVES.has(name)));
+    const qualify = name => name === 'Serializable' ? 'java.io.Serializable'
+        : name === 'Constable' || name === 'ConstantDesc' ? `java.lang.constant.${name}` : `java.lang.${name}`;
+    const supertypes = new Set([...names].map(qualify));
+    for (const name of JAVA_PLATFORM_SUPERTYPES.get(`java.lang.${actual}`) || []) supertypes.add(name);
+    // Boxed literals and String implement Comparable of their OWN type.
+    // Generic arguments are invariant; erasing Comparable<Integer> would
+    // incorrectly accept a String and select that overload over Object.
+    const genericStart = String(paramType).indexOf('<');
+    if (genericStart >= 0 && supertypes.has('java.lang.Comparable') &&
+        _javaKnownReferenceConversion(index, paramType, owner, new Set(['java.lang.Comparable'])) === true) {
+        const args = _splitTopLevelGenericArgs(String(paramType).slice(genericStart + 1,
+            String(paramType).lastIndexOf('>')));
+        if (args.length !== 1) return null;
+        const argument = args[0].trim();
+        if (argument !== '?') {
+            const upper = /^\?\s+extends\s+/.test(argument);
+            const bound = argument.replace(/^\?\s+(?:extends|super)\s+/, '').trim();
+            const conversion = _javaKnownReferenceConversion(index, bound, owner,
+                upper ? supertypes : new Set([`java.lang.${actual}`]), true);
+            if (conversion !== true) return conversion;
+        }
+    }
+    return _javaKnownReferenceConversion(index, paramType, owner, supertypes, true);
+}
+
+// A class literal's type is java.lang.Class. Known interfaces retain their
+// qualified identity; an unmodeled external relationship stays undecided.
+function _javaKnownReferenceConversion(index, paramType, owner, supertypes, closedActual = false) {
+    const type = String(paramType).replace(/<.*$/s, '').trim();
+    if (!type || type.endsWith('[]') || JAVA_PRIMITIVES.has(type)) return false;
+    const entry = owner?.file && index.files.get(owner.file);
+    if (owner?.file && !_typeNamesCanonicalAt(index, owner.file)) return null;
+    const names = type.split('.'), root = names[0], bare = names[names.length - 1];
+    if (_declaredTypeParameterNames(owner).has(root)) return null;
+    const definitions = (index.symbols.get(bare) || []).filter(def =>
+        ['class', 'interface', 'enum', 'record'].includes(def.type));
+    const canonical = def => [def.namespace, def.enclosingType, def.name].filter(Boolean).join('.');
+    // A closed value cannot acquire an ancestor whose declared name is
+    // absent from its complete SDK ancestry. A matching simple name still
+    // needs scoped identity, including inherited member types.
+    const ancestorNames = new Set([...supertypes].map(name => name.split('.').pop()));
+    const verdict = (name, project = false) => supertypes.has(name) ? true
+        : closedActual && !ancestorNames.has(name.split('.').pop()) || project ||
+            name.startsWith('java.lang.') && JAVA_FINAL_REFERENCE_TYPES.has(name.slice('java.lang.'.length)) ? false : null;
+    const member = _javaFormalMemberType(index, root, owner);
+    if (member.uncertain) return null;
+    if (member.definitions?.length) {
+        const answers = member.definitions.map(def => {
+            const name = [canonical(def), ...names.slice(1)].join('.');
+            return verdict(name, names.length === 1 || definitions.some(candidate => canonical(candidate) === name));
+        });
+        return answers.every(answer => answer === true) ? true : answers.every(answer => answer === false) ? false : null;
+    }
+    const imported = _javaTypeImports(index, entry, root);
+    if (imported.length) {
+        const answers = imported.map(binding => {
+            if (binding.unknownType) return null;
+            const name = [binding.module, ...names.slice(1)].join('.');
+            return verdict(name, definitions.some(def => canonical(def) === name));
+        });
+        return answers.every(answer => answer === true) ? true : answers.every(answer => answer === false) ? false : null;
+    }
+    if (names.length > 1) {
+        // A type in scope may obscure the package prefix of a written name.
+        // Its nested member cannot be identified by a package-looking string.
+        const roots = (index.symbols.get(root) || []).filter(def => !def.enclosingType &&
+            !def.lexicalScopeStartLine && ['class', 'interface', 'enum', 'record'].includes(def.type) &&
+            (owner?.namespace ? def.namespace === owner.namespace : !def.namespace &&
+                path.dirname(def.file) === path.dirname(owner?.file || '')));
+        if (roots.length) return null;
+        return verdict(type, definitions.some(def => canonical(def) === type));
+    }
+    if (owner && _javaParamTypeIsProject(index, type, owner, definitions)) {
+        const answers = definitions.filter(def => !def.enclosingType && !def.lexicalScopeStartLine &&
+            (owner.namespace ? def.namespace === owner.namespace
+                : !def.namespace && path.dirname(def.file) === path.dirname(owner.file))).map(def =>
+            supertypes.has(canonical(def)));
+        if (answers.length) return answers.every(Boolean) ? true : answers.every(answer => !answer) ? false : null;
+    }
+    if (supertypes.has(`java.lang.${type}`)) return true;
+    if (JAVA_FINAL_REFERENCE_TYPES.has(type) || ['Number', 'Enum', 'Throwable'].includes(type)) return false;
+    const onDemand = (entry?.importDetails || []).filter(item => item.names?.includes('*') && !item.static);
+    const providers = [...supertypes].filter(name => name.split('.').pop() === type)
+        .map(name => name.slice(0, name.lastIndexOf('.')));
+    if (onDemand.length === 1 && providers.includes(onDemand[0].module.replace(/\.\*$/, ''))) return true;
+    return null;
+}
+
+function _javaArgKindMatches(index, kind, paramType, language, typeParams = null, paramOwner = null, argumentOrigin = null) {
     if (!kind || kind === 'expr') return true;
     if (!paramType) return true;
+    if (language === 'csharp' && JAVA_KIND_TYPES[kind] && _csharpGenericInterfaceNeedsReview(paramType)) return true;
     const rawBare = String(paramType).replace(/<.*$/s, '').trim()
         .replace(/\.\.\.$/, '').replace(/\[\]$/, '').split('.').pop();
     const bare = CSHARP_OVERLOAD_ALIASES.get(rawBare) || rawBare;
@@ -22291,8 +23153,12 @@ function _javaArgKindMatches(index, kind, paramType, language, typeParams = null
         return targetArity === null || targetArity === lambdaArity;
     }
     if (language === 'java') {
-        const arrays = _javaArrayArgMatches(index, kind, paramType, typeParams);
+        if (!_typeNamesCanonicalAt(index, typeof argumentOrigin === 'string' ? argumentOrigin : argumentOrigin?.file) ||
+            !_typeNamesCanonicalAt(index, paramOwner?.file)) return true;
+        const arrays = _javaArrayArgMatches(index, kind, paramType, typeParams, paramOwner, argumentOrigin);
         if (arrays !== null) return arrays;
+        const known = _javaKnownArgumentConversion(index, kind, paramType, paramOwner, argumentOrigin);
+        if (known !== undefined) return known !== false;
     }
     if (!bare || bare === 'Object') return true;
     if (/^[A-Z][0-9]?$/.test(bare)) return true; // generic type variable (T, E, K1...)
@@ -22304,12 +23170,13 @@ function _javaArgKindMatches(index, kind, paramType, language, typeParams = null
     if (kind.startsWith('call:') || kind.startsWith('callshape:') ||
         kind.startsWith('chain:') || kind.startsWith('element:') ||
         kind.startsWith('field:') || kind.startsWith('fieldpath:')) {
-        const staticType = _javaStaticTypeForKind(index, kind);
+        const staticType = _javaStaticTypeForKind(index, kind, argumentOrigin?.file);
         // Only an owner-scoped, agreeing project annotation or an exact JDK
         // contract is type evidence.
         if (!staticType) return true;
         return _javaArgKindMatches(
-            index, `type:${staticType}`, paramType, language);
+            index, `type:${staticType}`, paramType, language, typeParams, paramOwner,
+            language === 'java' ? _javaArgumentOrigin(index, kind, argumentOrigin) : null);
     }
     if (kind.startsWith('new:') || kind.startsWith('cast:') || kind.startsWith('type:')) {
         const t = kind.slice(kind.indexOf(':') + 1);
@@ -22438,7 +23305,7 @@ const JAVA_ARRAY_SUPERTYPES = new Set(['Object', 'Cloneable', 'Serializable']);
  * primitives convert only to themselves. Null when the shapes do not
  * decide (the element comparison continues), true/false when they do.
  */
-function _javaArrayArgMatches(index, kind, paramType, typeParams) {
+function _javaArrayArgMatches(index, kind, paramType, typeParams, paramOwner, argumentOrigin = null) {
     if (typeof kind !== 'string') return null;
     const written = String(paramType).trim();
     // Neither side spells an array: shapes cannot decide.
@@ -22476,7 +23343,7 @@ function _javaArrayArgMatches(index, kind, paramType, typeParams) {
     if (JAVA_PRIMITIVES.has(actualSimple) || JAVA_PRIMITIVES.has(expectedSimple)) {
         return actualSimple === expectedSimple;
     }
-    return _javaArgKindMatches(index, `type:${actualElement}`, expectedElement, 'java', typeParams);
+    return _javaArgKindMatches(index, `type:${actualElement}`, expectedElement, 'java', typeParams, paramOwner, argumentOrigin);
 }
 
 function _cppTypeCategory(index, type) {
@@ -22681,6 +23548,64 @@ function _overloadArityFits(call, def) {
         (ps.some(p => p && p.rest) || call.argCount <= ps.length);
 }
 
+function _javaVariadicArgumentMatches(index, call, kind, type, position, typeParams, owner) {
+    const origin = _javaCallArgumentOrigin(call);
+    const language = index.files.get(owner.file)?.language;
+    if (_javaArgKindMatches(index, kind, type, language, typeParams, owner, origin)) return true;
+    // An unseen reference type may derive from the parameter's project
+    // type. Only closed literal/primitive/array shapes, or a proved SDK
+    // cast, can turn this new variadic check into an exclusion.
+    if (JAVA_KIND_TYPES[kind] || kind === 'null' || kind?.startsWith('class:')) return false;
+    const actual = _javaStaticTypeForKind(index, kind, call.argumentFile);
+    if (JAVA_PRIMITIVES.has(actual)) return false;
+    const actualDims = _writtenArrayDims(actual), expectedDims = _writtenArrayDims(type);
+    if (actualDims > 0) {
+        if (actualDims < expectedDims) return false;
+        const actualElement = actual.replace(/(?:\[\])+$/, '');
+        const expectedElement = type.replace(/(?:\[\])+$/, '');
+        if (actualDims > expectedDims) return JAVA_ARRAY_SUPERTYPES.has(expectedElement.split('.').pop());
+        if (JAVA_PRIMITIVES.has(actualElement) || JAVA_PRIMITIVES.has(expectedElement)) return false;
+        return true; // An unindexed reference element may derive from the expected one.
+    }
+    if (actual && expectedDims > 0) return false;
+    if (!kind?.startsWith('cast:') || !call.argumentFile || !call.callSite) return true;
+    const sdk = kind.slice('cast:'.length).replace(/<.*$/s, '').trim();
+    if (!JAVA_MODELED_PLATFORM_TYPES.has(sdk)) return true;
+    const file = path.resolve(index.root, call.argumentFile), site = call.callSite;
+    const entry = index.files.get(file);
+    if (!entry?.language || !Number.isInteger(site.start) || !Number.isInteger(site.end) || !site.nodeType) return true;
+    const source = index._readFile(file);
+    if (site.start < 0 || site.end > source.length || site.end <= site.start) return true;
+    const { getParser, safeParse } = require('../languages');
+    const tree = safeParse(getParser(entry.language), source);
+    if (!tree) return true;
+    try {
+        let node = tree.rootNode.descendantForIndex(site.start, site.start + 1);
+        while (node && !(node.startIndex === site.start && node.endIndex === site.end && node.type === site.nodeType)) node = node.parent;
+        while (node && !['method_invocation', 'object_creation_expression', 'explicit_constructor_invocation'].includes(node.type)) node = node.parent;
+        const argument = node?.childForFieldName('arguments')?.namedChildren
+            .filter(child => !child.type.endsWith('comment'))[position];
+        const cast = argument?.type === 'cast_expression' ? argument.childForFieldName('type') : null;
+        if (!cast) return true;
+        return !_javaPlatformProducerIdentity(index, sdk, { file, written: cast.text,
+            site: { start: cast.startIndex, line: cast.startPosition.row + 1 } },
+        sdk.split('.').pop(), sdk.split('.')[0]);
+    } finally { tree.delete?.(); }
+}
+
+// A variadic Java declaration also participates before expansion when its
+// last argument may convert to the declared array. Uncertainty retains it
+// in that phase; only a separate applicability proof may select its body.
+function _javaVariadicNormalFormPossible(index, call, definition) {
+    const ps = definition.paramsStructured;
+    if (!Array.isArray(ps) || call.argCount !== ps.length || !Array.isArray(call.argKinds)) return false;
+    const position = ps.findIndex(param => param?.rest);
+    if (position !== ps.length - 1 || position < 0 || !ps[position].type) return false;
+    const array = String(ps[position].type).replace(/\.\.\.$/, '[]');
+    return _javaVariadicArgumentMatches(index, call, call.argKinds[position], array,
+        position, _declaredTypeParameterNames(definition), definition);
+}
+
 function _overloadApplicable(index, call, def) {
     const rawParams = def.paramsStructured;
     const boundExtension = !!(def.isExtensionMethod && call.isMethod &&
@@ -22719,12 +23644,26 @@ function _overloadApplicable(index, call, def) {
     const kinds = call.argKinds;
     if (!Array.isArray(kinds)) return true;
     const typeParams = language === 'cpp' ? null : _declaredTypeParameterNames(def);
+    if (hasRest && langTraits(language)?.overloadPhases === 'strict-loose-variable') {
+        const position = ps.findIndex(param => param?.rest);
+        const type = String(ps[position]?.type || '').trim();
+        if (type) {
+            const element = type.replace(/\.\.\.$|\[\]$/, '');
+            const array = `${element}[]`;
+            const restKinds = kinds.slice(position);
+            const normal = restKinds.length === 1 && _javaVariadicArgumentMatches(
+                index, call, restKinds[0], array, position, typeParams, def);
+            const expanded = restKinds.every((kind, offset) => _javaVariadicArgumentMatches(
+                index, call, kind, element, position + offset, typeParams, def));
+            if (!normal && !expanded) return false;
+        }
+    }
     for (let i = 0; i < kinds.length && i < ps.length; i++) {
         const p = ps[i];
         if (!p || p.rest) break;
         const matches = language === 'cpp'
             ? _cppArgKindMatches(index, kinds[i], p.type)
-            : _javaArgKindMatches(index, kinds[i], p.type, language, typeParams, def);
+            : _javaArgKindMatches(index, kinds[i], p.type, language, typeParams, def, _javaCallArgumentOrigin(call));
         if (!matches) return false;
     }
     return true;
@@ -22799,13 +23738,16 @@ function _javaParamTypeIdentity(index, def, position, call = null) {
         .replace(/\.\.\.$/, '');
     // A C# `params T[]` argument in the expanded form binds T (fix #391).
     if (param.rest && call && type.endsWith('[]') &&
-        !_csharpParamsNormalFormApplicable(index, call, def)) {
+        !(langTraits(index.files.get(def.file)?.language)?.overloadPhases === 'strict-loose-variable'
+            ? _javaVariadicNormalFormPossible(index, call, def)
+            : _csharpParamsNormalFormApplicable(index, call, def))) {
         type = type.slice(0, -2);
     }
     if (!type || type.includes('.')) return type || null;
     const fileEntry = def?.file && index.files.get(def.file);
-    const imported = (fileEntry?.importBindings || [])
-        .filter(binding => binding.name === type)
+    const imports = fileEntry?.language === 'java' ? _javaTypeImports(index, fileEntry, type) : fileEntry?.importBindings || [];
+    const imported = imports
+        .filter(binding => binding.name === type && !binding.unknownType)
         .map(binding => binding.module)
         .filter(Boolean);
     if (imported.length === 1) return imported[0];
@@ -22858,7 +23800,7 @@ function _javaMostSpecificOverload(index, applicable, call, language) {
                 const kind = call.argKinds[i];
                 const bare = _javaBareParamType(_javaParamAt(definition, i, call));
                 if (!kind || !bare) continue;
-                const staticType = _javaStaticTypeForKind(index, kind);
+                const staticType = _javaStaticTypeForKind(index, kind, call.argumentFile);
                 const paramType = _javaParamTypeIdentity(index, definition, i, call);
                 if (staticType && paramType &&
                     (staticType === paramType ||
@@ -22895,7 +23837,7 @@ function _javaMostSpecificOverload(index, applicable, call, language) {
         const primOf = (kind) => {
             if (!kind || typeof kind !== 'string') return null;
             if (JAVA_PRIMITIVES.has(kind)) return kind; // literal kinds
-            const staticType = _javaStaticTypeForKind(index, kind);
+            const staticType = _javaStaticTypeForKind(index, kind, call.argumentFile);
             const simple = staticType ? staticType.split('.').pop() : null;
             return simple && JAVA_PRIMITIVES.has(simple) ? simple : null;
         };
@@ -23813,7 +24755,10 @@ function _overloadDiscipline(index, call, targetDefs, definitions, callerFile) {
     const pinKey = definition => {
         const cached = keyMemo?.get(definition);
         if (cached !== undefined) return cached;
-        const key = `${definition.file}:${definition.startLine}`;
+        const span = definition.sourceSpan;
+        const key = JSON.stringify([definition.file, definition.startLine,
+            span?.start, span?.end, definition.className, definition.namespace,
+            definition.enclosingType, definition.paramsStructured || definition.params]);
         keyMemo?.set(definition, key);
         return key;
     };
@@ -25090,6 +26035,56 @@ function _countDispatchCandidatesUncached(index, via, definitions) {
  * only: lets the unverified tier say "possible-dispatch via <Interface>".
  * Rust `dyn Trait` / `Box<dyn Trait>` / `&dyn Trait` resolve to Trait here.
  */
+// An instance call through a proven nominal interface cannot select a class's
+// static method. The ordinary dispatch hint is insufficient for exclusion:
+// prove the lexical field owner and its written type independently.
+function _interfaceFieldExcludesStatic(index, file, call, rootType, contract, targets) {
+    if (call.receiverRoot !== 'this' || !targets.length ||
+        !targets.every(def => !def.isExtensionMethod &&
+            (def.type === 'static' || def.modifiers?.includes('static')))) return false;
+    const entry = index.files.get(file), traits = langTraits(entry?.language);
+    if (traits?.typeSystem !== 'nominal') return false;
+    const current = index.findEnclosingFunction(file, call.line, true, call);
+    const owner = current && ownerDefinitionOf(index, current);
+    if (!owner || owner.name !== rootType ||
+        require('./callable-scope').containsCall(owner, occurrenceIdentity(entry.relativePath, call)) !== true) return false;
+    const fields = (index.symbols.get(call.receiverField) || []).filter(def =>
+        (def.type === 'field' || def.memberType === 'field') && def.fieldType &&
+        ownerDefinitionOf(index, def) === owner);
+    if (fields.length !== 1) return false;
+    const field = fields[0];
+    const interfaces = (index.symbols.get(contract) || []).filter(def => def.type === 'interface' &&
+        langTraits(index.files.get(def.file)?.language)?.nameReferenceFamily === traits.nameReferenceFamily);
+    if (!interfaces.length) return false;
+    if (traits.typeNameScoping === 'package-on-demand') {
+        const scopes = _javaArgumentScopes(index, { file,
+            site: call.callSite || occurrenceIdentity(entry.relativePath, call) }, entry);
+        if (!scopes?.length || scopes[0] !== owner) return false;
+        return _javaKnownReferenceConversion(index, field.fieldType, field,
+            new Set(interfaces.map(def => [def.namespace, def.enclosingType, def.name].filter(Boolean).join('.')))) === true;
+    }
+    if (traits.typeNameScoping !== 'namespace-usings') return false;
+    // An unseen or inherited member type can precede a C# using. Such an
+    // owner needs a fuller lookup witness; keep it unverified here.
+    const around = entry.symbols.filter(def => ['class', 'struct', 'record', 'interface'].includes(def.type) &&
+        def.startLine <= field.startLine && def.endLine >= field.endLine);
+    if (!around.length || around.some(def => def.extends || def.implements?.length) ||
+        entry.symbols.some(def => _declaredTypeParameterNames(def).has(contract))) return false;
+    if (hasParameterizedQualifier(field.fieldType)) return false;
+    const spelling = field.fieldType.replace(/<.*$/s, '').trim();
+    const qualifier = spelling.split('.').slice(0, -1).join('.');
+    const { TypeReferenceResolver } = require('./type-references');
+    const matches = interfaces.filter(def => {
+        const resolver = new TypeReferenceResolver(index, def, contract);
+        resolver.siteSyntax = { arity: genericArityOf(field.fieldType) };
+        const result = qualifier
+            ? resolver.resolveQualified(field.file, field.startLine, null, qualifier, { role: 'type' })
+            : resolver.resolveName(field.file, field.startLine, contract);
+        return result.verdict === 'yes';
+    });
+    return matches.length === 1;
+}
+
 function _declaredFieldInterfaceType(index, rootType, fieldName, language, rootNamespace) {
     const defs = index.symbols.get(fieldName);
     if (!defs) return null;

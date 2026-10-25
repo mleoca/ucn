@@ -243,6 +243,7 @@ function _processFunction(node, functions, processedRanges, lines, code) {
                 params: extractPythonParams(paramsNode),
                 paramsStructured,
                 startLine: decoratorStartLine,
+                sourceSpan: nodeToLocation(node.parent?.type === 'decorated_definition' ? node.parent : node, lines).sourceSpan,
                 endLine,
                 indent,
                 isAsync,
@@ -993,7 +994,7 @@ function _processTypeAlias(node, classes, processedRanges, lines) {
     const rangeKey = `${node.startIndex}-${node.endIndex}`;
     if (processedRanges.has(rangeKey)) return true;
     processedRanges.add(rangeKey);
-    const { startLine, endLine } = nodeToLocation(node, lines);
+    const { startLine, endLine, sourceSpan } = nodeToLocation(node, lines);
     const aliasOf = pythonAliasBase(valueNode);
     const aliasMembers = pythonAliasMembers(valueNode);
     classes.push({
@@ -1001,6 +1002,7 @@ function _processTypeAlias(node, classes, processedRanges, lines) {
         type: 'type',
         startLine,
         endLine,
+        sourceSpan,
         methods: [],
         members: [],
         ...(aliasOf && { aliasOf }),
@@ -1138,6 +1140,7 @@ function extractClassMembers(classNode, code) {
                     params: extractPythonParams(paramsNode),
                     paramsStructured,
                     startLine,
+                    sourceSpan: nodeToLocation(child, code).sourceSpan,
                     endLine,
                     memberType,
                     isAsync,

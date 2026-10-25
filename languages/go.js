@@ -108,7 +108,7 @@ function _processFunction(node, functions, processedRanges, lines) {
             const child = node.namedChild(i);
             if (child.type === 'identifier') names.push(child);
         }
-        const { startLine, endLine, indent } = nodeToLocation(node, lines);
+        const { startLine, endLine, indent, sourceSpan } = nodeToLocation(node, lines);
         for (const nameNode of names) {
             const isExported = /^[A-Z]/.test(nameNode.text);
             functions.push({
@@ -117,6 +117,7 @@ function _processFunction(node, functions, processedRanges, lines) {
                 paramsStructured: parseStructuredParams(paramsNode, 'go'),
                 startLine,
                 endLine,
+                sourceSpan,
                 indent,
                 modifiers: isExported ? ['export'] : [],
                 isFunctionVariable: true,
@@ -135,7 +136,7 @@ function _processFunction(node, functions, processedRanges, lines) {
         const paramsNode = node.childForFieldName('parameters');
 
         if (nameNode) {
-            const { startLine, endLine, indent } = nodeToLocation(node, lines);
+            const { startLine, endLine, indent, sourceSpan } = nodeToLocation(node, lines);
             const returnType = extractReturnType(node);
             const returnedFunctionResult = extractReturnedFunctionResult(node);
             const docstring = extractGoDocstring(lines, startLine);
@@ -148,6 +149,7 @@ function _processFunction(node, functions, processedRanges, lines) {
                 paramsStructured: parseStructuredParams(paramsNode, 'go'),
                 startLine,
                 endLine,
+                sourceSpan,
                 indent,
                 modifiers: isExported ? ['export'] : [],
                 ...(returnType && { returnType }),
@@ -169,7 +171,7 @@ function _processFunction(node, functions, processedRanges, lines) {
         const receiverNode = node.childForFieldName('receiver');
 
         if (nameNode) {
-            const { startLine, endLine, indent } = nodeToLocation(node, lines);
+            const { startLine, endLine, indent, sourceSpan } = nodeToLocation(node, lines);
             const receiver = extractReceiver(receiverNode);
             const returnType = extractReturnType(node);
             const returnedFunctionResult = extractReturnedFunctionResult(node);
@@ -182,6 +184,7 @@ function _processFunction(node, functions, processedRanges, lines) {
                 paramsStructured: parseStructuredParams(paramsNode, 'go'),
                 startLine,
                 endLine,
+                sourceSpan,
                 indent,
                 isMethod: true,
                 receiver,
@@ -342,7 +345,7 @@ function _processClass(node, types, processedRanges, lines) {
             const typeNode = spec.childForFieldName('type');
 
             if (nameNode && typeNode) {
-                const { startLine, endLine } = nodeToLocation(node, lines);
+                const { startLine, endLine, sourceSpan } = nodeToLocation(node, lines);
                 const name = nameNode.text;
                 const docstring = extractGoDocstring(lines, startLine);
                 const typeParams = extractTypeParams(spec);
@@ -376,6 +379,7 @@ function _processClass(node, types, processedRanges, lines) {
                     name,
                     startLine,
                     endLine,
+                    sourceSpan,
                     ...(nameLine !== startLine && { nameLine }),
                     type: typeKind,
                     members,
@@ -406,12 +410,13 @@ function _processClass(node, types, processedRanges, lines) {
                 // type of another package (fix #378).
                 const aliasQualifier = aliased?.type === 'qualified_type'
                     ? aliased.childForFieldName('package')?.text : null;
-                const { startLine, endLine } = nodeToLocation(node, lines);
+                const { startLine, endLine, sourceSpan } = nodeToLocation(node, lines);
                 const nameLine = nameNode.startPosition.row + 1;
                 types.push({
                     name: nameNode.text,
                     startLine,
                     endLine,
+                    sourceSpan,
                     ...(nameLine !== startLine && { nameLine }),
                     type: 'type',
                     members: [],
@@ -497,14 +502,14 @@ function _processState(node, objects, lines) {
                 const name = nameNode.text;
 
                 if (valueNode && _isCompositeLiteral(valueNode) && GO_STATE_PATTERN.test(name)) {
-                    const { startLine, endLine } = nodeToLocation(spec, lines);
-                    objects.push({ name, startLine, endLine });
+                    const { startLine, endLine, sourceSpan } = nodeToLocation(spec, lines);
+                    objects.push({ name, startLine, endLine, sourceSpan });
                 } else if (isIotaBlock && /^[A-Z]/.test(name)) {
-                    const { startLine, endLine } = nodeToLocation(spec, lines);
-                    objects.push({ name, startLine, endLine, isConst: true });
+                    const { startLine, endLine, sourceSpan } = nodeToLocation(spec, lines);
+                    objects.push({ name, startLine, endLine, sourceSpan, isConst: true });
                 } else if (_isGoExportedName(name)) {
-                    const { startLine, endLine } = nodeToLocation(spec, lines);
-                    objects.push({ name, startLine, endLine, isConst: true });
+                    const { startLine, endLine, sourceSpan } = nodeToLocation(spec, lines);
+                    objects.push({ name, startLine, endLine, sourceSpan, isConst: true });
                 }
             }
         }
@@ -521,11 +526,11 @@ function _processState(node, objects, lines) {
                 if (nameNode) {
                     const name = nameNode.text;
                     if (valueNode && _isCompositeLiteral(valueNode) && GO_STATE_PATTERN.test(name)) {
-                        const { startLine, endLine } = nodeToLocation(spec, lines);
-                        objects.push({ name, startLine, endLine });
+                        const { startLine, endLine, sourceSpan } = nodeToLocation(spec, lines);
+                        objects.push({ name, startLine, endLine, sourceSpan });
                     } else if (_isGoExportedName(name)) {
-                        const { startLine, endLine } = nodeToLocation(spec, lines);
-                        objects.push({ name, startLine, endLine });
+                        const { startLine, endLine, sourceSpan } = nodeToLocation(spec, lines);
+                        objects.push({ name, startLine, endLine, sourceSpan });
                     }
                 }
             }
@@ -601,7 +606,7 @@ function extractStructFields(structNode, codeOrLines) {
     for (let i = 0; i < fieldListNode.namedChildCount; i++) {
         const field = fieldListNode.namedChild(i);
         if (field.type === 'field_declaration') {
-            const { startLine, endLine } = nodeToLocation(field, codeOrLines);
+            const { startLine, endLine, sourceSpan } = nodeToLocation(field, codeOrLines);
             const nameNode = field.childForFieldName('name');
             const typeNode = field.childForFieldName('type');
 
@@ -610,6 +615,7 @@ function extractStructFields(structNode, codeOrLines) {
                     name: nameNode.text,
                     startLine,
                     endLine,
+                    sourceSpan,
                     memberType: 'field',
                     ...(typeNode && { fieldType: typeNode.text })
                 });
@@ -626,6 +632,7 @@ function extractStructFields(structNode, codeOrLines) {
                     name: embeddedName,
                     startLine,
                     endLine,
+                    sourceSpan,
                     memberType: 'field',
                     embedded: true,
                     fieldType: typeNode.text
@@ -646,7 +653,7 @@ function extractInterfaceMembers(interfaceNode, codeOrLines) {
         const child = interfaceNode.namedChild(i);
         // tree-sitter Go uses method_elem (or method_spec in older versions)
         if (child.type === 'method_elem' || child.type === 'method_spec') {
-            const { startLine, endLine } = nodeToLocation(child, codeOrLines);
+            const { startLine, endLine, sourceSpan } = nodeToLocation(child, codeOrLines);
             // Name is in a field_identifier child
             let nameText = null;
             let paramsText = null;
@@ -697,6 +704,7 @@ function extractInterfaceMembers(interfaceNode, codeOrLines) {
                         name: nameText,
                         startLine,
                         endLine,
+                        sourceSpan,
                         memberType: 'field',
                         embedded: true,
                         fieldType: nameText
@@ -706,6 +714,7 @@ function extractInterfaceMembers(interfaceNode, codeOrLines) {
                         name: nameText,
                         startLine,
                         endLine,
+                        sourceSpan,
                         memberType: 'method',
                         ...(paramsText !== null && { params: paramsText }),
                         ...(paramsNode && { paramsStructured: parseStructuredParams(paramsNode, 'go') }),
@@ -715,7 +724,7 @@ function extractInterfaceMembers(interfaceNode, codeOrLines) {
             }
         } else if (child.type === 'type_identifier' || child.type === 'qualified_type') {
             // Standalone type identifier inside interface body — embedded interface
-            const { startLine, endLine } = nodeToLocation(child, codeOrLines);
+            const { startLine, endLine, sourceSpan } = nodeToLocation(child, codeOrLines);
             let embName = child.text;
             const dotIdx = embName.indexOf('.');
             if (dotIdx >= 0) embName = embName.slice(dotIdx + 1);
@@ -723,6 +732,7 @@ function extractInterfaceMembers(interfaceNode, codeOrLines) {
                 name: embName,
                 startLine,
                 endLine,
+                sourceSpan,
                 memberType: 'field',
                 embedded: true,
                 fieldType: child.text
@@ -733,7 +743,7 @@ function extractInterfaceMembers(interfaceNode, codeOrLines) {
             for (let j = 0; j < child.namedChildCount; j++) {
                 const sub = child.namedChild(j);
                 if (sub.type === 'type_identifier' || sub.type === 'qualified_type') {
-                    const { startLine, endLine } = nodeToLocation(sub, codeOrLines);
+                    const { startLine, endLine, sourceSpan } = nodeToLocation(sub, codeOrLines);
                     let embName = sub.text;
                     const dotIdx = embName.indexOf('.');
                     if (dotIdx >= 0) embName = embName.slice(dotIdx + 1);
@@ -741,6 +751,7 @@ function extractInterfaceMembers(interfaceNode, codeOrLines) {
                         name: embName,
                         startLine,
                         endLine,
+                        sourceSpan,
                         memberType: 'field',
                         embedded: true,
                         fieldType: sub.text

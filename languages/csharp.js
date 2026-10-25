@@ -563,7 +563,7 @@ function memberFromNode(node, className, lines) {
     if (!name) return null;
     const paramsNode = node.childForFieldName('parameters');
     const returnNode = node.childForFieldName('returns') || node.childForFieldName('type');
-    const { startLine, endLine, indent } = nodeToLocation(node, lines);
+    const { startLine, endLine, indent, sourceSpan } = nodeToLocation(node, lines);
     const attrs = attributeData(node);
     const modifiers = modifiersOf(node);
     const isConstructor = node.type === 'constructor_declaration';
@@ -603,6 +603,7 @@ function memberFromNode(node, className, lines) {
         returnType: isConstructor ? null : nodeTextWithoutComments(returnNode).trim() || null,
         startLine,
         endLine,
+        sourceSpan,
         ...nameLineOf(nameNode, startLine),
         indent,
         modifiers,
@@ -635,11 +636,12 @@ function fieldMembers(node, lines) {
         if (declarator.type !== 'variable_declarator') continue;
         const nameNode = declarator.childForFieldName('name');
         if (!nameNode?.text) continue;
-        const { startLine, endLine, indent } = nodeToLocation(declarator, lines);
+        const { startLine, endLine, indent, sourceSpan } = nodeToLocation(declarator, lines);
         members.push({
             name: nameNode.text,
             startLine,
             endLine,
+            sourceSpan,
             indent,
             modifiers: modifiersOf(node),
             memberType: 'field',
@@ -663,7 +665,7 @@ function indexerMember(node, className, lines) {
     if (node.type !== 'indexer_declaration') return null;
     const paramsNode = node.childForFieldName('parameters');
     const typeNode = node.childForFieldName('type');
-    const { startLine, endLine, indent } = nodeToLocation(node, lines);
+    const { startLine, endLine, indent, sourceSpan } = nodeToLocation(node, lines);
     const explicitInterface = explicitInterfaceOf(node);
     return {
         name: 'this[]',
@@ -672,6 +674,7 @@ function indexerMember(node, className, lines) {
         returnType: nodeTextWithoutComments(typeNode).trim() || null,
         startLine,
         endLine,
+        sourceSpan,
         ...nameLineOf((node.children || []).find(child => child.type === 'this') || null, startLine),
         indent,
         modifiers: modifiersOf(node),
@@ -692,12 +695,13 @@ function propertyMember(node, lines) {
     // The real declaration is already indexed; reject the missing-node
     // artifact instead of letting one invalid symbol discard the whole file.
     if (!nameNode?.text) return null;
-    const { startLine, endLine, indent } = nodeToLocation(node, lines);
+    const { startLine, endLine, indent, sourceSpan } = nodeToLocation(node, lines);
     const explicitInterface = explicitInterfaceOf(node);
     return {
         name: nameNode.text,
         startLine,
         endLine,
+        sourceSpan,
         ...nameLineOf(nameNode, startLine),
         indent,
         modifiers: modifiersOf(node),
@@ -827,7 +831,7 @@ function findClassesInTree(code, tree) {
             // function-pointer typedef.
             const delegateName = node.childForFieldName('name');
             if (delegateName) {
-                const { startLine, endLine, indent } = nodeToLocation(node, lines);
+                const { startLine, endLine, indent, sourceSpan } = nodeToLocation(node, lines);
                 const delegateArity = typeParameterCount(node);
                 const delegateGenerics = typeParameterNames(node);
                 // fix #393: the delegate's parameter count, the count a
@@ -845,6 +849,7 @@ function findClassesInTree(code, tree) {
                     ...(Number.isInteger(delegateParams) && { delegateParams }),
                     startLine,
                     endLine,
+                    sourceSpan,
                     ...nameLineOf(delegateName, startLine),
                     indent,
                     modifiers: modifiersOf(node),
@@ -880,11 +885,12 @@ function findClassesInTree(code, tree) {
                 const enumName = child.childForFieldName('name') ||
                     child.namedChildren.find(item => item.type === 'identifier');
                 if (enumName) {
-                    const { startLine, endLine, indent } = nodeToLocation(child, lines);
+                    const { startLine, endLine, indent, sourceSpan } = nodeToLocation(child, lines);
                     members.push({
                         name: enumName.text,
                         startLine,
                         endLine,
+                        sourceSpan,
                         ...nameLineOf(enumName, startLine),
                         indent,
                         modifiers: ['public', 'static'],
@@ -905,7 +911,7 @@ function findClassesInTree(code, tree) {
         }
         const baseList = node.namedChildren.find(child => child.type === 'base_list');
         const bases = baseList?.namedChildren.map(child => child.text) || [];
-        const { startLine, endLine, indent } = nodeToLocation(node, lines);
+        const { startLine, endLine, indent, sourceSpan } = nodeToLocation(node, lines);
         const attrs = attributeData(node);
         let enclosingType;
         for (let parent = node.parent; parent; parent = parent.parent) {
@@ -927,6 +933,7 @@ function findClassesInTree(code, tree) {
             ...(primaryList && { primaryParams: structuredParams(primaryList) }),
             startLine,
             endLine,
+            sourceSpan,
             ...nameLineOf(nameNode, startLine),
             indent,
             modifiers: modifiersOf(node),
@@ -1003,7 +1010,7 @@ function findFunctionsInTree(code, tree, reaches = null) {
         }
         const paramsNode = node.childForFieldName('parameters');
         const returnNode = node.childForFieldName('returns') || node.childForFieldName('type');
-        const { startLine, endLine, indent } = nodeToLocation(node, lines);
+        const { startLine, endLine, indent, sourceSpan } = nodeToLocation(node, lines);
         const modifiers = modifiersOf(node);
         const localGenerics = typeParameterNames(node);
         functions.push({
@@ -1013,6 +1020,7 @@ function findFunctionsInTree(code, tree, reaches = null) {
             returnType: nodeTextWithoutComments(returnNode).trim() || null,
             startLine,
             endLine,
+            sourceSpan,
             ...nameLineOf(nameNode, startLine),
             indent,
             modifiers,
@@ -1063,11 +1071,12 @@ function findStateObjectsInTree(code, tree, reaches = null) {
             if (declarator.type !== 'variable_declarator') continue;
             const nameNode = declarator.childForFieldName('name');
             if (!nameNode) continue;
-            const { startLine, endLine, indent } = nodeToLocation(node, lines);
+            const { startLine, endLine, indent, sourceSpan } = nodeToLocation(node, lines);
             states.push({
                 name: nameNode.text,
                 startLine,
                 endLine,
+                sourceSpan,
                 indent,
                 modifiers: [],
             });
@@ -2048,6 +2057,11 @@ function staticArgKind(node, variableTypes) {
         }
         case 'invocation_expression': {
             const identity = invocationIdentity(node.childForFieldName('function'));
+            // An untyped local or member remains a value binding. Its
+            // spelling cannot identify a same-named producer class.
+            if (identity.receiver && !variableTypes?.has(identity.receiver) &&
+                (csharpBareNameShadowedByLocal(node, identity.receiver) ||
+                 enclosingTypeDeclaresMember(node, identity.receiver))) return 'expr';
             if (identity.name === 'GetValueOrDefault' && identity.receiver) {
                 const rawType = variableTypes?.get(identity.receiver);
                 if (rawType?.trim().endsWith('?')) {
@@ -2312,6 +2326,23 @@ function findCallsInTree(code, parser, tree, reaches = null) {
             // contains valid invocation AST nodes.
             return true;
         }
+        if (node.type === 'constructor_initializer') {
+            let owner = node.parent;
+            while (owner && !TYPE_DECLARATIONS.has(owner.type)) owner = owner.parent;
+            const isBase = node.children.some(child => child.type === 'base');
+            const baseList = owner?.namedChildren.find(child => child.type === 'base_list');
+            const type = isBase ? baseList?.namedChild(0) : owner?.childForFieldName('name');
+            if (!type) return true;
+            const raw = type.text.replace(/<.*>$/, ''), parts = raw.split('.'), name = parts.pop();
+            const args = callArgs(node, typesAt(node));
+            calls.push({ callSite: typeOrigin('call', node), name,
+                line: node.startPosition.row + 1, isMethod: false, isConstructor: true,
+                constructorSyntax: 'delegation', ctorDelegation: isBase ? 'super' : 'this',
+                ...(parts.length && { constructorQualifier: parts.join('.') }),
+                argCount: args.argCount, ...(args.argKinds && { argKinds: args.argKinds }),
+                enclosingFunction: enclosingFunctionOf(node) });
+            return true;
+        }
         if (node.type === 'invocation_expression') {
             const identity = invocationIdentity(node.childForFieldName('function'));
             if (!identity.name) return true;
@@ -2541,6 +2572,7 @@ function findCallsInTree(code, parser, tree, reaches = null) {
                 ...(targetTyped && { targetTyped: true }),
                 isMethod: false,
                 isConstructor: true,
+                ...(raw.includes('.') && { constructorQualifier: raw.split('.').slice(0, -1).join('.') }),
                 ...(typeArgs > 0 && { typeArgs }),
                 argCount: args.argCount,
                 ...(args.argKinds && { argKinds: args.argKinds }),
@@ -2549,6 +2581,7 @@ function findCallsInTree(code, parser, tree, reaches = null) {
         }
         return true;
     });
+    calls.push(...require('./constructor-bases').implicitBaseCalls(tree.rootNode, 'csharp', reaches));
     return calls;
 }
 
@@ -2923,6 +2956,15 @@ function accessorTypeSyntax(text) {
 }
 
 module.exports = {
+    implicitOwnerScope(node) {
+        let enclosingType = null;
+        for (let parent = node.parent; parent; parent = parent.parent) {
+            if (!TYPE_DECLARATIONS.has(parent.type)) continue;
+            enclosingType = parent.childForFieldName('name')?.text || null;
+            break;
+        }
+        return { namespace: namespaceOf(node, node.tree), enclosingType };
+    },
     queryBodyViews,
     queryBodyTree,
     methodGroupReceiver,

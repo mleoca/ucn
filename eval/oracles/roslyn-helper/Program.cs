@@ -218,6 +218,9 @@ internal sealed class RoslynOracle
             expression ??= ancestors
                 .OfType<ObjectCreationExpressionSyntax>()
                 .FirstOrDefault(candidate => candidate.Type.Span.Contains(position));
+            expression ??= ancestors
+                .OfType<ConstructorInitializerSyntax>()
+                .FirstOrDefault(candidate => candidate.ThisOrBaseKeyword.Span.Contains(position));
             expression ??= ancestors.OfType<SimpleNameSyntax>().FirstOrDefault();
             if (expression is null) continue;
             var symbol = expression switch
@@ -226,6 +229,8 @@ internal sealed class RoslynOracle
                     BestSymbol(model.GetSymbolInfo(invocation.Expression)),
                 ObjectCreationExpressionSyntax creation =>
                     BestSymbol(model.GetSymbolInfo(creation)),
+                ConstructorInitializerSyntax initializer =>
+                    BestSymbol(model.GetSymbolInfo(initializer)),
                 _ => BestSymbol(model.GetSymbolInfo(expression)),
             };
             if (symbol is IMethodSymbol { MethodKind: MethodKind.Constructor } constructor)
@@ -334,6 +339,20 @@ internal sealed class RoslynOracle
                 var symbol = BestSymbol(model.GetSymbolInfo(invocation.Expression));
                 var token = NameToken(invocation.Expression);
                 AddIndexedReference(symbol, tree, token.SpanStart, "call");
+            }
+
+            foreach (var initializer in root.DescendantNodes()
+                .OfType<ConstructorInitializerSyntax>())
+            {
+                var constructor = BestSymbol(model.GetSymbolInfo(initializer));
+                var type = constructor is IMethodSymbol method
+                    ? method.ContainingType
+                    : null;
+                AddIndexedReference(
+                    type,
+                    tree,
+                    initializer.ThisOrBaseKeyword.SpanStart,
+                    "call");
             }
 
             foreach (var creation in root.DescendantNodes()

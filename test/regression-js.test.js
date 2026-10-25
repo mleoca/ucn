@@ -8889,7 +8889,7 @@ describe('fix #254: namespace-container receivers confirm in the engine, both di
 describe('fix #254: constructor-pin cross-references the class pin', () => {
     const { execute } = require('../core/execute');
 
-    it('a 0-caller constructor pin hints at the class pin when new-sites exist', () => {
+    it('a constructor pin reports the class construction directly', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'w.ts': 'export class Widget {\n  id: number;\n  constructor(id: number) { this.id = id; }\n}\n',
@@ -8900,9 +8900,9 @@ describe('fix #254: constructor-pin cross-references the class pin', () => {
             for (const cmd of ['context', 'about']) {
                 const r = execute(index, cmd, { name: 'constructor', className: 'Widget' });
                 assert.ok(r.ok);
-                assert.ok((r.result.warnings || []).some(w =>
-                    w.type === 'hint' && w.message.includes('indexed under the class name')),
-                    `${cmd} carries the cross-reference hint`);
+                const callers = Array.isArray(r.result.callers) ? r.result.callers : r.result.callers.top;
+                assert.ok(callers.some(call => (call.relativePath || call.file) === 'use.ts' && call.line === 2),
+                    `${cmd} reports the actual construction`);
             }
         } finally { rm(dir); }
     });

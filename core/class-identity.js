@@ -456,7 +456,9 @@ function ownerDefinitionOf(index, member) {
     const state = _state(index);
     if (state.ownerDefs.has(member)) return state.ownerDefs.get(member);
     const defs = (index.symbols.get(name) || []).filter(d => d && d !== member &&
-        d.name === name && OWNER_CLASS_KINDS.has(d.type) && d.file === member.file);
+        d.name === name && OWNER_CLASS_KINDS.has(d.type) && d.file === member.file &&
+        (member.namespace == null || (d.namespace || null) === member.namespace) &&
+        (member.enclosingType == null || (d.enclosingType || null) === member.enclosingType));
     const span = d => d.endLine - d.startLine;
     const containing = (list, line, endLine = line) => list.filter(d =>
         d.startLine <= line && d.endLine >= endLine);

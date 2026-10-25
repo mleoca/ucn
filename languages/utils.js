@@ -80,7 +80,11 @@ function nodeToLocation(node, codeOrLines) {
     const indentMatch = firstLine.match(/^(\s*)/);
     const indent = indentMatch ? indentMatch[1].length : 0;
 
-    return { startLine, endLine, indent };
+    return { startLine, endLine, indent, sourceSpan: {
+        start: node.startIndex, end: node.endIndex,
+        startLine, endLine,
+        startColumn: node.startPosition.column, endColumn: node.endPosition.column,
+    } };
 }
 
 /**
@@ -343,7 +347,7 @@ function parseRustParam(param, info) {
 function parseJavaParam(param, info) {
     if (param.type === 'formal_parameter' || param.type === 'spread_parameter') {
         let nameNode = param.childForFieldName('name');
-        const typeNode = param.childForFieldName('type');
+        let typeNode = param.childForFieldName('type');
         // Java varargs: spread_parameter wraps name in variable_declarator
         // e.g., `String... args` → spread_parameter > variable_declarator > identifier
         if (!nameNode && param.type === 'spread_parameter') {
@@ -355,8 +359,14 @@ function parseJavaParam(param, info) {
                 }
             }
         }
+        if (!typeNode && param.type === 'spread_parameter') {
+            const types = new Set(['type_identifier', 'scoped_type_identifier', 'generic_type',
+                'array_type', 'annotated_type', 'integral_type', 'floating_point_type', 'boolean_type']);
+            typeNode = param.namedChildren.find(child => types.has(child.type));
+        }
         if (nameNode) info.name = nodeTextWithoutComments(nameNode);
-        if (typeNode) info.type = nodeTextWithoutComments(typeNode);
+        if (typeNode) info.type = nodeTextWithoutComments(typeNode) +
+            (param.type === 'spread_parameter' ? '[]' : '');
         if (param.type === 'spread_parameter') info.rest = true;
     }
 }
@@ -1322,6 +1332,20 @@ function genericArityOf(text) {
     return null;
 }
 
+// A type argument list on an enclosing segment belongs to that segment:
+// erasing everything after the first '<' would turn Outer<T>.Inner into
+// Outer. Callers without enclosing generic identity must retain uncertainty.
+function hasParameterizedQualifier(text) {
+    let depth = 0, parameterized = false;
+    for (const ch of String(text || '')) {
+        if (ch === '<') depth++;
+        else if (ch === '>') {
+            if (--depth === 0) parameterized = true;
+        } else if (ch === '.' && depth === 0 && parameterized) return true;
+    }
+    return false;
+}
+
 // Exclusive clauses of one compound statement (fix #398F): `if`/`elif`/
 // `else` and `case` arms never both run; a `try` body and its handlers, two
 // handlers, a handler and the `try` `else` are alternatives. A `try` body and
@@ -1360,6 +1384,7 @@ function goPathPackageName(modulePath) {
 
 module.exports = {
     genericArityOf,
+    hasParameterizedQualifier,
     goPathPackageName,
     parseErrorRegions,
     containsOwnNode,

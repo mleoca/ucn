@@ -2577,30 +2577,41 @@ class ProjectIndex {
             if (exact) return returnSymbol ? exact : exact.name;
         }
 
-        // Per-operation cache: avoid rescanning symbols for same (file, line),
-        // keyed per file then line (no composed key string per call).
+        // Call positions distinguish declarations sharing a line. Queries
+        // without a position retain the line-local cache entry.
         let byLine = null;
+        const column = call?.column ?? call?.callSite?.column;
+        const offset = call?.callStart ?? call?.callSite?.start;
+        const scopeKey = Number.isInteger(column) || Number.isInteger(offset)
+            ? `${lineNum}:${column ?? ''}:${offset ?? ''}` : lineNum;
         if (this._opEnclosingFnCache) {
             byLine = this._opEnclosingFnCache.get(filePath);
             if (!byLine) this._opEnclosingFnCache.set(filePath, byLine = new Map());
-            const cached = byLine.get(lineNum);
+            const cached = byLine.get(scopeKey);
             if (cached !== undefined) {
                 return cached === null ? null : (returnSymbol ? cached : cached.name);
             }
         }
 
         let best = null;
+        let bestSourceScope = false;
         for (const symbol of fileEntry.symbols) {
             if (!NON_CALLABLE_TYPES.has(symbol.type) &&
                 symbol.startLine <= lineNum &&
                 symbol.endLine >= lineNum) {
-                if (!best || (symbol.endLine - symbol.startLine) < (best.endLine - best.startLine)) {
+                const sourceScope = call ? require('./callable-scope').containsCall(symbol, call) : null;
+                if (sourceScope === false) continue;
+                const size = candidate => sourceScope === true && candidate.sourceSpan
+                    ? candidate.sourceSpan.end - candidate.sourceSpan.start : candidate.endLine - candidate.startLine;
+                if (!best || sourceScope === true && !bestSourceScope ||
+                    (sourceScope === true) === bestSourceScope && size(symbol) < size(best)) {
                     best = symbol;
+                    bestSourceScope = sourceScope === true;
                 }
             }
         }
 
-        if (byLine) byLine.set(lineNum, best);
+        if (byLine) byLine.set(scopeKey, best);
         return best ? (returnSymbol ? best : best.name) : null;
     }
 

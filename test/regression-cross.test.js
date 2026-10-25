@@ -18,6 +18,1621 @@ const { execute } = require('../core/execute');
 const { computeReachability } = require('../core/entrypoints');
 const { tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR, runCli, runInteractive } = require('./helpers');
 
+describe('fix #417: nominal interface field calls do not select static class methods', () => {
+    const cases = [
+        ['N.java', 'interface Contract {void pick();} class Target {static void pick(){}static void pick(Object value){}}class Use {Contract value;void build(){value.pick();}}'],
+        ['N.cs', 'interface Contract {void pick();} class Target {public static void pick(){}public static void pick(object value){}}class Use {Contract value;void build(){value.pick();}}'],
+    ];
+    for (const [file, source] of cases) it(file, () => {
+        const dir = tmp({ [file]: source });
+        try {
+            const index = idx(dir), target = index.symbols.get('pick').find(def => def.className === 'Target' && !def.paramsStructured.length);
+            for (const collectAccount of [false, true]) {
+                const callers = index.findCallers('pick', { targetDefinitions: [target], collectAccount });
+                assert.equal(callers.length, 0);
+                assert.equal(callers.unverifiedEntries?.length || 0, 0);
+            }
+        } finally { rm(dir); }
+    });
+    it('an imported class namesake retains an inherited static method', () => {
+        const dir = tmp({
+            'a/Target.java': 'package a; public class Target {public static void pick(){}public static void pick(Object value){}}',
+            'a/Contract.java': 'package a; public interface Contract {void pick();}',
+            'dep/Contract.java': 'package dep; public class Contract extends a.Target {}',
+            'a/Use.java': 'package a; import dep.Contract; class Use {Contract value;void build(){value.pick();}}',
+        });
+        try {
+            const index = idx(dir), target = index.symbols.get('pick').find(def => def.className === 'Target' && !def.paramsStructured.length);
+            const callers = index.findCallers('pick', { targetDefinitions: [target], collectAccount: true });
+            assert.equal(callers.length + callers.unverifiedEntries.length, 1);
+        } finally { rm(dir); }
+    });
+    it('an instance override remains possible through its interface field', () => {
+        const dir = tmp({ 'N.java': 'interface Contract {void pick();}class Target implements Contract {public void pick(){}}class Use {Contract value;void build(){value.pick();}}' });
+        try {
+            const index = idx(dir), target = index.symbols.get('pick').find(def => def.className === 'Target');
+            const callers = index.findCallers('pick', { targetDefinitions: [target], collectAccount: true });
+            assert.equal(callers.length, 0);
+            assert.equal(callers.unverifiedEntries.length, 1);
+        } finally { rm(dir); }
+    });
+    it('a C# extension remains callable through an interface field', () => {
+        const dir = tmp({ 'N.cs': 'interface Contract {}static class Extensions {public static void pick(this Contract value){}}class Use {Contract value;void build(){value.pick();}}' });
+        try {
+            const index = idx(dir), target = index.symbols.get('pick').find(def => def.className === 'Extensions');
+            assert.equal(target.isExtensionMethod, true);
+            const callers = index.findCallers('pick', { targetDefinitions: [target], collectAccount: true });
+            assert.equal(callers.length + callers.unverifiedEntries.length, 1);
+        } finally { rm(dir); }
+    });
+    it('an anonymous class can shadow the outer interface field', () => {
+        const dir = tmp({ 'N.java': 'interface Contract {void pick();}class Target {static void pick(){}static void pick(Object value){}}class Use {Contract value;Object nested=new Object(){Target value;void build(){value.pick();}};}' });
+        try {
+            const index = idx(dir), target = index.symbols.get('pick').find(def => def.className === 'Target' && !def.paramsStructured.length);
+            const callers = index.findCallers('pick', { targetDefinitions: [target], collectAccount: true });
+            assert.equal(callers.length + callers.unverifiedEntries.length, 1);
+        } finally { rm(dir); }
+    });
+    it('an interface in another language cannot change the field type', () => {
+        const dir = tmp({
+            'N.java': 'class Target {static void pick(){}static void pick(Object value){}}class Contract extends Target {}class Use {Contract value;void build(){value.pick();}}',
+            'N.cs': 'interface Contract {void pick();}',
+        });
+        try {
+            const index = idx(dir), target = index.symbols.get('pick').find(def => def.className === 'Target' && !def.paramsStructured.length);
+            const callers = index.findCallers('pick', { targetDefinitions: [target], collectAccount: true });
+            assert.equal(callers.length + callers.unverifiedEntries.length, 1);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #417: same-line overload pins retain distinct declarations', () => {
+    const cases = [
+        ['N.java', 'class Target {static int pick(int value){return 1;}static int pick(String value){return 2;}static int build(){return pick(1);}}', 'int'],
+        ['N.cs', 'class Target {static int pick(int value){return 1;}static int pick(string value){return 2;}static int build(){return pick(1);}}', 'int'],
+        ['n.cpp', 'struct Target {static int pick(int value){return 1;}static int pick(double value){return 2;}static int build(){int value=1;return pick(value);}};', 'int'],
+    ];
+    for (const [file, source, expected] of cases) it(file, () => {
+        const dir = tmp({ [file]: source });
+        try {
+            const index = idx(dir);
+            for (const target of index.symbols.get('pick')) {
+                const callers = index.findCallers('pick', { targetDefinitions: [target], collectAccount: true });
+                assert.equal(callers.length, target.paramsStructured[0].type === expected ? 1 : 0);
+                assert.equal(callers.unverifiedEntries.length, 0);
+            }
+            const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+            assert.deepEqual(callees.filter(def => def.name === 'pick').map(def => def.paramsStructured[0].type), file === 'n.cpp' ? [] : [expected]);
+            if (file === 'n.cpp') assert.ok(callees.unverifiedCallees.some(site => site.name === 'pick'));
+            assert.equal(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #417: C++ construction retains its enclosing member aliases', () => {
+    const cases = [
+        ['inline member', 'struct A {A(int value){}}; struct Box {using Maker=A; A make(){return Maker(1);}};'],
+        ['out-of-line member', 'struct A {A(int value){}}; struct Box {using Maker=A; A make();}; A Box::make(){return Maker(1);}'],
+        ['nested out-of-line member', 'struct A {A(int value){}}; struct Outer {struct Box {using Maker=A; A make();};}; A Outer::Box::make(){return Maker(1);}'],
+        ['decorated typedef member', '#define API\nstruct A {A(int value){}}; struct Box {typedef A Maker; Maker make();}; API Box::Maker Box::make(){return Maker(1);}'],
+        ['unrelated member alias', 'struct Other {typedef int Maker;};\nstruct A {A(int value){}};\nstruct Box {typedef A Maker; Maker make();};\nBox::Maker Box::make(){return Maker(1);}'],
+    ];
+    for (const [label, source] of cases) it(`${label}: the alias selects its actual constructor`, () => {
+        const dir = tmp({ 'n.cpp': source });
+        try {
+            const index = idx(dir), target = index.symbols.get('A').find(def => def.type === 'constructor');
+            const callers = index.findCallers('A', { targetDefinitions: [target], collectAccount: true });
+            assert.equal(callers.length, 1);
+            assert.equal(callers.unverifiedEntries.length, 0);
+            const callees = index.findCallees(index.symbols.get('make').find(def => !def.isSignature), { collectAccount: true });
+            const constructors = callees.filter(def => def.type === 'constructor');
+            assert.deepEqual(constructors.map(def => def.bindingId), [target.bindingId]);
+            assert.equal(callees.calleeAccount.conserved, true);
+            const { validateConfirmation, declarationIdentity } = require('../core/provenance');
+            for (const edge of constructors) for (const site of edge.siteProvenance || []) assert.equal(
+                validateConfirmation(JSON.parse(JSON.stringify(site.provenance)), declarationIdentity(target)).verdict, 'establishes-target');
+        } finally { rm(dir); }
+    });
+    it('different owners on one line keep different alias bindings', () => {
+        const dir = tmp({ 'n.cpp': 'struct A {A(int value){}}; struct B {B(int value){}}; struct Left {using Maker=A; A makeLeft(){return Maker(1);}}; struct Right {using Maker=B; B makeRight(){return Maker(2);}};' });
+        try {
+            const index = idx(dir);
+            for (const [name, caller] of [['A', 'makeLeft'], ['B', 'makeRight']]) {
+                const target = index.symbols.get(name).find(def => def.type === 'constructor');
+                const cs = index.findCallers(name, { targetDefinitions: [target], collectAccount: true });
+                assert.deepEqual(cs.map(site => site.callerName), [caller]);
+                const callees = index.findCallees(index.symbols.get(caller)[0], { collectAccount: true });
+                assert.deepEqual(callees.filter(def => def.type === 'constructor').map(def => def.bindingId), [target.bindingId]);
+                assert.equal(callees.calleeAccount.conserved, true);
+            }
+        } finally { rm(dir); }
+    });
+    it('missing class extents cannot turn a member alias into a namespace alias', () => {
+        const dir = tmp({ 'n.cpp': 'struct A {A(int value){}}; struct B {B(int value){}}; using Maker=A; struct Box {using Maker=B; B make(){return Maker(1);}};' });
+        try {
+            const index = idx(dir);
+            for (const definition of index.symbols.get('Box')) delete definition.sourceSpan;
+            const callees = index.findCallees(index.symbols.get('make')[0], { collectAccount: true });
+            assert.equal(callees.filter(def => def.type === 'constructor').length, 0);
+            assert.ok(callees.unverifiedCallees.some(site => site.reason === 'construction-type-unresolved'));
+            assert.equal(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #417: braced construction retains the list overload phase', () => {
+    for (const [label, statement] of [
+        ['direct declaration', 'Box value{1,2};'],
+        ['copy declaration', 'Box value={1,2};'],
+        ['temporary', 'Box{1,2};'],
+        ['alias temporary', 'Alias{1,2};'],
+    ]) it(`C++ ${label}: list construction remains a visible dependency`, () => {
+        const dir = tmp({ 'n.cpp': '#include <initializer_list>\n' +
+            'struct Box {Box(std::initializer_list<int> values){} Box(int a,int b){}};\nusing Alias=Box;\n' +
+            `void build(){${statement}}\n` });
+        try {
+            const index = idx(dir), callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+            assert.equal(callees.filter(def => def.type === 'constructor').length, 0);
+            assert.ok(callees.unverifiedCallees.some(def => def.reason === 'constructor-overload-ambiguous'));
+            for (const target of index.symbols.get('Box').filter(def => def.type === 'constructor')) {
+                const callers = index.findCallers('Box', { targetDefinitions: [target], collectAccount: true });
+                assert.equal(callers.length, 0);
+                assert.equal(callers.unverifiedEntries.length, 1);
+                assert.equal(callers.unverifiedEntries[0].reason, 'constructor-overload-ambiguous');
+            }
+            assert.equal(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+    it('a C compound literal does not acquire a C++ constructor call', () => {
+        const dir = tmp({ 'n.c': 'struct Box {int value;};\nstruct Box build(){return (struct Box){1};}\n' });
+        try {
+            const index = idx(dir), calls = index.getCachedCalls(path.join(dir, 'n.c'));
+            assert.ok(!calls.some(call => call.isConstructor || call.constructorSyntax === 'list'));
+            assert.equal(index.findCallees(index.symbols.get('build')[0], { collectAccount: true }).length, 0);
+        } finally { rm(dir); }
+    });
+    for (const argumentsText of ['{1,2}', '{}', '{1,2,3}', '(1,2)']) {
+        it(`C++ new Box${argumentsText}: element count cannot choose an ordinary overload`, () => {
+            const dir = tmp({ 'n.cpp': '#include <initializer_list>\n' +
+                'struct Box {Box(std::initializer_list<int> values){} Box(int a,int b){}};\n' +
+                `void build(){new Box${argumentsText};}\n` });
+            try {
+                const index = idx(dir), braced = argumentsText.startsWith('{');
+                const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+                const selected = callees.filter(def => def.type === 'constructor' && def.className === 'Box');
+                assert.equal(selected.length, braced ? 0 : 1);
+                if (!braced) assert.equal(selected[0].paramsStructured.length, 2);
+                else {
+                    assert.ok(callees.unverifiedCallees.some(def => def.reason === 'constructor-overload-ambiguous'));
+                    for (const target of index.symbols.get('Box').filter(def => def.type === 'constructor')) {
+                        const callers = index.findCallers('Box', { targetDefinitions: [target], collectAccount: true });
+                        assert.equal(callers.length, 0);
+                        assert.equal(callers.unverifiedEntries.length, 1);
+                        assert.equal(callers.unverifiedEntries[0].reason, 'constructor-overload-ambiguous');
+                    }
+                }
+                assert.equal(callees.calleeAccount.conserved, true);
+            } finally { rm(dir); }
+        });
+    }
+});
+
+describe('fix #417: C# generic interface arguments retain their types', () => {
+    const cases = [
+        ['comparable wrong element', 'System.IComparable<int>', 'object'],
+        ['comparable matching element', 'System.IComparable<string>', 'System.IComparable<string>'],
+        ['equatable wrong element', 'System.IEquatable<int>', 'object'],
+        ['equatable matching element', 'System.IEquatable<string>', 'System.IEquatable<string>'],
+        ['enumerable wrong element', 'System.Collections.Generic.IEnumerable<int>', 'object'],
+        ['enumerable matching element', 'System.Collections.Generic.IEnumerable<char>', 'System.Collections.Generic.IEnumerable<char>'],
+        ['contravariance keeps its direction', 'System.IComparable<object>', 'object'],
+        ['value elements do not acquire reference covariance', 'System.Collections.Generic.IEnumerable<object>', 'object'],
+        ['integer implements its own comparable', 'System.IComparable<int>', 'System.IComparable<int>', 'int', '1'],
+        ['integer does not widen inside comparable', 'System.IComparable<long>', 'object', 'int', '1'],
+        ['character implements its own equatable', 'System.IEquatable<char>', 'System.IEquatable<char>', 'char', "'x'"],
+        ['character does not widen inside equatable', 'System.IEquatable<int>', 'object', 'char', "'x'"],
+        ['boolean implements its own comparable', 'System.IComparable<bool>', 'System.IComparable<bool>', 'bool', 'true'],
+        ['integer is not enumerable', 'System.Collections.Generic.IEnumerable<int>', 'object', 'int', '1'],
+        ['double implements its own comparable', 'System.IComparable<double>', 'System.IComparable<double>', 'double', '1.0'],
+        ['long implements its own comparable', 'System.IComparable<long>', 'System.IComparable<long>', 'long', '1L'],
+    ];
+    for (const [label, formal, expected, actualType = 'string', literal = '"x"'] of cases) for (const typed of [false, true]) {
+        it(`${label}, ${typed ? 'typed value' : 'literal'}: uncertain generic identity stays in review`, () => {
+            const declaration = typed ? `${actualType} value` : '';
+            const argument = typed ? 'value' : literal;
+            const dir = tmp({ 'N.cs': `class Box {public Box(${formal} value){} public Box(object value){}}\nclass Target {public void accept(${formal} value){} public void accept(object value){}}\nclass Factory {public static Box build(${declaration}){return new Box(${argument});} public static void invoke(Target target${typed ? `, ${actualType} value` : ''}){target.accept(${argument});}}\n` });
+            try {
+                const index = idx(dir);
+                for (const [name, caller, constructor] of [['Box', 'build', true], ['accept', 'invoke', false]]) {
+                    const target = index.symbols.get(name).find(def => (constructor ? def.type === 'constructor' : true) && def.paramsStructured?.[0]?.type === expected);
+                    const callers = index.findCallers(name, { targetDefinitions: [target], collectAccount: true });
+                    assert.equal(callers.length, 0);
+                    assert.equal(callers.unverifiedEntries.length, 1);
+                    const callees = index.findCallees(index.symbols.get(caller)[0], { collectAccount: true });
+                    assert.equal(callees.filter(def => constructor ? def.type === 'constructor' && def.className === 'Box' : def.name === 'accept').length, 0);
+                    assert.ok(callees.unverifiedCallees.some(def => constructor ? def.name === 'Box' : def.name === 'accept'));
+                    assert.equal(callees.calleeAccount.conserved, true);
+                }
+            } finally { rm(dir); }
+        });
+    }
+});
+
+describe('fix #417: generic ancestry cannot stand in for a type-argument proof', () => {
+    for (const [file, formal, expected, source] of [
+        ['N.java', 'Comparable<Integer>', 'Object', 'import java.io.Closeable; class Item implements Comparable<String> {public int compareTo(String value){return 0;}} class Box implements Closeable {Box(Comparable<Integer> value){} Box(Object value){} public void close(){}} class Target implements Closeable {void accept(Comparable<Integer> value){} void accept(Object value){} public void close(){}} class Factory {static Box build(){return new Box(new Item());}static void invoke(Target target){target.accept(new Item());}}'],
+        ['N.cs', 'System.IComparable<int>', 'object', 'class Item:System.IComparable<string> {public int CompareTo(string value){return 0;}} class Box {public Box(System.IComparable<int> value){} public Box(object value){}} class Target {public void accept(System.IComparable<int> value){}public void accept(object value){}} class Factory {public static Box build(){return new Box(new Item());}public static void invoke(Target target){target.accept(new Item());}}'],
+    ]) it(`${file}: the interface name does not establish ${formal}`, () => {
+        const dir = tmp({ [file]: source + '\n' });
+        try {
+            const index = idx(dir), target = index.symbols.get('Box').find(def => def.type === 'constructor' && def.paramsStructured[0].type === expected);
+            const callers = index.findCallers('Box', { targetDefinitions: [target], collectAccount: true });
+            assert.equal(callers.length, 0);
+            assert.equal(callers.unverifiedEntries.length, 1);
+            const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+            assert.equal(callees.filter(def => def.type === 'constructor' && def.className === 'Box').length, 0);
+            assert.equal(callees.calleeAccount.conserved, true);
+            const method = index.symbols.get('accept').find(def => def.paramsStructured[0].type === expected);
+            const methodCallers = index.findCallers('accept', { targetDefinitions: [method], collectAccount: true });
+            assert.equal(methodCallers.length, 0);
+            assert.equal(methodCallers.unverifiedEntries.length, 1);
+            const methodCallees = index.findCallees(index.symbols.get('invoke')[0], { collectAccount: true });
+            assert.ok(!methodCallees.some(def => def.name === 'accept'));
+            assert.equal(methodCallees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+    it('a typed Class<?> does not prove Class<Integer>', () => {
+        const dir = tmp({ 'N.java': 'import java.io.Closeable; class Box implements Closeable {Box(Class<Integer> value){} Box(Object value){} public void close(){}} class Factory {static Box build(Class<?> value){return new Box(value);}}\n' });
+        try {
+            const index = idx(dir), target = index.symbols.get('Box').find(def => def.type === 'constructor' && def.paramsStructured[0].type === 'Object');
+            const callers = index.findCallers('Box', { targetDefinitions: [target], collectAccount: true });
+            assert.equal(callers.length, 0);
+            assert.equal(callers.unverifiedEntries.length, 1);
+            assert.ok(!index.findCallees(index.symbols.get('build')[0], { collectAccount: true })
+                .some(def => def.type === 'constructor' && def.className === 'Box'));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #417: constructor arguments require the producer overload return', () => {
+    for (const [file, language, method, factory, declaration] of [
+        ['N.java', 'java', 'make', 'ext.Source.create()', 'ext.Source.Helper'],
+        ['N.cs', 'csharp', 'Make', 'Ext.Source.Create()', 'Ext.Helper'],
+    ]) for (const binding of ['local', 'field', 'typed']) {
+        it(`${language} ${binding} producer: a value binding cannot borrow a type namesake`, () => {
+            const java = language === 'java';
+            const modifier = java ? '' : 'public ';
+            const initialization = binding === 'typed' ? 'Maker Maker=new Maker();'
+                : binding === 'local' ? `var Maker=${factory};` : '';
+            const field = binding === 'field' ? `static ${declaration} Maker=${factory};` : '';
+            const source = `class Product{} class ChildProduct ${java ? 'extends Product' : ':Product'}{}\n` +
+                `class Maker {${modifier}ChildProduct ${method}(){return new ChildProduct();}}\n` +
+                `class Box {${modifier}Box(ChildProduct value){} ${modifier}Box(Product value){}}\n` +
+                `class Factory {${field} ${modifier}static Box build(){${initialization}return new Box(Maker.${method}());}}\n`;
+            const dir = tmp({ [file]: source });
+            try {
+                const expected = binding === 'typed' ? 'ChildProduct' : 'Product';
+                const index = idx(dir), target = index.symbols.get('Box').find(def =>
+                    def.type === 'constructor' && def.paramsStructured[0].type === expected);
+                const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+                const constructors = callees.filter(def => def.type === 'constructor' && def.className === 'Box');
+                assert.deepEqual(constructors.map(def => def.paramsStructured[0].type), binding === 'typed' ? [expected] : []);
+                const callers = index.findCallers('Box', { targetDefinitions: [target], collectAccount: true });
+                assert.equal(callers.length, binding === 'typed' ? 1 : 0);
+                assert.equal(callers.length + callers.unverifiedEntries.length, 1);
+                assert.equal(callees.calleeAccount.conserved, true);
+            } finally { rm(dir); }
+        });
+    }
+    for (const [file, label, source, expected] of [
+        ['N.java', 'parameterized enclosing producer',
+            'class Product{} class ChildProduct extends Product{}\nclass Outer<T> {static ChildProduct make(){return new ChildProduct();} class Inner {static Product make(){return new Product();}}}\nclass Box {Box(ChildProduct value){} Box(Product value){}}\nclass Factory {static Box build(Outer<String>.Inner value){return new Box(value.make());}}\n', 'Product'],
+        ['N.cs', 'parameterized enclosing producer',
+            'class Product{} class ChildProduct:Product{}\nclass Outer<T> {public static ChildProduct Make(){return new ChildProduct();} public class Inner {public static Product Make(){return new Product();}}}\nclass Box {public Box(ChildProduct value){} public Box(Product value){}}\nclass Factory {public static Box build(){return new Box(Outer<int>.Inner.Make());}}\n', 'Product'],
+        ['N.java', 'parameterized enclosing return',
+            'class Outer<T> {class Inner{}}\nclass Box {Box(Outer<String> value){} Box(Object value){}}\nclass Factory {static Outer<String>.Inner make(){return new Outer<String>().new Inner();} static Box build(){return new Box(Factory.make());}}\n', 'Object'],
+        ['N.cs', 'parameterized enclosing return',
+            'class Outer<T> {public class Inner{}}\nclass Box {public Box(Outer<int> value){} public Box(object value){}}\nclass Factory {public static Outer<int>.Inner Make(){return new Outer<int>.Inner();} public static Box build(){return new Box(Factory.Make());}}\n', 'object'],
+        ['N.cs', 'generic owner arity',
+            'class Product{} class ChildProduct:Product{}\nclass Maker {public static ChildProduct Make(){return new ChildProduct();}}\nclass Maker<T> {public static Product Make(){return new Product();}}\nclass Box {public Box(ChildProduct value){} public Box(Product value){}}\nclass Factory {public static Box build(){return new Box(Maker<int>.Make());}}\n', 'Product'],
+    ]) it(`${file} ${label}: uncertainty preserves the selected constructor candidate`, () => {
+        const dir = tmp({ [file]: source });
+        try {
+            const index = idx(dir), target = index.symbols.get('Box').find(def =>
+                def.type === 'constructor' && def.paramsStructured[0].type === expected);
+            const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+            assert.equal(callees.filter(def => def.type === 'constructor' && def.className === 'Box').length, 0);
+            const callers = index.findCallers('Box', { targetDefinitions: [target], collectAccount: true });
+            assert.equal(callers.length, 0);
+            assert.equal(callers.unverifiedEntries.length, 1);
+            assert.equal(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+    for (const [language, files] of [
+        ['java', {
+            'p/Product.java': 'package p;public class Product{}\n',
+            'p/ChildProduct.java': 'package p;public class ChildProduct extends Product{}\n',
+            'p/Maker.java': 'package p;public class Maker {public static ChildProduct make(){return new ChildProduct();}}\n',
+            'N.java': 'import ext.Maker; import p.Product; import p.ChildProduct;\nclass Box {Box(ChildProduct value){} Box(Product value){}}\nclass Factory {static Box build(){return new Box(Maker.make());}}\n',
+        }],
+        ['csharp', { 'N.cs': 'using Maker=Q.ActualMaker;\nclass Product{} class ChildProduct:Product{}\nnamespace P {class Maker {public static ChildProduct Make(){return new ChildProduct();}}}\nnamespace Q {class ActualMaker {public static Product Make(){return new Product();}}}\nclass Box {public Box(ChildProduct value){} public Box(Product value){}}\nclass Factory {public static Box build(){return new Box(Maker.Make());}}\n' }],
+    ]) {
+        it(`${language}: an imported producer cannot borrow a project namesake's return`, () => {
+            const dir = tmp(files);
+            try {
+                const index = idx(dir), ctor = index.symbols.get('Box').find(def =>
+                    def.type === 'constructor' && def.paramsStructured[0].type === 'Product');
+                const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+                assert.ok(!callees.some(def => def.type === 'constructor' && def.className === 'Box' && def.paramsStructured[0].type === 'ChildProduct'));
+                const callers = index.findCallers('Box', { targetDefinitions: [ctor], collectAccount: true });
+                assert.equal(callers.length + callers.unverifiedEntries.length, 1);
+                assert.equal(callees.calleeAccount.conserved, true);
+            } finally { rm(dir); }
+        });
+    }
+    const cases = [
+        ['java', 'N.java', 'inherited interface fixed arity',
+            'class Product{} class ChildProduct extends Product{}\ninterface Contract {default Product make(){return new Product();}}\nclass Maker implements Contract {public ChildProduct make(String... values){return new ChildProduct();}}\nclass Box {Box(ChildProduct value){} Box(Product value){}}\nclass Factory {static Box build(){return new Box(new Maker().make());}}\n', 'Product'],
+        ['java', 'N.java', 'superclass before interface default',
+            'class Product{} class ChildProduct extends Product{}\ninterface Contract {default Product make(){return new Product();}}\nclass Grand {public ChildProduct make(){return new ChildProduct();}} class Parent extends Grand{}\nclass Maker extends Parent implements Contract {public ChildProduct make(String... values){return new ChildProduct();}}\nclass Box {Box(ChildProduct value){} Box(Product value){}}\nclass Factory {static Box build(){return new Box(new Maker().make());}}\n', 'ChildProduct'],
+        ['java', 'N.java', 'specific interface before redundant ancestor',
+            'class Product{} class ChildProduct extends Product{}\ninterface Contract {default Product make(){return new Product();}}\ninterface Specific extends Contract {default ChildProduct make(){return new ChildProduct();}} class Parent implements Specific{}\nclass Maker extends Parent implements Contract {public ChildProduct make(String... values){return new ChildProduct();}}\nclass Box {Box(ChildProduct value){} Box(Product value){}}\nclass Factory {static Box build(){return new Box(new Maker().make());}}\n', 'ChildProduct'],
+        ...['static', 'private'].map(modifier => ['java', 'N.java', `${modifier} interface member is not inherited`,
+            `class Product{} class ChildProduct extends Product{}\ninterface Contract {${modifier} Product make(){return new Product();}}\nclass Maker implements Contract {public ChildProduct make(String... values){return new ChildProduct();}}\nclass Box {Box(ChildProduct value){} Box(Product value){}}\nclass Factory {static Box build(){return new Box(new Maker().make());}}\n`, 'ChildProduct']),
+        ['java', 'N.java', 'unknown ancestor',
+            'class TypeName {static TypeName get(java.lang.reflect.Type value){return new TypeName();}}\nclass ClassName extends TypeName implements Contract {static ClassName get(Class<?> value){return new ClassName();}}\nclass Box {Box(ClassName value){} Box(TypeName value){}}\nclass Factory {static Box build(){return new Box(ClassName.get(Factory.class));}}\n', null],
+        ['java', 'N.java', 'inherited arity',
+            'class Product{} class ChildProduct extends Product{}\nclass BaseMaker {static Product make(){return new Product();}}\nclass Maker extends BaseMaker {static ChildProduct make(String value){return new ChildProduct();}}\nclass Box {Box(ChildProduct value){} Box(Product value){}}\nclass Factory {static Box build(){return new Box(Maker.make());}}\n', 'Product'],
+        ['csharp', 'N.cs', 'inherited arity',
+            'class Product{} class ChildProduct:Product{}\nclass BaseMaker {public static Product Make(){return new Product();}}\nclass Maker:BaseMaker {public static ChildProduct Make(string value){return new ChildProduct();}}\nclass Box {public Box(ChildProduct value){} public Box(Product value){}}\nclass Factory {public static Box build(){return new Box(Maker.Make());}}\n', 'Product'],
+        ['java', 'N.java', 'known argument shape',
+            'class TypeName {static TypeName get(java.lang.reflect.Type value){return new TypeName();}}\nclass ClassName extends TypeName {static ClassName get(Class<?> value){return new ClassName();}}\nclass Box {Box(ClassName value){} Box(TypeName value){}}\nclass Factory {static Box build(){return new Box(ClassName.get(Factory.class));}}\n', 'ClassName'],
+        ['java', 'N.java', 'generic return',
+            'class Target{} class T extends Target{}\nclass Box {Box(T value){} Box(Object value){}}\nclass Factory {static <T> T identity(T value){return value;} static Box build(){return new Box(Factory.identity("x"));}}\n', null],
+        ['csharp', 'N.cs', 'generic return',
+            'class Target{} class T:Target{}\nclass Box {public Box(T value){} public Box(object value){}}\nclass Factory {static T Identity<T>(T value){return value;} public static Box build(){return new Box(Factory.Identity("x"));}}\n', null],
+    ];
+    for (const [language, file, label, source, expected] of cases) {
+        it(`${language} ${label}: a return spelling cannot choose the wrong body`, () => {
+            const dir = tmp({ [file]: source });
+            try {
+                const index = idx(dir), ctors = index.symbols.get('Box').filter(def => def.type === 'constructor');
+                const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+                const selected = callees.filter(def => def.type === 'constructor' && def.className === 'Box');
+                assert.deepStrictEqual(selected.map(def => def.paramsStructured[0].type), expected ? [expected] : []);
+                for (const ctor of ctors) {
+                    const callers = index.findCallers('Box', { targetDefinitions: [ctor], collectAccount: true });
+                    if (expected) assert.equal(callers.length, ctor.paramsStructured[0].type === expected ? 1 : 0);
+                    else {
+                        assert.equal(callers.length, 0);
+                        assert.equal(callers.unverifiedEntries.length, 1);
+                    }
+                }
+                assert.equal(callees.calleeAccount.conserved, true);
+                const { declarationIdentity, validateConfirmation } = require('../core/provenance');
+                for (const edge of selected) for (const site of edge.siteProvenance) {
+                    assert.equal(validateConfirmation(site.provenance, declarationIdentity(edge)).verdict, 'establishes-target');
+                }
+            } finally { rm(dir); }
+        });
+    }
+});
+
+describe('fix #417: functional construction binds its type before constructor overloads', () => {
+    const code = 'namespace A {struct Value{};} namespace B {struct Value{};}\nstruct Box {\n Box(A::Value value){}\n Box(B::Value value){}\n};\nBox build(){return Box(A::Value{});}\n';
+    for (const [label, source] of [
+        ['separate declarations', code],
+        ['same-line declarations', 'namespace A {struct Value{};} namespace B {struct Value{};}\nstruct Box {Box(A::Value value){} Box(B::Value value){}};\nBox build(){return Box(A::Value{});}\n'],
+    ]) it(`C++ ${label}: constructor handles retain a site when argument identity cannot choose a body`, () => {
+        const dir = tmp({ 'n.cpp': source });
+        try {
+            const index = idx(dir);
+            for (const ctor of index.symbols.get('Box').filter(def => def.type === 'constructor')) {
+                const callers = index.findCallers('Box', { targetDefinitions: [ctor], collectAccount: true });
+                assert.equal(callers.length, 0);
+                assert.equal(callers.unverifiedEntries.length, 1);
+                assert.equal(callers.unverifiedEntries[0].reason, 'constructor-overload-ambiguous');
+            }
+            const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+            // The braced argument also constructs its proven aggregate type.
+            assert.deepEqual(callees.map(def => [def.name, def.namespace]), [['Value', 'A']]);
+            assert.ok(callees.unverifiedCallees.some(def => def.reason === 'constructor-overload-ambiguous'));
+        } finally { rm(dir); }
+    });
+    it('a changed constructor retains an old possible binding as a review item', () => {
+        const { execFileSync } = require('child_process');
+        const dir = tmp({ 'n.cpp': code });
+        const git = (...args) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd: dir, stdio: 'pipe' });
+        try {
+            git('init', '-q'); git('add', '.'); git('commit', '-qm', 'initial');
+            fs.writeFileSync(path.join(dir, 'n.cpp'), code.replace('A::Value value)', 'A::Value value,int required)'));
+            const result = execute(idx(dir), 'check', { name: 'n.cpp:3:Box' });
+            assert.ok(result.ok, result.error);
+            assert.ok(result.result.uncertain + result.result.unverifiedCount > 0, JSON.stringify(result.result));
+            assert.equal(result.result.valid, 0);
+        } finally { rm(dir); }
+    });
+    it('a function that hides a class name is not confirmed as its constructor', () => {
+        const dir = tmp({ 'n.cpp': 'struct Thing {Thing(int value){}};\nint Thing(int value){return value;}\nint build(){return Thing(1);}\n' });
+        try {
+            const index = idx(dir), callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+            assert.ok(!callees.some(def => def.type === 'constructor'));
+            assert.ok(callees.some(def => def.type === 'function' && def.name === 'Thing') ||
+                callees.unverifiedCallees.some(def => def.name === 'Thing'));
+            assert.equal(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #417: same-line constructor bodies remain separate callee declarations', () => {
+    for (const [file, source] of [
+        ['N.java', 'class Box {Box(){} Box(int value){}}\nclass Factory {static void build(){new Box();new Box(1);}}'],
+        ['N.cs', 'class Box {public Box(){} public Box(int value){}}\nclass Factory {static void build(){new Box();new Box(1);}}'],
+        ['n.cpp', 'struct Box {Box(){} Box(int value){}};\nvoid build(){Box();Box(1);}'],
+    ]) {
+        it(`${file}: each call retains the overload whose body it enters`, () => {
+            const dir = tmp({ [file]: source });
+            try {
+                const index = idx(dir), constructors = index.symbols.get('Box').filter(def => def.type === 'constructor');
+                const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+                assert.deepEqual(callees.map(def => [def.bindingId, def.callCount]),
+                    constructors.map(def => [def.bindingId, 1]));
+                for (const callee of callees) {
+                    assert.equal(callee.siteProvenance.length, 1);
+                    assert.equal(callee.siteProvenance[0].targetDef.bindingId, callee.bindingId);
+                }
+                assert.equal(callees.calleeAccount.conserved, true);
+                assert.equal(callees.calleeAccount.unverified, 0);
+            } finally { rm(dir); }
+        });
+    }
+});
+
+describe('fix #417: declaration extents isolate calls on shared source lines', () => {
+    const script = 'function alpha(){} function beta(){} function left(){alpha();} function right(){beta();}\n';
+    const fixtures = [
+        ['n.js', script], ['n.ts', script], ['n.tsx', script], ['n.html', `<script>${script}</script>`],
+        ['n.py', 'def alpha():pass\ndef beta():pass\ndef left():alpha()\ndef right():beta()\n'],
+        ['n.go', 'package p\nfunc alpha(){};func beta(){};func left(){alpha()};func right(){beta()}\n'],
+        ['n.rs', 'fn alpha(){} fn beta(){} fn left(){alpha();} fn right(){beta();}\n'],
+        ['N.java', 'class N {void alpha(){} void beta(){} void left(){alpha();} void right(){beta();}}\n'],
+        ['N.cs', 'class N {void alpha(){} void beta(){} void left(){alpha();} void right(){beta();}}\n'],
+        ['n.c', 'void alpha(){} void beta(){} void left(){alpha();} void right(){beta();}\n'],
+        ['n.cpp', 'void alpha(){} void beta(){} void left(){alpha();} void right(){beta();}\n'],
+    ];
+    for (const [file, code] of fixtures) {
+        it(`${file}: callers and callees keep the declaration that contains each site`, () => {
+            const dir = tmp({ [file]: code });
+            try {
+                const index = idx(dir);
+                for (const [owner, name] of [['left', 'alpha'], ['right', 'beta']]) {
+                    const definition = index.symbols.get(owner)[0];
+                    assert.ok(definition.sourceSpan);
+                    const callees = index.findCallees(definition, { collectAccount: true, includeMethods: true });
+                    assert.deepStrictEqual(callees.map(def => def.name), [name]);
+                    assert.equal(callees.calleeAccount.confirmed, 1);
+                    assert.equal(callees.calleeAccount.conserved, true);
+                    const target = index.symbols.get(name)[0];
+                    const callers = index.findCallers(name, { targetDefinitions: [target], collectAccount: true });
+                    assert.deepStrictEqual(callers.map(site => site.callerName), [owner]);
+                }
+            } finally { rm(dir); }
+        });
+    }
+    for (const [file, code, nested] of [
+        ['n.js', 'function alpha(){} function beta(){} const left=()=>alpha(),right=()=>beta();\n', false],
+        ['n.ts', 'function alpha(){} function beta(){} const left=()=>alpha(),right=()=>beta();\n', false],
+        ['n.js', 'function forwardRef(fn){return fn;} function alpha(){} function beta(){} const left=forwardRef(()=>alpha()),right=()=>beta();\n', false],
+        ['n.js', 'function alpha(){} function beta(){} const obj={};obj.left=()=>alpha();function right(){beta();}\n', false],
+        ['n.js', 'function alpha(){} function beta(){} function left(){function nested(){alpha();} nested();} function right(){beta();}\n', true],
+        ['n.cs', 'class N {void alpha(){} void beta(){} void left(){void nested(){alpha();} nested();} void right(){beta();}}\n', true],
+    ]) {
+        it(`${file}: ${nested ? 'nested closures retain their parent dependency' : 'sibling arrow bindings keep separate bodies'}`, () => {
+            const dir = tmp({ [file]: code });
+            try {
+                const index = idx(dir);
+                const left = index.findCallees(index.symbols.get('left')[0], { collectAccount: true });
+                assert.deepStrictEqual(left.map(def => def.name).sort(), nested ? ['alpha', 'nested'] : ['alpha']);
+                assert.deepStrictEqual(index.findCallees(index.symbols.get('right')[0], { collectAccount: true }).map(def => def.name), ['beta']);
+            } finally { rm(dir); }
+        });
+    }
+    for (const [file, code] of [
+        ['N.java', 'class N {void alpha(){} void beta(){} void left(){alpha(); class Inner {void inside(){beta();}}}}\n'],
+        ['n.js', 'function alpha(){} function beta(){} function left(){alpha(); class Inner {inside(){beta();}}}\n'],
+        ['n.cpp', 'void alpha(){} void beta(){} void left(){alpha(); struct Inner {void inside(){beta();}};}\n'],
+    ]) {
+        it(`${file}: a nested class method is independently callable on the same line`, () => {
+            const dir = tmp({ [file]: code });
+            try {
+                const index = idx(dir);
+                assert.deepStrictEqual(index.findCallees(index.symbols.get('left')[0], { collectAccount: true }).map(def => def.name), ['alpha']);
+                assert.deepStrictEqual(index.findCallees(index.symbols.get('inside')[0], { collectAccount: true }).map(def => def.name), ['beta']);
+            } finally { rm(dir); }
+        });
+    }
+});
+
+describe('fix #417: constructor type parameters preserve lexical identity', () => {
+    for (const [file, code, ctorName, shadowName, controlName] of [
+        ['N.cs', 'class Target {public Target(){}}\nclass Factory {static Target shadow<Target>() where Target:new(){return new Target();} static Target control(){return new Target();}}\n', 'Target', 'shadow', 'control'],
+        ['n.cpp', 'struct Target {Target(){}};\ntemplate<class Target> Target* shadow(){return new Target();} Target* control(){return new Target();}\n', 'Target', 'shadow', 'control'],
+        ['n.cpp', 'struct Target {Target(){}};\ntemplate<class Target> struct Factory {static Target* shadow(){return new Target();}};\nTarget* control(){return new Target();}\n', 'Target', 'shadow', 'control'],
+        ['N.cs', 'class Target {public Target(){}}\nclass Factory<Target> where Target:new(){public static Target shadow(){return new Target();}}\nclass Other {static Target control(){return new Target();}}\n', 'Target', 'shadow', 'control'],
+    ]) {
+        it(`${file}: ${code.includes('struct Factory') || code.includes('class Factory<Target>') ? 'class' : 'function'} type parameters stay unverified beside a concrete construction`, () => {
+            const dir = tmp({ [file]: code });
+            try {
+                const index = idx(dir), constructor = index.symbols.get(ctorName).find(def => def.type === 'constructor');
+                const callers = index.findCallers(ctorName, { targetDefinitions: [constructor], collectAccount: true });
+                assert.deepStrictEqual(callers.map(site => site.callerName), [controlName]);
+                assert.equal(callers.unverifiedEntries.length, 1);
+                const shadow = index.findCallees(index.symbols.get(shadowName)[0], { collectAccount: true, includeMethods: true });
+                const uncertain = shadow.unverifiedCallees.find(def => def.name === ctorName);
+                assert.ok(uncertain);
+                assert.ok(!shadow.some(def => def.type === 'constructor'));
+                const column = uncertain.siteProvenance[0].column;
+                assert.ok(!shadow.some(def => def.type === 'constructor' &&
+                    def.siteProvenance.some(site => site.column === column)));
+                assert.equal(shadow.calleeAccount.conserved, true);
+                const control = index.findCallees(index.symbols.get(controlName)[0], { collectAccount: true, includeMethods: true });
+                const edge = control.find(def => def.type === 'constructor');
+                assert.ok(edge, JSON.stringify(control.unverifiedCallees));
+                const proof = JSON.parse(JSON.stringify(edge.siteProvenance[0].provenance));
+                const { validateConfirmation, declarationIdentity } = require('../core/provenance');
+                assert.equal(validateConfirmation(proof, declarationIdentity(constructor)).verdict, 'establishes-target');
+                delete proof.facts.constructorCall.nameScope;
+                assert.notEqual(validateConfirmation(proof, declarationIdentity(constructor)).verdict, 'establishes-target');
+            } finally { rm(dir); }
+        });
+    }
+    for (const file of ['n.ts', 'n.tsx']) {
+        it(`${file}: a type parameter keeps the separate class value binding`, () => {
+            const dir = tmp({ [file]: 'class Target {constructor(){}}\nfunction build<Target>() {return new Target();}\n' });
+            try {
+                const index = idx(dir), constructor = index.symbols.get('constructor')[0];
+                assert.equal(index.findCallers('constructor', { targetDefinitions: [constructor], collectAccount: true }).length, 1);
+                assert.ok(index.findCallees(index.symbols.get('build')[0], { collectAccount: true }).some(def => def.type === 'constructor'));
+            } finally { rm(dir); }
+        });
+    }
+    for (const [file, code] of [
+        ['N.cs', 'class Target {}\nclass Factory {static Target build<Target>() where Target:new(){return new Target();}}\n'],
+        ['n.cpp', 'struct Target {};\ntemplate<class Target> Target* build(){return new Target();}\n'],
+    ]) {
+        it(`${file}: an implicit default constructor does not turn a type parameter into the project class`, () => {
+            const dir = tmp({ [file]: code });
+            try {
+                const index = idx(dir), cls = index.symbols.get('Target').find(def => ['class', 'struct'].includes(def.type));
+                const callers = index.findCallers('Target', { targetDefinitions: [cls], collectAccount: true });
+                assert.equal(callers.length, 0);
+                assert.equal(callers.unverifiedEntries.length, 1);
+                assert.equal(callers.unverifiedEntries[0].reason, 'constructor-type-parameter');
+                const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+                assert.equal(callees.length, 0);
+                assert.ok(callees.unverifiedCallees.some(def => def.reason === 'constructor-type-parameter'));
+                assert.equal(callees.calleeAccount.conserved, true);
+            } finally { rm(dir); }
+        });
+    }
+});
+
+describe('fix #417: constructor bodies retain imported value receivers', () => {
+    for (const [label, files, methodName] of [
+        ['Java', {
+            'p/SoftPool.java': 'package p;public class SoftPool {public int borrow(){return 1;}}\n',
+            'p/Holder.java': 'package p;public class Holder {public static final SoftPool Pool=new SoftPool();}\n',
+            'p/Use.java': 'package p;import static p.Holder.Pool;\npublic class Use {\n public Use(){Pool.borrow();}\n public int work(){return Pool.borrow();}\n}\n',
+        }, 'borrow'],
+        ['C#', { 'N.cs': 'using static Holder;\nclass SoftPool {public int Borrow(){return 1;}}\nclass Holder {public static SoftPool Pool=new SoftPool();}\nclass Use {\n public Use(){Pool.Borrow();}\n public int work(){return Pool.Borrow();}\n}\n' }, 'Borrow'],
+    ]) {
+        it(`${label}: a possible value binding is not an external type name`, () => {
+            const dir = tmp(files);
+            try {
+                const index = idx(dir), constructor = index.symbols.get('Use').find(def => def.type === 'constructor');
+                assert.ok(constructor);
+                for (const definition of [constructor, index.symbols.get('work')[0]]) {
+                    const callees = index.findCallees(definition, { collectAccount: true, includeMethods: true });
+                    assert.ok(callees.unverifiedCallees.some(edge => edge.name === methodName &&
+                        edge.reason === 'value-receiver-unresolved'), JSON.stringify(callees.calleeAccount));
+                    assert.ok(!callees.calleeAccount.external.sample.some(site => site.name === methodName));
+                    assert.equal(callees.calleeAccount.conserved, true);
+                }
+            } finally { rm(dir); }
+        });
+        it(`${label}: a typed local value keeps its existing receiver proof`, () => {
+            const changed = Object.fromEntries(Object.entries(files).map(([file, code]) =>
+                [file, code.replace('Use(){Pool.', 'Use(SoftPool Pool){Pool.')]));
+            const dir = tmp(changed);
+            try {
+                const index = idx(dir), constructor = index.symbols.get('Use').find(def => def.type === 'constructor');
+                const callees = index.findCallees(constructor, { collectAccount: true, includeMethods: true });
+                assert.ok(callees.some(edge => edge.name === methodName));
+                assert.equal(callees.calleeAccount.confirmed, 1);
+                assert.ok(!callees.unverifiedCallees.some(edge => edge.reason === 'value-receiver-unresolved'));
+            } finally { rm(dir); }
+        });
+    }
+});
+
+describe('fix #417: constructor alias candidates respect call-site scope', () => {
+    const declaration = 'struct Widget {Widget(){}};\n';
+    const ordinary = 'int info(int value){return value;}\nint build(){return info(1);}\n';
+    const fixtures = [
+        ['block.cpp', { 'n.cpp': declaration + 'void unrelated(){using info=Widget;}\n' + ordinary }, 'n.cpp'],
+        ['namespace.cpp', { 'n.cpp': declaration + 'namespace Hidden {using info=Widget;}\n' + ordinary }, 'n.cpp'],
+        ['member.cpp', { 'n.cpp': declaration + 'struct Hidden {using info=Widget;};\n' + ordinary }, 'n.cpp'],
+        ['foreign.cpp', { 'a.cpp': declaration + 'using info=Widget;\n', 'n.cpp': ordinary }, 'n.cpp'],
+        ['foreign.py', { 'a.py': 'class Widget:\n def __init__(self):pass\ninfo=Widget\n',
+            'n.py': 'def info(value):return value\ndef build():return info(1)\n' }, 'n.py'],
+        ['import.py', { 'a.py': 'class Widget:\n def __init__(self):pass\ninfo=Widget\n',
+            'helper.py': 'def info(value):return value\n',
+            'n.py': 'from helper import info\ndef build():return info(1)\n' }, 'helper.py'],
+        ['renamed-import.py', { 'a.py': 'class Widget:\n def __init__(self):pass\ninfo=Widget\n',
+            'helper.py': 'def info(value):return value\n',
+            'n.py': 'from helper import info as callInfo\ndef build():return callInfo(1)\n' }, 'helper.py'],
+        ['module.py', { 'a.py': 'class Widget:\n def __init__(self):pass\ninfo=Widget\n',
+            'helper.py': 'def info(value):return value\n',
+            'n.py': 'import helper\ndef build():return helper.info(1)\n' }, 'helper.py'],
+    ];
+    for (const [label, files, ownerFile] of fixtures) {
+        it(`${label}: an unavailable type alias does not hide an ordinary function`, () => {
+            const dir = tmp(files);
+            try {
+                const index = idx(dir), build = index.symbols.get('build')[0];
+                for (const collectAccount of [false, true]) {
+                    const callees = index.findCallees(build, { collectAccount, includeMethods: true });
+                    assert.ok(callees.some(def => def.name === 'info' && def.type === 'function' &&
+                        def.relativePath === ownerFile), JSON.stringify(callees.unverifiedCallees));
+                    if (collectAccount) {
+                        assert.strictEqual(callees.calleeAccount.confirmed, 1);
+                        assert.strictEqual(callees.calleeAccount.unverified, 0);
+                        assert.strictEqual(callees.calleeAccount.conserved, true);
+                    }
+                }
+            } finally { rm(dir); }
+        });
+    }
+});
+
+describe('fix #417: constructions reach the declared constructor', () => {
+    const script = 'function helper() {}\nclass Node {\n constructor(v) { helper(); }\n}\nfunction build() { return new Node(1); }\n';
+    const fixtures = [
+        { file: 'node.js', code: script, name: 'constructor', ctorLine: 3, callLine: 5, helperLine: 3 },
+        { file: 'node.ts', code: script.replace('constructor(v)', 'constructor(v: number)'), name: 'constructor', ctorLine: 3, callLine: 5, helperLine: 3 },
+        { file: 'node.tsx', code: script.replace('constructor(v)', 'constructor(v: number)'), name: 'constructor', ctorLine: 3, callLine: 5, helperLine: 3 },
+        { file: 'node.html', code: `<script>\n${script}</script>`, name: 'constructor', ctorLine: 4, callLine: 6, helperLine: 4 },
+        { file: 'node.py', code: 'def helper(): pass\nclass Node:\n def __init__(self, v):\n  helper()\ndef build(): return Node(1)\n', name: '__init__', ctorLine: 3, callLine: 5, helperLine: 4 },
+        { file: 'Node.java', code: 'class Node {\n Node(int v) { helper(); }\n static void helper() {}\n static Node build() { return new Node(1); }\n}\n', name: 'Node', ctorLine: 2, callLine: 4, helperLine: 2 },
+        { file: 'Node.cs', code: 'class Node {\n public Node(int v) { helper(); }\n static void helper() {}\n static Node build() { return new Node(1); }\n}\n', name: 'Node', ctorLine: 2, callLine: 4, helperLine: 2 },
+        { file: 'node.cpp', code: 'struct Node {\n explicit Node(int v) { helper(); }\n static void helper() {}\n};\nNode build() { return Node(1); }\n', name: 'Node', ctorLine: 2, callLine: 5, helperLine: 2 },
+    ];
+    for (const fixture of fixtures) {
+        describe(fixture.file, () => {
+            let dir, index;
+            before(() => { dir = tmp({ [fixture.file]: fixture.code }); index = idx(dir); });
+            after(() => rm(dir));
+            const constructor = () => (index.symbols.get(fixture.name) || []).find(d =>
+                d.type === 'constructor' && d.className === 'Node' && d.startLine === fixture.ctorLine);
+            const callers = def => index.findCallers(def.name, {
+                targetDefinitions: [def], includeMethods: true, collectAccount: true,
+            }).filter(c => c.tier !== 'unverified');
+            it('a construction is a caller of both the class and its actual constructor', () => {
+                const ctor = constructor();
+                assert.ok(ctor, 'the constructor declaration is indexed');
+                const owner = (index.symbols.get('Node') || []).find(d => ['class', 'struct'].includes(d.type));
+                assert.ok(callers(owner).some(c => c.line === fixture.callLine));
+                const sites = callers(ctor);
+                assert.deepStrictEqual(sites.map(c => c.line), [fixture.callLine]);
+                assert.ok(sites[0].provenance?.facts?.targets.some(t =>
+                    t.name === ctor.name && t.startLine === ctor.startLine && t.className === 'Node'));
+            });
+            it('the construction callee and the caller inside its body retain constructor identity', () => {
+                const ctor = constructor();
+                assert.ok(ctor);
+                const build = index.symbols.get('build')[0];
+                const callees = index.findCallees(build, { collectAccount: true });
+                assert.ok(callees.some(c => c.type === 'constructor' && c.className === 'Node' &&
+                    c.startLine === fixture.ctorLine), 'trace can enter the constructor body');
+                const helper = index.symbols.get('helper')[0];
+                assert.ok(callers(helper).some(c => c.line === fixture.helperLine &&
+                    c.callerName === ctor.name && c.callerStartLine === ctor.startLine));
+            });
+            it('signature checking sees the construction arguments through the constructor handle', () => {
+                const ctor = constructor();
+                assert.ok(ctor);
+                const answer = execute(index, 'verify', {
+                    name: `${fixture.file}:${fixture.ctorLine}:${fixture.name}`,
+                });
+                assert.strictEqual(answer.ok, true, answer.error);
+                assert.strictEqual(answer.result.valid, 1);
+                assert.strictEqual(answer.result.mismatches, 0);
+            });
+            it('a required constructor parameter reports the existing construction as a mismatch', () => {
+                const changed = fixture.code.replace('constructor(v)', 'constructor(v, w)')
+                    .replace('constructor(v: number)', 'constructor(v: number, w: number)')
+                    .replace('__init__(self, v)', '__init__(self, v, w)')
+                    .replace('Node(int v)', 'Node(int v, int w)');
+                assert.notStrictEqual(changed, fixture.code);
+                const changedDir = tmp({ [fixture.file]: changed });
+                try {
+                    const changedIndex = idx(changedDir);
+                    const answer = execute(changedIndex, 'verify', {
+                        name: `${fixture.file}:${fixture.ctorLine}:${fixture.name}`,
+                    });
+                    assert.strictEqual(answer.ok, true, answer.error);
+                    assert.strictEqual(answer.result.mismatches, 1);
+                    assert.strictEqual(answer.result.valid, 0);
+                } finally { rm(changedDir); }
+            });
+            it('check binds construction arguments to the constructor saved at the base revision', () => {
+                const { execFileSync } = require('child_process');
+                const changedDir = tmp({ [fixture.file]: fixture.code });
+                const git = (...args) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args],
+                    { cwd: changedDir, stdio: 'pipe' });
+                try {
+                    git('init', '-q');
+                    git('add', '.');
+                    git('commit', '-qm', 'initial');
+                    fs.writeFileSync(path.join(changedDir, fixture.file), fixture.code
+                        .replace('constructor(v)', 'constructor(v, w)')
+                        .replace('constructor(v: number)', 'constructor(v: number, w: number)')
+                        .replace('__init__(self, v)', '__init__(self, v, w)')
+                        .replace('Node(int v)', 'Node(int v, int w)'));
+                    const changedIndex = idx(changedDir);
+                    const target = execute(changedIndex, 'check', {
+                        name: `${fixture.file}:${fixture.ctorLine}:${fixture.name}`,
+                    });
+                    assert.ok(target.ok, target.error);
+                    assert.strictEqual(target.result.mismatches, 1);
+                    assert.ok(target.result.changedSince);
+                    const diff = execute(changedIndex, 'check', {});
+                    assert.ok(diff.ok, diff.error);
+                    assert.strictEqual(diff.result.trust.status, 'BLOCKED');
+                    assert.ok(diff.result.trust.signatureMismatches >= 1);
+                } finally { rm(changedDir); }
+            });
+        });
+    }
+});
+
+describe('fix #417: inherited construction selects the initializer body', () => {
+    for (const [file, code, name] of [
+        ['alias-parent.js', 'class Base {constructor(v){}}\nconst Alias=Base;\nclass Child extends Alias {}\nfunction build(){return new Child(1);}\n', 'constructor'],
+        ['alias-parent.py', 'class Base:\n def __init__(self,v):pass\nAlias=Base\nclass Child(Alias):pass\ndef build():return Child(1)\n', '__init__'],
+    ]) {
+        it(`${file}: the inherited base binding follows a stable alias`, () => {
+            const dir = tmp({ [file]: code });
+            try {
+                const index = idx(dir), ctor = index.symbols.get(name).find(def => def.className === 'Base');
+                assert.strictEqual(index.findCallers(name, { targetDefinitions: [ctor], collectAccount: true }).length, 1);
+                assert.ok(index.findCallees(index.symbols.get('build')[0], { collectAccount: true }).some(def =>
+                    def.name === name && def.className === 'Base'));
+            } finally { rm(dir); }
+        });
+    }
+    for (const [file, code, name] of [
+        ['direct-rebind.js', 'class Base {constructor(v){}}\nBase=class Other {};\nfunction build(){return new Base(1);}\n', 'constructor'],
+        ['decorated-class.ts', 'function wrap(target:any){return class Other {}; }\n@wrap\nclass Base {constructor(v:number){}}\nfunction build(){return new Base(1);}\n', 'constructor'],
+        ['shadow-parent.js', 'class Base {constructor(v){}}\nfunction factory(Base){\n class Child extends Base {}\n function build(){return new Child(1);}\n return build;\n}\n', 'constructor'],
+        ['rebind-parent.js', 'class Base {constructor(v){}}\nBase=class Other {};\nclass Child extends Base {}\nfunction build(){return new Child(1);}\n', 'constructor'],
+        ['decorated-parent.py', 'def wrap(fn):return lambda *args:None\nclass Base:\n @wrap\n def __init__(self,v):pass\nclass Child(Base):pass\ndef build():return Child(1)\n', '__init__'],
+        ['value-parent.py', 'def initializer(self,v):pass\nclass Base:\n def __init__(self,v):pass\nclass Child(Base):\n __init__=initializer\ndef build():return Child(1)\n', '__init__'],
+        ['own-parent.py', 'class Base:\n def __init__(self,v):pass\nclass Child(Base):\n def __init__(self,v):pass\ndef build():return Child(1)\n', '__init__'],
+    ]) {
+        it(`${file}: a replaced or unproven initializer cannot borrow an ancestor body`, () => {
+            const dir = tmp({ [file]: code });
+            try {
+                const index = idx(dir), ctor = index.symbols.get(name).find(def => def.className === 'Base');
+                assert.strictEqual(index.findCallers(name, { targetDefinitions: [ctor], collectAccount: true }).length, 0);
+                assert.ok(!index.findCallees(index.symbols.get('build')[0], { collectAccount: true }).some(def =>
+                    def.name === name && def.className === 'Base'));
+            } finally { rm(dir); }
+        });
+    }
+    const script = 'class Base {\n constructor(v){}\n}\nclass Child extends Base {}\nfunction build(){return new Child(1);}\n';
+    for (const [file, code, name, line] of [
+        ['inherit.js', script, 'constructor', 2],
+        ['inherit.ts', script.replace('constructor(v)', 'constructor(v:number)'), 'constructor', 2],
+        ['inherit.tsx', script.replace('constructor(v)', 'constructor(v:number)'), 'constructor', 2],
+        ['inherit.html', `<script>\n${script}</script>\n`, 'constructor', 3],
+        ['inherit.py', 'class Base:\n def __init__(self,v): pass\nclass Child(Base):pass\ndef build():return Child(1)\n', '__init__', 2],
+    ]) {
+        it(`${file}: the inherited constructor receives the constructed child's arguments`, () => {
+            const dir = tmp({ [file]: code });
+            try {
+                const index = idx(dir), ctor = index.symbols.get(name).find(def => def.className === 'Base');
+                const callers = index.findCallers(name, { targetDefinitions: [ctor], collectAccount: true });
+                assert.strictEqual(callers.length, 1);
+                const { validateConfirmation, declarationIdentity } = require('../core/provenance');
+                const proof = JSON.parse(JSON.stringify(callers[0].provenance));
+                const nativeRead = fs.readFileSync;
+                try {
+                    fs.readFileSync = () => { throw new Error('live read during inheritance replay'); };
+                    assert.strictEqual(validateConfirmation(proof, declarationIdentity(ctor)).verdict, 'establishes-target');
+                } finally { fs.readFileSync = nativeRead; }
+                proof.facts.constructorCall.hierarchy.reads = {};
+                assert.notStrictEqual(validateConfirmation(proof, declarationIdentity(ctor)).verdict, 'establishes-target');
+                const context = execute(index, 'context', { name: `${file}:${line}:${name}` });
+                assert.ok(context.ok, context.error);
+                assert.strictEqual(context.result.meta.account.conserved, true);
+                assert.strictEqual(index.verify(name, { file, line }).valid, 1);
+                assert.ok(index.findCallees(index.symbols.get('build')[0], { collectAccount: true }).some(def =>
+                    def.type === 'constructor' && def.className === 'Base'));
+                const changed = code.replace('constructor(v)', 'constructor(v,w)')
+                    .replace('constructor(v:number)', 'constructor(v:number,w:number)')
+                    .replace('__init__(self,v)', '__init__(self,v,w)');
+                fs.writeFileSync(path.join(dir, file), changed);
+                assert.strictEqual(idx(dir).verify(name, { file, line }).mismatches, 1);
+            } finally { rm(dir); }
+        });
+    }
+    it('Python: C3 method order selects a sibling before its shared ancestor', () => {
+        const dir = tmp({ 'mro.py': 'class Root:\n def __init__(self,v): pass\nclass Left(Root):pass\nclass Right(Root):\n def __init__(self,v): pass\nclass Child(Left,Right):pass\ndef build():return Child(1)\n' });
+        try {
+            const index = idx(dir), defs = index.symbols.get('__init__');
+            const selected = defs.find(def => def.className === 'Right');
+            assert.strictEqual(index.findCallers('__init__', { targetDefinitions: [selected], collectAccount: true }).length, 1);
+            const root = defs.find(def => def.className === 'Root');
+            assert.strictEqual(index.findCallers('__init__', { targetDefinitions: [root], collectAccount: true }).length, 0);
+            const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+            assert.ok(callees.some(def => def.className === 'Right' && def.name === '__init__'));
+            assert.ok(!callees.some(def => def.className === 'Root' && def.name === '__init__'));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #417: constructor methods have instance identity', () => {
+    for (const extension of ['js', 'html']) {
+        const wrap = code => extension === 'html' ? `<script>\n${code}</script>` : code;
+        const offset = extension === 'html' ? 1 : 0;
+        it(`${extension}: a static constructor-named method is called through its class`, () => {
+            const code = wrap('function marker(v){return v;}\nclass Widget {\n static constructor(v){return marker(v);}\n}\nfunction build(){return new Widget(1);}\nfunction useStatic(){return Widget.constructor(2);}\n');
+            const dir = tmp({ [`n.${extension}`]: code });
+            try {
+                const index = idx(dir), method = index.symbols.get('constructor').find(def => def.className === 'Widget');
+                assert.strictEqual(method.type, 'static');
+                const callers = index.findCallers('constructor', { targetDefinitions: [method], collectAccount: true });
+                assert.deepStrictEqual(callers.map(site => site.line), [6 + offset]);
+                const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+                assert.ok(!callees.some(def => def.name === 'constructor' && def.className === 'Widget'));
+                assert.ok(callees.some(def => def.name === 'Widget' && def.type === 'class'));
+            } finally { rm(dir); }
+        });
+        for (const member of ['static constructor(v){}', '["constructor"](v){}', '"construc\\tor"(v){}']) {
+            it(`${extension}: ${member} leaves the default derived constructor in place`, () => {
+                const dir = tmp({ [`n.${extension}`]: wrap('class Base {constructor(v){}}\n' +
+                    `class Child extends Base {${member}}\nfunction build(){return new Child(1);}\n`) });
+                try {
+                    const index = idx(dir), callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+                    assert.deepStrictEqual(callees.filter(def => def.type === 'constructor').map(def => def.className), ['Base']);
+                } finally { rm(dir); }
+            });
+        }
+        for (const spelling of ['"constructor"', "'constructor'", '"\\u0063onstructor"', 'c\\u006fnstructor',
+            '"\\x63onstructor"', '"\\u{63}onstructor"']) {
+            it(`${extension}: ${spelling} owns the instance constructor body`, () => {
+                const source = 'function childBody(){}\nclass Base {constructor(v){}}\nclass Child extends Base {\n' +
+                    ` ${spelling}(v){super(v);childBody();}\n` +
+                    '}\nfunction build(){return new Child(1);}\n';
+                const dir = tmp({ [`n.${extension}`]: wrap(source) });
+                try {
+                    const index = idx(dir), ctor = index.symbols.get('constructor').find(def => def.className === 'Child');
+                    assert.ok(ctor);
+                    assert.strictEqual(ctor.type, 'constructor');
+                    const callers = index.findCallers('constructor', { targetDefinitions: [ctor], collectAccount: true });
+                    assert.deepStrictEqual(callers.map(site => site.line), [6 + offset]);
+                    const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+                    assert.deepStrictEqual(callees.filter(def => def.type === 'constructor').map(def => def.className), ['Child']);
+                    const parent = index.symbols.get('constructor').find(def => def.className === 'Base');
+                    const parentCalls = index.findCallers('constructor', { targetDefinitions: [parent], collectAccount: true });
+                    assert.deepStrictEqual(parentCalls.map(site => site.line), [4 + offset]);
+                    const bodyCalls = index.findCallers('childBody', { collectAccount: true });
+                    assert.strictEqual(bodyCalls[0].callerName, 'constructor');
+                    assert.strictEqual(index.verify('constructor', { file: `n.${extension}`, line: 4 + offset }).valid, 1);
+                    const rename = execute(index, 'plan', { name: `n.${extension}:${4 + offset}:constructor`, renameTo: 'RenamedChild' });
+                    const classRename = execute(index, 'plan', { name: `n.${extension}:${3 + offset}:Child`, renameTo: 'RenamedChild' });
+                    assert.ok(rename.ok, rename.error);
+                    assert.ok(classRename.ok, classRename.error);
+                    assert.deepStrictEqual(rename.result, classRename.result);
+                } finally { rm(dir); }
+            });
+        }
+        it(`${extension}: a quoted derived constructor can return without entering its ancestor`, () => {
+            const dir = tmp({ [`n.${extension}`]: wrap('class Base {constructor(){throw new Error("ancestor");}}\n' +
+                'class Child extends Base {"constructor"(){return {};}}\nfunction build(){return new Child();}\n') });
+            try {
+                const index = idx(dir), base = index.symbols.get('constructor').find(def => def.className === 'Base');
+                assert.strictEqual(index.findCallers('constructor', { targetDefinitions: [base], collectAccount: true }).length, 0);
+                assert.deepStrictEqual(index.findCallees(index.symbols.get('build')[0], { collectAccount: true })
+                    .filter(def => def.type === 'constructor').map(def => def.className), ['Child']);
+            } finally { rm(dir); }
+        });
+    }
+    for (const explicit of [false, true]) {
+        it(`C#: a static initializer is separate from ${explicit ? 'an explicit' : 'a generated'} instance constructor`, () => {
+            const code = 'class Widget {\n static Widget(){}\n' +
+                (explicit ? ' public Widget(){}\n' : '') +
+                ' static Widget build(){return new Widget();}\n}\n';
+            const dir = tmp({ 'n.cs': code });
+            try {
+                const index = idx(dir), members = index.symbols.get('Widget').filter(def => def.type === 'constructor');
+                const initializer = members.find(def => def.modifiers.includes('static'));
+                assert.strictEqual(index.findCallers('Widget', { targetDefinitions: [initializer], collectAccount: true }).length, 0);
+                assert.strictEqual(index.verify('Widget', { file: 'n.cs', line: 2 }).valid, 0);
+                if (explicit) {
+                    const ctor = members.find(def => !def.modifiers.includes('static'));
+                    assert.deepStrictEqual(index.findCallers('Widget', { targetDefinitions: [ctor], collectAccount: true })
+                        .map(site => site.line), [4]);
+                    assert.strictEqual(index.verify('Widget', { file: 'n.cs', line: 3 }).valid, 1);
+                    const caller = index.findCallers('Widget', { targetDefinitions: [ctor], collectAccount: true })[0];
+                    const { validateConfirmation, declarationIdentity } = require('../core/provenance');
+                    const proof = JSON.parse(JSON.stringify(caller.provenance));
+                    proof.facts.constructorCall.overload.candidates[0].modifiers.push('static');
+                    assert.notStrictEqual(validateConfirmation(proof, declarationIdentity(ctor)).verdict, 'establishes-target');
+                }
+            } finally { rm(dir); }
+        });
+    }
+    it('C#: a static initializer cannot supply a class construction signature', () => {
+        const dir = tmp({ 'n.cs': 'class Widget {\n static Widget(){}\n public Widget(int v){}\n static Widget build(){return new Widget();}\n}\n' });
+        try {
+            const answer = execute(idx(dir), 'verify', { name: 'n.cs:1:Widget' });
+            assert.ok(answer.ok, answer.error);
+            assert.strictEqual(answer.result.mismatches, 1);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #417: native constructor delegation', () => {
+    it('C++: a macro type header retains its rename review without inventing invocation syntax', () => {
+        const code = 'struct Base {Base(){}};\n#define DECL(Type) struct Type : Base {};\nDECL(Child)\n';
+        const { getLanguageAdapter, getParser } = require('../languages');
+        const usages = getLanguageAdapter('cpp').findUsagesInCode(code, 'Base', getParser('cpp'));
+        assert.ok(!usages.some(site => site.line === 2 && site.usageType === 'call'));
+        const invocation = code.replace('struct Type : Base {};',
+            'struct Type : Base {static Base make(){return Base();}};');
+        assert.ok(getLanguageAdapter('cpp').findUsagesInCode(invocation, 'Base', getParser('cpp'))
+            .some(site => site.line === 2 && site.usageType === 'call'));
+        const dir = tmp({ 'macro.cpp': code });
+        try {
+            const answer = execute(idx(dir), 'plan', { name: 'macro.cpp:1:Base', renameTo: 'Renamed' });
+            assert.ok(answer.ok, answer.error);
+            assert.ok(!answer.result.unverifiedSites.some(site => site.line === 2 && site.reason === 'call-not-resolved'));
+            assert.ok(answer.result.changes.some(site => site.line === 2 && site.needsReview && site.reviewReason === 'macro-body'));
+        } finally { rm(dir); }
+    });
+    for (const extension of ['ts', 'tsx']) {
+        it(`${extension}: callable type parameters have their own scope in property rename plans`, () => {
+            const signatureSource = 'export * from "opaque";\n' +
+                'export interface I<T> {\n transform?: (value:T)=>typeof value;\n' +
+                ' make?:new(value:T)=>object;\n (value:T):typeof value;\n' +
+                ' new(value:T):object;\n method(value:T):typeof value;\n}\n';
+            const { getParser, safeParse } = require('../languages');
+            const { referenceScope } = require('../languages/lexical-scope');
+            const language = extension === 'tsx' ? 'tsx' : 'typescript';
+            const tree = safeParse(getParser(language), signatureSource);
+            const parameters = tree.rootNode.descendantsOfType('identifier').filter(node => node.text === 'value');
+            assert.ok(parameters.length > 5);
+            for (const parameter of parameters) {
+                assert.strictEqual(referenceScope(parameter, language, new Map(), 'value').local, true);
+            }
+            const dir = tmp({
+                [`value.${extension}`]: 'export const obj={get value(){return 1;}};\n',
+                'opaque.d.ts': 'declare module "opaque" {export const other:number;}\n',
+                [`types.${extension}`]: signatureSource,
+            });
+            try {
+                const answer = execute(idx(dir), 'plan', { name: `value.${extension}:1:value`, renameTo: 'renamed' });
+                assert.ok(answer.ok, answer.error);
+                assert.ok(!answer.result.changes.some(change => change.file === `types.${extension}`));
+                assert.ok(!answer.result.reviewItems.some(change => change.file === `types.${extension}`));
+            } finally { rm(dir); }
+        });
+    }
+    for (const [file, code] of [
+        ['value.cs', 'class Base {public Base(){}}\nclass Holder {public int Base {get;set;}}\nclass Child:Base {}\n'],
+        ['value.java', 'class Base {Base(){}}\nclass Holder {int Base;}\nclass Child extends Base {}\n'],
+        ['value.cpp', 'struct Base {Base(){}};\nstruct Holder {int Base;};\nstruct Child:Base {};\n'],
+    ]) {
+        it(`${file}: an implicit base initializer is not invocation syntax for a same-named value`, () => {
+            const dir = tmp({ [file]: code });
+            try {
+                const answer = execute(idx(dir), 'impact', { name: `${file}:2:Base` });
+                assert.ok(answer.ok, answer.error);
+                assert.strictEqual(answer.result.account.unverified, 0);
+                assert.strictEqual(answer.result.account.unaccounted, 0);
+                assert.ok(!answer.result.unverifiedSites?.length);
+            } finally { rm(dir); }
+        });
+    }
+    for (const [file, code] of [
+        ['scopes.cs', 'namespace A {class Base {public Base(){}}class Child:Base {public Child(){}}}\nnamespace B {class Base {public Base(){}}class Child:Base {public Child(){}}}\n'.replace(/\n/g, '')],
+        ['scopes.cpp', 'namespace A {struct Base {Base(){}};struct Child:Base {Child(){}};} namespace B {struct Base {Base(){}};struct Child:Base {Child(){}};}\n'],
+    ]) {
+        it(`${file}: same-line constructors retain the namespace of their implicit base call`, () => {
+            const dir = tmp({ [file]: code });
+            try {
+                const index = idx(dir);
+                const symbols = [...index.files.values()][0].symbols;
+                assert.strictEqual(new Set(symbols.map(def => def.bindingId)).size, symbols.length);
+                for (const namespace of ['A', 'B']) {
+                    const child = index.symbols.get('Child').find(def => def.type === 'constructor' && def.namespace === namespace);
+                    const callees = index.findCallees(child, { collectAccount: true });
+                    assert.deepStrictEqual(callees.filter(def => def.type === 'constructor' && def.className === 'Base')
+                        .map(def => def.namespace), [namespace]);
+                }
+            } finally { rm(dir); }
+        });
+    }
+    it('C#: a generated instance constructor never contributes calls to a same-line static constructor', () => {
+        const dir = tmp({ 'static.cs': 'class Base {public Base(){}}\nclass Child:Base {static Child(){}}\n' });
+        try {
+            const index = idx(dir), defs = index.symbols.get('Child');
+            const ctor = defs.find(def => def.type === 'constructor');
+            assert.ok(!index.findCallees(ctor, { collectAccount: true }).some(def => def.className === 'Base'));
+            const owner = defs.find(def => def.type === 'class');
+            assert.ok(index.findCallees(owner, { collectAccount: true }).some(def => def.type === 'constructor' && def.className === 'Base'));
+        } finally { rm(dir); }
+    });
+    it('C#: implementing an interface supplies no base constructor call', () => {
+        const dir = tmp({ 'interface.cs': 'interface I {}\nclass Child:I {public Child(){}}\n' });
+        try {
+            const index = idx(dir), child = index.symbols.get('Child').find(def => def.type === 'constructor');
+            const callees = index.findCallees(child, { collectAccount: true });
+            assert.strictEqual(callees.length, 0);
+            assert.strictEqual(callees.calleeAccount.excluded.byReason['non-class-base'], 1);
+        } finally { rm(dir); }
+    });
+    for (const [file, code, line, namespace] of [
+        ['generic.cs', 'class Base {public Base(int v){}}\nclass Base<T> {\n public Base(){}\n}\nclass Child:Base<int> {public Child(){}}\n', 3, null],
+        ['alias.cs', 'using Parent=N.Base<System.Int32>;\nnamespace N {class Base<T> {\n public Base(){}\n}}\nclass Child:Parent {public Child(){}}\n', 3, 'N'],
+        ['nested.java', 'class Base {\n Base(){}\n}\nclass Child extends Base {\n Child(){class Local extends Base {Local(){super();}}}\n}\n', 2, null],
+        ['union.cpp', 'struct Base {\n Base(int v=0){}\n};\nstruct Child:Base {union {int Base;};Child():Base(1){}};\n', 2, null],
+    ]) {
+        it(`${file}: implicit base arguments follow the header's type binding`, () => {
+            const dir = tmp({ [file]: code });
+            try {
+                const index = idx(dir), ctor = index.symbols.get('Base').find(def => def.type === 'constructor' &&
+                    def.startLine === line && (def.namespace || null) === namespace);
+                assert.ok(ctor);
+                const callers = index.findCallers('Base', { targetDefinitions: [ctor], collectAccount: true });
+                const implicit = callers.filter(site => site.implicitConstruction);
+                assert.strictEqual(implicit.length, 1);
+                assert.strictEqual(index.verify('Base', { file, line }).mismatches, 0);
+            } finally { rm(dir); }
+        });
+    }
+    for (const [file, code] of [
+        ['explicit.java', 'class Base {\n Base(){}\n}\nclass Child extends Base {Child(){}}\n'],
+        ['default.java', 'class Base {\n Base(){}\n}\nclass Child extends Base {}\n'],
+        ['explicit.cs', 'class Base {\n public Base(){}\n}\nclass Child:Base {public Child(){}}\n'],
+        ['default.cs', 'class Base {\n public Base(){}\n}\nclass Child:Base {}\n'],
+        ['explicit.cpp', 'struct Base {\n Base(){}\n};\nstruct Child:Base {Child(){}};\n'],
+    ]) {
+        it(`${file}: implicit base construction checks zero arguments at the base handle`, () => {
+            const dir = tmp({ [file]: code });
+            try {
+                const index = idx(dir), ctor = index.symbols.get('Base').find(def => def.type === 'constructor');
+                const callers = index.findCallers('Base', { targetDefinitions: [ctor], collectAccount: true });
+                assert.deepStrictEqual(callers.map(site => site.line), [4]);
+                assert.strictEqual(index.verify('Base', { file, line: 2 }).valid, 1);
+                const plan = execute(index, 'plan', { name: `${file}:2:Base`, addParam: 'w' });
+                assert.ok(plan.ok, plan.error);
+                assert.ok(plan.result.reviewItems.some(site => site.implicitConstruction && site.line === 4));
+                assert.ok(!plan.result.changes.some(site => site.editKind === 'call' && site.line === 4));
+                const { validateConfirmation, declarationIdentity } = require('../core/provenance');
+                const proof = JSON.parse(JSON.stringify(callers[0].provenance));
+                const rawRead = fs.readFileSync;
+                try {
+                    fs.readFileSync = () => { throw new Error('live filesystem read during implicit replay'); };
+                    assert.strictEqual(validateConfirmation(proof, declarationIdentity(ctor)).verdict, 'establishes-target');
+                } finally { fs.readFileSync = rawRead; }
+                proof.facts.constructorCall.classBinding.facts.implicitBaseBinding.source = code.includes('Child()')
+                    ? code.replace('Child()', 'Child(int x)')
+                    : code.replace('Child extends Base {}', 'Child extends Base {Child(){super();}}')
+                        .replace('Child:Base {}', 'Child:Base {public Child():base(){}}');
+                assert.notStrictEqual(validateConfirmation(proof, declarationIdentity(ctor)).verdict, 'establishes-target');
+                const child = index.symbols.get('Child').find(def => def.type === 'constructor') ||
+                    index.symbols.get('Child').find(def => ['class', 'struct'].includes(def.type));
+                assert.ok(index.findCallees(child, { collectAccount: true }).some(def =>
+                    def.type === 'constructor' && def.className === 'Base'));
+                const owner = index.symbols.get('Base').find(def => ['class', 'struct'].includes(def.type));
+                assert.strictEqual(index.findCallers('Base', { targetDefinitions: [owner], collectAccount: true }).length, 0);
+                const context = execute(index, 'context', { name: `${file}:1:Base` });
+                assert.ok(context.ok, context.error);
+                assert.strictEqual(context.result.meta.account.unverified, 0);
+                fs.writeFileSync(path.join(dir, file), code.replace('Base(){}', 'Base(int w){}'));
+                const changed = idx(dir).verify('Base', { file, line: 2 });
+                assert.strictEqual(changed.mismatches, 1, JSON.stringify(changed));
+            } finally { rm(dir); }
+        });
+    }
+    it('C++: an unused implicit default constructor is a potential call, never a hard mismatch', () => {
+        const dir = tmp({ 'unused.cpp': 'struct Base {\n Base(int w){}\n};\nstruct Child:Base {};\nvoid unrelated(){}\n' });
+        try {
+            const result = idx(dir).verify('Base', { file: 'unused.cpp', line: 2 });
+            assert.strictEqual(result.mismatches, 0);
+            assert.ok(result.uncertain > 0 || result.unverifiedCount > 0);
+        } finally { rm(dir); }
+    });
+    it('Java: a qualified superclass keeps its complete package identity', () => {
+        const dir = tmp({
+            'p/Base.java': 'package p;\npublic class Base {\n public Base(int v){}\n}\n',
+            'q/Base.java': 'package q;\nclass Base {Base(int v){}}\n',
+            'q/Child.java': 'package q;\nclass Child extends p.Base {\n Child(){super(1);}\n static p.Base build(){return new p.Base(1);}\n}\n',
+        });
+        try {
+            const index = idx(dir), target = index.symbols.get('Base').find(def =>
+                def.type === 'constructor' && def.relativePath === 'p/Base.java');
+            const callers = index.findCallers('Base', { targetDefinitions: [target], collectAccount: true });
+            assert.deepStrictEqual(callers.map(site => site.line), [3, 4]);
+            assert.strictEqual(index.verify('Base', { file: 'p/Base.java', line: 3 }).valid, 2);
+        } finally { rm(dir); }
+    });
+    it('C++: a field hiding the base name is a member initializer', () => {
+        const dir = tmp({ 'hidden.cpp': 'struct Base {\n Base(int v=0){}\n};\nstruct Child:Base {\n int Base;\n Child():Base(1){}\n};\n' });
+        try {
+            const index = idx(dir), ctor = index.symbols.get('Base').find(def => def.type === 'constructor');
+            const callers = index.findCallers('Base', { targetDefinitions: [ctor], collectAccount: true });
+            assert.strictEqual(callers.length, 1);
+            assert.strictEqual(callers[0].implicitConstruction, true);
+            assert.strictEqual(index.verify('Base', { file: 'hidden.cpp', line: 2 }).valid, 1);
+            const child = index.symbols.get('Child').find(def => def.type === 'constructor');
+            assert.ok(index.findCallees(child, { collectAccount: true }).some(def => def.type === 'constructor' &&
+                def.className === 'Base'));
+        } finally { rm(dir); }
+    });
+    for (const [file, code, name, line] of [
+        ['N.cs', 'class Base {\n public Base(int v){}\n}\nclass Child:Base {\n public Child():base(1){}\n public Child(int v):this(){}\n}\n', 'Base', 2],
+        ['n.cpp', 'struct Base {\n Base(int v){}\n};\nstruct Child:Base {\n Child():Base(1){}\n Child(int v):Child(){}\n};\n', 'Base', 2],
+        ['N.java', 'class Base {\n Base(int v){}\n}\nclass Child extends Base {\n Child(){super(1);}\n Child(int v){this();}\n}\n', 'Base', 2],
+    ]) {
+        it(`${file}: explicit base and same-class initializers bind their argument lists`, () => {
+            const dir = tmp({ [file]: code });
+            try {
+                const index = idx(dir), base = index.symbols.get(name).find(def => def.type === 'constructor');
+                const child = index.symbols.get('Child').find(def => def.type === 'constructor' && def.startLine === 5);
+                assert.ok(base && child);
+                for (const [target, callLine] of [[base, 5], [child, 6]]) {
+                    const callers = index.findCallers(target.name, { targetDefinitions: [target], collectAccount: true });
+                    assert.deepStrictEqual(callers.map(site => site.line), [callLine]);
+                    assert.strictEqual(index.verify(target.name, { file, line: target.startLine }).valid, 1);
+                }
+                const callees = index.findCallees(child, { collectAccount: true });
+                assert.ok(callees.some(def => def.type === 'constructor' && def.className === 'Base'));
+                fs.writeFileSync(path.join(dir, file), code.replace('Base(int v)', 'Base(int v,int w)'));
+                assert.strictEqual(idx(dir).verify(name, { file, line }).mismatches, 1);
+            } finally { rm(dir); }
+        });
+    }
+});
+
+describe('fix #417: cross-file construction type lookup', () => {
+    for (const [file, code, name] of [
+        ['qualified.cs', 'namespace A {class Base {public Base(int v){}}}\nnamespace B {class Base {\n public Base(int v){}\n}class Use {static Base build(){return new Base(1);}}}\nclass Use {static A.Base other(){return new A.Base(1);}}\n', 'Base'],
+        ['qualified.cpp', 'namespace A {struct Base {Base(int v){}};using Alias=Base;}\nA::Base build(){return A::Alias(1);}\nA::Base* other(){return new A::Alias(1);}\n', 'Base'],
+    ]) {
+        it(`${file}: a qualified construction reaches only its type definition`, () => {
+            const dir = tmp({ [file]: code });
+            try {
+                const index = idx(dir), ctor = index.symbols.get(name).find(def =>
+                    def.type === 'constructor' && def.namespace === 'A');
+                const callers = index.findCallers(name, { targetDefinitions: [ctor], collectAccount: true });
+                assert.strictEqual(callers.length, file.endsWith('cpp') ? 2 : 1);
+                const other = index.symbols.get('other')[0];
+                assert.ok(index.findCallees(other, { collectAccount: true }).some(def =>
+                    def.type === 'constructor' && def.namespace === 'A'));
+            } finally { rm(dir); }
+        });
+    }
+    const aliasScript = 'class Base {\n constructor(v) {}\n}\nconst Alias=Base;\nfunction build(){return new Alias(1);}\n';
+    for (const fixture of [
+        { file: 'alias.js', code: aliasScript, name: 'constructor', line: 2 },
+        { file: 'alias.ts', code: aliasScript.replace('constructor(v)', 'constructor(v:number)'), name: 'constructor', line: 2 },
+        { file: 'alias.tsx', code: aliasScript.replace('constructor(v)', 'constructor(v:number)'), name: 'constructor', line: 2 },
+        { file: 'alias.html', code: `<script>\n${aliasScript}</script>\n`, name: 'constructor', line: 3 },
+        { file: 'alias.py', code: 'class Base:\n def __init__(self,v): pass\nAlias=Base\ndef build(): return Alias(1)\n', name: '__init__', line: 2 },
+        { file: 'alias.cs', code: 'using Alias=N.Base;\nnamespace N {\n class Base {\n  public Base(int v){}\n }\n class Use {static Base build(){return new Alias(1);}}\n}\n', name: 'Base', line: 4 },
+        { file: 'alias.cpp', code: 'struct Base {\n Base(int v){}\n};\nusing Alias=Base;\nBase build(){return Alias(1);}\n', name: 'Base', line: 2 },
+        { file: 'new-alias.cpp', code: 'struct Base {\n Base(int v){}\n};\nusing Alias=Base;\nBase* build(){return new Alias(1);}\n', name: 'Base', line: 2 },
+    ]) {
+        it(`${fixture.file}: alias construction arguments detect a changed required parameter`, () => {
+            const changed = fixture.code.replace('constructor(v)', 'constructor(v,w)')
+                .replace('constructor(v:number)', 'constructor(v:number,w:number)')
+                .replace('__init__(self,v)', '__init__(self,v,w)')
+                .replace('Base(int v)', 'Base(int v,int w)');
+            assert.notStrictEqual(changed, fixture.code);
+            const dir = tmp({ [fixture.file]: changed });
+            try {
+                const result = idx(dir).verify(fixture.name, { file: fixture.file, line: fixture.line });
+                assert.strictEqual(result.mismatches, 1, JSON.stringify(result));
+                assert.strictEqual(result.valid, 0);
+            } finally { rm(dir); }
+        });
+        it(`${fixture.file}: a stable class alias reaches the declaring constructor`, () => {
+            const dir = tmp({ [fixture.file]: fixture.code });
+            try {
+                const index = idx(dir), ctor = index.symbols.get(fixture.name).find(def =>
+                    def.type === 'constructor' && def.className === 'Base');
+                const callers = index.findCallers(fixture.name, { targetDefinitions: [ctor], collectAccount: true });
+                assert.strictEqual(callers.length, 1);
+                const { validateConfirmation, declarationIdentity } = require('../core/provenance');
+                const proof = JSON.parse(JSON.stringify(callers[0].provenance));
+                assert.strictEqual(validateConfirmation(proof, declarationIdentity(ctor)).verdict, 'establishes-target');
+                const classProof = proof.facts.constructorCall.classBinding;
+                if (classProof.facts.constructionBinding) classProof.facts.constructionBinding.reads = {};
+                proof.facts.constructorCall.typeLookup = null;
+                assert.notStrictEqual(validateConfirmation(proof, declarationIdentity(ctor)).verdict, 'establishes-target');
+                const result = index.verify(fixture.name, { file: fixture.file, line: fixture.line });
+                assert.strictEqual(result.valid, 1, JSON.stringify(result));
+                assert.strictEqual(result.mismatches, 0);
+                const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+                assert.ok(callees.some(def => def.type === 'constructor' && def.className === 'Base'));
+            } finally { rm(dir); }
+        });
+    }
+    it('C++: a pointer-alias functional cast does not call the pointed-to constructor', () => {
+        const dir = tmp({ 'pointer.cpp': 'struct Base {\n Base(int v){}\n};\nusing Alias=Base*;\nBase* build(){return Alias(0);}\n' });
+        try {
+            const index = idx(dir), ctor = index.symbols.get('Base').find(def => def.type === 'constructor');
+            const callers = index.findCallers('Base', { targetDefinitions: [ctor], collectAccount: true });
+            assert.strictEqual(callers.length, 0);
+            assert.strictEqual(index.verify('Base', { file: 'pointer.cpp', line: 2 }).mismatches, 0);
+        } finally { rm(dir); }
+    });
+    for (const [file, code, name] of [
+        ['shadow.js', 'class Base {constructor(v){}}\nconst Alias=Base;\nfunction build(Alias){return new Alias(1);}\n', 'constructor'],
+        ['rebind.js', 'class Base {constructor(v){}}\nBase=class Other {};\nconst Alias=Base;\nfunction build(){return new Alias(1);}\n', 'constructor'],
+        ['shadow.py', 'class Base:\n def __init__(self,v): pass\nAlias=Base\ndef build(Alias): return Alias(1)\n', '__init__'],
+        ['rebind.py', 'class Base:\n def __init__(self,v): pass\nBase=lambda v:None\nAlias=Base\ndef build(): return Alias(1)\n', '__init__'],
+        ['pointer.cpp', 'struct Base {Base(int v){}};\nusing Alias=Base*;\nBase** build(){return new Alias(nullptr);}\n', 'Base'],
+        ['scope.cpp', 'namespace A {struct Base {Base(int v){}};using Alias=Base;}\nnamespace B {struct Base {Base(int v){}};using Alias=Base;Base build(){return Alias(1);}}\n', 'Base'],
+        ['scope.cs', 'namespace A {class Base {public Base(int v){}}}\nnamespace B {using Alias=B.Base;class Base {public Base(int v){}}class Use {static Base build(){return new Alias(1);}}}\n', 'Base'],
+    ]) {
+        it(`${file}: an unrelated or rebound alias cannot borrow a constructor`, () => {
+            const dir = tmp({ [file]: code });
+            try {
+                const index = idx(dir), ctor = index.symbols.get(name).find(def =>
+                    def.type === 'constructor' && def.className === 'Base');
+                const callers = index.findCallers(name, { targetDefinitions: [ctor], collectAccount: true });
+                assert.strictEqual(callers.length, 0, JSON.stringify(callers));
+                const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+                assert.ok(!callees.some(def => def.type === 'constructor' && def.file === ctor.file &&
+                    def.startLine === ctor.startLine));
+            } finally { rm(dir); }
+        });
+    }
+    for (const [name, files, ctorName, file, line] of [
+        ['JS imported alias chain', {
+            'base.js': 'export class Base {\n constructor(v){}\n}\n',
+            'alias.js': 'import {Base} from "./base.js";\nexport const Alias=Base;\n',
+            'use.js': 'import {Alias} from "./alias.js";\nconst Again=Alias;\nexport function build(){return new Again(1);}\n',
+        }, 'constructor', 'base.js', 2],
+        ['Python imported alias chain', {
+            'base.py': 'class Base:\n def __init__(self,v): pass\n',
+            'alias.py': 'from base import Base\nAlias=Base\n',
+            'use.py': 'from alias import Alias\nAgain=Alias\ndef build():return Again(1)\n',
+        }, '__init__', 'base.py', 2],
+        ['C++ scoped alias chain', {
+            'base.h': '#pragma once\nnamespace A {struct Base {\n Base(int v){}\n};using First=Base;using Alias=First;}\n',
+            'use.cpp': '#include "base.h"\nnamespace A {Base build(){return Alias(1);}}\n',
+        }, 'Base', 'base.h', 3],
+    ]) {
+        it(`${name}: both traversal directions enter the declaring constructor`, () => {
+            const dir = tmp(files);
+            try {
+                const index = idx(dir), ctor = index.symbols.get(ctorName).find(def =>
+                    def.type === 'constructor' && def.relativePath === file && def.startLine === line);
+                assert.strictEqual(index.findCallers(ctorName, { targetDefinitions: [ctor], collectAccount: true }).length, 1);
+                assert.ok(index.findCallees(index.symbols.get('build')[0], { collectAccount: true }).some(def =>
+                    def.type === 'constructor' && def.startLine === ctor.startLine && def.file === ctor.file));
+            } finally { rm(dir); }
+        });
+    }
+    const cases = [
+        { name: 'Java package', files: {
+            'p/Node.java': 'package p;\npublic class Node {\n public Node(int v) {}\n}\n',
+            'p/Use.java': 'package p;\nclass Use {\n static Node build(){return new Node(1);}\n}\n',
+        }, file: 'p/Node.java', line: 3 },
+        { name: 'Java single-type import', files: {
+            'p/Node.java': 'package p;\npublic class Node {\n public Node(int v) {}\n}\n',
+            'q/Use.java': 'package q;\nimport p.Node;\nclass Use {static Node build(){return new Node(1);}}\n',
+            'q/Other.java': 'package q;\nclass Other {}\n',
+        }, file: 'p/Node.java', line: 3 },
+        { name: 'C# namespace', files: {
+            'Node.cs': 'namespace P {public class Node {\n public Node(int v) {}\n}}\n',
+            'Use.cs': 'namespace P {class Use {static Node build(){return new Node(1);}}}\n',
+        }, file: 'Node.cs', line: 2 },
+        { name: 'C++ include', files: {
+            'node.h': '#pragma once\nstruct Node {\n explicit Node(int v) {}\n};\n',
+            'use.cpp': '#include "node.h"\nNode build(){return Node(1);}\n',
+        }, file: 'node.h', line: 3 },
+        { name: 'C++ direct initialization', files: {
+            'node.h': '#pragma once\nstruct Node {\n explicit Node(int v) {}\n};\n',
+            'use.cpp': '#include "node.h"\nvoid build(){Node n(1);}\n',
+        }, file: 'node.h', line: 3 },
+    ];
+    for (const fixture of cases) {
+        it(`${fixture.name}: valid arguments are checked against the declared constructor`, () => {
+            const dir = tmp(fixture.files);
+            try {
+                const index = idx(dir);
+                const result = index.verify('Node', { file: fixture.file, line: fixture.line });
+                assert.strictEqual(result.valid, 1, JSON.stringify(result));
+                assert.strictEqual(result.mismatches, 0);
+                assert.strictEqual(result.unverifiedCount, 0);
+            } finally { rm(dir); }
+        });
+        it(`${fixture.name}: a changed required parameter produces a mismatch`, () => {
+            const files = { ...fixture.files,
+                [fixture.file]: fixture.files[fixture.file].replace('Node(int v)', 'Node(int v, int w)') };
+            const dir = tmp(files);
+            try {
+                const index = idx(dir);
+                const result = index.verify('Node', { file: fixture.file, line: fixture.line });
+                assert.strictEqual(result.valid, 0);
+                assert.strictEqual(result.mismatches, 1, JSON.stringify(result));
+            } finally { rm(dir); }
+        });
+    }
+    it('a replay requires the package facts and does not borrow a previous lookup cache', () => {
+        const dir = tmp(cases[0].files);
+        try {
+            const index = idx(dir);
+            const ctor = index.symbols.get('Node').find(def => def.type === 'constructor');
+            const callers = index.findCallers('Node', { targetDefinitions: [ctor], collectAccount: true });
+            assert.strictEqual(callers.length, 1);
+            const { validateConfirmation, declarationIdentity } = require('../core/provenance');
+            const proof = JSON.parse(JSON.stringify(callers[0].provenance));
+            const target = declarationIdentity(ctor);
+            assert.strictEqual(validateConfirmation(proof, target).verdict, 'establishes-target');
+            const witness = proof.facts.constructorCall.typeLookup;
+            assert.ok(witness);
+            assert.ok(!Object.hasOwn(witness.reads, 'property:_classIdentity'));
+            assert.ok(!Object.hasOwn(witness.reads, 'property:_cppScope'));
+            const useKey = Object.keys(witness.reads).find(key => key.startsWith('files.get:') && key.includes('Use.java'));
+            delete witness.reads[useKey];
+            assert.notStrictEqual(validateConfirmation(proof, target).verdict, 'establishes-target');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #417: constructor declaration forms and saved overload bindings', () => {
+    for (const [label, file, code, line, expected] of [
+        ['compact record', 'Node.java', 'record Node(int v) {\n Node { helper(); }\n static void helper() {}\n static Node build(){return new Node(1);}\n}\n', 2, 1],
+        ['nested class', 'Outer.java', 'class Outer {\n static class Node {\n  Node(int v) {}\n }\n static Node build(){return new Node(1);}\n}\n', 3, 1],
+        ['enum constant', 'Node.java', 'enum Node {\n FIRST(1);\n Node(int v) {}\n}\n', 3, 1],
+        ['this delegation', 'Node.java', 'class Node {\n Node(int v){this(v,1);}\n Node(int v,int w){}\n static Node build(){return new Node(1);}\n}\n', 3, 1],
+    ]) {
+        it(`Java ${label}: the constructor body and its arguments are addressable`, () => {
+            const dir = tmp({ [file]: code });
+            try {
+                const index = idx(dir), ctor = index.symbols.get('Node').find(d => d.type === 'constructor' && d.startLine === line);
+                assert.ok(ctor);
+                assert.strictEqual(ctor.isConstructor, true);
+                const check = index.verify('Node', { file, line });
+                assert.strictEqual(check.valid, expected, JSON.stringify(check));
+                assert.strictEqual(check.mismatches, 0);
+                assert.strictEqual(check.uncertain, 0);
+            } finally { rm(dir); }
+        });
+    }
+
+    for (const [file, code, oldParams, newParams] of [
+        ['Node.java', 'class Node {\n Node(int v){}\n Node(String v){}\n static void build(){new Node(1);new Node("x");}\n}\n', 'Node(int v)', 'Node(int v,int w)'],
+        ['Node.cs', 'class Node {\n public Node(int v){}\n public Node(string v){}\n static void build(){new Node(1);new Node("x");}\n}\n', 'Node(int v)', 'Node(int v,int w)'],
+        ['node.cpp', 'struct Node {\n Node(int v){}\n Node(const char* v){}\n};\nvoid build(){Node a(1);Node b("x");}\n', 'Node(int v)', 'Node(int v,int w)'],
+    ]) {
+        it(`${file}: a saved constructor binding diagnoses a call fitting no remaining overload`, () => {
+            const { execFileSync } = require('child_process');
+            const dir = tmp({ [file]: code });
+            const git = (...args) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args],
+                { cwd: dir, stdio: 'pipe' });
+            try {
+                git('init', '-q'); git('add', '.'); git('commit', '-qm', 'initial');
+                fs.writeFileSync(path.join(dir, file), code.replace(oldParams, newParams));
+                const result = execute(idx(dir), 'check', { name: `${file}:2:Node` });
+                assert.ok(result.ok, result.error);
+                assert.strictEqual(result.result.mismatches, 1, JSON.stringify(result.result));
+                assert.strictEqual(result.result.valid, 0);
+                assert.strictEqual(result.result.mismatchDetails[0].boundBeforeChange, true);
+            } finally { rm(dir); }
+        });
+    }
+
+    it('C#: a nullable constructor overload retains concrete and cast-null arguments', () => {
+        const dir = tmp({
+            'V.cs': 'using System;\nnamespace P {class V {\n public V(string f){}\n public V(string f,DateTimeOffset? d){}\n}}\n',
+            'Use.cs': 'using System;\nnamespace P {class Use {void build(){\n var d=DateTimeOffset.UtcNow;\n new V("x",d);\n new V("x",(DateTimeOffset?)null);\n new V("x");\n}}}\n',
+        });
+        try {
+            const index = idx(dir), ctor = index.symbols.get('V').find(d => d.type === 'constructor' && d.startLine === 4);
+            const callers = index.findCallers('V', { targetDefinitions: [ctor], collectAccount: true });
+            assert.deepStrictEqual(callers.map(c => c.line), [4, 5]);
+            assert.strictEqual(callers.unverifiedEntries.length, 0);
+            assert.strictEqual(index.verify('V', { file: 'V.cs', line: 4 }).valid, 2);
+        } finally { rm(dir); }
+    });
+
+    for (const [file, code, oldParam, newParam] of [
+        ['Node.java', 'class Node {\n Node(int v,int... w){}\n Node(String v){}\n static void build(){new Node(1);new Node(1,2);new Node("x");}\n}\n', 'int... w', 'int w'],
+        ['Node.cs', 'class Node {\n public Node(int v,int w=0){}\n public Node(string v){}\n static void build(){new Node(1);new Node(1,2);new Node("x");}\n}\n', 'int w=0', 'int w'],
+        ['node.cpp', 'struct Node {\n Node(int v,int w=0){}\n Node(const char* v){}\n};\nvoid build(){Node a(1);Node b(1,2);Node c("x");}\n', 'int w=0', 'int w'],
+    ]) {
+        it(`${file}: a valid sibling site on the same line cannot hide a broken constructor call`, () => {
+            const { execFileSync } = require('child_process');
+            const dir = tmp({ [file]: code });
+            const git = (...args) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args],
+                { cwd: dir, stdio: 'pipe' });
+            try {
+                git('init', '-q'); git('add', '.'); git('commit', '-qm', 'initial');
+                fs.writeFileSync(path.join(dir, file), code.replace(oldParam, newParam));
+                const result = execute(idx(dir), 'check', { name: `${file}:2:Node` });
+                assert.ok(result.ok, result.error);
+                assert.strictEqual(result.result.valid, 1, JSON.stringify(result.result));
+                assert.strictEqual(result.result.mismatches, 1, JSON.stringify(result.result));
+                assert.strictEqual(result.result.mismatchDetails[0].boundBeforeChange, true);
+            } finally { rm(dir); }
+        });
+    }
+});
+
+describe('fix #417: constructor ownership, overloads and runtime hooks', () => {
+    for (const [label, code] of [
+        ['a project base with the default construction protocol', 'class Base: pass\nclass Node(Base):\n def __init__(self,v): pass\ndef build(): return Node(1)\n'],
+        ['an explicit builtin root', 'class Node(object):\n def __init__(self,v): pass\ndef build(): return Node(1)\n'],
+        ['several project bases without allocation hooks', 'class Left: pass\nclass Right: pass\nclass Node(Left,Right):\n def __init__(self,v): pass\ndef build(): return Node(1)\n'],
+        ['a direct class-preserving allocator', 'class Node:\n def __new__(cls,*args): return object.__new__(cls)\n def __init__(self,v): pass\ndef build(): return Node(1)\n'],
+        ['an allocator returning its stable local', 'class Base: pass\nclass Node(Base):\n def __new__(cls,*args):\n  instance=object.__new__(cls)\n  instance.value=1\n  return instance\n def __init__(self,v): pass\ndef build(): return Node(1)\n'],
+        ['an own allocator overriding a foreign-returning base allocator', 'class Base:\n def __new__(cls,*args): return object()\nclass Node(Base):\n def __new__(cls,*args): return object.__new__(cls)\n def __init__(self,v): pass\ndef build(): return Node(1)\n'],
+    ]) {
+        it(`Python: ${label} preserves the initializer call`, () => {
+            const dir = tmp({ 'node.py': code });
+            try {
+                const index = idx(dir), ctor = index.symbols.get('__init__').find(def => def.className === 'Node');
+                const callers = index.findCallers('__init__', { targetDefinitions: [ctor], collectAccount: true });
+                assert.strictEqual(callers.length, 1);
+                assert.strictEqual(callers.unverifiedEntries.length, 0);
+                assert.strictEqual(index.verify('__init__', { file: 'node.py', line: ctor.startLine }).valid, 1);
+            } finally { rm(dir); }
+        });
+    }
+    for (const [label, code] of [
+        ['an inherited foreign allocator', 'class Base:\n def __new__(cls,*args): return object()\nclass Node(Base):\n def __init__(self,v,w): pass\ndef build(): return Node(1)\n'],
+        ['an inherited custom metaclass', 'class Meta(type):\n def __call__(cls,*args): return object()\nclass Base(metaclass=Meta): pass\nclass Node(Base):\n def __init__(self,v,w): pass\ndef build(): return Node(1)\n'],
+        ['a rebound allocation result', 'class Node:\n def __new__(cls,*args):\n  instance=object.__new__(cls)\n  instance=object()\n  return instance\n def __init__(self,v,w): pass\ndef build(): return Node(1)\n'],
+        ['a rebound class parameter', 'class Other: pass\nclass Node:\n def __new__(cls,*args):\n  cls=Other\n  return object.__new__(cls)\n def __init__(self,v,w): pass\ndef build(): return Node(1)\n'],
+        ['an allocator that can fall through', 'class Node:\n def __new__(cls,*args):\n  if args: return object.__new__(cls)\n def __init__(self,v,w): pass\ndef build(): return Node(1)\n'],
+        ['a shadowed builtin allocator', 'def outer(object):\n class Node:\n  def __new__(cls,*args): return object.__new__(cls)\n  def __init__(self,v,w): pass\n return Node(1)\n'],
+        ['a shadowed base binding', 'class Base: pass\ndef outer(Base):\n class Node(Base):\n  def __init__(self,v,w): pass\n return Node(1)\n'],
+        ['a rebound module base', 'class Base: pass\nclass Other:\n def __new__(cls,*args): return object()\nBase=Other\nclass Node(Base):\n def __init__(self,v,w): pass\ndef build(): return Node(1)\n'],
+        ['a changed instance class', 'class Other: pass\nclass Node:\n def __new__(cls,*args):\n  instance=object.__new__(cls)\n  instance.__class__=Other\n  return instance\n def __init__(self,v,w): pass\ndef build(): return Node(1)\n'],
+    ]) {
+        it(`Python: ${label} stays unverified`, () => {
+            const dir = tmp({ 'node.py': code });
+            try {
+                const index = idx(dir), ctor = index.symbols.get('__init__').find(def => def.className === 'Node');
+                const callers = index.findCallers('__init__', { targetDefinitions: [ctor], collectAccount: true });
+                assert.strictEqual(callers.length, 0);
+                assert.ok(callers.unverifiedEntries.some(call => call.reason === 'constructor-protocol-unresolved'));
+                assert.strictEqual(index.verify('__init__', { file: 'node.py', line: ctor.startLine }).mismatches, 0);
+            } finally { rm(dir); }
+        });
+    }
+    for (const decorator of ['staticmethod', 'classmethod']) {
+        it(`Python: a ${decorator} initializer exposes its construction for review`, () => {
+            const dir = tmp({ 'node.py': `class Node:\n @${decorator}\n def __init__(self,v,w): pass\ndef build(): return Node(1)\n` });
+            try {
+                const index = idx(dir), ctor = index.symbols.get('__init__').find(def => def.className === 'Node');
+                const callers = index.findCallers('__init__', { targetDefinitions: [ctor], collectAccount: true });
+                assert.strictEqual(callers.length, 0);
+                assert.ok(callers.unverifiedEntries.some(call => call.reason === 'constructor-protocol-unresolved'));
+                const check = index.verify('__init__', { file: 'node.py', line: ctor.startLine });
+                assert.strictEqual(check.mismatches, 0);
+                assert.ok(check.unverifiedCount > 0);
+            } finally { rm(dir); }
+        });
+    }
+    it('C++: an included free function hides a same-named class in a functional call', () => {
+        const dir = tmp({
+            'factory.h': 'int Node(int v) { return v; }\n',
+            'node.cpp': '#include "factory.h"\nstruct Node {\n Node(int v){}\n};\nint build(){return Node(1);}\n',
+        });
+        try {
+            const index = idx(dir), ctor = index.symbols.get('Node').find(def => def.type === 'constructor');
+            const callers = index.findCallers('Node', { targetDefinitions: [ctor], collectAccount: true });
+            assert.strictEqual(callers.length, 0);
+            assert.ok(callers.unverifiedEntries.some(call => call.reason === 'constructor-functional-binding'));
+        } finally { rm(dir); }
+    });
+    for (const [file, code] of [
+        ['Node.java', 'class Node {\n Node(int v) {}\n Node(String v) {}\n static void build(){new Node(1);new Node("x");}\n}\n'],
+        ['Node.cs', 'class Node {\n public Node(int v) {}\n public Node(string v) {}\n static void build(){new Node(1);new Node("x");}\n}\n'],
+        ['node.cpp', 'struct Node {\n Node(int v) {}\n Node(const char* v) {}\n};\nvoid build(){Node a(1);Node b("x");}\n'],
+    ]) {
+        it(`${file}: same-line constructions select their own overload`, () => {
+            const dir = tmp({ [file]: code });
+            try {
+                const index = idx(dir);
+                const ctors = index.symbols.get('Node').filter(d => d.type === 'constructor');
+                assert.strictEqual(ctors.length, 2);
+                const positions = [];
+                for (const ctor of ctors) {
+                    const callers = index.findCallers('Node', { targetDefinitions: [ctor], collectAccount: true });
+                    assert.strictEqual(callers.filter(c => c.tier !== 'unverified').length, 1);
+                    assert.strictEqual(callers.unverifiedEntries.length, 0);
+                    positions.push(callers[0].provenance.facts.site.column);
+                }
+                assert.notStrictEqual(positions[0], positions[1]);
+                const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+                assert.deepStrictEqual(callees.filter(d => d.type === 'constructor').map(d => d.startLine)
+                    .sort((a, b) => a - b), [2, 3]);
+            } finally { rm(dir); }
+        });
+    }
+
+    for (const [label, code] of [
+        ['metaclass call override', 'class Meta(type):\n def __call__(cls,*args): return object()\nclass Node(metaclass=Meta):\n def __init__(self,a,b): pass\ndef build(): return Node(1)\n'],
+        ['allocator returning another type', 'class Node:\n def __new__(cls,*args): return object()\n def __init__(self,a,b): pass\ndef build(): return Node(1)\n'],
+        ['a decorator replacing the initializer', 'def adapt(fn):\n def wrap(self,*args): pass\n return wrap\nclass Node:\n @adapt\n def __init__(self,a,b): pass\ndef build(): return Node(1)\n'],
+    ]) {
+        it(`Python: ${label} needs review before checking initializer arguments`, () => {
+            const dir = tmp({ 'node.py': code });
+            try {
+                const index = idx(dir);
+                const ctor = index.symbols.get('__init__')[0];
+                const callers = index.findCallers('__init__', { targetDefinitions: [ctor], collectAccount: true });
+                assert.strictEqual(callers.filter(c => c.tier !== 'unverified').length, 0);
+                assert.ok(callers.unverifiedEntries.some(c => c.reason === 'constructor-protocol-unresolved'));
+                const check = index.verify('__init__', { file: 'node.py', line: ctor.startLine });
+                assert.strictEqual(check.mismatches, 0);
+                assert.ok(check.unverifiedCount > 0);
+                const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+                assert.ok(callees.some(def => def.name === 'Node' && def.type === 'class'));
+                assert.ok(!callees.some(def => def.name === '__init__'));
+            } finally { rm(dir); }
+        });
+    }
+
+    it('Python: an allocator owned by another class leaves the initializer proof intact', () => {
+        const dir = tmp({ 'node.py': 'class Other:\n def __new__(cls): return object()\nclass Node:\n def __init__(self,v): pass\ndef build(): return Node(1)\n' });
+        try {
+            const index = idx(dir), ctor = index.symbols.get('__init__')[0];
+            const callers = index.findCallers('__init__', { targetDefinitions: [ctor], collectAccount: true });
+            assert.strictEqual(callers.filter(c => c.tier !== 'unverified').length, 1);
+        } finally { rm(dir); }
+    });
+
+    it('Python: explicit initializer calls survive alongside construction calls', () => {
+        const dir = tmp({ 'node.py': 'class Node:\n def __init__(self,v): pass\ndef build():\n n=Node(1)\n n.__init__(2)\n return n\n' });
+        try {
+            const index = idx(dir), ctor = index.symbols.get('__init__')[0];
+            const callers = index.findCallers('__init__', { targetDefinitions: [ctor], collectAccount: true });
+            assert.deepStrictEqual(callers.filter(c => c.tier !== 'unverified').map(c => c.line), [4, 5]);
+            assert.strictEqual(index.verify('__init__', { file: 'node.py', line: 2 }).valid, 2);
+        } finally { rm(dir); }
+    });
+
+    it('C++: a same-named free function does not call the constructor', () => {
+        const dir = tmp({ 'node.cpp': 'struct Node {\n Node(int v) {}\n};\nint Node(int v){return v;}\nint build(){return Node(1);}\n' });
+        try {
+            const index = idx(dir), ctor = index.symbols.get('Node').find(d => d.type === 'constructor');
+            const callers = index.findCallers('Node', { targetDefinitions: [ctor], collectAccount: true });
+            assert.strictEqual(callers.filter(c => c.tier !== 'unverified').length, 0);
+        } finally { rm(dir); }
+    });
+
+    it('JS: calling the constructor property without new does not enter the class constructor', () => {
+        const dir = tmp({ 'node.js': 'class Node {\n constructor(v) {}\n}\nfunction build(){\n const n=new Node(1);\n try {n.constructor(2);} catch {}\n}\n' });
+        try {
+            const index = idx(dir), ctor = index.symbols.get('constructor')[0];
+            const callers = index.findCallers('constructor', { targetDefinitions: [ctor], collectAccount: true });
+            assert.deepStrictEqual(callers.filter(c => c.tier !== 'unverified').map(c => c.line), [5]);
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #416: an out-of-class constructor plans its declaring type rename', () => {
     const cases = [
         { label: 'a definition after its class body', file: 'main.cpp', files: {
@@ -11996,7 +13611,7 @@ describe('fix #381: class identity by lexical scope, name-exact import bindings,
         });
         try {
             assert.deepStrictEqual(relations(dir, 't/test_port.py:8:test_default_port').callees,
-                ['Connection@pkg/conn.py:1']);
+                ['__init__@pkg/conn.py:2']);
         } finally { rm(dir); }
     });
 
@@ -15434,4 +17049,51 @@ describe('fix #405b: repeated refinements in one operation answer as fresh queri
             } finally { shared._endOp(); }
         });
     }
+});
+
+describe('fix #417: constructor deletion needs allocation-protocol evidence', () => {
+    const cases = [
+        ['Java', 'N.java', 'class Target { public Target(int n) {} int idle(){return 1;} } class Use { Object make() throws Exception { return Class.forName("Target").getConstructor(int.class).newInstance(3); } }'],
+        ['C#', 'N.cs', 'class Target { public Target(int n) {} int idle(){return 1;} } class Use { object make(){return System.Activator.CreateInstance(System.Type.GetType("Target"),new object[]{3});} }'],
+        ['C++', 'n.cpp', 'struct Target { Target(int n) {} int idle(){return 1;} }; template<class T> T build(){return T(3);} auto make(){return build<Target>();}'],
+        ['JavaScript', 'n.js', 'class Target { constructor(n){this.n=n;} idle(){return 1;} } function make(){return Reflect.construct(Target,[3]);}'],
+        ['TypeScript', 'n.ts', 'class Target { constructor(public n:number){} idle(){return 1;} } function make(){return Reflect.construct(Target,[3]);}'],
+        ['TSX', 'n.tsx', 'class Target { constructor(public n:number){} idle(){return 1;} } function make(){return Reflect.construct(Target,[3]);}'],
+        ['HTML', 'n.html', '<script>class Target { constructor(n){this.n=n;} idle(){return 1;} } function make(){return Reflect.construct(Target,[3]);}</script>'],
+        ['Python', 'n.py', 'class Target:\n    def __init__(self, n): self.n = n\n    def idle(self): return 1\ndef make(): return type.__call__(Target, 3)\n'],
+    ];
+    for (const [language, file, source] of cases) {
+        it(`${language} retains allocation initializers while auditing ordinary members`, () => {
+            const dir = tmp({ [file]: source });
+            try {
+                const index = idx(dir), all = [...index.symbols.values()].flat();
+                const { isConstructor } = require('../core/constructor-calls');
+                const initializers = all.filter(d => isConstructor(d, index));
+                assert.ok(initializers.length, `${language} indexes the initializer`);
+                for (const options of [{ includeExported: true }, { includeExported: true, includeDecorated: true, includeTests: true }]) {
+                    const dead = index.deadcode(options);
+                    assert.ok(!dead.some(d => isConstructor(d, index)), `${language}: ${JSON.stringify(dead)}`);
+                    assert.ok(dead.some(d => d.name === 'idle'), `${language} still audits the ordinary member`);
+                }
+            } finally { rm(dir); }
+        });
+    }
+    it('static initializers are runtime members and ordinary constructor-named methods remain auditable', () => {
+        const dir = tmp({
+            'n.cs': 'class Target {static Target(){} static int idle(){return 1;}}',
+            'n.js': 'class Box { static constructor(){return 1;} } new Box();',
+            'n.java': 'class Other { static int Other(){return 1;} }',
+            'n.go': 'package n\nfunc constructor() int {return 1}\n',
+            'n.rs': 'fn constructor() -> i32 {1}\n',
+            'n.c': 'static int constructor(void){return 1;}\n',
+        });
+        try {
+            const index = idx(dir), dead = index.deadcode({ includeExported: true, includeTests: true });
+            assert.ok(!dead.some(d => d.type === 'constructor'));
+            for (const file of ['n.js', 'n.java', 'n.go', 'n.rs', 'n.c']) {
+                assert.ok(dead.some(d => (d.relativePath || d.file) === file && d.name === (file === 'n.java' ? 'Other' : 'constructor') && d.type !== 'class'), `${file}: ${JSON.stringify(dead)}`);
+            }
+            assert.ok(dead.some(d => (d.relativePath || d.file) === 'n.cs' && d.name === 'idle'));
+        } finally { rm(dir); }
+    });
 });

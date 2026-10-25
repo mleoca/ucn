@@ -18,6 +18,859 @@ const { tmp, rm, idx, FIXTURES_PATH } = require('./helpers');
 
 const PROJECT_DIR = path.resolve(__dirname, '..');
 
+describe('fix #417: a class literal fixes an unbounded method return variable', () => {
+    const cases = [
+        ['project type', 'class Wanted {}class Box {Box(Wanted value){}Box(Object value){}}class Producer {static <Value> Value create(Class<Value> type){return null;}}class Use {static Box build(){return new Box(Producer.create(Wanted.class));}}', 'Wanted', false],
+        ['primitive literal', 'class Box {Box(Integer value){}Box(Object value){}}class Producer {static <Value> Value create(Class<Value> type){return null;}}class Use {static Box build(){return new Box(Producer.create(int.class));}}', 'Integer', true],
+        ['array literal', 'class Wanted {}class Box {Box(Wanted[] value){}Box(Object value){}}class Producer {static <Value> Value create(Class<Value> type){return null;}}class Use {static Box build(){return new Box(Producer.create(Wanted[].class));}}', 'Wanted[]', true],
+        ['explicit arguments', 'class Wanted {}class Box {Box(Wanted value){}Box(Object value){}}class Producer {static <Value> Value create(Class<Value> type){return null;}static Object create(Object type){return null;}}class Use {static Box build(){return new Box(Producer.<Object>create(Wanted.class));}}', 'Object', true],
+    ];
+    for (const [label, source, expected, review] of cases) it(label, () => {
+        const dir = tmp({ 'N.java': source });
+        try {
+            const index = idx(dir), target = index.symbols.get('Box').find(def => def.type === 'constructor' && def.paramsStructured[0].type === expected);
+            const callers = index.findCallers('Box', { targetDefinitions: [target], collectAccount: true });
+            assert.equal(callers.length, review ? 0 : 1);
+            assert.equal(callers.unverifiedEntries.length, review ? 1 : 0);
+            const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+            assert.deepEqual(callees.filter(def => def.type === 'constructor').map(def => def.paramsStructured[0].type), review ? [] : [expected]);
+            assert.equal(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+    it('the literal type is resolved in the caller file', () => {
+        const dir = tmp({
+            'p/Wanted.java': 'package p; public class Wanted {}',
+            'q/Producer.java': 'package q; class Wanted {}public class Producer {public static <Value> Value create(Class<Value> type){return null;}}',
+            'N.java': 'import p.Wanted; import q.Producer; class Box {Box(Wanted value){}Box(Object value){}}class Use {static Box build(){return new Box(Producer.create(Wanted.class));}}',
+        });
+        try {
+            const index = idx(dir), target = index.symbols.get('Box').find(def => def.type === 'constructor' && def.paramsStructured[0].type === 'Wanted');
+            const callers = index.findCallers('Box', { targetDefinitions: [target], collectAccount: true });
+            assert.equal(callers.length, 1);
+            const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+            assert.deepEqual(callees.filter(def => def.type === 'constructor').map(def => def.paramsStructured[0].type), ['Wanted']);
+            const { validateConfirmation, declarationIdentity } = require('../core/provenance');
+            for (const edge of callees.filter(def => def.type === 'constructor')) for (const site of edge.siteProvenance || []) assert.equal(
+                validateConfirmation(JSON.parse(JSON.stringify(site.provenance)), declarationIdentity(target)).verdict, 'establishes-target');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #417: unbounded Class method parameters infer from one argument', () => {
+    const cases = [
+        ['class literal', 'import java.lang.reflect.Type; class Target {static <Value> int pick(Class<Value> value){return 1;}static int pick(Type value){return 2;}}class Use {static int build(){return Target.pick(String.class);}}', 'Class<Value>', false],
+        ['captured class', 'import java.lang.reflect.Type; class Target {static <Value> int pick(Class<Value> value){return 1;}static int pick(Type value){return 2;}}class Use {static int build(Class<?> value){return Target.pick(value);}}', 'Class<Value>', false],
+        ['SDK class producer', 'import java.lang.reflect.Type; import java.lang.reflect.Method; class Target {static <Value> int pick(Class<Value> value){return 1;}static int pick(Type value){return 2;}}class Use {static int build(Method value){return Target.pick(value.getReturnType());}}', 'Class<Value>', false],
+        ['SDK declaring class producer', 'import java.lang.reflect.Type; import java.lang.reflect.Constructor; class Target {static <Value> int pick(Class<Value> value){return 1;}static int pick(Type value){return 2;}}class Use {static int build(Constructor<?> value){return Target.pick(value.getDeclaringClass());}}', 'Class<Value>', false],
+        ['SDK annotation type', 'import java.lang.reflect.Type; import java.lang.annotation.Annotation; class Target {static <Value> int pick(Class<Value> value){return 1;}static int pick(Type value){return 2;}}class Use {static int build(Annotation value){return Target.pick(value.annotationType());}}', 'Class<Value>', false],
+        ['explicit argument mismatch', 'import java.lang.reflect.Type; class Target {static <Value> int pick(Class<Value> value){return 1;}static int pick(Type value){return 2;}}class Use {static int build(){return Target.<Integer>pick(String.class);}}', 'Type', true],
+        ['bounded variable', 'import java.lang.reflect.Type; class Target {static <Value extends Number> int pick(Class<Value> value){return 1;}static int pick(Type value){return 2;}}class Use {static int build(){return Target.pick(String.class);}}', 'Type', true],
+        ['another argument constrains the variable', 'import java.lang.reflect.Type; class Target {static <Value> int pick(Class<Value> value,Value other){return 1;}static int pick(Type value,Object other){return 2;}}class Use {static int build(){return Target.pick(String.class,1);}}', 'Type', true],
+        ['owner variable is already fixed', 'import java.lang.reflect.Type; class Target<Value> {int pick(Class<Value> value){return 1;}int pick(Type value){return 2;}}class Use {static int build(Target<Integer> value){return value.pick(String.class);}}', 'Type', true],
+        ['generic constructor', 'import java.lang.reflect.Type; class Box {<Value> Box(Class<Value> value){}Box(Type value){}}class Use {static Box build(){return new Box(String.class);}}', 'Class<Value>', false],
+        ['explicit constructor mismatch', 'import java.lang.reflect.Type; class Box {<Value> Box(Class<Value> value){}Box(Type value){}}class Use {static Box build(){return new <Integer> Box(String.class);}}', 'Type', true],
+    ];
+    for (const [label, source, expected, review] of cases) it(label, () => {
+        const dir = tmp({ 'N.java': source });
+        try {
+            const index = idx(dir), name = label.includes('constructor') ? 'Box' : 'pick';
+            const target = index.symbols.get(name).find(def =>
+                (name !== 'Box' || def.type === 'constructor') && def.paramsStructured?.[0]?.type === expected);
+            assert.ok(target);
+            const callers = index.findCallers(name, { targetDefinitions: [target], collectAccount: true });
+            assert.equal(callers.length, review ? 0 : 1);
+            assert.equal(callers.unverifiedEntries.length, review ? 1 : 0);
+            const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+            const selected = callees.filter(def => name === 'Box' ? def.type === 'constructor' && def.className === 'Box' : def.name === 'pick');
+            assert.deepEqual(selected.map(def => def.bindingId), review ? [] : [target.bindingId]);
+            assert.equal(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #417: closed SDK values exclude unrelated imported interfaces', () => {
+    const cases = [
+        ['constructor', 'import java.nio.file.Path; import java.nio.file.LinkOption; class Box {Box(Path value,LinkOption... options){}Box(String value,LinkOption... options){}}class Use {static Box build(){return new Box("x");}}', 'Box'],
+        ['method', 'import java.nio.file.Path; import java.nio.file.LinkOption; class Target {static int pick(Path value,LinkOption... options){return 1;}static int pick(String value,LinkOption... options){return 2;}}class Use {static int build(){return Target.pick("x");}}', 'pick'],
+        ['Path implementation', 'import java.nio.file.Path; import java.nio.file.LinkOption; abstract class Target implements Path {static int pick(Path value,LinkOption... options){return 1;}static int pick(String value,LinkOption... options){return 2;}}class Use {static int build(){return Target.pick("x");}}', 'pick'],
+        ['file-system provider', 'import java.nio.file.Path; import java.nio.file.LinkOption; import java.nio.file.spi.FileSystemProvider; abstract class Target extends FileSystemProvider {static int pick(Path value,LinkOption... options){return 1;}static int pick(String value,LinkOption... options){return 2;}}class Use {static int build(){return Target.pick("x");}}', 'pick'],
+    ];
+    for (const [label, source, name] of cases) it(`${label}: a string does not become a Path`, () => {
+        const dir = tmp({ 'N.java': source });
+        try {
+            const index = idx(dir);
+            for (const [type, count] of [['Path', 0], ['String', 1]]) {
+                const target = index.symbols.get(name).find(def => (name !== 'Box' || def.type === 'constructor') && def.paramsStructured?.[0]?.type === type);
+                const callers = index.findCallers(name, { targetDefinitions: [target], collectAccount: true });
+                assert.equal(callers.length, count);
+                assert.equal(callers.unverifiedEntries.length, 0);
+            }
+            const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+            const selected = callees.filter(def => name === 'Box' ? def.type === 'constructor' && def.className === 'Box' : def.name === 'pick');
+            assert.deepEqual(selected.map(def => def.paramsStructured[0].type), ['String']);
+            assert.equal(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+    it('an unseen parent may bind a formal type name to a different class', () => {
+        const dir = tmp({ 'N.java': 'import dep.Base; class Target extends Base {private int pick(Class<?> value){return 1;}private int pick(Other<?> value){return 3;}int build(){return pick(String.class);}}' });
+        try {
+            const index = idx(dir);
+            for (const target of index.symbols.get('pick')) {
+                const callers = index.findCallers('pick', { targetDefinitions: [target], collectAccount: true });
+                assert.equal(callers.length, 0);
+                assert.equal(callers.unverifiedEntries.length, 1);
+            }
+            const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+            assert.equal(callees.filter(def => def.name === 'pick').length, 0);
+            assert.equal(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #417: Comparable arguments retain their invariant type parameter', () => {
+    const cases = [
+        ['different invariant argument', 'Comparable<Integer>', '"x"', 'Object'],
+        ['same invariant argument', 'Comparable<String>', '"x"', 'Comparable<String>'],
+        ['boxed invariant argument', 'Comparable<Integer>', '1', 'Comparable<Integer>'],
+        ['wider invariant argument', 'Comparable<Number>', '1', 'Object'],
+        ['upper bound matches', 'Comparable<? extends CharSequence>', '"x"', 'Comparable<? extends CharSequence>'],
+        ['upper bound differs', 'Comparable<? extends Number>', '"x"', 'Object'],
+        ['lower bound matches', 'Comparable<? super String>', '"x"', 'Comparable<? super String>'],
+        ['lower bound differs', 'Comparable<? super Integer>', '"x"', 'Object'],
+        ['unbounded wildcard', 'Comparable<?>', '"x"', 'Comparable<?>'],
+    ];
+    for (const [label, formal, argument, expected] of cases) for (const constructor of [true, false]) {
+        it(`${label}: ${constructor ? 'constructor' : 'method'} selection uses the generic contract`, () => {
+            const source = constructor
+                ? `import java.io.Closeable;\nclass Box implements Closeable {Box(${formal} value){} Box(Object value){} public void close(){}}\nclass Factory {static Box build(){return new Box(${argument});}}\n`
+                : `import java.io.Closeable;\nclass Target implements Closeable {void accept(${formal} value){} void accept(Object value){} public void close(){}}\nclass Factory {static void build(Target value){value.accept(${argument});}}\n`;
+            const dir = tmp({ 'N.java': source });
+            try {
+                const index = idx(dir), name = constructor ? 'Box' : 'accept';
+                const target = index.symbols.get(name).find(def => (constructor ? def.type === 'constructor' : true) && def.paramsStructured?.[0]?.type === expected);
+                const callers = index.findCallers(name, { targetDefinitions: [target], collectAccount: true });
+                assert.equal(callers.length, 1, callers.unverifiedEntries.map(site => site.reason).join(','));
+                const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+                const edges = callees.filter(def => constructor ? def.type === 'constructor' && def.className === 'Box' : def.name === 'accept');
+                assert.deepEqual(edges.map(def => def.bindingId), [target.bindingId]);
+                const { validateConfirmation, declarationIdentity } = require('../core/provenance');
+                for (const edge of edges) for (const site of edge.siteProvenance || []) assert.equal(
+                    validateConfirmation(JSON.parse(JSON.stringify(site.provenance)), declarationIdentity(target)).verdict, 'establishes-target');
+                assert.equal(callees.calleeAccount.conserved, true);
+            } finally { rm(dir); }
+        });
+    }
+    for (const [label, source, expected] of [
+        ['class literal with a closed generic target',
+            'import java.io.Closeable; class Box implements Closeable {Box(Class<Integer> value){} Box(Object value){} public void close(){}} class Factory {static Box build(){return new Box(String.class);}}', 'Object'],
+        ['owner type parameter',
+            'import java.io.Closeable; class Box<T> implements Closeable {Box(Comparable<T> value){} Box(Object value){} public void close(){}} class Factory {static Box<String> build(){return new Box<String>("x");}}', 'Comparable<T>'],
+    ]) it(`${label}: unresolved substitutions retain the compiler-selected candidate`, () => {
+        const dir = tmp({ 'N.java': source + '\n' });
+        try {
+            const index = idx(dir), target = index.symbols.get('Box').find(def => def.type === 'constructor' && def.paramsStructured[0].type === expected);
+            const callers = index.findCallers('Box', { targetDefinitions: [target], collectAccount: true });
+            assert.equal(callers.length, 0);
+            assert.equal(callers.unverifiedEntries.length, 1);
+            const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+            assert.equal(callees.filter(def => def.type === 'constructor' && def.className === 'Box').length, 0);
+            assert.equal(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #417: variable-arity candidates check both argument forms', () => {
+    for (const [label, method] of [
+        ['external subtype', 'Box create(q.Foo value){return new Box(value);}'],
+        ['external subtype array', 'Box create(q.Foo[] value){return new Box(value);}'],
+        ['bounded parameter', '<Text extends Note> Box create(Text value){return new Box(value);}'],
+        ['bounded parameter array', '<Text extends Note> Box create(Text[] value){return new Box(value);}'],
+    ]) it(`${label}: an unproved ancestry cannot eliminate the variadic target`, () => {
+        const dir = tmp({
+            'p/Note.java': 'package p; public class Note{}',
+            'N.java': `import p.Note; class Box {Box(Note... values){}Box(Object... values){}} class Use {${method}}`,
+        });
+        try {
+            const index = idx(dir), target = index.symbols.get('Box').find(def =>
+                def.type === 'constructor' && def.paramsStructured[0].type === 'Note[]');
+            const callers = index.findCallers('Box', { targetDefinitions: [target], collectAccount: true });
+            assert.equal(callers.length, 0);
+            assert.equal(callers.unverifiedEntries.length, 1);
+            const callees = index.findCallees(index.symbols.get('create')[0], { collectAccount: true });
+            assert.ok(!callees.some(def => def.type === 'constructor'));
+            assert.equal(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+    for (const [label, source, expected, review] of [
+        ['fixed list', 'import java.util.List; class Note{} class Parent {void annotate(Note... values){}void annotate(List<Note> values){}} class Child extends Parent {@Override void annotate(List<Note> values){}} class Box {Box(Note... values){}Box(List<Note> values){}} class Use {void run(Parent value){value.annotate((List<Note>)null);}Box create(){return new Box((List<Note>)null);}}', 'List<Note>', false],
+        ['normal array', 'import java.util.List; class Note{} class Box {Box(Note... values){}Box(List<Note> values){}} class Use {Box create(){return new Box(new Note[]{new Note()});}}', 'Note', false],
+        ['expanded scalar', 'import java.util.List; class Note{} class Box {Box(Note... values){}Box(List<Note> values){}} class Use {Box create(){return new Box(new Note());}}', 'Note', false],
+        ['expanded tail', 'class Note{} class Box {Box(Note... values){}Box(Object... values){}} class Use {Box create(){return new Box(new Note(),"x");}}', 'Object', false],
+        ['generic object fallback', 'import java.util.List; class Box {Box(List<String> values){}Box(Object... values){}} class Use {Box create(){return new Box((List<Integer>)null);}}', 'Object', true],
+        ['reference array competes before expansion', 'class Note{} class Box {Box(Note... values){}Box(Object value){}} class Use {Box create(){return new Box(new Note[0]);}}', 'Note', true],
+        ['primitive array competes before expansion', 'class Box {Box(int... values){}Box(Object value){}} class Use {Box create(){return new Box(new int[0]);}}', 'int', false],
+    ]) it(`${label}: an incompatible element cannot keep a variadic candidate applicable`, () => {
+        const dir = tmp({ 'N.java': source });
+        try {
+            const index = idx(dir), targets = index.symbols.get('Box').filter(def => def.type === 'constructor');
+            const target = targets.find(def => def.paramsStructured[0].type.replace(/\.\.\.$|\[\]$/, '') === expected);
+            const callers = index.findCallers('Box', { targetDefinitions: [target], collectAccount: true });
+            assert.equal(callers.length, review ? 0 : 1);
+            assert.equal(callers.unverifiedEntries.length, review ? 1 : 0);
+            const callees = index.findCallees(index.symbols.get('create')[0], { collectAccount: true });
+            const strong = callees.filter(def => def.type === 'constructor' && def.className === 'Box');
+            assert.deepEqual(strong.map(def => def.bindingId), review ? [] : [target.bindingId]);
+            assert.equal(callees.calleeAccount.conserved, true);
+            if (label === 'fixed list') {
+                const override = index.symbols.get('annotate').find(def => def.className === 'Child');
+                const sites = index.findCallers('annotate', { targetDefinitions: [override], collectAccount: true });
+                assert.equal(sites.length, 0);
+                assert.deepEqual(sites.unverifiedEntries.map(site => site.reason), ['possible-dispatch']);
+            }
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #417: capitalized fields keep their value receiver', () => {
+    it('a wildcard static import does not turn an owned field into a type qualifier', () => {
+        const dir = tmp({
+            'q/Values.java': 'package q; public class Values {public static final int UNUSED=0;}',
+            'N.java': 'import static q.Values.*; class A {void copy(){}} class B {void copy(){}} class Use {A Cache=new A(); void run(){Cache.copy();}}',
+        });
+        try {
+            const index = idx(dir);
+            for (const [owner, count] of [['A', 1], ['B', 0]]) {
+                const target = index.symbols.get('copy').find(def => def.className === owner);
+                const callers = index.findCallers('copy', { targetDefinitions: [target], collectAccount: true });
+                assert.equal(callers.length, count);
+                assert.equal(callers.unverifiedEntries.length, 0);
+            }
+            const callees = index.findCallees(index.symbols.get('run')[0], { collectAccount: true });
+            assert.deepEqual(callees.filter(def => def.name === 'copy').map(def => def.className), ['A']);
+            assert.equal(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #417: qualified producer returns bind their actual root', () => {
+    for (const [label, packageName, provider] of [
+        ['same package', 'p', 'p'], ['imported root', 'r', 'p'], ['other imported root', 'r', 'q'],
+    ]) for (const chain of ['source().build()', 'source().step().build()']) it(`${label}, ${chain}: a relative nested return keeps its owner`, () => {
+        const dir = tmp({
+            'p/Outer.java': 'package p; public class Outer {public static class Builder {public Builder step(){return this;}public void build(){}}}',
+            'q/Outer.java': 'package q; public class Outer {public static class Builder {public Builder step(){return this;}public void build(){}}}',
+            [`${packageName}/Use.java`]: `package ${packageName}; ${packageName === provider ? '' : `import ${provider}.Outer;`} public class Use {Outer.Builder source(){return new Outer.Builder();}void run(){${chain};}}`,
+        });
+        try {
+            const index = idx(dir);
+            for (const namespace of ['p', 'q']) {
+                const target = index.symbols.get('build').find(def => def.namespace === namespace);
+                const callers = index.findCallers('build', { targetDefinitions: [target], collectAccount: true });
+                assert.equal(callers.length, namespace === provider ? 1 : 0);
+                assert.equal(callers.unverifiedEntries.length, 0);
+            }
+            const callees = index.findCallees(index.symbols.get('run')[0], { collectAccount: true });
+            assert.deepEqual(callees.filter(def => def.name === 'build').map(def => def.namespace), [provider]);
+            assert.equal(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #417: primitive conversion preserves nominal argument names', () => {
+    it('a concrete String cannot unbox to char under a wildcard import', () => {
+        const dir = tmp({ 'N.java': 'import static java.util.Collections.*; class Target {void pick(char value){} void pick(String value){}} class Use {void run(Target target,String value){target.pick(value);}}' });
+        try {
+            const index = idx(dir);
+            for (const [type, count] of [['char', 0], ['String', 1]]) {
+                const target = index.symbols.get('pick').find(def => def.paramsStructured[0].type === type);
+                const callers = index.findCallers('pick', { targetDefinitions: [target], collectAccount: true });
+                assert.equal(callers.length, count);
+                assert.equal(callers.unverifiedEntries.length, 0);
+            }
+        } finally { rm(dir); }
+    });
+    for (const name of ['String', 'Text']) it(`${name}: a type parameter may unbox through its wrapper bound`, () => {
+        const dir = tmp({ 'N.java': `class Target {void pick(char value){}} class Use {<${name} extends Character> void run(Target target,${name} value){target.pick(value);}}` });
+        try {
+            const index = idx(dir), target = index.symbols.get('pick')[0];
+            const callers = index.findCallers('pick', { targetDefinitions: [target], collectAccount: true });
+            assert.equal(callers.length + callers.unverifiedEntries.length, 1);
+            const callees = index.findCallees(index.symbols.get('run')[0], { collectAccount: true });
+            assert.equal(callees.length + callees.unverifiedCallees.length, 1);
+            assert.equal(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #417: SDK receiver producers retain their naming scope', () => {
+    for (const [label, imports, method, parameter] of [
+        ['map', 'import javax.lang.model.element.AnnotationMirror; import javax.lang.model.element.ExecutableElement;',
+            'Object use(AnnotationMirror annotation, ExecutableElement element){return annotation.getElementValues().get(element);}', 'Object'],
+        ['list', 'import javax.lang.model.element.TypeElement; import javax.lang.model.util.ElementFilter;',
+            'Object use(TypeElement element){return ElementFilter.methodsIn(element.getEnclosedElements()).get(0);}', 'int'],
+    ]) it(`${label}: an unrelated nested base does not obscure an imported producer`, () => {
+        const dir = tmp({ 'N.java': `${imports}\nclass Target {void get(${parameter} value){}}\nclass Use {${method}\n abstract static class Unrelated extends java.util.AbstractList<Object>{}}\n` });
+        try {
+            const index = idx(dir), target = index.symbols.get('get')[0];
+            const callers = index.findCallers('get', { targetDefinitions: [target], collectAccount: true });
+            assert.equal(callers.length, 0);
+            assert.equal(callers.unverifiedEntries.length, 0);
+            const callees = index.findCallees(index.symbols.get('use')[0], { collectAccount: true });
+            assert.ok(!callees.some(def => def.className === 'Target' && def.name === 'get'));
+            assert.equal(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #417: SDK contracts retain their written type identity', () => {
+    const cases = [
+        ['Iterable formal', '',
+            'class Box implements Iterable<Object> {Box(Number value){} Box(String value){} public java.util.Iterator<Object> iterator(){return null;}}',
+            'static Box build(){return new Box(1);}', 'Number'],
+        ['unbounded Class formal', '',
+            'class Box {Box(Class<?> value){} Box(Object value){}}',
+            'static Box build(){return new Box(String.class);}', 'Class<?>'],
+        ['implicit Class producer', '',
+            'class Box {Box(Class<?> value){} Box(java.lang.reflect.Type value){}}',
+            'static Box build(Class<?> value){return new Box(value.getEnclosingClass());}', 'Class<?>'],
+        ['implicit Enum producer', '',
+            'class Box {Box(Class<?> value){} Box(java.lang.reflect.Type value){}}',
+            'static Box build(Enum<?> value){return new Box(value.getDeclaringClass());}', 'Class<?>'],
+        ['final getClass producer', 'import static java.util.Collections.*;',
+            'class Box {Box(Class<?> value){} Box(java.lang.reflect.Type value){}}',
+            'static Box build(){return new Box(new Object(){}.getClass());}', 'Class<?>'],
+        ['getClass overload', '',
+            'class Maker {Maker self(){return this;} String getClass(int value){return "x";}} class Box {Box(Class<?> value){} Box(String value){}}',
+            'static Box build(){return new Box(new Maker().self().getClass(1));}', 'String'],
+        ['reflection generic array sibling', 'import java.lang.reflect.Type; import java.lang.reflect.GenericArrayType;',
+            'class Product{} class ChildProduct extends Product{} class Parent {static Product pick(Type value){return new Product();}} class Maker extends Parent {static ChildProduct pick(GenericArrayType value){return new ChildProduct();}} class Box {Box(Product value){} Box(ChildProduct value){}}',
+            'static Box build(){return new Box(Maker.pick(Object[].class));}', 'Product'],
+        ['reflection type variable sibling', 'import java.lang.reflect.Type; import java.lang.reflect.TypeVariable;',
+            'class Product{} class ChildProduct extends Product{} class Parent {static Product pick(Type value){return new Product();}} class Maker extends Parent {static ChildProduct pick(TypeVariable<?> value){return new ChildProduct();}} class Box {Box(Product value){} Box(ChildProduct value){}}',
+            'static Box build(){return new Box(Maker.pick(Object.class));}', 'Product'],
+        ['reflection wildcard sibling', 'import java.lang.reflect.Type; import java.lang.reflect.WildcardType;',
+            'class Product{} class ChildProduct extends Product{} class Parent {static Product pick(Type value){return new Product();}} class Maker extends Parent {static ChildProduct pick(WildcardType value){return new ChildProduct();}} class Box {Box(Product value){} Box(ChildProduct value){}}',
+            'static Box build(){return new Box(Maker.pick(Object.class));}', 'Product'],
+        ['string beside reflection type variable', 'import java.lang.reflect.TypeVariable;',
+            'class Product{} class ChildProduct extends Product{} class Parent {static Product pick(String value){return new Product();}} class Maker extends Parent {static ChildProduct pick(TypeVariable<?> value){return new ChildProduct();}} class Box {Box(Product value){} Box(ChildProduct value){}}',
+            'static Box build(){return new Box(Maker.pick("x"));}', 'Product'],
+        ['Closeable formal', 'import java.io.Closeable;',
+            'class Box implements Closeable {Box(String value){} Box(Integer value){} public void close(){}}',
+            'static Box build(){return new Box("x");}', 'String'],
+        ['Map.Entry formal', 'import java.util.Map;',
+            'class Box implements Map.Entry<String,String> {Box(Number value){} Box(String value){} public String getKey(){return "";} public String getValue(){return "";} public String setValue(String value){return value;}}',
+            'static Box build(){return new Box(1);}', 'Number'],
+        ['Map.Entry producer', 'import java.util.Map;',
+            'class Product{} class ChildProduct extends Product{} class Maker implements Map.Entry<String,String> {ChildProduct make(){return new ChildProduct();} public String getKey(){return "";} public String getValue(){return "";} public String setValue(String value){return value;}} class Box {Box(ChildProduct value){} Box(Product value){}}',
+            'static Box build(){return new Box(new Maker().make());}', 'ChildProduct'],
+        ['Comparable producer', '',
+            'class Product{} class ChildProduct extends Product{} class Parent {static Product get(java.lang.reflect.Type value){return new Product();} static Product get(javax.lang.model.type.TypeMirror value){return new Product();}} class Maker extends Parent implements Comparable<Maker> {static ChildProduct get(Class<?> value){return new ChildProduct();} public int compareTo(Maker other){return 0;}} class Box {Box(ChildProduct value){} Box(Product value){}}',
+            'static Box build(){return new Box(Maker.get(Factory.class));}', 'ChildProduct'],
+        ['imported reflection producer', 'import java.lang.reflect.Method; import java.lang.reflect.Type; import static java.util.Collections.*;',
+            'class Box {Box(Type value){} Box(String value){}}',
+            'static Box build(Method method){return new Box(method.getGenericReturnType());}', 'Type'],
+        ['imported model producer', 'import javax.lang.model.element.TypeParameterElement; import javax.lang.model.type.TypeMirror; import static java.util.Collections.*;',
+            'class Box {Box(TypeMirror value){} Box(String value){}}',
+            'static Box build(TypeParameterElement element){return new Box(element.asType());}', 'TypeMirror'],
+        ['reflection chain', 'import java.lang.reflect.Type; import static java.util.Collections.*;',
+            'class Box {Box(Type value){} Box(String value){}}',
+            'static Box build() throws Exception {return new Box(new Factory().getClass().getDeclaredMethod("build").getGenericReturnType());}', 'Type'],
+        ['model collection element', 'import java.util.List; import javax.lang.model.element.TypeParameterElement; import javax.lang.model.type.TypeMirror; import static java.util.Collections.*;',
+            'class Box {Box(TypeMirror value){} Box(String value){}}',
+            'static Box build(List<TypeParameterElement> elements){return new Box(elements.get(0).asType());}', 'TypeMirror'],
+        ['model map element', 'import java.util.Map; import javax.lang.model.element.TypeParameterElement; import javax.lang.model.type.TypeMirror; import static java.util.Collections.*;',
+            'class Box {Box(TypeMirror value){} Box(String value){}}',
+            'static Box build(Map<String, TypeParameterElement> elements){return new Box(elements.get("x").asType());}', 'TypeMirror'],
+        ['concrete SDK collection element', 'import java.util.ArrayList; import javax.lang.model.element.TypeParameterElement; import javax.lang.model.type.TypeMirror; import static java.util.Collections.*;',
+            'class Box {Box(TypeMirror value){} Box(String value){}}',
+            'static Box build(ArrayList<TypeParameterElement> elements){return new Box(elements.get(0).asType());}', 'TypeMirror'],
+        ['upper bounded collection element', 'import java.util.List; import javax.lang.model.element.TypeParameterElement; import javax.lang.model.type.TypeMirror; import static java.util.Collections.*;',
+            'class Box {Box(TypeMirror value){} Box(String value){}}',
+            'static Box build(List<? extends TypeParameterElement> elements){return new Box(elements.get(0).asType());}', 'TypeMirror'],
+        ['project container get', 'import javax.lang.model.element.TypeParameterElement; import javax.lang.model.type.TypeMirror; import java.lang.reflect.Type; import static java.util.Collections.*;',
+            'class Wrong {Type asType(){return String.class;}} class Container<T> {Wrong get(int index){return new Wrong();}} class Box {Box(TypeMirror value){} Box(Type value){}}',
+            'static Box build(Container<TypeParameterElement> elements){return new Box(elements.get(0).asType());}', 'Type'],
+        ['project interface namesake', '',
+            'interface Iterable<T> {class Number{}} class Box implements Iterable<Object> {Box(Number value){} Box(Object value){}}',
+            'static Box build(){return new Box(1);}', 'Object'],
+        ['project Closeable namesake', '',
+            'interface Closeable {class String{}} class Box implements Closeable {Box(String value){} Box(Object value){}}',
+            'static Box build(){return new Box("x");}', 'Object'],
+    ];
+    for (const [label, imports, declarations, build, expected] of cases) {
+        it(`${label}: caller and callee select the compiler-visible constructor`, () => {
+            const dir = tmp({ 'N.java': `${imports}\n${declarations}\nclass Factory {${build}}\n` });
+            try {
+                const index = idx(dir), target = index.symbols.get('Box').find(def =>
+                    def.type === 'constructor' && def.paramsStructured[0].type === expected);
+                const callers = index.findCallers('Box', { targetDefinitions: [target], collectAccount: true });
+                assert.equal(callers.length, 1, callers.unverifiedEntries.map(site => site.reason).join(','));
+                const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+                const edges = callees.filter(def => def.type === 'constructor' && def.className === 'Box');
+                assert.deepEqual(edges.map(def => def.bindingId), [target.bindingId]);
+                const { validateConfirmation, declarationIdentity } = require('../core/provenance');
+                for (const site of edges[0].siteProvenance) assert.equal(
+                    validateConfirmation(JSON.parse(JSON.stringify(site.provenance)), declarationIdentity(target)).verdict,
+                    'establishes-target');
+                assert.equal(callees.calleeAccount.conserved, true);
+            } finally { rm(dir); }
+        });
+    }
+    it('Iterable also closes ordinary method formal lookup', () => {
+        const dir = tmp({ 'N.java': 'class Target implements Iterable<Object> {void accept(Number value){} void accept(String value){} public java.util.Iterator<Object> iterator(){return null;}}\nclass Factory {static void build(Target value){value.accept(1);}}\n' });
+        try {
+            const index = idx(dir), target = index.symbols.get('accept').find(def => def.paramsStructured[0].type === 'Number');
+            assert.equal(index.findCallers('accept', { targetDefinitions: [target], collectAccount: true }).length, 1);
+            const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+            assert.deepEqual(callees.filter(def => def.name === 'accept').map(def => def.bindingId), [target.bindingId]);
+            assert.equal(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+    it('Closeable also closes ordinary method formal lookup', () => {
+        const dir = tmp({ 'N.java': 'import java.io.Closeable;\nclass Target implements Closeable {void accept(String value){} void accept(Integer value){} public void close(){}}\nclass Factory {static void build(Target value){value.accept("x");}}\n' });
+        try {
+            const index = idx(dir), target = index.symbols.get('accept').find(def => def.paramsStructured[0].type === 'String');
+            assert.equal(index.findCallers('accept', { targetDefinitions: [target], collectAccount: true }).length, 1);
+            const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+            assert.deepEqual(callees.filter(def => def.name === 'accept').map(def => def.bindingId), [target.bindingId]);
+            assert.equal(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+    it('an inherited member type wins over a single SDK import', () => {
+        const dir = tmp({ 'N.java': 'import java.lang.reflect.Method;\nclass Base {static class Method {String getGenericReturnType(){return "x";}}}\nclass Box {Box(java.lang.reflect.Type value){} Box(String value){}}\nclass Factory extends Base {static Box build(Method method){return new Box(method.getGenericReturnType());}}\n' });
+        try {
+            const index = idx(dir), wrong = index.symbols.get('Box').find(def =>
+                def.type === 'constructor' && def.paramsStructured[0].type === 'java.lang.reflect.Type');
+            assert.equal(index.findCallers('Box', { targetDefinitions: [wrong], collectAccount: true }).length, 0);
+            assert.ok(!index.findCallees(index.symbols.get('build')[0], { collectAccount: true })
+                .some(def => def.bindingId === wrong.bindingId));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #417: Java type-name evidence follows lexical translation', () => {
+    const { translateUnicodeEscapes, typeNameSourceCanonical } = require('../languages/java-unicode');
+    it('translates eligible escapes once, respecting backslash parity and repeated markers', () => {
+        for (const [source, expected] of [
+            [String.raw`\u0061`, 'a'], [String.raw`\uuuu0061`, 'a'],
+            [String.raw`\\u0061`, String.raw`\\u0061`],
+            [String.raw`\u005cu0061`, String.raw`\u0061`],
+            [String.raw`\u005c\u0061`, '\\a'],
+            [String.raw`\\\u006e`, '\\\\n'],
+            [String.raw`\uD83D\uDE00`, '😀'],
+            [String.raw`\u123`, null], [String.raw`\u12xz`, null],
+        ]) assert.equal(translateUnicodeEscapes(source), expected, source);
+    });
+    it('retains canonical names for harmless literal and comment changes', () => {
+        for (const source of [
+            'class A {String f(){return "x";}}',
+            String.raw`class A {String f(){return "\u0078";}}`,
+            String.raw`class A {String f(){return "\\u0078";}}`,
+            String.raw`// \u0061` + '\nclass A {}',
+            'class A {String f(){return "\u200d";}}',
+            String.raw`class A {char zero='\u0000'; String f(){return "\u0000";}}`,
+            String.raw`// \u0000 harmless comment` + '\nclass A {}',
+            String.raw`//\u0000` + '\nclass A {}',
+            String.raw`/*\u0000*/class A {}`,
+            String.raw`class A {String emoji="😀"; char zero='\u0000';}`,
+        ]) assert.equal(typeNameSourceCanonical(source), true, source);
+    });
+    it('withdraws certainty when translation changes imports or identifiers', () => {
+        for (const source of [
+            String.raw`//\u000a import q.java;` + '\nclass A {}',
+            String.raw`import q.j\u0061va;` + '\nclass A {}',
+            'import q.j\u200dava;\nclass A {}',
+            String.raw`class j\u0061va {}`,
+            'class A {',
+            String.raw`class j\u0000ava {}`,
+            'class j\0ava {}',
+            'class A {char zero=\'\0\'; String f(){return "\0";}}',
+            '// \0 harmless comment\nclass A {}',
+        ]) assert.equal(typeNameSourceCanonical(source), false, source);
+    });
+    it('literal NUL contents preserve a receiver member proof and constructor argument identity', () => {
+        const dir = tmp({
+            'Target.java': String.raw`class Target {char zero='\u0000'; void work(){}}` + '\n',
+            'Use.java': 'class Use {void call(Target value){value.work();}}\n',
+            'Box.java': String.raw`class Box {char zero='\u0000'; Box(Target value){} Box(Object value){}}` + '\n',
+            'Factory.java': String.raw`class Factory {static java.lang.String text(){return "\u0000";} static Box build(){return new Box(text());}}` + '\n',
+        });
+        try {
+            const index = idx(dir), work = index.symbols.get('work')[0];
+            const callers = index.findCallers('work', { targetDefinitions: [work], collectAccount: true });
+            assert.equal(callers.filter(site => site.tier !== 'unverified').length, 1);
+            const ctors = index.symbols.get('Box').filter(def => def.type === 'constructor');
+            assert.equal(index.findCallers('Box', { targetDefinitions: [ctors[1]], collectAccount: true }).length, 1);
+            const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+            assert.ok(callees.some(def => def.type === 'constructor' && def.className === 'Box' && def.paramsStructured[0].type === 'Object'));
+        } finally { rm(dir); }
+    });
+    for (const binding of [String.raw`//\u000a import q.java;`, String.raw`import q.j\u0061va;`, 'import q.j\u200dava;']) {
+        it(`${JSON.stringify(binding)}: an opaque lexical binding cannot prove a platform argument`, () => {
+            const dir = tmp({
+                'p/Target.java': 'package p;public class Target{}\n',
+                'q/java.java': 'package q;public class java {public static class lang {public static class String extends p.Target{}}}\n',
+                'N.java': `${binding}\nimport p.Target;\nclass Box {Box(Target value){} Box(Object value){}}\nclass Factory {static Box build(){return new Box(new java.lang.String());}}\n`,
+            });
+            try {
+                const index = idx(dir), ctors = index.symbols.get('Box').filter(def => def.type === 'constructor');
+                assert.equal(index.findCallers('Box', { targetDefinitions: [ctors[1]], collectAccount: true }).length, 0);
+                const target = index.findCallers('Box', { targetDefinitions: [ctors[0]], collectAccount: true });
+                assert.equal(target.length + target.unverifiedEntries.length, 1);
+                assert.ok(!index.findCallees(index.symbols.get('build')[0], { collectAccount: true })
+                    .some(def => def.type === 'constructor' && def.className === 'Box'));
+            } finally { rm(dir); }
+        });
+    }
+    it('a literal cannot prove a formal type whose import appears after Unicode processing', () => {
+        const dir = tmp({
+            'p/String.java': 'package p;public class String{}\n',
+            'N.java': String.raw`//\u000a import p.String;` + '\nclass Box {Box(String value){} Box(Object value){}}\nclass Factory {static Box build(){return new Box("x");}}\n',
+        });
+        try {
+            const index = idx(dir), ctors = index.symbols.get('Box').filter(def => def.type === 'constructor');
+            assert.equal(index.findCallers('Box', { targetDefinitions: [ctors[0]], collectAccount: true }).length, 0);
+            const target = index.findCallers('Box', { targetDefinitions: [ctors[1]], collectAccount: true });
+            assert.equal(target.length + target.unverifiedEntries.length, 1);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #417: argument type spellings retain their lexical identity', () => {
+    for (const shadowed of [false, true]) {
+        it(`${shadowed ? 'unresolved project' : 'platform'} receiver: a platform method contract needs type identity`, () => {
+            const dir = tmp({ 'N.java': `${shadowed ? 'import q.java;\n' : ''}class Target{}\nclass Box {Box(Target value){} Box(Object value){}}\nclass Factory {static Box build(java.lang.Class value){return new Box(value.getEnclosingClass());}}\n` });
+            try {
+                const index = idx(dir), constructors = index.symbols.get('Box').filter(def => def.type === 'constructor');
+                const selected = index.findCallees(index.symbols.get('build')[0], { collectAccount: true })
+                    .filter(def => def.type === 'constructor' && def.className === 'Box');
+                assert.deepStrictEqual(selected.map(def => def.paramsStructured[0].type), shadowed ? [] : ['Object']);
+                if (shadowed) for (const ctor of constructors) {
+                    const callers = index.findCallers('Box', { targetDefinitions: [ctor], collectAccount: true });
+                    assert.equal(callers.length, 0);
+                    assert.equal(callers.unverifiedEntries.length, 1);
+                }
+            } finally { rm(dir); }
+        });
+    }
+    it('an implemented interface supplies member types to constructor parameters', () => {
+        const dir = tmp({ 'N.java': 'interface Contract {class String{}}\nclass Box implements Contract {Box(String value){} Box(Object value){}}\nclass Factory {static Box build(){return new Box("x");}}\n' });
+        try {
+            const index = idx(dir), constructors = index.symbols.get('Box').filter(def => def.type === 'constructor');
+            const edge = index.findCallees(index.symbols.get('build')[0], { collectAccount: true })
+                .find(def => def.type === 'constructor' && def.className === 'Box');
+            assert.equal(edge?.paramsStructured[0].type, 'Object');
+            assert.equal(index.findCallers('Box', { targetDefinitions: [constructors[0]], collectAccount: true }).length, 0);
+            assert.equal(index.findCallers('Box', { targetDefinitions: [constructors[1]], collectAccount: true }).length, 1);
+        } finally { rm(dir); }
+    });
+    for (const name of ['String', 'Class', 'Integer']) {
+        it(`${name}: a project type cannot acquire a platform argument identity`, () => {
+            const dir = tmp({ 'N.java': `class Target{}\nclass ${name} extends Target{}\nclass Box {Box(Target value){} Box(Object value){}}\nclass Factory {static Box build(${name} value){return new Box(value);}}\n` });
+            try {
+                const index = idx(dir), ctors = index.symbols.get('Box').filter(def => def.type === 'constructor');
+                assert.equal(index.findCallers('Box', { targetDefinitions: [ctors[1]], collectAccount: true }).length, 0);
+                const target = index.findCallers('Box', { targetDefinitions: [ctors[0]], collectAccount: true });
+                assert.equal(target.length + target.unverifiedEntries.length, 1);
+                assert.ok(!index.findCallees(index.symbols.get('build')[0], { collectAccount: true })
+                    .some(def => def.type === 'constructor' && def.paramsStructured[0].type === 'Object'));
+            } finally { rm(dir); }
+        });
+    }
+    it('an unrelated nested class cannot supply types to an outer argument', () => {
+        const dir = tmp({ 'N.java': 'class Target{}\nclass Box {Box(Target value){} Box(Object value){}}\nclass Factory {static Box build(Class<?> value){return new Box(value);} static class Nested extends External{}}\n' });
+        try {
+            const index = idx(dir), ctor = index.symbols.get('Box').find(def => def.type === 'constructor' && def.paramsStructured[0].type === 'Object');
+            const edge = index.findCallees(index.symbols.get('build')[0], { collectAccount: true }).find(def => def.type === 'constructor');
+            assert.equal(edge?.bindingId, ctor.bindingId);
+            const { declarationIdentity, validateConfirmation } = require('../core/provenance');
+            const proof = JSON.parse(JSON.stringify(edge.siteProvenance[0].provenance));
+            assert.equal(validateConfirmation(proof, declarationIdentity(ctor)).verdict, 'establishes-target');
+            proof.facts.constructorCall.overload.call.callSite.start++;
+            assert.notEqual(validateConfirmation(proof, declarationIdentity(ctor)).verdict, 'establishes-target');
+        } finally { rm(dir); }
+    });
+    for (const [label, factory] of [
+        ['inherited', 'class Factory extends External {static Box build(String value){return new Box(value);}}'],
+        ['anonymous', 'class Factory {static void build(){new External(){Box call(String value){return new Box(value);}};}}'],
+    ]) {
+        it(`${label}: an unindexed lexical base keeps the actual type unresolved`, () => {
+            const dir = tmp({ 'N.java': `class Target{}\nclass Box {Box(Target value){} Box(Object value){}}\n${factory}\n` });
+            try {
+                const index = idx(dir), ctors = index.symbols.get('Box').filter(def => def.type === 'constructor');
+                for (const ctor of ctors) {
+                    const callers = index.findCallers('Box', { targetDefinitions: [ctor], collectAccount: true });
+                    assert.equal(callers.length, 0);
+                    assert.equal(callers.unverifiedEntries.length, 1);
+                }
+            } finally { rm(dir); }
+        });
+    }
+});
+
+describe('fix #417: class literal arguments retain their JDK identity', () => {
+    const targetSource = 'package p;public class Target{}\n';
+    const shadowSource = 'package q;public class java {public static class lang {public static class String extends p.Target{}}}\n';
+    for (const [label, declaration, argument] of [
+        ['construction', '', 'new java.lang.String()'],
+        ['cast', 'Object value', '(java.lang.String)value'],
+        ['annotation', 'java.lang.String value', 'value'],
+    ]) {
+        it(`${label}: a qualified argument type may start at an imported project type`, () => {
+            const dir = tmp({
+                'p/Target.java': targetSource, 'q/java.java': shadowSource,
+                'N.java': `import q.java;import p.Target;\nclass Box {Box(Target value){} Box(Object value){}}\nclass Factory {static Box build(${declaration}){return new Box(${argument});}}\n`,
+            });
+            try {
+                const index = idx(dir), constructors = index.symbols.get('Box').filter(def => def.type === 'constructor');
+                assert.equal(index.findCallers('Box', { targetDefinitions: [constructors[1]], collectAccount: true }).length, 0);
+                const target = index.findCallers('Box', { targetDefinitions: [constructors[0]], collectAccount: true });
+                assert.equal(target.length + target.unverifiedEntries.length, 1, 'the compiler-selected target remains visible');
+                const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+                assert.ok(!callees.some(def => def.bindingId === constructors[1].bindingId));
+                assert.equal(callees.calleeAccount.conserved, true);
+            } finally { rm(dir); }
+        });
+    }
+    for (const [label, producer, argument] of [
+        ['return', 'class Producer {static java.lang.String source(){return null;}}', 'Producer.source()'],
+        ['field', 'class Producer {static java.lang.String value;}', 'Producer.value'],
+    ]) {
+        for (const shadowed of [false, true]) {
+            it(`${label}: the type name belongs to the ${shadowed ? 'shadowed' : 'unshadowed'} declaring file`, () => {
+                const dir = tmp({
+                    'p/Target.java': targetSource,
+                    ...(shadowed ? {} : { 'q/java.java': shadowSource }),
+                    'Producer.java': `${shadowed ? 'import dep.java;\n' : ''}${producer}\n`,
+                    'N.java': `${shadowed ? '' : 'import q.java;'}import p.Target;\nclass Box {Box(Target value){} Box(Object value){}}\nclass Factory {static Box build(){return new Box(${argument});}}\n`,
+                });
+                try {
+                    const index = idx(dir), constructors = index.symbols.get('Box').filter(def => def.type === 'constructor');
+                    const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+                    if (shadowed) {
+                        assert.ok(!callees.some(def => def.bindingId === constructors[1].bindingId));
+                        const callers = index.findCallers('Box', { targetDefinitions: [constructors[0]], collectAccount: true });
+                        assert.equal(callers.length + callers.unverifiedEntries.length, 1);
+                    } else {
+                        const edge = callees.find(def => def.type === 'constructor' && def.className === 'Box');
+                        assert.equal(edge?.bindingId, constructors[1].bindingId, callees.unverifiedCallees.map(def => def.reason).join(','));
+                        const { validateConfirmation, declarationIdentity } = require('../core/provenance');
+                        const proof = JSON.parse(JSON.stringify(edge.siteProvenance[0].provenance));
+                        assert.equal(validateConfirmation(proof, declarationIdentity(constructors[1])).verdict, 'establishes-target');
+                        proof.facts.constructorCall.overload.call.argumentFile = 'Producer.java';
+                        assert.notEqual(validateConfirmation(proof, declarationIdentity(constructors[1])).verdict, 'establishes-target');
+                    }
+                    assert.equal(callees.calleeAccount.conserved, true);
+                } finally { rm(dir); }
+            });
+        }
+    }
+    for (const [label, source] of [
+        ['unrelated nested Object', 'package p; class Other {static class Object{}} class Type{} class Box {Box(Type value){} Box(Object value){}}'],
+        ['own member before import', 'import java.lang.reflect.Type; class Box {static class Type{} Box(Type value){} Box(Object value){}}'],
+        ['inherited member before import', 'import java.lang.reflect.Type; class Base {static class Type{}} class Box extends Base {Box(Type value){} Box(Object value){}}'],
+    ]) {
+        it(`${label}: formal type lookup uses the declaring class scope`, () => {
+            const dir = tmp({ 'N.java': `${source}\nclass Factory {static Box build(){return new Box(String.class);}}\n` });
+            try {
+                const index = idx(dir), ctors = index.symbols.get('Box').filter(def => def.type === 'constructor');
+                const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+                assert.equal(callees.find(def => def.type === 'constructor' && def.className === 'Box')?.bindingId,
+                    ctors[1].bindingId, callees.unverifiedCallees.map(def => def.reason).join(','));
+                for (const [position, ctor] of ctors.entries()) {
+                    const callers = index.findCallers('Box', { targetDefinitions: [ctor], collectAccount: true });
+                    assert.equal(callers.length, position);
+                }
+                assert.equal(callees.calleeAccount.conserved, true);
+            } finally { rm(dir); }
+        });
+    }
+    it('an unindexed superclass may supply a type that shadows an import', () => {
+        const dir = tmp({ 'N.java': 'import java.lang.reflect.Type;\nclass Box extends dep.Base {Box(Type value){}\n Box(Object value){}}\nclass Factory {static Box build(){return new Box(String.class);}}\n' });
+        try {
+            const index = idx(dir);
+            for (const ctor of index.symbols.get('Box').filter(def => def.type === 'constructor')) {
+                const callers = index.findCallers('Box', { targetDefinitions: [ctor], collectAccount: true });
+                assert.equal(callers.length, 0);
+                assert.equal(callers.unverifiedEntries.length, 1);
+            }
+            assert.equal(index.findCallees(index.symbols.get('build')[0], { collectAccount: true }).length, 0);
+        } finally { rm(dir); }
+    });
+    it('a superclass name is not an inherited member type', () => {
+        const dir = tmp({
+            'dep/Object.java': 'package dep;public class Object{}\n',
+            'N.java': 'class Type{}\nclass Box extends dep.Object {Box(Type value){}\n Box(Object value){}}\nclass Factory {static Box build(){return new Box(String.class);}}\n',
+        });
+        try {
+            const index = idx(dir), ctors = index.symbols.get('Box').filter(def => def.type === 'constructor');
+            assert.equal(index.findCallees(index.symbols.get('build')[0], { collectAccount: true })
+                .find(def => def.type === 'constructor')?.bindingId, ctors[1].bindingId);
+            assert.equal(index.findCallers('Box', { targetDefinitions: [ctors[1]], collectAccount: true }).length, 1);
+        } finally { rm(dir); }
+    });
+    for (const [name, argument, producer] of [
+        ['String', '"x"', ''], ['Integer', '1', ''], ['Number', '1', ''],
+        ['CharSequence', '"x"', ''], ['Boolean', 'true', ''], ['Character', "'x'", ''],
+        ['String', 'source()', 'static java.lang.String source(){return "x";}'],
+        ['String', 'new java.lang.String("x")', ''],
+    ]) {
+        it(`${name} with ${argument}: known JDK values do not convert to a project namesake`, () => {
+            const dir = tmp({ 'N.java': `class ${name} {}\nclass Box {Box(${name} value){}\n Box(java.lang.Object value){}}\nclass Factory {${producer} static Box build(){return new Box(${argument});}}\n` });
+            try {
+                const index = idx(dir), ctors = index.symbols.get('Box').filter(def => def.type === 'constructor');
+                const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+                assert.equal(callees.find(def => def.type === 'constructor' && def.className === 'Box')?.bindingId, ctors[1].bindingId,
+                    callees.unverifiedCallees.map(def => def.reason).join(','));
+                assert.equal(index.findCallers('Box', { targetDefinitions: [ctors[0]], collectAccount: true }).length, 0);
+            } finally { rm(dir); }
+        });
+    }
+    for (const name of ['Type', 'Class', 'Serializable', 'GenericDeclaration', 'AnnotatedElement', 'Object']) {
+        it(`a project ${name} is not a supertype of java.lang.Class`, () => {
+            const dir = tmp({ 'N.java': `class ${name} {}\nclass Box {\n Box(${name} value){}\n Box(java.lang.Object value){}\n}\nclass Factory {static Box build(){return new Box(String.class);}}\n` });
+            try {
+                const index = idx(dir);
+                for (const def of index.symbols.get('Box').filter(def => def.type === 'constructor')) {
+                    const callers = index.findCallers('Box', { targetDefinitions: [def], collectAccount: true });
+                    assert.equal(callers.length, def.startLine === 4 ? 1 : 0, def.params);
+                }
+                const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+                assert.equal(callees.find(def => def.type === 'constructor')?.startLine, 4);
+                assert.equal(callees.calleeAccount.conserved, true);
+            } finally { rm(dir); }
+        });
+    }
+    for (const [label, imports, formal, project, expected] of [
+        ['single JDK import', 'import java.lang.reflect.Type;', 'Type', false, 2],
+        ['JDK on-demand import', 'import java.lang.reflect.*;', 'Type', false, 2],
+        ['qualified JDK type', '', 'java.lang.reflect.Type', false, 2],
+        ['local type before on-demand import', 'import java.lang.reflect.*;', 'Type', true, 3],
+        ['qualified project type', 'package p;', 'p.Type', true, 3],
+        ['imported project type', 'import q.Type;', 'Type', false, 3],
+    ]) {
+        it(`${label}: parameter binding precedes platform assignability`, () => {
+            const code = `${imports}${project ? 'class Type {}' : ''}\nclass Box {Box(${formal} value){}\n Box(java.lang.Object value){}}\nclass Factory {static Box build(){return new Box(String.class);}}\n`;
+            const files = { 'N.java': code, 'q/Type.java': 'package q;public class Type {}\n' };
+            const dir = tmp(files);
+            try {
+                const index = idx(dir), callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+                assert.equal(callees.find(def => def.type === 'constructor')?.params,
+                    `${expected === 2 ? formal : 'java.lang.Object'} value`,
+                    callees.unverifiedCallees.map(def => def.reason).join(','));
+            } finally { rm(dir); }
+        });
+    }
+    it('Class array elements retain the formal declaration scope', () => {
+        const dir = tmp({ 'N.java': 'class Type {}\nclass Box {Box(Type[] value){}\n Box(java.lang.Object[] value){}}\nclass Factory {static java.lang.Class<?>[] source(){return null;} static Box build(){return new Box(source());}}\n' });
+        try {
+            const index = idx(dir), callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+            assert.equal(callees.find(def => def.type === 'constructor')?.startLine, 3);
+        } finally { rm(dir); }
+    });
+    for (const formal of ['java.lang.constant.Constable', 'java.lang.invoke.TypeDescriptor', 'java.lang.invoke.TypeDescriptor.OfField<?>']) {
+        it(`${formal}: a declared JDK superinterface remains applicable`, () => {
+            const dir = tmp({ 'N.java': `class Box {Box(${formal} value){}\n Box(java.lang.Object value){}}\nclass Factory {static Box build(){return new Box(String.class);}}\n` });
+            try {
+                const index = idx(dir), ctors = index.symbols.get('Box').filter(def => def.type === 'constructor');
+                const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+                assert.equal(callees.find(def => def.type === 'constructor')?.bindingId, ctors[0].bindingId);
+                assert.equal(index.findCallers('Box', { targetDefinitions: [ctors[0]], collectAccount: true }).length, 1);
+            } finally { rm(dir); }
+        });
+    }
+    for (const member of ['public static int Type;', 'public static void Type(){}']) {
+        it(`a static ${member.includes('void') ? 'method' : 'field'} import does not shadow a formal type`, () => {
+            const dir = tmp({
+                'p/Holder.java': `package p;public class Holder {${member}}\n`,
+                'q/Type.java': 'package q;public class Type {}\n',
+                'N.java': 'import static p.Holder.Type;\nimport java.lang.reflect.*;\nclass Box {Box(Type value){}\n Box(Object value){}}\nclass Factory {static Box build(){return new Box(String.class);}}\n',
+            });
+            try {
+                const index = idx(dir), ctors = index.symbols.get('Box').filter(def => def.type === 'constructor');
+                const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+                assert.equal(callees.find(def => def.type === 'constructor')?.bindingId, ctors[0].bindingId);
+            } finally { rm(dir); }
+        });
+    }
+    it('a static nested-type import belongs to the type namespace', () => {
+        const dir = tmp({
+            'p/Holder.java': 'package p;public class Holder {public static class Type{}}\n',
+            'N.java': 'import static p.Holder.Type;\nclass Box {Box(Type value){}\n Box(Object value){}}\nclass Factory {static Box build(){return new Box(String.class);}}\n',
+        });
+        try {
+            const index = idx(dir), ctors = index.symbols.get('Box').filter(def => def.type === 'constructor');
+            assert.equal(index.findCallees(index.symbols.get('build')[0], { collectAccount: true })
+                .find(def => def.type === 'constructor')?.bindingId, ctors[1].bindingId);
+        } finally { rm(dir); }
+    });
+    it('an explicit cast to java.lang.Class retains its qualified identity', () => {
+        const dir = tmp({ 'N.java': 'class Type{}\nclass Box {Box(Type value){}\n Box(Object value){}}\nclass Factory {static Box build(Object value){return new Box((java.lang.Class<?>)value);}}\n' });
+        try {
+            const index = idx(dir), ctors = index.symbols.get('Box').filter(def => def.type === 'constructor');
+            assert.equal(index.findCallees(index.symbols.get('build')[0], { collectAccount: true })
+                .find(def => def.type === 'constructor')?.bindingId, ctors[1].bindingId);
+        } finally { rm(dir); }
+    });
+    it('a class literal cannot implement an imported unrelated interface', () => {
+        const dir = tmp({ 'N.java': 'import dep.Opaque;\nclass Box {Box(Opaque value){}\n Box(Object value){}}\nclass Factory {static Box build(){return new Box(String.class);}}\n' });
+        try {
+            const index = idx(dir), ctors = index.symbols.get('Box').filter(def => def.type === 'constructor');
+            for (const ctor of ctors) {
+                const callers = index.findCallers('Box', { targetDefinitions: [ctor], collectAccount: true });
+                assert.equal(callers.length, ctor.paramsStructured[0].type === 'Object' ? 1 : 0);
+                assert.equal(callers.unverifiedEntries.length, 0);
+            }
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #417: external argument types cannot select unrelated constructor overloads', () => {
+    const source = (array = false, namespace = '') => `${namespace}class Lit {}\nclass Box {\n Box(Class<?>${array ? '[]' : ''} value){}\n Box(java.lang.reflect.Type${array ? '[]' : ''} value){}\n Box(Lit${array ? '[]' : ''} value){}\n}\nclass Factory {\n static java.lang.reflect.ParameterizedType${array ? '[]' : ''} source(){return null;}\n static java.lang.reflect.ParameterizedType${array ? '[]' : ''} value;\n static Box build(){return new Box(ARG);}\n}\n`;
+    for (const [label, argument, array] of [
+        ['return', 'source()', false], ['field', 'Factory.value', false],
+        ['array-return', 'source()', true], ['array-field', 'Factory.value', true],
+    ]) {
+        for (const namespace of ['', 'package p;']) {
+            it(`${namespace ? 'package' : 'default-package'} ${label}: a project namesake is not an applicable parameter type`, () => {
+                const dir = tmp({ 'N.java': source(array, namespace).replace('ARG', argument) });
+                try {
+                    const index = idx(dir), constructors = index.symbols.get('Box').filter(def => def.type === 'constructor');
+                    for (const ctor of constructors) {
+                        const callers = index.findCallers('Box', { targetDefinitions: [ctor], collectAccount: true });
+                        assert.equal(callers.length, ctor.startLine === 4 ? 1 : 0, ctor.params);
+                    }
+                    const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+                    assert.equal(callees.find(def => def.type === 'constructor')?.startLine, 4, JSON.stringify(callees.unverifiedCallees));
+                    assert.equal(callees.calleeAccount.conserved, true);
+                } finally { rm(dir); }
+            });
+        }
+    }
+    it('a recursive return-type comparison retains the constructor type parameter scope', () => {
+        const dir = tmp({ 'N.java': 'class Value {}\nclass Box {\n <Value> Box(Value value){}\n Box(String value){}\n}\nclass Factory {static java.lang.reflect.ParameterizedType source(){return null;} static Box build(){return new Box(source());}}\n' });
+        try {
+            const index = idx(dir), ctor = index.symbols.get('Box').find(def => def.type === 'constructor' && def.startLine === 3);
+            assert.equal(index.findCallers('Box', { targetDefinitions: [ctor], collectAccount: true }).length, 1);
+            assert.ok(index.findCallees(index.symbols.get('build')[0], { collectAccount: true }).some(def => def.type === 'constructor' && def.startLine === 3));
+        } finally { rm(dir); }
+    });
+    it('a changed interface-taking constructor is checked against the saved overload binding', () => {
+        const { execFileSync } = require('child_process');
+        const code = source().replace('ARG', 'source()'), dir = tmp({ 'N.java': code });
+        const git = (...args) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd: dir, stdio: 'pipe' });
+        try {
+            git('init', '-q'); git('add', '.'); git('commit', '-qm', 'initial');
+            fs.writeFileSync(path.join(dir, 'N.java'), code.replace('Type value)', 'Type value,int required)'));
+            const result = execute(idx(dir), 'check', { name: 'N.java:4:Box' });
+            assert.ok(result.ok, result.error);
+            assert.equal(result.result.mismatches, 1, JSON.stringify(result.result));
+            assert.equal(result.result.valid, 0);
+            assert.equal(result.result.mismatchDetails[0].boundBeforeChange, true);
+        } finally { rm(dir); }
+    });
+});
+
 // ============================================================================
 // Java class methods in context
 // ============================================================================
@@ -51,10 +904,7 @@ describe('Regression: Java class methods in context', () => {
             // Should identify as class
             assert.strictEqual(ctx.type, 'class', 'User should be identified as class');
             assert.ok(ctx.methods, 'Should have methods array');
-            // JAVA-3: constructors are no longer emitted as separate symbols.
-            // The class IS the symbol; the constructor is its initializer. So
-            // User class has 2 methods (greet, validate), not 3.
-            assert.strictEqual(ctx.methods.length, 2, 'User class should have 2 methods (greet + validate; constructor not emitted as separate symbol)');
+            assert.strictEqual(ctx.methods.length, 3, 'User exposes its constructor, greet and validate');
 
             const methodNames = ctx.methods.map(m => m.name);
             assert.ok(methodNames.includes('greet'), 'Should include greet');
@@ -414,16 +1264,13 @@ public class MyClass {
             index.build(null, { quiet: true });
 
             const symbols = index.symbols.get('MyClass') || [];
-            // JAVA-3: constructors are no longer emitted as separate symbols.
-            // The class IS the symbol; new MyClass() resolves to the class via
-            // isConstructor: true on the call. So we expect exactly 1 entry: the class.
             const types = symbols.map(s => s.type);
             assert.strictEqual(types.filter(t => t === 'class').length, 1, 'Should have exactly 1 class entry');
-            // Should NOT emit constructors as separate symbols
             const constructors = symbols.filter(s => s.type === 'constructor');
-            assert.strictEqual(constructors.length, 0, 'Should NOT emit constructors as separate symbols (class IS the symbol)');
-            // Total symbols for MyClass: just the class itself
-            assert.strictEqual(symbols.length, 1, 'Only the class symbol should exist for MyClass');
+            assert.strictEqual(constructors.length, 2, 'Each declared constructor has its own symbol');
+            assert.strictEqual(new Set(constructors.map(def => def.bindingId)).size, 2);
+            assert.deepStrictEqual(constructors.map(def => def.params), ['', 'int value']);
+            assert.strictEqual(symbols.length, 3, 'One class and two constructor declarations');
         } finally {
             fs.rmSync(tmpDir, { recursive: true, force: true });
         }
@@ -2448,12 +3295,18 @@ describe('fix #210: external-contract methods (Java)', () => {
     @Override
     public int intValue() { return 1; }
     public int ownMethod() { return 2; }
+    public long longValue() { return 1; }
+    public float floatValue() { return 1; }
+    public double doubleValue() { return 1; }
 }
 `,
         'Caller.java': `public class Caller {
     void use(Object o, java.util.List<LazyNum> nums) {
         int a = ((Integer) o).intValue();
         int b = nums.get(0).ownMethod();
+    }
+    void opaque(java.util.function.Supplier<LazyNum> value) {
+        value.get().ownMethod();
     }
 }
 `,
@@ -2520,13 +3373,24 @@ describe('fix #210: external-contract methods (Java)', () => {
         } finally { rm(dir); }
     });
 
+    it('a typed SDK collection element supplies receiver evidence', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'LazyNum.java:4:ownMethod');
+            assert.ok(res.confirmed.includes('Caller.java:4'));
+            assert.ok(!res.unverified.some(c => c.key === 'Caller.java:4'));
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
     it('un-marked single-owner methods remain visible without receiver evidence (#355)', () => {
         const dir = tmp(FILES);
         try {
             const index = idx(dir);
             const res = contract(index, 'LazyNum.java:4:ownMethod');
-            assert.ok(!res.confirmed.includes('Caller.java:4'));
-            assert.strictEqual(res.unverified.find(c => c.key === 'Caller.java:4')?.reason, 'single-owner');
+            assert.ok(!res.confirmed.includes('Caller.java:7'));
+            assert.strictEqual(res.unverified.find(c => c.key === 'Caller.java:7')?.reason, 'single-owner');
             assert.strictEqual(res.conserved, true);
         } finally { rm(dir); }
     });

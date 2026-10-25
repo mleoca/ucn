@@ -25,8 +25,7 @@ const tsMorphOracle = {
      * @returns {{ project, root, SyntaxKind }}
      */
     async prepare(repoDir) {
-        const { Project } = require('ts-morph');
-        const ts = require('typescript');
+        const { Project, ts } = require('ts-morph');
         // ProjectIndex roots at the nearest manifest so imports and callers
         // in sibling source/test directories remain visible even when the
         // requested target is a nested src directory. Mirror that universe;

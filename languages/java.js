@@ -18,6 +18,7 @@ const {
     visitNameNodes,
     sameNode,
     parseErrorRegions,
+    hasParameterizedQualifier,
 } = require('./utils');
 const { PARSE_OPTIONS, safeParse } = require('./index');
 
@@ -240,7 +241,7 @@ function _processFunction(node, functions, processedRanges, lines, code) {
         const paramsNode = node.childForFieldName('parameters');
 
         if (nameNode) {
-            const { startLine, endLine, indent } = nodeToLocation(node, lines);
+            const { startLine, endLine, indent, sourceSpan } = nodeToLocation(node, lines);
             const modifiers = extractModifiers(node);
             const annotations = extractAnnotations(node);
             const annotationsWithArgs = extractAnnotationsWithArgs(node);
@@ -256,6 +257,7 @@ function _processFunction(node, functions, processedRanges, lines, code) {
                 paramsStructured: parseStructuredParams(paramsNode, 'java'),
                 startLine,
                 endLine,
+                sourceSpan,
                 indent,
                 modifiers,
                 ...(returnType && { returnType }),
@@ -285,7 +287,7 @@ function _processFunction(node, functions, processedRanges, lines, code) {
         const paramsNode = node.childForFieldName('parameters');
 
         if (nameNode) {
-            const { startLine, endLine, indent } = nodeToLocation(node, lines);
+            const { startLine, endLine, indent, sourceSpan } = nodeToLocation(node, lines);
             const modifiers = extractModifiers(node);
             const annotations = extractAnnotations(node);
             const annotationsWithArgs = extractAnnotationsWithArgs(node);
@@ -298,6 +300,7 @@ function _processFunction(node, functions, processedRanges, lines, code) {
                 paramsStructured: parseStructuredParams(paramsNode, 'java'),
                 startLine,
                 endLine,
+                sourceSpan,
                 indent,
                 modifiers,
                 isConstructor: true,
@@ -386,7 +389,7 @@ function _processClass(node, classes, processedRanges, lines, code) {
 
         const nameNode = node.childForFieldName('name');
         if (nameNode) {
-            const { startLine, endLine } = nodeToLocation(node, lines);
+            const { startLine, endLine, sourceSpan } = nodeToLocation(node, lines);
             const members = extractClassMembers(node, lines);
             const modifiers = extractModifiers(node);
             const annotations = extractAnnotations(node);
@@ -405,6 +408,7 @@ function _processClass(node, classes, processedRanges, lines, code) {
                 name: nameNode.text,
                 startLine,
                 endLine,
+                sourceSpan,
                 // The name's own line when annotations precede it (fix #389).
                 ...(nameNode.startPosition.row + 1 !== startLine && { nameLine: nameNode.startPosition.row + 1 }),
                 type: 'class',
@@ -435,7 +439,7 @@ function _processClass(node, classes, processedRanges, lines, code) {
 
         const nameNode = node.childForFieldName('name');
         if (nameNode) {
-            const { startLine, endLine } = nodeToLocation(node, lines);
+            const { startLine, endLine, sourceSpan } = nodeToLocation(node, lines);
             const modifiers = extractModifiers(node);
             const annotations = extractAnnotations(node);
             const annotationsWithArgs = extractAnnotationsWithArgs(node);
@@ -447,6 +451,7 @@ function _processClass(node, classes, processedRanges, lines, code) {
                 name: nameNode.text,
                 startLine,
                 endLine,
+                sourceSpan,
                 // The name's own line when annotations precede it (fix #389).
                 ...(nameNode.startPosition.row + 1 !== startLine && { nameLine: nameNode.startPosition.row + 1 }),
                 type: 'interface',
@@ -473,7 +478,7 @@ function _processClass(node, classes, processedRanges, lines, code) {
 
         const nameNode = node.childForFieldName('name');
         if (nameNode) {
-            const { startLine, endLine } = nodeToLocation(node, lines);
+            const { startLine, endLine, sourceSpan } = nodeToLocation(node, lines);
             const modifiers = extractModifiers(node);
             const annotations = extractAnnotations(node);
             const annotationsWithArgs = extractAnnotationsWithArgs(node);
@@ -486,6 +491,7 @@ function _processClass(node, classes, processedRanges, lines, code) {
                 name: nameNode.text,
                 startLine,
                 endLine,
+                sourceSpan,
                 // The name's own line when annotations precede it (fix #389).
                 ...(nameNode.startPosition.row + 1 !== startLine && { nameLine: nameNode.startPosition.row + 1 }),
                 type: 'enum',
@@ -510,7 +516,7 @@ function _processClass(node, classes, processedRanges, lines, code) {
 
         const nameNode = node.childForFieldName('name');
         if (nameNode) {
-            const { startLine, endLine } = nodeToLocation(node, lines);
+            const { startLine, endLine, sourceSpan } = nodeToLocation(node, lines);
             const modifiers = extractModifiers(node);
             const annotations = extractAnnotations(node);
             const annotationsWithArgs = extractAnnotationsWithArgs(node);
@@ -546,6 +552,7 @@ function _processClass(node, classes, processedRanges, lines, code) {
                 name: nameNode.text,
                 startLine,
                 endLine,
+                sourceSpan,
                 // The name's own line when annotations precede it (fix #389).
                 ...(nameNode.startPosition.row + 1 !== startLine && { nameLine: nameNode.startPosition.row + 1 }),
                 type: 'record',
@@ -672,12 +679,13 @@ function extractEnumConstants(enumNode, codeOrLines) {
         if (child.type === 'enum_constant') {
             const nameNode = child.childForFieldName('name');
             if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(child, code);
+                const { startLine, endLine, sourceSpan } = nodeToLocation(child, code);
                 const argsNode = child.childForFieldName('arguments');
                 constants.push({
                     name: nameNode.text,
                     startLine,
                     endLine,
+                    sourceSpan,
                     memberType: 'constant',
                     // JLS: enum constants are implicitly public static final
                     // (fix #251 — api omitted them for lack of a modifier).
@@ -699,7 +707,7 @@ function extractEnumConstants(enumNode, codeOrLines) {
                         const nameNode = member.childForFieldName('name');
                         const paramsNode = member.childForFieldName('parameters');
                         if (nameNode) {
-                            const { startLine, endLine } = nodeToLocation(member, code);
+                            const { startLine, endLine, sourceSpan } = nodeToLocation(member, code);
                             const modifiers = extractModifiers(member);
                             const returnType = extractReturnType(member);
                             // The name's own line and annotations, as for class
@@ -714,6 +722,7 @@ function extractEnumConstants(enumNode, codeOrLines) {
                                 paramsStructured: parseStructuredParams(paramsNode, 'java'),
                                 startLine,
                                 endLine,
+                                sourceSpan,
                                 memberType: modifiers.includes('static') ? 'static' : 'method',
                                 modifiers,
                                 isMethod: true,
@@ -727,7 +736,7 @@ function extractEnumConstants(enumNode, codeOrLines) {
                         const nameNode = member.childForFieldName('name');
                         const paramsNode = member.childForFieldName('parameters');
                         if (nameNode) {
-                            const { startLine, endLine } = nodeToLocation(member, code);
+                            const { startLine, endLine, sourceSpan } = nodeToLocation(member, code);
                             const modifiers = extractModifiers(member);
                             constants.push({
                                 name: nameNode.text,
@@ -738,7 +747,9 @@ function extractEnumConstants(enumNode, codeOrLines) {
                                 paramsStructured: parseStructuredParams(paramsNode, 'java'),
                                 startLine,
                                 endLine,
+                                sourceSpan,
                                 memberType: 'constructor',
+                                isConstructor: true,
                                 modifiers,
                                 isMethod: true
                             });
@@ -774,7 +785,7 @@ function extractClassMembers(classNode, codeOrLines) {
             const paramsNode = child.childForFieldName('parameters');
 
             if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(child, code);
+                const { startLine, endLine, sourceSpan } = nodeToLocation(child, code);
                 const modifiers = extractModifiers(child);
                 const annotationsWithArgs = extractAnnotationsWithArgs(child);
                 // Interface methods are implicitly public and abstract in Java
@@ -802,6 +813,7 @@ function extractClassMembers(classNode, codeOrLines) {
                     paramsStructured: parseStructuredParams(paramsNode, 'java'),
                     startLine,
                     endLine,
+                    sourceSpan,
                     memberType,
                     modifiers,
                     isMethod: true,  // Mark as method for context() lookups
@@ -822,7 +834,7 @@ function extractClassMembers(classNode, codeOrLines) {
         if (child.type === 'annotation_type_element_declaration') {
             const nameNode = child.childForFieldName('name');
             if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(child, code);
+                const { startLine, endLine, sourceSpan } = nodeToLocation(child, code);
                 // Elements take no keyword modifiers besides public/abstract;
                 // `default` here introduces the default value.
                 const modifiers = extractModifiers(child).filter(modifier =>
@@ -838,6 +850,7 @@ function extractClassMembers(classNode, codeOrLines) {
                     paramsStructured: [],
                     startLine,
                     endLine,
+                    sourceSpan,
                     memberType: 'abstract',
                     modifiers,
                     isMethod: true,
@@ -848,13 +861,31 @@ function extractClassMembers(classNode, codeOrLines) {
             }
         }
 
-        // Constructor declarations: intentionally NOT emitted as separate class
-        // members. The class itself is the symbol; `new Foo(...)` calls resolve
-        // to the class via `isConstructor: true` on the call. Emitting the
-        // constructor as a member would create duplicate `find Foo` results
-        // (one for class, one for constructor), forcing users to disambiguate.
-        // Constructor signature info (params, line) remains accessible by reading
-        // the class body when needed (e.g. via verify's AST walk).
+        if (child.type === 'constructor_declaration' || child.type === 'compact_constructor_declaration') {
+            const nameNode = child.childForFieldName('name');
+            const paramsNode = child.childForFieldName('parameters') ||
+                (child.type === 'compact_constructor_declaration' && classNode.childForFieldName('parameters'));
+            if (nameNode) {
+                const { startLine, endLine, indent, sourceSpan } = nodeToLocation(child, code);
+                const nameLine = nameNode.startPosition.row + 1;
+                const annotationsWithArgs = extractAnnotationsWithArgs(child);
+                const generics = extractGenerics(child);
+                members.push({
+                    name: nameNode.text,
+                    params: extractJavaParams(paramsNode),
+                    paramsStructured: parseStructuredParams(paramsNode, 'java'),
+                    startLine, endLine, sourceSpan, indent,
+                    memberType: 'constructor',
+                    isMethod: true,
+                    isConstructor: true,
+                    modifiers: extractModifiers(child),
+                    ...(nameLine !== startLine && { nameLine }),
+                    ...(annotationsWithArgs.length > 0 && { annotationsWithArgs }),
+                    ...(generics && { generics }),
+                    docstring: extractJavaDocstring(code, startLine),
+                });
+            }
+        }
 
         // Field declarations: declared types drive receiver disambiguation
         // (fix #202) — Rust/Go already emit field members with fieldType.
@@ -879,7 +910,7 @@ function extractClassMembers(classNode, codeOrLines) {
                 if (decl.type === 'variable_declarator') {
                     const nameNode = decl.childForFieldName('name');
                     if (nameNode && fieldTypeText) {
-                        const { startLine, endLine } = nodeToLocation(child, code);
+                        const { startLine, endLine, sourceSpan } = nodeToLocation(child, code);
                         // fix #390: an annotation on its own line starts the
                         // declaration; the name's line is where edits go.
                         const nameLine = nameNode.startPosition.row + 1;
@@ -887,6 +918,7 @@ function extractClassMembers(classNode, codeOrLines) {
                             name: nameNode.text,
                             startLine,
                             endLine,
+                            sourceSpan,
                             ...(nameLine !== startLine && { nameLine }),
                             memberType: 'field',
                             ...(fieldModifiers.length > 0 && { modifiers: fieldModifiers }),
@@ -920,8 +952,8 @@ function _processState(node, objects, lines, code) {
                     if (nameNode && valueNode) {
                         const name = nameNode.text;
                         if (_statePattern.test(name)) {
-                            const { startLine, endLine } = nodeToLocation(node, lines);
-                            objects.push({ name, startLine, endLine, modifiers });
+                            const { startLine, endLine, sourceSpan } = nodeToLocation(node, lines);
+                            objects.push({ name, startLine, endLine, sourceSpan, modifiers });
                         }
                     }
                 }
@@ -1099,7 +1131,7 @@ function findCallsInCode(code, parser) {
 
     // Helper to check if a node creates a function scope
     const isFunctionNode = (node) => {
-        return ['method_declaration', 'constructor_declaration', 'lambda_expression'].includes(node.type);
+        return ['method_declaration', 'constructor_declaration', 'compact_constructor_declaration', 'lambda_expression'].includes(node.type);
     };
     const JAVA_TYPE_DECLARATIONS = new Set([
         'class_declaration', 'interface_declaration',
@@ -1193,7 +1225,9 @@ function findCallsInCode(code, parser) {
         if (!base) return null;
         if (base.includes('.')) return base;
         if (importedTypeNames.has(base)) return importedTypeNames.get(base);
-        if (['Class', 'Enum', 'Object', 'String', 'Throwable'].includes(base)) {
+        // String and Class can name project types. Preserve those spellings
+        // for query-time lookup in the file and lexical owner that wrote them.
+        if (['Enum', 'Object', 'Throwable'].includes(base)) {
             return `java.lang.${base}`;
         }
         return base;
@@ -1338,7 +1372,7 @@ function findCallsInCode(code, parser) {
             const nameNode = node.childForFieldName('name');
             return nameNode?.text || '<anonymous>';
         }
-        if (node.type === 'constructor_declaration') {
+        if (node.type === 'constructor_declaration' || node.type === 'compact_constructor_declaration') {
             const nameNode = node.childForFieldName('name');
             return nameNode?.text || '<constructor>';
         }
@@ -1519,7 +1553,8 @@ function findCallsInCode(code, parser) {
         let ownerNode = node.childForFieldName('object');
         if (!ownerNode) {
             const owner = findEnclosingClassName(node);
-            return owner ? { owner, methods: [method] } : null;
+            return owner ? { owner, written: owner, site: typeOrigin('call', node),
+                arities: [getCallArgs(node).argCount], methods: [method] } : null;
         }
         while (ownerNode?.type === 'parenthesized_expression' &&
             ownerNode.namedChildCount === 1) {
@@ -1528,7 +1563,8 @@ function findCallsInCode(code, parser) {
         if (ownerNode?.type === 'method_invocation') {
             const parent = methodCallPathOf(ownerNode);
             return parent
-                ? { owner: parent.owner, methods: [...parent.methods, method] }
+                ? { ...parent, methods: [...parent.methods, method],
+                    arities: [...parent.arities, getCallArgs(node).argCount] }
                 : null;
         }
         let ownerType = null;
@@ -1542,7 +1578,8 @@ function findCallsInCode(code, parser) {
             ownerType = ownerNode.childForFieldName('type')?.text;
         }
         return ownerType
-            ? { owner: qualifyTypeName(ownerType), methods: [method] }
+            ? { owner: qualifyTypeName(ownerType), written: ownerType,
+                site: typeOrigin('call', node), arities: [getCallArgs(node).argCount], methods: [method] }
             : null;
     };
     const argKindOf = (arg) => {
@@ -1631,7 +1668,7 @@ function findCallsInCode(code, parser) {
                 if (!methodNode) return 'expr';
                 if (!ownerNode) {
                     const owner = findEnclosingClassName(arg);
-                    return owner ? `call:${owner}:${methodNode.text}` : 'expr';
+                    return owner ? methodResultKind(owner, methodNode.text, arg) : 'expr';
                 }
                 let normalizedOwner = ownerNode;
                 while (normalizedOwner?.type === 'parenthesized_expression' &&
@@ -1642,7 +1679,9 @@ function findCallsInCode(code, parser) {
                 let ownerRawType = null;
                 if (normalizedOwner?.type === 'identifier') {
                     ownerType = getReceiverType(normalizedOwner.text) ||
-                        (/^[A-Z]/.test(normalizedOwner.text) ? normalizedOwner.text : null);
+                        (!isDeclaredLocal(normalizedOwner.text) &&
+                         !hasEnclosingField(arg, normalizedOwner.text) &&
+                         /^[A-Z]/.test(normalizedOwner.text) ? normalizedOwner.text : null);
                     ownerRawType = getReceiverRawType(normalizedOwner.text);
                 } else if (normalizedOwner?.type === 'cast_expression') {
                     const typeNode = normalizedOwner.childForFieldName('type');
@@ -1670,40 +1709,19 @@ function findCallsInCode(code, parser) {
                         }
                     }
                 }
-                // Generic container access has a source-declared result type:
-                // List<T>.get(i) -> T, Map<K,V>.get(k) -> V. Wildcard
-                // `? extends T` is safe in value position; `? super T` is not.
-                if (methodNode.text === 'get' && ownerRawType?.includes('<')) {
-                    const generic = ownerRawType.slice(
-                        ownerRawType.indexOf('<') + 1,
-                        ownerRawType.lastIndexOf('>'));
-                    const args = [];
-                    let start = 0;
-                    let depth = 0;
-                    for (let i = 0; i <= generic.length; i++) {
-                        const ch = generic[i];
-                        if (ch === '<') depth++;
-                        else if (ch === '>') depth--;
-                        else if ((ch === ',' || i === generic.length) && depth === 0) {
-                            args.push(generic.slice(start, i).trim());
-                            start = i + 1;
-                        }
-                    }
-                    const base = bareTypeName(ownerRawType);
-                    const picked = base === 'Map' ? args[1] : args[0];
-                    if (picked && !/^\?\s+super\b/.test(picked)) {
-                        const valueType = picked.replace(/^\?\s+extends\s+/, '').trim();
-                        if (valueType && valueType !== '?') {
-                            return `type:${qualifyTypeName(valueType)}`;
-                        }
-                    }
-                }
+                // Generic get() return contracts are resolved from the
+                // receiver's actual type at query time. A project container
+                // does not acquire List/Map semantics from its type arguments.
                 if (ownerType) {
-                    return `call:${qualifyTypeName(ownerRawType || ownerType)}:${methodNode.text}`;
+                    const written = ownerRawType || ownerType;
+                    return methodResultKind(hasParameterizedQualifier(written)
+                        ? written : qualifyTypeName(written), methodNode.text, arg, written);
                 }
                 const path = methodCallPathOf(arg);
                 if (path?.methods.length > 1) {
-                    return `chain:${path.owner}#${path.methods.join('#')}`;
+                    return `chain:${path.owner}#${path.methods.join('#')}|` +
+                        encodeURIComponent(JSON.stringify({ written: path.written, site: path.site,
+                            arities: path.arities }));
                 }
                 return 'expr';
             }
@@ -1759,6 +1777,13 @@ function findCallsInCode(code, parser) {
             kinds.push(argKindOf(arg));
         }
         return { argCount: kinds.length, argKinds: kinds.some(k => k !== 'expr') ? kinds : null };
+    };
+    const methodResultKind = (owner, method, node, written = owner) => {
+        const args = getCallArgs(node);
+        const kinds = args.argKinds || Array(args.argCount).fill('expr');
+        return `callshape:${encodeURIComponent(owner)}|${encodeURIComponent(method)}|` +
+            kinds.map(encodeURIComponent).join(',') + '|' +
+            encodeURIComponent(JSON.stringify({ written, site: typeOrigin('call', node) }));
     };
 
     traverseTree(tree.rootNode, (node) => {
@@ -1949,8 +1974,11 @@ function findCallsInCode(code, parser) {
                     ? methodCallPathOf(objNode) : null;
                 const receiverCallTypePath = receiverPath
                     ? (receiverPath.methods.length === 1
-                        ? `call:${receiverPath.owner}:${receiverPath.methods[0]}`
-                        : `chain:${receiverPath.owner}#${receiverPath.methods.join('#')}`)
+                        ? methodResultKind(receiverPath.owner, receiverPath.methods[0], objNode,
+                            receiverPath.written)
+                        : `chain:${receiverPath.owner}#${receiverPath.methods.join('#')}|` +
+                            encodeURIComponent(JSON.stringify({ written: receiverPath.written,
+                                site: receiverPath.site, arities: receiverPath.arities })))
                     : null;
                 calls.push({
                     callSite: typeOrigin('call', nameNode),
@@ -2002,8 +2030,8 @@ function findCallsInCode(code, parser) {
         // super(x) / this(x) — constructor delegation (fix #238: these
         // sites were invisible to every command). Resolve to the parent
         // class's constructor (super) or a same-class overload (this);
-        // Java constructors are indexed under the CLASS name, so the
-        // record carries the target class as its name.
+        // Java constructors are named after their class. The record carries
+        // that name, and constructor resolution selects its overload.
         if (node.type === 'explicit_constructor_invocation') {
             let cls = node.parent;
             while (cls && cls.type !== 'class_declaration' && cls.type !== 'enum_declaration') {
@@ -2023,6 +2051,7 @@ function findCallsInCode(code, parser) {
                 const genericIdx = targetClass.indexOf('<');
                 if (genericIdx > 0) targetClass = targetClass.substring(0, genericIdx);
                 const dotIdx = targetClass.lastIndexOf('.');
+                const constructorQualifier = dotIdx > 0 ? targetClass.substring(0, dotIdx) : null;
                 if (dotIdx > 0) targetClass = targetClass.substring(dotIdx + 1);
                 const enclosingFunction = getCurrentEnclosingFunction();
                 const ctorArgs = getCallArgs(node);
@@ -2032,10 +2061,12 @@ function findCallsInCode(code, parser) {
                     line: node.startPosition.row + 1,
                     isMethod: false,
                     isConstructor: true,
+                    ...(constructorQualifier && { constructorQualifier }),
                     // 'this' delegation names the ENCLOSING class by
                     // construction — an intra-class mechanism, never a
                     // caller edge for the class (jdtls-measured, fix #238).
                     ctorDelegation: isSuperCall ? 'super' : 'this',
+                    constructorSyntax: 'delegation',
                     argCount: ctorArgs.argCount,
                     ...(ctorArgs.argKinds && { argKinds: ctorArgs.argKinds }),
                     enclosingFunction
@@ -2067,6 +2098,7 @@ function findCallsInCode(code, parser) {
                     // constructor alive for deadcode/--unused, but never a
                     // caller edge for the enum (jdtls-measured, fix #238).
                     enumConstant: true,
+                    constructorSyntax: 'enum',
                     argCount: ctorArgs.argCount,
                     ...(ctorArgs.argKinds && { argKinds: ctorArgs.argKinds }),
                     enclosingFunction: getCurrentEnclosingFunction()
@@ -2088,8 +2120,10 @@ function findCallsInCode(code, parser) {
                 // as receiver (fix #206): a qualified type must not resolve to
                 // a same-file binding of an unrelated same-name symbol.
                 let typeQualifier = null;
+                let constructorQualifier = null;
                 const dotIdx = typeName.lastIndexOf('.');
                 if (dotIdx > 0) {
+                    constructorQualifier = typeName.substring(0, dotIdx);
                     const qualParts = typeName.substring(0, dotIdx).split('.');
                     typeQualifier = qualParts[qualParts.length - 1] || null;
                     typeName = typeName.substring(dotIdx + 1);
@@ -2104,6 +2138,7 @@ function findCallsInCode(code, parser) {
                     isMethod: false,
                     isConstructor: true,
                     ...(typeQualifier && { receiver: typeQualifier }),
+                    ...(constructorQualifier && { constructorQualifier }),
                     argCount: ctorArgs.argCount,
                     ...(ctorArgs.argKinds && { argKinds: ctorArgs.argKinds }),
                     enclosingFunction
@@ -2284,6 +2319,7 @@ function findCallsInCode(code, parser) {
         }
     });
 
+    calls.push(...require('./constructor-bases').implicitBaseCalls(tree.rootNode, 'java'));
     return calls;
 }
 
@@ -2591,6 +2627,7 @@ function isEntryPoint(symbol) {
 }
 
 module.exports = {
+    implicitOwnerScope: node => ({ enclosingType: enclosingTypeName(node) }),
     staticValueImportSyntax,
     findFunctions,
     findClasses,

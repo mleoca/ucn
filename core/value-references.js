@@ -1246,8 +1246,17 @@ function valueReferenceSites(index, def, name, groundSet) {
     if (!isValueDefinition(def)) return null;
     const resolver = new ValueReferenceResolver(index, def, name);
     const result = typeReferenceSites(index, def, name, groundSet, resolver);
+    // A line handle cannot distinguish declarations in separate indexed
+    // scopes, even when lookup has selected one of their owners internally.
+    const selectedLine = def.nameLine || def.startLine;
+    const indexedScopes = new Set((index.symbols.get(name) || []).filter(candidate =>
+        isValueDefinition(candidate) && candidate.file === def.file &&
+        (candidate.nameLine || candidate.startLine) === selectedLine &&
+        (candidate.className || null) === (def.className || null))
+        .map(candidate => JSON.stringify([candidate.namespace || null, candidate.enclosingType || null,
+            candidate.lexicalScopeStartLine ?? null, candidate.lexicalScopeEndLine ?? null])));
     const ambiguityReason = resolver.declarationStorages.size > 1 ? 'storage'
-        : resolver.declarationRegions.size > 1 ? 'scope' : null;
+        : resolver.declarationRegions.size > 1 || indexedScopes.size > 1 ? 'scope' : null;
     const ambiguousDeclaration = ambiguityReason !== null;
     if (ambiguousDeclaration) {
         for (const info of result.files.values()) for (const slot of info.lines.values()) {

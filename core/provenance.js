@@ -85,6 +85,83 @@ function validateConfirmation(provenance, target, invalidCall = false) {
         ? { verdict: 'establishes-target' }
         : { verdict: 'establishes-other', declaration };
     if (!targets.length || targets.some(t => !validIdentity(t))) return incomplete('missing-target-identity');
+    if (facts.implicitBaseBinding) {
+        const owner = facts.implicitBaseBinding.binding?.owner;
+        return validIdentity(owner) && require('./provenance-constructor-base').validateImplicitBase(facts.implicitBaseBinding, owner, facts.site)
+            ? verdictFor(owner) : incomplete('unproven-implicit-base');
+    }
+    if (facts.constructionBinding) {
+        const owner = facts.constructionBinding.owner;
+        return validIdentity(owner) && require('./provenance-type').validateTypeLookup(facts.constructionBinding, owner, facts.site)
+            ? verdictFor(owner) : incomplete('unproven-construction-type');
+    }
+    if (facts.constructorCall) {
+        const constructor = facts.constructorCall;
+        const { owner, members, selected, classBinding, call, overload } = constructor;
+        const constructed = constructor.constructedOwner || owner;
+        const structural = require('../languages').langTraits(facts.language)?.typeSystem === 'structural';
+        if (!validIdentity(owner) || !validIdentity(selected) || !Array.isArray(members) || !members.length ||
+            !call || !(call.isConstructor || require('../languages').langTraits(facts.language)?.classesCallableWithoutNew ||
+                require('../languages').langTraits(facts.language)?.functionalTypeConstruction) ||
+            call.isFunctionReference || call.isPotentialCallback) return incomplete('missing-constructor-facts');
+        if (!classBinding?.facts?.site || classBinding.facts.site.file !== facts.site?.file ||
+            classBinding.facts.site.line !== facts.site?.line ||
+            classBinding.facts.site.column !== facts.site?.column ||
+            (structural || validateConfirmation(classBinding, constructed).verdict !== 'establishes-target') &&
+                !require('./provenance-type').validateTypeLookup(constructor.typeLookup, constructed, facts.site)) {
+            return incomplete('unproven-construction-binding');
+        }
+        if (require('../languages').langTraits(facts.language)?.inheritedOverloadSignatures &&
+            overload?.call?.argumentFile !== facts.site?.file) {
+            return incomplete('unproven-construction-argument-source');
+        }
+        if (!structural && !['implicit', 'delegation', 'enum'].includes(call.syntax) &&
+            (constructor.nameScope?.query?.name !== overload?.call?.name ||
+                constructor.nameScope?.query?.qualifier !== (overload?.call?.constructorQualifier || overload?.call?.receiver || null) ||
+                !require('./provenance-type').validateTypeLookup(constructor.nameScope, constructed, facts.site))) {
+            return incomplete('unproven-construction-name-scope');
+        }
+        if (call.syntax === 'implicit') {
+            const base = classBinding.facts.implicitBaseBinding;
+            if (!base || !require('./provenance-constructor-base').validateImplicitBase(base, constructed, facts.site)) {
+                return incomplete('unproven-implicit-base');
+            }
+            if (base.base.potential) return incomplete('constructor-default-unresolved');
+        }
+        if (!sameDeclaration(owner, constructed) &&
+            !require('./constructor-hierarchy').validateHierarchy(constructor.hierarchy, constructed, owner, members)) {
+            return incomplete('unproven-constructor-inheritance');
+        }
+        const constructorProtocol = require('../languages').langTraits(facts.language)?.constructorProtocol;
+        if (members.some(member => (member.kind !== 'constructor' && member.name !== constructorProtocol?.initializer) || member.className !== owner.name ||
+            member.file !== owner.file || member.startLine < owner.startLine || member.endLine > owner.endLine ||
+            (member.namespace || null) !== (owner.namespace || null) ||
+            (member.enclosingType || null) !== (owner.enclosingType || null)) ||
+            !members.some(member => sameDeclaration(member, selected))) return inconsistent('constructor-owner-mismatch');
+        if (overload?.candidates?.some(def => def.type === 'constructor' &&
+            (!Array.isArray(def.modifiers) || def.modifiers.includes('static')))) {
+            return incomplete('constructor-instance-flags');
+        }
+        if (!call.isConstructor && require('../languages').langTraits(facts.language)?.functionalTypeConstruction) {
+            if (!(constructor.typeLookup?.query?.functional &&
+                require('./provenance-type').validateTypeLookup(constructor.typeLookup, owner, facts.site))) {
+                return incomplete('constructor-functional-binding');
+            }
+        }
+        const protocol = require('../languages').langTraits(facts.language)?.constructorProtocol;
+        if (protocol) {
+            if (!require('./constructor-protocol').validateConstructorProtocol(constructor.protocol, constructed, members, facts.language)) {
+                return incomplete('constructor-protocol-unresolved');
+            }
+        }
+        if (invalidCall && members.length !== 1) return incomplete('constructor-overload-unselected');
+        if (!require('../languages').langTraits(facts.language)?.hasArityOverloads && members.length > 1 &&
+            !overload?.candidates?.some(def => def.isSignature === true)) return incomplete('constructor-definition-ambiguous');
+        if (!require('./provenance-overload').validateOverload(overload, members, selected, invalidCall, false, facts.site)) {
+            return incomplete('constructor-overload-unselected');
+        }
+        return verdictFor(selected);
+    }
     if (facts.receiverOrigin?.externalFactory) {
         const factory = facts.receiverOrigin.externalFactory;
         const empty = value => Array.isArray(value) && !value.length;
@@ -301,6 +378,16 @@ function validateConfirmation(provenance, target, invalidCall = false) {
                 return incomplete('missing-member-lookup-facts');
             }
             const named = step.members.filter(member => member.name === selected.name);
+            const delegation = step.constructorDelegation;
+            if (delegation && (i !== 0 || facts.receiver !== 'super' || selected.kind !== 'constructor' ||
+                delegation.enclosing?.kind !== 'constructor' ||
+                delegation.enclosing.className !== step.owner.name ||
+                delegation.enclosing.file !== step.owner.file ||
+                facts.site?.line < delegation.enclosing.startLine || facts.site?.line > delegation.enclosing.endLine ||
+                !Array.isArray(delegation.members) || named.length ||
+                delegation.members.some(member => member.kind !== 'constructor' || member.className !== step.owner.name))) {
+                return inconsistent('constructor-delegation-mismatch');
+            }
             if (named.some(member => member.className !== step.owner.name ||
                 (member.namespace || null) !== (step.owner.namespace || null) ||
                 (member.enclosingType || null) !== (step.owner.enclosingType || null) ||
@@ -328,13 +415,13 @@ function validateConfirmation(provenance, target, invalidCall = false) {
             } else if (!overload && (named.length !== 1 || !sameDeclaration(named[0], selected))) {
                 const propertyRead = facts.valueReference && step.propertyRead &&
                     sameDeclaration(propertyReadMember(named), selected);
-                if (!propertyRead && !require('./provenance-overload').validateOverload(step.overload, named, selected)) {
+                if (!propertyRead && !require('./provenance-overload').validateOverload(step.overload, named, selected, false, false, facts.site)) {
                     return incomplete('ambiguous-or-missing-member');
                 }
             }
         }
         if (overload && !require('./provenance-overload').validateOverload(
-            overload, group.map(declarationIdentity), selected, invalidCall, ambiguousOverload)) {
+            overload, group.map(declarationIdentity), selected, invalidCall, ambiguousOverload, facts.site)) {
             return incomplete(overload.outcome === 'no-fit' ? 'no-applicable-overload' : 'ambiguous-or-missing-member');
         }
         if (facts.receiverTypeSource === 'guess' || facts.receiverTypeSource === 'unknown') {
@@ -420,6 +507,12 @@ function validateConfirmation(provenance, target, invalidCall = false) {
 
 /** An invalid member-family call is a diagnostic, never a confirmed edge. */
 function validateCallMismatch(provenance, target) {
+    const constructor = provenance?.facts?.constructorCall;
+    if (constructor) {
+        if (constructor.overload?.outcome !== 'no-fit' ||
+            !constructor.members?.some(member => sameDeclaration(member, target))) return false;
+        return validateConfirmation(provenance, constructor.members, true).verdict === 'establishes-target';
+    }
     const lookup = provenance?.facts?.lookup;
     if (lookup?.overload?.outcome !== 'no-fit') return false;
     const members = lookup.steps.flatMap(step => step.members || []);

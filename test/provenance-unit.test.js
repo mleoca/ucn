@@ -6,6 +6,142 @@ const { validateConfirmation, declarationIdentity: identity } = require('../core
 const { ReceiverTypeMap } = require('../languages/type-evidence');
 const { dedupeOccurrences, addRuleStat, finishRuleStats, ruleTable } = require('../eval/provenance-report');
 
+describe('fix #417: type lookup records only observed file facts', () => {
+    const { factIndex } = require('../core/provenance-overload');
+    it('a language read avoids unrelated declarations and refuses an uncaptured field during replay', () => {
+        const entry = { language: 'cpp' };
+        Object.defineProperty(entry, 'symbols', {
+            get() { throw new Error('unrelated declarations were read'); },
+        });
+        const live = { files: new Map([['unit.cpp', entry]]) }, reads = {};
+        const view = factIndex(reads, live, ['language', 'symbols']);
+        assert.equal(view.files.get('unit.cpp').language, 'cpp');
+        const replay = factIndex(JSON.parse(JSON.stringify(reads)), undefined, ['language', 'symbols']);
+        live.files.clear();
+        assert.equal(replay.files.get('unit.cpp').language, 'cpp');
+        assert.equal(replay.hasMissingProvenanceFacts, false);
+        assert.throws(() => replay.files.get('unit.cpp').symbols, /Missing provenance fact/);
+        assert.equal(replay.hasMissingProvenanceFacts, true);
+    });
+    it('observed arrays keep map identity within a view and isolate replay mutations', () => {
+        const live = { files: new Map([['unit.cpp', { language: 'cpp', symbols: [{ name: 'Box' }] }]]) };
+        const reads = {}, view = factIndex(reads, live, ['language', 'symbols']);
+        const file = view.files.get('unit.cpp');
+        assert.equal(file.language, 'cpp');
+        assert.equal(file.symbols[0].name, 'Box');
+        assert.equal(view.files.get('unit.cpp'), file);
+        assert.equal(file.symbols, file.symbols);
+        file.symbols[0].name = 'local'; file.language = 'local';
+        assert.equal(live.files.get('unit.cpp').symbols[0].name, 'Box');
+        const saved = JSON.parse(JSON.stringify(reads));
+        const first = factIndex(saved, undefined, ['language', 'symbols']);
+        first.files.get('unit.cpp').symbols[0].name = 'changed';
+        const second = factIndex(saved, undefined, ['language', 'symbols']);
+        assert.equal(second.files.get('unit.cpp').symbols[0].name, 'Box');
+        assert.equal(second.files.get('unit.cpp').language, 'cpp');
+    });
+    it('a missing file is captured as absent even if it appears before replay', () => {
+        const reads = {}, live = { files: new Map() };
+        const view = factIndex(reads, live, ['language', 'symbols']);
+        assert.equal(view.files.get('missing.cpp'), undefined);
+        live.files.set('missing.cpp', { language: 'cpp', symbols: [] });
+        const replay = factIndex(JSON.parse(JSON.stringify(reads)), undefined, ['language', 'symbols']);
+        assert.equal(replay.files.get('missing.cpp'), undefined);
+        assert.equal(replay.hasMissingProvenanceFacts, false);
+    });
+});
+
+describe('fix #417: overload witnesses record only observed file fields', () => {
+    it('reading the language does not copy unrelated declarations into an overload witness', () => {
+        const { captureOverload } = require('../core/provenance-overload');
+        const entry = { language: 'java', relativePath: 'Unit.java' };
+        Object.defineProperty(entry, 'symbols', {
+            get() { throw new Error('unread declarations were copied'); },
+        });
+        const live = { files: new Map([['Unit.java', entry]]) };
+        const candidate = { file: 'Unit.java', relativePath: 'Unit.java', name: 'run',
+            type: 'method', startLine: 2, endLine: 2, params: '', paramsStructured: [] };
+        const witness = captureOverload(live, { line: 4 }, [candidate], 'java', index => {
+            assert.equal(index.files.get('Unit.java').language, 'java');
+            return { match: candidate };
+        });
+        assert.ok(witness);
+        assert.equal(witness.fileFields, true);
+        assert.equal(witness.reads['files.get:"Unit.java"."language"'], 'java');
+        assert.equal(Object.hasOwn(witness.reads, 'files.get:"Unit.java"."symbols"'), false);
+    });
+});
+
+describe('fix #417: type lookup witnesses contain source facts', () => {
+    it('reused bindings isolate witness edits and temporary index views', () => {
+        const path = require('path');
+        const { tmp, rm, idx } = require('./helpers');
+        const { captureTypeLookup, validateTypeLookup } = require('../core/provenance-type');
+        const dir = tmp({
+            'box.js': 'export class Box {}\n',
+            'use.js': "import { Box } from './box.js';\nconst b = new Box();\n",
+        });
+        try {
+            const index = idx(dir), owner = index.symbols.get('Box').find(def => def.type === 'class');
+            const file = path.join(dir, 'use.js'), query = { file, relativePath: 'use.js',
+                line: 2, column: 14, name: 'Box', construction: true };
+            index._beginOp();
+            try {
+                const first = captureTypeLookup(index, query, owner);
+                assert.ok(first);
+                first.owner.name = 'Other'; first.query.name = 'Other';
+                const second = captureTypeLookup(index, { ...query, name: 'Box' }, owner);
+                assert.ok(second);
+                assert.equal(second.owner.name, 'Box');
+                assert.equal(second.query.name, 'Box');
+                assert.equal(validateTypeLookup(second, identity(owner), { file: 'use.js', line: 2, column: 14 }), true);
+                second.owner.name = 'Other'; second.query.name = 'Other';
+                const entry = index.files.get(file), bindings = entry.importBindings, details = entry.importDetails;
+                index._isolatedOperation(() => {
+                    try {
+                        entry.importBindings = []; entry.importDetails = [];
+                        assert.equal(captureTypeLookup(index, { ...query, name: 'Box' }, owner), null);
+                    } finally { entry.importBindings = bindings; entry.importDetails = details; }
+                });
+                const third = captureTypeLookup(index, { ...query, name: 'Box' }, owner);
+                assert.equal(third.owner.name, 'Box');
+                assert.equal(third.query.name, 'Box');
+            } finally { index._endOp(); }
+        } finally { rm(dir); }
+    });
+
+    it('captures project using text and replays after the project file is removed', () => {
+        const fs = require('fs'), path = require('path');
+        const { tmp, rm, idx } = require('./helpers');
+        const { captureTypeLookup, validateTypeLookup } = require('../core/provenance-type');
+        const projectText = '<Project><ItemGroup><Using Include="P" /></ItemGroup></Project>';
+        const dir = tmp({
+            'p/Node.cs': 'namespace P {public class Node {public Node(int v){}}}\n',
+            'q/Use.cs': 'namespace Q {class Use {static Node build(){return new Node(1);}}}\n',
+            'n.csproj': projectText,
+        });
+        try {
+            const index = idx(dir), target = index.symbols.get('Node').find(def => def.type === 'class');
+            const query = { file: path.join(dir, 'q/Use.cs'), relativePath: 'q/Use.cs', line: 1, column: 53,
+                name: 'Node', qualifier: null };
+            const proof = captureTypeLookup(index, query, target);
+            assert.ok(proof);
+            assert.ok(JSON.stringify(proof.reads).includes('<Project>'), 'the witness contains the project source');
+            assert.ok(!Object.hasOwn(proof.reads, 'property:_typeDenotation'), 'a live lookup memo is not source evidence');
+            fs.unlinkSync(path.join(dir, 'n.csproj'));
+            const raw = { readdirSync: fs.readdirSync, readFileSync: fs.readFileSync, existsSync: fs.existsSync };
+            try {
+                for (const name of Object.keys(raw)) fs[name] = () => { throw new Error('live filesystem read during replay'); };
+                assert.equal(validateTypeLookup(proof, identity(target), { file: 'q/Use.cs', line: 1, column: 53 }), true);
+            } finally { Object.assign(fs, raw); }
+            const missing = JSON.parse(JSON.stringify(proof));
+            const sourceKey = Object.keys(missing.reads).find(key => JSON.stringify(missing.reads[key]).includes('<Project>'));
+            delete missing.reads[sourceKey];
+            assert.equal(validateTypeLookup(missing, identity(target), { file: 'q/Use.cs', line: 1, column: 53 }), false);
+        } finally { rm(dir); }
+    });
+});
+
 const owner = identity({ file: 'm.ts', startLine: 1, endLine: 8, name: 'Local', type: 'class' });
 const method = identity({ file: 'm.ts', startLine: 2, endLine: 3, name: 'run', type: 'method', className: 'Local' });
 function witness() {

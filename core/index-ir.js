@@ -161,13 +161,13 @@ function createFileEntryFromIR({
 }
 
 const OPTIONAL_SYMBOL_FIELDS = Object.freeze([
-    'returnedFunctionResult', 'isFunctionVariable', 'paramTypes', 'isAsync',
+    'sourceSpan', 'returnedFunctionResult', 'isFunctionVariable', 'paramTypes', 'isAsync',
     'isGenerator', 'generics', 'ownerGenerics', 'genericBounds', 'extends', 'implements', 'indent', 'isNested',
     'enclosingType', 'isMethod', 'receiver', 'memberType', 'fieldType', 'embedded',
     'aliasOf', 'aliasQualifier', 'aliasMembers', 'aliasTypeText', 'aliasTypeParameters', 'aliasTypeDefaults', 'derefTarget', 'decorators', 'decoratorsWithArgs',
     'annotationsWithArgs', 'attributesWithArgs', 'nameLine', 'traitImpl',
     'traitName', 'isSignature', 'memberAssigned', 'assignedReceiver', 'assignedObject', 'selfNamed', 'bodyScopedName',
-    'registryMember', 'registryContainer', 'registryContainerType', 'objectLiteralLine', 'namespace',
+    'registryMember', 'registryContainer', 'registryContainerType', 'objectLiteralLine', 'namespace', 'isConstructor',
     'isExtensionMethod', 'extensionReceiver', 'explicitInterface', 'primaryParams',
     'lexicalScopeStartLine', 'lexicalScopeEndLine',
     'returnTypeQualifier', 'returnTypeResolved', 'supertraits', 'ownerGenericBounds', 'ownerSelfArgs', 'implSelfRef', 'implSelfQualifier', 'blanketSelfBounds', 'selfParamKind', 'macroNeverReturns', 'callbackParamTypes', 'iteratorItemType', 'futureReturn',
@@ -214,8 +214,25 @@ function materializeSymbol(fileEntry, item) {
     return symbol;
 }
 
+const fileBindingIds = new WeakMap();
+
 function addIRSymbol(fileEntry, item, symbolTable = null) {
     const symbol = materializeSymbol(fileEntry, item);
+    // Several declarations can occupy one source line. Keep the ordinary
+    // line-based id for its first declaration and give each later declaration
+    // an id of its own, in the parser's stable source order.
+    let ids = fileBindingIds.get(fileEntry);
+    if (!ids) {
+        ids = new Set(fileEntry.symbols.map(existing => existing.bindingId));
+        fileBindingIds.set(fileEntry, ids);
+    }
+    if (!item.id && ids.has(symbol.bindingId)) {
+        const base = symbol.bindingId;
+        let ordinal = 2;
+        while (ids.has(`${base}#${ordinal}`)) ordinal++;
+        symbol.bindingId = `${base}#${ordinal}`;
+    }
+    ids.add(symbol.bindingId);
     fileEntry.symbols.push(symbol);
     // A Rust `impl X`/`impl Trait for X` block introduces NO name into any
     // scope (fix #286b, cursive-measured: the impl symbol stole the bare-name
