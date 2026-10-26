@@ -80,6 +80,7 @@ class ProjectIndex {
         this.lastBuildWorkerCount = 1;
         this.lastBuildParallelEligible = false;
         this.lastBuildRequestedWorkers = null;
+        this.lastBuildWorkerLimit = null;
         // Parse workers the last build kept for Rust macro expansion (0: the
         // expansion ran in place or had nothing to expand).
         this.lastBuildExpansionWorkers = 0;
@@ -638,6 +639,9 @@ class ProjectIndex {
             ? workersSetting : (envWorkers > 0 ? envWorkers : null);
         this.lastBuildWorkerCount = 1;
         this.lastBuildRequestedWorkers = requestedWorkerCount;
+        // Threads later phases may start (fix #422): none when the build
+        // disabled workers, at most an explicit count, else their own choice.
+        this.lastBuildWorkerLimit = disableParallel ? 0 : requestedWorkerCount;
         let usedParallel = false;
 
         // C/C++ recovery performs materially heavier parser work per file

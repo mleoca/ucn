@@ -45,6 +45,11 @@ function createImportBindings(imports) {
                 ...(item.deferred && { deferred: true }),
                 ...(item.dynamic && { dynamic: true }),
                 ...(item.namespace && { namespace: item.namespace }),
+                // Rust block `use` (fix #422): visible in its block only.
+                ...(item.lexicalScopeStartLine != null && {
+                    lexicalScopeStartLine: item.lexicalScopeStartLine,
+                    lexicalScopeEndLine: item.lexicalScopeEndLine,
+                }),
             };
         });
     });
@@ -106,6 +111,13 @@ function createFileEntryFromIR({
             ...(item.global && { global: true }),
             // Go (fix #400): the import writes no local name.
             ...(item.implicitName && { implicitName: true }),
+            // Rust block `use` (fix #422): visible in its block only; a
+            // `use` item's visibility.
+            ...(item.lexicalScopeStartLine != null && {
+                lexicalScopeStartLine: item.lexicalScopeStartLine,
+                lexicalScopeEndLine: item.lexicalScopeEndLine,
+            }),
+            ...(item.visibility && { visibility: item.visibility }),
         })),
         globalImports: imports.filter(item => item.global).map(item => item.module),
         importNames: imports.flatMap(item => item.names || []),
@@ -126,6 +138,7 @@ function createFileEntryFromIR({
         ...(ir.asyncClosureNames?.length > 0 && {
             asyncClosureNames: ir.asyncClosureNames,
         }),
+        ...(ir.itemMacros?.length > 0 && { itemMacros: ir.itemMacros }),
         ...(Array.isArray(ir.openCalls) && { openCalls: ir.openCalls }),
         ...(ir.typeConversions?.length > 0 && {
             typeConversions: ir.typeConversions,

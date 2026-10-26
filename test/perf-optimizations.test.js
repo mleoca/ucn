@@ -3371,3 +3371,72 @@ describe('fix #421: constructor proofs read only what the query needs', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #422: macro expansion and call derivation in fresh workers', () => {
+    const { ProjectIndex } = require('../core/project');
+    const { indexSnapshot } = require('./helpers');
+    const rx = require('../core/rust-macro-expansion');
+    const fixture = () => {
+        const files = {
+            'Cargo.toml': '[package]\nname = "gen"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/lib.rs': [
+                '#[macro_export]',
+                'macro_rules! api {',
+                '    ($name:ident) => {',
+                '        pub struct $name(u32);',
+                '        impl $name {',
+                '            pub fn bits(&self) -> u32 { self.0 }',
+                '            pub fn twice(&self) -> u32 { self.bits() + helper(self.bits()) }',
+                '        }',
+                '    };',
+                '}',
+                'pub fn helper(x: u32) -> u32 { x }',
+            ].join('\n') + '\n' + Array.from({ length: 6 }, (_, i) => `pub mod m${i};`).join('\n') + '\n',
+        };
+        for (let i = 0; i < 6; i++) {
+            files[`src/m${i}.rs`] = `crate::api!(T${i});\npub fn use${i}(t: &T${i}) -> u32 { t.twice() + crate::helper(${i}) }\n`;
+        }
+        return tmp(files);
+    };
+    const withEnv = (value, fn) => {
+        const saved = process.env.UCN_FRESH_EXPANSION;
+        process.env.UCN_FRESH_EXPANSION = value;
+        try { return fn(); } finally {
+            if (saved === undefined) delete process.env.UCN_FRESH_EXPANSION;
+            else process.env.UCN_FRESH_EXPANSION = saved;
+        }
+    };
+    const build = (dir, env, options = {}) => withEnv(env, () => {
+        const index = new ProjectIndex(dir);
+        index.build(null, { quiet: true, ...options });
+        const expansionWorkers = index.lastBuildExpansionWorkers;
+        rx.materializeRustMacroCalls(index);
+        return { index, expansionWorkers };
+    });
+
+    it('a sequential build expanding in fresh workers and their derived calls equal in-place work', () => {
+        const dir = fixture();
+        try {
+            const inPlace = build(dir, '0');
+            const workers = build(dir, '1');
+            assert.strictEqual(inPlace.expansionWorkers, 0);
+            assert.ok(workers.expansionWorkers >= 2, `expansion workers: ${workers.expansionWorkers}`);
+            assert.strictEqual(indexSnapshot(workers.index), indexSnapshot(inPlace.index));
+            const bits = workers.index.symbols.get('bits') || [];
+            assert.strictEqual(bits.length, 6);
+            const callers = workers.index.findCallers('helper', { collectAccount: true });
+            assert.ok(callers.length >= 6, JSON.stringify(callers.map(c => `${c.relativePath}:${c.line}`)));
+        } finally { rm(dir); }
+    });
+
+    it('a build with workers disabled starts no expansion threads', () => {
+        const dir = fixture();
+        try {
+            const inPlace = build(dir, '0');
+            const disabled = build(dir, '1', { workers: 0 });
+            assert.strictEqual(disabled.expansionWorkers, 0);
+            assert.strictEqual(disabled.index.lastBuildWorkerLimit, 0);
+            assert.strictEqual(indexSnapshot(disabled.index), indexSnapshot(inPlace.index));
+        } finally { rm(dir); }
+    });
+});

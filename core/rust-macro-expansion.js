@@ -1722,11 +1722,25 @@ function inReadUnit(ctx, record) {
  * with the facts the file entry derives from them.
  */
 function composeCalls(index, ctx) {
+    const calls = composedCalls(ctx);
+    installComposedCalls(index, ctx.filePath, calls, ctx.original);
+    return calls;
+}
+
+/** The calls a derivation context composes, stable by line (not installed). */
+function composedCalls(ctx) {
     readGroups(ctx, ctx.groups.map((group, i) => i));
-    const fileEntry = index.files.get(ctx.filePath);
     const calls = ctx.original.filter(record => !inReadUnit(ctx, record));
     for (const group of ctx.groups) for (const record of group.records) calls.push(record);
     for (const record of invocationRecords(ctx)) calls.push(record);
+    // Stable by line: records keep document order within a line.
+    calls.sort((a, b) => a.line - b.line);
+    return calls;
+}
+
+/** Install a file's composed calls in the calls cache, with the facts the file entry derives from them. */
+function installComposedCalls(index, filePath, calls, original) {
+    const fileEntry = index.files.get(filePath);
     // Shapes of generated calls whose value may be lost (audit-async).
     const { openCallShape } = require('../languages/rust-value-flow');
     const shapes = calls.filter(call => call.macroExpansion && call.name && !call.inMacro && !call.valueConsumed)
@@ -1734,18 +1748,15 @@ function composeCalls(index, ctx) {
     if (shapes.length > 0) {
         fileEntry.openCalls = [...new Set([...(fileEntry.openCalls || []), ...shapes])].sort(codeUnitCompare);
     }
-    // Stable by line: records keep document order within a line.
-    calls.sort((a, b) => a.line - b.line);
-    const cached = index.callsCache.get(ctx.filePath);
+    const cached = index.callsCache.get(filePath);
     if (cached) {
-        if (index.calleeIndex) index._removeFromCalleeIndex(ctx.filePath, ctx.original);
+        if (index.calleeIndex) index._removeFromCalleeIndex(filePath, original);
         cached.calls = calls;
-        if (index.calleeIndex) index._addToCalleeIndex(ctx.filePath, calls);
+        if (index.calleeIndex) index._addToCalleeIndex(filePath, calls);
     } else {
-        index.callsCache.set(ctx.filePath, { mtime: fileEntry.mtime, hash: fileEntry.hash, calls });
+        index.callsCache.set(filePath, { mtime: fileEntry.mtime, hash: fileEntry.hash, calls });
     }
     index.callsCacheDirty = true;
-    return calls;
 }
 
 const CALL_NODES = new Set(['call_expression', 'macro_invocation', 'struct_expression', 'generic_function']);
@@ -2156,9 +2167,60 @@ function startRustMacroExpansion(index, pending, options = {}) {
     const files = invokingFiles(index, pending, inventory, names);
     let bytes = 0;
     for (const file of files) bytes += index.files.get(file)?.size || 0;
-    const run = files.length >= PARALLEL_MIN_FILES && bytes >= PARALLEL_MIN_BYTES
-        ? startWorkers(index, files, { ...options, inventory }) : null;
+    // A sequential build has no parse workers to keep (fix #422): when the
+    // planned expansion is large - a crate whose API macros generate most of
+    // its code has little source to parse - fresh workers expand it.
+    let pool = options.pool?.available.length > 0 ? options.pool : null;
+    let ownPool = null;
+    if (!pool && freshExpansionWorthwhile(index, files, inventory)) {
+        ownPool = require('./parallel-build').spawnExpansionPool(index,
+            freshWorkerCount(index, Math.ceil(files.length / FRESH_FILES_PER_WORKER), files.length));
+        pool = ownPool;
+    }
+    const run = files.length >= PARALLEL_MIN_FILES && (bytes >= PARALLEL_MIN_BYTES || ownPool)
+        ? startWorkers(index, files, { ...options, pool, inventory }) : null;
+    if (ownPool) {
+        if (run) {
+            const dispose = run.dispose;
+            run.dispose = () => { dispose(); ownPool.dispose(); };
+        } else {
+            ownPool.dispose();
+        }
+    }
     return { inventory, files, names, results: run };
+}
+
+// Fresh expansion workers start cold (module load, parser warm-up): they
+// pay for themselves from this much planned expansion.
+const FRESH_MIN_SITES = 48;
+const FRESH_MIN_FILES = 12;
+const FRESH_FILES_PER_WORKER = 6;
+
+/**
+ * How many fresh threads to start for `wanted` workers' worth of work over
+ * `files` files: 2 to EXPANSION_WORKERS, never more than an explicit build
+ * worker count (a request for that execution shape) and none when the build
+ * disabled workers; 0 when fewer than two would run.
+ */
+function freshWorkerCount(index, wanted, files) {
+    const limit = index.lastBuildWorkerLimit ?? EXPANSION_WORKERS;
+    const count = Math.min(EXPANSION_WORKERS, limit, files, Math.max(2, wanted));
+    return count >= 2 ? count : 0;
+}
+
+/** Is the planned expansion of a build without kept parse workers worth fresh workers? */
+function freshExpansionWorthwhile(index, files, inventory) {
+    const env = process.env.UCN_FRESH_EXPANSION;
+    if (env === '0' || freshWorkerCount(index, 2, files.length) === 0) return false;
+    if (env === '1') return true;
+    if (files.length < FRESH_MIN_FILES) return false;
+    let sites = 0;
+    for (const file of files) {
+        for (const call of index.callsCache.get(file)?.calls || []) {
+            if (call.isMacro && inventory.has(call.name)) sites++;
+        }
+    }
+    return sites >= FRESH_MIN_SITES;
 }
 
 /**
@@ -2235,7 +2297,7 @@ const EXPANSION_WORKERS = 3;
  * to expand their import facts, impl/trait spans and macro invocation
  * records. Also every name a project callable bears.
  */
-function workerSnapshot(index, workload, inventory) {
+function workerSnapshot(index, workload, inventory, fullCalls = false) {
     const expanding = new Set(workload);
     // Invocations resolve at the invoking file, and nested ones also at the
     // defining file.
@@ -2266,7 +2328,10 @@ function workerSnapshot(index, workload, inventory) {
             record.importBindings = (entry.importBindings || [])
                 .filter(binding => inventory.has(binding.alias || binding.name));
         }
-        if (full) {
+        if (full && fullCalls) {
+            // A calls derivation reads every parsed record of the file.
+            record.calls = index.callsCache.get(file)?.calls || [];
+        } else if (full) {
             record.calls = (index.callsCache.get(file)?.calls || [])
                 .filter(call => call.isMacro && !call.macroExpansion && inventory.has(call.name))
                 .map(call => ({
@@ -2337,7 +2402,7 @@ function snapshotIndex(snapshot) {
  * `signal[queueIndex]`), posting each record to `port`; `signal[workerIndex]`
  * is set when this worker is done.
  */
-function runExpansionQueue({ snapshot, files, signal, workerIndex, queueIndex }, port) {
+async function runExpansionQueue({ snapshot, files, signal, workerIndex, queueIndex, mode }, port) {
     const signalArray = new Int32Array(signal);
     try {
         const state = createState(snapshotIndex(JSON.parse(Buffer.from(snapshot).toString('utf8'))));
@@ -2347,16 +2412,26 @@ function runExpansionQueue({ snapshot, files, signal, workerIndex, queueIndex },
             const file = files[next];
             let result;
             try {
-                result = { file, record: expandForWorker(state, file) };
+                result = { file, record: mode === 'calls' ? deriveForWorker(state, file) : expandForWorker(state, file) };
             } catch (error) {
                 result = { file, error: error.message };
             }
             port.postMessage([result]);
+            // Yield between files, as the parse loop does (fix #365): the
+            // native trees of an expansion are freed only when this thread
+            // returns to its event loop (fix #422).
+            await new Promise(resolve => setImmediate(resolve));
         }
     } finally {
         Atomics.store(signalArray, workerIndex, 1);
         Atomics.notify(signalArray, workerIndex);
     }
+}
+
+/** Worker-side: the whole-file calls derivation of one file (fix #422). */
+function deriveForWorker(state, filePath) {
+    const ctx = expandFile(state, filePath, 'calls')?.context || null;
+    return ctx ? { calls: composedCalls(ctx) } : { none: true };
 }
 
 /** Worker-side: symbols-mode expansion of one file, as plain records. */
@@ -2391,7 +2466,8 @@ function startWorkers(index, files, options = {}) {
         codeUnitCompare(a, b));
     // One serialization shared by every worker (a structured clone per
     // worker cost more than the expansion on large workspaces).
-    const encoded = Buffer.from(JSON.stringify(workerSnapshot(index, files, options.inventory)), 'utf8');
+    const encoded = Buffer.from(JSON.stringify(workerSnapshot(index, files, options.inventory,
+        options.mode === 'calls')), 'utf8');
     const snapshot = new SharedArrayBuffer(encoded.length);
     encoded.copy(Buffer.from(snapshot));
     const sab = new SharedArrayBuffer(4 * (count + 1));
@@ -2400,7 +2476,8 @@ function startWorkers(index, files, options = {}) {
     for (let i = 0; i < count; i++) {
         const worker = pool.available[i];
         ports.push(pool.ports[worker]);
-        pool.post(worker, { snapshot, files: ordered, signal: sab, workerIndex: i, queueIndex: count });
+        pool.post(worker, { snapshot, files: ordered, signal: sab, workerIndex: i, queueIndex: count,
+            ...(options.mode === 'calls' && { mode: 'calls' }) });
     }
     // Kept workers this job does not need end now.
     for (const worker of pool.available.slice(count)) pool.retire(worker);
@@ -2451,12 +2528,16 @@ function rustExpandedCalls(index, filePath, rawCalls, { materialize = true } = {
         rec.callsPending = true;
         throw error;
     }
-    index._rustMacroState.contexts.delete(filePath);
+    finishDerivation(index, filePath, rec);
+    return index.callsCache.get(filePath)?.calls || rawCalls;
+}
+
+function finishDerivation(index, filePath, rec) {
+    index._rustMacroState?.contexts.delete(filePath);
     delete rec.words;
     delete rec.groups;
     delete rec.expansions;
     index.macroExpansionDirty = true;
-    return index.callsCache.get(filePath)?.calls || rawCalls;
 }
 
 // Derivation contexts whose trees are kept (fix #405); a context dropped
@@ -2976,11 +3057,62 @@ function completeRustMacroCalls(index) {
 
 /** Derive every pending file's expansion calls (whole-program consumers). */
 function materializeRustMacroCalls(index) {
+    const pending = [];
+    for (const [filePath, entry] of index.files) {
+        if (!entry.rustMacroExpansion?.callsPending || !index.callsCache.get(filePath)) continue;
+        // A file a query derived in part keeps its context's records.
+        if (index._rustMacroState?.contexts.has(filePath)) continue;
+        pending.push(filePath);
+    }
+    // Many files to derive at once (an orientation ranking, a deadcode
+    // audit): fresh workers derive them (fix #422), each whole in one pass
+    // exactly as below.
+    const derived = deriveInWorkers(index, pending);
     for (const [filePath, entry] of index.files) {
         if (!entry.rustMacroExpansion?.callsPending) continue;
         const cached = index.callsCache.get(filePath);
-        if (cached) rustExpandedCalls(index, filePath, cached.calls);
+        if (!cached) continue;
+        const result = derived?.get(filePath);
+        if (result) installDerived(index, filePath, entry.rustMacroExpansion, cached, result);
+        else rustExpandedCalls(index, filePath, cached.calls);
     }
+}
+
+// Expanded text a materialization derives in fresh workers from, and per
+// worker (the build recorded each expansion's length): below it, starting
+// threads costs more than deriving in place.
+const DERIVE_IN_WORKERS_MIN_BYTES = 192 * 1024;
+const DERIVE_BYTES_PER_WORKER = 192 * 1024;
+
+/** Whole-file calls derivations of `files` in fresh workers: Map<file, { calls } | { none }>, or null. */
+function deriveInWorkers(index, files) {
+    const env = process.env.UCN_FRESH_EXPANSION;
+    if (env === '0' || freshWorkerCount(index, 2, files.length) === 0) return null;
+    let bytes = 0;
+    for (const file of files) {
+        const recorded = index.files.get(file)?.rustMacroExpansion?.expansions || [];
+        for (let i = 2; i < recorded.length; i += 3) if (recorded[i] > 0) bytes += recorded[i];
+    }
+    if (env !== '1' && bytes < DERIVE_IN_WORKERS_MIN_BYTES) return null;
+    const inventory = index._rustMacroState?.inventory || macroInventory(index);
+    if (inventory.size === 0) return null;
+    const count = freshWorkerCount(index, Math.ceil(bytes / DERIVE_BYTES_PER_WORKER), files.length);
+    const pool = require('./parallel-build').spawnExpansionPool(index, count);
+    if (!pool) return null;
+    try {
+        const run = startWorkers(index, files, { pool, inventory, mode: 'calls' });
+        return run ? run.collect() : null;
+    } finally {
+        pool.dispose();
+    }
+}
+
+function installDerived(index, filePath, rec, cached, result) {
+    const hints = (rec.calleeNames || []).map(name => ({ name, line: 0, calleeHint: true }));
+    if (index.calleeIndex && hints.length > 0) index._removeFromCalleeIndex(filePath, hints);
+    rec.callsPending = false;
+    if (result.calls) installComposedCalls(index, filePath, result.calls, cached.calls);
+    finishDerivation(index, filePath, rec);
 }
 
 /** Expanded and blind invocation sites, for health and deadcode disclosure. */

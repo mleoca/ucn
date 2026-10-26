@@ -710,6 +710,12 @@ const LANGUAGES = {
             // A fn declared inside a fn body is an item of that block: a
             // bare path outside the block never names it (fix #377).
             nestedItemsBlockScoped: true,
+            // A name resolves through the scopes that bind it, innermost
+            // first: block items and `use` declarations, then the module's
+            // items and explicit `use` bindings, then its globs, with types,
+            // values and macros in separate namespaces (fix #422,
+            // core/rust-names.js).
+            itemScopeResolution: true,
             // Names every module sees without a `use` (the std prelude of
             // editions 2015-2024 and the primitive types): a name no `use`,
             // glob or item binds must be one of them, or come from a macro

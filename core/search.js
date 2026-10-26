@@ -385,6 +385,8 @@ function usages(index, name, options = {}) {
                             }),
                             ...(u.receiverIsModule && { receiverIsModule: true }),
                             ...(u.receiverLocalBinding && { receiverLocalBinding: true }),
+                            // A path-qualified reference (`T::m`, fix #422).
+                            ...(u.scopedReference && { scopedReference: true }),
                             ...(u.namespace && { namespace: u.namespace }),
                             ...(u.scopeBinding && { scopeBinding: u.scopeBinding }),
                             ...(u.scopeDefLines && { scopeDefLines: u.scopeDefLines }),

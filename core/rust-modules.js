@@ -200,4 +200,4 @@ function rustItemAccessible(index, modifiers, file, line, siteFile, siteLine) {
     return scope.length <= site.segs.length && scope.every((seg, i) => site.segs[i] === seg);
 }
 
-module.exports = { rustPathModule, rustModuleItems, rustModulePathAt, rustItemAccessible };
+module.exports = { rustPathModule, rustModuleItems, rustModulePathAt, rustItemAccessible, moduleTree };

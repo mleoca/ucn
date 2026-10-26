@@ -242,6 +242,10 @@ function createFileIR({
         ...(parsed.asyncClosureNames?.length > 0 && {
             asyncClosureNames: [...parsed.asyncClosureNames],
         }),
+        // Rust item-position macro invocations of each module (fix #422).
+        ...(parsed.itemMacros?.length > 0 && {
+            itemMacros: parsed.itemMacros.map(item => ({ ...item })),
+        }),
         // Shapes of calls whose value is not consumed where it is produced
         // (fix #371/#372): audit-async reads a file's call records only when
         // one of these can reach a future producer.

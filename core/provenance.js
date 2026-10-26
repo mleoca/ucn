@@ -563,6 +563,7 @@ function createProvenance(evidence, resolution) {
     }
     if (evidence.typeQualifiedReceiver) rules.push('type-qualified');
     if (evidence.moduleOwnedPath) rules.push('module-owned');
+    if (evidence.itemScope) rules.push('item-scope');
     if (evidence.hasBindingId) rules.push('binding');
     if (evidence.hasSingleOwnerEvidence) rules.push('single-owner');
     if (evidence.hasImportEvidence) {

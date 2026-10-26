@@ -311,6 +311,8 @@ function indexSnapshot(index) {
             // Go package-level variables (fix #399) come from the worker parse too.
             packageVars: (fe.packageVars || []).map(variable => JSON.stringify(variable)),
             buildConstraint: fe.buildConstraint || null,
+            // Rust item-position macro invocations (fix #422) come from the worker parse too.
+            itemMacros: (fe.itemMacros || []).map(macro => JSON.stringify(macro)),
             bindings: (fe.bindings || []).map(binding => JSON.stringify(Object.fromEntries(
                 Object.entries(binding).sort(([a], [b]) => a.localeCompare(b))))).sort(),
             parseRecovery: !!fe.parseRecovery,

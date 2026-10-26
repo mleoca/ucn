@@ -1660,7 +1660,7 @@ fn main() {}
 });
 
 describe('fix #167: Rust method references detected as callbacks', () => {
-    it('retains an unresolved method-value expression without a confirmed callee (#355)', () => {
+    it('a paren-less member access is a field read, never a method callee (#355, fix #422)', () => {
         const dir = tmp({
             'main.rs': `struct Handler;
 impl Handler {
@@ -1680,8 +1680,10 @@ fn main() {
             const calleeNames = callees.map(c => c.name);
             assert.ok(calleeNames.includes('execute'), 'should find execute as callee');
             assert.ok(!calleeNames.includes('process'), 'an untyped method value cannot manufacture a callee binding');
+            // Rust method values are path-only: `h.process` reads a field.
             const contract = index.findCallees(mainDef, { collectAccount: true, includeMethods: true });
-            assert.ok(contract.unverifiedCallees.some(c => c.name === 'process'));
+            assert.ok(!contract.unverifiedCallees.some(c => c.name === 'process'));
+            assert.strictEqual(contract.calleeAccount.excluded.byReason['member-reference'], 1);
             assert.strictEqual(contract.calleeAccount.conserved, true);
         } finally {
             rm(dir);
@@ -9182,6 +9184,474 @@ describe('fix #405b: recorded groups choose what a view reads; refinements keep 
             assert.ok(r1.ok && r2.ok);
             const strip = r => JSON.stringify(r.result, (k, v) => (k === 'buildTime' ? undefined : v));
             assert.strictEqual(strip(r1), strip(r2));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #422: Rust item scopes, namespaces, path values, trait paths', () => {
+    const CARGO = '[package]\nname = "subm"\nversion = "0.1.0"\nedition = "2021"\n';
+    const callers = (index, handle) => {
+        const r = execute(index, 'show', { name: handle });
+        assert.ok(r.ok, JSON.stringify(r.error));
+        const ctx = r.result.context;
+        return {
+            confirmed: (ctx.callers || []).map(c => `${c.relativePath}:${c.line}`).sort(),
+            unverified: (ctx.unverifiedCallers || []).map(c => `${c.relativePath}:${c.line}:${c.reason}`).sort(),
+            excluded: Object.fromEntries(Object.entries(ctx.meta.account.excluded.byReason || {})
+                .map(([reason, v]) => [reason, v.count])),
+            callees: (ctx.callees || []).map(c => `${c.relativePath}:${c.startLine}:${c.name}`).sort(),
+            conserved: ctx.meta.account.conserved,
+        };
+    };
+    const submodule = {
+        'Cargo.toml': CARGO,
+        'src/lib.rs': 'pub mod bytes;\n\npub fn sign() -> u32 {\n    use crate::bytes::complete::tag;\n    tag(1)\n}\n',
+        'src/bytes/mod.rs': 'pub mod complete;\n\npub fn tag(x: u32) -> u32 {\n    x + 1\n}\n',
+        'src/bytes/complete.rs': 'pub fn tag(x: u32) -> u32 {\n    x + 2\n}\n',
+        'examples/ex.rs': 'use subm::bytes::complete::tag;\n\nfn main() {\n    println!("{}", tag(3));\n}\n',
+        'examples/ex2.rs': 'use subm::{\n    bytes::complete::tag,\n    sign,\n};\n\nfn main() {\n    println!("{} {}", tag(3), sign());\n}\n',
+    };
+
+    it('block-level and grouped `use` bind the name for their scope, never the parent module\'s namesake', () => {
+        const dir = tmp(submodule);
+        try {
+            const index = idx(dir);
+            const parent = callers(index, 'src/bytes/mod.rs:3:tag');
+            assert.deepStrictEqual(parent.confirmed, []);
+            assert.deepStrictEqual(parent.unverified, []);
+            assert.strictEqual(parent.excluded['other-definition-import'], 3);
+            const leaf = callers(index, 'src/bytes/complete.rs:1:tag');
+            assert.deepStrictEqual(leaf.confirmed, ['examples/ex.rs:4', 'examples/ex2.rs:7', 'src/lib.rs:5']);
+            assert.ok(parent.conserved && leaf.conserved);
+            // The callee of sign() is the block import's target.
+            assert.deepStrictEqual(callers(index, 'src/lib.rs:3:sign').callees, ['src/bytes/complete.rs:1:tag']);
+        } finally { rm(dir); }
+    });
+
+    it('a rename never edits calls a block `use` binds to another item (nom take_until)', () => {
+        const dir = tmp({
+            'Cargo.toml': CARGO,
+            'src/lib.rs': 'pub mod complete;\npub mod streaming;\n#[cfg(test)]\nmod tests;\n',
+            'src/complete.rs': 'pub fn take_until(x: u32) -> u32 { x }\npub fn user() -> u32 { take_until(1) }\n',
+            'src/streaming.rs': 'pub fn take_until(x: u32) -> u32 { x + 1 }\n',
+            'src/tests.rs': [
+                'use crate::complete::*;',
+                '#[test]',
+                'fn a() { assert_eq!(take_until(1), 1); }',
+                '#[test]',
+                'fn b() {',
+                '    use crate::streaming::take_until;',
+                '    assert_eq!(take_until(1), 2);',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const plan = execute(index, 'plan', { name: 'src/complete.rs:1:take_until', renameTo: 'tu' });
+            assert.ok(plan.ok, JSON.stringify(plan.error));
+            const edits = plan.result.changes.filter(c => !c.needsReview).map(c => `${c.file}:${c.line}`).sort();
+            assert.deepStrictEqual(edits, ['src/complete.rs:1', 'src/complete.rs:2', 'src/tests.rs:3']);
+        } finally { rm(dir); }
+    });
+
+    it('a rename edits only the imports whose path names the renamed item', () => {
+        const dir = tmp({
+            'Cargo.toml': CARGO,
+            'src/lib.rs': 'pub mod complete;\npub mod streaming;\npub mod user;\n',
+            'src/complete.rs': 'use crate::internal_glob::*;\npub fn tag(x: u32) -> u32 { x }\n',
+            'src/streaming.rs': 'pub fn tag(x: u32) -> u32 { x + 1 }\n',
+            'src/user.rs': 'use crate::complete::{tag};\nuse crate::streaming::tag as stag;\npub fn go() -> u32 { tag(1) + stag(2) }\n',
+        });
+        try {
+            const index = idx(dir);
+            const plan = execute(index, 'plan', { name: 'src/streaming.rs:1:tag', renameTo: 'tagZq' });
+            assert.ok(plan.ok, JSON.stringify(plan.error));
+            const userEdits = plan.result.changes.filter(c => c.file === 'src/user.rs').map(c => c.line).sort();
+            assert.deepStrictEqual(userEdits, [2], JSON.stringify(plan.result.changes));
+        } finally { rm(dir); }
+    });
+
+    it('scopes shadow outward: an inner block import over a module item, explicit names over globs, no parent names in an inline module', () => {
+        const dir = tmp({
+            'Cargo.toml': CARGO,
+            'src/lib.rs': [
+                'pub mod a { pub fn f() -> u8 { 1 } pub fn g() -> u8 { 2 } }',   // 1
+                'pub mod b { pub fn f() -> u8 { 3 } }',                           // 2
+                'pub fn f() -> u8 { 4 }',                                         // 3
+                'pub fn outer() -> u8 {',                                         // 4
+                '    let x = f();',                                               // 5 module item
+                '    { use crate::a::f; f() + x }',                               // 6 block import
+                '}',                                                              // 7
+                'pub mod c {',                                                    // 8
+                '    use crate::a::*;',                                           // 9
+                '    use crate::b::f;',                                           // 10
+                '    pub fn h() -> u8 { f() + g() }',                             // 11 explicit b::f over glob a::f
+                '}',                                                              // 12
+                'pub mod d {',                                                    // 13
+                '    pub fn k() -> u8 { 0 }',                                     // 14
+                '    pub fn h() -> u8 { k() }',                                   // 15
+                '}',                                                              // 16
+                'pub fn k() -> u8 { 9 }',                                         // 17
+                'pub fn n() -> u8 { fn inner() -> u8 { 0 } use crate::a::g; fn nested() -> u8 { g() + inner() } nested() }', // 18
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(callers(index, 'src/lib.rs:3:f').confirmed, ['src/lib.rs:5']);
+            assert.deepStrictEqual(callers(index, 'src/lib.rs:1:f').confirmed, ['src/lib.rs:6']);
+            assert.deepStrictEqual(callers(index, 'src/lib.rs:2:f').confirmed, ['src/lib.rs:11']);
+            // a::g reaches c through the glob and n's nested fn through n's block import.
+            assert.deepStrictEqual(callers(index, 'src/lib.rs:1:g').confirmed, ['src/lib.rs:11', 'src/lib.rs:18']);
+            // d::h calls d::k; the crate root's k is not in d's scope.
+            assert.deepStrictEqual(callers(index, 'src/lib.rs:17:k').confirmed, []);
+            assert.deepStrictEqual(callers(index, 'src/lib.rs:14:k').confirmed, ['src/lib.rs:15']);
+        } finally { rm(dir); }
+    });
+
+    it('a module never hides a function of its name (separate namespaces), on both sides', () => {
+        const dir = tmp({
+            'Cargo.toml': CARGO,
+            'src/lib.rs': [
+                'pub mod parser {',
+                '    pub fn to_writer(v: u32) -> String {',
+                '        v.to_string()',
+                '    }',
+                '}',
+                '',
+                '#[cfg(test)]',
+                'mod tests {',
+                '    use crate::parser::*;',
+                '',
+                '    mod to_writer {',
+                '        use super::*;',
+                '',
+                '        fn write(v: u32) -> String {',
+                '            to_writer(v)',
+                '        }',
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const fn = callers(index, 'src/lib.rs:2:to_writer');
+            assert.deepStrictEqual(fn.confirmed, ['src/lib.rs:15']);
+            assert.deepStrictEqual(fn.excluded, {});
+            assert.deepStrictEqual(callers(index, 'src/lib.rs:14:write').callees, ['src/lib.rs:2:to_writer']);
+        } finally { rm(dir); }
+    });
+
+    it('integration-test files are separate crates: a name only another test file declares is out of scope', () => {
+        const dir = tmp({
+            'Cargo.toml': CARGO,
+            'src/lib.rs': 'pub fn lib_fn() -> u8 { 0 }\n',
+            'tests/a.rs': 'fn helper() -> u8 { 1 }\n#[test]\nfn t() { assert_eq!(helper(), 1); }\n',
+            'tests/b.rs': '#[test]\nfn t() { assert_eq!(helper(), 1); }\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = callers(index, 'tests/a.rs:1:helper');
+            assert.deepStrictEqual(r.confirmed, ['tests/a.rs:3']);
+            assert.deepStrictEqual(r.unverified, []);
+            assert.strictEqual(r.excluded['name-not-in-scope'], 1);
+        } finally { rm(dir); }
+    });
+
+    it('a function a test macro nests inside the function it declares is that function\'s callee', () => {
+        const dir = tmp({
+            'Cargo.toml': CARGO,
+            'src/lib.rs': 'pub fn target() -> bool { true }\n',
+            'tests/quick.rs': [
+                'macro_rules! quick {',
+                '    ($(fn $name:ident($($arg:tt)*) -> bool { $($code:tt)* })*) => ($(',
+                '        #[test]',
+                '        fn $name() {',
+                '            fn prop($($arg)*) -> bool { $($code)* }',
+                '            assert!(prop(1));',
+                '        }',
+                '    )*);',
+                '}',
+                'quick! {',
+                '    fn uses_target(x: u8) -> bool {',
+                '        use subm::target;',
+                '        target() && x > 0',
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const def = index.symbols.get('uses_target').find(d => d.type === 'function');
+            const callees = index.findCallees(def, { collectAccount: true }).map(c => c.name);
+            assert.ok(callees.includes('target'), JSON.stringify(callees));
+        } finally { rm(dir); }
+    });
+
+    it('impls of an external trait by two or more project types are reached through the trait (deadcode)', () => {
+        const dir = tmp({
+            'Cargo.toml': CARGO,
+            'src/lib.rs': [
+                'mod inner {',
+                '    pub struct A(Vec<u32>);',
+                '    pub struct B(Vec<u32>);',
+                '    impl FromIterator<u32> for A {',
+                '        fn from_iter<T: IntoIterator<Item = u32>>(iter: T) -> Self { A(iter.into_iter().collect()) }',
+                '    }',
+                '    impl FromIterator<u32> for B {',
+                '        fn from_iter<T: IntoIterator<Item = u32>>(iter: T) -> Self { B(iter.into_iter().collect()) }',
+                '    }',
+                '    pub fn make() -> usize {',
+                '        let a: A = vec![1u32].into_iter().collect();',
+                '        let b: B = vec![1u32].into_iter().collect();',
+                '        a.0.len() + b.0.len()',
+                '    }',
+                '}',
+                'pub fn run() -> usize { inner::make() }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'deadcode', {});
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const dead = (r.result.results || r.result || []).map(d => d.name);
+            assert.ok(!dead.includes('from_iter'), JSON.stringify(dead));
+        } finally { rm(dir); }
+    });
+
+    const flagsFixture = {
+        'Cargo.toml': CARGO,
+        'src/lib.rs': [
+            'pub mod traits;',                                                     // 1
+            'pub mod generated; pub use generated::*;',                            // 2
+            'pub use traits::Flags;',                                              // 3
+            'pub struct T(u32);',                                                  // 4
+            'impl Flags for T { fn bits(&self) -> u32 { self.0 } }',              // 5
+            'impl T { pub fn inherent(&self) -> u32 { 1 } }',                     // 6
+            'fn case(v: &T, f: impl Fn(&T) -> u32) -> u32 { f(v) }',              // 7
+            'pub fn run() -> u32 {',                                               // 8
+            '    let t = T(3);',                                                   // 9
+            '    case(&t, T::unknown_bits) + case(&t, T::inherent) + t.unknown_bits()', // 10
+            '}',                                                                   // 11
+            'pub fn ufcs(mut t: T) -> T {',                                        // 12
+            '    use crate::Flags;',                                               // 13
+            '    Flags::insert(&mut t, 1);',                                       // 14
+            '    t',                                                               // 15
+            '}',                                                                   // 16
+        ].join('\n'),
+        'src/traits.rs': [
+            'pub trait Flags: Sized {',
+            '    fn bits(&self) -> u32;',
+            '    fn unknown_bits(&self) -> u32 { self.bits() & 0xF0 }',
+            '    fn insert(&mut self, _other: u32) {}',
+            '}',
+        ].join('\n'),
+        'src/generated.rs': [
+            'pub struct Flags(u32);',
+            'impl Flags {',
+            '    pub fn insert(&mut self, other: u32) { self.0 |= other; }',
+            '}',
+        ].join('\n'),
+    };
+
+    it('`T::method` values are renamed with the method; a same-line call stays listed', () => {
+        const dir = tmp(flagsFixture);
+        try {
+            const index = idx(dir);
+            const inherent = execute(index, 'plan', { name: 'src/lib.rs:6:inherent', renameTo: 'inh' });
+            assert.ok(inherent.ok, JSON.stringify(inherent.error));
+            const line10 = inherent.result.changes.find(c => c.file === 'src/lib.rs' && c.line === 10);
+            assert.match(line10?.newExpression || '', /case\(&t, T::inh\)/);
+            const provided = execute(index, 'plan', { name: 'src/traits.rs:3:unknown_bits', renameTo: 'ub' });
+            assert.ok(provided.ok, JSON.stringify(provided.error));
+            const edit = provided.result.changes.find(c => c.file === 'src/lib.rs' && c.line === 10);
+            assert.match(edit?.newExpression || '', /case\(&t, T::ub\)/);
+            // The undecided `t.unknown_bits()` on the same line is listed, not dropped.
+            const listed = [...(provided.result.unverifiedSites || []), ...provided.result.changes.filter(c => c.needsReview)]
+                .some(site => site.file === 'src/lib.rs' && site.line === 10);
+            assert.ok(listed || /t\.ub\(\)/.test(edit.newExpression), JSON.stringify(provided.result));
+        } finally { rm(dir); }
+    });
+
+    it('`Trait::m(x)` names the trait\'s member, never an inherent member of a type spelled like the trait', () => {
+        const dir = tmp({
+            'Cargo.toml': CARGO,
+            'src/lib.rs': 'pub mod traits;\npub mod generated;\npub use traits::Flags;\n#[cfg(test)]\nmod tests;\n',
+            'src/traits.rs': 'pub trait Flags: Sized {\n    fn insert(&mut self, _other: u32) {}\n}\n',
+            'src/generated.rs': 'pub struct Flags(u32);\nimpl Flags {\n    pub fn insert(&mut self, other: u32) { self.0 |= other; }\n}\n',
+            'src/tests.rs': 'use super::*;\nmod insert;\npub struct TestFlags(u32);\nimpl Flags for TestFlags {}\n',
+            'src/tests/insert.rs': 'use super::*;\n\nuse crate::Flags;\n\nfn case<T: Flags>(mut value: T) -> T {\n    Flags::insert(&mut value, 1);\n    value\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const inherent = callers(index, 'src/generated.rs:3:insert');
+            assert.deepStrictEqual(inherent.confirmed, []);
+            assert.strictEqual(inherent.excluded['path-type-mismatch'], 1);
+            const plan = execute(index, 'plan', { name: 'src/generated.rs:3:insert', renameTo: 'ins' });
+            assert.ok(plan.ok);
+            assert.ok(!plan.result.changes.some(c => c.file === 'src/tests/insert.rs' && !c.needsReview));
+            assert.ok(callers(index, 'src/traits.rs:2:insert').confirmed.includes('src/tests/insert.rs:6'));
+        } finally { rm(dir); }
+    });
+
+    it('`Default::default()` selects the impl by the type its value is written into, on both sides', () => {
+        const dir = tmp({
+            'Cargo.toml': CARGO,
+            'src/lib.rs': [
+                'pub struct Inner(u8);',                                            // 1
+                'impl Default for Inner {',                                         // 2
+                '    fn default() -> Self { Inner(0) }',                            // 3
+                '}',                                                                // 4
+                'pub struct Other(u8);',                                            // 5
+                'impl Default for Other {',                                         // 6
+                '    fn default() -> Self { Other(1) }',                            // 7
+                '}',                                                                // 8
+                'pub struct Outer { inner: Inner }',                                // 9
+                'impl Default for Outer {',                                         // 10
+                '    fn default() -> Self { Self { inner: Default::default() } }', // 11
+                '}',                                                                // 12
+                'pub fn annotated() -> u8 { let o: Other = Default::default(); o.0 }', // 13
+                'pub fn take(_i: Inner) {}',                                        // 14
+                'pub fn passed() { take(Default::default()) }',                     // 15
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const inner = callers(index, 'src/lib.rs:3:default');
+            assert.ok(inner.confirmed.includes('src/lib.rs:11'), JSON.stringify(inner));
+            assert.ok(!inner.confirmed.includes('src/lib.rs:13'));
+            // No written type decides an argument: visible, with its reason.
+            assert.ok(inner.unverified.includes('src/lib.rs:15:trait-self-unknown'), JSON.stringify(inner));
+            assert.ok(callers(index, 'src/lib.rs:7:default').confirmed.includes('src/lib.rs:13'));
+            assert.ok(callers(index, 'src/lib.rs:11:default').callees.includes('src/lib.rs:3:default'));
+            assert.ok(inner.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('a path value outside an argument names its qualifier\'s member', () => {
+        const dir = tmp({
+            'Cargo.toml': CARGO,
+            'src/lib.rs': [
+                'pub struct T(u32);',
+                'impl T { pub fn inherent(&self) -> u32 { 1 } }',
+                'pub struct U(u32);',
+                'impl U { pub fn inherent(&self) -> u32 { 2 } }',
+                'pub fn run(t: &T) -> u32 {',
+                '    let f = T::inherent;',
+                '    let g = U::inherent;',
+                '    f(t) + g(&U(1))',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const plan = execute(index, 'plan', { name: 'src/lib.rs:2:inherent', renameTo: 'zz' });
+            assert.ok(plan.ok, JSON.stringify(plan.error));
+            const edits = plan.result.changes.filter(c => !c.needsReview).map(c => `${c.line}:${c.newExpression.trim()}`);
+            assert.ok(edits.includes('6:let f = T::zz;'), JSON.stringify(edits));
+            assert.ok(!plan.result.changes.some(c => c.line === 7));
+        } finally { rm(dir); }
+    });
+
+    it('a type path names the type its scopes bind (a block import alias), on the callee side', () => {
+        const dir = tmp({
+            'Cargo.toml': CARGO,
+            'src/lib.rs': [
+                'pub mod sep {',                                               // 1
+                '    pub struct ContextSeparator(u8);',                        // 2
+                '    impl ContextSeparator { pub fn new(v: u8) -> Self { ContextSeparator(v) } }', // 3
+                '}',                                                           // 4
+                'pub struct Separator(u8);',                                   // 5
+                'impl Separator { pub fn new(v: u8) -> Self { Separator(v) } }', // 6
+                'pub fn update(v: u8) -> u8 {',                                // 7
+                '    use crate::sep::ContextSeparator as Separator;',          // 8
+                '    let s = Separator::new(v);',                              // 9
+                '    s.0',                                                     // 10
+                '}',                                                           // 11
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(callers(index, 'src/lib.rs:7:update').callees, ['src/lib.rs:3:new']);
+            assert.deepStrictEqual(callers(index, 'src/lib.rs:6:new').confirmed, []);
+            assert.deepStrictEqual(callers(index, 'src/lib.rs:3:new').confirmed, ['src/lib.rs:9']);
+        } finally { rm(dir); }
+    });
+
+    it('a parse error inside a function body hides no module item', () => {
+        const dir = tmp({
+            'Cargo.toml': CARGO,
+            'src/lib.rs': [
+                'pub struct Inner(u8);',
+                'impl Default for Inner { fn default() -> Self { Inner(0) } }',
+                'pub struct Outer { inner: Inner }',
+                'impl Default for Outer {',
+                '    fn default() -> Self { Self { inner: Default::default() } }',
+                '}',
+                'pub fn raw(x: &Inner) -> u8 { let p = &raw const x.0; unsafe { *p } }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const entry = [...index.files.values()].find(e => e.relativePath === 'src/lib.rs');
+            assert.ok(entry.parseErrorRegions?.length > 0, 'the grammar must still fail on `&raw const`');
+            assert.ok(callers(index, 'src/lib.rs:2:default').confirmed.includes('src/lib.rs:5'));
+        } finally { rm(dir); }
+    });
+
+    it('crate names resolve through manifest dependencies (renamed path dependencies)', () => {
+        const dir = tmp({
+            'Cargo.toml': '[workspace]\nmembers = ["core", "app"]\n',
+            'core/Cargo.toml': '[package]\nname = "core-lib"\nversion = "0.1.0"\nedition = "2021"\n',
+            'core/src/lib.rs': 'pub fn tag() -> u8 { 1 }\npub mod other { pub fn tag() -> u8 { 2 } }\n',
+            'app/Cargo.toml': '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nnicecore = { package = "core-lib", path = "../core" }\n',
+            'app/src/main.rs': 'use nicecore::tag;\nfn main() { tag(); }\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(callers(index, 'core/src/lib.rs:1:tag').confirmed, ['app/src/main.rs:2']);
+            assert.deepStrictEqual(callers(index, 'core/src/lib.rs:2:tag').confirmed, []);
+        } finally { rm(dir); }
+    });
+
+    it('a paren-less field read is never a method callee', () => {
+        const dir = tmp({
+            'Cargo.toml': CARGO,
+            'src/lib.rs': [
+                'pub struct S { len: usize }',
+                'impl S {',
+                '    pub fn len(&self) -> usize { self.len }',
+                '    pub fn go(&self) -> usize { take(self.len) + take2(u32::MAX) }',
+                '}',
+                'fn take(x: usize) -> usize { x }',
+                'fn take2(x: u32) -> usize { x as usize }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = callers(index, 'src/lib.rs:4:go');
+            assert.deepStrictEqual(r.callees, ['src/lib.rs:6:take', 'src/lib.rs:7:take2']);
+        } finally { rm(dir); }
+    });
+
+    it('parallel and sequential builds carry the same scope facts', () => {
+        const { indexSnapshot } = require('./helpers');
+        const files = { ...flagsFixture, ...submodule, 'src/lib.rs': submodule['src/lib.rs'] };
+        for (let i = 0; i < 40; i++) {
+            files[`src/m${i}.rs`] = `use crate::bytes::complete::*;\nlazy_static! { static ref X${i}: u8 = 1; }\n` +
+                `pub fn f${i}() -> u32 { use crate::bytes::tag; tag(${i}) + X${i}.clone() as u32 }\n` + '// pad\n'.repeat(4000);
+        }
+        files['src/lib.rs'] += Array.from({ length: 40 }, (_, i) => `pub mod m${i};`).join('\n');
+        const dir = tmp(files);
+        try {
+            const parallel = new ProjectIndex(dir);
+            parallel.build(null, { quiet: true, workers: 2 });
+            const sequential = new ProjectIndex(dir);
+            sequential.build(null, { quiet: true, workers: 0 });
+            assert.ok(parallel.lastBuildWorkerCount >= 2);
+            assert.strictEqual(indexSnapshot(parallel), indexSnapshot(sequential));
+            const entry = [...sequential.files.values()].find(e => e.relativePath === 'src/m3.rs');
+            assert.deepStrictEqual(entry.itemMacros.map(m => m.name), ['lazy_static']);
+            assert.ok(entry.importDetails.some(d => d.lexicalScopeStartLine === 3));
         } finally { rm(dir); }
     });
 });

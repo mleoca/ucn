@@ -180,7 +180,7 @@ if (control) {
     Atomics.wait(controlArray, workerIndex, 0);
     if (Atomics.load(controlArray, workerIndex) === 2) {
         const job = receiveMessageOnPort(port)?.message;
-        if (job) require('./rust-macro-expansion').runExpansionQueue(job, port);
+        if (job) await require('./rust-macro-expansion').runExpansionQueue(job, port);
     }
 }
 try { port.close(); } catch (_) { /* closed */ }

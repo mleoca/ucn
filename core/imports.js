@@ -459,6 +459,9 @@ function snapshotWorkspaceManifests(projectRoot) {
             packageName: info.packageName,
             srcDir: rel(info.srcDir),
             targetDirs: info.targetDirs.map(rel),
+            ...(info.dependencies && { dependencies: Object.fromEntries(Object.entries(info.dependencies)
+                .map(([name, dep]) => [name, { ...dep, ...(dep.path && { path: rel(dep.path) }) }])) }),
+            ...(info.edition && { edition: info.edition }),
         });
     }
     workspaceCrateCache.set(projectRoot, _registryFromManifestDirs(dirs));
@@ -480,6 +483,9 @@ function seedWorkspaceManifests(projectRoot, manifests) {
             srcDir: path.join(projectRoot, m.srcDir),
             packageName: m.packageName,
             targetDirs: m.targetDirs.map(t => path.join(projectRoot, t)),
+            ...(m.dependencies && { dependencies: Object.fromEntries(Object.entries(m.dependencies)
+                .map(([name, dep]) => [name, { ...dep, ...(dep.path && { path: path.join(projectRoot, dep.path) }) }])) }),
+            ...(m.edition && { edition: m.edition }),
         });
     }
     workspaceCrateCache.set(projectRoot, _registryFromManifestDirs(dirs));
@@ -517,6 +523,50 @@ function resetCargoCaches(projectRoot) {
 }
 
 /**
+ * The crate names a manifest's dependency tables declare (fix #422), as
+ * code spells them (`-` read as `_`): `{ name: { path?, package?,
+ * workspace? } }` with `path` the dependency's directory for a path
+ * dependency, `package` the package a rename names, `workspace` for an entry
+ * inherited from the workspace. Null when the manifest declares none.
+ */
+function cargoDependencies(toml, dir) {
+    const deps = {};
+    let section = null;
+    let tableDep = null;
+    const add = (name, body) => {
+        const key = name.replace(/-/g, '_');
+        const entry = deps[key] || (deps[key] = {});
+        const pathMatch = /\bpath\s*=\s*"([^"]+)"/.exec(body);
+        if (pathMatch) entry.path = path.resolve(dir, pathMatch[1]);
+        const pkg = /\bpackage\s*=\s*"([^"]+)"/.exec(body);
+        if (pkg) entry.package = pkg[1].replace(/-/g, '_');
+        if (/\bworkspace\s*=\s*true\b/.test(body)) entry.workspace = true;
+    };
+    for (const raw of toml.split(/\r?\n/)) {
+        const line = raw.replace(/#.*$/, '').trim();
+        if (!line) continue;
+        const header = /^\[\s*([^\]]+?)\s*\]$/.exec(line);
+        if (header) {
+            const name = header[1].replace(/\s+/g, '');
+            const parts = name.split('.');
+            const kind = parts.findIndex(part => /^(dev-|build-)?dependencies$/.test(part));
+            section = kind >= 0 ? name : null;
+            tableDep = kind >= 0 && kind === parts.length - 2 ? parts[parts.length - 1].replace(/^["']|["']$/g, '') : null;
+            if (tableDep) add(tableDep, '');
+            continue;
+        }
+        if (!section) continue;
+        if (tableDep) {
+            add(tableDep, line);
+            continue;
+        }
+        const entry = /^["']?([A-Za-z0-9_-]+)["']?(\.workspace)?\s*=\s*(.*)$/.exec(line);
+        if (entry) add(entry[1], entry[2] ? 'workspace = true' : entry[3]);
+    }
+    return Object.keys(deps).length > 0 ? deps : null;
+}
+
+/**
  * Find the nearest Cargo.toml and return the crate's source root
  * @param {string} startDir - Directory to start searching from
  * @returns {{root: string, srcDir: string}|null}
@@ -539,11 +589,20 @@ function findCargoRoot(startDir) {
             // tests/*.rs — fix #246); `-` normalizes to `_` in code.
             let packageName = null;
             const targetDirs = [];
+            let dependencies = null;
+            let edition = null;
             try {
                 const toml = fs.readFileSync(cargoPath, 'utf-8');
                 const pkgSection = toml.split(/^\s*\[/m).find(s => s.startsWith('package]'));
                 const m = pkgSection && pkgSection.match(/^\s*name\s*=\s*"([^"]+)"/m);
                 if (m) packageName = m[1].replace(/-/g, '_');
+                // The edition decides how `use` paths start (fix #422): a
+                // package without one is 2015 (paths from the crate root);
+                // an inherited edition is not known here.
+                if (pkgSection) {
+                    const ed = pkgSection.match(/^\s*edition\s*=\s*"(\d+)"/m);
+                    edition = ed ? ed[1] : /^\s*edition(\.workspace|\s*=\s*\{)/m.test(pkgSection) ? null : '2015';
+                }
                 // Explicit target roots (fix #260b, ripgrep-measured): a
                 // manifest may root its targets OUTSIDE src/ — ripgrep's
                 // `[[bin]] path = "crates/core/main.rs"` puts the whole bin
@@ -554,8 +613,10 @@ function findCargoRoot(startDir) {
                     const tDir = path.dirname(path.resolve(dir, tm[1]));
                     if (!targetDirs.includes(tDir)) targetDirs.push(tDir);
                 }
+                dependencies = cargoDependencies(toml, dir);
             } catch { /* unreadable Cargo.toml — no package identity */ }
-            const result = { root: dir, srcDir: fs.existsSync(srcDir) ? srcDir : dir, packageName, targetDirs };
+            const result = { root: dir, srcDir: fs.existsSync(srcDir) ? srcDir : dir, packageName, targetDirs,
+                ...(dependencies && { dependencies }), ...(edition && { edition }) };
             cargoCache.set(startDir, result);
             return result;
         }

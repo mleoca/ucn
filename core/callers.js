@@ -1092,6 +1092,36 @@ function findCallers(index, name, options = {}) {
             routeUnverified(filePath, fileEntry, call, 'provenance-incomplete', calledAs, undefined, facts);
         }
     };
+    // `Trait::m(..)` naming a Self-returning impl member (fix #422): the type
+    // the call's value is written into selects the impl. true when the call
+    // was routed (confirmed, or visible because no written type decides).
+    const routeTraitPathSelf = (filePath, fileEntry, call, calledAs, callerSymbol, targets) => {
+        if (!langTraits(fileEntry.language)?.itemScopeResolution) return false;
+        const expected = _rustTraitPathExpectedSelf(index, filePath, call, callerSymbol, targets);
+        if (expected === 'target') {
+            if (!pendingByFile.has(filePath)) pendingByFile.set(filePath, []);
+            pendingByFile.get(filePath).push({
+                call, fileEntry, callerSymbol, isMethod: true,
+                isFunctionReference: !!call.isFunctionReference,
+                receiver: call.receiver, calledAs,
+                _evidence: {
+                    facts: _confirmationFacts(index, filePath, call, targets, {}),
+                    typeQualifiedReceiver: true,
+                    itemScope: true,
+                    hasImportEvidence: true,
+                },
+            });
+            pendingCount++;
+            return true;
+        }
+        if (expected === 'unknown' && collectAccount) {
+            routeUnverified(filePath, fileEntry, call, 'trait-self-unknown', calledAs, {
+                dispatchVia: `${String(call.receiver).split('::').pop()} — Self from context`,
+            });
+            return true;
+        }
+        return false;
+    };
     // A std wrapper step may supply the method (fix #401): the target's own
     // type behind the wrapper, the wrapper, a blanket or a trait owner can be
     // what the probe selects there. A target owned by an unrelated concrete
@@ -1517,6 +1547,55 @@ function findCallers(index, name, options = {}) {
                         recordExcluded(filePath, call.line, 'other-definition');
                         continue;
                     }
+                }
+
+                // Item scopes (fix #422): a bare name denotes what the
+                // innermost scope binding it names - a block's items and
+                // `use` declarations, then its module's items, explicit
+                // `use` bindings and globs - resolved over the module tree.
+                // A module-level import edge to a file is no evidence about
+                // a name the site's scopes bind elsewhere.
+                if (langTraits(fileEntry.language)?.itemScopeResolution &&
+                    _itemScopeCandidate(call, pinnedLanguageTargets)) {
+                    const scoped = _itemScopeVerdict(index, filePath, call, pinnedLanguageTargets);
+                    if (scoped === 'other') {
+                        recordExcluded(filePath, call.line, 'other-definition-import');
+                        continue;
+                    }
+                    if (scoped === 'unbound') {
+                        recordExcluded(filePath, call.line, 'name-not-in-scope');
+                        continue;
+                    }
+                    if (scoped === 'target') {
+                        const callerSymbol = index.findEnclosingFunction(filePath, call.line, true, call);
+                        if (!pendingByFile.has(filePath)) pendingByFile.set(filePath, []);
+                        pendingByFile.get(filePath).push({
+                            call, fileEntry, callerSymbol,
+                            isMethod: false,
+                            isFunctionReference: !!call.isFunctionReference,
+                            calledAs,
+                            _evidence: {
+                                facts: _confirmationFacts(index, filePath, call, pinnedLanguageTargets, {}),
+                                itemScope: true,
+                                hasImportEvidence: true,
+                            },
+                        });
+                        pendingCount++;
+                        continue;
+                    }
+                }
+
+                // The qualifier of a path names a type, trait or module by
+                // the same scopes (fix #422): `Trait::m(x)` / `<T as
+                // Trait>::m(x)` names the trait's member - never an inherent
+                // member of a type spelled like it - and `Type::m()` an
+                // associated item of that type definition.
+                if (langTraits(fileEntry.language)?.itemScopeResolution && call.isPathCall &&
+                    call.receiver && !call.isMacro && !call.macroScopeUnknown && !call.inMacroDefinition &&
+                    pinnedLanguageTargets.length > 0 &&
+                    _pathQualifierVerdict(index, filePath, call, pinnedLanguageTargets) === 'other') {
+                    recordExcluded(filePath, call.line, 'path-type-mismatch');
+                    continue;
                 }
 
                 // Rust module paths (fix #377): `crate::f()`, `super::f()`,
@@ -2423,7 +2502,12 @@ function findCallers(index, name, options = {}) {
 
                 // For potential callbacks (function passed as arg), validate against symbol table
                 // and skip complex binding resolution — just check the name exists
-                if (call.isPotentialCallback) {
+                // A Rust path value (`T::m` passed as an argument, fix #422)
+                // names what the same path called would: the path rules
+                // below decide it.
+                const pathValue = call.isPathCall && call.receiver &&
+                    langTraits(fileEntry.language)?.itemScopeResolution;
+                if (call.isPotentialCallback && !pathValue) {
                     // Go closure-entry marker: a composite-field func literal
                     // records the ENCLOSING function's name at the closure line
                     // (deadcode reachability for RunE-style closures) — it is a
@@ -2546,7 +2630,7 @@ function findCallers(index, name, options = {}) {
                     // method values are path-only (Type::method), so
                     // `self.paths.has_implicit_path` provably denotes the bool
                     // FIELD, never the method (fix #220, ripgrep-measured).
-                    if (call.isMethod && call.isFunctionReference &&
+                    if (call.isMethod && call.isFunctionReference && !call.isPathCall &&
                         langTraits(fileEntry.language)?.memberAccessNeverMethod) {
                         const allMethodTargets = cbTargetDefs.length > 0 && cbTargetDefs.every(d =>
                             !NON_CALLABLE_TYPES.has(d.type) && (d.className || d.receiver));
@@ -5868,6 +5952,9 @@ function findCallers(index, name, options = {}) {
                                             });
                                             continue;
                                         }
+                                        // A Self-returning trait member (fix #422).
+                                        if (routeTraitPathSelf(filePath, fileEntry, call, calledAs,
+                                            index.findEnclosingFunction(filePath, call.line, true, call), targetDefs)) continue;
                                         isUncertain = true;
                                         typeMismatch = true;
                                         if (collectAccount) {
@@ -6442,11 +6529,37 @@ function findCallers(index, name, options = {}) {
                             if (selfImplMember) {
                                 // falls through to scope/import confirmation
                             } else if (traitVia2) {
+                                // A concrete type the item scopes name, that
+                                // implements the pinned trait and declares
+                                // no member of the name itself: the path
+                                // selects the trait's member (fix #422).
+                                if (langTraits(fileEntry.language)?.itemScopeResolution &&
+                                    _rustTraitDeclPathProbe(index, filePath, call, targetDefs2) === 'target') {
+                                    if (!pendingByFile.has(filePath)) pendingByFile.set(filePath, []);
+                                    pendingByFile.get(filePath).push({
+                                        call, fileEntry, callerSymbol, isMethod: true,
+                                        isFunctionReference: !!call.isFunctionReference,
+                                        receiver: call.receiver, calledAs,
+                                        _evidence: {
+                                            facts: _confirmationFacts(index, filePath, call, targetDefs2, {}),
+                                            typeQualifiedReceiver: true,
+                                            itemScope: true,
+                                            hasImportEvidence: true,
+                                        },
+                                    });
+                                    pendingCount++;
+                                    continue;
+                                }
                                 routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
                                     dispatchVia: `${pathReceiverSegment} — ${traitVia2} implementor`,
                                 });
                                 continue;
                             } else {
+                                // A Self-returning member of a trait the
+                                // qualifier names (`Default::default()`, fix
+                                // #422): the type its value is written into
+                                // selects the impl.
+                                if (routeTraitPathSelf(filePath, fileEntry, call, calledAs, callerSymbol, targetDefs2)) continue;
                                 recordExcluded(filePath, call.line, 'path-type-mismatch');
                                 continue;
                             }
@@ -7916,7 +8029,8 @@ function findCallees(index, definition, options = {}) {
             if (call.isMethod && !call.receiverIsModule && !call.moduleOwnedPath &&
                 !evidence.typeQualifiedReceiver && !evidence.extensionMethod) evidence.hasBindingId = false;
             if (!call.isMethod && target && !evidence.hasBindingId) {
-                evidence.hasImportEvidence = (index.symbols.get(call.name) || []).length === 1 ||
+                evidence.hasImportEvidence = !!evidence.itemScope ||
+                    (index.symbols.get(call.name) || []).length === 1 ||
                     target.file === def.file || index.importGraph.get(def.file)?.has(target.file);
             }
             const scored = scoreEdge(evidence);
@@ -8240,9 +8354,13 @@ function findCallees(index, definition, options = {}) {
             // A macro expansion (fix #374) lays every function it generates
             // on the invocation's lines: a sibling generated on the same
             // line is another function, never a nested callback.
+            // A function the expansion nests inside this one (fix #422: the
+            // `fn prop(..) { body }` a test macro wraps in `fn name()`) is
+            // nested by its scope chain, not a sibling.
             if (call.macroExpansion && call.enclosingFunction &&
                 call.enclosingFunction.startLine === def.startLine &&
-                call.enclosingFunction.name !== def.name) continue;
+                call.enclosingFunction.name !== def.name &&
+                !(call.enclosingFunction.scopeChain || []).slice(0, -1).includes(def.startLine)) continue;
             // Method 1: Direct match via enclosingFunction (fast path for direct calls)
             const isDirectMatch = call.enclosingFunction &&
                 call.enclosingFunction.startLine === def.startLine;
@@ -8256,7 +8374,20 @@ function findCallees(index, definition, options = {}) {
             const isNestedCallback = isInRange && !isInInnerSymbol && !isDirectMatch;
 
             if (!isDirectMatch && !isNestedCallback) continue;
+            // A path value no project callable is named by (a constant,
+            // variant or external value: `take(u32::MAX)`) is no call site
+            // (fix #422).
+            if (call.isFunctionReference && call.isPathCall &&
+                !(index.symbols.get(call.name) || []).some(d => CALLABLE_SYMBOL_KINDS.has(d.type))) continue;
             if (calleeAccount) calleeAccount.totalSites++;
+            // A paren-less member access is always a field where method
+            // values are path-only (fix #422, the caller side's #220 rule):
+            // `take(self.len)` reads the field, never the method `len`.
+            if (call.isMethod && call.isFunctionReference && !call.isPathCall &&
+                langTraits(language)?.memberAccessNeverMethod) {
+                noteSite(siteId, 'excluded', 'member-reference', call);
+                continue;
+            }
             if (call.implicitOutOfClass) {
                 noteUnverified(siteId, call, 'constructor-implicit-base-unproven');
                 continue;
@@ -8501,6 +8632,27 @@ function findCallees(index, definition, options = {}) {
                     _csharpExtensionCallVerdict(index, def.file, fileEntry, call, [candidate]) === 'possible');
                 if (possibleExtension) {
                     noteUnverified(siteId, call, 'extension-receiver-unresolved');
+                    continue;
+                }
+            }
+
+            // A Self-returning trait member selected by the type the value
+            // is written into (fix #422): `inner: Default::default()`.
+            if (call.isPathCall && call.receiver && langTraits(language)?.itemScopeResolution &&
+                !call.macroScopeUnknown && !call.inMacroDefinition) {
+                const member = _rustCalleeTraitPathSelf(index, def, call);
+                if (member) {
+                    const key = member.bindingId || `${member.className}.${call.name}`;
+                    const existing = callees.get(key);
+                    if (existing) {
+                        existing.count += 1;
+                        existing.sites.push(call.line); existing.siteIds.push(siteId);
+                    } else {
+                        callees.set(key, { name: call.name, bindingId: member.bindingId, count: 1,
+                            sites: [call.line], siteIds: [siteId] });
+                    }
+                    siteEvidence.get(siteId).evidence.typeQualifiedReceiver = true;
+                    siteEvidence.get(siteId).evidence.itemScope = true;
                     continue;
                 }
             }
@@ -9661,6 +9813,34 @@ function findCallees(index, definition, options = {}) {
             // implicit-this/static-import machinery.
             // A parser-proven local binding (a nested class or function,
             // parameter or local) shadows the import (fix #381).
+            // Item scopes (fix #422, the caller side's rule): the scopes
+            // binding a bare name decide its callee.
+            if (langTraits(language)?.itemScopeResolution && !call.isMacro && !call.isPathCall &&
+                !call.isMethod && !call.receiver && !call.isConstructor && !call.localShadow &&
+                !call.inMacroDefinition && !call.macroScopeUnknown) {
+                const named = _rustCallName(index, def.file, call);
+                if (named?.external) {
+                    noteSite(siteId, 'external', null, call);
+                    continue;
+                }
+                const callables = named?.defs?.filter(d => d.type === 'function' && !d.className && !d.receiver);
+                if (callables?.length > 0 && callables.length === named.defs.length) {
+                    for (const match of callables) {
+                        const key = match.bindingId || `${match.file}:${match.startLine}:${call.name}`;
+                        const existing = callees.get(key);
+                        if (existing) {
+                            existing.count += 1;
+                            existing.sites.push(call.line); existing.siteIds.push(siteId);
+                        } else {
+                            callees.set(key, { name: match.name, bindingId: match.bindingId, count: 1,
+                                sites: [call.line], siteIds: [siteId] });
+                        }
+                    }
+                    siteEvidence.get(siteId).evidence.itemScope = true;
+                    continue;
+                }
+            }
+
             if (!call.isMethod && !call.receiver && !call.isConstructor && !call.localShadow &&
                 !langTraits(language)?.bareCallReachesMethods) {
                 const importRoute = _calleeStructuralImportedNameRoute(index, fileEntry, call, language);
@@ -9789,8 +9969,10 @@ function findCallees(index, definition, options = {}) {
                             fileEntry.bindings.filter(b => b.name === call.name), call));
                 // A marked macro invocation binds only macros, a call only
                 // fns and values (fix #377).
+                // A module is a name of the type namespace (fix #422).
                 if (langTraits(language)?.macroInvocationSyntax === 'marked') {
-                    bindings = bindings.filter(b => (b.type === 'macro') === !!call.isMacro);
+                    bindings = bindings.filter(b => (b.type === 'macro') === !!call.isMacro &&
+                        b.type !== 'module');
                 }
                 if (macroBindingsInert) bindings = bindings.filter(b => b.type !== 'macro');
                 // For Go, also check sibling files in same directory (same
@@ -14890,7 +15072,7 @@ function _projectTopLevelNames(index) {
  */
 function _scopeImportBindings(fileEntry, bindings, callLine) {
     if (!bindings || bindings.length === 0 || callLine == null) return bindings;
-    if (!bindings.some(b => b.line != null && b.deferred)) return bindings;
+    if (!bindings.some(b => (b.line != null && b.deferred) || b.lexicalScopeStartLine != null)) return bindings;
     const scopes = (fileEntry.symbols || []).filter(s =>
         s.startLine != null && s.endLine != null && s.endLine >= s.startLine &&
         CALLABLE_SYMBOL_KINDS.has(s.type));
@@ -14905,6 +15087,13 @@ function _scopeImportBindings(fileEntry, bindings, callLine) {
     const local = [];
     const moduleLevel = [];
     for (const b of bindings) {
+        // A block-scoped import (Rust `use` in a block, fix #422) binds its
+        // names in that block only.
+        if (b.lexicalScopeStartLine != null) {
+            if (callLine < b.lexicalScopeStartLine || callLine > b.lexicalScopeEndLine) continue;
+            local.push({ b, size: b.lexicalScopeEndLine - b.lexicalScopeStartLine });
+            continue;
+        }
         // An eager import is outside every function by parser evidence.
         // A function beginning on the same line must not absorb it.
         const typeOnly = b.deferred && (fileEntry.importDetails || []).some(detail =>
@@ -19457,13 +19646,289 @@ function _enclosingFunctionOfDefinition(index, def) {
 function _enclosingFunctionOfDefinitionUncached(index, def) {
     const entry = index.files.get(def.file);
     let best = null;
+    // Source spans decide where both have them (fix #422): items a macro
+    // expansion generates share the invocation's lines.
+    const spanned = d => Number.isFinite(d?.sourceSpan?.start) && Number.isFinite(d?.sourceSpan?.end);
     for (const symbol of entry?.symbols || []) {
         if (!['function', 'method', 'constructor'].includes(symbol.type)) continue;
         if (symbol.startLine === def.startLine && symbol.name === def.name) continue;
+        if (spanned(symbol) && spanned(def)) {
+            const a = symbol.sourceSpan, b = def.sourceSpan;
+            if (a.start > b.start || a.end < b.end || (a.start === b.start && a.end === b.end)) continue;
+            if (!best || !spanned(best) || a.start >= best.sourceSpan.start) best = symbol;
+            continue;
+        }
         if (symbol.startLine > def.startLine || symbol.endLine < def.endLine) continue;
         if (!best || symbol.startLine >= best.startLine) best = symbol;
     }
     return best ? { file: def.file, startLine: best.startLine, endLine: best.endLine } : null;
+}
+
+/**
+ * A bare value call whose name the item scopes decide (fix #422): no
+ * receiver or path, no local binding (a token-tree call whose macro may
+ * bind its tokens is left to the other rules), pinned to free functions.
+ */
+function _itemScopeCandidate(call, targets) {
+    if (call.receiver || call.isMethod || call.isPathCall || call.isMacro || call.isConstructor ||
+        call.localShadow || call.inMacroDefinition || call.macroScopeUnknown) return false;
+    return targets.length > 0 && targets.every(target => target.type === 'function' &&
+        !target.className && !target.receiver);
+}
+
+/**
+ * What a call record's bare name, and its path qualifier, denote by item
+ * scopes (fix #422), memoized per record for the index's lifetime: every
+ * pinned query visits the same records again.
+ */
+function _rustCallName(index, filePath, call) {
+    return _rustRecordAnswer(index, '\x01rustCallName', call, () => require('./rust-names')
+        .resolveRustName(index, filePath, call.line, call.name, 'value', call.scopeBinding));
+}
+
+function _rustCallQualifier(index, filePath, call) {
+    return _rustRecordAnswer(index, '\x01rustCallQualifier', call, () => require('./rust-names')
+        .resolveRustPathQualifier(index, filePath, call.line, call.receiver, call.receiverScopeBinding));
+}
+
+function _rustRecordAnswer(index, slot, call, compute) {
+    const memo = index._rustScopeMemo || (index._rustScopeMemo = new Map());
+    let byRecord = memo.get(slot);
+    if (!byRecord) memo.set(slot, byRecord = new WeakMap());
+    if (byRecord.has(call)) return byRecord.get(call);
+    const result = compute();
+    byRecord.set(call, result);
+    return result;
+}
+
+/**
+ * 'target' when the scopes binding the call's name name one of `targets`,
+ * 'other' when they name other project items or an external item,
+ * 'unbound' when no scope binds it (the prelude's, or a compile error),
+ * null when the module tree cannot decide.
+ */
+function _itemScopeVerdict(index, filePath, call, targets) {
+    const named = _rustCallName(index, filePath, call);
+    if (!named) return null;
+    if (named.external) return named.unbound ? 'unbound' : 'other';
+    const hit = named.defs.some(def => targets.some(target =>
+        sameDeclaration(declarationIdentity(def), declarationIdentity(target))));
+    return hit ? 'target' : 'other';
+}
+
+/**
+ * 'other' when the type, trait or module a path call's qualifier names (by
+ * item scopes, fix #422) owns none of `targets`, else null (the qualifier
+ * is the owner of some target, or the scopes cannot say what it names).
+ */
+function _pathQualifierVerdict(index, filePath, call, targets) {
+    const named = _rustCallQualifier(index, filePath, call);
+    const defs = named?.defs;
+    if (!defs?.length) return null;
+    const ownerKey = target => {
+        const def = ownerRefOf(index, target)?.def;
+        return def ? classKeyOf(index, def) : null;
+    };
+    if (defs.every(def => def.type === 'trait')) {
+        const traitKeys = new Set(defs.map(def => classKeyOf(index, def)));
+        const owns = target => {
+            if (!target.className) return false;
+            if (target.traitName) {
+                const traits = require('./contract-membership').rustProjectTraits(
+                    index, target.traitName, target.file, target.startLine);
+                if (traits.length === 0) return false;
+                return traits.some(trait => traitKeys.has(classKeyOf(index, trait))) ? null : false;
+            }
+            const owner = ownerRefOf(index, target)?.def;
+            if (!owner) return null;
+            // An inherent member is never named through a trait.
+            if (owner.type !== 'trait') return false;
+            return traitKeys.has(classKeyOf(index, owner)) ? null : false;
+        };
+        return targets.every(target => owns(target) === false) ? 'other' : null;
+    }
+    if (defs.every(def => ['struct', 'enum', 'union'].includes(def.type))) {
+        const keys = new Set(defs.map(def => classKeyOf(index, def)));
+        if (keys.size !== 1) return null;
+        const owns = target => {
+            if (!target.className) return false;
+            const owner = ownerRefOf(index, target)?.def;
+            // A trait's provided member is reached through the type's impl.
+            if (!owner || owner.type === 'trait') return null;
+            const key = ownerKey(target);
+            return key == null ? null : keys.has(key) ? null : false;
+        };
+        return targets.every(target => owns(target) === false) ? 'other' : null;
+    }
+    return null;
+}
+
+/**
+ * 'target' when `Type::m` (a call or a path value) selects a pinned trait
+ * declaration member (fix #422): the item scopes resolve the qualifier to
+ * one concrete type, a project impl of the pinned trait for that type
+ * exists, the type declares no member of the name itself (inherent members
+ * come first; an impl overriding the member is that member) and no other
+ * project trait it implements declares the name. null otherwise.
+ */
+function _rustTraitDeclPathProbe(index, filePath, call, targets) {
+    if (!call.isPathCall || !call.receiver || targets.length === 0) return null;
+    const owners = targets.map(target => !target.traitName && ownerRefOf(index, target)?.def);
+    if (owners.some(owner => !owner || owner.type !== 'trait')) return null;
+    const traitKey = classKeyOf(index, owners[0]);
+    if (owners.some(owner => classKeyOf(index, owner) !== traitKey)) return null;
+    const { resolveRustName } = require('./rust-names');
+    const named = _rustCallQualifier(index, filePath, call);
+    if (named?.defs?.length !== 1 || !['struct', 'enum', 'union'].includes(named.defs[0].type)) return null;
+    const typeDef = named.defs[0];
+    const typeKey = classKeyOf(index, typeDef);
+    const ownedByType = def => {
+        const owner = ownerRefOf(index, def)?.def;
+        return !!owner && classKeyOf(index, owner) === typeKey;
+    };
+    if ((index.symbols.get(call.name) || []).some(def => def.className === typeDef.name && ownedByType(def))) return null;
+    const { rustProjectTraits } = require('./contract-membership');
+    let implementsTarget = false;
+    for (const impl of index.symbols.get(typeDef.name) || []) {
+        if (impl.type !== 'impl' || !impl.traitName) continue;
+        const self = resolveRustName(index, impl.file, impl.startLine, typeDef.name, 'type');
+        if (!self?.defs?.some(def => classKeyOf(index, def) === typeKey)) continue;
+        const traits = rustProjectTraits(index, impl.traitName, impl.file, impl.startLine);
+        if (traits.some(trait => classKeyOf(index, trait) === traitKey)) {
+            implementsTarget = true;
+            continue;
+        }
+        // Another project trait of the type declaring the name: ambiguous.
+        if (traits.some(trait => (index.symbols.get(call.name) || []).some(def =>
+            def.className === trait.name && ownerRefOf(index, def)?.def === trait))) return null;
+    }
+    return implementsTarget ? 'target' : null;
+}
+
+const _flatType = text => String(text || '').replace(/\s+/g, '');
+const _typeHead = text => _flatType(text).replace(/^(&(mut)?|&'[A-Za-z_]\w*(mut)?)+/, '')
+    .replace(/<.*$/s, '').split('::').pop();
+
+/** Is `member` a Self-returning impl member of a trait named `traitHead` with no self parameter? */
+function _rustSelfReturningTraitMember(member, traitHead) {
+    return !!member?.traitImpl && _typeHead(member.traitName) === traitHead &&
+        _flatType(member.returnType) === 'Self' &&
+        !(member.paramsStructured || []).some(param =>
+            /^(&\s*(mut\s+)?|mut\s+)?self$/.test(String(param.name || '').trim()));
+}
+
+/**
+ * The trait a path call's qualifier names, for Self-returning trait member
+ * selection (fix #422): `{ trait }` (a project trait), `{ external: true }`
+ * (the prelude's or another crate's), or null.
+ */
+function _rustPathTrait(index, filePath, call) {
+    const qualified = _rustCallQualifier(index, filePath, call);
+    if (!qualified) return null;
+    if (qualified.defs?.length === 1 && qualified.defs[0].type === 'trait') return { trait: qualified.defs[0] };
+    return qualified.external ? { external: true } : null;
+}
+
+/** Does `member`'s impl implement the trait `pathTrait` names? */
+function _rustImplOfPathTrait(index, member, pathTrait) {
+    const traits = require('./contract-membership').rustProjectTraits(
+        index, member.traitName, member.file, member.startLine);
+    return pathTrait.trait
+        ? traits.some(trait => classKeyOf(index, trait) === classKeyOf(index, pathTrait.trait))
+        : traits.length === 0;
+}
+
+/**
+ * The type a call's value is written into (fix #422): a struct
+ * expression's field type, an annotated `let`, the enclosing function's
+ * return type. `{ typeDef }` (a project struct/enum/union), `{ external:
+ * true }` (a type no project scope binds), 'unknown' when no written type
+ * decides.
+ */
+function _rustWrittenValueType(index, filePath, call, callerSymbol) {
+    const { resolveRustName } = require('./rust-names');
+    let written = null;
+    let writtenAt = null;
+    if (call.fieldInit) {
+        const struct = call.fieldInit.struct === 'Self'
+            ? (callerSymbol ? ownerRefOf(index, callerSymbol)?.def : null)
+            : (() => {
+                const named = resolveRustName(index, filePath, call.line,
+                    String(call.fieldInit.struct).split('::').pop(), 'type');
+                return named?.defs?.length === 1 ? named.defs[0] : null;
+            })();
+        if (!struct || struct.type !== 'struct') return 'unknown';
+        const fields = (index.symbols.get(call.fieldInit.field) || []).filter(def =>
+            def.type === 'field' && def.className === struct.name && def.file === struct.file &&
+            def.startLine >= struct.startLine && def.endLine <= struct.endLine);
+        if (fields.length !== 1 || !fields[0].fieldType) return 'unknown';
+        written = fields[0].fieldType;
+        writtenAt = { file: fields[0].file, line: fields[0].startLine };
+    } else if (call.expectedType) {
+        written = call.expectedType;
+        writtenAt = { file: filePath, line: call.line };
+    } else if (call.returnPosition && callerSymbol?.returnType) {
+        written = callerSymbol.returnType;
+        writtenAt = { file: callerSymbol.file || filePath, line: callerSymbol.startLine };
+    }
+    if (!written) return 'unknown';
+    const typeName = _typeHead(written);
+    let typeDef = null;
+    if (typeName === 'Self') {
+        typeDef = callerSymbol ? ownerRefOf(index, callerSymbol)?.def : null;
+    } else if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(typeName)) {
+        const named = resolveRustName(index, writtenAt.file, writtenAt.line, typeName, 'type');
+        if (named?.external) return { external: true };
+        typeDef = named?.defs?.length === 1 ? named.defs[0] : null;
+    }
+    if (!typeDef || !['struct', 'enum', 'union'].includes(typeDef.type)) return 'unknown';
+    return { typeDef };
+}
+
+/**
+ * `Trait::m(..)` where every target is a Self-returning member of an impl
+ * of the trait the qualifier names, with no self parameter (fix #422):
+ * Self is the type the call's value is written into. 'target' when that
+ * type owns a target, 'other' when it is another type, 'unknown' when no
+ * written type decides, null when the call is not such a trait path.
+ */
+function _rustTraitPathExpectedSelf(index, filePath, call, callerSymbol, targets) {
+    if (!call.isPathCall || !call.receiver || targets.length === 0) return null;
+    const traitHead = String(call.receiver).split('::').pop();
+    if (!targets.every(target => _rustSelfReturningTraitMember(target, traitHead))) return null;
+    const pathTrait = _rustPathTrait(index, filePath, call);
+    if (!pathTrait || !targets.every(target => _rustImplOfPathTrait(index, target, pathTrait))) return null;
+    const written = _rustWrittenValueType(index, filePath, call, callerSymbol);
+    if (written === 'unknown') return 'unknown';
+    if (written.external) return 'other';
+    const key = classKeyOf(index, written.typeDef);
+    return targets.some(target => {
+        const owner = ownerRefOf(index, target)?.def;
+        return owner && classKeyOf(index, owner) === key;
+    }) ? 'target' : 'other';
+}
+
+/**
+ * The callee of `Trait::m(..)` selected by the type its value is written
+ * into (fix #422, the caller side's rule): the one Self-returning member
+ * of that type's impl of the trait, or null.
+ */
+function _rustCalleeTraitPathSelf(index, def, call) {
+    if (!call.isPathCall || !call.receiver) return null;
+    const traitHead = String(call.receiver).split('::').pop();
+    const members = (index.symbols.get(call.name) || []).filter(member =>
+        _rustSelfReturningTraitMember(member, traitHead));
+    if (members.length === 0) return null;
+    const pathTrait = _rustPathTrait(index, def.file, call);
+    if (!pathTrait) return null;
+    const written = _rustWrittenValueType(index, def.file, call, def);
+    if (!written?.typeDef) return null;
+    const key = classKeyOf(index, written.typeDef);
+    const selected = members.filter(member => {
+        const owner = ownerRefOf(index, member)?.def;
+        return owner && classKeyOf(index, owner) === key && _rustImplOfPathTrait(index, member, pathTrait);
+    });
+    return selected.length === 1 ? selected[0] : null;
 }
 
 /**
@@ -20608,6 +21073,26 @@ function _calleeTypeQualifiedReceiver(index, def, fileEntry, call, language) {
     // a project type shares the name, external when none does.
     // A module-qualified Rust type path (fix #399): the module tree names
     // the type; path resolution takes its inherent associated item first.
+    // The type the item scopes name (fix #422): `use ..::ContextSeparator as
+    // Separator; Separator::new(..)`, a type a block import brings in, a
+    // same-name type of another module.
+    if (style === 'path' && traits?.itemScopeResolution && !call.macroScopeUnknown && !call.inMacroDefinition) {
+        const named = require('./rust-names').resolveRustPathQualifier(
+            index, def.file, call.line, receiver, call.receiverScopeBinding);
+        const types = (named?.defs || []).filter(d => ['struct', 'enum', 'union'].includes(d.type));
+        const keys = new Set(types.map(d => classKeyOf(index, d)));
+        if (types.length > 0 && types.length === named.defs.length && keys.size === 1) {
+            const key = [...keys][0];
+            const typeName = types[0].name;
+            const members = (index.symbols.get(call.name) || []).filter(member =>
+                !NON_CALLABLE_TYPES.has(member.type) && member.className === typeName &&
+                ownerRefOf(index, member)?.def && classKeyOf(index, ownerRefOf(index, member).def) === key);
+            const inherent = members.filter(member => !member.traitImpl);
+            const pick = (inherent.length > 0 ? inherent : members).filter((member, i, list) =>
+                !list.slice(0, i).some(other => _isConfigurationAlternative(index, other, member)));
+            if (pick.length === 1) return { match: pick[0], typeName };
+        }
+    }
     if (style === 'path' && receiver.includes('::') && language === 'rust') {
         const typed = _rustTypePathDefinition(index, def.file, call);
         if (typed) {
@@ -29883,6 +30368,6 @@ function findCallbackUsages(index, name) {
     return usages;
 }
 
-module.exports = { _recordIsNoCall, _cppMemberUsingBases, _cppTargetVisibility, rustTypeNameDenotes, _textualIncludeClosures, _textualLinkVerdict, isProvenanceBuiltinReceiver, provenanceParameterIdentity: _overloadTypeIdentity, selectProvenanceOverload, _unresolvedModuleIsGap, _importReaches, _sameNominalPackageDir, getCachedCalls, getCachedCallsBearing, findCallers, findCallees, getInstanceAttributeTypes, findCallbackUsages, _nameBindingReaches, _moduleAttributeBindingReaches, _declaredFieldType, _projectTopLevelNames, _callArityCompatible, _closeCallableIdentityGroup, _overloadDiscipline, _overloadApplicable, _buildReturnTypeFlowMap, _lookupReturnTypeFlow, _cFamilySignatureKey,
+module.exports = { rustPathQualifierVerdict: _pathQualifierVerdict, rustTraitDeclPathProbe: _rustTraitDeclPathProbe, _recordIsNoCall, _cppMemberUsingBases, _cppTargetVisibility, rustTypeNameDenotes, _textualIncludeClosures, _textualLinkVerdict, isProvenanceBuiltinReceiver, provenanceParameterIdentity: _overloadTypeIdentity, selectProvenanceOverload, _unresolvedModuleIsGap, _importReaches, _sameNominalPackageDir, getCachedCalls, getCachedCallsBearing, findCallers, findCallees, getInstanceAttributeTypes, findCallbackUsages, _nameBindingReaches, _moduleAttributeBindingReaches, _declaredFieldType, _projectTopLevelNames, _callArityCompatible, _closeCallableIdentityGroup, _overloadDiscipline, _overloadApplicable, _buildReturnTypeFlowMap, _lookupReturnTypeFlow, _cFamilySignatureKey,
     _isConfigurationAlternative, _isCrossFileConfigurationMember, _configurationAlternativeFiles, _sameOwnerPath,
     _goFileConstraint };

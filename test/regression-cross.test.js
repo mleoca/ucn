@@ -16680,8 +16680,10 @@ describe('fix #402: impact keeps the reason of every unverified caller', () => {
                 '    assert_eq!(m(1), 2);',        // 7
                 '}',                               // 8
             ].join('\n'),
+            // A glob of a crate the manifest does not declare (fix #422):
+            // the module tree cannot say what binds `m` here.
             'b/tests/two.rs': [
-                '#[test]',                         // 1
+                'use helpers::*; #[test]',         // 1
                 'fn uses_other() {',               // 2
                 '    assert!(m("").is_empty());',  // 3
                 '}',                               // 4

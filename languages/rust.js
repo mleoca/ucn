@@ -2228,8 +2228,49 @@ function parse(code, parser) {
             const names = rustAsyncClosureNames(tree);
             return names.length > 0 ? { asyncClosureNames: names } : {};
         })(),
+        ...(() => {
+            const itemMacros = rustModuleItemMacros(tree.rootNode);
+            return itemMacros.length > 0 ? { itemMacros } : {};
+        })(),
         imports: [], exports: [],
     };
+}
+
+/**
+ * Macro invocations in item position of a module (fix #422): `name!(..)`
+ * directly in a file or an inline module body, with the identifier words
+ * of their arguments. Such an invocation may declare items named by those
+ * words, so a lookup of one of them in that module cannot rule out a name
+ * the expansion binds.
+ */
+function rustModuleItemMacros(root) {
+    const out = [];
+    const visit = container => {
+        for (let i = 0; i < container.namedChildCount; i++) {
+            let item = container.namedChild(i);
+            if (item.type === 'expression_statement' && item.namedChildCount === 1) item = item.namedChild(0);
+            if (item.type === 'macro_invocation') {
+                const macro = item.childForFieldName('macro');
+                if (!macro) continue;
+                const name = macro.type === 'scoped_identifier'
+                    ? macro.childForFieldName('name')?.text : macro.text;
+                if (!name) continue;
+                const words = new Set();
+                for (const child of item.namedChildren) {
+                    if (child.type !== 'token_tree') continue;
+                    for (const token of child.descendantsOfType('identifier')) words.add(token.text);
+                }
+                out.push({ name, line: item.startPosition.row + 1, words: [...words].sort() });
+                continue;
+            }
+            if (item.type === 'mod_item') {
+                const body = item.childForFieldName('body');
+                if (body) visit(body);
+            }
+        }
+    };
+    visit(root);
+    return out;
 }
 
 const DECLARATION_NODE_TYPES = [
@@ -2826,6 +2867,8 @@ function extractCallsFromTokenTree(tree, enclosingFunction, calls, getReceiverTy
                 isPathCall: true,
                 receiver: segments.length > 0 ? segments.join('::') : undefined,
                 ...(tokenArgTypes && { argTypes: tokenArgTypes }),
+                ...(segments.length > 0 && rustReceiverScopeBindingField(tok, segments.join('::'))),
+                ...(segments.length > 0 && rustTokenTreeMayBind(tok, segments[0]) && { macroScopeUnknown: true }),
                 ...macroFields,
                 enclosingFunction
             };
@@ -2915,6 +2958,9 @@ function extractCallsFromTokenTree(tree, enclosingFunction, calls, getReceiverTy
                 callEnd: callArgs.endIndex,
                 isMethod: false,
                 ...macroFields,
+                ...(rustBareNameShadowedByLocal(tok, tok.text) && { localShadow: true }),
+                ...rustScopeBindingField(tok, tok.text),
+                ...(rustTokenTreeMayBind(tok, tok.text) && { macroScopeUnknown: true }),
                 enclosingFunction
             };
             calls.push(record);
@@ -3424,6 +3470,31 @@ function rustMacroCallIdentity(macroNode) {
  * value then has the fn's declared return type, which lets a trait path call
  * (`Trait::assoc(..)`) infer its Self from the declaration.
  */
+/**
+ * Where a call's value goes with a written type (fix #422): a struct
+ * expression's field (`Self { inner: Default::default() }` ->
+ * `{ fieldInit: { struct: 'Self', field: 'inner' } }`) or an annotated `let`
+ * (`let x: T = T::new()` -> `{ expectedType: 'T' }`). The type a
+ * Self-returning trait member is selected by.
+ */
+function rustExpectedTypeFields(node) {
+    const parent = node.parent;
+    if (parent?.type === 'field_initializer' && sameNode(parent.childForFieldName('value'), node)) {
+        const field = parent.childForFieldName('field');
+        const expression = parent.parent?.type === 'field_initializer_list' ? parent.parent.parent : null;
+        const nameNode = expression?.type === 'struct_expression' ? expression.childForFieldName('name') : null;
+        const struct = rustPlainPathText(nameNode?.type === 'generic_type_with_turbofish'
+            ? nameNode.childForFieldName('type') : nameNode) || (nameNode?.type === 'type_identifier' ? nameNode.text : null);
+        if (field?.type === 'field_identifier' && struct) return { fieldInit: { struct, field: field.text } };
+        return null;
+    }
+    if (parent?.type === 'let_declaration' && sameNode(parent.childForFieldName('value'), node)) {
+        const type = parent.childForFieldName('type');
+        if (type) return { expectedType: type.text.replace(/\s+/g, '') };
+    }
+    return null;
+}
+
 function rustFunctionReturnPosition(node) {
     const parent = node.parent;
     if (!parent) return false;
@@ -3479,6 +3550,283 @@ function rustPatternBindsName(pattern, name) {
         for (let i = 0; i < current.namedChildCount; i++) pending.push(current.namedChild(i));
     }
     return false;
+}
+
+/**
+ * Join two Rust use-path pieces (`a::b` + `c` -> `a::b::c`).
+ */
+function rustJoinUsePath(prefix, suffix) {
+    // Paths are compared as written without whitespace (`a:: b` is `a::b`).
+    const left = String(prefix || '').replace(/\s+/g, '').replace(/::$/, '');
+    const right = String(suffix || '').replace(/\s+/g, '').replace(/^::/, '');
+    return left && right ? `${left}::${right}` : left || right;
+}
+
+/**
+ * Every binding a `use` tree makes (fix #422): `visit({ path, local,
+ * original })` for a named leaf (the path ends with the item's ORIGINAL
+ * name; `local` is the name the scope binds, an alias for `as`), and
+ * `visit({ path, glob: true })` for `path::*`. `use a::b::{self}` binds
+ * `b` to the path `a::b`.
+ */
+function walkRustUseTree(node, prefix, visit) {
+    if (!node || node.type === 'visibility_modifier') return;
+    if (node.type === 'scoped_use_list') {
+        const pathNode = node.childForFieldName('path');
+        const listNode = node.childForFieldName('list');
+        if (listNode) walkRustUseTree(listNode, rustJoinUsePath(prefix, pathNode?.text), visit);
+        return;
+    }
+    if (node.type === 'use_list') {
+        for (let i = 0; i < node.namedChildCount; i++) walkRustUseTree(node.namedChild(i), prefix, visit);
+        return;
+    }
+    if (node.type === 'use_as_clause') {
+        const pathNode = node.namedChild(0);
+        const aliasNode = node.childForFieldName('alias') || node.namedChild(1);
+        if (pathNode && aliasNode) {
+            const original = String(pathNode.text).replace(/\s+/g, '').split('::').pop();
+            visit({ path: rustJoinUsePath(prefix, pathNode.text), local: aliasNode.text, original, node });
+        }
+        return;
+    }
+    if (node.type === 'use_wildcard') {
+        visit({ path: rustJoinUsePath(prefix, node.namedChild(0)?.text), glob: true, node });
+        return;
+    }
+    if (node.type === 'identifier' || node.type === 'scoped_identifier' ||
+        node.type === 'crate' || node.type === 'self' || node.type === 'super') {
+        if (node.text === 'self' && prefix) {
+            const local = prefix.split('::').pop();
+            visit({ path: prefix, local, original: local, node });
+            return;
+        }
+        const local = node.text.replace(/\s+/g, '').split('::').pop();
+        visit({ path: rustJoinUsePath(prefix, node.text), local, original: local, node });
+    }
+}
+
+// Item kinds a block declares in the value namespace, and in the type
+// namespace (fix #422). A tuple or unit struct names a value too.
+const RUST_BLOCK_VALUE_ITEMS = new Set(['function_item', 'const_item', 'static_item']);
+const RUST_BLOCK_TYPE_ITEMS = new Set(['struct_item', 'enum_item', 'union_item', 'trait_item',
+    'type_item', 'mod_item']);
+
+/**
+ * The names a block's own items and `use` declarations bind (fix #422):
+ * `{ value: Map, type: Map, globs }`, each map name -> `{ kind: 'use', path,
+ * line }` or `{ kind: 'item', line }`. Rust resolves a name through the
+ * innermost block that binds it, its explicit names before its globs.
+ */
+function rustBlockBindingTable(block) {
+    let value = null;
+    let type = null;
+    let globs = null;
+    const bind = (map, name, binding) => {
+        if (!name) return map;
+        const out = map || new Map();
+        if (!out.has(name)) out.set(name, binding);
+        return out;
+    };
+    for (let i = 0; i < block.namedChildCount; i++) {
+        const item = block.namedChild(i);
+        if (item.type === 'use_declaration') {
+            const line = item.startPosition.row + 1;
+            for (let j = 0; j < item.namedChildCount; j++) {
+                walkRustUseTree(item.namedChild(j), '', leaf => {
+                    if (leaf.glob) {
+                        if (leaf.path) (globs || (globs = [])).push(leaf.path);
+                        return;
+                    }
+                    const binding = { kind: 'use', path: leaf.path, line };
+                    value = bind(value, leaf.local, binding);
+                    type = bind(type, leaf.local, binding);
+                });
+            }
+            continue;
+        }
+        if (item.type === 'foreign_mod_item') {
+            const body = item.namedChildren.find(child => child.type === 'declaration_list');
+            for (const decl of body?.namedChildren || []) {
+                if (decl.type !== 'function_signature_item' && decl.type !== 'static_item') continue;
+                const nameNode = decl.childForFieldName('name');
+                value = bind(value, nameNode?.text, { kind: 'item', line: decl.startPosition.row + 1 });
+            }
+            continue;
+        }
+        const nameNode = (RUST_BLOCK_VALUE_ITEMS.has(item.type) || RUST_BLOCK_TYPE_ITEMS.has(item.type))
+            ? item.childForFieldName('name') : null;
+        if (!nameNode) continue;
+        const binding = { kind: 'item', line: item.startPosition.row + 1 };
+        if (RUST_BLOCK_VALUE_ITEMS.has(item.type)) {
+            value = bind(value, nameNode.text, binding);
+            continue;
+        }
+        type = bind(type, nameNode.text, binding);
+        if (item.type === 'struct_item' && rustStructValueShape(item)) value = bind(value, nameNode.text, binding);
+    }
+    return value || type || globs ? { value, type, globs } : EMPTY_BLOCK_TABLE;
+}
+
+const EMPTY_BLOCK_TABLE = Object.freeze({ value: null, type: null, globs: null });
+
+/**
+ * What the enclosing blocks of `node` bind `name` to in namespace `ns`
+ * ('value' or 'type'), fix #422: the innermost block naming it explicitly
+ * (`{ kind, path?, line }`), with `innerGlobs` when a nearer block has glob
+ * imports that may provide it, or `{ kind: 'globs', paths }` when only
+ * blocks' globs may. null when no block between the node and its module
+ * binds the name (the module's own scope decides). Items of outer blocks
+ * are visible inside nested fns and impls; an inline module starts a new
+ * scope.
+ */
+const rustBlockTablesByTree = new WeakMap();
+
+/** The memo of block binding tables for the tree holding `node`. */
+function rustBlockTables(node) {
+    const tree = node?.tree;
+    if (!tree) return new Map();
+    let tables = rustBlockTablesByTree.get(tree);
+    if (!tables) rustBlockTablesByTree.set(tree, tables = new Map());
+    return tables;
+}
+
+/**
+ * The receiver a bracketed path head spells (fix #422): `<T as Trait>` ->
+ * `{ receiver: 'Trait', selfType: 'T' }`, `<T>` -> `{ receiver: 'T' }`;
+ * null for any other head.
+ */
+function rustQualifiedPathHead(pathNode) {
+    if (pathNode?.type !== 'bracketed_type') return null;
+    const inner = pathNode.namedChild(0);
+    const plainPath = n => n && (n.type === 'type_identifier' || n.type === 'scoped_type_identifier' ||
+        n.type === 'identifier' || n.type === 'scoped_identifier') ? n.text.replace(/\s+/g, '') : null;
+    if (inner?.type === 'qualified_type') {
+        const trait = plainPath(inner.childForFieldName('alias'));
+        if (!trait) return null;
+        const selfType = plainPath(inner.childForFieldName('type'));
+        return { receiver: trait, ...(selfType && { selfType }) };
+    }
+    const typeName = plainPath(inner);
+    return typeName ? { receiver: typeName } : null;
+}
+
+const rustTokenTreeScopeFacts = new WeakMap();
+const RUST_SCOPING_KEYWORD = /\b(?:use|fn|mod|impl)\b/;
+
+/**
+ * Whether the macro invocation holding a token may bind `name` itself
+ * (fix #422): its tokens hold a `use`, `fn`, `mod` or `impl` keyword (items
+ * and imports scoped by what the macro expands to), or spell `name` other
+ * than as a callee (a `let`, closure parameter or pattern). The scopes
+ * around the invocation then do not decide what the call names. The tokens
+ * are read only when the invocation's text can hold such a token: every
+ * keyword token spells its keyword there, and a second token spelling the
+ * name spells it a second time.
+ */
+function rustTokenTreeMayBind(token, name) {
+    let top = null;
+    for (let p = token.parent; p && p.type === 'token_tree'; p = p.parent) top = p;
+    if (!top) return false;
+    const tree = top.tree;
+    let byTree = tree ? rustTokenTreeScopeFacts.get(tree) : null;
+    if (tree && !byTree) rustTokenTreeScopeFacts.set(tree, byTree = new Map());
+    let facts = byTree?.get(top.id);
+    if (!facts) {
+        const text = top.text;
+        facts = { text, keyword: RUST_SCOPING_KEYWORD.test(text), tokens: null };
+        byTree?.set(top.id, facts);
+    }
+    const tokens = () => facts.tokens || (facts.tokens = rustTokenTreeTokens(top));
+    if (facts.keyword && tokens().scoped) return true;
+    return rustWordSpelledTwice(facts.text, name) && tokens().words.has(name);
+}
+
+/** The keyword tokens and the non-callee identifier words of a token tree. */
+function rustTokenTreeTokens(top) {
+    const facts = { scoped: false, words: new Set() };
+    const visit = node => {
+        const children = node.children;
+        for (let i = 0; i < children.length; i++) {
+            const child = children[i];
+            const type = child.type;
+            if (type === 'use' || type === 'fn' || type === 'mod' || type === 'impl') facts.scoped = true;
+            if (type === 'token_tree') { visit(child); continue; }
+            if (type !== 'identifier') continue;
+            const next = children[i + 1];
+            const callee = next && ((next.type === 'token_tree' && next.child(0)?.type === '(') ||
+                next.type === '!' || next.type === '::');
+            if (!callee) facts.words.add(child.text);
+        }
+    };
+    visit(top);
+    return facts;
+}
+
+/** ASCII identifier characters: any other character counts as a boundary, so no token is missed. */
+function rustAsciiWordChar(code) {
+    return (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || code === 95;
+}
+
+/** Whether `word` stands at least twice in `text` between non-word characters. */
+function rustWordSpelledTwice(text, word) {
+    if (!word) return false;
+    let count = 0;
+    for (let at = text.indexOf(word); at !== -1; at = text.indexOf(word, at + 1)) {
+        if (at > 0 && rustAsciiWordChar(text.charCodeAt(at - 1))) continue;
+        if (rustAsciiWordChar(text.charCodeAt(at + word.length))) continue;
+        if (++count >= 2) return true;
+    }
+    return false;
+}
+
+/**
+ * A plain path's text without whitespace or type arguments (`a::b::T`,
+ * `Vec::<u8>` -> `Vec`), or null for any other path head.
+ */
+function rustPlainPathText(pathNode) {
+    if (!pathNode) return null;
+    if (pathNode.type === 'generic_type') return rustPlainPathText(pathNode.childForFieldName('type'));
+    if (!['identifier', 'scoped_identifier', 'type_identifier', 'scoped_type_identifier',
+        'self', 'super', 'crate'].includes(pathNode.type)) return null;
+    const text = pathNode.text.replace(/\s+/g, '');
+    return /^[A-Za-z_][A-Za-z0-9_]*(::[A-Za-z_][A-Za-z0-9_]*)*$/.test(text) ? text : null;
+}
+
+/** `scopeBinding` record field of a bare value name (fix #422), or null. */
+function rustScopeBindingField(node, name) {
+    const binding = rustBlockScopeBinding(node, name, 'value', rustBlockTables(node));
+    return binding ? { scopeBinding: binding } : null;
+}
+
+/** `receiverScopeBinding` of a path's first segment in the type namespace (fix #422). */
+function rustReceiverScopeBindingField(node, receiver) {
+    const head = String(receiver || '').split('::')[0];
+    if (!head || head === 'crate' || head === 'self' || head === 'super' || head === 'Self' ||
+        !/^[A-Za-z_][A-Za-z0-9_]*$/.test(head)) return null;
+    const binding = rustBlockScopeBinding(node, head, 'type', rustBlockTables(node));
+    return binding ? { receiverScopeBinding: binding } : null;
+}
+
+function rustBlockScopeBinding(node, name, ns, tables) {
+    let globs = null;
+    for (let p = node.parent; p; p = p.parent) {
+        if (p.type === 'mod_item' || p.type === 'source_file') break;
+        if (p.type !== 'block') continue;
+        let table = tables.get(p.id);
+        if (!table) {
+            table = rustBlockBindingTable(p);
+            tables.set(p.id, table);
+        }
+        const hit = table[ns]?.get(name);
+        if (hit) {
+            const binding = { ...hit };
+            if (globs) binding.innerGlobs = globs;
+            return binding;
+        }
+        if (table.globs) globs = (globs || []).concat(table.globs);
+    }
+    return globs ? { kind: 'globs', paths: globs } : null;
 }
 
 function rustBareNameShadowedByLocal(callNode, name) {
@@ -4565,6 +4913,7 @@ function findCallsInCode(code, parser, options = {}) {
                     ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp }),
                     ...(mayBeLocallyBound(funcNode.text) &&
                         rustBareNameShadowedByLocal(node, funcNode.text) && { localShadow: true }),
+                    ...rustScopeBindingField(node, funcNode.text),
                 });
             } else if (funcNode.type === 'field_expression') {
                 // Method call: obj.method()
@@ -4911,8 +5260,13 @@ function findCallsInCode(code, parser, options = {}) {
                 // Turbofish receivers (`Vec::<String>::new`) carry the type
                 // arguments as their own `::`-split segments — drop them so
                 // the receiver is the plain type/module path (fix #222).
-                const recvSegments = segments.slice(0, -1)
+                let recvSegments = segments.slice(0, -1)
                     .filter(s => !s.startsWith('<') && !s.endsWith('>'));
+                // A qualified path (fix #422): `<T as Trait>::m(x)` names
+                // the trait's member with Self = T; `<T>::m()` is `T::m()`.
+                const qualified = rustQualifiedPathHead(funcNode.childForFieldName('path'));
+                if (qualified) recvSegments = qualified.receiver.split('::');
+                const receiverText = recvSegments.length > 0 ? recvSegments.join('::') : undefined;
                 calls.push({
                     name: name,
                     line: node.startPosition.row + 1,
@@ -4922,7 +5276,9 @@ function findCallsInCode(code, parser, options = {}) {
                     ...(consumingMethod && { consumingMethod }),
                     isMethod: segments.length > 1,
                     isPathCall: true,  // Distinguishes Type::func()/module::func() from obj.method()
-                    receiver: recvSegments.length > 0 ? recvSegments.join('::') : undefined,
+                    receiver: receiverText,
+                    ...(qualified?.selfType && { receiverQualifiedSelf: qualified.selfType }),
+                    ...(receiverText && rustReceiverScopeBindingField(node, receiverText)),
                     argCount,
                     ...(segments.length > 1 && (() => {
                         const argTypes = rustArgTypesOfNode(argNodes, astArgTypeOfName);
@@ -4936,6 +5292,7 @@ function findCallsInCode(code, parser, options = {}) {
                     enclosingFunction,
                     ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp }),
                     ...(rustFunctionReturnPosition(node) && { returnPosition: true }),
+                    ...(receiverText && rustExpectedTypeFields(node)),
                 });
             }
             return true;
@@ -5118,6 +5475,32 @@ function findCallsInCode(code, parser, options = {}) {
                         enclosingFunction
                     });
                 }
+            }
+        }
+
+        // Path values passed as arguments (fix #422): `case(&t,
+        // T::unknown_bits)`, `.map(Self::parse)`. A method value is
+        // path-only in Rust; the path's qualifier decides what it names.
+        if (node.type === 'scoped_identifier' && node.parent?.type === 'arguments') {
+            const nameNode = node.childForFieldName('name');
+            const pathNode = node.childForFieldName('path');
+            const qualified = rustQualifiedPathHead(pathNode);
+            const receiver = qualified ? qualified.receiver : rustPlainPathText(pathNode);
+            if (nameNode?.type === 'identifier' && receiver) {
+                calls.push({
+                    name: nameNode.text,
+                    line: nameNode.startPosition.row + 1,
+                    callStart: node.startIndex,
+                    callEnd: node.endIndex,
+                    isMethod: true,
+                    isPathCall: true,
+                    receiver,
+                    ...(qualified?.selfType && { receiverQualifiedSelf: qualified.selfType }),
+                    ...rustReceiverScopeBindingField(node, receiver),
+                    isFunctionReference: true,
+                    isPotentialCallback: true,
+                    enclosingFunction: getCurrentEnclosingFunction(),
+                });
             }
         }
 
@@ -5341,12 +5724,7 @@ function findImportsInCode(code, parser) {
     const tree = parseTree(parser, code);
     const imports = [];
 
-    const joinUsePath = (prefix, suffix) => {
-        const left = String(prefix || '').replace(/::$/, '');
-        const right = String(suffix || '').replace(/^::/, '');
-        return left && right ? `${left}::${right}` : left || right;
-    };
-    const addLeaf = (module, localName, type = 'use', dynamic = false, line, rename = null) => {
+    const addLeaf = (module, localName, type = 'use', dynamic = false, line, rename = null, scope = null) => {
         if (!module || !localName) return;
         imports.push({
             module,
@@ -5355,63 +5733,33 @@ function findImportsInCode(code, parser) {
             dynamic,
             line,
             ...(rename && { renames: [rename] }),
+            // A `use` in a block binds its names in that block only (fix
+            // #422): its lines bound where the bindings are visible.
+            ...scope,
         });
     };
-    const collectUseTree = (node, prefix, line) => {
-        if (!node || node.type === 'visibility_modifier') return;
-        if (node.type === 'scoped_use_list') {
-            const pathNode = node.childForFieldName('path');
-            const listNode = node.childForFieldName('list');
-            const nextPrefix = joinUsePath(prefix, pathNode?.text);
-            if (listNode) collectUseTree(listNode, nextPrefix, line);
+    const collectUseTree = (node, line, scope) => walkRustUseTree(node, '', leaf => {
+        if (leaf.glob) {
+            addLeaf(leaf.path, '*', 'use-glob', true, line, null, scope);
             return;
         }
-        if (node.type === 'use_list') {
-            for (let i = 0; i < node.namedChildCount; i++) {
-                collectUseTree(node.namedChild(i), prefix, line);
-            }
-            return;
+        // fix #353: `use alpha::widget as renamed; renamed()` — the alias
+        // pairing feeds findCallers' import-rename surface (calledAs),
+        // exactly like Python/JS `import x as y`. fix #357: `renames` pairs
+        // the alias with ITS record so createImportBindings emits {name:
+        // original, alias: local} (the #348 Python shape); two renames of
+        // one source name from different modules each pair with their own
+        // module instead of both bindings matching both calls. `names` keeps
+        // the local spelling (parser contract, imports command).
+        const renamed = leaf.node.type === 'use_as_clause' && leaf.original &&
+            leaf.original !== leaf.local && leaf.original !== 'self';
+        addLeaf(leaf.path, leaf.local, 'use', false, line,
+            renamed ? { original: leaf.original, local: leaf.local } : null, scope);
+        if (renamed) {
+            if (!imports.aliases) imports.aliases = [];
+            imports.aliases.push({ original: leaf.original, local: leaf.local });
         }
-        if (node.type === 'use_as_clause') {
-            const pathNode = node.namedChild(0);
-            const aliasNode = node.childForFieldName('alias') || node.namedChild(1);
-            if (pathNode && aliasNode) {
-                // fix #353: `use alpha::widget as renamed; renamed()` — the
-                // alias pairing feeds findCallers' import-rename surface
-                // (calledAs), exactly like Python/JS `import x as y`.
-                // fix #357: `renames` pairs the alias with ITS record so
-                // createImportBindings emits {name: original, alias: local}
-                // (the #348 Python shape); two renames of one source name
-                // from different modules each pair with their own module
-                // instead of both bindings matching both calls. `names`
-                // keeps the local spelling (parser contract, imports command).
-                const original = String(pathNode.text).split('::').pop();
-                const renamed = original && original !== aliasNode.text && original !== 'self';
-                addLeaf(joinUsePath(prefix, pathNode.text), aliasNode.text,
-                    'use', false, line, renamed ? { original, local: aliasNode.text } : null);
-                if (renamed) {
-                    if (!imports.aliases) imports.aliases = [];
-                    imports.aliases.push({ original, local: aliasNode.text });
-                }
-            }
-            return;
-        }
-        if (node.type === 'use_wildcard') {
-            const pathNode = node.namedChild(0);
-            addLeaf(joinUsePath(prefix, pathNode?.text), '*',
-                'use-glob', true, line);
-            return;
-        }
-        if (node.type === 'identifier' || node.type === 'scoped_identifier' ||
-            node.type === 'crate' || node.type === 'self' || node.type === 'super') {
-            if (node.text === 'self' && prefix) {
-                addLeaf(prefix, prefix.split('::').pop(), 'use', false, line);
-                return;
-            }
-            const module = joinUsePath(prefix, node.text);
-            addLeaf(module, node.text.split('::').pop(), 'use', false, line);
-        }
-    };
+    });
 
     traverseTreeCached(tree.rootNode, (node) => {
         // use declarations
@@ -5424,9 +5772,16 @@ function findImportsInCode(code, parser) {
             // bindings `crate::haystack::Haystack` and
             // `crate::haystack::Builder`, rather than the lossy old
             // `{ module: "crate", name: "haystack" }` approximation.
+            const scope = rustBlockItemScope(node);
+            // A `use` is an item: its visibility decides which modules a
+            // glob of its module reaches it from (fix #422).
+            const visibility = node.namedChildren.find(child => child.type === 'visibility_modifier')
+                ?.text.replace(/\s+/g, '');
+            const recordScope = scope.lexicalScopeStartLine != null || visibility
+                ? { ...scope, ...(visibility && { visibility }) } : null;
             for (let i = 0; i < node.namedChildCount; i++) {
                 const child = node.namedChild(i);
-                collectUseTree(child, '', line);
+                collectUseTree(child, line, recordScope);
             }
             return true;
         }

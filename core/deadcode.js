@@ -15,7 +15,7 @@ const { splitParentList } = require('./graph-build');
 const { isOverrideMarked, codeUnitCompare, lineInRanges, maskBlockComments, escapeRegExp } = require('./shared');
 const { projectComputedDispatch, projectReflectionSites } = require('./ast-analysis');
 const { reflectionPatternReferences } = require('./reflection');
-const { protocolMemberOf, protocolTypeOf, typedLiteralContract } = require('./contract-membership');
+const { protocolMemberOf, protocolTypeOf, typedLiteralContract, rustProjectTraits } = require('./contract-membership');
 
 const _CLASS_KINDS = ['class', 'struct', 'interface', 'trait', 'record'];
 
@@ -212,6 +212,13 @@ function _classHasExternalBase(index, symbol) {
  */
 function overridesOutOfTreeBase(index, symbol) {
     if (!symbol.className) return false; // standalone function can't override
+    // A member that names its contract (Rust `impl Trait for X`, fix #422):
+    // the trait's identity decides, not the number of same-name owners. Two
+    // project types implementing one external trait (`FromIterator`) are
+    // each reached through it (`.collect::<A>()`), the impls being owners
+    // of nothing the project declares.
+    if (symbol.traitName &&
+        rustProjectTraits(index, symbol.traitName, symbol.file, symbol.startLine).length === 0) return true;
     if (isOverrideMarked(symbol)) {
         const owners = (index.symbols.get(symbol.name) || []).filter(s => s.className);
         if (owners.length <= 1) return true;

@@ -275,4 +275,55 @@ function parallelBuild(index, files, options = {}) {
     return changed;
 }
 
-module.exports = { parallelBuild, scheduleFiles };
+/**
+ * Worker threads for a sequential build's Rust macro expansion (fix #422): a
+ * pool shaped like the one a parallel build keeps (`options.onParsed`), whose
+ * workers have no file to parse and wait for their expansion job. A crate
+ * whose API macros generate most of its code has little source to parse and
+ * much expansion work.
+ */
+function spawnExpansionPool(index, count) {
+    if (!(count >= 1)) return null;
+    const sab = new SharedArrayBuffer(4 * (count + 1));
+    const control = new SharedArrayBuffer(4 * count);
+    const controlArray = new Int32Array(control);
+    const ports = [];
+    const workers = [];
+    for (let i = 0; i < count; i++) {
+        const { port1, port2 } = new MessageChannel();
+        ports.push(port1);
+        const worker = new Worker(path.join(__dirname, 'build-worker.js'), {
+            workerData: {
+                files: [], rootDir: index.root, existingHashes: {}, signal: sab, workerIndex: i,
+                queueIndex: count, port: port2, control, macroDictionary: null, dictionarySignal: null,
+            },
+            transferList: [port2],
+            resourceLimits: { maxYoungGenerationSizeMb: WORKER_YOUNG_GENERATION_MB },
+        });
+        worker.unref();
+        workers.push(worker);
+    }
+    const live = new Set(workers.map((_, i) => i));
+    const retire = i => {
+        if (!live.delete(i)) return;
+        Atomics.store(controlArray, i, 1);
+        Atomics.notify(controlArray, i);
+        ports[i].close();
+        workers[i].terminate();
+    };
+    return {
+        available: [...live],
+        ports,
+        post(i, job) {
+            ports[i].postMessage(job);
+            Atomics.store(controlArray, i, 2);
+            Atomics.notify(controlArray, i);
+        },
+        retire,
+        dispose() {
+            for (const i of [...live]) retire(i);
+        },
+    };
+}
+
+module.exports = { parallelBuild, scheduleFiles, spawnExpansionPool };

@@ -1376,7 +1376,7 @@ function sitesReboundByChange(index, name, def, rawCallers, confirmed, unverifie
 
 /** Map an unverified sweep entry to the public site shape (relative `file`). */
 function unverifiedSiteShape(u) {
-    return {
+    const shape = {
         file: u.relativePath,
         line: u.line,
         expression: (u.content || '').trim(),
@@ -1395,6 +1395,34 @@ function unverifiedSiteShape(u) {
         ...(u.moduleAttribute && { moduleAttribute: true }),
         ...(u.annotationShorthand && { annotationShorthand: u.annotationShorthand }),
     };
+    // The site's own token (fix #422): a same-line edit of another token
+    // leaves it undecided.
+    const site = u.provenance?.facts?.site;
+    const range = site && site.line === u.line && Number.isInteger(site.start) && Number.isInteger(site.end)
+        ? { start: site.start, end: site.end } : null;
+    if (Number.isInteger(u.column) || range) {
+        Object.defineProperty(shape, '_token', {
+            value: { file: u.file, column: Number.isInteger(u.column) ? u.column : null, range },
+            enumerable: false,
+        });
+    }
+    return shape;
+}
+
+/**
+ * Does a planned change cover an unverified site (fix #422)? A change on
+ * its line covers it unless the change edits known tokens and the site's
+ * own token is another one.
+ */
+function siteCoveredByChanges(index, changes, site, name) {
+    const change = changes.find(c => c.file === site.file && c.line === site.line);
+    if (!change) return false;
+    const columns = change._edit?.columns;
+    const token = site._token;
+    if (!Array.isArray(columns) || !token) return true;
+    const column = token.column ?? (token.range
+        ? callTokenColumn(index, token.file, token.range, name, site.line) : null);
+    return column == null || columns.includes(column);
 }
 
 /**
@@ -2483,6 +2511,28 @@ const {
  * pin) or its class (a member): 'edit'; another namespace or class: null;
  * unresolvable: 'review'.
  */
+/**
+ * A Rust path value `Q::m` naming a member pin (fix #422): 'edit' when the
+ * qualifier names the pin's own type or trait (or a type implementing the
+ * pinned trait without a member of its own), null when it names another
+ * type or trait, 'review' when the scopes cannot say.
+ */
+function rustPathValueVerdict(index, ref, def) {
+    const callers = require('./callers');
+    const call = { name: def.name, line: ref.line, receiver: ref.receiver, isPathCall: true,
+        isMethod: true, isFunctionReference: true };
+    if (callers.rustPathQualifierVerdict(index, ref.file, call, [def]) === 'other') return null;
+    const { resolveRustPathQualifier } = require('./rust-names');
+    const named = resolveRustPathQualifier(index, ref.file, ref.line, ref.receiver);
+    const owner = require('./class-identity').ownerRefOf(index, def)?.def;
+    const { classKeyOf } = require('./class-identity');
+    if (named?.defs?.length === 1 && owner && classKeyOf(index, named.defs[0]) === classKeyOf(index, owner)) {
+        return 'edit';
+    }
+    if (callers.rustTraitDeclPathProbe(index, ref.file, call, [def]) === 'target') return 'edit';
+    return 'review';
+}
+
 function cppQualifiedReferenceVerdict(index, ref, def) {
     const { resolveQualifier, effectiveNamespace, macroPrefixAt, includeClosure } = require('./cpp-scope');
     // Inside an indexed declaration the reference's scope is that
@@ -3664,6 +3714,15 @@ function plan(index, name, options = {}) {
                 binding.alias === name && binding.name !== name)) return false;
             if (bindings.length === 0) return true;
             return bindings.some(binding => {
+                // A Rust `use` path names the item its module declares (fix
+                // #422): another module's namesake is never the pin.
+                if (langTraits(fileEntry.language)?.itemScopeResolution && !def.className && !def.receiver) {
+                    const named = require('./rust-names').resolveRustUsePath(index, filePath, binding.line,
+                        binding.module, ['struct', 'enum', 'union', 'trait', 'type', 'module'].includes(def.type)
+                            ? 'type' : 'value');
+                    if (named?.external) return false;
+                    if (named?.defs) return named.defs.some(d => d.name === name && renameTargetFiles.has(d.file));
+                }
                 const rel = fileEntry.moduleResolved?.[binding.module];
                 const abs = rel ? (require('path').isAbsolute(rel) ? rel
                     : require('path').join(index.root, rel)) : null;
@@ -4056,8 +4115,7 @@ function plan(index, name, options = {}) {
             if (alternativeSites.length > 0) {
                 emitRenameCallSites(alternativeSites);
                 slotAccountSites.push(...alternativeSites);
-                const changedLines = new Set(changes.map(change => `${change.file}:${change.line}`));
-                const kept = planUnverified.filter(site => !changedLines.has(`${site.file}:${site.line}`));
+                const kept = planUnverified.filter(site => !siteCoveredByChanges(index, changes, site, name));
                 planUnverified.length = 0;
                 planUnverified.push(...kept);
                 planUnverified.sort((a, b) => codeUnitCompare(a.file, b.file) || a.line - b.line);
@@ -4505,10 +4563,8 @@ function plan(index, name, options = {}) {
             slotAccountSites.push(...slotMemberSites);
             // A site a slot member's sweep CONFIRMED is a planned edit now —
             // it no longer belongs in the pin's "may need this change" band.
-            const changedLines = new Set(changes.map(change =>
-                `${change.file}:${change.line}`));
             const keptUnverified = planUnverified.filter(site =>
-                !changedLines.has(`${site.file}:${site.line}`));
+                !siteCoveredByChanges(index, changes, site, name));
             planUnverified.length = 0;
             planUnverified.push(...keptUnverified);
             planUnverified.sort((a, b) => codeUnitCompare(a.file, b.file) ||
@@ -4673,8 +4729,7 @@ function plan(index, name, options = {}) {
                 }, edit));
             }
             if (editsByLine.size > 0) {
-                const changedLines = new Set(changes.map(change => `${change.file}:${change.line}`));
-                const kept = planUnverified.filter(site => !changedLines.has(`${site.file}:${site.line}`));
+                const kept = planUnverified.filter(site => !siteCoveredByChanges(index, changes, site, name));
                 planUnverified.length = 0;
                 planUnverified.push(...kept);
             }
@@ -4790,6 +4845,12 @@ function plan(index, name, options = {}) {
                 // resolves to from the reference's own scope.
                 if (ref.receiver && index.files.get(ref.file)?.language === 'cpp') {
                     return cppQualifiedReferenceVerdict(index, ref, def);
+                }
+                // A path value naming a member (`let f = T::method;`, fix
+                // #422) names what its qualifier resolves to by item scopes.
+                if (def.className && ref.receiver && ref.scopedReference &&
+                    langTraits(index.files.get(ref.file)?.language)?.itemScopeResolution) {
+                    return rustPathValueVerdict(index, ref, def);
                 }
                 // A function declared in a function body (a C# local
                 // function, a nested def) is in scope only in its block:
@@ -4929,7 +4990,9 @@ function plan(index, name, options = {}) {
                 let refColumns = records.filter((record, i) => verdicts[i] === 'edit')
                     .map(record => record.column);
                 if (!refColumns.every(Number.isInteger)) refColumns = null;
-                if (verdict === 'edit' && ref.file === def.file && def.className) {
+                // A path value (`T::m`, fix #422) is its own token.
+                if (verdict === 'edit' && ref.file === def.file && def.className &&
+                    records.some((record, i) => verdicts[i] === 'edit' && !record.scopedReference)) {
                     const selfColumns = selfMemberTokenColumns(index, def.file, ref.line, name);
                     if (selfColumns.length === 0) verdict = 'review';
                     else refColumns = selfColumns;

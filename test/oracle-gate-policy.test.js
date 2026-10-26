@@ -751,3 +751,12 @@ describe('fix #406: unscored edges are classified by the oracle\'s own projectio
         assert.ok(bundle.includes(`"unreachableCodeCondition":"${STATIC_CONDITION_UNREACHABLE}"`));
     });
 });
+
+describe('fix #422: the rust-analyzer oracle projects a plain cargo build', () => {
+    it('sets the cfgs a `cargo check --all-targets` build sees: no `miri`', () => {
+        const { CARGO_PROJECTION } = require('../eval/oracles/rust-analyzer-oracle');
+        assert.deepStrictEqual(CARGO_PROJECTION.cfgs, ['debug_assertions']);
+        assert.strictEqual(CARGO_PROJECTION.features, 'all');
+        assert.strictEqual(CARGO_PROJECTION.allTargets, true);
+    });
+});

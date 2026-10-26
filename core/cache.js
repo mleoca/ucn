@@ -946,7 +946,12 @@ function clearAllCaches() {
 // carry its parameters (`primaryParams`); record constructors delegate.
 // v309 (fix #421): C++ out-of-class constructor mem-initializers and
 // default initializations are call records.
-const CACHE_FORMAT_VERSION = 309;
+// v310 (fix #422): Rust bare and path call records carry the binding the
+// enclosing blocks give their name (`scopeBinding`, `receiverScopeBinding`),
+// qualified-path receivers and `macroScopeUnknown`; block `use` imports carry
+// their block lines and `use` items their visibility; files list their
+// item-position macro invocations (`itemMacros`).
+const CACHE_FORMAT_VERSION = 310;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 function usageResultKey(index, filePath, name, mode) {

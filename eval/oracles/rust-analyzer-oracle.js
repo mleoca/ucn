@@ -24,7 +24,7 @@
  * feature-gated code active, and active code is scored. Calls a project
  * macro_rules! transcriber generates are resolved through rust-analyzer's own
  * expansion of the invocation (`rust-analyzer/expandMacro`), inlined in its
- * in-memory copy of the file.
+ * in-memory copy of the file. The cfg set is a plain build's (no `miri`).
  *
  * rust-analyzer resolution: $UCN_EVAL_RUST_ANALYZER, else PATH. Requires a
  * cargo toolchain (also builds/runs the syn helper).
@@ -37,6 +37,12 @@ const path = require('path');
 const { spawn, spawnSync } = require('child_process');
 const { LspClient, pathToUri, uriToPath } = require('./lsp-client');
 const { makeHelperHandle } = require('./jsonl-helper');
+
+// The configuration a `cargo check --all-targets` / `cargo test` build sees
+// with every feature on (fix #422): rust-analyzer's default `cargo.cfgs` adds
+// `miri`, which made `#[cfg(not(miri))]` code (slow tests) inactive in the
+// oracle's projection - no oracle edges there, and UCN edges there unscored.
+const CARGO_PROJECTION = Object.freeze({ features: 'all', allTargets: true, cfgs: ['debug_assertions'] });
 
 const HELPER_MANIFEST = path.join(__dirname, 'rust-ast-helper', 'Cargo.toml');
 // `serverStatus.quiescent` is rust-analyzer's semantic-readiness barrier. The
@@ -102,7 +108,7 @@ const rustAnalyzerOracle = {
                 // minimal client own change notifications so macOS's server
                 // watcher cannot strand VFS readiness at N-1 roots.
                 files: { watcher: 'client' },
-                cargo: { features: 'all', allTargets: true },
+                cargo: CARGO_PROJECTION,
                 ...(linkedProjects.length > 1 && { linkedProjects }),
             });
             process.stdout.write('  waiting for rust-analyzer to load the workspace (cargo metadata + build scripts)...\n');
@@ -532,6 +538,7 @@ function findWorkspaceRoot(dir) {
 module.exports = {
     rustAnalyzerOracle,
     cargoLinkedProjects,
+    CARGO_PROJECTION,
     projectionStatus,
     lineOutsideProjection,
     inlineExpansion,
