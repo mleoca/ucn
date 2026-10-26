@@ -345,6 +345,7 @@ function classifyGroundLines(index, name, groundSet, claimedKeys) {
         // name on unclaimed lines are read below).
         if (!getCachedCallsBearing) getCachedCallsBearing = require('./callers').getCachedCallsBearing;
         const cachedCalls = getCachedCallsBearing(index, filePath, name, new Set(unclaimed));
+        const recordIsNoCall = require('./callers')._recordIsNoCall;
         const callLines = new Set();
         if (Array.isArray(cachedCalls)) {
             for (const c of cachedCalls) {
@@ -353,6 +354,9 @@ function classifyGroundLines(index, name, groundSet, claimedKeys) {
                 // merely entering the candidate cache is not a call fact.
                 // An implicit initializer has no written invocation either.
                 if (c.isFunctionReference || c.isTypeReference || c.constructorSyntax === 'implicit') continue;
+                // Nor a data member's mem-initializer or a default
+                // initialization of no class (fix #421).
+                if ((c.memberInitializer || c.constructorSyntax === 'default') && recordIsNoCall(index, filePath, c)) continue;
                 if (c.name === name || c.resolvedName === name ||
                     (c.resolvedNames && c.resolvedNames.includes(name))) {
                     callLines.add(c.line);

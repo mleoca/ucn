@@ -146,9 +146,11 @@ function indexedContent(index, file, entry, content) {
  * Are the type names written in `file` usable as the index read them (trait
  * `typeNameSourceCanonical` of `language`)? The index's own parse of the
  * same content tells whether it had errors, so most sources need no second
- * parse (fix #418).
+ * parse (fix #418). `lines` (`{ startLine, endLine }`) asks about the names
+ * of that line range only: a parse error confined to another member does not
+ * reach them (fix #421).
  */
-function typeNamesCanonical(index, file, canonical, language) {
+function typeNamesCanonical(index, file, canonical, language, lines = null) {
     const source = index._readFile(file);
     // The verdict is the same with or without the hint, so a witness view
     // takes it unrecorded from its live index; its replay derives it again.
@@ -157,7 +159,7 @@ function typeNamesCanonical(index, file, canonical, language) {
         return entry?.language === language && indexedContent(live, file, entry, source)
             ? !!entry.parseRecovery : undefined;
     };
-    return canonical(source, () => index.isProvenanceFactIndex ? index.unrecordedHint(hint) : hint(index));
+    return canonical(source, () => index.isProvenanceFactIndex ? index.unrecordedHint(hint) : hint(index), lines);
 }
 
 /** The parsed views of a file: grammar, configured views, recovery blanks and external macro scope. */

@@ -222,6 +222,28 @@ function unverifiedCalleeLines(entries, compact) {
     return lines;
 }
 
+/** " (constructs X)" for a constructor body edge beside its class callee (fix #421). */
+function constructsSuffix(callee) {
+    return callee?.initializerOf ? ` (constructs ${callee.initializerOf})` : '';
+}
+
+/**
+ * Constructions whose class edge is confirmed while the constructor body
+ * they run is undecided (fix #421). Their sites are in the class edge's
+ * account; these lines say which body is not proven.
+ */
+function initializerReviewLines(entries, compact) {
+    if (!entries || entries.length === 0) return [];
+    const lines = [`${compact ? '' : '\n'}CONSTRUCTOR BODIES — UNDECIDED (${entries.length}) — class dependency confirmed above; which constructor runs is not proven:`];
+    for (const entry of entries) {
+        const candidates = entry.candidates > 1 ? ` (${entry.candidates} candidates)` : '';
+        const sites = entry.sites?.length ? ` L${entry.sites.join(',L')}` : '';
+        const label = entry.name === entry.initializerOf ? entry.name : `${entry.initializerOf}.${entry.name}`;
+        lines.push(`  ${label} ×${entry.callCount} — ${entry.reason}${candidates}${sites}`);
+    }
+    return lines;
+}
+
 /** "NON-CALL OCCURRENCES" summary line from the account. */
 function formatNonCallLine(account, hintName, usagesHint) {
     if (!account || !account.nonCall || account.nonCall.total === 0) return null;
@@ -388,11 +410,13 @@ function formatContextJson(context) {
                 ...(c.tier && { tier: c.tier }),
                 ...(c.sites && { sites: c.sites }),
                 ...(c.functionReference && { functionReference: true }),
+                ...(c.initializerOf && { initializerOf: c.initializerOf }),
                 ...(c.reachable !== undefined && { reachable: c.reachable }),
             })),
             // v4 callee contract: visible unresolved-call entries (aggregated
             // name+reason), reconciled by meta.calleeAccount.
             unverifiedCallees: context.unverifiedCallees || [],
+            ...(context.initializerReviews?.length && { initializerReviews: context.initializerReviews }),
             ...(context.warnings && { warnings: context.warnings })
         }
     }, provenanceReplacer);
@@ -747,9 +771,9 @@ function formatContext(ctx, options = {}) {
         if (compact) {
             const snip = c.docstring ? calleeDocstringSnippet(c.docstring) : '';
             const docPart = snip ? `: ${snip}` : '';
-            lines.push(`  [${itemNum}] ${c.name}${returnSuffix}${sideEffects} - ${c.relativePath}:${c.startLine}${docPart}${unreachableMark}`);
+            lines.push(`  [${itemNum}] ${c.name}${returnSuffix}${sideEffects} - ${c.relativePath}:${c.startLine}${constructsSuffix(c)}${docPart}${unreachableMark}`);
         } else {
-            lines.push(`  [${itemNum}] ${c.name}${weight}${returnSuffix}${sideEffects} - ${c.relativePath}:${c.startLine}${unreachableMark}`);
+            lines.push(`  [${itemNum}] ${c.name}${weight}${returnSuffix}${sideEffects} - ${c.relativePath}:${c.startLine}${constructsSuffix(c)}${unreachableMark}`);
             if (c.docstring) {
                 const snip = calleeDocstringSnippet(c.docstring);
                 if (snip) lines.push(`    "${snip}"`);
@@ -770,6 +794,7 @@ function formatContext(ctx, options = {}) {
     // Unverified callee band (v4): aggregated name+reason entries — visible,
     // never silently dropped. Not expandable (no definition resolved).
     lines.push(...unverifiedCalleeLines(ctx.unverifiedCallees, compact));
+    lines.push(...initializerReviewLines(ctx.initializerReviews, compact));
 
     // Conservation contract lines: non-call summary + ACCOUNT/WARNING/FILTERED
     const account = ctx.meta && ctx.meta.account;
@@ -1155,7 +1180,7 @@ function formatAbout(about, options = {}) {
             const returnSuffix = c.returnType ? ` → ${c.returnType}` : '';
             const sideEffects = (c.sideEffects && c.sideEffects.length) ? ` {${c.sideEffects.join(',')}}` : '';
             const unreachableMark = (aboutCalleeReach.perLine && c.reachable === false) ? ' [unreachable]' : '';
-            lines.push(`  ${c.name}${weight}${returnSuffix}${sideEffects} - ${c.file}:${c.line} (${c.callCount}x)${unreachableMark}`);
+            lines.push(`  ${c.name}${weight}${returnSuffix}${sideEffects} - ${c.file}:${c.line} (${c.callCount}x)${constructsSuffix(c)}${unreachableMark}`);
             if (!compact && c.docstring) {
                 const snip = calleeDocstringSnippet(c.docstring);
                 if (snip) lines.push(`    "${snip}"`);
@@ -1284,4 +1309,6 @@ module.exports = {
     // Shared with output/analysis-ext.js (smart): single-node callee contract.
     formatCalleeAccountLine,
     unverifiedCalleeLines,
+    initializerReviewLines,
+    constructsSuffix,
 };

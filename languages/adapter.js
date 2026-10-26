@@ -36,6 +36,7 @@ const OPTIONAL_HELPERS = Object.freeze([
     'queryTree',
     'queryTreeIsPlain',
     'queryUsingDirectives',
+    'implicitBaseCallsOf',
 ]);
 
 function adapterCapabilities(languageModule) {

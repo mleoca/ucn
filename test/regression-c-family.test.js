@@ -5266,8 +5266,9 @@ describe('fix #389: C++ function-local classes', () => {
             assert.strictEqual(local.lexicalScopeEndLine, 11);
             assert.deepStrictEqual(at(index.context('render', { file: 'mod.cpp', line: 2 }).callers), ['mod.cpp:15']);
             assert.deepStrictEqual(at(index.context('render', { file: 'mod.cpp', line: 7 }).callers), ['mod.cpp:10']);
+            // `Widget w;` default-constructs the local class (fix #421).
             assert.deepStrictEqual(index.context('build', { file: 'mod.cpp' }).callees
-                .map(c => `${c.name}:${c.startLine}`), ['render:7']);
+                .map(c => `${c.name}:${c.startLine}`).sort(), ['Widget:6', 'render:7']);
             const fn = execute(index, 'plan', { name: 'render', file: 'mod.cpp', line: 7, renameTo: 'draw' });
             assert.deepStrictEqual(fn.result.changes.map(c => c.line).sort((a, b) => a - b), [7, 10]);
             const type = execute(index, 'plan', { name: 'Widget', file: 'mod.cpp', line: 1, renameTo: 'Gadget' });
@@ -7243,6 +7244,205 @@ describe('fix #420: C/C++ value references by linkage, global qualification and 
             assert.deepEqual(Object.fromEntries(plan(index, 'a.cpp:2:limit').edits), {
                 'a.cpp:2': 'int cap = 2;', 'a.cpp:5': 'int get() const { return limit + this->limit + ::cap + ns::limit; }',
             });
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #421: C++ constructors defined outside their class', () => {
+    const files = {
+        'w.h': [
+            'struct Widget {',                                   // 1
+            '  Widget(const char* name, int size);',             // 2
+            '  explicit Widget(int size);',                       // 3
+            '  int size_;',                                       // 4
+            '};',                                                 // 5
+            'struct Fancy : Widget {',                            // 6
+            '  Fancy();',                                         // 7
+            '  Fancy(int a);',                                    // 8
+            '};',                                                 // 9
+            'struct Bare : Widget {',                             // 10
+            '  Bare(int q);',                                     // 11
+            '};',                                                 // 12
+            'struct Dflt { Dflt(); };',                           // 13
+            'struct Kid : Dflt { Kid(int k); };',                 // 14
+        ].join('\n') + '\n',
+        'w.cpp': [
+            '#include "w.h"',                                                     // 1
+            'Widget::Widget(const char* name, int size) : size_(size) { (void)name; }', // 2
+            'Widget::Widget(int size) : Widget("anon", size) {}',                 // 3
+            'Fancy::Fancy() : Widget("fancy", 3) {}',                             // 4
+            'Fancy::Fancy(int a) : Fancy() { (void)a; }',                         // 5
+            'Bare::Bare(int q) : Widget(q) {}',                                    // 6
+            'Dflt::Dflt() {}',                                                    // 7
+            'Kid::Kid(int k) { (void)k; }',                                       // 8
+        ].join('\n') + '\n',
+    };
+    const callersOf = (index, file, line, name) => {
+        const target = index.symbols.get(name).find(def => def.relativePath === file && def.startLine === line && def.type === 'constructor');
+        return index.findCallers(name, { targetDefinitions: [target], collectAccount: true });
+    };
+    it('delegations and base initializers bind the declarations their definitions select', () => {
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            for (const [file, line] of [['w.h', 2], ['w.cpp', 2]]) {
+                assert.deepStrictEqual(callersOf(index, file, line, 'Widget').map(site => `${site.relativePath}:${site.line}`),
+                    ['w.cpp:3', 'w.cpp:4']);
+            }
+            assert.deepStrictEqual(callersOf(index, 'w.h', 3, 'Widget').map(site => `${site.relativePath}:${site.line}`), ['w.cpp:6']);
+            assert.deepStrictEqual(callersOf(index, 'w.h', 7, 'Fancy').map(site => `${site.relativePath}:${site.line}`), ['w.cpp:5']);
+            // A delegation never targets the constructor it runs in.
+            assert.deepStrictEqual(callersOf(index, 'w.h', 8, 'Fancy').map(site => site.line), []);
+            const { validateConfirmation, declarationIdentity } = require('../core/provenance');
+            const delegation = callersOf(index, 'w.h', 7, 'Fancy')[0];
+            const target = index.symbols.get('Fancy').find(def => def.relativePath === 'w.h' && def.startLine === 7);
+            const proof = JSON.parse(JSON.stringify(delegation.provenance));
+            assert.strictEqual(validateConfirmation(proof, declarationIdentity(target)).verdict, 'establishes-target');
+            proof.facts.constructorCall.delegatingDefinition.signature = 'double';
+            assert.strictEqual(validateConfirmation(proof, declarationIdentity(target)).verdict, 'inconsistent');
+            // The member initializer `size_(size)` is no call.
+            const body = index.symbols.get('Widget').find(def => def.relativePath === 'w.cpp' && def.startLine === 2);
+            const callees = index.findCallees(body, { collectAccount: true });
+            assert.strictEqual(callees.calleeAccount.totalSites, 0);
+            // The delegation's edge names the definition holding the body.
+            const fancy = index.symbols.get('Fancy').find(def => def.relativePath === 'w.cpp' && def.startLine === 5);
+            assert.deepStrictEqual(index.findCallees(fancy, { collectAccount: true }).map(def => `${def.relativePath}:${def.startLine}`),
+                ['w.cpp:4']);
+        } finally { rm(dir); }
+    });
+    it('an omitted base initializer is an unverified candidate on both sides', () => {
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const callers = callersOf(index, 'w.h', 13, 'Dflt');
+            assert.strictEqual(callers.length, 0);
+            assert.deepStrictEqual(callers.unverifiedEntries.map(entry => [entry.relativePath, entry.line, entry.reason]),
+                [['w.cpp', 8, 'constructor-implicit-base-unproven']]);
+            const kid = index.symbols.get('Kid').find(def => def.relativePath === 'w.cpp');
+            const callees = index.findCallees(kid, { collectAccount: true });
+            assert.deepStrictEqual(callees.unverifiedCallees.map(entry => [entry.name, entry.reason]),
+                [['Dflt', 'constructor-implicit-base-unproven']]);
+            assert.strictEqual(callees.calleeAccount.conserved, true);
+            // A definition that initializes the base, or delegates, constructs none implicitly.
+            for (const [name, line] of [['Bare', 6], ['Fancy', 5]]) {
+                const def = index.symbols.get(name).find(d => d.relativePath === 'w.cpp' && d.startLine === line);
+                assert.ok(!index.findCallees(def, { collectAccount: true }).unverifiedCallees
+                    .some(entry => entry.reason === 'constructor-implicit-base-unproven'));
+            }
+        } finally { rm(dir); }
+    });
+    it('check reports the out-of-class initializers a signature change breaks', () => {
+        const { execFileSync } = require('child_process');
+        const dir = tmp(files);
+        const git = (...args) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd: dir, stdio: 'pipe' });
+        try {
+            git('init', '-q'); git('add', '.'); git('commit', '-qm', 'initial');
+            for (const file of ['w.h', 'w.cpp']) {
+                const full = path.join(dir, file);
+                fs.writeFileSync(full, fs.readFileSync(full, 'utf8').replace('const char* name, int size)', 'const char* name, int size, int extra)'));
+            }
+            const answer = execute(idx(dir), 'check', { name: 'w.h:2:Widget' });
+            assert.ok(answer.ok, answer.error);
+            assert.deepStrictEqual(answer.result.mismatchDetails.map(site => `${site.file}:${site.line}`), ['w.cpp:3', 'w.cpp:4']);
+        } finally { rm(dir); }
+    });
+    it('a data member initialized in an out-of-class definition is no call site of a field rename', () => {
+        const dir = tmp(files);
+        try {
+            const answer = execute(idx(dir), 'plan', { name: 'w.h:4:size_', renameTo: 'count_' });
+            assert.ok(answer.ok, answer.error);
+            assert.ok(!(answer.result.unverifiedSites || []).some(site => site.reason === 'call-not-resolved'),
+                JSON.stringify(answer.result.unverifiedSites));
+            assert.strictEqual(answer.result.account.unverified, 0);
+        } finally { rm(dir); }
+    });
+    it('sequential, two-worker and cache builds record the same initializer calls', () => {
+        const { ProjectIndex } = require('../core/project');
+        const dir = tmp(files);
+        try {
+            const records = index => [...index.files.keys()].sort().map(file => JSON.stringify(index.getCachedCalls(file)));
+            const sequential = new ProjectIndex(dir); sequential.build(null, { quiet: true, workers: 0 });
+            const parallel = new ProjectIndex(dir); parallel.build(null, { quiet: true, workers: 2 });
+            assert.deepStrictEqual(records(parallel), records(sequential));
+            assert.ok(records(sequential).some(text => text.includes('"memberInitializer":true')));
+            const { saveCache, loadCache } = require('../core/cache');
+            const cachePath = path.join(dir, '.cache-421', 'index.json');
+            saveCache(sequential, cachePath);
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loadCache(loaded, cachePath));
+            assert.deepStrictEqual(records(loaded), records(sequential));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #421: C++ default initialization constructs a class', () => {
+    const code = [
+        '#include <initializer_list>',                 // 1
+        'struct Box {',                                // 2
+        '  Box(int v) : v(v) {}',                      // 3
+        '  Box() : v(0) {}',                           // 4
+        '  Box(std::initializer_list<int> l) : v(1) {}', // 5
+        '  int v;',                                    // 6
+        '};',                                          // 7
+        'typedef int MyInt;',                          // 8
+        'enum Color { Red };',                         // 9
+        'Box global;',                                 // 10
+        'int use() {',                                 // 11
+        '  Box b;',                                    // 12
+        '  static Box s;',                             // 13
+        '  Box c{};',                                  // 14
+        '  Box *p = new Box;',                         // 15
+        '  Box arr[2];',                               // 16
+        '  MyInt i = 0;',                              // 17
+        '  Color col = Red;',                          // 18
+        '  extern Box e;',                             // 19
+        '  Box f();',                                  // 20
+        '  return b.v + s.v + c.v + p->v + arr[0].v + i + col;', // 21
+        '}',                                           // 22
+    ].join('\n') + '\n';
+    it('the default constructor receives every default-initialized object and an empty list', () => {
+        const dir = tmp({ 'a.cpp': code });
+        try {
+            const index = idx(dir);
+            const target = index.symbols.get('Box').find(def => def.type === 'constructor' && def.startLine === 4);
+            const callers = index.findCallers('Box', { targetDefinitions: [target], collectAccount: true });
+            assert.deepStrictEqual(callers.map(site => site.line), [10, 12, 13, 14, 15, 16]);
+            assert.ok(callers.every(site => site.tier === 'confirmed'));
+            const callees = index.findCallees(index.symbols.get('use')[0], { collectAccount: true });
+            assert.deepStrictEqual(callees.filter(def => def.type === 'constructor').map(def => [def.startLine, def.callCount]), [[4, 5]]);
+            assert.ok(!callees.some(def => ['MyInt', 'Color'].includes(def.name)));
+            assert.strictEqual(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #421: constructions of a specialized class template stay unverified', () => {
+    it('a template-id construction names no single member of a specialization family', () => {
+        const dir = tmp({ 'a.hpp': [
+            'namespace fmt {',                                                        // 1
+            'template <typename T, typename Char = char> struct formatter { formatter() {} };', // 2
+            'struct weekday {};',                                                     // 3
+            'template <typename Char> struct formatter<weekday, Char> { formatter() {} };',    // 4
+            'struct plain { plain() {} };',                                           // 5
+            'template <typename Char, typename T> int write_alt(const T& v) {',       // 6
+            '  formatter<T, Char> underlying;',                                       // 7
+            '  plain p;',                                                             // 8
+            '  return 0;',                                                            // 9
+            '}',                                                                      // 10
+            '}',                                                                      // 11
+        ].join('\n') + '\n' });
+        try {
+            const index = idx(dir);
+            for (const target of index.symbols.get('formatter').filter(def => def.type === 'struct')) {
+                const callers = index.findCallers('formatter', { targetDefinitions: [target], collectAccount: true });
+                assert.equal(callers.length, 0, `${target.startLine}`);
+                assert.deepEqual(callers.unverifiedEntries.map(entry => [entry.line, entry.reason]), [[7, 'template-specialization']]);
+            }
+            const callees = index.findCallees(index.symbols.get('write_alt')[0], { collectAccount: true });
+            assert.ok(!callees.some(def => def.name === 'formatter'));
+            assert.ok(callees.some(def => def.name === 'plain' && def.type === 'struct'));
+            assert.ok(callees.unverifiedCallees.some(entry => entry.name === 'formatter'));
+            assert.equal(callees.calleeAccount.conserved, true);
         } finally { rm(dir); }
     });
 });

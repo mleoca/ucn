@@ -5905,6 +5905,28 @@ function implicitConstructorInfo(node, ownerName, owner) {
             initialized.some(entry => !entry.field && !entry.qualifier && entry.name === ownerName) };
 }
 
+/**
+ * The call a mem-initializer of an out-of-class constructor definition makes
+ * (fix #421), or null when the definition is no constructor. Its own class
+ * name (unqualified, or qualified as the definition qualifies the class)
+ * delegates; any other name is a base or a member, decided by the engine.
+ */
+function outOfClassMemInitializer(definition, target, args, variableTypes) {
+    const identity = declaratorIdentity(functionDeclarator(definition));
+    const className = String(identity.className || '').replace(/<.*$/s, '').trim();
+    if (!identity.name || identity.name !== className) return null;
+    const name = typeName(target);
+    if (!name) return null;
+    const scope = target.childForFieldName('scope');
+    const delegates = name === className && (!scope || scope.text.replace(/\s+/g, '') === identity.ownerQualifier);
+    const values = args.namedChildren.filter(child => !child.type.endsWith('comment'));
+    return { name, isMethod: false, isConstructor: true, constructorSyntax: 'delegation',
+        ctorDelegation: delegates ? 'this' : 'super',
+        ...(scope && { constructorQualifier: scope.text }),
+        ...(!delegates && { memberInitializer: true }),
+        argCount: values.length, argKinds: values.map(arg => staticArgumentKind(arg, variableTypes)) };
+}
+
 function implicitOwnerScope(node) {
     const identity = classIdentity(node);
     const namespace = identity.ownerQualifier
@@ -6146,9 +6168,22 @@ function findCallsInTree(code, parser, _options = {}, existingTree = null,
             }
         }
         if (mode === 'cpp' && node.type === 'field_initializer') {
-            let owner = node.parent;
-            while (owner && !['class_specifier', 'struct_specifier', 'union_specifier'].includes(owner.type)) owner = owner.parent;
+            let owner = node.parent, definition = null;
+            while (owner && !['class_specifier', 'struct_specifier', 'union_specifier'].includes(owner.type)) {
+                if (!definition && owner.type === 'function_definition') definition = owner;
+                owner = owner.parent;
+            }
             const target = node.namedChild(0), args = node.namedChildren.find(child => child.type === 'argument_list');
+            if (!owner && definition && target && args) {
+                // An out-of-class constructor definition (`W::W(..) : W(..)`,
+                // `D::D() : B(..)`, fix #421): its class body is in another
+                // place, so a name other than the class's own may be a
+                // member. The engine decides that by the class at query time.
+                const outOfClass = outOfClassMemInitializer(definition, target, args, variableTypes);
+                if (outOfClass) calls.push({ ...outOfClass, line: target.startPosition.row + 1,
+                    column: target.startPosition.column, callStart: node.startIndex, callEnd: node.endIndex,
+                    enclosingFunction: enclosingFunctionOf(node) });
+            }
             if (owner && target && args) {
                 const hidden = constructorFieldNames(owner).has(target.text);
                 const self = owner.childForFieldName('name');
@@ -6212,6 +6247,24 @@ function findCallsInTree(code, parser, _options = {}, existingTree = null,
                 });
             }
         }
+        // `Box b;`, `static Box s;`, `Box a[2];` (fix #421): default
+        // initialization runs the default constructor of a class type. The
+        // engine keeps the record only where the name denotes a class.
+        if (mode === 'cpp' && node.type === 'declaration') {
+            const type = node.childForFieldName('type');
+            const external = node.namedChildren.some(child => child.type === 'storage_class_specifier' && child.text === 'extern');
+            const name = !external && ['type_identifier', 'qualified_identifier', 'template_type'].includes(type?.type)
+                ? typeName(type) : null;
+            for (const declarator of name ? node.childrenForFieldName('declarator') : []) {
+                const target = declarator.type === 'array_declarator' ? declarator.childForFieldName('declarator') : declarator;
+                if (target?.type !== 'identifier') continue;
+                calls.push({ name, line: target.startPosition.row + 1, column: target.startPosition.column,
+                    callStart: declarator.startIndex, callEnd: declarator.endIndex,
+                    isMethod: false, isConstructor: true, constructorSyntax: 'default',
+                    ...(type.childForFieldName('scope') && { constructorQualifier: type.childForFieldName('scope').text }),
+                    argCount: 0, argKinds: [], enclosingFunction: enclosingFunctionOf(node) });
+            }
+        }
         if (mode === 'cpp' && node.type === 'compound_literal_expression') {
             const type = node.childForFieldName('type'), value = node.childForFieldName('value');
             const name = type && typeName(type);
@@ -6230,6 +6283,17 @@ function findCallsInTree(code, parser, _options = {}, existingTree = null,
     if (includeMacroBodies) calls.push(...findMacroBodyCalls(tree, code, parser));
     calls.push(...require('./constructor-bases').implicitBaseCalls(tree.rootNode, mode, null, implicitOwners));
     return calls;
+}
+
+/** Omitted base initializer calls of one class, read as findCallsInCode reads them (fix #421). */
+function implicitBaseCallsOf(code, parser, ownerLine, ownerEndLine, mode) {
+    const { implicitBaseCallsOfOwner } = require('./constructor-bases');
+    const tree = parseTree(parser, code);
+    const primary = implicitBaseCallsOfOwner(tree.rootNode, mode, null, ownerLine, ownerEndLine);
+    const literal = literalRecoveryTree(parser, code, tree);
+    if (!literal) return primary;
+    return mergeExtracted(primary, implicitBaseCallsOfOwner(literal.rootNode, mode, null, ownerLine, ownerEndLine)
+        .map(call => ({ ...call, configurationVariant: true })), callIdentityKey);
 }
 
 function callIdentityKey(call) {
@@ -6975,6 +7039,7 @@ function parse(code, parser, mode, options = {}) {
             result.externalMacroNames = [...externalMacroContext.consulted].sort();
         }
         if (mode === 'cpp') {
+            result.typeParameterNames = require('./utils').declaredTypeParameterNames(tree, literal);
             const markers = findMacroScopeMarkers(code, tree, lines);
             if (markers.length > 0) result.macroScopeMarkers = markers;
             const primaryUsings = findCppUsingFacts(tree);
@@ -7047,6 +7112,8 @@ function createCFamilyLanguage(mode) {
         findMacros,
         findCallsInCode: (code, parser, options, existingTree, includeMacroBodies) =>
             findCallsInCode(code, parser, options, existingTree, includeMacroBodies, mode),
+        implicitBaseCallsOf: (code, parser, ownerLine, ownerEndLine) =>
+            implicitBaseCallsOf(code, parser, ownerLine, ownerEndLine, mode),
         findImportsInCode,
         findExportsInCode: (code, parser) => findExportsInCodeShallow(code, parser, mode),
         findUsagesInCode: (code, name, parser, existingTree, options) =>

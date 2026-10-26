@@ -54,7 +54,9 @@ describe('fix #417: constructor facts survive worker and cache boundaries', () =
             'EnumNode.java:3:EnumNode', 'SdkBox.java:3:SdkBox', 'GenericSdkBox.java:4:GenericSdkBox', 'VarargNode.java:2:VarargNode', 'Node.cs:2:CsNode', 'node.cpp:2:CppNode', 'role.js:3:constructor'];
         const snapshot = index => JSON.stringify({
             symbols: [...index.symbols],
-            aliases: [...index.files].map(([file, entry]) => [file, entry.moduleAssignedNames, entry.moduleValueAliases]),
+            // Declared type-parameter names (fix #421) ride the same boundaries.
+            aliases: [...index.files].map(([file, entry]) => [file, entry.moduleAssignedNames, entry.moduleValueAliases,
+                entry.typeParameterNames]),
             calls: [...index.files.keys()].map(file => [file, index.getCachedCalls(file)]),
             genericReturn: index.findCallees(index.symbols.get('genericReturnBuild')[0], { collectAccount: true }),
             answers: handles.map(name => {
@@ -77,7 +79,8 @@ describe('fix #417: constructor facts survive worker and cache boundaries', () =
                 const variadicEdges = index.findCallees(index.symbols.get('varargBuild')[0], { collectAccount: true });
                 assert.deepEqual(variadicEdges.filter(def => def.type === 'constructor').map(def => def.bindingId), [variadic.bindingId]);
                 const { validateConfirmation, declarationIdentity } = require('../core/provenance');
-                for (const edge of variadicEdges) for (const site of edge.siteProvenance || []) assert.equal(
+                // The class edge beside it validates its class (fix #421).
+                for (const edge of variadicEdges.filter(def => def.type === 'constructor')) for (const site of edge.siteProvenance || []) assert.equal(
                     validateConfirmation(JSON.parse(JSON.stringify(site.provenance)), declarationIdentity(variadic)).verdict, 'establishes-target');
                 assert.equal(index.getCachedCalls(path.join(dir, 'node.cpp')).filter(call => call.constructorSyntax === 'list').length, 3);
                 const sdkCall = index.getCachedCalls(path.join(dir, 'SdkBox.java')).find(call => call.isConstructor);

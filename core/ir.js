@@ -261,6 +261,9 @@ function createFileIR({
         ...(parsed.cppUsings?.length > 0 && {
             cppUsings: parsed.cppUsings.map(item => ({ ...item })),
         }),
+        // Type-parameter names a file declares (fix #421), when the parser
+        // read them from the raw source.
+        ...(Array.isArray(parsed.typeParameterNames) && { typeParameterNames: [...parsed.typeParameterNames] }),
         ...(parsed.languageFeatures?.length > 0 && {
             languageFeatures: [...parsed.languageFeatures],
         }),

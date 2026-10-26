@@ -13,6 +13,13 @@ const { isTestFile } = require('./discovery');
 const { NON_CALLABLE_TYPES, isOverrideMarked, codeUnitCompare, isTestPath, CALLABLE_SYMBOL_KINDS,
     isMacroNamespaceDefinition } = require('./shared');
 const { _resolveJavaPackageImport, _rustWalkUsePath, splitParentList } = require('./graph-build');
+// JDK contracts used by Java overload and receiver rules (fix #421: language
+// data lives in the language's module).
+const {
+    JAVA_FINAL_REFERENCE_TYPES, JAVA_PLATFORM_VALUE_ANCESTRY, JAVA_WRAPPER_PRIMITIVES, JAVA_PLATFORM_FIELD_TYPES,
+    JAVA_PLATFORM_METHOD_RETURNS, JAVA_PLATFORM_ANCESTOR_MEMBERS, JAVA_PLATFORM_SUPERTYPES,
+    JAVA_MODELED_PLATFORM_TYPES, platformAssignable: _javaPlatformAssignable,
+} = require('../languages/java-platform');
 const { externalTypeGate, stripExternalReceiverType, externalTypeDenotation, externalProducerVia, externalReceiverVerdict, csharpUsings, siteNamespaceOf } = require('./type-denotation');
 const { scoreEdge, tierForResolution, TIER, validateConfirmation } = require('./confidence');
 const { summarizeProvenance, declarationIdentity, sameDeclaration } = require('./provenance');
@@ -1289,6 +1296,17 @@ function findCallers(index, name, options = {}) {
                 }
                 // `T v(X());` declares a function when X is a type (fix #401).
                 if (call.declarationReading && _cppNamesType(index, call.name)) continue;
+                // A data member's out-of-class mem-initializer, a default
+                // initialization of no class type (fix #421).
+                if (_recordIsNoCall(index, filePath, call)) continue;
+                // A class template with specializations: which one a
+                // construction instantiates is decided by template-argument
+                // matching, never by its name (fix #421).
+                if ((call.name === name || call.resolvedName === name) && _constructsSpecializedTemplate(index, fileEntry, call) &&
+                    _specializationFamily(index, options.targetDefinitions || definitions)) {
+                    routeUnverified(filePath, fileEntry, call, 'template-specialization', null);
+                    continue;
+                }
                 if (structuralLanguage && call.receiverType) {
                     call = _withModuleValueAliasReceiver(index, filePath, call, true);
                 }
@@ -7572,8 +7590,9 @@ function findCallers(index, name, options = {}) {
                     ...(receiverType && { receiverType }),
                     ...(edgeCalledAs && { calledAs: edgeCalledAs }),
                     ...(call.macroExpansion && { macroExpansion: _macroSite(call) }),
-                    // A target-typed construction spells no name (fix #400).
-                    ...(call.targetTyped && { targetTyped: true }),
+                    // A target-typed construction or a keyword delegation
+                    // spells no name (fixes #400, #421).
+                    ..._namelessSiteFields(fileEntry, call),
                     ...(call.destructuredFrom && { destructured: call.destructuredFrom }),
                     ...(_spelledByImportAlias(fileEntry, call, edgeCalledAs) && { importAliasSpelling: true }),
                 };
@@ -7631,6 +7650,7 @@ function findCallers(index, name, options = {}) {
                     ...(receiverType && { receiverType }),
                     ...(edgeCalledAs && { calledAs: edgeCalledAs }),
                     ...(call.macroExpansion && { macroExpansion: _macroSite(call) }),
+                    ..._namelessSiteFields(fileEntry, call),
                     ...(call.destructuredFrom && { destructured: call.destructuredFrom }),
                     ...(_spelledByImportAlias(fileEntry, call, edgeCalledAs) && { importAliasSpelling: true }),
                 });
@@ -7662,8 +7682,9 @@ function findCallers(index, name, options = {}) {
                 ...(edgeCalledAs && { calledAs: edgeCalledAs }),
                 ...(call.macroExpansion && { macroExpansion: _macroSite(call) }),
                 // A target-typed construction (`HealthInfo h = new(..)`)
-                // spells no name at its site (fix #393).
-                ...(call.targetTyped && { targetTyped: true }),
+                // or a keyword delegation spells no name at its site
+                // (fixes #393, #421).
+                ..._namelessSiteFields(fileEntry, call),
                 // A name destructured from the member: the member's name is
                 // spelled at the pattern key (fix #397).
                 ...(call.destructuredFrom && { destructured: call.destructuredFrom }),
@@ -7775,6 +7796,7 @@ function findCallers(index, name, options = {}) {
     }
 
     require('./constructor-calls').projectConstructorCallers(index, name, options, callers);
+    _addOutOfClassImplicitBaseCallers(index, name, options, callers);
 
     if (queryProfile) {
         const countBy = (rows, field) => {
@@ -7850,9 +7872,13 @@ function findCallees(index, definition, options = {}) {
         // remain in the slice and retain the existing inner-symbol rules.
         // Annotation element keys (fix #389) name an element of the
         // annotation type; the annotated declaration makes no call.
-        const calls = (rangeRecords !== undefined ? rangeRecords : _callsInDefinitionRange(index, def.file, allCalls,
+        // An out-of-class constructor definition also runs the default
+        // constructors of the bases its class declares elsewhere and it
+        // does not initialize (fix #421): unverified candidate records.
+        const calls = [...(rangeRecords !== undefined ? rangeRecords : _callsInDefinitionRange(index, def.file, allCalls,
             def.startLine, def.endLine)).filter(call => !call.annotationElement && !isDataMemberReference(
-                index.files.get(def.file), call, index.symbols.get(call.name) || []));
+            index.files.get(def.file), call, index.symbols.get(call.name) || [])),
+        ...require('./out-of-class-members').implicitBaseRecords(index, def, name => _cppNamesType(index, name))];
         // The reachability walk uses the legacy (non-accounting) path and most
         // entry/test symbols contain no calls. Avoid constructing receiver,
         // overload, and flow machinery for an empty source range. Contract
@@ -7924,6 +7950,30 @@ function findCallees(index, definition, options = {}) {
         } : null;
         const claimedSiteIds = collectAccount ? new Set() : null;
         const unverifiedCallees = collectAccount ? new Map() : null; // name|reason -> entry
+        // Constructions whose class edge is confirmed but whose constructor
+        // body is undecided (fix #421), by class, constructor name and
+        // reason. Their sites belong to the class edge's account.
+        const initializerReviews = collectAccount ? new Map() : null;
+        const noteInitializerReview = (entry, owner) => {
+            const name = entry.provenance?.facts?.constructorCall?.members?.[0]?.name ||
+                langTraits(index.files.get(owner.file)?.language)?.constructorProtocol?.initializer ||
+                langTraits(index.files.get(owner.file)?.language)?.fixedConstructorName || owner.name;
+            const key = `${owner.name}|${name}|${entry.reason}`;
+            let review = initializerReviews.get(key);
+            if (!review) {
+                const candidates = entry.provenance?.facts?.constructorCall?.members?.length;
+                review = { name, initializerOf: owner.name, reason: entry.reason, callCount: 0, sites: [],
+                    siteProvenance: [], ...(candidates > 1 && { candidates }) };
+                initializerReviews.set(key, review);
+            }
+            review.callCount++;
+            review.sites.push(entry.call.line);
+            const score = scoreEdge({ isUncertain: true, reason: entry.reason });
+            review.siteProvenance.push({ ...provenanceForSite(entry.siteId, owner, entry.reason),
+                provenance: entry.provenance, tier: TIER.UNVERIFIED, reason: entry.reason,
+                confidence: score.confidence, evidenceScore: score.evidenceScore,
+                resolution: entry.reason, scoreKind: score.scoreKind });
+        };
         const noteSite = (siteId, bucket, reason, call) => {
             if (!calleeAccount || claimedSiteIds.has(siteId)) return;
             claimedSiteIds.add(siteId);
@@ -8094,6 +8144,9 @@ function findCallees(index, definition, options = {}) {
                 call = _withCppMacroParamReceiver(index, def.file, call);
             }
             if (call.declarationReading && _cppNamesType(index, call.name)) continue;
+            // A data member's out-of-class mem-initializer, a default
+            // initialization of no class type (fix #421).
+            if (_recordIsNoCall(index, def.file, call)) continue;
             // A local declared with a supertype and never reassigned after
             // `new T(..)` runs T's member (fix #394; the caller-side twin).
             if (call.receiverType && call.receiverTypeEvidence?.constructedType) {
@@ -8204,6 +8257,10 @@ function findCallees(index, definition, options = {}) {
 
             if (!isDirectMatch && !isNestedCallback) continue;
             if (calleeAccount) calleeAccount.totalSites++;
+            if (call.implicitOutOfClass) {
+                noteUnverified(siteId, call, 'constructor-implicit-base-unproven');
+                continue;
+            }
             if (importQualifier) {
                 noteUnverified(siteId, call, 'package-qualifier');
                 continue;
@@ -10881,10 +10938,23 @@ function findCallees(index, definition, options = {}) {
                     }
                 }
 
+                // Constructions of a specialized class template: the member
+                // they instantiate is not decided by the name (fix #421).
+                if (IDENTITY_TYPE_KINDS.has(callee.type) && collectAccount && _specializationFamily(index, [callee])) {
+                    const constructions = siteIds.filter(siteId => _constructsSpecializedTemplate(index, fileEntry,
+                        siteEvidence.get(siteId).call));
+                    for (const siteId of constructions) noteUnverified(siteId, siteEvidence.get(siteId).call, 'template-specialization');
+                    if (constructions.length === siteIds.length) continue;
+                    siteIds = siteIds.filter(siteId => !constructions.includes(siteId));
+                    sites = siteIds.map(siteId => siteEvidence.get(siteId).call.line);
+                    count = siteIds.length;
+                }
+                let constructed = null;
                 if (IDENTITY_TYPE_KINDS.has(callee.type)) {
                     const projected = require('./constructor-calls').projectConstructorCalleeSites(index, callee,
                         siteIds, siteId => ({ call: siteEvidence.get(siteId).call,
                             site: provenanceForSite(siteId, callee) }));
+                    constructed = projected;
                     if (projected) {
                         for (const entry of projected.unverified) {
                             noteUnverified(entry.siteId, entry.call, entry.reason, {}, {
@@ -10905,9 +10975,11 @@ function findCallees(index, definition, options = {}) {
                                     sites: evidence.map(site => site.line).sort((a, b) => a - b) }) });
                         }
                         if (!projected.remaining.length) continue;
-                        siteIds = projected.remaining;
-                        sites = siteIds.map(siteId => siteEvidence.get(siteId).call.line);
-                        count = siteIds.length;
+                        if (projected.remaining.length !== siteIds.length) {
+                            siteIds = projected.remaining;
+                            sites = siteIds.map(siteId => siteEvidence.get(siteId).call.line);
+                            count = siteIds.length;
+                        }
                     }
                 }
 
@@ -10970,6 +11042,32 @@ function findCallees(index, definition, options = {}) {
                         ...(isFunctionReference && { functionReference: true }),
                     }),
                 });
+                // The constructor bodies the confirmed constructions run
+                // (fix #421): an edge beside the class dependency, never a
+                // replacement of it, and no call site of its own in the
+                // account. An undecided body is a review of the class edge.
+                if (constructed) {
+                    const classSites = new Set(collectAccount ? siteProvenance.map(site => site.siteId) : siteIds);
+                    for (const entry of constructed.initializers) {
+                        const evidence = entry.sites.filter(site => classSites.has(site.siteId));
+                        if (!evidence.length) continue;
+                        const weakest = evidence.reduce((a, b) => a.evidenceScore < b.evidenceScore ? a : b);
+                        result.push({ ...entry.definition, callCount: evidence.length,
+                            weight: index.calculateWeight(evidence.length),
+                            confidence: weakest.confidence, evidenceScore: weakest.evidenceScore,
+                            scoreKind: weakest.scoreKind, resolution: weakest.resolution,
+                            initializerOf: callee.name,
+                            ...(collectAccount && { tier: TIER.CONFIRMED,
+                                provenance: summarizeProvenance(evidence), siteProvenance: evidence,
+                                sites: evidence.map(site => site.line).sort((a, b) => a - b) }) });
+                    }
+                    if (collectAccount) {
+                        for (const entry of constructed.initializerReviews) {
+                            if (!classSites.has(entry.siteId)) continue;
+                            noteInitializerReview(entry, callee);
+                        }
+                    }
+                }
             }
         }
 
@@ -10991,6 +11089,13 @@ function findCallees(index, definition, options = {}) {
             });
             Object.defineProperty(result, 'unverifiedCallees', {
                 value: unverifiedList, enumerable: false, writable: true, configurable: true,
+            });
+            const reviewList = [...initializerReviews.values()]
+                .map(entry => ({ ...entry, sites: [...entry.sites].sort((a, b) => a - b) }))
+                .sort((a, b) => codeUnitCompare(a.initializerOf, b.initializerOf) || codeUnitCompare(a.name, b.name) ||
+                    codeUnitCompare(a.reason, b.reason));
+            Object.defineProperty(result, 'initializerReviews', {
+                value: reviewList, enumerable: false, writable: true, configurable: true,
             });
         }
 
@@ -17579,8 +17684,15 @@ function _goPackageSymbolMatch(index, symbols, importModule) {
 
 function selectProvenanceOverload(index, call, candidates, language) {
     // Braced construction has a separate list-initialization overload phase.
-    // Its element count is not an ordinary constructor argument count.
+    // Its element count is not an ordinary constructor argument count. An
+    // empty list value-initializes a class with a default constructor, before
+    // any initializer-list constructor ([dcl.init.list] 3.4, fix #421).
     if (call.constructorSyntax === 'list' && candidates.some(def => def.type === 'constructor')) {
+        if (call.argCount === 0) {
+            const defaults = candidates.filter(def => def.type === 'constructor' && Array.isArray(def.paramsStructured) &&
+                def.paramsStructured.every(param => param.optional || param.default !== undefined || param.rest || param.variadic));
+            if (defaults.length === 1) return { match: defaults[0] };
+        }
         return { ambiguous: true };
     }
     // The slots depend only on the candidate set: one decomposition per
@@ -17601,13 +17713,21 @@ function selectProvenanceOverload(index, call, candidates, language) {
         }
         memo?.set(key, slots);
     }
+    // Where calls may pass any argument count (JavaScript), one callable
+    // identity is the call's target whatever its arguments: an extra or
+    // missing argument is a mismatch verify reports (fix #421).
+    if (slots.length === 1 && langTraits(language)?.lenientCallArity) return { match: slots[0] };
     return _calleeOverloadSelect(index, call, slots, language);
 }
 
 function _calleeOverloadSelect(index, call, matches, language) {
     if (matches.length === 0) return { match: null };
+    // The call's own member and each candidate declaration are where the
+    // overload facts were read (fix #421).
     if (langTraits(language)?.typeNameSourceCanonical && call.argumentFile &&
-        (!_typeNamesCanonicalAt(index, call.argumentFile) || matches.some(def => !_typeNamesCanonicalAt(index, def.file)))) {
+        (!_typeNamesCanonicalAt(index, call.argumentFile, call.enclosingFunction?.startLine != null
+            ? call.enclosingFunction : { startLine: call.line }) ||
+            matches.some(def => !_typeNamesCanonicalAt(index, def.file, def)))) {
         return { ambiguous: true };
     }
     if (langTraits(language)?.typeNameScoping === 'package-on-demand' && call.argumentFile && call.argKinds) {
@@ -17653,7 +17773,9 @@ function _calleeOverloadSelect(index, call, matches, language) {
         const probed = _rustProbeReferenceSiblings(call, applicable);
         if (probed) return { match: probed };
     }
-    return { ambiguous: true };
+    // The overloads still applicable: a caller that needs only what they
+    // share (a producer's return type) can decide without choosing one.
+    return { ambiguous: true, applicable };
 }
 
 /**
@@ -18421,6 +18543,106 @@ function _cppMacroParamReceiverType(index, filePath, call) {
 }
 
 /** Does a C/C++ project declaration make `name` a type (class or alias)? */
+/**
+ * Out-of-class constructor definitions of derived classes that leave a
+ * base to implicit default construction (fix #421): unverified callers of
+ * the base class and of its constructors callable without arguments. The
+ * base list is read from a class declared in another place, so no site is
+ * confirmed.
+ */
+function _addOutOfClassImplicitBaseCallers(index, name, options, callers) {
+    if (!options.collectAccount || options.constructorProjectionSource) return;
+    const members = require('./out-of-class-members');
+    const { isConstructor } = require('./constructor-calls');
+    const { ownerDefinitionOf } = require('./class-identity');
+    const owners = new Set();
+    for (const target of options.targetDefinitions || index.symbols.get(name) || []) {
+        if (!langTraits(index.files.get(target.file)?.language)?.outOfClassMemberDefinitions) continue;
+        if (['class', 'struct'].includes(target.type)) owners.add(target);
+        else if (isConstructor(target, index) && (target.paramsStructured || []).every(param =>
+            param.default !== undefined || param.optional || param.rest || param.variadic)) {
+            const owner = ownerDefinitionOf(index, target) || members.definitionOwner(index, target);
+            if (owner) owners.add(owner);
+        }
+    }
+    if (!owners.size) return;
+    const existing = new Set([...callers, ...(callers.unverifiedEntries || [])].map(row => `${row.file}\0${row.line}`));
+    const added = [];
+    for (const owner of owners) {
+        for (const def of members.implicitBaseCallerRows(index, owner, base => _cppNamesType(index, base))) {
+            const key = `${def.file}\0${def.startLine}`;
+            if (existing.has(key)) continue;
+            existing.add(key);
+            const reason = 'constructor-implicit-base-unproven';
+            const scored = scoreEdge({ isUncertain: true, reason });
+            let content;
+            try { content = index._getFileLines(def.file)[def.startLine - 1] ?? ''; } catch { content = ''; }
+            added.push({ file: def.file, relativePath: def.relativePath, line: def.startLine, content,
+                callerName: def.name, callerFile: def.file, callerStartLine: def.startLine, callerEndLine: def.endLine,
+                isMethod: false, implicitConstruction: true, confidence: scored.confidence,
+                evidenceScore: scored.evidenceScore, scoreKind: scored.scoreKind, resolution: reason,
+                provenance: scored.provenance, tier: TIER.UNVERIFIED, reason });
+        }
+    }
+    if (!added.length) return;
+    const entries = [...(callers.unverifiedEntries || []), ...added].sort((a, b) =>
+        codeUnitCompare(a.relativePath, b.relativePath) || (a.line || 0) - (b.line || 0));
+    Object.defineProperty(callers, 'unverifiedEntries', { value: entries, enumerable: false, writable: true, configurable: true });
+}
+
+/**
+ * A C++ record the engine reads as no call (fix #421): an out-of-class
+ * mem-initializer of a data member, or a default initialization whose type
+ * is no class. Callers, callees and the text account agree on it.
+ */
+function _recordIsNoCall(index, filePath, call) {
+    return (!!call.memberInitializer && _initializesMember(index, filePath, call)) ||
+        (call.constructorSyntax === 'default' && !_cppNamesClass(index, call.name));
+}
+
+/** Is the record a construction spelled by a class name (C++ functional or explicit)? */
+function _constructsSpecializedTemplate(index, fileEntry, call) {
+    return !call.isMethod && !call.isFunctionReference && !call.isTypeReference &&
+        (call.isConstructor || !!langTraits(fileEntry?.language)?.functionalTypeConstruction) &&
+        !['delegation', 'implicit'].includes(call.constructorSyntax);
+}
+
+/**
+ * Does a target class (or a target constructor's class) belong to a class
+ * template family with specializations (fix #421)? Its constructions
+ * instantiate a member chosen by template-argument matching, which the
+ * engine does not model: they stay unverified `template-specialization`.
+ */
+function _specializationFamily(index, targets) {
+    const memo = index.isProvenanceFactIndex ? null : index._opMemo?.('specializationFamily', () => new WeakMap());
+    const scope = def => [def.namespace, def.enclosingType].filter(Boolean).join('::');
+    for (const target of targets || []) {
+        if (memo?.has(target)) { if (memo.get(target)) return true; continue; }
+        let owner = IDENTITY_TYPE_KINDS.has(target.type) ? target : null;
+        if (!owner && require('./constructor-calls').isConstructor(target, index)) {
+            owner = require('./class-identity').ownerDefinitionOf(index, target) ||
+                require('./out-of-class-members').definitionOwner(index, target);
+        }
+        const family = owner ? (index.symbols.get(owner.name) || []).filter(def => IDENTITY_TYPE_KINDS.has(def.type) &&
+            !def.forwardDeclaration && scope(def) === scope(owner)) : [];
+        const specialized = family.length > 1 && family.some(def => def.specialization);
+        memo?.set(target, specialized);
+        if (specialized) return true;
+    }
+    return false;
+}
+
+/** Does `name` denote a C/C++ class type, directly or through an alias (fix #421)? */
+function _cppNamesClass(index, name) {
+    return require('./constructor-calls').constructionTypeCandidates(index, name).some(def =>
+        ['class', 'struct'].includes(def.type) && ['c', 'cpp'].includes(index.files.get(def.file)?.language));
+}
+
+function _initializesMember(index, filePath, call) {
+    return require('./out-of-class-members').initializesMember(index, filePath, call,
+        name => _cppNamesType(index, name));
+}
+
 function _cppNamesType(index, name) {
     return (index.symbols.get(name) || []).some(d =>
         (IDENTITY_TYPE_KINDS.has(d.type) || d.type === 'type') && d.file &&
@@ -20039,6 +20261,18 @@ function _destructuredMemberView(call) {
  * already carry `calledAs`.
  */
 const _importAliasLocalsMemo = new WeakMap();
+/**
+ * A site that spells no name of the called type (fix #421): a C#
+ * target-typed `new(..)` (fix #393) or a keyword constructor delegation
+ * (`this(..)`, `super(..)`, `base(..)`). A rename never edits its token.
+ */
+function _namelessSiteFields(fileEntry, call) {
+    if (call.targetTyped) return { targetTyped: true };
+    if (call.constructorSyntax === 'delegation' && call.ctorDelegation &&
+        langTraits(fileEntry?.language)?.keywordConstructorDelegation) return { keywordDelegation: true };
+    return null;
+}
+
 function _spelledByImportAlias(fileEntry, call, calledAs) {
     if (calledAs || call.isMethod || call.receiver || call.resolvedName) return false;
     const bindings = fileEntry.importBindings;
@@ -21842,32 +22076,7 @@ const CSHARP_PLATFORM_MEMBER_TYPES = new Map([
     ['String.Empty', 'String'],
     ['string.Empty', 'String'],
 ]);
-const JAVA_FINAL_REFERENCE_TYPES = new Set([
-    'String', 'Class', 'Boolean', 'Byte', 'Character', 'Short',
-    'Integer', 'Long', 'Float', 'Double', 'Void',
-]);
 
-// Complete reference-supertype sets for JDK value types (fix #299D): these
-// types are final (or effectively closed) with a fixed, fully-known
-// ancestry, so an argument statically typed as one of them can bind ONLY a
-// parameter type in this list (plus Object/generics, handled earlier). A
-// project class shadowing one of these simple names disables the denial —
-// the guard is tDefs.length === 0 at the use site. Modern-JDK marker
-// interfaces (Constable, ConstantDesc) are included so their params never
-// get falsely denied.
-const JAVA_PLATFORM_VALUE_ANCESTRY = new Map([
-    ['Integer', ['Number', 'Comparable', 'Serializable', 'Constable', 'ConstantDesc']],
-    ['Long', ['Number', 'Comparable', 'Serializable', 'Constable', 'ConstantDesc']],
-    ['Short', ['Number', 'Comparable', 'Serializable', 'Constable', 'ConstantDesc']],
-    ['Byte', ['Number', 'Comparable', 'Serializable', 'Constable', 'ConstantDesc']],
-    ['Float', ['Number', 'Comparable', 'Serializable', 'Constable', 'ConstantDesc']],
-    ['Double', ['Number', 'Comparable', 'Serializable', 'Constable', 'ConstantDesc']],
-    ['Character', ['Comparable', 'Serializable', 'Constable']],
-    ['Boolean', ['Comparable', 'Serializable', 'Constable']],
-    ['String', ['CharSequence', 'Comparable', 'Serializable', 'Constable', 'ConstantDesc']],
-    ['BigInteger', ['Number', 'Comparable', 'Serializable']],
-    ['BigDecimal', ['Number', 'Comparable', 'Serializable']],
-]);
 
 // Which parameter types a call-site literal kind can bind (Java overload
 // resolution: identity, widening, boxing — plus the boxed types' interfaces).
@@ -21886,30 +22095,7 @@ const JAVA_KIND_TYPES = {
     byte: ['byte', 'short', 'int', 'long', 'float', 'double', 'Byte', 'Number', 'Comparable', 'Serializable'],
 };
 
-// Unboxing is defined for exactly these wrapper types (JLS 5.1.8).
-const JAVA_WRAPPER_PRIMITIVES = new Map([
-    ['Integer', 'int'], ['Long', 'long'], ['Short', 'short'], ['Byte', 'byte'],
-    ['Character', 'char'], ['Boolean', 'boolean'],
-    ['Float', 'float'], ['Double', 'double'],
-]);
 
-// Declared types of the JDK numeric-constant fields (fix #299D): exact
-// compiler contracts, consulted only when no project field shadows the
-// owner/field pair.
-const JAVA_PLATFORM_FIELD_TYPES = new Map([
-    ['Float.NaN', 'float'], ['Float.POSITIVE_INFINITY', 'float'],
-    ['Float.NEGATIVE_INFINITY', 'float'], ['Float.MIN_VALUE', 'float'],
-    ['Float.MAX_VALUE', 'float'], ['Float.MIN_NORMAL', 'float'],
-    ['Double.NaN', 'double'], ['Double.POSITIVE_INFINITY', 'double'],
-    ['Double.NEGATIVE_INFINITY', 'double'], ['Double.MIN_VALUE', 'double'],
-    ['Double.MAX_VALUE', 'double'], ['Double.MIN_NORMAL', 'double'],
-    ['Integer.MAX_VALUE', 'int'], ['Integer.MIN_VALUE', 'int'],
-    ['Long.MAX_VALUE', 'long'], ['Long.MIN_VALUE', 'long'],
-    ['Short.MAX_VALUE', 'short'], ['Short.MIN_VALUE', 'short'],
-    ['Byte.MAX_VALUE', 'byte'], ['Byte.MIN_VALUE', 'byte'],
-    ['Character.MAX_VALUE', 'char'], ['Character.MIN_VALUE', 'char'],
-    ['Boolean.TRUE', 'Boolean'], ['Boolean.FALSE', 'Boolean'],
-]);
 
 // Exact subset of C# implicit conversions for compiler-owned closed types.
 // Returns null when user-defined conversions or external ancestry could
@@ -22022,84 +22208,7 @@ function _csharpKnownTypeAssignable(actualRaw, expectedRaw) {
     return false;
 }
 
-// Small, authoritative platform surface used only when the parser preserved
-// the imported owner. These are JDK interface/method declarations, not
-// name-based guesses. They close the common portable-AST gap where overload
-// resolution depends on the return type of a library call.
-const JAVA_PLATFORM_METHOD_RETURNS = new Map([
-    // Exact JDK factory contracts (fix #299D): valueOf on the boxed and
-    // arbitrary-precision types returns the owner type itself.
-    ['java.math.BigInteger#valueOf', 'java.math.BigInteger'],
-    ['java.math.BigDecimal#valueOf', 'java.math.BigDecimal'],
-    ['java.lang.Integer#valueOf', 'java.lang.Integer'],
-    ['java.lang.Long#valueOf', 'java.lang.Long'],
-    ['java.lang.Short#valueOf', 'java.lang.Short'],
-    ['java.lang.Byte#valueOf', 'java.lang.Byte'],
-    ['java.lang.Float#valueOf', 'java.lang.Float'],
-    ['java.lang.Double#valueOf', 'java.lang.Double'],
-    ['java.lang.Boolean#valueOf', 'java.lang.Boolean'],
-    ['java.lang.Character#valueOf', 'java.lang.Character'],
-    ['java.lang.String#valueOf', 'java.lang.String'],
-    ['java.lang.Object#getClass', 'java.lang.Class'],
-    ['java.lang.Class#getEnclosingClass', 'java.lang.Class'],
-    ['java.lang.Class#getDeclaringClass', 'java.lang.Class'],
-    ['java.lang.Class#getDeclaredMethod', 'java.lang.reflect.Method'],
-    ['java.lang.Enum#getDeclaringClass', 'java.lang.Class'],
-    ['java.lang.reflect.Method#getReturnType', 'java.lang.Class'],
-    ['java.lang.reflect.Constructor#getDeclaringClass', 'java.lang.Class'],
-    ['java.lang.annotation.Annotation#annotationType', 'java.lang.Class'],
-    ['java.lang.reflect.Method#getGenericReturnType', 'java.lang.reflect.Type'],
-    ['java.lang.reflect.Method#getParameterTypes', 'java.lang.Class[]'],
-    ['java.lang.reflect.Method#getGenericParameterTypes', 'java.lang.reflect.Type[]'],
-    ['javax.lang.model.element.Element#asType', 'javax.lang.model.type.TypeMirror'],
-    ['javax.lang.model.element.TypeElement#asType', 'javax.lang.model.type.TypeMirror'],
-    ['javax.lang.model.element.TypeParameterElement#asType', 'javax.lang.model.type.TypeMirror'],
-    ['javax.lang.model.element.VariableElement#asType', 'javax.lang.model.type.TypeMirror'],
-    ['javax.lang.model.element.ExecutableElement#asType', 'javax.lang.model.type.TypeMirror'],
-    ['javax.lang.model.element.ExecutableElement#getReturnType', 'javax.lang.model.type.TypeMirror'],
-    ['javax.lang.model.element.AnnotationMirror#getElementValues', 'java.util.Map'],
-    ['javax.lang.model.element.Element#getAnnotationMirrors', 'java.util.List'],
-    ['javax.lang.model.element.TypeElement#getAnnotationMirrors', 'java.util.List'],
-    ['javax.lang.model.element.TypeElement#getEnclosedElements', 'java.util.List'],
-    ['javax.lang.model.element.ExecutableElement#getParameters', 'java.util.List'],
-    ['javax.lang.model.util.ElementFilter#methodsIn', 'java.util.List'],
-    ['javax.lang.model.util.Types#getPrimitiveType', 'javax.lang.model.type.PrimitiveType'],
-    ['javax.lang.model.util.Types#getArrayType', 'javax.lang.model.type.ArrayType'],
-    ['javax.lang.model.util.Types#getDeclaredType', 'javax.lang.model.type.DeclaredType'],
-    ['javax.lang.model.util.Types#getWildcardType', 'javax.lang.model.type.WildcardType'],
-    ['javax.lang.model.util.Types#getNoType', 'javax.lang.model.type.NoType'],
-    ['javax.lang.model.util.Types#getNullType', 'javax.lang.model.type.NullType'],
-]);
 
-// Complete inherited member-name surfaces of these JDK contracts. None declares
-// a member type. A contract is usable only after the written supertype has
-// resolved to this qualified SDK identity; an external namesake is unknown.
-const JAVA_PLATFORM_ANCESTOR_MEMBERS = new Map([
-    ['java.lang.Object', new Set(['getClass', 'hashCode', 'equals', 'clone',
-        'toString', 'notify', 'notifyAll', 'wait', 'finalize'])],
-    ['java.lang.Comparable', new Set(['compareTo'])],
-    ['java.lang.Iterable', new Set(['iterator', 'forEach', 'spliterator'])],
-    ['java.lang.AutoCloseable', new Set(['close'])],
-    ['java.io.Closeable', new Set(['close'])],
-    ['java.util.Map.Entry', new Set(['getKey', 'getValue', 'setValue', 'equals', 'hashCode'])],
-    ['java.lang.Runnable', new Set(['run'])],
-    ['java.lang.Cloneable', new Set()],
-    ['java.io.Serializable', new Set()],
-    ['java.nio.file.Path', new Set(['compareTo', 'endsWith', 'equals', 'forEach',
-        'getFileName', 'getFileSystem', 'getName', 'getNameCount', 'getParent',
-        'getRoot', 'hashCode', 'isAbsolute', 'iterator', 'normalize', 'of',
-        'register', 'relativize', 'resolve', 'resolveSibling', 'spliterator',
-        'startsWith', 'subpath', 'toAbsolutePath', 'toFile', 'toRealPath',
-        'toString', 'toUri'])],
-    ['java.nio.file.spi.FileSystemProvider', new Set(['checkAccess', 'clone', 'copy',
-        'createDirectory', 'createLink', 'createSymbolicLink', 'delete', 'deleteIfExists',
-        'equals', 'exists', 'finalize', 'getClass', 'getFileAttributeView', 'getFileStore',
-        'getFileSystem', 'getPath', 'getScheme', 'hashCode', 'installedProviders',
-        'isHidden', 'isSameFile', 'move', 'newAsynchronousFileChannel', 'newByteChannel',
-        'newDirectoryStream', 'newFileChannel', 'newFileSystem', 'newInputStream',
-        'newOutputStream', 'notify', 'notifyAll', 'readAttributes', 'readAttributesIfExists',
-        'readSymbolicLink', 'setAttribute', 'toString', 'wait'])],
-]);
 
 function _javaPlatformSupertypeContract(index, parent, owner) {
     const entry = owner?.file && index.files.get(owner.file);
@@ -22132,80 +22241,8 @@ function _javaPlatformSupertypeContract(index, parent, owner) {
     return JAVA_PLATFORM_ANCESTOR_MEMBERS.get(qualified) || null;
 }
 
-const JAVA_PLATFORM_SUPERTYPES = new Map([
-    ['java.lang.reflect.Type', ['java.lang.Object']],
-    ['java.lang.reflect.ParameterizedType', ['java.lang.Object', 'java.lang.reflect.Type']],
-    ['java.lang.reflect.GenericArrayType', ['java.lang.Object', 'java.lang.reflect.Type']],
-    ['java.lang.reflect.TypeVariable', ['java.lang.Object', 'java.lang.reflect.Type',
-        'java.lang.reflect.AnnotatedElement']],
-    ['java.lang.reflect.WildcardType', ['java.lang.Object', 'java.lang.reflect.Type']],
-    ['java.lang.Class', ['java.lang.Object', 'java.lang.reflect.Type', 'java.io.Serializable',
-        'java.lang.reflect.GenericDeclaration', 'java.lang.reflect.AnnotatedElement',
-        'java.lang.invoke.TypeDescriptor.OfField', 'java.lang.invoke.TypeDescriptor',
-        'java.lang.constant.Constable']],
-    ['javax.lang.model.type.ArrayType', ['javax.lang.model.type.ReferenceType',
-        'javax.lang.model.type.TypeMirror']],
-    ['javax.lang.model.type.DeclaredType', ['javax.lang.model.type.ReferenceType',
-        'javax.lang.model.type.TypeMirror']],
-    ['javax.lang.model.type.ErrorType', ['javax.lang.model.type.DeclaredType',
-        'javax.lang.model.type.ReferenceType', 'javax.lang.model.type.TypeMirror']],
-    ['javax.lang.model.type.ExecutableType', ['javax.lang.model.type.TypeMirror']],
-    ['javax.lang.model.type.IntersectionType', ['javax.lang.model.type.TypeMirror']],
-    ['javax.lang.model.type.NoType', ['javax.lang.model.type.TypeMirror']],
-    ['javax.lang.model.type.NullType', ['javax.lang.model.type.ReferenceType',
-        'javax.lang.model.type.TypeMirror']],
-    ['javax.lang.model.type.PrimitiveType', ['javax.lang.model.type.TypeMirror']],
-    ['javax.lang.model.type.TypeVariable', ['javax.lang.model.type.ReferenceType',
-        'javax.lang.model.type.TypeMirror']],
-    ['javax.lang.model.type.UnionType', ['javax.lang.model.type.TypeMirror']],
-    ['javax.lang.model.type.WildcardType', ['javax.lang.model.type.TypeMirror']],
-    // JDK collections (fix #391): their declared supertypes, so a
-    // `new LinkedHashMap<>()` argument proves a Map parameter applicable.
-    ...[
-        ['ArrayList', ['List', 'Collection', 'Iterable', 'RandomAccess', 'AbstractList',
-            'AbstractCollection', 'SequencedCollection', 'Cloneable', 'Serializable']],
-        ['LinkedList', ['List', 'Deque', 'Queue', 'Collection', 'Iterable', 'AbstractSequentialList',
-            'AbstractList', 'AbstractCollection', 'SequencedCollection', 'Cloneable', 'Serializable']],
-        ['ArrayDeque', ['Deque', 'Queue', 'Collection', 'Iterable', 'AbstractCollection',
-            'SequencedCollection', 'Cloneable', 'Serializable']],
-        ['HashMap', ['Map', 'AbstractMap', 'Cloneable', 'Serializable']],
-        ['LinkedHashMap', ['HashMap', 'Map', 'SequencedMap', 'AbstractMap', 'Cloneable', 'Serializable']],
-        ['TreeMap', ['NavigableMap', 'SortedMap', 'SequencedMap', 'Map', 'AbstractMap', 'Cloneable',
-            'Serializable']],
-        ['HashSet', ['Set', 'Collection', 'Iterable', 'AbstractSet', 'AbstractCollection', 'Cloneable',
-            'Serializable']],
-        ['LinkedHashSet', ['HashSet', 'SequencedSet', 'SequencedCollection', 'Set', 'Collection', 'Iterable',
-            'AbstractSet', 'AbstractCollection', 'Cloneable', 'Serializable']],
-        ['TreeSet', ['NavigableSet', 'SortedSet', 'SequencedSet', 'SequencedCollection', 'Set', 'Collection',
-            'Iterable', 'AbstractSet', 'AbstractCollection', 'Cloneable', 'Serializable']],
-    ].map(([type, supertypes]) => [`java.util.${type}`, supertypes.map(name =>
-        (name === 'Iterable' || name === 'Cloneable' ? `java.lang.${name}`
-            : name === 'Serializable' ? 'java.io.Serializable' : `java.util.${name}`))]),
-]);
 
-const JAVA_MODELED_PLATFORM_TYPES = new Set([
-    ...JAVA_PLATFORM_ANCESTOR_MEMBERS.keys(),
-    ...JAVA_PLATFORM_METHOD_RETURNS.keys()].map(name => name.split('#')[0]));
-for (const type of JAVA_PLATFORM_METHOD_RETURNS.values()) JAVA_MODELED_PLATFORM_TYPES.add(type.replace(/\[\]$/, ''));
-for (const [type, parents] of JAVA_PLATFORM_SUPERTYPES) {
-    JAVA_MODELED_PLATFORM_TYPES.add(type);
-    for (const parent of parents) JAVA_MODELED_PLATFORM_TYPES.add(parent);
-}
 
-function _javaPlatformAssignable(actualType, expectedSimple) {
-    if (!actualType?.includes('.')) return null;
-    const actualSimple = actualType.split('.').pop();
-    if (actualSimple === expectedSimple) return true;
-    const known = JAVA_PLATFORM_SUPERTYPES.get(actualType);
-    if (known) return known.some(type => type.split('.').pop() === expectedSimple);
-    if (actualType === 'java.lang.Class') {
-        return ['Type', 'Serializable', 'GenericDeclaration', 'AnnotatedElement',
-            'Object'].includes(expectedSimple);
-    }
-    // An unmodeled actual type may implement any of these interfaces.
-    // Knowing only the expected type cannot disprove the conversion.
-    return null;
-}
 
 function _javaReceiverProducerCall(index, call, file, projectOnly = false) {
     if (langTraits(index.files.get(file)?.language)?.typeNameScoping !== 'package-on-demand' ||
@@ -22277,10 +22314,14 @@ function _javaCallReturnInfo(index, kind, contextFile = null) {
             ...(contextFile && { argumentFile: contextFile }),
             ...(origin?.site && { callSite: origin.site }),
         }, definitions, language);
-        return selected.match
-            ? _javaDefinitionReturnInfo(index, selected.match) ||
-                _javaClassLiteralReturnInfo(index, selected.match, contextFile, origin, argKinds)
-            : null;
+        if (selected.match) {
+            return _javaDefinitionReturnInfo(index, selected.match) ||
+                _javaClassLiteralReturnInfo(index, selected.match, contextFile, origin, argKinds);
+        }
+        // Undecided between overloads that all return one type (fix #421:
+        // every `Key.get(..)` returns `Key`): the producer's value has that
+        // type whichever one the compiler selects.
+        return _sharedProducerReturnInfo(index, selected.applicable);
     }
     if (!kind?.startsWith('call:')) return null;
     const parts = kind.split(':');
@@ -22327,6 +22368,14 @@ function _javaClassLiteralReturnInfo(index, definition, file, origin, argKinds) 
             site: { source: 'type', line: query.line, column: query.column,
                 start: type.startIndex, end: type.endIndex, nodeType: type.type } } };
     }
+}
+
+function _sharedProducerReturnInfo(index, candidates) {
+    if (!Array.isArray(candidates) || candidates.length < 2) return null;
+    const infos = candidates.map(definition => _javaDefinitionReturnInfo(index, definition));
+    const first = infos[0];
+    return first && infos.every(info => info && info.type === first.type && info.fromFile === first.fromFile)
+        ? first : null;
 }
 
 function _javaDefinitionReturnInfo(index, definition) {
@@ -22911,14 +22960,18 @@ function _javaFormalMemberType(index, name, owner) {
     return {};
 }
 
-function _typeNamesCanonicalAt(index, writtenFile) {
+// `at` (a definition or `{ startLine, endLine }`) asks about the names of
+// those lines only (fix #421); without it, about the whole file.
+function _typeNamesCanonicalAt(index, writtenFile, at = null) {
     if (!writtenFile) return true;
     const file = path.isAbsolute(writtenFile) ? writtenFile : path.resolve(index.root, writtenFile);
     const language = index.files.get(file)?.language;
     const canonical = langTraits(language)?.typeNameSourceCanonical;
     if (!canonical) return true;
     if (typeof index._readFile !== 'function') return false;
-    try { return require('./source-memo').typeNamesCanonical(index, file, canonical, language); }
+    const lines = Number.isInteger(at?.startLine)
+        ? { startLine: at.startLine, endLine: Number.isInteger(at.endLine) ? at.endLine : at.startLine } : null;
+    try { return require('./source-memo').typeNamesCanonical(index, file, canonical, language, lines); }
     catch (error) {
         if (['ENOENT', 'EACCES', 'EPERM', 'EISDIR', 'ENOTDIR'].includes(error.code)) return false;
         throw error;
@@ -29830,6 +29883,6 @@ function findCallbackUsages(index, name) {
     return usages;
 }
 
-module.exports = { _cppMemberUsingBases, _cppTargetVisibility, rustTypeNameDenotes, _textualIncludeClosures, _textualLinkVerdict, isProvenanceBuiltinReceiver, provenanceParameterIdentity: _overloadTypeIdentity, selectProvenanceOverload, _unresolvedModuleIsGap, _importReaches, _sameNominalPackageDir, getCachedCalls, getCachedCallsBearing, findCallers, findCallees, getInstanceAttributeTypes, findCallbackUsages, _nameBindingReaches, _moduleAttributeBindingReaches, _declaredFieldType, _projectTopLevelNames, _callArityCompatible, _closeCallableIdentityGroup, _overloadDiscipline, _overloadApplicable, _buildReturnTypeFlowMap, _lookupReturnTypeFlow, _cFamilySignatureKey,
+module.exports = { _recordIsNoCall, _cppMemberUsingBases, _cppTargetVisibility, rustTypeNameDenotes, _textualIncludeClosures, _textualLinkVerdict, isProvenanceBuiltinReceiver, provenanceParameterIdentity: _overloadTypeIdentity, selectProvenanceOverload, _unresolvedModuleIsGap, _importReaches, _sameNominalPackageDir, getCachedCalls, getCachedCallsBearing, findCallers, findCallees, getInstanceAttributeTypes, findCallbackUsages, _nameBindingReaches, _moduleAttributeBindingReaches, _declaredFieldType, _projectTopLevelNames, _callArityCompatible, _closeCallableIdentityGroup, _overloadDiscipline, _overloadApplicable, _buildReturnTypeFlowMap, _lookupReturnTypeFlow, _cFamilySignatureKey,
     _isConfigurationAlternative, _isCrossFileConfigurationMember, _configurationAlternativeFiles, _sameOwnerPath,
     _goFileConstraint };

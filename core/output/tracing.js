@@ -39,18 +39,31 @@ function renderFrontier(lines, frontier, options = {}, expanded = false) {
     return true;
 }
 
-/** Render a node's unresolved callee calls as [unverified] leaves. */
-function renderUnverifiedCallees(lines, node, prefix, isParentLast) {
-    if (!node.unverifiedCallees || node.unverifiedCallees.length === 0) return;
-    const extension = isParentLast ? '    ' : '│   ';
-    for (let i = 0; i < node.unverifiedCallees.length; i++) {
-        const u = node.unverifiedCallees[i];
-        const isLast = i === node.unverifiedCallees.length - 1;
-        const connector = isLast ? '└── ' : '├── ';
+/**
+ * A node's unresolved callee calls as [unverified] leaves, then the
+ * constructions whose constructor body is undecided (fix #421; their class
+ * edge is a child of the node).
+ */
+function undecidedLeafLines(node) {
+    const out = [];
+    for (const u of node.unverifiedCallees || []) {
         const owners = u.ownerCount > 1 ? ` (${u.ownerCount} owners)` : '';
         const linesPart = u.sites && u.sites.length > 0 ? ` L${u.sites.join(',L')}` : '';
-        lines.push(`${prefix}${extension}${connector}[unverified] ${u.name} — ${u.reason}${owners}${linesPart}`);
+        out.push(`[unverified] ${u.name} — ${u.reason}${owners}${linesPart}`);
     }
+    for (const r of node.initializerReviews || []) {
+        const candidates = r.candidates > 1 ? ` (${r.candidates} candidates)` : '';
+        const linesPart = r.sites && r.sites.length > 0 ? ` L${r.sites.join(',L')}` : '';
+        const label = r.name === r.initializerOf ? r.name : `${r.initializerOf}.${r.name}`;
+        out.push(`[constructor undecided] ${label} — ${r.reason}${candidates}${linesPart}`);
+    }
+    return out;
+}
+
+function renderUnverifiedCallees(lines, node, prefix, isParentLast) {
+    const leaves = undecidedLeafLines(node);
+    const extension = isParentLast ? '    ' : '│   ';
+    leaves.forEach((text, i) => lines.push(`${prefix}${extension}${i === leaves.length - 1 ? '└── ' : '├── '}${text}`));
 }
 
 /** TREE ACCOUNT line for caller-direction trees. */
@@ -129,6 +142,7 @@ function formatTrace(trace, options = {}) {
         } else if (node.file) {
             label += ` (${node.file}:${node.line})`;
         }
+        if (node.constructs) label += ` (constructs ${node.constructs})`;
         if (node.weight && node.weight !== 'normal') {
             label += ` [${node.weight}]`;
         }
@@ -143,7 +157,7 @@ function formatTrace(trace, options = {}) {
 
         if (node.children && !node.alreadyShown) {
             const hasMore = node.truncatedChildren > 0;
-            const hasUnverified = node.unverifiedCallees && node.unverifiedCallees.length > 0;
+            const hasUnverified = node.unverifiedCallees?.length > 0 || node.initializerReviews?.length > 0;
             for (let i = 0; i < node.children.length; i++) {
                 const isChildLast = !hasMore && !hasUnverified && i === node.children.length - 1;
                 renderNode(node.children[i], prefix + extension, isChildLast);
@@ -160,7 +174,8 @@ function formatTrace(trace, options = {}) {
     lines.push(trace.root);
     if (trace.tree && trace.tree.children) {
         const rootHasMore = trace.tree.truncatedChildren > 0;
-        const rootHasUnverified = trace.tree.unverifiedCallees && trace.tree.unverifiedCallees.length > 0;
+        const rootLeaves = undecidedLeafLines(trace.tree);
+        const rootHasUnverified = rootLeaves.length > 0;
         for (let i = 0; i < trace.tree.children.length; i++) {
             const isLast = !rootHasMore && !rootHasUnverified && i === trace.tree.children.length - 1;
             renderNode(trace.tree.children[i], '', isLast);
@@ -169,17 +184,8 @@ function formatTrace(trace, options = {}) {
             hasTruncation = true;
             lines.push((rootHasUnverified ? '├── ' : '└── ') + `... and ${trace.tree.truncatedChildren} more callees`);
         }
-        if (rootHasUnverified) {
-            // Root-level unverified callees: render with no prefix
-            for (let i = 0; i < trace.tree.unverifiedCallees.length; i++) {
-                const u = trace.tree.unverifiedCallees[i];
-                const isLast = i === trace.tree.unverifiedCallees.length - 1;
-                const connector = isLast ? '└── ' : '├── ';
-                const owners = u.ownerCount > 1 ? ` (${u.ownerCount} owners)` : '';
-                const linesPart = u.sites && u.sites.length > 0 ? ` L${u.sites.join(',L')}` : '';
-                lines.push(`${connector}[unverified] ${u.name} — ${u.reason}${owners}${linesPart}`);
-            }
-        }
+        // Root-level unverified callees: render with no prefix
+        rootLeaves.forEach((text, i) => lines.push(`${i === rootLeaves.length - 1 ? '└── ' : '├── '}${text}`));
     }
 
     // Callers section

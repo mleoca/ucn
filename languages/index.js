@@ -196,6 +196,16 @@ const STRUCTURAL_TRAITS = {
     functionalTypeConstruction: false,
     constructorInheritance: { order: 'single', classNodes: ['class_declaration', 'class'], headerNode: 'class_heritage' },
     implicitBaseConstruction: null,
+    // Whether a constructor delegation is spelled by a keyword (`this(..)`,
+    // `super(..)`, `base(..)`) rather than by the type's name (C++
+    // mem-initializers): such a site holds no token a type rename edits
+    // (fix #421).
+    keywordConstructorDelegation: false,
+    // Whether a call may pass more or fewer arguments than the callee
+    // declares without error (JavaScript): argument count then never decides
+    // which one callable runs. TypeScript reports the mismatch at compile time
+    // and Python raises at run time, so there it stays evidence (fix #421).
+    lenientCallArity: false,
     // Whether a decorator REPLACES the callable it decorates with its own
     // return value (Python/JS decorators, fix #364). What a decorated async
     // function's call returns is then decided by the decorator, not by the
@@ -302,6 +312,11 @@ const NOMINAL_TRAITS = {
     fixedConstructorName: null,
     constructorInheritance: null,
     implicitBaseConstruction: null,
+    keywordConstructorDelegation: false,
+    // Whether a member may be defined outside its class body (C++
+    // `W::W(int) {}` in a source file, its class in a header): such a
+    // definition holds the body of one in-class declaration (fix #421).
+    outOfClassMemberDefinitions: false,
     plainQueryTree: true,
     physicalCallTokenSyntax: true,
     scopeAlternativeBindings: false,
@@ -503,6 +518,7 @@ const LANGUAGES = {
             languageProtocolMember: JS_PROTOCOL_MEMBERS,
             storedPromises: true,
             knownAsyncGlobals: ['fetch'],
+            lenientCallArity: true,
             testFileCandidates: (base, ext) => [`${base}.test${ext}`, `${base}.spec${ext}`, `${base}.test.ts`, `${base}.test.js`, `${base}.spec.ts`, `${base}.spec.js`],
             testDirs: ['__tests__'],
         },
@@ -725,6 +741,7 @@ const LANGUAGES = {
                 constructors: ['constructor_declaration'], delegationNodes: ['explicit_constructor_invocation'],
                 ownerScope: node => require('./java').implicitOwnerScope(node),
                 baseKinds: ['class'], separator: '.' },
+            keywordConstructorDelegation: true,
             constructorArgumentNodes: {
                 delegation: { nodeType: 'explicit_constructor_invocation', argsField: 'arguments' },
                 enum: { nodeType: 'enum_constant', argsField: 'arguments' },
@@ -740,7 +757,7 @@ const LANGUAGES = {
             implicitEnumCaseLabels: true,
             standardPathRoots: ['java', 'javax'],
             typeNameScoping: 'package-on-demand',
-            typeNameSourceCanonical: (source, parseError) => require('./java-unicode').typeNameSourceCanonical(source, parseError),
+            typeNameSourceCanonical: (source, parseError, lines) => require('./java-unicode').typeNameSourceCanonical(source, parseError, lines),
             typeNameOwnersAt: (source, site) => require('./java-unicode').typeNameOwnersAt(source, site),
             typeNamedSourceFile: true,
             // The public top-level types of java.lang (JDK 8-21, preview
@@ -857,6 +874,7 @@ const LANGUAGES = {
                 ownerScope: node => require('./c-family').implicitOwnerScope(node),
                 baseKinds: ['class', 'struct'], separator: '::' },
             functionalTypeConstruction: true,
+            outOfClassMemberDefinitions: true,
             constructorArgumentNodes: { direct: { nodeType: 'init_declarator', argsField: 'value' },
                 delegation: { nodeType: 'field_initializer', argsNodeType: 'argument_list' } },
             isInvokedName: (node, options) => require('./c-family').isInvokedName(node, options),
@@ -905,6 +923,7 @@ const LANGUAGES = {
                 constructors: ['constructor_declaration'], delegationNodes: ['constructor_initializer'],
                 ownerScope: node => require('./csharp').implicitOwnerScope(node),
                 firstBaseOnly: true, referenceTypesOnly: true, baseKinds: ['class', 'record'], separator: '.' },
+            keywordConstructorDelegation: true,
             plainQueryTree: false,
             isInvokedName: (node, options) => require('./csharp').isInvokedName(node, options),
             nameReferenceFamily: 'csharp',
@@ -988,6 +1007,7 @@ const LANGUAGES = {
         treeSitterModule: () => require('tree-sitter-html'),
         traits: {
             ...STRUCTURAL_TRAITS,
+            lenientCallArity: true,
             // Embedded scripts supply their own parse trees.
             physicalCallTokenSyntax: false,
             // The script source with its rows and columns kept, parsed in its

@@ -1090,6 +1090,7 @@ function parse(code, parser) {
         classes,
         stateObjects,
         ...(tree.rootNode.hasError && { parseRecovery: true, parseErrorRegions: parseErrorRegions(tree.rootNode) }),
+        typeParameterNames: require('./utils').declaredTypeParameterNames(tree),
         imports: [],
         exports: []
     };
@@ -2798,8 +2799,15 @@ function isEntryPoint(symbol) {
     return getEntryPointKind(symbol) !== null;
 }
 
+/** Omitted base initializer calls of one class, read as findCallsInCode reads them (fix #421). */
+function implicitBaseCallsOf(code, parser, ownerLine, ownerEndLine) {
+    return require('./constructor-bases').implicitBaseCallsOfOwner(parseTree(parser, code).rootNode, 'java', null,
+        ownerLine, ownerEndLine);
+}
+
 module.exports = {
     implicitOwnerScope: node => ({ enclosingType: enclosingTypeName(node) }),
+    implicitBaseCallsOf,
     staticValueImportSyntax,
     patternBindingReach,
     findFunctions,

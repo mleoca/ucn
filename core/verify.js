@@ -1477,6 +1477,7 @@ function computePlanCallSites(index, name, def, options = {}) {
             ...(c.calledAs && { calledAs: c.calledAs }),
             ...(c.macroExpansion && { macroExpansion: c.macroExpansion }),
             ...(c.targetTyped && { targetTyped: true }),
+            ...(c.keywordDelegation && { keywordDelegation: true }),
             ...(c.destructured && { destructured: c.destructured }),
             ...(c.importAliasSpelling && { importAliasSpelling: true }),
         });
@@ -1488,9 +1489,10 @@ function computePlanCallSites(index, name, def, options = {}) {
         if (fc !== 0) return fc;
         return (a.line || 0) - (b.line || 0);
     });
-    // A target-typed `new(..)` spells no name (fix #400): a rename never
-    // edits it, so an undecided one is no rename candidate either.
-    const renameRelevant = u => u.macroExpansion?.origin !== 'template' && !u.targetTyped;
+    // A target-typed `new(..)` or a keyword delegation spells no name
+    // (fixes #400, #421): a rename never edits it, so an undecided one is no
+    // rename candidate either.
+    const renameRelevant = u => u.macroExpansion?.origin !== 'template' && !u.targetTyped && !u.keywordDelegation;
     return {
         sites,
         unverifiedSites: unverified.filter(renameRelevant).map(unverifiedSiteShape),
@@ -3455,9 +3457,10 @@ function plan(index, name, options = {}) {
         const emitRenameCallSites = (siteList) => {
         const touched = new Set();
         for (const incoming of siteList) {
-            // A target-typed `new(..)` spells no name: the type written at
-            // its declaration site is what the rename edits (fix #393).
-            if (incoming.targetTyped) continue;
+            // A target-typed `new(..)` or a keyword delegation (`base(..)`)
+            // spells no name: the type written at its declaration site is
+            // what the rename edits (fixes #393, #421).
+            if (incoming.targetTyped || incoming.keywordDelegation) continue;
             // A call of a name destructured from the member (`const { run }
             // = make(); run()`) spells the member at the pattern key (fix
             // #397): the key is renamed and the local binding kept

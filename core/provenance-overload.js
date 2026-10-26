@@ -2,6 +2,32 @@
 
 const { declarationIdentity, sameDeclaration } = require('./provenance');
 const { langTraits } = require('../languages');
+const { UcnError, isInternalError } = require('./errors');
+
+/**
+ * A witness that cannot prove its answer (fix #421): a fact its view did
+ * not record, or a filesystem read that failed when it was captured. A
+ * capture or a replay that meets one proves nothing; any other exception is
+ * a defect and propagates.
+ */
+class ProvenanceRefusal extends UcnError {
+    constructor(message, code) {
+        super(message);
+        this.name = 'UcnError';
+        this.provenanceRefusal = true;
+        if (code !== undefined) this.code = code;
+    }
+}
+
+/**
+ * Null for an expected refusal (a missing witness fact, an unreadable
+ * source); rethrows an internal error so it reaches the surface as one
+ * instead of becoming a review row (fix #421).
+ */
+function refusedProof(error, refusal = null) {
+    if (error?.provenanceRefusal || !isInternalError(error)) return refusal;
+    throw error;
+}
 
 const OVERLOAD_FILE_FIELDS = ['language', 'relativePath', 'importBindings',
     'importDetails', 'symbols', 'moduleResolved'];
@@ -106,7 +132,7 @@ function factIndex(reads, live, fileFields) {
         }
         if (!Object.hasOwn(reads, key)) {
             missingFacts = true;
-            throw new Error(`Missing provenance fact: ${key}`);
+            throw new ProvenanceRefusal(`Missing provenance fact: ${key}`);
         }
         return decodeFact(reads[key]);
     };
@@ -191,7 +217,7 @@ function factIndex(reads, live, fileFields) {
                         try { return { ok: true, value: require('fs')[method](...args) }; }
                         catch (error) { return { ok: false, code: error.code || null }; }
                     });
-                    if (!result.ok) throw Object.assign(new Error('Captured filesystem read failed'), { code: result.code });
+                    if (!result.ok) throw new ProvenanceRefusal('Captured filesystem read failed', result.code);
                     return result.value;
                 }]));
             if (local.has(property)) return local.get(property);
@@ -355,7 +381,7 @@ function captureOverload(index, call, candidates, language, select) {
                         match: result.match ? declarationIdentity(result.match) : null } } });
         }
         return witness;
-    } catch { return null; }
+    } catch (error) { return refusedProof(error); }
 }
 
 // The selector's answer over a witness's recorded facts. A frozen witness
@@ -378,7 +404,7 @@ function overloadReplay(witness) {
         const result = select(index, decode(witness.call), candidates, witness.language);
         replay.result = { missing: index.hasMissingProvenanceFacts, ambiguous: result.ambiguous === true,
             match: result.match ? declarationIdentity(result.match) : null };
-    } catch { /* An unreplayable witness proves nothing. */ }
+    } catch (error) { refusedProof(error); /* An unreplayable witness proves nothing. */ }
     if (reusable) OVERLOAD_REPLAYS.set(witness, { reads: witness.reads, call: witness.call,
         candidates: witness.candidates, language: witness.language, fileFields: witness.fileFields, replay });
     return replay;
@@ -387,7 +413,7 @@ function overloadReplay(witness) {
 function validateOverload(witness, members, selected, invalidCall = false, ambiguous = false, site = null) {
     if (!witness || !Array.isArray(witness.candidates)) return false;
     let replay;
-    try { replay = overloadReplay(witness); } catch { return false; }
+    try { replay = overloadReplay(witness); } catch (error) { return refusedProof(error, false); }
     if (replay.candidates.length !== members.length || replay.candidates.some(candidate =>
         !members.some(member => sameDeclaration(member, candidate)))) return false;
     const { call, result } = replay;
@@ -429,4 +455,4 @@ function overloadMemberGroup(steps) {
 }
 
 module.exports = { captureOverload, validateOverload, overloadMemberGroup, factIndex, projectFact, projectHas, sharedRead,
-    sealFacts, replayed, seedReplay, provenanceWork };
+    sealFacts, replayed, seedReplay, provenanceWork, ProvenanceRefusal, refusedProof };

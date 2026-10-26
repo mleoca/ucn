@@ -203,7 +203,12 @@ function csBuildViews(parser, code) {
     });
     if (resolved.length === 0) return null;
     for (const group of resolved) group.primary = csPrimaryBranch(group, lines);
-    return csViewsFromGroups(parser, code, lines, resolved, damaged.errors);
+    const views = csViewsFromGroups(parser, code, lines, resolved, damaged.errors);
+    // The raw parse the views read from: its type-parameter names are the
+    // file's (fix #421).
+    if (views) Object.defineProperty(views, 'typeParameterNames', {
+        value: require('./utils').declaredTypeParameterNames(literal), enumerable: false });
+    return views;
 }
 
 // Rows of branch b of a group (between its directive and the next).
@@ -2304,6 +2309,15 @@ function findCallsInCode(code, parser) {
             (a.callSite?.column ?? 0) - (b.callSite?.column ?? 0));
 }
 
+/** Omitted base initializer calls of one class, read as findCallsInCode reads them (fix #421). */
+function implicitBaseCallsOf(code, parser, ownerLine, ownerEndLine) {
+    const extract = (tree, reaches) => require('./constructor-bases').implicitBaseCallsOfOwner(tree.rootNode, 'csharp',
+        reaches, ownerLine, ownerEndLine);
+    const views = csharpViews(parser, code);
+    if (!views) return extract(safeParse(parser, code, undefined, PARSE_OPTIONS), null);
+    return csMergeViewItems(views, extract, call => call.line);
+}
+
 function findCallsInTree(code, parser, tree, reaches = null) {
     const variableTypesByScope = buildVariableTypes(tree, parser);
     const calls = [];
@@ -2917,6 +2931,10 @@ function parse(code, parser) {
         }),
         ...(features.length > 0 && { languageFeatures: features }),
         ...(views && { conditionalViews: views.groups.map(group => [...group]) }),
+        // The raw parse's names: configuration views parse rewritten sources.
+        ...((!views || views.typeParameterNames) && {
+            typeParameterNames: views ? views.typeParameterNames : require('./utils').declaredTypeParameterNames(tree),
+        }),
     };
 }
 
@@ -2962,6 +2980,7 @@ function accessorTypeSyntax(text) {
 }
 
 module.exports = {
+    implicitBaseCallsOf,
     implicitOwnerScope(node) {
         let enclosingType = null;
         for (let parent = node.parent; parent; parent = parent.parent) {

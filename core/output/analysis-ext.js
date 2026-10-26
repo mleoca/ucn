@@ -3,7 +3,7 @@
  */
 
 const { dynamicImportsNote, formatLineRanges, unverifiedReasonLabel, advisoryLine } = require('./shared');
-const { formatAccountLines, formatCalleeAccountLine, unverifiedCalleeLines } = require('./analysis');
+const { formatAccountLines, formatCalleeAccountLine, unverifiedCalleeLines, initializerReviewLines } = require('./analysis');
 
 /**
  * Format related command output - text
@@ -146,6 +146,7 @@ function formatSmart(smart, options = {}) {
     // v4 callee contract: unresolved calls inside the target — visible with
     // reasons (they may be dependencies smart could not inline).
     lines.push(...unverifiedCalleeLines(smart.unverifiedCallees, false));
+    lines.push(...initializerReviewLines(smart.initializerReviews, false));
     const smartCalleeAcct = formatCalleeAccountLine(smart.meta && smart.meta.calleeAccount);
     if (smartCalleeAcct) lines.push(`\n${smartCalleeAcct}`);
 
@@ -185,7 +186,8 @@ function formatSmartJson(result) {
             types: result.types || [],
             // v4 callee contract: visible unresolved-call entries, reconciled
             // by meta.calleeAccount.
-            unverifiedCallees: result.unverifiedCallees || []
+            unverifiedCallees: result.unverifiedCallees || [],
+            ...(result.initializerReviews?.length && { initializerReviews: result.initializerReviews }),
         }
     });
 }

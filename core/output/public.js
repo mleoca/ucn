@@ -410,6 +410,7 @@ function formatPublicJson(command, result, params = {}, execution = {}) {
         commandMeta.excludedDecorated = result.excludedDecorated || 0;
         commandMeta.excludedExternalContract = result.excludedExternalContract || 0;
         commandMeta.excludedRuntimeContract = result.excludedRuntimeContract || 0;
+        commandMeta.excludedConstructors = result.excludedConstructors || 0;
         commandMeta.pythonImplicitExportFiles = result.pythonImplicitExportFiles || 0;
         commandMeta.excludedDynamicDispatch = result.excludedDynamicDispatch || 0;
         commandMeta.computedDispatch = result.computedDispatch || { count: 0, names: [] };

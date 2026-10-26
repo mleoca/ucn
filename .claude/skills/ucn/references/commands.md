@@ -183,7 +183,7 @@ Route paths include router mount prefixes composed from the code: FastAPI `inclu
 
 ### deadcode
 
-Constructor declarations are withheld as allocation-protocol members. Reflection, frameworks and implicit replacement initializers can use or depend on them without a direct construction call. An unused type can still appear as a whole-type candidate.
+Constructor declarations are not claims of their own (`N constructor(s) not listed`, JSON `excludedConstructors`): reflection, frameworks and the initializer the compiler generates when one is deleted can depend on them without a construction call. An unused type still appears as a whole-type candidate.
 
 `deadcode` is a candidate generator; every candidate is review-only. Computed dispatch such as `handlers[key]()` is a reported blind spot; registry members reached by a modeled computed receiver are withheld. Statically named reflection such as `getattr(obj, "run")` is positive liveness evidence, so every matching member spelling is withheld. A reflective name built from literal fragments around a runtime part (`getattr(self, "_get_%s_perms" % src)`, f-strings, `.format`, `"get" + name` in `getMethod`, `MethodByName(fmt.Sprintf(...))`, `obj["on" + evt]`) is a pattern: members it can spell on a receiver that may hold their class are withheld and counted per pattern, and `show`/`impact`/`plan` list the site as an unverified `reflection-pattern` caller. `eval(name)`/`globals()[name]` reach only their own module's top-level names. Reflection with no specific literal part is counted and warned because it cannot be attributed to one member.
 

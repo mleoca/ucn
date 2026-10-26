@@ -122,7 +122,12 @@ describe('fix #417: compiler class references retain proven constructor dependen
             const dir = tmp({ [file]: code });
             try {
                 const index = idx(dir), target = index.symbols.get('Widget').find(def => def.type === 'class');
-                const edges = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+                const answer = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+                // The answer's own class edge is never projected again (fix #421);
+                // the projection is measured on the constructor body edge alone.
+                assert.ok(answer.some(def => def.type === 'class' && def.name === 'Widget'));
+                assert.equal(constructorClassEdges(answer, [target]).length, 0);
+                const edges = answer.filter(def => def.type === 'constructor');
                 const projected = constructorClassEdges(edges, [target]);
                 assert.equal(projected.length, 1);
                 assert.equal(projected[0].name, 'Widget');
@@ -141,7 +146,8 @@ describe('fix #417: compiler class references retain proven constructor dependen
     it('shared inherited bodies retain each constructed type at its own sites', () => {
         const dir = tmp({ 'n.js': 'class Base {constructor(v){}}\nclass Left extends Base {}\nclass Right extends Base {}\nfunction build(){\n new Left(1);\n new Right(2);\n}\n' });
         try {
-            const index = idx(dir), edges = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+            const index = idx(dir), edges = index.findCallees(index.symbols.get('build')[0], { collectAccount: true })
+                .filter(def => def.type === 'constructor');
             const targets = ['Left', 'Right'].map(name => index.symbols.get(name).find(def => def.type === 'class'));
             const projected = constructorClassEdges(edges, targets);
             assert.deepEqual(projected.map(edge => [edge.name, edge.sites]), [['Left', [5]], ['Right', [6]]]);

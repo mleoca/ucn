@@ -173,7 +173,9 @@ describe('fix #417: braced construction retains the list overload phase', () => 
         try {
             const index = idx(dir), callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
             assert.equal(callees.filter(def => def.type === 'constructor').length, 0);
-            assert.ok(callees.unverifiedCallees.some(def => def.reason === 'constructor-overload-ambiguous'));
+            // The class dependency stays; the undecided body is its review (fix #421).
+            assert.ok(callees.some(def => def.type === 'struct' && def.name === 'Box'));
+            assert.ok(callees.initializerReviews.some(def => def.reason === 'constructor-overload-ambiguous'));
             for (const target of index.symbols.get('Box').filter(def => def.type === 'constructor')) {
                 const callers = index.findCallers('Box', { targetDefinitions: [target], collectAccount: true });
                 assert.equal(callers.length, 0);
@@ -203,7 +205,8 @@ describe('fix #417: braced construction retains the list overload phase', () => 
                 assert.equal(selected.length, braced ? 0 : 1);
                 if (!braced) assert.equal(selected[0].paramsStructured.length, 2);
                 else {
-                    assert.ok(callees.unverifiedCallees.some(def => def.reason === 'constructor-overload-ambiguous'));
+                    assert.ok(callees.some(def => def.type === 'struct' && def.name === 'Box'));
+                    assert.ok(callees.initializerReviews.some(def => def.reason === 'constructor-overload-ambiguous'));
                     for (const target of index.symbols.get('Box').filter(def => def.type === 'constructor')) {
                         const callers = index.findCallers('Box', { targetDefinitions: [target], collectAccount: true });
                         assert.equal(callers.length, 0);
@@ -250,7 +253,11 @@ describe('fix #417: C# generic interface arguments retain their types', () => {
                     assert.equal(callers.unverifiedEntries.length, 1);
                     const callees = index.findCallees(index.symbols.get(caller)[0], { collectAccount: true });
                     assert.equal(callees.filter(def => constructor ? def.type === 'constructor' && def.className === 'Box' : def.name === 'accept').length, 0);
-                    assert.ok(callees.unverifiedCallees.some(def => constructor ? def.name === 'Box' : def.name === 'accept'));
+                    // A construction keeps its class dependency; the undecided
+                    // constructor body is a review of it (fix #421).
+                    if (constructor) assert.ok(callees.some(def => def.type === 'class' && def.name === 'Box'));
+                    assert.ok((constructor ? callees.initializerReviews : callees.unverifiedCallees)
+                        .some(def => constructor ? def.name === 'Box' : def.name === 'accept'));
                     assert.equal(callees.calleeAccount.conserved, true);
                 }
             } finally { rm(dir); }
@@ -434,9 +441,12 @@ describe('fix #417: functional construction binds its type before constructor ov
                 assert.equal(callers.unverifiedEntries[0].reason, 'constructor-overload-ambiguous');
             }
             const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
-            // The braced argument also constructs its proven aggregate type.
-            assert.deepEqual(callees.map(def => [def.name, def.namespace]), [['Value', 'A']]);
-            assert.ok(callees.unverifiedCallees.some(def => def.reason === 'constructor-overload-ambiguous'));
+            // The braced argument also constructs its proven aggregate type;
+            // the Box construction keeps its class with an undecided body
+            // (fix #421).
+            assert.deepEqual(callees.map(def => [def.name, def.namespace || null]).sort(),
+                [['Box', null], ['Value', 'A']]);
+            assert.ok(callees.initializerReviews.some(def => def.reason === 'constructor-overload-ambiguous'));
         } finally { rm(dir); }
     });
     it('a changed constructor retains an old possible binding as a review item', () => {
@@ -474,15 +484,20 @@ describe('fix #417: same-line constructor bodies remain separate callee declarat
             const dir = tmp({ [file]: source });
             try {
                 const index = idx(dir), constructors = index.symbols.get('Box').filter(def => def.type === 'constructor');
-                const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+                const all = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+                // Both constructions depend on the class (fix #421); each
+                // body edge is the overload it enters.
+                assert.ok(all.some(def => ['class', 'struct'].includes(def.type) && def.name === 'Box' && def.callCount === 2));
+                const callees = all.filter(def => def.type === 'constructor');
+                assert.ok(callees.every(def => def.initializerOf === 'Box'));
                 assert.deepEqual(callees.map(def => [def.bindingId, def.callCount]),
                     constructors.map(def => [def.bindingId, 1]));
                 for (const callee of callees) {
                     assert.equal(callee.siteProvenance.length, 1);
                     assert.equal(callee.siteProvenance[0].targetDef.bindingId, callee.bindingId);
                 }
-                assert.equal(callees.calleeAccount.conserved, true);
-                assert.equal(callees.calleeAccount.unverified, 0);
+                assert.equal(all.calleeAccount.conserved, true);
+                assert.equal(all.calleeAccount.unverified, 0);
             } finally { rm(dir); }
         });
     }
@@ -785,7 +800,13 @@ describe('fix #417: constructions reach the declared constructor', () => {
                     });
                     assert.ok(target.ok, target.error);
                     assert.strictEqual(target.result.mismatches, 1);
-                    assert.ok(target.result.changedSince);
+                    // Where any argument count is legal (JavaScript) the
+                    // changed constructor still binds the construction (fix
+                    // #421); elsewhere the base declaration rebinds it.
+                    const { langTraits } = require('../languages');
+                    const language = changedIndex.files.get(path.join(changedDir, fixture.file)).language;
+                    if (!langTraits(language).lenientCallArity) assert.ok(target.result.changedSince);
+                    else assert.strictEqual(target.result.mismatchDetails[0].line, fixture.callLine);
                     const diff = execute(changedIndex, 'check', {});
                     assert.ok(diff.ok, diff.error);
                     assert.strictEqual(diff.result.trust.status, 'BLOCKED');
@@ -13614,8 +13635,9 @@ describe('fix #381: class identity by lexical scope, name-exact import bindings,
             ].join('\n'),
         });
         try {
+            // The class dependency and the constructor body it runs (fix #421).
             assert.deepStrictEqual(relations(dir, 't/test_port.py:8:test_default_port').callees,
-                ['__init__@pkg/conn.py:2']);
+                ['Connection@pkg/conn.py:1', '__init__@pkg/conn.py:2']);
         } finally { rm(dir); }
     });
 
@@ -17239,4 +17261,151 @@ describe('fix #419: a reference review on a declaration line keeps its own entry
                 [3, 'function renamed() { return 1; }', false], [4, 'const alias = renamed;', false]]);
         } finally { rm(dir); }
     });
+});
+
+describe('fix #421: a construction keeps its class callee beside the constructor body it runs', () => {
+    const fixtures = [
+        ['js', 'b.js', 'class Base {\n constructor(v) { this.v = v; }\n}\nclass Child extends Base {}\nfunction make() { return new Child(1); }\n', 'Child', 'constructor', 2],
+        ['ts', 'b.ts', 'class Base {\n constructor(v: number) { }\n}\nclass Child extends Base {}\nfunction make() { return new Child(1); }\n', 'Child', 'constructor', 2],
+        ['python', 'b.py', 'class Base:\n    def __init__(self, v):\n        self.v = v\nclass Child(Base):\n    pass\ndef make():\n    return Child(1)\n', 'Child', '__init__', 2],
+        ['java', 'B.java', 'class Child {\n Child(int v) { }\n Child(String s) { }\n static Child make() { return new Child(1); }\n}\n', 'Child', 'Child', 2],
+        ['csharp', 'B.cs', 'class Child {\n public Child(int v) { }\n public Child(string s) { }\n static Child make() { return new Child(1); }\n}\n', 'Child', 'Child', 2],
+        ['cpp', 'b.cpp', 'struct Child {\n Child(int v) { }\n Child(const char* s) { }\n};\nChild make() { return Child(1); }\n', 'Child', 'Child', 2],
+    ];
+    for (const [language, file, code, className, ctorName, ctorLine] of fixtures) {
+        it(`${language}: the class edge is confirmed and the constructor joins as a body edge`, () => {
+            const dir = tmp({ [file]: code });
+            try {
+                const index = idx(dir), make = index.symbols.get('make')[0];
+                const callees = index.findCallees(make, { collectAccount: true });
+                const classEdge = callees.find(def => ['class', 'struct'].includes(def.type) && def.name === className);
+                assert.ok(classEdge, JSON.stringify(callees.map(def => [def.name, def.type])));
+                assert.strictEqual(classEdge.tier, 'confirmed');
+                const body = callees.find(def => def.name === ctorName && def.startLine === ctorLine && def.initializerOf);
+                assert.ok(body, 'the constructor body edge');
+                assert.strictEqual(body.initializerOf, className);
+                // One call site, claimed once by the class edge.
+                assert.strictEqual(callees.calleeAccount.totalSites, 1);
+                assert.strictEqual(callees.calleeAccount.confirmed, 1);
+                assert.strictEqual(callees.calleeAccount.conserved, true);
+                const trace = execute(index, 'trace', { name: 'make', depth: 2 });
+                assert.ok(trace.ok, trace.error);
+                const text = output.formatTrace(trace.result);
+                assert.match(text, new RegExp(`${className} \\(`));
+                assert.match(text, new RegExp(`\\(constructs ${className}\\)`));
+            } finally { rm(dir); }
+        });
+    }
+    for (const [language, file, code] of [
+        ['java', 'B.java', 'import java.util.Map;\nclass Box {\n Box(int v) { }\n Box(String s) { }\n static Object make(Map<String, Object> m) { return new Box(m.size() > 0 ? 1 : 2); }\n}\n'],
+        ['csharp', 'B.cs', 'class Box {\n public Box(int v) { }\n public Box(object o) { }\n static object make(dynamic d) { return new Box(d); }\n}\n'],
+        ['cpp', 'b.cpp', '#include <initializer_list>\nstruct Box {\n Box(std::initializer_list<int> v) { }\n Box(int a, int b) { }\n};\nvoid make() { Box b{1, 2}; }\n'],
+    ]) {
+        it(`${language}: an undecided overload reviews the constructor body, never demotes the class`, () => {
+            const dir = tmp({ [file]: code });
+            try {
+                const index = idx(dir), make = index.symbols.get('make')[0];
+                const callees = index.findCallees(make, { collectAccount: true });
+                const classEdge = callees.find(def => ['class', 'struct'].includes(def.type) && def.name === 'Box');
+                assert.ok(classEdge && classEdge.tier === 'confirmed', JSON.stringify(callees.map(def => def.name)));
+                assert.ok(!callees.some(def => def.type === 'constructor'));
+                assert.ok(!callees.unverifiedCallees.some(entry => entry.name === 'Box'));
+                assert.strictEqual(callees.initializerReviews.length, 1);
+                assert.strictEqual(callees.initializerReviews[0].initializerOf, 'Box');
+                const context = execute(index, 'context', { name: 'make' });
+                assert.ok(context.ok, context.error);
+                const text = output.formatContext(context.result).text;
+                assert.match(text, /CONSTRUCTOR BODIES — UNDECIDED \(1\)/);
+            } finally { rm(dir); }
+        });
+    }
+    for (const [language, file, code] of [
+        ['js', 'p.js', 'class Plain { run() { return 1; } }\nfunction make() { return new Plain(); }\n'],
+        ['python', 'p.py', 'class Plain:\n    def run(self):\n        return 1\ndef make():\n    return Plain()\n'],
+    ]) {
+        it(`${language}: a class whose order declares no constructor needs no constructor review`, () => {
+            const dir = tmp({ [file]: code });
+            try {
+                const index = idx(dir), callees = index.findCallees(index.symbols.get('make')[0], { collectAccount: true });
+                assert.deepStrictEqual(callees.map(def => def.name), ['Plain']);
+                assert.deepStrictEqual(callees.initializerReviews, []);
+            } finally { rm(dir); }
+        });
+    }
+    it('python: an allocator keeps the constructor body undecided beside the class edge', () => {
+        const dir = tmp({ 'n.py': 'class WithNew:\n    def __new__(cls, *a):\n        return super().__new__(cls)\n    def __init__(self, y):\n        self.y = y\ndef make():\n    return WithNew(3)\n' });
+        try {
+            const index = idx(dir), callees = index.findCallees(index.symbols.get('make')[0], { collectAccount: true });
+            assert.ok(callees.some(def => def.type === 'class' && def.name === 'WithNew'));
+            assert.ok(!callees.some(def => def.name === '__init__'));
+            assert.deepStrictEqual(callees.initializerReviews.map(entry => [entry.name, entry.reason]),
+                [['__init__', 'constructor-protocol-unresolved']]);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #421: constructor answers without stale hints, nameless delegations and arity overloads', () => {
+    it('deadcode counts withheld constructors apart from runtime callbacks', () => {
+        const dir = tmp({ 'A.java': 'class Unused {\n Unused(int v) { }\n Unused() { }\n}\n' });
+        try {
+            const response = execute(idx(dir), 'deadcode', {});
+            assert.ok(response.ok, response.error);
+            assert.strictEqual(response.result.excludedConstructors, 2);
+            assert.strictEqual(response.result.excludedRuntimeContract, 0);
+            const text = output.formatDeadcode(response.result);
+            assert.match(text, /2 constructor\(s\) not listed: a constructor belongs to its type's allocation protocol/);
+            assert.doesNotMatch(text, /runtime callback/);
+            const json = JSON.parse(output.formatDeadcodeJson(response.result));
+            assert.strictEqual(json.data.excludedConstructors, 2);
+        } finally { rm(dir); }
+    });
+    it('a constructor handle with only unverified constructions gets no class-name hint', () => {
+        const dir = tmp({ 'm.js': 'class Box {\n  constructor(v) { this.v = v; }\n}\nfunction make(K) { return new K(1); }\nmodule.exports = { Box, make };\n',
+            'u.js': 'const lib = require("./m");\nfunction use(Box) { return new Box(2); }\nmodule.exports = { use };\n' });
+        try {
+            const index = idx(dir);
+            for (const command of ['context', 'about']) {
+                const answer = execute(index, command, { name: 'm.js:2:constructor' });
+                assert.ok(answer.ok, answer.error);
+                const warnings = answer.result.warnings || [];
+                assert.ok(!warnings.some(warning => /indexed under the class name/.test(warning.message)));
+            }
+        } finally { rm(dir); }
+    });
+    for (const [language, files, pin] of [
+        ['csharp', { 'W.cs': 'namespace App {\n    public class Widget {\n        public Widget(string n, int s) { }\n        public Widget(string n) : this(n, 1) { }\n    }\n    public class Fancy : Widget {\n        public Fancy() : base("fancy", 3) { }\n    }\n}\n' }, 'W.cs:2:Widget'],
+        ['java', { 'p/Widget.java': 'package p;\npublic class Widget {\n    public Widget(String n, int s) { }\n    public Widget(String n) { this(n, 1); }\n}\n',
+            'p/Fancy.java': 'package p;\npublic class Fancy extends Widget {\n    public Fancy() { super("fancy", 3); }\n}\n' }, 'p/Widget.java:2:Widget'],
+    ]) {
+        it(`${language}: a class rename has no review item for a keyword delegation`, () => {
+            const dir = tmp(files);
+            try {
+                const answer = execute(idx(dir), 'plan', { name: pin, renameTo: 'Gadget' });
+                assert.ok(answer.ok, answer.error);
+                assert.ok(!answer.result.changes.some(change => change.needsReview), JSON.stringify(answer.result.changes));
+            } finally { rm(dir); }
+        });
+    }
+    for (const [language, file, code, ctor, binds] of [
+        ['js', 'k.js', 'class K { constructor(a) { this.a = a; } }\nfunction make() { return new K(1, 2); }\nmodule.exports = { K, make };\n', 'constructor', true],
+        ['html', 'k.html', '<script>\nclass K { constructor(a) { this.a = a; } }\nfunction make() { return new K(1, 2); }\n</script>\n', 'constructor', true],
+        // A TypeScript compile error or a Python TypeError: the count stays evidence.
+        ['ts', 'k.ts', 'class K { constructor(a: number) { } }\nexport function make() { return new K(1, 2 as any); }\n', 'constructor', false],
+        ['python', 'k.py', 'class K:\n    def __init__(self, a):\n        self.a = a\ndef make():\n    return K(1, 2)\n', '__init__', false],
+    ]) {
+        it(`${language}: the only constructor ${binds ? 'binds any argument count' : 'keeps an argument-count mismatch in review'}`, () => {
+            const dir = tmp({ [file]: code });
+            try {
+                const index = idx(dir), target = index.symbols.get(ctor).find(def => def.className === 'K');
+                const callers = index.findCallers(ctor, { targetDefinitions: [target], collectAccount: true });
+                if (binds) {
+                    assert.deepStrictEqual(callers.map(site => site.tier), ['confirmed']);
+                    assert.ok(!(callers.unverifiedEntries || []).some(entry => entry.reason === 'constructor-overload-no-fit'));
+                } else {
+                    assert.strictEqual(callers.length, 0);
+                    assert.deepStrictEqual(callers.unverifiedEntries.map(entry => entry.reason), ['constructor-overload-no-fit']);
+                }
+            } finally { rm(dir); }
+        });
+    }
 });

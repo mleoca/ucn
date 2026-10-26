@@ -4,7 +4,7 @@ const path = require('path');
 const { langTraits } = require('../languages');
 const { ownerDefinitionOf } = require('./class-identity');
 const { declarationIdentity, identityKey, sameDeclaration, validateConfirmation } = require('./provenance');
-const { captureOverload, projectFact } = require('./provenance-overload');
+const { captureOverload, projectFact, refusedProof } = require('./provenance-overload');
 const { codeUnitCompare, NON_CALLABLE_TYPES } = require('./shared');
 
 const isConstructor = (def, index) => !def?.modifiers?.includes('destructor') &&
@@ -92,13 +92,21 @@ const ACCESS_MODIFIERS = new Set(['public', 'protected', 'private', 'internal'])
 // The constructor a `this(...)` delegation runs in: the declared
 // constructor of the owner whose source extent holds the site. A
 // constructor never delegates to itself (Java JLS 8.8.7, C# CS0516, C++
-// [class.base.init]), so it leaves the candidate family (fix #419).
-function delegatingConstructor(declared, call) {
+// [class.base.init]), so it leaves the candidate family (fix #419). A site
+// in an out-of-class definition runs in the declaration it defines (fix
+// #421): `{ member, definition }` names both.
+function delegatingConstructor(index, owner, declared, call, file) {
     const start = call.callStart ?? call.callSite?.start;
-    const holding = declared.filter(def => Number.isFinite(start) && def.sourceSpan
+    const sameFile = def => !file || def.file === file;
+    const holding = declared.filter(def => sameFile(def) && (Number.isFinite(start) && def.sourceSpan
         ? def.sourceSpan.start <= start && start < def.sourceSpan.end
-        : def.startLine === call.enclosingFunction?.startLine && def.endLine === call.enclosingFunction?.endLine);
-    return holding.length === 1 ? holding[0] : null;
+        : def.startLine === call.enclosingFunction?.startLine && def.endLine === call.enclosingFunction?.endLine));
+    if (holding.length === 1) return { member: holding[0] };
+    if (holding.length || !file) return null;
+    const { enclosingDefinition, declarationOf } = require('./out-of-class-members');
+    const definition = enclosingDefinition(index, file, call, owner);
+    const member = definition && declarationOf(index, definition);
+    return member && declared.includes(member) ? { member, definition } : null;
 }
 
 // These spellings only select candidates. Every site must replay the
@@ -229,7 +237,14 @@ function constructionAliasBinding(index, file, call, targets) {
     let candidates = targets;
     if (!candidates) {
         candidates = constructionTypeCandidates(index, call.name);
+    } else {
+        // Only a type the call's spelling can name (its own name, or one an
+        // alias of it reaches) can be the construction's class (fix #421: a
+        // type query looked every call record of a file up at its site).
+        const spelled = projectFact(index, `construction-type-names:${call.name}`, live => constructionTypeNames(live, call.name));
+        candidates = candidates.filter(def => spelled.includes(def.name));
     }
+    if (!candidates.length) return null;
     if (call.implicitBase) return require('./provenance-constructor-base').implicitBaseBinding(index, file, call, candidates);
     const { occurrenceIdentity } = require('./provenance-facts');
     const site = occurrenceIdentity(index.files.get(file).relativePath, call);
@@ -243,8 +258,9 @@ function constructionAliasBinding(index, file, call, targets) {
             const bound = require('./provenance-type').cppConstructionClasses(index, query);
             candidates = candidates.filter(owner => bound.length > 0 && bound.every(def =>
                 sameDeclaration(declarationIdentity(def), declarationIdentity(owner))));
-        } catch {
-            // A failed optional lookup leaves the ordinary proof attempts.
+        } catch (error) {
+            // A refused optional lookup leaves the ordinary proof attempts.
+            refusedProof(error);
         }
     }
     const family = langTraits(language)?.nameReferenceFamily || language;
@@ -301,10 +317,22 @@ function constructionEvidence(index, owner, call, classBinding) {
 }
 
 function constructionEvidenceUncached(index, owner, call, classBinding) {
-    let members = ownConstructors(index, owner), declaring = owner, hierarchy = null, delegating = null;
+    let members = ownConstructors(index, owner), declaring = owner, hierarchy = null, delegating = null,
+        delegatingDefinition = null;
     if (!members.length) {
         const inherited = require('./constructor-hierarchy').captureHierarchy(index, owner);
         if (!inherited) return { unresolved: true };
+        if (inherited.none) {
+            // No class of the order declares a constructor. Only an
+            // allocation protocol the language checks can still run project
+            // code; a construction then depends on its class alone.
+            const language = index.files.get(owner.file).language;
+            const wrapped = langTraits(language)?.decoratorsWrapCallables && owner.decorators?.length;
+            const protocol = langTraits(language)?.constructorProtocol;
+            const plain = !wrapped && (!protocol || require('./constructor-protocol').validateConstructorProtocol(
+                protocolFacts(index, owner), declarationIdentity(owner), [], language));
+            return plain ? { noBody: true } : { unresolved: true };
+        }
         members = inherited.members; declaring = inherited.declaring; hierarchy = inherited.witness;
     } else {
         const header = headerConstructor(owner, members);
@@ -312,12 +340,16 @@ function constructionEvidenceUncached(index, owner, call, classBinding) {
             // A same-type delegation runs in one of the owner's own
             // constructors; any other enclosing scope means the site does
             // not belong to this owner's family.
-            delegating = delegatingConstructor(members, call);
-            if (!delegating) return { unresolved: true, delegation: true };
+            const siteFile = classBinding?.facts?.site?.file;
+            const found = delegatingConstructor(index, owner, members, call,
+                siteFile ? path.resolve(index.root, siteFile) : null);
+            if (!found) return { unresolved: true, delegation: true };
+            delegating = found.member;
+            delegatingDefinition = found.definition || null;
             members = members.filter(def => def !== delegating);
         }
         if (header) members = [...members, header];
-        if (!members.length) return { unresolved: true, delegation: true, delegating };
+        if (!members.length) return { unresolved: true, delegation: true, delegating, delegatingDefinition };
     }
     const language = index.files.get(owner.file).language;
     const protocol = protocolFacts(index, owner);
@@ -346,11 +378,23 @@ function constructionEvidenceUncached(index, owner, call, classBinding) {
             qualifier: call.constructorQualifier || call.receiver || null, functional: !!functional, construction: true,
             localShadow: !!call.localShadow,
         }, owner) : null;
-    return { members, declaring, hierarchy, delegating, language, protocol, overload, selected, chosen, nameScope, typeLookup };
+    return { members, declaring, hierarchy, delegating, delegatingDefinition, language, protocol, overload, selected,
+        chosen, nameScope, typeLookup };
+}
+
+// The out-of-class definition a delegation runs in and the signature it
+// shares with its in-class declaration (fix #421): the replay checks that
+// the site lies in that definition and that the two declare one constructor.
+function delegatingDefinitionFacts(evidence) {
+    const { _cFamilySignatureKey } = require('./callers');
+    return { delegatingDefinition: { ...declarationIdentity(evidence.delegatingDefinition),
+        signature: _cFamilySignatureKey(evidence.delegatingDefinition) },
+    delegatingSignature: _cFamilySignatureKey(evidence.delegating) };
 }
 
 function constructionChoice(index, owner, call, classBinding, targets) {
     const evidence = constructionEvidence(index, owner, call, classBinding);
+    if (evidence.noBody) return { noBody: true };
     if (evidence.unresolved) {
         const facts = { language: index.files.get(owner.file)?.language, site: classBinding?.facts?.site,
             targets: (targets || []).map(declarationIdentity) };
@@ -358,7 +402,8 @@ function constructionChoice(index, owner, call, classBinding, targets) {
         // even when no other member of the family remains (fix #419).
         if (evidence.delegating) {
             facts.constructorCall = { owner: declarationIdentity(owner), members: [],
-                delegating: declarationIdentity(evidence.delegating), classBinding,
+                delegating: declarationIdentity(evidence.delegating),
+                ...(evidence.delegatingDefinition && delegatingDefinitionFacts(evidence)), classBinding,
                 call: { isConstructor: !!call.isConstructor, syntax: call.constructorSyntax || null, delegation: 'this' } };
             const provenance = { rule: 'constructor-call', rules: ['constructor-call'], facts };
             if (targets && validateConfirmation(provenance, targets.map(declarationIdentity)).verdict === 'establishes-other') {
@@ -368,12 +413,14 @@ function constructionChoice(index, owner, call, classBinding, targets) {
         return { reason: evidence.delegation ? 'constructor-delegation-unresolved' : 'constructor-inheritance-unresolved',
             provenance: { rule: 'constructor-call', rules: ['constructor-call'], facts } };
     }
-    const { members, declaring, hierarchy, delegating, language, protocol, overload, selected, chosen, nameScope, typeLookup } = evidence;
+    const { members, declaring, hierarchy, delegating, delegatingDefinition, language, protocol, overload, selected, chosen,
+        nameScope, typeLookup } = evidence;
     targets ||= members;
     const facts = { language, site: classBinding?.facts?.site, targets: targets.map(declarationIdentity),
         constructorCall: { owner: declarationIdentity(declaring), members: members.map(declarationIdentity),
             ...(hierarchy && { constructedOwner: declarationIdentity(owner), hierarchy }),
             ...(delegating && { delegating: declarationIdentity(delegating) }),
+            ...(delegatingDefinition && delegatingDefinitionFacts(evidence)),
             classBinding, call: { isConstructor: !!call.isConstructor,
                 isFunctionReference: !!call.isFunctionReference, isPotentialCallback: !!call.isPotentialCallback,
                 syntax: call.constructorSyntax || null, ...(delegating && { delegation: 'this' }) },
@@ -402,19 +449,50 @@ function constructionChoice(index, owner, call, classBinding, targets) {
         provenance, reason };
 }
 
+// Syntax whose site runs a constructor body without constructing the class
+// at a source spelling of its own: a delegation (`this(..)`, `super(..)`,
+// a mem-initializer), an omitted base initializer, an enum constant.
+const BODY_ONLY_SYNTAX = new Set(['delegation', 'implicit', 'enum']);
+
+const groupOrder = (a, b) => codeUnitCompare(a.definition.relativePath, b.definition.relativePath) ||
+    a.definition.startLine - b.definition.startLine ||
+    (a.definition.sourceSpan?.start ?? Infinity) - (b.definition.sourceSpan?.start ?? Infinity) ||
+    codeUnitCompare(identityKey(declarationIdentity(a.definition)), identityKey(declarationIdentity(b.definition)));
+
+/**
+ * The constructor bodies a class callee's sites run (fix #421). A
+ * construction (`new C(..)`, `C(..)`) stays a dependency on the class,
+ * certain whenever its class binding is: its proven constructor joins as an
+ * initializer edge (`initializers`), and an undecided one is a review of the
+ * class edge (`initializerReviews`), never a demotion of it. A delegation,
+ * an omitted base initializer or an enum constant runs a constructor body
+ * only: its sites leave the class edge (`groups`, `unverified`).
+ */
 function projectConstructorCalleeSites(index, owner, siteIds, readSite) {
     if (!siteIds?.length || !ownConstructors(index, owner).length &&
         !langTraits(index.files.get(owner.file)?.language)?.constructorInheritance) return null;
     const language = index.files.get(owner.file)?.language;
-    const remaining = [], unverified = [], groups = new Map();
+    const remaining = [], unverified = [], groups = new Map(), initializers = new Map(), initializerReviews = [];
     for (const siteId of siteIds) {
         const { call, site } = readSite(siteId);
         if (!isConstruction(call, site, language)) { remaining.push(siteId); continue; }
+        const bodyOnly = BODY_ONLY_SYNTAX.has(call.constructorSyntax);
+        if (!bodyOnly) remaining.push(siteId);
         const choice = constructionChoice(index, owner, call, site.provenance);
-        // The type header's own constructor has no declaration: the site
-        // remains a dependency on the class (fix #419).
-        if (!choice.reason && choice.definition?.headerConstructor) { remaining.push(siteId); continue; }
+        // The type header's own constructor has no declaration (fix #419),
+        // and a class whose whole order declares none runs no project body
+        // (fix #421): a construction remains a dependency on the class.
+        if (choice.noBody && !bodyOnly) continue;
+        if (!choice.reason && choice.definition?.headerConstructor) {
+            if (bodyOnly) remaining.push(siteId);
+            continue;
+        }
         if (choice.reason || !choice.definition) {
+            const reason = choice.reason || 'constructor-proof-incomplete';
+            if (!bodyOnly) {
+                initializerReviews.push({ siteId, call, reason, provenance: choice.provenance });
+                continue;
+            }
             // A Python class call still depends on its proven class binding
             // when its allocator/decorator protocol cannot select a body.
             // The constructor-handle query retains that uncertainty.
@@ -423,21 +501,22 @@ function projectConstructorCalleeSites(index, owner, siteIds, readSite) {
                 remaining.push(siteId);
                 continue;
             }
-            unverified.push({ siteId, call, reason: choice.reason || 'constructor-proof-incomplete', provenance: choice.provenance });
+            unverified.push({ siteId, call, reason, provenance: choice.provenance });
             continue;
         }
-        const definition = choice.definition;
+        // The edge names the definition holding the selected constructor's
+        // body (an in-class declaration's out-of-class definition, fix
+        // #421); its proof establishes the declaration.
+        const definition = require('./out-of-class-members').bodyDefinitionOf(index, choice.definition) || choice.definition;
         const key = identityKey(declarationIdentity(definition));
-        if (!groups.has(key)) groups.set(key, { definition, sites: [] });
-        groups.get(key).sites.push({ ...site, targetDef: declarationIdentity(definition),
+        const target = bodyOnly ? groups : initializers;
+        if (!target.has(key)) target.set(key, { definition, sites: [] });
+        target.get(key).sites.push({ ...site, targetDef: declarationIdentity(choice.definition),
             provenance: choice.provenance, tier: 'confirmed' });
     }
-    if (remaining.length === siteIds.length) return null;
-    return { remaining, unverified, groups: [...groups.values()].sort((a, b) =>
-        codeUnitCompare(a.definition.relativePath, b.definition.relativePath) ||
-        a.definition.startLine - b.definition.startLine ||
-        (a.definition.sourceSpan?.start ?? Infinity) - (b.definition.sourceSpan?.start ?? Infinity) ||
-        codeUnitCompare(identityKey(declarationIdentity(a.definition)), identityKey(declarationIdentity(b.definition)))) };
+    if (remaining.length === siteIds.length && !initializers.size && !initializerReviews.length) return null;
+    return { remaining, unverified, groups: [...groups.values()].sort(groupOrder),
+        initializers: [...initializers.values()].sort(groupOrder), initializerReviews };
 }
 
 // A class's construction sites, read once per operation for every
@@ -503,6 +582,8 @@ function projectConstructorCallers(index, name, options, result) {
             if (!isConstruction(call, site, language)) continue;
             replaced.add(siteKey(site));
             const choice = constructionChoice(index, owner, call, site.provenance, targets);
+            // No project constructor body runs here, so none of the targets.
+            if (choice.noBody) continue;
             if (choice.other) {
                 excluded.push({ file: site.file, line: site.line, reason: choice.reason || 'constructor-overload-other',
                     provenance: choice.provenance });
@@ -532,7 +613,11 @@ function projectConstructorCallers(index, name, options, result) {
     const unique = rows => [...new Map(rows.map(row => [siteKey(row), row])).values()].sort(order);
     const all = unique([...confirmed, ...promoted]);
     const limit = options.maxResults || Infinity;
-    result.splice(0, result.length, ...all.slice(0, limit));
+    // A row read beyond the enrichment limit carries no line text; one that
+    // moves into the visible slice is enriched like the others (fix #421).
+    const visible = all.slice(0, limit).map(row => row.content != null ? row : {
+        ...row, content: index._getFileLines(row.file)?.[row.line - 1] ?? '' });
+    result.splice(0, result.length, ...visible);
     result.shadowEntries = all.slice(limit);
     result.totalCount = all.length;
     if (options.collectAccount) {

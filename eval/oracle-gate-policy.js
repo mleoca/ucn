@@ -387,6 +387,7 @@ function oracleCallerScope(index, call) {
 // Compiler class references and a proven initializer body describe the same
 // construction dependency. Project each occurrence separately: two derived
 // types can enter the same inherited initializer from one enclosing function.
+// A construction's class edge already in the answer is not projected again.
 function constructorClassEdges(edges, targets, alreadyExact = () => false) {
     const { declarationIdentity, sameDeclaration, validateConfirmation } = require('../core/provenance');
     const projected = [];
@@ -395,7 +396,10 @@ function constructorClassEdges(edges, targets, alreadyExact = () => false) {
         for (const target of targets) {
             if (!['class', 'struct', 'record', 'enum'].includes(target.type)) continue;
             const identity = declarationIdentity(target);
+            const classLines = new Set(edges.filter(other => other.type !== 'constructor' &&
+                sameDeclaration(declarationIdentity(other), identity)).flatMap(other => other.sites || []));
             const sites = (edge.siteProvenance || []).filter(site => {
+                if (classLines.has(site.line)) return false;
                 const proof = site.provenance, call = proof?.facts?.constructorCall;
                 return call && call.call?.syntax !== 'implicit' &&
                     sameDeclaration(call.constructedOwner || call.owner, identity) &&

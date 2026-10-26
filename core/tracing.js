@@ -231,6 +231,11 @@ function trace(index, name, options = {}) {
                     }
                 }
             }
+            // A construction whose constructor body is undecided (fix #421):
+            // its class edge is a child, the review a leaf beside it.
+            if (callees.initializerReviews && callees.initializerReviews.length > 0) {
+                node.initializerReviews = callees.initializerReviews;
+            }
             for (const callee of callees.slice(0, maxChildren)) {
                 // callee already has the best-matched definition from findCallees
                 const childTree = buildTree(callee, currentDepth + 1, 'down');
@@ -238,7 +243,8 @@ function trace(index, name, options = {}) {
                     node.children.push({
                         ...childTree,
                         callCount: callee.callCount,
-                        weight: callee.weight
+                        weight: callee.weight,
+                        ...(callee.initializerOf && { constructs: callee.initializerOf }),
                     });
                 }
             }

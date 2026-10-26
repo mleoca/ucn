@@ -1386,7 +1386,38 @@ function goPathPackageName(modulePath) {
     return cut > 0 ? base.slice(0, cut) : base;
 }
 
+// Node types that declare a type parameter, and the name-token types under
+// them (fix #421; shared with core/provenance-type.js).
+const TYPE_PARAMETER_PARENTS = Object.freeze(['type_parameter', 'type_parameters',
+    'constrained_type_parameter', 'type_parameter_declaration',
+    'optional_type_parameter_declaration', 'variadic_type_parameter_declaration']);
+const TYPE_PARAMETER_NAME_TOKENS = Object.freeze(['identifier', 'type_identifier', 'namespace_identifier',
+    'qualified_identifier', 'scoped_type_identifier', 'qualified_name', 'alias_qualified_name']);
+const TYPE_PARAMETER_NAME_TOKEN_SET = new Set(TYPE_PARAMETER_NAME_TOKENS);
+
+/**
+ * Every name token written directly in a type-parameter declaration of the
+ * trees (fix #421): a superset of the file's type-parameter names (bounds
+ * and defaults included), sorted. A name outside it is no type parameter
+ * anywhere in the file, which a construction's name-scope proof reads
+ * without parsing the file again.
+ */
+function declaredTypeParameterNames(...trees) {
+    const names = new Set();
+    for (const tree of trees) {
+        for (const parent of tree?.rootNode?.descendantsOfType([...TYPE_PARAMETER_PARENTS]) || []) {
+            for (const node of parent.children) {
+                if (TYPE_PARAMETER_NAME_TOKEN_SET.has(node.type)) names.add(node.text);
+            }
+        }
+    }
+    return [...names].sort();
+}
+
 module.exports = {
+    TYPE_PARAMETER_PARENTS,
+    TYPE_PARAMETER_NAME_TOKENS,
+    declaredTypeParameterNames,
     genericArityOf,
     hasParameterizedQualifier,
     goPathPackageName,

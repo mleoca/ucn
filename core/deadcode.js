@@ -745,6 +745,7 @@ function deadcode(index, options = {}) {
     let excludedExported = 0;
     let excludedExternalContract = 0;
     let excludedRuntimeContract = 0;
+    let excludedConstructors = 0;
     let excludedDynamicDispatch = 0;
     const computedDispatchByFile = projectComputedDispatch(index);
     const computedDispatchReceivers = new Set();
@@ -1358,10 +1359,12 @@ function deadcode(index, options = {}) {
             // initializer that deleting it may introduce. A zero name count
             // cannot establish that this declaration is independently dead.
             // Ordinary methods with a constructor-like name remain auditable.
+            // Counted apart from runtime callbacks (fix #421): the type is
+            // audited instead, its constructors are not claims of their own.
             if (symbol.type === 'constructor' ||
                 (symbol.className && !classAuditSet.has(symbol.type) &&
                     langTraits(lang)?.constructorProtocol?.initializer === name)) {
-                excludedRuntimeContract++;
+                excludedConstructors++;
                 continue;
             }
             // Members the runtime/compiler invokes by name (trait
@@ -1613,6 +1616,7 @@ function deadcode(index, options = {}) {
     results.excludedExported = excludedExported;
     results.excludedExternalContract = excludedExternalContract;
     results.excludedRuntimeContract = excludedRuntimeContract;
+    results.excludedConstructors = excludedConstructors;
     results.excludedDynamicDispatch = excludedDynamicDispatch;
     results.computedDispatch = computedDispatchInfo;
     reflectionInfo.withheldByPattern = [...reflectionWithheldByPattern]

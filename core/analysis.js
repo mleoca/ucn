@@ -346,6 +346,23 @@ function callNotResolvedEntries(index, account, options = {}) {
  * @param {object} options - { file, className, includeMethods, includeUncertain, exclude, minConfidence }
  * @returns {object|null}
  */
+/**
+ * The hint for a constructor handle with no callers whose declaring class
+ * is unresolved (fix #421): constructions name the class, and without its
+ * definition they cannot be bound to this constructor. Null otherwise: a
+ * constructor of a resolved class receives every construction selecting it.
+ */
+function unownedConstructorHint(index, def, callerCount) {
+    if (callerCount > 0 || !def?.className) return null;
+    const { isConstructor } = require('./constructor-calls');
+    if (!isConstructor(def, index) || require('./class-identity').ownerDefinitionOf(index, def) ||
+        !index.getCalleeFiles(def.className)) return null;
+    return {
+        type: 'hint',
+        message: `The class declaring this constructor was not resolved, so constructions of \`${def.className}\` are not bound to it; query \`${def.className}\` for the construction sites.`,
+    };
+}
+
 function context(index, name, options = {}) {
     index._beginOp();
     try {
@@ -591,6 +608,7 @@ function context(index, name, options = {}) {
         ...(ambiguityCandidates && { ambiguityCandidates }),
         callees,
         unverifiedCallees: rawCallees.unverifiedCallees || [],
+        ...(rawCallees.initializerReviews?.length && { initializerReviews: rawCallees.initializerReviews }),
         callerHistogram,
         calleeHistogram,
         meta: {
@@ -619,18 +637,11 @@ function context(index, name, options = {}) {
         }
     };
 
-    // Constructor pins surface their invocation sites under the CLASS pin
-    // (`new Widget()` indexes under 'Widget' — the fix #239 liveness rule;
-    // fix #254 makes it discoverable): a bare empty answer sent readers
-    // hunting for callers the class pin already has.
-    if (def.className && callers.length === 0 &&
-        (def.type === 'constructor' || name === 'constructor' || name === '__init__') &&
-        index.getCalleeFiles(def.className)) {
-        warnings.push({
-            type: 'hint',
-            message: `Constructor invocations (\`new ${def.className}(...)\` / \`${def.className}(...)\`) are indexed under the class name — query \`${def.className}\` for the call sites.`,
-        });
-    }
+    // A constructor handle lists the constructions that select it (fix
+    // #417). Only a constructor whose declaring class is unresolved cannot
+    // receive them; its class handle still has the sites (fix #421).
+    const unownedHint = unownedConstructorHint(index, def, callers.length);
+    if (unownedHint) warnings.push(unownedHint);
 
     if (warnings.length > 0) {
         result.warnings = warnings;
@@ -711,6 +722,7 @@ function smart(index, name, options = {}) {
         dependencies,
         types,
         unverifiedCallees: smartUnverified,
+        ...(callees.initializerReviews?.length && { initializerReviews: callees.initializerReviews }),
         meta: {
             complete: stats.uncertain === 0 && dynamicImports === 0 && smartUnverified.length === 0,
             skipped: 0,
@@ -1861,6 +1873,7 @@ function about(index, name, options = {}) {
             ...(c.paramsStructured && { paramsStructured: c.paramsStructured }),
             ...(c.docstring && { docstring: c.docstring }),
             ...(c.sideEffects && c.sideEffects.length && { sideEffects: c.sideEffects }),
+            ...(c.initializerOf && { initializerOf: c.initializerOf }),
         }));
     }
 
@@ -1994,16 +2007,8 @@ function about(index, name, options = {}) {
         completeness: detectCompleteness(index)
     };
 
-    // Constructor pins surface their invocation sites under the CLASS pin
-    // (`new Widget()` indexes under 'Widget' — fix #254, same hint as context).
-    if (primary.className && (callers?.length ?? 0) === 0 &&
-        (primary.type === 'constructor' || symbolName === 'constructor' || symbolName === '__init__') &&
-        index.getCalleeFiles(primary.className)) {
-        result.warnings = [...(result.warnings || []), {
-            type: 'hint',
-            message: `Constructor invocations (\`new ${primary.className}(...)\` / \`${primary.className}(...)\`) are indexed under the class name — query \`${primary.className}\` for the call sites.`,
-        }];
-    }
+    const unownedHint = unownedConstructorHint(index, primary, callers?.length ?? 0);
+    if (unownedHint) result.warnings = [...(result.warnings || []), unownedHint];
 
     return result;
     } finally { index._endOp(); }

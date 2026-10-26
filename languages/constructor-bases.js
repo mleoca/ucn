@@ -89,4 +89,17 @@ function implicitBaseCalls(root, language, reaches, owners = null) {
     return calls;
 }
 
-module.exports = { implicitBaseCalls, baseSpelling };
+/**
+ * The omitted-initializer calls of the classes spanning exactly
+ * `ownerLine`..`ownerEndLine` (fix #421): what implicitBaseCalls yields for
+ * them in a whole-tree walk, without extracting every other call.
+ */
+function implicitBaseCallsOfOwner(root, language, reaches, ownerLine, ownerEndLine) {
+    const config = require('./index').langTraits(language)?.implicitBaseConstruction;
+    if (!config || !root) return [];
+    const owners = root.descendantsOfType(config.classes).filter(node =>
+        node.startPosition.row + 1 === ownerLine && node.endPosition.row + 1 === ownerEndLine);
+    return owners.length ? implicitBaseCalls(root, language, reaches, owners) : [];
+}
+
+module.exports = { implicitBaseCalls, implicitBaseCallsOfOwner, baseSpelling };

@@ -452,3 +452,32 @@ it('receiver import aliases must end at the recorded owner declaration', () => {
     proof.facts.receiverImportChain[0].importedName = 'Other';
     assert.equal(validateConfirmation(proof, method).verdict, 'inconsistent');
 });
+
+describe('fix #421: witness captures refuse only what they cannot prove', () => {
+    const { captureOverload, ProvenanceRefusal } = require('../core/provenance-overload');
+    const { tmp, rm, idx } = require('./helpers');
+    it('a refusal yields no witness; an internal error propagates', () => {
+        const dir = tmp({ 'A.java': 'class A {\n void f(int v) { }\n void f(String s) { }\n void g() { f(1); }\n}\n' });
+        try {
+            const index = idx(dir), candidates = index.symbols.get('f');
+            const call = { name: 'f', line: 4, argCount: 1, argKinds: ['int'] };
+            assert.strictEqual(captureOverload(index, call, candidates, 'java', () => {
+                throw new ProvenanceRefusal('Missing provenance fact: x');
+            }), null);
+            assert.strictEqual(captureOverload(index, call, candidates, 'java', () => {
+                throw Object.assign(new Error('unreadable'), { code: 'ENOENT', syscall: 'open' });
+            }), null);
+            assert.throws(() => captureOverload(index, call, candidates, 'java', () => {
+                throw new TypeError('defect');
+            }), /defect/);
+            const { captureTypeLookup } = require('../core/provenance-type');
+            const owner = index.symbols.get('A')[0];
+            const original = index.files.get(owner.file).language;
+            // A defect inside the type lookup surfaces as one.
+            const broken = Object.create(index, { _readFile: { value: () => { throw new TypeError('lookup defect'); } } });
+            assert.throws(() => captureTypeLookup(broken, { file: owner.file, relativePath: 'A.java', line: 4, column: 0,
+                name: 'A', construction: true }, owner), /lookup defect/);
+            assert.strictEqual(index.files.get(owner.file).language, original);
+        } finally { rm(dir); }
+    });
+});

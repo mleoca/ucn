@@ -95,10 +95,26 @@ describe('fix #417: closed SDK values exclude unrelated imported interfaces', ()
         ['Path implementation', 'import java.nio.file.Path; import java.nio.file.LinkOption; abstract class Target implements Path {static int pick(Path value,LinkOption... options){return 1;}static int pick(String value,LinkOption... options){return 2;}}class Use {static int build(){return Target.pick("x");}}', 'pick'],
         ['file-system provider', 'import java.nio.file.Path; import java.nio.file.LinkOption; import java.nio.file.spi.FileSystemProvider; abstract class Target extends FileSystemProvider {static int pick(Path value,LinkOption... options){return 1;}static int pick(String value,LinkOption... options){return 2;}}class Use {static int build(){return Target.pick("x");}}', 'pick'],
     ];
+    // A platform supertype's members are unknown (fix #421: no JDK member
+    // tables in the engine), so an owner implementing one keeps an open
+    // overload family: both overloads are reviewed, the Path one never
+    // confirmed.
+    const openFamily = new Set(['Path implementation', 'file-system provider']);
     for (const [label, source, name] of cases) it(`${label}: a string does not become a Path`, () => {
         const dir = tmp({ 'N.java': source });
         try {
             const index = idx(dir);
+            if (openFamily.has(label)) {
+                for (const target of index.symbols.get(name)) {
+                    const callers = index.findCallers(name, { targetDefinitions: [target], collectAccount: true });
+                    assert.equal(callers.length, 0);
+                    assert.deepEqual(callers.unverifiedEntries.map(entry => entry.reason), ['overload-ambiguous']);
+                }
+                const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+                assert.equal(callees.filter(def => def.name === name).length, 0);
+                assert.deepEqual(callees.unverifiedCallees.map(entry => entry.name), [name]);
+                return;
+            }
             for (const [type, count] of [['Path', 0], ['String', 1]]) {
                 const target = index.symbols.get(name).find(def => (name !== 'Box' || def.type === 'constructor') && def.paramsStructured?.[0]?.type === type);
                 const callers = index.findCallers(name, { targetDefinitions: [target], collectAccount: true });
@@ -694,7 +710,10 @@ describe('fix #417: class literal arguments retain their JDK identity', () => {
                 assert.equal(callers.length, 0);
                 assert.equal(callers.unverifiedEntries.length, 1);
             }
-            assert.equal(index.findCallees(index.symbols.get('build')[0], { collectAccount: true }).length, 0);
+            // The class dependency stays; its constructor body is undecided (fix #421).
+            const callees = index.findCallees(index.symbols.get('build')[0], { collectAccount: true });
+            assert.deepStrictEqual(callees.map(def => [def.name, def.type]), [['Box', 'class']]);
+            assert.deepStrictEqual(callees.initializerReviews.map(def => def.name), ['Box']);
         } finally { rm(dir); }
     });
     it('a superclass name is not an inherited member type', () => {
@@ -6572,8 +6591,9 @@ describe('fix #401: Java super in enum-constant bodies, nested-class member scop
             const index = idx(dir);
             const run = index.symbols.get('run').find(d => d.relativePath === 'src/app/UseIt.java');
             const callees = index.findCallees(run, { collectAccount: true });
-            assert.deepStrictEqual(callees.filter(c => c.name === 'TestClass').map(c => c.relativePath),
-                ['src/lib/model/TestClass.java']);
+            // The class and its constructor body (fix #421), both from the import.
+            assert.deepStrictEqual(callees.filter(c => c.name === 'TestClass').map(c => [c.relativePath, c.type]),
+                [['src/lib/model/TestClass.java', 'class'], ['src/lib/model/TestClass.java', 'constructor']]);
         } finally { rm(dir); }
     });
 });
@@ -6727,6 +6747,65 @@ describe('fix #420: Java pattern variables are locals scoped by their pattern fl
                 2: 'int cap = 3;', 6: 'return limit + this.cap;', 8: 'return cap;', 14: 'default -> cap;', 19: 'return cap;',
             });
             assert.ok(!result.result.changes.some(change => change.needsReview), 'every token is decided');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #421: a parse error reaches only the member it lies in', () => {
+    const files = {
+        'p/T.java': 'package p;\npublic class T {\n    public static int pick(int v) { return 1; }\n    public static int pick(String s) { return 2; }\n    public static int one(int v) { return 3; }\n}\n',
+        'p/Use.java': 'package p;\npublic class Use {\n    static int a() { return T.pick(1); }\n    static int b() { return T.one(1); }\n    static int c() { int x = 1 +; return T.one(x); }\n}\n',
+    };
+    it('calls in other members keep their overload choice; the broken member stays in review', () => {
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const calleesOf = name => index.findCallees(index.symbols.get(name)[0], { collectAccount: true });
+            assert.deepStrictEqual(calleesOf('a').map(def => [def.name, def.startLine]), [['pick', 3]]);
+            assert.deepStrictEqual(calleesOf('b').map(def => [def.name, def.startLine]), [['one', 5]]);
+            const broken = calleesOf('c');
+            assert.ok(!broken.some(def => def.name === 'one'));
+            assert.ok(broken.unverifiedCallees.some(entry => entry.name === 'one'));
+        } finally { rm(dir); }
+    });
+    it('an error outside every member (an import) keeps the whole file in review', () => {
+        const dir = tmp({ ...files, 'p/Use.java': 'package p;\nimport java.util.;\npublic class Use {\n    static int b() { return T.one(1); }\n}\n' });
+        try {
+            const index = idx(dir);
+            const callees = index.findCallees(index.symbols.get('b')[0], { collectAccount: true });
+            assert.ok(!callees.some(def => def.name === 'one'));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #421: producer overloads that agree on their return type decide the argument type', () => {
+    const key = 'package p;\npublic class Key<T> {\n    public static <T> Key<T> get(Class<T> type) { return null; }\n    public static Key<?> get(java.lang.reflect.Type type) { return null; }\n}\n';
+    it('every applicable producer returns Key: the Key overload is the target', () => {
+        const dir = tmp({
+            'p/Key.java': key,
+            'p/Injector.java': 'package p;\npublic class Injector {\n    public <T> Object getBinding(Key<T> key) { return key; }\n    public <T> Object getBinding(Class<T> type) { return getBinding(Key.get(check(type))); }\n    static <T> T check(T value) { return value; }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const [byKey, byClass] = ['Key<T>', 'Class<T>'].map(type => index.symbols.get('getBinding')
+                .find(def => def.paramsStructured[0].type === type));
+            const callers = index.findCallers('getBinding', { targetDefinitions: [byKey], collectAccount: true });
+            assert.deepStrictEqual(callers.map(site => [site.line, site.tier]), [[4, 'confirmed']]);
+            assert.deepStrictEqual(index.findCallers('getBinding', { targetDefinitions: [byClass], collectAccount: true })
+                .map(site => site.line), []);
+        } finally { rm(dir); }
+    });
+    it('producers that disagree leave the outer call in review', () => {
+        const dir = tmp({
+            'p/Key.java': key.replace('public static Key<?> get(java.lang.reflect.Type type)', 'public static String get(java.lang.reflect.Type type)'),
+            'p/Injector.java': 'package p;\npublic class Injector {\n    public <T> Object getBinding(Key<T> key) { return key; }\n    public Object getBinding(String type) { return getBinding(Key.get(check(type))); }\n    static <T> T check(T value) { return value; }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const byKey = index.symbols.get('getBinding').find(def => def.paramsStructured[0].type === 'Key<T>');
+            const callers = index.findCallers('getBinding', { targetDefinitions: [byKey], collectAccount: true });
+            assert.strictEqual(callers.length, 0);
+            assert.deepStrictEqual(callers.unverifiedEntries.map(site => site.line), [4]);
         } finally { rm(dir); }
     });
 });

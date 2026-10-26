@@ -105,13 +105,24 @@ function validateConfirmation(provenance, target, invalidCall = false) {
         const delegating = constructor.delegating;
         if (delegating !== undefined) {
             const site = facts.site;
+            // An out-of-class definition (fix #421) holds the site and
+            // defines the in-class declaration: same owner scope path and
+            // parameter signature.
+            const body = constructor.delegatingDefinition || delegating;
+            const scopePath = def => [def.namespace, def.enclosingType].filter(Boolean).join('::');
             if (!validIdentity(owner) || !validIdentity(delegating) || call?.delegation !== 'this' ||
                 call.syntax !== 'delegation' || delegating.kind !== 'constructor' ||
                 delegating.className !== owner.name || delegating.file !== owner.file ||
                 delegating.startLine < owner.startLine || delegating.endLine > owner.endLine ||
                 (delegating.namespace || null) !== (owner.namespace || null) ||
-                !site || site.file !== delegating.file || site.line < delegating.startLine || site.line > delegating.endLine ||
+                !site || site.file !== body.file || site.line < body.startLine || site.line > body.endLine ||
                 (members || []).some(member => sameDeclaration(member, delegating))) {
+                return inconsistent('constructor-delegation-mismatch');
+            }
+            if (constructor.delegatingDefinition && (!validIdentity(body) || body.kind !== 'constructor' ||
+                body.className !== owner.name || body.name !== delegating.name ||
+                scopePath(body) !== [owner.namespace, owner.enclosingType].filter(Boolean).join('::') ||
+                typeof body.signature !== 'string' || body.signature !== constructor.delegatingSignature)) {
                 return inconsistent('constructor-delegation-mismatch');
             }
             if (targets.every(t => sameDeclaration(t, delegating))) {

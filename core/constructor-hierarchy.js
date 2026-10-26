@@ -4,7 +4,7 @@ const { langTraits, getParser } = require('../languages');
 const { parsedSource } = require('./source-memo');
 const { referenceScope } = require('../languages/lexical-scope');
 const { declarationIdentity, sameDeclaration, identityKey } = require('./provenance');
-const { factIndex, sealFacts, replayed, seedReplay } = require('./provenance-overload');
+const { factIndex, sealFacts, replayed, seedReplay, refusedProof } = require('./provenance-overload');
 const { FILE_FIELDS, resolveTypeLookup } = require('./provenance-type');
 
 function basesOf(index, owner, config) {
@@ -102,7 +102,10 @@ function selectHierarchy(index, identity) {
         const initializer = langTraits(index.files.get(declaring.file)?.language)?.constructorProtocol?.initializer;
         if (initializer && require('./constructor-calls').ownMembers(index, declaring).some(def => def.name === initializer)) return null;
     }
-    return null;
+    // Every class of the complete order is a project class and none declares
+    // a constructor: the construction runs no project constructor body (fix
+    // #421). The caller still checks the allocation protocol.
+    return { constructed, none: true };
 }
 
 function captureHierarchy(index, owner) {
@@ -110,6 +113,7 @@ function captureHierarchy(index, owner) {
     try {
         const result = selectHierarchy(factIndex(reads, index, FILE_FIELDS), constructed);
         if (!result) return null;
+        if (result.none) return { none: true };
         // Return live definitions for the caller, keeping only source reads
         // and identities in the independently replayed witness.
         const declaring = (index.symbols.get(result.declaring.name) || []).find(def =>
@@ -119,7 +123,7 @@ function captureHierarchy(index, owner) {
         seedReplay(witness.reads, JSON.stringify(['hierarchy', constructed]), {
             declaring: declarationIdentity(result.declaring), members: result.members.map(declarationIdentity) });
         return { declaring, members: require('./constructor-calls').ownConstructors(index, declaring), witness };
-    } catch { return null; }
+    } catch (error) { return refusedProof(error); }
 }
 
 function validateHierarchy(witness, constructed, declaring, members) {
@@ -131,9 +135,9 @@ function validateHierarchy(witness, constructed, declaring, members) {
         try {
             const index = factIndex(witness.reads, undefined, FILE_FIELDS);
             const selected = selectHierarchy(index, constructed);
-            return selected && !index.hasMissingProvenanceFacts ? { declaring: declarationIdentity(selected.declaring),
+            return selected && !selected.none && !index.hasMissingProvenanceFacts ? { declaring: declarationIdentity(selected.declaring),
                 members: selected.members.map(declarationIdentity) } : null;
-        } catch { return null; }
+        } catch (error) { return refusedProof(error); }
     });
     return !!result && sameDeclaration(result.declaring, declaring) &&
         result.members.length === members.length && result.members.every(def =>

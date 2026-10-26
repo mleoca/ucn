@@ -944,7 +944,9 @@ function clearAllCaches() {
 // v307: Overload witnesses capture observed file fields separately.
 // v308 (fix #419): Java records without a declared canonical constructor
 // carry its parameters (`primaryParams`); record constructors delegate.
-const CACHE_FORMAT_VERSION = 308;
+// v309 (fix #421): C++ out-of-class constructor mem-initializers and
+// default initializations are call records.
+const CACHE_FORMAT_VERSION = 309;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 function usageResultKey(index, filePath, name, mode) {

@@ -1681,6 +1681,7 @@ const HANDLERS = {
             if (result.excludedDecorated != null) sliced.excludedDecorated = result.excludedDecorated;
             if (result.excludedExternalContract != null) sliced.excludedExternalContract = result.excludedExternalContract;
             if (result.excludedRuntimeContract != null) sliced.excludedRuntimeContract = result.excludedRuntimeContract;
+            if (result.excludedConstructors != null) sliced.excludedConstructors = result.excludedConstructors;
             if (result.excludedDynamicDispatch != null) sliced.excludedDynamicDispatch = result.excludedDynamicDispatch;
             if (result.pythonImplicitExportFiles != null) sliced.pythonImplicitExportFiles = result.pythonImplicitExportFiles;
             if (result.computedDispatch != null) sliced.computedDispatch = result.computedDispatch;

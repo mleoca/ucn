@@ -113,8 +113,18 @@ function plainStructure(tree, source) {
 // error-free source with no escape, no string template and no character an
 // identifier test could reject is canonical without a second parse; a source
 // with errors never is.
-function typeNameSourceCanonical(source, parseError = undefined) {
+function typeNameSourceCanonical(source, parseError = undefined, lines = null) {
     if (typeof source !== 'string') return false;
+    if (wholeSourceCanonical(source, parseError)) return true;
+    if (!lines) return false;
+    // A parse error confined to member declarations leaves the names of
+    // every other member as the index read them (fix #421): one unrelated
+    // syntax error demoted every overload choice of its file.
+    const scopes = errorMemberScopes(source);
+    return !!scopes && !scopes.some(([start, end]) => start <= lines.endLine && lines.startLine <= end);
+}
+
+function wholeSourceCanonical(source, parseError) {
     const saved = canonicalSources.get(source);
     if (saved !== undefined) return saved;
     const indexed = typeof parseError === 'function' ? parseError() : parseError;
@@ -137,6 +147,48 @@ function typeNameSourceCanonical(source, parseError = undefined) {
     }
     canonicalSources.set(source, canonical);
     return canonical;
+}
+
+// The member declarations a source's parse errors lie in, by line range
+// ([startLine, endLine] each), or null when an error is outside every member
+// (an import, a type header, a type body between members) or the source
+// needs lexical translation. Keyed by source text.
+const MEMBER_DECLARATIONS = new Set(['method_declaration', 'constructor_declaration',
+    'compact_constructor_declaration', 'field_declaration', 'constant_declaration', 'static_initializer',
+    'block', 'annotation_type_element_declaration']);
+const TYPE_BODIES = new Set(['class_body', 'interface_body', 'enum_body_declarations', 'annotation_type_body']);
+const errorScopeSources = new (require('../core/source-memo').BoundedMap)({ maxEntries: 256,
+    maxWeight: 8 * 1024 * 1024, weigh: (_scopes, source) => source.length * 2 });
+
+function errorMemberScopes(source) {
+    const saved = errorScopeSources.get(source);
+    if (saved !== undefined) return saved;
+    let scopes = null;
+    if (!source.includes('\\u') && !source.includes('\\{') && !noncanonicalIdentifier(source)) {
+        const tree = require('../core/source-memo').parsedSource('java', source);
+        if (tree) {
+            scopes = [];
+            const stack = [tree.rootNode];
+            while (stack.length && scopes) {
+                const node = stack.pop();
+                if (node.type === 'ERROR' || node.isMissing) {
+                    let member = node.parent;
+                    while (member && !(MEMBER_DECLARATIONS.has(member.type) && TYPE_BODIES.has(member.parent?.type))) {
+                        member = member.type === 'ERROR' ? null : member.parent;
+                    }
+                    if (!member) scopes = null;
+                    else scopes.push([member.startPosition.row + 1, member.endPosition.row + 1]);
+                    continue;
+                }
+                if (!node.hasError) continue;
+                const children = node.children;
+                for (let i = children.length - 1; i >= 0; i--) stack.push(children[i]);
+            }
+            if (scopes && !scopes.length && !plainStructure(tree, source)) scopes = null;
+        }
+    }
+    errorScopeSources.set(source, scopes);
+    return scopes;
 }
 
 function typeNameOwnersAt(source, site) {

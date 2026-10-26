@@ -1312,7 +1312,9 @@ async function evaluateRepo(repo, oracle) {
                     e.sites && e.sites.includes(oc.line) &&
                     isExactCalleeTargetEdge(e));
                 if (exactEdge) { placeCallee('confirmed'); continue; }
-                const unvEntry = (ucnCallees.unverifiedCallees || []).find(u =>
+                // An undecided constructor body beside its confirmed class
+                // edge is a visible review of the constructor (fix #421).
+                const unvEntry = [...(ucnCallees.unverifiedCallees || []), ...(ucnCallees.initializerReviews || [])].find(u =>
                     u.name === sym.name && u.sites && u.sites.includes(oc.line));
                 const otherDefEdge = ucnCallees.find(e =>
                     e.name === sym.name && e.sites && e.sites.includes(oc.line));

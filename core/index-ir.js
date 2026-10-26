@@ -139,6 +139,7 @@ function createFileEntryFromIR({
         ...(ir.cppUsings?.length > 0 && {
             cppUsings: ir.cppUsings,
         }),
+        ...(Array.isArray(ir.typeParameterNames) && { typeParameterNames: ir.typeParameterNames }),
         ...(ir.languageFeatures?.length > 0 && {
             languageFeatures: ir.languageFeatures,
         }),

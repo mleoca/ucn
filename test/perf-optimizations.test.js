@@ -3297,3 +3297,77 @@ describe('fix #418: witnesses share recorded facts, record project facts once an
         }
     });
 });
+
+describe('fix #421: constructor proofs read only what the query needs', () => {
+    // Tree-sitter parses of the language's grammar while `run` executes.
+    const countParses = (language, run) => {
+        const parser = require('../languages').getParser(language);
+        const original = parser.parse;
+        let parses = 0;
+        parser.parse = function (...args) { parses++; return original.apply(this, args); };
+        try { run(); } finally { parser.parse = original; }
+        return parses;
+    };
+    for (const [language, files, name] of [
+        ['java', { 'p/Box.java': 'package p;\npublic class Box { public Box(int v) { } }\n',
+            'p/Use.java': 'package p;\npublic class Use { static Box a() { return new Box(1); } }\n' }, 'Box'],
+        ['csharp', { 'Box.cs': 'class Box { public Box(int v) { } }\nclass Use { static Box A() { return new Box(1); } }\n' }, 'Box'],
+        ['cpp', { 'b.cpp': 'struct Box { Box(int v) { } };\nBox a() { return Box(1); }\nvoid b() { Box x(2); }\n' }, 'Box'],
+    ]) {
+        it(`${language}: the declared type-parameter names prove the name scope without a second parse`, () => {
+            const dir = tmp(files);
+            try {
+                const index = idx(dir);
+                const entry = [...index.files.values()].find(file => file.relativePath.includes('Use') || file.relativePath === 'b.cpp' || file.relativePath === 'Box.cs');
+                assert.ok(Array.isArray(entry.typeParameterNames));
+                const constructor = index.symbols.get(name).find(def => def.type === 'constructor');
+                const nameScope = require('../core/provenance-type').constructionNameScope;
+                let callers;
+                const parses = countParses(language, () => {
+                    callers = index.findCallers(name, { targetDefinitions: [constructor], collectAccount: true });
+                    assert.ok(nameScope(index, { file: entry.file || [...index.files.keys()].find(f => index.files.get(f) === entry),
+                        line: 1, column: 0, name }));
+                });
+                assert.ok(callers.length >= 1);
+                assert.strictEqual(parses, 0, 'no name-scope parse for a name no type parameter declares');
+            } finally { rm(dir); }
+        });
+    }
+    it('cpp: an omitted base initializer replays only its class, and the capture seeds that replay', () => {
+        const dir = tmp({ 'b.cpp': 'struct Base { Base() {} };\nstruct Child : Base { Child(int v) { (void)v; } };\nint other() { return 1; }\n' });
+        try {
+            const index = idx(dir);
+            const { getLanguageAdapter } = require('../languages');
+            const adapter = getLanguageAdapter('cpp');
+            const base = index.symbols.get('Base').find(def => def.type === 'constructor');
+            const callers = index.findCallers('Base', { targetDefinitions: [base], collectAccount: true });
+            assert.deepStrictEqual(callers.map(site => site.line), [2]);
+            const { validateConfirmation, declarationIdentity } = require('../core/provenance');
+            const copy = JSON.parse(JSON.stringify(callers[0].provenance));
+            // A copied proof is re-derived: from its class alone.
+            const owner = adapter.implicitBaseCallsOf(fs.readFileSync(path.join(dir, 'b.cpp'), 'utf8'),
+                require('../languages').getParser('cpp'), 2, 2);
+            assert.deepStrictEqual(owner.map(call => call.name), ['Base']);
+            assert.strictEqual(validateConfirmation(copy, declarationIdentity(base)).verdict, 'establishes-target');
+            const binding = copy.facts.constructorCall.classBinding.facts.implicitBaseBinding;
+            binding.base = { ...binding.base, ownerLine: 1 };
+            assert.notStrictEqual(validateConfirmation(copy, declarationIdentity(base)).verdict, 'establishes-target');
+        } finally { rm(dir); }
+    });
+    it('a type query reads no construction lookup for calls whose spelling names another type', () => {
+        // An alias makes the query visit every record of the file.
+        const dir = tmp({ 'b.cpp': 'struct Box { Box(int v) { } };\ntypedef Box BoxAlias;\nint f(int v) { return v; }\nint g() { return f(1) + f(2) + f(3); }\nBox h() { return Box(4); }\nBoxAlias k() { return BoxAlias(5); }\n' });
+        try {
+            const index = idx(dir);
+            const lookups = require('../core/provenance-type');
+            const original = lookups.cppConstructionClasses;
+            const names = [];
+            lookups.cppConstructionClasses = (i, query, ...rest) => { names.push(query.name); return original(i, query, ...rest); };
+            try {
+                const box = index.symbols.get('Box').find(def => def.type === 'struct');
+                assert.deepStrictEqual(index.findCallers('Box', { targetDefinitions: [box], collectAccount: true }).map(site => site.line), [5, 6]);
+            } finally { lookups.cppConstructionClasses = original; }
+            assert.deepStrictEqual(names.sort(), ['Box', 'BoxAlias']);
+        } finally { rm(dir); }
+    });
+});

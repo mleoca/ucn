@@ -214,7 +214,7 @@ function formatStatsJson(stats) {
 function formatDeadcode(results, options = {}) {
     if (results.length === 0 && !results.excludedDecorated &&
         !results.excludedExported && !results.excludedExternalContract &&
-        !results.excludedRuntimeContract && !results.pythonImplicitExportFiles &&
+        !results.excludedRuntimeContract && !results.excludedConstructors && !results.pythonImplicitExportFiles &&
         !results.excludedDynamicDispatch && !results.computedDispatch?.count &&
         results.coverage?.complete !== false) {
         return 'No dead code found.';
@@ -291,6 +291,9 @@ function formatDeadcode(results, options = {}) {
     if (results.excludedRuntimeContract > 0) {
         lines.push(`\n${results.excludedRuntimeContract} runtime callback(s) hidden (language/runtime registrations, not dead).`);
     }
+    if (results.excludedConstructors > 0) {
+        lines.push(`\n${results.excludedConstructors} constructor(s) not listed: a constructor belongs to its type's allocation protocol, so the type is audited instead.`);
+    }
     if (results.pythonImplicitExportFiles > 0) {
         lines.push(`\nPython public-surface rule active in ${results.pythonImplicitExportFiles} file(s) without __all__: top-level non-underscore names are treated as externally reachable.`);
     }
@@ -366,6 +369,7 @@ function formatDeadcodeJson(results) {
             ...(results.excludedDecorated > 0 && { excludedDecorated: results.excludedDecorated }),
             ...(results.excludedExternalContract > 0 && { excludedExternalContract: results.excludedExternalContract }),
             ...(results.excludedRuntimeContract > 0 && { excludedRuntimeContract: results.excludedRuntimeContract }),
+            ...(results.excludedConstructors > 0 && { excludedConstructors: results.excludedConstructors }),
             ...(results.pythonImplicitExportFiles > 0 && { pythonImplicitExportFiles: results.pythonImplicitExportFiles }),
             ...(results.excludedDynamicDispatch > 0 && { excludedDynamicDispatch: results.excludedDynamicDispatch }),
             ...(results.computedDispatch?.count > 0 && { computedDispatch: results.computedDispatch }),
