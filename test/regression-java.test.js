@@ -6688,3 +6688,45 @@ describe('fix #419: record constructors delegate inside the record; a delegation
         } finally { rm(dir); }
     });
 });
+
+describe('fix #420: Java pattern variables are locals scoped by their pattern flow', () => {
+    const { tmp, rm, idx } = require('./helpers');
+    it('instanceof and switch patterns hide a field only where the pattern matched', () => {
+        const dir = tmp({ 'Box.java': [
+            'public class Box {',
+            '    int limit = 3;',
+            '    record P(int limit, int other) {}',
+            '    int a(Object o) {',
+            '        if (o instanceof Integer limit) {',
+            '            return limit + this.limit;',
+            '        }',
+            '        return limit;',
+            '    }',
+            '    int b(Object o) {',
+            '        return switch (o) {',
+            '            case P(int limit, int other) -> limit + other;',
+            '            case Integer limit when limit > 0 -> limit;',
+            '            default -> limit;',
+            '        };',
+            '    }',
+            '    int c(Object o) {',
+            '        if (!(o instanceof Integer limit)) {',
+            '            return limit;',
+            '        }',
+            '        return limit;',
+            '    }',
+            '}',
+            '',
+        ].join('\n') });
+        try {
+            const result = execute(idx(dir), 'plan', { name: 'Box.java:2:limit', renameTo: 'cap' });
+            assert.strictEqual(result.ok, true, result.error);
+            const edits = Object.fromEntries(result.result.changes.filter(change => !change.needsReview &&
+                change.newExpression !== undefined).map(change => [change.line, change.newExpression]));
+            assert.deepStrictEqual(edits, {
+                2: 'int cap = 3;', 6: 'return limit + this.cap;', 8: 'return cap;', 14: 'default -> cap;', 19: 'return cap;',
+            });
+            assert.ok(!result.result.changes.some(change => change.needsReview), 'every token is decided');
+        } finally { rm(dir); }
+    });
+});

@@ -7174,3 +7174,75 @@ describe('fix #419: configuration alternatives as one rename closure; other tran
         } finally { rm(dir); }
     });
 });
+
+describe('fix #420: C/C++ value references by linkage, global qualification and local bindings', () => {
+    const plan = (index, name, renameTo = 'cap') => {
+        const result = execute(index, 'plan', { name, renameTo });
+        assert.equal(result.ok, true, result.error);
+        const edits = new Map(), reviews = new Set();
+        for (const change of result.result.changes) {
+            if (change.needsReview || change.newExpression === undefined) reviews.add(`${change.file}:${change.line}`);
+            else edits.set(`${change.file}:${change.line}`, change.newExpression);
+        }
+        return { edits, reviews };
+    };
+    it('an extern declaration and the external definition are one object', () => {
+        const dir = tmp({
+            'g.h': 'extern int g_count;\nint a_get(void);\n',
+            'a.c': '#include "g.h"\nint g_count = 0;\nstatic int s_val = 1;\nint a_get(void) { return g_count + s_val; }\n',
+            'b.c': '#include "g.h"\nstatic int s_val = 2;\nint b_get(void) { g_count++; return s_val; }\n',
+        });
+        try {
+            const index = idx(dir);
+            const expected = {
+                'g.h:1': 'extern int cap;', 'a.c:2': 'int cap = 0;',
+                'a.c:4': 'int a_get(void) { return cap + s_val; }', 'b.c:3': 'int b_get(void) { cap++; return s_val; }',
+            };
+            for (const handle of ['a.c:2:g_count', 'g.h:1:g_count']) {
+                const { edits, reviews } = plan(index, handle);
+                assert.deepEqual(Object.fromEntries(edits), expected, handle);
+                assert.equal(reviews.size, 0, handle);
+            }
+            // Internal linkage stays per translation unit.
+            assert.deepEqual(Object.fromEntries(plan(index, 'a.c:3:s_val').edits), {
+                'a.c:3': 'static int cap = 1;', 'a.c:4': 'int a_get(void) { return g_count + cap; }',
+            });
+        } finally { rm(dir); }
+    });
+    it('external definitions in several programs leave the shared declaration for review', () => {
+        const dir = tmp({
+            'g.h': 'extern int g_count;\n',
+            'one.c': '#include "g.h"\nint g_count = 1;\nint main(void) { return g_count; }\n',
+            'two.c': '#include "g.h"\nint g_count = 2;\n',
+            'use.c': '#include "g.h"\nint use(void) { return g_count; }\n',
+        });
+        try {
+            const { edits, reviews } = plan(idx(dir), 'one.c:2:g_count');
+            assert.ok(edits.has('one.c:2'));
+            assert.ok(reviews.has('g.h:1') && reviews.has('use.c:2'), JSON.stringify([...reviews]));
+            assert.ok(!edits.has('two.c:2'));
+        } finally { rm(dir); }
+    });
+    it('`::name` names the global namespace only; structured bindings are locals', () => {
+        const dir = tmp({ 'a.cpp': [
+            'namespace ns { int limit = 1; }',
+            'int limit = 2;',
+            'struct Box {',
+            '    int limit = 3;',
+            '    int get() const { return limit + this->limit + ::limit + ns::limit; }',
+            '    int pair(int (&p)[2]) const { auto [limit, other] = p; return limit + other + this->limit; }',
+            '};',
+            '',
+        ].join('\n') });
+        try {
+            const index = idx(dir);
+            assert.deepEqual(Object.fromEntries(plan(index, 'a.cpp:4:limit').edits), {
+                'a.cpp:4': 'int cap = 3;', 'a.cpp:5': 'int get() const { return cap + this->cap + ::limit + ns::limit; }',
+                'a.cpp:6': 'int pair(int (&p)[2]) const { auto [limit, other] = p; return limit + other + this->cap; }',
+            });
+            assert.deepEqual(Object.fromEntries(plan(index, 'a.cpp:2:limit').edits), {
+                'a.cpp:2': 'int cap = 2;', 'a.cpp:5': 'int get() const { return limit + this->limit + ::cap + ns::limit; }',
+            });
+        } finally { rm(dir); }
+    });
+});

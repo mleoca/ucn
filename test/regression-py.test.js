@@ -9467,3 +9467,128 @@ describe('fix #418: a protocol-blocked initializer rename never lists class cons
         } finally { rm(dir); }
     });
 });
+
+describe('fix #420: Python value renames follow the language name lookup', () => {
+    const { tmp, rm, idx } = require('./helpers');
+    const { execute } = require('../core/execute');
+    // Automatic edits by `file:line`, and the lines left for review.
+    const plan = (index, name, renameTo = 'cap') => {
+        const result = execute(index, 'plan', { name, renameTo });
+        assert.strictEqual(result.ok, true, result.error);
+        const edits = new Map(), reviews = new Set();
+        for (const change of result.result.changes) {
+            if (change.needsReview || change.newExpression === undefined) reviews.add(`${change.file}:${change.line}`);
+            else edits.set(`${change.file}:${change.line}`, change.newExpression);
+        }
+        return { edits, reviews, result: result.result };
+    };
+    it('a global declaration and its writes name the module variable; defaults read the enclosing scope', () => {
+        const dir = tmp({ 'conf.py': [
+            'limit = 10',
+            'def bump():',
+            '    global limit',
+            '    limit += 1',
+            '    return limit',
+            'def reset():',
+            '    global limit',
+            '    limit = 4',
+            'def shadow():',
+            '    limit = 5',
+            '    return limit',
+            'def g(limit=limit):',
+            '    return limit',
+            'h = lambda limit=limit: limit',
+            '',
+        ].join('\n') });
+        try {
+            const { edits, reviews } = plan(idx(dir), 'conf.py:1:limit');
+            assert.deepStrictEqual(Object.fromEntries(edits), {
+                'conf.py:1': 'cap = 10', 'conf.py:3': 'global cap', 'conf.py:4': 'cap += 1',
+                'conf.py:5': 'return cap', 'conf.py:7': 'global cap', 'conf.py:8': 'cap = 4',
+                'conf.py:12': 'def g(limit=cap):', 'conf.py:14': 'h = lambda limit=cap: limit',
+            });
+            assert.strictEqual(reviews.size, 0);
+        } finally { rm(dir); }
+    });
+    it('a module variable is one variable: every binding statement is renamed with the pin', () => {
+        const dir = tmp({
+            'app.py': [
+                'import json',
+                'def process(x):',
+                '    return x + 1',
+                'process = process',
+                'json = json',
+                'def main():',
+                '    return process(1), json.dumps(1)',
+                '',
+            ].join('\n'),
+            'm.py': 'from a import run, other\nimport functools\nrun = functools.lru_cache(run)\nother = other\n' +
+                'def main():\n    return run(1) + other()\n',
+            'r.py': 'from a import run\ndef local(x):\n    return x\nrun = local\ndef main():\n    return run(1)\n',
+            'a.py': 'def run(x):\n    return x\ndef other():\n    return 1\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(Object.fromEntries(plan(index, 'app.py:4:process').edits), {
+                'app.py:2': 'def cap(x):', 'app.py:4': 'cap = cap', 'app.py:7': 'return cap(1), json.dumps(1)',
+            });
+            assert.deepStrictEqual(Object.fromEntries(plan(index, 'app.py:5:json').edits), {
+                'app.py:1': 'import json as cap', 'app.py:5': 'cap = cap', 'app.py:7': 'return process(1), cap.dumps(1)',
+            });
+            assert.deepStrictEqual(Object.fromEntries(plan(index, 'm.py:4:other').edits), {
+                'm.py:1': 'from a import run, other as cap', 'm.py:4': 'cap = cap', 'm.py:6': 'return run(1) + cap()',
+            });
+            // The callers side: `other = other` keeps the imported function
+            // and `run = lru_cache(run)` wraps it; a rebinding to another
+            // value stays visible, never excluded.
+            const other = execute(index, 'impact', { name: 'a.py:3:other' }).result;
+            assert.ok(other.byFile.some(group => group.file === 'm.py' && group.sites.some(site => site.line === 6)));
+            const run = execute(index, 'impact', { name: 'a.py:1:run' }).result;
+            assert.ok(run.byFile.some(group => group.file === 'm.py' && group.sites.some(site => site.line === 6)));
+            assert.ok(run.unverifiedSites.some(site => site.file === 'r.py' && site.line === 6 &&
+                site.reason === 'module-rebinding'), JSON.stringify(run.unverifiedSites));
+        } finally { rm(dir); }
+    });
+    it("an importer's own rebinding of the imported name is renamed with it; an unrelated module variable is not", () => {
+        const dir = tmp({
+            'conf.py': 'limit = 10\ndef reader():\n    return limit\n',
+            'use.py': 'from conf import limit\nlimit = limit + 1\ndef bump():\n    global limit\n    limit += 1\n    return limit\n',
+            'other.py': 'limit = 5\nprint(limit)\n',
+            'main.py': 'import use, other, conf\nprint(use.bump(), use.limit, conf.reader())\n',
+        });
+        try {
+            const { edits, reviews } = plan(idx(dir), 'conf.py:1:limit');
+            assert.deepStrictEqual(Object.fromEntries(edits), {
+                'conf.py:1': 'cap = 10', 'conf.py:3': 'return cap', 'use.py:1': 'from conf import cap',
+                'use.py:2': 'cap = cap + 1', 'use.py:4': 'global cap', 'use.py:5': 'cap += 1', 'use.py:6': 'return cap',
+                'main.py:2': 'print(use.bump(), use.cap, conf.reader())',
+            });
+            assert.strictEqual(reviews.size, 0);
+        } finally { rm(dir); }
+    });
+    it('a class body reads the module variable before its own binding and the class attribute after it', () => {
+        const dir = tmp({ 'm.py': [
+            'limit = 10',
+            'class A:',
+            '    limit = limit',
+            '    double = [limit for _ in range(2)]',
+            '    after = limit + 1',
+            '    def get(self):',
+            '        return limit + self.limit',
+            '',
+        ].join('\n') });
+        try {
+            const index = idx(dir);
+            const module = plan(index, 'm.py:1:limit');
+            assert.deepStrictEqual(Object.fromEntries(module.edits), {
+                'm.py:1': 'cap = 10', 'm.py:3': 'limit = cap', 'm.py:4': 'double = [cap for _ in range(2)]',
+                'm.py:7': 'return cap + self.limit',
+            });
+            assert.strictEqual(module.reviews.size, 0);
+            const field = plan(index, 'm.py:3:limit');
+            assert.deepStrictEqual(Object.fromEntries(field.edits), {
+                'm.py:3': 'cap = limit', 'm.py:5': 'after = cap + 1', 'm.py:7': 'return limit + self.cap',
+            });
+        } finally { rm(dir); }
+    });
+});

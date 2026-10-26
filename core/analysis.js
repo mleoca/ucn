@@ -1421,6 +1421,25 @@ function impact(index, name, options = {}) {
             includeTests: true, exclude: options.exclude,
         }) : null;
 
+    // A value token that is also a call is one dependency site (fix #420):
+    // the value band lists every token, the call band only the calls.
+    const valueOnlyCount = valueAccesses ? (() => {
+        const calls = new Map();
+        for (const site of filteredSites) {
+            const key = `${site.file}\0${site.line}`;
+            calls.set(key, (calls.get(key) || 0) + 1);
+        }
+        let count = 0;
+        for (const group of valueAccesses.byFile) {
+            for (const site of group.sites) {
+                const key = `${site.file}\0${site.line}`;
+                if (calls.get(key) > 0) calls.set(key, calls.get(key) - 1);
+                else count++;
+            }
+        }
+        return count;
+    })() : 0;
+
     // Apply top limit if specified (limits total call sites shown)
     const totalBeforeLimit = filteredSites.length;
     if (options.top && options.top > 0 && filteredSites.length > options.top) {
@@ -1494,7 +1513,7 @@ function impact(index, name, options = {}) {
         }),
         ...(valueAccesses && {
             valueAccesses,
-            totalDependencySites: totalBeforeLimit + valueAccesses.confirmedCount,
+            totalDependencySites: totalBeforeLimit + valueOnlyCount,
             affectedFiles: affectedFiles.size,
         }),
         account: impactAccount,
@@ -2565,7 +2584,9 @@ function diffImpact(index, options = {}) {
         totalUnverifiedSites += evidence.unverifiedSites?.length || 0;
         for (const group of evidence.byFile || []) callerFileSet.add(path.resolve(index.root, group.file));
         const refs = evidence.typeReferences || evidence.propertyAccesses || evidence.valueAccesses;
-        totalDependencySites += refs?.confirmedCount || 0;
+        // Non-call sites only: a value band also lists the call tokens.
+        totalDependencySites += refs && Number.isInteger(evidence.totalDependencySites)
+            ? Math.max(0, evidence.totalDependencySites - (evidence.totalCallSites || 0)) : refs?.confirmedCount || 0;
         unverifiedDependencySites += refs?.unverifiedCount || 0;
         for (const group of refs?.byFile || []) dependencyFiles.add(group.file);
         for (const site of refs?.unverifiedSites || []) dependencyFiles.add(site.file);

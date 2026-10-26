@@ -2553,6 +2553,99 @@ function staticValueImportSyntax(tree) {
     return imports;
 }
 
+/**
+ * Whether a pattern variable's scope (JLS 6.3.1) holds a reference (fix
+ * #420): 'in' (the reference names the pattern variable), 'out' (the
+ * variable is not in scope there) or 'unknown'. A switch-label pattern
+ * reaches its arm; an `instanceof` pattern follows the boolean structure
+ * of its condition (`&&`, `||`, `!`, `?:`, if/while conditions) and, when
+ * introduced while false, the statements after an `if` whose branch
+ * cannot complete normally.
+ */
+function patternBindingReach(binding, reference) {
+    const within = (outer, inner) => !!outer && outer.startIndex <= inner.startIndex && inner.endIndex <= outer.endIndex;
+    if (reference.startIndex <= binding.startIndex) return 'out';
+    for (let node = binding.parent; node; node = node.parent) {
+        if (node.type === 'switch_label') {
+            const arm = node.parent;
+            return arm && (arm.type === 'switch_rule' || arm.type === 'switch_block_statement_group') &&
+                within(arm, reference) ? 'in' : 'out';
+        }
+        if (node.type === 'instanceof_expression') return instanceofReach(node, reference, within);
+        if (/_statement$|^block$|_declaration$|lambda_expression/.test(node.type)) break;
+    }
+    return 'unknown';
+}
+
+function instanceofReach(expression, reference, within) {
+    // A statement that cannot complete normally (null: undecided).
+    const abrupt = statement => {
+        if (!statement) return false;
+        if (['return_statement', 'throw_statement', 'break_statement', 'continue_statement',
+            'yield_statement'].includes(statement.type)) return true;
+        if (statement.type === 'block') {
+            const last = statement.namedChildren.filter(child => !child.type.includes('comment')).pop();
+            return last ? abrupt(last) : false;
+        }
+        if (['expression_statement', 'local_variable_declaration'].includes(statement.type)) return false;
+        return null;
+    };
+    let polarity = true;
+    let node = expression;
+    for (;;) {
+        const parent = node.parent;
+        if (!parent) return 'unknown';
+        if (parent.type === 'parenthesized_expression') { node = parent; continue; }
+        if (parent.type === 'unary_expression' && parent.childForFieldName('operator')?.type === '!') {
+            polarity = !polarity;
+            node = parent;
+            continue;
+        }
+        if (parent.type === 'binary_expression') {
+            const operator = parent.childForFieldName('operator')?.type;
+            if (operator !== '&&' && operator !== '||') return 'out';
+            if (within(parent.childForFieldName('left'), node) && within(parent.childForFieldName('right'), reference)) {
+                return (operator === '&&') === polarity ? 'in' : 'out';
+            }
+            if ((operator === '&&') !== polarity) return 'out';
+            node = parent;
+            continue;
+        }
+        if (parent.type === 'ternary_expression' && within(parent.childForFieldName('condition'), node)) {
+            if (within(parent.childForFieldName('consequence'), reference)) return polarity ? 'in' : 'out';
+            if (within(parent.childForFieldName('alternative'), reference)) return polarity ? 'out' : 'in';
+            return 'out';
+        }
+        if (['while_statement', 'for_statement', 'do_statement'].includes(parent.type) &&
+            within(parent.childForFieldName('condition'), node)) {
+            if (within(parent.childForFieldName('body'), reference)) {
+                return parent.type !== 'do_statement' && polarity ? 'in' : 'out';
+            }
+            if (within(parent, reference)) return 'out';
+            // After a loop exited through its condition only.
+            return polarity ? 'out' : 'unknown';
+        }
+        if (parent.type === 'if_statement' && within(parent.childForFieldName('condition'), node)) {
+            const consequence = parent.childForFieldName('consequence');
+            const alternative = parent.childForFieldName('alternative');
+            if (within(consequence, reference)) return polarity ? 'in' : 'out';
+            if (alternative && within(alternative, reference)) return polarity ? 'out' : 'in';
+            if (within(parent, reference)) return 'out';
+            // The statements after the `if` in its block (JLS 6.3.2.2).
+            const block = parent.parent;
+            if (!block || !within(block, reference) || !['block', 'switch_block_statement_group',
+                'constructor_body'].includes(block.type)) return 'out';
+            const taken = polarity ? alternative : consequence;
+            const other = polarity ? consequence : alternative;
+            if (polarity && !alternative) return 'out';
+            const takenAbrupt = abrupt(taken), otherAbrupt = other ? abrupt(other) : false;
+            if (takenAbrupt === null || otherAbrupt === null) return 'unknown';
+            return takenAbrupt && !otherAbrupt ? 'in' : 'out';
+        }
+        return 'out';
+    }
+}
+
 function findUsagesInCode(code, name, parser, tree) {
     tree = tree || parseTree(parser, code);
     const usages = [];
@@ -2708,6 +2801,7 @@ function isEntryPoint(symbol) {
 module.exports = {
     implicitOwnerScope: node => ({ enclosingType: enclosingTypeName(node) }),
     staticValueImportSyntax,
+    patternBindingReach,
     findFunctions,
     findClasses,
     findStateObjects,

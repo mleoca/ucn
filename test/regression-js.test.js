@@ -12207,3 +12207,114 @@ describe('fix #402: audit-async import chains and typed receivers, default impor
         } finally { rm(dir); }
     });
 });
+
+describe('fix #420: JS/TS value members by namespace identity, slot closure and lookup', () => {
+    const plan = (index, name, renameTo = 'cap') => {
+        const result = execute(index, 'plan', { name, renameTo });
+        assert.strictEqual(result.ok, true, result.error);
+        const edits = new Map(), reviews = new Set();
+        for (const change of result.result.changes) {
+            if (change.needsReview || change.newExpression === undefined) reviews.add(`${change.file}:${change.line}`);
+            else edits.set(`${change.file}:${change.line}`, change.newExpression);
+        }
+        return { edits, reviews };
+    };
+    it('only a namespace or exports object holds a module binding as a member', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t","type":"module"}',
+            'a.js': 'export let total = 0;\nexport const settings = { total: 99 };\nexport default settings;\n',
+            'c.js': [
+                "import { settings, total } from './a.js';",
+                "import def from './a.js';",
+                "import * as ns from './a.js';",
+                'function local(settings) { return settings.total; }',
+                'export const z = settings.total + total + ns.total + def.total + local({ total: 5 });',
+                '',
+            ].join('\n'),
+            'cjs/a.js': 'let total = 0;\nexports.total = total;\n',
+            'cjs/b.js': "const A = require('./a');\nfunction f(A) { return A.total; }\nmodule.exports = { v: A.total + f({ total: 1 }) };\n",
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(Object.fromEntries(plan(index, 'a.js:1:total').edits), {
+                'a.js:1': 'export let cap = 0;', 'c.js:1': "import { settings, cap } from './a.js';",
+                'c.js:5': 'export const z = settings.total + cap + ns.cap + def.total + local({ total: 5 });',
+            });
+            // A CommonJS export key is a property of the exports object.
+            const cjs = plan(index, 'cjs/a.js:1:total');
+            assert.deepStrictEqual(Object.fromEntries(cjs.edits), {
+                'cjs/a.js:1': 'let cap = 0;', 'cjs/a.js:2': 'exports.total = cap;',
+            });
+            assert.strictEqual(cjs.reviews.size, 0);
+        } finally { rm(dir); }
+    });
+    it('enum members reached through an import are never a same-name module value', () => {
+        const dir = tmp({
+            'tsconfig.json': '{"compilerOptions":{"strict":true}}',
+            'e.ts': "export enum Color { Red, Green }\nexport enum Shade { Red = 5 }\nexport const Red = 'r';\n",
+            'u.ts': "import { Color as C, Shade, Red } from './e';\nimport * as E from './e';\n" +
+                'export const v = C.Red + Shade.Red + E.Red.length + Red.length;\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(Object.fromEntries(plan(index, 'e.ts:3:Red').edits), {
+                'e.ts:3': "export const cap = 'r';", 'u.ts:1': "import { Color as C, Shade, cap } from './e';",
+                'u.ts:3': 'export const v = C.Red + Shade.Red + E.cap.length + cap.length;',
+            });
+            // The enum member: a bare name or an import never names it.
+            const member = plan(index, 'e.ts:1:Red');
+            assert.ok(!member.reviews.has('u.ts:1'), 'an import names a module export, never a member');
+            assert.ok(!member.edits.has('u.ts:1'));
+        } finally { rm(dir); }
+    });
+    it('a field renames with the interface it implements, its overrides and typed literals', () => {
+        const dir = tmp({
+            'tsconfig.json': '{"compilerOptions":{"strict":true}}',
+            'a.ts': [
+                'export interface HasCount { count: number }',
+                'export class Acc implements HasCount {',
+                '  count = 1;',
+                '  static count = 0;',
+                '}',
+                'export class Sub extends Acc {',
+                '  count = 2;',
+                '}',
+                'export function f(h: HasCount, a: Acc): number { return h.count + a.count; }',
+                'export const lit: HasCount = { count: 3 };',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            for (const handle of ['a.ts:1:count', 'a.ts:3:count']) {
+                const { edits, reviews } = plan(index, handle);
+                assert.deepStrictEqual(Object.fromEntries(edits), {
+                    'a.ts:1': 'export interface HasCount { cap: number }', 'a.ts:3': 'cap = 1;', 'a.ts:7': 'cap = 2;',
+                    'a.ts:9': 'export function f(h: HasCount, a: Acc): number { return h.cap + a.cap; }',
+                    'a.ts:10': 'export const lit: HasCount = { cap: 3 };',
+                }, handle);
+                assert.strictEqual(reviews.size, 0, handle);
+            }
+        } finally { rm(dir); }
+    });
+    it('a comment in an aliased rule is text whichever walk first read its node', () => {
+        const source = 'export interface Base { tag: number }\nexport interface Empty extends Base {\n  // tag: number;\n}\n' +
+            'export const b: Base = { tag: 1 };\n';
+        const dir = tmp({ 'tsconfig.json': '{}', 'a.ts': source });
+        try {
+            const index = idx(dir);
+            const file = path.join(dir, 'a.ts');
+            // A children walk wraps the comment as the alias first.
+            index._beginOp();
+            try {
+                const tree = index._getParsedTree(file, index._readFile(file), 'typescript');
+                const walk = node => { for (const child of node.children) walk(child); };
+                walk(tree.rootNode);
+            } finally { index._endOp(); }
+            const result = execute(index, 'plan', { name: 'a.ts:1:tag', renameTo: 'label' });
+            assert.strictEqual(result.ok, true, result.error);
+            assert.ok(!result.result.changes.some(change => change.line === 3),
+                JSON.stringify(result.result.changes.filter(change => change.line === 3)));
+        } finally { rm(dir); }
+    });
+});

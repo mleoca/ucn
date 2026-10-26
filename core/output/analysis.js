@@ -793,6 +793,23 @@ function formatContext(ctx, options = {}) {
 }
 
 /** Format impact command output - text. Shows what would need updating if a function signature changes. */
+/**
+ * The value band's token account (fix #420): every name token of the
+ * scanned lines is an access (confirmed, unverified, excluded by reason) or
+ * a declaration token.
+ */
+function formatValueAccount(name, band) {
+    const account = band.account;
+    const reasons = Object.entries(band.excluded?.byReason || {})
+        .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+        .slice(0, 4).map(([reason, count]) => `${reason} ${count}`).join(', ');
+    return `VALUE ACCOUNT: "${name}" is ${account.tokens} name token(s) on ${account.lines} line(s) in ` +
+        `${account.files} file(s): ${account.confirmed} confirmed, ${account.unverified} unverified, ` +
+        `${account.excluded} excluded${reasons ? ` (${reasons})` : ''}, ${account.declarations} declaration` +
+        `${account.textLines ? `; ${account.textLines} text-only line(s)` : ''}` +
+        `${account.conserved ? '' : ' [NOT CONSERVED]'}`;
+}
+
 function formatImpact(impact, options = {}) {
     if (!impact) {
         return 'Function not found.';
@@ -910,12 +927,15 @@ function formatImpact(impact, options = {}) {
             for (const site of access.unverifiedSites.slice(0, 10)) {
                 const caller = site.callerName ? ` [${site.callerName}]` : '';
                 const expr = site.expression ? `: ${site.expression.replace(/\s+/g, ' ').slice(0, 100)}` : '';
-                lines.push(`  ${site.file}:${site.line}${caller} [${site.accessKind || 'access'}${Number.isInteger(site.column) ? `, column ${site.column + 1}` : ''}]${expr}`);
+                const why = impact.valueAccesses && site.reason ? ` (${site.reason})` : '';
+                lines.push(`  ${site.file}:${site.line}${caller} [${site.accessKind || 'access'}${Number.isInteger(site.column) ? `, column ${site.column + 1}` : ''}]${expr}${why}`);
             }
             if (access.unverifiedSites.length > 10) {
                 lines.push(`  (+${access.unverifiedSites.length - 10} more unverified)`);
             }
         }
+        const valueAccount = impact.valueAccesses?.account;
+        if (valueAccount) lines.push(formatValueAccount(impact.function, impact.valueAccesses));
     }
 
     // fix #345: annotation sites of a type-kind definition, tiered like the

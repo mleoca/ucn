@@ -8601,3 +8601,57 @@ describe('fix #400: Go import names by package clause, unknown import names, bui
         } finally { rm(dir); }
     });
 });
+
+describe('fix #420: Go value references by block scope and selector identity', () => {
+    const { tmp, rm, idx } = require('./helpers');
+    const { execute } = require('../core/execute');
+    const plan = (index, name, renameTo) => {
+        const result = execute(index, 'plan', { name, renameTo });
+        assert.strictEqual(result.ok, true, result.error);
+        const edits = new Map(), reviews = new Set();
+        for (const change of result.result.changes) {
+            if (change.needsReview || change.newExpression === undefined) reviews.add(`${change.file}:${change.line}`);
+            else edits.set(`${change.file}:${change.line}`, change.newExpression);
+        }
+        return { edits, reviews };
+    };
+    it('a local declared from the package value hides the package name in its block', () => {
+        const dir = tmp({
+            'go.mod': 'module ex\n\ngo 1.21\n',
+            'conf/c.go': 'package conf\n\nvar Limit = 10\n\ntype Settings struct{ Limit int }\n\nvar Default = Settings{Limit: 3}\n',
+            'main.go': [
+                'package main',
+                '',
+                'import "ex/conf"',
+                '',
+                'func shadow() int {',
+                '\tconf := conf.Default',
+                '\treturn conf.Limit',
+                '}',
+                '',
+                'func main() { println(conf.Limit, shadow()) }',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const { edits } = plan(idx(dir), 'conf/c.go:3:Limit', 'Capped');
+            assert.deepStrictEqual(Object.fromEntries(edits), {
+                'conf/c.go:3': 'var Capped = 10', 'main.go:10': 'func main() { println(conf.Capped, shadow()) }',
+            });
+        } finally { rm(dir); }
+    });
+    it('a bare name never names a struct field', () => {
+        const dir = tmp({
+            'go.mod': 'module ex\n\ngo 1.21\n',
+            'a.go': 'package main\n\nvar limit = 10\n\ntype Box struct {\n\tlimit int\n}\n\n' +
+                'func (b *Box) Get() int {\n\treturn b.limit + limit\n}\n\nfunc main() { println((&Box{}).Get(), limit) }\n',
+        });
+        try {
+            const { edits, reviews } = plan(idx(dir), 'a.go:6:limit', 'cap');
+            assert.deepStrictEqual(Object.fromEntries(edits), {
+                'a.go:6': 'cap int', 'a.go:10': 'return b.cap + limit',
+            });
+            assert.strictEqual(reviews.size, 0);
+        } finally { rm(dir); }
+    });
+});

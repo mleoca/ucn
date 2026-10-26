@@ -2375,14 +2375,16 @@ describe('fix #415: value scopes, enum paths and runtime identity guards', () =>
                 "a.js",
                 1,
                 "class Account { Renamed=1; }"
+            ],
+            // fix #420: the subclass field is the same run-time slot.
+            [
+                "a.js",
+                2,
+                "class Other extends Account { Renamed=2; }"
             ]
         ],
         "keeps": [],
         "reviews": [
-            [
-                "a.js",
-                2
-            ],
             [
                 "a.js",
                 3
@@ -2548,24 +2550,26 @@ describe('fix #415: value scopes, enum paths and runtime identity guards', () =>
         "files": {
             "a.py": "LIMIT=1\nLIMIT=2\ndef read(): return LIMIT\n"
         },
+        // fix #420: one module variable, however many statements bind it.
         "edits": [
             [
                 "a.py",
                 1,
                 "Renamed=1"
-            ]
-        ],
-        "keeps": [],
-        "reviews": [
-            [
-                "a.py",
-                2
             ],
             [
                 "a.py",
-                3
+                2,
+                "Renamed=2"
+            ],
+            [
+                "a.py",
+                3,
+                "def read(): return Renamed"
             ]
-        ]
+        ],
+        "keeps": [],
+        "reviews": []
     },
     {
         "label": "Java fields keep same-named method invocations",

@@ -686,6 +686,10 @@ function getTokenTypeAtPosition(rootNode, line, column) {
     // Find the smallest node at this position
     const node = rootNode.descendantForPosition({ row, column });
     if (!node) return 'code';
+    // A comment in an aliased rule can be wrapped with the alias type,
+    // depending on which traversal read it first (fix #420): an extra's
+    // grammar type is stable.
+    if (node.isExtra && /comment/.test(node.grammarType || '')) return 'comment';
 
     // Walk up the tree to check if we're in a comment or string
     let current = node;

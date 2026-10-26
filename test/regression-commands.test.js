@@ -8558,3 +8558,44 @@ describe('fix #394: usages lists test files by default and discloses --exclude-t
         } finally { rm(dir); }
     });
 });
+
+describe('fix #420: value dependency counts, value account and check on value changes', () => {
+    const { execFileSync } = require('child_process');
+    it('a called value token is one dependency site, and every name token is accounted', () => {
+        const dir = tmp({
+            'm.py': 'import functools\ncb = functools.partial(print, "x")\ndef run():\n    cb()\n    return cb\n',
+            'n.py': 'from m import cb\ncb()\n',
+        });
+        try {
+            const index = idx(dir);
+            const impact = execute(index, 'impact', { name: 'm.py:2:cb' });
+            assert.strictEqual(impact.ok, true, impact.error);
+            const result = impact.result;
+            assert.strictEqual(result.totalCallSites, 2);
+            assert.strictEqual(result.valueAccesses.confirmedCount, 4);
+            assert.strictEqual(result.totalDependencySites, 4, 'calls and value reads, each token once');
+            const account = result.valueAccesses.account;
+            assert.strictEqual(account.tokens, account.confirmed + account.unverified + account.excluded + account.declarations);
+            assert.ok(account.conserved);
+            const text = output.formatImpact(result);
+            assert.match(text, /VALUE ACCOUNT: "cb" is 5 name token\(s\) on 5 line\(s\) in 2 file\(s\): 4 confirmed, 0 unverified, 0 excluded, 1 declaration/);
+        } finally { rm(dir); }
+    });
+    it('a module value edit is reviewed through its accesses, not blocked as a type shape change', () => {
+        const dir = tmp({ 'm.py': 'count = 0\ndef bump():\n    global count\n    count += 1\n    return count\n' });
+        try {
+            execFileSync('git', ['init'], { cwd: dir, stdio: 'pipe' });
+            execFileSync('git', ['add', '.'], { cwd: dir, stdio: 'pipe' });
+            execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=T', 'commit', '-m', 'init'], { cwd: dir, stdio: 'pipe' });
+            fs.writeFileSync(path.join(dir, 'm.py'), 'count = 1\ndef bump():\n    global count\n    count += 1\n    return count\n');
+            const { ok, result } = execute(idx(dir), 'check', { base: 'HEAD' });
+            assert.ok(ok);
+            const item = result.changed.find(entry => entry.name === 'count');
+            assert.ok(item?.valueDeclaration, JSON.stringify(result.changed));
+            assert.strictEqual(item.dependencyCount, 3, 'global declaration, write and read');
+            assert.ok(result.actions.some(action => action.kind === 'value_change' && action.severity === 'warn'));
+            assert.ok(!result.actions.some(action => action.kind === 'declaration_change'));
+            assert.strictEqual(result.trust.status, 'REVIEW_REQUIRED');
+        } finally { rm(dir); }
+    });
+});

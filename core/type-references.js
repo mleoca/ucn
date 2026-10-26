@@ -164,8 +164,17 @@ function classifyJava(node) {
             if (field === 'name') return skip('variable', { binding: true });
             break;
         case 'formal_parameter': case 'catch_formal_parameter': case 'spread_parameter':
-        case 'enhanced_for_statement': case 'resource': case 'record_pattern_component':
+        case 'enhanced_for_statement': case 'resource':
             if (field === 'name') return skip('parameter', { binding: true });
+            break;
+        // Pattern variables (fix #420): `o instanceof T v`, `case T v`,
+        // `case R(int v, ..)` declare locals whose scope follows the
+        // pattern's flow (JLS 6.3.1).
+        case 'instanceof_expression':
+            if (field === 'name') return skip('pattern', { binding: true });
+            break;
+        case 'type_pattern': case 'record_pattern_component':
+            if (node.type === 'identifier') return skip('pattern', { binding: true });
             break;
         case 'lambda_expression':
             if (field === 'parameters') return skip('parameter', { binding: true });
@@ -727,6 +736,10 @@ function classifyC(node, language) {
             return skip('type-parameter', { typeParam: true });
         case 'preproc_def': case 'preproc_function_def': case 'preproc_params':
             return skip('macro-name');
+        case 'structured_binding_declarator':
+            // `auto [a, b] = p;` declares each name (fix #420).
+            if (node.type === 'identifier') return skip('variable', { binding: true });
+            break;
         case 'reference_declarator':
             // The C++ grammar gives the referenced declarator no field name.
             if (sameNode(parent.namedChild(0), node)) {
@@ -1896,6 +1909,21 @@ class TypeReferenceResolver {
                 return { verdict: 'no', reason: 'member' };
             }
             case 'go': {
+                // A local declared before the selector hides the package
+                // name in its block (fix #420: `conf := conf.Default` then
+                // `conf.Limit` reads a field of the local).
+                if (qualifierNode?.type === 'identifier') {
+                    if (!this._goScopes) this._goScopes = new WeakMap();
+                    let memo = this._goScopes.get(qualifierNode.tree);
+                    if (!memo) { memo = new Map(); this._goScopes.set(qualifierNode.tree, memo); }
+                    const { referenceScope } = require('../languages/lexical-scope');
+                    const scope = referenceScope(qualifierNode, 'go', memo, text);
+                    if (scope === 'unknown') return { verdict: 'unknown', reason: 'qualifier-scope' };
+                    if (scope && scope !== 'module' && scope !== 'none') {
+                        if (tok.role === 'member') return this.goFieldVerdict(this.siteNode, file);
+                        return { verdict: 'no', reason: 'local-binding' };
+                    }
+                }
                 const binding = (entry.importBindings || []).find(b => (b.alias || b.name) === text && b.module);
                 if (!binding) {
                     if (tok.role === 'member') return this.goFieldVerdict(this.siteNode, file);
@@ -2338,15 +2366,20 @@ function scanFile(index, resolver, file, entry, language, lineNumbers) {
         };
         for (const at of occurrences) {
             let node = root.descendantForIndex(at, at + name.length);
+            // An extra (a comment) inside an aliased rule can carry the
+            // alias as its type, depending on which traversal first wrapped
+            // the node (fix #420: `{ // x }` read as `interface_body` after a
+            // children walk, as `comment` otherwise): its grammar type is
+            // the stable one.
+            const type = node && (node.isExtra ? node.grammarType || node.type : node.type);
             // The smallest node holding the text: a token, a text or macro
             // leaf, or (between tokens) a container the walk would not read.
-            while (node && !TOKEN_TYPES.has(node.type) && !TEXT_NODE.test(node.type) &&
-                node.type !== 'preproc_arg' && !(node.type === 'ERROR' && node.namedChildCount === 0)) {
+            if (node && !TOKEN_TYPES.has(type) && !TEXT_NODE.test(type) &&
+                type !== 'preproc_arg' && !(type === 'ERROR' && node.namedChildCount === 0)) {
                 node = null;
             }
             if (!node || seen.has(node.id) || !overlaps(node)) continue;
             seen.add(node.id);
-            const type = node.type;
             if (TOKEN_TYPES.has(type)) {
                 const length = node.endIndex - node.startIndex;
                 if ((length === name.length || length === nameBytes) && node.text === name) found.push(node);
@@ -2460,7 +2493,11 @@ function scanFile(index, resolver, file, entry, language, lineNumbers) {
         // An `__all__` entry is a code reference: once edited it is no
         // longer a text-only review item.
         if (token.role.role === 'dunder-all') slot.stringAnnotation = true;
-        if (decision.verdict === 'yes') slot.edits.push(token.node.startPosition.column);
+        if (decision.verdict === 'yes') {
+            slot.edits.push(token.node.startPosition.column);
+            // A binding renamed by aliasing its import (`import x as y`).
+            if (decision.importAlias) (slot.importAliases ||= []).push(token.node.startPosition.column);
+        }
         else if (decision.verdict === 'unknown') {
             slot.reviews.push({ column: token.node.startPosition.column, reason: decision.reason || 'unresolved' });
         } else {

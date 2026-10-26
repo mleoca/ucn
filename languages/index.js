@@ -173,6 +173,13 @@ const STRUCTURAL_TRAITS = {
     // inside a class means this.execute(), and static imports bind foreign
     // class methods to bare names (fix #220).
     bareCallReachesMethods: false,
+    // Where a bare (receiver-less) name can denote a class or enum MEMBER
+    // value when bare names never reach methods (fix #420): 'declaration-body'
+    // (JS/TS: only inside the enum or namespace declaring it), 'class-body'
+    // (Python: directly in the class body, never in its methods), 'imports'
+    // (Rust: enum variants a `use` brings in), 'none' (Go struct fields, C).
+    // Imports in these languages never name a member either.
+    bareValueMemberScope: 'declaration-body',
     // A method-shaped call CAN reach a standalone function here: attribute
     // assignment rebinds functions onto objects (obj.print = print), so the
     // #218b gate routes such calls visible instead of excluding (fix #220).
@@ -374,6 +381,7 @@ const NOMINAL_TRAITS = {
     // cobra/grpc-go-measured). Java overrides true (implicit this-calls,
     // static imports).
     bareCallReachesMethods: false,
+    bareValueMemberScope: 'none',
     // Whether a method-shaped call (x.f()) can reach a standalone FUNCTION:
     // Go func-typed fields are name-callable (s.Run() may invoke a stored
     // function), so exclusion needs !bindingId there; Rust requires (s.f)()
@@ -561,6 +569,7 @@ const LANGUAGES = {
             // keyword-only (`*`) and positional-only (`/`) markers (fix #281).
             keywordArguments: true,
             assignmentDeclaresLocal: true,
+            bareValueMemberScope: 'class-body',
             // Calling an async def creates a coroutine object in any scope:
             // audit-async checks such calls in sync functions too, and
             // follows a local assigned from the call to the uses that need
@@ -676,6 +685,7 @@ const LANGUAGES = {
             callValueFacts: true,
             memberAccessNeverMethod: true,
             fieldsAndMethodsSeparate: true,
+            bareValueMemberScope: 'imports',
             genericBoundDispatchClosed: true,
             macroTemplateBodies: true,
             // Macro invocations are written `name!(...)` / `#[name]`: a
@@ -725,6 +735,8 @@ const LANGUAGES = {
             closedQueryBodies: ['method_declaration', 'constructor_declaration',
                 'compact_constructor_declaration', 'lambda_expression'],
             staticValueImportSyntax: tree => require('./java').staticValueImportSyntax(tree),
+            // Pattern variables are scoped by the pattern's flow (fix #420).
+            patternBindingReach: (binding, reference) => require('./java').patternBindingReach(binding, reference),
             implicitEnumCaseLabels: true,
             standardPathRoots: ['java', 'javax'],
             typeNameScoping: 'package-on-demand',

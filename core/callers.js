@@ -4393,8 +4393,21 @@ function findCallers(index, name, options = {}) {
                     // is stronger and must outrank that receiver-blind name
                     // binding (rich Status._live -> Live, measured).
                     if (!fieldHopMatchesTarget && !resolvedBySameClass && !overloadGroupBinding) {
-                        recordExcluded(filePath, call.line, 'other-definition');
-                        continue;
+                        // A module variable that rebinds an imported name
+                        // (fix #420) is that name's variable, not another
+                        // callable: `other = other` and `run = lru_cache(run)`
+                        // keep or wrap the imported value, as a same-file
+                        // `def` rebinding does (the import evidence decides);
+                        // a rebinding to another value leaves it open.
+                        const rebinding = _importRebinding(index, fileEntry, filePath, name, boundDefinition);
+                        if (rebinding === 'rebound') {
+                            routeUnverified(filePath, fileEntry, call, 'module-rebinding', calledAs);
+                            continue;
+                        }
+                        if (rebinding !== 'alias') {
+                            recordExcluded(filePath, call.line, 'other-definition');
+                            continue;
+                        }
                     }
                     // The mismatched binding was explicitly overruled by
                     // stronger receiver/overload evidence. Do not carry it
@@ -15186,6 +15199,54 @@ function _csharpNamespaceQualifiedReceiver(index, call, enclosing) {
  * same-named packages across a monorepo stay separate.
  */
 /** A type declared inside a function body (lexically scoped, no enclosing type). */
+/**
+ * How a module variable rebinds a name its own module also imports
+ * (fix #420, languages whose assignments declare variables): 'alias' when
+ * every module-scope assignment of the name computes its value from the
+ * name itself (`other = other`, `run = lru_cache(run)`), 'rebound' for any
+ * other value, null when the binding is not such a variable.
+ */
+function _importRebinding(index, fileEntry, filePath, name, definition) {
+    if (!definition || definition.className || definition.file !== filePath ||
+        !langTraits(fileEntry.language)?.assignmentDeclaresLocal ||
+        !require('./shared').isValueDefinition(definition) ||
+        !(fileEntry.importBindings || []).some(binding => binding.name !== '*' &&
+            (binding.alias || binding.name) === name)) return null;
+    const content = index._readFile(filePath);
+    const tree = index._getParsedTree(filePath, content, fileEntry.language) ||
+        require('../languages').safeParse(getParser(fileEntry.language), content);
+    if (!tree) return 'rebound';
+    let assigned = 0, aliases = 0;
+    const visit = node => {
+        for (const child of node.namedChildren) {
+            if (['function_definition', 'class_definition', 'decorated_definition', 'lambda'].includes(child.type)) continue;
+            if (child.type === 'assignment' || child.type === 'augmented_assignment') {
+                const left = child.childForFieldName('left');
+                if (left?.type === 'identifier' && left.text === name) {
+                    assigned++;
+                    const right = child.childForFieldName('right');
+                    let reads = false;
+                    if (child.type === 'assignment' && right) {
+                        const { traverseTree, sameNode } = require('../languages/utils');
+                        traverseTree(right, inner => {
+                            if (reads || inner.type === 'lambda') return false;
+                            if (inner.type === 'identifier' && inner.text === name &&
+                                !(inner.parent?.type === 'attribute' &&
+                                    sameNode(inner.parent.childForFieldName('attribute'), inner))) reads = true;
+                            return !reads;
+                        });
+                    }
+                    if (reads) aliases++;
+                    continue;
+                }
+            }
+            visit(child);
+        }
+    };
+    visit(tree.rootNode);
+    return assigned > 0 && aliases === assigned ? 'alias' : 'rebound';
+}
+
 function _isFunctionLocalType(def) {
     return def.lexicalScopeStartLine != null && !def.enclosingType;
 }

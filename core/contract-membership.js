@@ -880,11 +880,18 @@ function _explicitInterfaceName(member) {
         ? String(member.explicitInterface).replace(/<.*$/s, '').split('.').pop().trim() : null;
 }
 
-function _slotMembersOf(index, name, ref, pin, overloads, frame = null, slotInterfaces = null) {
+// A value slot (fix #420): fields and properties of one name, and the
+// accessors that implement them.
+const VALUE_SLOT_KINDS = new Set(['field', 'private field', 'constant', 'state', 'get', 'set', 'property']);
+
+function _slotMembersOf(index, name, ref, pin, overloads, frame = null, slotInterfaces = null, valueSlot = false,
+    byClass = null) {
     const { ownedBy } = require('./class-identity');
     const refFile = ref.def?.file || null;
-    let defs = (index.symbols.get(name) || []).filter(member => {
-        if (NON_CALLABLE_TYPES.has(member.type) || member.className !== ref.name) return false;
+    let defs = (byClass ? byClass.get(ref.name) || [] : index.symbols.get(name) || []).filter(member => {
+        if (member.className !== ref.name) return false;
+        if (valueSlot ? !VALUE_SLOT_KINDS.has(member.type) && !VALUE_SLOT_KINDS.has(member.memberType)
+            : NON_CALLABLE_TYPES.has(member.type)) return false;
         const owned = ownedBy(index, member, ref);
         return owned === 'yes' || (owned === 'maybe' && refFile && member.file === refFile);
     });
@@ -952,7 +959,15 @@ function _slotMembersOf(index, name, ref, pin, overloads, frame = null, slotInte
  * @returns {{pinRef, ancestors: {ref, members}[], descendants: {ref, members,
  *   viaImplements}[], unresolved: string[], external: string[]}|null}
  */
-function hierarchySlotClosure(index, def, startRef = null) {
+function hierarchySlotClosure(index, def, startRef = null, options = {}) {
+    const valueSlot = options.values === true;
+    // The name's definitions by class, read once for every class visited.
+    const byClass = new Map();
+    for (const member of index.symbols.get(def.name) || []) {
+        if (!member.className) continue;
+        if (!byClass.has(member.className)) byClass.set(member.className, []);
+        byClass.get(member.className).push(member);
+    }
     const { ownerRefOf, supertypeRefsOf, classDefsNamed } = require('./class-identity');
     const pinRef = startRef || ownerRefOf(index, def);
     if (!pinRef || (!pinRef.key && !pinRef.def)) return null;
@@ -1024,7 +1039,7 @@ function hierarchySlotClosure(index, def, startRef = null) {
             // its slot (fix #395).
             if (resolved.def?.type === 'interface' && !_explicitInterfaceName(def) && _nonPublicMember(def)) continue;
             const members = _slotMembersOf(index, name, resolved, def, overloads,
-                subst ? { memberSubst: subst } : null);
+                subst ? { memberSubst: subst } : null, null, valueSlot, byClass);
             if (members.length > 0) ancestors.push({ ref: resolved, members });
             upQueue.push({ ref: resolved, contextFile: resolved.def?.file || current.contextFile, subst,
                 explicitVia: explicitViaOf(resolved, current.explicitVia) });
@@ -1117,9 +1132,9 @@ function hierarchySlotClosure(index, def, startRef = null) {
                 // the slot once per instantiation (fix #400).
                 let members = instantiations
                     ? [...new Set(instantiations.flatMap(types => _slotMembersOf(index, name, childRef, def,
-                        overloads, { slotTypes: types }, slotInterfaces)))]
+                        overloads, { slotTypes: types }, slotInterfaces, valueSlot, byClass)))]
                     : _slotMembersOf(index, name, childRef, def, overloads,
-                        slotTypes ? { slotTypes } : null, slotInterfaces);
+                        slotTypes ? { slotTypes } : null, slotInterfaces, valueSlot, byClass);
                 if (link.viaImplements) members = members.filter(m => memberInClassBody(index, m));
                 // In an interface member's slot a class takes part with a
                 // public member or an explicit implementation only (fix
@@ -1135,7 +1150,7 @@ function hierarchySlotClosure(index, def, startRef = null) {
         }
     }
     if (startRef) {
-        const own = _slotMembersOf(index, name, startRef, def, overloads);
+        const own = _slotMembersOf(index, name, startRef, def, overloads, null, null, valueSlot, byClass);
         if (own.length > 0) ancestors.unshift({ ref: startRef, members: own });
     }
     return { pinRef, ancestors, descendants, unresolved, external, slotTypesByKey };

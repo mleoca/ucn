@@ -341,18 +341,29 @@ function mergeTokenEdit(change, edit) {
         prior.oldName !== edit.oldName || prior.newName !== edit.newName) return false;
     const columns = [...new Set([...prior.columns, ...edit.columns])].sort((a, b) => b - a);
     if (columns.length === prior.columns.length) return true;
-    let renamed = prior.rawSource;
-    for (const column of columns) {
-        if (renamed.slice(column, column + prior.oldName.length) !== prior.oldName) continue;
-        renamed = renamed.slice(0, column) + prior.newName + renamed.slice(column + prior.oldName.length);
-    }
+    const aliasColumns = [...new Set([...(prior.aliasColumns || []), ...(edit.aliasColumns || [])])];
+    const renamed = renameColumns(prior.rawSource, columns, prior.oldName, prior.newName, aliasColumns);
     const previous = change.newExpression;
     change.newExpression = renamed.trim();
     if (typeof change.suggestion === 'string' && previous) {
         change.suggestion = change.suggestion.replace(previous, change.newExpression);
     }
-    tagTokenEdit(change, { ...prior, columns, renamed: change.newExpression });
+    tagTokenEdit(change, { ...prior, columns, renamed: change.newExpression,
+        ...(aliasColumns.length > 0 && { aliasColumns }) });
     return true;
+}
+
+/** Replace the name at code-unit columns (descending), aliasing the
+ * import bindings among them (`name as newName`). */
+function renameColumns(raw, columns, oldName, newName, aliasColumns = []) {
+    const aliased = new Set(aliasColumns);
+    let renamed = raw;
+    for (const column of [...columns].sort((a, b) => b - a)) {
+        if (renamed.slice(column, column + oldName.length) !== oldName) continue;
+        const replacement = aliased.has(column) ? `${oldName} as ${newName}` : newName;
+        renamed = renamed.slice(0, column) + replacement + renamed.slice(column + oldName.length);
+    }
+    return renamed;
 }
 
 /**
@@ -2672,16 +2683,15 @@ function applyTypeReferencePass(index, ctx) {
     const special = change => change.contractDependency || change.templateDependency ||
         change.editKind === 'example' || change.editKind === 'macro-expansion';
     // Rebuild a line edit from code-unit token columns.
-    const lineEdit = (raw, columns) => {
+    // A Python import that binds the renamed module variable keeps its
+    // module and gains an alias (`import json as j`, fix #420).
+    const lineEdit = (raw, columns, aliases = []) => {
         const sorted = [...columns].sort((a, b) => b - a);
-        let renamed = raw;
-        for (const column of sorted) {
-            if (renamed.slice(column, column + name.length) !== name) continue;
-            renamed = renamed.slice(0, column) + renameTo + renamed.slice(column + name.length);
-        }
+        const aliased = aliases.filter(column => sorted.includes(column));
         return {
-            source: raw.trim(), renamed: renamed.trim(), count: sorted.length,
-            columns: sorted, rawSource: raw, oldName: name, newName: renameTo,
+            source: raw.trim(), renamed: renameColumns(raw, sorted, name, renameTo, aliased).trim(),
+            count: sorted.length, columns: sorted, rawSource: raw, oldName: name, newName: renameTo,
+            ...(aliased.length > 0 && { aliasColumns: aliased }),
         };
     };
     for (const [abs, info] of files) {
@@ -2713,6 +2723,7 @@ function applyTypeReferencePass(index, ctx) {
             const units = columns => columns.map(column => tokenColumn(raw, column, name))
                 .filter(Number.isInteger);
             const editUnits = units(slot.edits);
+            const aliasUnits = units(slot.importAliases || []);
             const skipUnits = new Set(units(slot.skipColumns || []));
             const reviewList = slot.reviews.map(review => ({
                 ...review,
@@ -2750,7 +2761,7 @@ function applyTypeReferencePass(index, ctx) {
                     reviewed.set(key, { abs, reason: open[0].reason });
                     continue;
                 }
-                const edit = lineEdit(raw, final);
+                const edit = lineEdit(raw, final, aliasUnits);
                 const previous = existing.newExpression;
                 existing.expression = edit.source;
                 existing.newExpression = edit.renamed;
@@ -2775,7 +2786,7 @@ function applyTypeReferencePass(index, ctx) {
                 continue;
             }
             const certain = reviewList.length === 0;
-            const edit = editUnits.length > 0 ? lineEdit(raw, editUnits) : null;
+            const edit = editUnits.length > 0 ? lineEdit(raw, editUnits, aliasUnits) : null;
             const hasEdit = !!edit && edit.renamed !== edit.source;
             if (certain) {
                 decided.set(key, { abs, edited: hasEdit });

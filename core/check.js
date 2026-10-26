@@ -12,6 +12,7 @@
 'use strict';
 
 const { diffImpact, composeAccount, callNotResolvedEntries } = require('./analysis');
+const { isValueDefinition } = require('./shared');
 
 function summarizeAccount(account) {
     if (!account) {
@@ -123,13 +124,22 @@ function check(index, options = {}) {
     for (const fn of changed) {
         const filePath = fn.relativePath || fn.file || '';
         if (fn._nonCallable) {
-            const dependency = fn.impact?.typeReferences || fn.impact?.propertyAccesses;
+            const dependency = fn.impact?.typeReferences || fn.impact?.propertyAccesses || fn.impact?.valueAccesses;
+            // A value declaration (field, constant, module variable) is read
+            // and written through its value-access sites (fix #420): its
+            // change is reviewed there, as a function body change is through
+            // its callers. A type's shape and inheritance are not checked.
+            const valueDeclaration = isValueDefinition(fn);
             items.push({
                 name: fn.name, file: filePath, line: fn.startLine, kind: fn._kind,
                 symbolType: fn.type, requiresToolchainValidation: true,
+                ...(valueDeclaration && { valueDeclaration: true }),
                 callerCount: fn.impact?.totalCallSites || 0,
                 unverifiedCallerCount: fn.impact?.unverifiedSites?.length || 0,
-                dependencyCount: dependency?.confirmedCount || 0,
+                // Non-call sites: a value band also lists its call tokens.
+                dependencyCount: valueDeclaration && Number.isInteger(fn.impact?.totalDependencySites)
+                    ? Math.max(0, fn.impact.totalDependencySites - (fn.impact.totalCallSites || 0))
+                    : dependency?.confirmedCount || 0,
                 unverifiedDependencyCount: (dependency?.unverifiedCount || 0) + (fn.remainingReferences?.length || 0),
                 signatureMismatches: 0,
                 account: summarizeAccount(fn.impact?.account),
@@ -237,7 +247,13 @@ function check(index, options = {}) {
     // Action items
     const actions = [];
     for (const it of items) {
-        if (it.requiresToolchainValidation) {
+        if (it.requiresToolchainValidation && it.valueDeclaration && it.kind !== 'deleted') {
+            actions.push({
+                severity: 'warn',
+                kind: 'value_change',
+                message: `${it.name}: ${it.kind} ${it.symbolType}; review its ${it.dependencyCount + it.callerCount} value access site(s) and run the compiler/type checker and tests`,
+            });
+        } else if (it.requiresToolchainValidation) {
             actions.push({
                 severity: it.kind === 'added' ? 'warn' : 'error',
                 kind: 'declaration_change',
@@ -308,10 +324,11 @@ function check(index, options = {}) {
     const signatureMismatches = items.reduce((sum, it) => sum + (it.signatureMismatches || 0), 0);
     const filteredEdges = items.reduce((sum, it) => sum + (it.account ? it.account.filtered || 0 : 0), 0);
     const usageReviewSymbols = items.filter(it => it.account && it.account.requiresUsageReview).length;
-    const unvalidatedDeclarations = items.filter(it => it.requiresToolchainValidation && it.kind !== 'added').length;
+    const unvalidatedDeclarations = items.filter(it => it.requiresToolchainValidation && it.kind !== 'added' &&
+        !(it.valueDeclaration && it.kind === 'modified')).length;
     const reviewRequired = incompleteAccounts > 0 || unverifiedCallSites > 0 ||
         signatureMismatches > 0 || filteredEdges > 0 || usageReviewSymbols > 0 ||
-        actions.some(a => a.kind === 'orphan_new' || a.kind === 'declaration_change') ||
+        actions.some(a => a.kind === 'orphan_new' || a.kind === 'declaration_change' || a.kind === 'value_change') ||
         !!(limit && allChanged.length > limit);
 
     return {

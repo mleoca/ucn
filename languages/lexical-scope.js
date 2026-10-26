@@ -291,13 +291,26 @@ function pyScopeBindings(scopeNode, body, name, isFunction, includeClasses = fal
     }
 }
 
-function pyVerdict(info) {
+function pyVerdict(info, scopeNode) {
     if (info.import || info.starImport) return 'unknown';
-    if (info.other) return { local: true, defRows: null };
-    return { local: true, defRows: info.defRows.slice() };
+    if (info.other) return withScopeNode({ local: true, defRows: null }, scopeNode);
+    return withScopeNode({ local: true, defRows: info.defRows.slice() }, scopeNode);
 }
 
-function pythonReferenceScope(node, name, memo, includeClasses) {
+/** A local verdict names its binding scope node only when asked for. */
+function withScopeNode(verdict, scopeNode) {
+    if (scopeNode) Object.defineProperty(verdict, 'scopeNode', { value: scopeNode, enumerable: false });
+    return verdict;
+}
+
+/**
+ * `globalBindsModule` (fix #420): a name a function declares `global` is the
+ * module variable there, assigned or not. Callable resolution keeps 'unknown'
+ * for an assigned global (the binding the call reaches changes at run time);
+ * a value reference names the variable itself.
+ */
+function pythonReferenceScope(node, name, memo, includeClasses, globalBindsModule = false) {
+    const local = scope => (globalBindsModule ? scope : null);
     const parent = node.parent;
     if (!parent) return 'unknown';
     if (parent.type === 'keyword_argument' && sameNode(parent.childForFieldName('name'), node)) return 'none';
@@ -316,6 +329,7 @@ function pythonReferenceScope(node, name, memo, includeClasses) {
                 if (info.global) {
                     // A function that assigns a `global` name rebinds the module
                     // binding at run time.
+                    if (globalBindsModule) return 'module';
                     return info.other || info.defRows.length > 0 || info.import ? 'unknown' : 'module';
                 }
                 if (info.nonlocal) {
@@ -323,7 +337,7 @@ function pythonReferenceScope(node, name, memo, includeClasses) {
                     crossedFunction = true;
                     continue;
                 }
-                if (info.bound) return pyVerdict(info);
+                if (info.bound) return pyVerdict(info, local(scope));
                 crossedFunction = true;
                 continue;
             }
@@ -331,7 +345,7 @@ function pythonReferenceScope(node, name, memo, includeClasses) {
                 if (!sameNode(scope.childForFieldName('body'), child)) continue;
                 const names = [];
                 pyParameterNames(scope.childForFieldName('parameters'), names);
-                if (names.some(n => n.text === name)) return { local: true, defRows: null };
+                if (names.some(n => n.text === name)) return withScopeNode({ local: true, defRows: null }, local(scope));
                 crossedFunction = true;
                 continue;
             }
@@ -354,7 +368,7 @@ function pythonReferenceScope(node, name, memo, includeClasses) {
                 for (const clause of clauses) {
                     const names = [];
                     pyTargetNames(clause.childForFieldName('left'), names);
-                    if (names.some(n => n.text === name)) return { local: true, defRows: null };
+                    if (names.some(n => n.text === name)) return withScopeNode({ local: true, defRows: null }, local(scope));
                 }
                 crossedFunction = true;
                 continue;
@@ -1209,7 +1223,8 @@ function referenceScope(node, language, memo = new Map(), name = node?.text, opt
             memo = classMemo;
         }
         switch (family) {
-            case 'python': return pythonReferenceScope(node, name, memo, includeClasses);
+            case 'python': return pythonReferenceScope(node, name, memo, includeClasses,
+                options.globalBindsModule === true);
             case 'js': return jsReferenceScope(node, name, memo, includeClasses);
             case 'go': return goReferenceScope(node, name, memo);
             case 'rust': return rustReferenceScope(node, name, memo);
@@ -1304,4 +1319,50 @@ function pythonBindingSites(scope, name) {
     return sites;
 }
 
-module.exports = { referenceScope, referenceScopeNode, scopeFields, familyOf, rustLetBindingOf, rustSelfFieldBinding, pythonBindingSites };
+/**
+ * Statement-order lookup of a name read directly in a Python class body
+ * whose body also binds it (fix #420): a class body reads its namespace,
+ * then the scope around the class, as it executes. 'outer' when every
+ * binding of the name in the body runs after the read (`limit = limit`
+ * reads the outer binding), 'class' when an unconditional earlier
+ * statement of the body binds it, null when the order cannot settle it
+ * (loops, conditional bindings, `global` in the body).
+ */
+function pythonClassBodyOrder(classNode, node, name) {
+    const body = classNode?.childForFieldName('body');
+    if (!body) return null;
+    const sites = [];
+    const info = pyScopeBindings(classNode, body, name, false, false, site => sites.push(site));
+    if (info.global || info.nonlocal || info.starImport || sites.length === 0) return null;
+    const statementOf = site => {
+        let current = site;
+        while (current.parent && !sameNode(current.parent, body)) current = current.parent;
+        return sameNode(current.parent, body) ? current : null;
+    };
+    const readStatement = statementOf(node);
+    if (!readStatement) return null;
+    for (let current = node.parent; current && !sameNode(current, body); current = current.parent) {
+        if (['for_statement', 'while_statement'].includes(current.type)) return null;
+    }
+    let before = 0;
+    for (const site of sites) {
+        const statement = statementOf(site);
+        if (!statement) return null;
+        if (statement.startIndex > readStatement.startIndex) continue;
+        if (sameNode(statement, readStatement)) {
+            // `x = <reads x>`: the value is evaluated before the target binds.
+            const assignment = statement.type === 'expression_statement' ? statement.namedChild(0) : statement;
+            const left = assignment?.type === 'assignment' ? assignment.childForFieldName('left') : null;
+            const right = assignment?.type === 'assignment' ? assignment.childForFieldName('right') : null;
+            if (left && right && within(site, left) && within(node, right)) continue;
+            return null;
+        }
+        if (statement.type !== 'expression_statement' && statement.type !== 'function_definition' &&
+            statement.type !== 'class_definition' && statement.type !== 'decorated_definition') return null;
+        before++;
+    }
+    return before === 0 ? 'outer' : 'class';
+}
+
+module.exports = { referenceScope, referenceScopeNode, scopeFields, familyOf, rustLetBindingOf, rustSelfFieldBinding,
+    pythonBindingSites, pythonClassBodyOrder };

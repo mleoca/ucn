@@ -2,7 +2,7 @@
 
 const { langTraits, LANGUAGES, getParser, safeParse } = require('../languages');
 const { sameNode, visitNameNodes } = require('../languages/utils');
-const { referenceScope } = require('../languages/lexical-scope');
+const { referenceScope, pythonClassBodyOrder } = require('../languages/lexical-scope');
 const { TypeReferenceResolver, referenceRole, referenceBindingScope, referenceTypeParameterScope,
     typeReferenceSites, referenceImportVerdict } = require('./type-references');
 const { ownerRefOf, classDefsNamed, findDeclaringClass, relationToTargets,
@@ -36,6 +36,37 @@ const CALLABLE_SCOPES = new Set([...FUNCTION_NODES, 'function_definition', 'meth
 const WRITE_EXPRESSIONS = new Set(['assignment', 'assignment_expression', 'assignment_statement',
     'augmented_assignment', 'augmented_assignment_expression', 'compound_assignment_expr',
     'update_expression', 'inc_statement', 'dec_statement']);
+
+/** One answer for several bindings of a name (jsBindingHolds). */
+function mergeHolds(holds) {
+    if (holds.length > 0 && holds.every(hold => hold === 'value')) return 'value';
+    if (holds.length > 0 && holds.every(hold => hold?.modules)) {
+        return { modules: [...new Set(holds.flatMap(hold => hold.modules))] };
+    }
+    return 'unknown';
+}
+
+/** The Python class whose body a node is directly in (not in a nested
+ * function, lambda or comprehension body), or null. */
+function pythonClassBodyOf(node) {
+    let child = node;
+    for (let scope = node.parent; scope; child = scope, scope = scope.parent) {
+        if (scope.type === 'function_definition' || scope.type === 'lambda') {
+            if (sameNode(scope.childForFieldName('body'), child)) return null;
+            continue;
+        }
+        if (['list_comprehension', 'set_comprehension', 'dictionary_comprehension', 'generator_expression']
+            .includes(scope.type)) {
+            const first = scope.namedChildren.find(part => part.type === 'for_in_clause')?.childForFieldName('right');
+            if (!first || !contains(first, node)) return null;
+            continue;
+        }
+        if (scope.type === 'class_definition') {
+            return sameNode(scope.childForFieldName('body'), child) ? scope : null;
+        }
+    }
+    return null;
+}
 
 function declarationTrees(index, file, content, language) {
     const memo = index.isProvenanceFactIndex ? null
@@ -208,12 +239,98 @@ class ValueReferenceResolver extends TypeReferenceResolver {
                 return true;
             });
         }
+        // A Python module variable is one variable however many statements
+        // bind it (fix #420): every module-scope binding of the name in the
+        // pin's file is renamed with it, as the run-time alternatives of a
+        // callable are (fix #376), so `x = x` and `import json; json = json`
+        // keep reading the variable they read before.
+        this.moduleVariable = !!langTraits(this.language)?.assignmentDeclaresLocal &&
+            !def.className && def.lexicalScopeStartLine == null;
+        if (this.moduleVariable) {
+            for (const other of this.all) {
+                if (other.file === def.file && !other.className && other.lexicalScopeStartLine == null) this.group.add(other);
+            }
+        }
+        this.linkAlternatives = null;
+        if (langTraits(this.language)?.textualIncludes) this.groupLinkage();
         this.members = (index.symbols.get(name) || []).filter(d => d.className &&
             !TYPE_KINDS.has(d.type) &&
             (!langTraits(this.language)?.fieldsAndMethodsSeparate || isValueDefinition(d)));
+        // A member value's slot (fix #420): where member lookup is by name
+        // through the class chain (structural languages), the same-name
+        // fields of the declaring ancestors, of the interfaces a class body
+        // implements and of overriding descendants are one member: TS checks
+        // `implements`, and a subclass field shadows the renamed one at run
+        // time. Accessors filling the slot are reviewed, not token-renamed.
         this.targetStorage = this.valueStorage(def);
+        this.slotAccessors = [];
+        const traits = langTraits(this.language);
+        // A private member (`#x`, a mangled `__x`) is lexical to its class,
+        // and static and instance storage are separate slots.
+        const privateMember = member => member.type === 'private field' ||
+            !!traits?.privateMemberName?.(member.name);
+        if (this.owner && traits?.typeSystem === 'structural' && !privateMember(def)) {
+            const closure = require('./contract-membership').hierarchySlotClosure(index, def, null, { values: true });
+            for (const entry of closure ? [...closure.ancestors, ...closure.descendants] : []) {
+                for (const member of entry.members) {
+                    if (member === def || privateMember(member) ||
+                        traits.separateStaticStorage && this.valueStorage(member) !== this.targetStorage) continue;
+                    if (isValueDefinition(member)) this.group.add(member);
+                    else if (!this.slotAccessors.includes(member)) this.slotAccessors.push(member);
+                }
+            }
+        }
         this.memberCandidates = langTraits(this.language)?.separateStaticStorage
             ? this.members.filter(member => this.valueStorage(member) === this.targetStorage) : this.members;
+    }
+
+    /**
+     * C/C++ external linkage (fix #420): every file-scope declaration of the
+     * name without `static` in one namespace denotes one object of the
+     * program, so `extern int g;` in a header and `int g = 0;` in a source
+     * file are renamed together, as functions are by their linkage (#361).
+     * Several external definitions belong to different programs or
+     * configurations: their declarations and the uses that see them are
+     * review items (`link-alternatives`).
+     */
+    groupLinkage() {
+        const def = this.def;
+        const { effectiveNamespace } = require('./cpp-scope');
+        const namespace = d => effectiveNamespace(this.index, d) || '';
+        const linked = d => !d.className && !d.enclosingType && d.lexicalScopeStartLine == null &&
+            !(d.modifiers || []).includes('static') &&
+            langTraits(this.index.files.get(d.file)?.language)?.textualIncludes;
+        if (!linked(def)) return;
+        const ownNamespace = namespace(def);
+        const family = this.all.filter(d => linked(d) && namespace(d) === ownNamespace);
+        const definitions = family.filter(d => !(d.modifiers || []).includes('extern'));
+        if (definitions.length <= 1) {
+            for (const member of family) this.group.add(member);
+            return;
+        }
+        this.linkAlternatives = new Set(family.filter(member => member !== def));
+    }
+
+    judge(defs, reason) {
+        if (this.linkAlternatives && defs.some(d => this.linkAlternatives.has(d))) {
+            return { verdict: 'unknown', reason: 'link-alternatives' };
+        }
+        return super.judge(defs, reason);
+    }
+
+    /**
+     * Another declaration of the renamed entity declared by this token: a
+     * linkage declaration (C/C++), a module-variable binding statement
+     * (Python) or a member of the slot closure (fix #420). 'group' renames
+     * it, 'alternative' leaves it for review.
+     */
+    groupMemberAt(file, node, otherOwner = null) {
+        const line = node.startPosition.row + 1;
+        const at = d => d !== this.def && d.file === file && (d.nameLine || d.startLine) === line &&
+            (!otherOwner || ownerRefOf(this.index, d)?.key === otherOwner.key);
+        if ([...this.group].some(at)) return 'group';
+        if (this.linkAlternatives && [...this.linkAlternatives].some(at)) return 'alternative';
+        return null;
     }
 
     sourceLocalBinding(file, binding, reference = binding.node) {
@@ -428,13 +545,65 @@ class ValueReferenceResolver extends TypeReferenceResolver {
         return bindings.length === 1 && sameNode(bindings[0].node, node);
     }
 
-    localBinding(file, node, name, includeModule = false, contextualValue = false) {
-        const language = this.index.files.get(file)?.language;
+    lexicalMemo(node) {
         let memo = this.lexicalScopeMemos.get(node.tree);
         if (!memo) { memo = new Map(); this.lexicalScopeMemos.set(node.tree, memo); }
+        return memo;
+    }
+
+    /** Python scope lookup (LEGB, `global`/`nonlocal`, defaults and
+     * decorators in the enclosing scope) of a name at `node`. A read
+     * directly in a class body that binds the name too follows the body's
+     * statement order: before every binding it reads the scope around the
+     * class (`limit = limit`), after an unconditional one the class
+     * namespace ('class'). */
+    pythonScope(node, name) {
+        const lexical = referenceScope(node, 'python', this.lexicalMemo(node), name, { globalBindsModule: true });
+        if (lexical !== 'unknown') return lexical;
+        const classNode = pythonClassBodyOf(node);
+        const order = classNode && pythonClassBodyOrder(classNode, node, name);
+        if (order === 'outer') return this.pythonScope(classNode, name);
+        if (order === 'class') return { local: true, defRows: null, classBody: classNode };
+        return lexical;
+    }
+
+    /**
+     * The binding a Python name reference resolves to (fix #420). Python
+     * binds per scope, not per statement: the lookup's own scope verdict
+     * decides, and a binding of the name in an enclosing function never
+     * shadows a reference its rules send elsewhere (a `global` declaration,
+     * a default value evaluated in the enclosing scope).
+     */
+    pythonLocalBinding(file, node, name, lexical, includeModule) {
+        if (lexical === 'none') return { verdict: 'no', reason: 'non-value-position' };
+        if (!lexical || lexical === 'unknown') return { verdict: 'unknown', reason: 'lexical-binding-unresolved' };
+        if (lexical === 'module' && !includeModule) return null;
+        if (lexical.classBody) return this.owner ? null : { verdict: 'no', reason: 'class-binding' };
+        const scope = lexical === 'module' ? node.tree.rootNode : lexical.scopeNode;
+        const tokens = this.syntaxNodes(file, node.tree, name);
+        if (lexical === 'module' && tokens.some(token => token.role.scopeDeclaration === 'global_statement')) {
+            return { verdict: 'unknown', reason: 'module-rebinding' };
+        }
+        const bindings = scope ? tokens.filter(token => token.role.binding && token.scope &&
+            sameNode(token.scope, scope)) : [];
+        if (bindings.length === 1 && bindings[0].node.startIndex < node.startIndex) {
+            return { binding: { ...bindings[0], scope } };
+        }
+        if (lexical === 'module') {
+            return bindings.length ? { verdict: 'unknown', reason: 'module-rebinding' } : null;
+        }
+        return { verdict: 'no', reason: 'local-binding' };
+    }
+
+    localBinding(file, node, name, includeModule = false, contextualValue = false) {
+        const language = this.index.files.get(file)?.language;
+        const memo = this.lexicalMemo(node);
+        if (langTraits(language)?.assignmentDeclaresLocal) {
+            return this.pythonLocalBinding(file, node, name, this.pythonScope(node, name), includeModule);
+        }
         const lexical = referenceScope(node, language, memo, name);
         if (lexical === 'none' && !contextualValue) return { verdict: 'no', reason: 'non-value-position' };
-        const bindings = this.syntaxNodes(file, node.tree, name).filter(binding =>
+        let bindings = this.syntaxNodes(file, node.tree, name).filter(binding =>
             binding.role.binding &&
             this.scopeRelation(file, binding.node.startPosition.row + 1, node,
                 binding.node.startPosition.column) !== 'no' &&
@@ -444,6 +613,18 @@ class ValueReferenceResolver extends TypeReferenceResolver {
             !['class_body', 'declaration_list', 'field_declaration_list'].includes(binding.scope?.type) &&
             contains(binding.scope, node)).map(binding => ({ ...binding,
             scope: binding.scope || node.tree.rootNode }));
+        // A pattern variable is in scope where its pattern's flow puts it
+        // (fix #420: Java `instanceof`/switch patterns), not in its block.
+        const patternReach = langTraits(language)?.patternBindingReach;
+        if (patternReach && bindings.some(binding => binding.role.why === 'pattern')) {
+            const reached = [];
+            for (const binding of bindings) {
+                const verdict = binding.role.why === 'pattern' ? patternReach(binding.node, node) : 'in';
+                if (verdict === 'unknown') return { verdict: 'unknown', reason: 'pattern-variable-scope' };
+                if (verdict === 'in') reached.push(binding);
+            }
+            bindings = reached;
+        }
         if (!bindings.length) {
             if (lexical?.local && name === this.name && langTraits(language)?.moduleValueLookup &&
                 this.resolveName(file, node.startPosition.row + 1).verdict === 'yes') return null;
@@ -466,6 +647,237 @@ class ValueReferenceResolver extends TypeReferenceResolver {
         }
         return { binding: nearest,
             ...(name === this.name && this.selectedBinding(file, nearest.node) && { pin: true }) };
+    }
+
+    /**
+     * A Python token that binds or declares a name (an assignment or loop
+     * target, a def or class name, an import, a `global` declaration):
+     * whether it binds the pinned module variable (fix #420). Null for
+     * tokens that bind nothing. An unaliased import of the name binds the
+     * variable too; renaming it gives the import an alias (`importAlias`).
+     */
+    pythonBindingAt(file, token) {
+        const { node, role } = token;
+        const parent = node.parent;
+        const inPinFile = file === this.def.file;
+        const moduleVerdict = () => {
+            if (inPinFile) return { verdict: 'yes' };
+            // Another module's variable that its import binds to the pin is
+            // renamed as a whole there; one some other import also binds
+            // stays for review.
+            const importer = this.pythonImporterVariable(file);
+            return importer === true ? { verdict: 'yes' } : importer === 'mixed'
+                ? { verdict: 'unknown', reason: 'module-rebinding' } : { verdict: 'no', reason: 'other-module' };
+        };
+        if (role.scopeDeclaration) {
+            return role.scopeDeclaration === 'global_statement' ? moduleVerdict()
+                : { verdict: 'no', reason: 'nonlocal-binding' };
+        }
+        // Another module's imports of the pin are import references.
+        const importStatement = inPinFile &&
+            (role.role === 'import' || ['module-path', 'import-alias'].includes(role.why));
+        const classDecl = role.role === 'decl' && parent?.type === 'class_definition';
+        if (!role.binding && !importStatement && !classDecl) return null;
+        if (role.why === 'parameter') return { verdict: 'no', reason: 'local-binding' };
+        let edit = { verdict: 'yes' };
+        if (importStatement) {
+            if (role.why === 'module-path') {
+                // `import json` binds its first segment; `from pkg import x`
+                // names a module path and binds nothing of that spelling.
+                const dotted = parent?.type === 'dotted_name' ? parent : null;
+                if (!dotted || dotted.parent?.type !== 'import_statement' ||
+                    !sameNode(dotted.namedChild(0), node)) return { verdict: 'no', reason: 'module-path' };
+                if (dotted.namedChildCount > 1) edit = { verdict: 'unknown', reason: 'dotted-import-binding' };
+                else edit = { verdict: 'yes', importAlias: true };
+            } else if (role.role === 'import') {
+                if (role.aliased) return { verdict: 'no', reason: 'import-alias' };
+                // The alias token of `from m import x as x` binds; a plain
+                // `from m import x` binds the name it imports.
+                if (parent?.type !== 'aliased_import') edit = { verdict: 'yes', importAlias: true };
+            }
+        }
+        const scope = referenceBindingScope(role.why === 'function' || classDecl ? parent : node, 'python', role);
+        if (scope?.type === 'class_definition') return { verdict: 'no', reason: 'class-binding' };
+        const lexical = this.pythonScope(node, this.name);
+        if (lexical === 'module') {
+            const verdict = moduleVerdict();
+            return verdict.verdict === 'yes' ? edit : verdict;
+        }
+        if (lexical && typeof lexical === 'object') return { verdict: 'no', reason: 'local-binding' };
+        // An import binds in the function holding it, a lookup the scope
+        // rules leave open only for imported names.
+        if (importStatement) {
+            for (let current = node.parent; current; current = current.parent) {
+                if (current.type === 'function_definition' || current.type === 'lambda') {
+                    return { verdict: 'no', reason: 'local-binding' };
+                }
+            }
+        }
+        return { verdict: 'unknown', reason: 'lexical-binding-unresolved' };
+    }
+
+    /**
+     * A Python module whose module variable of the pin's name its own
+     * imports bind to the pin (fix #420): that variable is the pin there
+     * (true), so its rebindings, `global` writes and reads are renamed with
+     * the import. 'mixed' when another import binds it to something else,
+     * false when no import of the module binds it to the pin.
+     */
+    pythonImporterVariable(file) {
+        if (!this._importerVariables) this._importerVariables = new Map();
+        if (this._importerVariables.has(file)) return this._importerVariables.get(file);
+        const entry = this.index.files.get(file);
+        let result = false;
+        if (file !== this.def.file && !this.owner && entry && langTraits(entry.language)?.assignmentDeclaresLocal) {
+            // An import inside a function binds a local of it.
+            const bindings = (entry.importBindings || []).filter(binding => binding.module != null &&
+                binding.name !== '*' && (binding.alias || binding.name) === this.name &&
+                !(Number.isInteger(binding.line) && this.index.findEnclosingFunction(file, binding.line, true)));
+            const reaches = bindings.map(binding => binding.kind !== 'import' && binding.name === this.name &&
+                this.importBindingVerdict(file, entry, { ...binding, alias: undefined }, this.name).verdict === 'yes');
+            if (reaches.length > 0 && reaches.every(Boolean)) result = true;
+            else if (reaches.some(Boolean)) result = 'mixed';
+        }
+        this._importerVariables.set(file, result);
+        return result;
+    }
+
+    /**
+     * What a JS/TS import binding holds (fix #420): 'namespace' (the
+     * imported module's own namespace or exports object), `{ modules }`
+     * (the namespace of other modules it re-exports: `export * as ns`,
+     * `import * as ns ..; export { ns }`), 'value' (an exported declaration:
+     * its members are properties of that value) or 'unknown' (a re-export
+     * chain the index cannot follow).
+     */
+    jsBindingHolds(file, binding, depth = 0) {
+        const entry = this.index.files.get(file);
+        if (binding.kind === 'namespace' || binding.kind === 'require') {
+            if (depth === 0) return 'namespace';
+            const module = entry && this.moduleFile(entry, binding.module);
+            return module ? { modules: [module] } : 'unknown';
+        }
+        if (depth > 4) return 'unknown';
+        const target = entry && this.moduleFile(entry, binding.module);
+        if (!target) {
+            const { bindingIsExternal } = require('./type-denotation');
+            return bindingIsExternal(this.index, entry, file, binding) === true ? 'value' : 'unknown';
+        }
+        const targetEntry = this.index.files.get(target);
+        const exports = targetEntry?.exportDetails || [];
+        const defaultImport = binding.kind === 'default';
+        const details = exports.filter(detail => defaultImport ? detail.type === 'default'
+            : detail.type !== 'default' && detail.type !== 're-export-all' && (detail.alias || detail.name) === binding.name ||
+                detail.type === 're-export-all' && detail.alias === binding.name);
+        if (details.length === 0) return 'unknown';
+        const holds = details.map(detail => {
+            if (detail.type === 're-export-all') {
+                const module = detail.source && this.moduleFile(targetEntry, detail.source);
+                return module ? { modules: [module] } : 'unknown';
+            }
+            if (detail.type === 're-export') {
+                return detail.source ? this.jsBindingHolds(target, { name: detail.name, module: detail.source,
+                    kind: detail.name === 'default' ? 'default' : 'named' }, depth + 1) : 'unknown';
+            }
+            if (detail.type === 'exports' || detail.type === 'module.exports') return 'value';
+            const imported = (targetEntry?.importBindings || []).filter(other =>
+                (other.alias || other.name) === detail.name && other.module != null);
+            if (imported.length === 0) return 'value';
+            return mergeHolds(imported.map(other => this.jsBindingHolds(target, other, depth + 1)));
+        });
+        return mergeHolds(holds);
+    }
+
+    /**
+     * A JS/TS member access `R.name` against a module-scope value (fix
+     * #420): only a module namespace or exports object holds the module's
+     * bindings as members. A receiver a local binding shadows, or an
+     * imported value (named or default import of a declaration), holds
+     * ordinary properties. A CommonJS export key (`exports.name = ..`) is
+     * a property of the exports object, not the module's binding. Null when
+     * the module-attribute lookup decides.
+     */
+    jsModuleMemberAt(file, receiver) {
+        if (receiver.type !== 'identifier') return null;
+        const language = this.index.files.get(file)?.language;
+        const lexical = referenceScope(receiver, language === 'html' ? 'javascript' : language,
+            this.lexicalMemo(receiver), receiver.text);
+        if (lexical === 'none') return null;
+        if (!lexical || lexical === 'unknown') return { verdict: 'unknown', reason: 'receiver-scope' };
+        if (lexical !== 'module') return { verdict: 'no', reason: 'member' };
+        const entry = this.index.files.get(file);
+        const bindings = (entry?.importBindings || []).filter(binding =>
+            (binding.alias || binding.name) === receiver.text && binding.module != null);
+        if (bindings.length === 0) return null;
+        const holds = bindings.map(binding => this.jsBindingHolds(file, binding));
+        if (holds.every(hold => hold === 'value')) return { verdict: 'no', reason: 'member' };
+        // A re-exported namespace names the modules it re-exports.
+        if (holds.every(hold => hold?.modules)) {
+            const reach = holds.flatMap(hold => hold.modules).map(module => this.chase(module, this.name));
+            return reach.every(verdict => verdict === 'yes') ? { verdict: 'yes' }
+                : reach.every(verdict => verdict === 'no') ? { verdict: 'no', reason: 'other-module' }
+                    : { verdict: 'unknown', reason: 'module-attribute' };
+        }
+        if (holds.some(hold => hold !== 'namespace')) return { verdict: 'unknown', reason: 'import-binding-value' };
+        const keyed = bindings.filter(binding => binding.kind === 'require').map(binding => {
+            const target = this.moduleFile(entry, binding.module);
+            const exports = target ? this.index.files.get(target)?.exportDetails || [] : [];
+            const own = exports.filter(detail => (detail.alias || detail.name) === this.name);
+            return own.length > 0 && own.every(detail => detail.type === 'exports' || detail.type === 'module.exports');
+        });
+        if (keyed.length > 0 && keyed.every(Boolean)) return { verdict: 'no', reason: 'export-key' };
+        if (keyed.some(Boolean)) return { verdict: 'unknown', reason: 'export-key' };
+        return null;
+    }
+
+    /**
+     * A bare name that provably never denotes a class or enum member here
+     * (fix #420): a language without implicit `this` reaches member values
+     * by name only inside the declaring enum or namespace (JS/TS), directly
+     * in a class body (Python), through imported variants (Rust), or never.
+     */
+    bareMemberVerdict(file, node, language) {
+        const traits = langTraits(language);
+        const miss = { verdict: 'no', reason: 'bare-name-not-member' };
+        if (!traits || traits.bareCallReachesMethods) return null;
+        switch (traits.bareValueMemberScope) {
+            case 'none': return miss;
+            case 'imports': return this.def.type !== 'variant' ? miss : null;
+            case 'class-body': {
+                const lexical = this.pythonScope(node, this.name);
+                // A class body read after its binding reads that class's
+                // attribute (statement order).
+                if (lexical?.classBody) return this.memberAt(this.enclosingOwner(file, node));
+                return lexical === 'module' || (!!lexical && typeof lexical === 'object') ? miss : null;
+            }
+            case 'declaration-body':
+                for (let parent = node.parent; parent; parent = parent.parent) {
+                    if (['enum_declaration', 'enum_body', 'internal_module', 'module'].includes(parent.type)) return null;
+                }
+                return miss;
+            default: return null;
+        }
+    }
+
+    /**
+     * The declared type of the object literal holding a JS/TS property
+     * (fix #420): `const v: T = { key: .. }`, `{ .. } as T`, `{ .. }
+     * satisfies T`. Its key is that type's member. Null when no written
+     * type gives the literal its contract.
+     */
+    objectLiteralOwner(file, pair) {
+        const object = pair.parent;
+        if (object?.type !== 'object') return null;
+        const holder = object.parent;
+        let type = null;
+        if (holder?.type === 'variable_declarator' && sameNode(holder.childForFieldName('value'), object)) {
+            type = holder.childForFieldName('type');
+        } else if ((holder?.type === 'as_expression' || holder?.type === 'satisfies_expression') &&
+            sameNode(holder.namedChild(0), object)) {
+            type = holder.namedChild(1);
+        }
+        const syntax = type && typeSyntax(type);
+        return syntax ? this.classForType(file, syntax) : null;
     }
 
     declarationNode(definition) {
@@ -1091,6 +1503,9 @@ class ValueReferenceResolver extends TypeReferenceResolver {
             !langTraits(entry.language)?.fieldsAndMethodsSeparate;
         const qualifier = role.qualifier || (parent?.type === 'qualified_identifier' &&
             sameNode(parent.childForFieldName('name'), node) && parent.childForFieldName('scope'));
+        const globalQualified = langTraits(entry.language)?.typeArgumentValues === 'ordinary' &&
+            parent?.type === 'qualified_identifier' && sameNode(parent.childForFieldName('name'), node) &&
+            !parent.childForFieldName('scope') && parent.children.some(child => child.type === '::');
         const shape = this.owner && !declarationRole
             ? langTraits(entry.language)?.accessorReferenceShape?.(node.tree, {
                 line: node.startPosition.row + 1, column: node.startPosition.column, usageType: 'reference',
@@ -1098,7 +1513,12 @@ class ValueReferenceResolver extends TypeReferenceResolver {
         const patternReference = this.patternReference(file, node, role);
         const scriptScope = file === this.def.file && this.scopeRelation(file,
             this.def.nameLine || this.def.startLine, node);
-        if (privateToken) {
+        const pythonBinding = this.moduleVariable && !receiver && !(qualifier && role.role !== 'import') &&
+            !(declarationRole && this.selectedBinding(file, node))
+            ? this.pythonBindingAt(file, token) : null;
+        if (pythonBinding) {
+            verdict = pythonBinding;
+        } else if (privateToken) {
             declaration = privateDeclaration;
             verdict = this.privateValueAt(file, node);
         } else if (position === 'type' || role.role === 'decl') {
@@ -1117,7 +1537,10 @@ class ValueReferenceResolver extends TypeReferenceResolver {
         } else if (shorthand) {
             verdict = { verdict: 'unknown', reason: 'value-key-binding' };
         } else if (pattern || objectKey) {
-            verdict = this.owner ? { verdict: 'unknown', reason: 'value-initializer-owner-unresolved' }
+            const literalOwner = this.owner && objectKey && parent.type === 'pair' &&
+                this.family === 'js' ? this.objectLiteralOwner(file, parent) : null;
+            verdict = literalOwner ? this.memberAt(literalOwner)
+                : this.owner ? { verdict: 'unknown', reason: 'value-initializer-owner-unresolved' }
                 : { verdict: 'no', reason: 'object-key' };
         } else if (shape?.uncertainRole) {
             verdict = { verdict: 'unknown', reason: 'value-role-unresolved' };
@@ -1127,8 +1550,15 @@ class ValueReferenceResolver extends TypeReferenceResolver {
             verdict = langTraits(entry.language)?.typeArgumentValues === 'ordinary'
                 ? this.cppMemberAt(this.receiverOwner(file, receiver))
                 : this.owner ? this.memberAt(this.receiverOwner(file, receiver))
-                : this.resolveQualified(file, node.startPosition.row + 1, receiver,
-                    receiver.text, { role: 'member' });
+                : (this.family === 'js' && this.jsModuleMemberAt(file, receiver)) ||
+                    this.resolveQualified(file, node.startPosition.row + 1, receiver,
+                        receiver.text, { role: 'member' });
+        } else if (globalQualified) {
+            // `::name` is looked up in the global namespace only (fix #420):
+            // never a class member, and never a local or a class-scope
+            // value the unqualified spelling would find first.
+            verdict = this.owner ? { verdict: 'no', reason: 'global-qualified' }
+                : this.resolveCFamily(file, node.startPosition.row + 1, this.name, '::');
         } else if (qualifier && role.role !== 'import') {
             verdict = langTraits(entry.language)?.typeArgumentValues === 'ordinary'
                 ? this.qualifiedValueAt(file, qualifier, role)
@@ -1138,8 +1568,11 @@ class ValueReferenceResolver extends TypeReferenceResolver {
         } else if (role.role === 'qualified') {
             verdict = { verdict: 'unknown', reason: 'qualified-value-unresolved' };
         } else if (role.role === 'import' && this.owner) {
-            verdict = this.staticImportAt(file, node, true) ||
-                { verdict: 'unknown', reason: 'value-import-unresolved' };
+            verdict = ['none', 'declaration-body', 'class-body'].includes(
+                langTraits(entry.language)?.bareValueMemberScope) && !langTraits(entry.language)?.bareCallReachesMethods
+                ? { verdict: 'no', reason: 'module-import' }
+                : this.staticImportAt(file, node, true) ||
+                    { verdict: 'unknown', reason: 'value-import-unresolved' };
         } else if (role.role === 'import') {
             verdict = referenceImportVerdict(this, file, entry, token);
         } else if (!callableValue && (role.role === 'skip' || role.role === 'decl')) {
@@ -1163,6 +1596,13 @@ class ValueReferenceResolver extends TypeReferenceResolver {
                 verdict = sameDeclaration && (globalDeclaration || sameOwner || selectedEnum ||
                     this.selectedBinding(file, node))
                     ? { verdict: 'yes' } : { verdict: 'no', reason: 'other-declaration' };
+                const member = verdict.verdict === 'no' && (globalDeclaration || otherOwner) &&
+                    this.groupMemberAt(file, node, otherOwner || null);
+                if (member) {
+                    verdict = member === 'group' ? { verdict: 'yes', declarationOf: true }
+                        : { verdict: 'unknown', reason: 'link-alternatives', declarationOf: true };
+                    declaration = false;
+                }
                 const declaredStorage = langTraits(this.language)?.separateStaticStorage && this.thisStorage(node);
                 if (sameDeclaration && sameOwner && declaredStorage) this.declarationStorages.add(declaredStorage);
                 if (verdict.verdict === 'no' && declaredStorage && declaredStorage !== this.targetStorage) {
@@ -1190,9 +1630,14 @@ class ValueReferenceResolver extends TypeReferenceResolver {
             }
         } else if (callableValue || role.role === 'value' || role.role === 'pin-binding' || role.role === 'dunder-all') {
             const local = this.localBinding(file, node, this.name, false, contextualValue);
+            const importer = !local && this.moduleVariable && file !== this.def.file &&
+                this.pythonImporterVariable(file);
             if (local) verdict = local.pin ? { verdict: 'yes' }
                 : local.binding ? { verdict: 'no', reason: 'local-binding',
                     fileLocalOnly: this.sourceLocalBinding(file, local.binding, node) } : local;
+            else if (importer) {
+                verdict = importer === true ? { verdict: 'yes' } : { verdict: 'unknown', reason: 'module-rebinding' };
+            }
             else if (langTraits(entry.language)?.textualIncludes && enclosingEnum(node)) {
                 verdict = this.globalAt(file, node, contextualValue);
             }
@@ -1202,6 +1647,7 @@ class ValueReferenceResolver extends TypeReferenceResolver {
             else if (this.enumInfo(this.def)?.unscoped) verdict = this.globalAt(file, node, contextualValue);
             else if (this.owner) {
                 verdict = this.enumCaseAt(file, node);
+                if (!verdict) verdict = this.bareMemberVerdict(file, node, entry.language);
                 if (!verdict) {
                     const owner = this.enclosingOwner(file, node);
                     verdict = langTraits(entry.language)?.bareCallReachesMethods
@@ -1227,7 +1673,9 @@ class ValueReferenceResolver extends TypeReferenceResolver {
             this.references.push({ file: entry.relativePath, absoluteFile: file, line,
                 column: node.startPosition.column, expression: this.index.getLineContent(file, line).trim(),
                 ...(receiver && { receiver: receiver.text }),
-                accessKind: require('./accessors').referenceAccessKind(node.tree,
+                // Another declaration of the renamed entity (a linkage
+                // declaration, a slot member) is listed as a declaration.
+                accessKind: verdict.declarationOf ? 'declaration' : require('./accessors').referenceAccessKind(node.tree,
                     { line, column: node.startPosition.column }, node),
                 verdict: verdict.verdict, reason: verdict.reason });
             if (this.enumReferenceSyntax?.collecting(file)) {
@@ -1302,13 +1750,31 @@ function findValueReferences(index, name, def, options = {}) {
     }
     const sorted = [...byFile].sort((a, b) => compare(a[0], b[0]))
         .map(([file, sites]) => ({ file, count: sites.length, sites }));
-    return { confirmedCount: sorted.reduce((n, group) => n + group.count, 0),
+    const confirmedCount = sorted.reduce((n, group) => n + group.count, 0);
+    // Every name token the scan decided is in one bucket (fix #420): an
+    // access (confirmed, unverified, excluded with a reason) or a declaration
+    // token (the pin's own and other declarations of the name).
+    let tokens = 0, lines = 0, textLines = 0;
+    const scannedFiles = new Set();
+    for (const [absoluteFile, info] of result.files) {
+        if (!index.matchesFilters(info.relativePath, options) ||
+            options.files && !options.files.has(absoluteFile)) continue;
+        for (const slot of info.lines.values()) {
+            tokens += slot.tokens;
+            if (slot.tokens > 0) { lines++; scannedFiles.add(absoluteFile); } else if (slot.text) textLines++;
+        }
+    }
+    const accessTokens = confirmedCount + unverifiedSites.length + excluded.length;
+    return { confirmedCount,
         unverifiedCount: unverifiedSites.length,
-        totalCandidates: sorted.reduce((n, group) => n + group.count, 0) + unverifiedSites.length,
+        totalCandidates: confirmedCount + unverifiedSites.length,
         byFile: sorted, unverifiedSites, excluded: { total: excluded.length,
             byReason: excluded.reduce((out, site) => {
                 out[site.reason] = (out[site.reason] || 0) + 1; return out;
-            }, {}) } };
+            }, {}) },
+        account: { tokens, lines, files: scannedFiles.size, textLines, confirmed: confirmedCount,
+            unverified: unverifiedSites.length, excluded: excluded.length,
+            declarations: tokens - accessTokens, conserved: tokens >= accessTokens } };
 }
 
 /** The class a field annotation denotes, completed only in this use's unit. */
