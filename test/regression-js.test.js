@@ -12706,3 +12706,35 @@ describe('fix #423: JS/TS name scopes, own imports, self-package subpaths, runti
         } finally { rm(dir); }
     });
 });
+
+describe('fix #424: nested callees and parameters added before a rest parameter', () => {
+    it('a function declared in another function is no callee of a call outside it', () => {
+        const dir = tmp({
+            'a.js': 'function outer() {\n  function helper() { return 1; }\n  return helper();\n}\n' +
+                'function other() {\n  return helper();\n}\nmodule.exports = { outer, other };\n',
+        });
+        try {
+            const index = idx(dir);
+            const { findCallees } = require('../core/callers');
+            const def = name => index.symbols.get(name).find(d => d.relativePath === 'a.js');
+            const other = findCallees(index, def('other'), { collectAccount: true });
+            assert.deepStrictEqual(other.map(c => c.name), []);
+            assert.strictEqual(other.calleeAccount.external.count, 1);
+            assert.deepStrictEqual(findCallees(index, def('outer'), { collectAccount: true })
+                .map(c => `${c.name}:${c.startLine}`), ['helper:2']);
+        } finally { rm(dir); }
+    });
+
+    it('calls passing arguments where a new parameter is inserted before ...rest are listed', () => {
+        const dir = tmp({
+            'a.js': 'function f(a, ...rest) { return rest; }\nf(1);\nf(1, 2, 3);\nf(...xs);\nmodule.exports = { f };\n',
+        });
+        try {
+            const r = execute(idx(dir), 'plan', { name: 'a.js:1:f', addParam: 'extra', defaultValue: 'null' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const calls = r.result.changes.filter(change => change.editKind === 'call');
+            assert.deepStrictEqual(calls.map(change => change.line), [3, 4]);
+            assert.ok(calls.every(change => change.needsReview && /Argument 2 now binds extra/.test(change.suggestion)));
+        } finally { rm(dir); }
+    });
+});

@@ -933,6 +933,41 @@ class TypeReferenceResolver {
     inGroup(d) { return this.group.has(d); }
 
     /**
+     * The Python function scope the pinned class statement binds its name
+     * in (fix #424), when that scope binds the name by other statements
+     * too: one variable, renamed whole (its other bindings are the plan's
+     * alternative bindings), so a reference resolving to that scope names
+     * the pin's variable. Null for module and class-body scopes, which the
+     * module lookup and class-body order decide.
+     */
+    pythonPinScope(tree) {
+        if (this.family !== 'python' || !tree) return null;
+        if (this._pythonPinScope && this._pythonPinScope.tree === tree) return this._pythonPinScope.scope;
+        let scope = null;
+        const row = (this.def.nameLine || this.def.startLine) - 1;
+        const stack = [tree.rootNode];
+        let classNode = null;
+        while (stack.length > 0 && !classNode) {
+            const node = stack.pop();
+            if (node.startPosition.row > row || node.endPosition.row < row) continue;
+            if (node.type === 'class_definition' && node.childForFieldName('name')?.text === this.name &&
+                node.childForFieldName('name').startPosition.row === row) {
+                classNode = node;
+                break;
+            }
+            for (let i = node.namedChildCount - 1; i >= 0; i--) stack.push(node.namedChild(i));
+        }
+        const owner = classNode && bindingScope(classNode, 'python', {});
+        if (owner?.type === 'function_definition') {
+            const { pythonScopeBindingKinds } = require('../languages/lexical-scope');
+            const sites = pythonScopeBindingKinds(classNode.parent, this.name);
+            if (sites.some(site => !sameNode(site.node, classNode.childForFieldName('name')))) scope = owner;
+        }
+        this._pythonPinScope = { tree, scope };
+        return scope;
+    }
+
+    /**
      * Generic arity written at the token being decided, where arity is part
      * of a type's identity (trait genericArityIsIdentity, fix #389): `X` is
      * 0, `X<int>` 1, the open generic `X<>` 1 and `X<,>` 2. null when the
@@ -1083,7 +1118,13 @@ class TypeReferenceResolver {
 
     chase(startFile, name) {
         const { _nameBindingReaches } = require('./callers');
-        return _nameBindingReaches(this.index, startFile, name, this.pinFiles, 8, { exactName: true });
+        const reach = _nameBindingReaches(this.index, startFile, name, this.pinFiles, 8,
+            { exactName: true, configurationVerdict: true });
+        // A module binding the name through one alternative of a
+        // configuration item keeps the item's name (fix #424, the #398F
+        // import rule): its importers' and attribute readers' tokens name
+        // the item, never the renamed pin.
+        return reach === 'configuration' ? 'no' : reach;
     }
 
     moduleFile(entry, module) {
@@ -2560,11 +2601,13 @@ function decideDocCrefs(resolver, file, comment, slot) {
     if (handled) slot.stringAnnotation = true;
 }
 
-function shadowOf(token, bindings, space, family) {
+function shadowOf(token, bindings, space, family, pinScope = null) {
     let verdict = null;
     for (const binding of bindings) {
         if (sameNode(binding.node, token.node)) continue;
         if (!binding.scope || !contains(binding.scope, token.node)) continue;
+        // Another binding of the pinned class's own variable (fix #424).
+        if (pinScope && sameNode(binding.scope, pinScope)) continue;
         // Type positions are a separate namespace outside Python/JS values.
         if (space === 'type' && family !== 'python') continue;
         if (binding.role.patternBinding) return 'unknown';
@@ -2872,7 +2915,8 @@ function memberShadowOf(resolver, file, node) {
 function resolveUnqualifiedToken(resolver, file, token, bindings, typeParams, space) {
     const family = resolver.family;
     if (space === 'value' || family === 'python' || family === 'js') {
-        const shadow = shadowOf(token, bindings, space, family);
+        const shadow = shadowOf(token, bindings, space, family,
+            file === resolver.def.file ? resolver.pythonPinScope(token.node.tree) : null);
         if (shadow === 'no') return { verdict: 'no', reason: 'local-binding' };
         if (shadow === 'unknown') return { verdict: 'unknown', reason: 'local-binding' };
         if (shadow === 'module') {

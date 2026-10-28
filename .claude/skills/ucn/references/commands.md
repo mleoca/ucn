@@ -22,7 +22,7 @@ Use text search (grep/ripgrep) for simple literals, error messages, configuratio
 | `impact [handle]` | Direct impact of one symbol; without a handle, the Git diff (`--base=<ref>`, `--staged`). Property targets add an access-site band, type targets a reference-site band. |
 | `tests <handle\|file>` | Statically linked direct tests; `--depth=N` adds transitively affected tests; `--calls-only` keeps direct calls and test-case matches. |
 | `check [handle]` | Call-site validation for one symbol against its declaration at `--base` (default `HEAD`); without a handle, the composed pre-commit check of the diff (`--base`, `--staged`). |
-| `plan <handle>` | Preview `--rename-to=X`, `--add-param=p` (`--default-value=v`), or `--remove-param=p`. Never edits files. |
+| `plan <handle>` | Preview `--rename-to=X`, `--add-param=p` (`--default-value=v`), or `--remove-param=p`. Never edits files. A Python param added beside `*args` or keyword-only params is keyword-only (after them, before `**kwargs`); calls passing arguments where a param is inserted before a rest param are listed. |
 
 ## Repository and architecture
 

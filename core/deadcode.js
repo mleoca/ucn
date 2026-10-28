@@ -1172,8 +1172,10 @@ function deadcode(index, options = {}) {
                                     // base definition this syntax consumes.
                                     dottedScope = undefined;
                                 } else {
+                                    // The receiver is a binding's local name
+                                    // (fix #424: `from pkg import sub as x`).
                                     const binding = (fileEntry.importBindings || [])
-                                        .find(b => b.name === receiver);
+                                        .find(b => (b.alias || b.name) === receiver);
                                     let resolved;
                                     if (binding && fileEntry.moduleResolved) {
                                         // `from . import types` binds the
@@ -1186,7 +1188,7 @@ function deadcode(index, options = {}) {
                                         // to the file that actually owns them.
                                         const mod = String(binding.module);
                                         const submodule = mod.endsWith('.')
-                                            ? mod + receiver : mod + '.' + receiver;
+                                            ? mod + binding.name : mod + '.' + binding.name;
                                         resolved = fileEntry.moduleResolved[submodule] ||
                                             fileEntry.moduleResolved[mod];
                                     }

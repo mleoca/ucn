@@ -392,6 +392,8 @@ function usages(index, name, options = {}) {
                             ...(u.scopeDefLines && { scopeDefLines: u.scopeDefLines }),
                             ...(u.shorthandProperty && { shorthandProperty: true }),
                             ...(u.importAlias && { importAlias: true }),
+                            ...(u.modulePath && { modulePath: true }),
+                            ...(u.importSource && { importSource: true }),
                         }),
                         ...(callerSym && {
                             callerName: callerSym.name,

@@ -13,6 +13,7 @@ const REQUIRED_ADAPTER_OPERATIONS = Object.freeze([
 ]);
 
 const OPTIONAL_HELPERS = Object.freeze([
+    'annotatedReceiverType',
     'findFunctions',
     'findClasses',
     'findStateObjects',

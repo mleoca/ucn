@@ -764,6 +764,34 @@ function computeModifierTokens(def) {
 }
 
 /**
+ * A parameter list as source text. Python binding-position markers (fix
+ * #281): the bare `*` before the first keyword-only param (unless `*args`
+ * already plays that role) and the `/` after the last positional-only
+ * param, so the signature matches the source contract (fix #424: a changed
+ * list keeps them too).
+ */
+function formatTypedParamList(ps, paramTypes = {}) {
+    const lastPosOnly = ps.reduce(
+        (acc, p, i) => (p && p.positionalOnly ? i : acc), -1);
+    let starShown = false;
+    const parts = [];
+    ps.forEach((p, i) => {
+        // Apply paramTypes mapping when paramsStructured doesn't carry types
+        const merged = { ...p };
+        if (!merged.type && paramTypes?.[p.name]) merged.type = paramTypes[p.name];
+        if (p && p.rest && /^\*(?!\*)/.test(String(p.name))) starShown = true;
+        if (!starShown && p && p.keywordOnly) {
+            parts.push('*');
+            starShown = true;
+        }
+        const tok = formatTypedParam(merged);
+        if (tok) parts.push(tok);
+        if (i === lastPosOnly) parts.push('/');
+    });
+    return parts.join(', ');
+}
+
+/**
  * Build a function signature string from a definition, using
  * TS-correct param formatting (BUG-BV). Local to verify.js to avoid
  * the shared formatter's incorrect `?` placement.
@@ -781,29 +809,7 @@ function formatTypedSignature(def, overrides = {}) {
     parts.push(name);
     const ps = overrides.paramsStructured != null ? overrides.paramsStructured : def.paramsStructured;
     if (Array.isArray(ps)) {
-        const paramTypes = def.paramTypes || {};
-        // Python binding-position markers (fix #281): re-render the bare `*`
-        // before the first keyword-only param (unless `*args` already plays
-        // that role) and the `/` after the last positional-only param, so the
-        // displayed signature matches the source contract.
-        const lastPosOnly = ps.reduce(
-            (acc, p, i) => (p && p.positionalOnly ? i : acc), -1);
-        let starShown = false;
-        const parts2 = [];
-        ps.forEach((p, i) => {
-            // Apply paramTypes mapping when paramsStructured doesn't carry types
-            const merged = { ...p };
-            if (!merged.type && paramTypes[p.name]) merged.type = paramTypes[p.name];
-            if (p && p.rest && /^\*(?!\*)/.test(String(p.name))) starShown = true;
-            if (!starShown && p && p.keywordOnly) {
-                parts2.push('*');
-                starShown = true;
-            }
-            const tok = formatTypedParam(merged);
-            if (tok) parts2.push(tok);
-            if (i === lastPosOnly) parts2.push('/');
-        });
-        parts.push(`(${parts2.join(', ')})`);
+        parts.push(`(${formatTypedParamList(ps, def.paramTypes)})`);
     } else if (def.params !== undefined) {
         parts.push(`(${def.params})`);
     }
@@ -2801,7 +2807,8 @@ function applyTypeReferencePass(index, ctx) {
     const target = `${def.relativePath || def.file}:${def.nameLine || def.startLine}`;
     const reasonText = reason => String(reason || 'unresolved').replace(/-/g, ' ');
     const special = change => change.contractDependency || change.templateDependency ||
-        change.editKind === 'example' || change.editKind === 'macro-expansion';
+        change.editKind === 'example' || change.editKind === 'macro-expansion' || change.scopeAlternative ||
+        change.keepsLocalName;
     // Rebuild a line edit from code-unit token columns.
     // A Python import that binds the renamed module variable keeps its
     // module and gains an alias (`import json as j`, fix #420).
@@ -2856,6 +2863,24 @@ function applyTypeReferencePass(index, ctx) {
             // its replacement list uses in another role) leaves the edit,
             // unless the edit is the pin's own declaration or one a
             // dedicated pass proved.
+            // A binding of the pin's own variable keeps its edit; the other
+            // tokens of its line the lookup proves join it (fix #424: `x =
+            // getattr(x, ..)` reads the variable it rebinds).
+            if (existing && existing.scopeAlternative && existing.newExpression !== undefined) {
+                if (editUnits.length > 0) mergeTokenEdit(existing, lineEdit(raw, editUnits));
+                const edited = existing._edit?.columns || [];
+                const open = reviewList.filter(review => review.unit == null || !edited.includes(review.unit));
+                if (open.length > 0) {
+                    existing.needsReview = true;
+                    existing.reviewReason = existing.reviewReason || open[0].reason;
+                    existing.suggestion += `; verify the "${name}" token(s) UCN could not resolve ` +
+                        `(${reasonText(open[0].reason)})`;
+                    reviewed.set(key, { abs, reason: open[0].reason });
+                } else {
+                    decided.set(key, { abs, edited: true });
+                }
+                continue;
+            }
             if (existing && existing.newExpression !== undefined && !special(existing)) {
                 const prior = existing._edit && existing._edit.rawSource === raw ? existing._edit.columns
                     : renameIdentifierTokens(index, abs, line, name, renameTo).columns || [];
@@ -3367,10 +3392,27 @@ function plan(index, name, options = {}) {
 
         // When adding a param, insert before rest params (*args/**kwargs) and
         // before optional params (required must precede optional in Python/TS).
-        {
-            const selfNames = ['self', 'cls', '&self', '&mut self', 'mut self'];
-            const minIdx = (newParams.length > 0 && selfNames.includes(newParams[0].name)) ? 1 : 0;
+        // Where calls bind arguments by name (Python), a list with `*args`
+        // or keyword-only params takes the new param as keyword-only, after
+        // them and before `**kwargs` (fix #424): a positional param before
+        // `*args` would rebind every call passing extra positionals.
+        // Inserted before a rest param elsewhere, calls passing arguments
+        // there now bind the new param: they are listed (`rebindIndex`).
+        let rebindIndex = null;
+        const selfNames = ['self', 'cls', '&self', '&mut self', 'mut self'];
+        const minIdx = (newParams.length > 0 && selfNames.includes(newParams[0].name)) ? 1 : 0;
+        const varPositional = p => p.rest && /^\*(?!\*)/.test(String(p.name));
+        const varKeyword = p => p.rest && String(p.name).startsWith('**');
+        if (langTraits(planLang)?.keywordArguments &&
+            newParams.some(p => varPositional(p) || p.keywordOnly)) {
+            newParam.keywordOnly = true;
+            const kwIdx = newParams.findIndex(varKeyword);
+            newParams.splice(kwIdx !== -1 ? kwIdx : newParams.length, 0, newParam);
+        } else {
             const firstRestIdx = newParams.findIndex(p => p.rest || (p.name && (p.name.startsWith('*') || p.name.startsWith('...'))));
+            if (firstRestIdx !== -1 && !varKeyword(newParams[firstRestIdx])) {
+                rebindIndex = Math.max(firstRestIdx, minIdx) - minIdx;
+            }
             if (firstRestIdx !== -1) {
                 // Always insert before rest params (*args, **kwargs, ...rest)
                 const insertIdx = Math.max(firstRestIdx, minIdx);
@@ -3391,7 +3433,7 @@ function plan(index, name, options = {}) {
         // Generate new signature with TS-correct optional marker (BUG-BV)
         // and arrow-fn enriched return type (BUG-BY).
         // BUG-5: preserve all modifier tokens (async/static/public/...).
-        const paramsList = newParams.map(formatTypedParam).filter(Boolean).join(', ');
+        const paramsList = formatTypedParamList(newParams, def.paramTypes);
         const modTokens = computeModifierTokens(def);
         const modPrefix = modTokens.length ? modTokens.join(' ') + ' ' : '';
         newSignature = `${modPrefix}${name}(${paramsList})`;
@@ -3402,6 +3444,23 @@ function plan(index, name, options = {}) {
         // for default values, every call site must pass the new argument.
         for (const site of planCallSites) {
             let suggestion;
+            const positional = site.positionalCount ?? site.argCount;
+            if (rebindIndex !== null && !site.implicitConstruction &&
+                (!site.args || site.args.some(arg => /^(\.\.\.|\*)/.test(arg)) || positional > rebindIndex)) {
+                // An argument this call passes at the new param's position
+                // now binds it instead of the rest param.
+                changes.push({
+                    file: site.file,
+                    line: site.line,
+                    expression: site.expression,
+                    suggestion: `Argument ${rebindIndex + 1} now binds ${options.addParam}: pass ${options.addParam} ` +
+                        `at position ${rebindIndex + 1} so the remaining arguments still reach the rest parameter`,
+                    args: site.args,
+                    needsReview: true,
+                    editKind: 'call',
+                });
+                continue;
+            }
             if (options.defaultValue && langHasDefaults) {
                 // The default makes the existing call valid. Keep the fact in
                 // metadata, but do not inflate the concrete edit plan with a
@@ -3416,7 +3475,8 @@ function plan(index, name, options = {}) {
             } else if (options.defaultValue) {
                 suggestion = `Add argument: ${options.defaultValue} (no default parameter values in ${planFileEntry?.language || 'this language'})`;
             } else {
-                const keywordCall = langTraits(planLang)?.keywordArguments && site.keywordArgNames?.length > 0;
+                const keywordCall = langTraits(planLang)?.keywordArguments &&
+                    (newParam.keywordOnly || site.keywordArgNames?.length > 0);
                 suggestion = keywordCall
                     ? `Add keyword argument: ${options.addParam}=${options.addParam} (replace the right-hand value with the intended expression; keep existing keyword arguments)`
                     : `Add argument: ${options.addParam}`;
@@ -3454,7 +3514,7 @@ function plan(index, name, options = {}) {
         // Generate new signature with TS-correct optional marker (BUG-BV)
         // and arrow-fn enriched return type (BUG-BY).
         // BUG-5: preserve all modifier tokens (async/static/public/...).
-        const paramsList = newParams.map(formatTypedParam).filter(Boolean).join(', ');
+        const paramsList = formatTypedParamList(newParams, def.paramTypes);
         const modTokens = computeModifierTokens(def);
         const modPrefix = modTokens.length ? modTokens.join(' ') + ' ' : '';
         newSignature = `${modPrefix}${name}(${paramsList})`;
@@ -3507,6 +3567,9 @@ function plan(index, name, options = {}) {
 
     // The rename's usage records, shared with the method-group pass below.
     let planUsages = null;
+    // The pin's scope binds its name by other statements too (fix #424): the
+    // rename is the variable's, so references resolving there follow it.
+    let pinScopeRebound = false;
     if (options.renameTo) {
         operation = 'rename';
         newSignature = currentSignature.replace(new RegExp('\\b' + escapeRegExp(name) + '\\b'), options.renameTo);
@@ -3810,11 +3873,31 @@ function plan(index, name, options = {}) {
         };
         // An unaliased import that is one alternative of a configuration
         // item in its own scope (fix #398F: `try: from ._speedups import f` /
-        // `except ImportError: def f`) keeps the item's local name.
-        const importKeepsItemName = (filePath, line) => {
+        // `except ImportError: def f`) keeps the item's local name, as does
+        // one whose scope also declares the name by a def or class statement
+        // (fix #424: `class OMD` then `try: from .dictutils import OMD`): the
+        // importer's variable is not the renamed definition alone (a plain
+        // rebinding joins the variable's rename, fix #420).
+        const importKeepsItemName = (filePath, line, column = null) => {
             const { itemsNamed } = require('./configuration-items');
-            return itemsNamed(index, filePath, name).some(item =>
-                item.sites.some(site => site.kind === 'import' && site.line === line));
+            if (itemsNamed(index, filePath, name).some(item =>
+                item.sites.some(site => site.kind === 'import' && site.line === line))) return true;
+            const entry = index.files.get(filePath);
+            if (!langTraits(entry?.language)?.assignmentDeclaresLocal) return false;
+            let tree;
+            try {
+                const content = index._readFile(filePath);
+                tree = index._getParsedTree?.(filePath, content, entry.language) ||
+                    safeParse(getParser(entry.language), content);
+            } catch { tree = null; }
+            const text = index._getFileLines(filePath)[line - 1] || '';
+            const at = Number.isInteger(column) ? column : text.length - text.trimStart().length;
+            let importNode = tree?.rootNode.descendantForPosition({ row: line - 1, column: at }) || null;
+            while (importNode && importNode.type !== 'import_from_statement' &&
+                importNode.type !== 'import_statement') importNode = importNode.parent;
+            if (!importNode) return false;
+            const { pythonScopeBindingKinds } = require('../languages/lexical-scope');
+            return pythonScopeBindingKinds(importNode, name).some(site => site.kind === 'def');
         };
         for (const imp of importUsages) {
             // Skip if already covered by a call site change in the same file:line
@@ -3825,14 +3908,17 @@ function plan(index, name, options = {}) {
             // The token is the importer's own local alias (fix #397): an
             // import alias keeps its local name.
             if (imp.importAlias) continue;
+            // A module path segment names a module (fix #424).
+            if (imp.modulePath) continue;
             if (imp.file && def.file && !importMayBindPin(imp.file)) continue;
             if (imp.file && !importSourceBindsPin(imp.file, imp.line, imp.column)) continue;
+            const keepsLocalName = !!imp.file && importKeepsItemName(imp.file, imp.line, imp.column);
             const edit = renameIdentifierTokens(index, imp.file,
-                imp.line, name, imp.file && importKeepsItemName(imp.file, imp.line)
+                imp.line, name, keepsLocalName
                     ? `${options.renameTo} as ${name}` : options.renameTo);
             const newImport = edit.renamed;
             if (newImport === edit.source) continue;
-            changes.push(tagTokenEdit({
+            const importChange = tagTokenEdit({
                 file: imp.relativePath || imp.file,
                 line: imp.line,
                 expression: edit.source,
@@ -3840,7 +3926,11 @@ function plan(index, name, options = {}) {
                 newExpression: newImport,
                 isImport: true,
                 editKind: 'import',
-            }, edit));
+            }, edit);
+            // The module still binds the old name (fix #424): its `__all__`
+            // entry names that binding.
+            if (keepsLocalName) Object.defineProperty(importChange, 'keepsLocalName', { value: true });
+            changes.push(importChange);
         }
 
         // Renamed CJS/Python imports are intentionally surfaced as reference
@@ -3958,7 +4048,7 @@ function plan(index, name, options = {}) {
             const pathMod = require('path');
             const dunderFiles = new Set([def.file]);
             for (const change of changes) {
-                if (change.editKind !== 'import') continue;
+                if (change.editKind !== 'import' || change.keepsLocalName) continue;
                 const abs = pathMod.isAbsolute(change.file)
                     ? change.file : pathMod.join(index.root, change.file);
                 dunderFiles.add(abs);
@@ -3995,14 +4085,18 @@ function plan(index, name, options = {}) {
                                 const quoteRe = new RegExp(`(["'])${escapeRegExp(name)}\\1`, 'g');
                                 const newLine = sourceLine.replace(quoteRe, `$1${options.renameTo}$1`);
                                 if (newLine === sourceLine) continue;
-                                changes.push({
+                                const entryChange = {
                                     file: rel,
                                     line: lineNo,
                                     expression: sourceLine.trim(),
                                     suggestion: `Update __all__ entry: ${newLine.trim()}`,
                                     newExpression: newLine.trim(),
                                     editKind: 'reference',
-                                });
+                                };
+                                // The edited entry is no text dependency left
+                                // for review (fix #424).
+                                Object.defineProperty(entryChange, 'dunderAllEntry', { value: true });
+                                changes.push(entryChange);
                             } else {
                                 for (let i = 0; i < s.namedChildCount; i++) strStack.push(s.namedChild(i));
                             }
@@ -4216,6 +4310,7 @@ function plan(index, name, options = {}) {
                     ? adapter.findScopeAlternativeBindings(tree, def.nameLine || def.startLine, name)
                     : [];
                 const rel = def.relativePath || def.file;
+                if (bindings.some(binding => binding.kind !== 'reference')) pinScopeRebound = true;
                 for (const binding of bindings) {
                     if (changes.some(change => change.file === rel && change.line === binding.line)) continue;
                     const replacement = binding.kind === 'import-name'
@@ -4224,7 +4319,7 @@ function plan(index, name, options = {}) {
                         replacement, [binding.column]);
                     if (edit.renamed === edit.source) continue;
                     const isReference = binding.kind === 'reference';
-                    changes.push(tagTokenEdit({
+                    const change = tagTokenEdit({
                         file: rel,
                         line: binding.line,
                         expression: edit.source,
@@ -4234,7 +4329,12 @@ function plan(index, name, options = {}) {
                         newExpression: edit.renamed,
                         ...(!isReference && { isDefinition: true }),
                         editKind: isReference ? 'reference' : 'definition',
-                    }, edit));
+                    }, edit);
+                    // A binding of the pin's own variable (fix #424): the
+                    // type lookup never re-decides it (`from threading
+                    // import RLock` beside `class RLock` keeps its alias).
+                    Object.defineProperty(change, 'scopeAlternative', { value: true });
+                    changes.push(change);
                 }
             }
         }
@@ -4900,6 +5000,37 @@ function plan(index, name, options = {}) {
             // declared at file scope for a file-scope resolution to reach it
             // (a Rust inline module is its own scope).
             const pinNameLine = def.nameLine || def.startLine;
+            // Does a Python reference in the pin's file resolve to the scope
+            // the pin's statement binds its name in (fix #424)?
+            let pinScopeTree;
+            let pinScopeNode;
+            const referenceInPinScope = (ref) => {
+                if (ref.file !== def.file || !Number.isInteger(ref.column)) return false;
+                if (pinScopeTree === undefined) {
+                    pinScopeTree = null;
+                    try {
+                        const content = index._readFile(def.file);
+                        pinScopeTree = index._getParsedTree?.(def.file, content, planLang) ||
+                            safeParse(getParser(planLang), content);
+                    } catch { pinScopeTree = null; }
+                    let declNode = pinScopeTree?.rootNode.descendantForPosition({ row: pinNameLine - 1,
+                        column: Math.max(0, (index._getFileLines(def.file)[pinNameLine - 1] || '').indexOf(name)) });
+                    while (declNode && declNode.type !== 'function_definition' && declNode.type !== 'class_definition') {
+                        declNode = declNode.parent;
+                    }
+                    pinScopeNode = declNode?.parent || null;
+                    while (pinScopeNode && pinScopeNode.type !== 'function_definition' && pinScopeNode.type !== 'module') {
+                        if (pinScopeNode.type === 'class_definition') { pinScopeNode = null; break; }
+                        pinScopeNode = pinScopeNode.parent;
+                    }
+                }
+                if (!pinScopeNode || pinScopeNode.type !== 'function_definition') return false;
+                const node = pinScopeTree.rootNode.descendantForPosition({ row: ref.line - 1, column: ref.column });
+                if (node?.type !== 'identifier' || node.text !== name) return false;
+                const { referenceScopeNode } = require('../languages/lexical-scope');
+                const scope = referenceScopeNode(node, name);
+                return !!scope && sameNode(scope, pinScopeNode);
+            };
             const pinAtFileScope = !pinContainer && !fileSymbols.some(symbol =>
                 symbol.type === 'module' && symbol !== def &&
                 symbol.startLine <= pinNameLine &&
@@ -4976,9 +5107,11 @@ function plan(index, name, options = {}) {
                         if (!pinAtFileScope) return null;
                     } else if (!ref.receiver && ref.scopeBinding === 'local') {
                         // An enclosing function or block binds the name: the
-                        // pin only when that binding is the pin's own def.
-                        return Array.isArray(ref.scopeDefLines) &&
-                            ref.scopeDefLines.includes(pinNameLine) ? 'edit' : null;
+                        // pin only when that binding is the pin's own def, or
+                        // the variable the pin's scope binds by other
+                        // statements too, renamed whole (fix #424).
+                        if (Array.isArray(ref.scopeDefLines) && ref.scopeDefLines.includes(pinNameLine)) return 'edit';
+                        return pinScopeRebound && referenceInPinScope(ref) ? 'edit' : null;
                     }
                     let winner = null;
                     let ambiguous = false;
@@ -5061,6 +5194,10 @@ function plan(index, name, options = {}) {
             };
             const eligible = (ref) => {
                 if (ref.usageType !== 'reference' || ref.isDefinition) return false;
+                // A module path segment names a module; the name of `from m
+                // import name as alias` is decided by m in the import pass
+                // (fix #424), never by this file's binding of the name.
+                if (ref.modulePath || ref.importSource) return false;
                 // Keyword-argument names, object keys and struct field keys
                 // are not references to a non-member binding (a member pin
                 // reads its receiver tokens from the line below).
@@ -5317,6 +5454,8 @@ function plan(index, name, options = {}) {
             const rel = textRef.relativePath || textRef.file;
             if (reviewItems.some(item =>
                 item.file === rel && item.line === textRef.line)) continue;
+            if (changes.some(change => change.dunderAllEntry && change.file === rel &&
+                change.line === textRef.line)) continue;
             reviewItems.push({
                 file: rel,
                 line: textRef.line,

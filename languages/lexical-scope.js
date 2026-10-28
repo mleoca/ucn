@@ -1311,6 +1311,23 @@ function referenceScopeNode(node, name, memo = new Map()) {
     return null;
 }
 
+/**
+ * Every binding of `name` in the Python scope (module or function) that
+ * holds `node` (fix #424), with its kind: 'def' (def and class
+ * statements), 'binding' (assignment targets, parameters, captures) or
+ * 'import'.
+ */
+function pythonScopeBindingKinds(node, name) {
+    let scope = node;
+    while (scope && !['module', 'function_definition', 'class_definition'].includes(scope.type)) scope = scope.parent;
+    if (!scope || scope.type === 'class_definition') return [];
+    const sites = [];
+    const isFunction = scope.type === 'function_definition';
+    pyScopeBindings(scope, isFunction ? scope.childForFieldName('body') : scope, name, isFunction, true,
+        (site, kind) => sites.push({ node: site, kind }));
+    return sites;
+}
+
 /** Declaration tokens binding one name in a Python function's own scope. */
 function pythonBindingSites(scope, name) {
     const sites = [];
@@ -1365,4 +1382,4 @@ function pythonClassBodyOrder(classNode, node, name) {
 }
 
 module.exports = { referenceScope, referenceScopeNode, scopeFields, familyOf, rustLetBindingOf, rustSelfFieldBinding,
-    pythonBindingSites, pythonClassBodyOrder };
+    pythonBindingSites, pythonClassBodyOrder, pythonScopeBindingKinds };

@@ -7284,8 +7284,19 @@ function findCallers(index, name, options = {}) {
                         if (typeQualifiedReceiver && langTraits(fileEntry.language)?.moduleTypeIdentity &&
                             _resolveReceiverTypeIdentity(index, filePath, call.receiver, targetDefs2,
                                 call.line) === 'other') {
-                            recordExcluded(filePath, call.line, 'path-type-mismatch');
-                            continue;
+                            // Another class of the name still runs the member
+                            // it inherits (fix #424: `tqdm.get_lock()` with
+                            // tqdm.auto's subclass): an undecided ancestry
+                            // keeps the site visible.
+                            const inherited = _qualifyingClassInherits(index, filePath, call.receiver, call.line, targetDefs2);
+                            if (inherited === 'unknown') {
+                                routeUnverified(filePath, fileEntry, call, 'inherited-unresolved', calledAs);
+                                continue;
+                            }
+                            if (inherited !== 'target') {
+                                recordExcluded(filePath, call.line, 'path-type-mismatch');
+                                continue;
+                            }
                         }
                         if (typeQualifiedReceiver) resolvedReceiverFacts = {
                             receiverType: call.receiver, receiverTypeSource: 'type-qualified',
@@ -10873,6 +10884,13 @@ function findCallees(index, definition, options = {}) {
                         const current = queue.shift();
                         if (current.external || visited.has(visitKey(current))) continue;
                         visited.add(visitKey(current));
+                        // A base its import leaves undecided (fix #424) may
+                        // be any class: its members are not known by name.
+                        if (current.importUnresolved) {
+                            noteUnverified(siteId, call, 'inherited-unresolved');
+                            ambiguityClaimed = true;
+                            break;
+                        }
                         selected = selectOwner(current);
                         if (selected.ambiguous) {
                             noteUnverified(siteId, call, 'overload-ambiguous');
@@ -10987,6 +11005,14 @@ function findCallees(index, definition, options = {}) {
                 // external import) - Python `len(self.it)` inside `def len`
                 // is the builtin, never the enclosing method.
                 symbols = symbols.filter(s => !bareCallCannotDenote(s, language));
+                // A nested item outside its enclosing function binds no name
+                // at these sites (fix #424, the caller side's #377/#402/#403
+                // rule): with no binding left, the name is not resolved to it
+                // by spelling.
+                if (!bindingId && langTraits(language)?.nestedItemsBlockScoped && sites?.length) {
+                    symbols = symbols.filter(s => s.className || s.receiver ||
+                        !sites.every(line => _nestedItemOutOfScope(index, def.file, s, line)));
+                }
                 // fix #384: member-assigned candidates a bare name cannot
                 // reach from this function (the caller-side reach rule).
                 if (!bindingId && symbols.some(s => s.memberAssigned)) {
@@ -14458,15 +14484,26 @@ function _nameBindingReaches(index, startAbs, name, targetFiles, maxDepth = 4, o
                 // method of a local object; `loads = _json.loads` is the
                 // submodule's attribute (followed). A value the chase cannot
                 // follow is neither a path to the targets nor a dead end.
-                const route = unresolvedStar ? null : _pythonModuleValueRoute(index, abs, fe, attr);
-                if (route?.next) next.push([...route.next, hopAlternative]);
-                else if (route?.value) valueOwned = true;
-                // A bound method of a module object is that method: no path
-                // to the targets, unless its own file is one (the chase is
-                // by file and name and cannot tell a same-name function of
-                // that file from the method).
-                else if (route?.declaration) { if (targetFiles.has(route.declaration.file)) unknown = true; }
-                else if (!route?.external) unknown = true;
+                // A configuration item (fix #424) binds the name per
+                // alternative: its value alternatives are followed, its
+                // def/class alternatives are this module's declarations and
+                // its imports are followed above.
+                const item = !unresolvedStar && fe.language === 'python' && fe.configurationItems
+                    ? moduleItemNamed(index, abs, attr) : null;
+                const routes = item
+                    ? item.sites.filter(site => site.kind === 'value').map(site => site.target
+                        ? _pythonAliasTargetRoute(index, abs, fe, site.target) : { value: true })
+                    : [unresolvedStar ? null : _pythonModuleValueRoute(index, abs, fe, attr)];
+                for (const route of routes) {
+                    if (route?.next) next.push([...route.next, hopAlternative]);
+                    else if (route?.value) valueOwned = true;
+                    // A bound method of a module object is that method: no
+                    // path to the targets, unless its own file is one (the
+                    // chase is by file and name and cannot tell a same-name
+                    // function of that file from the method).
+                    else if (route?.declaration) { if (targetFiles.has(route.declaration.file)) unknown = true; }
+                    else if (!route?.external) unknown = true;
+                }
             }
             if ((index.symbols.get('__getattr__') || []).some(s => s.file === abs && !s.className)) {
                 unknown = true;                                                  // PEP 562 dynamic attrs
@@ -14506,7 +14543,12 @@ function _pythonModuleValueRoute(index, abs, fe, attr) {
     const aliases = (fe.moduleValueAliases || []).filter(entry => entry.name === attr);
     if (aliases.length === 0) return { value: true };
     if (aliases.length > 1 || Array.isArray(aliases[0].alternatives)) return null;
-    const parts = String(aliases[0].target).split('.');
+    return _pythonAliasTargetRoute(index, abs, fe, aliases[0].target);
+}
+
+/** The route of a module alias value `name = target` (see above). */
+function _pythonAliasTargetRoute(index, abs, fe, target) {
+    const parts = String(target).split('.');
     if (parts.length === 1) return { next: [abs, parts[0]] };
     if (parts.length !== 2) return { value: true };
     const [root, member] = parts;
@@ -15013,11 +15055,22 @@ function _submoduleReceiverModule(index, fileEntry, receiverName) {
     if (!receiverName || !fileEntry || !fileEntry.moduleResolved) return null;
     if (!langTraits(fileEntry.language)?.submoduleImports) return null;
     for (const b of (fileEntry.importBindings || [])) {
-        if (!b || b.name !== receiverName || b.module == null) continue;
+        // The receiver is the binding's LOCAL name: `from pkg import v1 as
+        // x` binds the submodule v1 as x (fix #424), and binds no `v1`.
+        if (!b || (b.alias || b.name) !== receiverName || b.module == null) continue;
         const mod = String(b.module);
-        const spec = mod.endsWith('.') ? mod + receiverName : mod + '.' + receiverName;
+        const spec = mod.endsWith('.') ? mod + b.name : mod + '.' + b.name;
         const rel = fileEntry.moduleResolved[spec];
-        if (rel) return rel;
+        if (!rel) continue;
+        // An attribute the package itself binds under that name is what the
+        // from-import reads (`class model` in pkg/__init__.py beside
+        // pkg/model.py): not the submodule.
+        const parentRel = fileEntry.moduleResolved[mod];
+        const parentAbs = parentRel && (path.isAbsolute(parentRel) ? parentRel : path.join(index.root, parentRel));
+        const parentEntry = parentAbs && index.files.get(parentAbs);
+        if (parentEntry && ((parentEntry.moduleAssignedNames || []).includes(b.name) ||
+            definitionsInFile(index, b.name, parentAbs).some(d => !d.className))) continue;
+        return rel;
     }
     return null;
 }
@@ -16083,6 +16136,30 @@ function _resolveStructuralFlowTypeIdentity(index, originFile, knownType, target
         // ancestor slot. In that case ancestry is evidence for the other
         // definition, not the pinned one.
         if (overridesPinnedSlot(cur.name, cur.file)) continue;
+        // Where names bind per runtime configuration (Python, fix #424), a
+        // base the module imports is the class the import's chase decides
+        // (class-identity); an undecided one may be the target's class.
+        if (cur.file && langTraits(index.files.get(cur.file)?.language)?.conditionalDefinitions === 'branch') {
+            const own = classDefsNamed(index, cur.name).entries.filter(e => e.def.file === cur.file &&
+                (cur.defStartLine == null || e.def.startLine === cur.defStartLine));
+            if (own.length === 1) {
+                const refs = parentRefsOfClass(index, { name: cur.name, key: own[0].key, def: own[0].def });
+                if (refs.some(parent => parent.importUnresolved)) sawUnresolved = true;
+                for (const parent of refs) {
+                    if (parent.importUnresolved || parent.external) continue;
+                    // A base no project class is named after is outside the
+                    // project: it never inherits the target.
+                    if (!parent.def) {
+                        if (classDefsNamed(index, parent.name).entries.length > 0) sawUnresolved = true;
+                        continue;
+                    }
+                    const verdict = ownerIdentity(parent.name, parent.def.file);
+                    if (verdict === 'target') return 'target';
+                    queue.push({ name: parent.name, file: parent.def.file, defStartLine: parent.def.startLine });
+                }
+                continue;
+            }
+        }
         const parents = cur.defStartLine != null
             ? (index._getInheritanceParentsAt?.(cur.name, cur.file, cur.defStartLine) || [])
             : (index._getInheritanceParents(cur.name, cur.file) || []);
@@ -16096,6 +16173,23 @@ function _resolveStructuralFlowTypeIdentity(index, originFile, knownType, target
         }
     }
     return sawUnresolved ? 'unknown' : 'other';
+}
+
+/**
+ * Does the class a qualifying name denotes at a site run a target member it
+ * inherits (fix #424)? 'target' when the member's declaring class for that
+ * class is a target owner, 'unknown' when its ancestry is undecided, else
+ * 'other'.
+ */
+function _qualifyingClassInherits(index, filePath, typeName, line, targetDefs) {
+    const memberName = targetDefs[0]?.name;
+    if (!memberName || !targetDefs.every(t => t.className && t.name === memberName)) return 'other';
+    const ref = resolveClassRef(index, typeName, filePath, { line });
+    if (!ref?.key) return ref?.external ? 'other' : 'unknown';
+    const declaring = findDeclaringClass(index, ref, index.symbols.get(memberName) || []);
+    if (!declaring) return 'other';
+    if (declaring.uncertain) return 'unknown';
+    return relationToTargets(index, declaring.ref, targetDefs) === 'same' ? 'target' : 'other';
 }
 
 /**
@@ -17475,7 +17569,8 @@ function _structuralModuleBindings(fileEntry, call) {
             module: call.receiverModuleSpecifier,
         }];
     }
-    return (fileEntry?.importBindings || []).filter(b => b.name === call?.receiver);
+    // A binding's local name: an aliased import binds only its alias.
+    return (fileEntry?.importBindings || []).filter(b => (b.alias || b.name) === call?.receiver);
 }
 
 /**

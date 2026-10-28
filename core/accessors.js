@@ -2,7 +2,7 @@
 
 const path = require('path');
 const { codeUnitCompare, CALLABLE_SYMBOL_KINDS } = require('./shared');
-const { getParser, safeParse, langTraits } = require('../languages');
+const { getParser, safeParse, langTraits, getLanguageAdapter } = require('../languages');
 
 function inheritedAccessor(index, enclosing, name, definition) {
     let owner = enclosing?.className;
@@ -433,6 +433,9 @@ function findAccessorReferences(index, name, definition, options = {}) {
         const parser = getParser(entry.language);
         const tree = parser ? index._getParsedTree?.(file, content, entry.language) || safeParse(parser, content) : null;
         const lines = index._getFileLines?.(file) || content.split('\n');
+        let adapter;
+        try { adapter = getLanguageAdapter(entry.language); } catch { adapter = null; }
+        const annotatedType = typeof adapter?.annotatedReceiverType === 'function' ? adapter.annotatedReceiverType : null;
         for (const usage of candidates) {
             const dependencyShape = grammarShape ? grammarShape(tree, usage) : null;
             if (dependencyShape === 'none') continue;
@@ -441,8 +444,13 @@ function findAccessorReferences(index, name, definition, options = {}) {
                 shape = receiverlessShape(tree, usage);
                 if (shape === 'none') continue;
             }
+            // A parameter annotation types the receiver (fix #424), the
+            // evidence method calls on it already take.
+            const annotated = annotatedType && usage.receiver && !usage.receiverType && tree &&
+                Number.isInteger(usage.column) ? annotatedType(tree, usage.line, usage.column, usage.receiver) : undefined;
             refs.push({
                 ...usage,
+                ...(annotated && { receiverType: annotated, receiverAnnotation: true }),
                 ...(shape?.pattern && { patternKey: shape, ...(shape.thisSource && { receiver: 'this' }) }),
                 ...(dependencyShape && { dependencyShape }),
                 accessKind: dependencyShape?.accessKind || (shape?.pattern ? 'read' : accessKind(tree, usage, dependencyShape?.node)),
@@ -515,7 +523,7 @@ function findAccessorReferences(index, name, definition, options = {}) {
                 ...shaped,
                 callerName: enclosing?.name || null,
                 receiverType,
-                resolution: 'receiver-field-type',
+                resolution: ref.receiverAnnotation ? 'receiver-annotation' : 'receiver-field-type',
                 tier: 'confirmed',
             });
             continue;

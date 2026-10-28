@@ -954,7 +954,10 @@ function clearAllCaches() {
 // v311 (fix #423): JS/TS module resolution follows a directory's package.json
 // `main` and maps workspace subpath exports naming absent build output to
 // their `src/` sources (persisted `moduleResolved` and import edges).
-const CACHE_FORMAT_VERSION = 311;
+// v312 (fix #424): Python usage records mark module-path segments
+// (`modulePath`) and the source-side name of an aliased from-import
+// (`importSource`).
+const CACHE_FORMAT_VERSION = 312;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 function usageResultKey(index, filePath, name, mode) {

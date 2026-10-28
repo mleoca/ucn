@@ -9644,3 +9644,305 @@ describe('fix #423: a def nested in a decorated method is scoped to that method 
         } finally { rm(dir); }
     });
 });
+
+describe('fix #424: Python rename closure, nested scopes and configuration items', () => {
+    const { applyRenamePlan } = require('./helpers');
+    const { findCallees } = require('../core/callers');
+    const plan = (index, handle, renameTo) => {
+        const r = execute(index, 'plan', { name: handle, renameTo });
+        assert.ok(r.ok, JSON.stringify(r.error));
+        return r.result;
+    };
+    const applied = (dir, index, handle, renameTo) => applyRenamePlan(dir, plan(index, handle, renameTo));
+
+    it('a nested def is no callee of a call outside its enclosing function (P0-1 callee side)', () => {
+        const dir = tmp({
+            'm.py': [
+                'class Bar:',
+                '    @classmethod',
+                '    def cm(cls, fp):',
+                '        def helper(s):',
+                '            return s',
+                '        def use(s):',
+                '            return helper(s)',
+                '        return use',
+                '',
+                'def plain():',
+                '    def inner():',
+                '        return 1',
+                '    return inner()',
+                '',
+                'def outside():',
+                '    return helper(1) + inner()',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const def = name => index.symbols.get(name).find(d => d.relativePath === 'm.py');
+            const outside = findCallees(index, def('outside'), { collectAccount: true });
+            assert.deepStrictEqual(outside.map(c => c.name), []);
+            assert.strictEqual(outside.calleeAccount.external.count, 2);
+            const use = findCallees(index, def('use'), { collectAccount: true });
+            assert.deepStrictEqual(use.map(c => `${c.name}:${c.startLine}`), ['helper:4']);
+        } finally { rm(dir); }
+    });
+
+    it('the name of `from m import name as alias` is decided by m (P0-2)', () => {
+        const dir = tmp({
+            'pkg/__init__.py': "from .gui import trange as tgrange\nfrom .std import trange\n__all__ = ['trange', 'tgrange']\n",
+            'pkg/gui.py': 'from .std import trange as std_trange\n\ndef tgrange(n):\n    return std_trange(n)\n\ntrange = tgrange\n',
+            'pkg/std.py': 'def trange(n):\n    return range(n)\n',
+        });
+        try {
+            const index = idx(dir);
+            const { contents } = applied(dir, index, 'pkg/std.py:1:trange', 'trZ');
+            assert.strictEqual(contents['pkg/__init__.py'],
+                "from .gui import trange as tgrange\nfrom .std import trZ\n__all__ = ['trZ', 'tgrange']\n");
+            assert.strictEqual(contents['pkg/gui.py'].split('\n')[0], 'from .std import trZ as std_trange');
+            const result = plan(index, 'pkg/std.py:1:trange', 'trZ');
+            assert.ok(!(result.reviewItems || []).some(item => item.file === 'pkg/__init__.py' && item.line === 3),
+                'an edited __all__ entry is no text dependency left for review');
+        } finally { rm(dir); }
+    });
+
+    it('an import alternative that keeps its local name keeps the module __all__ entry (P0-3)', () => {
+        const dir = tmp({
+            'pkg/__init__.py': '',
+            'pkg/std.py': 'def trange(n):\n    return list(range(n))\n',
+            'pkg/fancy.py': 'def trange(n):\n    return range(n)\n',
+            'pkg/auto.py': 'import os\ntry:\n    if os.environ.get("X"):\n        raise ImportError("x")\n' +
+                '    from .std import trange\nexcept ImportError:\n    from .fancy import trange\n\n__all__ = ["trange"]\n',
+        });
+        try {
+            const { contents } = applied(dir, idx(dir), 'pkg/std.py:1:trange', 'trZ');
+            assert.match(contents['pkg/auto.py'], /from \.std import trZ as trange/);
+            assert.match(contents['pkg/auto.py'], /__all__ = \["trange"\]/);
+        } finally { rm(dir); }
+    });
+
+    it('a variable bound by several statements of one function scope is renamed whole (P0-4)', () => {
+        const dir = tmp({
+            'm.py': [
+                'import sys',
+                '',
+                'def main(null):',
+                '    if null:',
+                '        class Sink:',
+                '            @staticmethod',
+                '            def write(_):',
+                '                pass',
+                '    else:',
+                '        Sink = sys.stdout',
+                '        Sink = getattr(Sink, "buffer", Sink)',
+                '    Sink.write("x")',
+                '    return Sink',
+                '',
+                'def other():',
+                '    if True:',
+                '        def sink(_):',
+                '            pass',
+                '    else:',
+                '        sink = print',
+                '    sink("x")',
+                '    return sink',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const sink = applied(dir, index, 'm.py:5:Sink', 'SinkZ').contents['m.py'].split('\n');
+            assert.deepStrictEqual([sink[4], sink[9], sink[10], sink[11], sink[12]].map(line => line.trim()), [
+                'class SinkZ:', 'SinkZ = sys.stdout', 'SinkZ = getattr(SinkZ, "buffer", SinkZ)',
+                'SinkZ.write("x")', 'return SinkZ',
+            ]);
+            const fn = applied(dir, index, 'm.py:17:sink', 'sinkZ').contents['m.py'].split('\n');
+            assert.deepStrictEqual([fn[16], fn[19], fn[20], fn[21]].map(line => line.trim()), [
+                'def sinkZ(_):', 'sinkZ = print', 'sinkZ("x")', 'return sinkZ',
+            ]);
+        } finally { rm(dir); }
+    });
+
+    it("an import of another module's name keeps that name: alternatives alias, importers that declare it alias (P0-5)", () => {
+        const dir = tmp({
+            'm.py': 'try:\n    from threading import RLock\nexcept Exception:\n    class RLock:\n        pass\n\n' +
+                'def make():\n    return RLock()\n',
+            'pkg/__init__.py': '',
+            'pkg/dictutils.py': 'class OMD(dict):\n    pass\n',
+            'pkg/urlutils.py': 'class OMD(dict):\n    pass\n\ntry:\n    from .dictutils import OMD\nexcept ImportError:\n' +
+                '    pass\n\nclass Query(OMD):\n    pass\n',
+        });
+        try {
+            const index = idx(dir);
+            const rlock = applied(dir, index, 'm.py:4:RLock', 'RLockZ').contents['m.py'];
+            assert.match(rlock, /from threading import RLock as RLockZ/);
+            assert.match(rlock, /class RLockZ:/);
+            assert.match(rlock, /return RLockZ\(\)/);
+            const local = applied(dir, index, 'pkg/urlutils.py:1:OMD', 'OMDZ').contents['pkg/urlutils.py'];
+            assert.match(local, /from \.dictutils import OMD as OMDZ/);
+            assert.match(local, /class Query\(OMDZ\)/);
+            const imported = applied(dir, index, 'pkg/dictutils.py:1:OMD', 'OMDZ').contents['pkg/urlutils.py'];
+            assert.match(imported, /from \.dictutils import OMDZ as OMD\n/);
+            assert.match(imported, /^class OMD\(dict\):/);
+            assert.match(imported, /class Query\(OMD\)/);
+        } finally { rm(dir); }
+    });
+
+    it('a module path segment spelled like the renamed function is never edited (P0-6)', () => {
+        const dir = tmp({
+            'pkg/__init__.py': '',
+            'pkg/util.py': 'def check_updates(env):\n    return env\n',
+            'pkg/tasks/__init__.py': 'from pkg.tasks.check_updates import cli\nfrom .check_updates import cli as c2\n' +
+                'import pkg.tasks.check_updates\nfrom pkg.util import check_updates\n\nTASKS = {"c": cli, "u": check_updates}\n',
+            'pkg/tasks/check_updates.py': 'def cli(args):\n    return args\n',
+        });
+        try {
+            const { contents } = applied(dir, idx(dir), 'pkg/util.py:1:check_updates', 'cuZ');
+            assert.strictEqual(contents['pkg/tasks/__init__.py'],
+                'from pkg.tasks.check_updates import cli\nfrom .check_updates import cli as c2\n' +
+                'import pkg.tasks.check_updates\nfrom pkg.util import cuZ\n\nTASKS = {"c": cli, "u": cuZ}\n');
+        } finally { rm(dir); }
+    });
+
+    it('a submodule bound by `from pkg import sub as alias` is a module receiver (P0-7)', () => {
+        const dir = tmp({
+            'pkg/__init__.py': '',
+            'pkg/legacy/__init__.py': '',
+            'pkg/legacy/v1.py': 'def pre_process(data):\n    return data\n',
+            'pkg/legacy/v2.py': 'def pre_process(data):\n    return data\n',
+            'pkg/sessions.py': 'from .legacy import (\n    v1 as legacy_a,\n    v2 as legacy_b\n)\n' +
+                'from pkg.legacy import v1 as single\n\ndef run(d):\n' +
+                '    for fn in (legacy_a.pre_process, legacy_b.pre_process):\n        d = fn(d)\n' +
+                '    single.pre_process(d)\n    return legacy_a.pre_process(d)\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'show', { name: 'pkg/legacy/v1.py:1:pre_process', sections: 'callers' });
+            assert.ok(r.ok, r.error);
+            const ctx = r.result.context || r.result;
+            assert.deepStrictEqual((ctx.callers || []).map(c => `${c.relativePath}:${c.line}`).sort(),
+                ['pkg/sessions.py:10', 'pkg/sessions.py:11']);
+            const { contents } = applied(dir, index, 'pkg/legacy/v1.py:1:pre_process', 'ppZ');
+            assert.match(contents['pkg/sessions.py'], /\(legacy_a\.ppZ, legacy_b\.pre_process\)/);
+            assert.match(contents['pkg/sessions.py'], /single\.ppZ\(d\)/);
+            assert.match(contents['pkg/sessions.py'], /return legacy_a\.ppZ\(d\)/);
+        } finally { rm(dir); }
+    });
+
+    it('a function read only through `from pkg import sub as alias` is not dead (P0-7 deadcode)', () => {
+        const dir = tmp({
+            'pkg/__init__.py': '',
+            'pkg/legacy/__init__.py': '',
+            'pkg/legacy/v1.py': 'def pre_process(data):\n    return data\n',
+            'pkg/sessions.py': 'from .legacy import v1 as legacy_a\n\nHOOKS = (legacy_a.pre_process,)\n',
+        });
+        try {
+            const r = execute(idx(dir), 'deadcode', { includeExported: true });
+            assert.ok(r.ok, r.error);
+            const names = JSON.stringify(r.result);
+            assert.ok(!names.includes('"pre_process"'), names);
+        } finally { rm(dir); }
+    });
+
+    it('--add-param keeps the parameter kinds: after *args and keyword-only markers, before **kwargs (P1-5)', () => {
+        const dir = tmp({
+            'm.py': 'def f(a, *args, **kw):\n    return a\n\ndef g(a, *, k=1):\n    return a\n\nf(1, 2, 3)\ng(1, k=2)\n',
+        });
+        try {
+            const index = idx(dir);
+            const add = (handle, extra = {}) => {
+                const r = execute(index, 'plan', { name: handle, addParam: 'extra', ...extra });
+                assert.ok(r.ok, JSON.stringify(r.error));
+                return r.result;
+            };
+            assert.strictEqual(add('m.py:1:f', { defaultValue: 'None' }).after.signature,
+                'f(a, *args, extra = None, **kw)');
+            assert.strictEqual(add('m.py:4:g', { defaultValue: 'None' }).after.signature,
+                'g(a, *, k = 1, extra = None)');
+            const required = add('m.py:4:g');
+            assert.strictEqual(required.after.signature, 'g(a, *, k = 1, extra)');
+            assert.ok(required.changes.some(change => change.line === 8 && /keyword argument: extra=/.test(change.suggestion)));
+        } finally { rm(dir); }
+    });
+
+    it('a class whose bases are outside the project never dispatches into a project method', () => {
+        const dir = tmp({
+            'app.py': 'import argparse\n\n\nclass Group:\n    def add_argument(self, *a):\n        return a\n\n\n' +
+                'class Parser(argparse.ArgumentParser):\n    pass\n\n\ndef build():\n    p = Parser()\n' +
+                '    p.add_argument("--x")\n    return Group().add_argument(1)\n',
+        });
+        try {
+            const r = execute(idx(dir), 'show', { name: 'app.py:5:add_argument', sections: 'callers' });
+            assert.ok(r.ok, r.error);
+            const ctx = r.result.context || r.result;
+            assert.deepStrictEqual((ctx.callers || []).map(c => c.line), [16]);
+            assert.deepStrictEqual((ctx.unverifiedCallers || []).map(c => c.line), []);
+        } finally { rm(dir); }
+    });
+
+    it('a parameter annotation types the receiver of a property access (P1-7)', () => {
+        const dir = tmp({
+            'env.py': 'class Environment:\n    @property\n    def config(self):\n        return {}\n',
+            'use.py': 'from env import Environment\n\ndef check(env: Environment):\n    return env.config\n\n' +
+                'def rebound(env: Environment):\n    env = make()\n    return env.config\n',
+        });
+        try {
+            const result = idx(dir).impact('config', { file: 'env.py', line: 3 });
+            const confirmed = result.propertyAccesses.byFile.flatMap(group =>
+                group.sites.map(site => `${group.file}:${site.line}`));
+            assert.deepStrictEqual(confirmed, ['use.py:4']);
+            assert.strictEqual(result.propertyAccesses.confirmedCount, 1);
+        } finally { rm(dir); }
+    });
+
+    it('configuration items resolve per alternative: no base-class borrowing (P1-12)', () => {
+        const dir = tmp({
+            'pkg/__init__.py': '',
+            'pkg/std.py': 'class tqdm:\n    def update(self):\n        return 1\n    @classmethod\n' +
+                '    def get_lock(cls):\n        return 1\n',
+            'pkg/aio.py': 'from .std import tqdm as std_tqdm\n\nclass tqdm_asyncio(std_tqdm):\n    pass\n\ntqdm = tqdm_asyncio\n',
+            'pkg/nb.py': 'from .std import tqdm as std_tqdm\n\nclass tqdm_notebook(std_tqdm):\n' +
+                '    def update(self):\n        return 2\n\ntqdm = tqdm_notebook\n',
+            'pkg/autonb.py': 'try:\n    import IPython\nexcept ImportError:\n    from .std import tqdm\nelse:\n' +
+                '    from .nb import tqdm\n',
+            'pkg/auto.py': 'from .autonb import tqdm as notebook_tqdm\nfrom .aio import tqdm as asyncio_tqdm\n' +
+                'from .std import tqdm as std_tqdm\n\nif notebook_tqdm != std_tqdm:\n' +
+                '    class tqdm(notebook_tqdm, asyncio_tqdm):\n        pass\nelse:\n    tqdm = asyncio_tqdm\n',
+            'use.py': 'from pkg.auto import tqdm\n\nclass Up(tqdm):\n    def go(self):\n        return self.update()\n\n' +
+                'def run():\n    bar = tqdm()\n    return tqdm.get_lock(), bar\n',
+        });
+        try {
+            const index = idx(dir);
+            const show = handle => {
+                const r = execute(index, 'show', { name: handle, sections: 'callers' });
+                assert.ok(r.ok, r.error);
+                const ctx = r.result.context || r.result;
+                return {
+                    confirmed: (ctx.callers || []).map(c => `${c.relativePath}:${c.line}`),
+                    unverified: (ctx.unverifiedCallers || []).map(c => `${c.relativePath}:${c.line}`),
+                };
+            };
+            // The construction builds tqdm.auto's class (or another
+            // module's value), never pkg/std.py's tqdm.
+            assert.ok(!show('pkg/std.py:1:tqdm').confirmed.includes('use.py:8'));
+            assert.ok(show('pkg/auto.py:6:tqdm').confirmed.includes('use.py:8'));
+            // Up's base inherits through bases its imports leave undecided.
+            const update = show('pkg/std.py:2:update');
+            assert.ok(!update.confirmed.includes('use.py:5'));
+            assert.ok(update.unverified.includes('use.py:5'));
+            const up = index.symbols.get('go').find(d => d.relativePath === 'use.py');
+            const callees = findCallees(index, up, { collectAccount: true, includeMethods: true });
+            assert.ok(!callees.some(c => c.name === 'update'));
+            assert.ok((callees.unverifiedCallees || []).some(c => c.name === 'update'));
+            // A class-qualified call through that class stays visible.
+            assert.ok(show('pkg/std.py:5:get_lock').unverified.includes('use.py:9'));
+            // Renaming the base class keeps the item's name in the module
+            // whose import alternative binds it, and its importers' tokens.
+            const { contents } = applied(dir, index, 'pkg/std.py:1:tqdm', 'TqdmZ');
+            assert.match(contents['pkg/autonb.py'], /from \.std import TqdmZ as tqdm/);
+            assert.ok(!contents['pkg/auto.py'] ||
+                /from \.autonb import tqdm as notebook_tqdm/.test(contents['pkg/auto.py']));
+            assert.match(contents['pkg/auto.py'] || '', /from \.std import TqdmZ as std_tqdm/);
+        } finally { rm(dir); }
+    });
+});

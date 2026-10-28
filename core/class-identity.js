@@ -613,8 +613,14 @@ function parentRefsOf(index, ref) {
         // language's own disambiguation. Re-read it from the declared clause.
         const rawParents = decl.extends ? splitParentList(decl.extends) : [];
         const declRef = { name: ref.name, key: ref.key, def: decl };
+        // A base the module binds by import where names bind per runtime
+        // configuration (Python, fix #424): the import's own chase decides
+        // which class it is (`from .auto import tqdm as base`, where auto
+        // binds `tqdm` to a class or another module's value per branch).
+        const imported = _importBoundParents(index, contextFile, rawParents, ref);
+        for (const parent of imported.refs) push(parent);
         for (const parentName of names || []) {
-            if (!parentName) continue;
+            if (!parentName || imported.names.has(parentName)) continue;
             const qualified = parentName.includes('::') || parentName.includes('.');
             if (qualified && classDefsNamed(index, parentName).entries.length === 0) {
                 push(_resolveQualifiedParent(index, parentName, contextFile, declRef));
@@ -649,6 +655,46 @@ function parentRefsOf(index, ref) {
         }
     }
     if (cacheKey) state.parents.set(cacheKey, out);
+    return out;
+}
+
+/**
+ * Bases a Python declaration spells by a name its module binds by a
+ * module-level import (fix #424). Each candidate class definition of the
+ * imported name is asked whether the import's module chase reaches it under
+ * that name: one definite hit is the base; a hit through one configuration
+ * alternative, a module value or no project class leave it unresolved
+ * (key null). A chase the index cannot follow keeps the name lookup.
+ * Returns the resolved refs and the inheritance-graph names they cover.
+ */
+function _importBoundParents(index, contextFile, rawParents, childRef) {
+    const out = { refs: [], names: new Set() };
+    const fileEntry = contextFile ? index.files.get(contextFile) : null;
+    if (!fileEntry || langTraits(fileEntry.language)?.conditionalDefinitions !== 'branch' ||
+        rawParents.length === 0) return out;
+    const { _nameBindingReaches } = require('./callers');
+    for (const written of rawParents) {
+        if (!/^[A-Za-z_]\w*$/.test(written)) continue;
+        const bindings = (fileEntry.importBindings || []).filter(b => b.module != null && b.name !== '*' &&
+            b.kind !== 'import' && (b.alias || b.name) === written &&
+            !(Number.isInteger(b.line) && index.findEnclosingFunction(contextFile, b.line, true)));
+        if (bindings.length !== 1) continue;
+        const binding = bindings[0];
+        const rel = fileEntry.moduleResolved?.[binding.module];
+        if (!rel) continue;
+        const moduleFile = path.isAbsolute(rel) ? rel : path.join(index.root, rel);
+        let entries = classDefsNamed(index, binding.name).entries.filter(e => !e.def.lexicalScopeStartLine);
+        if (binding.name === childRef.name && childRef.key) entries = entries.filter(e => e.key !== childRef.key);
+        if (entries.length === 0) continue;
+        const verdicts = entries.map(e => _nameBindingReaches(index, moduleFile, binding.name, new Set([e.def.file]), 4,
+            { targetName: binding.name, configurationVerdict: true, valueVerdict: true }));
+        if (verdicts.includes('unknown')) continue;
+        const hits = entries.filter((e, i) => verdicts[i] === 'yes');
+        out.names.add(binding.name);
+        out.refs.push(hits.length === 1 && verdicts.filter(v => v !== 'no').length === 1
+            ? { name: binding.name, key: hits[0].key, def: hits[0].def }
+            : { name: binding.name, key: null, def: null, importUnresolved: true });
+    }
     return out;
 }
 
@@ -903,6 +949,9 @@ function _findDeclaringClass(index, startRef, definitions, opts) {
         const vk = _refVisitKey(ref);
         if (visited.has(vk)) continue;
         visited.add(vk);
+        // A base its import leaves undecided (fix #424) may declare the
+        // member under any class name.
+        if (ref.importUnresolved) return { ref, uncertain: true, members: check(ref)?.members || [] };
         const hit = check(ref);
         if (hit) {
             // An unresolved parent can only yield an uncertain match.

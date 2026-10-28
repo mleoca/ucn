@@ -681,12 +681,12 @@ function pythonConfigurationItems(root, bindingNodes = null, reboundNodes = null
     const rebound = new Set();  // `global` / `nonlocal` names
     const lineOf = node => node.startPosition.row + 1;
     const endOf = node => node.endPosition.row + 1;
-    const add = (scope, name, kind, line, branch) => {
+    const add = (scope, name, kind, line, branch, target = null) => {
         if (!name) return;
         let names = scopes.get(scope);
         if (!names) scopes.set(scope, names = new Map());
         if (!names.has(name)) names.set(name, []);
-        names.get(name).push({ kind, line, branch });
+        names.get(name).push({ kind, line, branch, ...(target && { target }) });
     };
     const bindTarget = (scope, node, branch) => {
         if (!node) return;
@@ -740,8 +740,20 @@ function pythonConfigurationItems(root, bindingNodes = null, reboundNodes = null
             case 'expression_statement':
                 for (let expr of node.namedChildren) {
                     while (expr?.type === 'assignment' || expr?.type === 'augmented_assignment') {
-                        bindTarget(scope, expr.childForFieldName('left'), branch);
-                        expr = expr.type === 'assignment' ? expr.childForFieldName('right') : null;
+                        const left = expr.childForFieldName('left');
+                        const right = expr.childForFieldName('right');
+                        // An alias value (`f = other`, `f = mod.other`)
+                        // names what it binds (fix #424): the chase follows it.
+                        if (expr.type === 'assignment' && left?.type === 'identifier' &&
+                            !expr.childForFieldName('type') &&
+                            (right?.type === 'identifier' || right?.type === 'attribute') &&
+                            /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(right.text) &&
+                            right.text !== left.text) {
+                            add(scope, left.text, 'value', lineOf(left), branch, right.text);
+                        } else {
+                            bindTarget(scope, left, branch);
+                        }
+                        expr = expr.type === 'assignment' ? right : null;
                     }
                 }
                 return;
@@ -853,7 +865,8 @@ function pythonConfigurationItems(root, bindingNodes = null, reboundNodes = null
             const statements = new Set(sites.flatMap(site => site.branch.map(([line]) => line)));
             items.push({
                 name, scope,
-                sites: sites.map(site => ({ kind: site.kind, line: site.line, branch: site.branch })),
+                sites: sites.map(site => ({ kind: site.kind, line: site.line, branch: site.branch,
+                    ...(site.target && { target: site.target }) })),
                 clauses: [...statements].sort((a, b) => a - b).map(line => [line, clauseRanges.get(line) || []]),
             });
         }
@@ -4605,6 +4618,16 @@ function findUsagesInTree(code, name, parser, tree, options = {}) {
             }
         }
 
+        // A module path segment (`from a.b import c`, `import a.b [as x]`)
+        // names a module, never a function, class or variable; the name of
+        // `from m import name as alias` is m's attribute, decided by m (fix
+        // #424). Neither is a reference resolved in this file's scopes.
+        const importRole = pythonImportTokenRole(node);
+        if (importRole) {
+            usages.push({ line, column, usageType, ...(importRole === 'module-path'
+                ? { modulePath: true } : { importSource: true }) });
+            return true;
+        }
         // Where a bare reference resolves (fix #392): plan edits it only
         // when the language's scoping proves it names the renamed binding.
         const scope = scopeMemo && usageType === 'reference'
@@ -4614,6 +4637,29 @@ function findUsagesInTree(code, name, parser, tree, options = {}) {
     });
 
     return usages;
+}
+
+/**
+ * The role of an identifier inside an import statement (fix #424):
+ * 'module-path' for a segment of the imported module's dotted path,
+ * 'import-source' for the imported name of `from m import name as alias`,
+ * null otherwise (bound names and aliases).
+ */
+function pythonImportTokenRole(node) {
+    const dotted = node.parent;
+    if (dotted?.type !== 'dotted_name') return null;
+    const holder = dotted.parent;
+    if (!holder) return null;
+    if (holder.type === 'relative_import' || holder.type === 'import_statement') return 'module-path';
+    if (holder.type === 'import_from_statement') {
+        return sameNode(holder.childForFieldName('module_name'), dotted) ? 'module-path' : null;
+    }
+    if (holder.type === 'aliased_import' && sameNode(holder.childForFieldName('name'), dotted)) {
+        const statement = holder.parent?.type;
+        if (statement === 'import_statement') return 'module-path';
+        if (statement === 'import_from_statement') return 'import-source';
+    }
+    return null;
 }
 
 /**
@@ -5503,7 +5549,33 @@ function findScopeAlternativeBindings(tree, defLine, name) {
     return out;
 }
 
+/**
+ * The annotated type of a plain receiver of an attribute reference (fix
+ * #424): `env.config` inside `def f(env: Environment)` reads a member of
+ * Environment when the parameter is the only binding of `env` in the scope
+ * the reference resolves to. `column` is the attribute token's column.
+ * Undefined when the receiver is rebound, unannotated or not a parameter.
+ */
+function annotatedReceiverType(tree, line, column, receiver) {
+    if (!tree || !receiver || receiver === 'self' || receiver === 'cls') return undefined;
+    const token = tree.rootNode.descendantForPosition({ row: line - 1, column });
+    const attribute = token?.parent;
+    if (attribute?.type !== 'attribute' || !sameNode(attribute.childForFieldName('attribute'), token)) return undefined;
+    const object = attribute.childForFieldName('object');
+    if (object?.type !== 'identifier' || object.text !== receiver) return undefined;
+    const { referenceScopeNode, pythonBindingSites } = require('./lexical-scope');
+    const scope = referenceScopeNode(object, receiver);
+    if (scope?.type !== 'function_definition') return undefined;
+    const sites = pythonBindingSites(scope, receiver);
+    if (sites.length !== 1) return undefined;
+    const parameter = sites[0].parent;
+    if (!parameter || !['typed_parameter', 'typed_default_parameter'].includes(parameter.type) ||
+        parameter.parent?.type !== 'parameters') return undefined;
+    return typeNameFromAnnotation(parameter.childForFieldName('type')) || undefined;
+}
+
 module.exports = {
+    annotatedReceiverType,
     findScopeAlternativeBindings,
     findPythonModuleEvidence,
     findFunctions,
