@@ -91,6 +91,8 @@ function _state(index) {
             // fix #390: class name -> Set of files declaring it without a
             // possible base elsewhere (see fileDeclaresClass).
             declaringFiles: new Map(),
+            // fix #427: forward declaration -> the class it declares.
+            forwardProviders: new WeakMap(),
         };
         index._classIdentity = state;
     }
@@ -130,10 +132,57 @@ function _enclosingScopeStart(index, def) {
     return best ? best.startLine : 0;
 }
 
+/**
+ * The class a C/C++ forward declaration (`class State;`) declares, when the
+ * project defines exactly one class identity of its qualified name and kind
+ * (fix #427): every declaration of `Y::State` in a program names one class,
+ * and a member access through it compiles only where it is complete.
+ * Several definitions (separate programs, a vendored copy) leave it apart.
+ */
+function forwardDeclarationProvider(index, declaration) {
+    if (!declaration?.forwardDeclaration || declaration.anonymousNamespace ||
+        declaration.specialization || declaration.lexicalScopeStartLine || declaration.typedefName ||
+        !langTraits(index.files.get(declaration.file)?.language)?.textualIncludes) return null;
+    const state = _state(index);
+    if (state.forwardProviders.has(declaration)) return state.forwardProviders.get(declaration);
+    const { effectiveNamespace } = require('./cpp-scope');
+    const namespace = effectiveNamespace(index, declaration);
+    const recordKind = kind => ['class', 'struct'].includes(kind) ? 'record' : kind;
+    // Template parameter count (`generics` is the written `<T, U>` list or an array).
+    const arity = definition => {
+        const generics = definition.generics;
+        if (!generics) return 0;
+        if (Array.isArray(generics)) return generics.length;
+        const inner = String(generics).trim().replace(/^<|>$/g, '').trim();
+        return inner ? inner.split(',').length : 0;
+    };
+    const providers = (index.symbols.get(declaration.name) || []).filter(candidate =>
+        candidate !== declaration && OWNER_CLASS_KINDS.has(candidate.type) && !candidate.forwardDeclaration &&
+        !candidate.aliasOf && !candidate.typedefName && !candidate.anonymousNamespace &&
+        !candidate.specialization && !candidate.lexicalScopeStartLine &&
+        langTraits(index.files.get(candidate.file)?.language)?.textualIncludes &&
+        recordKind(candidate.type) === recordKind(declaration.type) &&
+        (candidate.enclosingType || '') === (declaration.enclosingType || '') &&
+        arity(candidate) === arity(declaration) &&
+        effectiveNamespace(index, candidate) === namespace);
+    // `#if` alternatives of one definition share its key.
+    const provider = providers.length > 0 &&
+        new Set(providers.map(candidate => classKeyOf(index, candidate))).size === 1 ? providers[0] : null;
+    state.forwardProviders.set(declaration, provider);
+    return provider;
+}
+
 /** Identity key of one class definition. */
 function classKeyOf(index, def) {
     const state = _state(index);
     let key = state.classKeys.get(def);
+    if (key === undefined && def?.forwardDeclaration) {
+        const provider = forwardDeclarationProvider(index, def);
+        if (provider) {
+            key = classKeyOf(index, provider);
+            state.classKeys.set(def, key);
+        }
+    }
     if (key === undefined) {
         // A `partial` type (C#) is ONE class declared across files: its
         // identity is the namespace + enclosing type + name, never the file.
@@ -167,6 +216,12 @@ function classDefsNamed(index, name) {
     let entries = defs.length <= 1
         ? defs.map(def => ({ def, key: `name:${name}` }))
         : defs.map(def => ({ def, key: classKeyOf(index, def) }));
+    // A forward declaration of a defined class shares its key (fix #427);
+    // the definition represents the class, never the declaration.
+    if (entries.length > 1 && entries.some(entry => entry.def.forwardDeclaration)) {
+        entries = [...entries.filter(entry => !entry.def.forwardDeclaration),
+            ...entries.filter(entry => entry.def.forwardDeclaration)];
+    }
     const unique = new Set(entries.map(e => e.key)).size <= 1;
     // One identity (a single def, or the parts of one partial/merged type):
     // every consumer uses the name key, so comparisons stay consistent.
@@ -1134,6 +1189,7 @@ module.exports = {
     classKeyOf,
     classDefsNamed,
     completeForwardDeclaration,
+    forwardDeclarationProvider,
     resolveClassRef,
     resolveQualifiedClassRef: _resolveQualifiedParent,
     ownerRefOf,

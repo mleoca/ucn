@@ -7479,3 +7479,388 @@ describe('fix #426: C++ template overloads of one parameter list are no configur
         } finally { rm(dir); }
     });
 });
+
+describe('fix #427: C/C++ names, declarations and receivers by the languages own rules', () => {
+    const callerLines = result => result.callers.map(c => `${c.relativePath}:${c.line}`).sort();
+    const unverifiedLines = result => result.unverifiedCallers.map(c => `${c.relativePath}:${c.line}:${c.reason}`).sort();
+    const calleesOf = (index, name, file) => {
+        const def = index.symbols.get(name).find(d => d.relativePath === file);
+        return index.findCallees(def, { includeMethods: true, collectAccount: true });
+    };
+
+    it('a capitalized namespace qualifier names a namespace, on both sides', () => {
+        const dir = tmp({
+            'a.hpp': [
+                '#pragma once',
+                'namespace Aa { inline int One(int x) { return x; } }',
+                'namespace Bb { inline int One(int x) { return x + 1; } }',
+                'struct Cc { static int One(int x) { return x + 2; } };',
+                'namespace Y { namespace Exp { inline int Escape(int x) { return x; } } }',
+            ].join('\n'),
+            'main.cpp': [
+                '#include "a.hpp"',
+                'namespace Y { int scan(int v) { return Exp::Escape(v); } }',
+                'int main() {',
+                '    int r = Aa::One(1);',
+                '    r += Bb::One(2);',
+                '    r += Cc::One(3);',
+                '    return r + Y::Exp::Escape(4);',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const one = index.context('One', { file: 'a.hpp', line: 2 });
+            assert.deepEqual(callerLines(one), ['main.cpp:4']);
+            assert.equal(one.meta.account.conserved, true);
+            const escape = index.context('Escape', { file: 'a.hpp', line: 5 });
+            assert.deepEqual(callerLines(escape), ['main.cpp:2', 'main.cpp:7']);
+            const member = index.context('One', { file: 'a.hpp', line: 4 });
+            assert.deepEqual(callerLines(member), ['main.cpp:6']);
+            const callees = calleesOf(index, 'main', 'main.cpp');
+            assert.deepEqual(callees.map(c => `${c.relativePath}:${c.startLine}`).sort(),
+                ['a.hpp:2', 'a.hpp:3', 'a.hpp:4', 'a.hpp:5']);
+            assert.equal(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('a forward-declared class reached through a smart-pointer field is its definition', () => {
+        const dir = tmp({
+            'include/emitter.h': '#pragma once\n#include <memory>\nnamespace Y {\nclass State;\nclass Emitter {\n public:\n  void Doc();\n private:\n  std::unique_ptr<State> m_pState;\n  State* m_raw;\n};\n}',
+            'src/state.h': '#pragma once\nnamespace Y {\nclass State {\n public:\n  void StartedDoc();\n};\n}',
+            'src/state.cpp': '#include "state.h"\nnamespace Y {\nvoid State::StartedDoc() {}\n}',
+            'src/emitter.cpp': '#include "emitter.h"\n#include "state.h"\nnamespace Y {\nvoid Emitter::Doc() {\n  m_pState->StartedDoc();\n  m_raw->StartedDoc();\n}\n}',
+        });
+        try {
+            const index = idx(dir);
+            const result = index.context('StartedDoc', { file: 'src/state.h', line: 5 });
+            assert.deepEqual(callerLines(result), ['src/emitter.cpp:5', 'src/emitter.cpp:6']);
+            assert.equal(result.meta.account.conserved, true);
+            const callees = calleesOf(index, 'Doc', 'src/emitter.cpp');
+            assert.deepEqual([...new Set(callees.map(c => `${c.name}:${c.relativePath}`))], ['StartedDoc:src/state.h']);
+            assert.equal(callees.unverifiedCallees?.length || 0, 0);
+        } finally { rm(dir); }
+    });
+
+    it('a field declared as a pointer to an external class reaches that class through ->', () => {
+        const dir = tmp({
+            'a.hpp': '#pragma once\n#include <map>\n#include <string>\ntypedef std::map<std::string, std::string> KVMap;\nstruct List { bool empty() const { return true; } };\nstruct Iter {\n    const KVMap* const map_;\n    bool done() const { return map_->empty(); }\n};',
+        });
+        try {
+            const index = idx(dir);
+            const result = index.context('empty', { file: 'a.hpp', line: 5 });
+            assert.equal(result.callers.length + result.unverifiedCallers.length, 0);
+            assert.equal(result.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('a member declared in its class and defined outside it is one callee', () => {
+        const dir = tmp({
+            's.h': '#pragma once\nclass S { public: void f(); int g(int); };',
+            's.cpp': '#include "s.h"\nvoid S::f() {}\nint S::g(int x) { return x; }',
+            'm.cpp': '#include "s.h"\nvoid run(S* p) {\n    S s;\n    s.f();\n    p->g(1);\n}',
+        });
+        try {
+            const index = idx(dir);
+            const callees = calleesOf(index, 'run', 'm.cpp');
+            assert.deepEqual(callees.filter(c => c.name !== 'S').map(c => `${c.name}:${c.relativePath}`).sort(),
+                ['f:s.h', 'g:s.h']);
+            assert.equal(callees.unverifiedCallees?.length || 0, 0);
+            assert.equal(callees.calleeAccount.excluded.total || 0, 0);
+        } finally { rm(dir); }
+    });
+
+    for (const extension of ['c', 'cpp']) {
+        it(`${extension}: a definition after a static declaration has internal linkage`, () => {
+            const dir = tmp({
+                [`a.${extension}`]: 'static void expression(int x);\n\nstatic void statement(int y) {\n    expression(y);\n}\n\nvoid expression(int x) {\n    if (x > 0) statement(x - 1);\n}\n\nint main(void) { statement(3); return 0; }\n',
+                [`b.${extension}`]: 'void expression(int x) { (void)x; }\n',
+            });
+            try {
+                const index = idx(dir);
+                const definition = index.symbols.get('expression').find(d => d.relativePath === `a.${extension}` && d.startLine === 7);
+                assert.ok(definition.modifiers.includes('static'));
+                const result = index.context('expression', { file: `a.${extension}`, line: 7 });
+                assert.deepEqual(callerLines(result), [`a.${extension}:4`]);
+                const plan = execute(index, 'plan', { name: `a.${extension}:7:expression`, renameTo: 'expressionZ' });
+                assert.ok(plan.ok, plan.error);
+                assert.deepEqual(plan.result.changes.map(c => `${c.file}:${c.line}`).sort(),
+                    [`a.${extension}:1`, `a.${extension}:4`, `a.${extension}:7`]);
+            } finally { rm(dir); }
+        });
+    }
+
+    it('a decoration macro whose definitions name another decoration macro is decoration', () => {
+        const dir = tmp({
+            'api.h': [
+                '#ifndef API_H',
+                '#define API_H',
+                '#ifndef LIB_VISIBILITY',
+                '#  if defined(__GNUC__) && (__GNUC__ >= 4)',
+                '#    define LIB_VISIBILITY __attribute__ ((visibility ("default")))',
+                '#  else',
+                '#    define LIB_VISIBILITY',
+                '#  endif',
+                '#endif',
+                '#if defined(LIB_DLL_EXPORT) && (LIB_DLL_EXPORT==1)',
+                '#  define LIB_API __declspec(dllexport) LIB_VISIBILITY',
+                '#else',
+                '#  define LIB_API LIB_VISIBILITY',
+                '#endif',
+                'typedef union stream_u stream_t;',
+                '#if !defined(RC_INVOKED)',
+                'LIB_API stream_t* create_stream(void);',
+                'LIB_API int free_stream(stream_t* s);',
+                '#endif',
+                '#endif',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const create = index.symbols.get('create_stream')[0];
+            assert.equal(create.returnType, 'stream_t *');
+            const plan = execute(index, 'plan', { name: 'api.h:15:stream_t', renameTo: 'flow_t' });
+            assert.ok(plan.ok, plan.error);
+            const edited = plan.result.changes.filter(c => !c.needsReview).map(c => c.line).sort((a, b) => a - b);
+            assert.deepEqual(edited, [15, 17, 18]);
+        } finally { rm(dir); }
+    });
+
+    it('out-of-class conversion operators are members; their bare calls reach the class', () => {
+        const dir = tmp({
+            't.hpp': '#pragma once\nclass Text {\n    typedef void (*bool_type)(Text***);\npublic:\n    operator bool_type() const;\n    bool operator!() const;\n    explicit operator int() const;\nprivate:\n    int* _data() const;\n    int* _root = nullptr;\n};',
+            't.cpp': '#include "t.hpp"\nstatic void bool_text(Text***) {}\nint* Text::_data() const { return _root; }\nText::operator Text::bool_type() const { return _data() ? bool_text : nullptr; }\nbool Text::operator!() const { return !_data(); }\nText::operator int() const { return _data() ? 1 : 0; }',
+        });
+        try {
+            const index = idx(dir);
+            const conversions = (index.symbols.get('operator bool_type') || []).map(d => `${d.relativePath}:${d.startLine}:${d.className}`).sort();
+            assert.deepEqual(conversions, ['t.cpp:4:Text', 't.hpp:5:Text']);
+            const result = index.context('_data', { file: 't.cpp', line: 3 });
+            assert.deepEqual(callerLines(result), ['t.cpp:4', 't.cpp:5', 't.cpp:6']);
+            assert.equal(result.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('a class template deriving from its template parameter routes its receivers unverified', () => {
+        const dir = tmp({
+            'a.hpp': '#pragma once\ntemplate <class Derived>\nstruct Countable {\n    int bump() { return ++count_; }\n    int count_ = 0;\n};\ntemplate <class T>\nstruct Holder : T {\n    int twice() { return 2; }\n};\nstruct Widget : Countable<Widget> {};\ninline int run(Widget& w, Holder<Widget>& h) {\n    int a = h.bump();\n    return a + w.bump();\n}',
+        });
+        try {
+            const index = idx(dir);
+            const result = index.context('bump', { file: 'a.hpp', line: 4 });
+            assert.deepEqual(callerLines(result), ['a.hpp:14']);
+            assert.deepEqual(unverifiedLines(result), ['a.hpp:13:template-parameter-base']);
+            assert.equal(result.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('a class template that declares the member itself never reaches it through its parameter base', () => {
+        const dir = tmp({
+            'a.hpp': '#pragma once\nstruct Plain {};\ntemplate <class Traits>\nstruct Buffer : Traits {\n    int out() { return 1; }\n};\nstruct Ctx { int out() { return 2; } };\ninline int run(Buffer<Plain>& b) { return b.out(); }',
+        });
+        try {
+            const index = idx(dir);
+            const result = index.context('out', { file: 'a.hpp', line: 7 });
+            assert.equal(result.callers.length + result.unverifiedCallers.length, 0);
+        } finally { rm(dir); }
+    });
+
+    it('member types the standard library reads by name block their rename', () => {
+        const dir = tmp({
+            'it.hpp': '#pragma once\n#include <cstddef>\nclass node_iterator {\npublic:\n    typedef std::ptrdiff_t difference_type;\n    typedef int value_type;\n    typedef int& reference;\n    node_iterator(int* p) : p_(p) {}\n    reference operator*() const { return *p_; }\n    int& reference_of() { return *p_; }\nprivate:\n    int* p_;\n};',
+        });
+        try {
+            const index = idx(dir);
+            const blocked = execute(index, 'plan', { name: 'it.hpp:7:reference', renameTo: 'refZ' });
+            assert.ok(blocked.ok, blocked.error);
+            assert.equal(blocked.result.changes.filter(c => !c.needsReview).length, 0);
+            assert.ok(blocked.result.changes.some(c => c.needsReview && c.reviewReason === 'language-protocol-member'));
+            const ordinary = execute(index, 'plan', { name: 'it.hpp:10:reference_of', renameTo: 'refOf' });
+            assert.ok(ordinary.ok, ordinary.error);
+            assert.ok(ordinary.result.changes.some(c => !c.needsReview && c.isDefinition));
+        } finally { rm(dir); }
+    });
+
+    it('a deduction guide is no function; the class rename edits its name', () => {
+        const dir = tmp({
+            'a.hpp': '#pragma once\ntemplate<typename... Func>\nstruct overloaded: Func... {\n    using Func::operator()...;\n};\ntemplate<typename... Func>\noverloaded(Func...) -> overloaded<Func...>;\ntemplate<typename T>\nstruct Box {\n    Box(T v) : value(v) {}\n    T value;\n};\nBox(const char *) -> Box<int>;',
+            'main.cpp': '#include "a.hpp"\nint main() {\n    overloaded func{[](int) {}, [](double) {}};\n    func(1);\n    Box b{3};\n    return b.value;\n}',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepEqual((index.symbols.get('overloaded') || []).map(d => d.type), ['struct']);
+            assert.ok(!(index.symbols.get('Box') || []).some(d => d.type === 'function'));
+            for (const [handle, line, renamed] of [['a.hpp:3:overloaded', 7, 'ovZ(Func...) -> ovZ<Func...>;'],
+                ['a.hpp:9:Box', 13, 'BoxZ(const char *) -> BoxZ<int>;']]) {
+                const plan = execute(index, 'plan', { name: handle, renameTo: renamed.match(/^\w+/)[0] });
+                assert.ok(plan.ok, plan.error);
+                const guide = plan.result.changes.find(c => c.file === 'a.hpp' && c.line === line);
+                assert.ok(guide && !guide.needsReview);
+                assert.equal(guide.newExpression.trim(), renamed);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('a local declared with decltype of a variable has its declared type; other decltypes stay untyped', () => {
+        const dir = tmp({
+            'a.hpp': 'template<typename T>\nstruct sigh {\n    void swap(sigh &other) noexcept {}\n};\nstruct other { void swap(other &o) {} };\ninline sigh<int> make();',
+            't.cpp': '#include "a.hpp"\nvoid run() {\n    sigh<int> s{};\n    decltype(s) copy{s};\n    decltype(s) move{};\n    copy.swap(move);\n    decltype(auto) alias = s;\n    alias.swap(move);\n    decltype(make()) made;\n    made.swap(move);\n    other o1, o2;\n    o1.swap(o2);\n}',
+        });
+        try {
+            const index = idx(dir);
+            const result = index.context('swap', { file: 'a.hpp', line: 3 });
+            assert.deepEqual(callerLines(result), ['t.cpp:6']);
+            assert.deepEqual(result.unverifiedCallers.map(c => c.line).sort((a, b) => a - b), [8, 10]);
+            assert.equal(result.meta.account.excluded.byReason['receiver-type-mismatch']?.count || 0, 1);
+            assert.equal(result.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('a pointer-to-member parameter declares no callable of the return type', () => {
+        const dir = tmp({
+            'b.hpp': '\ntemplate<typename Ret, typename... Args>\nauto function_pointer(Ret (*)(Args...)) -> Ret (*)(Args...);\n\ntemplate<typename Class, typename Ret, typename... Args, typename... Other>\nauto function_pointer(Ret (Class::*)(Args...), Other &&...) -> Ret (*)(Args...);\n\ntemplate<typename Class, typename Ret, typename... Args, typename... Other>\nauto function_pointer(Ret (Class::*)(Args...) const, Other &&...) -> Ret (*)(Args...);\n\ntemplate<typename Class, typename Ret, typename... Args>\nstruct picker { static int pick_up(Ret (Class::*)(Args...)); };',
+        });
+        try {
+            const index = idx(dir);
+            assert.equal((index.symbols.get('Ret') || []).filter(d => d.type === 'function').length, 0);
+            const overloads = (index.symbols.get('function_pointer') || []).map(d => `${d.startLine}:${d.params}`);
+            assert.deepEqual(overloads, ['2:Ret (*)(Args...)', '5:Ret (Class::*)(Args...), Other &&...',
+                '8:Ret (Class::*)(Args...) const, Other &&...']);
+            assert.deepEqual(index.symbols.get('pick_up').map(d => d.paramsStructured.map(p => p.name)),
+                [['Ret (Class::*)(Args...)']]);
+        } finally { rm(dir); }
+    });
+
+    it('C: a macro invocation followed by a body defines the function its expansion names', () => {
+        const dir = tmp({
+            'p.h': '#ifndef P_H\n#define P_H\n#include <stdbool.h>\n#define DEF_PRIMITIVE(name) static bool prim_##name(int* vm, int* args)\nbool validate(int* vm);\n#endif',
+            'core.c': '#include "p.h"\nbool validate(int* vm) { return vm != 0; }\nDEF_PRIMITIVE(object_not)\n{\n  return validate(vm);\n}\nDEF_PRIMITIVE(object_eq) { return validate(args); }\nUNKNOWN_WRAPPER(object_ne) { return validate(args); }',
+        });
+        try {
+            const index = idx(dir);
+            const generated = index.symbols.get('prim_object_not')?.[0];
+            assert.ok(generated, 'the expansion names the function');
+            assert.deepEqual(generated.paramsStructured.map(p => p.name), ['vm', 'args']);
+            assert.ok(generated.modifiers.includes('static'));
+            assert.ok(index.symbols.get('prim_object_eq'));
+            assert.ok(index.symbols.get('object_ne'), 'an unknown macro names the body from its arguments');
+            const result = index.context('validate', { file: 'core.c', line: 2 });
+            assert.deepEqual(result.callers.map(c => `${c.line}:${c.callerName}`).sort(),
+                ['5:prim_object_not', '7:prim_object_eq', '8:object_ne']);
+            const plan = execute(index, 'plan', { name: 'core.c:3:prim_object_not', renameTo: 'prim_negate' });
+            assert.ok(plan.ok, plan.error);
+            assert.equal(plan.result.changes.filter(c => !c.needsReview).length, 0);
+        } finally { rm(dir); }
+    });
+
+    it('statement macros a configuration reads as try/catch and another as if keep the class body', () => {
+        const dir = tmp({
+            'src/config.h': '#pragma once\n#if defined(__cpp_exceptions) && !defined(LIB_NO_EXCEPTION)\n#    define LIB_THROW throw\n#    define LIB_TRY try\n#    define LIB_CATCH catch(...)\n#else\n#    define LIB_THROW\n#    define LIB_TRY if(true)\n#    define LIB_CATCH if(false)\n#endif',
+            'src/storage.hpp': '#pragma once\n#include "config.h"\ntemplate<typename Type>\nclass basic_storage {\npublic:\n    void shrink(int sz) {\n        LIB_TRY {\n            grow(sz);\n        }\n        LIB_CATCH {\n            reset();\n            LIB_THROW;\n        }\n    }\n    void grow(int) {}\n    void reset() {}\n    int emplace(int v) { return v; }\n};',
+        });
+        try {
+            const index = idx(dir);
+            const emplace = index.symbols.get('emplace')[0];
+            assert.equal(emplace.className, 'basic_storage');
+            const result = index.context('grow', { file: 'src/storage.hpp', line: 15 });
+            assert.deepEqual(callerLines(result), ['src/storage.hpp:8']);
+        } finally { rm(dir); }
+    });
+
+    it('a parenthesized typedef name before a parenthesized operand is a cast, not a call', () => {
+        const dir = tmp({
+            'a.c': 'typedef unsigned char BYTE;\nint twice(int x) { return 2 * x; }\nint use(int v) {\n    BYTE b = (BYTE)(v << 2);\n    BYTE* p = (BYTE*)(&b);\n    return b + *p + (twice)(v);\n}',
+            'b.c': '#include "a.c"\nint use2(int v) { return (BYTE)(v >> 1); }\n#define LOW(v) ((BYTE)(v))',
+        });
+        try {
+            const index = idx(dir);
+            const byte = index.context('BYTE', { file: 'a.c', line: 1 });
+            assert.equal(byte.callers.length + byte.unverifiedCallers.length, 0);
+            assert.equal(byte.meta.account.conserved, true);
+            const twice = index.context('twice', { file: 'a.c', line: 2 });
+            assert.deepEqual(callerLines(twice), ['a.c:6']);
+            const callees = calleesOf(index, 'use', 'a.c');
+            assert.deepEqual(callees.map(c => c.name), ['twice']);
+            // A cast in a replacement list is renamed with the type.
+            const plan = execute(index, 'plan', { name: 'a.c:1:BYTE', renameTo: 'OCTET' });
+            assert.ok(plan.ok, plan.error);
+            const macro = plan.result.changes.find(c => c.file === 'b.c' && c.line === 3);
+            assert.ok(macro && !macro.needsReview, 'the replacement-list cast is an edit');
+        } finally { rm(dir); }
+    });
+
+    it('const and non-const member overloads are chosen by the object\'s constness', () => {
+        const dir = tmp({
+            'v.hpp': '#pragma once\nstruct Vec {\n    int& at(int i) { return data[i]; }\n    const int& at(int i) const { return data[i]; }\n    int sum() const { return at(0) + this->at(1); }\n    void bump() { at(0)++; }\n    int& get() & { return data[0]; }\n    int get() && { return data[0]; }\n    int data[4];\n};',
+            'main.cpp': '#include "v.hpp"\nint use(Vec& v, const Vec& cv, Vec* pv, const Vec* pcv, auto& unknown) {\n    v.at(0) = 1;\n    pv->at(2) = 3;\n    int r = cv.at(0);\n    r += pcv->at(1);\n    r += unknown.at(2);\n    return r + v.get();\n}',
+        });
+        try {
+            const index = idx(dir);
+            const mutable = index.context('at', { file: 'v.hpp', line: 3 });
+            assert.deepEqual(callerLines(mutable), ['main.cpp:3', 'main.cpp:4', 'v.hpp:6']);
+            const constant = index.context('at', { file: 'v.hpp', line: 4 });
+            assert.deepEqual(callerLines(constant), ['main.cpp:5', 'main.cpp:6', 'v.hpp:5', 'v.hpp:5']);
+            assert.ok(unverifiedLines(constant).some(line => line.startsWith('main.cpp:7:')), 'an undecided object stays a review');
+            const getter = index.context('get', { file: 'v.hpp', line: 7 });
+            assert.ok(unverifiedLines(getter).some(line => line.startsWith('main.cpp:8:')), 'ref-qualified overloads stay undecided');
+            const callees = calleesOf(index, 'sum', 'v.hpp');
+            assert.deepEqual(callees.map(c => `${c.name}:${c.startLine}`), ['at:4']);
+        } finally { rm(dir); }
+    });
+
+    it('a typedef of a function type renames its declaration with its uses', () => {
+        const dir = tmp({
+            'api.h': 'typedef int read_handler_t(void *data, unsigned char *buffer);\nstruct parser { read_handler_t *handler; };\nvoid set_input(struct parser *p, read_handler_t *handler);',
+        });
+        try {
+            const index = idx(dir);
+            const plan = execute(index, 'plan', { name: 'api.h:1:read_handler_t', renameTo: 'input_handler_t' });
+            assert.ok(plan.ok, plan.error);
+            assert.deepEqual(plan.result.changes.filter(c => !c.needsReview).map(c => c.line).sort((a, b) => a - b), [1, 2, 3]);
+        } finally { rm(dir); }
+    });
+
+    it('a local variable hides a type name in a declaration that passes it', () => {
+        const dir = tmp({
+            'a.hpp': '#pragma once\ntemplate <typename... T> struct store {};\ntemplate <typename... T>\nusing vargs = store<T...>;\nstruct ctx_t { ctx_t(int, const store<int>&) {} };\ninline int use(int out) {\n    const auto& vargs = store<int>{};\n    ctx_t ctx(out, vargs);\n    return 0;\n}\ninline vargs<int> make(int out) { ctx_t ctx(out, vargs<int>{}); return {}; }',
+        });
+        try {
+            const index = idx(dir);
+            const plan = execute(index, 'plan', { name: 'a.hpp:4:vargs', renameTo: 'args_t' });
+            assert.ok(plan.ok, plan.error);
+            assert.deepEqual(plan.result.changes.filter(c => !c.needsReview).map(c => c.line).sort((a, b) => a - b), [4, 11]);
+        } finally { rm(dir); }
+    });
+
+    it('sequential, two-worker and cache builds record the same declarations and receivers', () => {
+        const { ProjectIndex } = require('../core/project');
+        const dir = tmp({
+            'p.h': '#ifndef P_H\n#define P_H\n#define DEF_PRIMITIVE(name) static int prim_##name(int* vm)\n#endif',
+            'core.c': '#include "p.h"\ntypedef int I;\nDEF_PRIMITIVE(object_not) { return *vm; }\nstatic int helper(int);\nint helper(int x) { return (I)(x); }',
+            'v.hpp': '#pragma once\n#include <memory>\nstruct Vec { int& at(int i); const int& at(int i) const; int get() &; };\nstruct Holder { std::unique_ptr<Vec> p; int run() { return p->at(1); } };\ntemplate<typename C, typename R> int pick(R (C::*)(int));',
+            'use.cpp': '#include "v.hpp"\nint use(const Vec& cv) { decltype(cv) copy = cv; return copy.at(0) + cv.at(1); }',
+        });
+        try {
+            const symbols = index => [...index.files.values()].sort((a, b) => (a.relativePath < b.relativePath ? -1 : 1))
+                .map(entry => JSON.stringify(entry.symbols.map(sym => [sym.name, sym.type, sym.startLine, sym.params,
+                    sym.modifiers, sym.memberConst, sym.refQualifier, sym.generatedByMacro])));
+            const records = index => [...index.files.keys()].sort().map(file => JSON.stringify(index.getCachedCalls(file)));
+            const sequential = new ProjectIndex(dir); sequential.build(null, { quiet: true, workers: 0 });
+            const parallel = new ProjectIndex(dir); parallel.build(null, { quiet: true, workers: 2 });
+            assert.deepStrictEqual(symbols(parallel), symbols(sequential));
+            assert.deepStrictEqual(records(parallel), records(sequential));
+            const all = symbols(sequential).join('\n') + records(sequential).join('\n');
+            for (const fact of ['prim_object_not', '"receiverFieldArrow":true', '"receiverConst":true',
+                '"parenthesizedCallee":true', 'R (C::*)(int)']) {
+                assert.ok(all.includes(fact), fact);
+            }
+            const { saveCache, loadCache } = require('../core/cache');
+            const cachePath = path.join(dir, '.cache-427', 'index.json');
+            saveCache(sequential, cachePath);
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loadCache(loaded, cachePath));
+            assert.deepStrictEqual(symbols(loaded), symbols(sequential));
+            assert.deepStrictEqual(records(loaded), records(sequential));
+        } finally { rm(dir); }
+    });
+});

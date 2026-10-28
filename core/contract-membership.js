@@ -307,9 +307,12 @@ function protocolMemberCertainty(index, def) {
     const lang = index.files.get(def.file)?.language;
     const predicate = langTraits(lang)?.languageProtocolMember;
     if (typeof predicate !== 'function') return null;
-    const isMember = !!def.className;
+    // A C/C++ member type alias names its class as `enclosingType` (fix #427).
+    const isTypeMember = def.type === 'type' && !!(def.className || def.enclosingType);
+    const isMember = !!def.className || isTypeMember;
     const verdict = predicate(def.name, {
         isMember,
+        isTypeMember,
         isField: def.type === 'field' || def.type === 'property' || def.type === 'constant',
         modifiers: def.modifiers || [],
         paramTypes: Array.isArray(def.paramsStructured)
@@ -476,6 +479,18 @@ function externalContractOf(index, def) {
             certainty: 'definite',
             via: [`${def.namespace ? `${def.namespace}.` : ''}${def.name}`],
             reason: 'compiler-protocol-type',
+            sites: [{ file: def.file, relativePath: def.relativePath || _rel(index, def.file),
+                line: def.nameLine || def.startLine }],
+        };
+    }
+    // A member type alias the standard library reads by name (fix #427).
+    if (def && !def.className && def.type === 'type' && def.enclosingType) {
+        const certainty = protocolMemberCertainty(index, def);
+        if (!certainty) return null;
+        return {
+            certainty,
+            via: ['standard library traits (iterator_traits, pointer_traits, container)'],
+            reason: 'language-protocol-member',
             sites: [{ file: def.file, relativePath: def.relativePath || _rel(index, def.file),
                 line: def.nameLine || def.startLine }],
         };

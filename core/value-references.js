@@ -1093,7 +1093,8 @@ class ValueReferenceResolver extends TypeReferenceResolver {
     ambiguousClassFamily(owner) {
         if (langTraits(this.language)?.typeArgumentValues !== 'ordinary' || !owner?.name) return false;
         const info = classDefsNamed(this.index, owner.name);
-        return info.unique && info.entries.length > 1;
+        // A forward declaration of the class is no alternative of it (fix #427).
+        return info.unique && info.entries.filter(entry => !entry.def.forwardDeclaration).length > 1;
     }
 
     classValueMembers() {

@@ -347,6 +347,8 @@ function classifyGroundLines(index, name, groundSet, claimedKeys) {
         const cachedCalls = getCachedCallsBearing(index, filePath, name, new Set(unclaimed));
         const recordIsNoCall = require('./callers')._recordIsNoCall;
         const callLines = new Set();
+        // `(T)(x)` casts: uses of the type, not calls (fix #427).
+        let castLines = null;
         if (Array.isArray(cachedCalls)) {
             for (const c of cachedCalls) {
                 // Unclaimed callback/type references have no invocation
@@ -357,6 +359,10 @@ function classifyGroundLines(index, name, groundSet, claimedKeys) {
                 // Nor a data member's mem-initializer or a default
                 // initialization of no class (fix #421).
                 if ((c.memberInitializer || c.constructorSyntax === 'default') && recordIsNoCall(index, filePath, c)) continue;
+                if (c.parenthesizedCallee && c.name === name && recordIsNoCall(index, filePath, c)) {
+                    (castLines ||= new Set()).add(c.line);
+                    continue;
+                }
                 if (c.name === name || c.resolvedName === name ||
                     (c.resolvedNames && c.resolvedNames.includes(name))) {
                     callLines.add(c.line);
@@ -369,6 +375,8 @@ function classifyGroundLines(index, name, groundSet, claimedKeys) {
         for (const line of unclaimed) {
             if (callLines.has(line)) {
                 callNotResolved.push({ file: filePath, relativePath, line });
+            } else if (castLines?.has(line)) {
+                nonCall.references++;
             } else if (defLines && defLines.has(line)) {
                 nonCall.definitions++;
             } else {

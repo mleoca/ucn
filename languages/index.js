@@ -33,6 +33,9 @@ function protocolMembers(rules) {
             const named = rule.pattern ? rule.pattern.test(name) : rule.names.includes(name);
             if (!named) continue;
             if (rule.member && ctx.isMember === false) continue;
+            // A member type alias (fix #427: `typedef int& reference;`).
+            if (rule.typeMember && !ctx.isTypeMember) continue;
+            if (!rule.typeMember && ctx.isTypeMember) continue;
             // Owner kinds the runtime exempts from the protocol (fix #392:
             // Java enum constants serialize by name and ignore the callbacks).
             if (rule.exceptOwnerKinds && typeof ctx.ownerKinds === 'function' &&
@@ -728,6 +731,11 @@ const LANGUAGES = {
             // alternatives selected by `#[cfg]` (fix #376).
             conditionalDefinitions: 'attribute',
             typeQualifiedCallStyle: 'path',
+            // A path segment's case tells a type from a module (CamelCase
+            // types, snake_case modules: the language's naming lints); C++
+            // namespaces are not case-coded, its qualifiers are resolved by
+            // name lookup (fix #427).
+            caseCodedPathQualifiers: true,
             standardPathRoots: ['std', 'core', 'alloc'],
             // Call records say whether their value is consumed where it is
             // produced (`valueConsumed`, `consumingMethod`; fix #371).
@@ -942,8 +950,16 @@ const LANGUAGES = {
             standardPathRoots: ['std'],
             hasArityOverloads: true,
             // Range-for lowers onto member begin()/end() with no name token.
+            // The standard library's traits read member types by name
+            // (fix #427): std::iterator_traits (value_type, difference_type,
+            // pointer, reference, iterator_category, iterator_concept),
+            // std::pointer_traits (element_type), container adaptors
+            // (size_type, const_reference), transparent comparators.
             languageProtocolMember: protocolMembers([
                 { names: ['begin', 'end'], member: true },
+                { names: ['value_type', 'difference_type', 'pointer', 'reference', 'iterator_category',
+                    'iterator_concept', 'element_type', 'size_type', 'const_reference', 'is_transparent'],
+                member: true, typeMember: true },
             ]),
             // C++ instance dispatch is virtual only when the declaration
             // explicitly says virtual/override (unlike Java's implicit rule).

@@ -963,7 +963,15 @@ function clearAllCaches() {
 // selectors as values, and type type-switch bindings per clause.
 // v314 (fix #426): C# `out var` / implicitly typed pattern locals record no
 // receiver type (was the written `var`).
-const CACHE_FORMAT_VERSION = 314;
+// v315 (fix #427): C/C++ call records mark `field->m()` receivers
+// (`receiverFieldArrow`), the implicit object's constness
+// (`receiverConst`) and `(N)(x)` cast-or-call shapes
+// (`parenthesizedCallee`); member functions record `memberConst` /
+// `refQualifier`; a definition after a `static` declaration is `static`;
+// out-of-class conversion operators, pointer-to-member parameters,
+// `decltype(x)` locals and macro-wrapped C bodies are read; deduction
+// guides are no functions.
+const CACHE_FORMAT_VERSION = 315;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 function usageResultKey(index, filePath, name, mode) {

@@ -177,6 +177,8 @@ function formatClassSignature(cls) {
     if (cls.implements && cls.implements.length > 0) {
         parts.push(`implements ${cls.implements.join(', ')}`);
     }
+    // `class State;` declares a class defined elsewhere (fix #427).
+    if (cls.forwardDeclaration) parts.push('(forward declaration)');
 
     return parts.join(' ');
 }

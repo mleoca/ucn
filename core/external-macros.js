@@ -115,7 +115,7 @@ function leadsWithProjectMacro(body, perName) {
 // `catch (...) { }` / `try`: statement fragments are read by the probe
 // even though they hold braces.
 function mayBeStatementFragment(body) {
-    return /^(?:try|catch|if)\b/.test(body.trim());
+    return /^(?:try|catch|if|while|for|switch)\b/.test(body.trim());
 }
 
 /**
@@ -166,24 +166,53 @@ function projectMacroDictionary(index, files) {
         if (!readingMemo.has(key)) readingMemo.set(key, compute());
         return readingMemo.get(key);
     };
+    // An object-like body naming another project macro that reads as
+    // decoration reads as the rest of it (fix #427).
+    const { withoutDecorationMacros } = require('../languages/c-family');
+    const objectReading = new Map();
+    const objectReadingOf = name => {
+        if (objectReading.has(name)) return objectReading.get(name);
+        objectReading.set(name, null); // in progress
+        const slot = perName.get(name);
+        let reading = null;
+        if (slot && slot.objects.size > 0 && slot.functions.size === 0 && !slot.objects.has(null)) {
+            const bodies = [...slot.objects].sort(codeUnitCompare).map(body => withoutDecorationMacros(body,
+                word => word !== name && perName.has(word) && objectReadingOf(word) === 'decoration'));
+            if (bodies.every(body => !body || maySpecify(body) || mayBeStatementFragment(body)) &&
+                !bodies.some(body => leadsWithProjectMacro(body, perName))) {
+                reading = read(`o\0${bodies.join('\u0001')}`, () => objectMacroReading(parser, bodies));
+            }
+        }
+        objectReading.set(name, reading);
+        return reading;
+    };
     const objectBodies = [];
     const functionMacros = [];
+    // Function-like macros whose every expansion ends in a function head
+    // (fix #427): an invocation followed by a body defines the function the
+    // expansion names (`DEF_PRIMITIVE(name) { .. }`).
+    const functionHeads = [];
+    const { endsFunctionHead } = require('../languages/c-family');
     for (const name of [...perName.keys()].sort(codeUnitCompare)) {
         const slot = perName.get(name);
         // Every definition of the name is one kind; object bodies are short.
         if (slot.objects.size > 0 && slot.functions.size > 0) continue;
         if (slot.objects.size > 0) {
             if (slot.objects.has(null)) continue;
-            const bodies = [...slot.objects].sort(codeUnitCompare);
-            if (!bodies.every(body => !body || maySpecify(body) || mayBeStatementFragment(body))) continue;
-            if (bodies.some(body => leadsWithProjectMacro(body, perName))) continue;
-            const reading = read(`o\0${bodies.join('\u0001')}`, () => objectMacroReading(parser, bodies));
-            if (reading === 'decoration' || reading === 'statement' || reading === 'if') objectBodies.push([name, bodies]);
+            const reading = objectReadingOf(name);
+            if (reading === 'decoration' || reading === 'statement' || reading === 'if') {
+                objectBodies.push([name, [...slot.objects].sort(codeUnitCompare).map(body => withoutDecorationMacros(body,
+                    word => word !== name && perName.has(word) && objectReadingOf(word) === 'decoration'))]);
+            }
             continue;
         }
         const templates = [...slot.functions.values()]
             .sort((a, b) => codeUnitCompare(JSON.stringify(a), JSON.stringify(b)));
         if (new Set(templates.map(template => template.params.length)).size !== 1) continue;
+        if (templates.every(template => template.body && endsFunctionHead(template.body)) &&
+            !templates.some(template => leadsWithProjectMacro(template.body, perName))) {
+            functionHeads.push([name, templates]);
+        }
         // Only an attribute or return-type macro (its expansion reads as
         // specifiers or a type) can explain a misread declaration; statement
         // macros such as test assertions read as calls.
@@ -197,8 +226,8 @@ function projectMacroDictionary(index, files) {
         if (reading === 'decoration' || reading === 'type') functionMacros.push([name, templates]);
     }
     const byLanguage = {};
-    if (objectBodies.length > 0 || functionMacros.length > 0) {
-        const entries = { objectBodies, functionMacros };
+    if (objectBodies.length > 0 || functionMacros.length > 0 || functionHeads.length > 0) {
+        const entries = { objectBodies, functionMacros, functionHeads };
         byLanguage.c = entries;
         byLanguage.cpp = entries;
     }
@@ -222,6 +251,7 @@ function contextFor(dictionary, language, excluded = null) {
             key: `${dictionary.key}-${[...excluded].sort(codeUnitCompare).join(',')}`,
             objectBodies: new Map(entry.objectBodies.filter(keep)),
             functionMacros: new Map(entry.functionMacros.filter(keep)),
+            functionHeads: new Map((entry.functionHeads || []).filter(keep)),
             consulted: new Set(),
         };
     }
@@ -233,7 +263,8 @@ function contextFor(dictionary, language, excluded = null) {
     }
     let maps = byLanguage.get(language);
     if (!maps) {
-        maps = { objectBodies: new Map(entry.objectBodies), functionMacros: new Map(entry.functionMacros) };
+        maps = { objectBodies: new Map(entry.objectBodies), functionMacros: new Map(entry.functionMacros),
+            functionHeads: new Map(entry.functionHeads || []) };
         byLanguage.set(language, maps);
     }
     return { key: dictionary.key, ...maps, consulted: new Set() };
@@ -245,8 +276,9 @@ function keyOfNames(dictionary, language, names) {
     const entry = dictionary?.byLanguage?.[language];
     const objects = new Map(entry?.objectBodies || []);
     const functions = new Map(entry?.functionMacros || []);
+    const heads = new Map(entry?.functionHeads || []);
     const parts = [...new Set(names)].sort(codeUnitCompare)
-        .map(name => [name, objects.get(name) || null, functions.get(name) || null]);
+        .map(name => [name, objects.get(name) || null, functions.get(name) || null, heads.get(name) || null]);
     return crypto.createHash('sha1').update(JSON.stringify(parts)).digest('base64url');
 }
 

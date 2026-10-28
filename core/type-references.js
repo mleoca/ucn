@@ -744,6 +744,10 @@ function classifyC(node, language) {
         }
         case 'function_declarator': {
             if (field !== 'declarator') break;
+            // `typedef int F(void *data);` names a function type (fix #427).
+            if (parent.parent?.type === 'type_definition' && isField(parent, 'declarator')) {
+                return { role: 'decl', declNode: parent.parent, typedef: true };
+            }
             const classNode = ancestor(node, C_TYPE_SPECIFIERS, new Set(['compound_statement']));
             const body = classNode?.childForFieldName('body');
             // `struct List<K>::Node { Node(..) }` names its class by the
@@ -755,6 +759,10 @@ function classifyC(node, language) {
             const classBase = className?.text;
             if (classNode && body && contains(body, node) && classBase === node.text) {
                 return { role: 'ctor', classNode };
+            }
+            // A deduction guide's name is the class template's (fix #427).
+            if (language === 'cpp' && require('../languages/c-family').deductionGuideOf(parent.parent)) {
+                return { role: 'type' };
             }
             return skip('function', { binding: true });
         }
@@ -2602,8 +2610,35 @@ function scanFile(index, resolver, file, entry, language, lineNumbers) {
         }
     }
     for (const comment of docComments) decideDocCrefs(resolver, file, comment, lineOf(comment.startPosition.row));
+    if (resolver.family === 'c' && !resolver.valueReferences) decideReplacementListCasts(resolver, file, lines);
     resolver.rememberLocalFile?.(file, lines, fileLocalOnly);
     return lines;
+}
+
+/**
+ * A cast spelled in a C/C++ replacement list (`#define D(t, p) t[(U16)(p)]`,
+ * fix #427): the name is the type its file's lookup finds where the macro is
+ * defined, so a line whose every occurrence of the name is such a cast to
+ * the renamed type is an edit; any other replacement-list text stays a
+ * review item.
+ */
+function decideReplacementListCasts(resolver, file, lines) {
+    const { getCachedCalls, _recordIsNoCall } = require('./callers');
+    let records = null;
+    const fileLines = resolver.index._getFileLines(file);
+    const word = new RegExp(`(?<![A-Za-z0-9_$])${resolver.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![A-Za-z0-9_$])`, 'g');
+    for (const [line, slot] of lines) {
+        if (!slot.macroBody || slot.tokens > 0 || slot.reviews.length > 0) continue;
+        records ||= getCachedCalls(resolver.index, file) || [];
+        const casts = records.filter(call => call.line === line && call.name === resolver.name &&
+            call.parenthesizedCallee && call.inMacroBody && Number.isInteger(call.column));
+        if (casts.length === 0) continue;
+        const occurrences = (String(fileLines[line - 1] || '').match(word) || []).length;
+        if (occurrences !== casts.length || !casts.every(call => _recordIsNoCall(resolver.index, file, call))) continue;
+        if (resolver.resolveName(file, line)?.verdict !== 'yes') continue;
+        slot.tokens += casts.length;
+        slot.edits.push(...casts.map(call => call.column));
+    }
 }
 
 /**
@@ -2997,6 +3032,16 @@ function resolveUnqualifiedToken(resolver, file, token, bindings, typeParams, sp
             }
             return { verdict: 'unknown', reason: 'module-rebinding' };
         }
+    }
+    // C and C++ name lookup finds a variable or parameter declared before
+    // the name in an enclosing block before any type (C: one ordinary
+    // namespace; C++: the variable hides the class or alias): `ctx(out,
+    // vargs)` after `auto& vargs = ..` passes the variable (fix #427).
+    if (space === 'type' && family === 'c' && bindings.some(binding =>
+        ['variable', 'parameter'].includes(binding.role.why) && !sameNode(binding.node, token.node) &&
+        binding.scope && binding.scope.type !== 'translation_unit' && contains(binding.scope, token.node) &&
+        binding.node.startIndex < token.node.startIndex)) {
+        return { verdict: 'no', reason: 'local-binding' };
     }
     if (space === 'value') {
         const member = memberShadowOf(resolver, file, token.node);

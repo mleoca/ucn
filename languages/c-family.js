@@ -405,6 +405,18 @@ const definitionReadingMemo = new Map(); // grammar + replacement list -> readin
 const IDENTIFIER_TEXT = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /**
+ * A replacement list without the object-like macro names `isDecoration`
+ * accepts (names that expand to declaration specifiers or nothing), as
+ * preprocessing tokens joined by spaces (fix #427).
+ */
+function withoutDecorationMacros(body, isDecoration) {
+    const tokens = lexPP(String(body || ''));
+    if (!tokens.some(token => token.k === 'id' && isDecoration(token.v))) return body;
+    return tokens.filter((token, i) => !(token.k === 'id' && tokens[i + 1]?.v !== '(' && isDecoration(token.v)))
+        .map(token => token.v).join(' ');
+}
+
+/**
  * Per-file evidence for decoration decisions, gathered lazily from the
  * file's own tree and directives: names proven types by an occurrence, names
  * proven decoration by a recovery shape that proves it, and the file's own
@@ -446,6 +458,9 @@ class DecorationEvidence {
             }
         }
         if (this.defines.has(name)) return this.defines.get(name);
+        // A definition that names itself (or one that names it) reads as
+        // no reading while it is being read.
+        this.defines.set(name, null);
         const bodies = [];
         const code = this.code;
         // A name the file does not define reads by the project's definitions
@@ -471,6 +486,14 @@ class DecorationEvidence {
             }
             bodies.push(body.replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, ' '));
         }
+        // Object-like macros a body names that themselves read as
+        // decoration expand to specifiers or nothing: the body reads as the
+        // rest of it (fix #427: `#define API __declspec(dllexport) VIS` with
+        // `#define VIS __attribute__((visibility("default")))` or empty).
+        const reduced = bodies.map(body => withoutDecorationMacros(body, word => word !== name &&
+            (this.defineEnds.has(word) || externalMacroContext?.objectBodies?.has(word)) &&
+            this.defined(word) === 'decoration'));
+        bodies.splice(0, bodies.length, ...reduced);
         const readings = new Set(bodies.map(body => this.readBody(body)));
         let reading = readings.size === 1 ? [...readings][0] : null;
         // A statement macro defined empty in some configuration
@@ -504,11 +527,24 @@ class DecorationEvidence {
     }
 
     probeBody(text) {
-        if (/^catch\b/.test(text)) {
-            const tree = safeParse(this.parser, `void __ucn_probe__() { try { } ${text} }`, undefined, PARSE_OPTIONS);
+        const statementProbe = source => {
+            const tree = safeParse(this.parser, source, undefined, PARSE_OPTIONS);
             const clean = !!tree && !tree.rootNode.hasError;
             tree?.delete?.();
-            return clean ? 'statement' : null;
+            return clean;
+        };
+        if (/^catch\b/.test(text)) {
+            // A complete handler, or (fix #427) a handler head the block
+            // after the invocation completes (`catch(...)`).
+            return statementProbe(`void __ucn_probe__() { try { } ${text} }`) ||
+                statementProbe(`void __ucn_probe__() { try { } ${text} { } }`) ? 'statement' : null;
+        }
+        // A conditional head with its condition (`if(true)`, `if(false)`):
+        // removed, the block after it stays a statement (fix #427: one
+        // configuration's `try`/`catch(...)` is another's `if(true)` /
+        // `if(false)`).
+        if (/^(?:if|while|for|switch)\s*\(/.test(text)) {
+            return statementProbe(`void __ucn_probe__() { ${text} { } }`) ? 'statement' : null;
         }
         const probe = source => {
             const tree = safeParse(this.parser, source, undefined, PARSE_OPTIONS);
@@ -998,6 +1034,14 @@ function dependentTypeInBodyError(node) {
     return false;
 }
 
+/** `Class::*` with no declarator name after the `*` (the grammar's MISSING name). */
+function memberPointerAbstractDeclarator(node) {
+    const name = node.childForFieldName('name');
+    if (name?.type !== 'pointer_type_declarator') return false;
+    const declarator = name.childForFieldName('declarator');
+    return !!declarator?.isMissing && name.namedChildCount === 1;
+}
+
 function macroTypeRanges(tree, code, evidence = null) {
     const ranges = [];
     const pairs = [];
@@ -1044,6 +1088,15 @@ function macroTypeRanges(tree, code, evidence = null) {
         return true;
     };
     traverseTree(tree.rootNode, node => {
+        // An abstract pointer-to-member declarator (`Ret (Class::*)(Args...)`,
+        // `Type Class::*`) has no reading in the grammar, which then misreads
+        // the whole declaration (fix #427). Read with `*` in place of
+        // `Class::*`, it is the pointer declarator of the same shape; the
+        // parameter keeps its written type (structuredParams).
+        if (treeHasError && node.type === 'qualified_identifier' && memberPointerAbstractDeclarator(node)) {
+            ranges.push([node.startIndex, node.endIndex, '*'.padStart(node.endIndex - node.startIndex, ' ')]);
+            return false;
+        }
         ranges.push(...errorMacroRanges(node, code, pairs, evidence));
         const statementMacro = statementMacroRange(node, code, evidence);
         if (statementMacro) ranges.push(statementMacro);
@@ -2540,6 +2593,9 @@ function functionDeclarator(node) {
     }
     const direct = node.childForFieldName('declarator');
     if (direct?.type === 'operator_cast') return direct;
+    // An out-of-class conversion operator (`T::operator int() const {..}`,
+    // fix #427): the qualified name holds the operator_cast.
+    if (direct?.type === 'qualified_identifier' && qualifiedOperatorCast(direct)) return direct;
     const unwrapped = unwrapDeclarator(direct);
     if (unwrapped) return unwrapped;
     for (const child of node.namedChildren || []) {
@@ -2548,6 +2604,39 @@ function functionDeclarator(node) {
         if (found) return found;
     }
     return null;
+}
+
+/**
+ * A C++17 deduction guide (`template<class T> W(T) -> W<T>;`, `explicit
+ * W(const char*) -> W<int>;`): a declaration with no type whose function
+ * declarator names a class template and whose trailing return type is a
+ * template-id of that same template ([temp.deduct.guide]). It declares no
+ * function; its name token names the class template (fix #427). Returns the
+ * name node, or null.
+ */
+function deductionGuideOf(node) {
+    if (!node || !['declaration', 'field_declaration', 'ERROR'].includes(node.type)) return null;
+    if (node.childForFieldName?.('type')) return null;
+    const declarator = node.type === 'ERROR'
+        ? (node.namedChildren || []).find(child => child.type === 'function_declarator')
+        : node.childForFieldName('declarator');
+    if (declarator?.type !== 'function_declarator') return null;
+    const nameNode = declarator.childForFieldName('declarator');
+    if (!nameNode || !['identifier', 'type_identifier', 'field_identifier'].includes(nameNode.type)) return null;
+    const trailing = (declarator.namedChildren || []).find(child => child.type === 'trailing_return_type');
+    let type = trailing?.namedChildren.find(child => child.type === 'type_descriptor')?.childForFieldName('type');
+    while (type?.type === 'qualified_identifier') type = type.childForFieldName('name');
+    if (type?.type !== 'template_type') return null;
+    return type.childForFieldName('name')?.text === nameNode.text ? nameNode : null;
+}
+
+/** The operator_cast a qualified name ends in (`A::B::operator int`), or null. */
+function qualifiedOperatorCast(node) {
+    let current = node;
+    while (current?.type === 'qualified_identifier') {
+        current = current.childForFieldName('name') || current.namedChildren[current.namedChildCount - 1];
+    }
+    return current?.type === 'operator_cast' ? current : null;
 }
 
 function canonicalCallableName(raw) {
@@ -2627,6 +2716,27 @@ function declaratorIdentity(declarator) {
         const scopeNode = scopes[scopes.length - 1];
         const qualifier = scopes.slice(0, -1).map(scope => scope.text.replace(/\s+/g, ''))
             .filter(Boolean).join('::');
+        if (nameNode?.type === 'operator_cast') {
+            // `Text::operator Text::bool_type()` converts to the member type
+            // the class body spells `bool_type` (fix #427): the owner's own
+            // qualification is not part of the in-class name.
+            const cast = declaratorIdentity(nameNode);
+            if (!cast.name) return {};
+            const owner = [...scopes.map(scope => scope.text.replace(/\s+/g, ''))].join('::');
+            let name = cast.name;
+            for (const prefix of [owner, scopeNode?.text?.replace(/\s+/g, '')].filter(Boolean)) {
+                if (name.startsWith(`operator ${prefix}::`)) {
+                    name = `operator ${name.slice(`operator ${prefix}::`.length)}`;
+                    break;
+                }
+            }
+            return {
+                ...cast,
+                name,
+                className: scopeNode?.text?.split('::').pop(),
+                ...(qualifier && { ownerQualifier: qualifier }),
+            };
+        }
         return {
             name: canonicalCallableName(nameNode?.text),
             className: scopeNode?.text?.split('::').pop(),
@@ -3162,9 +3272,31 @@ function paramTypeText(param, identity) {
     return typeText || null;
 }
 
-function structuredParams(paramsNode) {
+/**
+ * The written text of a node the recovery read with `*` in place of an
+ * abstract pointer-to-member declarator's `Class::*` (fix #427), or null.
+ */
+function writtenMemberPointerText(node, lines) {
+    if (!node || !lines) return null;
+    const start = node.startPosition;
+    const end = node.endPosition;
+    if (start.row !== end.row) return null;
+    const written = lines[start.row]?.slice(start.column, end.column);
+    return written && written !== node.text && /::\s*\*/.test(written)
+        ? written.replace(/\s+/g, ' ').trim() : null;
+}
+
+function paramsDisplayText(paramsNode, lines) {
+    const text = writtenMemberPointerText(paramsNode, lines) || nodeTextWithoutComments(paramsNode);
+    return text.replace(/^\(|\)$/g, '').trim();
+}
+
+function structuredParams(paramsNode, lines = null) {
     if (!paramsNode) return [];
     const result = [];
+    // A parameter the recovery read as a pointer declarator in place of an
+    // abstract pointer-to-member one keeps its written type (fix #427).
+    const writtenMemberPointer = param => writtenMemberPointerText(param, lines);
     for (const param of paramsNode.namedChildren || []) {
         if (param.type !== 'parameter_declaration' &&
             param.type !== 'optional_parameter_declaration' &&
@@ -3197,6 +3329,8 @@ function structuredParams(paramsNode) {
                 info.unnamed = true;
             }
         }
+        const memberPointer = writtenMemberPointer(param);
+        if (memberPointer && info.unnamed) info.name = memberPointer;
         if (param.type === 'optional_parameter_declaration') info.optional = true;
         let declaratorCursor = declarator;
         let variadicDeclarator = false;
@@ -3388,6 +3522,26 @@ function templatedDeclaration(node) {
     return current || node;
 }
 
+/**
+ * The cv- and ref-qualifiers of a member function's implicit object
+ * parameter (`int f() const &`, fix #427): { memberConst, refQualifier }.
+ */
+function memberQualifiers(declarator) {
+    let holder = declarator;
+    if (holder?.type === 'qualified_identifier') holder = qualifiedOperatorCast(holder);
+    if (holder?.type === 'operator_cast') {
+        holder = holder.childForFieldName('declarator') ||
+            (holder.namedChildren || []).find(child => child.type === 'abstract_function_declarator');
+    }
+    if (!holder) return {};
+    const out = {};
+    for (const child of holder.namedChildren || []) {
+        if (child.type === 'type_qualifier' && child.text === 'const') out.memberConst = true;
+        if (child.type === 'ref_qualifier') out.refQualifier = child.text.replace(/\s+/g, '');
+    }
+    return out;
+}
+
 function memberFromNode(node, className, access, lines, mode) {
     const declarator = functionDeclarator(node);
     if (!declarator) return null;
@@ -3402,8 +3556,8 @@ function memberFromNode(node, className, access, lines, mode) {
     if (isConstructor && identity.name.startsWith('~')) modifiers.push('destructor');
     return {
         name: identity.name,
-        params: paramsNode ? nodeTextWithoutComments(paramsNode).replace(/^\(|\)$/g, '').trim() : '...',
-        paramsStructured: structuredParams(paramsNode),
+        params: paramsNode ? paramsDisplayText(paramsNode, lines) : '...',
+        paramsStructured: structuredParams(paramsNode, lines),
         returnType: isConstructor ? null :
             (identity.conversionType || returnTypeOf(templatedDeclaration(node))),
         startLine,
@@ -3417,6 +3571,7 @@ function memberFromNode(node, className, access, lines, mode) {
         memberType: isConstructor ? 'constructor' : 'method',
         isMethod: true,
         isConstructor,
+        ...(mode === 'cpp' && memberQualifiers(declarator)),
         ...(enclosingNamespace(node) && {
             namespace: enclosingNamespace(node),
         }),
@@ -3455,6 +3610,16 @@ function fieldMembers(node, access, lines) {
         const identity = declaratorIdentity(child);
         if (!identity.name || identity.name === typeNode?.text) continue;
         const { startLine, endLine, indent, sourceSpan } = nodeToLocation(child, lines);
+        // Pointer declarators of the field (`State* m_raw`): `->` on it
+        // dereferences the pointer, on an object it calls operator-> (fix #427).
+        let pointers = 0;
+        let arrays = false;
+        for (let current = child; current && !IDENTIFIER_NODES.has(current.type);) {
+            if (current.type === 'pointer_declarator') pointers++;
+            if (current.type === 'array_declarator' || current.type === 'function_declarator') arrays = true;
+            current = current.childForFieldName('declarator') ||
+                (current.namedChildren || []).find(next => next.type.endsWith('_declarator'));
+        }
         fields.push({
             name: identity.name,
             startLine,
@@ -3464,6 +3629,7 @@ function fieldMembers(node, access, lines) {
             modifiers: access ? [access] : [],
             memberType: 'field',
             fieldType: typeNode?.text || null,
+            ...(!arrays && { fieldPointers: pointers }),
         });
     }
     return fields;
@@ -3968,7 +4134,16 @@ function findFunctionsInTree(code, tree, mode, sourceLines = null) {
         }
         if (!FUNCTION_CONTAINERS.has(node.type)) return true;
         const declarator = functionDeclarator(node);
-        if (!declarator) return true;
+        if (!declarator) {
+            // `M(name) { .. }` read as a definition with no function
+            // declarator (C, fix #427).
+            const generated = node.type === 'function_definition' ? generatedCallableOf(node, lines) : null;
+            if (generated) {
+                functions.push(generated);
+                return false;
+            }
+            return true;
+        }
         // A macro invocation read as a function is not one (fix #385); an
         // invocation with a body at namespace scope defines the callable
         // the expansion declares around that body (fix #391).
@@ -3980,6 +4155,8 @@ function findFunctionsInTree(code, tree, mode, sourceLines = null) {
         const owner = enclosingClass(node);
         const identity = declaratorIdentity(declarator);
         if (!identity.name) return true;
+        // A deduction guide declares no function (fix #427).
+        if (mode === 'cpp' && deductionGuideOf(node)) return false;
         // A name joined by `##` is replacement-list text of a macro the
         // grammar could not read as a directive, never a declared function
         // (fix #387).
@@ -4023,8 +4200,8 @@ function findFunctionsInTree(code, tree, mode, sourceLines = null) {
             name: identity.name,
             sourceSpan: lexicalEnd == null ? location.sourceSpan : { ...location.sourceSpan,
                 end: lexicalEnd, endLine, endColumn: lexicalEnd - lineStarts[endLine - 1] },
-            params: paramsNode ? nodeTextWithoutComments(paramsNode).replace(/^\(|\)$/g, '').trim() : '...',
-            paramsStructured: structuredParams(paramsNode),
+            params: paramsNode ? paramsDisplayText(paramsNode, lines) : '...',
+            paramsStructured: structuredParams(paramsNode, lines),
             returnType: isConstructor ? null :
                 (identity.conversionType || returnTypeOf(node)),
             startLine,
@@ -4040,6 +4217,7 @@ function findFunctionsInTree(code, tree, mode, sourceLines = null) {
                 receiver: identity.className,
                 isMethod: true,
             }),
+            ...(mode === 'cpp' && identity.className && memberQualifiers(declarator)),
             ...(friendOf && { friendOf: friendOf.ownerName || friendOf.name }),
             ...(mode === 'cpp' && isTemplateDependentCallable(node) && {
                 templateDependent: true,
@@ -4911,7 +5089,22 @@ function generatedCallableOf(node, lines) {
     let macroNode;
     let argsNode;
     let body;
-    if (node.type === 'function_definition') {
+    if (node.type === 'function_definition' &&
+        node.childForFieldName('declarator')?.type === 'parenthesized_declarator') {
+        // C reads `M(name) { .. }` as a definition of `name` returning the
+        // type `M` (fix #427); a function definition needs a function
+        // declarator, so the shape is an invocation with a body.
+        const declarator = node.childForFieldName('declarator');
+        const typeNode = node.childForFieldName('type');
+        body = node.childForFieldName('body');
+        if (body?.type !== 'compound_statement' || typeNode?.type !== 'type_identifier' ||
+            declarator.namedChildCount !== 1 || declarator.namedChild(0).type !== 'identifier' ||
+            (node.namedChildren || []).some(child => child.type === 'storage_class_specifier' ||
+                child.type === 'type_qualifier')) return null;
+        macroNode = { type: 'identifier', text: typeNode.text };
+        argsNode = declarator;
+        head = node;
+    } else if (node.type === 'function_definition') {
         const declarator = node.childForFieldName('declarator');
         body = node.childForFieldName('body');
         if (body?.type !== 'compound_statement' || declarator?.type !== 'function_declarator') return null;
@@ -4969,18 +5162,98 @@ function generatedCallableOf(node, lines) {
     const startLine = head.startPosition.row + 1;
     const endLine = body.endPosition.row + 1;
     const namespace = enclosingNamespace(head);
+    // The function the expansion declares, when the project defines the
+    // macro (fix #427): the file's own definition in effect, else the
+    // headers' function-head macros.
+    let templates = definition ? [definition] : null;
+    if (!templates && externalMacroContext?.functionHeads?.has(macroName)) {
+        templates = externalMacroContext.functionHeads.get(macroName);
+        externalMacroContext.consulted?.add(macroName);
+    }
+    const expanded = templates && expandedFunctionHead(templates, argsNode.text, isCppTree(node.tree));
     return {
-        name,
-        params: '...',
-        returnType: null,
+        name: expanded?.name || name,
+        params: expanded?.params ?? '...',
+        ...(expanded && { paramsStructured: expanded.paramsStructured }),
+        returnType: expanded?.returnType || null,
         startLine,
         endLine,
         indent: head.startPosition.column,
-        modifiers: [],
+        modifiers: expanded?.modifiers || [],
         ...(namespace && { namespace }),
-        generatedByMacro: { name: macroName, ...(names.length > 0 && { args: names }) },
+        generatedByMacro: { name: macroName, ...(names.length > 0 && { args: names }),
+            ...(expanded && { expanded: true }) },
         docstring: extractJSDocstring(lines, startLine),
     };
+}
+
+/**
+ * The function a function-like macro invocation's expansion declares (fix
+ * #427): the replacement list with the invocation's arguments substituted
+ * (`#` stringizes, `##` pastes), read as a function head. Its name,
+ * parameters, return type and storage class, when every definition gives
+ * one unqualified function; null otherwise (a nested macro, a member, a
+ * head the grammar cannot read).
+ */
+function expandedFunctionHead(templates, argsText, cpp) {
+    const args = splitInvocationArguments(argsText).map(arg => arg.trim());
+    let result = null;
+    for (const template of templates) {
+        const params = template.params || [];
+        const variadicIndex = params.indexOf('__VA_ARGS__');
+        if (variadicIndex < 0 ? args.length !== params.length && !(params.length === 0 && args.length === 1 && !args[0])
+            : args.length < variadicIndex) return null;
+        const valueOf = param => {
+            const at = params.indexOf(param);
+            if (at < 0) return null;
+            return at === variadicIndex ? args.slice(at).join(', ') : (args[at] ?? '');
+        };
+        const tokens = lexPP(String(template.body || ''));
+        const out = [];
+        for (let i = 0; i < tokens.length; i++) {
+            const token = tokens[i];
+            if (token.v === '#' && tokens[i + 1]?.k === 'id' && valueOf(tokens[i + 1].v) != null) {
+                out.push(JSON.stringify(valueOf(tokens[i + 1].v)));
+                i++;
+                continue;
+            }
+            if (token.v === '##') {
+                const right = tokens[i + 1];
+                if (!right || out.length === 0) return null;
+                const value = right.k === 'id' && valueOf(right.v) != null ? valueOf(right.v) : right.v;
+                out[out.length - 1] = `${out[out.length - 1]}${value}`;
+                i++;
+                continue;
+            }
+            out.push(token.k === 'id' && valueOf(token.v) != null ? valueOf(token.v) : token.v);
+        }
+        const text = out.join(' ');
+        const parser = require('./index').getParser(cpp ? 'cpp' : 'c');
+        const tree = parser && safeParse(parser, `${text} { }`, undefined, PARSE_OPTIONS);
+        try {
+            const definition = tree && !tree.rootNode.hasError && tree.rootNode.namedChildCount === 1
+                ? tree.rootNode.namedChild(0) : null;
+            if (definition?.type !== 'function_definition') return null;
+            const declarator = functionDeclarator(definition);
+            const identity = declarator && declaratorIdentity(declarator);
+            if (!identity?.name || identity.className || !/^[A-Za-z_]\w*$/.test(identity.name)) return null;
+            const paramsNode = parameterListOf(declarator);
+            const modifiers = modifiersOf(definition);
+            if (!modifiers.includes('static')) modifiers.push('export');
+            const head = {
+                name: identity.name,
+                params: paramsNode ? nodeTextWithoutComments(paramsNode).replace(/^\(|\)$/g, '').trim() : '',
+                paramsStructured: structuredParams(paramsNode),
+                returnType: returnTypeOf(definition),
+                modifiers,
+            };
+            if (result && (result.name !== head.name || result.params !== head.params)) return null;
+            result = head;
+        } finally {
+            tree?.delete?.();
+        }
+    }
+    return result;
 }
 
 function macroInvocationDeclaration(node) {
@@ -5168,6 +5441,7 @@ function buildVariableTypes(tree) {
     const memberReceiverUses = [];
     const ambiguousDirectInitializers = [];
     const autoElementInitializers = [];
+    const decltypeDeclarations = [];
     const declaratorStaticType = (type, declarator, holder) => {
         // The declaration's type node carries only the base type. Preserve
         // array rank from the AST declarator for overload arguments:
@@ -5206,7 +5480,13 @@ function buildVariableTypes(tree) {
             child.type === 'type_qualifier' && child.text === 'const');
         return `${pointeeConst ? 'const ' : ''}${type} ${'*'.repeat(pointers)}`;
     };
-    const addBindings = (node, type, pointeeType, scope, declarators, containerElementType, typeNamespace) => {
+    const addBindings = (node, type, pointeeType, scope, declarators, containerElementType, typeNamespace,
+        constKnown = true) => {
+        // The decl-specifier `const` qualifies the object a value or
+        // reference names, or what a pointer points at (fix #427).
+        const declConst = constKnown
+            ? (node.children || []).some(child => child.type === 'type_qualifier' && child.text === 'const')
+            : undefined;
         for (const declarator of declarators) {
             const identity = declaratorIdentity(declarator);
             if (!identity.name) continue;
@@ -5240,6 +5520,7 @@ function buildVariableTypes(tree) {
                     ? 'constructor' : 'annotation', declarator),
                 ...(pointeeType && { pointeeType }),
                 ...(pointers === 0 && arrays === 0 && { valueDeclarator: true }),
+                ...(declConst !== undefined && arrays === 0 && pointers <= 1 && { declConst, pointers }),
                 ...(typeNamespace?.name === type && { typeNamespace: typeNamespace.namespace }),
                 declaredAt: node.type === 'parameter_declaration'
                     ? scope.startIndex : declarator.startIndex,
@@ -5277,6 +5558,19 @@ function buildVariableTypes(tree) {
         }
         const typeNode = node.childForFieldName('type') ||
             (node.namedChildren || []).find(child => TYPE_NODES.has(child.type));
+        // `decltype(x) v` declares v with x's declared type; any other
+        // decltype (`decltype(auto)`, an expression) leaves v untyped, never
+        // a type named by the decltype's text (fix #427).
+        if (typeNode?.type === 'decltype' || (typeNode?.type === 'placeholder_type_specifier' &&
+            (typeNode.namedChildren || []).some(child => child.type === 'decltype'))) {
+            const operand = typeNode.type === 'decltype' && typeNode.namedChildCount === 1
+                ? typeNode.namedChild(0) : null;
+            if (operand?.type === 'identifier') {
+                decltypeDeclarations.push({ node, operand, scope: variableBindingScope(node),
+                    declarators: variableDeclarators(node) });
+            }
+            return true;
+        }
         const type = typeName(typeNode);
         if (type === 'auto') {
             // `auto &c = items[i]` binds the declared element (fix #359);
@@ -5382,6 +5676,24 @@ function buildVariableTypes(tree) {
                 [candidate.declarator]);
         }
     }
+    // In source order: `decltype(copy) c2` sees the binding `copy` got.
+    decltypeDeclarations.sort((a, b) => a.node.startIndex - b.node.startIndex);
+    for (const candidate of decltypeDeclarations) {
+        const at = candidate.operand.startIndex;
+        const operands = bindings.filter(binding =>
+            binding.name === candidate.operand.text &&
+            binding.scopeStart <= at && at < binding.scopeEnd &&
+            binding.declaredAt <= at);
+        operands.sort((a, b) => (a.scopeEnd - a.scopeStart) - (b.scopeEnd - b.scopeStart) ||
+            b.declaredAt - a.declaredAt);
+        const operand = operands[0];
+        // An object (not a pointer) of a named type: the declared variable
+        // has its type.
+        if (operand?.type && operand.valueDeclarator && !operand.pointeeType) {
+            addBindings(candidate.node, operand.type, undefined, candidate.scope, candidate.declarators,
+                undefined, undefined, false);
+        }
+    }
     // Bindings are complete before call extraction. Partition by spelling
     // once: every argument and receiver lookup otherwise scans all locals
     // in the translation unit, including unrelated functions.
@@ -5414,6 +5726,14 @@ function buildVariableTypes(tree) {
         },
         getPointee: (name, atNode) =>
             resolveBinding(name, atNode)?.pointeeType,
+        // Is the object `name` denotes (through `->` when `arrow`) const?
+        // true / false where the declaration decides, else undefined.
+        objectConst: (name, atNode, arrow) => {
+            const binding = resolveBinding(name, atNode);
+            if (!binding || binding.declConst === undefined) return undefined;
+            if (arrow ? binding.pointers !== 1 : binding.pointers !== 0) return undefined;
+            return binding.declConst;
+        },
         // fix #379: `v->m()` on a variable declared as an object (no
         // pointer declarator) goes through the class's operator->: the
         // declared type is a smart pointer or iterator (possibly behind an
@@ -6072,6 +6392,15 @@ function findCallsInTree(code, parser, _options = {}, existingTree = null,
                 ...(functionNode?.type === 'identifier' &&
                     cLocalBindingNames(tree).has(identity.name) &&
                     cBareNameShadowedByLocal(node, identity.name) && { localShadow: true }),
+                // `(N)(x)` (fix #427): a call of N, or a cast to the type N;
+                // which one depends on what N names where it is written.
+                ...(functionNode?.type === 'parenthesized_expression' && functionNode.namedChildCount === 1 &&
+                    ['identifier', 'qualified_identifier'].includes(functionNode.namedChild(0).type) && {
+                    parenthesizedCallee: true,
+                    ...(functionNode.namedChild(0).type === 'identifier' &&
+                        cLocalBindingNames(tree).has(identity.name) &&
+                        cBareNameShadowedByLocal(node, identity.name) && { localShadow: true }),
+                }),
                 ...(identity.receiver && { receiver: identity.receiver }),
                 ...(identity.isPathCall && { isPathCall: true }),
                 ...(identity.globalQualified && { globalQualified: true }),
@@ -6090,6 +6419,12 @@ function findCallsInTree(code, parser, _options = {}, existingTree = null,
                 // as an object records its declared type for that lookup.
                 ...(identity.pointerAccess && receiverNode?.type === 'identifier' &&
                     receiverFields.length === 0 && { receiverArrow: true }),
+                // The implicit object's constness where the declaration of
+                // a plain variable receiver decides it (fix #427).
+                ...(receiverNode?.type === 'identifier' && receiverFields.length === 0 && !arrowThroughObject &&
+                    variableTypes.objectConst?.(receiverNode.text, node, identity.pointerAccess) !== undefined && {
+                    receiverConst: variableTypes.objectConst(receiverNode.text, node, identity.pointerAccess),
+                }),
                 ...(arrowThroughObject && variableTypes.get(receiverRoot, node) && {
                     receiverArrowObject: variableTypes.get(receiverRoot, node),
                     receiverArrowObjectAt: variableTypes.evidence(receiverRoot, node)
@@ -6124,6 +6459,9 @@ function findCallsInTree(code, parser, _options = {}, existingTree = null,
                     receiverField: receiverFields[0],
                     receiverFields,
                     ...(receiverRootType && { receiverRootType }),
+                    // `field->m()` (fix #427): the member is looked up in
+                    // what `->` yields from the last field's declared type.
+                    ...(identity.pointerAccess && { receiverFieldArrow: true }),
                 }),
                 ...(assignedTo && { assignedTo }),
                 argCount: args.argCount,
@@ -6144,7 +6482,10 @@ function findCallsInTree(code, parser, _options = {}, existingTree = null,
             // parenthesized-value shape and recover its base/path identity.
             const typeNode = node.childForFieldName('type');
             const valueNode = node.childForFieldName('value');
-            if (typeNode?.type === 'type_descriptor' &&
+            // A declarator or a qualifier in the parentheses (`(BYTE*)(p)`,
+            // `(const T)(x)`) only spells a type (fix #427).
+            if (typeNode?.type === 'type_descriptor' && !typeNode.childForFieldName('declarator') &&
+                !(typeNode.namedChildren || []).some(child => child.type === 'type_qualifier') &&
                 valueNode?.type === 'parenthesized_expression') {
                 const identity = callIdentity(typeNode);
                 if (identity.name) {
@@ -6158,6 +6499,7 @@ function findCallsInTree(code, parser, _options = {}, existingTree = null,
                         isMethod: identity.isMethod,
                         ...(identity.receiver && { receiver: identity.receiver }),
                         ...(identity.isPathCall && { isPathCall: true }),
+                        parenthesizedCallee: true,
                         argCount: values.length,
                         argKinds: values.map(value =>
                             staticArgumentKind(value, variableTypes)),
@@ -6388,6 +6730,36 @@ function directiveRanges(code) {
     if (directiveRangesMemo.size >= 8) directiveRangesMemo.delete(directiveRangesMemo.keys().next().value);
     directiveRangesMemo.set(code, ranges);
     return ranges;
+}
+
+/**
+ * A namespace-scope function declared `static` keeps internal linkage in
+ * every later declaration of the file that omits the storage class, its
+ * definition included (C11 6.2.2p4-5; C++ [dcl.stc]: successive
+ * declarations of an entity agree on linkage). Those declarations are
+ * recorded `static` (fix #427). A `static` declaration in a conditional
+ * branch reaches only the later declarations inside that branch.
+ */
+function inheritDeclaredLinkage(functions, mode) {
+    const paramKey = fn => (fn.paramsStructured || []).map(param => param.variadic ? '...'
+        : String(param.type || (param.unnamed ? param.name : '') || '').replace(/\s+/g, '')).join(',');
+    const keyOf = fn => mode === 'cpp' ? `${fn.namespace || ''}\0${fn.name}\0${paramKey(fn)}` : fn.name;
+    const free = fn => !fn.className && !fn.receiver && !fn.isMethod && !fn.friendOf &&
+        !fn.lexicalScopeStartLine && Array.isArray(fn.modifiers);
+    const internal = new Map();
+    const ordered = functions.filter(free).sort((a, b) => a.startLine - b.startLine);
+    for (const fn of ordered) {
+        const key = keyOf(fn);
+        if (fn.modifiers.includes('static')) {
+            if (!internal.has(key)) internal.set(key, []);
+            internal.get(key).push(fn);
+            continue;
+        }
+        const reaches = (internal.get(key) || []).some(prior => prior.startLine < fn.startLine &&
+            (!prior.ppBranch || (fn.startLine >= prior.ppBranch[0] && fn.startLine <= prior.ppBranch[1])));
+        if (!reaches) continue;
+        fn.modifiers = [...fn.modifiers.filter(modifier => modifier !== 'export'), 'static'];
+    }
 }
 
 function attributeCallsToLexicalFunctions(calls, functions) {
@@ -7000,6 +7372,7 @@ function parse(code, parser, mode, options = {}) {
             classes.sort(byLine);
             calls.sort(byLine);
         }
+        inheritDeclaredLinkage(functions, mode);
         attributeCallsToLexicalFunctions(calls, functions);
         markDirectiveBodyCalls(code, calls);
         const result = {
@@ -7180,6 +7553,9 @@ function objectMacroReading(parser, bodies) {
 }
 
 module.exports = {
+    deductionGuideOf,
+    endsFunctionHead,
+    withoutDecorationMacros,
     implicitOwnerScope,
     implicitConstructorInfo,
     isInvokedName,

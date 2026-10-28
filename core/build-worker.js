@@ -55,6 +55,7 @@ function externalMacrosFor(language) {
         consulted: new Set(),
         get objectBodies() { return resolve()?.objectBodies || EMPTY_MACROS; },
         get functionMacros() { return resolve()?.functionMacros || EMPTY_MACROS; },
+        get functionHeads() { return resolve()?.functionHeads || EMPTY_MACROS; },
     };
 }
 const signalArray = new Int32Array(signal);

@@ -3289,8 +3289,7 @@ function findCallers(index, name, options = {}) {
                         const strictOwner = binding => {
                             const memoKey = `${filePath}\0${call.name}\0${binding.startLine}`;
                             if (ownerMemo?.has(memoKey)) return ownerMemo.get(memoKey);
-                            const own = fileSymbols.find(symbol => symbol.name === call.name &&
-                                symbol.startLine === binding.startLine);
+                            const own = _firstSymbolAt(fileSymbols, call.name, binding.startLine);
                             let best = null;
                             if (!own) {
                                 best = index.findEnclosingFunction(filePath, binding.startLine, true);
@@ -4033,6 +4032,19 @@ function findCallers(index, name, options = {}) {
                         if (arity && arity.related.length > 0 && arity.matching.length === 0) {
                             recordExcluded(filePath, call.line, 'generic-arity-mismatch');
                             continue;
+                        }
+                    }
+                    // `field->m()` reaches what `->` yields (fix #427).
+                    if (call.receiverFieldArrow && fileEntry.language === 'cpp' &&
+                        (fieldHopType || hopInfo.declaredText)) {
+                        const reached = _cppFieldArrowType(index, fieldHopType, hopInfo.declaredText,
+                            hopInfo.declaredPointers);
+                        if (reached !== fieldHopType) {
+                            fieldHopType = reached;
+                            const origin = reached && _cppCompletedTypeOrigin(index, hopInfo.declaredFile || filePath, reached);
+                            hopInfo.fromFile = origin?.fromFile;
+                            delete hopInfo.namespace;
+                            if (origin?.namespace) hopInfo.namespace = origin.namespace;
                         }
                     }
                     if (fieldHopType && hopInfo.fromFile &&
@@ -5088,11 +5100,16 @@ function findCallers(index, name, options = {}) {
                     targetDefs.some(definition => definition.className);
                 let cppTypeQualifiedPath = false;
                 let cppQualifierClasses = null;
+                // What the qualifier denotes by name lookup ('type',
+                // 'namespace', 'unknown', ...) where the language does not
+                // code it in the segment's case (fix #427).
+                let scopeQualifierKind = null;
                 if (fileEntry.language === 'cpp' && call.isPathCall &&
                     call.receiver && !call.globalQualified) {
                     const verdict = _cppPathQualifierVerdict(
                         index, filePath, call, targetDefs);
                     cppQualifierClasses = verdict.classes || null;
+                    scopeQualifierKind = verdict.kind || null;
                     if (verdict.exclude) {
                         recordExcluded(filePath, call.line, verdict.exclude);
                         continue;
@@ -5811,6 +5828,19 @@ function findCallers(index, name, options = {}) {
                                     // Not evidence against — visible possible-dispatch.
                                     // Go struct embedding binds statically and stays
                                     // excluded.
+                                    // A class template deriving from its own template
+                                    // parameter (`Holder<T> : T`) has members its
+                                    // argument supplies (fix #427).
+                                    const parameterBase = fileEntry.language === 'cpp' &&
+                                        _cppTemplateParameterBase(index, knownType, call.name);
+                                    if (parameterBase) {
+                                        routeUnverified(filePath, fileEntry, call, 'template-parameter-base', calledAs, {
+                                            dispatchVia: parameterBase,
+                                            uncertaintyClass: 'compile-time-dispatch',
+                                            dispatchFamily: `${name} members a template argument supplies (${parameterBase})`,
+                                        });
+                                        continue;
+                                    }
                                     if (_dispatchCapableSupertype(index, fileEntry.language, knownType, targetDefs, definitions) ||
                                         (!knownTypeHasProjectIdentity && externalContractTarget()?.via === knownType)) {
                                         // Declared with a supertype, holding exactly a
@@ -6112,8 +6142,8 @@ function findCallers(index, name, options = {}) {
                                     // `Self` exempt (fix #232, the #222(2) rule): Self names the
                                     // enclosing impl's type, not a foreign one — same-class
                                     // resolution above owns it.
-                                    if (call.isPathCall && /^[A-Z]/.test(receiverSegment) &&
-                                        receiverSegment !== 'Self') {
+                                    if (call.isPathCall && receiverSegment !== 'Self' &&
+                                        _pathSegmentNamesType(fileEntry.language, receiverSegment, scopeQualifierKind)) {
                                         // Generic-param carve-out (fix #296 — the
                                         // #222(2) single-def branch had this, the
                                         // multi-def fallback didn't): `F::as_cast(x)`
@@ -6698,8 +6728,8 @@ function findCallers(index, name, options = {}) {
                         // reach here.
                         const pathReceiverSegment = call.isPathCall && call.receiver
                             ? String(call.receiver).split('::').pop() : null;
-                        if (pathReceiverSegment &&
-                            /^[A-Z]/.test(pathReceiverSegment) && pathReceiverSegment !== 'Self') {
+                        if (pathReceiverSegment && pathReceiverSegment !== 'Self' &&
+                            _pathSegmentNamesType(fileEntry.language, pathReceiverSegment, scopeQualifierKind)) {
                             if (/^[A-Z][A-Z0-9]?$/.test(pathReceiverSegment) &&
                                 !(index.symbols.get(pathReceiverSegment) || []).some(d => IDENTITY_TYPE_KINDS.has(d.type))) {
                                 routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs, {
@@ -6785,7 +6815,7 @@ function findCallers(index, name, options = {}) {
                         // scope keywords, not module names — exempt.
                         if (call.isPathCall && call.receiver) {
                             const _modSeg = String(call.receiver).split('::').pop();
-                            if (_modSeg && !/^[A-Z]/.test(_modSeg) &&
+                            if (_modSeg && !_pathSegmentNamesType(fileEntry.language, _modSeg, scopeQualifierKind) &&
                                 !['crate', 'self', 'super'].includes(_modSeg)) {
                                 if (fileEntry.language === 'cpp' &&
                                     _cppQualifiedPathOwnsTarget(
@@ -8466,6 +8496,12 @@ function findCallees(index, definition, options = {}) {
             if (langTraits(language)?.inheritedOverloadSignatures) {
                 call = { ...call, argumentFile: index.files.get(def.file)?.relativePath };
             }
+            // The implicit object of `this->m()` / a bare member call is the
+            // enclosing member function's (fix #427).
+            if (language === 'cpp' && call.receiverConst === undefined && call.isMethod !== undefined) {
+                const objectConst = _cppObjectConstness(call, def);
+                if (objectConst !== undefined) call = { ...call, receiverConst: objectConst };
+            }
             if (collectAccount) call = _javaReceiverProducerCall(index, call, def.file, true);
             call = _withModuleValueAliasReceiver(index, def.file,
                 _withoutShadowedStdLiteral(index, _destructuredMemberView(call)), structuralCallee);
@@ -9052,6 +9088,20 @@ function findCallees(index, definition, options = {}) {
                     const fields = call.receiverFields || [call.receiverField];
                     fieldHopType = _declaredFieldPathType(index, hopRoot, fields,
                         language, fieldHopInfo, call.receiverRootNamespace, null, def.file);
+                    // `field->m()` reaches what `->` yields (fix #427).
+                    if (call.receiverFieldArrow && language === 'cpp' &&
+                        (fieldHopType || fieldHopInfo.declaredText)) {
+                        const reached = _cppFieldArrowType(index, fieldHopType, fieldHopInfo.declaredText,
+                            fieldHopInfo.declaredPointers);
+                        if (reached !== fieldHopType) {
+                            fieldHopType = reached;
+                            const origin = reached && _cppCompletedTypeOrigin(index,
+                                fieldHopInfo.declaredFile || def.file, reached);
+                            fieldHopInfo.fromFile = origin?.fromFile;
+                            delete fieldHopInfo.namespace;
+                            if (origin?.namespace) fieldHopInfo.namespace = origin.namespace;
+                        }
+                    }
                     // Imported Go root types outside this project have no
                     // indexed field table. The attempted field hop is still
                     // owned by that external type and must not fall through
@@ -9343,7 +9393,13 @@ function findCallees(index, definition, options = {}) {
                 !_isReservedReceiver(language, call.receiver) &&
                 !(localTypes && localTypes.has(call.receiver))) {
                 typeQual = _calleeTypeQualifiedReceiver(index, def, fileEntry, call, language);
-                if (typeQual) siteEvidence.get(siteId).evidence.typeQualifiedReceiver = true;
+                if (typeQual?.moduleOwnedPath) {
+                    // A namespace path owns the name like a module path.
+                    const record = siteEvidence.get(siteId);
+                    record.call = { ...call, moduleOwnedPath: true };
+                    record.evidence.moduleOwnedPath = true;
+                    record.evidence.hasImportEvidence = true;
+                } else if (typeQual) siteEvidence.get(siteId).evidence.typeQualifiedReceiver = true;
             }
 
             // Package-qualified NON-method records (fix #268, chi-measured):
@@ -17588,6 +17644,97 @@ function _cppArrowObjectPointeeAt(index, typeName, rawText, depth) {
     return _normalizeFieldTypeName(returned.replace(/\*\s*$/, ''), 'cpp');
 }
 
+/**
+ * The class a C++ `field->m()` reaches (fix #427): `->` applies to the
+ * field's declared type. A project class without an operator-> in its
+ * hierarchy was declared a pointer (the declarator holds the `*`; the code
+ * compiles), so it keeps its type; a class with one yields its operator->'s
+ * pointee; a standard smart pointer or an alias its pointee. Anything else
+ * (an iterator, an external class) is undecidable: null.
+ */
+/**
+ * Where a C/C++ type name written in `file` is declared, a forward
+ * declaration completed to the class it declares (fix #427).
+ */
+function _cppCompletedTypeOrigin(index, file, typeName) {
+    const origin = _resolveFlowTypeOrigin(index, file, typeName);
+    if (!origin?.fromFile) return origin;
+    const declared = (index.symbols.get(typeName) || []).filter(d =>
+        d.file === origin.fromFile && IDENTITY_TYPE_KINDS.has(d.type));
+    if (declared.length === 1 && declared[0].forwardDeclaration) {
+        const provider = require('./class-identity').forwardDeclarationProvider(index, declared[0]);
+        if (provider) return { ...origin, fromFile: provider.file, ...(provider.namespace && { namespace: provider.namespace }) };
+    }
+    return origin;
+}
+
+function _cppFieldArrowType(index, fieldType, declaredText, pointers) {
+    if (!declaredText) return null;
+    // A field declared a pointer (`KVMap* map_`): `->` dereferences it.
+    if (pointers === 1) return fieldType;
+    if (Number.isInteger(pointers) && pointers > 1) return null;
+    let text = declaredText;
+    let head = _normalizeFieldTypeName(text, 'cpp');
+    // What an alias names (`using Shared = Worker;`).
+    const aliased = head && _cppAliasTargetText(index, head);
+    if (aliased != null) {
+        text = aliased;
+        head = _normalizeFieldTypeName(text, 'cpp');
+    }
+    const written = String(text).replace(/\b(?:const|volatile)\b/g, '').trim();
+    if (/\*\s*$/.test(written)) return _normalizeFieldTypeName(written.replace(/\*\s*$/, ''), 'cpp');
+    const projectClass = head && (index.symbols.get(head) || []).some(d =>
+        IDENTITY_TYPE_KINDS.has(d.type) || d.type === 'union');
+    if (projectClass) {
+        if (!_cppClassHasArrowOperator(index, head)) return fieldType || head;
+        return _cppArrowObjectPointee(index, head);
+    }
+    return _cppArrowObjectPointee(index, null, text);
+}
+
+/**
+ * A C++ class template in `typeName`'s project ancestry that derives from
+ * one of its own template parameters (`template <class T> struct Holder : T`,
+ * fix #427): its instantiations inherit the members of whatever argument
+ * they are given, so a member the class does not declare may still be
+ * found there. Returns `Holder<T>`-style text, or null.
+ */
+function _cppTemplateParameterBase(index, typeName, memberName) {
+    const memo = index._opMemo?.('cppTemplateParameterBase');
+    const memoKey = `${typeName}\0${memberName}`;
+    if (memo?.has(memoKey)) return memo.get(memoKey);
+    let result = null;
+    const seen = new Set();
+    let level = [typeName];
+    // Member lookup stops at the first class that declares the name: a
+    // base the lookup never reaches supplies nothing.
+    const declares = owner => (index.symbols.get(memberName) || []).some(d =>
+        !NON_CALLABLE_TYPES.has(d.type) && String(d.className || '').replace(/<.*$/s, '') === owner);
+    for (let hop = 0; hop < 16 && level.length > 0 && !result; hop++) {
+        for (const owner of level) seen.add(owner);
+        if (level.some(declares)) break;
+        for (const owner of level) {
+            for (const def of index.symbols.get(owner) || []) {
+                if (!IDENTITY_TYPE_KINDS.has(def.type) || !def.extends || !def.generics) continue;
+                const params = new Set(String(def.generics).replace(/^<|>$/g, '').split(',')
+                    .map(param => param.trim().replace(/\.\.\.$/, '').split(/\s+/).pop()).filter(Boolean));
+                const base = splitParentList(def.extends).map(spelling =>
+                    String(spelling).replace(/^(?:public|protected|private|virtual)\s+/g, '').replace(/<.*$/s, '').trim())
+                    .find(head => params.has(head));
+                if (base) {
+                    result = `${owner}<${base}> : ${base}`;
+                    break;
+                }
+            }
+            if (result) break;
+        }
+        level = [...new Set(level.flatMap(owner => index._getInheritanceParents?.(owner) || []))]
+            .filter(owner => owner && !seen.has(owner));
+    }
+    memo?.set(memoKey, result);
+    return result;
+}
+
 /** Does a project class of this name (or a project base) declare operator->? */
 function _cppClassHasArrowOperator(index, typeName) {
     const memo = index._opMemo?.('cppClassHasArrowOperator');
@@ -18292,8 +18439,55 @@ function selectProvenanceOverload(index, call, candidates, language) {
     return _calleeOverloadSelect(index, call, slots, language);
 }
 
+/**
+ * A C++ member function declared in its class and defined outside it is one
+ * member (fix #427): member lookup finds the in-class declaration, so an
+ * out-of-class definition of the same owner, parameter types and
+ * implicit-object qualifiers leaves a candidate list that holds it.
+ */
+function _cppWithoutDefinedDeclarations(matches) {
+    if (matches.length < 2 || !matches.some(d => d.isSignature && d.className)) return matches;
+    const key = d => `${String(d.className || '').replace(/<.*>$/s, '')}\0${d.namespace || ''}\0${_cFamilySignatureKey(d)}` +
+        `\0${d.memberConst ? 1 : 0}\0${d.refQualifier || ''}`;
+    const declared = new Set(matches.filter(d => d.className && d.isSignature).map(key));
+    const kept = matches.filter(d => !(!d.isSignature && d.className && d.receiver && declared.has(key(d))));
+    return kept.length === matches.length ? matches : kept;
+}
+
+/**
+ * The constness of a C++ call's implicit object argument (fix #427): what
+ * the receiver's declaration says (`receiverConst`), or for `this->m()` and
+ * a bare member call, whether the enclosing member function is const.
+ * undefined when unknown.
+ */
+function _cppObjectConstness(call, enclosingDef) {
+    if (call.receiverConst !== undefined) return call.receiverConst;
+    if (call.isPathCall || (call.receiver && call.receiver !== 'this')) return undefined;
+    if (!enclosingDef?.className || enclosingDef.modifiers?.includes('static')) return undefined;
+    return !!enclosingDef.memberConst;
+}
+
+/**
+ * Overloads that differ only in the implicit object parameter's
+ * cv-qualification (`T& at(int)` / `const T& at(int) const`) are decided by
+ * the object's constness (fix #427, [over.match.funcs]): a const object
+ * reaches only the const member; a non-const one binds the non-const member
+ * better. Ref-qualified members and differing parameter lists stay undecided.
+ */
+function _cppSelectByObjectConstness(applicable, objectConst) {
+    if (objectConst === undefined || applicable.length < 2) return null;
+    if (!applicable.every(d => d.className) || applicable.some(d => d.refQualifier)) return null;
+    const signatures = new Set(applicable.map(d => _cFamilySignatureKey(d)));
+    if (signatures.size !== 1) return null;
+    const constMembers = applicable.filter(d => d.memberConst);
+    if (constMembers.length === 0 || constMembers.length === applicable.length) return null;
+    const chosen = objectConst ? constMembers : applicable.filter(d => !d.memberConst);
+    return chosen.length > 0 && chosen.length < applicable.length ? chosen : null;
+}
+
 function _calleeOverloadSelect(index, call, matches, language) {
     if (matches.length === 0) return { match: null };
+    if (language === 'cpp') matches = _cppWithoutDefinedDeclarations(matches);
     // The call's own member and each candidate declaration are where the
     // overload facts were read (fix #421).
     if (langTraits(language)?.typeNameSourceCanonical && call.argumentFile &&
@@ -18337,6 +18531,10 @@ function _calleeOverloadSelect(index, call, matches, language) {
                 index, applicable, call, language);
             if (mostSpecific) return { match: mostSpecific };
         }
+    }
+    if (language === 'cpp') {
+        const byConst = _cppSelectByObjectConstness(applicable, call.receiverConst);
+        if (byConst) applicable = _cppWithoutDefinedDeclarations(byConst);
     }
     if (applicable.length === 1) return { match: applicable[0] };
     // Rust impls of one type that differ in their self reference layer
@@ -18730,18 +18928,68 @@ function _cppEnclosingClassNames(index, filePath, owner, enclosing) {
     const fileEntry = index.files.get(filePath);
     if (!fileEntry || !owner) return [];
     const line = enclosing?.startLine;
+    // One type-span table per file (fix #427, entt: the file's symbols were
+    // filtered and sorted for every bare call).
+    const spans = index.isProvenanceFactIndex ? _cppTypeSpansOf(fileEntry) : _cppTypeSpans(fileEntry);
+    const inner = (spans.byName.get(owner) || []).find(symbol =>
+        !line || (symbol.startLine <= line && symbol.endLine >= line));
+    if (!inner) return [];
+    let names = spans.outer.get(inner);
+    if (!names) {
+        const reach = spans.byStart.length === 0 ? 0 : _lastStartAtOrBefore(spans.byStart, inner.startLine) + 1;
+        const outer = [];
+        for (let i = 0; i < reach; i++) {
+            const symbol = spans.byStart[i];
+            if (symbol !== inner && symbol.endLine >= inner.endLine &&
+                (symbol.startLine < inner.startLine || symbol.endLine > inner.endLine)) outer.push(symbol);
+        }
+        // In the file's order, nearest first (the sort is stable).
+        outer.sort((a, b) => spans.order.get(a) - spans.order.get(b));
+        names = outer.sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine)).map(symbol => symbol.name);
+        spans.outer.set(inner, names);
+    }
+    return names;
+}
+
+const CPP_TYPE_SPANS = new WeakMap();
+
+function _cppTypeSpans(fileEntry) {
+    const known = CPP_TYPE_SPANS.get(fileEntry);
+    if (known && known.symbols === fileEntry.symbols && known.length === fileEntry.symbols?.length) return known;
+    const spans = _cppTypeSpansOf(fileEntry);
+    CPP_TYPE_SPANS.set(fileEntry, spans);
+    return spans;
+}
+
+/** A file's class-like type spans: by name (narrowest first), by start line, in file order. */
+function _cppTypeSpansOf(fileEntry) {
     const types = (fileEntry.symbols || []).filter(symbol =>
         (IDENTITY_TYPE_KINDS.has(symbol.type) || symbol.type === 'type' || symbol.type === 'union') && !symbol.aliasOf);
-    const inner = types
-        .filter(symbol => symbol.name === owner && (!line || (symbol.startLine <= line && symbol.endLine >= line)))
-        .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))[0];
-    if (!inner) return [];
-    return types
-        .filter(symbol => symbol !== inner && symbol.startLine <= inner.startLine &&
-            symbol.endLine >= inner.endLine &&
-            (symbol.startLine < inner.startLine || symbol.endLine > inner.endLine))
-        .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))
-        .map(symbol => symbol.name);
+    const order = new Map(types.map((symbol, i) => [symbol, i]));
+    const byName = new Map();
+    for (const symbol of types) {
+        if (!byName.has(symbol.name)) byName.set(symbol.name, []);
+        byName.get(symbol.name).push(symbol);
+    }
+    for (const list of byName.values()) list.sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine));
+    const byStart = [...types].sort((a, b) => a.startLine - b.startLine || order.get(a) - order.get(b));
+    return { symbols: fileEntry.symbols, length: fileEntry.symbols?.length, byName, byStart, order, outer: new Map() };
+}
+
+function _lastStartAtOrBefore(sorted, line) {
+    let low = 0;
+    let high = sorted.length - 1;
+    let found = -1;
+    while (low <= high) {
+        const mid = (low + high) >> 1;
+        if (sorted[mid].startLine <= line) {
+            found = mid;
+            low = mid + 1;
+        } else {
+            high = mid - 1;
+        }
+    }
+    return found;
 }
 
 /** A nested C++ type's enclosing static members, including out-of-line bodies. */
@@ -19169,7 +19417,28 @@ function _addOutOfClassImplicitBaseCallers(index, name, options, callers) {
  */
 function _recordIsNoCall(index, filePath, call) {
     return (!!call.memberInitializer && _initializesMember(index, filePath, call)) ||
-        (call.constructorSyntax === 'default' && !_cppNamesClass(index, call.name));
+        (call.constructorSyntax === 'default' && !_cppNamesClass(index, call.name)) ||
+        (!!call.parenthesizedCallee && _parenthesizedNameIsType(index, filePath, call));
+}
+
+/**
+ * `(N)(x)` is a cast when N names a type where it is written (fix #427,
+ * lz4: `(BYTE)(v >> 8)`): the project declarations of N the unit sees are
+ * all types (typedefs, records, enums) and none is a function, macro or
+ * local. A cast is a use of the type, never a call.
+ */
+function _parenthesizedNameIsType(index, filePath, call) {
+    if (call.localShadow || call.isMethod || call.receiver) return false;
+    const fileEntry = index.files.get(filePath);
+    if (!langTraits(fileEntry?.language)?.textualIncludes) return false;
+    const visible = _cppVisibleFiles(index, filePath);
+    const defs = (index.symbols.get(call.name) || []).filter(d =>
+        d.file === filePath || visible.has(d.file));
+    if (defs.length === 0) return false;
+    if (defs.some(d => d.type === 'macro' || (!NON_CALLABLE_TYPES.has(d.type) && !IDENTITY_TYPE_KINDS.has(d.type)))) return false;
+    if (!defs.every(d => IDENTITY_TYPE_KINDS.has(d.type) || d.type === 'type' || d.type === 'union')) return false;
+    // A C++ cast to a class type constructs it (a converting constructor).
+    return fileEntry.language !== 'cpp' || !_cppNamesClass(index, call.name);
 }
 
 /** Is the record a construction spelled by a class name (C++ functional or explicit)? */
@@ -19766,6 +20035,18 @@ function _declaredFieldTypeUncached(index, rootType, fieldName, language, info, 
     if (aliasBase) typeName = aliasBase;
     if (info) {
         if (onType.length === 1 && onType[0].fieldOrigin) Object.assign(info, onType[0].fieldOrigin);
+        // The declared type as written, where `->` applies to it (fix #427).
+        if (langTraits(language)?.textualIncludes) {
+            const texts = new Set(onType.map(f => String((isAccessor(f) ? (f.returnType || f.fieldType) : f.fieldType) || '')
+                .replace(/\s+/g, ' ').trim()));
+            const files = new Set(onType.map(f => f.file));
+            const pointers = new Set(onType.map(f => f.fieldPointers));
+            if (texts.size === 1 && files.size === 1 && [...texts][0]) {
+                info.declaredText = [...texts][0];
+                info.declaredFile = [...files][0];
+                if (pointers.size === 1 && Number.isInteger([...pointers][0])) info.declaredPointers = [...pointers][0];
+            }
+        }
         const origins = new Set();
         const namespaces = new Set();
         let complete = true;
@@ -19860,6 +20141,9 @@ function _declaredFieldPathType(
         if (hopInfo && langTraits(language)?.textualIncludes) {
             delete hopInfo.namespace;
             delete hopInfo.fromFile;
+            delete hopInfo.declaredText;
+            delete hopInfo.declaredFile;
+            delete hopInfo.declaredPointers;
         }
         currentType = _declaredFieldType(
             index, currentType, fieldNames[i], language, hopInfo,
@@ -21440,6 +21724,12 @@ function _calleeTypeQualifiedReceiver(index, def, fileEntry, call, language) {
     const style = traits?.typeQualifiedCallStyle;
     if (style === 'path' && !call.isPathCall) return null;
     if (style === 'method-expr' && call.argCount != null && call.argCount < 1) return null;
+    // A C++ qualifier is a namespace or a type by name lookup, never by its
+    // case (fix #427): `Exp::Break()` calls namespace Exp's function.
+    if (language === 'cpp' && style === 'path' && !call.globalQualified) {
+        const namespacePath = _cppCalleeNamespacePath(index, def, call);
+        if (namespacePath !== undefined) return namespacePath;
+    }
 
     // Namespace/module container (fix #254): checked before the
     // capitalization gate — namespaces resolve by symbol lookup, not case
@@ -25478,6 +25768,80 @@ function _cppTargetVisibility(index, callerFile, targetDefs) {
  * when Q cannot be resolved for a member target (or the target's own kind
  * is unproven), and { kind } to let the ordinary pipeline continue.
  */
+/**
+ * Does a path qualifier's last segment name a TYPE? Where the language codes
+ * it in the case (Rust naming: CamelCase types, snake_case modules) the
+ * spelling says so; elsewhere (C++: `Exp::Break()`, `YAML::Load()` name
+ * namespaces) only the qualifier's name lookup does (fix #427).
+ */
+function _pathSegmentNamesType(language, segment, scopeKind) {
+    if (langTraits(language)?.caseCodedPathQualifiers) return /^[A-Z]/.test(segment);
+    return scopeKind === 'type';
+}
+
+/**
+ * The callee of a C++ `N::f(..)` whose qualifier name lookup resolves to a
+ * namespace: the namespace's own functions named f the unit can see, one
+ * item per callable identity (a prototype and its definition are one),
+ * chosen by the call's shape. `undefined` when the qualifier is no
+ * namespace (the type path decides); null when the namespace declares no
+ * visible function of the name (fix #427).
+ */
+function _cppCalleeNamespacePath(index, def, call) {
+    if (!call.isPathCall || !call.receiver || call.qualifierTemplateParam) return undefined;
+    const visible = _cppVisibleFiles(index, def.file);
+    const resolved = resolveCppQualifier(index, {
+        file: def.file,
+        line: call.line,
+        namespace: cppEffectiveNamespace(index, def),
+        className: def.className || null,
+    }, call.receiver, visible);
+    if (resolved.kind !== 'namespace') return undefined;
+    const namespace = resolved.resolvedNamespace ?? resolved.namespace;
+    const symbols = index.symbols.get(call.name) || [];
+    // A using-declaration of the name in the namespace brings in another
+    // entity (possibly per configuration, fix #413): not decided here.
+    const usings = _cppNamespaceUsings(index).get(namespace);
+    if (usings && (usings.directive || usings.names.has(call.name))) return undefined;
+    const functions = symbols.filter(definition => !NON_CALLABLE_TYPES.has(definition.type) &&
+        definition.type !== 'macro' && !definition.className && !definition.receiver &&
+        (definition.file === def.file || visible.has(definition.file)) &&
+        cppEffectiveNamespace(index, definition) === namespace);
+    if (functions.length === 0) return null;
+    const items = [];
+    const grouped = new Set();
+    for (const definition of functions) {
+        if (grouped.has(definition)) continue;
+        const group = _closeCallableIdentityGroup(index, [definition], symbols)
+            .filter(member => functions.includes(member));
+        for (const member of group) grouped.add(member);
+        items.push(group.find(member => !member.isSignature) || definition);
+    }
+    const selected = _calleeOverloadSelect(index, call, items, 'cpp');
+    if (selected.match) return { match: selected.match, typeName: call.receiver, moduleOwnedPath: true };
+    if (selected.ambiguous) return { unverified: 'overload-ambiguous' };
+    return null;
+}
+
+/** Using-declaration names and directives per namespace, project-wide (fix #427). */
+function _cppNamespaceUsings(index) {
+    const memo = index._opMemo?.('cppNamespaceUsings', () => ({ value: null }));
+    if (memo?.value) return memo.value;
+    const byNamespace = new Map();
+    for (const fileEntry of index.files.values()) {
+        for (const fact of fileEntry.cppUsings || []) {
+            if (fact.kind === 'namespace-alias') continue;
+            const key = fact.namespace || '';
+            if (!byNamespace.has(key)) byNamespace.set(key, { names: new Set(), directive: false });
+            const entry = byNamespace.get(key);
+            if (fact.kind === 'directive') entry.directive = true;
+            else if (fact.name) entry.names.add(fact.name);
+        }
+    }
+    if (memo) memo.value = byNamespace;
+    return byNamespace;
+}
+
 function _cppPathQualifierVerdict(index, callerFile, call, targetDefs) {
     const callable = targetDefs.filter(definition => !NON_CALLABLE_TYPES.has(definition.type));
     if (callable.length === 0) return { kind: 'none' };
@@ -25738,6 +26102,34 @@ function _cppDependentUsingOverload(index, filePath, call, boundDef, targetDefs)
  * when it has none. null when the class definition is not found.
  */
 function _cppMemberUsingBases(index, className, name, contextFile) {
+    // Asked per class of every hierarchy walk of every call (fix #427, entt).
+    const memo = index.isProvenanceFactIndex ? null : index._opMemo?.('cppMemberUsingBases');
+    const memoKey = `${className}\0${name}\0${contextFile || ''}`;
+    if (memo?.has(memoKey)) return memo.get(memoKey);
+    const result = _cppMemberUsingBasesUncached(index, className, name, contextFile);
+    memo?.set(memoKey, result);
+    return result;
+}
+
+const FIRST_SYMBOL_AT = new WeakMap();
+
+/** The first symbol of a file's list with this name and start line (one table per list, fix #427). */
+function _firstSymbolAt(fileSymbols, name, startLine) {
+    let known = FIRST_SYMBOL_AT.get(fileSymbols);
+    // A list that grew since (macro-generated declarations) is read again.
+    if (!known || known.length !== fileSymbols.length) {
+        const table = new Map();
+        for (const symbol of fileSymbols) {
+            const key = `${symbol.name}\0${symbol.startLine}`;
+            if (!table.has(key)) table.set(key, symbol);
+        }
+        known = { length: fileSymbols.length, table };
+        FIRST_SYMBOL_AT.set(fileSymbols, known);
+    }
+    return known.table.get(`${name}\0${startLine}`);
+}
+
+function _cppMemberUsingBasesUncached(index, className, name, contextFile) {
     const classes = (index.symbols.get(className) || []).filter(d =>
         IDENTITY_TYPE_KINDS.has(d.type) && d.file);
     if (classes.length === 0) return null;
@@ -26037,6 +26429,12 @@ function _overloadDiscipline(index, call, targetDefs, definitions, callerFile) {
         }
     }
     let applicable = family.filter(d => _overloadApplicable(index, call, d));
+    if (targetLanguage === 'cpp' && applicable.length > 1) {
+        const enclosingDef = call.receiverConst === undefined && callerFile
+            ? index.findEnclosingFunction(callerFile, call.line, true, call) : null;
+        const byConst = _cppSelectByObjectConstness(applicable, _cppObjectConstness(call, enclosingDef));
+        if (byConst) applicable = byConst;
+    }
     if (applicable.length === 0) {
         // The argument TYPES fit none of the owner's overloads, the pinned
         // one included (fix #391): the call binds something the family does
