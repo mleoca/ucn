@@ -6809,3 +6809,45 @@ describe('fix #421: producer overloads that agree on their return type decide th
         } finally { rm(dir); }
     });
 });
+
+describe('fix #425: Java pattern variables type their receivers where their scope reaches', () => {
+    const { tmp, rm, idx } = require('./helpers');
+    const { execute } = require('../core/execute');
+    const callers = (index, name) => {
+        const result = execute(index, 'context', { name });
+        assert.strictEqual(result.ok, true, result.error);
+        return {
+            confirmed: (result.result.callers || []).map(c => `${c.relativePath}:${c.line}`).sort(),
+            unverified: (result.result.unverifiedCallers || []).map(c => `${c.relativePath}:${c.line}`).sort(),
+        };
+    };
+    it('instanceof, switch-label and record-component patterns; a field of the name outside the scope stays untyped', () => {
+        const dir = tmp({
+            'p/Sq.java': 'package p;\n\npublic class Sq { int scale() { return 2; } }\n',
+            'p/Ci.java': 'package p;\n\npublic class Ci { int scale() { return 3; } }\n',
+            'p/Pt.java': 'package p;\n\npublic record Pt(Sq a, int b) {}\n',
+            'p/Use.java': [
+                'package p;',
+                '',
+                'class Use {',
+                '    Ci s;',
+                '    int use(Object x) {',
+                '        switch (x) {',
+                '            case Sq s -> { return s.scale(); }',
+                '            case Pt(Sq a, int b) -> { return a.scale(); }',
+                '            default -> { }',
+                '        }',
+                '        if (x instanceof Sq q) return q.scale();',
+                '        return s.scale();',
+                '    }',
+                '}',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(callers(index, 'p/Sq.java:3:scale').confirmed, ['p/Use.java:11', 'p/Use.java:7', 'p/Use.java:8']);
+            assert.ok(!callers(index, 'p/Sq.java:3:scale').confirmed.includes('p/Use.java:12'));
+        } finally { rm(dir); }
+    });
+});

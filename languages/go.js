@@ -1544,6 +1544,61 @@ const GO_BUILTINS = new Set([
 // Value positions of an instantiated generic function value (fix #378).
 const GENERIC_VALUE_PARENTS = new Set(['argument_list', 'literal_element', 'expression_list']);
 
+// A value in argument position (fix #425): a call argument, or the operand
+// of a generic instantiation read as a conversion (`conv[[]uint16](Uint16s)`
+// with `type conv[T any] func(..)` converts the function value Uint16s, and
+// tree-sitter reads every `X[T](v)` that way).
+function isArgumentValue(node) {
+    const parent = node?.parent;
+    if (!parent) return false;
+    if (parent.type === 'argument_list') return true;
+    return parent.type === 'type_conversion_expression' &&
+        parent.childForFieldName('type')?.type === 'generic_type' &&
+        sameNode(parent.childForFieldName('operand'), node);
+}
+
+// A value an instantiated generic function denotes (fix #378, #425): an
+// argument, a literal element, or a value list (right-hand side, var spec
+// value, return).
+function isGenericValuePosition(node) {
+    const parent = node?.parent;
+    if (!parent) return false;
+    if (isArgumentValue(node)) return true;
+    if (!GENERIC_VALUE_PARENTS.has(parent.type)) return false;
+    return parent.type !== 'expression_list' || isValueExpressionList(parent);
+}
+
+// Predeclared types no function value converts to.
+const GO_NON_FUNCTION_TYPES = new Set(['bool', 'string', 'error', 'byte', 'rune', 'uintptr',
+    'int', 'int8', 'int16', 'int32', 'int64', 'uint', 'uint8', 'uint16', 'uint32', 'uint64',
+    'float32', 'float64', 'complex64', 'complex128']);
+
+/**
+ * Is a positional element of a slice, array or map literal of a predeclared
+ * non-function element type (`[]string{r.Name}`, fix #425)? Such an element
+ * is never a method value. Nested element literals (`[][]string{{..}}`)
+ * descend one element type per level; struct literals and named element
+ * types are undecided (false).
+ */
+function holdsNoFunctionValue(literalElement) {
+    let depth = 0;
+    let n = literalElement.parent;
+    while (n?.type === 'literal_value' && n.parent?.type === 'literal_element' &&
+        n.parent.parent?.type === 'literal_value') {
+        depth++;
+        n = n.parent.parent;
+    }
+    if (n?.type !== 'literal_value' || n.parent?.type !== 'composite_literal') return false;
+    let type = n.parent.childForFieldName('type');
+    for (let i = 0; i <= depth; i++) {
+        if (type?.type === 'slice_type' || type?.type === 'array_type' ||
+            type?.type === 'implicit_length_array_type') type = type.childForFieldName('element');
+        else if (type?.type === 'map_type') type = type.childForFieldName('value');
+        else return false;
+    }
+    return type?.type === 'type_identifier' && GO_NON_FUNCTION_TYPES.has(type.text);
+}
+
 // An expression_list holding VALUES: the right side of `=` / `:=`, a var
 // spec's values, or a return list (never an assignment's left side).
 function isValueExpressionList(list) {
@@ -1771,6 +1826,8 @@ function findCallsInCode(code, parser, options = {}) {
     const packageTypeQualifiers = new Map();
     // Names whose scope type is a New*-prefix GUESS (fix #266) — per scope
     const scopeGuesses = new Map();
+    // Open type switches whose binding is typed per clause (fix #425).
+    const typeSwitches = [];
     // Container-typed variables (slice/map/array declared TYPE TEXT) for
     // range-element typing (fix #300, mux-measured): `for _, route := range
     // r.routes` types route from the field's declared []*Route. Element
@@ -1992,6 +2049,109 @@ function findCallsInCode(code, parser, options = {}) {
             return { receiverType: typeNode.text };
         }
         return null;
+    };
+    // A parenthesized selector operand (fix #425): `(*T).M`, `(T).M` and
+    // `(*pkg.T).M` are method expressions that name type T's method M as
+    // `T.M` does (Go spec, Method expressions); `(*p).M` and `(&v).M` select
+    // the method of a value. The operand reduces to the name it holds, an
+    // identifier or a package-qualified name, resolved like the unwrapped
+    // form; a written instantiated type (`(*Pair[int, string]).M`) names its
+    // generic type. null for any other parenthesized expression.
+    const methodOperandOf = (operandNode) => {
+        if (operandNode?.type !== 'parenthesized_expression') return null;
+        let n = operandNode;
+        const unparen = () => {
+            while (n?.type === 'parenthesized_expression') n = n.namedChildCount === 1 ? n.namedChild(0) : null;
+        };
+        unparen();
+        if (n?.type === 'unary_expression' && ['*', '&'].includes(n.child(0)?.type)) {
+            n = n.childForFieldName('operand');
+            unparen();
+        }
+        if (n?.type === 'type_instantiation_expression') {
+            let t = n.childForFieldName('type');
+            if (t?.type === 'pointer_type') t = t.namedChildCount === 1 ? t.namedChild(0) : null;
+            if (t?.type === 'type_identifier') return { node: t, name: t.text, writtenType: true };
+            if (t?.type === 'qualified_type') {
+                const pkg = t.childForFieldName('package');
+                const name = t.childForFieldName('name');
+                return pkg && name && isPackageQualifier(pkg, pkg.text)
+                    ? { node: t, name: name.text, qualifier: pkg.text, writtenType: true } : null;
+            }
+            return null;
+        }
+        if (n?.type === 'identifier') return { node: n, name: n.text };
+        if (n?.type === 'selector_expression') {
+            const pkg = n.childForFieldName('operand');
+            const name = n.childForFieldName('field');
+            if (pkg?.type === 'identifier' && name && isPackageQualifier(pkg, pkg.text)) {
+                return { node: n, name: name.text, qualifier: pkg.text, packageNode: pkg };
+            }
+        }
+        return null;
+    };
+    // A selector VALUE (fix #425: one record shape for every value position,
+    // which used to repeat it per position): `obj.method` (a method value),
+    // `pkg.Func` (a package-qualified function reference), `T.M` / `(*T).M`
+    // (a method expression) and `(&T{..}).M`. A receiver no local binds
+    // names a package-level declaration (`receiverPackageLevel`): the
+    // package's type of that name makes the value a method expression.
+    const selectorValueRecord = (valueNode, extra = {}, bindingEnclosing = false) => {
+        const fieldNode = valueNode.childForFieldName('field');
+        let operandNode = valueNode.childForFieldName('operand');
+        if (!fieldNode || !operandNode) return null;
+        const methodOperand = methodOperandOf(operandNode);
+        let qualifiedOperand = null;
+        if (methodOperand?.qualifier) qualifiedOperand = methodOperand;
+        else if (methodOperand && !methodOperand.writtenType) operandNode = methodOperand.node;
+        const receiver = qualifiedOperand ? undefined : operandNode.type === 'identifier'
+            ? operandNode.text : methodOperand?.writtenType ? methodOperand.name : undefined;
+        // `pkg.Func` as a value is a package-qualified function
+        // reference, never a method value (fix #378).
+        const pkgValue = !methodOperand && isPackageQualifier(operandNode, receiver);
+        let receiverTypeEvidence;
+        let receiverType = receiver && !methodOperand?.writtenType
+            ? getReceiverType(receiver, operandNode) : undefined;
+        let receiverTypeQualifier = receiverType
+            ? getReceiverTypeQualifier(receiver, operandNode) : undefined;
+        // Composite-literal receiver (fix #298): the literal's type is
+        // compiler-true, never guessed.
+        if (!receiver && !receiverType && !qualifiedOperand) {
+            const lit = literalReceiverInfo(operandNode);
+            if (lit) {
+                receiverType = lit.receiverType;
+                receiverTypeEvidence = typeOrigin('constructor', operandNode);
+                receiverTypeQualifier = lit.receiverTypeQualifier;
+            }
+        }
+        const packageLevel = !!(receiver && !pkgValue && !receiverType &&
+            (methodOperand?.writtenType || !isShadowedByLocal(operandNode, receiver)) &&
+            !importAliases.has(receiver));
+        const enclosingFunction = bindingEnclosing && receiver && !methodOperand?.writtenType
+            ? getCurrentEnclosingFunction(operandNode, receiver)
+            : getCurrentEnclosingFunction();
+        return {
+            name: fieldNode.text,
+            // #223 name-node convention: the field's own line.
+            line: fieldNode.startPosition.row + 1,
+            column: fieldNode.startPosition.column,
+            isMethod: !pkgValue,
+            ...(pkgValue && { isFunctionReference: true }),
+            receiver,
+            ...(receiverType && { receiverType, ...(receiverTypeEvidence ? { receiverTypeSource: 'constructor', receiverTypeEvidence } : getReceiverType(receiver, valueNode, true) || { receiverTypeSource: 'unknown' }) }),
+            ...(receiverTypeQualifier && { receiverTypeQualifier }),
+            ...(receiverType && receiver && isGuessedType(receiver) && { receiverTypeGuessed: true }),
+            ...(packageLevel && { receiverPackageLevel: true }),
+            ...(qualifiedOperand && {
+                receiverRoot: qualifiedOperand.qualifier,
+                receiverField: qualifiedOperand.name,
+                receiverRootIsModule: true,
+            }),
+            enclosingFunction,
+            isPotentialCallback: true,
+            uncertain: false,
+            ...extra,
+        };
     };
     // Is the FIRST scope-chain hit for this variable a New*-prefix GUESS
     // (fix #266, viper-measured)? `registry := NewCodecRegistry()` types
@@ -2381,6 +2541,64 @@ function findCallsInCode(code, parser, options = {}) {
             }
         }
 
+        // Type switch bindings (fix #425): in `switch v := x.(type)`, a
+        // clause listing exactly one type gives v that type; a clause of
+        // several types and the default clause give v the type of x (Go
+        // spec, Type switches). The binding is the switch's own: the outer
+        // meaning of the name returns after the switch (onLeave).
+        if (node.type === 'type_switch_statement' && functionStack.length > 0) {
+            const alias = node.childForFieldName('alias');
+            const id = alias?.type === 'expression_list' && alias.namedChildCount === 1
+                ? alias.namedChild(0) : alias;
+            if (id?.type === 'identifier' && id.text !== '_') {
+                const scopeKey = functionStack[functionStack.length - 1].startLine;
+                const typeMap = scopeTypes.get(scopeKey);
+                const qualifiers = scopeTypeQualifiers.get(scopeKey);
+                const value = node.childForFieldName('value');
+                const valueType = value?.type === 'identifier' && !isGuessedType(value.text)
+                    ? getReceiverType(value.text, value) : undefined;
+                typeSwitches.push({
+                    node, name: id.text, scopeKey, typeMap, qualifiers,
+                    valueType,
+                    valueQualifier: valueType ? getReceiverTypeQualifier(value.text, value) : undefined,
+                    valueEvidence: valueType ? getReceiverType(value.text, value, true) : undefined,
+                    saved: typeMap?.has(id.text) ? {
+                        type: typeMap.get(id.text), origin: typeMap.origins.get(id.text),
+                        qualifier: qualifiers?.get(id.text),
+                        guessed: !!scopeGuesses.get(scopeKey)?.has(id.text),
+                    } : null,
+                });
+            }
+        }
+        if ((node.type === 'type_case' || node.type === 'default_case') &&
+            typeSwitches.length > 0 && sameNode(typeSwitches.at(-1).node, node.parent)) {
+            const sw = typeSwitches.at(-1);
+            const types = node.type === 'type_case' ? node.childrenForFieldName('type') : [];
+            let typeName = null;
+            let qualifier = null;
+            let origin = null;
+            if (types.length === 1) {
+                typeName = extractTypeName(types[0]);
+                qualifier = typeName ? extractTypeQualifier(types[0]) : null;
+                origin = { source: 'type-assertion', node: types[0] };
+            } else if (sw.valueType) {
+                typeName = sw.valueType;
+                qualifier = sw.valueQualifier || null;
+            }
+            if (sw.typeMap) {
+                if (typeName) {
+                    if (origin) sw.typeMap.set(sw.name, typeName, origin.source, origin.node);
+                    else sw.typeMap.set(sw.name, typeName, sw.valueEvidence?.receiverTypeEvidence || 'flow');
+                    if (qualifier) sw.qualifiers?.set(sw.name, qualifier);
+                    else sw.qualifiers?.delete(sw.name);
+                } else {
+                    sw.typeMap.delete(sw.name);
+                    sw.qualifiers?.delete(sw.name);
+                }
+                scopeGuesses.get(sw.scopeKey)?.delete(sw.name);
+            }
+        }
+
         // Track local variable types from composite literals and typed assignments
         // e.g., s := &Status{...} → s has type Status
         //        registry := Registry{...} → registry has type Registry
@@ -2764,6 +2982,10 @@ function findCallsInCode(code, parser, options = {}) {
                 // Method or package call: obj.Method() or pkg.Func()
                 const fieldNode = funcNode.childForFieldName('field');
                 let operandNode = funcNode.childForFieldName('operand');
+                // `(*T).M(t, ..)`, `(*p).M(..)` and `(*pkg.T).M(..)` receive
+                // like `T.M(t, ..)`, `p.M(..)` and `pkg.T.M(..)` (fix #425).
+                const methodOperand = methodOperandOf(operandNode);
+                if (methodOperand && !methodOperand.writtenType) operandNode = methodOperand.node;
                 // fix #381: `c.Load()` after `c := s.config` receives like
                 // `s.config.Load()`.
                 if (operandNode?.type === 'identifier' && !importAliases.has(operandNode.text) &&
@@ -2773,17 +2995,19 @@ function findCallsInCode(code, parser, options = {}) {
                 }
 
                 if (fieldNode) {
-                    const receiver = operandNode?.type === 'identifier' ? operandNode.text : undefined;
+                    const writtenReceiver = methodOperand?.writtenType && !methodOperand.qualifier
+                        ? methodOperand.name : undefined;
+                    const receiver = operandNode?.type === 'identifier' ? operandNode.text : writtenReceiver;
                     // Distinguish pkg.Func() (package-qualified) from obj.Method()
                     // If receiver is a known import alias, this is a package call, not a method call
                     // A local binding shadows a same-named import inside its
                     // scope (`fs := NewMemMapFs(); fs.Chown(...)` in a file
                     // importing "io/fs"): that call is a METHOD call on the
                     // local, never the package function (fix #360).
-                    const isPkgCall = receiver && importAliases.has(receiver) &&
-                        !isShadowedByLocal(operandNode, receiver);
+                    const isPkgCall = !writtenReceiver && !methodOperand && receiver &&
+                        importAliases.has(receiver) && !isShadowedByLocal(operandNode, receiver);
                     let receiverTypeEvidence;
-                    let receiverType = (!isPkgCall && receiver)
+                    let receiverType = (!isPkgCall && receiver && !writtenReceiver)
                         ? getReceiverType(receiver, operandNode) : undefined;
                     let receiverTypeQualifier = receiverType
                         ? getReceiverTypeQualifier(receiver, operandNode) : undefined;
@@ -2794,7 +3018,7 @@ function findCallsInCode(code, parser, options = {}) {
                     // package (fix #399): typed at query time. So is an
                     // untyped package-level variable of this file, whose
                     // value may come from another package (fix #400).
-                    const receiverPackageScope = !!(receiver && !isPkgCall && !receiverType &&
+                    const receiverPackageScope = !!(receiver && !writtenReceiver && !isPkgCall && !receiverType &&
                         !receiverIndexedSource &&
                         (!fileLevelNames().has(receiver) || fileVarNames().has(receiver)) &&
                         !isShadowedByLocal(operandNode, receiver));
@@ -3019,52 +3243,12 @@ function findCallsInCode(code, parser, options = {}) {
         }
 
         // Detect function references passed as arguments: dc.worker passed to UntilWithContext(ctx, dc.worker, ...)
-        // selector_expression inside argument_list (not inside call_expression as the function)
-        if (node.type === 'selector_expression' && node.parent?.type === 'argument_list') {
-            // Only if this selector_expression is NOT the function being called
-            const grandparent = node.parent?.parent;
-            if (!grandparent || grandparent.type !== 'call_expression' || grandparent.childForFieldName('function') !== node) {
-                const fieldNode = node.childForFieldName('field');
-                const operandNode = node.childForFieldName('operand');
-                if (fieldNode && operandNode) {
-                    const receiver = operandNode.type === 'identifier' ? operandNode.text : undefined;
-                    // `pkg.Func` as a value is a package-qualified function
-                    // reference, never a method value (fix #378).
-                    const pkgValue = isPackageQualifier(operandNode, receiver);
-                    let receiverTypeEvidence;
-                    let receiverType = receiver
-                        ? getReceiverType(receiver, operandNode) : undefined;
-                    let receiverTypeQualifier = receiverType
-                        ? getReceiverTypeQualifier(receiver, operandNode) : undefined;
-                    // Composite-literal receiver (fix #298): the literal's
-                    // type is compiler-true, never guessed.
-                    if (!receiver && !receiverType) {
-                        const lit = literalReceiverInfo(operandNode);
-                        if (lit) {
-                            receiverType = lit.receiverType;
-                            receiverTypeEvidence = typeOrigin('constructor', operandNode);
-                            receiverTypeQualifier = lit.receiverTypeQualifier;
-                        }
-                    }
-                    const enclosingFunction = receiver
-                        ? getCurrentEnclosingFunction(operandNode, receiver)
-                        : getCurrentEnclosingFunction();
-                    calls.push({
-                        name: fieldNode.text,
-                        line: fieldNode.startPosition.row + 1,
-                        column: fieldNode.startPosition.column,
-                        isMethod: !pkgValue,
-                        ...(pkgValue && { isFunctionReference: true }),
-                        receiver,
-                        ...(receiverType && { receiverType, ...(receiverTypeEvidence ? { receiverTypeSource: 'constructor', receiverTypeEvidence } : getReceiverType(receiver, node, true) || { receiverTypeSource: 'unknown' }) }),
-                        ...(receiverTypeQualifier && { receiverTypeQualifier }),
-                        ...(receiverType && receiver && isGuessedType(receiver) && { receiverTypeGuessed: true }),
-                        enclosingFunction,
-                        isPotentialCallback: true,
-                        uncertain: false
-                    });
-                }
-            }
+        // selector_expression inside argument_list (not inside call_expression as the function),
+        // or the operand of a conversion to a generic function type (fix #425:
+        // `anyFieldC[[]uint16](Uint16s)` where anyFieldC is a type).
+        if (node.type === 'selector_expression' && isArgumentValue(node)) {
+            const record = selectorValueRecord(node, {}, true);
+            if (record) calls.push(record);
         }
 
         // Instantiated generic function VALUES (fix #378): `id[int]` /
@@ -3073,18 +3257,37 @@ function findCallsInCode(code, parser, options = {}) {
         // The same syntax indexes a slice or map: a locally bound operand is
         // an index, and a package-level non-function never matches a
         // function pin (Go forbids a same-package var and func of one name).
-        if (node.type === 'index_expression' && GENERIC_VALUE_PARENTS.has(node.parent?.type) &&
-            (node.parent.type !== 'expression_list' || isValueExpressionList(node.parent))) {
-            const operandNode = node.childForFieldName('operand');
-            if (operandNode?.type === 'identifier') {
-                const name = operandNode.text;
+        // Several type arguments (`Map[int, string]`, `lo.Map[int, string]`)
+        // parse as a type_instantiation_expression (fix #425), which only
+        // instantiates.
+        if ((node.type === 'index_expression' || node.type === 'type_instantiation_expression') &&
+            isGenericValuePosition(node)) {
+            let nameNode = null;
+            let qualifierNode = null;
+            if (node.type === 'index_expression') {
+                const operandNode = node.childForFieldName('operand');
+                if (operandNode?.type === 'identifier') nameNode = operandNode;
+                else if (operandNode?.type === 'selector_expression') {
+                    qualifierNode = operandNode.childForFieldName('operand');
+                    nameNode = operandNode.childForFieldName('field');
+                }
+            } else {
+                const typeNode = node.childForFieldName('type');
+                if (typeNode?.type === 'type_identifier') nameNode = typeNode;
+                else if (typeNode?.type === 'qualified_type') {
+                    qualifierNode = typeNode.childForFieldName('package');
+                    nameNode = typeNode.childForFieldName('name');
+                }
+            }
+            if (nameNode && !qualifierNode) {
+                const name = nameNode.text;
                 if (!GO_SKIP_IDENTS.has(name) && !GO_BUILTINS.has(name) &&
-                    !importAliases.has(name) && !isShadowedByLocal(operandNode, name) &&
+                    !importAliases.has(name) && !isShadowedByLocal(nameNode, name) &&
                     !isFuncTypedParam(name) && !getLocalClosure(name)) {
                     calls.push({
                         name,
-                        line: operandNode.startPosition.row + 1,
-                        column: operandNode.startPosition.column,
+                        line: nameNode.startPosition.row + 1,
+                        column: nameNode.startPosition.column,
                         isMethod: false,
                         isFunctionReference: true,
                         isPotentialCallback: true,
@@ -3092,15 +3295,14 @@ function findCallsInCode(code, parser, options = {}) {
                         uncertain: false,
                     });
                 }
-            } else if (operandNode?.type === 'selector_expression') {
-                const qualifier = operandNode.childForFieldName('operand');
-                const fieldNode = operandNode.childForFieldName('field');
-                const receiver = qualifier?.type === 'identifier' ? qualifier.text : undefined;
-                if (fieldNode && isPackageQualifier(qualifier, receiver)) {
+            } else if (nameNode && qualifierNode) {
+                const receiver = ['identifier', 'package_identifier'].includes(qualifierNode.type)
+                    ? qualifierNode.text : undefined;
+                if (isPackageQualifier(qualifierNode, receiver)) {
                     calls.push({
-                        name: fieldNode.text,
-                        line: fieldNode.startPosition.row + 1,
-                        column: fieldNode.startPosition.column,
+                        name: nameNode.text,
+                        line: nameNode.startPosition.row + 1,
+                        column: nameNode.startPosition.column,
                         isMethod: false,
                         receiver,
                         isFunctionReference: true,
@@ -3114,7 +3316,8 @@ function findCallsInCode(code, parser, options = {}) {
 
         // Detect plain identifier function references passed as arguments:
         // e.g., r.GET("/users", listUsers) — listUsers is a plain identifier in argument_list
-        if (node.type === 'identifier' && node.parent?.type === 'argument_list') {
+        // (or converted: `conv[[]uint16](Uint16s)`, fix #425)
+        if (node.type === 'identifier' && isArgumentValue(node)) {
             const name = node.text;
             if (!GO_SKIP_IDENTS.has(name) && !importAliases.has(name)) {
                 const enclosingFunction = getCurrentEnclosingFunction();
@@ -3151,43 +3354,8 @@ function findCallsInCode(code, parser, options = {}) {
                 for (const rhs of rhsNodes) {
                     // selector_expression: sched.schedulePod
                     if (rhs.type === 'selector_expression') {
-                        const fieldNode = rhs.childForFieldName('field');
-                        const operandNode = rhs.childForFieldName('operand');
-                        if (fieldNode && operandNode) {
-                            const receiver = operandNode.type === 'identifier' ? operandNode.text : undefined;
-                            // `pkg.Func` as a value is a package-qualified function
-                            // reference, never a method value (fix #378).
-                            const pkgValue = isPackageQualifier(operandNode, receiver);
-                            let receiverTypeEvidence;
-                            let receiverType = receiver
-                                ? getReceiverType(receiver, operandNode) : undefined;
-                            let receiverTypeQualifier = receiverType
-                                ? getReceiverTypeQualifier(receiver, operandNode) : undefined;
-                            // Composite-literal receiver (fix #298).
-                            if (!receiver && !receiverType) {
-                                const lit = literalReceiverInfo(operandNode);
-                                if (lit) {
-                                    receiverType = lit.receiverType;
-                                    receiverTypeEvidence = typeOrigin('constructor', operandNode);
-                                    receiverTypeQualifier = lit.receiverTypeQualifier;
-                                }
-                            }
-                            const enclosingFunction = getCurrentEnclosingFunction();
-                            calls.push({
-                                name: fieldNode.text,
-                                line: fieldNode.startPosition.row + 1,
-                                column: fieldNode.startPosition.column,
-                                isMethod: !pkgValue,
-                                ...(pkgValue && { isFunctionReference: true }),
-                                receiver,
-                                ...(receiverType && { receiverType, ...(receiverTypeEvidence ? { receiverTypeSource: 'constructor', receiverTypeEvidence } : getReceiverType(receiver, node, true) || { receiverTypeSource: 'unknown' }) }),
-                                ...(receiverTypeQualifier && { receiverTypeQualifier }),
-                                ...(receiverType && receiver && isGuessedType(receiver) && { receiverTypeGuessed: true }),
-                                enclosingFunction,
-                                isPotentialCallback: true,
-                                uncertain: false
-                            });
-                        }
+                        const record = selectorValueRecord(rhs);
+                        if (record) calls.push(record);
                     }
                     // Plain identifier: schedulePod (standalone function reference)
                     if (rhs.type === 'identifier') {
@@ -3224,42 +3392,18 @@ function findCallsInCode(code, parser, options = {}) {
                 : (exprList ? [exprList] : []);
             for (const val of values) {
                 if (val.type !== 'selector_expression') continue;
-                const fieldNode = val.childForFieldName('field');
-                const operandNode = val.childForFieldName('operand');
-                if (!fieldNode || !operandNode) continue;
-                const receiver = operandNode.type === 'identifier' ? operandNode.text : undefined;
-                // `pkg.Func` as a value is a package-qualified function
-                // reference, never a method value (fix #378).
-                const pkgValue = isPackageQualifier(operandNode, receiver);
-                let receiverTypeEvidence;
-                let receiverType = receiver
-                    ? getReceiverType(receiver, operandNode) : undefined;
-                let receiverTypeQualifier = receiverType
-                    ? getReceiverTypeQualifier(receiver, operandNode) : undefined;
-                if (!receiver && !receiverType) {
-                    const lit = literalReceiverInfo(operandNode);
-                    if (lit) {
-                        receiverType = lit.receiverType;
-                        receiverTypeEvidence = typeOrigin('constructor', operandNode);
-                        receiverTypeQualifier = lit.receiverTypeQualifier;
-                    }
-                }
-                calls.push({
-                    name: fieldNode.text,
-                    // #223 name-node convention: the field's own line.
-                    line: fieldNode.startPosition.row + 1,
-                    column: fieldNode.startPosition.column,
-                    isMethod: !pkgValue,
-                    ...(pkgValue && { isFunctionReference: true }),
-                    receiver,
-                    ...(receiverType && { receiverType, ...(receiverTypeEvidence ? { receiverTypeSource: 'constructor', receiverTypeEvidence } : getReceiverType(receiver, node, true) || { receiverTypeSource: 'unknown' }) }),
-                    ...(receiverTypeQualifier && { receiverTypeQualifier }),
-                    ...(receiverType && receiver && isGuessedType(receiver) && { receiverTypeGuessed: true }),
-                    enclosingFunction: getCurrentEnclosingFunction(),
-                    isPotentialCallback: true,
-                    uncertain: false
-                });
+                const record = selectorValueRecord(val);
+                if (record) calls.push(record);
             }
+        }
+
+        // Selector values as positional composite-literal elements (fix #425,
+        // zap: `[]withAny{(*SugaredLogger).With}`, a struct literal's
+        // `(*Logger).With` field value): the same values as keyed ones.
+        if (node.type === 'selector_expression' && node.parent?.type === 'literal_element' &&
+            node.parent.parent?.type !== 'keyed_element' && !holdsNoFunctionValue(node.parent)) {
+            const record = selectorValueRecord(node);
+            if (record) calls.push(record);
         }
 
         // Detect function references in composite literal fields:
@@ -3318,45 +3462,11 @@ function findCallsInCode(code, parser, options = {}) {
                     }
                 }
                 if (valueNode.type === 'selector_expression') {
-                    const fieldNode = valueNode.childForFieldName('field');
-                    const operandNode = valueNode.childForFieldName('operand');
-                    if (fieldNode && operandNode) {
-                        const receiver = operandNode.type === 'identifier' ? operandNode.text : undefined;
-                        // `pkg.Func` as a value is a package-qualified function
-                        // reference, never a method value (fix #378).
-                        const pkgValue = isPackageQualifier(operandNode, receiver);
-                        let receiverTypeEvidence;
-                        let receiverType = receiver
-                            ? getReceiverType(receiver, operandNode) : undefined;
-                        let receiverTypeQualifier = receiverType
-                            ? getReceiverTypeQualifier(receiver, operandNode) : undefined;
-                        // Composite-literal receiver (fix #298).
-                        if (!receiver && !receiverType) {
-                            const lit = literalReceiverInfo(operandNode);
-                            if (lit) {
-                                receiverType = lit.receiverType;
-                                receiverTypeEvidence = typeOrigin('constructor', operandNode);
-                                receiverTypeQualifier = lit.receiverTypeQualifier;
-                            }
-                        }
-                        const enclosingFunction = getCurrentEnclosingFunction();
-                        calls.push({
-                            name: fieldNode.text,
-                            line: fieldNode.startPosition.row + 1,
-                            column: fieldNode.startPosition.column,
-                            isMethod: !pkgValue,
-                            ...(pkgValue && { isFunctionReference: true }),
-                            receiver,
-                            ...(receiverType && { receiverType, ...(receiverTypeEvidence ? { receiverTypeSource: 'constructor', receiverTypeEvidence } : getReceiverType(receiver, node, true) || { receiverTypeSource: 'unknown' }) }),
-                            ...(receiverTypeQualifier && { receiverTypeQualifier }),
-                            ...(receiverType && receiver && isGuessedType(receiver) && { receiverTypeGuessed: true }),
-                            enclosingFunction,
-                            isPotentialCallback: true,
-                            uncertain: false,
-                            ...(compositeType && { compositeType }),
-                            ...(fieldName && { fieldName }),
-                        });
-                    }
+                    const record = selectorValueRecord(valueNode, {
+                        ...(compositeType && { compositeType }),
+                        ...(fieldName && { fieldName }),
+                    });
+                    if (record) calls.push(record);
                 }
                 // Inline closure: RunE: func(cmd *cobra.Command, args []string) { ... }
                 // Mark the enclosing function as the entry point (the closure itself has no name)
@@ -3383,6 +3493,25 @@ function findCallsInCode(code, parser, options = {}) {
         return true;
     }, {
         onLeave: (node) => {
+            if (node.type === 'type_switch_statement' && typeSwitches.length > 0 &&
+                sameNode(typeSwitches.at(-1).node, node)) {
+                const sw = typeSwitches.pop();
+                if (sw.typeMap) {
+                    if (sw.saved) {
+                        sw.typeMap.set(sw.name, sw.saved.type, sw.saved.origin || 'unknown');
+                        if (sw.saved.qualifier) sw.qualifiers?.set(sw.name, sw.saved.qualifier);
+                        else sw.qualifiers?.delete(sw.name);
+                        if (sw.saved.guessed) {
+                            let gset = scopeGuesses.get(sw.scopeKey);
+                            if (!gset) scopeGuesses.set(sw.scopeKey, gset = new Set());
+                            gset.add(sw.name);
+                        }
+                    } else {
+                        sw.typeMap.delete(sw.name);
+                        sw.qualifiers?.delete(sw.name);
+                    }
+                }
+            }
             if (isFunctionNode(node)) {
                 const leaving = functionStack.pop();
                 if (leaving) {
@@ -3695,6 +3824,21 @@ function findUsagesInCode(code, name, parser, tree, options = {}) {
 }
 
 /**
+ * Does a local binding hide the receiver of the selector whose field token
+ * starts at (line, column) (fix #425: `pkg.F` names an import only when no
+ * local binds `pkg`)? true / false; null when no such selector is there.
+ */
+function selectorReceiverIsLocal(tree, line, column) {
+    const point = { row: line - 1, column };
+    const field = tree?.rootNode?.descendantForPosition(point);
+    if (field?.type !== 'field_identifier' || field.parent?.type !== 'selector_expression') return null;
+    const operand = field.parent.childForFieldName('operand');
+    if (operand?.type !== 'identifier') return null;
+    const scope = referenceScope(operand, 'go');
+    return !!scope && typeof scope !== 'string';
+}
+
+/**
  * Classify a Go symbol as a runtime entry point of a specific kind.
  * Returns 'test' | 'main' | null.
  *
@@ -3750,6 +3894,7 @@ module.exports = {
     findImportsInCode,
     findExportsInCode,
     findUsagesInCode,
+    selectorReceiverIsLocal,
     isPlatformConcreteCall,
     isPlatformConcreteType,
     isEntryPoint,

@@ -683,6 +683,9 @@ const LANGUAGES = {
             },
             testFileCandidates: (base, ext) => [`${base}_test.go`],
             nameBoundTestFunctions: GO_EXAMPLE_NAMES,
+            // One package-level name declared in files of one package under
+            // different build constraints is one item (fix #425).
+            conditionalDefinitions: 'build-constraint',
         },
     },
     rust: {

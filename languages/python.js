@@ -1641,6 +1641,30 @@ function narrowedReceiverType(refNode, receiverName, declaredUnion) {
                 if (remaining.length === 1) return remaining[0];
             }
         }
+        // A class pattern (fix #425, the Go type-switch rule): in `case
+        // Sq() as s:` the capture s is a Sq instance, and `match x: case
+        // Sq():` narrows x to Sq, in the clause's body. A union of class
+        // patterns names no single type.
+        if (parent.type === 'case_clause' && sameNode(parent.childForFieldName('consequence'), current)) {
+            const casePatterns = parent.namedChildren.filter(child => child.type === 'case_pattern');
+            const pattern = casePatterns.length === 1 ? casePatterns[0].namedChild(0) : null;
+            let classPattern = null;
+            if (pattern?.type === 'as_pattern') {
+                const target = pattern.namedChild(pattern.namedChildCount - 1);
+                const targetName = target?.type === 'as_pattern_target' ? target.namedChild(0)?.text : target?.text;
+                const inner = pattern.namedChild(0);
+                if (targetName === receiverName && inner?.type === 'case_pattern' &&
+                    inner.namedChild(0)?.type === 'class_pattern') classPattern = inner.namedChild(0);
+            } else if (pattern?.type === 'class_pattern') {
+                const subject = parent.parent?.parent?.type === 'match_statement'
+                    ? parent.parent.parent.childForFieldName('subject') : null;
+                if (subject?.type === 'identifier' && subject.text === receiverName) classPattern = pattern;
+            }
+            const dotted = classPattern?.namedChild(0);
+            if (dotted?.type === 'dotted_name' && dotted.namedChildCount > 0) {
+                return dotted.namedChild(dotted.namedChildCount - 1).text;
+            }
+        }
         if (parent.type === 'conditional_expression' &&
             parent.namedChildCount >= 3) {
             const consequence = parent.namedChild(0);

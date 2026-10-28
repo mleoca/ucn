@@ -327,8 +327,10 @@ function _resolveAmong(index, entries, contextFile, namespace) {
     const traits = langTraits(language);
     // 2. Directory package scope (Go): every file of the package sees it.
     if (traits?.packageScope === 'directory') {
-        const dir = path.dirname(contextFile);
-        const samePkg = entries.filter(e => path.dirname(e.def.file) === dir);
+        // The file's own package (fix #425): `package x_test` is another
+        // package of the directory, which sees x's names through a dot import.
+        const { goBareNameReaches } = require('./go-packages');
+        const samePkg = entries.filter(e => goBareNameReaches(index, contextFile, e.def));
         if (samePkg.length > 0) return _single(samePkg);
     }
     // 3. Direct imports.

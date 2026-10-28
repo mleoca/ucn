@@ -957,7 +957,11 @@ function clearAllCaches() {
 // v312 (fix #424): Python usage records mark module-path segments
 // (`modulePath`) and the source-side name of an aliased from-import
 // (`importSource`).
-const CACHE_FORMAT_VERSION = 312;
+// v313 (fix #425): Go call records read method expressions `(*T).M` like
+// `T.M`, mark receivers no local binds (`receiverPackageLevel`), record
+// conversion operands, instantiated values and positional literal-element
+// selectors as values, and type type-switch bindings per clause.
+const CACHE_FORMAT_VERSION = 313;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 function usageResultKey(index, filePath, name, mode) {

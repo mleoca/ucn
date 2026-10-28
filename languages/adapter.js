@@ -34,6 +34,7 @@ const OPTIONAL_HELPERS = Object.freeze([
     'findScopeAlternativeBindings',
     'isPlatformConcreteCall',
     'isPlatformConcreteType',
+    'selectorReceiverIsLocal',
     'queryTree',
     'queryTreeIsPlain',
     'queryUsingDirectives',

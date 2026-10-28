@@ -26,6 +26,8 @@ const { summarizeProvenance, declarationIdentity, sameDeclaration } = require('.
 const { confirmationFacts, occurrenceIdentity, definitionsInFile, definitionAt } = require('./provenance-facts');
 const { BUILTIN_RECEIVER_TYPES, isProvenanceBuiltinReceiver } = require('./receiver-types');
 const { findGoModule, resolveRustImport, resolveRustModuleFile } = require('./imports');
+const { goFileConstraint: _goFileConstraint, goSamePackage, goBuildAlternatives, goAlternativesAt,
+    goPackageTypes, goBareNameReaches } = require('./go-packages');
 const { rustWrapperContract, validateRustWrapperContract } = require('./rust-result-flow');
 const { pythonFixtureReceiver, pythonFixtureType } = require('./python-fixture-flow');
 const { sameConfigurationItem, itemsNamed, moduleItemNamed, siteExcludedAt, sitesReachableAt,
@@ -651,6 +653,10 @@ function findCallers(index, name, options = {}) {
         typeQueryTargets.every(target => IDENTITY_TYPE_KINDS.has(target.type));
     const targetDefinitionFiles = new Set(
         typeQueryTargets.map(definition => definition.file).filter(Boolean));
+    // Go build-configuration alternatives of a target (fix #425).
+    const goConfigurationsExclude = typeQueryTargets.some(target =>
+        langTraits(index.files.get(target.file)?.language)?.conditionalDefinitions === 'build-constraint' &&
+        definitions.some(other => _isConfigurationAlternative(index, other, target)));
 
     // Possible-dispatch tiering inputs (nominal contract surface) — all fixed
     // per query, computed lazily once. targetTypes mirrors the receiver-class
@@ -1459,6 +1465,14 @@ function findCallers(index, name, options = {}) {
                     !pinnedLanguageTargets.some(target =>
                         _calleeLanguageCompatible(index, target, fileEntry.language))) {
                     recordExcluded(filePath, call.line, 'language-boundary');
+                    continue;
+                }
+
+                // Go build configurations (fix #425): a site in a file whose
+                // constraint is one alternative's own compiles only with that
+                // alternative, never with the pinned one.
+                if (goConfigurationsExclude && _goConfigurationExcludes(index, filePath, pinnedLanguageTargets, definitions)) {
+                    recordExcluded(filePath, call.line, 'other-definition');
                     continue;
                 }
 
@@ -2781,13 +2795,63 @@ function findCallers(index, name, options = {}) {
                                 cbThisReached = true;
                             }
                         }
+                        // A qualified method expression (fix #425):
+                        // `(*pkg.T).M` names the method of project type
+                        // pkg.T, the target's only when T owns the target.
+                        let cbQualifiedMethodExpression = false;
+                        if (fileEntry.language === 'go' && call.receiverRootIsModule && call.receiverRoot &&
+                            call.receiverField && !call.receiverType) {
+                            const qualified = _goQualifiedReceiverType(index, fileEntry, call.receiverRoot, call.receiverField);
+                            if (qualified?.kind === 'project' && qualified.defs.length > 0) {
+                                const ownsTarget = cbTargetDefs.some(target => target.file &&
+                                    String(target.className || target.receiver || '').replace(/^\*/, '') === call.receiverField &&
+                                    path.dirname(target.file) === qualified.dir);
+                                if (ownsTarget) {
+                                    cbQualifiedMethodExpression = true;
+                                    cbPackageQualified = true;
+                                } else {
+                                    if (_dispatchCapableSupertype(index, fileEntry.language, call.receiverField, cbTargetDefs, definitions)) {
+                                        if (collectAccount) {
+                                            routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
+                                                dispatchVia: qualified.via,
+                                                dispatchCandidates: countDispatchCandidates(call.receiverField),
+                                            });
+                                        }
+                                    } else {
+                                        recordExcluded(filePath, call.line, 'receiver-other-class');
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                        // A method expression (fix #425): `B.M` / `(*B).M`
+                        // whose receiver no local binds names the method of
+                        // the package's type B. Another type's method is not
+                        // the target's, unless B is an interface the target
+                        // can be called through (a visible possible dispatch).
+                        if (!call.receiverType && (call.receiverPackageLevel || call.receiverPackageScope) &&
+                            langTraits(fileEntry.language)?.typeQualifiedCallStyle === 'method-expr' &&
+                            !dispatchTargetTypes(cbTargetDefs, filePath, call).has(call.receiver) &&
+                            goPackageTypes(index, filePath, call.receiver).length > 0) {
+                            if (_dispatchCapableSupertype(index, fileEntry.language, call.receiver, cbTargetDefs, definitions)) {
+                                if (collectAccount) {
+                                    routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
+                                        dispatchVia: call.receiver,
+                                        dispatchCandidates: countDispatchCandidates(call.receiver),
+                                    });
+                                }
+                            } else {
+                                recordExcluded(filePath, call.line, 'receiver-other-class');
+                            }
+                            continue;
+                        }
                         if (collectAccount) {
                             const cbTypes = dispatchTargetTypes(cbTargetDefs, filePath, call);
                             const cbTypeQualified = call.receiver && cbTypes.has(call.receiver);
                             const cbTypedMatch = call.receiverType && cbTypes.has(call.receiverType);
                             const cbAllTypeTargets = cbTargetDefs.length > 0 &&
                                 cbTargetDefs.every(d => IDENTITY_TYPE_KINDS.has(d.type));
-                            if (!cbTypeQualified && !cbTypedMatch && !cbThisReached) {
+                            if (!cbTypeQualified && !cbTypedMatch && !cbThisReached && !cbQualifiedMethodExpression) {
                                 routeUnverified(filePath, fileEntry, call,
                                     methodOwnerKeys().size === 1 && !cbAllTypeTargets ? 'single-owner' : 'method-ambiguous', calledAs,
                                     { dispatchCandidates: methodOwnerKeys().size });
@@ -2832,7 +2896,7 @@ function findCallers(index, name, options = {}) {
                     const cbSamePackage = !cbSameFile && !cbPackageQualified &&
                         langTraits(fileEntry.language)?.typeSystem === 'nominal' &&
                         cbTargetDefs.some(d => d.file &&
-                            _sameNominalPackageDir(path.dirname(d.file), path.dirname(filePath), fileEntry.language));
+                            _sameNominalPackage(index, filePath, d.file, fileEntry.language));
                     // A bare reference to a member-assigned target (fix
                     // #384): same reach rule as bare calls.
                     if (!call.isMethod && !call.receiver && !call.localShadow && !calledAs &&
@@ -3125,7 +3189,10 @@ function findCallers(index, name, options = {}) {
                     if (langTraits(fileEntry.language)?.macroInvocationSyntax === 'marked') {
                         bindings = bindings.filter(b => (b.type === 'macro') === !!call.isMacro);
                     }
-                    // For Go, also check sibling files in same directory (same package scope)
+                    // For Go, also check sibling files in same directory (same package scope):
+                    // the files of the call's own package (fix #425: a `package
+                    // x_test` file of the directory is another package, and a
+                    // non-test file never sees a `_test.go` declaration)
                     if (bindings.length === 0 && langTraits(fileEntry.language)?.packageScope === 'directory') {
                         const dir = path.dirname(filePath);
                         const siblings = index.dirToFiles?.get(dir) || [];
@@ -3134,9 +3201,21 @@ function findCallers(index, name, options = {}) {
                                 const fe = index.files.get(fp);
                                 if (fe) {
                                     const sibling = dropMethodBindings(
-                                        (fe.bindings || []).filter(b => b.name === call.name), fp);
+                                        (fe.bindings || []).filter(b => b.name === call.name &&
+                                            goBareNameReaches(index, filePath, { file: fp, name: b.name })), fp);
                                     bindings = bindings.concat(sibling);
                                 }
+                            }
+                        }
+                        // The build alternatives of one item (fix #425): the
+                        // one the call's own configuration compiles with.
+                        if (bindings.length > 1) {
+                            const named = index.symbols.get(call.name) || [];
+                            const defsOf = bindings.map(b => named.find(s => s.bindingId === b.id));
+                            if (defsOf.every(Boolean) && defsOf.every(d => d === defsOf[0] ||
+                                _isConfigurationAlternative(index, defsOf[0], d))) {
+                                const reached = goAlternativesAt(index, filePath, defsOf);
+                                bindings = [bindings[defsOf.indexOf(reached[0])]];
                             }
                         }
                     }
@@ -6292,6 +6371,14 @@ function findCallers(index, name, options = {}) {
                         importEdgeLink = true;
                     }
                 }
+                // A bare Go name reaches another package's declaration only
+                // through a dot import of that package (fix #425): an import
+                // edge of the file is no evidence for it.
+                if (importEdgeLink && !call.isMethod && !call.receiver &&
+                    langTraits(fileEntry.language)?.packageScope === 'directory') {
+                    importEdgeLink = targetDefs2.some(d => d.file && !goSamePackage(index, filePath, d.file) &&
+                        goBareNameReaches(index, filePath, d));
+                }
                 const hasImportLink = importEdgeLink ||
                     (targetFiles2.has(filePath) && !uncertainMethodReceiver && !nameImportFiles);
 
@@ -6337,7 +6424,7 @@ function findCallers(index, name, options = {}) {
                 const hasSamePackageEvidence = !hasImportLink &&
                     langTraits(fileEntry.language)?.typeSystem === 'nominal' &&
                     targetDefs2.some(d => d.file &&
-                        _sameNominalPackageDir(path.dirname(d.file), path.dirname(filePath), fileEntry.language));
+                        _sameNominalPackage(index, filePath, d.file, fileEntry.language));
 
                 // Possible-dispatch tiering (nominal languages, contract surface
                 // only): methodCallInclusion='auto' confirms method calls with
@@ -9796,7 +9883,7 @@ function findCallees(index, definition, options = {}) {
                 const hasBinding = fileEntry?.bindings?.some(b => b.name === call.name);
                 const inSameFile = syms.some(s => s.file === def.file);
                 const inSamePackage = langTraits(language)?.packageScope === 'directory' &&
-                    syms.some(s => path.dirname(s.file) === path.dirname(def.file));
+                    syms.some(s => goBareNameReaches(index, def.file, s));
                 if (!hasBinding && !inSameFile && !inSamePackage) {
                     noteSite(siteId, 'excluded', 'callback-no-evidence', call);
                     continue;
@@ -10080,10 +10167,26 @@ function findCallees(index, definition, options = {}) {
                     langTraits(language)?.packageScope === 'directory') {
                     const dir = path.dirname(def.file);
                     for (const fp of index.dirToFiles?.get(dir) || []) {
+                        // The files of the call's own package, or of the
+                        // package it dot-imports (fix #425).
                         if (fp === def.file) continue;
                         const fe = index.files.get(fp);
-                        const sibling = (fe?.bindings || []).filter(b => b.name === call.name);
+                        const sibling = (fe?.bindings || []).filter(b => b.name === call.name &&
+                            goBareNameReaches(index, def.file, { file: fp, name: b.name }));
                         if (sibling.length > 0) bindings = bindings.concat(sibling);
+                    }
+                    // Several declarations of one package-level name are the
+                    // build alternatives of one item (fix #425): the call
+                    // binds the one its file's configuration compiles with,
+                    // or the item (every alternative joins at the end).
+                    if (bindings.length > 1) {
+                        const named = index.symbols.get(call.name) || [];
+                        const defsOf = bindings.map(b => named.find(s => s.bindingId === b.id));
+                        if (defsOf.every(Boolean) && defsOf.every(d => d === defsOf[0] ||
+                            _isConfigurationAlternative(index, defsOf[0], d))) {
+                            const reached = goAlternativesAt(index, def.file, defsOf);
+                            bindings = [bindings[defsOf.indexOf(reached[0])]];
+                        }
                     }
                 }
                 // A constructor/composite-literal record names a type/value
@@ -11275,6 +11378,20 @@ function findCallees(index, definition, options = {}) {
                     }
                 }
 
+                // Go build configurations (fix #425): the call reaches every
+                // alternative of the item its own file's configuration may
+                // compile, whichever one the name table listed first.
+                let configurationAlternatives = [];
+                if (langTraits(language)?.conditionalDefinitions === 'build-constraint' &&
+                    !NON_CALLABLE_TYPES.has(callee.type)) {
+                    const item = symbols.filter(s => s === callee || _isConfigurationAlternative(index, s, callee));
+                    if (item.length > 1) {
+                        const reached = goAlternativesAt(index, def.file, item);
+                        if (!reached.includes(callee)) callee = reached[0];
+                        configurationAlternatives = reached.filter(s => s !== callee);
+                    }
+                }
+
                 let calleeScored = scoreEdge({
                     hasBindingId: !!bindingId,
                     hasImportEvidence: !!bindingId || resolutionSymbols.length === 1 ||
@@ -11334,6 +11451,21 @@ function findCallees(index, definition, options = {}) {
                         ...(isFunctionReference && { functionReference: true }),
                     }),
                 });
+                for (const alternative of configurationAlternatives) {
+                    const primary = result[result.length - 1];
+                    result.push({
+                        ...alternative,
+                        callCount: primary.callCount, weight: primary.weight,
+                        confidence: primary.confidence, evidenceScore: primary.evidenceScore,
+                        scoreKind: primary.scoreKind, resolution: primary.resolution,
+                        configurationAlternativeOf: `${callee.relativePath || path.relative(index.root, callee.file)}:${callee.startLine}`,
+                        ...(collectAccount && {
+                            tier: TIER.CONFIRMED, provenance: primary.provenance,
+                            siteProvenance: primary.siteProvenance, sites: primary.sites,
+                            ...(isFunctionReference && { functionReference: true }),
+                        }),
+                    });
+                }
                 // The constructor bodies the confirmed constructions run
                 // (fix #421): an edge beside the class dependency, never a
                 // replacement of it, and no call site of its own in the
@@ -12623,9 +12755,10 @@ function _populateReturnTypeFlowScope(index, filePath, calls, scopeCalls, scoped
             } else if (nominal && langTraits(language)?.packageScope === 'directory') {
                 // Go: an unqualified call resolves within the package — a
                 // globally-unique def in ANOTHER package is unreachable
-                const dir = path.dirname(filePath);
-                const samePkg = defs.filter(d => d.file && path.dirname(d.file) === dir);
-                if (samePkg.length === 1) chosen = samePkg[0];
+                // (the external test package is another package, fix #425)
+                const samePkg = goAlternativesAt(index, filePath,
+                    defs.filter(d => d.file && goBareNameReaches(index, filePath, d)));
+                if (samePkg.length === 1 || _oneConfigurationItem(index, samePkg)) chosen = samePkg[0];
             } else if (defs.length === 1) {
                 chosen = defs[0];
             } else if (nominal && defs.length > 1) {
@@ -15712,6 +15845,16 @@ function _scopedTypeDefinitionAt(index, file, name, line) {
     }
     const moduleLevel = defs.filter(d => d.file === file && !_isFunctionLocalType(d));
     return moduleLevel.length === 1 ? moduleLevel[0] : null;
+}
+
+/**
+ * Is a declaration of `declFile` in the package a site of `siteFile` sees
+ * without an import? Go (fix #425): the site's own package (directory and
+ * package clause, test visibility); otherwise the package directory rule.
+ */
+function _sameNominalPackage(index, siteFile, declFile, language) {
+    if (langTraits(language)?.packageScope === 'directory') return goSamePackage(index, siteFile, declFile);
+    return _sameNominalPackageDir(path.dirname(declFile), path.dirname(siteFile), language);
 }
 
 function _sameNominalPackageDir(dirA, dirB, language) {
@@ -26269,27 +26412,32 @@ function _goQualifiedReceiverType(index, fileEntry, qualifier, typeName) {
     return { kind: 'project', via: `${qualifier}.${typeName}`, importModule, dir, defs };
 }
 
-const _GO_OS = new Set(['aix', 'android', 'darwin', 'dragonfly', 'freebsd', 'hurd', 'illumos', 'ios', 'js',
-    'linux', 'nacl', 'netbsd', 'openbsd', 'plan9', 'solaris', 'wasip1', 'windows', 'zos']);
-const _GO_ARCH = new Set(['386', 'amd64', 'amd64p32', 'arm', 'arm64', 'arm64be', 'armbe', 'loong64', 'mips',
-    'mips64', 'mips64le', 'mips64p32', 'mips64p32le', 'mipsle', 'ppc', 'ppc64', 'ppc64le', 'riscv', 'riscv64',
-    's390', 's390x', 'sparc', 'sparc64', 'wasm']);
+/**
+ * Do these definitions form one configuration item whose alternatives all
+ * declare one result (fix #425)? A return type is then the item's own.
+ */
+function _oneConfigurationItem(index, defs) {
+    if (defs.length < 2) return false;
+    const [first, ...rest] = defs;
+    return rest.every(d => _isConfigurationAlternative(index, first, d) &&
+        (d.returnType || null) === (first.returnType || null));
+}
 
 /**
- * The build configurations a Go file belongs to (fix #399): its
- * `//go:build` expression plus the GOOS/GOARCH its file name implies
- * (`x_linux.go`, `x_windows_amd64_test.go`); '' when every build compiles it.
+ * Go (fix #425): is every target unreachable from a site in `siteFile`?
+ * A site in a file whose build constraint is one alternative's own compiles
+ * only with that alternative of the item.
  */
-function _goFileConstraint(index, file) {
-    const tag = index.files.get(file)?.buildConstraint || '';
-    const parts = path.basename(file, '.go').replace(/_test$/, '').split('_');
-    let implied = '';
-    if (parts.length >= 3 && _GO_OS.has(parts[parts.length - 2]) && _GO_ARCH.has(parts[parts.length - 1])) {
-        implied = `${parts[parts.length - 2]}/${parts[parts.length - 1]}`;
-    } else if (parts.length >= 2 && (_GO_OS.has(parts[parts.length - 1]) || _GO_ARCH.has(parts[parts.length - 1]))) {
-        implied = parts[parts.length - 1];
+function _goConfigurationExcludes(index, siteFile, targets, definitions) {
+    let reachedAny = false;
+    let alternativeFound = false;
+    for (const target of targets) {
+        const item = definitions.filter(d => d === target || _isConfigurationAlternative(index, d, target));
+        if (item.length < 2) return false;
+        alternativeFound = true;
+        if (goAlternativesAt(index, siteFile, item).includes(target)) reachedAny = true;
     }
-    return tag || implied ? `${tag}|${implied}` : '';
+    return alternativeFound && !reachedAny;
 }
 
 /**
@@ -26574,9 +26722,16 @@ function _definitionFileSet(index, name, kind, accepts) {
  * receiver-blind name table happened to list first.
  */
 function _isConfigurationAlternative(index, a, b) {
-    if (!a || !b || a === b || a.file !== b.file || a.name !== b.name) return false;
+    if (!a || !b || a === b || a.name !== b.name) return false;
     const style = langTraits(index.files.get(a.file)?.language)?.conditionalDefinitions;
     if (!style) return false;
+    // Go (fix #425): files of one package under different build
+    // constraints declare one item.
+    if (style === 'build-constraint') {
+        return !NON_CALLABLE_TYPES.has(a.type) && !NON_CALLABLE_TYPES.has(b.type) &&
+            goBuildAlternatives(index, a, b);
+    }
+    if (a.file !== b.file) return false;
     // Runtime configuration (fix #398F, Python): alternatives are the
     // definition sites of one parser-recorded item, whatever their
     // signatures (no overloads to tell apart).
@@ -27346,9 +27501,9 @@ function _nominalChainedReceiverType(index, call, fileEntry, filePath) {
         const cands = defs.filter(d => !(d.className || d.receiver));
         let chosen = null;
         if (langTraits(language)?.packageScope === 'directory') {
-            const dir = path.dirname(filePath);
-            const samePkg = cands.filter(d => d.file && path.dirname(d.file) === dir);
-            if (samePkg.length === 1) chosen = samePkg[0];
+            const samePkg = goAlternativesAt(index, filePath,
+                cands.filter(d => d.file && goBareNameReaches(index, filePath, d)));
+            if (samePkg.length === 1 || _oneConfigurationItem(index, samePkg)) chosen = samePkg[0];
         } else if (cands.length === 1) {
             chosen = cands[0];
         } else {
@@ -30262,9 +30417,9 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
         .filter(d => !NON_CALLABLE_TYPES.has(d.type) && !(d.className || d.receiver));
     let chosen = null;
     if (traits?.packageScope === 'directory') {
-        const dir = path.dirname(filePath);
-        const samePkg = defs.filter(d => d.file && path.dirname(d.file) === dir);
-        if (samePkg.length === 1) chosen = samePkg[0];
+        const samePkg = goAlternativesAt(index, filePath,
+            defs.filter(d => d.file && goBareNameReaches(index, filePath, d)));
+        if (samePkg.length === 1 || _oneConfigurationItem(index, samePkg)) chosen = samePkg[0];
     } else if (defs.length === 1) {
         chosen = defs[0];
     } else {

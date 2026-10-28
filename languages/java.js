@@ -1283,6 +1283,52 @@ function findCallsInCode(code, parser) {
     };
     const extractReceiverTypeQualifier = (typeNode) =>
         extractTypeQualifier(typeNode) || extractTypePackage(typeNode);
+    // Pattern variables (fix #425, the Go type-switch rule): `x instanceof
+    // Sq s`, `case Sq s ->` and record components `case Pt(Sq a, ..)` bind a
+    // local of the written type wherever its scope reaches (JLS 6.3.1,
+    // decided by patternBindingReach). Collected once per file by name.
+    let patternBindings = null;
+    // Patterns occur only after `instanceof` and in `case` labels.
+    const mayHavePatterns = /\binstanceof\b|\bcase\b/.test(code);
+    const patternTypeAt = (refNode) => {
+        if (!mayHavePatterns) return null;
+        if (!patternBindings) {
+            patternBindings = new Map();
+            for (const n of tree.rootNode.descendantsOfType(['type_pattern', 'instanceof_expression',
+                'record_pattern_component'])) {
+                let nameNode;
+                let typeNode;
+                if (n.type === 'instanceof_expression') {
+                    nameNode = n.childForFieldName('name');
+                    typeNode = n.childForFieldName('right');
+                } else {
+                    const kids = n.namedChildren.filter(kid => !kid.type.includes('comment'));
+                    nameNode = kids.length === 2 ? kids[1] : null;
+                    typeNode = kids.length === 2 ? kids[0] : null;
+                }
+                if (nameNode?.type !== 'identifier' || !typeNode || typeNode.text === 'var') continue;
+                if (!patternBindings.has(nameNode.text)) patternBindings.set(nameNode.text, []);
+                patternBindings.get(nameNode.text).push({ nameNode, typeNode });
+            }
+        }
+        const list = refNode?.type === 'identifier' ? patternBindings.get(refNode.text) : null;
+        if (!list) return null;
+        for (let i = list.length - 1; i >= 0; i--) {
+            const { nameNode, typeNode } = list[i];
+            if (patternBindingReach(nameNode, refNode) !== 'in') continue;
+            const type = extractTypeName(typeNode);
+            if (!type) return null;
+            return {
+                type,
+                qualifier: extractReceiverTypeQualifier(typeNode) || undefined,
+                evidence: {
+                    receiverTypeSource: 'annotation',
+                    receiverTypeEvidence: { ...typeOrigin('annotation', typeNode), name: refNode.text, type },
+                },
+            };
+        }
+        return null;
+    };
     const qualifyTypeName = (text) => {
         const raw = String(text || '').trim()
             .replace(/^\?\s+extends\s+/, '')
@@ -1980,10 +2026,13 @@ function findCallsInCode(code, parser) {
                         }
                     }
                 }
+                const pattern = !castReceiverType && receiverNode?.type === 'identifier'
+                    ? patternTypeAt(receiverNode) : null;
                 const receiverType = castReceiverType || inlineConstructorType || arrayElementType ||
-                    ((receiver && receiver !== 'this') ? getReceiverType(receiver) : undefined);
+                    pattern?.type || ((receiver && receiver !== 'this') ? getReceiverType(receiver) : undefined);
                 const receiverTypeQualifier = packageQualifier || arrayElementQualifier ||
-                    (!castReceiverType && receiver ? getReceiverTypeQualifier(receiver) : undefined);
+                    (pattern ? pattern.qualifier : undefined) ||
+                    (!castReceiverType && !pattern && receiver ? getReceiverTypeQualifier(receiver) : undefined);
                 const receiverIsTypeQualified = !!((receiverNode?.type === 'identifier' || packageQualifier) &&
                     receiver && /^[A-Z]/.test(receiver) && !receiverType &&
                     !isDeclaredLocal(receiver) && !hasEnclosingField(node, receiver));
@@ -2066,7 +2115,8 @@ function findCallsInCode(code, parser) {
                     line: nameNode.startPosition.row + 1,
                     isMethod: !!objNode,
                     receiver,
-                    ...(receiverType && { receiverType, ...(getReceiverType(receiver, true) ||
+                    ...(receiverType && { receiverType, ...((pattern && pattern.type === receiverType && pattern.evidence) ||
+                        getReceiverType(receiver, true) ||
                         (castReceiverType ? { receiverTypeSource: 'cast', receiverTypeEvidence: typeOrigin('cast', objNode) } :
                             inlineConstructorType ? { receiverTypeSource: 'constructor', receiverTypeEvidence: typeOrigin('constructor', receiverNode) } :
                             arrayElementType ? { receiverTypeSource: 'annotation', receiverTypeEvidence: typeOrigin('annotation', receiverNode) } :

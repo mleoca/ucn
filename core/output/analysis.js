@@ -222,9 +222,14 @@ function unverifiedCalleeLines(entries, compact) {
     return lines;
 }
 
-/** " (constructs X)" for a constructor body edge beside its class callee (fix #421). */
+/**
+ * " (constructs X)" for a constructor body edge beside its class callee (fix
+ * #421); " (build alternative of F:L)" for a Go declaration of the callee in
+ * a file of another build constraint (fix #425).
+ */
 function constructsSuffix(callee) {
-    return callee?.initializerOf ? ` (constructs ${callee.initializerOf})` : '';
+    if (callee?.initializerOf) return ` (constructs ${callee.initializerOf})`;
+    return callee?.configurationAlternativeOf ? ` (build alternative of ${callee.configurationAlternativeOf})` : '';
 }
 
 /**
@@ -411,6 +416,7 @@ function formatContextJson(context) {
                 ...(c.sites && { sites: c.sites }),
                 ...(c.functionReference && { functionReference: true }),
                 ...(c.initializerOf && { initializerOf: c.initializerOf }),
+                ...(c.configurationAlternativeOf && { configurationAlternativeOf: c.configurationAlternativeOf }),
                 ...(c.reachable !== undefined && { reachable: c.reachable }),
             })),
             // v4 callee contract: visible unresolved-call entries (aggregated

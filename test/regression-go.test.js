@@ -8655,3 +8655,292 @@ describe('fix #420: Go value references by block scope and selector identity', (
         } finally { rm(dir); }
     });
 });
+
+describe('fix #425: Go generic values, method expressions, build alternatives, test packages, type switches', () => {
+    const { tmp, rm, idx } = require('./helpers');
+    const { execute } = require('../core/execute');
+    const plan = (index, name, renameTo) => {
+        const result = execute(index, 'plan', { name, renameTo });
+        assert.strictEqual(result.ok, true, result.error);
+        const edits = new Map(), reviews = new Set();
+        for (const change of result.result.changes) {
+            if (change.needsReview || change.newExpression === undefined) reviews.add(`${change.file}:${change.line}`);
+            else edits.set(`${change.file}:${change.line}`, change.newExpression);
+        }
+        for (const site of result.result.unverifiedSites || []) reviews.add(`${site.file}:${site.line}`);
+        return { edits, reviews };
+    };
+    const callers = (index, name) => {
+        const result = execute(index, 'context', { name });
+        assert.strictEqual(result.ok, true, result.error);
+        return {
+            confirmed: (result.result.callers || []).map(c => `${c.relativePath}:${c.line}`),
+            unverified: (result.result.unverifiedCallers || []).map(c => `${c.relativePath}:${c.line}`),
+        };
+    };
+    const calleeSites = (index, name) => {
+        const result = execute(index, 'context', { name });
+        assert.strictEqual(result.ok, true, result.error);
+        return (result.result.callees || []).map(c => `${c.relativePath}:${c.startLine}`).sort();
+    };
+
+    it('P0-17: generic function values are references of the function in every value position', () => {
+        const dir = tmp({
+            'go.mod': 'module ex\n\ngo 1.22\n',
+            'lo/lo.go': 'package lo\n\nfunc Map[T, R any](xs []T, f func(T) R) []R { return nil }\n',
+            'a.go': [
+                'package g',
+                '',
+                'import "ex/lo"',
+                '',
+                'type Field struct{}',
+                '',
+                'func Uint16s(key string, nums []uint16) Field { return Field{} }',
+                '',
+                'type conv[T any] func(string, T) Field',
+                '',
+                'var mapper = lo.Map[int, string]',
+                '',
+                'func apply(f func([]int, func(int) string) []string) {}',
+                '',
+                'func Use() interface{} {',
+                '\tapply(lo.Map[int, string])',
+                '\treturn conv[[]uint16](Uint16s)',
+                '}',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(Object.fromEntries(plan(index, 'a.go:7:Uint16s', 'U16').edits), {
+                'a.go:7': 'func U16(key string, nums []uint16) Field { return Field{} }',
+                'a.go:17': 'return conv[[]uint16](U16)',
+            });
+            assert.deepStrictEqual(Object.fromEntries(plan(index, 'lo/lo.go:3:Map', 'Each').edits), {
+                'lo/lo.go:3': 'func Each[T, R any](xs []T, f func(T) R) []R { return nil }',
+                'a.go:11': 'var mapper = lo.Each[int, string]',
+                'a.go:16': 'apply(lo.Each[int, string])',
+            });
+        } finally { rm(dir); }
+    });
+
+    it('P0-17: a bare name no local binds names its own package declaration in every file of the package', () => {
+        const dir = tmp({
+            'go.mod': 'module ex\n\ngo 1.22\n',
+            'a.go': 'package g\n\nfunc F() {}\n',
+            'b.go': [
+                'package g',
+                '',
+                'var table = []func(){F}',
+                '',
+                'func h() func() { return F }',
+                '',
+                'type S struct{ fn func() }',
+                '',
+                'var s = S{F}',
+                '',
+                'func run(ch chan func()) {',
+                '\tch <- F',
+                '\tF := 1',
+                '\t_ = F',
+                '}',
+                '',
+            ].join('\n'),
+            'x_test.go': 'package g_test\n\nfunc F() {}\n\nvar y = []func(){F}\n',
+        });
+        try {
+            const { edits } = plan(idx(dir), 'a.go:3:F', 'G');
+            assert.deepStrictEqual([...edits.keys()].sort(), ['a.go:3', 'b.go:12', 'b.go:3', 'b.go:5', 'b.go:9']);
+        } finally { rm(dir); }
+    });
+
+    it('P0-17: `pkg.F` references of an import no local shadows are renamed', () => {
+        const dir = tmp({
+            'go.mod': 'module ex\n\ngo 1.22\n',
+            'lib/lib.go': 'package lib\n\nfunc F() {}\n',
+            'use.go': [
+                'package main',
+                '',
+                'import "ex/lib"',
+                '',
+                'var table = []func(){lib.F}',
+                '',
+                'func k() bool { return lib.F != nil }',
+                '',
+                'func shadow() {',
+                '\tlib := struct{ F int }{1}',
+                '\tprintln(lib.F == 1)',
+                '}',
+                '',
+                'func main() { go lib.F() }',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const { edits, reviews } = plan(idx(dir), 'lib/lib.go:3:F', 'G');
+            assert.deepStrictEqual([...edits.keys()].sort(), ['lib/lib.go:3', 'use.go:14', 'use.go:5', 'use.go:7']);
+            assert.strictEqual(reviews.size, 0);
+        } finally { rm(dir); }
+    });
+
+    it('P0-18: (*T).M names T\'s method: confirmed for T, excluded for another type, renamed with T.M', () => {
+        const dir = tmp({
+            'go.mod': 'module ex\n\ngo 1.22\n',
+            'buf/buf.go': 'package buf\n\ntype Buffer struct{}\n\nfunc (b *Buffer) Append(s string) {}\n',
+            'a.go': [
+                'package me',
+                '',
+                'import "ex/buf"',
+                '',
+                'type Sugared struct{}',
+                'type Plain struct{}',
+                '',
+                'func (s *Sugared) WithLazy() *Sugared { return s }',
+                'func (p *Plain) WithLazy() *Plain     { return p }',
+                '',
+                'type withAny func(*Sugared) *Sugared',
+                '',
+                'var methods = []withAny{(*Sugared).WithLazy}',
+                'var plainFn = (*Plain).WithLazy',
+                'var call = (*Sugared).WithLazy(&Sugared{})',
+                'var app = (*buf.Buffer).Append',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const sugared = callers(index, 'a.go:8:WithLazy');
+            assert.deepStrictEqual(sugared.confirmed.sort(), ['a.go:13', 'a.go:15']);
+            assert.deepStrictEqual(sugared.unverified, []);
+            assert.deepStrictEqual(callers(index, 'a.go:9:WithLazy').confirmed, ['a.go:14']);
+            const { edits, reviews } = plan(index, 'a.go:8:WithLazy', 'Lazy');
+            assert.deepStrictEqual(Object.fromEntries(edits), {
+                'a.go:8': 'func (s *Sugared) Lazy() *Sugared { return s }',
+                'a.go:13': 'var methods = []withAny{(*Sugared).Lazy}',
+                'a.go:15': 'var call = (*Sugared).Lazy(&Sugared{})',
+            });
+            assert.strictEqual(reviews.size, 0);
+            assert.deepStrictEqual(callers(index, 'buf/buf.go:5:Append').confirmed, ['a.go:16']);
+        } finally { rm(dir); }
+    });
+
+    it('P0-19: //go:build alternatives in separate files are one item for plan, callers and callees', () => {
+        const dir = tmp({
+            'go.mod': 'module ex\n\ngo 1.22\n',
+            'x/old.go': '//go:build !go1.22\n\npackage x\n\nfunc Int64() int64 { return 1 }\n',
+            'x/new.go': '//go:build go1.22\n\npackage x\n\nfunc Int64() int64 { return 2 }\n',
+            'x/old_user.go': '//go:build !go1.22\n\npackage x\n\nfunc Old() int64 { return Int64() }\n',
+            'use.go': 'package main\n\nimport "ex/x"\n\nfunc Use() int64 { return x.Int64() }\n\nfunc main() { _ = Use() }\n',
+        });
+        try {
+            const index = idx(dir);
+            const { edits } = plan(index, 'x/old.go:5:Int64', 'Rand');
+            assert.deepStrictEqual([...edits.keys()].sort(), ['use.go:5', 'x/new.go:5', 'x/old.go:5', 'x/old_user.go:5']);
+            assert.deepStrictEqual(callers(index, 'x/new.go:5:Int64').confirmed, ['use.go:5']);
+            assert.deepStrictEqual(callers(index, 'x/old.go:5:Int64').confirmed.sort(), ['use.go:5', 'x/old_user.go:5']);
+            assert.deepStrictEqual(calleeSites(index, 'use.go:5:Use'), ['x/new.go:5', 'x/old.go:5']);
+            assert.deepStrictEqual(calleeSites(index, 'x/old_user.go:5:Old'), ['x/old.go:5']);
+        } finally { rm(dir); }
+    });
+
+    it('P0-27: an internal test never binds the external test package namesake', () => {
+        const dir = tmp({
+            'go.mod': 'module ex\n\ngo 1.22\n',
+            'a.go': 'package m\n\nfunc F() int { return 1 }\n',
+            'common_test.go': 'package m\n\nimport "testing"\n\nfunc withLogger(t testing.TB, a, b, c int) {}\n',
+            // The external test package declares its namesake at a line that
+            // falls inside the internal caller's function.
+            'ext_test.go': 'package m_test\n\nimport "testing"\n\n\n\n\n\nfunc withLogger(t *testing.T, s string) {}\n\n' +
+                'func TestExt(t *testing.T) { withLogger(t, "x") }\n',
+            'int_test.go': [
+                'package m',
+                '',
+                'import "testing"',
+                '',
+                'func TestInt(t *testing.T) {',
+                '\tfor i := 0; i < 1; i++ {',
+                '\t\tt.Run("a", func(t *testing.T) {',
+                '\t\t\t_ = F()',
+                '\t\t\twithLogger(t, 1, 2, 3)',
+                '\t\t})',
+                '\t}',
+                '}',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(callers(index, 'common_test.go:5:withLogger').confirmed, ['int_test.go:9']);
+            assert.deepStrictEqual(callers(index, 'ext_test.go:9:withLogger').confirmed, ['ext_test.go:11']);
+            assert.ok(calleeSites(index, 'int_test.go:5:TestInt').includes('common_test.go:5'));
+            assert.ok(!calleeSites(index, 'int_test.go:5:TestInt').includes('ext_test.go:9'));
+        } finally { rm(dir); }
+    });
+
+    it('P1-9: a type switch types its binding per clause and restores the outer binding after it', () => {
+        const dir = tmp({
+            'go.mod': 'module ex\n\ngo 1.22\n',
+            'a.go': [
+                'package gs',
+                '',
+                'type Shape interface{ Area() int }',
+                'type Sq struct{ s int }',
+                'type Ci struct{ r int }',
+                '',
+                'func (q *Sq) Scale() int { return 2 }',
+                'func (c *Ci) Scale() int { return 3 }',
+                'func (q *Sq) Area() int  { return 4 }',
+                'func (c *Ci) Area() int  { return 5 }',
+                '',
+                'func Use(x Shape, v *Ci) int {',
+                '\tswitch v := x.(type) {',
+                '\tcase *Sq:',
+                '\t\treturn v.Scale()',
+                '\tcase *Ci, nil:',
+                '\t\treturn v.Area()',
+                '\t}',
+                '\treturn v.Scale()',
+                '}',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(callers(index, 'a.go:7:Scale').confirmed, ['a.go:15']);
+            assert.deepStrictEqual(callers(index, 'a.go:8:Scale').confirmed, ['a.go:19']);
+            // A clause of several types keeps the switched value's type: an
+            // interface call, a possible dispatch.
+            const area = callers(index, 'a.go:9:Area');
+            assert.deepStrictEqual(area.confirmed, []);
+            assert.deepStrictEqual(area.unverified, ['a.go:17']);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #425: a bare Go name reaches another package only through a dot import', () => {
+    const { tmp, rm, idx } = require('./helpers');
+    const { execute } = require('../core/execute');
+    const confirmed = (index, name) => {
+        const result = execute(index, 'context', { name });
+        assert.strictEqual(result.ok, true, result.error);
+        return (result.result.callers || []).map(c => `${c.relativePath}:${c.line}`).sort();
+    };
+    it('the external test package sees its dot-imported package; an import edge alone is no evidence', () => {
+        const dir = tmp({
+            'go.mod': 'module ex\n\ngo 1.22\n',
+            'pool/pool.go': 'package pool\n\nfunc New() int { return 1 }\n',
+            'obs/obs.go': 'package obs\n\nimport "ex/pool"\n\nfunc New() int { return pool.New() }\n',
+            'obs/obs_test.go': 'package obs_test\n\nimport (\n\t"testing"\n\n\t. "ex/obs"\n)\n\nfunc TestNew(t *testing.T) { _ = New() }\n',
+            'use/use.go': 'package use\n\nimport "ex/obs"\n\nfunc New() int { return 3 }\n\nfunc U() int { return New() + obs.New() }\n',
+            // A dot import of another directory's package.
+            'other/other_test.go': 'package other_test\n\nimport (\n\t"testing"\n\n\t. "ex/obs"\n)\n\nfunc TestOther(t *testing.T) { _ = New() }\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(confirmed(index, 'obs/obs.go:5:New'),
+                ['obs/obs_test.go:9', 'other/other_test.go:9', 'use/use.go:7']);
+            assert.deepStrictEqual(confirmed(index, 'pool/pool.go:3:New'), ['obs/obs.go:5']);
+            assert.deepStrictEqual(confirmed(index, 'use/use.go:5:New'), ['use/use.go:7']);
+        } finally { rm(dir); }
+    });
+});

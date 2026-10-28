@@ -9946,3 +9946,44 @@ describe('fix #424: Python rename closure, nested scopes and configuration items
         } finally { rm(dir); }
     });
 });
+
+describe('fix #425: Python class patterns type the capture and narrow the subject in their case body', () => {
+    const { tmp, rm, idx } = require('./helpers');
+    const { execute } = require('../core/execute');
+    const callers = (index, name) => {
+        const result = execute(index, 'context', { name });
+        assert.strictEqual(result.ok, true, result.error);
+        return {
+            confirmed: (result.result.callers || []).map(c => `${c.relativePath}:${c.line}`).sort(),
+            unverified: (result.result.unverifiedCallers || []).map(c => `${c.relativePath}:${c.line}`).sort(),
+        };
+    };
+    it('`case Sq() as s`, `case Sq():` on a name subject; a union of class patterns names no type', () => {
+        const dir = tmp({
+            'shapes.py': [
+                'class Sq:',
+                '    def scale(self): return 2',
+                '',
+                'class Ci:',
+                '    def scale(self): return 3',
+                '',
+                'def use(x):',
+                '    match x:',
+                '        case Sq() as s:',
+                '            return s.scale()',
+                '        case Ci():',
+                '            return x.scale()',
+                '        case Sq(a=1) | Ci() as t:',
+                '            return t.scale()',
+                '    return 0',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(callers(index, 'shapes.py:2:scale').confirmed, ['shapes.py:10']);
+            assert.deepStrictEqual(callers(index, 'shapes.py:5:scale').confirmed, ['shapes.py:12']);
+            assert.ok(callers(index, 'shapes.py:2:scale').unverified.includes('shapes.py:14'));
+        } finally { rm(dir); }
+    });
+});

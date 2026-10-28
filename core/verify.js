@@ -2754,6 +2754,61 @@ function cLinkAlternatives(index, def, definitions) {
 
 // C: plain identifiers of one spelling at file scope name one entity
 // (no overloading, no namespaces).
+/**
+ * Go (fix #425): does a dot import of `refFile` (`import . "p"`) bring the
+ * pinned package-level declaration into the file? Its package is the
+ * imported directory's (never its tests) and only exported names enter.
+ */
+function goDotImportReaches(index, refFile, def) {
+    if (!def?.file || !/^\p{Lu}/u.test(def.name || '') || def.file.endsWith('_test.go')) return false;
+    const entry = index.files.get(refFile);
+    const pinDir = path.dirname(def.file);
+    return (entry?.importDetails || []).some(detail => {
+        if (detail.type !== 'dot-import' || !detail.module) return false;
+        const rel = entry.moduleResolved?.[detail.module];
+        if (!rel) return false;
+        const abs = path.isAbsolute(rel) ? rel : path.join(index.root, rel);
+        if (path.dirname(abs) !== pinDir) return false;
+        const imported = index.files.get(abs)?.packageName;
+        const pinPackage = index.files.get(def.file)?.packageName;
+        return !imported || !pinPackage || imported === pinPackage;
+    });
+}
+
+/**
+ * Go (fix #425): does the import named `qualifier` in `refFile` (by package
+ * clause, or the name the file writes) resolve to the package that declares
+ * the pinned exported, non-test declaration?
+ */
+function goImportReaches(index, refFile, qualifier, def) {
+    if (!def?.file || !/^\p{Lu}/u.test(def.name || '') || def.file.endsWith('_test.go')) return false;
+    const entry = index.files.get(refFile);
+    const modules = entry?.imports || [];
+    const names = entry?.importNames || [];
+    if (names.length !== modules.length) return false;
+    const pinDir = path.dirname(def.file);
+    return modules.some((module, i) => {
+        if (names[i] !== qualifier) return false;
+        const rel = entry.moduleResolved?.[module];
+        if (!rel) return false;
+        const abs = path.isAbsolute(rel) ? rel : path.join(index.root, rel);
+        return path.dirname(abs) === pinDir;
+    });
+}
+
+/** Is the receiver of a Go selector reference bound by a local? (fix #425) */
+function goSelectorReceiverIsLocal(index, ref) {
+    if (!Number.isInteger(ref.column)) return null;
+    try {
+        const content = index._readFile(ref.file);
+        const tree = index._getParsedTree?.(ref.file, content, 'go') ||
+            safeParse(getParser('go'), content);
+        return getLanguageAdapter('go')?.selectorReceiverIsLocal?.(tree, ref.line, ref.column) ?? null;
+    } catch {
+        return null;
+    }
+}
+
 function cExternalReferenceLanguage(index, file) {
     const traits = langTraits(index.files.get(file)?.language);
     return !!traits?.textualIncludes && !traits.hasArityOverloads;
@@ -4179,6 +4234,9 @@ function plan(index, name, options = {}) {
                 // parser-recorded alternatives of the item, whatever their
                 // parameters.
                 conditionalStyle === 'branch' ? _isConfigurationAlternative(index, def, other) :
+                // Go (fix #425): the files of the package that declare the
+                // item under other build constraints.
+                conditionalStyle === 'build-constraint' ? _isConfigurationAlternative(index, def, other) :
                 other.file === def.file && !other.isSignature &&
                 !NON_CALLABLE_TYPES.has(other.type) &&
                 (other.className || null) === (def.className || null) &&
@@ -5139,6 +5197,24 @@ function plan(index, name, options = {}) {
                     return null;
                 }
                 if (def.className) return null;
+                // Go (fix #425): a bare name no local binds denotes the
+                // package-level declaration of the reference's own package
+                // (directory and package clause, test visibility), or the
+                // exported name a dot import brings into the file.
+                if (!ref.receiver && ref.scopeBinding === 'module' && !def.receiver &&
+                    langTraits(index.files.get(ref.file)?.language)?.packageScope === 'directory') {
+                    const { goSamePackage } = require('./go-packages');
+                    if (goSamePackage(index, ref.file, def.file)) return 'edit';
+                    return goDotImportReaches(index, ref.file, def) ? 'edit' : null;
+                }
+                // `pkg.F` (fix #425): an import no local shadows names the
+                // imported package's declaration.
+                if (ref.receiver && !def.receiver &&
+                    langTraits(index.files.get(ref.file)?.language)?.packageScope === 'directory') {
+                    if (!goImportReaches(index, ref.file, ref.receiver, def)) return null;
+                    const local = goSelectorReceiverIsLocal(index, ref);
+                    return local === false ? 'edit' : local === true ? null : 'review';
+                }
                 // Module-attribute references carry stronger evidence
                 // than a bare name: `import requests; requests.put` binds
                 // through requests' export chain even inside a function.
