@@ -173,6 +173,15 @@ const STRUCTURAL_TRAITS = {
     // inside a class means this.execute(), and static imports bind foreign
     // class methods to bare names (fix #220).
     bareCallReachesMethods: false,
+    // A function declared in a function body is a binding of that body
+    // (JS/TS function scope, fix #423; Python defs, fix #402): a bare name
+    // outside the enclosing function never names it.
+    nestedItemsBlockScoped: true,
+    // Whether a declaration binds its name in its whole scope whatever its
+    // position (JS/TS: function declarations hoist, `let`/`const`/`class`
+    // names resolve statically; fix #423). Python binds names as statements
+    // run, so a module-level reference sees only earlier bindings.
+    staticModuleScope: true,
     // Where a bare (receiver-less) name can denote a class or enum MEMBER
     // value when bare names never reach methods (fix #420): 'declaration-body'
     // (JS/TS: only inside the enum or namespace declaring it), 'class-body'
@@ -601,6 +610,7 @@ const LANGUAGES = {
             // bare name outside it never names it (fix #402), unless the
             // function declares the name `global`.
             nestedItemsBlockScoped: true,
+            staticModuleScope: false,
             // Decorators with a known effect on what calling the decorated
             // function returns (fix #364), as resolved qualified names (a
             // trailing `()` marks a decorator factory call). Any other

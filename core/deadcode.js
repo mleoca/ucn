@@ -1354,6 +1354,13 @@ function deadcode(index, options = {}) {
             if (symbol.relativePath.endsWith('.d.ts')) {
                 continue;
             }
+            // The same holds for a `declare global` / `declare module 'x'`
+            // block in a source file (fix #423): its declarations merge
+            // with declarations outside the project, whose readers UCN
+            // cannot see (`interface Window`, a library's `Register`).
+            if (symbol.ambientAugmentation) {
+                continue;
+            }
 
             // Language-specific entry points (called by runtime/test runner, not user code)
             // Each language module declares its own isEntryPoint() rules.

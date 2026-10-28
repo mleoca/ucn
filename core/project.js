@@ -19,7 +19,7 @@ const { detectLanguage, getParser, getLanguageAdapter, safeParse, langTraits, PA
 const { validateFileIR } = require('./ir');
 const { createFileEntryFromIR, populateFileEntryFromIR } = require('./index-ir');
 const { getTokenTypeAtPosition } = require('../languages/utils');
-const { escapeRegExp, NON_CALLABLE_TYPES, codeUnitCompare, literalNameRegex, calleeNames } = require('./shared');
+const { escapeRegExp, isCallableMember, codeUnitCompare, literalNameRegex, calleeNames } = require('./shared');
 const stacktrace = require('./stacktrace');
 const indexCache = require('./cache');
 // Loaded on first use (fix #375): most commands never reach dead-code
@@ -2576,7 +2576,7 @@ class ProjectIndex {
         const hint = call?.macroExpansion && call.enclosingFunction;
         if (hint?.name) {
             const exact = this._symbolsNamedAt(fileEntry, hint.name, hint.startLine)
-                .find(symbol => !NON_CALLABLE_TYPES.has(symbol.type) &&
+                .find(symbol => isCallableMember(symbol) &&
                     symbol.startLine <= lineNum && symbol.endLine >= lineNum);
             if (exact) return returnSymbol ? exact : exact.name;
         }
@@ -2599,8 +2599,9 @@ class ProjectIndex {
 
         let best = null;
         let bestSourceScope = false;
+        // An arrow-function class field is a function body (fix #423).
         for (const symbol of fileEntry.symbols) {
-            if (!NON_CALLABLE_TYPES.has(symbol.type) &&
+            if (isCallableMember(symbol) &&
                 symbol.startLine <= lineNum &&
                 symbol.endLine >= lineNum) {
                 const sourceScope = call ? require('./callable-scope').containsCall(symbol, call) : null;

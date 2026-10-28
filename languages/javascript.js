@@ -1359,12 +1359,38 @@ function findFunctions(code, parser) {
  * Process a node for class/interface/type/enum extraction (single-pass helper)
  * Returns true if node was matched, false otherwise
  */
+/**
+ * The location of a class declaration from its first decorator (fix #423):
+ * `@Component({..}) export class C` places the decorators on the export
+ * statement, before `export`; the declaration starts there, as an
+ * undecorated-export or non-exported decorated class starts at its first
+ * token.
+ */
+function _decoratedDeclarationLocation(node, lines) {
+    const located = nodeToLocation(node, lines);
+    const wrapper = node.parent?.type === 'export_statement' ? node.parent : null;
+    let first = null;
+    for (let i = 0; wrapper && i < wrapper.namedChildCount; i++) {
+        const child = wrapper.namedChild(i);
+        if (child.type !== 'decorator') continue;
+        if (child.startIndex < node.startIndex) first = first || child;
+    }
+    if (!first) return located;
+    const startLine = first.startPosition.row + 1;
+    const indent = ((lines[first.startPosition.row] || '').match(/^(\s*)/) || ['', ''])[1].length;
+    return {
+        startLine, endLine: located.endLine, indent,
+        sourceSpan: { ...located.sourceSpan, start: first.startIndex, startLine,
+            startColumn: first.startPosition.column },
+    };
+}
+
 function _processClass(node, classes, processedRanges, lines) {
     // Class declarations (including abstract classes)
     if (node.type === 'class_declaration' || node.type === 'class' || node.type === 'abstract_class_declaration') {
         const nameNode = node.childForFieldName('name');
         if (nameNode) {
-            const { startLine, endLine, sourceSpan } = nodeToLocation(node, lines);
+            const { startLine, endLine, sourceSpan } = _decoratedDeclarationLocation(node, lines);
             const members = extractClassMembers(node, lines);
             const docstring = extractJSDocstring(lines, startLine);
             const generics = extractGenerics(node);
@@ -1374,11 +1400,14 @@ function _processClass(node, classes, processedRanges, lines) {
             const decoratorsWithArgs = extractDecoratorsWithArgs(node);
 
             const isAbstract = node.type === 'abstract_class_declaration';
+            const nameLine = nameNode.startPosition.row + 1;
             classes.push({
                 name: nameNode.text,
                 startLine,
                 endLine,
                 sourceSpan,
+                // A decorated class names itself below its first decorator.
+                ...(nameLine !== startLine && { nameLine }),
                 type: 'class',
                 members,
                 ...(isAbstract && { modifiers: ['abstract'] }),
@@ -2175,6 +2204,38 @@ function jsModuleValueAliases(root) {
     return { aliases, assignedNames: [...written].sort() };
 }
 
+/**
+ * Declarations inside `declare global { .. }` and `declare module 'name' {
+ * .. }` merge with declarations outside the project (fix #423: `interface
+ * Window`, a router's `Register`): the checker reads them through the merged
+ * declaration, so no use names them in project code. Marks every symbol
+ * (and member) whose span lies in such a block `ambientAugmentation`.
+ */
+function markAmbientAugmentations(root, groups) {
+    const ranges = [];
+    for (let i = 0; i < root.namedChildCount; i++) {
+        let node = root.namedChild(i);
+        if (node.type === 'export_statement') node = node.namedChild(0);
+        if (node?.type !== 'ambient_declaration') continue;
+        const inner = node.namedChild(0);
+        const augments = inner?.type === 'statement_block' ||
+            (inner?.type === 'module' && inner.childForFieldName('name')?.type === 'string');
+        if (augments) ranges.push([node.startIndex, node.endIndex]);
+    }
+    if (ranges.length === 0) return;
+    const inside = item => {
+        const start = item?.sourceSpan?.start;
+        return Number.isInteger(start) && ranges.some(([from, to]) => start >= from && start < to);
+    };
+    for (const group of groups) {
+        for (const item of group) {
+            if (!inside(item)) continue;
+            item.ambientAugmentation = true;
+            for (const member of item.members || []) member.ambientAugmentation = true;
+        }
+    }
+}
+
 function parse(code, parser) {
     const tree = parseTree(parser, code);
     const lines = code.split('\n');
@@ -2286,6 +2347,7 @@ function parse(code, parser) {
     classes.sort((a, b) => a.startLine - b.startLine);
     stateObjects.sort((a, b) => a.startLine - b.startLine);
     callableAliases.sort((a, b) => a.startLine - b.startLine);
+    markAmbientAugmentations(tree.rootNode, [functions, classes, stateObjects]);
     const { aliases: moduleValueAliases, assignedNames: moduleAssignedNames } = jsModuleValueAliases(tree.rootNode);
 
     return {
@@ -3772,6 +3834,38 @@ function findCallsInCode(code, parser) {
             enclosingFunction: getCurrentEnclosingFunction(),
         });
     };
+    // A method overwritten on a typed receiver (fix #423, commander tests:
+    // `cmd.copyInheritedSettings = mock` with `cmd = new Command()`): the
+    // written member names the method exactly like a stored read, and a
+    // rename that leaves it assigns another property. Only values that can
+    // hold a callable record a reference; a data write (`x.count = 0`)
+    // records nothing, and `this` members are read by their own pass.
+    const CALLABLE_VALUE_TYPES = new Set(['identifier', 'member_expression', 'arrow_function',
+        'function_expression', 'function', 'call_expression', 'conditional_expression']);
+    const memberWriteReference = (leftNode, rightNode) => {
+        if (leftNode?.type !== 'member_expression') return;
+        const prop = leftNode.childForFieldName('property');
+        const obj = leftNode.childForFieldName('object');
+        if (prop?.type !== 'property_identifier' || obj?.type !== 'identifier' || SKIP_IDENTS.has(prop.text)) return;
+        let value = rightNode;
+        while (value && (value.type === 'parenthesized_expression' || value.type === 'as_expression' ||
+            value.type === 'satisfies_expression' || value.type === 'non_null_expression')) {
+            value = value.namedChild(0);
+        }
+        if (!value || !CALLABLE_VALUE_TYPES.has(value.type)) return;
+        const facts = memberReceiverFacts(obj, prop.text);
+        if (!facts.receiverType) return;
+        calls.push({
+            name: prop.text,
+            line: prop.startPosition.row + 1,
+            column: prop.startPosition.column,
+            isMethod: true,
+            ...facts,
+            isFunctionReference: true,
+            memberValue: true,
+            enclosingFunction: getCurrentEnclosingFunction(),
+        });
+    };
     const destructuredFields = (refNode) => {
         const destructured = destructuredBindingOf(refNode, refNode.text);
         return destructured ? { destructured } : null;
@@ -3963,6 +4057,7 @@ function findCallsInCode(code, parser) {
             const left = node.childForFieldName('left');
             const right = node.childForFieldName('right');
             memberValueReference(right);
+            memberWriteReference(left, right);
             if (left?.type === 'identifier') {
                 if (right?.type === 'new_expression') {
                     nonCallableNames.add(left.text);
@@ -5090,8 +5185,39 @@ function findImportsInCode(code, parser) {
                     const deferredFields = deferral ? { deferred: true, deferredReason: deferral } : {};
                     if (firstArg && firstArg.type === 'string') {
                         const modulePath = firstArg.text.slice(1, -1);
-                        imports.push({ module: modulePath, names: [], type: 'dynamic', line, dynamic: false,
-                            ...deferredFields });
+                        // `const { a, b: c } = await import('m')` binds the
+                        // module's named exports like a static import does
+                        // (fix #423, swr `const { preload } = await
+                        // import('swr')` in a test).
+                        const names = [], renames = [];
+                        // `{ default: x }` reads the module's default value,
+                        // as `import x from 'm'` (and `require('m')`) does.
+                        let defaultLocal = null;
+                        let holder = node.parent;
+                        while (holder && (holder.type === 'parenthesized_expression' ||
+                            holder.type === 'await_expression')) holder = holder.parent;
+                        const pattern = holder?.type === 'variable_declarator' ? holder.childForFieldName('name') : null;
+                        if (pattern?.type === 'object_pattern' && holder.childForFieldName('value') &&
+                            node.startIndex >= holder.childForFieldName('value').startIndex) {
+                            for (let i = 0; i < pattern.namedChildCount; i++) {
+                                const prop = pattern.namedChild(i);
+                                if (prop.type === 'shorthand_property_identifier_pattern') names.push(prop.text);
+                                else if (prop.type === 'pair_pattern') {
+                                    const key = prop.childForFieldName('key');
+                                    const val = prop.childForFieldName('value');
+                                    if (key?.type !== 'property_identifier' || val?.type !== 'identifier') continue;
+                                    if (key.text === 'default') { defaultLocal = val.text; continue; }
+                                    names.push(key.text);
+                                    if (val.text !== key.text) renames.push({ original: key.text, local: val.text });
+                                }
+                            }
+                        }
+                        imports.push({ module: modulePath, names, type: 'dynamic', line, dynamic: false,
+                            ...deferredFields, ...(renames.length > 0 && { renames }) });
+                        if (defaultLocal) {
+                            imports.push({ module: modulePath, names: [defaultLocal], type: 'dynamic', line,
+                                dynamic: false, defaultLike: true, ...deferredFields });
+                        }
                     } else if (firstArg) {
                         imports.push({ module: firstArg.text, names: [], type: 'dynamic', line, dynamic: true,
                             ...deferredFields });
@@ -5484,6 +5610,16 @@ function findUsagesInCode(code, name, parser, tree, options = {}) {
                     importAliasLocal = true;
                 }
             }
+            // `const { default: name } = await import('m')` / `require('m')`:
+            // the local of the module's default value is an import (fix #423).
+            else if (parent.type === 'pair_pattern' && sameNode(parent.childForFieldName('value'), node) &&
+                     parent.childForFieldName('key')?.text === 'default' &&
+                     parent.parent?.type === 'object_pattern' &&
+                     parent.parent.parent?.type === 'variable_declarator' &&
+                     sameNode(parent.parent.parent.childForFieldName('name'), parent.parent) &&
+                     isImportInitializerNode(parent.parent.parent.childForFieldName('value'))) {
+                usageType = 'import';
+            }
             // Call: identifier is function in call_expression
             else if (parent.type === 'call_expression' &&
                      sameNode(parent.childForFieldName('function'), node)) {
@@ -5557,10 +5693,13 @@ function findUsagesInCode(code, name, parser, tree, options = {}) {
                 // Check if the object_pattern is part of a variable_declarator with require()
                 const declarator = parent.parent;
                 if (declarator && declarator.type === 'variable_declarator') {
-                    const value = declarator.childForFieldName('value');
+                    let value = declarator.childForFieldName('value');
+                    // `const { name } = await import('m')` (fix #423).
+                    while (value && (value.type === 'await_expression' ||
+                        value.type === 'parenthesized_expression')) value = value.namedChild(0);
                     if (value && value.type === 'call_expression') {
                         const func = value.childForFieldName('function');
-                        if (func && func.text === 'require') {
+                        if (func && (func.text === 'require' || func.type === 'import')) {
                             usageType = 'import';
                         }
                     }

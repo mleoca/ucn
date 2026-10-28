@@ -10,7 +10,7 @@ const crypto = require('crypto');
 const { detectLanguage, getParser, getLanguageAdapter, langTraits } = require('../languages');
 const { genericArityOf, hasParameterizedQualifier, goPathPackageName } = require('../languages/utils');
 const { isTestFile } = require('./discovery');
-const { NON_CALLABLE_TYPES, isOverrideMarked, codeUnitCompare, isTestPath, CALLABLE_SYMBOL_KINDS,
+const { NON_CALLABLE_TYPES, isCallableMember, isOverrideMarked, codeUnitCompare, isTestPath, CALLABLE_SYMBOL_KINDS,
     isMacroNamespaceDefinition } = require('./shared');
 const { _resolveJavaPackageImport, _rustWalkUsePath, splitParentList } = require('./graph-build');
 // JDK contracts used by Java overload and receiver rules (fix #421: language
@@ -1277,9 +1277,21 @@ function findCallers(index, name, options = {}) {
             // Only records bearing the name can match below unless an alias
             // surface or a type-qualifier reference can (fix #365): visit
             // those, in record order, instead of every call in the file.
+            // With alias surfaces, a record can match only by the name, an
+            // alias surface's name, a destructured key, or a construction
+            // spelled through a qualifier or base (fix #423: a resolved
+            // self-package import made swr's test files expose aliases, and
+            // every record of them ran the views below).
+            const functionalConstruction = !!langTraits(fileEntry.language)?.functionalTypeConstruction;
             let visitCalls = pendingRecords !== undefined ? pendingRecords
-                : hasAliasSurfaces || targetIsTypeQuery
-                    ? calls : _callsBearingName(index, filePath, calls, name);
+                : targetIsTypeQuery ? calls
+                : hasAliasSurfaces
+                    ? calls.filter(call => call && (_callBearsName(call, name) || aliasNames.has(call.name) ||
+                        (call.resolvedName && aliasNames.has(call.resolvedName)) ||
+                        (Array.isArray(call.resolvedNames) && call.resolvedNames.some(n => aliasNames.has(n))) ||
+                        call.destructured || call.receiverIsTypeQualified || call.constructorQualifier ||
+                        call.implicitBase || functionalConstruction))
+                    : _callsBearingName(index, filePath, calls, name);
             if (typedViews) {
                 // A file reached only through such records visits only them.
                 visitCalls = !nameBearingFiles || nameBearingFiles.has(filePath) || hasAliasSurfaces
@@ -1539,8 +1551,13 @@ function findCallers(index, name, options = {}) {
 
                 // A fn declared in a fn body is visible only inside that
                 // body (fix #377): a bare call elsewhere names something else.
+                // A name a local or module VALUE binds here (`const app =
+                // createApplication()`, an import) may hold the nested item
+                // its function returned (fix #423): the value rules decide.
                 if (!call.receiver && !call.isMethod && pinnedLanguageTargets.length > 0 &&
-                    langTraits(fileEntry.language)?.nestedItemsBlockScoped) {
+                    langTraits(fileEntry.language)?.nestedItemsBlockScoped &&
+                    !call.moduleLocalBinding && !call.localShadow &&
+                    !_fileImportBindsName(fileEntry, call.name)) {
                     const outside = pinnedLanguageTargets.every(target =>
                         _nestedItemOutOfScope(index, filePath, target, call.line));
                     if (outside) {
@@ -2797,11 +2814,18 @@ function findCallers(index, name, options = {}) {
                     // names never own module scope — a same-file `class X {
                     // validate() {} }` must not exclude the imported
                     // validate passed as a callback.
+                    // A statically scoped module (JS/TS, fix #423, pino
+                    // `onExit.register(stream, autoEnd)` above tools.js's own
+                    // `function autoEnd`) binds its declarations in the whole
+                    // module; a nested item binds only inside its function.
+                    const cbStaticScope = langTraits(fileEntry.language)?.staticModuleScope;
+                    const cbNestedScoped = langTraits(fileEntry.language)?.nestedItemsBlockScoped;
                     if (!cbSameFile && !cbPackageQualified && definitionsInFile(index, call.name, filePath).some(d =>
                         !cbTargetFiles.has(d.file) &&
-                        d.startLine <= call.line &&
+                        (cbStaticScope || d.startLine <= call.line) &&
                         !d.className && !d.memberAssigned && !d.bodyScopedName &&
-                        !NON_CALLABLE_TYPES.has(d.type))) {
+                        !NON_CALLABLE_TYPES.has(d.type) &&
+                        !(cbNestedScoped && !d.receiver && _nestedItemOutOfScope(index, filePath, d, call.line)))) {
                         recordExcluded(filePath, call.line, 'other-definition-import');
                         continue;
                     }
@@ -2885,6 +2909,22 @@ function findCallers(index, name, options = {}) {
                             continue;
                         }
                         cbImportLink = true;
+                    }
+                    // A bare reference a module file binds by no import, no
+                    // module declaration and no global the project assigns
+                    // names a local, a global or a builtin (fix #423, the
+                    // #215 rule for plain calls; pino `plan.equal(child, ..)`
+                    // reads a test's `const child` through a closure): the
+                    // file's other imports never make it another file's def.
+                    if (!call.isMethod && !call.receiver && !cbSameFile && !cbPackageQualified &&
+                        !call.moduleLocalBinding && !call.resolvedName && !calledAs && cbNameBindings.length === 0 &&
+                        langTraits(fileEntry.language)?.typeSystem === 'structural' &&
+                        (fileEntry.importBindings || []).length > 0 &&
+                        !(fileEntry.importNames || []).includes('*') &&
+                        !cbTargetDefs.some(d => d.memberAssigned && d.assignedObject === 'global') &&
+                        !definitionsInFile(index, call.name, filePath).length) {
+                        recordExcluded(filePath, call.line, 'name-not-in-scope');
+                        continue;
                     }
                     if (!cbSameFile && !cbSamePackage && !cbPackageQualified) {
                         const cbImports = index.importGraph.get(filePath);
@@ -3742,6 +3782,20 @@ function findCallers(index, name, options = {}) {
                                          (relation !== 'ancestor' &&
                                           !shareClassDescendant(index, declaring.ref, tDefs)))) {
                                         routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs);
+                                        continue;
+                                    }
+                                    // fix #423 (commander-measured: `this.createCommand()`
+                                    // inside Command confirmed for every subclass
+                                    // override): `this` dispatches by the runtime
+                                    // class. The lexical match is the declaring
+                                    // class's own member; a pinned override below
+                                    // it (or reached through a shared descendant)
+                                    // is a possible dispatch, as in the nominal
+                                    // and Python branch above.
+                                    if (!isTargetClass && !parentOnlyReceiver) {
+                                        routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
+                                            dispatchVia: matchedClass,
+                                        });
                                         continue;
                                     }
                                 }
@@ -4632,6 +4686,10 @@ function findCallers(index, name, options = {}) {
                 // (fix #397): file-level import-graph fallbacks below never
                 // override that name-level evidence.
                 let importChainReachesTarget = false;
+                // The project files the name's own import bindings resolve to
+                // when their chains could not be modeled (fix #423): the only
+                // import edges that are evidence about this name.
+                let nameImportFiles = null;
                 if (!bindingId && !call.isMethod &&
                     langTraits(fileEntry.language)?.typeSystem === 'structural' &&
                     (fileEntry.importBindings || []).length > 0) {
@@ -4720,8 +4778,17 @@ function findCallers(index, name, options = {}) {
                     // every pinned def is class-scoped (fix #222, rich-measured):
                     // the class member is outside the bare-name lookup chain,
                     // so the file's import bindings own the name.
+                    // Same for every pin a bare name here cannot bind (fix
+                    // #423, pino-measured: `const test = require('tape')`
+                    // beside `{ test: () => .. }`): members assigned to an
+                    // object, a function expression's own body-scoped name
+                    // and a nested item outside its enclosing function.
+                    const nestedScoped = langTraits(fileEntry.language)?.nestedItemsBlockScoped;
                     const samefilePinsOutOfScope = targetDefs.length > 0 &&
-                        targetDefs.every(d => d.className);
+                        targetDefs.every(d => d.className || (d.file === filePath &&
+                            (d.memberAssigned || d.bodyScopedName ||
+                                (nestedScoped && !d.receiver &&
+                                    _nestedItemOutOfScope(index, filePath, d, call.line)))));
                     const pairedImportAlias = (call.resolvedName || calledAs) &&
                         nameBindings.some(b => b.alias === call.name);
                     const localImport = nameBindings.some(b => b.deferred &&
@@ -4743,8 +4810,10 @@ function findCallers(index, name, options = {}) {
                         let undetermined = false;
                         let moduleValue = false;
                         let configurationReach = false;
+                        const ownResolved = new Set();
                         for (const b of nameBindings) {
                             const rel = fileEntry.moduleResolved && fileEntry.moduleResolved[b.module];
+                            if (rel) ownResolved.add(path.join(index.root, rel));
                             if (!rel) {
                                 // Unresolved module: external — unless it is
                                 // relative (project-internal by construction)
@@ -4809,6 +4878,19 @@ function findCallers(index, name, options = {}) {
                                 routeUnverified(filePath, fileEntry, call, 'ambiguous-binding', calledAs);
                             }
                             continue;
+                        }
+                        // The name's own import decides it (fix #423, swr
+                        // `unstable_serialize` from 'swr/infinite' confirmed
+                        // through the file's 'swr' import): an import of the
+                        // name the resolver cannot follow is visible, and
+                        // one it follows into an unmodelable chain is
+                        // evidence only through the file it resolves to.
+                        if (!reaches && undetermined && collectAccount) {
+                            if (ownResolved.size === 0) {
+                                routeUnverified(filePath, fileEntry, call, 'import-unresolved', calledAs);
+                                continue;
+                            }
+                            nameImportFiles = ownResolved;
                         }
                     }
                 }
@@ -6132,8 +6214,10 @@ function findCallers(index, name, options = {}) {
                 // The name's own import binding chased to a target through
                 // any number of re-exports (fix #397) is import evidence; the
                 // file-level edge check looks one re-export hop deep.
-                let importEdgeLink = importChainReachesTarget ||
-                    fileImportEdgeLink(filePath, callerImports, targetFiles2);
+                let importEdgeLink = importChainReachesTarget || (nameImportFiles
+                    ? setSome(nameImportFiles, f => f !== filePath && (targetFiles2.has(f) ||
+                        setSome(index.importGraph.get(f) || new Set(), ti => ti !== filePath && targetFiles2.has(ti))))
+                    : fileImportEdgeLink(filePath, callerImports, targetFiles2));
                 // Same-file membership is module-scope evidence for plain calls,
                 // but says nothing about a method receiver: `foo.map()` sharing a
                 // file with `function map()` must not confirm while foo's type is
@@ -6209,7 +6293,7 @@ function findCallers(index, name, options = {}) {
                     }
                 }
                 const hasImportLink = importEdgeLink ||
-                    (targetFiles2.has(filePath) && !uncertainMethodReceiver);
+                    (targetFiles2.has(filePath) && !uncertainMethodReceiver && !nameImportFiles);
 
                 // Several external-linkage definitions of one free function
                 // (platform variants: src/unix vs src/win) are chosen by the
@@ -9207,7 +9291,7 @@ function findCallees(index, definition, options = {}) {
                         });
                         continue;
                     }
-                    const isCallable = (s) => !NON_CALLABLE_TYPES.has(s.type) ||
+                    const isCallable = (s) => isCallableMember(s) ||
                         (s.type === 'field' && s.fieldType && /^func\b/.test(s.fieldType));
                     // Same-class overloads select by static call shape —
                     // arity, then Java argKinds (fix #268); an undecidable
@@ -9319,7 +9403,7 @@ function findCallees(index, definition, options = {}) {
                         });
                         continue;
                     }
-                    const isCallableRT = (s) => !NON_CALLABLE_TYPES.has(s.type) ||
+                    const isCallableRT = (s) => isCallableMember(s) ||
                         (s.type === 'field' && s.fieldType && /^func\b/.test(s.fieldType));
                     // Same-class overload selection by static call shape (fix #268)
                     const receiverOriginFile = directReceiverFlow?.fromFile ||
@@ -9501,7 +9585,7 @@ function findCallees(index, definition, options = {}) {
                             receiverOrigin: { source: 'flow', ...chained }, originFile: chained.fromFile,
                         });
                         const symbols = index.symbols.get(call.name);
-                        const isCallableCh = (s) => !NON_CALLABLE_TYPES.has(s.type) ||
+                        const isCallableCh = (s) => isCallableMember(s) ||
                             (s.type === 'field' && s.fieldType && /^func\b/.test(s.fieldType));
                         const scopedConstructor = chained.exactConstructor &&
                             classDefsNamed(index, chained.type).hasScoped;
@@ -10721,7 +10805,7 @@ function findCallees(index, definition, options = {}) {
                 const selectOwner = ref => _calleeOverloadSelect(
                     index,
                     call,
-                    symbols.filter(symbol => !NON_CALLABLE_TYPES.has(symbol.type) &&
+                    symbols.filter(symbol => isCallableMember(symbol) &&
                         ownedBy(index, symbol, ref) !== 'no'),
                     language);
                 // Rust method probe (fix #399): the receiver's reference
@@ -10745,14 +10829,14 @@ function findCallees(index, definition, options = {}) {
                     : rustProbed?.match ? { match: rustProbed.match }
                     : _calleeSelectReceiverMethod(
                         index, call, symbols, def.className, language, def.file,
-                        symbol => !NON_CALLABLE_TYPES.has(symbol.type) &&
+                        symbol => isCallableMember(symbol) &&
                             _notForeignSameNameOwner(index, symbol, callerClassRef));
                 if (selected.ambiguous && callerClassRef?.key) {
                     // Same-class members that are alternatives of one
                     // configuration item (fix #402: defs under `if` /
                     // `try` in a Python class body): each is the callee
                     // whenever it exists, like the caller side's fan-out.
-                    const own = symbols.filter(symbol => !NON_CALLABLE_TYPES.has(symbol.type) &&
+                    const own = symbols.filter(symbol => isCallableMember(symbol) &&
                         ownedBy(index, symbol, callerClassRef) === 'yes');
                     if (own.length > 1 && own.every(member => member === own[0] ||
                         _isConfigurationAlternative(index, member, own[0]))) {
@@ -19614,6 +19698,15 @@ function _containerDeclaresGlobal(index, container, name) {
         let fn = tree?.rootNode.descendantForPosition({ row, column: 0 }, { row, column: 1 << 20 });
         while (fn && !(fn.type === 'function_definition' && fn.startPosition.row >= row - 64 &&
             fn.endPosition.row + 1 === container.endLine)) fn = fn.parent;
+        // A method's line range starts at its decorators or indentation
+        // (fix #423: `@classmethod` above `def cm`): the function whose
+        // span ends with the container's and starts in its first lines.
+        if (!fn && tree) {
+            fn = tree.rootNode.descendantsOfType('function_definition',
+                { row, column: 0 }, { row: container.endLine - 1, column: 1 << 20 })
+                .find(node => node.startPosition.row >= row && node.startPosition.row <= row + 64 &&
+                    node.endPosition.row + 1 === container.endLine) || null;
+        }
         if (fn) {
             declares = false;
             const stack = [fn.childForFieldName('body')].filter(Boolean);
@@ -19650,7 +19743,11 @@ function _enclosingFunctionOfDefinitionUncached(index, def) {
     // expansion generates share the invocation's lines.
     const spanned = d => Number.isFinite(d?.sourceSpan?.start) && Number.isFinite(d?.sourceSpan?.end);
     for (const symbol of entry?.symbols || []) {
-        if (!['function', 'method', 'constructor'].includes(symbol.type)) continue;
+        // Every callable body is a function scope (fix #423): JS static
+        // methods, accessors and arrow-function fields, Python decorated
+        // methods are indexed by their kind (`static`, `get`, `classmethod`,
+        // `property`).
+        if (!CALLABLE_SYMBOL_KINDS.has(symbol.type) && !(symbol.type === 'field' && isCallableMember(symbol))) continue;
         if (symbol.startLine === def.startLine && symbol.name === def.name) continue;
         if (spanned(symbol) && spanned(def)) {
             const a = symbol.sourceSpan, b = def.sourceSpan;
@@ -20681,6 +20778,10 @@ function _localShadowDenotes(index, filePath, call, d) {
  * declare the name `global`.
  */
 function _nestedItemOutOfScope(index, filePath, target, line) {
+    // A function assigned to a member, or a function expression's own name,
+    // binds no name of the enclosing function (fix #423): the member rules
+    // decide it.
+    if (target.memberAssigned || target.bodyScopedName) return false;
     const container = _enclosingFunctionOfDefinition(index, target);
     return !!container && (container.file !== filePath ||
         line < container.startLine || line > container.endLine) &&

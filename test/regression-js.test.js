@@ -6155,7 +6155,7 @@ describe('fix #213: this-calls pin to the enclosing class for JS/TS (routed, not
         } finally { rm(dir); }
     });
 
-    it('subclass override pinning: this-call in an ancestor stays confirmed (dynamic dispatch)', () => {
+    it('subclass override pinning: this-call in an ancestor routes possible-dispatch (fix #423)', () => {
         const dir = tmp({
             'package.json': '{"name":"t"}',
             'lib.ts': [
@@ -6170,10 +6170,15 @@ describe('fix #213: this-calls pin to the enclosing class for JS/TS (routed, not
         });
         try {
             const index = idx(dir);
-            // this.parse(1) inside Base can dispatch to Child.parse at runtime
+            // this.parse(1) inside Base can dispatch to Child.parse at
+            // runtime: visible as a possible dispatch, never confirmed
+            // (fix #423); Base.parse itself keeps the confirmed edge.
             const res = contract(index, 'lib.ts:6:parse'); // Child.parse
-            assert.ok(res.confirmed.includes('lib.ts:3'),
-                `Base.run's this.parse may dispatch to the Child override: ${res.confirmed} / ${JSON.stringify(res.unverified)}`);
+            assert.ok(!res.confirmed.includes('lib.ts:3'), `possible, not certain: ${res.confirmed}`);
+            const entry = res.unverified.find(u => u.key === 'lib.ts:3');
+            assert.strictEqual(entry?.reason, 'possible-dispatch', JSON.stringify(res.unverified));
+            assert.strictEqual(res.conserved, true);
+            assert.ok(contract(index, 'lib.ts:2:parse').confirmed.includes('lib.ts:3'));
         } finally { rm(dir); }
     });
 
@@ -12315,6 +12320,389 @@ describe('fix #420: JS/TS value members by namespace identity, slot closure and 
             assert.strictEqual(result.ok, true, result.error);
             assert.ok(!result.result.changes.some(change => change.line === 3),
                 JSON.stringify(result.result.changes.filter(change => change.line === 3)));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #423: JS/TS name scopes, own imports, self-package subpaths, runtime this-dispatch', () => {
+    const bands = (index, handle) => {
+        const r = execute(index, 'show', { name: handle, sections: 'callers' });
+        assert.ok(r.ok, r.error);
+        const ctx = r.result.context || r.result;
+        return {
+            confirmed: (ctx.callers || []).map(c => `${c.relativePath}:${c.line}`).sort(),
+            unverified: (ctx.unverifiedCallers || []).map(c => `${c.relativePath}:${c.line}:${c.reason}`).sort(),
+            excluded: Object.fromEntries(Object.entries(ctx.meta?.account?.excluded?.byReason || {})
+                .map(([reason, v]) => [reason, v.count])),
+            conserved: ctx.meta?.account?.conserved,
+        };
+    };
+    const plan = (index, handle, renameTo = 'NEW') => {
+        const r = execute(index, 'plan', { name: handle, renameTo });
+        assert.ok(r.ok, r.error);
+        const edits = new Map(), reviews = new Set();
+        for (const change of r.result.changes) {
+            if (change.needsReview || change.newExpression === undefined) reviews.add(`${change.file}:${change.line}`);
+            else edits.set(`${change.file}:${change.line}`, change.newExpression.trim());
+        }
+        return { edits, reviews, result: r.result };
+    };
+
+    it('a bare call bound to an outside import never reaches a same-file object or member function (P0-10)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'a.test.js': [
+                "const test = require('tape')",
+                "const parent = { test: () => 'parent' }",
+                'const child = {',
+                "  test: () => 'child'",
+                '}',
+                "test('a', (t) => t.end(parent, child))",
+            ].join('\n'),
+            'b.test.mjs': "import test from 'tape'\nconst s = { test: () => 1 }\ntest('b', () => s)\n",
+        });
+        try {
+            const index = idx(dir);
+            for (const handle of ['a.test.js:2:test', 'a.test.js:4:test', 'b.test.mjs:2:test']) {
+                const b = bands(index, handle);
+                assert.deepStrictEqual(b.confirmed, [], handle);
+                assert.deepStrictEqual(b.unverified, [], handle);
+                assert.strictEqual(b.conserved, true, handle);
+                assert.deepStrictEqual([...plan(index, handle).edits.keys()],
+                    [handle.split(':').slice(0, 2).join(':')], `only the member renames: ${handle}`);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('a JSX element of an imported component is not a member-assigned namesake; module declarations hoist for callbacks (P0-10)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'tsconfig.json': '{"compilerOptions":{"jsx":"react"}}',
+            'field.tsx': 'export function Field(props: any) { return null }\n',
+            'form.tsx': [
+                "import { Field } from './field'",
+                'export function make(api: any) {',
+                '  api.Field = function APIField(props: any) { return <Field {...props} /> }',
+                '  return api',
+                '}',
+            ].join('\n'),
+            'transport.js': 'function autoEnd (s) { return s }\nfunction setup (r, s) { r(s, autoEnd) }\nmodule.exports = setup\n',
+            'tools.js': [
+                "const setup = require('./transport')",
+                'function build (r, s) { r(s, autoEnd); return setup }',
+                'function autoEnd (s, e) { return e }',
+                'module.exports = { build }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const member = bands(index, 'form.tsx:3:Field');
+            assert.ok(!member.confirmed.includes('form.tsx:3'), JSON.stringify(member));
+            assert.ok(!plan(index, 'form.tsx:3:Field').edits.has('form.tsx:3') ||
+                plan(index, 'form.tsx:3:Field').edits.get('form.tsx:3').includes('<Field'),
+            'the imported component keeps its JSX tag');
+            assert.deepStrictEqual(bands(index, 'transport.js:1:autoEnd').confirmed, ['transport.js:2']);
+            assert.deepStrictEqual(bands(index, 'tools.js:3:autoEnd').confirmed, ['tools.js:2']);
+        } finally { rm(dir); }
+    });
+
+    it('a bare callback reference no import binds is never another file\'s def through other imports', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': 'function child () { return 1 }\nclass Form {\n  submit () { return 1 }\n}\nmodule.exports = { child, Form }\n',
+            'index.js': "const { child, Form } = require('./lib')\nmodule.exports = { child, Form }\n",
+            'a.test.js': [
+                "const lib = require('./index')",
+                'function t (check) {',
+                '  const o = { write () { check(child) } }',
+                '  const child = lib.child()',
+                '  return o',
+                '}',
+                'module.exports = t',
+            ].join('\n'),
+            'b.test.jsx': "const lib = require('./index')\nfunction C (props) { return <b onClick={props.submit} x={lib} /> }\nmodule.exports = C\n",
+        });
+        try {
+            const index = idx(dir);
+            const b = bands(index, 'lib.js:1:child');
+            assert.ok(!b.confirmed.includes('a.test.js:3') && !b.unverified.some(u => u.startsWith('a.test.js:3:')),
+                JSON.stringify(b));
+            const member = bands(index, 'lib.js:3:submit');
+            assert.ok(member.confirmed.includes('b.test.jsx:2') || member.unverified.some(u => u.startsWith('b.test.jsx:2:')),
+                `a member reference is not a bare name: ${JSON.stringify(member)}`);
+            assert.strictEqual(b.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('a base-class this.m() is a possible dispatch for a subclass override, certain for the base (P0-11)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t","type":"module"}',
+            'base.js': 'export class Command {\n  createCommand(n) { return new Command(n) }\n  command(n) { return this.createCommand(n) }\n}\n',
+            'sub.js': "import { Command } from './base.js'\nexport class My extends Command {\n  createCommand(n) { return new My(n) }\n}\n",
+            'base.ts': 'export class B {\n  make(n: string): B { return new B() }\n  run(n: string) { return this.make(n) }\n}\n',
+            'sub.ts': "import { B } from './base'\nexport class S extends B {\n  make(n: string): B { return new S() }\n}\n",
+        });
+        try {
+            const index = idx(dir);
+            for (const [override, base, site] of [['sub.js:3:createCommand', 'base.js:2:createCommand', 'base.js:3'],
+                ['sub.ts:3:make', 'base.ts:2:make', 'base.ts:3']]) {
+                const b = bands(index, override);
+                assert.ok(!b.confirmed.includes(site), JSON.stringify(b));
+                assert.ok(b.unverified.includes(`${site}:possible-dispatch`), JSON.stringify(b));
+                assert.strictEqual(b.conserved, true);
+                assert.ok(bands(index, base).confirmed.includes(site), base);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('a multi-line destructuring require of another module is not edited by a nested function rename (P0-12)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'a.js': "'use strict'\nmodule.exports = pino\nfunction pino (opts) {\n  const logger = {}\n  Object.defineProperty(logger, 'level', { get: getLevel })\n  function getLevel () { return opts.level }\n  return logger\n}\n",
+            'b.js': "'use strict'\nfunction getLevel (level) { return level }\nmodule.exports = { getLevel }\n",
+            'd.js': "'use strict'\nconst {\n  x,\n  getLevel,\n  y\n} = require('./b')\nmodule.exports = { level: getLevel, x, y }\n",
+        });
+        try {
+            const index = idx(dir);
+            const nested = plan(index, 'a.js:6:getLevel');
+            assert.deepStrictEqual([...nested.edits.keys()].sort(), ['a.js:5', 'a.js:6']);
+            const exported = plan(index, 'b.js:2:getLevel');
+            assert.strictEqual(exported.edits.get('d.js:4'), 'NEW,', 'the module\'s own import is still edited');
+        } finally { rm(dir); }
+    });
+
+    it('an import alias spelled like the renamed export is never renamed (P0-13)', () => {
+        const dir = tmp({
+            'tsconfig.json': '{}',
+            'p.ts': 'export const preload = (k: string) => k\nexport const middleware = (h: unknown) => h\n',
+            'm.ts': "import { middleware as preload } from './p'\nexport const BUILT_IN = [preload]\nexport const x = preload(1)\n",
+            'r.ts': "export { middleware as preload } from './p'\n",
+        });
+        try {
+            const index = idx(dir);
+            const { edits, reviews } = plan(index, 'p.ts:1:preload');
+            assert.deepStrictEqual([...edits.keys()], ['p.ts:1'], JSON.stringify([...edits]));
+            assert.strictEqual(reviews.size, 0);
+            assert.strictEqual(plan(index, 'p.ts:2:middleware').edits.get('m.ts:1'),
+                "import { NEW as preload } from './p'");
+        } finally { rm(dir); }
+    });
+
+    it('self-package subpath exports resolve to their src/ sources; an unresolved name import is never confirmed through another import (P0-14, P0-15, P1-3)', () => {
+        const dir = tmp({
+            'package.json': JSON.stringify({ name: 'selfpkg', main: './dist/index/index.js', exports: {
+                '.': { import: { types: './dist/index/index.d.mts', default: './dist/index/index.mjs' } },
+                './sub': { 'react-server': './dist/sub/react-server.mjs',
+                    import: { types: './dist/sub/index.d.mts', default: './dist/sub/index.mjs' } },
+            } }),
+            'tsconfig.json': '{"compilerOptions":{"strict":true}}',
+            'src/index.ts': 'export const serialize = (key: string) => key\nexport const other = 1\n',
+            'src/sub/index.ts': "export type SubOptions = { key: string }\nexport const serialize = (getKey: () => string) => getKey()\n",
+            'test/a.test.ts': "import { other } from 'selfpkg'\nimport { serialize } from 'selfpkg/sub'\nexport const v = serialize(() => 'k') + other\n",
+            'test/b.test.ts': "import { serialize } from 'selfpkg'\nexport const w = serialize('k')\n",
+            'test/c.test.ts': "import { other } from 'selfpkg'\nimport { serialize } from 'selfpkg/missing'\nexport const v = serialize(() => 'k') + other\n",
+            'test/t.ts': "import type { SubOptions } from 'selfpkg/sub'\nexport const o: SubOptions = { key: 'k' }\n",
+        });
+        try {
+            const index = idx(dir);
+            const root = bands(index, 'src/index.ts:1:serialize');
+            assert.deepStrictEqual(root.confirmed, ['test/b.test.ts:2']);
+            assert.deepStrictEqual(root.unverified, ['test/c.test.ts:3:import-unresolved']);
+            const sub = bands(index, 'src/sub/index.ts:2:serialize');
+            assert.deepStrictEqual(sub.confirmed, ['test/a.test.ts:3']);
+            const fn = plan(index, 'src/sub/index.ts:2:serialize');
+            assert.ok(fn.edits.has('test/a.test.ts:2') && fn.edits.has('test/a.test.ts:3'), JSON.stringify([...fn.edits]));
+            const type = plan(index, 'src/sub/index.ts:1:SubOptions');
+            assert.strictEqual(type.edits.get('test/t.ts:1'), "import type { NEW } from 'selfpkg/sub'");
+            assert.strictEqual(type.edits.get('test/t.ts:2'), "export const o: NEW = { key: 'k' }");
+            assert.strictEqual(type.reviews.size, 0);
+        } finally { rm(dir); }
+    });
+
+    it('a name destructured from a dynamic import is that import\'s binding', () => {
+        const dir = tmp({
+            'package.json': JSON.stringify({ name: 'selfpkg', exports: { '.': { import: './dist/index.mjs' } } }),
+            'tsconfig.json': '{}',
+            'src/index.ts': 'export const preload = (key: string) => key\n',
+            'test/a.test.ts': "export async function t() {\n  const { preload } = await import('selfpkg')\n  return preload('k')\n}\n",
+            'test/b.test.ts': "export async function u() {\n  const { preload: p } = await import('../src/index')\n  return p('k')\n}\n",
+            'lib/run.js': 'function run (o) { return o }\nmodule.exports = run\n',
+            'test/c.test.mjs': "export async function v () {\n  const { default: run } = await import('../lib/run.js')\n  return run({})\n}\n",
+        });
+        try {
+            const index = idx(dir);
+            const b = bands(index, 'src/index.ts:1:preload');
+            assert.ok(b.confirmed.includes('test/a.test.ts:3'), JSON.stringify(b));
+            const { edits } = plan(index, 'src/index.ts:1:preload');
+            assert.strictEqual(edits.get('test/a.test.ts:2'), "const { NEW } = await import('selfpkg')");
+            assert.strictEqual(edits.get('test/a.test.ts:3'), "return NEW('k')");
+            assert.strictEqual(edits.get('test/b.test.ts:2'), "const { NEW: p } = await import('../src/index')");
+            assert.ok(!edits.has('test/b.test.ts:3'), 'an aliased local keeps its name');
+            // `{ default: run }` reads the module's default value: its calls
+            // and its local are renamed together.
+            assert.ok(bands(index, 'lib/run.js:1:run').confirmed.includes('test/c.test.mjs:3'));
+            const runPlan = plan(index, 'lib/run.js:1:run');
+            assert.strictEqual(runPlan.edits.get('test/c.test.mjs:2'), "const { default: NEW } = await import('../lib/run.js')");
+            assert.strictEqual(runPlan.edits.get('test/c.test.mjs:3'), 'return NEW({})');
+        } finally { rm(dir); }
+    });
+
+    it('declare global / declare module augmentations are never dead (P0-16)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"aug","private":true}',
+            'tsconfig.json': '{"compilerOptions":{"strict":true}}',
+            'src/main.ts': "import { getRouter } from './router'\nexport function boot(): number {\n  window.__appVersion = '1.0'\n  return getRouter().routes.length\n}\n",
+            'src/router.ts': "export function getRouter() { return { routes: [] as string[] } }\n" +
+                "declare module 'some-router' {\n  interface Register { router: ReturnType<typeof getRouter> }\n}\n" +
+                'declare global {\n  interface Window { __appVersion: string }\n}\ninterface Unused { a: number }\nexport {}\n',
+        });
+        try {
+            const index = idx(dir);
+            const dead = index.deadcode({ includeExported: true }).map(d => d.name);
+            assert.ok(!dead.includes('Register') && !dead.includes('Window'), JSON.stringify(dead));
+            assert.ok(dead.includes('Unused'), 'an ordinary unused interface is still reported');
+        } finally { rm(dir); }
+    });
+
+    it('a function declared in a function body is visible only there (P0-25)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'b.js': 'function outer () {\n  function helper () { return 1 }\n  return helper()\n}\nfunction other () { return helper() }\nmodule.exports = { outer, other }\n',
+            'c.ts': 'export function outer2(): number {\n  function helper2(): number { return 1 }\n  return helper2()\n}\n// @ts-ignore\nexport function other2(): number { return helper2() }\n',
+            'd.js': "const { helper } = require('./lib')\nfunction outer () {\n  function helper () { return 1 }\n  return helper()\n}\nfunction other () { return helper() }\nmodule.exports = { outer, other }\n",
+            'lib.js': 'function helper () { return 2 }\nmodule.exports = { helper }\n',
+            'e.js': [
+                'class Bar {',
+                '  static printer (fp) {',
+                '    function fpWrite (s) { return fp.write(s) }',
+                '    return (s) => fpWrite(s)',
+                '  }',
+                '  get prop () {',
+                '    function inner () { return 1 }',
+                '    return inner()',
+                '  }',
+                '}',
+                'function outside () { return fpWrite(1) + inner() }',
+                'module.exports = { Bar, outside }',
+            ].join('\n'),
+            'f.js': 'class K {\n  run = () => {\n    function h () { return 1 }\n    return h()\n  }\n}\nfunction z () { return h() }\nmodule.exports = { K, z }\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(bands(index, 'b.js:2:helper').confirmed, ['b.js:3']);
+            assert.deepStrictEqual(bands(index, 'c.ts:2:helper2').confirmed, ['c.ts:3']);
+            assert.deepStrictEqual(bands(index, 'd.js:3:helper').confirmed, ['d.js:4']);
+            assert.deepStrictEqual(bands(index, 'lib.js:1:helper').confirmed, ['d.js:6']);
+            assert.deepStrictEqual(bands(index, 'e.js:3:fpWrite').confirmed, ['e.js:4']);
+            assert.deepStrictEqual(bands(index, 'e.js:7:inner').confirmed, ['e.js:8']);
+            assert.deepStrictEqual(bands(index, 'f.js:3:h').confirmed, ['f.js:4'], 'an arrow-function field body is a function scope');
+            assert.deepStrictEqual([...plan(index, 'b.js:2:helper').edits.keys()].sort(), ['b.js:2', 'b.js:3']);
+        } finally { rm(dir); }
+    });
+
+    it('a local arrow function rename never edits a same-named property access (P0-26)', () => {
+        const dir = tmp({
+            'tsconfig.json': '{}',
+            'c.ts': [
+                'type Opts = { revalidate?: boolean }',
+                'export const infinite = ((flag: boolean) => (opts?: Opts | boolean) => {',
+                '  if (flag) {',
+                '    const revalidate = async () => 1',
+                '    void revalidate()',
+                '  }',
+                "  const options = typeof opts === 'boolean' ? { revalidate: opts } : opts || {}",
+                '  return options.revalidate !== false',
+                '}) as unknown as (f: boolean) => (o?: Opts | boolean) => boolean',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const { edits, reviews } = plan(index, 'c.ts:4:revalidate');
+            assert.deepStrictEqual([...edits.keys()].sort(), ['c.ts:4', 'c.ts:5']);
+            assert.strictEqual(reviews.size, 0);
+        } finally { rm(dir); }
+    });
+
+    it('a method overwritten on a typed receiver is renamed with the method (P1-0)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t","type":"module"}',
+            'lib.js': 'export class Command {\n  copy(src) { return src }\n  make() { const c = new Command(); c.copy(this); return c }\n}\n',
+            'a.test.js': [
+                "import * as lib from './lib.js'",
+                'export function t(mock) {',
+                '  const cmd = new lib.Command()',
+                '  cmd.copy = mock',
+                '  cmd.count = 0',
+                '  return cmd',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const { edits } = plan(index, 'lib.js:2:copy');
+            assert.strictEqual(edits.get('a.test.js:4'), 'cmd.NEW = mock');
+            assert.ok(!edits.has('a.test.js:5'));
+        } finally { rm(dir); }
+    });
+
+    it('an arrow-function class field is a method for its callers and callees (P1-1)', () => {
+        const dir = tmp({
+            'tsconfig.json': '{}',
+            'a.ts': 'export class Api {\n  reset = (v?: number) => {\n    return v\n  }\n  mount = () => {\n    this.reset()\n    return 1\n  }\n}\n',
+            'b.ts': "import { Api } from './a'\nexport function use() {\n  const api = new Api()\n  api.reset()\n}\n",
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(bands(index, 'a.ts:2:reset').confirmed, ['a.ts:6', 'b.ts:4']);
+            for (const handle of ['a.ts:5:mount', 'b.ts:2:use']) {
+                const r = execute(index, 'show', { name: handle, sections: 'callees' });
+                assert.ok(r.ok, r.error);
+                const ctx = r.result.context || r.result;
+                assert.ok((ctx.callees || []).some(c => c.name === 'reset'), `${handle}: ${JSON.stringify(ctx.callees)}`);
+            }
+        } finally { rm(dir); }
+    });
+
+    it("require('..') and require('../') load the package main (P1-2)", () => {
+        const dir = tmp({
+            'package.json': '{"name":"rq","version":"1.0.0","main":"lib.js"}',
+            'lib.js': "'use strict'\nfunction pino (opts) { return { opts } }\nmodule.exports = pino\n",
+            'test/a.test.js': "const pino = require('../')\npino({})\n",
+            'test/b.test.js': "const pino = require('..')\npino({})\n",
+        });
+        try {
+            const index = idx(dir);
+            const b = bands(index, 'lib.js:2:pino');
+            assert.ok(b.confirmed.includes('test/a.test.js:2') && b.confirmed.includes('test/b.test.js:2'), JSON.stringify(b));
+        } finally { rm(dir); }
+    });
+
+    it('destructuring a member from a required module object renames the key and keeps the local (P1-4)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'time.js': "const epochTime = () => 1\nconst nullTime = () => ''\nmodule.exports = { nullTime, epochTime }\n",
+            'pino.js': "const time = require('./time')\nconst { epochTime, nullTime } = time\nmodule.exports = { t: epochTime, n: nullTime }\n",
+        });
+        try {
+            const index = idx(dir);
+            const { edits, reviews } = plan(index, 'time.js:1:epochTime');
+            assert.strictEqual(edits.get('pino.js:2'), 'const { NEW: epochTime, nullTime } = time');
+            assert.ok(!edits.has('pino.js:3') && !reviews.has('pino.js:3'), 'the local keeps its name');
+        } finally { rm(dir); }
+    });
+
+    it('a decorated exported class starts at its first decorator (P1-11)', () => {
+        const dir = tmp({
+            'tsconfig.json': '{}',
+            'a.ts': "declare function Component(o: any): any\n\n@Component({\n  selector: 'x',\n})\nexport class AppComponent {\n  m() { return 1 }\n}\n",
+        });
+        try {
+            const index = idx(dir);
+            const def = index.symbols.get('AppComponent')[0];
+            assert.strictEqual(def.startLine, 3);
+            assert.strictEqual(def.endLine, 8);
+            const { edits } = plan(index, 'a.ts:3:AppComponent');
+            assert.strictEqual(edits.get('a.ts:6'), 'export class NEW {');
         } finally { rm(dir); }
     });
 });

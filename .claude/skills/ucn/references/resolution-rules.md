@@ -74,7 +74,11 @@ A bare call of a global assigned in another file (`globalThis.f = ..` in a test 
 
 A JS/TS name destructured from an object (`const { run } = api`, `({ run }: Api) => run()`) reads that member: its calls are member calls on the source, confirmed when the source is typed and unverified otherwise, and a same-name free function is never their target.
 
-A JS file's extensionless import resolves a TS source; a bare specifier naming a package of the repository (workspaces, `@scope/core`) resolves to that package's source (its `exports`/`source` entries, else `src/index`), and one whose manifest names only build output absent from the checkout stays unverified, never external.
+A JS file's extensionless import resolves a TS source; a bare specifier naming a package of the repository (workspaces, `@scope/core`, the package's own name inside it) resolves to that package's source (its `exports`/`source` entries, else `src/index`; a subpath export naming build output absent from the checkout, such as `./dist/infinite/index.mjs`, is its source under `src/`), and one that still does not resolve stays unverified `import-unresolved`, never external and never confirmed through another import of the file. `require('..')` and `require('../')` load the directory's package.json `main`.
+
+JS/TS names are lexically scoped: a function declared in a function body is visible only in that function, a module's top-level declarations bind its name everywhere in the module whatever their position, and a bare name an import binds never reaches a same-file object or member function of that name. `this.m()` in a base class dispatches by the runtime class: it confirms the base's own `m` and is an unverified `possible-dispatch` candidate of each subclass override. An arrow-function class field (`reset = () => {..}`) is a method for its callers and callees.
+
+`plan` renames a method overwritten on a typed receiver (`cmd.m = mock` with `cmd = new Command()`) and an object-pattern key that destructures the renamed export from a module object (`const time = require('./time'); const { epochTime } = time` becomes `{ renamed: epochTime }`, the local kept). Declarations inside `declare global { }` and `declare module 'x' { }` merge with declarations outside the project and are never reported dead.
 
 A structural receiver whose class resolves to a definition reaches the target only through that definition's ancestry: a sibling class sharing an ancestor's name is excluded, not a possible dispatch.
 

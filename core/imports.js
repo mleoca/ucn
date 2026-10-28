@@ -202,6 +202,17 @@ function resolveImport(importPath, fromFile, config = {}) {
     // Relative imports
     const extensions = config.extensions || getExtensions(config.language);
     const resolved = path.resolve(fromDir, normalizedPath);
+    // A JS/TS directory specifier (`require('..')`, `require('../')`) loads
+    // the directory's package.json `main` before its index file (Node's
+    // directory resolution, fix #423), unless a file of that name exists.
+    if (_isJsFamily(config.language) && _isDir(resolved) && !_isFile(resolved) &&
+        !extensions.some(ext => _isFile(resolved + ext))) {
+        const manifest = _findPackageJson(resolved, resolved);
+        if (manifest && manifest.dir === resolved && typeof manifest.main === 'string' && manifest.main) {
+            const main = resolveFilePath(path.resolve(resolved, manifest.main), extensions);
+            if (main) return main;
+        }
+    }
     const direct = resolveFilePath(resolved, extensions);
     if (direct) return direct;
 
@@ -1067,7 +1078,10 @@ function _resolvePackageSpecifier(pkg, importPath, config) {
         return subpath === '.' ? tryTargets(exp, null) : null;
     }
     if (exp && typeof exp === 'object') {
+        // The subpath's entry, exact or through a '*' pattern.
+        let matched = null;
         if (exp[subpath] !== undefined) {
+            matched = { entry: exp[subpath], wildcard: null };
             const hit = tryTargets(exp[subpath], null);
             if (hit) return hit;
         }
@@ -1079,6 +1093,7 @@ function _resolvePackageSpecifier(pkg, importPath, config) {
             if (subpath.length > pre.length + post.length &&
                 subpath.startsWith(pre) && subpath.endsWith(post)) {
                 const wild = subpath.slice(pre.length, subpath.length - post.length);
+                if (!matched) matched = { entry: val, wildcard: wild };
                 const hit = tryTargets(val, wild);
                 if (hit) return hit;
             }
@@ -1092,6 +1107,11 @@ function _resolvePackageSpecifier(pkg, importPath, config) {
             if (source) return source;
         }
         if (subpath === '.' && pkg.workspace) return _workspaceSourceEntry(pkg, extensions);
+        // A subpath of a package of the repository whose targets are build
+        // output absent from the checkout (fix #423, swr `swr/infinite` ->
+        // `./dist/infinite/index.mjs`) is its source under `src/`, the
+        // layout the package's own entry falls back to.
+        if (matched && pkg.workspace) return _workspaceSubpathSource(pkg, matched, extensions);
         return null;
     }
     // No exports map: bare name -> main/index; subpath -> direct file
@@ -1101,6 +1121,55 @@ function _resolvePackageSpecifier(pkg, importPath, config) {
             resolveFilePath(path.resolve(pkg.dir, 'index'), extensions);
     }
     return resolveFilePath(path.resolve(pkg.dir, subpath), extensions);
+}
+
+// Export conditions in the order a source build resolves them: the module
+// and default entries first, platform and custom conditions after.
+const _SOURCE_CONDITION_RANK = ['import', 'module', 'default', 'require', 'node', 'browser'];
+
+/** The export targets of an entry with their condition paths (fix #423). */
+function _conditionTargets(entry, conditions = [], out = []) {
+    if (typeof entry === 'string') out.push({ target: entry, conditions });
+    else if (Array.isArray(entry)) for (const e of entry) _conditionTargets(e, conditions, out);
+    else if (entry && typeof entry === 'object') {
+        for (const [cond, v] of Object.entries(entry)) _conditionTargets(v, [...conditions, cond], out);
+    }
+    return out;
+}
+
+/**
+ * The source of a workspace package subpath whose export targets name build
+ * output absent from the checkout (fix #423): each target's path below its
+ * output directory, under the package's `src/` (`./dist/infinite/index.mjs`
+ * -> `src/infinite/index.ts`). Standard conditions are tried before custom
+ * ones (`react-server`), declaration targets last; a target leaving the
+ * package or a declaration file never answers.
+ */
+function _workspaceSubpathSource(pkg, matched, extensions) {
+    const rank = conditions => {
+        let worst = 0;
+        for (const cond of conditions) {
+            const at = cond === 'types' ? _SOURCE_CONDITION_RANK.length + 1
+                : (_SOURCE_CONDITION_RANK.indexOf(cond) === -1 ? _SOURCE_CONDITION_RANK.length
+                    : _SOURCE_CONDITION_RANK.indexOf(cond));
+            if (at > worst) worst = at;
+        }
+        return worst;
+    };
+    const targets = _conditionTargets(matched.entry)
+        .map((t, order) => ({ ...t, order, rank: rank(t.conditions) }))
+        .sort((a, b) => a.rank - b.rank || a.order - b.order);
+    for (const { target } of targets) {
+        const concrete = matched.wildcard != null ? target.replace(/\*/g, matched.wildcard) : target;
+        const rel = path.relative(pkg.dir, path.resolve(pkg.dir, concrete));
+        if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) continue;
+        const segments = rel.split(path.sep);
+        if (segments.length < 2 || segments[0] === 'src') continue;
+        const rest = segments.slice(1).join(path.sep).replace(/(\.d)?\.[cm]?[jt]sx?$/, '');
+        const hit = resolveFilePath(path.join(pkg.dir, 'src', rest), extensions);
+        if (hit && !/\.d\.[cm]?ts$/.test(hit)) return hit;
+    }
+    return null;
 }
 
 // A workspace package whose `main` names a build artifact absent from the
@@ -1164,6 +1233,10 @@ function _isFile(p) {
 
 function _isDir(p) {
     try { return fs.statSync(p).isDirectory(); } catch { return false; }
+}
+
+function _isJsFamily(language) {
+    return language === 'javascript' || language === 'typescript' || language === 'tsx';
 }
 
 /**

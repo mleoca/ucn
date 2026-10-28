@@ -142,6 +142,53 @@ function selfMemberTokenColumns(index, filePath, lineNumber, name) {
     return out;
 }
 
+/**
+ * The object-pattern keys `name` on `lineNumber` of declarators that read an
+ * identifier (fix #423): `const { name } = src` / `const { name: local } =
+ * src`, defaults included. Returns [{ line, column, shorthand, local,
+ * source }]; nested patterns read members of members and are not listed.
+ */
+function objectPatternKeysAt(index, filePath, lineNumber, name) {
+    const path = require('path');
+    const absolute = path.isAbsolute(filePath) ? filePath : path.join(index.root, filePath);
+    const language = index.files.get(absolute)?.language;
+    const parser = language && getParser(language);
+    if (!parser) return [];
+    let content;
+    try { content = index._readFile(absolute); } catch { return []; }
+    const text = content.split('\n')[lineNumber - 1] || '';
+    if (!text.includes(name)) return [];
+    const tree = index._getParsedTree?.(absolute, content, language) || safeParse(parser, content);
+    if (!tree) return [];
+    const out = [];
+    for (let at = text.indexOf(name); at !== -1; at = text.indexOf(name, at + 1)) {
+        const node = tree.rootNode.descendantForPosition({ row: lineNumber - 1, column: at });
+        if (!node || node.text !== name || node.startPosition.column !== at) continue;
+        let property = node;
+        let shorthand = false;
+        let local = name;
+        if (node.type === 'shorthand_property_identifier_pattern') {
+            shorthand = true;
+            if (node.parent?.type === 'object_assignment_pattern') property = node.parent;
+        } else if (node.type === 'property_identifier' && node.parent?.type === 'pair_pattern' &&
+            sameNode(node.parent.childForFieldName('key'), node)) {
+            property = node.parent;
+            const value = property.childForFieldName('value');
+            const target = value?.type === 'assignment_pattern' ? value.childForFieldName('left') : value;
+            if (target?.type !== 'identifier') continue;
+            local = target.text;
+        } else continue;
+        const pattern = property.parent;
+        const declarator = pattern?.parent;
+        if (pattern?.type !== 'object_pattern' || declarator?.type !== 'variable_declarator' ||
+            !sameNode(declarator.childForFieldName('name'), pattern)) continue;
+        const source = declarator.childForFieldName('value');
+        if (source?.type !== 'identifier') continue;
+        out.push({ line: lineNumber, column: at, ...(shorthand && { shorthand: true }), local, source: source.text });
+    }
+    return out;
+}
+
 // The embedded-script tree of a file's content (fix #419), the last few
 // contents kept.
 const EMBEDDED_TREES = new Map();
@@ -2620,21 +2667,42 @@ const IMPORT_STATEMENT_TYPES = new Set(['import_statement', 'import_from_stateme
     'future_import_statement', 'use_declaration', 'import_declaration', 'using_directive', 'export_statement']);
 
 /** The first line of the import statement holding the token at
- * line/column (1-based line, 0-based column), or `line` when none does. */
-function importStatementLine(index, filePath, line, column) {
+ * line/column (1-based line, 0-based column), or `line` when none does. A
+ * token of a declarator initialized by `require(..)`/`import(..)` belongs to
+ * the binding recorded on the initializer's line (fix #423: `const {\n
+ * getLevel,\n} = require('./levels')`); without a column the token `name`
+ * spells on the line is used. */
+function importStatementLine(index, filePath, line, column, name = null) {
     const entry = index.files.get(filePath);
-    if (!entry || !Number.isInteger(column)) return line;
+    if (!entry || (!Number.isInteger(column) && !name)) return line;
     let tree;
+    let content = null;
     try {
-        const content = index._readFile(filePath);
+        content = index._readFile(filePath);
         tree = index._getParsedTree?.(filePath, content, entry.language) ||
             safeParse(getParser(entry.language), content);
     } catch {
         tree = null;
     }
-    let node = tree?.rootNode?.descendantForPosition({ row: line - 1, column });
-    while (node && !IMPORT_STATEMENT_TYPES.has(node.type)) node = node.parent;
-    return node ? node.startPosition.row + 1 : line;
+    const columns = [];
+    if (Number.isInteger(column)) columns.push(column);
+    else if (content != null) {
+        const text = content.split('\n')[line - 1] || '';
+        for (let at = text.indexOf(name); at !== -1; at = text.indexOf(name, at + 1)) columns.push(at);
+    }
+    for (const at of columns) {
+        let node = tree?.rootNode?.descendantForPosition({ row: line - 1, column: at });
+        if (!Number.isInteger(column) && (!node || node.text !== name || node.startPosition.column !== at)) continue;
+        while (node && !IMPORT_STATEMENT_TYPES.has(node.type) && node.type !== 'variable_declarator') {
+            node = node.parent;
+        }
+        if (node?.type === 'variable_declarator') {
+            const value = node.childForFieldName('value');
+            return value ? value.startPosition.row + 1 : line;
+        }
+        if (node) return node.startPosition.row + 1;
+    }
+    return line;
 }
 
 /** Is a Go site file compiled under another build constraint than the
@@ -3701,7 +3769,7 @@ function plan(index, name, options = {}) {
             // `from m import (\n    a,\n)`) belongs to that statement (fix #400).
             const onLine = (fileEntry?.importBindings || []).some(binding => binding.line === line &&
                 (binding.name === name || binding.alias === name));
-            const statementLine = onLine ? line : importStatementLine(index, filePath, line, column);
+            const statementLine = onLine ? line : importStatementLine(index, filePath, line, column, name);
             const bindings = (fileEntry?.importBindings || []).filter(binding =>
                 (binding.line === line || binding.line === statementLine) &&
                 binding.name === name && binding.module);
@@ -3814,8 +3882,10 @@ function plan(index, name, options = {}) {
             for (const exported of targetEntry.exportDetails || []) {
                 if ((exported.name !== name && exported.alias !== name) ||
                     !exported.line) continue;
+                // Under the pin's own name (fix #423): `export { other as
+                // name } from './pin'` exposes another declaration.
                 const ownership = _nameBindingReaches(
-                    index, exportPath, name, renameTargetFiles, 8);
+                    index, exportPath, name, renameTargetFiles, 8, { targetName: name });
                 // Transitive file reachability is not name ownership. A file
                 // can import the target somewhere in its dependency closure
                 // while exporting its own same-spelled local declaration.
@@ -4886,6 +4956,18 @@ function plan(index, name, options = {}) {
                         }
                         return null;
                     }
+                    // A member access (`options.revalidate`) never names a
+                    // non-member declaration through its binding (fix #423,
+                    // swr: a pin in an untyped-cast arrow had no container
+                    // and module-scope binder logic edited the property);
+                    // only a module namespace receiver can, as below.
+                    if (ref.receiver) {
+                        const viaModule = !ref.receiverLocalBinding
+                            ? _moduleAttributeBindingReaches(index, ref.file, ref.receiver, name,
+                                renameTargetFiles)
+                            : null;
+                        return viaModule === 'yes' ? 'edit' : viaModule === 'unknown' ? 'review' : null;
+                    }
                     if (!ref.receiver && ref.scopeBinding === 'module') {
                         // Resolves at file scope: the pin when it is the
                         // file's only binding of the name there (a nested pin
@@ -4947,8 +5029,29 @@ function plan(index, name, options = {}) {
                 if (ref.scopeBinding === 'module' && cExternalReferenceLanguage(index, ref.file)) {
                     return cExternalReferenceVerdict(index, ref, def, pinIdentity, definitions);
                 }
+                // A file-scope reference of a statically scoped module names
+                // that module's own top-level declaration of the name when no
+                // import binds it (fix #423, pino `const { epochTime } =
+                // time`): a local declaration, never the pin of another file.
+                if (ref.scopeBinding === 'module' &&
+                    langTraits(index.files.get(ref.file)?.language)?.staticModuleScope) {
+                    const refEntry = index.files.get(ref.file);
+                    const imported = (refEntry?.importBindings || []).some(binding =>
+                        (binding.alias || binding.name) === name);
+                    if (!imported && (refEntry?.symbols || []).some(symbol => symbol.name === name &&
+                        !symbol.className && !symbol.memberAssigned && !symbol.bodyScopedName &&
+                        !(refEntry.symbols || []).some(scope => scope !== symbol &&
+                            scopeKinds.has(scope.type) && scope.startLine <= symbol.startLine &&
+                            (scope.endLine || scope.startLine) >= (symbol.endLine || symbol.startLine) &&
+                            !(scope.startLine === symbol.startLine && scope.endLine === symbol.endLine)))) {
+                        return null;
+                    }
+                }
+                // The chain must arrive under the pin's own name (fix #423,
+                // swr `import { middleware as preload }`): an import alias
+                // spelled like the pin binds the other export.
                 const ownership = _nameBindingReaches(
-                    index, ref.file, name, renameTargetFiles);
+                    index, ref.file, name, renameTargetFiles, 4, { targetName: name });
                 if (ownership === 'yes' &&
                     (ref.scopeBinding === 'module' ||
                         !insideFunctionLike(ref.file, ref.line))) {
@@ -5093,6 +5196,45 @@ function plan(index, name, options = {}) {
                         Object.defineProperty(review, '_reviewColumns', { value: reviewed, enumerable: false });
                     }
                     changes.push(review);
+                }
+            }
+            // An object-pattern key that destructures the pin from a module
+            // object (fix #423, pino `const time = require('./lib/time');
+            // const { epochTime } = time`) reads the module member: the key
+            // is renamed and the local kept, as for a destructured member
+            // call. A module chain UCN cannot follow is a review item.
+            if (!def.className) {
+                const seenPatternLines = new Set();
+                for (const u of usages) {
+                    if (!u.isDefinition || u.file === def.file || !u.file) continue;
+                    const fileLanguage = index.files.get(u.file)?.language;
+                    if (!langTraits(fileLanguage)?.staticModuleScope) continue;
+                    const lineKey = `${u.file}:${u.line}`;
+                    if (seenPatternLines.has(lineKey)) continue;
+                    seenPatternLines.add(lineKey);
+                    for (let line = u.startLine || u.line; line <= (u.endLine || u.line); line++) {
+                        for (const key of objectPatternKeysAt(index, u.file, line, name)) {
+                            const verdict = _moduleAttributeBindingReaches(index, u.file, key.source, name,
+                                renameTargetFiles);
+                            if (verdict === 'yes') {
+                                emitPatternKeyEdit(u.file, u.relativePath || u.file, key);
+                            } else if (verdict === 'unknown') {
+                                const rel = u.relativePath || u.file;
+                                if (!reviewItems.some(item => item.file === rel && item.line === key.line)) {
+                                    reviewItems.push({
+                                        file: rel,
+                                        line: key.line,
+                                        expression: (index.getLineContent(u.file, key.line) || '').trim(),
+                                        suggestion: `Verify whether "${key.source}.${name}" names ${name} at ` +
+                                            `${def.relativePath || def.file}:${def.startLine}; if it does, ` +
+                                            `rename the destructured property to "${options.renameTo}", keeping the local binding`,
+                                        needsReview: true,
+                                        editKind: 'reference',
+                                    });
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

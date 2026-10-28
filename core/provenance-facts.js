@@ -2,7 +2,7 @@
 
 const path = require('path');
 const { langTraits } = require('../languages');
-const { NON_CALLABLE_TYPES } = require('./shared');
+const { NON_CALLABLE_TYPES, isCallableMember } = require('./shared');
 const { declarationIdentity, identityKey, propertyReadMember } = require('./provenance');
 const { captureOverload, overloadMemberGroup } = require('./provenance-overload');
 const { splitParentList } = require('./graph-build');
@@ -36,13 +36,13 @@ function callableMembersOwnedBy(index, name, owner) {
     const definitions = index.symbols.get(name) || [];
     const memo = index._opMemo?.('callableMembersByOwner', () => new WeakMap());
     if (!memo) {
-        return definitions.filter(d => !NON_CALLABLE_TYPES.has(d.type) && ownerName(d) === owner);
+        return definitions.filter(d => isCallableMember(d) && ownerName(d) === owner);
     }
     let byOwner = memo.get(definitions);
     if (!byOwner) {
         byOwner = new Map();
         for (const d of definitions) {
-            if (NON_CALLABLE_TYPES.has(d.type)) continue;
+            if (!isCallableMember(d)) continue;
             const key = ownerName(d);
             let list = byOwner.get(key);
             if (!list) {

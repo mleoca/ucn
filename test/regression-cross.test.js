@@ -10884,7 +10884,7 @@ describe('fix #214: generic extends clauses split on top-level commas only', () 
         } finally { rm(dir); }
     });
 
-    it('base-class this-call dispatch edges stay confirmed through generic extends', () => {
+    it('base-class this-call dispatch edges stay visible through generic extends (possible dispatch, fix #423)', () => {
         const dir = tmp({
             'package.json': '{"name":"t"}',
             'a.ts': [
@@ -10904,8 +10904,10 @@ describe('fix #214: generic extends clauses split on top-level commas only', () 
             assert.ok(r.ok, r.error);
             const json = JSON.parse(output.formatContextJson(r.result));
             const confirmed = (json.data.callers || []).map(c => `${c.file}:${c.line}`);
-            assert.ok(confirmed.includes('a.ts:3'),
-                `Base.run's this._parse() can dispatch to the Str override: ${confirmed}`);
+            const unverified = (json.data.unverifiedCallers || []).find(u => `${u.file}:${u.line}` === 'a.ts:3');
+            assert.ok(!confirmed.includes('a.ts:3'), `a dispatch, not a certain edge: ${confirmed}`);
+            assert.strictEqual(unverified?.reason, 'possible-dispatch',
+                `Base.run's this._parse() can dispatch to the Str override: ${JSON.stringify(json.data.unverifiedCallers)}`);
         } finally { rm(dir); }
     });
 });

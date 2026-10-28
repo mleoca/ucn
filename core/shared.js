@@ -150,6 +150,16 @@ function escapeRegExp(text) {
 const NON_CALLABLE_TYPES = new Set(['class', 'struct', 'interface', 'type', 'enum', 'trait', 'state', 'impl', 'field']);
 const VALUE_SYMBOL_KINDS = new Set(['field', 'private field', 'constant', 'state', 'variant']);
 
+/**
+ * A member a call can name (fix #423): a callable kind, or a class field the
+ * parser read as a function (`reset = () => {..}`, `isMethod`), which
+ * `form.reset()` and `this.reset()` call like a method.
+ */
+function isCallableMember(definition) {
+    return !!definition && (!NON_CALLABLE_TYPES.has(definition.type) ||
+        (definition.type === 'field' && definition.isMethod === true));
+}
+
 function isValueDefinition(definition) {
     return !!definition && !definition.isMethod &&
         (VALUE_SYMBOL_KINDS.has(definition.type) || VALUE_SYMBOL_KINDS.has(definition.memberType));
@@ -590,6 +600,7 @@ module.exports = { literalNameRegex,
     classDispatchNames,
     maskBlockComments,
     NON_CALLABLE_TYPES,
+    isCallableMember,
     isValueDefinition,
     CALLABLE_SYMBOL_KINDS,
     formatSymbolHandle,

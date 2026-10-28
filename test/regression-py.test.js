@@ -9592,3 +9592,55 @@ describe('fix #420: Python value renames follow the language name lookup', () =>
         } finally { rm(dir); }
     });
 });
+
+describe('fix #423: a def nested in a decorated method is scoped to that method (audit P0-1)', () => {
+    it('closure callers confirm and out-of-scope bare calls are excluded under @staticmethod/@classmethod/@property', () => {
+        const dir = tmp({
+            'm.py': [
+                'class Bar(object):',
+                '    @staticmethod',
+                '    def status_printer(fp):',
+                '        def fp_write(s):',
+                '            fp.write(str(s))',
+                '',
+                '        def print_status(s):',
+                "            fp_write('\\r' + s)",
+                '',
+                '        return print_status',
+                '',
+                '    @classmethod',
+                '    def cm(cls, fp):',
+                '        def helper(s):',
+                '            return s',
+                '',
+                '        def use(s):',
+                '            return helper(s)',
+                '',
+                '        return use',
+                '',
+                '    @property',
+                '    def prop(self):',
+                '        def inner():',
+                '            return 1',
+                '',
+                '        return inner()',
+                '',
+                '',
+                'def outside():',
+                '    return helper(1) + inner()',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const callers = handle => {
+                const r = execute(index, 'show', { name: handle, sections: 'callers' });
+                assert.ok(r.ok, r.error);
+                return ((r.result.context || r.result).callers || []).map(c => `${c.relativePath}:${c.line}`);
+            };
+            assert.deepStrictEqual(callers('m.py:4:fp_write'), ['m.py:8']);
+            assert.deepStrictEqual(callers('m.py:14:helper'), ['m.py:18']);
+            assert.deepStrictEqual(callers('m.py:24:inner'), ['m.py:27']);
+        } finally { rm(dir); }
+    });
+});

@@ -951,7 +951,10 @@ function clearAllCaches() {
 // qualified-path receivers and `macroScopeUnknown`; block `use` imports carry
 // their block lines and `use` items their visibility; files list their
 // item-position macro invocations (`itemMacros`).
-const CACHE_FORMAT_VERSION = 310;
+// v311 (fix #423): JS/TS module resolution follows a directory's package.json
+// `main` and maps workspace subpath exports naming absent build output to
+// their `src/` sources (persisted `moduleResolved` and import edges).
+const CACHE_FORMAT_VERSION = 311;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 function usageResultKey(index, filePath, name, mode) {
