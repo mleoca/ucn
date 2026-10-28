@@ -6851,3 +6851,135 @@ describe('fix #425: Java pattern variables type their receivers where their scop
         } finally { rm(dir); }
     });
 });
+
+describe('fix #426: Java rename closure, qualified inner creations and method references to overloads', () => {
+    const plan = (index, file, line, name, renameTo) => {
+        const result = execute(index, 'plan', { name, file, line, renameTo });
+        assert.strictEqual(result.ok, true, result.error);
+        const changes = result.result.changes;
+        return {
+            edits: changes.filter(c => !c.needsReview).map(c => `${c.file}:${c.line}`).sort(),
+            reviews: changes.filter(c => c.needsReview).map(c => `${c.file}:${c.line}`).sort(),
+            text: changes.filter(c => !c.needsReview).map(c => c.newExpression),
+        };
+    };
+    it('method type parameters take an override slot by position only', () => {
+        const dir = tmp({
+            'p/Marker.java': 'package p;\npublic interface Marker { }\n',
+            'p/Request.java': 'package p;\npublic interface Request<R> { }\n',
+            'p/Sender.java': [
+                'package p;',
+                'public interface Sender {',
+                '    <R> R send(Request<R> request);',
+                '    <Q extends Marker> void send(Q request);',
+                '    Object send(Object request);',
+                '    <T> void put(T x, int n);',
+                '}',
+                '',
+            ].join('\n'),
+            'p/Impl.java': [
+                'package p;',
+                'public class Impl implements Sender {',
+                '    @Override public <R> R send(Request<R> request) { return null; }',
+                '    @Override public <Q extends Marker> void send(Q request) { }',
+                '    @Override public Object send(Object request) { return request; }',
+                '    @Override public void put(Object x, int n) { }',
+                '}',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(plan(index, 'p/Sender.java', 4, 'send', 'sendZ').edits,
+                ['p/Impl.java:4', 'p/Sender.java:4']);
+            assert.deepStrictEqual(plan(index, 'p/Sender.java', 3, 'send', 'sendZ').edits,
+                ['p/Impl.java:3', 'p/Sender.java:3']);
+            assert.deepStrictEqual(plan(index, 'p/Sender.java', 5, 'send', 'sendZ').edits,
+                ['p/Impl.java:5', 'p/Sender.java:5']);
+            // A non-generic method takes a generic slot through its erasure (JLS 8.4.2).
+            assert.deepStrictEqual(plan(index, 'p/Sender.java', 6, 'put', 'putZ').edits,
+                ['p/Impl.java:6', 'p/Sender.java:6']);
+        } finally { rm(dir); }
+    });
+    it('an inherited implementation and a second interface join the slot from either side', () => {
+        const dir = tmp({
+            'p/Base.java': 'package p;\npublic abstract class Base {\n    public final long getCount() { return 1; }\n}\n',
+            'p/Bean.java': 'package p;\npublic interface Bean {\n    long getCount();\n}\n',
+            'p/Impl.java': 'package p;\npublic class Impl extends Base implements Bean {\n}\n',
+            'p/Use.java': 'package p;\npublic class Use {\n    long a(Impl i, Bean b) { return i.getCount() + b.getCount(); }\n}\n',
+            'p/Pool.java': 'package p;\npublic interface Pool { int getNumActive(); }\n',
+            'p/PoolMXBean.java': 'package p;\npublic interface PoolMXBean { int getNumActive(); }\n',
+            'p/GenericPool.java': 'package p;\npublic class GenericPool implements Pool, PoolMXBean {\n    @Override\n    public int getNumActive() { return 0; }\n}\n',
+            'p/Proxied.java': 'package p;\npublic class Proxied implements Pool {\n    private final Pool pool;\n    Proxied(Pool pool) { this.pool = pool; }\n    @Override\n    public int getNumActive() { return pool.getNumActive(); }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const all = ['p/Base.java:3', 'p/Bean.java:3', 'p/Use.java:3'];
+            assert.deepStrictEqual(plan(index, 'p/Base.java', 3, 'getCount', 'n').edits, all);
+            assert.deepStrictEqual(plan(index, 'p/Bean.java', 3, 'getCount', 'n').edits, all);
+            assert.strictEqual(plan(index, 'p/Base.java', 3, 'getCount', 'n').text.find(t => t.includes('b.')),
+                'long a(Impl i, Bean b) { return i.n() + b.n(); }');
+            const pool = ['p/GenericPool.java:4', 'p/Pool.java:2', 'p/PoolMXBean.java:2', 'p/Proxied.java:6'];
+            assert.deepStrictEqual(plan(index, 'p/Pool.java', 2, 'getNumActive', 'n').edits, pool);
+            assert.deepStrictEqual(plan(index, 'p/Proxied.java', 6, 'getNumActive', 'n').edits, pool);
+        } finally { rm(dir); }
+    });
+    it('a qualified instance creation outer.new Inner() names the member class of the outer value', () => {
+        const dir = tmp({
+            'p/Outer.java': 'package p;\npublic class Outer<T> {\n    final class Inner { }\n    Inner make() { return new Inner(); }\n}\n',
+            'p/Other.java': 'package p;\npublic class Other {\n    final class Inner { }\n}\n',
+            'p/Use.java': [
+                'package p;',
+                'public class Use {',
+                '    void a(Outer<String> pool, Other other) {',
+                '        final Outer<String>.Inner i1 = pool.new Inner();',
+                '        Object o = pool.new Inner();',
+                '        Object q = other.new Inner();',
+                '    }',
+                '}',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = plan(index, 'p/Outer.java', 3, 'Inner', 'InnerZ');
+            assert.deepStrictEqual(result.edits, ['p/Outer.java:3', 'p/Outer.java:4', 'p/Use.java:4', 'p/Use.java:5']);
+            assert.ok(result.text.includes('final Outer<String>.InnerZ i1 = pool.new InnerZ();'), JSON.stringify(result.text));
+            assert.ok(result.text.includes('Object o = pool.new InnerZ();'), JSON.stringify(result.text));
+            assert.deepStrictEqual(result.reviews, []);
+        } finally { rm(dir); }
+    });
+    it('a method reference to an overloaded method is undecided between its overloads', () => {
+        const dir = tmp({
+            'p/R.java': [
+                'package p;',
+                'import java.util.List;',
+                'public class R {',
+                '    static class Element { }',
+                '    static class Source { }',
+                '    private static void clear(Element e) { }',
+                '    private static void clear(Source s) { }',
+                '    private static void once(Element e) { }',
+                '    static void run(List<Element> elements, List<Source> sources) {',
+                '        elements.forEach(R::clear);',
+                '        sources.forEach(R::clear);',
+                '        elements.forEach(R::once);',
+                '    }',
+                '}',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const context = execute(index, 'context', { name: 'p/R.java:6:clear' });
+            assert.strictEqual(context.ok, true, context.error);
+            assert.deepStrictEqual((context.result.callers || []).map(c => c.line), []);
+            assert.deepStrictEqual((context.result.unverifiedCallers || []).map(c => `${c.line}:${c.reason}`),
+                ['10:overload-ambiguous', '11:overload-ambiguous']);
+            const once = execute(index, 'context', { name: 'p/R.java:8:once' });
+            assert.deepStrictEqual((once.result.callers || []).map(c => c.line), [12]);
+            const renamed = plan(index, 'p/R.java', 7, 'clear', 'clearZ');
+            assert.deepStrictEqual(renamed.edits, ['p/R.java:7']);
+        } finally { rm(dir); }
+    });
+});

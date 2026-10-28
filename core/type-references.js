@@ -215,12 +215,67 @@ function classifyJava(node) {
             break;
         case 'labeled_statement': case 'break_statement': case 'continue_statement':
             return skip('label');
+        case 'object_creation_expression': {
+            // A qualified instance creation `outer.new Inner()` names a
+            // member class of the outer expression's type (JLS 15.9.1), not a
+            // type in scope at the site (fix #426).
+            const outer = parent.namedChild(0);
+            if (outer && field === 'type' && !sameNode(outer, node) &&
+                outer.endIndex <= node.startIndex) return { role: 'qualified-creation', outer };
+            break;
+        }
         default:
             break;
     }
     if (node.type === 'type_identifier') return { role: 'type' };
     if (node.type === 'identifier') return { role: 'value' };
     return { role: 'unknown', why: `java:${parent.type}` };
+}
+
+/**
+ * The declared type of a Java expression naming a value, read from its
+ * declaration in scope (fix #426): `this` is the enclosing class, a simple
+ * name the nearest local, parameter or field declaring it. null otherwise.
+ */
+function javaExpressionTypeName(expression) {
+    const head = typeNode => {
+        if (!typeNode) return null;
+        if (typeNode.type === 'generic_type') {
+            return head(typeNode.namedChildren.find(child =>
+                child.type === 'type_identifier' || child.type === 'scoped_type_identifier'));
+        }
+        if (typeNode.type === 'scoped_type_identifier') return typeNode.namedChildren.at(-1)?.text || null;
+        return typeNode.type === 'type_identifier' ? typeNode.text : null;
+    };
+    if (expression.type === 'this') {
+        const owner = ancestor(expression, JAVA_CLASS_NODES);
+        return owner?.childForFieldName('name')?.text || null;
+    }
+    if (expression.type !== 'identifier') return null;
+    const name = expression.text;
+    const declares = (declaration) => (declaration.namedChildren || []).some(child =>
+        child.type === 'variable_declarator' && child.childForFieldName('name')?.text === name);
+    for (let scope = expression.parent; scope; scope = scope.parent) {
+        if (scope.type === 'block' || scope.type === 'constructor_body' || scope.type === 'class_body') {
+            for (const child of scope.namedChildren || []) {
+                if (child.startIndex >= expression.startIndex && scope.type !== 'class_body') break;
+                if ((child.type === 'local_variable_declaration' || child.type === 'field_declaration') &&
+                    declares(child)) return head(child.childForFieldName('type'));
+            }
+        }
+        if (['method_declaration', 'constructor_declaration', 'lambda_expression'].includes(scope.type)) {
+            const params = scope.childForFieldName('parameters');
+            for (const param of params?.namedChildren || []) {
+                if ((param.type === 'formal_parameter' || param.type === 'spread_parameter') &&
+                    param.childForFieldName('name')?.text === name) return head(param.childForFieldName('type'));
+            }
+        }
+        if (JAVA_CLASS_NODES.has(scope.type)) {
+            // Fields of an enclosing class are in scope through its body.
+            continue;
+        }
+    }
+    return null;
 }
 const JAVA_CLASS_NODES = new Set(['class_declaration', 'enum_declaration', 'record_declaration',
     'interface_declaration']);
@@ -2824,6 +2879,20 @@ function decide(resolver, file, entry, token, bindings, typeParams) {
             return resolveUnqualifiedToken(resolver, file, token, bindings, typeParams, 'type');
         }
         case 'import': return decideImport(resolver, file, entry, token);
+        case 'qualified-creation': {
+            // Only a member class is created through an outer instance.
+            const members = resolver.all.filter(d => d.name === resolver.name && d.enclosingType);
+            if (members.length === 0) return { verdict: 'no', reason: 'not-member-type' };
+            const outerType = javaExpressionTypeName(role.outer);
+            const owner = outerType ? resolver.resolveTypeNamed(file, line, outerType) : 'unknown';
+            if (owner === 'owner') return { verdict: 'yes' };
+            // Another outer type may inherit the member class; only one that
+            // declares its own member class of the name settles it.
+            if (owner === 'other' && members.some(d => !resolver.inGroup(d) && d.enclosingType === outerType)) {
+                return { verdict: 'no', reason: 'other-type' };
+            }
+            return { verdict: 'unknown', reason: 'qualified-creation' };
+        }
         case 'member':
             return decideMember(resolver, file, token, bindings);
         case 'gofield':

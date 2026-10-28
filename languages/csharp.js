@@ -1605,7 +1605,10 @@ function buildVariableTypes(tree, parser) {
     const conflictsByScope = new Map([['global', new Set()]]);
     const scopeStack = [];
     const setType = (scope, name, type, source = 'unknown', node = null) => {
-        if (!name || !type) return;
+        // An implicitly typed declaration (`out var f`, `is var x` in a
+        // recovered condition) writes no type: the name is a local of
+        // unknown type, never a value of a type named `var` (fix #426).
+        if (!name || !type || type === 'var') return;
         if (!conflictsByScope.has(scope)) conflictsByScope.set(scope, new Set());
         const conflicts = conflictsByScope.get(scope);
         if (conflicts.has(name)) return;

@@ -9,7 +9,7 @@ const { detectLanguage, getParser, getLanguageAdapter, safeParse, langTraits } =
 const { sameNode } = require('../languages/utils');
 const { escapeRegExp, codeUnitCompare, NON_CALLABLE_TYPES, isOverrideMarked, isMacroNamespaceDefinition,
     isValueDefinition } = require('./shared');
-const { classDefsNamed, distinctOwnerDefinitions, ownerDefinitionOf } = require('./class-identity');
+const { classDefsNamed, ownerDefinitionOf } = require('./class-identity');
 const { isTypeRenamePin, referenceRole } = require('./type-references');
 const { findAccessorReferences, isAccessorDefinition } = require('./accessors');
 const { csharpLocalBinding } = require('../languages/csharp-scope');
@@ -231,8 +231,14 @@ function renameIdentifierTokens(index, filePath, lineNumber, oldName, newName,
         // A file whose code is embedded (HTML scripts) is read in the
         // script's own syntax, rows and columns kept (fix #419).
         const embedded = langTraits(language)?.embeddedSyntax;
-        const tree = embedded ? embeddedTree(embedded, parser, content) : parser &&
+        let tree = embedded ? embeddedTree(embedded, parser, content) : parser &&
             (index._getParsedTree?.(absolute, content, language) || safeParse(parser, content));
+        // A row another configuration view reads (fix #426: a C# `#else`
+        // branch of a file whose literal parse was damaged) is blank in the
+        // primary view: its tokens are that view's.
+        const ownerView = tree && langTraits(language)?.queryBodyViews?.(tree)
+            ?.find(view => view.owns?.has(lineNumber - 1));
+        if (ownerView?.tree) tree = ownerView.tree;
         if (tree) {
             const targetRow = lineNumber - 1;
             const stack = [tree.rootNode];
@@ -340,8 +346,12 @@ function callTokenColumn(index, filePath, range, name, line) {
     return require('./rename-token-syntax').callTokenSyntax(index, absolute, entry,
         content, range, name, line, () => {
             const parser = language && getParser(language);
-            const tree = parser &&
+            let tree = parser &&
                 (index._getParsedTree?.(absolute, content, language) || safeParse(parser, content));
+            // A row another configuration view reads (fix #426).
+            const ownerView = tree && langTraits(language)?.queryBodyViews?.(tree)
+                ?.find(view => view.owns?.has(line - 1));
+            if (ownerView?.tree) tree = ownerView.tree;
             return tree ? callTokenColumnInTree(tree, content, range, name, line) : null;
         });
 }
@@ -357,20 +367,25 @@ function callTokenColumnInTree(tree, content, range, name, line) {
         node.startPosition.row === line - 1 && node.endPosition.row === line - 1) {
         return node.startPosition.column + (range.start - node.startIndex);
     }
-    const isName = n => n && n.text === name && /identifier$/.test(n.type) &&
+    const isPlainName = n => n && n.text === name && /identifier$/.test(n.type) &&
         n.startPosition.row === line - 1;
-    if (isName(node)) return node.startPosition.column;
+    // A generic callee head (`r.Get<int>(2)`, C++ `get<int>(1)`) names the
+    // call by its identifier, the type arguments aside (fix #426).
+    const isName = n => isPlainName(n) || (n && /generic_name$|^template_(?:function|method)$/.test(n.type) &&
+        isPlainName(n.childForFieldName?.('name') || n.namedChild(0)));
+    const nameColumn = n => (isPlainName(n) ? n : (n.childForFieldName?.('name') || n.namedChild(0))).startPosition.column;
+    if (isName(node)) return nameColumn(node);
     // The callee part of the call node: its last same-name token outside
     // the argument list names the call (`x.run(y.run())` -> the outer run).
     const callee = node.childForFieldName?.('function') || node.childForFieldName?.('name') ||
         node.childForFieldName?.('method') || node.childForFieldName?.('constructor') ||
         node.childForFieldName?.('macro') || null;
     if (!callee) return null;
-    if (isName(callee)) return callee.startPosition.column;
+    if (isName(callee)) return nameColumn(callee);
     const named = ['property', 'attribute', 'field', 'name'];
     for (const field of named) {
         const part = callee.childForFieldName?.(field);
-        if (isName(part)) return part.startPosition.column;
+        if (isName(part)) return nameColumn(part);
     }
     return null;
 }
@@ -4190,6 +4205,8 @@ function plan(index, name, options = {}) {
                         ? `Update declaration: ${edit.renamed}`
                         : isAccessorDefinition(member) && isAccessorDefinition(def)
                         ? `Update accessor: ${edit.renamed}`
+                        : member.modifiers?.includes('partial') && def.modifiers?.includes('partial')
+                        ? `Update partial method part: ${edit.renamed}`
                         : `Update overload signature: ${edit.renamed}`,
                     newExpression: edit.renamed,
                     isDefinition: true,
@@ -4225,33 +4242,16 @@ function plan(index, name, options = {}) {
             });
         }
         if (conditionalStyle && !def.isSignature) {
-            const { _cFamilySignatureKey, _isCrossFileConfigurationMember, _sameOwnerPath,
-                _isConfigurationAlternative } = require('./callers');
-            const hasCfg = d => (d.attributesWithArgs || []).some(a => a.name === 'cfg') ||
-                (d.modifiers || []).includes('cfg');
-            const alternatives = definitions.filter(other => other !== def && ((
-                // Runtime configuration items (fix #398F, Python): the
-                // parser-recorded alternatives of the item, whatever their
-                // parameters.
-                conditionalStyle === 'branch' ? _isConfigurationAlternative(index, def, other) :
-                // Go (fix #425): the files of the package that declare the
-                // item under other build constraints.
-                conditionalStyle === 'build-constraint' ? _isConfigurationAlternative(index, def, other) :
-                other.file === def.file && !other.isSignature &&
-                !NON_CALLABLE_TYPES.has(other.type) &&
-                (other.className || null) === (def.className || null) &&
-                (other.traitName || null) === (def.traitName || null) &&
-                (other.namespace || null) === (def.namespace || null) &&
-                (other.explicitInterface || null) === (def.explicitInterface || null) &&
-                !(other.startLine === def.startLine && other.endLine === def.endLine) &&
-                // Members of two same-name classes declared in different
-                // scopes (a function-local class) are two items (fix #389).
-                !distinctOwnerDefinitions(index, other, def) &&
-                // One full owner path (fix #395): same-name nested types of
-                // two outer classes are two items.
-                _sameOwnerPath(index, other, def) &&
-                _cFamilySignatureKey(other) === _cFamilySignatureKey(def) &&
-                (conditionalStyle !== 'attribute' || hasCfg(def) || hasCfg(other))) ||
+            const { _isCrossFileConfigurationMember, _isConfigurationAlternative } = require('./callers');
+            const alternatives = definitions.filter(other => other !== def && (
+                // One rule with the caller engine (fix #426): Python runtime
+                // configuration items (fix #398F), Go build-constraint files
+                // (fix #425), and same-file definitions of one owner, owner
+                // path, signature and generic arity with configuration
+                // evidence (`#[cfg]`, a conditional branch the other does not
+                // share): overloads differing in generic arity and local
+                // functions of two methods are two items.
+                _isConfigurationAlternative(index, def, other, { macros: true }) ||
                 // The same class defined again in a file no translation unit
                 // includes beside this one (fix #385: `#ifdef _WIN32
                 // #include "client-windows.h" #else #include "client.h"`).
@@ -4997,10 +4997,19 @@ function plan(index, name, options = {}) {
             const fileSymbols = index.files.get(def.file)?.symbols || [];
             const scopeKinds = new Set(['function', 'method', 'constructor',
                 'private', 'get', 'set', 'property', 'classmethod', 'special']);
+            // Source spans (line, column) decide nesting on one line (fix
+            // #426: `int Go() { int Handler() => 3; return Handler(); }`).
+            const spanOf = symbol => {
+                const span = symbol.sourceSpan;
+                return span && Number.isInteger(span.startColumn) && Number.isInteger(span.endColumn) ? span : null;
+            };
+            const atOrBefore = (l1, c1, l2, c2) => l1 < l2 || (l1 === l2 && c1 <= c2);
             const rangeOf = symbol => ({
                 start: symbol.startLine,
                 end: symbol.endLine || symbol.startLine,
+                span: spanOf(symbol),
             });
+            const spanWidth = range => (range.span ? range.span.end - range.span.start : Infinity);
             const containerOf = (symbol) => {
                 const target = rangeOf(symbol);
                 let best = null;
@@ -5008,12 +5017,27 @@ function plan(index, name, options = {}) {
                     if (candidate === symbol || !scopeKinds.has(candidate.type)) continue;
                     const range = rangeOf(candidate);
                     if (!(range.start <= target.start && range.end >= target.end)) continue;
-                    if (range.start === target.start && range.end === target.end) continue;
-                    if (!best || (range.end - range.start) < (best.end - best.start)) {
+                    if (range.start === target.start && range.end === target.end &&
+                        !(range.span && target.span && spanWidth(range) > spanWidth(target) &&
+                            atOrBefore(range.span.startLine, range.span.startColumn,
+                                target.span.startLine, target.span.startColumn) &&
+                            atOrBefore(target.span.endLine, target.span.endColumn,
+                                range.span.endLine, range.span.endColumn))) continue;
+                    if (!best || (range.end - range.start) < (best.end - best.start) ||
+                        ((range.end - range.start) === (best.end - best.start) && spanWidth(range) < spanWidth(best))) {
                         best = range;
                     }
                 }
                 return best; // null = module scope
+            };
+            // Does a container hold a reference? By its span when both have
+            // columns and the container shares a line with others.
+            const holds = (container, ref) => {
+                if (!(container.start <= ref.line && container.end >= ref.line)) return false;
+                if (!container.span || !Number.isInteger(ref.column) ||
+                    (ref.line !== container.start && ref.line !== container.end)) return true;
+                return atOrBefore(container.span.startLine, container.span.startColumn, ref.line, ref.column) &&
+                    atOrBefore(ref.line, ref.column, container.span.endLine, container.span.endColumn);
             };
             // A prototype and its definition (C/C++ forward declarations,
             // overload signatures) are one callable (fix #396): each binds
@@ -5174,17 +5198,16 @@ function plan(index, name, options = {}) {
                     let winner = null;
                     let ambiguous = false;
                     for (const binder of binders) {
-                        const contains = !binder.container ||
-                            (binder.container.start <= ref.line &&
-                                binder.container.end >= ref.line);
+                        const contains = !binder.container || holds(binder.container, ref);
                         if (!contains) continue;
                         const size = binder.container
                             ? binder.container.end - binder.container.start
                             : Infinity;
-                        if (!winner || size < winner.size) {
-                            winner = { def: binder.def, size };
+                        const width = binder.container ? spanWidth(binder.container) : Infinity;
+                        if (!winner || size < winner.size || (size === winner.size && width < winner.width)) {
+                            winner = { def: binder.def, size, width };
                             ambiguous = false;
-                        } else if (size === winner.size &&
+                        } else if (size === winner.size && width === winner.width &&
                             binder.def !== winner.def) {
                             ambiguous = true;
                         }
@@ -5456,9 +5479,46 @@ function plan(index, name, options = {}) {
         // form: attribute reads and writes. Reuse impact's receiver-evidence
         // query so a typed field is edited mechanically and an unresolved
         // receiver is surfaced for review instead of silently omitted.
-        const accessorReferences = findAccessorReferences(index, name, def, {
+        let accessorReferences = findAccessorReferences(index, name, def, {
             includeTests: true,
         });
+        // A property's dispatch slot (fix #426): an access the pin's lookup
+        // leaves to an overriding member (`Count` read inside a subclass
+        // declaring `override Count`) is an access of that slot member, and
+        // so is one the pin's own lookup could not decide but a slot
+        // member's lookup confirms. The members' confirmed accesses join the
+        // pin's answer; what they leave undecided the pin's own answer
+        // already partitions.
+        const slotAccessors = accessorReferences && hierarchySlot
+            ? [...hierarchySlot.ancestors, ...hierarchySlot.descendants]
+                .flatMap(entry => entry.members)
+                .filter(member => member !== def && isAccessorDefinition(member))
+            : [];
+        if (slotAccessors.length > 0) {
+            const tokenKey = ref => `${ref.absoluteFile}\0${ref.line}\0${ref.column ?? '*'}`;
+            const confirmed = new Map(accessorReferences.confirmed.map(ref => [tokenKey(ref), ref]));
+            const unverified = [...accessorReferences.unverified];
+            for (const member of slotAccessors.slice(0, 25)) {
+                const answer = findAccessorReferences(index, name, member, { includeTests: true });
+                if (!answer) continue;
+                for (const ref of answer.confirmed) {
+                    if (!confirmed.has(tokenKey(ref))) confirmed.set(tokenKey(ref), ref);
+                }
+            }
+            const sort = (a, b) => codeUnitCompare(a.file, b.file) || a.line - b.line ||
+                (a.column ?? -1) - (b.column ?? -1);
+            const seenUnverified = new Set();
+            accessorReferences = {
+                ...accessorReferences,
+                confirmed: [...confirmed.values()].sort(sort),
+                unverified: unverified.filter(ref => {
+                    const key = tokenKey(ref);
+                    if (confirmed.has(key) || seenUnverified.has(key)) return false;
+                    seenUnverified.add(key);
+                    return true;
+                }).sort(sort),
+            };
+        }
         if (accessorReferences) {
             const confirmedByLine = new Map();
             for (const ref of accessorReferences.confirmed) {

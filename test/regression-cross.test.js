@@ -17413,3 +17413,329 @@ describe('fix #421: constructor answers without stale hints, nameless delegation
         });
     }
 });
+
+describe('fix #426: C# rename closure, configuration alternatives, partial methods, records and out var', () => {
+    const plan = (index, file, line, name, renameTo) => {
+        const result = execute(index, 'plan', { name, file, line, renameTo });
+        assert.strictEqual(result.ok, true, result.error);
+        const changes = result.result.changes;
+        return {
+            edits: changes.filter(c => !c.needsReview).map(c => `${c.file}:${c.line}`).sort(),
+            reviews: changes.filter(c => c.needsReview).map(c => `${c.file}:${c.line}`).sort(),
+            text: changes.filter(c => !c.needsReview).map(c => c.newExpression),
+            unverified: (result.result.unverifiedSites || []).map(c => `${c.file}:${c.line}`).sort(),
+        };
+    };
+    it('generic method slots match by method type parameter position', () => {
+        const dir = tmp({
+            'ISender.cs': [
+                'namespace Acme;',
+                'public interface IRequest<out T> { }',
+                'public interface IRequest { }',
+                'public interface ISender',
+                '{',
+                '    Task<T> Send<T>(IRequest<T> request);',
+                '    Task Send<TRequest>(TRequest request) where TRequest : IRequest;',
+                '    Task<object?> Send(object request);',
+                '}',
+                'public class Mediator : ISender',
+                '{',
+                '    public Task<TResponse> Send<TResponse>(IRequest<TResponse> request) => null!;',
+                '    public Task Send<TRequest>(TRequest request) where TRequest : IRequest => null!;',
+                '    public Task<object?> Send(object request) => null!;',
+                '}',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(plan(index, 'ISender.cs', 6, 'Send', 'SendZ').edits, ['ISender.cs:12', 'ISender.cs:6']);
+            assert.deepStrictEqual(plan(index, 'ISender.cs', 7, 'Send', 'SendZ').edits, ['ISender.cs:13', 'ISender.cs:7']);
+            assert.deepStrictEqual(plan(index, 'ISender.cs', 13, 'Send', 'SendZ').edits, ['ISender.cs:13', 'ISender.cs:7']);
+        } finally { rm(dir); }
+    });
+    it('an inherited implementation and every interface of an implementer join the slot', () => {
+        const dir = tmp({
+            'A.cs': [
+                'namespace Acme;',
+                'public interface IBean { long GetCount(); }',
+                'public abstract class Base { public long GetCount() { return 1; } }',
+                'public class Impl : Base, IBean { }',
+                'public interface IPool { int GetNumActive(); }',
+                'public interface IPoolMXBean { int GetNumActive(); }',
+                'public class GenericPool : IPool, IPoolMXBean { public int GetNumActive() { return 0; } }',
+                'public class Proxied : IPool { private readonly IPool _pool = null!; public int GetNumActive() { return _pool.GetNumActive(); } }',
+                'public class Use { long A(Impl i, IBean b) { return i.GetCount() + b.GetCount(); } }',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const bean = ['A.cs:2', 'A.cs:3', 'A.cs:9'];
+            assert.deepStrictEqual(plan(index, 'A.cs', 3, 'GetCount', 'N').edits, bean);
+            assert.deepStrictEqual(plan(index, 'A.cs', 2, 'GetCount', 'N').edits, bean);
+            const pool = ['A.cs:5', 'A.cs:6', 'A.cs:7', 'A.cs:8'];
+            assert.deepStrictEqual(plan(index, 'A.cs', 5, 'GetNumActive', 'N').edits, pool);
+            assert.deepStrictEqual(plan(index, 'A.cs', 8, 'GetNumActive', 'N').edits, pool);
+        } finally { rm(dir); }
+    });
+    it('overloads of other generic arities and local functions of two methods are no configuration alternatives', () => {
+        const dir = tmp({
+            'A.cs': [
+                'namespace Acme;',
+                'public class Row',
+                '{',
+                '    public virtual string? Get(int index) => null;',
+                '    public virtual T? Get<T>(int index) => default;',
+                '    public virtual T? Get<T, TConv>(int index) => default;',
+                '}',
+                'public class Use { public object? Run(Row r) => r.Get(1) ?? (object?)r.Get<int>(2); }',
+                'public class W<T, R>',
+                '{',
+                '    public int Run()',
+                '    {',
+                '        int Handler(int t = 0) => t + 1;',
+                '        return Handler();',
+                '    }',
+                '}',
+                'public class W<T>',
+                '{',
+                '    public int Run()',
+                '    {',
+                '        int Handler(int t = 0) => t + 2;',
+                '        return Handler();',
+                '    }',
+                '}',
+                'public class C',
+                '{',
+                '#if NET7_0_OR_GREATER',
+                '    public int M(int x) { return x; }',
+                '#else',
+                '    public int M(int x) { return x + 1; }',
+                '#endif',
+                '    public int Use() => M(1);',
+                '}',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const generic = plan(index, 'A.cs', 5, 'Get', 'GetZ');
+            assert.deepStrictEqual(generic.edits, ['A.cs:5', 'A.cs:8']);
+            assert.ok(generic.text.includes('public class Use { public object? Run(Row r) => r.Get(1) ?? (object?)r.GetZ<int>(2); }'),
+                JSON.stringify(generic.text));
+            assert.deepStrictEqual(plan(index, 'A.cs', 4, 'Get', 'GetZ').edits, ['A.cs:4', 'A.cs:8']);
+            assert.deepStrictEqual(plan(index, 'A.cs', 13, 'Handler', 'HandlerZ').edits, ['A.cs:13', 'A.cs:14']);
+            // A real `#if`/`#else` pair stays one item.
+            assert.deepStrictEqual(plan(index, 'A.cs', 28, 'M', 'MZ').edits, ['A.cs:28', 'A.cs:30', 'A.cs:32']);
+        } finally { rm(dir); }
+    });
+    it('the declaring and implementing parts of a partial method are one method', () => {
+        const dir = tmp({
+            'A.cs': 'namespace Acme;\npublic partial class Gen\n{\n    public int Run(string s) => Compute(s);\n    private partial int Compute(string s);\n}\n',
+            'B.cs': 'namespace Acme;\npublic partial class Gen\n{\n    private partial int Compute(string s) { return s.Length; }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const context = execute(index, 'context', { name: 'A.cs:5:Compute' });
+            assert.deepStrictEqual((context.result.callers || []).map(c => `${c.relativePath}:${c.line}`), ['A.cs:4']);
+            assert.deepStrictEqual(context.result.unverifiedCallers || [], []);
+            assert.deepStrictEqual(plan(index, 'B.cs', 4, 'Compute', 'ComputeZ').edits, ['A.cs:4', 'A.cs:5', 'B.cs:4']);
+        } finally { rm(dir); }
+    });
+    it('a record-qualified static call reaches the record member; an out var receiver is untyped', () => {
+        const dir = tmp({
+            'A.cs': [
+                'namespace Acme;',
+                'public readonly record struct Money(decimal Amount) { public static Money Zero() => new(0); }',
+                'public record class Tag(string Name) { public static Tag Of(string n) => new(n); }',
+                'public interface IF { bool Create(int t); }',
+                'public static class U',
+                '{',
+                '    public static object F() => (Money.Zero(), Tag.Of("x"));',
+                '    public static bool A(Dictionary<int, IF> d, int k) { if (d.TryGetValue(k, out var f)) return f.Create(k); return false; }',
+                '}',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            for (const handle of ['A.cs:2:Zero', 'A.cs:3:Of']) {
+                const context = execute(index, 'context', { name: handle });
+                assert.deepStrictEqual((context.result.callers || []).map(c => c.line), [7], handle);
+            }
+            const create = execute(index, 'context', { name: 'A.cs:4:Create' });
+            assert.deepStrictEqual((create.result.callers || []).map(c => c.line), []);
+            assert.deepStrictEqual((create.result.unverifiedCallers || []).map(c => c.line), [8]);
+        } finally { rm(dir); }
+    });
+    it('property slots: accesses in overriding classes are renamed, a new member hides the slot', () => {
+        const dir = tmp({
+            'A.cs': [
+                'namespace N',
+                '{',
+                '    public class Base',
+                '    {',
+                '        public virtual int Count { get; set; }',
+                '        int UseBase() => Count;',
+                '    }',
+                '    public class Derived : Base',
+                '    {',
+                '        public override int Count { get; set; }',
+                '        int UseDerived() => Count;',
+                '    }',
+                '    public class Hider : Base',
+                '    {',
+                '        public new int Count => 5;',
+                '        int UseHider() => Count;',
+                '    }',
+                '    public class Plain : Base',
+                '    {',
+                '        int UsePlain() => Count;',
+                '    }',
+                '}',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const slot = ['A.cs:10', 'A.cs:11', 'A.cs:20', 'A.cs:5', 'A.cs:6'];
+            assert.deepStrictEqual(plan(index, 'A.cs', 5, 'Count', 'CountZ').edits, slot);
+            assert.deepStrictEqual(plan(index, 'A.cs', 10, 'Count', 'CountZ').edits, slot);
+            assert.deepStrictEqual(plan(index, 'A.cs', 15, 'Count', 'CountZ').edits, ['A.cs:15', 'A.cs:16']);
+        } finally { rm(dir); }
+    });
+    it('a definition in a conditional branch another configuration view reads is renamed by its own token', () => {
+        const dir = tmp({
+            'R.cs': [
+                'using System.Text.RegularExpressions;',
+                'namespace Acme;',
+                'internal static partial class Rx',
+                '{',
+                '#if DEBUG',
+                '    [System.Obsolete]',
+                '#endif',
+                '    private const string',
+                '        LegacyPattern = "x";',
+                '#if NET7_0_OR_GREATER',
+                '    [GeneratedRegex(LegacyPattern)]',
+                '    private static partial Regex LegacyGen();',
+                '    internal static Regex Legacy => LegacyGen();',
+                '#else',
+                '    internal static Regex Legacy { get; }',
+                '        = new(LegacyPattern);',
+                '#endif',
+                '}',
+                'public static class Use { public static bool M(string s) => Rx.Legacy.IsMatch(s); }',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            for (const line of [13, 15]) {
+                const result = plan(index, 'R.cs', line, 'Legacy', 'LegacyZ');
+                assert.deepStrictEqual(result.edits, ['R.cs:13', 'R.cs:15', 'R.cs:19'], `pin ${line}`);
+                assert.ok(result.text.includes('internal static Regex LegacyZ { get; }'), JSON.stringify(result.text));
+            }
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #426: TypeScript and Python slot holders reach the supertypes beside the pin', () => {
+    const plan = (index, file, line, name, renameTo) => {
+        const result = execute(index, 'plan', { name, file, line, renameTo });
+        assert.strictEqual(result.ok, true, result.error);
+        return result.result.changes.filter(c => !c.needsReview).map(c => `${c.file}:${c.line}`).sort();
+    };
+    it('ts: an inherited implementation fills the implementer interface', () => {
+        const dir = tmp({
+            'a.ts': [
+                'export interface Bean {',
+                '  getCount(): number;',
+                '}',
+                'export abstract class Base {',
+                '  getCount(): number { return 1; }',
+                '}',
+                'export class Impl extends Base implements Bean {',
+                '}',
+                'export function a(i: Impl, b: Bean): number { return i.getCount() + b.getCount(); }',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(plan(index, 'a.ts', 5, 'getCount', 'n'), ['a.ts:2', 'a.ts:5', 'a.ts:9']);
+            assert.deepStrictEqual(plan(index, 'a.ts', 2, 'getCount', 'n'), ['a.ts:2', 'a.ts:5', 'a.ts:9']);
+        } finally { rm(dir); }
+    });
+    it('python: an override in a class with two bases overrides both', () => {
+        const dir = tmp({
+            'm.py': [
+                'class Pool:',
+                '    def active(self):',
+                '        return 1',
+                '',
+                'class Bean:',
+                '    def active(self):',
+                '        return 2',
+                '',
+                'class Generic(Pool, Bean):',
+                '    def active(self):',
+                '        return 0',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(plan(index, 'm.py', 2, 'active', 'busy'), ['m.py:10', 'm.py:2', 'm.py:6']);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #426: a C# target-typed new(..) in an argument slot runs the constructor its arguments select', () => {
+    it('the class binding names the construction: the constructor body is confirmed, the other overload excluded', () => {
+        const dir = tmp({
+            'Box.cs': 'namespace App.Model\n{\n    public class Box\n    {\n        public Box(int v) { }\n        public Box(string s) { }\n    }\n}\n',
+            'Use.cs': 'using App.Model;\nnamespace App\n{\n    public static class Use\n    {\n        public static void Take(Box b) { }\n        public static void B() { Take(new(4)); }\n    }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const [intCtor, stringCtor] = index.symbols.get('Box').filter(d => d.type === 'constructor').sort((a, b) => a.startLine - b.startLine);
+            const callers = index.findCallers('Box', { targetDefinitions: [intCtor], collectAccount: true, includeMethods: true });
+            assert.deepStrictEqual(callers.map(c => `${c.relativePath}:${c.line}`), ['Use.cs:7']);
+            assert.deepStrictEqual(callers.unverifiedEntries || [], []);
+            const other = index.findCallers('Box', { targetDefinitions: [stringCtor], collectAccount: true, includeMethods: true });
+            assert.deepStrictEqual(other.map(c => c.line), []);
+            assert.deepStrictEqual((other.unverifiedEntries || []).map(c => c.line), []);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #426: a local function sharing its method\'s line is scoped by source span', () => {
+    it('the call and the method-group value bind the local function of their own method', () => {
+        const dir = tmp({
+            'A.cs': [
+                'namespace Acme;',
+                'public class W<T, R>',
+                '{',
+                '    public int Run() { int Handler(int t = 0) => t + 1; Func<int, int> f = Handler; return f(1); }',
+                '}',
+                'public class Other',
+                '{',
+                '    public int Go() { int Handler(int t = 0) => t + 3; return Handler(); }',
+                '}',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const go = index.symbols.get('Handler').find(d => d.startLine === 8);
+            const callers = index.findCallers('Handler', { targetDefinitions: [go], collectAccount: true });
+            assert.deepStrictEqual(callers.map(c => c.line), [8]);
+            const result = execute(index, 'plan', { name: 'Handler', file: 'A.cs', line: 4, renameTo: 'HandlerZ' });
+            assert.ok(result.ok, result.error);
+            assert.deepStrictEqual(result.result.changes.map(c => c.newExpression),
+                ['public int Run() { int HandlerZ(int t = 0) => t + 1; Func<int, int> f = HandlerZ; return f(1); }']);
+        } finally { rm(dir); }
+    });
+});

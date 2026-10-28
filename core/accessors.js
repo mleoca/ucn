@@ -412,54 +412,67 @@ function findAccessorReferences(index, name, definition, options = {}) {
     // line-oriented inventory. A line can contain two same-spelled member
     // accesses with different receivers; collapsing them by file+line would
     // make a rename edit one token while silently losing the other.
-    const refs = [];
-    for (const [file, entry] of index.files) {
-        // `files` (fix #398F): a caller that needs one file family (tests)
-        // never parses the rest of the project.
-        if (options.files && !options.files.has(file)) continue;
-        if (!index.matchesFilters(entry.relativePath, options)) continue;
-        let content;
-        let occurrences;
-        try {
-            content = index._readFile(file);
-            if (!content.includes(name)) continue;
-            occurrences = index._getCachedUsages(file, name);
-        } catch { continue; }
-        if (!occurrences) continue;
-        const grammarShape = langTraits(entry.language)?.accessorReferenceShape;
-        const candidates = occurrences.filter(usage => usage.usageType === 'reference' ||
-            (grammarShape && usage.usageType === 'call'));
-        if (!candidates.length) continue;
-        const parser = getParser(entry.language);
-        const tree = parser ? index._getParsedTree?.(file, content, entry.language) || safeParse(parser, content) : null;
-        const lines = index._getFileLines?.(file) || content.split('\n');
-        let adapter;
-        try { adapter = getLanguageAdapter(entry.language); } catch { adapter = null; }
-        const annotatedType = typeof adapter?.annotatedReceiverType === 'function' ? adapter.annotatedReceiverType : null;
-        for (const usage of candidates) {
-            const dependencyShape = grammarShape ? grammarShape(tree, usage) : null;
-            if (dependencyShape === 'none') continue;
-            let shape = null;
-            if (!usage.receiver && !dependencyShape) {
-                shape = receiverlessShape(tree, usage);
-                if (shape === 'none') continue;
+    // The raw occurrence records depend on the name and the scan options
+    // only: one scan per operation serves every member of a property slot
+    // (fix #426: plan asks each overriding accessor too).
+    let refsMemoKey;
+    try { refsMemoKey = JSON.stringify([name, options.files ? [...options.files].sort() : null, options]); }
+    catch { refsMemoKey = null; }
+    const refsMemo = refsMemoKey && !index.isProvenanceFactIndex
+        ? index._opMemo?.('accessorReferenceRecords', () => new Map()) : null;
+    const memoRefs = refsMemo?.get(refsMemoKey);
+    const refs = memoRefs || [];
+    if (!memoRefs) {
+        for (const [file, entry] of index.files) {
+            // `files` (fix #398F): a caller that needs one file family (tests)
+            // never parses the rest of the project.
+            if (options.files && !options.files.has(file)) continue;
+            if (!index.matchesFilters(entry.relativePath, options)) continue;
+            let content;
+            let occurrences;
+            try {
+                content = index._readFile(file);
+                if (!content.includes(name)) continue;
+                occurrences = index._getCachedUsages(file, name);
+            } catch { continue; }
+            if (!occurrences) continue;
+            const grammarShape = langTraits(entry.language)?.accessorReferenceShape;
+            const candidates = occurrences.filter(usage => usage.usageType === 'reference' ||
+                (grammarShape && usage.usageType === 'call'));
+            if (!candidates.length) continue;
+            const parser = getParser(entry.language);
+            const tree = parser ? index._getParsedTree?.(file, content, entry.language) || safeParse(parser, content) : null;
+            const lines = index._getFileLines?.(file) || content.split('\n');
+            let adapter;
+            try { adapter = getLanguageAdapter(entry.language); } catch { adapter = null; }
+            const annotatedType = typeof adapter?.annotatedReceiverType === 'function' ? adapter.annotatedReceiverType : null;
+            for (const usage of candidates) {
+                const dependencyShape = grammarShape ? grammarShape(tree, usage) : null;
+                if (dependencyShape === 'none') continue;
+                let shape = null;
+                if (!usage.receiver && !dependencyShape) {
+                    shape = receiverlessShape(tree, usage);
+                    if (shape === 'none') continue;
+                }
+                // A parameter annotation types the receiver (fix #424), the
+                // evidence method calls on it already take.
+                const annotated = annotatedType && usage.receiver && !usage.receiverType && tree &&
+                    Number.isInteger(usage.column) ? annotatedType(tree, usage.line, usage.column, usage.receiver) : undefined;
+                refs.push({
+                    ...usage,
+                    ...(annotated && { receiverType: annotated, receiverAnnotation: true }),
+                    ...(shape?.pattern && { patternKey: shape, ...(shape.thisSource && { receiver: 'this' }) }),
+                    ...(dependencyShape && { dependencyShape }),
+                    accessKind: dependencyShape?.accessKind || (shape?.pattern ? 'read' : accessKind(tree, usage, dependencyShape?.node)),
+                    ...(usage.receiver && { flowSite: flowSiteOf(tree, usage, dependencyShape?.node) }),
+                    file,
+                    relativePath: entry.relativePath,
+                    content: lines[usage.line - 1] || '',
+                });
             }
-            // A parameter annotation types the receiver (fix #424), the
-            // evidence method calls on it already take.
-            const annotated = annotatedType && usage.receiver && !usage.receiverType && tree &&
-                Number.isInteger(usage.column) ? annotatedType(tree, usage.line, usage.column, usage.receiver) : undefined;
-            refs.push({
-                ...usage,
-                ...(annotated && { receiverType: annotated, receiverAnnotation: true }),
-                ...(shape?.pattern && { patternKey: shape, ...(shape.thisSource && { receiver: 'this' }) }),
-                ...(dependencyShape && { dependencyShape }),
-                accessKind: dependencyShape?.accessKind || (shape?.pattern ? 'read' : accessKind(tree, usage, dependencyShape?.node)),
-                ...(usage.receiver && { flowSite: flowSiteOf(tree, usage, dependencyShape?.node) }),
-                file,
-                relativePath: entry.relativePath,
-                content: lines[usage.line - 1] || '',
-            });
         }
+
+    refsMemo?.set(refsMemoKey, refs);
     }
 
     for (const ref of refs) {

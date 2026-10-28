@@ -578,8 +578,14 @@ function projectConstructorCallers(index, name, options, result) {
             if (records.length > 1 && records.some(call => call.implicitBase)) records = records.filter(call => call.implicitBase &&
                 call.name === (site.calledAs || owner.name) && constructionAliasBinding(index, site.file, call, [owner]));
             if (records.length !== 1) continue;
-            const call = records[0];
+            let call = records[0];
             if (!isConstruction(call, site, language)) continue;
+            // A target-typed `new(..)` whose slot (an argument, a member it
+            // is assigned to) is resolved at query time carries no type name
+            // in its record: the class binding named it (fix #426).
+            if (call.targetTyped && call.targetSlot) {
+                call = { ...call, name: site.calledAs || owner.name };
+            }
             replaced.add(siteKey(site));
             const choice = constructionChoice(index, owner, call, site.provenance, targets);
             // No project constructor body runs here, so none of the targets.

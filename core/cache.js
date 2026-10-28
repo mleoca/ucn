@@ -961,7 +961,9 @@ function clearAllCaches() {
 // `T.M`, mark receivers no local binds (`receiverPackageLevel`), record
 // conversion operands, instantiated values and positional literal-element
 // selectors as values, and type type-switch bindings per clause.
-const CACHE_FORMAT_VERSION = 313;
+// v314 (fix #426): C# `out var` / implicitly typed pattern locals record no
+// receiver type (was the written `var`).
+const CACHE_FORMAT_VERSION = 314;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 function usageResultKey(index, filePath, name, mode) {

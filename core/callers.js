@@ -1082,6 +1082,23 @@ function findCallers(index, name, options = {}) {
                 : { isUncertain: true }), ...(facts && { facts }) },
         });
     };
+    // A method reference or method group naming an overloaded method
+    // (`R::clear` with `clear(Element)` and `clear(Source)`, fix #426)
+    // selects the overload its target functional or delegate type fits (JLS
+    // 15.13.1, C# method group conversion): with no target type modeled, a
+    // reference whose owner declares other same-name methods than the pinned
+    // ones is undecided, never a confirmed reference of each overload.
+    const routeMethodReferenceOverload = (filePath, fileEntry, call, calledAs, targets) => {
+        if (!collectAccount || !options.targetDefinitions || !call.isFunctionReference ||
+            call.argCount != null || !langTraits(fileEntry.language)?.hasArityOverloads ||
+            langTraits(fileEntry.language)?.textualIncludes) return false;
+        const siblings = _methodReferenceSiblings(index, targets, definitions);
+        if (siblings === 0) return false;
+        routeUnverified(filePath, fileEntry, call, 'overload-ambiguous', calledAs, {
+            dispatchCandidates: siblings + 1,
+        });
+        return true;
+    };
     const excludeReceiver = (filePath, fileEntry, call, calledAs, receiverOptions = {}) => {
         const targets = options.targetDefinitions || definitions;
         const facts = _confirmationFacts(index, filePath, call, targets, receiverOptions);
@@ -3038,6 +3055,7 @@ function findCallers(index, name, options = {}) {
                         recordExcluded(filePath, call.line, 'local-shadow');
                         continue;
                     }
+                    if (routeMethodReferenceOverload(filePath, fileEntry, call, calledAs, cbTargetDefs)) continue;
                     if (!pendingByFile.has(filePath)) pendingByFile.set(filePath, []);
                     pendingByFile.get(filePath).push({
                         call, fileEntry, callerSymbol,
@@ -3277,13 +3295,22 @@ function findCallers(index, name, options = {}) {
                             if (!own) {
                                 best = index.findEnclosingFunction(filePath, binding.startLine, true);
                             } else {
+                                // Source spans decide nesting on one line (fix #426: `int
+                                // Go() { int Handler() => 3; return Handler(); }`).
+                                const spanned = symbol => Number.isInteger(symbol.sourceSpan?.start) &&
+                                    Number.isInteger(own.sourceSpan?.start);
+                                const width = symbol => (spanned(symbol)
+                                    ? symbol.sourceSpan.end - symbol.sourceSpan.start
+                                    : symbol.endLine - symbol.startLine);
                                 for (const symbol of fileSymbols) {
                                     if (symbol === own || NON_CALLABLE_TYPES.has(symbol.type) ||
-                                        symbol.startLine > own.startLine || symbol.endLine < own.endLine ||
-                                        (symbol.startLine === own.startLine && symbol.endLine === own.endLine)) continue;
-                                    if (!best || symbol.endLine - symbol.startLine < best.endLine - best.startLine) {
-                                        best = symbol;
-                                    }
+                                        symbol.startLine > own.startLine || symbol.endLine < own.endLine) continue;
+                                    if (symbol.startLine === own.startLine && symbol.endLine === own.endLine &&
+                                        !(spanned(symbol) && symbol.sourceSpan.start <= own.sourceSpan.start &&
+                                            symbol.sourceSpan.end >= own.sourceSpan.end &&
+                                            symbol.sourceSpan.end - symbol.sourceSpan.start >
+                                                own.sourceSpan.end - own.sourceSpan.start)) continue;
+                                    if (!best || width(symbol) < width(best)) best = symbol;
                                 }
                             }
                             ownerMemo?.set(memoKey, best);
@@ -6275,6 +6302,13 @@ function findCallers(index, name, options = {}) {
                         continue;
                     }
                 }
+                // A method reference to an overloaded method (`R::clear` with
+                // `clear(Element)` and `clear(Source)`, fix #426) selects the
+                // overload its target functional type's parameters fit (JLS
+                // 15.13.1): with no target type modeled, a reference reaching
+                // an owner whose other same-name methods are not pinned is
+                // undecided, never a confirmed caller of each overload.
+                if (routeMethodReferenceOverload(filePath, fileEntry, call, calledAs, targetDefs)) continue;
 
                 // Find the enclosing function (get full symbol info)
                 const callerSymbol = index.findEnclosingFunction(filePath, call.line, true, call);
@@ -15433,7 +15467,9 @@ function _unresolvedModuleIsGap(index, module, binding) {
     return false;
 }
 
-const IDENTITY_TYPE_KINDS = new Set(['class', 'struct', 'interface', 'trait', 'enum']);
+// A record (C# `record class`/`record struct`, Java `record`) is a type like
+// a class (fix #426: `Tag.Of(..)` qualified by a record was external).
+const IDENTITY_TYPE_KINDS = new Set(['class', 'struct', 'interface', 'trait', 'enum', 'record']);
 
 /**
  * Parse a generics/type-parameter list text (`<T: Wipe, U>`, `<T extends X>`,
@@ -16819,6 +16855,31 @@ function _closeCallableIdentityGroupUncached(index, targetDefs, definitions) {
                 (expanded && expanded.includes(candidate))) continue;
             if (!expanded) expanded = [...targetDefs];
             expanded.push(candidate);
+        }
+    }
+
+    // A partial method's declaring and implementing parts (C#, fix #426:
+    // `partial int Compute(string s);` in one part of a partial type and its
+    // body in another) are ONE method: a type holds at most one declaring
+    // and one implementing part of a signature (CS0756/CS0757), so two
+    // `partial` methods of one partial type with one parameter list and one
+    // generic arity are its two parts, never overloads.
+    const partialPart = d => d.className && !NON_CALLABLE_TYPES.has(d.type) &&
+        Array.isArray(d.modifiers) && d.modifiers.includes('partial');
+    const methodArity = d => _genericParamNames(d.generics)?.size || 0;
+    for (const target of targetDefs) {
+        if (!partialPart(target)) continue;
+        for (const candidate of definitions) {
+            if (candidate === target || !partialPart(candidate) || candidate.name !== target.name ||
+                candidate.className !== target.className ||
+                (candidate.namespace || null) !== (target.namespace || null) ||
+                (candidate.enclosingType || null) !== (target.enclosingType || null) ||
+                (candidate.ownerTypeArity || 0) !== (target.ownerTypeArity || 0) ||
+                (candidate.explicitInterface || null) !== (target.explicitInterface || null) ||
+                methodArity(candidate) !== methodArity(target) ||
+                _cFamilySignatureKey(candidate) !== _cFamilySignatureKey(target) ||
+                (candidate.file === target.file && candidate.startLine === target.startLine)) continue;
+            addToGroup(candidate);
         }
     }
 
@@ -25704,6 +25765,31 @@ function _cppMemberUsingBases(index, className, name, contextFile) {
     return bases;
 }
 
+/**
+ * Same-owner methods of the targets' name that are not themselves targets
+ * (fix #426): the overloads a method reference or method group could select
+ * instead of a pinned one. Configuration alternatives and the parts of one
+ * callable are the pinned item, never siblings.
+ */
+function _methodReferenceSiblings(index, targetDefs, definitions) {
+    const owners = targetDefs.filter(target => target.className && !NON_CALLABLE_TYPES.has(target.type));
+    if (owners.length === 0) return 0;
+    const ownerKeys = new Set(owners.map(target => ownerRefOf(index, target)?.key).filter(Boolean));
+    const pinned = new Set(_closeCallableIdentityGroup(index, targetDefs, definitions));
+    let count = 0;
+    for (const definition of definitions) {
+        if (pinned.has(definition) || NON_CALLABLE_TYPES.has(definition.type) || !definition.className) continue;
+        if (targetDefs.some(target => target.file === definition.file && target.startLine === definition.startLine)) continue;
+        const key = ownerRefOf(index, definition)?.key;
+        const sameOwner = key ? ownerKeys.has(key)
+            : owners.some(target => target.file === definition.file && target.className === definition.className);
+        if (!sameOwner) continue;
+        if (targetDefs.some(target => _isConfigurationAlternative(index, definition, target))) continue;
+        count++;
+    }
+    return count;
+}
+
 function _overloadDiscipline(index, call, targetDefs, definitions, callerFile) {
     const targetOwners = new Set(targetDefs.map(d => d.className).filter(Boolean));
     const targetLanguage = targetDefs[0]?.file && index.files.get(targetDefs[0].file)?.language;
@@ -26721,7 +26807,7 @@ function _definitionFileSet(index, name, kind, accepts) {
  * which body depends on the configuration, never on which of them a
  * receiver-blind name table happened to list first.
  */
-function _isConfigurationAlternative(index, a, b) {
+function _isConfigurationAlternative(index, a, b, opts = {}) {
     if (!a || !b || a === b || a.name !== b.name) return false;
     const style = langTraits(index.files.get(a.file)?.language)?.conditionalDefinitions;
     if (!style) return false;
@@ -26736,7 +26822,11 @@ function _isConfigurationAlternative(index, a, b) {
     // definition sites of one parser-recorded item, whatever their
     // signatures (no overloads to tell apart).
     if (style === 'branch') return sameConfigurationItem(index, a, b);
-    if (a.isSignature || b.isSignature || a.type === 'macro' || b.type === 'macro') return false;
+    // A function-like macro in one branch and a function in another are one
+    // name to rename (plan, `opts.macros`, fix #385); callers keep the macro
+    // namespace apart.
+    if (a.isSignature || b.isSignature ||
+        (!opts.macros && (a.type === 'macro' || b.type === 'macro'))) return false;
     if (NON_CALLABLE_TYPES.has(a.type) || NON_CALLABLE_TYPES.has(b.type)) return false;
     if ((a.className || null) !== (b.className || null) ||
         (a.receiver || null) !== (b.receiver || null) ||
@@ -26753,14 +26843,30 @@ function _isConfigurationAlternative(index, a, b) {
     // One item has one full owner path (fix #395): `TestA.Destination` and
     // `TestB.Destination` are two nested types, whatever their names.
     if (!_sameOwnerPath(index, a, b)) return false;
-    // C/C++ record the preprocessor branch of a definition: one of the two
-    // must sit in a conditional branch the other does not share (two
-    // constrained templates with one parameter list are overloads).
-    if (langTraits(index.files.get(a.file)?.language)?.textualIncludes) {
-        if (!a.ppBranch && !b.ppBranch) return false;
-        if (a.ppBranch && b.ppBranch && a.ppBranch[0] === b.ppBranch[0] &&
-            a.ppBranch[1] === b.ppBranch[1]) return false;
-        return true;
+    if (style === 'preprocessor') {
+        // One item has one generic arity (fix #426): `Get(int)`, `Get<T>(int)`
+        // and `template <class T> T get(int)` are overloads, never one
+        // definition in two configurations; owners of two arities (C#
+        // `W<T, R>` and `W<T>`) are two types.
+        const arity = d => _genericParamNames(d.templateParams || d.generics)?.size || 0;
+        if (arity(a) !== arity(b) || (a.ownerTypeArity || 0) !== (b.ownerTypeArity || 0)) return false;
+        // C/C++ record the preprocessor branch of a definition: one of the two
+        // must sit in a conditional branch the other does not share (two
+        // constrained templates with one parameter list are overloads).
+        if (langTraits(index.files.get(a.file)?.language)?.textualIncludes) {
+            if (!a.ppBranch && !b.ppBranch) return false;
+            if (a.ppBranch && b.ppBranch && a.ppBranch[0] === b.ppBranch[0] &&
+                a.ppBranch[1] === b.ppBranch[1]) return false;
+            return true;
+        }
+        // C# (fix #426): the directive lines decide, as the line-based
+        // preprocessor reads them; two definitions on one conditional path
+        // (both unconditional, or in one branch) are two members, never
+        // alternatives (local functions of two methods, `Get(int)` beside
+        // `Get<T>(int)`).
+        const paths = _preprocessorBranchPaths(index, a.file);
+        const pathOf = d => (paths?.[(d.startLine || 0) - 1] || []).join('|');
+        return !!paths && pathOf(a) !== pathOf(b);
     }
     if (style !== 'attribute') return true;
     const hasCfg = d => (d.attributesWithArgs || []).some(attr => attr.name === 'cfg') ||
@@ -26799,7 +26905,7 @@ function _sameOwnerPath(index, a, b) {
 }
 
 /**
- * Conditional-branch path of every line of a C/C++ file: for each line, the
+ * Conditional-branch path of every line of a C, C++ or C# file: for each line, the
  * `chain:branch` of each enclosing `#if` chain (`#if`/`#ifdef`/`#ifndef`
  * opens a chain, `#elif`/`#else` start its next branch). Directive lines are
  * read as the preprocessor reads them.

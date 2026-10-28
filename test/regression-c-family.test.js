@@ -7446,3 +7446,36 @@ describe('fix #421: constructions of a specialized class template stay unverifie
         } finally { rm(dir); }
     });
 });
+
+describe('fix #426: C++ template overloads of one parameter list are no configuration alternatives', () => {
+    it('a template and a non-template get(int) are two members; an #if pair stays one item', () => {
+        const dir = tmp({
+            'a.hpp': [
+                '#pragma once',
+                'struct Row {',
+                '    const char* get(int index) const { return nullptr; }',
+                '    template <class T> T get(int index) const { return T(); }',
+                '    template <class T, class C> T get(int index) const { return T(); }',
+                '#ifdef WIDE',
+                '    long put(int v) const { return v; }',
+                '#else',
+                '    long put(int v) const { return v + 1; }',
+                '#endif',
+                '};',
+                'inline int use(const Row& r) { return r.get<int>(1) + (r.get(2) ? 1 : 0) + (int)r.put(3); }',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const edits = (line, name) => {
+                const result = execute(index, 'plan', { name, file: 'a.hpp', line, renameTo: `${name}Z` });
+                assert.ok(result.ok, result.error);
+                return result.result.changes.filter(c => !c.needsReview && c.isDefinition).map(c => c.line).sort((a, b) => a - b);
+            };
+            assert.deepStrictEqual(edits(4, 'get'), [4]);
+            assert.deepStrictEqual(edits(3, 'get'), [3]);
+            assert.deepStrictEqual(edits(7, 'put'), [7, 9]);
+        } finally { rm(dir); }
+    });
+});

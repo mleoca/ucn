@@ -60,7 +60,7 @@ Inherited calls keep their declaring class; a shadowed or rebound module stays u
 
 ### Configuration alternatives
 
-Definitions of one name, owner and signature in one file under different `#if` branches (C/C++/C#) or `#[cfg]` attributes (Rust) are one item: a call bound to any of them reaches every variant alike, a type declared once per configuration is one type (receivers typed by either declaration reach its impls), members inside a class body's `#if` blocks are indexed in each branch, and a C++ implicit-this call reaches its own class definition, never a same-named class defined in another file. Python exclusive branches and Go files of other build constraints are one item too (see Python and Go below). Java pattern variables (`x instanceof Sq s`, `case Sq s ->`, record components) and Python class patterns (`case Sq() as s:`, `case Sq():` on a name subject) type their receivers inside their scope.
+Definitions of one name, owner, signature and generic arity in one file under different `#if` branches (C/C++/C#) or `#[cfg]` attributes (Rust) are one item (two such definitions on one conditional path are separate members): a call bound to any of them reaches every variant alike, a type declared once per configuration is one type (receivers typed by either declaration reach its impls), members inside a class body's `#if` blocks are indexed in each branch, and a C++ implicit-this call reaches its own class definition, never a same-named class defined in another file. Python exclusive branches and Go files of other build constraints are one item too (see Python and Go below). Java pattern variables (`x instanceof Sq s`, `case Sq s ->`, record components) and Python class patterns (`case Sq() as s:`, `case Sq():` on a name subject) type their receivers inside their scope.
 
 ### Callback references
 
@@ -158,7 +158,7 @@ In C# and Java a type name is no value: a bare argument spelled like a type (a p
 
 A bare Java/C# call binds a member of the enclosing classes (own or inherited, by class definition, never a same-name class of another package) before a static import (`import static`, `using static`); the import decides it, as caller and callee, only when every class in scope has a resolved project ancestry, and otherwise it stays unverified.
 
-A Java/C# local's declared type is its static receiver type: `Shape s = new Circle(); s.area()` is a caller of `Shape.area` and a `possible-dispatch` candidate of each implementation, except those the constructed type cannot reach when the local is never reassigned. A field initializer types only its own class's field, and only a field that cannot be reassigned.
+A Java/C# local's declared type is its static receiver type: `Shape s = new Circle(); s.area()` is a caller of `Shape.area` and a `possible-dispatch` candidate of each implementation, except those the constructed type cannot reach when the local is never reassigned. An implicitly typed C# `out var` or pattern variable writes no type: calls on it stay unverified. A record (`record class`, `record struct`, Java `record`) qualifies static calls like a class. The declaring and implementing parts of a C# partial method are one method; a Java method reference or C# method group to one of several overloads stays `overload-ambiguous`, its target type choosing the overload. A field initializer types only its own class's field, and only a field that cannot be reassigned.
 
 ## Java
 

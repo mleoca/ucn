@@ -683,8 +683,10 @@ function _typeParams(...defs) {
 /**
  * Could `member` override (occupy the same slot as) `pin` by parameter
  * types? Types compare by their terminal name; a type parameter of either
- * side's method or class matches anything (`m(T)` overridden as
- * `m(String)`).
+ * side's class matches anything (`m(T)` overridden as `m(String)`). Method
+ * type parameters correspond by position (fix #426, JLS 8.4.2 / C#
+ * signature identity): `Send<TRequest>(TRequest)` never takes the slot of
+ * `Send<TResponse>(IRequest<TResponse>)`.
  */
 function _slotParamsCompatible(index, member, pin) {
     const params = d => (d.paramsStructured || []).filter(p => !p?.extensionReceiver &&
@@ -692,18 +694,62 @@ function _slotParamsCompatible(index, member, pin) {
     const a = params(member);
     const b = params(pin);
     if (a.length !== b.length) return false;
+    const correspondence = _methodParamCorrespondence(index, member, pin);
+    if (!correspondence) return false;
     const owners = d => (d.className ? (index.symbols.get(d.className) || [])
         .filter(c => c.file === d.file && CLASS_KINDS.has(c.type)) : []);
-    const variables = _typeParams(member, pin, ...owners(member), ...owners(pin));
+    const variables = _typeParams(...owners(member), ...owners(pin));
     for (let i = 0; i < a.length; i++) {
-        const ta = _slotTypeName(_paramTypeText(a[i]));
-        const tb = _slotTypeName(_paramTypeText(b[i]));
+        const ta = _slotTypeName(_substituteType(_paramTypeText(a[i]), correspondence.member));
+        const tb = _slotTypeName(_substituteType(_paramTypeText(b[i]), correspondence.slot));
         if (!ta || !tb || ta === tb) continue;
+        if (ta.startsWith('$M') || tb.startsWith('$M')) return false;
         if (variables.has(ta) || variables.has(tb)) continue;
         if (/^[A-Z]$/.test(ta) || /^[A-Z]$/.test(tb)) continue;
         return false;
     }
     return true;
+}
+
+/** A method's own type parameters in order, with each one's erasure (its
+ * first bound's head, `Object` without one). */
+function _methodTypeParamList(def) {
+    const raw = String(def?.generics || '').trim().replace(/^<|>$/g, '');
+    if (!raw) return [];
+    return _splitTypeArgs(raw).map(part => {
+        const text = part.replace(/@[\w.]+(?:\([^)]*\))?/g, ' ').trim();
+        const tokens = text.split(/[\s:=]+/).filter(Boolean);
+        const name = (tokens.find(token => !TYPE_PARAM_PREFIXES.has(token)) || '_').replace(/\.\.\.$/, '');
+        const bound = /\bextends\b/.test(text)
+            ? text.split(/\bextends\b/)[1].split('&')[0].replace(/<.*$/s, '').trim() : null;
+        return { name, erasure: bound || 'Object' };
+    });
+}
+
+/**
+ * How the method type parameters of a member and of the slot it may take
+ * correspond (fix #426): position by position into shared placeholders
+ * (`$M0`, ..), so `<U> m(U)` takes the slot `<V> m(V)` and `<Q> m(Q)` never
+ * takes `<R> m(Box<R>)`'s. Unequal counts: Java lets a non-generic method
+ * take a generic slot through the slot's erasure (JLS 8.4.2 subsignature);
+ * anything else is another slot (null).
+ */
+function _methodParamCorrespondence(index, member, slot) {
+    const own = _methodTypeParamList(member);
+    const other = _methodTypeParamList(slot);
+    const memberMap = new Map();
+    const slotMap = new Map();
+    if (own.length === other.length) {
+        own.forEach((param, i) => memberMap.set(param.name, `$M${i}`));
+        other.forEach((param, i) => slotMap.set(param.name, `$M${i}`));
+        return { member: memberMap, slot: slotMap };
+    }
+    const lang = index.files.get(member.file)?.language;
+    if (own.length === 0 && !langTraits(lang)?.genericArityIsIdentity) {
+        for (const param of other) slotMap.set(param.name, param.erasure);
+        return { member: memberMap, slot: slotMap };
+    }
+    return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -837,21 +883,19 @@ function _slotParams(def) {
 
 /**
  * Does `member` take the slot whose parameter types, in the member's own
- * class terms, are `slotTypes`? Method-level type parameters of either
- * side match any type (`<U> m(U)` overrides `<V> m(V)`).
+ * class terms, are `slotTypes`? Method type parameters correspond by
+ * position (fix #426) with those of `slotDef`, the method `slotTypes` were
+ * read from.
  */
-function _slotTypesMatch(member, slotTypes, slotMethodParams) {
+function _slotTypesMatch(index, member, slotTypes, slotDef) {
     const params = _slotParams(member);
     if (params.length !== slotTypes.length) return false;
-    const wild = new Set([...(_orderedTypeParams({ generics: member.generics }) || []),
-        ...slotMethodParams]);
+    const correspondence = _methodParamCorrespondence(index, member, slotDef);
+    if (!correspondence) return false;
     for (let i = 0; i < params.length; i++) {
-        const a = _slotTypeKey(params[i]?.type);
-        const b = _slotTypeKey(slotTypes[i]);
+        const a = _slotTypeKey(_substituteType(params[i]?.type, correspondence.member));
+        const b = _slotTypeKey(_substituteType(slotTypes[i], correspondence.slot));
         if (!a || !b || a === b) continue;
-        const baseA = a.replace(/[^\w$].*$/s, '');
-        const baseB = b.replace(/[^\w$].*$/s, '');
-        if (wild.has(baseA) || wild.has(baseB)) continue;
         return false;
     }
     return true;
@@ -919,18 +963,19 @@ function _slotMembersOf(index, name, ref, pin, overloads, frame = null, slotInte
         same = same.filter(member => methodArity(member) === pinMethodArity);
     }
     if (frame && arity != null) {
-        const pinMethodParams = _orderedTypeParams({ generics: pin.generics }) || [];
         if (frame.slotTypes) {
+            const slotDef = frame.slotDef || pin;
             return same.filter(member => _arity(member) == null ||
-                _slotTypesMatch(member, frame.slotTypes, pinMethodParams));
+                _slotTypesMatch(index, member, frame.slotTypes, slotDef));
         }
         if (frame.memberSubst) {
-            const pinTypes = _slotParams(pin).map(p => p?.type);
+            const targetTypes = frame.targetTypes || _slotParams(pin).map(p => p?.type);
+            const targetDef = frame.targetDef || pin;
             return same.filter(member => {
                 if (_arity(member) == null) return true;
                 const inPinTerms = { ...member, paramsStructured: _slotParams(member)
                     .map(p => ({ ...p, type: _substituteType(p?.type, frame.memberSubst) })) };
-                return _slotTypesMatch(inPinTerms, pinTypes, pinMethodParams);
+                return _slotTypesMatch(index, inPinTerms, targetTypes, targetDef);
             });
         }
     }
@@ -972,7 +1017,8 @@ function hierarchySlotClosure(index, def, startRef = null, options = {}) {
     const pinRef = startRef || ownerRefOf(index, def);
     if (!pinRef || (!pinRef.key && !pinRef.def)) return null;
     const lang = index.files.get(def.file)?.language;
-    const overloads = !!langTraits(lang)?.hasArityOverloads;
+    const traits = langTraits(lang);
+    const overloads = !!traits?.hasArityOverloads;
     const name = def.name;
     // Only a member declared inside the class body is constrained by the
     // class's implements clause (a Rust inherent method never fills the
@@ -989,15 +1035,19 @@ function hierarchySlotClosure(index, def, startRef = null, options = {}) {
             .find(e => e.def.file === file);
         return entry ? { name: parent.name, key: entry.key, def: entry.def } : null;
     };
+    // A member that hides the inherited one (C# `new`, fix #426) starts a
+    // slot of its own: it never joins the inherited member's slot.
+    const hides = member => !!traits?.memberHidingModifier &&
+        (member?.modifiers || []).includes(traits.memberHidingModifier);
 
     const ancestors = [];
     const unresolved = [];
     const external = [];
-    const ancestorSeen = new Set([refKey(pinRef)]);
-    // Each class carries the substitution of its type parameters into the
-    // pin's terms, composed over the generic base clauses walked (fix #390):
-    // `Mid<T> : Base<T, bool>` maps Base's S to the pin class's T. null when
-    // a base clause on the way cannot be read.
+    // Classes that hold the slot (declare a member of it, or inherit one).
+    const inSlot = new Set([refKey(pinRef)]);
+    // Classes whose supertypes some climb already walked: a later climb
+    // reaching one stops there, everything above it is known.
+    const explored = new Set();
     // Interfaces whose member of this name a class on the upward path
     // implements explicitly (C#).
     const explicitViaOf = (ref, inherited) => {
@@ -1006,45 +1056,86 @@ function hierarchySlotClosure(index, def, startRef = null, options = {}) {
         if (own.length === 0) return inherited || null;
         return new Set([...(inherited || []), ...own]);
     };
-    const upQueue = [{ ref: pinRef, contextFile: pinRef.def?.file || def.file,
-        subst: overloads ? new Map() : null, explicitVia: explicitViaOf(pinRef, null) }];
-    while (upQueue.length > 0 && ancestorSeen.size < 256) {
-        const current = upQueue.shift();
-        for (const parent of supertypeRefsOf(index, current.ref,
-            { implements: followImplements })) {
-            if (parent.external) {
-                if (!external.includes(parent.name)) external.push(parent.name);
-                continue;
-            }
-            const resolved = resolveLoose(parent, current.contextFile);
-            if (!resolved) continue;
-            const key = refKey(resolved);
-            if (ancestorSeen.has(key)) continue;
-            ancestorSeen.add(key);
-            let subst = null;
-            if (current.subst && resolved.def) {
-                const step = _baseSubstitution(index, current.ref, resolved);
-                if (step) {
-                    subst = new Map();
-                    for (const [param, arg] of step) subst.set(param, _substituteType(arg, current.subst));
+    // Each class carries the substitution of its type parameters into the
+    // origin's terms, composed over the generic base clauses walked (fix
+    // #390): `Mid<T> : Base<T, bool>` maps Base's S to the origin's T. null
+    // when a base clause on the way cannot be read.
+    const pendingRoots = [];
+    // Where a class member is overridden only when it is virtual (C++
+    // `virtual`, C# `virtual`/`abstract`/`override`; trait
+    // virtualMemberModifiers), a holder's climb joins a class's member only
+    // when it is (fix #426: `struct D : Pool, Plain` overrides Pool's
+    // virtual, never Plain's plain member). Interface members always are.
+    const virtualModifiers = traits?.virtualMemberModifiers || null;
+    const overridable = (ref, member) => !virtualModifiers || ref.def?.type === 'interface' ||
+        (member.modifiers || []).some(modifier => virtualModifiers.includes(modifier));
+    const climb = (origin, originTypes, originDef, interfacesOnly, virtualOnly = false) => {
+        const queue = [{ ref: origin, contextFile: origin.def?.file || def.file,
+            subst: overloads ? new Map() : null, explicitVia: explicitViaOf(origin, null) }];
+        explored.add(refKey(origin));
+        let steps = 0;
+        while (queue.length > 0 && steps++ < 256) {
+            const current = queue.shift();
+            for (const parent of supertypeRefsOf(index, current.ref,
+                { implements: followImplements })) {
+                if (parent.external) {
+                    if (!external.includes(parent.name)) external.push(parent.name);
+                    continue;
                 }
+                const resolved = resolveLoose(parent, current.contextFile);
+                if (!resolved) continue;
+                const key = refKey(resolved);
+                if (explored.has(key)) continue;
+                // A hiding member's slot reaches only the interfaces its own
+                // class declares.
+                if (interfacesOnly && current.ref === origin && resolved.def?.type !== 'interface') continue;
+                let subst = null;
+                if (current.subst && resolved.def) {
+                    const step = _baseSubstitution(index, current.ref, resolved);
+                    if (step) {
+                        subst = new Map();
+                        for (const [param, arg] of step) subst.set(param, _substituteType(arg, current.subst));
+                    }
+                }
+                // A class on the way that implements this interface's member
+                // explicitly keeps the slot out of the interface (fix #395,
+                // C#): `string IValidator.M()` beside `protected virtual M()`
+                // are two slots.
+                if (!_explicitInterfaceName(originDef) && current.explicitVia?.has(resolved.name)) continue;
+                // An interface member is implemented by public members only (C#,
+                // Java, TS): a `protected`/`private`/`internal` member is never
+                // its slot (fix #395).
+                if (resolved.def?.type === 'interface' && !_explicitInterfaceName(originDef) &&
+                    _nonPublicMember(originDef)) continue;
+                explored.add(key);
+                // Types compare in the origin's terms; without them (a base
+                // clause below that could not be read) they compare loosely
+                // with the pin's.
+                const frame = subst && originTypes
+                    ? { memberSubst: subst, targetTypes: originTypes, targetDef: originDef } : null;
+                const declared = inSlot.has(key) ? [] : _slotMembersOf(index, name, resolved, def, overloads,
+                    frame, null, valueSlot, byClass);
+                // A member hiding the inherited one (C# `new virtual M`) is
+                // the top of the slot below it: it joins, and what is above
+                // it is another slot.
+                const hiding = declared.length > 0 && declared.every(hides);
+                const members = declared.filter(member => !virtualOnly || overridable(resolved, member));
+                if (members.length > 0) {
+                    inSlot.add(key);
+                    const entry = { ref: resolved, members };
+                    ancestors.push(entry);
+                    pendingRoots.push(entry);
+                }
+                if (hiding) continue;
+                queue.push({ ref: resolved, contextFile: resolved.def?.file || current.contextFile, subst,
+                    explicitVia: explicitViaOf(resolved, current.explicitVia) });
             }
-            // A class on the way that implements this interface's member
-            // explicitly keeps the pin's slot out of the interface (fix
-            // #395, C#): `string IValidator.M()` beside `protected virtual
-            // M()` are two slots.
-            if (!_explicitInterfaceName(def) && current.explicitVia?.has(resolved.name)) continue;
-            // An interface member is implemented by public members only (C#,
-            // Java, TS): a `protected`/`private`/`internal` member is never
-            // its slot (fix #395).
-            if (resolved.def?.type === 'interface' && !_explicitInterfaceName(def) && _nonPublicMember(def)) continue;
-            const members = _slotMembersOf(index, name, resolved, def, overloads,
-                subst ? { memberSubst: subst } : null, null, valueSlot, byClass);
-            if (members.length > 0) ancestors.push({ ref: resolved, members });
-            upQueue.push({ ref: resolved, contextFile: resolved.def?.file || current.contextFile, subst,
-                explicitVia: explicitViaOf(resolved, current.explicitVia) });
         }
-    }
+    };
+    climb(pinRef, overloads ? _slotParams(def).map(p => p?.type) : null, def, hides(def));
+    // The pin's own climb found the ancestors; descendants' climbs (below)
+    // add the supertypes a slot holder reaches beside the pin's line.
+    pendingRoots.length = 0;
 
     // Children spelled their parent with a qualifier the inheritance graph
     // kept (`extends Outer.Inner<T>`): look those buckets up too.
@@ -1064,8 +1155,7 @@ function hierarchySlotClosure(index, def, startRef = null, options = {}) {
     // Descendants of every slot owner: the pin's class and each declaring
     // ancestor (siblings of the pin override the same slot).
     const descendants = [];
-    const roots = [pinRef, ...ancestors.map(a => a.ref)];
-    const downSeen = new Set(roots.map(refKey));
+    const downSeen = new Set([pinRef, ...ancestors.map(a => a.ref)].map(refKey));
     // Each class carries the slot's parameter types in its own terms, read
     // through the generic base clauses from the root that declares the slot
     // (fix #390): below `Fmt : Visitor<TextWriter, bool>` the slot
@@ -1076,76 +1166,119 @@ function hierarchySlotClosure(index, def, startRef = null, options = {}) {
     // virtual (fix #395); a subclass re-implementing the interface is found
     // through the interface.
     const onlyExplicit = members => members.length > 0 && members.every(m => m.explicitInterface);
-    const interfaceSlot = pinRef.def?.type === 'interface' || !!def.explicitInterface ||
-        ancestors.some(a => a.ref.def?.type === 'interface' && a.members.length > 0);
-    // The interfaces whose member is this slot: their explicit
-    // implementations below are slot members.
-    const slotInterfaces = new Set([
-        ...(pinRef.def?.type === 'interface' ? [pinRef.name] : []),
-        ...ancestors.filter(a => a.ref.def?.type === 'interface' && a.members.length > 0).map(a => a.ref.name),
-        ...(_explicitInterfaceName(def) ? [_explicitInterfaceName(def)] : []),
-    ]);
+    let interfaceSlot = false;
+    const slotInterfaces = new Set(_explicitInterfaceName(def) ? [_explicitInterfaceName(def)] : []);
+    const noteInterfaces = () => {
+        interfaceSlot = pinRef.def?.type === 'interface' || !!def.explicitInterface ||
+            ancestors.some(a => a.ref.def?.type === 'interface' && a.members.length > 0);
+        if (pinRef.def?.type === 'interface') slotInterfaces.add(pinRef.name);
+        for (const a of ancestors) {
+            if (a.ref.def?.type === 'interface' && a.members.length > 0) slotInterfaces.add(a.ref.name);
+        }
+    };
+    noteInterfaces();
+    const rootEntry = (ref, members) => ({ ref,
+        slotTypes: overloads && members.length === 1 ? slotTypesOf(members[0]) : null,
+        slotDef: members.length === 1 ? members[0] : def,
+        explicitOnly: onlyExplicit(members) });
     const downQueue = [
-        { ref: pinRef, slotTypes: overloads ? slotTypesOf(def) : null, explicitOnly: !!def.explicitInterface },
-        ...ancestors.map(a => ({ ref: a.ref,
-            slotTypes: overloads && a.members.length === 1 ? slotTypesOf(a.members[0]) : null,
-            explicitOnly: onlyExplicit(a.members) })),
+        { ref: pinRef, slotTypes: overloads ? slotTypesOf(def) : null, slotDef: def,
+            explicitOnly: !!def.explicitInterface },
+        ...ancestors.map(a => rootEntry(a.ref, a.members)),
     ];
-    // The slot's parameter types in each class's own terms (null: unknown).
+    // The slot's parameter types in each class's own terms (null: unknown),
+    // and the method whose type parameters they are spelled with.
     const slotTypesByKey = new Map(downQueue.map(entry => [refKey(entry.ref), entry.slotTypes]));
-    while (downQueue.length > 0 && descendants.length < 5000) {
-        const currentEntry = downQueue.shift();
-        const current = currentEntry.ref;
-        const children = [
-            ...(currentEntry.explicitOnly ? [] : qualifiedChildKeys(current.name).flatMap(key =>
-                index.extendedByGraph.get(key) || []).map(child =>
-                typeof child === 'string' ? { name: child, file: null }
-                    : { name: child.name, file: child.file || null })),
-            ...implementedBy(index, current.name),
-        ];
-        for (const child of children) {
-            if (!child.name) continue;
-            const entries = classDefsNamed(index, child.name).entries
-                .filter(e => !child.file || e.def.file === child.file);
-            for (const entry of entries) {
-                if (downSeen.has(entry.key)) continue;
-                const childRef = { name: child.name, key: entry.key, def: entry.def };
-                const link = supertypeRefsOf(index, childRef, { implements: true }).find(p => {
-                    if (p.external || _slotTypeName(p.name) !== current.name) return false;
-                    if (p.key) return p.key === current.key;
-                    return !!current.def?.file &&
-                        index._resolveClassFile(current.name, entry.def.file) === current.def.file;
-                });
-                if (!link) continue;
-                downSeen.add(entry.key);
-                let slotTypes = null;
-                let instantiations = null;
-                if (currentEntry.slotTypes && current.def) {
-                    const steps = _baseSubstitutions(index, childRef, current);
-                    if (steps?.length === 1) {
-                        slotTypes = currentEntry.slotTypes.map(type => _substituteType(type, steps[0]));
-                    } else if (steps?.length > 1) {
-                        instantiations = steps.map(step => currentEntry.slotTypes.map(type => _substituteType(type, step)));
+    const slotDefsByKey = new Map(downQueue.map(entry => [refKey(entry.ref), entry.slotDef]));
+    // Supertypes of a slot holder beside the pin's line fill the slot too
+    // (fix #426): a class's member implements the same-signature member of
+    // every interface it implements (`GenericPool implements Pool,
+    // PoolMXBean`), and where the language lets an inherited member
+    // implement (Java, C#, TS), a class inheriting the slot member fills
+    // its own interfaces with it (`Impl extends Base implements Bean`).
+    const climbsFromHolders = !!traits?.memberFillsSupertypeSlots;
+    const climbsFromInheritors = !!traits?.inheritedMemberFillsSlots;
+    let rounds = 0;
+    while (downQueue.length > 0 && rounds++ < 64) {
+        while (downQueue.length > 0 && descendants.length < 5000) {
+            const currentEntry = downQueue.shift();
+            const current = currentEntry.ref;
+            const children = [
+                ...(currentEntry.explicitOnly ? [] : qualifiedChildKeys(current.name).flatMap(key =>
+                    index.extendedByGraph.get(key) || []).map(child =>
+                    typeof child === 'string' ? { name: child, file: null }
+                        : { name: child.name, file: child.file || null })),
+                ...implementedBy(index, current.name),
+            ];
+            for (const child of children) {
+                if (!child.name) continue;
+                const entries = classDefsNamed(index, child.name).entries
+                    .filter(e => !child.file || e.def.file === child.file);
+                for (const entry of entries) {
+                    if (downSeen.has(entry.key)) continue;
+                    const childRef = { name: child.name, key: entry.key, def: entry.def };
+                    const link = supertypeRefsOf(index, childRef, { implements: true }).find(p => {
+                        if (p.external || _slotTypeName(p.name) !== current.name) return false;
+                        if (p.key) return p.key === current.key;
+                        return !!current.def?.file &&
+                            index._resolveClassFile(current.name, entry.def.file) === current.def.file;
+                    });
+                    if (!link) continue;
+                    downSeen.add(entry.key);
+                    let slotTypes = null;
+                    let instantiations = null;
+                    if (currentEntry.slotTypes && current.def) {
+                        const steps = _baseSubstitutions(index, childRef, current);
+                        if (steps?.length === 1) {
+                            slotTypes = currentEntry.slotTypes.map(type => _substituteType(type, steps[0]));
+                        } else if (steps?.length > 1) {
+                            instantiations = steps.map(step => currentEntry.slotTypes.map(type => _substituteType(type, step)));
+                        }
+                    }
+                    const slotDef = currentEntry.slotDef || def;
+                    // A class implementing the generic base more than once fills
+                    // the slot once per instantiation (fix #400).
+                    let members = instantiations
+                        ? [...new Set(instantiations.flatMap(types => _slotMembersOf(index, name, childRef, def,
+                            overloads, { slotTypes: types, slotDef }, slotInterfaces, valueSlot, byClass)))]
+                        : _slotMembersOf(index, name, childRef, def, overloads,
+                            slotTypes ? { slotTypes, slotDef } : null, slotInterfaces, valueSlot, byClass);
+                    if (link.viaImplements) members = members.filter(m => memberInClassBody(index, m));
+                    // In an interface member's slot a class takes part with a
+                    // public member or an explicit implementation only (fix
+                    // #395): a protected override below it overrides another
+                    // slot.
+                    if (interfaceSlot && childRef.def?.type !== 'interface') {
+                        members = members.filter(m => !!m.explicitInterface || !_nonPublicMember(m));
+                    }
+                    // A member hiding the slot member (C# `new`) is another
+                    // slot, and so is everything below it.
+                    if (members.length > 0 && members.every(hides)) continue;
+                    members = members.filter(m => !hides(m));
+                    inSlot.add(entry.key);
+                    descendants.push({ ref: childRef, members, viaImplements: !!link.viaImplements });
+                    downQueue.push({ ref: childRef, slotTypes, slotDef, explicitOnly: onlyExplicit(members) });
+                    slotTypesByKey.set(entry.key, slotTypes);
+                    slotDefsByKey.set(entry.key, slotDef);
+                    if (!onlyExplicit(members) &&
+                        (members.length > 0 ? climbsFromHolders : climbsFromInheritors)) {
+                        // A declared member overrides; an inherited one is the
+                        // implementation its provider declares, virtual or not.
+                        climb(childRef, slotTypes, members.length === 1 ? members[0] : def, false,
+                            members.length > 0);
                     }
                 }
-                // A class implementing the generic base more than once fills
-                // the slot once per instantiation (fix #400).
-                let members = instantiations
-                    ? [...new Set(instantiations.flatMap(types => _slotMembersOf(index, name, childRef, def,
-                        overloads, { slotTypes: types }, slotInterfaces, valueSlot, byClass)))]
-                    : _slotMembersOf(index, name, childRef, def, overloads,
-                        slotTypes ? { slotTypes } : null, slotInterfaces, valueSlot, byClass);
-                if (link.viaImplements) members = members.filter(m => memberInClassBody(index, m));
-                // In an interface member's slot a class takes part with a
-                // public member or an explicit implementation only (fix
-                // #395): a protected override below it overrides another
-                // slot.
-                if (interfaceSlot && childRef.def?.type !== 'interface') {
-                    members = members.filter(m => !!m.explicitInterface || !_nonPublicMember(m));
-                }
-                descendants.push({ ref: childRef, members, viaImplements: !!link.viaImplements });
-                downQueue.push({ ref: childRef, slotTypes, explicitOnly: onlyExplicit(members) });
-                slotTypesByKey.set(entry.key, slotTypes);
+            }
+        }
+        // Ancestors a holder's climb joined: their descendants hold the slot.
+        if (pendingRoots.length > 0) {
+            noteInterfaces();
+            for (const root of pendingRoots.splice(0)) {
+                downSeen.add(refKey(root.ref));
+                const entry = rootEntry(root.ref, root.members);
+                downQueue.push(entry);
+                slotTypesByKey.set(refKey(root.ref), entry.slotTypes);
+                slotDefsByKey.set(refKey(root.ref), entry.slotDef);
             }
         }
     }
@@ -1153,7 +1286,7 @@ function hierarchySlotClosure(index, def, startRef = null, options = {}) {
         const own = _slotMembersOf(index, name, startRef, def, overloads, null, null, valueSlot, byClass);
         if (own.length > 0) ancestors.unshift({ ref: startRef, members: own });
     }
-    return { pinRef, ancestors, descendants, unresolved, external, slotTypesByKey };
+    return { pinRef, ancestors, descendants, unresolved, external, slotTypesByKey, slotDefsByKey };
 }
 
 function sourceSyntaxRecord(index, file, name, content, kind, positions, accept) {
@@ -1186,7 +1319,6 @@ function anonymousSlotMembers(index, name, perFile, closure, pin) {
         ...closure.descendants.map(d => d.ref)].filter(ref => ref?.key).map(ref => ref.key));
     if (slotKeys.size === 0) return [];
     const overloads = !!langTraits(index.files.get(pin.file)?.language)?.hasArityOverloads;
-    const pinMethodParams = _orderedTypeParams({ generics: pin.generics }) || [];
     const out = [];
     for (const [file, lineNos] of perFile) {
         const fileEntry = index.files.get(file);
@@ -1273,9 +1405,9 @@ function anonymousSlotMembers(index, name, perFile, closure, pin) {
                             slotTypes = null; // diamond `new X<>() {..}`: arguments inferred
                         }
                     }
-                    const member = { paramsStructured: params, generics: null };
+                    const member = { paramsStructured: params, generics: null, file };
                     const fits = slotTypes
-                        ? _slotTypesMatch(member, slotTypes, pinMethodParams)
+                        ? _slotTypesMatch(index, member, slotTypes, closure.slotDefsByKey?.get(ref.key) || pin)
                         : params.length === _slotParams(pin).length;
                     if (!fits) continue;
                     if (!slotTypes) {

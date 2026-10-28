@@ -141,6 +141,16 @@ const STRUCTURAL_TRAITS = {
     // signature must not use `= value` syntax (Go/Java/Rust).
     hasDefaultParams: true,
     allMethodsVirtual: false,
+    // A class member fills the slot of every supertype declaring that member
+    // (an override of `A.m` in `D(A, B)` overrides `B.m` too), and a member a
+    // class inherits implements its own interfaces' members (TS `class Impl
+    // extends Base implements Bean`): plan's rename closure climbs from
+    // every slot holder (fix #426). memberHidingModifier: the modifier of a
+    // member that hides the inherited one instead (C# `new`).
+    memberFillsSupertypeSlots: true,
+    inheritedMemberFillsSlots: true,
+    memberHidingModifier: null,
+    virtualMemberModifiers: null,
     hasArityOverloads: false,
     overloadPhases: null,
     overloadFileSymbols: false,
@@ -368,6 +378,13 @@ const NOMINAL_TRAITS = {
     // sets and Rust inherent methods bind statically — only interface/trait
     // receivers dispatch there, which is detected per-type, not per-language.
     allMethodsVirtual: false,
+    // See STRUCTURAL_TRAITS (fix #426): Go and Rust members never fill
+    // other supertypes' slots (structural satisfaction and trait impls have
+    // closures of their own); Java, C# and C++ override.
+    memberFillsSupertypeSlots: false,
+    inheritedMemberFillsSlots: false,
+    memberHidingModifier: null,
+    virtualMemberModifiers: null,
     // Whether one class can define several same-name methods differing only
     // in parameters (Java overloading). Drives the overload discipline in
     // the caller contract: a pinned overload is only confirmed when the call
@@ -575,6 +592,9 @@ const LANGUAGES = {
         traits: {
             ...STRUCTURAL_TRAITS,
             selfParam: ['self', 'cls'],
+            // An inherited member shadows other bases' members in the MRO,
+            // no interface contract: not modeled as slot evidence (fix #426).
+            inheritedMemberFillsSlots: false,
             fixedConstructorName: null,
             nameReferenceFamily: 'python',
             separateStaticStorage: false,
@@ -755,6 +775,10 @@ const LANGUAGES = {
         treeSitterModule: () => require('tree-sitter-java'),
         traits: {
             ...NOMINAL_TRAITS,
+            // A method overrides/implements every supertype's same-signature
+            // member, an inherited one included (JLS 8.4.8) (fix #426).
+            memberFillsSupertypeSlots: true,
+            inheritedMemberFillsSlots: true,
             hasConstructors: true,
             implicitBaseConstruction: { classes: ['class_declaration'], headerField: 'superclass',
                 constructors: ['constructor_declaration'], delegationNodes: ['explicit_constructor_invocation'],
@@ -886,6 +910,11 @@ const LANGUAGES = {
         treeSitterModule: () => require('tree-sitter-cpp'),
         traits: {
             ...NOMINAL_TRAITS,
+            // An override overrides every base's virtual of its signature; an
+            // inherited member never implements another base's pure virtual
+            // (fix #426).
+            memberFillsSupertypeSlots: true,
+            virtualMemberModifiers: ['virtual', 'override'],
             hasConstructors: true,
             implicitBaseConstruction: { classes: ['class_specifier', 'struct_specifier'], headerNode: 'base_class_clause',
                 constructors: ['function_definition', 'field_declaration', 'declaration'], defaultPotential: true,
@@ -937,6 +966,13 @@ const LANGUAGES = {
         treeSitterModule: () => require('tree-sitter-c-sharp'),
         traits: {
             ...NOMINAL_TRAITS,
+            // Interface mapping takes inherited members (C# spec 18.6.5); a
+            // `new` member hides the inherited one, starting a slot of its
+            // own (fix #426).
+            memberFillsSupertypeSlots: true,
+            inheritedMemberFillsSlots: true,
+            memberHidingModifier: 'new',
+            virtualMemberModifiers: ['virtual', 'abstract', 'override'],
             hasConstructors: true,
             implicitBaseConstruction: { classes: ['class_declaration', 'record_declaration'], headerNode: 'base_list',
                 constructors: ['constructor_declaration'], delegationNodes: ['constructor_initializer'],
