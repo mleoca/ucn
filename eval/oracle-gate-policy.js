@@ -87,13 +87,14 @@ function summarizeReviewBurden({
     const actionableFalseUnverifiedCandidates = Math.max(0,
         actionableUnverifiedScored - actionableUnverifiedHits);
     const semanticEligibleEdges = Math.max(0,
-        oracleCallEdges - (placement.missingExplained || 0));
+        oracleCallEdges - (placement.missingExplained || 0) - (placement.configurationGated || 0));
     // Runtime polymorphism and compiler-dependent templates both identify a
     // family that MAY reach the target, not one statically exact definition.
     // Keep those edges in semantic recall, but do not mislabel them as exact
     // target identity. Each family remains visible and separately charged.
     const exactSemanticEligibleEdges = Math.max(0,
-        exactOracleCallEdges - (exactPlacement.missingExplained || 0));
+        exactOracleCallEdges - (exactPlacement.missingExplained || 0) -
+            (exactPlacement.configurationGated || 0));
     const nonExactOracleEdges = Math.max(0,
         semanticEligibleEdges - exactSemanticEligibleEdges);
     const runtimeDependentOracleEdges = Math.min(
@@ -241,7 +242,16 @@ function evaluateOracleCoverage(summary, maxUnscoredRatio) {
             (summary.oracleBroadReferenceEdges || 0));
     const definitionUnresolvedRatio = rate(
         summary.definitionUnresolvedReferenceEdges || 0, definitionUniverse);
+    // Oracle edges at lines the oracle's own projection leaves out (fix
+    // #429) leave the recall universe; the same hard bound keeps that from
+    // shrinking it unnoticed.
+    const recallConfigGatedRatio = rate(
+        summary.oracleConfigurationGatedEdges || 0, summary.oracleCallEdges || 0);
     const failures = [];
+    if (maxUnscoredRatio != null && recallConfigGatedRatio > maxUnscoredRatio) {
+        failures.push(`recall configuration-unscored ratio ${(recallConfigGatedRatio * 100).toFixed(2)}% ` +
+            `> ${(maxUnscoredRatio * 100).toFixed(2)}%`);
+    }
 
     if (maxUnscoredRatio != null && precisionConfigGatedRatio > maxUnscoredRatio) {
         failures.push(`precision configuration-unscored ratio ${(precisionConfigGatedRatio * 100).toFixed(2)}% ` +
@@ -280,6 +290,7 @@ function evaluateOracleCoverage(summary, maxUnscoredRatio) {
         unverifiedUnscoredRatio,
         calleeUnscoredRatio,
         definitionUnresolvedRatio,
+        recallConfigGatedRatio,
     };
 }
 
@@ -414,7 +425,171 @@ function constructorClassEdges(edges, targets, alreadyExact = () => false) {
     return projected;
 }
 
+// Symbol kinds each arm samples (fix #429). Oracles list both; the caller
+// arm keeps its pre-#429 universe (callables and types) and draws its sample
+// unchanged, the value arm draws its own.
+const CALLER_ARM_KINDS = new Set(['function', 'method', 'class', 'constructor']);
+const VALUE_ARM_KINDS = new Set(['field', 'constant', 'enum-member', 'variable', 'property']);
+// The reference-count buckets stop at ">20": classifying more calls than this
+// never changes a symbol's bucket.
+const BUCKET_CALL_LIMIT = 21;
+
+const ORACLE_EVAL_USAGE = `Usage: node eval/run-oracle-eval.js [options]
+
+Scores UCN's tiered caller answers (and value-member access answers) against
+compiler/LSP ground truth. Reports go to $UCN_EVAL_REPORTS_DIR (default
+eval/reports).
+
+  --repo NAME[,NAME]         repositories to run (default: every repo with an oracle)
+  --release                  the publish-blocking release board
+  --fresh [N]                N unpinned repos from the fresh rotation (default 2)
+  --sample N                 caller-arm symbols per repo (default 50)
+  --value-sample N           value-arm members per repo (default 20; 0 disables)
+  --seed N                   sample seed (non-default seeds get their own reports)
+  --symbols F:L:NAME[,...]   score these named handles instead of a random draw
+                             (one --repo; reports suffixed -targeted)
+  --oracle NAME              force an oracle (python: pyright, or jedi)
+  --min-precision R          also gate tier-1 precision (caller, callee, value)
+  --max-unscored-ratio R     gate oracle coverage (configuration/abstention)
+  --max-true-edge-unverified-rate R
+  --max-kind-true-edge-unverified-rate R
+  --min-kind-oracle-edges N
+  --min-zero-unverified-rate R
+  --max-unverified-p95 N
+  --max-unverified-review-items-per-oracle-edge R
+                             review-burden gates (--release uses the v5 budgets)
+  --manifest PATH            write a run manifest
+  --replay-manifest PATH     replay a manifest's samples and oracle populations
+  -h, --help                 print this help and exit
+`;
+
+const VALUE_FLAGS = new Set([
+    '--repo', '--sample', '--value-sample', '--seed', '--symbols', '--oracle',
+    '--min-precision', '--max-unscored-ratio', '--max-true-edge-unverified-rate',
+    '--max-kind-true-edge-unverified-rate', '--min-kind-oracle-edges',
+    '--min-zero-unverified-rate', '--max-unverified-p95',
+    '--max-unverified-review-items-per-oracle-edge', '--manifest', '--replay-manifest',
+]);
+const BOOLEAN_FLAGS = new Set(['--release', '--help', '-h']);
+
+/**
+ * Reject unknown options and options that need a value (fix #429). Before,
+ * a misspelled gate flag was ignored and the board ran ungated.
+ */
+function validateOracleArgs(argv) {
+    for (let index = 0; index < argv.length; index++) {
+        const arg = argv[index];
+        if (VALUE_FLAGS.has(arg)) {
+            const value = argv[index + 1];
+            if (value == null || /^--/.test(value)) throw new Error(`${arg} requires a value`);
+            index++;
+        } else if (arg === '--fresh') {
+            if (argv[index + 1] != null && /^\d+$/.test(argv[index + 1])) index++;
+        } else if (!BOOLEAN_FLAGS.has(arg)) {
+            throw new Error(`unknown option ${arg} (see --help)`);
+        }
+    }
+}
+
+/** `file:line:name[,file:line:name...]` -> [{ file, line, name }] (paths are
+ *  project-relative, as UCN handles print them). */
+function parseSymbolHandles(raw) {
+    if (raw == null) return null;
+    const handles = String(raw).split(',').map(part => part.trim()).filter(Boolean).map(part => {
+        const match = part.match(/^(.+):(\d+):([^:]+)$/);
+        if (!match) throw new Error(`--symbols expects file:line:name, got ${part}`);
+        return { file: match[1], line: Number(match[2]), name: match[3] };
+    });
+    if (handles.length === 0) throw new Error('--symbols needs at least one handle');
+    return handles;
+}
+
+/**
+ * The oracle symbol a named handle denotes: the oracle row at that exact
+ * position, else the one row of that name inside the indexed definition's
+ * head (its start line through its name line: attribute and decorator
+ * conventions differ). Never a guess: a missing or ambiguous handle throws.
+ */
+function resolveSymbolHandle(spec, symbols, index, kinds) {
+    const label = `${spec.file}:${spec.line}:${spec.name}`;
+    const eligible = symbols.filter(symbol => symbol.file === spec.file && symbol.name === spec.name &&
+        (!kinds || kinds.has(symbol.kind)));
+    const exact = eligible.filter(symbol => symbol.line === spec.line);
+    if (exact.length === 1) return exact[0];
+    if (exact.length > 1) {
+        throw new Error(`--symbols ${label} is ambiguous (${exact.map(symbol => symbol.kind).join(', ')})`);
+    }
+    const definition = (index?.symbols?.get(spec.name) || []).find(candidate =>
+        candidate.relativePath === spec.file &&
+        (candidate.startLine === spec.line || candidate.nameLine === spec.line));
+    if (definition) {
+        const first = definition.startLine;
+        const last = Math.max(definition.nameLine || first, first);
+        const within = eligible.filter(symbol => symbol.line >= first && symbol.line <= last);
+        if (within.length === 1) return within[0];
+    }
+    const nearby = eligible.map(symbol => `${symbol.line}:${symbol.kind}`).join(', ') || 'none';
+    throw new Error(`--symbols ${label}: no oracle symbol at that declaration (oracle rows of that name in the file: ${nearby})`);
+}
+
+function emptyValuePlacement() {
+    return { confirmed: 0, unverified: 0, accountedNotShown: 0, missingExplained: 0,
+        configurationGated: 0, missingBeyondText: 0, missingUnexplained: 0 };
+}
+
+/**
+ * Value-member arm accumulator and summary (fix #429). Oracle references
+ * are placed line by line in impact's access band; the exact ones (no
+ * uncertainty class) carry semantic recall, every confirmed access is
+ * scored for precision.
+ */
+function emptyValueArm(extra = {}) {
+    return {
+        listed: 0, sampled: 0, evaluated: 0, errors: 0, notIndexed: 0, indexedAsOtherKind: 0,
+        oracleBroadReferences: 0,
+        oracleRefSites: 0, exactOracleRefSites: 0,
+        placement: emptyValuePlacement(), exactPlacement: emptyValuePlacement(),
+        confirmedSites: 0, confirmedHits: 0, confirmedUnscored: 0, confirmedUnscoredByClass: {},
+        unverifiedSites: 0, unverifiedHits: 0, unverifiedUnscored: 0,
+        accounts: 0, conserved: 0,
+        notIndexedSamples: [], errorSamples: [], falseConfirmationSamples: [], semanticMissingSamples: [],
+        perSymbol: [],
+        ...extra,
+    };
+}
+
+function finishValueArm(arm) {
+    const scored = arm.confirmedSites - arm.confirmedUnscored;
+    const unverifiedScored = arm.unverifiedSites - arm.unverifiedUnscored;
+    const exactEligible = Math.max(0, arm.exactOracleRefSites - arm.exactPlacement.missingExplained -
+        arm.exactPlacement.configurationGated);
+    const semanticMissing = arm.exactPlacement.accountedNotShown + arm.exactPlacement.missingBeyondText +
+        arm.exactPlacement.missingUnexplained;
+    return {
+        ...arm,
+        tier1Precision: scored > 0 ? roundedRate(arm.confirmedHits, scored) : null,
+        unverifiedPrecision: unverifiedScored > 0 ? roundedRate(arm.unverifiedHits, unverifiedScored) : null,
+        semanticRecall: exactEligible > 0 ? roundedRate(exactEligible - semanticMissing, exactEligible) : 1,
+        semanticMissing,
+        missingUnexplained: arm.exactPlacement.missingUnexplained,
+        allOracleMissingUnexplained: arm.placement.missingUnexplained,
+        conservedRate: arm.accounts > 0 ? roundedRate(arm.conserved, arm.accounts) : 1,
+        confirmedConfigurationUnscored: arm.confirmedUnscoredByClass['configuration-gated'] || 0,
+        confirmedAbstentionUnscored: arm.confirmedUnscored - (arm.confirmedUnscoredByClass['configuration-gated'] || 0),
+    };
+}
+
+
 module.exports = {
+    emptyValueArm,
+    finishValueArm,
+    CALLER_ARM_KINDS,
+    VALUE_ARM_KINDS,
+    BUCKET_CALL_LIMIT,
+    ORACLE_EVAL_USAGE,
+    validateOracleArgs,
+    parseSymbolHandles,
+    resolveSymbolHandle,
     PORTABLE_AST_REVIEW_BUDGETS,
     optionalRate,
     optionalNonNegative,

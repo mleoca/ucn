@@ -29,13 +29,29 @@ const SYMBOL_KIND = {
     NAMESPACE: 3,
     CLASS: 5,
     METHOD: 6,
+    PROPERTY: 7,
+    FIELD: 8,
     CONSTRUCTOR: 9,
     INTERFACE: 11,
     FUNCTION: 12,
+    VARIABLE: 13,
+    CONSTANT: 14,
+    ENUM_MEMBER: 22,
     STRUCT: 23,
 };
 
+// Value members (fix #429): sampled by the value arm only, kept apart from
+// the callable symbol table the caller arm's definition checks read.
+function valueKind(kind) {
+    if (kind === SYMBOL_KIND.FIELD || kind === SYMBOL_KIND.PROPERTY) return 'field';
+    if (kind === SYMBOL_KIND.VARIABLE) return 'variable';
+    if (kind === SYMBOL_KIND.CONSTANT) return 'constant';
+    if (kind === SYMBOL_KIND.ENUM_MEMBER) return 'enum-member';
+    return null;
+}
+
 const INACTIVE_REGIONS_TIMEOUT_MS = 120000;
+const AST_CACHE_NODE_BUDGET = 400000;
 
 const clangdOracle = {
     name: 'clangd',
@@ -112,6 +128,7 @@ const clangdOracle = {
             source: new Map(),
             versions: new Map(),
             symbols: new Map(),
+            valueSymbols: new Map(),
             astLines: new Map(),
             occurrenceCache: new Map(),
             lexicalCodeCache: new Map(),
@@ -152,6 +169,21 @@ const clangdOracle = {
                 const compilerArtifact = isAnonymousRecordSymbol(entry) ||
                     isRedundantRecordTypedef(entry, namedRecords) ||
                     isUnexpandedMacroFunction(handle, absFile, entry, containers);
+                const memberKind = valueKind(entry.kind);
+                if (memberKind && range && !isAnonymousRecordSymbol(entry)) {
+                    const line = range.start.line + 1;
+                    const name = sourceIdentifier(handle, absFile, line, range.start.character, entry.name);
+                    if (name && name === semanticName) {
+                        const key = `${relFile}:${line}:${name}:${memberKind}`;
+                        if (!seen.has(key)) {
+                            seen.add(key);
+                            rows.push({ name, file: relFile, line, kind: memberKind });
+                            handle.valueSymbols.set(`${relFile}:${line}:${name}`, {
+                                name, file: relFile, line, kind: memberKind, column: range.start.character,
+                            });
+                        }
+                    }
+                }
                 if (mappedKind && range && !compilerArtifact) {
                     const line = range.start.line + 1;
                     const name = sourceIdentifier(
@@ -183,6 +215,7 @@ const clangdOracle = {
                                     ...row,
                                     column: range.start.character,
                                     ...(arity && { arity }),
+                                    body: declarationHasBody(handle, absFile, entry.range),
                                 });
                         }
                     }
@@ -206,10 +239,12 @@ const clangdOracle = {
         return limit ? filtered.slice(0, limit) : filtered;
     },
 
-    async findReferences(handle, { name, file, line, comprehensive = false }) {
+    async findReferences(handle, { name, file, line, comprehensive = false, callLimit = null }) {
         const absFile = path.join(handle.root, file);
         ensureOpen(handle, absFile);
-        const symbol = handle.symbols.get(`${file}:${line}:${name}`);
+        const valueTarget = !handle.symbols.has(`${file}:${line}:${name}`) &&
+            handle.valueSymbols.get(`${file}:${line}:${name}`);
+        const symbol = handle.symbols.get(`${file}:${line}:${name}`) || valueTarget || undefined;
         const targetArity = symbol?.arity || null;
         const targetIsClass = symbol?.kind === 'class';
         const repeatedCallableName = handle.language === 'cpp' &&
@@ -217,16 +252,25 @@ const clangdOracle = {
         const character = symbol?.column ??
             nameColumns(sourceLine(handle, absFile, line), name)[0] ?? 0;
         const position = { line: line - 1, character };
-        const callSites = await incomingCallSites(
-            handle, absFile, position);
         const locations = await handle.lsp.request(
             'textDocument/references', {
                 textDocument: { uri: pathToUri(absFile) },
                 position,
                 context: { includeDeclaration: true },
             }) || [];
+        // clangd keys a symbol by USR: separate programs that each define
+        // `test_compress`, or a header vendored twice (src/ and an
+        // amalgamated single_include/), are ONE symbol to its index. Each
+        // translation unit binds a reference to the copy it compiles, so
+        // when the target has several definitions every reference is judged
+        // by its own unit's definition (fix #429).
+        const copies = valueTarget
+            ? valueDefinitionCopies(handle, { name, file, line, locations })
+            : await definitionCopies(handle, { name, file, line, character, locations });
         const refs = new Map();
+        let calls = 0;
         for (const location of locations) {
+            if (callLimit != null && calls >= callLimit) break;
             const normalized = normalizeLocation(location);
             if (!normalized) continue;
             const refAbs = canonical(uriToPath(normalized.uri));
@@ -238,7 +282,27 @@ const clangdOracle = {
             const siteKey = `${rel}:${refLine}`;
             const isDefinition =
                 (rel === file && refLine === line) ||
-                handle.symbols.has(`${rel}:${refLine}:${name}`);
+                handle.symbols.has(`${rel}:${refLine}:${name}`) ||
+                (!!valueTarget && handle.valueSymbols.has(`${rel}:${refLine}:${name}`));
+            const copy = !isDefinition && copies
+                ? await referenceCopy(handle, copies, refAbs, refLine, refColumn) : null;
+            if (copy === 'other') continue;
+            if (valueTarget) {
+                // A value's references are its uses; no call classification.
+                // A use the line does not spell is a macro expansion's.
+                refs.set(`${rel}:${refLine}:${refColumn}:${isDefinition ? 'definition' : 'reference'}`, {
+                    file: rel, line: refLine, column: refColumn,
+                    kind: isDefinition ? 'definition' : 'reference',
+                    ...(!isDefinition && !identifierOnLine(handle, refAbs, refLine, name) && {
+                        oracleResolution: 'macro-expansion',
+                    }),
+                    ...(copy === 'unknown' && {
+                        uncertaintyClass: 'oracle-unresolved',
+                        oracleResolution: 'unresolved',
+                    }),
+                });
+                continue;
+            }
             const astCall = isDefinition || targetIsClass
                 ? { isCall: false } :
                 await callReferenceInfo(
@@ -251,7 +315,9 @@ const clangdOracle = {
             // back to hierarchy only on clangd versions without the AST
             // extension.
             const compilerCall = !isDefinition &&
-                (astCall == null ? callSites.has(siteKey) : astCall.isCall);
+                (astCall == null
+                    ? (await cachedIncomingCallSites(handle, absFile, position, name)).has(siteKey)
+                    : astCall.isCall);
             if (compilerCall && targetArity &&
                 astCall?.argCount != null &&
                 !arityAccepts(targetArity, astCall.argCount)) {
@@ -259,6 +325,7 @@ const clangdOracle = {
             }
             const kind = isDefinition ? 'definition' :
                 compilerCall ? 'call' : 'reference';
+            if (kind === 'call') calls++;
             refs.set(`${rel}:${refLine}:${refColumn}:${kind}`, {
                 file: rel,
                 line: refLine,
@@ -269,12 +336,19 @@ const clangdOracle = {
                     uncertaintyClass: astCall?.uncertaintyClass ||
                         'compile-time-dispatch',
                 }),
+                ...(copy === 'unknown' && {
+                    uncertaintyClass: 'oracle-unresolved',
+                    oracleResolution: 'unresolved',
+                }),
                 ...(compilerCall &&
                     !identifierOnLine(handle, refAbs, refLine, name) && {
                     oracleResolution: 'macro-expansion',
                 }),
             });
         }
+        // Bucketing only needs to know the count reached the top bucket.
+        if (valueTarget || (callLimit != null && calls >= callLimit)) return [...refs.values()];
+        const callSites = await cachedIncomingCallSites(handle, absFile, position, name);
         for (const [siteKey, site] of callSites) {
             if (targetIsClass) break;
             const siteAbs = path.join(handle.root, site.file);
@@ -282,6 +356,9 @@ const clangdOracle = {
                 !handle.fileSet.has(canonical(siteAbs))) {
                 continue;
             }
+            const copy = copies
+                ? await referenceCopy(handle, copies, canonical(siteAbs), site.line, site.column) : null;
+            if (copy === 'other') continue;
             const astCall = await callReferenceInfo(
                 handle, siteAbs, site.range, name, {
                     directCalleeOnly: symbol?.kind === 'class',
@@ -304,6 +381,10 @@ const clangdOracle = {
                     uncertaintyClass: astCall?.uncertaintyClass ||
                         'compile-time-dispatch',
                 }),
+                ...(copy === 'unknown' && {
+                    uncertaintyClass: 'oracle-unresolved',
+                    oracleResolution: 'unresolved',
+                }),
                 ...(!identifierOnLine(
                     handle, path.join(handle.root, site.file),
                     site.line, name) && {
@@ -317,6 +398,7 @@ const clangdOracle = {
                 file,
                 line,
                 refs,
+                copies,
             });
         }
         return [...refs.values()];
@@ -369,6 +451,14 @@ const clangdOracle = {
                                 line: definitionLine,
                                 external: true,
                             });
+                        continue;
+                    }
+                    // A dependent member (`base_type::hash` in a template)
+                    // is answered with the declaration of the alias that
+                    // names its base: a location that does not spell the
+                    // identifier is not its binding (fix #429).
+                    if (method !== 'textDocument/typeDefinition' &&
+                        !spellsName(handle, definitionAbs, normalized.range, name)) {
                         continue;
                     }
                     const entry = {
@@ -426,7 +516,16 @@ const clangdOracle = {
     },
 };
 
-async function incomingCallSites(handle, absFile, position) {
+async function cachedIncomingCallSites(handle, absFile, position, name) {
+    const key = `${canonical(absFile)}:${position.line}:${position.character}`;
+    if (!handle.callSiteCache) handle.callSiteCache = new Map();
+    if (!handle.callSiteCache.has(key)) {
+        handle.callSiteCache.set(key, await incomingCallSites(handle, absFile, position, name));
+    }
+    return handle.callSiteCache.get(key);
+}
+
+async function incomingCallSites(handle, absFile, position, name = null) {
     const sites = new Map();
     let prepared;
     try {
@@ -452,6 +551,18 @@ async function incomingCallSites(handle, absFile, position) {
             const rel = path.relative(handle.root, callerAbs);
             for (const range of call.fromRanges || []) {
                 const line = range.start.line + 1;
+                // `fromRanges` are positions in the CALLER's file. Callers
+                // sharing one USR across translation units (`main` of every
+                // test program) are reported under one of their files, so a
+                // range from another program lands on unrelated text there
+                // (fix #429: libyaml phantom `tests/run-scanner.c` edges). A
+                // call site spells the callee's name at its range, or (a
+                // macro expansion's site, spelled by the macro) lies inside
+                // the caller's own declaration.
+                const callerRange = call.from?.range;
+                const insideCaller = callerRange &&
+                    range.start.line >= callerRange.start.line && range.end.line <= callerRange.end.line;
+                if (name && !spellsName(handle, callerAbs, range, name) && !insideCaller) continue;
                 sites.set(`${rel}:${line}`, {
                     file: rel,
                     line,
@@ -472,8 +583,15 @@ async function incomingCallSites(handle, absFile, position) {
  * classifies whether that exact reference occupies the callee subtree of a
  * call expression, without lexical or regex inference.
  */
-async function lineAst(handle, absFile, line) {
-    const cacheKey = `${canonical(absFile)}:${line}`;
+// The node clangd answers is the smallest one enclosing the requested range,
+// so the range starts at the queried token: from column 0, a line inside a
+// macro-expanded construct at namespace scope (gtest `TEST(..) { .. }`
+// bodies, `INSTANTIATE_TEST_SUITE_P`) is answered with the whole namespace
+// (60k nodes per line on yaml-cpp's vendored gmock tests). A node enclosing
+// [token, end of line] still encloses every call whose callee holds the
+// token.
+async function lineAst(handle, absFile, line, column = 0) {
+    const cacheKey = `${canonical(absFile)}:${line}:${column}`;
     let ast = handle.astLines.get(cacheKey);
     if (ast === undefined) {
         ensureOpen(handle, absFile);
@@ -481,16 +599,63 @@ async function lineAst(handle, absFile, line) {
             ast = await handle.lsp.request('textDocument/ast', {
                 textDocument: { uri: pathToUri(absFile) },
                 range: {
-                    start: { line, character: 0 },
+                    start: { line, character: column },
                     end: { line, character: 1000000 },
                 },
             });
         } catch {
             ast = null;
         }
-        handle.astLines.set(cacheKey, ast);
+        // Only nodes that touch the line are ever read: keep the line's
+        // slice and a bounded number of slices (fix #429: yaml-cpp seed runs
+        // ran out of a 4 GB heap holding whole-function ASTs).
+        ast = pruneToLine(ast, line);
+        // Bounded by retained nodes, not entries: range-less nodes of macro
+        // expansions are kept whole, so one slice can still be large.
+        const nodes = countNodes(ast);
+        if (nodes <= AST_CACHE_NODE_BUDGET / 16) {
+            handle.astCachedNodes = (handle.astCachedNodes || 0) + nodes;
+            handle.astLines.set(cacheKey, ast);
+            handle.astNodeCounts = handle.astNodeCounts || new Map();
+            handle.astNodeCounts.set(cacheKey, nodes);
+            while (handle.astCachedNodes > AST_CACHE_NODE_BUDGET && handle.astLines.size > 0) {
+                const oldest = handle.astLines.keys().next().value;
+                handle.astCachedNodes -= handle.astNodeCounts.get(oldest) || 0;
+                handle.astNodeCounts.delete(oldest);
+                handle.astLines.delete(oldest);
+            }
+        }
     }
     return ast;
+}
+
+function countNodes(node) {
+    let count = 0;
+    const stack = node ? [node] : [];
+    while (stack.length > 0) {
+        const current = stack.pop();
+        count++;
+        for (const child of current.children || []) stack.push(child);
+    }
+    return count;
+}
+
+// Only nodes touching the line are kept. A call keeps every child (its
+// callee position and argument count are read), the ones off the line as
+// childless stubs; elsewhere children off the line are dropped (a namespace
+// answered for a macro-expanded line holds thousands of declarations).
+function pruneToLine(node, line) {
+    if (!node || typeof node !== 'object') return node;
+    if (!Array.isArray(node.children) || node.children.length === 0) return node;
+    const touches = child => !child?.range ||
+        (child.range.start.line <= line && child.range.end.line >= line);
+    const call = /Call$/.test(node.kind || '') || node.kind === 'Recovery';
+    const children = call
+        ? node.children.map(child => touches(child)
+            ? pruneToLine(child, line)
+            : { kind: child.kind, role: child.role, range: child.range })
+        : node.children.filter(touches).map(child => pruneToLine(child, line));
+    return { ...node, children };
 }
 
 function containsPosition(node, line, column) {
@@ -502,7 +667,7 @@ function containsPosition(node, line, column) {
 }
 
 async function constructionTypeAt(handle, absFile, line, column) {
-    const ast = await lineAst(handle, absFile, line);
+    const ast = await lineAst(handle, absFile, line, column);
     const visit = node => {
         if (!node || !containsPosition(node, line, column)) return false;
         if (['CXXTemporaryObject', 'CXXFunctionalCast', 'CXXNew'].includes(node.kind) &&
@@ -517,9 +682,9 @@ async function callReferenceInfo(handle, absFile, range, name, {
     directCalleeOnly = false,
 } = {}) {
     const line = range.start.line;
-    const ast = await lineAst(handle, absFile, line);
-    if (!ast) return null;
     const column = range.start.character;
+    const ast = await lineAst(handle, absFile, line, column);
+    if (!ast) return null;
     const containsReference = node => containsPosition(node, line, column);
     const visitCallee = node => {
         if (!node || !containsReference(node)) return null;
@@ -590,6 +755,112 @@ async function callReferenceInfo(handle, absFile, range, name, {
         return null;
     };
     return visit(ast) || { isCall: false };
+}
+
+function spellsName(handle, absFile, range, name) {
+    // Operator callees span other tokens; an identifier callee is spelled
+    // at its range (a range on another line or other text is another
+    // file's position).
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(String(name))) return true;
+    if (range.start.line !== range.end.line) return false;
+    const text = sourceLine(handle, absFile, range.start.line + 1);
+    return text.slice(range.start.character, range.end.character) === name;
+}
+
+/**
+ * Several definitions behind one USR (fix #429): separate programs that each
+ * define `test_compress`, or a header vendored twice (src/ and an
+ * amalgamated single_include/). clangd's index merges them, but a reference
+ * resolves in its own translation unit to the copy that unit compiles.
+ * Returns null unless the sampled target is itself a definition and the
+ * reference set declares another definition in another file.
+ */
+async function definitionCopies(handle, { name, file, line, locations }) {
+    const target = handle.symbols.get(`${file}:${line}:${name}`);
+    if (!target?.body) return null;
+    const definitionFiles = new Set([file]);
+    for (const location of locations) {
+        const normalized = normalizeLocation(location);
+        if (!normalized) continue;
+        const refAbs = canonical(uriToPath(normalized.uri));
+        if (!inside(handle.root, refAbs)) continue;
+        const rel = path.relative(handle.root, refAbs);
+        const row = handle.symbols.get(`${rel}:${normalized.range.start.line + 1}:${name}`);
+        if (row?.body) definitionFiles.add(rel);
+    }
+    return definitionFiles.size > 1 ? { target: `${file}:${line}` } : null;
+}
+
+/**
+ * The value counterpart of definitionCopies: a member or variable declared
+ * by two copies of one header (src/ and an amalgamated single_include/) is
+ * one USR, so its references span both copies. Copies are defining
+ * declarations in different files; a qualified out-of-class definition
+ * (`int Foo::x = 0;`) or an `extern` declaration redeclares the one entity
+ * and is never a copy (fix #429).
+ */
+function valueDefinitionCopies(handle, { name, file, line, locations }) {
+    if (!definesValue(handle, file, line, name)) return null;
+    const files = new Set([file]);
+    for (const location of locations) {
+        const normalized = normalizeLocation(location);
+        if (!normalized) continue;
+        const refAbs = canonical(uriToPath(normalized.uri));
+        if (!inside(handle.root, refAbs)) continue;
+        const rel = path.relative(handle.root, refAbs);
+        const refLine = normalized.range.start.line + 1;
+        if (rel !== file && handle.valueSymbols.has(`${rel}:${refLine}:${name}`) &&
+            definesValue(handle, rel, refLine, name)) {
+            files.add(rel);
+        }
+    }
+    return files.size > 1 ? { target: `${file}:${line}` } : null;
+}
+
+function definesValue(handle, relFile, line, name) {
+    const row = handle.valueSymbols.get(`${relFile}:${line}:${name}`);
+    const text = sourceLine(handle, path.join(handle.root, relFile), line);
+    const column = row?.column ?? nameColumns(text, name)[0];
+    if (column == null) return false;
+    const before = text.slice(0, column);
+    return !/::\s*$/.test(before) && !/\bextern\b/.test(before);
+}
+
+/** 'target', 'other' or 'unknown': the copy a reference resolves to in its
+ *  own translation unit. Only a copy the unit compiles is binding; otherwise
+ *  the linker decides. */
+async function referenceCopy(handle, copies, absFile, line, column) {
+    let definitions;
+    try {
+        definitions = await definitionsAt(handle, absFile, line, column);
+    } catch {
+        return 'unknown';
+    }
+    const internal = definitions.filter(definition => !definition.external);
+    if (internal.length !== 1) return 'unknown';
+    if (!unitCompiles(handle, absFile, internal[0].file)) return 'unknown';
+    return definitionKey(internal[0]) === copies.target ? 'target' : 'other';
+}
+
+/** A declaration whose compiler range ends with a closing brace has a body. */
+function declarationHasBody(handle, absFile, range) {
+    if (!range) return false;
+    const lines = handle.source.get(canonical(absFile)) ||
+        fs.readFileSync(absFile, 'utf8').split('\n');
+    const last = (lines[range.end.line] || '').slice(0, range.end.character).trimEnd();
+    return last.endsWith('}');
+}
+
+/**
+ * Whether a definition clangd answers for a position in `absFile` is one the
+ * unit compiles itself: a definition in the file, or in a header (a unit sees
+ * a header's definition only by including it). A definition in another source
+ * file is the index's choice among separately linked copies.
+ */
+function unitCompiles(handle, absFile, relDefinitionFile) {
+    const relFile = path.relative(handle.root, canonical(absFile));
+    return relDefinitionFile === relFile ||
+        ['.h', '.hh', '.hpp', '.hxx', '.inc'].includes(path.extname(relDefinitionFile).toLowerCase());
 }
 
 function identifierOnLine(handle, absFile, line, name) {
@@ -828,6 +1099,7 @@ async function addCompilerResolvedCallOccurrences(handle, {
     file,
     line,
     refs,
+    copies = null,
 }) {
     const targetAbs = path.join(handle.root, file);
     const symbol = handle.symbols.get(`${file}:${line}:${name}`);
@@ -848,7 +1120,10 @@ async function addCompilerResolvedCallOccurrences(handle, {
     const uniqueCallableIdentity = callableIdentities.size === 1;
     const knownCallableLocations = new Set(callableCandidates.map(candidate =>
         `${candidate.file}:${candidate.line}`));
-    const targetKeys = new Set([
+    // With several copies behind the USR, the target's own definition
+    // lookup answers with the index's preferred copy: only the sampled copy
+    // is the target (fix #429).
+    const targetKeys = copies ? new Set([`${file}:${line}`]) : new Set([
         `${file}:${line}`,
         ...targetDefinitions
             .filter(definition => !definition.external)
@@ -857,6 +1132,8 @@ async function addCompilerResolvedCallOccurrences(handle, {
             .filter(declaration => !declaration.external)
             .map(definitionKey),
     ]);
+    // An occurrence binds to the sampled copy only in a unit that compiles it.
+    const compilesTarget = async absFile => !copies || unitCompiles(handle, absFile, file);
     const isExactTarget = definitions => {
         const internal = definitions.filter(definition => !definition.external);
         if (internal.length === 0) return false;
@@ -906,7 +1183,7 @@ async function addCompilerResolvedCallOccurrences(handle, {
         }
         const definitions = await definitionsAt(
             handle, occurrence.absFile, occurrence.line, occurrence.column);
-        if (!isExactTarget(definitions)) continue;
+        if (!isExactTarget(definitions) || !await compilesTarget(occurrence.absFile)) continue;
         const range = {
             start: {
                 line: occurrence.line - 1,
@@ -988,7 +1265,7 @@ async function addCompilerResolvedCallOccurrences(handle, {
             for (const occurrence of occurrences) {
                 const definitions = await definitionsAt(
                     handle, absFile, occurrence.line, occurrence.column);
-                if (!isExactTarget(definitions)) continue;
+                if (!isExactTarget(definitions) || !await compilesTarget(absFile)) continue;
                 const range = {
                     start: {
                         line: occurrence.line - 1,
@@ -1627,4 +1904,4 @@ function inside(root, candidate) {
 
 // canonicalOperatorName is exported for the lockstep test against the
 // engine-side canon (languages/c-family.js).
-module.exports = { clangdOracle, canonicalOperatorName };
+module.exports = { clangdOracle, canonicalOperatorName, pruneToLine, declarationHasBody, spellsName, definesValue };

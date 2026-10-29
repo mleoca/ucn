@@ -215,7 +215,11 @@ async function evaluateSymbolCommandProof({
     // `usages` is a literal-name inventory, not a target-pinned reference
     // command. Exact recall is therefore judged only for unique project names
     // and oracle references whose source line contains the literal token.
-    if (sameNameDefs.length === 1) {
+    // A class and the constructors it declares are one named entity: since
+    // constructors are indexed (fixes #417/#421), counting them made every
+    // class with an explicit constructor non-unique and silently removed it
+    // from these arms (fix #429).
+    if (namedEntities(sameNameDefs, sym.name).length === 1) {
         const eligibleRefs = (oracleRefs || []).filter(ref =>
             ref.kind !== 'definition' && indexedFiles.has(ref.file) &&
             lineContainsIdentifier(index, ref.file, ref.line, sym.name));
@@ -270,6 +274,13 @@ async function evaluateSymbolCommandProof({
     return record;
 }
 
+/** Distinct named entities among same-name definitions: a constructor named
+ *  after its own class is part of that class, not another declaration. */
+function namedEntities(definitions, name) {
+    return (definitions || []).filter(definition =>
+        !(definition.type === 'constructor' && definition.className === name));
+}
+
 function finalizeCommandProof(summary) {
     let missing = 0;
     for (const command of PROOF_COMMANDS) {
@@ -290,4 +301,5 @@ module.exports = {
     evaluateSymbolCommandProof,
     finalizeCommandProof,
     lineContainsIdentifier,
+    namedEntities,
 };

@@ -537,3 +537,19 @@ describe('outcome-policy: gate thresholds', () => {
         assert.deepStrictEqual(policy.evaluateOutcomeGate([even]), []);
     });
 });
+
+describe('fix #429: value-member rename mode is measurement-only', () => {
+    const path = require('path');
+    const { spawnSync } = require('child_process');
+    const script = path.join(__dirname, '..', 'eval', 'run-outcome-eval.js');
+    it('--kinds value cannot run as the gate', () => {
+        const result = spawnSync(process.execPath, [script, '--gate', '--kinds', 'value'], { encoding: 'utf8' });
+        assert.notStrictEqual(result.status, 0);
+        assert.match(result.stderr, /--kinds value is a measurement mode/);
+    });
+    it('--kinds accepts only callable or value', () => {
+        const result = spawnSync(process.execPath, [script, '--kinds', 'type'], { encoding: 'utf8' });
+        assert.notStrictEqual(result.status, 0);
+        assert.match(result.stderr, /--kinds must be callable or value/);
+    });
+});

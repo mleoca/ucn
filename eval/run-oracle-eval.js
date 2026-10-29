@@ -84,6 +84,15 @@ const {
     expandedDefinitionStatus,
     constructorClassEdges,
     oracleCallerScope,
+    ORACLE_EVAL_USAGE,
+    emptyValueArm,
+    finishValueArm,
+    validateOracleArgs,
+    parseSymbolHandles,
+    resolveSymbolHandle,
+    CALLER_ARM_KINDS,
+    VALUE_ARM_KINDS,
+    BUCKET_CALL_LIMIT,
 } = require('./oracle-gate-policy');
 const { tsMorphOracle } = require('./oracles/ts-morph-oracle');
 const { pyrightOracle } = require('./oracles/pyright-oracle');
@@ -95,6 +104,13 @@ const { roslynOracle } = require('./oracles/roslyn-oracle');
 const { clangdOracle } = require('./oracles/clangd-oracle');
 
 const args = process.argv.slice(2);
+if (args.includes('--help') || args.includes('-h')) {
+    process.stdout.write(ORACLE_EVAL_USAGE);
+    process.exit(0);
+}
+// An unknown or misspelled option used to be ignored silently, so a gate
+// flag with a typo ran ungated (fix #429).
+validateOracleArgs(args);
 const manifestPath = readArgValue(args, '--manifest');
 const replayPath = readArgValue(args, '--replay-manifest');
 const replayManifest = replayPath ? JSON.parse(fs.readFileSync(replayPath, 'utf8')) : null;
@@ -131,7 +147,20 @@ const sampleSeed = readArgValue(args, '--seed') ? Number(readArgValue(args, '--s
 // own report filenames so they never clobber the canonical dated rollup.
 const freshCount = args.includes('--fresh') ? (Number(readArgValue(args, '--fresh')) || 2) : 0;
 const freshSuffix = freshCount ? '-fresh' : '';
-const seedSuffix = (sampleSeed === DEFAULT_SEED ? '' : `-seed${sampleSeed.toString(16)}`) + freshSuffix;
+// Named handles (--symbols file:line:name,...; fix #429) replace the random
+// draw for one repository; their reports carry their own suffix.
+const symbolHandles = parseSymbolHandles(readArgValue(args, '--symbols'));
+if (symbolHandles && (!repoFilterSet || repoFilterSet.size !== 1 || freshCount || releaseOnly || replayPath)) {
+    throw new Error('--symbols needs exactly one --repo (and no --release, --fresh or --replay-manifest)');
+}
+// Value-member arm (fix #429): fields, constants, enum members, globals and
+// properties, sampled separately so the caller-arm sample is unchanged.
+const valueSampleSize = Number(readArgValue(args, '--value-sample') ?? 20);
+if (!Number.isInteger(valueSampleSize) || valueSampleSize < 0) {
+    throw new Error('--value-sample must be a non-negative integer');
+}
+const seedSuffix = (sampleSeed === DEFAULT_SEED ? '' : `-seed${sampleSeed.toString(16)}`) + freshSuffix +
+    (symbolHandles ? '-targeted' : '');
 const REPORTS_DIR = path.resolve(
     process.env.UCN_EVAL_REPORTS_DIR || path.join(__dirname, 'reports'));
 
@@ -185,8 +214,16 @@ function isExactOracleCall(call) {
 
 const SYMBOL_KINDS = ['function', 'method', 'class'];
 
+// configurationGated: an oracle edge at a line the oracle's own projection
+// leaves out (an inactive preprocessor branch): clangd's index merges
+// references from every translation unit's configuration, so such an edge
+// came from a configuration the projection does not analyze. Unscored on
+// both arms like a configuration-gated UCN edge, and bounded by the same
+// coverage ratio (fix #429: pugixml `#ifdef PUGIXML_WCHAR_MODE`
+// definitions read as missed calls).
 function emptyPlacement() {
-    return { confirmed: 0, unverified: 0, accountedNotShown: 0, missingExplained: 0, missingBeyondText: 0, missingUnexplained: 0 };
+    return { confirmed: 0, unverified: 0, accountedNotShown: 0, missingExplained: 0,
+        configurationGated: 0, missingBeyondText: 0, missingUnexplained: 0 };
 }
 
 // Callee-arm placement (trace-down contract): every oracle call edge X←D,
@@ -197,7 +234,8 @@ function emptyPlacement() {
 function emptyCalleePlacement() {
     return { confirmed: 0, oracleBroadReference: 0, confirmedOtherDef: 0,
         unverified: 0, unverifiedWithOtherDef: 0, accounted: 0,
-        moduleLevel: 0, missingExplained: 0, missingBeyondText: 0, missingUnexplained: 0 };
+        moduleLevel: 0, missingExplained: 0, configurationGated: 0,
+        missingBeyondText: 0, missingUnexplained: 0 };
 }
 
 function emptyKindTotals() {
@@ -296,9 +334,12 @@ async function evaluateRepo(repo, oracle) {
     process.stdout.write(`  oracle lists ${allSymbols.length} symbols\n`);
 
     // Restrict to symbols in files BOTH sides see (file-universe normalization),
-    // with usable names.
+    // with usable names. The caller arm samples callables and types; value
+    // members (fields, constants, enum members, globals, properties) have
+    // their own arm below (fix #429).
     const candidates = allSymbols.filter(s =>
-        s.name && s.name.length >= 3 && indexedFiles.has(s.file));
+        s.name && s.name.length >= 3 && indexedFiles.has(s.file) &&
+        CALLER_ARM_KINDS.has(s.kind));
 
     // Seeded shuffle, then stratify by oracle reference count.
     const rand = seededRandom(sampleSeed);
@@ -310,11 +351,38 @@ async function evaluateRepo(repo, oracle) {
     const buckets = new Map(REF_BUCKETS.map(b => [b.name, []]));
     const refCache = new Map();
     const replayRepo = replayManifest?.repos.find(r => r.name === repo.name);
-    for (const sym of candidates) {
+    // Named handles (fix #429): the same scoring for chosen targets, in
+    // place of the random draw.
+    let targetedSymbols = null;
+    let targetedValues = null;
+    if (symbolHandles) {
+        targetedSymbols = [];
+        targetedValues = [];
+        for (const spec of symbolHandles) {
+            try {
+                targetedSymbols.push(resolveSymbolHandle(spec, allSymbols, index, CALLER_ARM_KINDS));
+            } catch (callerError) {
+                try {
+                    targetedValues.push(resolveSymbolHandle(spec, allSymbols, index, VALUE_ARM_KINDS));
+                } catch {
+                    throw callerError;
+                }
+            }
+        }
+    }
+    for (const sym of targetedSymbols ? [] : candidates) {
         if ([...buckets.values()].every(list => list.length >= perBucket)) break;
         let refs;
         try {
-            refs = await oracle.findReferences(handle, { name: sym.name, file: sym.oracleFile, line: sym.line });
+            // Bucketing needs the call count only up to the top bucket's
+            // floor; an oracle that re-reads every sampled symbol's
+            // references comprehensively below may stop classifying there
+            // (fix #429: yaml-cpp seed runs exhausted the heap classifying
+            // every reference of vendored gtest names).
+            refs = await oracle.findReferences(handle, {
+                name: sym.name, file: sym.oracleFile, line: sym.line,
+                ...(oracle.comprehensiveReferences && { callLimit: BUCKET_CALL_LIMIT }),
+            });
         } catch (e) { continue; }
         refs = refs.map(r => ({ ...r, file: toUcnRel(r.file) }));
         const callRefs = refs.filter(r => r.kind === 'call');
@@ -324,13 +392,21 @@ async function evaluateRepo(repo, oracle) {
         refCache.set(sym, refs);
         list.push(sym);
     }
-    const sampled = replayRepo ? replayRepo.sampledTargets.map(target => {
+    if (targetedSymbols) {
+        for (const sym of targetedSymbols) {
+            const refs = await oracle.findReferences(handle, {
+                name: sym.name, file: sym.oracleFile, line: sym.line,
+            });
+            refCache.set(sym, refs.map(r => ({ ...r, file: toUcnRel(r.file) })));
+        }
+    }
+    const sampled = targetedSymbols || (replayRepo ? replayRepo.sampledTargets.map(target => {
         const matches = allSymbols.filter(s => s.file === target.file && s.line === target.line &&
             s.name === target.name && s.kind === target.kind);
         if (matches.length !== 1) throw new Error(`Replay target missing or ambiguous: ${JSON.stringify(target)}`);
         return matches[0];
-    }) : [...buckets.values()].flat().slice(0, sampleSize);
-    if (replayRepo) for (const sym of sampled) {
+    }) : [...buckets.values()].flat().slice(0, sampleSize));
+    if (replayRepo && !targetedSymbols) for (const sym of sampled) {
         if (!refCache.has(sym)) throw new Error(`Replay sampling population changed: ${sym.file}:${sym.line}:${sym.name}`);
     }
     if (runManifest) {
@@ -339,11 +415,16 @@ async function evaluateRepo(repo, oracle) {
         }));
         saveManifest(manifestPath, runManifest);
     }
-    process.stdout.write(`  sampled ${sampled.length} symbols (buckets: ${[...buckets].map(([n, l]) => `${n}:${l.length}`).join(' ')})\n`);
+    process.stdout.write(targetedSymbols
+        ? `  targeted ${sampled.length} named symbol(s): ${sampled.map(s => `${s.file}:${s.line}:${s.name}`).join(', ')}\n`
+        : `  sampled ${sampled.length} symbols (buckets: ${[...buckets].map(([n, l]) => `${n}:${l.length}`).join(' ')})\n`);
     if (oracle.comprehensiveReferences) {
         process.stdout.write(
             '  resolving comprehensive compiler call occurrences for sampled symbols...\n');
         for (const sym of sampled) {
+            if (process.env.UCN_EVAL_PROGRESS) {
+                process.stderr.write(`  comprehensive ${sym.kind} ${sym.file}:${sym.line}:${sym.name}\n`);
+            }
             const refs = await oracle.findReferences(handle, {
                 name: sym.name,
                 file: sym.oracleFile,
@@ -527,6 +608,16 @@ async function evaluateRepo(repo, oracle) {
         let targetDef = sameNameDefs.find(d =>
             d.relativePath === sym.file &&
             (d.startLine === sym.line || d.nameLine === sym.line));
+        // The two sides can start one declaration head on different lines
+        // (an attribute in an inactive `#if DEBUG` region the engine reads and
+        // the compiler's configuration does not): the one same-file
+        // definition whose head, first line to name line, holds the oracle
+        // row is that declaration (fix #429).
+        if (!targetDef) {
+            const heads = sameNameDefs.filter(d => d.relativePath === sym.file && d.nameLine &&
+                sym.line >= d.startLine && sym.line <= d.nameLine);
+            if (heads.length === 1) targetDef = heads[0];
+        }
         // A bodyless C/C++ type declaration (`struct S;`) is a redeclaration
         // of the one type; the engine indexes the type once, at its body.
         // Map a sampled forward declaration to the definition the oracle
@@ -537,6 +628,27 @@ async function evaluateRepo(repo, oracle) {
                 const equivalent = sameNameDefs.find(definition =>
                     !definition.className && definition.type !== 'function' &&
                     definition.type !== 'method' &&
+                    definition.relativePath === location.file &&
+                    location.line >= definition.startLine &&
+                    location.line <= definition.endLine);
+                if (equivalent) {
+                    targetDef = equivalent;
+                    break;
+                }
+            }
+        }
+        // A same-file C/C++ prototype (`static int f(void);` ahead of its
+        // definition) is folded into the definition by the engine; the
+        // oracle may list the prototype. Pin the definition the compiler
+        // resolves the prototype to, in the prototype's own file (static
+        // linkage: its own unit), never a guess across files (fix #429:
+        // libyaml scanner.c prototypes failed the command-surface gate).
+        if (!targetDef && ['function', 'method'].includes(sym.kind) &&
+            /\.(?:c|h|cc|cpp|cxx|hh|hpp|hxx)$/i.test(sym.file)) {
+            for (const location of await resolvedDefinitions(sym.file, sym.line, sym.name)) {
+                const equivalent = sameNameDefs.find(definition =>
+                    ['function', 'method'].includes(definition.type) && !definition.isSignature &&
+                    definition.relativePath === sym.file &&
                     definition.relativePath === location.file &&
                     location.line >= definition.startLine &&
                     location.line <= definition.endLine);
@@ -1177,6 +1289,7 @@ async function evaluateRepo(repo, oracle) {
                 // macro-body edge remains visible to trace.
                 place('missingExplained');
             }
+            else if (await isConfigurationGated(oc.file, oc.line)) place('configurationGated');
             else if (!lineMatchesSymbol(index.root, oc.file, oc.line, sym.name)) {
                 place('missingBeyondText');
                 const sample = {
@@ -1346,6 +1459,11 @@ async function evaluateRepo(repo, oracle) {
                     });
                     continue;
                 }
+                // Shown edges are scored wherever they are; an edge the
+                // callee answer does not show at a line the oracle's
+                // projection leaves out is configuration-unscored (see
+                // emptyPlacement).
+                if (await isConfigurationGated(oc.file, oc.line)) { placeCallee('configurationGated'); continue; }
                 if (!lineMatchesSymbol(index.root, oc.file, oc.line, sym.name)) {
                     placeCallee('missingBeyondText');
                     if (exactOracleEdge) pushSample(calleeSemanticMissingSamples, {
@@ -1399,7 +1517,8 @@ async function evaluateRepo(repo, oracle) {
             // edge remains, not only when the compiler returned no runtime
             // edge whatsoever.
             const exactOracleCallsForSymbol = oracleCalls.filter(isExactOracleCall).length;
-            if (exactOracleCallsForSymbol === exactPlacement.missingExplained) {
+            if (exactOracleCallsForSymbol ===
+                exactPlacement.missingExplained + exactPlacement.configurationGated) {
                 totals.zeroAgreed++;
             }
         }
@@ -1514,7 +1633,8 @@ async function evaluateRepo(repo, oracle) {
     const allOracleSemanticMissing = totals.placement.accountedNotShown +
         totals.placement.missingBeyondText + totals.placement.missingUnexplained;
     const allOracleSemanticEligible = Math.max(
-        0, totals.oracleCallEdges - totals.placement.missingExplained);
+        0, totals.oracleCallEdges - totals.placement.missingExplained -
+            totals.placement.configurationGated);
     const allOracleSemanticRecall = allOracleSemanticEligible > 0
         ? rate(allOracleSemanticEligible - allOracleSemanticMissing,
             allOracleSemanticEligible)
@@ -1527,7 +1647,8 @@ async function evaluateRepo(repo, oracle) {
         totals.exactPlacement.missingBeyondText +
         totals.exactPlacement.missingUnexplained;
     const semanticEligible = Math.max(0,
-        totals.exactOracleCallEdges - totals.exactPlacement.missingExplained);
+        totals.exactOracleCallEdges - totals.exactPlacement.missingExplained -
+            totals.exactPlacement.configurationGated);
     const semanticRecall = semanticEligible > 0 ? rate(semanticEligible - semanticMissing, semanticEligible) : 1;
     const allOracleCalleeSemanticMissing =
         calleeTotals.placement.confirmedOtherDef +
@@ -1542,7 +1663,8 @@ async function evaluateRepo(repo, oracle) {
         calleeTotals.exactPlacement).reduce((a, b) => a + b, 0);
     const calleeSemanticEligible = Math.max(0, calleePlacementTotal -
         calleeTotals.exactPlacement.moduleLevel -
-        calleeTotals.exactPlacement.missingExplained);
+        calleeTotals.exactPlacement.missingExplained -
+        calleeTotals.exactPlacement.configurationGated);
     const calleeSemanticRecall = calleeSemanticEligible > 0
         ? rate(calleeSemanticEligible - calleeSemanticMissing, calleeSemanticEligible) : 1;
     const reviewBurden = summarizeReviewBurden({
@@ -1683,6 +1805,8 @@ async function evaluateRepo(repo, oracle) {
         definitionLookupErrors,
         oracleBroadReferenceEdges,
         unscoredEdges,
+        oracleConfigurationGatedEdges: totals.placement.configurationGated,
+        calleeOracleConfigurationGatedEdges: calleeTotals.placement.configurationGated,
         confirmedConfigurationUnscored,
         confirmedAbstentionUnscored,
         unverifiedConfigurationUnscored,
@@ -1784,11 +1908,309 @@ async function evaluateRepo(repo, oracle) {
             `${JSON.stringify([...summary.commandProof.missingSamples, ...summary.commandProof.errorSamples].slice(0, 5))}\n`);
     }
 
+    // ── Value-member arm (fix #429) ─────────────────────────────────────
+    // Fields, constants, enum members, globals and properties: no gate
+    // sampled them before. Each sampled member's oracle references (every
+    // non-declaration token the compiler binds to it) are compared with
+    // impact's VALUE/PROPERTY ACCESS band, line by line: confirmed sites
+    // must be oracle references (precision), oracle references must be
+    // shown confirmed or unverified (semantic recall), and a member the
+    // compiler declares that the engine does not index is a failure.
+    const valueArm = await scoreValueArm({
+        repo, oracle, handle, index, allSymbols, indexedFiles, toUcnRel,
+        targetedValues, isConfigurationGated, resolvedDefinitions, definitionMatchesTarget,
+    });
+    if (valueArm) {
+        summary.valueArm = valueArm;
+        // The arm's oracle requests count toward the same infrastructure
+        // failure counters.
+        summary.sourceStatusErrors = sourceStatusErrors;
+        summary.definitionLookupErrors = definitionLookupErrors;
+        printValueArm(valueArm);
+    }
+
     if (oracle.dispose) {
         try { await oracle.dispose(handle); } catch (e) { /* teardown is best-effort */ }
     }
 
     return { summary, perSymbol };
+}
+
+// Every value definition kind the engine indexes, plus accessor-shaped
+// properties (C# properties, TS accessors) whose answer is the PROPERTY
+// ACCESS band.
+const ENGINE_VALUE_TYPES = new Set(['field', 'private field', 'constant', 'state', 'variant',
+    'property', 'get', 'set', 'getter', 'setter']);
+
+async function scoreValueArm({ repo, oracle, handle, index, allSymbols, indexedFiles, toUcnRel,
+    targetedValues, isConfigurationGated, resolvedDefinitions, definitionMatchesTarget }) {
+    if (targetedValues ? targetedValues.length === 0 : valueSampleSize === 0) return null;
+    let sampled;
+    const refCache = new Map();
+    const fetchRefs = async sym => {
+        const refs = await oracle.findReferences(handle, { name: sym.name, file: sym.oracleFile, line: sym.line });
+        return refs.map(r => ({ ...r, file: toUcnRel(r.file) }));
+    };
+    if (targetedValues) {
+        sampled = targetedValues;
+        for (const sym of sampled) refCache.set(sym, await fetchRefs(sym));
+    } else {
+        const candidates = allSymbols.filter(s => VALUE_ARM_KINDS.has(s.kind) && s.name &&
+            s.name.length >= 2 && /^[A-Za-z_$][\w$]*$/.test(s.name) && indexedFiles.has(s.file));
+        if (candidates.length === 0) {
+            return emptyValueArm({ listed: 0, note: `${oracle.name} lists no value members` });
+        }
+        const rand = seededRandom(sampleSeed ^ VALUE_SEED_SALT);
+        for (let i = candidates.length - 1; i > 0; i--) {
+            const j = Math.floor(rand() * (i + 1));
+            [candidates[i], candidates[j]] = [candidates[j], candidates[i]];
+        }
+        const perBucket = Math.ceil(valueSampleSize / REF_BUCKETS.length);
+        const buckets = new Map(REF_BUCKETS.map(b => [b.name, []]));
+        for (const sym of candidates) {
+            if ([...buckets.values()].every(list => list.length >= perBucket)) break;
+            let refs;
+            try { refs = await fetchRefs(sym); } catch { continue; }
+            const uses = refs.filter(r => r.kind !== 'definition');
+            const list = buckets.get(REF_BUCKETS.find(b => b.test(uses.length)).name);
+            if (list.length >= perBucket) continue;
+            refCache.set(sym, refs);
+            list.push(sym);
+        }
+        sampled = [...buckets.values()].flat().slice(0, valueSampleSize);
+    }
+    const arm = emptyValueArm({ listed: allSymbols.filter(s => VALUE_ARM_KINDS.has(s.kind)).length });
+    const contentCache = new Map();
+    arm.sampled = sampled.length;
+    for (const sym of sampled) {
+        const sameNameDefs = index.symbols.get(sym.name) || [];
+        const valueDefs = sameNameDefs.filter(d => ENGINE_VALUE_TYPES.has(d.type) ||
+            ENGINE_VALUE_TYPES.has(d.memberType));
+        let def = valueDefs.find(d => d.relativePath === sym.file &&
+            (d.startLine === sym.line || d.nameLine === sym.line)) ||
+            valueDefs.find(d => d.relativePath === sym.file &&
+                sym.line >= d.startLine && sym.line <= (d.endLine || d.startLine));
+        // A redeclaration the engine folds into one declaration (a C++
+        // out-of-class static member definition): pin the declaration the
+        // oracle resolves it to.
+        if (!def && typeof oracle.resolveDefinition === 'function') {
+            for (const location of await resolvedDefinitions(sym.file, sym.line, sym.name)) {
+                def = valueDefs.find(d => d.relativePath === location.file &&
+                    location.line >= d.startLine && location.line <= (d.endLine || d.startLine));
+                if (def) break;
+            }
+        }
+        const row = { name: sym.name, file: sym.file, line: sym.line, kind: sym.kind };
+        // The engine indexes the declaration as another kind (a Python
+        // `Alias = Union[..]` type alias, a function alias): no value
+        // answer to score, and not an unindexed member.
+        const otherKind = !def && sameNameDefs.find(d => d.relativePath === sym.file &&
+            (d.startLine === sym.line || d.nameLine === sym.line));
+        if (otherKind) {
+            arm.indexedAsOtherKind++;
+            arm.perSymbol.push({ ...row, indexedAs: otherKind.type });
+            continue;
+        }
+        if (!def) {
+            arm.notIndexed++;
+            pushSample(arm.notIndexedSamples, { ...row, text: lineText(index.root, sym.file, sym.line) }, 40);
+            arm.perSymbol.push({ ...row, notIndexed: true });
+            continue;
+        }
+        const handleName = `${def.relativePath}:${def.startLine}:${sym.name}`;
+        const response = execute(index, 'impact', { name: handleName, includeTests: true });
+        const band = response.ok ? (response.result.valueAccesses || response.result.propertyAccesses) : null;
+        if (!band) {
+            arm.errors++;
+            pushSample(arm.errorSamples, { ...row, error: response.ok ? 'impact has no value or property access band' : response.error }, 20);
+            arm.perSymbol.push({ ...row, error: response.ok ? 'no access band' : response.error });
+            continue;
+        }
+        arm.evaluated++;
+        if (band.account) {
+            arm.accounts++;
+            if (band.account.conserved) arm.conserved++;
+        }
+        const confirmedSites = (band.byFile || []).flatMap(group => group.sites || [])
+            .map(site => ({ file: site.file, line: site.line, column: site.column }));
+        const unverifiedSites = (band.unverifiedSites || []).map(site => ({ file: site.file, line: site.line, column: site.column }));
+        const confirmedKeys = new Set(confirmedSites.map(site => key(site.file, site.line)));
+        const unverifiedKeys = new Set(unverifiedSites.map(site => key(site.file, site.line)));
+        // Declarations of the name are declaration tokens, not accesses:
+        // the oracle's own, and those of every engine value definition of
+        // the name (an out-of-class `int Foo::x = 0;`).
+        const declarationKeys = new Set([key(sym.file, sym.line), key(def.relativePath, def.nameLine || def.startLine)]);
+        for (const other of valueDefs) declarationKeys.add(key(other.relativePath, other.nameLine || other.startLine));
+        // Documentation references (Javadoc `{@link #x}`, doc comments) and
+        // name text inside strings are not accesses (the deadcode arm's #269
+        // rule, read by the engine's own comment/string masker).
+        const inCommentOrString = r => {
+            if (!Number.isInteger(r.column) || !indexedFiles.has(r.file)) return false;
+            const abs = path.join(index.root, r.file);
+            if (!contentCache.has(abs)) {
+                try { contentCache.set(abs, fs.readFileSync(abs, 'utf8')); } catch { contentCache.set(abs, null); }
+            }
+            const content = contentCache.get(abs);
+            return content != null && index.isCommentOrStringAtPosition(content, r.line, r.column, abs);
+        };
+        // Every declaration the oracle's own references list in the target's
+        // file is the same symbol (a Python name rebound in one scope:
+        // `class Factory` then `Factory = _add_hash(Factory)`); a definition
+        // lookup landing on any of them names this member.
+        const symbolDeclarations = new Set([key(sym.file, sym.line), ...(refCache.get(sym) || [])
+            .filter(r => r.kind === 'definition' && r.file === sym.file).map(r => key(r.file, r.line))]);
+        const namesTarget = d => definitionMatchesTarget(d, [def]) || symbolDeclarations.has(key(d.file, d.line));
+        const candidateRefs = (refCache.get(sym) || []).filter(r => r.kind !== 'definition' &&
+            !declarationKeys.has(key(r.file, r.line)) && !inCommentOrString(r));
+        // Reference search is name- and alias-driven in some oracles (a
+        // TypedDict key's "references" were builtin `max(..)` calls); the
+        // oracle's own definition lookup at each reference is the identity
+        // check, as for repeated callable names in the caller arm: a site
+        // bound elsewhere leaves this member's references, one the lookup
+        // cannot resolve is kept only as non-exact.
+        const oracleRefs = [];
+        for (const ref of candidateRefs) {
+            if (oracle.exactReferenceIdentity || typeof oracle.resolveDefinition !== 'function' ||
+                ref.uncertaintyClass || ref.oracleResolution === 'macro-expansion' || !Number.isInteger(ref.column) ||
+                !indexedFiles.has(ref.file)) {
+                oracleRefs.push(ref);
+                continue;
+            }
+            const defs = await resolvedDefinitions(ref.file, ref.line, sym.name, ref.column);
+            if (defs.some(namesTarget)) {
+                oracleRefs.push(ref);
+            } else if (defs.length === 0) {
+                oracleRefs.push({ ...ref, uncertaintyClass: 'oracle-unresolved' });
+            } else {
+                arm.oracleBroadReferences++;
+            }
+        }
+        const refKeys = new Set(oracleRefs.map(r => key(r.file, r.line)));
+        // A compiler use at a macro invocation whose expansion holds the
+        // name: the engine models it once in the macro body (as the caller
+        // arm's macro-expansion edges).
+        const macroExpansionKeys = new Set(oracleRefs.filter(r => r.oracleResolution === 'macro-expansion')
+            .map(r => key(r.file, r.line)));
+        const exactRefKeys = new Set(oracleRefs.filter(r => !r.uncertaintyClass).map(r => key(r.file, r.line)));
+        const placement = emptyPlacement();
+        const exactPlacement = emptyPlacement();
+        for (const refKey of refKeys) {
+            const [file, lineText_] = [refKey.slice(0, refKey.lastIndexOf(':')), refKey.slice(refKey.lastIndexOf(':') + 1)];
+            const line = Number(lineText_);
+            const exact = exactRefKeys.has(refKey);
+            const place = field => { placement[field]++; if (exact) exactPlacement[field]++; };
+            if (confirmedKeys.has(refKey)) place('confirmed');
+            else if (unverifiedKeys.has(refKey)) place('unverified');
+            else if (!indexedFiles.has(file) || macroExpansionKeys.has(refKey)) place('missingExplained');
+            else if (await isConfigurationGated(file, line)) place('configurationGated');
+            else if (!lineMatchesSymbol(index.root, file, line, sym.name)) {
+                place('missingBeyondText');
+                if (exact) pushSample(arm.semanticMissingSamples, { category: 'missingBeyondText', symbol: sym.name,
+                    target: `${sym.file}:${sym.line}`, edge: refKey, text: lineText(index.root, file, line) });
+            } else if (band.account ? band.account.conserved : true) {
+                place('accountedNotShown');
+                if (exact) pushSample(arm.semanticMissingSamples, { category: 'accountedNotShown', symbol: sym.name,
+                    target: `${sym.file}:${sym.line}`, edge: refKey, text: lineText(index.root, file, line) });
+            } else {
+                place('missingUnexplained');
+                if (exact) pushSample(arm.semanticMissingSamples, { category: 'missingUnexplained', symbol: sym.name,
+                    target: `${sym.file}:${sym.line}`, edge: refKey, text: lineText(index.root, file, line) });
+            }
+        }
+        for (const field of Object.keys(placement)) {
+            arm.placement[field] += placement[field];
+            arm.exactPlacement[field] += exactPlacement[field];
+        }
+        arm.oracleRefSites += refKeys.size;
+        arm.exactOracleRefSites += exactRefKeys.size;
+        // Precision: every confirmed site is an oracle reference of this
+        // member, or the oracle's definition lookup at the site names it.
+        const siteVerdict = async site => {
+            const siteKey = key(site.file, site.line);
+            if (refKeys.has(siteKey)) return { hit: true, scorable: true };
+            // A site on another declaration of the name (a subclass's
+            // class attribute shadowing the target) is a slot member, not an
+            // access the oracle's references could confirm or refute.
+            if (declarationKeys.has(siteKey)) {
+                return { hit: false, scorable: false, abstention: 'declaration-site' };
+            }
+            // A name in a string (an `__all__` export list) is an edit site
+            // the engine resolves; reference search never reports strings.
+            if (Number.isInteger(site.column) && inCommentOrString({ ...site, kind: 'reference' })) {
+                return { hit: false, scorable: false, abstention: 'string-token' };
+            }
+            if (typeof oracle.resolveDefinition === 'function') {
+                const defs = await resolvedDefinitions(site.file, site.line, sym.name);
+                if (defs.some(namesTarget)) return { hit: true, scorable: true };
+                if (await isConfigurationGated(site.file, site.line)) {
+                    return { hit: false, scorable: false, abstention: 'configuration-gated' };
+                }
+                if (defs.length === 0 && lineContainsIdentifier(index, site.file, site.line, sym.name)) {
+                    return { hit: false, scorable: false, abstention: 'definition-unresolved' };
+                }
+                return { hit: false, scorable: true };
+            }
+            if (await isConfigurationGated(site.file, site.line)) {
+                return { hit: false, scorable: false, abstention: 'configuration-gated' };
+            }
+            return { hit: false, scorable: true };
+        };
+        let rowHits = 0, rowUnscored = 0, rowUnverifiedHits = 0, rowUnverifiedUnscored = 0;
+        for (const site of dedupe(confirmedSites)) {
+            const verdict = await siteVerdict(site);
+            arm.confirmedSites++;
+            if (!verdict.scorable) {
+                rowUnscored++;
+                arm.confirmedUnscored++;
+                arm.confirmedUnscoredByClass[verdict.abstention] = (arm.confirmedUnscoredByClass[verdict.abstention] || 0) + 1;
+            } else if (verdict.hit) {
+                rowHits++;
+                arm.confirmedHits++;
+            } else {
+                pushSample(arm.falseConfirmationSamples, { symbol: sym.name, target: `${sym.file}:${sym.line}`,
+                    edge: key(site.file, site.line), text: lineText(index.root, site.file, site.line) }, 40);
+            }
+        }
+        for (const site of dedupe(unverifiedSites)) {
+            const verdict = await siteVerdict(site);
+            arm.unverifiedSites++;
+            if (!verdict.scorable) { rowUnverifiedUnscored++; arm.unverifiedUnscored++; }
+            else if (verdict.hit) { rowUnverifiedHits++; arm.unverifiedHits++; }
+        }
+        arm.perSymbol.push({ ...row, handle: handleName, engineType: def.type,
+            oracleRefs: refKeys.size, confirmed: confirmedKeys.size, confirmedHits: rowHits,
+            confirmedUnscored: rowUnscored, unverified: unverifiedKeys.size,
+            unverifiedHits: rowUnverifiedHits, unverifiedUnscored: rowUnverifiedUnscored,
+            placement, exactPlacement, conserved: band.account ? band.account.conserved : null });
+    }
+    return finishValueArm(arm);
+}
+
+const VALUE_SEED_SALT = 0x5A1E;
+
+function printValueArm(arm) {
+    if (arm.note) {
+        process.stdout.write(`  value arm: ${arm.note}\n`);
+        return;
+    }
+    process.stdout.write(`  value arm: ${arm.sampled} sampled of ${arm.listed} listed | not indexed ${arm.notIndexed} | ` +
+        `indexed as another kind ${arm.indexedAsOtherKind} | ` +
+        `errors ${arm.errors} | tier1 ${arm.tier1Precision == null ? 'n/a' : pct(arm.tier1Precision)} ` +
+        `(${arm.confirmedHits}/${arm.confirmedSites - arm.confirmedUnscored} scored; ${arm.confirmedUnscored} unscored) | ` +
+        `unverified ${arm.unverifiedPrecision == null ? 'n/a' : pct(arm.unverifiedPrecision)} | ` +
+        `semanticRecall ${pct(arm.semanticRecall)} (${arm.semanticMissing} missing) | ` +
+        `exact placement ${JSON.stringify(arm.exactPlacement)} | conserved ${pct(arm.conservedRate)}\n`);
+    if (arm.notIndexed > 0) {
+        process.stdout.write(`  ⚠ VALUE COMMAND-SURFACE GATE FAILURE: ${arm.notIndexed} compiler-declared value member(s) not indexed: ` +
+            `${JSON.stringify(arm.notIndexedSamples.slice(0, 3))}\n`);
+    }
+    if (arm.semanticMissing > 0) {
+        process.stdout.write(`  ⚠ VALUE SEMANTIC RECALL GATE FAILURE: ${arm.semanticMissing} oracle reference(s) not shown: ` +
+            `${JSON.stringify(arm.semanticMissingSamples.slice(0, 3))}\n`);
+    }
+    if (arm.falseConfirmationSamples.length > 0) {
+        process.stdout.write(`  value arm false confirmations: ${JSON.stringify(arm.falseConfirmationSamples.slice(0, 3))}\n`);
+    }
 }
 
 const _lineCache = new Map();
@@ -1948,6 +2370,8 @@ async function main() {
             result.summary.unverifiedUnscoredRatio = Number(
                 coverageGate.unverifiedUnscoredRatio.toFixed(4));
             result.summary.calleeUnscoredRatio = Number(coverageGate.calleeUnscoredRatio.toFixed(4));
+            result.summary.recallConfigGatedRatio = Number(
+                coverageGate.recallConfigGatedRatio.toFixed(4));
             result.summary.definitionUnresolvedRatio = Number(
                 coverageGate.definitionUnresolvedRatio.toFixed(4));
             if (coverageGate.failures.length > 0) {
@@ -1974,7 +2398,9 @@ async function main() {
                 process.stdout.write(`  ⚠ REVIEW-BURDEN GATE FAILURE: ${reviewFailures.join('; ')}\n`);
                 gateFailed = true;
             }
-            if (result.summary.conservedRate < 1) {
+            // A targeted run that names only value members has no caller
+            // sample by design; an empty default sample still fails.
+            if (result.summary.conservedRate < 1 && !(symbolHandles && result.summary.sampled === 0)) {
                 process.stdout.write(`  ⚠ CONSERVATION GATE FAILURE: ${pct(result.summary.conservedRate)} of sampled accounts conserved\n`);
                 gateFailed = true;
             }
@@ -1991,6 +2417,28 @@ async function main() {
                 result.summary.calleePrecision < minPrecision) {
                 process.stdout.write(`  ⚠ CALLEE PRECISION GATE FAILURE: ${pct(result.summary.calleePrecision)} < floor ${pct(minPrecision)}\n`);
                 gateFailed = true;
+            }
+            const valueArm = result.summary.valueArm;
+            if (valueArm && !valueArm.note) {
+                const valueFailures = [];
+                if (valueArm.errors > 0) valueFailures.push(`${valueArm.errors} value target(s) without an access answer`);
+                if (valueArm.notIndexed > 0) valueFailures.push(`${valueArm.notIndexed} compiler-declared value member(s) not indexed`);
+                if (valueArm.semanticMissing > 0) valueFailures.push(`semantic recall ${pct(valueArm.semanticRecall)} (${valueArm.semanticMissing} oracle reference(s) not shown)`);
+                if (valueArm.allOracleMissingUnexplained > 0) valueFailures.push(`${valueArm.allOracleMissingUnexplained} oracle reference(s) unexplained`);
+                if (valueArm.conservedRate < 1) valueFailures.push(`${pct(valueArm.conservedRate)} of value accounts conserved`);
+                if (minPrecision != null && valueArm.tier1Precision != null && valueArm.tier1Precision < minPrecision) {
+                    valueFailures.push(`tier1 ${pct(valueArm.tier1Precision)} < floor ${pct(minPrecision)}`);
+                }
+                if (maxUnscoredRatio != null && valueArm.confirmedSites > 0) {
+                    const configuration = valueArm.confirmedConfigurationUnscored / valueArm.confirmedSites;
+                    const abstention = valueArm.confirmedAbstentionUnscored / valueArm.confirmedSites;
+                    if (configuration > maxUnscoredRatio) valueFailures.push(`configuration-unscored ratio ${pct(configuration)} > ${pct(maxUnscoredRatio)}`);
+                    if (abstention > maxUnscoredRatio * 3) valueFailures.push(`oracle-abstention ratio ${pct(abstention)} > ${pct(maxUnscoredRatio * 3)}`);
+                }
+                if (valueFailures.length > 0) {
+                    process.stdout.write(`  ⚠ VALUE-ARM GATE FAILURE: ${valueFailures.join('; ')}\n`);
+                    gateFailed = true;
+                }
             }
             const jsonPath = path.join(REPORTS_DIR, `oracle-eval-${repo.name}-${oracle.name}-${date}${seedSuffix}.json`);
             fs.writeFileSync(jsonPath, JSON.stringify(result, null, 2));
@@ -2134,6 +2582,29 @@ async function main() {
         if (s.error || !s.calleePlacement) continue;
         const cp = s.calleePlacement;
         lines.push(`| ${s.repo} | ${pct(s.calleePrecision)} (${s.calleeHits}/${s.calleeSites}) | ${pct(s.calleeSemanticRecall)} | **${s.calleeSemanticMissing}** | ${cp.confirmed} | ${cp.oracleBroadReference} | ${cp.confirmedOtherDef} | ${cp.unverified} | ${cp.unverifiedWithOtherDef} | ${cp.accounted} | ${cp.moduleLevel} | ${cp.missingBeyondText} |`);
+    }
+    lines.push('');
+    lines.push('## Value-member arm');
+    lines.push('');
+    lines.push('Fields, constants, enum members, globals and properties, sampled apart from');
+    lines.push('the caller arm. Every oracle reference of a sampled member must be shown in');
+    lines.push("impact's value or property access band (confirmed or unverified); every");
+    lines.push('confirmed access must be an oracle reference; a member the compiler declares');
+    lines.push('and the engine does not index fails the arm.');
+    lines.push('');
+    lines.push('| repo | listed | sampled | not indexed | errors | oracle ref sites | tier1 precision | semantic recall | semantic missing | unverified precision | configuration-unscored refs | conserved |');
+    lines.push('|---|---:|---:|---:|---:|---:|---|---|---:|---|---:|---|');
+    for (const { summary: s } of rollupResults) {
+        if (s.error || !s.valueArm) continue;
+        const v = s.valueArm;
+        if (v.note) {
+            lines.push(`| ${s.repo} | ${v.listed} | 0 | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | ${v.note} |`);
+            continue;
+        }
+        lines.push(`| ${s.repo} | ${v.listed} | ${v.sampled} | **${v.notIndexed}** | **${v.errors}** | ${v.oracleRefSites} | ` +
+            `${v.tier1Precision == null ? 'n/a' : pct(v.tier1Precision)} (${v.confirmedHits}/${v.confirmedSites - v.confirmedUnscored}) | ` +
+            `${pct(v.semanticRecall)} | **${v.semanticMissing}** | ${v.unverifiedPrecision == null ? 'n/a' : pct(v.unverifiedPrecision)} | ` +
+            `${v.placement.configurationGated} | ${pct(v.conservedRate)} |`);
     }
     lines.push('');
     lines.push('## Exact-definition adjudication');

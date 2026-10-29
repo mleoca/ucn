@@ -7,7 +7,8 @@ On startup prints a ready banner line: {"ok": true, "ready": true, ...}.
 Ops:
   {"op": "list_symbols"}
       -> {"ok": true, "symbols": [{"name", "file", "line", "kind"}]}
-         file: relative to root; kind: function|method|class.
+         file: relative to root; kind: function|method|class, or a value
+         member: variable (module level) | field (class or instance attribute).
          line follows UCN's convention: the FIRST DECORATOR line for decorated
          defs (tree-sitter decorated_definition start), so the runner's
          file:line:name handles pin UCN resolution exactly.
@@ -124,6 +125,65 @@ def analyze_file(abs_path):
                 visit(child, class_depth)
 
     visit(tree, 0)
+
+    # Value members (fix #429): module-level names, class attributes and
+    # instance attributes (`self.x = ...` in a method, first assignment, when
+    # the class body does not declare the name). kind: variable | field.
+    def char_col(lineno, byte_col):
+        return byte_to_char(lines[lineno - 1], byte_col) if 1 <= lineno <= len(lines) else byte_col
+
+    def record_value(name, lineno, col, kind):
+        if DUNDER_RE.match(name) or (lineno, name) in info["name_pos"]:
+            return
+        info["symbols"].append({"name": name, "line": lineno, "kind": kind})
+        info["name_pos"][(lineno, name)] = (lineno, col)
+
+    def assigned_names(statement):
+        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        for target in targets:
+            stack = [target]
+            while stack:
+                node = stack.pop(0)
+                if isinstance(node, ast.Name):
+                    yield node
+                elif isinstance(node, (ast.Tuple, ast.List)):
+                    stack.extend(node.elts)
+
+    for statement in tree.body:
+        if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            for name in assigned_names(statement):
+                record_value(name.id, name.lineno, char_col(name.lineno, name.col_offset), "variable")
+
+    def visit_class(class_node):
+        declared = set()
+        for statement in class_node.body:
+            if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                for name in assigned_names(statement):
+                    declared.add(name.id)
+                    record_value(name.id, name.lineno, char_col(name.lineno, name.col_offset), "field")
+        for statement in class_node.body:
+            if not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            arguments = statement.args.posonlyargs + statement.args.args
+            if not arguments or any(isinstance(d, ast.Name) and d.id == "staticmethod"
+                                    for d in statement.decorator_list):
+                continue
+            receiver = arguments[0].arg
+            for node in ast.walk(statement):
+                if not isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                    continue
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for target in targets:
+                    if (isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name)
+                            and target.value.id == receiver and target.attr not in declared
+                            and target.end_lineno is not None):
+                        declared.add(target.attr)
+                        end_col = char_col(target.end_lineno, target.end_col_offset)
+                        record_value(target.attr, target.end_lineno, end_col - len(target.attr), "field")
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            visit_class(node)
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
@@ -259,6 +319,65 @@ def find_references(rel_file, line, name):
     return {"ok": True, "refs": out}
 
 
+def _parse(abs_path):
+    try:
+        with open(abs_path, encoding="utf-8", errors="replace") as f:
+            source = f.read()
+        return source.split("\n"), ast.parse(source)
+    except (OSError, SyntaxError, ValueError):
+        return None, None
+
+
+def _base_positions(lines, class_node):
+    out = []
+    for base in class_node.bases:
+        node = base.value if isinstance(base, ast.Subscript) else base
+        if isinstance(node, ast.Attribute) and node.end_lineno is not None:
+            end_col = byte_to_char(lines[node.end_lineno - 1], node.end_col_offset)
+            out.append({"line": node.end_lineno,
+                        "utf16Col": char_to_utf16(lines[node.end_lineno - 1], end_col - len(node.attr))})
+        elif isinstance(node, ast.Name):
+            col = byte_to_char(lines[node.lineno - 1], node.col_offset)
+            out.append({"line": node.lineno, "utf16Col": char_to_utf16(lines[node.lineno - 1], col)})
+    return out
+
+
+def enclosing_class(rel_file, line, name):
+    """Bases (LSP positions) of the class declaring the method listed at
+    (line, name): the start of an external-contract walk (fix #429)."""
+    lines, tree = _parse(os.path.join(ROOT, rel_file))
+    if tree is None:
+        return {"ok": True, "bases": None}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for child in node.body:
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name == name:
+                start = child.decorator_list[0].lineno if child.decorator_list else child.lineno
+                if start == line or child.lineno == line:
+                    return {"ok": True, "bases": _base_positions(lines, node)}
+    return {"ok": True, "bases": None}
+
+
+def class_bases(abs_path, line):
+    """Bases of the class whose name sits on `line` of any file."""
+    lines, tree = _parse(abs_path)
+    if tree is None:
+        return {"ok": True, "bases": [], "members": []}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and (node.lineno == line or
+                (node.decorator_list and node.decorator_list[0].lineno <= line <= node.lineno)):
+            members = []
+            for child in node.body:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    members.append(child.name)
+                elif isinstance(child, (ast.Assign, ast.AnnAssign)):
+                    targets = child.targets if isinstance(child, ast.Assign) else [child.target]
+                    members.extend(t.id for t in targets if isinstance(t, ast.Name))
+            return {"ok": True, "bases": _base_positions(lines, node), "members": members}
+    return {"ok": True, "bases": [], "members": []}
+
+
 def main():
     sys.stdout.write(json.dumps({
         "ok": True, "ready": True,
@@ -282,6 +401,10 @@ def main():
                 resp = name_position(req["file"], req["line"], req["name"])
             elif op == "classify_ref":
                 resp = classify_ref(req["file"], req["line"], req["utf16_col"], req["name"])
+            elif op == "enclosing_class":
+                resp = enclosing_class(req["file"], req["line"], req["name"])
+            elif op == "class_bases":
+                resp = class_bases(req["path"], req["line"])
             elif op == "shutdown":
                 break
             else:

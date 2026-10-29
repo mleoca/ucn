@@ -57,6 +57,7 @@
  *   node eval/run-outcome-eval.js --gate                # tuned set + hard thresholds (exit 1)
  *   node eval/run-outcome-eval.js --oracle-targets      # LSP-enumerated candidate universe
  *   node eval/run-outcome-eval.js --seeds 42,7,101      # one board per seed
+ *   node eval/run-outcome-eval.js --repo websocket --kinds value   # value-member renames
  *   node eval/run-outcome-eval.js --repo gson --targets gson/src/.../JsonArray.java:106:add
  */
 
@@ -80,7 +81,10 @@ const { ProjectIndex } = require('..');
 const { isTestPath } = require('../core/shared');
 
 const CLI_PATH = path.join(__dirname, '..', 'cli', 'index.js');
-const REPORTS_DIR = path.join(__dirname, 'reports');
+// UCN_EVAL_REPORTS_DIR keeps evaluation artifacts out of the tracked tree,
+// as for every other eval runner (fix #429: this one ignored it).
+const REPORTS_DIR = path.resolve(
+    process.env.UCN_EVAL_REPORTS_DIR || path.join(__dirname, 'reports'));
 const OUTCOME_TEMP_DIR = path.join(require('os').tmpdir(), 'ucn-outcome-repos');
 const PYRIGHT_BIN = path.join(__dirname, '..', 'node_modules', '.bin', 'pyright');
 
@@ -348,7 +352,11 @@ function defNameLine(contentByFile, relativePath, def, name) {
     return null;
 }
 
-function candidateDefs(index, repo, contentByFile) {
+// Value-member rename tasks (fix #429, --kinds value): fields, constants,
+// enum members, module values and Rust variants, judged like functions.
+const VALUE_TASK_TYPES = new Set(['field', 'constant', 'state', 'variant']);
+
+function candidateDefs(index, repo, contentByFile, kinds = 'callable') {
     const extensions = new Set(LANG_EXTENSIONS[repo.language] || []);
     const skipNames = new Set(['main', 'init', '__init__']);
     const out = [];
@@ -356,7 +364,8 @@ function candidateDefs(index, repo, contentByFile) {
         if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) continue;
         if (name.length < 3 || skipNames.has(name) || /^__.*__$/.test(name)) continue;
         for (const def of defs) {
-            if (def.type !== 'function' && def.type !== 'method') continue;
+            if (kinds === 'value' ? !VALUE_TASK_TYPES.has(def.type)
+                : def.type !== 'function' && def.type !== 'method') continue;
             if (!extensions.has(path.extname(def.file))) continue;
             const relativePath = path.relative(index.root, def.file).replace(/\\/g, '/');
             if (isTestPath(relativePath)) continue;
@@ -894,7 +903,7 @@ async function runRepo(repo, options) {
     log(`baseline: ${baseline.keys.length} pre-existing error key(s), ${baseline.ms}ms`);
 
     const rand = seededRandom(options.seed);
-    let candidates = candidateDefs(index, repo, contentByFile);
+    let candidates = candidateDefs(index, repo, contentByFile, options.kinds);
     let oracleTargetInfo = null;
     if (options.oracleTargets) {
         oracleTargetInfo = await oracleCandidateDefs(
@@ -1240,12 +1249,19 @@ async function main() {
         ? targetsRaw.split(',').map(value => value.trim()).filter(Boolean)
         : null;
     const oracleTargets = argv.includes('--oracle-targets');
+    // --kinds value: value-member rename tasks only (fix #429). Measurement
+    // mode: deadcode makes no value claims, so there are no delete tasks.
+    const kinds = readArgValue(argv, '--kinds') || 'callable';
+    if (!['callable', 'value'].includes(kinds)) throw new Error('--kinds must be callable or value');
     // --gate: run the PINNED tuned regression set and fail on the explicit
     // thresholds in OUTCOME_GATE_THRESHOLDS (pinned commit + fixed seed →
     // deterministic tasks; unpinned holdouts never gate). --tuned runs the
     // same set without gating.
     const gateMode = argv.includes('--gate');
     const tunedMode = gateMode || argv.includes('--tuned');
+    if (gateMode && kinds !== 'callable') {
+        throw new Error('--gate runs the callable board; --kinds value is a measurement mode');
+    }
     if (gateMode && (oracleTargets || targets || seeds.length > 1)) {
         throw new Error('--gate is the deterministic pinned board: ' +
             '--oracle-targets/--targets/--seeds are measurement-mode flags');
@@ -1280,15 +1296,17 @@ async function main() {
     const reports = [];
     let failures = 0;
     for (const seed of seeds) {
-        const options = { seed, renameTasks, deleteTasks, targets, oracleTargets };
+        const options = { seed, renameTasks, deleteTasks: kinds === 'value' ? 0 : deleteTasks,
+            targets, oracleTargets: kinds === 'value' ? false : oracleTargets, kinds };
         for (const repo of repos) {
             try {
                 const report = await runRepo(repo, options);
                 reports.push(report);
                 const date = report.generatedAt.slice(0, 10);
-                const suffix = seed === DEFAULT_SEED ? '' : `-seed${seed}`;
+                const suffix = (seed === DEFAULT_SEED ? '' : `-seed${seed}`) + (kinds === 'value' ? '-values' : '');
                 const jsonPath = path.join(REPORTS_DIR,
                     `outcome-eval-${repo.name}-${date}${suffix}.json`);
+                fs.mkdirSync(REPORTS_DIR, { recursive: true });
                 fs.writeFileSync(jsonPath, JSON.stringify(report, null, 2));
                 process.stdout.write(`[${repo.name}] JSON: ${jsonPath}\n`);
             } catch (error) {

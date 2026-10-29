@@ -760,3 +760,291 @@ describe('fix #422: the rust-analyzer oracle projects a plain cargo build', () =
         assert.strictEqual(CARGO_PROJECTION.allTargets, true);
     });
 });
+
+describe('fix #429: the oracle runner refuses unknown options and prints help', () => {
+    const fs = require('fs');
+    const os = require('os');
+    const { validateOracleArgs, ORACLE_EVAL_USAGE } = require('../eval/oracle-gate-policy');
+    const script = path.join(__dirname, '..', 'eval', 'run-oracle-eval.js');
+
+    it('--help prints the usage and exits without running or writing a board', () => {
+        const reports = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-429-help-'));
+        fs.rmSync(reports, { recursive: true });
+        const result = spawnSync(process.execPath, [script, '--help'], {
+            encoding: 'utf8', env: { ...process.env, UCN_EVAL_REPORTS_DIR: reports },
+        });
+        assert.strictEqual(result.status, 0);
+        assert.match(result.stdout, /^Usage: node eval\/run-oracle-eval\.js/);
+        assert.ok(result.stdout.includes('--symbols'));
+        assert.strictEqual(fs.existsSync(reports), false);
+        assert.strictEqual(result.stdout, ORACLE_EVAL_USAGE);
+    });
+
+    it('a misspelled gate flag fails instead of running ungated', () => {
+        assert.throws(() => validateOracleArgs(['--max-unscored', '0.10']), /unknown option --max-unscored/);
+        assert.throws(() => validateOracleArgs(['--repo']), /--repo requires a value/);
+        assert.throws(() => validateOracleArgs(['zod']), /unknown option zod/);
+        const result = spawnSync(process.execPath, [script, '--min-precison', '0.98'], { encoding: 'utf8' });
+        assert.notStrictEqual(result.status, 0);
+        assert.match(result.stderr, /unknown option --min-precison/);
+    });
+
+    it('accepts every documented option shape', () => {
+        validateOracleArgs(['--release', '--min-precision', '0.98', '--max-unscored-ratio', '0.10']);
+        validateOracleArgs(['--fresh', '--max-unscored-ratio', '0.10']);
+        validateOracleArgs(['--fresh', '2', '--seed', '0x5eed3b', '--value-sample', '0']);
+        validateOracleArgs(['--repo', 'zod', '--symbols', 'a.ts:3:f', '-h']);
+    });
+});
+
+describe('fix #429: named handles are scored like sampled symbols', () => {
+    const { parseSymbolHandles, resolveSymbolHandle, CALLER_ARM_KINDS, VALUE_ARM_KINDS } =
+        require('../eval/oracle-gate-policy');
+    const symbols = [
+        { name: 'Map', file: 'src/ClassMap`1.cs', line: 28, kind: 'method' },
+        { name: 'Map', file: 'src/ClassMap`1.cs', line: 43, kind: 'method' },
+        { name: 'with', file: 'core/Modules.java', line: 200, kind: 'method' },
+        { name: 'count', file: 'core/Modules.java', line: 12, kind: 'field' },
+        { name: 'f', file: 'a.py', line: 4, kind: 'function' },
+    ];
+    const index = { symbols: new Map([['f', [{ relativePath: 'a.py', startLine: 4, nameLine: 5 }]]]) };
+
+    it('parses file:line:name lists, file paths with colons-free names', () => {
+        assert.deepStrictEqual(parseSymbolHandles('src/ClassMap`1.cs:28:Map, core/Modules.java:200:with'), [
+            { file: 'src/ClassMap`1.cs', line: 28, name: 'Map' },
+            { file: 'core/Modules.java', line: 200, name: 'with' },
+        ]);
+        assert.strictEqual(parseSymbolHandles(null), null);
+        assert.throws(() => parseSymbolHandles('Map'), /file:line:name/);
+    });
+
+    it('pins the exact declaration and never guesses between overloads', () => {
+        assert.strictEqual(resolveSymbolHandle({ file: 'src/ClassMap`1.cs', line: 43, name: 'Map' },
+            symbols, index, CALLER_ARM_KINDS).line, 43);
+        assert.throws(() => resolveSymbolHandle({ file: 'src/ClassMap`1.cs', line: 30, name: 'Map' },
+            symbols, index, CALLER_ARM_KINDS), /no oracle symbol at that declaration \(oracle rows of that name in the file: 28:method, 43:method\)/);
+    });
+
+    it('maps an engine handle onto the oracle row inside the declaration head', () => {
+        assert.strictEqual(resolveSymbolHandle({ file: 'a.py', line: 5, name: 'f' },
+            symbols, index, CALLER_ARM_KINDS).line, 4);
+    });
+
+    it('routes value members to the value arm', () => {
+        assert.throws(() => resolveSymbolHandle({ file: 'core/Modules.java', line: 12, name: 'count' },
+            symbols, index, CALLER_ARM_KINDS));
+        assert.strictEqual(resolveSymbolHandle({ file: 'core/Modules.java', line: 12, name: 'count' },
+            symbols, index, VALUE_ARM_KINDS).kind, 'field');
+    });
+});
+
+describe('fix #429: a class and its constructors are one named entity in usages/tests eligibility', () => {
+    const { namedEntities } = require('../eval/command-proof');
+    it('Java/C#/C++ constructors named after their class do not make the class name repeated', () => {
+        const defs = [
+            { name: 'Foo', type: 'class' },
+            { name: 'Foo', type: 'constructor', className: 'Foo' },
+            { name: 'Foo', type: 'constructor', className: 'Foo' },
+        ];
+        assert.strictEqual(namedEntities(defs, 'Foo').length, 1);
+    });
+    it('a second class of the name is still another entity', () => {
+        const defs = [
+            { name: 'Foo', type: 'class', namespace: 'a' },
+            { name: 'Foo', type: 'class', namespace: 'b' },
+            { name: 'Foo', type: 'constructor', className: 'Foo' },
+        ];
+        assert.strictEqual(namedEntities(defs, 'Foo').length, 2);
+        assert.strictEqual(namedEntities([{ name: 'm', type: 'method', className: 'Foo' },
+            { name: 'm', type: 'method', className: 'Bar' }], 'm').length, 2);
+    });
+});
+
+describe('fix #429: oracle edges in code the oracle projection leaves out', () => {
+    it('leave the recall universe and are bounded by the coverage ratio', () => {
+        const burden = summarizeReviewBurden({
+            symbols: [], oracleCallEdges: 100,
+            placement: { confirmed: 90, unverified: 0, missingExplained: 5, configurationGated: 5 },
+            exactOracleCallEdges: 100,
+            exactPlacement: { confirmed: 90, unverified: 0, missingExplained: 5, configurationGated: 5 },
+        });
+        assert.strictEqual(burden.semanticEligibleEdges, 90);
+        assert.strictEqual(burden.exactSemanticEligibleEdges, 90);
+        assert.deepStrictEqual(evaluateOracleCoverage({ oracleCallEdges: 100, oracleConfigurationGatedEdges: 5 },
+            0.10).failures, []);
+        assert.match(evaluateOracleCoverage({ oracleCallEdges: 100, oracleConfigurationGatedEdges: 11 },
+            0.10).failures.join(), /recall configuration-unscored ratio 11\.00% > 10\.00%/);
+    });
+});
+
+describe('fix #429: Roslyn oracle project universe and framework cap', () => {
+    const fs = require('fs');
+    const os = require('os');
+    const { chooseTargetFramework, frameworkBuildable, findProjects } = require('../eval/oracles/roslyn-oracle');
+    it('picks the newest framework the SDK can build', () => {
+        assert.strictEqual(chooseTargetFramework(null, 'net461;netstandard2.0;net8.0;net10.0', 9), 'net8.0');
+        assert.strictEqual(chooseTargetFramework(null, 'net461;netstandard2.0;net8.0;net10.0', 10), 'net10.0');
+        assert.strictEqual(chooseTargetFramework('net10.0', null, 9), null);
+        assert.strictEqual(chooseTargetFramework(null, 'net481;net8.0-windows;net8.0', 10), 'net8.0');
+        assert.strictEqual(chooseTargetFramework(null, 'netstandard2.0;netstandard2.1', 9), 'netstandard2.1');
+        assert.strictEqual(chooseTargetFramework('netcoreapp2.2', null, 9), 'netcoreapp2.2');
+        assert.strictEqual(frameworkBuildable('net461', 6), true);
+        assert.strictEqual(frameworkBuildable('net9.0', 8), false);
+    });
+    it('lists every project under the target, tests and samples included', () => {
+        const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-429-cs-'));
+        try {
+            for (const rel of ['src/A/A.csproj', 'tests/A.Tests/A.Tests.csproj', 'samples/S/S.csproj',
+                'src/A/bin/Release/Copy.csproj', '.hidden/H.csproj']) {
+                fs.mkdirSync(path.join(root, path.dirname(rel)), { recursive: true });
+                fs.writeFileSync(path.join(root, rel), '<Project/>');
+            }
+            assert.deepStrictEqual(findProjects(root).map(p => path.relative(root, p)),
+                ['samples/S/S.csproj', 'src/A/A.csproj', 'tests/A.Tests/A.Tests.csproj']);
+        } finally {
+            fs.rmSync(root, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('fix #429: clangd oracle answers stay bounded and copy-aware', () => {
+    const { pruneToLine, declarationHasBody } = require('../eval/oracles/clangd-oracle');
+    it('a cached line AST keeps the line slice and every child position', () => {
+        const at = (line, children) => ({ kind: 'X', range: { start: { line, character: 0 }, end: { line, character: 9 } }, children });
+        const call = { kind: 'Call', range: { start: { line: 4, character: 0 }, end: { line: 6, character: 1 } }, children: [
+            at(4, [at(4)]), at(5, [at(5, [at(5)])]), at(6),
+        ] };
+        const pruned = pruneToLine({ kind: 'Function', children: [call, at(9, [at(9)])] }, 4);
+        assert.strictEqual(pruned.children.length, 1); // the declaration off the line is dropped
+        assert.strictEqual(pruned.children[0].children.length, 3); // a call keeps its argument count
+        assert.strictEqual(pruned.children[0].children[1].children, undefined);
+    });
+    it('a declaration whose compiler range closes a brace is a definition', () => {
+        const file = path.join(__dirname, 'fixtures-429-virtual.c');
+        const handle = { source: new Map([[file, ['int f(void);', 'int g(void) {', '  return 1;', '}']]]) };
+        const range = (sl, el, ec) => ({ start: { line: sl, character: 0 }, end: { line: el, character: ec } });
+        assert.strictEqual(declarationHasBody(handle, file, range(0, 0, 11)), false);
+        assert.strictEqual(declarationHasBody(handle, file, range(1, 3, 1)), true);
+    });
+    it('a vendored copy of a value is a defining declaration; out-of-class and extern ones redeclare', () => {
+        const { definesValue } = require('../eval/oracles/clangd-oracle');
+        const root = path.join(__dirname, 'fixtures-429-virtual');
+        const file = path.join(root, 'v.hpp');
+        const handle = { root, valueSymbols: new Map(), source: new Map([[file, [
+            'static constexpr int max_size = 4;', 'int Foo::count = 0;', 'extern int g_level;', '    int depth{};',
+        ]]]) };
+        assert.strictEqual(definesValue(handle, 'v.hpp', 1, 'max_size'), true);
+        assert.strictEqual(definesValue(handle, 'v.hpp', 2, 'count'), false);
+        assert.strictEqual(definesValue(handle, 'v.hpp', 3, 'g_level'), false);
+        assert.strictEqual(definesValue(handle, 'v.hpp', 4, 'depth'), true);
+    });
+    it('a definition location must spell the identifier (a dependent member answered with its base alias)', () => {
+        const { spellsName } = require('../eval/oracles/clangd-oracle');
+        const file = path.join(__dirname, 'fixtures-429-virtual.hpp');
+        const handle = { source: new Map([[file, ['    using base_type = internal::basic<Char>;', '    hash_type hash{};']]]) };
+        const at = (line, start, end) => ({ start: { line, character: start }, end: { line, character: end } });
+        assert.strictEqual(spellsName(handle, file, at(0, 10, 19), 'hash'), false);
+        assert.strictEqual(spellsName(handle, file, at(1, 14, 18), 'hash'), true);
+    });
+});
+
+describe('fix #429: jdtls method-reference definitions', () => {
+    const { declarationSpells } = require('../eval/oracles/jdtls-oracle');
+    const fs = require('fs');
+    const os = require('os');
+    it('a functional interface method is not the binding of `T::m`', async () => {
+        const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-429-jdtls-'));
+        try {
+            const file = path.join(root, 'CharacterReader.java');
+            fs.writeFileSync(file, 'interface CharPredicate {\n    boolean test(char c);\n}\n');
+            const uri = require('url').pathToFileURL(file).href;
+            assert.strictEqual(await declarationSpells({}, uri, 1, 'isIdent'), false);
+            assert.strictEqual(await declarationSpells({}, uri, 1, 'test'), true);
+        } finally {
+            fs.rmSync(root, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('fix #429: jdtls oracle helpers', () => {
+    const { documentMethodSignatures, nestedTypeRanges, onBuildPath, declaringTypeName } =
+        require('../eval/oracles/jdtls-oracle');
+    it('a runtime body belongs to the type its declaration sits in (flat or nested symbols)', () => {
+        const range = (s, e) => ({ start: { line: s, character: 0 }, end: { line: e, character: 0 } });
+        const flat = [
+            { name: 'getNumIdle()', kind: 6, containerName: 'GenericKeyedObjectPool<K, T, E>', location: { range: range(1210, 1213) } },
+            { name: 'toString()', kind: 6, containerName: 'ObjectDeque<S>', location: { range: range(120, 125) } },
+        ];
+        assert.strictEqual(declaringTypeName(flat, 1211), 'GenericKeyedObjectPool<K, T, E>');
+        assert.strictEqual(declaringTypeName(flat, 122), 'ObjectDeque<S>');
+        const nested = [{ name: 'Outer', kind: 5, range: range(0, 50), children: [
+            { name: 'Inner', kind: 5, range: range(10, 20), children: [{ name: 'm()', kind: 6, range: range(12, 14) }] },
+            { name: 'm()', kind: 6, range: range(30, 32) },
+        ] }];
+        assert.strictEqual(declaringTypeName(nested, 13), 'Inner');
+        assert.strictEqual(declaringTypeName(nested, 31), 'Outer');
+    });
+    it('reads parameter counts of an owner type\'s methods from documentSymbol labels', () => {
+        const symbols = [{ name: 'Object', kind: 5, children: [
+            { name: 'toString()', kind: 6 }, { name: 'equals(Object)', kind: 6 }, { name: 'wait(long, int)', kind: 6 },
+        ] }, { name: 'Other', kind: 5, children: [{ name: 'toString()', kind: 6 }] }];
+        assert.deepStrictEqual(documentMethodSignatures(symbols, 'Object', 'toString'), [0]);
+        assert.deepStrictEqual(documentMethodSignatures(symbols, 'Object', 'wait'), [2]);
+        assert.deepStrictEqual(documentMethodSignatures(symbols, 'Missing', 'toString'), []);
+        const flat = [{ name: 'run()', kind: 6, containerName: 'Runnable' }, { name: 'call()', kind: 6, containerName: 'Other' }];
+        assert.deepStrictEqual(documentMethodSignatures(flat, 'Runnable', 'run'), [0]);
+        assert.deepStrictEqual(documentMethodSignatures(flat, 'Runnable', 'call'), []);
+    });
+    it('a body declared in a nested type is not the outer type\'s', () => {
+        const range = (s, e) => ({ start: { line: s, character: 0 }, end: { line: e, character: 0 } });
+        const outer = range(0, 50);
+        const symbols = [{ name: 'Outer', kind: 5, range: outer, children: [
+            { name: 'Inner', kind: 5, range: range(10, 20), children: [] }, { name: 'm()', kind: 6, range: range(30, 32) },
+        ] }];
+        assert.deepStrictEqual(nestedTypeRanges(symbols, outer), [range(10, 20)]);
+    });
+    it('a method reference on a constructed local follows its runtime class like a call', () => {
+        const { constructedReceiverAt } = require('../eval/oracles/jdtls-oracle');
+        const source = ['void t() {', '  try (ObjectPool<Object> pool = new GenericObjectPool<>(f)) {',
+            '    assertThrows(X.class, pool::addObject);', '    pool.addObject();'];
+        for (const line of [3, 4]) {
+            const constructed = constructedReceiverAt({ name: 'addObject', line, source, sourceLine: source[line - 1] });
+            assert.strictEqual(constructed?.ownerName, 'GenericObjectPool', `line ${line}`);
+        }
+    });
+    it('files outside every imported source folder are outside the projection', () => {
+        const handle = { root: '/r', sourcePaths: ['/r/src/main/java', '/r/src/test/java'] };
+        assert.strictEqual(onBuildPath(handle, 'src/main/java/a/A.java'), true);
+        assert.strictEqual(onBuildPath(handle, 'doc/Example.java'), false);
+        assert.strictEqual(onBuildPath({ root: '/r', sourcePaths: null }, 'doc/Example.java'), true);
+    });
+});
+
+describe('fix #429: the value-member arm summary', () => {
+    const { emptyValueArm, finishValueArm } = require('../eval/oracle-gate-policy');
+    it('scores precision over scored accesses and recall over exact eligible references', () => {
+        const arm = emptyValueArm({ listed: 40 });
+        Object.assign(arm, {
+            sampled: 3, evaluated: 3, confirmedSites: 10, confirmedHits: 8, confirmedUnscored: 1,
+            confirmedUnscoredByClass: { 'configuration-gated': 1 },
+            exactOracleRefSites: 12, oracleRefSites: 13, accounts: 3, conserved: 3,
+        });
+        Object.assign(arm.exactPlacement, { confirmed: 8, unverified: 1, missingExplained: 1,
+            configurationGated: 1, accountedNotShown: 1 });
+        Object.assign(arm.placement, { ...arm.exactPlacement, missingUnexplained: 1 });
+        const summary = finishValueArm(arm);
+        assert.strictEqual(summary.tier1Precision, 0.8889); // 8 of 9 scored
+        assert.strictEqual(summary.semanticMissing, 1);
+        assert.strictEqual(summary.semanticRecall, 0.9); // 10 eligible (12 - explained - configuration)
+        assert.strictEqual(summary.missingUnexplained, 0);
+        assert.strictEqual(summary.allOracleMissingUnexplained, 1);
+        assert.strictEqual(summary.confirmedConfigurationUnscored, 1);
+        assert.strictEqual(summary.confirmedAbstentionUnscored, 0);
+        assert.strictEqual(summary.conservedRate, 1);
+    });
+    it('a member with no oracle references and no accesses keeps full recall', () => {
+        const summary = finishValueArm(emptyValueArm());
+        assert.strictEqual(summary.semanticRecall, 1);
+        assert.strictEqual(summary.tier1Precision, null);
+    });
+});

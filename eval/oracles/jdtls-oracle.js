@@ -52,6 +52,7 @@ const jdtlsOracle = {
         if (!banner.ok) throw new Error(`java ast helper failed to start: ${banner.error}`);
 
         const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-jdtls-data-'));
+        const compileErrors = new Map();
         let ready;
         const serviceReady = new Promise((resolve, reject) => {
             ready = resolve;
@@ -65,16 +66,30 @@ const jdtlsOracle = {
             env: { ...process.env, JAVA_HOME: javaHome, PATH: `${path.join(javaHome, 'bin')}:${process.env.PATH}` },
             onNotification: (method, params) => {
                 if (method === 'language/status' && params?.type === 'ServiceReady') ready(params);
+                // Compile errors per file, as the build reports them.
+                if (method === 'textDocument/publishDiagnostics' && params?.uri) {
+                    const errors = (params.diagnostics || []).filter(d => d.severity === 1);
+                    compileErrors.set(safeRealpath(uriToPath(params.uri)), errors.length);
+                }
             },
         });
         await lsp2.initialize(repoRoot, {
+            // Definitions in JDK/library classes come back as jdt:// class
+            // file locations only when the client says it can read them;
+            // without this jdtls answers nothing for `obj.hashCode()` on an
+            // Object receiver, and the edge read as definition-unresolved
+            // instead of statically bound to an external member (fix #429).
+            extendedClientCapabilities: { classFileContentsSupport: true },
             settings: {
                 java: {
                     // autobuild ON: JDT's search engine answers references from
                     // the BUILT index — with autobuild off every query returns []
                     autobuild: { enabled: true },
                     import: { gradle: { enabled: false }, maven: { enabled: true } },
-                    references: { includeDecompiledSources: false },
+                    // includeAccessors (jdtls default true) adds a field's
+                    // getter/setter calls to its references: accessor calls
+                    // are not uses of the field (fix #429, value arm).
+                    references: { includeDecompiledSources: false, includeAccessors: false },
                 },
             },
         });
@@ -100,12 +115,29 @@ const jdtlsOracle = {
                 await new Promise(r => setTimeout(r, 2000));
             }
         }
-        const handle = { lsp: lsp2, helper, root: repoDir, repoRoot };
+        const handle = { lsp: lsp2, helper, root: repoDir, repoRoot, sourcePaths: null, compileErrors };
+        // The build path: jdtls compiles and indexes only the source folders
+        // of the projects it imported (Maven source/test roots). Java files
+        // elsewhere (commons-pool `doc/*.java` examples) are outside the
+        // oracle's projection (fix #429).
+        handle.sourcePaths = await listSourcePaths(lsp2, 3);
         // jdtls does NOT honor includeDeclaration (measured), so a zero-usage
         // sentinel legitimately returns [] — poll across several symbols; ANY
-        // non-empty result proves the search index is serving.
-        const sentinels = (await helper.request({ op: 'list_symbols' })).symbols
-            .filter(s => s.kind === 'method').slice(0, 5);
+        // non-empty result proves the search index is serving. Sentinels come
+        // from build-path files, one per file: files jdtls never indexes
+        // answer [] forever (fix #429: commons-pool's first five methods were
+        // all in doc/*.java and failed the run).
+        const sentinels = [];
+        const sentinelFiles = new Set();
+        for (const symbol of (await helper.request({ op: 'list_symbols' })).symbols) {
+            if (symbol.kind !== 'method' || sentinelFiles.has(symbol.file) ||
+                !onBuildPath(handle, symbol.file)) continue;
+            sentinelFiles.add(symbol.file);
+            sentinels.push(symbol);
+            // Without the build path, more files make it likelier that one
+            // is on it.
+            if (sentinels.length >= (handle.sourcePaths ? 5 : 20)) break;
+        }
         if (sentinels.length > 0) {
             const deadline = Date.now() + 180000;
             let lastError = null;
@@ -125,15 +157,28 @@ const jdtlsOracle = {
                 await new Promise(r => setTimeout(r, 2000));
             }
         }
-        process.stdout.write(`  jdtls ready (root ${path.relative(repoDir, repoRoot) || '.'}, workspace ${dataDir})\n`);
+        // The command registers with the project model; once the index
+        // serves references it answers (measured: early calls fail).
+        if (!handle.sourcePaths) handle.sourcePaths = await listSourcePaths(lsp2, 15);
+        if (!handle.sourcePaths) {
+            process.stdout.write('  ⚠ jdtls did not list its source paths; every Java file under the root is treated as on the build path\n');
+        }
+        process.stdout.write(`  jdtls ready (root ${path.relative(repoDir, repoRoot) || '.'}, workspace ${dataDir}` +
+            `${handle.sourcePaths ? `, ${handle.sourcePaths.length} source folder(s)` : ''})\n`);
+        const erroneous = [...compileErrors.values()].filter(count => count > 0).length;
+        if (erroneous > 0) {
+            process.stdout.write(`  ⚠ jdtls build reports compile errors in ${erroneous} file(s) (a language level or ` +
+                'classpath its project model does not reproduce): definition lookups there abstain\n');
+        }
 
         return handle;
     },
 
-    /** javac-enumerated defs (methods incl. static, classes/enums/records). */
+    /** javac-enumerated defs (methods incl. static, classes/enums/records)
+     *  in files on jdtls' build path. */
     async listSymbols(handle, { kinds, limit } = {}) {
         const resp = await handle.helper.request({ op: 'list_symbols' });
-        let symbols = resp.symbols || [];
+        let symbols = (resp.symbols || []).filter(s => onBuildPath(handle, s.file));
         if (kinds) {
             const wanted = new Set(kinds);
             symbols = symbols.filter(s => wanted.has(s.kind));
@@ -181,19 +226,31 @@ const jdtlsOracle = {
      *  callee-placement adjudication. */
     async resolveDefinition(handle, { name, file, line, column }) {
         const absFile = path.join(handle.root, file);
+        // A unit the oracle's build does not compile (fix #429: gson's
+        // Java 17 record tests under a lower test release) is answered by
+        // error recovery: `gson.toJson(record)` bound to toJson(JsonElement).
+        // No compiler answer there: abstain.
+        if ((handle.compileErrors.get(safeRealpath(absFile)) || 0) > 0) return [];
         const source = fs.readFileSync(absFile, 'utf-8').split('\n');
         const sourceLine = source[line - 1] || '';
         const columns = Number.isInteger(column) ? [column] : nameColumns(sourceLine, name);
         const defs = new Map();
+        const staticTargets = [];
         for (const character of columns) {
             const locations = await handle.lsp.request('textDocument/definition', {
                 textDocument: { uri: pathToUri(absFile) },
                 position: { line: line - 1, character },
             }) || [];
+            // jdtls answers the name of a method reference `T::m` with the
+            // functional interface method it converts to (`CharPredicate.test`
+            // for `TokenQueue::isIdent`): a declaration that does not spell
+            // the name is not the reference's binding (fix #429).
+            const methodReference = /::\s*$/.test(sourceLine.slice(0, character));
             for (const loc of Array.isArray(locations) ? locations : [locations]) {
                 const uri = loc.targetUri || loc.uri;
                 const range = loc.targetSelectionRange || loc.targetRange || loc.range;
                 if (!uri || !range) continue;
+                if (methodReference && !(await declarationSpells(handle, uri, range.start.line, name))) continue;
                 const defAbs = uriToPath(uri);
                 if (!defAbs.startsWith(handle.repoRoot + path.sep)) {
                     defs.set(`external:${defAbs}:${range.start.line + 1}`, {
@@ -205,6 +262,7 @@ const jdtlsOracle = {
                 }
                 const entry = { file: path.relative(handle.root, defAbs), line: range.start.line + 1 };
                 defs.set(`${entry.file}:${entry.line}`, entry);
+                staticTargets.push({ uri, position: range.start });
             }
         }
         if (defs.size === 0 && sourceLine.includes('->')) {
@@ -224,11 +282,64 @@ const jdtlsOracle = {
         // HttpConnection.Base.addHeader. This is compiler-backed adjudication,
         // not a name-based oracle exception.
         const runtimeDefs = await resolveConstructedReceiverMethods(
-            handle, { absFile, file, line, name, source, sourceLine });
+            handle, { absFile, file, line, name, source, sourceLine, staticTargets });
         for (const entry of runtimeDefs) {
             defs.set(`${entry.file}:${entry.line}`, entry);
         }
         return [...defs.values()];
+    },
+
+    /** A method that overrides or implements a member of a supertype
+     *  declared outside the project (`toString`, `run`, a library callback)
+     *  is reached through that contract by code reference search cannot
+     *  see (fix #429). */
+    async referenceBlindness(handle, { name, file, line }) {
+        const owner = await handle.helper.request({ op: 'method_owner', file, line, name });
+        if (owner.line == null) return null;
+        const absFile = path.join(handle.root, file);
+        let frontier = await handle.lsp.request('textDocument/prepareTypeHierarchy', {
+            textDocument: { uri: pathToUri(absFile) },
+            position: { line: owner.line - 1, character: owner.utf16Col },
+        }) || [];
+        frontier = Array.isArray(frontier) ? frontier : [frontier];
+        const visited = new Set();
+        let declaredInProject = false;
+        let external = null;
+        while (frontier.length > 0 && visited.size < 64) {
+            const next = [];
+            for (const item of frontier) {
+                if (!item?.uri || visited.has(`${item.uri}:${item.name}`)) continue;
+                visited.add(`${item.uri}:${item.name}`);
+                if (visited.size > 1) {
+                    const inProject = uriToPath(item.uri).startsWith(handle.repoRoot + path.sep);
+                    let symbols;
+                    try {
+                        symbols = await handle.lsp.request('textDocument/documentSymbol', {
+                            textDocument: { uri: item.uri },
+                        }) || [];
+                    } catch { symbols = []; }
+                    const declares = documentMethodSignatures(symbols, item.name, name)
+                        .some(params => params == null || params === owner.params);
+                    if (declares && inProject) declaredInProject = true;
+                    if (declares && !inProject && !external) external = `${item.name}.${name}`;
+                }
+                let parents;
+                try { parents = await handle.lsp.request('typeHierarchy/supertypes', { item }) || []; } catch { parents = []; }
+                next.push(...parents);
+            }
+            frontier = next;
+        }
+        if (external) return { reason: 'external-contract', detail: external };
+        // @Override is compiler-checked: with no project supertype declaring
+        // the method, the overridden member is external.
+        if (owner.override && !declaredInProject) return { reason: 'external-contract', detail: `@Override ${name}` };
+        return null;
+    },
+
+    /** A file outside every imported project's source folders is outside
+     *  the oracle's projection (fix #429). */
+    async isConfigurationGated(handle, { file }) {
+        return !onBuildPath(handle, file);
     },
 
     async dispose(handle) {
@@ -239,6 +350,24 @@ const jdtlsOracle = {
         } catch (e) { /* gone */ }
     },
 };
+
+/** Whether the declaration line at `uri` (a project file or a jdt:// class
+ *  file, read through `java/classFileContents`) spells `name`. */
+async function declarationSpells(handle, uri, zeroBasedLine, name) {
+    handle.declarationText ||= new Map();
+    if (!handle.declarationText.has(uri)) {
+        let text;
+        try {
+            text = uri.startsWith('jdt:')
+                ? await handle.lsp.request('java/classFileContents', { uri })
+                : fs.readFileSync(uriToPath(uri), 'utf-8');
+        } catch { text = null; }
+        handle.declarationText.set(uri, typeof text === 'string' ? text.split('\n') : null);
+    }
+    const lines = handle.declarationText.get(uri);
+    if (!lines) return false;
+    return nameColumns(lines[zeroBasedLine] || '', name).length > 0;
+}
 
 function nameColumns(line, name) {
     const cols = [];
@@ -328,7 +457,8 @@ function constructedReceiverAt(query) {
     let receiver = null;
     for (const nameCol of nameColumns(query.sourceLine, query.name)) {
         const prefix = query.sourceLine.slice(0, nameCol);
-        const match = prefix.match(/([A-Za-z_$][\w$]*)\s*\.\s*$/);
+        // `receiver.m(..)` and the method reference `receiver::m` (fix #429).
+        const match = prefix.match(/([A-Za-z_$][\w$]*)\s*(?:\.|::)\s*$/);
         if (match) { receiver = match[1]; break; }
     }
     if (!receiver) return null;
@@ -361,6 +491,27 @@ async function resolveConstructedReceiverMethods(handle, query) {
     const constructed = constructedReceiverAt(query);
     if (!constructed || constructed.character < 0) return [];
 
+    // The executed body is the static target or one of its overrides
+    // (jdtls `textDocument/implementation` of the exact overload the call
+    // binds to), declared by the nearest type of the constructed class's
+    // hierarchy (fix #429: a by-name search abstained on every overloaded
+    // interface member, commons-pool `kop.getNumIdle(key)`).
+    const bodies = [];
+    for (const target of query.staticTargets || []) {
+        bodies.push({ uri: target.uri, line: target.position.line });
+        let implementations;
+        try {
+            implementations = await handle.lsp.request('textDocument/implementation', {
+                textDocument: { uri: target.uri },
+                position: target.position,
+            }) || [];
+        } catch { implementations = []; }
+        for (const loc of Array.isArray(implementations) ? implementations : [implementations]) {
+            const uri = loc.targetUri || loc.uri;
+            const range = loc.targetSelectionRange || loc.targetRange || loc.range;
+            if (uri && range) bodies.push({ uri, line: range.start.line });
+        }
+    }
     const starts = await handle.lsp.request('textDocument/prepareTypeHierarchy', {
         textDocument: { uri: pathToUri(query.absFile) },
         position: { line: constructed.line - 1, character: constructed.character },
@@ -379,11 +530,28 @@ async function resolveConstructedReceiverMethods(handle, query) {
 
             const ownerAbs = uriToPath(item.uri);
             if (ownerAbs.startsWith(handle.repoRoot + path.sep)) {
-                const symbols = await handle.lsp.request('textDocument/documentSymbol', {
-                    textDocument: { uri: item.uri },
-                }) || [];
-                for (const method of documentMethodsForOwner(symbols, item.name, query.name)) {
-                    levelMatches.push({ file: path.relative(handle.root, ownerAbs), line: method.line });
+                if (bodies.length > 0) {
+                    // Bodies declared directly in this type: inside the type's
+                    // declaration (a hierarchy item prepared at a construction
+                    // carries the constructor's range, so the type's own range
+                    // comes from the document's symbols) and not inside a
+                    // nested type declared within it.
+                    const symbols = await handle.lsp.request('textDocument/documentSymbol', {
+                        textDocument: { uri: item.uri },
+                    }) || [];
+                    for (const body of bodies) {
+                        if (uriToPath(body.uri) !== ownerAbs) continue;
+                        const declaring = declaringTypeName(symbols, body.line);
+                        if (!declaring || bareTypeName(declaring) !== bareTypeName(item.name)) continue;
+                        levelMatches.push({ file: path.relative(handle.root, ownerAbs), line: body.line + 1 });
+                    }
+                } else {
+                    const symbols = await handle.lsp.request('textDocument/documentSymbol', {
+                        textDocument: { uri: item.uri },
+                    }) || [];
+                    for (const method of documentMethodsForOwner(symbols, item.name, query.name)) {
+                        levelMatches.push({ file: path.relative(handle.root, ownerAbs), line: method.line });
+                    }
                 }
             }
 
@@ -441,6 +609,109 @@ function methodScanFloor(source, fromLine) {
         }
     }
     return -1;
+}
+
+function bareTypeName(name) {
+    return String(name || '').replace(/<.*$/, '').split('.').pop();
+}
+
+/** The innermost type declaring the member whose declaration covers `line`
+ *  (0-based), from a documentSymbol answer in either shape: flat
+ *  SymbolInformation (a member's containerName) or hierarchical symbols. */
+function declaringTypeName(symbols, line) {
+    let best = null;
+    const consider = (range, owner) => {
+        if (!range || !owner || !lineInRange(line, range)) return;
+        if (!best || range.end.line - range.start.line < best.size) {
+            best = { size: range.end.line - range.start.line, owner };
+        }
+    };
+    const walk = (nodes, owner) => {
+        for (const node of nodes || []) {
+            const range = node.range || node.location?.range;
+            const isType = [5, 10, 11, 23].includes(node.kind);
+            if (!isType) consider(range, node.containerName || owner);
+            walk(node.children, isType ? node.name : owner);
+        }
+    };
+    walk(symbols, null);
+    return best?.owner || null;
+}
+
+function safeRealpath(file) {
+    try { return fs.realpathSync(file); } catch { return file; }
+}
+
+function lineInRange(line, range) {
+    return !!range && line >= range.start.line && line <= range.end.line;
+}
+
+/** Ranges of the types declared inside `outer` (not `outer` itself). */
+function nestedTypeRanges(symbols, outer) {
+    const ranges = [];
+    const walk = nodes => {
+        for (const node of nodes || []) {
+            const range = node.range || node.location?.range;
+            if ([5, 10, 11, 23].includes(node.kind) && range && outer &&
+                range.start.line >= outer.start.line && range.end.line <= outer.end.line &&
+                !(range.start.line === outer.start.line && range.end.line === outer.end.line)) {
+                ranges.push(range);
+            }
+            walk(node.children);
+        }
+    };
+    walk(symbols);
+    return ranges;
+}
+
+/** The source folders of every project jdtls imported (absolute paths), or
+ *  null when the server does not answer the command. */
+async function listSourcePaths(lsp, attempts = 3) {
+    for (let attempt = 0; attempt < attempts; attempt++) {
+        try {
+            const response = await lsp.request('workspace/executeCommand', {
+                command: 'java.project.listSourcePaths', arguments: [],
+            });
+            const paths = (response?.data || []).map(entry => entry.path).filter(Boolean);
+            // Declared folders need not exist (a Maven resources root).
+            if (paths.length > 0) {
+                return paths.map(entry => {
+                    try { return fs.realpathSync(entry); } catch { return path.resolve(entry); }
+                });
+            }
+        } catch { /* registration can race readiness: retry */ }
+        await new Promise(resolve => setTimeout(resolve, 2000));
+    }
+    return null;
+}
+
+function onBuildPath(handle, relFile) {
+    if (!handle.sourcePaths) return true;
+    const absolute = path.join(handle.root, relFile);
+    return handle.sourcePaths.some(folder => absolute === folder || absolute.startsWith(folder + path.sep));
+}
+
+/** Parameter counts of the methods named `methodName` declared by the type
+ *  `ownerName` in a documentSymbol answer (null when the detail has none). */
+function documentMethodSignatures(symbols, ownerName, methodName) {
+    const counts = [];
+    const visit = (nodes, inOwner) => {
+        for (const node of nodes || []) {
+            const label = String(node.name || '');
+            const base = label.replace(/\(.*/, '');
+            // Flat SymbolInformation names the declaring type in containerName.
+            const declaredHere = inOwner || (node.containerName != null &&
+                bareTypeName(node.containerName) === bareTypeName(ownerName));
+            if (declaredHere && node.kind === 6 && base === methodName) {
+                const params = label.includes('(') ? label.slice(label.indexOf('(') + 1, label.lastIndexOf(')')).trim() : null;
+                counts.push(params == null ? null : (params === '' ? 0 : params.split(',').length));
+            }
+            const owner = [5, 10, 11, 23].includes(node.kind) && base.replace(/<.*/, '') === ownerName.replace(/<.*/, '');
+            visit(node.children, owner || (inOwner && ![5, 10, 11, 23].includes(node.kind)));
+        }
+    };
+    visit(symbols, false);
+    return counts;
 }
 
 function documentMethodsForOwner(symbols, ownerName, methodName) {
@@ -507,4 +778,5 @@ function findRepoRoot(dir) {
     return pomRoot || dir;
 }
 
-module.exports = { jdtlsOracle, constructedReceiverAt };
+module.exports = { jdtlsOracle, constructedReceiverAt, documentMethodSignatures, nestedTypeRanges, onBuildPath, declarationSpells,
+    declaringTypeName };

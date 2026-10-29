@@ -9,7 +9,9 @@
 //   {"op": "list_symbols"}
 //       -> {"ok": true, "symbols": [{"name", "file", "line", "kind"}]}
 //          kind: function (fn items, incl. mod-nested) | method (impl fns) |
-//          class (struct/enum). Lines are the first declaration token
+//          class (struct/enum) | constant / variable (module const/static
+//          items) | field (named struct fields) | enum-member (variants).
+//          Lines are the first declaration token
 //          (pub/const/async/unsafe/extern/fn/struct/enum) — attributes and
 //          doc comments excluded, matching UCN's tree-sitter convention so
 //          file:line:name handles pin exactly. Trait declaration methods and
@@ -26,6 +28,9 @@
 //          ident-followed-by-(...) inside macro token trees (mirrors UCN's
 //          fix #201 token-tree convention, independently implemented on
 //          proc-macro2 token streams).
+//   {"op": "impl_trait", "file": rel, "line": n, "name": s}
+//       -> {"ok": true, "line": l|null, "utf16Col": c}: the trait path of the
+//          impl block declaring the fn listed at (line, name), if any
 //   {"op": "macro_calls", "file": rel, "line": n}
 //       -> {"ok": true, "calls": [{"kind", "pathLine", "pathUtf16Col",
 //          "startLine", "startUtf16Col", "endLine", "endUtf16Col"}]}
@@ -59,6 +64,9 @@ struct FileInfo {
     def_pos: HashMap<(usize, usize), String>,    // decl-name positions -> name
     imports: Vec<(usize, usize)>,                // use-item line spans
     macro_calls: Vec<MacroCall>,                 // source macro invocations
+    // (declLine, name) of an impl fn -> (line, charCol) of its impl's trait
+    // path last segment (fix #429: external-contract deadcode blindness)
+    impl_trait: HashMap<(usize, String), (usize, usize)>,
 }
 
 struct MacroCall {
@@ -70,6 +78,8 @@ struct MacroCall {
 
 struct Collector<'a> {
     info: &'a mut FileInfo,
+    // fn bodies entered: items there are block-scoped, not module values.
+    fn_depth: usize,
 }
 
 impl<'a> Collector<'a> {
@@ -181,13 +191,56 @@ impl<'a, 'ast> Visit<'ast> for Collector<'a> {
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
         let line = fn_decl_line(Some(&i.vis), None, &i.sig);
         self.record(line, &i.sig.ident, "function");
+        self.fn_depth += 1;
         visit::visit_item_fn(self, i);
+        self.fn_depth -= 1;
+    }
+
+    fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
+        if let Some((_, path, _)) = &i.trait_ {
+            if let Some(segment) = path.segments.last() {
+                let trait_pos = segment.ident.span().start();
+                for item in &i.items {
+                    if let syn::ImplItem::Fn(f) = item {
+                        let line = fn_decl_line(Some(&f.vis), f.defaultness.as_ref(), &f.sig);
+                        self.info.impl_trait.insert((line, f.sig.ident.to_string()), (trait_pos.line, trait_pos.column));
+                    }
+                }
+            }
+        }
+        visit::visit_item_impl(self, i);
     }
 
     fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
         let line = fn_decl_line(Some(&i.vis), i.defaultness.as_ref(), &i.sig);
         self.record(line, &i.sig.ident, "method");
+        self.fn_depth += 1;
         visit::visit_impl_item_fn(self, i);
+        self.fn_depth -= 1;
+    }
+
+    // Value members (fix #429): module-level const/static items, named
+    // struct fields, enum variants.
+    fn visit_item_const(&mut self, i: &'ast syn::ItemConst) {
+        if self.fn_depth == 0 && i.ident != "_" {
+            let mut line = i.const_token.span.start().line;
+            if let Some(l) = vis_line(&i.vis) {
+                line = line.min(l);
+            }
+            self.record(line, &i.ident, "constant");
+        }
+        visit::visit_item_const(self, i);
+    }
+
+    fn visit_item_static(&mut self, i: &'ast syn::ItemStatic) {
+        if self.fn_depth == 0 {
+            let mut line = i.static_token.span.start().line;
+            if let Some(l) = vis_line(&i.vis) {
+                line = line.min(l);
+            }
+            self.record(line, &i.ident, "variable");
+        }
+        visit::visit_item_static(self, i);
     }
 
     fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
@@ -201,6 +254,19 @@ impl<'a, 'ast> Visit<'ast> for Collector<'a> {
             line = line.min(l);
         }
         self.record(line, &i.ident, "class");
+        if self.fn_depth == 0 {
+            if let syn::Fields::Named(fields) = &i.fields {
+                for field in &fields.named {
+                    if let Some(ident) = &field.ident {
+                        let mut line = ident.span().start().line;
+                        if let Some(l) = vis_line(&field.vis) {
+                            line = line.min(l);
+                        }
+                        self.record(line, ident, "field");
+                    }
+                }
+            }
+        }
         visit::visit_item_struct(self, i);
     }
 
@@ -210,6 +276,11 @@ impl<'a, 'ast> Visit<'ast> for Collector<'a> {
             line = line.min(l);
         }
         self.record(line, &i.ident, "class");
+        if self.fn_depth == 0 {
+            for variant in &i.variants {
+                self.record(variant.ident.span().start().line, &variant.ident, "enum-member");
+            }
+        }
         visit::visit_item_enum(self, i);
     }
 
@@ -313,7 +384,7 @@ impl Server {
             if let Ok(src) = std::fs::read_to_string(abs) {
                 info.lines = src.split('\n').map(|s| s.to_string()).collect();
                 if let Ok(file) = syn::parse_file(&src) {
-                    let mut c = Collector { info: &mut info };
+                    let mut c = Collector { info: &mut info, fn_depth: 0 };
                     c.visit_file(&file);
                 }
                 // parse failure: lines-only info — every ref classifies as
@@ -367,6 +438,18 @@ impl Server {
                 json!({"ok": true, "line": line, "utf16Col": utf16_col(text, char_idx)})
             }
             None => json!({"ok": false, "error": format!("name not found at {}:{}", rel, line)}),
+        }
+    }
+
+    fn impl_trait(&mut self, rel: &str, line: usize, name: &str) -> Value {
+        let abs = self.root.join(rel);
+        let info = self.analyze(&abs);
+        match info.impl_trait.get(&(line, name.to_string())) {
+            Some(&(trait_line, char_col)) => {
+                let text = Self::line_text(info, trait_line);
+                json!({"ok": true, "line": trait_line, "utf16Col": utf16_col(text, char_col)})
+            }
+            None => json!({"ok": true, "line": null}),
         }
     }
 
@@ -531,6 +614,11 @@ fn main() {
                     get_str(&req, "file"),
                     get_usize(&req, "line"),
                     get_usize(&req, "utf16_col"),
+                    get_str(&req, "name"),
+                ),
+                Some("impl_trait") => server.impl_trait(
+                    get_str(&req, "file"),
+                    get_usize(&req, "line"),
                     get_str(&req, "name"),
                 ),
                 Some("macro_calls") => {

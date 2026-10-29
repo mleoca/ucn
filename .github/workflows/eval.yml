@@ -58,9 +58,14 @@ jobs:
           sudo apt-get install -y clangd-18
           sudo ln -sf /usr/bin/clangd-18 /usr/local/bin/clangd
 
+      # The Roslyn oracle builds its helper with, and evaluates the target's
+      # projects under, the newest installed SDK (9.0 floor); 10.0 restores
+      # and compiles net10.0 projects (tests, samples) the 9.0 SDK cannot.
       - uses: actions/setup-dotnet@v5
         with:
-          dotnet-version: 9.0.x
+          dotnet-version: |
+            9.0.x
+            10.0.x
 
       - uses: actions/setup-java@v5
         with:

@@ -14,7 +14,42 @@ const path = require('path');
 const fs = require('fs');
 const { findProjectRoot } = require('../../core/discovery');
 
-const SYMBOL_KINDS = { function: 'function', method: 'method', class: 'class' };
+const SYMBOL_KINDS = {
+    function: 'function', method: 'method', class: 'class',
+    field: 'field', 'enum-member': 'enum-member', variable: 'variable',
+};
+
+function isIdentifierName(name) {
+    return typeof name === 'string' && /^[A-Za-z_$][\w$]*$/.test(name);
+}
+
+// A declaration the value arm leaves out: a function, arrow or class
+// initializer, a value whose type the checker reads as callable (an alias of
+// a method: `const arrayType = ZodArray.create`) - the caller arm's
+// callables - and a CommonJS `require(..)` binding, an import.
+function declaresCallable(declaration) {
+    const { SyntaxKind } = require('ts-morph');
+    let value = declaration.getInitializer?.();
+    while (value && [SyntaxKind.ParenthesizedExpression, SyntaxKind.AsExpression,
+        SyntaxKind.SatisfiesExpression].includes(value.getKind())) {
+        value = value.getExpression?.();
+    }
+    if (value && [SyntaxKind.ArrowFunction, SyntaxKind.FunctionExpression,
+        SyntaxKind.ClassExpression].includes(value.getKind())) return true;
+    // `require('m')`, `require('m').member`: an import binding.
+    let base = value;
+    while (base && [SyntaxKind.PropertyAccessExpression, SyntaxKind.ElementAccessExpression]
+        .includes(base.getKind())) {
+        base = base.getExpression();
+    }
+    if (base?.getKind() === SyntaxKind.CallExpression &&
+        base.getExpression().getText() === 'require') return true;
+    try {
+        return declaration.getType().getCallSignatures().length > 0;
+    } catch {
+        return false;
+    }
+}
 
 const tsMorphOracle = {
     name: 'ts-morph',
@@ -99,6 +134,33 @@ const tsMorphOracle = {
                     for (const m of cls.getMethods()) {
                         out.push({ name: m.getName(), file: rel, line: m.getStartLineNumber(), kind: 'method' });
                     }
+                }
+                // Value members (fix #429): class fields that hold values.
+                if (wanted.has('field')) {
+                    for (const property of cls.getProperties()) {
+                        const name = property.getName();
+                        if (!isIdentifierName(name) || declaresCallable(property)) continue;
+                        out.push({ name, file: rel, line: property.getStartLineNumber(), kind: 'field' });
+                    }
+                }
+            }
+            if (wanted.has('enum-member')) {
+                for (const declaration of sf.getEnums()) {
+                    for (const member of declaration.getMembers()) {
+                        const name = member.getName();
+                        if (!isIdentifierName(name)) continue;
+                        out.push({ name, file: rel, line: member.getStartLineNumber(), kind: 'enum-member' });
+                    }
+                }
+            }
+            // Module-level variables that hold values. A function, arrow or
+            // class initializer declares a callable the caller arm samples
+            // through UCN's naming rules.
+            if (wanted.has('variable')) {
+                for (const declaration of sf.getVariableDeclarations()) {
+                    const name = declaration.getName();
+                    if (!isIdentifierName(name) || declaresCallable(declaration)) continue;
+                    out.push({ name, file: rel, line: declaration.getStartLineNumber(), kind: 'variable' });
                 }
             }
             // Plain-JS projects define most callables in CJS shapes invisible
@@ -208,6 +270,86 @@ const tsMorphOracle = {
         }
 
         return dedupeReferences(refs);
+    },
+
+    /**
+     * Why reference search cannot see every use of a declaration, or null
+     * (fix #429). An ambient augmentation (`declare global`, `declare module
+     * 'pkg'` in a module) and any declaration merged with one outside the
+     * project are consumed through the external entity; a class member that
+     * an external base or interface declares is reached through that
+     * contract; a member read by computed access (`obj[key]`) on a value of
+     * its declaring type has no reference token.
+     */
+    async referenceBlindness(handle, { name, file, line }) {
+        const sf = handle.project.getSourceFile(path.join(handle.root, file));
+        if (!sf) return null;
+        const decl = findDeclarationAt(sf, name, line);
+        if (!decl) return null;
+        const { SyntaxKind } = require('ts-morph');
+        const outside = node => {
+            const source = node.getSourceFile();
+            const filePath = source.getFilePath();
+            return source.isInNodeModules?.() || source.isFromExternalLibrary?.() ||
+                !(filePath === handle.root || filePath.startsWith(handle.root + path.sep));
+        };
+        for (let node = decl.getParent(); node; node = node.getParent()) {
+            if (node.getKind() !== SyntaxKind.ModuleDeclaration) continue;
+            const nameNode = node.getNameNode?.();
+            const global = node.getDeclarationKind?.() === 'global' ||
+                (nameNode && nameNode.getText() === 'global');
+            const moduleAugmentation = nameNode?.getKind() === SyntaxKind.StringLiteral &&
+                node.getSourceFile().isModule?.() !== false &&
+                (node.getSourceFile().getImportDeclarations().length > 0 ||
+                    node.getSourceFile().getExportDeclarations().length > 0 ||
+                    node.getSourceFile().getExportAssignments().length > 0);
+            if (global || moduleAugmentation) {
+                return { reason: 'ambient-augmentation', detail: global ? 'declare global' : `declare module ${nameNode.getText()}` };
+            }
+        }
+        let symbol;
+        try { symbol = decl.getSymbol?.(); } catch { symbol = null; }
+        if (symbol && (symbol.getDeclarations() || []).some(outside)) {
+            return { reason: 'external-declaration-merge', detail: symbol.getName() };
+        }
+        const owner = decl.getParent?.();
+        if (owner && [SyntaxKind.ClassDeclaration, SyntaxKind.ClassExpression].includes(owner.getKind())) {
+            const contracts = [];
+            try {
+                contracts.push(...owner.getBaseTypes());
+                for (const clause of owner.getImplements()) contracts.push(clause.getType());
+            } catch { /* unresolvable heritage: no evidence either way */ }
+            for (const contract of contracts) {
+                const member = contract.getProperty?.(name);
+                if (member && (member.getDeclarations() || []).some(outside)) {
+                    const contractName = contract.getSymbol?.()?.getName() || contract.getText();
+                    return { reason: 'external-contract', detail: `${contractName}.${name}` };
+                }
+            }
+        }
+        if (!handle.computedAccesses) {
+            handle.computedAccesses = [];
+            for (const source of handle.project.getSourceFiles()) {
+                if (outside(source)) continue;
+                for (const access of source.getDescendantsOfKind(SyntaxKind.ElementAccessExpression)) {
+                    const argument = access.getArgumentExpression();
+                    if (!argument || [SyntaxKind.StringLiteral, SyntaxKind.NumericLiteral,
+                        SyntaxKind.NoSubstitutionTemplateLiteral].includes(argument.getKind())) continue;
+                    handle.computedAccesses.push(access);
+                }
+            }
+        }
+        const declarationKey = `${decl.getSourceFile().getFilePath()}:${decl.getStart()}`;
+        for (const access of handle.computedAccesses) {
+            let member;
+            try { member = access.getExpression().getType().getProperty(name); } catch { member = null; }
+            if (member && (member.getDeclarations() || []).some(d =>
+                `${d.getSourceFile().getFilePath()}:${d.getStart()}` === declarationKey)) {
+                const site = path.relative(handle.root, access.getSourceFile().getFilePath());
+                return { reason: 'computed-member-access', detail: `${site}:${access.getStartLineNumber()}` };
+            }
+        }
+        return null;
     },
 
     /**
@@ -529,6 +671,14 @@ function findDeclarationAt(sf, name, line) {
         for (const m of cls.getMethods()) {
             if (m.getName() === name && m.getStartLineNumber() === line) return m;
         }
+        for (const property of cls.getProperties()) {
+            if (property.getName() === name && property.getStartLineNumber() === line) return property;
+        }
+    }
+    for (const declaration of sf.getEnums()) {
+        for (const member of declaration.getMembers()) {
+            if (member.getName() === name && member.getStartLineNumber() === line) return member;
+        }
     }
     // Arrow-function consts (`export const f = () => ...`) and anything nested
     // in a namespace — getFunctions()/getClasses() are top-level only, so walk
@@ -555,6 +705,15 @@ function findDeclarationAt(sf, name, line) {
     // CJS property-assigned functions (`proto.use = function use() {}`)
     for (const af of jsAssignedFunctions(sf)) {
         if (af.name === name && af.line === line) return af.anchor;
+    }
+    // Object-literal members (`exports.warn = { useFormat(prop) {...} }`):
+    // the deadcode eval claims them (fix #429: they were unpinnable).
+    for (const kind of [SyntaxKind.MethodDeclaration, SyntaxKind.PropertyAssignment,
+        SyntaxKind.ShorthandPropertyAssignment]) {
+        for (const d of sf.getDescendantsOfKind(kind)) {
+            if (d.getParent()?.getKind() !== SyntaxKind.ObjectLiteralExpression) continue;
+            if (d.getName?.() === name && d.getStartLineNumber() === line) return d;
+        }
     }
     // Fallback: match by name only (line drift)
     for (const fn of sf.getFunctions()) if (fn.getName() === name) return fn;

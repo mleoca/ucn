@@ -37,7 +37,10 @@ const args = process.argv.slice(2);
 const repoFilter = readArgValue(args, '--repo');
 const sampleSize = Number(readArgValue(args, '--sample') || 30);
 
-const REPORTS_DIR = path.join(__dirname, 'reports');
+// UCN_EVAL_REPORTS_DIR keeps evaluation artifacts out of the tracked tree,
+// as for every other eval runner (fix #429: this one ignored it).
+const REPORTS_DIR = path.resolve(
+    process.env.UCN_EVAL_REPORTS_DIR || path.join(__dirname, 'reports'));
 const USAGE_BUCKETS = [
     { name: '0', test: (n) => n === 0 },
     { name: '1-5', test: (n) => n >= 1 && n <= 5 },

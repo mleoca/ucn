@@ -5,7 +5,8 @@
 //
 //	{"op": "list_symbols"}
 //	    -> {"ok": true, "symbols": [{"name", "file", "line", "kind"}]}
-//	       kind: function|method|class (structs map to class). Lines are the
+//	       kind: function|method|class (structs map to class) | field (named
+//	       struct fields) | constant | variable (package level). Lines are the
 //	       func/type keyword line — matching UCN's tree-sitter convention so
 //	       file:line:name handles pin exactly.
 //	{"op": "name_position", "file": rel, "line": n, "name": s}
@@ -98,8 +99,30 @@ func analyze(absPath string) *fileInfo {
 		case *ast.GenDecl:
 			for _, spec := range d.Specs {
 				if ts, ok := spec.(*ast.TypeSpec); ok && ts.Name != nil {
-					if _, isStruct := ts.Type.(*ast.StructType); isStruct {
+					if st, isStruct := ts.Type.(*ast.StructType); isStruct {
 						record(ts.Pos(), ts.Name.Pos(), ts.Name.Name, "class")
+						// Value members (fix #429): named struct fields.
+						if st.Fields != nil {
+							for _, field := range st.Fields.List {
+								for _, name := range field.Names {
+									if name.Name != "_" {
+										record(name.Pos(), name.Pos(), name.Name, "field")
+									}
+								}
+							}
+						}
+					}
+				}
+				// Package-level constants and variables (fix #429).
+				if vs, ok := spec.(*ast.ValueSpec); ok {
+					kind := "variable"
+					if d.Tok == token.CONST {
+						kind = "constant"
+					}
+					for _, name := range vs.Names {
+						if name.Name != "_" {
+							record(name.Pos(), name.Pos(), name.Name, kind)
+						}
 					}
 				}
 			}

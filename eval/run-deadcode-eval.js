@@ -25,6 +25,10 @@
  *                       index (universe gap, not a usage-scan miss)
  *   unpinnable        — oracle could not resolve the symbol at the claimed
  *                       position (reported, not gated)
+ *   oracle-blind      — oracle finds no references but declares it cannot see
+ *                       every use (external-contract dispatch, a declaration
+ *                       merged into an external one, computed access):
+ *                       unscored, reported, never counted as agreement
  *
  * Usage:
  *   node eval/run-deadcode-eval.js                  # all repos with an oracle
@@ -48,7 +52,7 @@ const { isTestFile } = require('../core/discovery');
 const { DEF_NAME_LINE_KINDS } = require('../core/deadcode');
 const { maskBlockComments, escapeRegExp } = require('../core/shared');
 const { REPOS, RELEASE_REPOS, cloneAtCommit, resolveTarget, seededRandom } = require('./lib/repos');
-const { validateOracle } = require('./oracles/oracle-interface');
+const { validateOracle, createOraclePathMapper } = require('./oracles/oracle-interface');
 const { tsMorphOracle } = require('./oracles/ts-morph-oracle');
 const { pyrightOracle } = require('./oracles/pyright-oracle');
 const { jediOracle } = require('./oracles/jedi-oracle');
@@ -59,6 +63,38 @@ const { roslynOracle } = require('./oracles/roslyn-oracle');
 const { clangdOracle } = require('./oracles/clangd-oracle');
 
 const args = process.argv.slice(2);
+const DEADCODE_EVAL_USAGE = `Usage: node eval/run-deadcode-eval.js [options]
+
+Checks every sampled UCN deadcode claim against compiler/LSP references.
+Gate: default-arm false-dead = 0. Reports go to $UCN_EVAL_REPORTS_DIR
+(default eval/reports).
+
+  --repo NAME[,NAME]   repositories to run (default: every repo with an oracle)
+  --release            the publish-blocking release board
+  --sample N           claims per repo per arm (default 60)
+  --arm default|exported|both
+  --oracle NAME        force an oracle
+  -h, --help           print this help and exit
+`;
+if (require.main === module) {
+    if (args.includes('--help') || args.includes('-h')) {
+        process.stdout.write(DEADCODE_EVAL_USAGE);
+        process.exit(0);
+    }
+    // A misspelled option used to be ignored silently (fix #429).
+    for (let index = 0; index < args.length; index++) {
+        if (['--repo', '--sample', '--arm', '--oracle'].includes(args[index])) {
+            if (args[index + 1] == null || /^--/.test(args[index + 1])) {
+                process.stderr.write(`${args[index]} requires a value\n`);
+                process.exit(2);
+            }
+            index++;
+        } else if (args[index] !== '--release') {
+            process.stderr.write(`unknown option ${args[index]} (see --help)\n`);
+            process.exit(2);
+        }
+    }
+}
 const releaseOnly = args.includes('--release');
 const repoFilter = readArgValue(args, '--repo');
 const repoFilterSet = repoFilter ? new Set(repoFilter.split(',').map(s => s.trim())) : null;
@@ -137,6 +173,18 @@ async function oracleRefsForClaim(oracle, handle, claim, oracleFile, symbol) {
     return { error: lastErr || 'unpinnable' };
 }
 
+async function oracleBlindness(oracle, handle, name, oracleFile, claim, symbol) {
+    const lines = [claim.startLine];
+    if (symbol && symbol.nameLine && symbol.nameLine !== claim.startLine) lines.push(symbol.nameLine);
+    for (const line of lines) {
+        try {
+            const blindness = await oracle.referenceBlindness(handle, { name, file: oracleFile, line });
+            if (blindness) return blindness;
+        } catch { /* a declaration the oracle cannot pin here is checked at the next line */ }
+    }
+    return null;
+}
+
 async function evaluateRepo(repo, oracle) {
     process.stdout.write(`\n=== ${repo.name} (${repo.language}) @ ${repo.commit.slice(0, 8)} — oracle: ${oracle.name} ===\n`);
     const repoPath = cloneAtCommit(repo);
@@ -200,6 +248,7 @@ async function evaluateRepo(repo, oracle) {
                 falseDead: 0,
                 outsideUniverse: 0,
                 unpinnable: 0,
+                oracleBlind: 0,
                 falseDeadRate: 0,
             };
             process.stdout.write(
@@ -216,11 +265,14 @@ async function evaluateRepo(repo, oracle) {
     }
 
     const handle = await oracle.prepare(target, { repo });
-    // Oracle paths are relative to the prepared target; UCN paths are relative
-    // to its detected project root (possibly a parent). Same normalization as
-    // run-oracle-eval.js.
-    const toUcnRel = (f) => path.relative(index.root, path.join(target, f));
-    const toOracleRel = (f) => path.relative(target, path.join(index.root, f));
+    // Oracle paths are relative to the oracle's prepared root, which is not
+    // always the target: ts-morph roots at the target's project manifest
+    // (zod `packages/zod`). Mapping against the target made every claim of
+    // such a repo unpinnable (fix #429: zod exported arm, 53 of 53). Same
+    // mapper as run-oracle-eval.js.
+    const pathMapper = createOraclePathMapper(index.root, handle.root || target);
+    const toUcnRel = pathMapper.toIndex;
+    const toOracleRel = pathMapper.toOracle;
 
     for (const { arm, claims } of arms) {
         // Seeded shuffle + cap — LSP findReferences costs real time per claim.
@@ -233,7 +285,8 @@ async function evaluateRepo(repo, oracle) {
         const sampled = shuffled.slice(0, sampleSize);
 
         const perClaim = [];
-        const totals = { claims: claims.length, verified: 0, agreedDead: 0, falseDead: 0, outsideUniverse: 0, unpinnable: 0 };
+        const totals = { claims: claims.length, verified: 0, agreedDead: 0, falseDead: 0, outsideUniverse: 0,
+            unpinnable: 0, oracleBlind: 0 };
         const maskedLineCache = new Map(); // rel → masked lines (fix #269 doc-ref classification)
 
         for (const claim of sampled) {
@@ -311,6 +364,23 @@ async function evaluateRepo(repo, oracle) {
             }
 
             if (usageRefs.length === 0) {
+                // An oracle that sees no reference agrees only when it can see
+                // every way the declaration is reached. Members dispatched
+                // through a contract declared outside the project (an external
+                // trait/interface/base member), declarations merged into an
+                // external declaration (`declare global`, module
+                // augmentations) and members reached by computed access are
+                // invisible to reference search: unscorable, never agreement
+                // (fix #429: hashbrown `from_iter`, TanStack form
+                // augmentations, winston computed registry).
+                const blindness = typeof oracle.referenceBlindness === 'function'
+                    ? await oracleBlindness(oracle, handle, res.pinnedName, oracleFile, claim, symbol)
+                    : null;
+                if (blindness) {
+                    totals.oracleBlind++;
+                    perClaim.push({ ...record, verdict: 'oracle-blind', blindness, ...(docRefs > 0 && { docRefs }) });
+                    continue;
+                }
                 totals.agreedDead++;
                 perClaim.push({ ...record, verdict: 'agreed-dead', ...(docRefs > 0 && { docRefs }) });
                 continue;
@@ -339,10 +409,15 @@ async function evaluateRepo(repo, oracle) {
             falseDead: totals.falseDead,
             outsideUniverse: totals.outsideUniverse,
             unpinnable: totals.unpinnable,
+            oracleBlind: totals.oracleBlind,
             falseDeadRate: totals.verified ? Number((totals.falseDead / totals.verified).toFixed(4)) : 0,
         };
         process.stdout.write(`  [${arm}] claims ${summary.claims} | sampled ${summary.sampled} | agreed-dead ${summary.agreedDead} | ` +
-            `FALSE-DEAD ${summary.falseDead} | outside-universe ${summary.outsideUniverse} | unpinnable ${summary.unpinnable}\n`);
+            `FALSE-DEAD ${summary.falseDead} | outside-universe ${summary.outsideUniverse} | unpinnable ${summary.unpinnable} | ` +
+            `oracle-blind ${summary.oracleBlind}\n`);
+        for (const c of perClaim.filter(c => c.verdict === 'oracle-blind').slice(0, 10)) {
+            process.stdout.write(`      ? ${c.type} ${c.name} @ ${c.file}:${c.startLine}: oracle cannot see its uses (${c.blindness.reason}${c.blindness.detail ? `: ${c.blindness.detail}` : ''})\n`);
+        }
         for (const c of perClaim.filter(c => c.verdict === 'false-dead').slice(0, 10)) {
             process.stdout.write(`      ✗ ${c.type} ${c.name} @ ${c.file}:${c.startLine} — ${c.refs.length} oracle ref(s), e.g. ${c.refs[0].file}:${c.refs[0].line} (${c.refs[0].kind})${c.testRefsOnly ? ' [tests only]' : ''}\n`);
         }
@@ -433,13 +508,17 @@ async function main() {
         'scan missed; deleting the symbol breaks the code. Gate: default-arm',
         'false-dead = 0.',
         '',
-        '| repo | oracle | arm | claims | sampled | agreed-dead | false-dead | outside-universe | unpinnable |',
-        '|---|---|---|---|---|---|---|---|---|',
+        '`oracle-blind`: the oracle saw no reference but cannot see every use of the',
+        'declaration (contract dispatch from outside the project, a merged external',
+        'declaration, computed access): neither agreement nor a false-dead verdict.',
+        '',
+        '| repo | oracle | arm | claims | sampled | agreed-dead | false-dead | outside-universe | unpinnable | oracle-blind |',
+        '|---|---|---|---|---|---|---|---|---|---|',
     ];
     for (const r of rollupResults) {
-        if (r.error) { lines.push(`| ${r.repo} | n/a | n/a | n/a | n/a | n/a | n/a | n/a | ERROR: ${r.error} |`); continue; }
+        if (r.error) { lines.push(`| ${r.repo} | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | ERROR: ${r.error} |`); continue; }
         for (const { summary: s } of r.arms) {
-            lines.push(`| ${r.repo} | ${r.oracle} | ${s.arm} | ${s.claims} | ${s.sampled} | ${s.agreedDead} | **${s.falseDead}** | ${s.outsideUniverse} | ${s.unpinnable} |`);
+            lines.push(`| ${r.repo} | ${r.oracle} | ${s.arm} | ${s.claims} | ${s.sampled} | ${s.agreedDead} | **${s.falseDead}** | ${s.outsideUniverse} | ${s.unpinnable} | ${s.oracleBlind ?? 'n/a'} |`);
         }
     }
     lines.push('');

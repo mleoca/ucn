@@ -8,13 +8,15 @@
 // Ops:
 //   {"op": "list_symbols"}
 //       -> {"ok": true, "symbols": [{"name", "file", "line", "kind"}]}
-//          kind: method (class/enum/record methods, incl. static) |
-//          class (class/enum/record declarations, incl. nested named).
-//          Interfaces, annotation types, constructors, and anonymous-class
-//          members are excluded (dispatch/constructor-equivalents — same
-//          exclusions the other oracles apply). Lines are ANNOTATION-INCLUSIVE
-//          declaration starts, matching UCN's tree-sitter convention so
-//          file:line:name handles pin exactly.
+//          kind: method (class/enum/record/interface methods, incl. static,
+//          abstract and interface members) | constructor (named after its
+//          class) | class (class/enum/record declarations, incl. nested
+//          named) | field | constant (static final) | enum-member (value
+//          members of named types; record components are the record's
+//          accessors and are not listed). Interface and annotation TYPES,
+//          annotation elements and anonymous-class members are excluded.
+//          Lines are ANNOTATION-INCLUSIVE declaration starts, matching UCN's
+//          tree-sitter convention so file:line:name handles pin exactly.
 //   {"op": "name_position", "file": rel, "line": n, "name": s}
 //       -> {"ok": true, "line": defLine, "utf16Col": c}   (LSP-ready position)
 //   {"op": "classify_ref", "file": rel, "line": n, "utf16_col": c, "name": s}
@@ -47,9 +49,15 @@ public class JavaAstHelper {
         Set<Long> calleePos = new HashSet<>();           // (line << 32) | utf16Col
         Map<Long, String> defPos = new HashMap<>();      // name-position -> name
         List<int[]> imports = new ArrayList<>();         // {startLine, endLine}
+        // "declLine:name" -> {ownerNameLine, ownerNameUtf16Col, paramCount, override}
+        Map<String, long[]> methodOwner = new HashMap<>();
     }
 
     static long key(long line, long col) { return (line << 32) | col; }
+
+    // Marks a class scope whose members are not enumerated (anonymous
+    // classes, annotation types).
+    static final Object NO_OWNER = new Object();
 
     static FileInfo analyze(Path abs) {
         String k = abs.toString();
@@ -141,6 +149,10 @@ public class JavaAstHelper {
                 return c == '_' || c == '$' || Character.isLetterOrDigit(c);
             }
 
+            // The named type whose members are being visited (null inside
+            // method bodies, anonymous classes and annotation types).
+            private final Deque<Object> owners = new ArrayDeque<>();
+
             @Override
             public Void visitClass(ClassTree node, Boolean inClass) {
                 String name = node.getSimpleName() == null ? "" : node.getSimpleName().toString();
@@ -148,6 +160,7 @@ public class JavaAstHelper {
                 boolean named = !name.isEmpty();
                 boolean enumerable = named &&
                     (kindOf == Tree.Kind.CLASS || kindOf == Tree.Kind.ENUM || kindOf == Tree.Kind.RECORD);
+                boolean memberOwner = enumerable || (named && kindOf == Tree.Kind.INTERFACE);
                 if (named) {
                     // name token follows the class/enum/record/interface keyword
                     long bodyStart = pos.getStartPosition(unit, node);
@@ -158,23 +171,59 @@ public class JavaAstHelper {
                         recordDef(name, namePosition);
                     }
                 }
-                return super.visitClass(node, enumerable);
+                owners.push(memberOwner ? node : NO_OWNER);
+                try {
+                    return super.visitClass(node, memberOwner);
+                } finally {
+                    owners.pop();
+                }
+            }
+
+            private ClassTree owner(Boolean inClass) {
+                Object current = owners.peek();
+                return Boolean.TRUE.equals(inClass) && current instanceof ClassTree tree ? tree : null;
             }
 
             @Override
             public Void visitMethod(MethodTree node, Boolean inClass) {
                 String name = node.getName().toString();
+                ClassTree owner = owner(inClass);
                 if (!"<init>".equals(name)) {
-                    // name token follows the return type (methods always have one;
-                    // <init> constructors are skipped)
+                    // name token follows the return type
                     long scanFrom = node.getReturnType() != null
                         ? pos.getEndPosition(unit, node.getReturnType())
                         : pos.getStartPosition(unit, node);
                     long namePosition = findName(scanFrom, name);
-                    if (Boolean.TRUE.equals(inClass) && node.getBody() != null) {
+                    // Bodied, abstract and interface methods are callable
+                    // declarations (fix #429: abstract and interface members
+                    // were outside the oracle universe).
+                    if (owner != null) {
                         recordSymbol(node, name, "method", namePosition);
+                        long ownerName = findName(pos.getStartPosition(unit, owner), owner.getSimpleName().toString());
+                        long declStart = pos.getStartPosition(unit, node);
+                        if (ownerName >= 0 && declStart >= 0) {
+                            boolean override = node.getModifiers().getAnnotations().stream().anyMatch(annotation -> {
+                                String type = annotation.getAnnotationType().toString();
+                                return type.equals("Override") || type.equals("java.lang.Override");
+                            });
+                            info.methodOwner.put(lm.getLineNumber(declStart) + ":" + name, new long[]{
+                                lm.getLineNumber(ownerName), lm.getColumnNumber(ownerName) - 1,
+                                node.getParameters().size(), override ? 1 : 0});
+                        }
                     } else {
                         recordDef(name, namePosition);
+                    }
+                } else if (owner != null && owner.getKind() != Tree.Kind.INTERFACE) {
+                    // A constructor is named after its class; its name token
+                    // starts the declaration after modifiers and type params.
+                    String className = owner.getSimpleName().toString();
+                    long scanFrom = node.getTypeParameters().isEmpty()
+                        ? pos.getEndPosition(unit, node.getModifiers())
+                        : pos.getEndPosition(unit, node.getTypeParameters().get(node.getTypeParameters().size() - 1));
+                    if (scanFrom < 0) scanFrom = pos.getStartPosition(unit, node);
+                    long namePosition = findName(scanFrom, className);
+                    if (namePosition >= 0 && namePosition < pos.getEndPosition(unit, node)) {
+                        recordSymbol(node, className, "constructor", namePosition);
                     }
                 }
                 return super.visitMethod(node, false); // anonymous/local members not enumerated
@@ -186,8 +235,45 @@ public class JavaAstHelper {
                 long scanFrom = node.getType() != null
                     ? pos.getEndPosition(unit, node.getType())
                     : pos.getStartPosition(unit, node);
-                recordDef(node.getName().toString(), findName(scanFrom, node.getName().toString()));
-                return super.visitVariable(node, inClass);
+                // An enum constant's synthetic type has no end position.
+                if (scanFrom < 0) scanFrom = pos.getStartPosition(unit, node);
+                String name = node.getName().toString();
+                long namePosition = findName(scanFrom, name);
+                ClassTree owner = owner(inClass);
+                Set<javax.lang.model.element.Modifier> flags = node.getModifiers().getFlags();
+                boolean isStatic = flags.contains(javax.lang.model.element.Modifier.STATIC);
+                if (owner != null && namePosition >= 0 && isMemberOf(owner, node)) {
+                    // Value members (fix #429). Enum constants are variables
+                    // whose initializer is the constant's own construction;
+                    // record components (non-static record variables) are
+                    // the record's accessors and are not listed.
+                    boolean enumConstant = owner.getKind() == Tree.Kind.ENUM && isEnumConstant(node, namePosition);
+                    boolean recordComponent = owner.getKind() == Tree.Kind.RECORD && !isStatic;
+                    if (!recordComponent) {
+                        boolean constant = (isStatic && flags.contains(javax.lang.model.element.Modifier.FINAL)) ||
+                            owner.getKind() == Tree.Kind.INTERFACE;
+                        recordSymbol(node, name, enumConstant ? "enum-member" : constant ? "constant" : "field", namePosition);
+                    } else {
+                        recordDef(name, namePosition);
+                    }
+                } else {
+                    recordDef(name, namePosition);
+                }
+                return super.visitVariable(node, false);
+            }
+
+            private boolean isMemberOf(ClassTree owner, VariableTree node) {
+                for (Tree member : owner.getMembers()) if (member == node) return true;
+                return false;
+            }
+
+            private boolean isEnumConstant(VariableTree node, long namePosition) {
+                // javac models `RED, GREEN(1)` as variables whose synthetic
+                // type identifier sits at the constant's own name; an
+                // explicit field spells its type before the name.
+                Tree type = node.getType();
+                long typeStart = type == null ? -1 : pos.getStartPosition(unit, type);
+                return type == null || typeStart < 0 || typeStart == namePosition;
             }
 
             @Override
@@ -251,6 +337,9 @@ public class JavaAstHelper {
             try {
                 switch (op) {
                     case "list_symbols": resp = listSymbols(); break;
+                    case "method_owner":
+                        resp = methodOwner(req.get("file"), Long.parseLong(req.getOrDefault("line", "0")), req.get("name"));
+                        break;
                     case "name_position":
                         resp = namePosition(req.get("file"), Long.parseLong(req.getOrDefault("line", "0")), req.get("name"));
                         break;
@@ -321,6 +410,14 @@ public class JavaAstHelper {
         int idx = indexOfWord(text, name);
         if (idx < 0) return "{\"ok\": false, \"error\": " + quote("name not found at " + rel + ":" + line) + "}";
         return "{\"ok\": true, \"line\": " + line + ", \"utf16Col\": " + idx + "}";
+    }
+
+    static String methodOwner(String rel, long line, String name) {
+        FileInfo info = analyze(root.resolve(rel).normalize());
+        long[] owner = info.methodOwner.get(line + ":" + name);
+        if (owner == null) return "{\"ok\": true, \"line\": null}";
+        return "{\"ok\": true, \"line\": " + owner[0] + ", \"utf16Col\": " + owner[1] +
+            ", \"params\": " + owner[2] + ", \"override\": " + (owner[3] == 1) + "}";
     }
 
     static String classifyRef(String rel, long line, long col, String name) {

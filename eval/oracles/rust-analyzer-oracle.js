@@ -181,6 +181,29 @@ const rustAnalyzerOracle = {
         return refs;
     },
 
+    /** An impl member of a trait declared outside the workspace (std,
+     *  registry crates) is reached through that trait from code outside the
+     *  project (`.collect()` calls `FromIterator::from_iter`): reference
+     *  search cannot see those uses (fix #429). */
+    async referenceBlindness(handle, { name, file, line }) {
+        const position = await handle.helper.request({ op: 'impl_trait', file, line, name });
+        if (position.line == null) return null;
+        const absFile = path.join(handle.root, file);
+        ensureOpen(handle, absFile);
+        const locations = await handle.lsp.request('textDocument/definition', {
+            textDocument: { uri: pathToUri(absFile) },
+            position: { line: position.line - 1, character: position.utf16Col },
+        }) || [];
+        const entries = definitionEntries(handle, Array.isArray(locations) ? locations : [locations]);
+        const external = entries.find(entry => entry.external);
+        if (external && !entries.some(entry => !entry.external)) {
+            const text = fs.readFileSync(absFile, 'utf-8').split('\n')[position.line - 1] || '';
+            const trait = text.slice(position.utf16Col).match(/^[A-Za-z_]\w*/)?.[0] || 'trait';
+            return { reason: 'external-contract', detail: `${trait}::${name}` };
+        }
+        return null;
+    },
+
     /** Resolve the compiler-selected declaration(s) for a source-line name.
      *  Reference search can omit inactive/re-exported workspace edges; this
      *  independent definition check prevents those gaps from becoming fake

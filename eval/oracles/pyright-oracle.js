@@ -209,7 +209,55 @@ const pyrightOracle = {
             }
             await requestAt(defAbs, entry.line, rhs.character);
         }
-        return [...defs.values()];
+        // A project type stub (`pkg/__init__.pyi` beside `pkg/__init__.py`)
+        // is the checker's declaration, not the runtime binding: pyright
+        // resolves `attrs.Factory(..)` to the stub's re-export alias. Such
+        // an answer neither confirms nor refutes a runtime target (fix #429).
+        return [...defs.values()].filter(entry => entry.external || !entry.file.endsWith('.pyi'));
+    },
+
+    /** A method that overrides a member of a base class declared outside
+     *  the project (a framework hook such as `do_GET`, `emit`, `run`) is
+     *  called through that base by code reference search cannot see
+     *  (fix #429). Bases resolve through pyright's definitions; an external
+     *  base is read from its own source or stub. */
+    async referenceBlindness(handle, { name, file, line }) {
+        const start = await handle.helper.request({ op: 'enclosing_class', file, line, name });
+        if (!start.bases) return null;
+        const queue = start.bases.map(base => ({ abs: path.join(handle.root, file), ...base }));
+        const seen = new Set();
+        while (queue.length > 0 && seen.size < 32) {
+            const base = queue.shift();
+            const key = `${base.abs}:${base.line}:${base.utf16Col}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            if (!handle.opened.has(base.abs) && base.abs.startsWith(handle.projectRoot + path.sep)) {
+                handle.lsp.didOpen(base.abs, 'python', fs.readFileSync(base.abs, 'utf-8'));
+                handle.opened.add(base.abs);
+            }
+            let locations;
+            try {
+                locations = await handle.lsp.request('textDocument/definition', {
+                    textDocument: { uri: pathToUri(base.abs) },
+                    position: { line: base.line - 1, character: base.utf16Col },
+                }) || [];
+            } catch { locations = []; }
+            for (const loc of Array.isArray(locations) ? locations : [locations]) {
+                const uri = loc.targetUri || loc.uri;
+                const range = loc.targetSelectionRange || loc.targetRange || loc.range;
+                if (!uri || !range) continue;
+                const defAbs = uriToPath(uri);
+                const external = !defAbs.startsWith(handle.projectRoot + path.sep);
+                const declared = await handle.helper.request({ op: 'class_bases', path: defAbs, line: range.start.line + 1 });
+                if (external && (declared.members || []).includes(name)) {
+                    return { reason: 'external-contract', detail: `${path.basename(defAbs)}:${range.start.line + 1}.${name}` };
+                }
+                // Project bases (and external bases' own bases in the same
+                // stub) are walked further.
+                for (const next of declared.bases || []) queue.push({ abs: defAbs, ...next });
+            }
+        }
+        return null;
     },
 
     /** Whether pyright leaves this line out of its analysis because a
