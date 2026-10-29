@@ -841,6 +841,21 @@ function formatValueAccount(name, band) {
         `${account.conserved ? '' : ' [NOT CONSERVED]'}`;
 }
 
+function formatTypeAccount(name, band) {
+    const account = band.account;
+    const reasons = Object.entries(band.excluded?.byReason || {})
+        .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+        .slice(0, 4).map(([reason, count]) => `${reason} ${count}`).join(', ');
+    return `TYPE ACCOUNT: "${name}" is ${account.tokens} name token(s) on ${account.lines} line(s) in ` +
+        `${account.files} file(s): ${account.confirmed} confirmed, ${account.unverified} unverified, ` +
+        `${account.excluded} excluded${reasons ? ` (${reasons})` : ''}, ${account.constructions} at call sites, ` +
+        `${account.declarations} declaration` +
+        `${account.attributeTokens ? ` (${account.attributeTokens} attribute short name(s))` : ''}` +
+        `${account.unparsedLines ? `; ${account.unparsedLines} unparsed line(s)` : ''}` +
+        `${account.textLines ? `; ${account.textLines} text-only line(s)` : ''}` +
+        `${account.conserved ? '' : ' [NOT CONSERVED]'}`;
+}
+
 function formatImpact(impact, options = {}) {
     if (!impact) {
         return 'Function not found.';
@@ -969,32 +984,30 @@ function formatImpact(impact, options = {}) {
         if (valueAccount) lines.push(formatValueAccount(impact.function, impact.valueAccesses));
     }
 
-    // fix #345: annotation sites of a type-kind definition, tiered like the
-    // accessor band. The headline no longer says 0 for a type with dependents.
+    // fixes #345, #428: the tokens naming a type outside its call sites,
+    // tiered by the type lookup, with their own account.
     if (impact.typeReferences) {
         const refs = impact.typeReferences;
         lines.push(`${compact ? '' : '\n'}TYPE REFERENCE SITES: ${refs.confirmedCount} confirmed` +
-            (refs.unverifiedCount ? ` + ${refs.unverifiedCount} unverified` : '') +
-            (refs.excluded?.total ? ` (${refs.excluded.total} other-target)` : ''));
+            (refs.unverifiedCount ? ` + ${refs.unverifiedCount} unverified` : ''));
+        const position = site => `${site.kind || 'type'}${Number.isInteger(site.column) ? `, column ${site.column + 1}` : ''}`;
         for (const group of refs.byFile) {
             for (const site of group.sites) {
                 const expr = site.expression ? `: ${site.expression.replace(/\s+/g, ' ').slice(0, 100)}` : '';
-                lines.push(`  ${group.file}:${site.line}${expr}`);
+                lines.push(`  ${group.file}:${site.line} [${position(site)}]${expr}`);
             }
         }
         if (refs.unverifiedSites.length > 0) {
-            lines.push(`${compact ? '' : '\n'}UNVERIFIED TYPE REFERENCE CANDIDATES (${refs.unverifiedSites.length}) — name matches, no import link to this definition:`);
+            lines.push(`${compact ? '' : '\n'}UNVERIFIED TYPE REFERENCE CANDIDATES (${refs.unverifiedSites.length}) — the name, the type lookup cannot decide what it names:`);
             for (const site of refs.unverifiedSites.slice(0, 10)) {
                 const expr = site.expression ? `: ${site.expression.replace(/\s+/g, ' ').slice(0, 100)}` : '';
-                lines.push(`  ${site.file}:${site.line}${expr} (${site.reason})`);
+                lines.push(`  ${site.file}:${site.line} [${position(site)}]${expr} (${site.reason})`);
             }
             if (refs.unverifiedSites.length > 10) {
                 lines.push(`  (+${refs.unverifiedSites.length - 10} more unverified)`);
             }
         }
-        if (refs.confirmedCount === 0 && refs.unverifiedCount === 0) {
-            lines.push('  (no annotation sites outside the definition)');
-        }
+        if (refs.account) lines.push(formatTypeAccount(impact.function, refs));
     }
 
     // Unverified tier: visible, capped at 10 one-liners

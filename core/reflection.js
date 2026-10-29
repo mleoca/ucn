@@ -25,6 +25,7 @@
  */
 
 const { langTraits } = require('../languages');
+const { sameNode } = require('../languages/utils');
 
 const WILD = '\u0000*';
 const MODULE_RECEIVER = Object.freeze({ kind: 'module' });
@@ -502,6 +503,224 @@ function classifyReceiver(node, language) {
 }
 
 // ---------------------------------------------------------------------------
+// Names one call away (fix #428)
+// ---------------------------------------------------------------------------
+
+// Callables whose parameters a reflective name can be (grammar node types).
+const PARAMETER_OWNERS = new Set([
+    'function_declaration', 'generator_function_declaration', 'function_expression', 'generator_function',
+    'arrow_function', 'method_definition', 'function_definition', 'method_declaration',
+    'constructor_declaration', 'local_function_statement', 'func_literal',
+]);
+const PARAMETER_LISTS = new Set(['formal_parameters', 'parameters', 'parameter_list']);
+const VARIADIC_PARAMETERS = new Set(['rest_pattern', 'list_splat_pattern', 'dictionary_splat_pattern',
+    'spread_parameter', 'variadic_parameter_declaration', 'variadic_parameter']);
+
+/** The parameter names of a callable in declaration order (null if unknown). */
+function _parameterNames(fn) {
+    const list = fn.childForFieldName('parameters') ||
+        (fn.namedChildren || []).find(child => PARAMETER_LISTS.has(child.type));
+    if (!list) {
+        // `x => ..`: a single bare parameter.
+        const single = fn.childForFieldName('parameter');
+        return single?.type === 'identifier' ? [single.text] : null;
+    }
+    const names = [];
+    for (const param of list.namedChildren) {
+        if (param.type === 'comment') continue;
+        if (param.type === 'identifier') { names.push(param.text); continue; }
+        // A Go declaration may name several parameters of one type.
+        if (param.type === 'parameter_declaration' || param.type === 'variadic_parameter_declaration') {
+            const ids = param.namedChildren.filter(child => child.type === 'identifier');
+            if (ids.length === 0) names.push(null);
+            for (const id of ids) names.push(id.text);
+            continue;
+        }
+        const named = param.childForFieldName('name') || param.childForFieldName('pattern') ||
+            param.childForFieldName('left') ||
+            (param.type === 'typed_parameter' ? param.namedChild(0) : null);
+        names.push(named?.type === 'identifier' ? named.text : null);
+    }
+    return names;
+}
+
+/** The name a callable is called by: its own, or the binding it is assigned to. */
+function _callableName(fn) {
+    const own = fn.childForFieldName('name');
+    if (own) return own.text;
+    const parent = fn.parent;
+    if (parent?.type === 'variable_declarator') return parent.childForFieldName('name')?.text || null;
+    if (parent?.type === 'pair') return parent.childForFieldName('key')?.text?.replace(/^["']|["']$/g, '') || null;
+    if (parent?.type === 'assignment_expression') {
+        const left = parent.childForFieldName('left');
+        if (left?.type === 'identifier') return left.text;
+        if (left?.type === 'member_expression') return left.childForFieldName('property')?.text || null;
+    }
+    return null;
+}
+
+/** Does `body` assign the name anywhere (nested callables included)? */
+function _assignsName(body, name) {
+    const stack = [body];
+    while (stack.length > 0) {
+        const node = stack.pop();
+        if (_bindingPairs(node).some(([bound]) => bound === name)) return true;
+        for (const child of node.namedChildren || []) stack.push(child);
+    }
+    return false;
+}
+
+/**
+ * A reflective name that is a parameter of an enclosing callable, never
+ * rebound: { name, line, index } (the call-site argument position), else
+ * null. Its value is the argument the callable's callers pass.
+ */
+function _keyParameter(ident, language) {
+    if (ident?.type !== 'identifier') return null;
+    for (let fn = ident.parent; fn; fn = fn.parent) {
+        if (CLASS_NODES.has(fn.type)) return null;
+        if (!PARAMETER_OWNERS.has(fn.type)) continue;
+        const names = _parameterNames(fn);
+        if (!names) return null;
+        let position = names.indexOf(ident.text);
+        if (position < 0) continue; // captured from an outer callable
+        const name = _callableName(fn);
+        if (!name || _assignsName(fn.childForFieldName('body') || fn, ident.text)) return null;
+        // A method's receiver parameter (`self`, `cls`) is not a call
+        // argument of a bound call.
+        const selfNames = langTraits(language)?.selfParam || [];
+        let owner = fn.parent?.type === 'decorated_definition' ? fn.parent.parent : fn.parent;
+        if (fn.type === 'function_definition' && owner?.type === 'block' &&
+            owner.parent?.type === 'class_definition' && selfNames.includes(names[0])) {
+            if (position === 0) return null;
+            position--;
+        }
+        // The class a method belongs to: a call naming another class as its
+        // qualifier is no call of it. A C# extension's `this` parameter is
+        // the receiver of an extension call (`t.M(x)`).
+        const ownerClass = _enclosingClass(fn, false);
+        const ownerName = ownerClass ? _classInfo(ownerClass)?.name || null : null;
+        const params = (fn.childForFieldName('parameters')?.namedChildren || []).filter(child => child.type !== 'comment');
+        const firstParam = params.find(child => child.type === 'parameter');
+        const extension = !!firstParam?.children?.some(child => child.type === 'modifier' && child.text === 'this');
+        // A call passing more arguments than a fixed parameter list takes
+        // is not a call of it.
+        const variadic = params.some(param => VARIADIC_PARAMETERS.has(param.type) ||
+            param.children?.some(child => child.type === 'modifier' && child.text === 'params') ||
+            param.namedChildren?.some(child => VARIADIC_PARAMETERS.has(child.type)));
+        const maxArgs = variadic ? null : names.length - (names.length > 0 && selfNames.includes(names[0]) &&
+            fn.type === 'function_definition' && owner?.type === 'block' && owner.parent?.type === 'class_definition' ? 1 : 0);
+        return { name, line: fn.startPosition.row + 1, index: position,
+            ...(ownerName && { owner: ownerName }), ...(extension && { extension: true }),
+            ...(Number.isInteger(maxArgs) && { maxArgs }) };
+    }
+    return null;
+}
+
+const MAX_KEY_CALLS = 256;
+// Characters after a call's name its arguments are looked for in, when the
+// record keeps only the name's position.
+const KEY_CALL_WINDOW = 4096;
+
+/**
+ * The names a parameter-keyed site receives (fix #428): the string-shaped
+ * arguments at the parameter's position in the calls naming its callable,
+ * read from each call's own AST (one hop). Null when no call passes one.
+ */
+function resolveKeyParameter(index, site, language, onlyFiles = null, onlyName = null) {
+    const key = site.keyParameter;
+    const { getCachedCalls } = require('./callers');
+    const { getParser, safeParse } = require('../languages');
+    const files = [...(onlyFiles || index.getCalleeFiles?.(key.name) || [])].sort();
+    const exact = new Set();
+    let seen = 0;
+    for (const file of files) {
+        const entry = index.files.get(file);
+        if (!entry || _family(entry.language) !== _family(language)) continue;
+        // A call qualified by another class's name never calls the method;
+        // an extension call passes the `this` argument as its receiver.
+        const shift = call => key.extension && call.isMethod && call.receiver && call.receiver !== key.owner ? 1 : 0;
+        const position = call => key.index - shift(call);
+        let calls = (getCachedCalls(index, file) || []).filter(call => call.name === key.name &&
+            !call.isFunctionReference && position(call) >= 0 &&
+            !(Number.isInteger(key.maxArgs) && Number.isInteger(call.argCount) && call.argCount > key.maxArgs - shift(call)) &&
+            !(Number.isInteger(call.argCount) && call.argCount <= position(call)) &&
+            !(key.owner && call.receiverIsTypeQualified && call.receiver && call.receiver !== key.owner));
+        if (calls.length === 0) continue;
+        seen += calls.length;
+        if (seen > MAX_KEY_CALLS) return null;
+        let content;
+        try { content = index._readFile(file); } catch { continue; }
+        // A literal argument lies in the call's text: a call whose text
+        // spells no quoted `onlyName` cannot pass it, and needs no parse.
+        if (onlyName) {
+            const quoted = ['"', "'", '`'].map(quote => `${quote}${onlyName}${quote}`);
+            calls = calls.filter(call => {
+                const start = call.callStart ?? call.callSite?.start;
+                if (!Number.isInteger(start)) return true;
+                const text = content.slice(start, call.callEnd ?? start + KEY_CALL_WINDOW);
+                return quoted.some(spelling => text.includes(spelling));
+            });
+            if (calls.length === 0) continue;
+        }
+        const tree = index._getParsedTree?.(file, content, entry.language) || safeParse(getParser(entry.language), content);
+        if (!tree) continue;
+        const api = langTraits(entry.language)?.reflectionApi || {};
+        const ctx = { formatCalls: api.formatCalls || null, resolve: makeResolver() };
+        for (const call of calls) {
+            const offset = call.callStart ?? call.callSite?.start;
+            if (!Number.isInteger(offset)) continue;
+            let node = tree.rootNode.descendantForIndex(offset);
+            for (let depth = 0; node && depth < 6 && !CALL_NODE_TYPES.includes(node.type); depth++) node = node.parent;
+            const args = node ? _callArgs(node) : null;
+            // Keyword, spread or missing arguments do not bind by position.
+            if (!args || args.slice(0, position(call) + 1).some(arg =>
+                /keyword_argument|spread|splat|named_argument/.test(arg.type) ||
+                (arg.type === 'argument' && arg.childForFieldName('name')))) continue;
+            let arg = args[position(call)];
+            if (arg?.type === 'argument') arg = arg.namedChildren.find(child => child.type !== 'comment') || arg;
+            if (!arg) continue;
+            const cls = classifyNameExpression(arg, ctx);
+            if (cls.name) exact.add(cls.name);
+            for (const pattern of cls.patterns || []) if (!pattern.includes('*')) exact.add(pattern);
+        }
+    }
+    return exact.size > 0 ? [...exact].sort() : null;
+}
+
+const QUOTED_IDENTIFIER = /(["'`])([A-Za-z_$][\w$]*)\1/g;
+
+/**
+ * Could a parameter-keyed site receive `name` (fix #428)? Only when a file
+ * holding a call of its callable spells `name` as a string literal: the
+ * files' quoted identifiers are read once, and the AST resolution runs only
+ * for a name they hold.
+ */
+function _keyParameterPasses(index, pidx, entry, name) {
+    const files = index.getCalleeFiles?.(entry.site.keyParameter.name);
+    if (!files || files.size === 0) return false;
+    const spelled = [];
+    for (const file of files) {
+        let quoted = pidx.quoted.get(file);
+        if (!quoted) {
+            quoted = new Set();
+            try {
+                for (const match of index._readFile(file).matchAll(QUOTED_IDENTIFIER)) quoted.add(match[2]);
+            } catch { /* unreadable: no literal */ }
+            pidx.quoted.set(file, quoted);
+        }
+        if (quoted.has(name)) spelled.push(file);
+    }
+    if (spelled.length === 0) return false;
+    let byName = pidx.keyNames.get(entry);
+    if (!byName) pidx.keyNames.set(entry, byName = new Map());
+    if (!byName.has(name)) {
+        byName.set(name, !!resolveKeyParameter(index, entry.site, entry.language, spelled, name)?.includes(name));
+    }
+    return byName.get(name);
+}
+
+// ---------------------------------------------------------------------------
 // Site extraction
 // ---------------------------------------------------------------------------
 
@@ -558,7 +777,12 @@ function reflectionSitesInTree(tree, language, code = null) {
     const push = (node, kind, nameNode, receiverNode, receiverFact) => {
         const cls = classifyNameExpression(nameNode, ctx);
         const expression = String(node.text || '');
+        // A name that is the enclosing callable's parameter is decided one
+        // call away, by what its callers pass (fix #428).
+        const keyParameter = cls.dynamic && !cls.patterns && _unwrap(nameNode)?.type === 'identifier'
+            ? _keyParameter(_unwrap(nameNode), language) : null;
         sites.push({
+            ...(keyParameter && { keyParameter }),
             kind,
             line: node.startPosition.row + 1,
             expression: expression.length > EXPRESSION_CAP
@@ -595,6 +819,14 @@ function reflectionSitesInTree(tree, language, code = null) {
             // counts; opaque keys stay the computed-dispatch disclosure.
             const index = node.childForFieldName('index');
             const inner = _unwrap(index);
+            // `registry[type](..)` with `type` a parameter of the enclosing
+            // callable dispatches by the name its callers pass (fix #428).
+            if (inner?.type === 'identifier' && node.parent?.type === 'call_expression' &&
+                sameNode(node.parent.childForFieldName('function'), node) &&
+                _keyParameter(inner, language)) {
+                push(node, 'computed', index, node.childForFieldName('object'));
+                return;
+            }
             if (!inner || !COMPUTED_PATTERN_KEYS.has(inner.type)) return;
             const cls = classifyNameExpression(index, ctx);
             if (cls.patterns && cls.patterns.length > 0) {
@@ -713,6 +945,7 @@ function reflectionPatternIndex(index) {
     const lengths = new Set();
     let entryCount = 0;
     const moduleScoped = new Map();
+    const keyParameterSites = [];
     for (const [file, sites] of byFile) {
         const fe = index.files.get(file);
         if (!fe) continue;
@@ -728,6 +961,11 @@ function reflectionPatternIndex(index) {
                 }
                 continue;
             }
+            if (site.keyParameter && !site.patterns) {
+                keyParameterSites.push({ file, relativePath: fe.relativePath,
+                    language: fe.language, family: _family(fe.language), site });
+                continue;
+            }
             if (!site.patterns) continue;
             for (const pattern of site.patterns) {
                 const frag = _longestFragment(pattern);
@@ -740,7 +978,8 @@ function reflectionPatternIndex(index) {
             }
         }
     }
-    const result = { byFragment, lengths: [...lengths].sort((a, b) => a - b), entryCount, moduleScoped };
+    const result = { byFragment, lengths: [...lengths].sort((a, b) => a - b), entryCount, moduleScoped,
+        keyParameterSites, quoted: new Map(), keyNames: new Map() };
     index._reflectionPatternIndex = result;
     return result;
 }
@@ -755,8 +994,12 @@ function patternEntriesFor(index, name, language, file = null) {
             if (globMatches(entry.pattern, name)) out.push(entry);
         }
     }
-    if (pidx.entryCount === 0) return out;
     const family = language ? _family(language) : null;
+    for (const entry of pidx.keyParameterSites) {
+        if (family && entry.family !== family) continue;
+        if (_keyParameterPasses(index, pidx, entry, name)) out.push({ ...entry, pattern: name });
+    }
+    if (pidx.entryCount === 0) return out;
     const seenFrag = new Set();
     for (const len of pidx.lengths) {
         if (len > name.length) break;
@@ -874,4 +1117,5 @@ module.exports = {
     reflectionPatternReferences,
     reflectionPatternIndex,
     resetReflectionIndex,
+    resolveKeyParameter,
 };

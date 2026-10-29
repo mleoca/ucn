@@ -216,6 +216,7 @@ function formatDeadcode(results, options = {}) {
         !results.excludedExported && !results.excludedExternalContract &&
         !results.excludedRuntimeContract && !results.excludedConstructors && !results.pythonImplicitExportFiles &&
         !results.excludedDynamicDispatch && !results.computedDispatch?.count &&
+        !results.reflection?.withheld && !results.reflection?.dynamicCount && !results.reflection?.literalCount &&
         results.coverage?.complete !== false) {
         return 'No dead code found.';
     }

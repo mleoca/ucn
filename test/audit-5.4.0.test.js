@@ -30,10 +30,11 @@ describe('5.4.0 independent audit regressions', () => {
             assert.equal(response.ok, true);
             const point = response.result.symbols.find(s => s.name === 'Point');
             assert.equal(point.type, 'interface');
-            assert.equal(point.impact.typeReferences.confirmedCount, 1);
+            // The import and the annotation (fix #428: every token).
+            assert.equal(point.impact.typeReferences.confirmedCount, 2);
             const text = formatPublicText('impact', response.result, {}, response);
             assert.match(text, /MODIFIED DECLARATIONS/);
-            assert.match(text, /TYPE REFERENCE SITES: 1 confirmed/);
+            assert.match(text, /TYPE REFERENCE SITES: 2 confirmed/);
             assert.doesNotMatch(text, /BY FILE:/);
             const shell = cli(dir, 'impact', '--lines');
             assert.match(shell.stdout, /types.ts:1:Point/);
@@ -42,7 +43,7 @@ describe('5.4.0 independent audit regressions', () => {
             assert.equal(checked.status, 1, checked.stderr);
             const data = JSON.parse(checked.stdout).data;
             assert.equal(data.trust.status, 'BLOCKED');
-            assert.ok(data.changed.some(s => s.name === 'Point' && s.dependencyCount === 1));
+            assert.ok(data.changed.some(s => s.name === 'Point' && s.dependencyCount === 2));
             assert.ok(data.actions.some(a => a.kind === 'declaration_change'));
         } finally { rm(dir); }
     });

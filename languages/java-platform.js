@@ -109,6 +109,18 @@ const JAVA_PLATFORM_METHOD_RETURNS = new Map([
     ['javax.lang.model.util.Types#getWildcardType', 'javax.lang.model.type.WildcardType'],
     ['javax.lang.model.util.Types#getNoType', 'javax.lang.model.type.NoType'],
     ['javax.lang.model.util.Types#getNullType', 'javax.lang.model.type.NullType'],
+    // JDK collection factories (fix #428): `with(Arrays.asList(..))` passes a
+    // List, never the element type of a sibling varargs overload.
+    ['java.util.Arrays#asList', 'java.util.List'],
+    ['java.util.List#of', 'java.util.List'], ['java.util.List#copyOf', 'java.util.List'],
+    ['java.util.Set#of', 'java.util.Set'], ['java.util.Set#copyOf', 'java.util.Set'],
+    ['java.util.Map#of', 'java.util.Map'], ['java.util.Map#copyOf', 'java.util.Map'],
+    ['java.util.Collections#emptyList', 'java.util.List'], ['java.util.Collections#singletonList', 'java.util.List'],
+    ['java.util.Collections#unmodifiableList', 'java.util.List'],
+    ['java.util.Collections#emptySet', 'java.util.Set'], ['java.util.Collections#singleton', 'java.util.Set'],
+    ['java.util.Collections#unmodifiableSet', 'java.util.Set'],
+    ['java.util.Collections#emptyMap', 'java.util.Map'], ['java.util.Collections#singletonMap', 'java.util.Map'],
+    ['java.util.Collections#unmodifiableMap', 'java.util.Map'],
 ]);
 
 // Complete inherited member-name surfaces of these JDK contracts. None declares
@@ -163,6 +175,11 @@ const JAVA_PLATFORM_SUPERTYPES = new Map([
             'AbstractList', 'AbstractCollection', 'SequencedCollection', 'Cloneable', 'Serializable']],
         ['ArrayDeque', ['Deque', 'Queue', 'Collection', 'Iterable', 'AbstractCollection',
             'SequencedCollection', 'Cloneable', 'Serializable']],
+        // The collection interfaces themselves (fix #428).
+        ['List', ['SequencedCollection', 'Collection', 'Iterable']],
+        ['Set', ['Collection', 'Iterable']],
+        ['Collection', ['Iterable']],
+        ['Map', []],
         ['HashMap', ['Map', 'AbstractMap', 'Cloneable', 'Serializable']],
         ['LinkedHashMap', ['HashMap', 'Map', 'SequencedMap', 'AbstractMap', 'Cloneable', 'Serializable']],
         ['TreeMap', ['NavigableMap', 'SortedMap', 'SequencedMap', 'Map', 'AbstractMap', 'Cloneable',

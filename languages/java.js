@@ -26,6 +26,50 @@ function parseTree(parser, code) {
     return safeParse(parser, code, undefined, PARSE_OPTIONS);
 }
 
+const ANNOTATION_BEFORE_DOTS = /@\s*[A-Za-z_$][\w$.]*(?:\s*\((?:[^()]|\([^()]*\))*\))?\s*\.\.\./;
+// An annotation (with optional arguments) written right before `...`.
+const VARARGS_ANNOTATION = /@\s*[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*(?:\s*\((?:[^()]|\([^()]*\))*\))?\s*(?=\.\.\.)/g;
+
+/**
+ * Recovery of a grammar gap (fix #428): tree-sitter-java does not parse a
+ * type annotation between a variable arity parameter's type and its `...`
+ * (`Object @Nullable ... args`, JLS 8.4.1), and drops the parameter. Inside
+ * each parse error of a parameter list, such annotations are blanked (same
+ * offsets) and the source reparsed; the recovered tree is kept only when it
+ * has fewer errors. Annotations carry no call or type facts the index reads
+ * there.
+ */
+function recoverTypeAnnotatedVarargs(tree, source, reparse) {
+    // Only a source spelling an annotation right before `...` can hold the
+    // gap: one text test before any tree walk.
+    if (!source.includes('...') || !ANNOTATION_BEFORE_DOTS.test(source)) return null;
+    const ranges = [];
+    for (const error of tree.rootNode.descendantsOfType('ERROR')) {
+        let inParameters = false;
+        for (let node = error.parent; node && !inParameters; node = node.parent) {
+            if (node.type === 'formal_parameters') inParameters = true;
+            if (node.type === 'class_body' || node.type === 'program') break;
+        }
+        if (!inParameters) continue;
+        const text = source.slice(error.startIndex, error.endIndex);
+        for (const match of text.matchAll(VARARGS_ANNOTATION)) {
+            ranges.push([error.startIndex + match.index, error.startIndex + match.index + match[0].length]);
+        }
+    }
+    if (ranges.length === 0) return null;
+    let blanked = '';
+    let at = 0;
+    for (const [start, end] of ranges.sort((a, b) => a[0] - b[0])) {
+        if (start < at) continue;
+        blanked += source.slice(at, start) + source.slice(start, end).replace(/[^\n]/g, ' ');
+        at = end;
+    }
+    blanked += source.slice(at);
+    const recovered = reparse(blanked);
+    const errors = root => root.descendantsOfType('ERROR').length + (root.hasError ? 1 : 0);
+    return recovered && errors(recovered.rootNode) < errors(tree.rootNode) ? recovered : null;
+}
+
 /**
  * Extract Java parameters
  */
@@ -36,7 +80,8 @@ function extractJavaParams(paramsNode) {
     // the shared utils.extractParams already had it).
     if (!paramsNode) return '...';
     const text = nodeTextWithoutComments(paramsNode);
-    let params = text.replace(/^\(|\)$/g, '').trim();
+    // A recovered variable arity annotation leaves blanks before `...`.
+    let params = text.replace(/^\(|\)$/g, '').trim().replace(/ {2,}(?=\.\.\.)/g, ' ');
     return params;
 }
 
@@ -2856,6 +2901,7 @@ function implicitBaseCallsOf(code, parser, ownerLine, ownerEndLine) {
 }
 
 module.exports = {
+    recoverTypeAnnotatedVarargs,
     implicitOwnerScope: node => ({ enclosingType: enclosingTypeName(node) }),
     implicitBaseCallsOf,
     staticValueImportSyntax,

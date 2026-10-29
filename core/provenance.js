@@ -351,6 +351,14 @@ function validateConfirmation(provenance, target, invalidCall = false) {
             facts.receiverOrigin.source !== facts.receiverTypeSource) return incomplete('builtin-origin-not-established');
         return { verdict: 'establishes-other', declaration: { builtin: facts.receiverType, language: facts.language } };
     }
+    if (facts.typeReference) {
+        const reference = facts.typeReference;
+        if (!validIdentity(reference.declaration) || !reference.written ||
+            String(reference.written).split(/::|\./).pop() !== reference.declaration.name) {
+            return inconsistent('type-reference-mismatch');
+        }
+        return verdictFor(reference.declaration);
+    }
     if (facts.lookup) {
         const { receiver, steps, selected } = facts.lookup;
         if (!validIdentity(receiver) || !validIdentity(selected) || !Array.isArray(steps) || !steps.length) {
@@ -418,15 +426,60 @@ function validateConfirmation(provenance, target, invalidCall = false) {
                 delegation.members.some(member => member.kind !== 'constructor' || member.className !== step.owner.name))) {
                 return inconsistent('constructor-delegation-mismatch');
             }
+            // A super lookup (fix #428) passes over the enclosing class's
+            // own members: only the first step, for the language's super
+            // receiver inside a member of that class.
+            const superLookup = step.superLookup;
+            if (superLookup) {
+                const enclosing = facts.receiverOrigin?.declaration;
+                const keyword = require('../languages').langTraits(facts.language)?.superReceiver;
+                if (i !== 0 || !keyword || facts.receiver !== keyword || named.length ||
+                    facts.receiverOrigin?.source !== 'same-class' || facts.receiverOrigin.superLookup !== true ||
+                    !validIdentity(enclosing) || enclosing.className !== step.owner.name ||
+                    enclosing.file !== facts.site?.file || facts.site.line < enclosing.startLine ||
+                    facts.site.line > enclosing.endLine || !Array.isArray(superLookup.skipped) ||
+                    superLookup.skipped.some(member => member.className !== step.owner.name)) {
+                    return inconsistent('super-lookup-mismatch');
+                }
+            }
+            // The parts of a C# partial type declare one class's members.
+            const parts = Array.isArray(step.partialParts) ? step.partialParts : null;
+            if (parts && (facts.language !== 'csharp' || !parts.some(part => sameDeclaration(part, step.owner)) ||
+                parts.some(part => !validIdentity(part) || part.name !== step.owner.name || part.kind !== step.owner.kind ||
+                    (part.namespace || null) !== (step.owner.namespace || null) ||
+                    (part.enclosingType || null) !== (step.owner.enclosingType || null)))) {
+                return inconsistent('partial-part-mismatch');
+            }
             if (named.some(member => member.className !== step.owner.name ||
                 (member.namespace || null) !== (step.owner.namespace || null) ||
                 (member.enclosingType || null) !== (step.owner.enclosingType || null) ||
-                (facts.language !== 'go' && member.file !== step.owner.file))) {
+                (facts.language !== 'go' && member.file !== step.owner.file &&
+                    !parts?.some(part => part.file === member.file) &&
+                    // Rust impl blocks may sit in any file of the crate.
+                    !require('../languages').langTraits(facts.language)?.itemScopeResolution))) {
                 return inconsistent('member-owner-mismatch');
             }
             if (i + 1 < steps.length) {
                 if (named.length && !overload) return inconsistent('overriding-member-before-target');
-                if (!step.parents.some(parent => sameDeclaration(parent, steps[i + 1].owner))) {
+                const next = steps[i + 1];
+                if (next.enclosingOf) {
+                    // A lexical hop (fix #428): a bare call, a hierarchy that
+                    // ends here with no member of the name since the type
+                    // it started from, and the declaration enclosing it.
+                    const inner = next.enclosingOf;
+                    let start = 0;
+                    for (let j = i; j > 0; j--) if (steps[j].enclosingOf) { start = j; break; }
+                    const segments = String(inner?.enclosingType || '').split('.');
+                    const outerName = segments.pop();
+                    if (facts.receiver || facts.receiverOrigin?.source !== 'same-class' || !['java', 'csharp'].includes(facts.language) ||
+                        step.parents.length !== 0 || !validIdentity(inner) || !sameDeclaration(inner, steps[start].owner) ||
+                        steps.slice(start, i + 1).some(prior => prior.members.some(member => member.name === selected.name)) ||
+                        next.owner.name !== outerName || next.owner.file !== inner.file ||
+                        (next.owner.enclosingType || null) !== (segments.length ? segments.join('.') : null) ||
+                        next.owner.startLine > inner.startLine || (next.owner.endLine ?? next.owner.startLine) < inner.endLine) {
+                        return inconsistent('unproven-enclosing-hop');
+                    }
+                } else if (!step.parents.some(parent => sameDeclaration(parent, next.owner))) {
                     return inconsistent('unproven-inheritance-hop');
                 }
             } else if (configurationItem) {
@@ -465,7 +518,9 @@ function validateConfirmation(provenance, target, invalidCall = false) {
         }
         if (memberSetMembers) {
             if (targets.some(target => memberSetMembers.some(member => sameDeclaration(target, member)))) {
-                return incomplete('ambiguous-or-missing-member');
+                // A choice among them the replay cannot state (fix #428).
+                return facts.lookupGap ? { verdict: 'incomplete', diagnostic: facts.lookupGap, gap: true }
+                    : incomplete('ambiguous-or-missing-member');
             }
             return { verdict: 'establishes-other', declarations: memberSetMembers };
         }
@@ -528,6 +583,12 @@ function validateConfirmation(provenance, target, invalidCall = false) {
             last.declaration.name !== last.importedName) return incomplete('missing-import-declaration');
         return verdictFor(last.declaration);
     }
+    // A lookup this collector cannot state yet (fix #428: extension
+    // invocations, impl selection, members a using-declaration brings in,
+    // const/ref-qualified pairs, trait-provided methods, Rust name scopes)
+    // proves nothing: for exclusion and receiver migration it is incomplete,
+    // as before; on an edge another rule confirmed it reads `unsupported`.
+    if (facts.lookupGap) return { verdict: 'incomplete', diagnostic: facts.lookupGap, gap: true };
     // An unsupported rule is an instrumentation result, not a failed proof.
     // A collector that entered a supported lookup must still fail closed if
     // its witness is absent (including when a saved witness was tampered with).
@@ -556,7 +617,9 @@ function createProvenance(evidence, resolution) {
     const rules = [];
     if (evidence.possibleDispatch) rules.push('possible-dispatch');
     if (evidence.methodAmbiguous) rules.push('method-ambiguous');
-    if (evidence.resolvedBySameClass) rules.push('same-class');
+    // A qualified static call resolved to its class is type-qualified, not
+    // a same-class receiver (fix #428).
+    if (evidence.resolvedBySameClass && !evidence.qualifiedOwner) rules.push('same-class');
     if (evidence.extensionMethod) rules.push('extension-method');
     if (evidence.hasReceiverType || evidence.resolvedByReceiverHint) {
         rules.push(TYPE_SOURCE_RULES[source] || 'receiver-type');
@@ -590,7 +653,7 @@ function createProvenance(evidence, resolution) {
     const provenance = { rule: rules[0], rules: [...new Set(rules)], facts };
     if (facts.targets?.length) {
         const checked = validateConfirmation(provenance, facts.targets);
-        provenance.validation = checked.verdict;
+        provenance.validation = checked.gap ? 'unsupported' : checked.verdict;
         if (checked.diagnostic) provenance.diagnostic = checked.diagnostic;
     } else {
         provenance.validation = 'incomplete';

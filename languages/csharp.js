@@ -2149,11 +2149,16 @@ function staticArgKind(node, variableTypes) {
         case 'anonymous_method_expression': {
             // Its parameter count selects among delegate overloads (fix
             // #391); `delegate { }` without a list converts to any count.
+            // An implicitly typed lambda (`x => ..`, `(a, b) => ..`) is
+            // marked `:i`: its parameter types come from the target
+            // delegate, never the other way (fix #428).
             const params = node.childForFieldName('parameters');
             if (!params) return 'lambda';
-            return params.type === 'parameter_list'
-                ? `lambda:${params.namedChildren.filter(child => child.type === 'parameter').length}`
-                : 'lambda:1';
+            if (params.type !== 'parameter_list') return 'lambda:1:i';
+            const list = params.namedChildren.filter(child => child.type === 'parameter');
+            const implicit = node.type === 'lambda_expression' && list.length > 0 &&
+                list.every(child => !child.childForFieldName('type'));
+            return `lambda:${list.length}${implicit ? ':i' : ''}`;
         }
         case 'binary_expression': {
             // String concatenation: `+` with a string operand is a string

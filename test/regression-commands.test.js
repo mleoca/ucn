@@ -7390,18 +7390,22 @@ describe('fix #345: impact on a type-kind definition renders a type-reference ba
             assert.ok(r.ok, JSON.stringify(r));
             const refs = r.result.typeReferences;
             assert.ok(refs, 'type band present');
-            assert.strictEqual(refs.confirmedCount, 1);
-            assert.strictEqual(refs.byFile[0].file, 'use.ts');
-            assert.strictEqual(refs.unverifiedCount, 1, 'no-import-link site stays visible');
-            assert.strictEqual(refs.unverifiedSites[0].reason, 'no-import-link');
-            assert.strictEqual(r.result.totalDependencySites, 1);
+            // fix #428: every token, decided by the type lookup: the import
+            // and both annotations; a module file without an import of the
+            // name never sees the type.
+            assert.strictEqual(refs.confirmedCount, 3);
+            assert.deepStrictEqual(refs.byFile.map(group => group.file), ['use.ts']);
+            assert.strictEqual(refs.unverifiedCount, 0);
+            assert.deepStrictEqual(refs.excluded.byReason, { 'not-imported': 1 });
+            assert.strictEqual(r.result.totalDependencySites, 3);
             assert.strictEqual(r.result.totalCallSites, 0);
             const text = output.formatImpact(r.result);
-            assert.match(text, /DEPENDENCY SITES: 1 confirmed \+ 1 unverified/);
-            assert.match(text, /TYPE REFERENCE SITES: 1 confirmed \+ 1 unverified/);
+            assert.match(text, /DEPENDENCY SITES: 3 confirmed/);
+            assert.match(text, /TYPE REFERENCE SITES: 3 confirmed/);
+            assert.match(text, /TYPE ACCOUNT: "Signal" is 5 name token\(s\) on 4 line\(s\) in 3 file\(s\): 3 confirmed, 0 unverified, 1 excluded \(not-imported 1\), 0 at call sites, 1 declaration/);
             const lines = runCli(dir, 'impact', ['Signal'], ['--lines']);
-            assert.match(lines, /^use\.ts:2:.*\t# type-reference$/m);
-            assert.match(lines, /^loose\.ts:1:.*\t# unverified: no-import-link; type-reference$/m);
+            assert.match(lines, /^use\.ts:2:.*\t# type-reference: type, column 26$/m);
+            assert.match(lines, /^use\.ts:1:.*\t# type-reference: import, column 10$/m);
         } finally {
             rm(dir);
         }
@@ -7419,9 +7423,9 @@ describe('fix #345: impact on a type-kind definition renders a type-reference ba
             const r = execute(index, 'impact', { name: 'Box', file: 'a.ts' });
             assert.ok(r.ok, JSON.stringify(r));
             const refs = r.result.typeReferences;
-            assert.strictEqual(refs.confirmedCount, 1, 'c.ts imports a.ts');
-            assert.strictEqual(refs.byFile[0].file, 'c.ts');
-            assert.strictEqual(refs.excluded.byReason['other-definition'], 1, 'b.ts:2 binds b.ts\'s own Box');
+            assert.strictEqual(refs.confirmedCount, 2, 'c.ts imports a.ts');
+            assert.deepStrictEqual(refs.byFile.map(group => group.file), ['c.ts']);
+            assert.strictEqual(refs.excluded.byReason['other-type'], 3, 'b.ts binds its own Box');
             assert.strictEqual(refs.unverifiedCount, 0);
             const fn = execute(index, 'impact', { name: 'fit' });
             assert.ok(fn.ok && !fn.result.typeReferences, 'callable pins keep the call-shaped answer');
@@ -7444,11 +7448,11 @@ describe('fix #345: impact on a type-kind definition renders a type-reference ba
         try {
             const g = execute(idx(goDir), 'impact', { name: 'Runner' });
             assert.ok(g.ok && g.result.typeReferences, JSON.stringify(g));
-            assert.strictEqual(g.result.typeReferences.confirmedCount, 1);
-            assert.strictEqual(g.result.typeReferences.byFile[0].sites[0].evidence, 'package-scope');
+            assert.strictEqual(g.result.typeReferences.confirmedCount, 2);
+            assert.deepStrictEqual(g.result.typeReferences.byFile.map(group => group.file), ['use.go']);
             const p = execute(idx(pyDir), 'impact', { name: 'UserId' });
             assert.ok(p.ok && p.result.typeReferences, JSON.stringify(p));
-            assert.strictEqual(p.result.typeReferences.confirmedCount, 1);
+            assert.strictEqual(p.result.typeReferences.confirmedCount, 3, 'the import and both annotations');
         } finally {
             rm(goDir); rm(pyDir);
         }
@@ -8596,6 +8600,68 @@ describe('fix #420: value dependency counts, value account and check on value ch
             assert.ok(result.actions.some(action => action.kind === 'value_change' && action.severity === 'warn'));
             assert.ok(!result.actions.some(action => action.kind === 'declaration_change'));
             assert.strictEqual(result.trust.status, 'REVIEW_REQUIRED');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #428: impact of a class lists its type reference sites, accounted token by token', () => {
+    const cases = [
+        ['a.ts', 'export class Foo {}\nexport function f(x: Foo): Foo { const y: Foo = new Foo(); return y }\n', 'a.ts:1:Foo', 3, 1],
+        ['a.py', 'class Foo:\n    pass\n\ndef f(x: Foo) -> Foo:\n    y: Foo = Foo()\n    return y\n', 'a.py:1:Foo', 3, 1],
+        ['A.java', 'class Foo {}\nclass U { Foo f(Foo x) { Foo y = new Foo(); return y; } }\n', 'A.java:1:Foo', 3, 1],
+        ['A.cs', 'class Foo {}\nclass U { Foo F(Foo x) { Foo y = new Foo(); return y; } }\n', 'A.cs:1:Foo', 3, 1],
+        ['a.go', 'package p\ntype Foo struct{ A int }\nfunc f(x Foo) Foo { y := Foo{A: 1}; var z Foo = y; return z }\n', 'a.go:2:Foo', 3, 1],
+        ['a.rs', 'struct Foo { a: i32 }\nfn f(x: Foo) -> Foo { let y: Foo = Foo { a: 1 }; y }\n', 'a.rs:1:Foo', 3, 1],
+        ['a.cpp', 'struct Foo { int a; };\nFoo f(Foo x) { Foo y; Foo z{}; return Foo(); }\n', 'a.cpp:1:Foo', 2, 3],
+        ['a.c', 'struct Foo { int a; };\nstruct Foo f(struct Foo x) { struct Foo y = x; return y; }\n', 'a.c:1:Foo', 3, 0],
+    ];
+    for (const [file, source, handle, references, constructions] of cases) {
+        it(`${file}: annotations are type references, constructions stay call sites`, () => {
+            const dir = tmp({ [file]: source });
+            try {
+                const { ok, result, error } = execute(idx(dir), 'impact', { name: handle });
+                assert.ok(ok, error);
+                const band = result.typeReferences;
+                assert.ok(band, 'a type reference band');
+                assert.strictEqual(band.confirmedCount, references, JSON.stringify(band.byFile));
+                assert.strictEqual(band.account.constructions, constructions);
+                assert.strictEqual(result.totalCallSites, constructions);
+                assert.strictEqual(result.totalDependencySites, references + constructions, 'each token once');
+                assert.ok(band.account.conserved);
+                assert.strictEqual(band.account.tokens, band.account.confirmed + band.account.unverified +
+                    band.account.excluded + band.account.constructions + band.account.declarations);
+                assert.match(output.formatImpact(result), new RegExp(`TYPE ACCOUNT: "Foo" is ${band.account.tokens} name token`));
+            } finally { rm(dir); }
+        });
+    }
+    it('a namesake of another scope is excluded with its reason, an unresolved import is unverified', () => {
+        const dir = tmp({
+            'm.ts': 'export class Foo {}\nexport function f(x: Foo) { return x }\n',
+            'other.ts': 'class Foo {}\nexport function g(x: Foo) { return x }\n',
+            'use.ts': 'import { Foo } from "./m"\nexport function h(x: Foo) { return x }\n',
+            'loose.ts': 'import { Foo } from "missing-pkg"\nexport function k(x: Foo) { return x }\n',
+        });
+        try {
+            const { result } = execute(idx(dir), 'impact', { name: 'm.ts:1:Foo' });
+            const band = result.typeReferences;
+            const sites = band.byFile.flatMap(group => group.sites.map(site => `${site.file}:${site.line}:${site.kind}`));
+            assert.deepStrictEqual(sites, ['m.ts:2:type', 'use.ts:1:import', 'use.ts:2:type']);
+            assert.ok(!sites.some(site => site.startsWith('other.ts') || site.startsWith('loose.ts')));
+            assert.deepStrictEqual(band.excluded, { total: 2, byReason: { 'other-type': 2 } });
+            assert.deepStrictEqual(band.unverifiedSites.map(site => `${site.file}:${site.line}:${site.reason}`),
+                ['loose.ts:1:unresolved-import', 'loose.ts:2:unresolved-import']);
+            assert.ok(band.account.conserved);
+        } finally { rm(dir); }
+    });
+    it('a static call through the class is one call site, never also a type reference (Java)', () => {
+        const dir = tmp({ 'K.java': 'class K { static K get() { return new K(); } }\nclass U { K k = K.get(); }\n' });
+        try {
+            const { result } = execute(idx(dir), 'impact', { name: 'K.java:1:K' });
+            const band = result.typeReferences;
+            assert.strictEqual(result.totalCallSites, 2, 'the construction and the qualified call');
+            assert.strictEqual(band.confirmedCount, 2, 'the return type and the field type');
+            assert.strictEqual(band.account.constructions, 2);
+            assert.strictEqual(result.totalDependencySites, 4);
         } finally { rm(dir); }
     });
 });

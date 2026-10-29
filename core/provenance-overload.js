@@ -1,6 +1,6 @@
 'use strict';
 
-const { declarationIdentity, sameDeclaration } = require('./provenance');
+const { declarationIdentity, identityKey, sameDeclaration } = require('./provenance');
 const { langTraits } = require('../languages');
 const { UcnError, isInternalError } = require('./errors');
 
@@ -352,8 +352,12 @@ function encodeDefinition(definition) {
     let saved = ENCODED_DEFINITIONS.get(definition);
     if (!saved || saved.params !== definition.params || saved.paramsStructured !== definition.paramsStructured ||
         saved.generics !== definition.generics) {
-        saved = { value: encode(definition, {}), params: definition.params,
+        const frozen = { plain: true };
+        saved = { value: encode(definition, frozen), params: definition.params,
             paramsStructured: definition.paramsStructured, generics: definition.generics };
+        // A plain recorded declaration has one frozen decoded twin every
+        // capture selects over (fix #428).
+        if (frozen.plain) PLAIN_FACTS.add(saved.value);
         ENCODED_DEFINITIONS.set(definition, saved);
     }
     return saved.value;
@@ -367,7 +371,7 @@ function captureOverload(index, call, candidates, language, select) {
         const recordedCall = encode(call, {});
         const recordedCandidates = Object.freeze(candidates.map(encodeDefinition));
         const view = factIndex(reads, index, OVERLOAD_FILE_FIELDS);
-        const selectable = decode(recordedCandidates);
+        const selectable = recordedCandidates.map(decodeFact);
         const result = select(view, decode(recordedCall), selectable, language);
         const witness = { call: recordedCall, candidates: recordedCandidates, language,
             reads: sealFacts(reads), fileFields: true,
@@ -414,8 +418,11 @@ function validateOverload(witness, members, selected, invalidCall = false, ambig
     if (!witness || !Array.isArray(witness.candidates)) return false;
     let replay;
     try { replay = overloadReplay(witness); } catch (error) { return refusedProof(error, false); }
-    if (replay.candidates.length !== members.length || replay.candidates.some(candidate =>
-        !members.some(member => sameDeclaration(member, candidate)))) return false;
+    // Members usually arrive in the replay's own order: an aligned pass
+    // decides those in one comparison each (fix #428).
+    if (replay.candidates.length !== members.length || (!replay.candidates.every((candidate, i) =>
+        sameDeclaration(members[i], candidate)) && replay.candidates.some(candidate =>
+        !members.some(member => sameDeclaration(member, candidate))))) return false;
     const { call, result } = replay;
     if (site && call?.argumentFile !== undefined && call.argumentFile !== site.file) return false;
     if (site && call?.argumentFile !== undefined && call.callSite &&
@@ -429,21 +436,39 @@ function validateOverload(witness, members, selected, invalidCall = false, ambig
 
 // Reconstruct inherited overload slots from the actual declarations, with
 // the nearest declaration of an identical signature hiding the ancestor.
+const SLOT_SIGNATURES = new WeakMap();
+const STEP_MEMBER_CHECKS = new WeakMap();
 function overloadMemberGroup(steps) {
     const normalize = require('./callers').provenanceParameterIdentity;
     const seen = new Set();
     const group = [];
     for (const step of steps) {
         if (!Array.isArray(step.memberDefinitions) ||
-            step.memberDefinitions.length !== step.members.length ||
-            step.memberDefinitions.some(d => !step.members.some(m =>
-                sameDeclaration(m, declarationIdentity(d))))) return null;
+            step.memberDefinitions.length !== step.members.length) return null;
+        // Every definition is one of the step's members: one key set per
+        // pair of lists, never a pairwise comparison per witness (fix #428).
+        let byDefinitions = STEP_MEMBER_CHECKS.get(step.members);
+        if (!byDefinitions) STEP_MEMBER_CHECKS.set(step.members, byDefinitions = new WeakMap());
+        let consistent = byDefinitions.get(step.memberDefinitions);
+        if (consistent === undefined) {
+            const memberKeys = new Set(step.members.map(member => identityKey(member)));
+            consistent = !memberKeys.has(null) &&
+                step.memberDefinitions.every(d => memberKeys.has(identityKey(declarationIdentity(d))));
+            byDefinitions.set(step.memberDefinitions, consistent);
+        }
+        if (!consistent) return null;
         const sameDepth = [];
         for (const definition of step.memberDefinitions) {
-            const signature = Array.isArray(definition.paramsStructured)
-                ? definition.paramsStructured.filter(p => !p?.extensionReceiver)
-                    .map(p => `${normalize(p?.type || '')}:${p?.rest ? 'rest' : 'fixed'}`).join(',')
-                : `${definition.file}:${definition.startLine}`;
+            // One signature per declaration and parameter list (fix #428).
+            let saved = SLOT_SIGNATURES.get(definition);
+            if (!saved || saved.params !== definition.paramsStructured) {
+                saved = { params: definition.paramsStructured, signature: Array.isArray(definition.paramsStructured)
+                    ? definition.paramsStructured.filter(p => !p?.extensionReceiver)
+                        .map(p => `${normalize(p?.type || '')}:${p?.rest ? 'rest' : 'fixed'}`).join(',')
+                    : `${definition.file}:${definition.startLine}` };
+                SLOT_SIGNATURES.set(definition, saved);
+            }
+            const signature = saved.signature;
             if (!seen.has(signature)) {
                 group.push(definition);
                 sameDepth.push(signature);

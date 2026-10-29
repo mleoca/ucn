@@ -23,7 +23,7 @@ const {
 const { externalTypeGate, stripExternalReceiverType, externalTypeDenotation, externalProducerVia, externalReceiverVerdict, csharpUsings, siteNamespaceOf } = require('./type-denotation');
 const { scoreEdge, tierForResolution, TIER, validateConfirmation } = require('./confidence');
 const { summarizeProvenance, declarationIdentity, sameDeclaration } = require('./provenance');
-const { confirmationFacts, occurrenceIdentity, definitionsInFile, definitionAt } = require('./provenance-facts');
+const { confirmationFacts, occurrenceIdentity, definitionsInFile, definitionAt, partialTypeParts } = require('./provenance-facts');
 const { BUILTIN_RECEIVER_TYPES, isProvenanceBuiltinReceiver } = require('./receiver-types');
 const { findGoModule, resolveRustImport, resolveRustModuleFile } = require('./imports');
 const { goFileConstraint: _goFileConstraint, goSamePackage, goBuildAlternatives, goAlternativesAt,
@@ -66,7 +66,8 @@ const CROSS_OPERATION_FLOW_CACHE_LIMIT = 4096;
 
 // The options confirmationFacts reads besides its resolvers; a falsy value
 // reads as absent.
-const _FACT_OPTION_KEYS = ['receiverType', 'receiverTypeSource', 'receiverOrigin', 'originFile', 'bindingId', 'sameClass'];
+const _FACT_OPTION_KEYS = ['receiverType', 'receiverTypeSource', 'receiverOrigin', 'originFile', 'bindingId', 'sameClass',
+    'extensionMethod'];
 
 function _confirmationFacts(index, file, call, targets, options = {}) {
     // Only the target identities depend on the targets: the facts of a
@@ -136,8 +137,18 @@ function _confirmationFactsUncached(index, file, call, targets, options) {
         ...options,
         selectOverload: selectProvenanceOverload,
         typeHead: name => _structuralTypeHead(name, { index, language: index.files.get(file)?.language }),
-        resolveType(name, context, line, qualified) {
+        resolveType(name, context, line, qualified, arity) {
             const language = index.files.get(context)?.language;
+            // Rust names and paths resolve by the language's item and `use`
+            // scopes (fix #422); its answer is the witness's (fix #428).
+            if (langTraits(language)?.itemScopeResolution && Number.isInteger(line)) {
+                const rustNames = require('./rust-names');
+                const named = qualified ? rustNames.resolveRustPathQualifier(index, context, line, `${qualified}::${name}`)
+                    : rustNames.resolveRustName(index, context, line, name, 'type');
+                const types = (named?.defs || []).filter(d => IDENTITY_TYPE_KINDS.has(d.type) ||
+                    (d.type === 'type' && d.aliasOf));
+                if (types.length === 1) return types[0];
+            }
             const parts = name.split(name.includes('::') ? '::' : '.');
             if (parts.length > 1) {
                 const simple = parts.pop();
@@ -148,10 +159,17 @@ function _confirmationFactsUncached(index, file, call, targets, options) {
                 if (named.length === 1) return named[0];
             }
             if (language === 'java' || language === 'csharp') {
-                const definitions = (index.symbols.get(name) || []).filter(d => IDENTITY_TYPE_KINDS.has(d.type));
+                // A type of another language is never the name's denotation.
+                const definitions = (index.symbols.get(name) || []).filter(d => IDENTITY_TYPE_KINDS.has(d.type) &&
+                    index.files.get(d.file)?.language === language &&
+                    (!Number.isInteger(arity) || !langTraits(language)?.genericArityIsIdentity || (d.typeArity || 0) === arity));
                 const selected = definitions.filter(d => _resolveReceiverTypeIdentity(
-                    index, context, name, [{ ...d, className: name }], line, qualified) === 'target');
+                    index, context, name, [{ ...d, className: name }], line, qualified, arity) === 'target');
                 if (selected.length === 1) return selected[0];
+                // The parts of one C# partial type are one type (fix #428):
+                // its first part stands for it.
+                const parts = selected.length > 1 ? partialTypeParts(index, selected[0]) : null;
+                if (parts && selected.every(d => parts.includes(d))) return parts[0];
             }
             if (language === 'java' && qualified) {
                 const nested = (index.symbols.get(name) || []).filter(d =>
@@ -3457,6 +3475,10 @@ function findCallers(index, name, options = {}) {
                 // self/this.method() calls can be resolved by same-class matching
                 // even when binding is ambiguous (e.g. method exists in multiple classes)
                 let resolvedBySameClass = false;
+                // The type a qualified static call names (`Util.f()` resolved
+                // to its declaring class, fix #428): the witness looks the
+                // member up from it, never from the enclosing class.
+                let qualifiedOwnerMatch = null;
                 // Python self.attr.method() resolved from __init__/field type
                 // inference. It shares the routing precedence of same-class
                 // resolution, but its evidence grade is receiver-hint, not
@@ -3506,6 +3528,15 @@ function findCallers(index, name, options = {}) {
                     // the extension's `this` parameter (an external type) is
                     // a visible unverified caller, never a type mismatch.
                     if (extensionVerdict === 'possible') {
+                        // Whatever the receiver binds, arguments that provably
+                        // select a sibling overload are no call of this one
+                        // (fix #428: `cnn.Execute(new CommandDefinition(..))`
+                        // never runs `Execute(this IDbConnection, string, ..)`).
+                        if (collectAccount && options.targetDefinitions && call.argCount != null && !call.argSpread &&
+                            _overloadDiscipline(index, call, options.targetDefinitions, definitions, filePath) === 'other-overload') {
+                            recordExcluded(filePath, call.line, 'overload-mismatch');
+                            continue;
+                        }
                         routeUnverified(filePath, fileEntry, call, 'extension-receiver-unresolved', calledAs);
                         continue;
                     }
@@ -3593,6 +3624,7 @@ function findCallers(index, name, options = {}) {
                         if (targetKeys.has(matchKey)) {
                             bindingId = qualified.match.bindingId;
                             resolvedBySameClass = true;
+                            qualifiedOwnerMatch = qualified.match;
                         } else {
                             recordExcluded(filePath, call.line, 'other-definition');
                             continue;
@@ -4115,6 +4147,11 @@ function findCallers(index, name, options = {}) {
                     // A platform instance member that may take the arguments
                     // leaves the extension undecided (fix #395).
                     if (hopVerdict === 'possible') {
+                        if (collectAccount && options.targetDefinitions && call.argCount != null && !call.argSpread &&
+                            _overloadDiscipline(index, call, options.targetDefinitions, definitions, filePath) === 'other-overload') {
+                            recordExcluded(filePath, call.line, 'overload-mismatch');
+                            continue;
+                        }
                         routeUnverified(filePath, fileEntry, call, 'extension-receiver-unresolved', calledAs);
                         continue;
                     }
@@ -4161,6 +4198,7 @@ function findCallers(index, name, options = {}) {
                         }
                         bindingId = qualified.match.bindingId;
                         resolvedBySameClass = true;
+                        qualifiedOwnerMatch = qualified.match;
                     } else if (qualified?.external) {
                         recordExcluded(filePath, call.line, 'external-package');
                         continue;
@@ -7776,14 +7814,21 @@ function findCallers(index, name, options = {}) {
                         facts: _confirmationFacts(index, filePath, call, targetDefs, {
                             bindingId,
                             ...resolvedReceiverFacts,
-                            sameClass: !!resolvedBySameClass && !resolvedByTypedAttribute,
+                            sameClass: !!resolvedBySameClass && !resolvedByTypedAttribute && !qualifiedOwnerMatch,
+                            ...(resolvedByExtensionMethod && { extensionMethod: true }),
+                            ...(qualifiedOwnerMatch && {
+                                receiverType: call.receiver, receiverTypeSource: 'type-qualified',
+                                receiverOrigin: { source: 'type-qualified', site: occurrenceIdentity(fileEntry.relativePath, call) },
+                            }),
                             ...(fieldHopType && !call.receiverType && {
                                 receiverType: fieldHopType, receiverTypeSource: 'field',
                                 receiverOrigin: { source: 'field', root: call.receiverRoot,
                                     rootType: call.receiverRootType, field: call.receiverField },
                             }),
                         }),
-                        typeQualifiedReceiver: resolvedReceiverFacts.receiverTypeSource === 'type-qualified',
+                        typeQualifiedReceiver: resolvedReceiverFacts.receiverTypeSource === 'type-qualified' ||
+                            !!qualifiedOwnerMatch,
+                        ...(qualifiedOwnerMatch && { qualifiedOwner: true }),
                         moduleOwnedPath: !!call.moduleOwnedPath,
                         extensionMethod: !!resolvedByExtensionMethod,
                         hasBindingId: !!bindingId,
@@ -7914,6 +7959,20 @@ function findCallers(index, name, options = {}) {
                     const ranking = scoreEdge({ isUncertain: true,
                         hasSingleOwnerEvidence: routedReason === 'single-owner' });
                     scored = { ...ranking, provenance: scored.provenance };
+                }
+            }
+            // A confirmed edge's witness establishes the target, or its rule's
+            // witness is not migrated yet (`unsupported`): the tier and the
+            // validation agree by construction (fix #428). Any other verdict
+            // (incomplete, inconsistent, another declaration, runtime
+            // dispatch) keeps the site visible, never confirmed or excluded.
+            if (!routedTier && collectAccount && !_evidence?.typeMismatch &&
+                tierForResolution(scored.resolution) === TIER.CONFIRMED) {
+                const validation = scored.provenance?.validation;
+                if (validation && validation !== 'establishes-target' && validation !== 'unsupported') {
+                    routedTier = TIER.UNVERIFIED;
+                    routedReason = 'provenance-incomplete';
+                    scored = { ...scoreEdge({ isUncertain: true }), provenance: scored.provenance };
                 }
             }
             // Family B contract field (fix #221): a bind/call/apply site reaches
@@ -18418,18 +18477,29 @@ function selectProvenanceOverload(index, call, candidates, language) {
     // operation (fix #396: every receiver-typed site of a many-overload
     // name recomputed it, a quadratic identity closure per site).
     const memo = index.isProvenanceFactIndex ? null : index._opMemo?.('provenanceOverloadSlots', () => new Map());
-    const key = memo ? candidates.map(d => `${d.file}\0${d.startLine}\0${d.name}\0${d.type}`).join('\u0001') : null;
+    const key = candidates.map(d => `${d.file}\0${d.startLine}\0${d.name}\0${d.type}`).join('\u0001');
+    // Slot positions in the candidate list, computed on a view.
+    const slotPositions = view => {
+        const remaining = new Set(candidates);
+        const positions = [];
+        candidates.forEach((definition, position) => {
+            if (!remaining.has(definition)) return;
+            const group = _closeCallableIdentityGroup(view, [definition], candidates);
+            const representative = group.find(d => !d.isSignature && !d.isDeclaration) || definition;
+            positions.push(candidates.indexOf(representative));
+            for (const member of group) remaining.delete(member);
+        });
+        return positions;
+    };
     let slots = memo?.get(key);
     if (!slots) {
-        const remaining = new Set(candidates);
-        slots = [];
-        for (const definition of candidates) {
-            if (!remaining.has(definition)) continue;
-            const group = _closeCallableIdentityGroup(index, [definition], candidates);
-            const representative = group.find(d => !d.isSignature && !d.isDeclaration) || definition;
-            slots.push(representative);
-            for (const member of group) remaining.delete(member);
-        }
+        // A witness view shares one decomposition per candidate set and
+        // operation, its reads recorded for every witness (fix #428: each
+        // capture over a forty-overload family recomputed it).
+        const positions = index.isProvenanceFactIndex
+            ? require('./provenance-overload').sharedRead(index, `overload-slots\0${key}`, slotPositions)
+            : slotPositions(index);
+        slots = positions.map(position => candidates[position]);
         memo?.set(key, slots);
     }
     // Where calls may pass any argument count (JavaScript), one callable
@@ -22247,6 +22317,18 @@ const _CSHARP_PLATFORM_BASES = new Map([
     ['ICollection', new Set(['IEnumerable'])],
     ['IReadOnlyList', new Set(['IEnumerable', 'IReadOnlyCollection'])],
     ['IReadOnlyCollection', new Set(['IEnumerable'])],
+    // System.Data.Common (fix #428): the ADO.NET base classes and the
+    // System.Data interfaces they implement.
+    ['DbConnection', new Set(['IDbConnection', 'IDisposable', 'IAsyncDisposable', 'Component'])],
+    ['DbCommand', new Set(['IDbCommand', 'IDisposable', 'IAsyncDisposable', 'Component'])],
+    ['DbDataReader', new Set(['IDataReader', 'IDataRecord', 'IDisposable', 'IAsyncDisposable', 'IEnumerable'])],
+    ['DbTransaction', new Set(['IDbTransaction', 'IDisposable', 'IAsyncDisposable'])],
+    ['DbParameter', new Set(['IDbDataParameter', 'IDataParameter'])],
+    ['IDbConnection', new Set(['IDisposable'])],
+    ['IDbCommand', new Set(['IDisposable'])],
+    ['IDbTransaction', new Set(['IDisposable'])],
+    ['IDataReader', new Set(['IDataRecord', 'IDisposable'])],
+    ['IDbDataParameter', new Set(['IDataParameter'])],
 ]);
 
 function _csharpTypeAssignable(index, actualType, expectedType) {
@@ -22257,8 +22339,10 @@ function _csharpTypeAssignable(index, actualType, expectedType) {
         const current = queue.shift();
         if (!current || seen.has(current)) continue;
         seen.add(current);
-        if (current === expectedType ||
-            _CSHARP_PLATFORM_BASES.get(current)?.has(expectedType)) return true;
+        // A project type spelled like a platform type is the project's.
+        if (current === expectedType || (_CSHARP_PLATFORM_BASES.get(current)?.has(expectedType) &&
+            !(index.symbols.get(current) || []).some(d => _ARITY_TYPE_KINDS.has(d.type) &&
+                index.files.get(d.file)?.language === 'csharp'))) return true;
         for (const parent of index._getInheritanceParents?.(current) || []) {
             const name = typeof parent === 'string' ? parent : parent?.name;
             if (name && !seen.has(name)) queue.push(name);
@@ -22517,6 +22601,17 @@ const _CSHARP_LIST_MEMBERS = {
     ..._CSHARP_COLLECTION_MEMBERS,
     IndexOf: [['T'], ['T', '*'], ['T', '*', '*']], Insert: [['*', 'T']], RemoveAt: [['*']],
 };
+const _CSHARP_DB_CONNECTION_INTERFACE_MEMBERS = {
+    BeginTransaction: [[], ['*']], ChangeDatabase: [['*']], Close: [[]], CreateCommand: [[]], Dispose: [[]], Open: [[]],
+};
+const _CSHARP_DB_COMMAND_INTERFACE_MEMBERS = {
+    Cancel: [[]], CreateParameter: [[]], Dispose: [[]], ExecuteNonQuery: [[]], ExecuteReader: [[], ['*']],
+    ExecuteScalar: [[]], Prepare: [[]],
+};
+// System.ComponentModel.Component and System.MarshalByRefObject members.
+const _CSHARP_COMPONENT_MEMBERS = {
+    Dispose: [[]], CreateObjRef: [['*']], GetLifetimeService: [[]], InitializeLifetimeService: [[]],
+};
 const _CSHARP_PLATFORM_INSTANCE_MEMBERS = new Map([
     ['ICollection', _CSHARP_COLLECTION_MEMBERS],
     ['IList', _CSHARP_LIST_MEMBERS],
@@ -22546,6 +22641,21 @@ const _CSHARP_PLATFORM_INSTANCE_MEMBERS = new Map([
         Add: [['K', 'V'], ['*']], Clear: [[]], Contains: [['*']], ContainsKey: [['K']], ContainsValue: [['V']],
         CopyTo: [['*', '*']], EnsureCapacity: [['*']], Remove: [['K'], ['K', '*'], ['*']], TrimExcess: [[], ['*']],
         TryAdd: [['K', 'V']], TryGetValue: [['K', '*']],
+    }],
+    // System.Data (fix #428).
+    ['IDbConnection', _CSHARP_DB_CONNECTION_INTERFACE_MEMBERS],
+    ['DbConnection', {
+        ..._CSHARP_DB_CONNECTION_INTERFACE_MEMBERS, ..._CSHARP_COMPONENT_MEMBERS,
+        BeginTransactionAsync: [[], ['*'], ['*', '*']], ChangeDatabaseAsync: [['*'], ['*', '*']],
+        CloseAsync: [[]], CreateBatch: [[]], DisposeAsync: [[]], EnlistTransaction: [['*']],
+        GetSchema: [[], ['*'], ['*', '*']], GetSchemaAsync: [[], ['*'], ['*', '*'], ['*', '*', '*']],
+        OpenAsync: [[], ['*']],
+    }],
+    ['IDbCommand', _CSHARP_DB_COMMAND_INTERFACE_MEMBERS],
+    ['DbCommand', {
+        ..._CSHARP_DB_COMMAND_INTERFACE_MEMBERS, ..._CSHARP_COMPONENT_MEMBERS,
+        DisposeAsync: [[]], ExecuteNonQueryAsync: [[], ['*']], ExecuteReaderAsync: [[], ['*'], ['*', '*']],
+        ExecuteScalarAsync: [[], ['*']], PrepareAsync: [[], ['*']],
     }],
 ]);
 
@@ -23916,8 +24026,14 @@ function _isLambdaKind(kind) {
 
 function _lambdaKindArity(kind) {
     if (typeof kind !== 'string' || !kind.startsWith('lambda:')) return null;
-    const arity = Number(kind.slice('lambda:'.length));
+    const arity = Number(kind.slice('lambda:'.length).replace(/:i$/, ''));
     return Number.isInteger(arity) && arity >= 0 ? arity : null;
+}
+
+// An implicitly typed lambda (`x => ..`, fix #428): its parameter types are
+// the target delegate's.
+function _isImplicitLambdaKind(kind) {
+    return typeof kind === 'string' && kind.startsWith('lambda:') && kind.endsWith(':i');
 }
 
 // Standard delegate / functional-interface types whose parameter count is
@@ -23987,6 +24103,77 @@ function _delegateParameterCount(index, paramType, language) {
     }
     if (language === 'java') return JAVA_FUNCTIONAL_ARITY.get(bare) ?? null;
     return null;
+}
+
+// Types every lambda converts to through its natural type (C# 10) or that
+// only name a delegate shape (`Expression`, `LambdaExpression`).
+const _LAMBDA_NATURAL_TARGETS = new Set(['object', 'Object', 'Delegate', 'MulticastDelegate',
+    'Expression', 'LambdaExpression', 'dynamic']);
+
+/**
+ * Can no lambda convert to `paramType` (fix #428)? True only when every
+ * same-language project declaration of the written name is a type no
+ * anonymous function converts to: a class, struct, enum or record (C# and
+ * Java), a C# interface, or a Java interface whose project closure declares
+ * other than one abstract method. A delegate, an alias, an external or an
+ * undecidable type stays possible.
+ */
+function _lambdaTargetImpossible(index, paramType, language) {
+    if (language !== 'csharp' && language !== 'java') return false;
+    const text = String(paramType || '').trim().replace(/\?$/, '');
+    const head = text.replace(/<.*$/s, '').trim();
+    const bare = head.split('.').pop();
+    // A qualified name, or one spelled like a platform delegate or functional
+    // interface, may name the platform type beside a project namesake.
+    if (!bare || head.includes('.') || _LAMBDA_NATURAL_TARGETS.has(bare) || bare === 'Action' || bare === 'Func' ||
+        CSHARP_FIXED_DELEGATE_ARITY.has(bare) || JAVA_FUNCTIONAL_ARITY.has(bare)) return false;
+    const own = (index.symbols.get(bare) || []).filter(d => NON_CALLABLE_TYPES.has(d.type) &&
+        index.files.get(d.file)?.language === language);
+    if (own.length === 0) return false;
+    const written = language === 'csharp' ? _genericArgumentCount(text) : null;
+    const candidates = written === null ? own : own.filter(d => (d.typeArity || 0) === written);
+    if (candidates.length === 0) return false;
+    return candidates.every(d => {
+        if (['class', 'struct', 'enum', 'record'].includes(d.type)) return true;
+        if (d.type !== 'interface') return false;
+        if (language === 'csharp') return true;
+        return _javaInterfaceAbstractCount(index, d) !== null && _javaInterfaceAbstractCount(index, d) !== 1;
+    });
+}
+
+/**
+ * The abstract method count of a Java interface over its project closure,
+ * or null when an external super-interface may add some.
+ */
+function _javaInterfaceAbstractCount(index, root) {
+    const abstract = new Set();
+    const seen = new Set();
+    const queue = [root];
+    while (queue.length > 0) {
+        const iface = queue.shift();
+        const key = `${iface.file}:${iface.startLine}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        if (seen.size > 32) return null;
+        for (const member of index.files.get(iface.file)?.symbols || []) {
+            if (member.className !== iface.name || NON_CALLABLE_TYPES.has(member.type) ||
+                member.startLine < iface.startLine || member.endLine > iface.endLine) continue;
+            const modifiers = member.modifiers || [];
+            if (modifiers.includes('default') || modifiers.includes('static') ||
+                modifiers.includes('private')) continue;
+            const arity = Array.isArray(member.paramsStructured) ? member.paramsStructured.length : null;
+            if (arity == null) return null;
+            if (_JAVA_OBJECT_METHOD_ARITY.get(member.name) === arity) continue;
+            abstract.add(`${member.name}/${arity}`);
+        }
+        for (const parent of iface.extends ? [].concat(iface.extends) : []) {
+            const name = String(parent).replace(/<.*$/s, '').trim().split('.').pop();
+            const parents = (index.symbols.get(name) || []).filter(d => d.type === 'interface');
+            if (parents.length !== 1) return null;
+            queue.push(parents[0]);
+        }
+    }
+    return abstract.size;
 }
 
 /**
@@ -24456,6 +24643,11 @@ function _javaArgKindMatches(index, kind, paramType, language, typeParams = null
         if (bare === 'Object' || bare === 'dynamic') return language !== 'java';
         if (bare === 'String' || JAVA_PRIMITIVES.has(bare) || CSHARP_CLOSED_TYPES.has(bare) ||
             /\[\]\??$|\.\.\.$/.test(text)) return false;
+        // A project class, struct, enum or record is never a lambda's target
+        // type, nor in C# an interface (C# 10.7.1 anonymous function
+        // conversions; JLS 15.27.3 needs a functional interface): it never
+        // decides against a delegate overload (fix #428).
+        if (_lambdaTargetImpossible(index, paramType, language)) return false;
         // Its parameter count must equal the target's (C# 10.7.1, JLS
         // 15.27.3) where the target's parameter count is known.
         const lambdaArity = _lambdaKindArity(kind);
@@ -24472,6 +24664,8 @@ function _javaArgKindMatches(index, kind, paramType, language, typeParams = null
         if (known !== undefined) return known !== false;
     }
     if (!bare || bare === 'Object') return true;
+    // Every C# expression converts to `dynamic` (C# 10.2.10, fix #428).
+    if (language === 'csharp' && bare === 'dynamic') return true;
     if (/^[A-Z][0-9]?$/.test(bare)) return true; // generic type variable (T, E, K1...)
     if (kind === 'null') return !JAVA_PRIMITIVES.has(bare);
     if (kind.startsWith('class:')) {
@@ -24879,6 +25073,10 @@ function _javaVariadicArgumentMatches(index, call, kind, type, position, typePar
         return true; // An unindexed reference element may derive from the expected one.
     }
     if (actual && expectedDims > 0) return false;
+    // A modeled JDK type's supertypes are closed (fix #428): a `List`
+    // argument never converts to a project element type.
+    if (actual && JAVA_PLATFORM_SUPERTYPES.has(actual) &&
+        _javaPlatformAssignable(actual, String(type).replace(/<.*$/s, '').trim().split('.').pop()) === false) return false;
     if (!kind?.startsWith('cast:') || !call.argumentFile || !call.callSite) return true;
     const sdk = kind.slice('cast:'.length).replace(/<.*$/s, '').trim();
     if (!JAVA_MODELED_PLATFORM_TYPES.has(sdk)) return true;
@@ -24938,16 +25136,13 @@ function _overloadApplicable(index, call, def) {
     }
     // Without explicit type arguments a C# generic method is applicable only
     // when inference from the arguments fixes every type parameter (fix
-    // #393): one no parameter type mentions is never inferred.
+    // #393): one no parameter type mentions is never inferred, nor one only
+    // an implicitly typed lambda's parameter types mention (fix #428).
     if (!(call.methodTypeArgs > 0) && language &&
         langTraits(language)?.typeArgumentsFromArgumentsOnly &&
-        _methodTypeParameterCount(def) > 0) {
-        const own = _methodTypeParameterNames(def);
-        // Every parameter infers, the extension receiver's `this` one too.
-        const written = (Array.isArray(rawParams) ? rawParams : ps).map(p => String(p?.type || '')).join(' ');
-        for (const typeParam of own) {
-            if (!new RegExp(`(^|[^A-Za-z0-9_])${typeParam}([^A-Za-z0-9_]|$)`).test(written)) return false;
-        }
+        _methodTypeParameterCount(def) > 0 &&
+        !_csharpTypeParametersInferable(def, rawParams, ps, boundExtension, call.argKinds)) {
+        return false;
     }
     const kinds = call.argKinds;
     if (!Array.isArray(kinds)) return true;
@@ -24975,6 +25170,75 @@ function _overloadApplicable(index, call, def) {
         if (!matches) return false;
     }
     return true;
+}
+
+// Delegate shapes whose input and output type arguments the platform fixes
+// (fix #428): `Func<.., TResult>`, `Action<..>`, `Predicate<T>`.
+function _csharpDelegateShape(type) {
+    let text = String(type || '').trim().replace(/\?$/, '');
+    const head = () => text.replace(/<.*$/s, '').trim().split('.').pop();
+    if (head() === 'Expression' && text.includes('<')) text = text.slice(text.indexOf('<') + 1, text.lastIndexOf('>')).trim();
+    const name = head();
+    const args = _topLevelTypeArguments(text);
+    if (name === 'Func' && args.length > 0) return { inputs: args.slice(0, -1), output: args[args.length - 1] };
+    if (name === 'Action') return { inputs: args, output: null };
+    if (name === 'Predicate' && args.length === 1) return { inputs: args, output: null };
+    return null;
+}
+
+// Top-level type arguments of a written generic type (`A<B, C<D>>` -> [B, C<D>]).
+function _topLevelTypeArguments(text) {
+    const open = text.indexOf('<');
+    if (open < 0 || !text.endsWith('>')) return [];
+    const inner = text.slice(open + 1, -1);
+    const out = [];
+    let depth = 0;
+    let part = '';
+    for (const ch of inner) {
+        if (ch === '<' || ch === '(' || ch === '[') depth++;
+        else if (ch === '>' || ch === ')' || ch === ']') depth--;
+        if (ch === ',' && depth === 0) { out.push(part.trim()); part = ''; } else part += ch;
+    }
+    if (part.trim()) out.push(part.trim());
+    return out;
+}
+
+/**
+ * Does C# type inference from the arguments fix every method type
+ * parameter (fixes #393, #428)? A parameter type contributes the type
+ * parameters it mentions; an implicitly typed lambda argument contributes
+ * its delegate's output type only once every type parameter of its input
+ * types is fixed (C# 12.6.3: output type inference waits for fixed inputs),
+ * so `Map<T>(Expression<Func<T, object>>)` is never inferred from
+ * `Map(m => m.Id)`, while `Select(this IEnumerable<TSource>, Func<TSource,
+ * TResult>)` is.
+ */
+function _csharpTypeParametersInferable(def, rawParams, ps, boundExtension, kinds) {
+    const own = _methodTypeParameterNames(def);
+    const mentions = text => [...own].filter(typeParam =>
+        new RegExp(`(^|[^A-Za-z0-9_])${typeParam}([^A-Za-z0-9_]|$)`).test(text));
+    const fixed = new Set();
+    const pending = [];
+    const all = Array.isArray(rawParams) ? rawParams : (ps || []);
+    const offset = boundExtension ? 1 : 0;
+    all.forEach((param, position) => {
+        const type = String(param?.type || '');
+        const kind = position >= offset && Array.isArray(kinds) ? kinds[position - offset] : null;
+        const shape = _isImplicitLambdaKind(kind) && !param?.rest ? _csharpDelegateShape(type) : null;
+        if (shape) pending.push(shape);
+        else for (const typeParam of mentions(type)) fixed.add(typeParam);
+    });
+    for (let changed = true; changed;) {
+        changed = false;
+        for (let i = pending.length - 1; i >= 0; i--) {
+            const shape = pending[i];
+            if (!mentions(shape.inputs.join(' ')).every(typeParam => fixed.has(typeParam))) continue;
+            for (const typeParam of mentions(shape.output || '')) fixed.add(typeParam);
+            pending.splice(i, 1);
+            changed = true;
+        }
+    }
+    return [...own].every(typeParam => fixed.has(typeParam));
 }
 
 // Type parameter names a method or its owner declares (`<T, TResult>`),
@@ -26442,9 +26706,14 @@ function _overloadDiscipline(index, call, targetDefs, definitions, callerFile) {
         // static import), or the model misread its arguments. Either way it
         // is not evidence for the pin, and not proof against it: visible.
         // An argument COUNT no overload accepts keeps the arity verdict.
-        return (targetLanguage === 'java' || targetLanguage === 'csharp') &&
-            family.some(d => _overloadArityFits(call, d))
-            ? { ambiguous: true, candidates: 0 } : null;
+        if (!(targetLanguage === 'java' || targetLanguage === 'csharp') ||
+            !family.some(d => _overloadArityFits(call, d))) return null;
+        // Another project definition of the name every argument provably
+        // converts to shows the arguments were read right (fix #428:
+        // `lbf.getBean(TestBean.class)` binds a subclass's getBean(Class<T>),
+        // never AbstractBeanFactory.getBean(String)).
+        return _argumentsProvablyFitElsewhere(index, call, definitions, family, targetLanguage)
+            ? 'other-overload' : { ambiguous: true, candidates: 0 };
     }
     if (targetLanguage === 'java' || targetLanguage === 'csharp') {
         applicable = _preferFixedArityOverloads(
@@ -26485,6 +26754,24 @@ function _overloadDiscipline(index, call, targetDefs, definitions, callerFile) {
                 : `${call.name} C++ overload set`,
         }),
     };
+}
+
+/**
+ * Does a callable member of the name outside `family`, in the call's
+ * language, take every argument with a provable conversion (fix #428)?
+ */
+function _argumentsProvablyFitElsewhere(index, call, definitions, family, language) {
+    if (!Array.isArray(call.argKinds) || call.argSpread || call.argCount !== call.argKinds.length) return false;
+    const origin = _javaCallArgumentOrigin(call);
+    return definitions.some(def => {
+        if (family.includes(def) || NON_CALLABLE_TYPES.has(def.type) || !def.className ||
+            index.files.get(def.file)?.language !== language || !_overloadArityFits(call, def)) return false;
+        for (let i = 0; i < call.argCount; i++) {
+            const param = _javaParamAt(def, i, call);
+            if (!param || !_argProvablyConverts(index, call.argKinds[i], param, language, def, origin)) return false;
+        }
+        return true;
+    });
 }
 
 // C++ exact-static-type overload selection (fix #299C): when every argument

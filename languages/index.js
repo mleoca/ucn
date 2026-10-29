@@ -99,6 +99,10 @@ const JAVA_LANG_NOT_SERIALIZABLE = ['Object', 'Runnable', 'AutoCloseable', 'Comp
 
 const STRUCTURAL_TRAITS = {
     typeSystem: 'structural',
+    // The receiver keyword whose member lookup starts at the enclosing
+    // class's bases, skipping its own members (`super.m()`, Python
+    // `super().m()`, C# `base.M()`), or null (fix #428).
+    superReceiver: 'super',
     plainQueryTree: true,
     physicalCallTokenSyntax: true,
     scopeAlternativeBindings: false,
@@ -330,6 +334,7 @@ const STRUCTURAL_TRAITS = {
 };
 const NOMINAL_TRAITS = {
     typeSystem: 'nominal',
+    superReceiver: null,
     hasConstructors: false,
     fixedConstructorName: null,
     constructorInheritance: null,
@@ -781,12 +786,16 @@ const LANGUAGES = {
         treeSitterLang: 'java',
         module: () => require('./java'),
         treeSitterModule: () => require('tree-sitter-java'),
+        // tree-sitter-java misreads a type annotation before a variable
+        // arity parameter's `...` (`Object @Nullable ... args`, JLS 8.4.1).
+        parseRecovery: () => require('./java').recoverTypeAnnotatedVarargs,
         traits: {
             ...NOMINAL_TRAITS,
             // A method overrides/implements every supertype's same-signature
             // member, an inherited one included (JLS 8.4.8) (fix #426).
             memberFillsSupertypeSlots: true,
             inheritedMemberFillsSlots: true,
+            superReceiver: 'super',
             hasConstructors: true,
             implicitBaseConstruction: { classes: ['class_declaration'], headerField: 'superclass',
                 constructors: ['constructor_declaration'], delegationNodes: ['explicit_constructor_invocation'],
@@ -987,6 +996,7 @@ const LANGUAGES = {
             // own (fix #426).
             memberFillsSupertypeSlots: true,
             inheritedMemberFillsSlots: true,
+            superReceiver: 'base',
             memberHidingModifier: 'new',
             virtualMemberModifiers: ['virtual', 'abstract', 'override'],
             hasConstructors: true,
@@ -1395,8 +1405,12 @@ function getParser(language) {
     }
 
     parsers[language] = parser;
+    parserLanguages.set(parser, language);
     return parser;
 }
+
+// The language each cached parser reads, for grammar-gap recovery (fix #428).
+const parserLanguages = new WeakMap();
 
 /**
  * Detect language from file path
@@ -1516,7 +1530,16 @@ function safeParse(parser, content, oldTree = undefined, options = {}) {
     let lastError;
     for (const bufferSize of bufferSizes) {
         try {
-            const tree = parser.parse(content, oldTree, { ...options, bufferSize });
+            let tree = parser.parse(content, oldTree, { ...options, bufferSize });
+            // A language whose grammar misses a construct of valid source
+            // recovers that construct by a reparse with the construct's
+            // inert tokens blanked (positions unchanged, fix #428).
+            const recovery = oldTree ? null : LANGUAGES[parserLanguages.get(parser)]?.parseRecovery;
+            if (recovery && tree?.rootNode?.hasError) {
+                const recovered = recovery()(tree, content,
+                    text => parser.parse(text, undefined, { ...options, bufferSize }));
+                if (recovered) tree = recovered;
+            }
             // Cache the result for same-(parser, content) reuse
             if (!oldTree) {
                 _lastParseParser = parser;

@@ -971,7 +971,12 @@ function clearAllCaches() {
 // out-of-class conversion operators, pointer-to-member parameters,
 // `decltype(x)` locals and macro-wrapped C bodies are read; deduction
 // guides are no functions.
-const CACHE_FORMAT_VERSION = 315;
+// v316 (fix #428): C# call records mark implicitly typed lambda arguments
+// (`lambda:N:i`); Java files whose only parse errors are type annotations
+// before a variable arity `...` are read from the recovered parse (the
+// parameter is kept); reflection sites keyed by a parameter of the enclosing
+// callable record it (`keyParameter`).
+const CACHE_FORMAT_VERSION = 316;
 const USAGE_CACHE_FILE = 'usage-results.json';
 
 function usageResultKey(index, filePath, name, mode) {

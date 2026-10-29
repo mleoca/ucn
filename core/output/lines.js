@@ -244,15 +244,16 @@ function impactRecords(result) {
     }
     if (result.typeReferences) {
         const refs = result.typeReferences;
+        const where = site => `type-reference: ${site.kind || 'type'}${Number.isInteger(site.column) ? `, column ${site.column + 1}` : ''}`;
         for (const group of refs.byFile || []) {
             for (const site of group.sites || []) {
-                out.push(record(group.file, site.line, site.expression, 'type-reference'));
+                out.push(record(group.file, site.line, site.expression, where(site)));
             }
         }
         for (const site of refs.unverifiedSites || []) {
-            out.push(record(pathOf(site), site.line, site.expression, `unverified: ${site.reason}; type-reference`));
+            out.push(record(pathOf(site), site.line, site.expression, `unverified: ${site.reason}; ${where(site)}`));
         }
-        notes.push(`# TYPE REFERENCE SITES: ${refs.confirmedCount} confirmed, ${refs.unverifiedCount} unverified, ${refs.excluded?.total || 0} other-target (separate from caller ACCOUNT).`);
+        notes.push(`# TYPE REFERENCE SITES: ${refs.confirmedCount} confirmed, ${refs.unverifiedCount} unverified, ${refs.excluded?.total || 0} excluded (separate from caller ACCOUNT).`);
     }
     notes.push(...accountComments(result.account));
     for (const warning of result.warnings || []) notes.push(...commentLines(warning.message));

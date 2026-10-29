@@ -1003,99 +1003,129 @@ function related(index, name, options = {}) {
  * @param {object} options - { file, className, exclude, top }
  * @returns {object|null}
  */
-// Kinds whose dependents are annotation/reference sites rather than calls.
-// Classes and structs stay out: `new X()` / `X{}` are call-shaped and already
-// flow through the caller sweep.
-const TYPE_REFERENCE_KINDS = new Set(['type', 'interface', 'enum', 'trait', 'record']);
+// Kinds whose dependents include annotation/reference sites (fix #345):
+// every type declaration. A class or struct is also constructed: its
+// constructions are call sites of the caller band, every other token naming
+// it (annotations, bases, casts, qualifiers, imports) a type reference
+// (fix #428).
+const TYPE_REFERENCE_KINDS = new Set(['class', 'struct', 'interface', 'type', 'enum', 'trait', 'record', 'union']);
+// Tokens that declare the type (its own name, its constructors' names).
+const TYPE_DECLARATION_ROLES = new Set(['decl', 'ctor', 'ctor-qualified', 'pin-binding']);
 
 /**
- * fix #345: tiered annotation-site band for a type-kind definition.
- * Confirmed needs identity evidence: same file as the definition, or an
- * import binding of the name in the referencing file that reaches the
- * definition's file (the #215/#217 scope discipline). Anything else is
- * VISIBLE unverified with a reason. A same-name definition elsewhere is
- * excluded as other-target. Spelling alone never confirms.
+ * The type reference band of a type definition (fixes #345, #428): every
+ * token naming the type on the name's ground lines, decided by the
+ * type-rename lookup (core/type-references.js, the language's own name
+ * lookup: lexical shadows, type parameters, imports, packages, namespaces,
+ * include closures). A token the lookup proves names the type is confirmed,
+ * one it cannot settle is unverified with its reason, one naming something
+ * else is excluded with its reason. Tokens at call sites (constructions)
+ * belong to the caller band and declaration tokens to the definitions; the
+ * account partitions all of them.
  */
 function findTypeReferences(index, name, def, options = {}) {
-    if (!def || !TYPE_REFERENCE_KINDS.has(def.type)) return null;
-    const { usages } = require('./search');
-    const { _importReaches, _sameNominalPackageDir } = require('./callers');
-    const records = usages(index, name, {
-        includeTests: true, codeOnly: true, exclude: options.exclude,
-    });
-    const targetFiles = new Set([def.file]);
-    const sameNameDefs = (index.symbols.get(name) || []).filter(d => d !== def);
-    const confirmed = [];
-    const unverified = [];
-    const excluded = [];
-    for (const u of (Array.isArray(records) ? records : records?.usages || [])) {
-        if (u.isDefinition || u.usageType !== 'reference') continue;
-        const site = {
-            file: u.relativePath, line: u.line,
-            expression: (u.content || '').trim(),
-        };
-        // A same-name type defined in the referencing file owns that file's
-        // bare references (the #215 scope rule): excluded, never confirmed.
-        if (u.file !== def.file && sameNameDefs.some(d => d.file === u.file && TYPE_REFERENCE_KINDS.has(d.type))) {
-            excluded.push({ ...site, reason: 'other-definition' });
-            continue;
+    if (!def || !TYPE_REFERENCE_KINDS.has(def.type) || def.isMethod) return null;
+    const { TypeReferenceResolver, typeReferenceSites, csharpAttributeShortSites } = require('./type-references');
+    const { computeGroundSet } = require('./account');
+    const { getCachedCalls, _recordIsNoCall } = require('./callers');
+    const resolver = new TypeReferenceResolver(index, def, name);
+    resolver.collectRoles = true;
+    const { files } = typeReferenceSites(index, def, name, computeGroundSet(index, name), resolver);
+    const confirmed = [], unverified = [], excluded = [];
+    let tokens = 0, lineCount = 0, textLines = 0, constructions = 0, declarations = 0;
+    const scannedFiles = new Set();
+    const roleKind = role => role === 'value' || role === 'shorthand' ? 'value' : role === 'import' ? 'import'
+        : role === 'string-annotation' ? 'annotation-string' : role === 'doc-cref' ? 'doc-reference'
+            : role === 'member' ? 'member' : 'type';
+    for (const [absoluteFile, info] of [...files].sort((a, b) => codeUnitCompare(a[1].relativePath, b[1].relativePath))) {
+        const file = info.relativePath;
+        if (!index.matchesFilters(file, options) || options.files && !options.files.has(absoluteFile)) continue;
+        // One split of the file and one grouping of its call records by line.
+        let fileLines;
+        try { fileLines = index._getFileLines(absoluteFile) || []; } catch { fileLines = []; }
+        let callsByLine = null;
+        for (const [line, slot] of [...info.lines].sort((a, b) => a[0] - b[0])) {
+            const expression = String(fileLines[line - 1] || '').trim();
+            if (slot.tokens === 0 && slot.reviews.length === 0) {
+                if (slot.text && !slot.macroBody) { textLines++; continue; }
+                // The name outside every parsed token and comment: code the
+                // lookup cannot read (a macro body, an unparsed region).
+                lineCount++;
+                scannedFiles.add(absoluteFile);
+                unverified.push({ file, line, expression, kind: 'unparsed',
+                    reason: slot.unparsedReason || (slot.macroBody ? 'macro-body' : 'unparsed-occurrence'), tier: 'unverified' });
+                continue;
+            }
+            if (slot.tokens > 0) { lineCount++; scannedFiles.add(absoluteFile); }
+            tokens += slot.tokens;
+            // Call-site tokens of the line: the construction records' name
+            // columns; records without a column, by the token's AST position.
+            if (!callsByLine) {
+                callsByLine = new Map();
+                for (const call of getCachedCalls(index, absoluteFile) || []) {
+                    if (call.name !== name && !(call.receiverIsTypeQualified && call.receiver === name)) continue;
+                    if (!callsByLine.has(call.line)) callsByLine.set(call.line, []);
+                    callsByLine.get(call.line).push(call);
+                }
+            }
+            // A cast or a member initializer spelled like a call is no call.
+            // A static member call through the type (`Key.get(..)`, Java and
+            // C#) is a type-qualifier site of the caller band too.
+            const lineCalls = (callsByLine.get(line) || []).filter(call => !_recordIsNoCall(index, absoluteFile, call));
+            // A default or list initialization (`Foo y;`, `Foo z{}`, fix
+            // #421) is recorded at its declarator and a qualified call at its
+            // member: the type token is the nearest name token before it.
+            const lineTokens = [...slot.edits, ...slot.reviews.map(review => review.column),
+                ...(slot.skipColumns || [])].filter(Number.isInteger).sort((a, b) => a - b);
+            const callColumns = new Set(lineCalls.map(call => {
+                const column = call.column ?? call.callSite?.column;
+                const before = call.name !== name || ['default', 'list'].includes(call.constructorSyntax);
+                if (!Number.isInteger(column) || !before || lineTokens.includes(column)) return column;
+                return lineTokens.filter(token => token < column).pop();
+            }).filter(Number.isInteger));
+            const columnless = lineCalls.some(call => !Number.isInteger(call.column ?? call.callSite?.column));
+            const atCall = column => callColumns.has(column) ||
+                (columnless && (slot.constructionColumns || []).includes(column));
+            const roleAt = column => slot.roles?.get(column);
+            const site = (column, extra) => ({ file, line, ...(Number.isInteger(column) && { column }), expression, ...extra });
+            for (const column of slot.edits) {
+                const role = roleAt(column);
+                if (TYPE_DECLARATION_ROLES.has(role)) { declarations++; continue; }
+                if (atCall(column)) { constructions++; continue; }
+                confirmed.push(site(column, { kind: roleKind(role), tier: 'confirmed' }));
+            }
+            for (const review of slot.reviews) {
+                if (Number.isInteger(review.column) && atCall(review.column)) { constructions++; continue; }
+                unverified.push(site(review.column, { kind: roleKind(roleAt(review.column)),
+                    reason: review.reason || 'unresolved', tier: 'unverified' }));
+            }
+            for (const column of slot.skipColumns || []) {
+                if (atCall(column)) { constructions++; continue; }
+                excluded.push(site(column, { reason: slot.skipReasons?.get(column) || 'other-declaration' }));
+            }
         }
-        if (sameNameDefs.some(d => d.file === u.file && (d.nameLine || d.startLine) === u.line)) {
-            excluded.push({ ...site, reason: 'other-definition' });
-            continue;
-        }
-        if (u.file === def.file) {
-            confirmed.push({ ...site, evidence: 'same-file' });
-            continue;
-        }
-        const fileEntry = index.files.get(u.file);
-        // Directory-scoped packages (Go) and Java packages see sibling files'
-        // types without an import; a same-name def in another package would
-        // have been excluded above only if it shared the line, so require the
-        // pinned def to be the package's own.
-        const packageScoped = fileEntry && (
-            (langTraits(fileEntry.language).packageScope === 'directory' &&
-                path.dirname(u.file) === path.dirname(def.file)) ||
-            (fileEntry.language === 'java' &&
-                _sameNominalPackageDir(path.dirname(def.file), path.dirname(u.file), 'java')));
-        if (packageScoped) {
-            const foreign = sameNameDefs.some(d => TYPE_REFERENCE_KINDS.has(d.type) &&
-                path.dirname(d.file) === path.dirname(u.file));
-            if (foreign) unverified.push({ ...site, reason: 'same-package-ambiguous' });
-            else confirmed.push({ ...site, evidence: 'package-scope' });
-            continue;
-        }
-        const bindings = (fileEntry?.importBindings || []).filter(b =>
-            b.name === name || b.alias === name);
-        if (bindings.length > 0) {
-            const reaches = bindings.some(b => {
-                const rel = fileEntry.moduleResolved && fileEntry.moduleResolved[b.module];
-                return rel && _importReaches(index, path.join(index.root, rel), targetFiles);
-            });
-            if (reaches) { confirmed.push({ ...site, evidence: 'import' }); continue; }
-            const otherProject = bindings.some(b =>
-                fileEntry.moduleResolved && fileEntry.moduleResolved[b.module]);
-            if (otherProject) { excluded.push({ ...site, reason: 'other-definition-import' }); continue; }
-            unverified.push({ ...site, reason: 'import-unresolved' });
-            continue;
-        }
-        if (fileEntry?.importNames?.includes('*')) {
-            unverified.push({ ...site, reason: 'star-import' });
-            continue;
-        }
-        unverified.push({ ...site, reason: 'no-import-link' });
     }
-    if (confirmed.length === 0 && unverified.length === 0 && excluded.length === 0) {
-        return { owner: def.type, confirmedCount: 0, unverifiedCount: 0, totalCandidates: 0,
-            byFile: [], unverifiedSites: [], excluded: { total: 0, byReason: {} } };
+    // C# applies `XAttribute` as `[X]` (fix #390): the short spellings.
+    let attributeTokens = 0;
+    for (const short of csharpAttributeShortSites(index, def, name)) {
+        if (!index.matchesFilters(short.relativePath, options) || options.files && !options.files.has(short.file)) continue;
+        attributeTokens++;
+        const entry = { file: short.relativePath, line: short.line, column: short.column,
+            expression: (index.getLineContent(short.file, short.line) || '').trim(), kind: 'attribute' };
+        if (short.verdict === 'yes') confirmed.push({ ...entry, tier: 'confirmed' });
+        else if (short.verdict === 'unknown') unverified.push({ ...entry, reason: short.reason || 'unresolved', tier: 'unverified' });
+        else excluded.push({ ...entry, reason: short.reason || 'other-declaration' });
     }
-    const bySite = (a, b) => a.file !== b.file ? codeUnitCompare(a.file, b.file) : a.line - b.line;
+    const bySite = (a, b) => codeUnitCompare(a.file, b.file) || a.line - b.line || (a.column ?? -1) - (b.column ?? -1);
     confirmed.sort(bySite); unverified.sort(bySite);
     const byFile = new Map();
-    for (const site of confirmed) {
-        if (!byFile.has(site.file)) byFile.set(site.file, []);
-        byFile.get(site.file).push(site);
+    for (const entry of confirmed) {
+        if (!byFile.has(entry.file)) byFile.set(entry.file, []);
+        byFile.get(entry.file).push(entry);
     }
+    const tokenSites = unverified.filter(entry => entry.kind !== 'unparsed').length;
+    const allTokens = tokens + attributeTokens;
+    const decided = confirmed.length + tokenSites + excluded.length + constructions + declarations;
     return {
         owner: def.type,
         confirmedCount: confirmed.length,
@@ -1105,7 +1135,14 @@ function findTypeReferences(index, name, def, options = {}) {
         unverifiedSites: unverified,
         excluded: {
             total: excluded.length,
-            byReason: excluded.reduce((out, s) => { out[s.reason] = (out[s.reason] || 0) + 1; return out; }, {}),
+            byReason: excluded.reduce((out, entry) => { out[entry.reason] = (out[entry.reason] || 0) + 1; return out; }, {}),
+        },
+        account: {
+            tokens: allTokens, lines: lineCount, files: scannedFiles.size, textLines,
+            confirmed: confirmed.length, unverified: tokenSites, unparsedLines: unverified.length - tokenSites,
+            excluded: excluded.length, constructions, declarations,
+            ...(attributeTokens > 0 && { attributeTokens }),
+            conserved: decided === allTokens,
         },
     };
 }

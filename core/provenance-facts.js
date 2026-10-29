@@ -185,6 +185,65 @@ function ownerCountOf(index, name) {
     return count;
 }
 
+/**
+ * Every part of a C# `partial` type (one class across declarations, fix
+ * #428): same namespace, enclosing type, name and generic arity, each
+ * declared `partial`, in (file, line) order; null for any other type.
+ */
+function partialTypeParts(index, definition) {
+    if (!Array.isArray(definition.modifiers) || !definition.modifiers.includes('partial') ||
+        index.files.get(definition.file)?.language !== 'csharp') return null;
+    const parts = (index.symbols.get(definition.name) || []).filter(d => d.type === definition.type &&
+        Array.isArray(d.modifiers) && d.modifiers.includes('partial') &&
+        (d.namespace || null) === (definition.namespace || null) &&
+        (d.enclosingType || null) === (definition.enclosingType || null) &&
+        (d.typeArity || 0) === (definition.typeArity || 0) &&
+        index.files.get(d.file)?.language === 'csharp');
+    if (parts.length < 2) return null;
+    return parts.sort((a, b) => a.file < b.file ? -1 : a.file > b.file ? 1 : a.startLine - b.startLine);
+}
+
+/**
+ * Does the Rust name model (core/rust-names.js) bind a bare name at the call
+ * to something other than `declaration` (fix #428)? An undecided model
+ * answer keeps the witness.
+ */
+function rustNameDisagrees(index, file, call, declaration, ns) {
+    if (!langTraits(index.files.get(file)?.language)?.itemScopeResolution || call.isMethod || call.receiver) return false;
+    const named = require('./rust-names').resolveRustName(index, file, call.line, call.resolvedName || call.name, ns,
+        call.scopeBinding || null);
+    if (!named?.defs?.length) return !!named?.external;
+    return !named.defs.includes(declaration);
+}
+
+/**
+ * Does a call select its only candidate without reading any fact (fix
+ * #428): no type arguments, no spread, no typed argument, exactly the
+ * candidate's fixed, non-generic, non-extension parameter list?
+ */
+function soleMemberFits(call, definition) {
+    const params = definition.paramsStructured;
+    return !call.methodTypeArgs && !call.argSpread && Number.isInteger(call.argCount) &&
+        (!Array.isArray(call.argKinds) || call.argKinds.every(kind => kind === 'expr')) &&
+        !definition.generics && !definition.isExtensionMethod && Array.isArray(params) &&
+        params.length === call.argCount &&
+        params.every(param => param && !param.rest && !param.optional && param.default === undefined);
+}
+
+/** The generic arity of each top-level entry of a base list (`A, B<T, U>` -> [0, 2]). */
+function writtenArities(clause) {
+    const out = [];
+    let depth = 0;
+    let count = 0;
+    for (const ch of `${clause},`) {
+        if (ch === '<') { if (depth === 0) count = 1; depth++; }
+        else if (ch === '>') depth = Math.max(0, depth - 1);
+        else if (ch === ',' && depth === 1) count++;
+        else if (ch === ',' && depth === 0) { out.push(count); count = 0; }
+    }
+    return out;
+}
+
 /** Collect independent facts; a failed lookup never manufactures a negative. */
 function confirmationFacts(index, file, call, targets, options = {}) {
     const entry = index.files.get(file);
@@ -224,14 +283,48 @@ function confirmationFacts(index, file, call, targets, options = {}) {
         const result = namedDeclaration(index, file, call.resolvedName || call.name,
             d => constructsType ? TYPE_KINDS.has(d.type)
                 : !NON_CALLABLE_TYPES.has(d.type) || call.isConstructor, call.line);
-        if (result?.chain.length) facts.importChain = result.chain;
+        // Rust binds a bare name by its own item and `use` scopes (fix
+        // #422): an import chain naming another item than the language's
+        // lookup is no witness of it (fix #428).
+        if (result?.chain.length && rustNameDisagrees(index, file, call, result.declaration, constructsType ? 'type' : 'value')) {
+            facts.lookupGap = 'rust-name-scope';
+        } else if (result?.chain.length) facts.importChain = result.chain;
     }
     let type = facts.receiverType;
+    let anonymousQualifier = null;
     if (options.sameClass) {
         const enclosing = index.findEnclosingFunction(file, call.line, true, call);
         type = enclosing?.className || enclosing?.receiver?.replace(/^\*/, '');
         facts.receiverTypeSource = 'same-class';
         facts.receiverOrigin = { source: 'same-class', declaration: declarationIdentity(enclosing) };
+        // `super.m()` / `super().m()` / `base.M()` look the member up from
+        // the enclosing class's bases, never its own members (fix #428): the
+        // witness starts there too. In an anonymous class body `super` names
+        // the instantiated base type (fix #394), looked up as written.
+        const superReceiver = langTraits(language)?.superReceiver;
+        if (superReceiver && call.isMethod && call.receiver === superReceiver && !call.constructorSyntax) {
+            if (call.receiverSuperType) type = call.receiverSuperType;
+            else facts.receiverOrigin.superLookup = true;
+        }
+        // A bare call in an anonymous class body (`new Base() { .. m() .. }`,
+        // fix #401) looks the member up from the instantiated base (fix #428).
+        if (!call.receiver && call.anonymousSuperType) {
+            const parts = String(call.anonymousSuperType).replace(/<.*$/s, '').trim().split('.');
+            type = parts.pop();
+            if (parts.length) anonymousQualifier = parts.join('.');
+            facts.receiverOrigin.anonymousSuperType = call.anonymousSuperType;
+        }
+    }
+    // A static member call is also a reference to the type it is written
+    // through (`JsonParser.parseString(..)` for a class query, fix #428):
+    // its witness is the type the qualifier names, not a member lookup.
+    if (call.isTypeReference && call.receiver && options.resolveType) {
+        const written = String(call.receiver).split('.').pop();
+        const qualified = String(call.receiver).includes('.') ? String(call.receiver).split('.').slice(0, -1).join('.') : null;
+        const named = options.resolveType(written, file, call.line, qualified || call.receiverTypeNamespace || undefined);
+        if (named) facts.typeReference = { written: call.receiver, declaration: declarationIdentity(named) };
+        else facts.lookupGap = 'type-qualifier-unresolved';
+        return facts;
     }
     if (language === 'csharp' && call.receiverCastThis) {
         const enclosing = index.findEnclosingFunction(file, call.line, true, call);
@@ -244,35 +337,52 @@ function confirmationFacts(index, file, call, targets, options = {}) {
         facts.incomplete = ['receiverType'];
         return facts;
     }
+    // A C# extension invocation binds a static member of another class
+    // through the receiver's `this` parameter: no member lookup on the
+    // receiver's type describes it, and this collector has no extension
+    // witness yet (a rule not yet validated, fix #428).
+    if (options.extensionMethod) {
+        facts.lookupGap = 'extension-method';
+        return facts;
+    }
     if (facts.receiverTypeSource === 'unknown') facts.incomplete = ['receiverTypeSource'];
     const originFile = options.originFile || call.receiverTypeFlowFile || file;
-    const resolveType = (name, context, atLine, qualifier) => {
+    // A written generic arity names one of the same-name types where arity is
+    // identity (C# `MemberMap` vs `MemberMap<TClass, TMember>`, fix #428).
+    const arityFits = (d, arity) => !Number.isInteger(arity) || !langTraits(language)?.genericArityIsIdentity ||
+        (d.typeArity || 0) === arity;
+    const resolveType = (name, context, atLine, qualifier, arity) => {
         // A qualified annotation cannot bind to a same-named local type.
         // Apply the qualifier only to the receiver's first lookup: aliases
         // and parent annotations are resolved in their own declaration scope.
         if (qualifier && options.resolveType &&
             langTraits(language)?.typeSystem !== 'structural') {
-            const definition = options.resolveType(name, context, atLine, qualifier);
+            const definition = options.resolveType(name, context, atLine, qualifier, arity);
             return definition ? {
                 declaration: completeForwardDeclaration(index, definition, file), chain: [] } : null;
         }
         const named = namedDeclaration(index, context, name, d =>
-            (TYPE_KINDS.has(d.type) && d.type !== 'impl') ||
+            ((TYPE_KINDS.has(d.type) && d.type !== 'impl') ||
             (['javascript', 'typescript', 'tsx'].includes(language) &&
                 d.type === 'function' && !d.className &&
-                ['constructor', 'flow'].includes(facts.receiverTypeSource)), atLine);
+                ['constructor', 'flow'].includes(facts.receiverTypeSource))) && arityFits(d, arity), atLine);
         if (named) return { ...named,
             declaration: completeForwardDeclaration(index, named.declaration, file) };
         // Nominal package/type lookup is delegated to the engine's language
         // rules, then pinned to a unique declaration in the resolved scope.
         if (langTraits(language)?.typeSystem !== 'structural' && options.resolveType) {
-            const definition = options.resolveType(name, context, atLine);
+            const definition = options.resolveType(name, context, atLine, undefined, arity);
             if (definition) return {
                 declaration: completeForwardDeclaration(index, definition, file), chain: [] };
         }
         return null;
     };
-    const qualifier = call.receiverTypeNamespace || call.receiverTypeQualifier;
+    // A Rust path receiver (`crate::m::T::new()`) names the type its module
+    // path declares (fix #428).
+    const rustPath = langTraits(language)?.itemScopeResolution && facts.receiverTypeSource === 'type-qualified' &&
+        String(call.receiver || '').includes('::') && String(call.receiver).split('::').pop() === type
+        ? String(call.receiver).split('::').slice(0, -1).join('::') : null;
+    const qualifier = anonymousQualifier || rustPath || call.receiverTypeNamespace || call.receiverTypeQualifier;
     if (qualifier) facts.receiverTypeQualifier = qualifier;
     // A parser annotation's qualifier belongs to the consuming file. The
     // already-pinned declaration file may be another crate/module, where
@@ -312,12 +422,53 @@ function confirmationFacts(index, file, call, targets, options = {}) {
     if (aliases.length) facts.receiverAliases = aliases;
     facts.receiverResolvedIn = declarationIdentity(resolved.declaration);
     const visited = new Set();
-    const walk = (owner, steps) => {
+    // A bare (implicit-this) call whose class hierarchy declares no member
+    // of the name looks it up in the lexically enclosing type next (JLS
+    // 15.12.1, C# member lookup through enclosing type declarations): the
+    // innermost declaration of this file enclosing the type that started
+    // the current lexical level (fix #428).
+    const lexicalOuterOf = chain => {
+        if (call.receiver || facts.receiverTypeSource !== 'same-class' || facts.receiverOrigin?.superLookup) return null;
+        let start = 0;
+        for (let i = chain.length - 1; i > 0; i--) if (chain[i].enclosingOf) { start = i; break; }
+        if (chain.slice(start).some(step => step.members.length > 0)) return null;
+        const inner = chain[start].owner;
+        if (!inner.enclosingType) return null;
+        const segments = String(inner.enclosingType).split('.');
+        const name = segments.pop();
+        const prefix = segments.length ? segments.join('.') : null;
+        const outer = (index.files.get(path.resolve(index.root, inner.file))?.symbols || []).filter(d =>
+            TYPE_KINDS.has(d.type) && d.type !== 'impl' && d.name === name && (d.enclosingType || null) === prefix &&
+            (d.namespace || null) === (inner.namespace || null) &&
+            d.startLine <= inner.startLine && (d.endLine ?? d.startLine) >= inner.endLine)
+            .sort((a, b) => b.startLine - a.startLine)[0];
+        return outer ? { definition: outer, inner } : null;
+    };
+    // Choices among same-name members the overload replay cannot state yet
+    // (report-only, fix #428): Rust probes inherent impls before trait impls
+    // and selects among one type's trait impls by argument type (fixes #384,
+    // #399); C++ member pairs that differ in `const` or a ref-qualifier are
+    // chosen by the object expression (fix #427).
+    const memberChoiceGap = members => {
+        if (langTraits(language)?.typeQualifiedCallStyle === 'path' &&
+            new Set(members.map(member => (member.traitImpl
+                ? `trait:${member.traitName || ''}:${member.implSelfRef || ''}` : 'inherent') +
+                `:${(member.ownerSelfArgs || []).join(',')}`)).size > 1) return 'impl-selection';
+        if (new Set(members.map(member => `${!!member.memberConst}:${member.refQualifier || ''}`)).size > 1) {
+            return 'object-qualified-overload';
+        }
+        return null;
+    };
+    const walk = (owner, steps, extra = null) => {
         const identity = declarationIdentity(owner);
         const key = identityKey(identity);
         if (visited.has(key) || visited.size >= 16) return null;
         visited.add(key);
         const ownerDefinition = owner.file && TYPE_KINDS.has(owner.type) ? owner : null;
+        // The parts of a C# `partial` type are one class (fix #428): members
+        // and bases declared in any part belong to it.
+        const partialParts = ownerDefinition ? partialTypeParts(index, ownerDefinition) : null;
+        const partFiles = partialParts ? new Set(partialParts.map(part => part.file)) : null;
         let members = callableMembersOwnedBy(index, call.name, owner.name).filter(d => {
             // A member of a same-name class declared in another scope of
             // the file is not this owner's member (fix #389).
@@ -326,21 +477,48 @@ function confirmationFacts(index, file, call, targets, options = {}) {
                 (!facts.receiverCastThis || d.explicitInterface !== facts.receiverCastThis.interfaceType)) return false;
             if ((d.namespace || null) !== (owner.namespace || null)) return false;
             if ((d.enclosingType || null) !== (owner.enclosingType || null)) return false;
-            return d.file === owner.file || (language === 'go' &&
-                path.dirname(d.file) === path.dirname(owner.file));
+            return d.file === owner.file || !!partFiles?.has(d.file) || (language === 'go' &&
+                path.dirname(d.file) === path.dirname(owner.file)) ||
+                // A Rust impl block anywhere in the crate whose self type
+                // names this definition declares its members (fix #428).
+                // A member of a same-name type declared in its own file (a
+                // function-local struct) belongs to that type.
+                (!!ownerDefinition && langTraits(language)?.itemScopeResolution &&
+                    !require('./class-identity').ownerDefinitionOf(index, d) &&
+                    !!require('./rust-names').resolveRustName(index, d.file, d.startLine, owner.name, 'type')
+                        ?.defs?.includes(ownerDefinition));
         });
+        // A super lookup passes over the enclosing class's own members.
+        const superLookup = steps.length === 0 && facts.receiverOrigin?.superLookup === true
+            ? { skipped: members.map(declarationIdentity) } : null;
+        if (superLookup) members = [];
         // Use the AST spelling before the inheritance graph normalizes aliases
         // and qualifiers. A terminal name alone loses its declaring scope.
-        const rawOwner = index.files.get(owner.file)?.symbols.find(d =>
-            d.name === owner.name && d.startLine === owner.startLine && d.type === owner.type) || owner;
-        const parentNames = rawOwner.extends ? splitParentList(rawOwner.extends) : [];
+        const rawOf = part => index.files.get(part.file)?.symbols.find(d =>
+            d.name === part.name && d.startLine === part.startLine && d.type === part.type) || part;
+        const rawOwner = rawOf(owner);
+        const written = [];
+        for (const part of partialParts || [owner]) {
+            const raw = part === owner ? rawOwner : rawOf(part);
+            const arities = raw.extends ? writtenArities(raw.extends) : [];
+            (raw.extends ? splitParentList(raw.extends) : []).forEach((name, i) => written.push({ name, part, arity: arities[i] }));
+        }
         const derefTarget = language === 'rust' ? rawOwner.derefTarget : null;
-        const parents = [...parentNames, ...(derefTarget ? [derefTarget] : [])]
-            .map(name => resolveType(name, owner.file, owner.startLine)).filter(Boolean).map(r => r.declaration);
+        const resolvedParents = [...written, ...(derefTarget ? [{ name: derefTarget, part: owner }] : [])]
+            .map(entry => resolveType(entry.name, entry.part.file, entry.part.startLine, undefined, entry.arity));
+        const resolvedCount = resolvedParents.filter(Boolean).length;
+        // Two parts may name one base: it is one parent.
+        const parentKeys = new Set();
+        const parents = resolvedParents.filter(Boolean).map(r => r.declaration).filter(parent => {
+            const parentKey = identityKey(declarationIdentity(parent));
+            if (parentKeys.has(parentKey)) return false;
+            parentKeys.add(parentKey);
+            return true;
+        });
         // The member may be inherited from an external declaration. This
         // collector has no platform-member lookup; report the coverage gap
         // separately from an ambiguous or inconsistent project lookup.
-        if (!members.length && parents.length < parentNames.length) {
+        if (!members.length && resolvedCount < written.length) {
             facts.lookupUnsupported = 'external-parent-member';
             return null;
         }
@@ -362,6 +540,12 @@ function confirmationFacts(index, file, call, targets, options = {}) {
                 } catch {
                     choice = null;
                 }
+                // A base member brought in is chosen by a lookup this
+                // witness cannot state yet: report-only (fix #428).
+                if (choice?.match && baseMembers.includes(choice.match)) {
+                    facts.lookupGap = 'using-declaration-member';
+                    return null;
+                }
                 if (!choice?.match || members.length !== 1 || choice.match !== members[0]) return null;
             }
         }
@@ -371,6 +555,9 @@ function confirmationFacts(index, file, call, targets, options = {}) {
         if (delegation) members = [];
         const step = { owner: identity, members: members.map(declarationIdentity), parents: parents.map(declarationIdentity),
             ...(delegation && { constructorDelegation: delegation }),
+            ...(superLookup && { superLookup }),
+            ...(extra?.enclosingOf && { enclosingOf: extra.enclosingOf }),
+            ...(partialParts && { partialParts: partialParts.map(declarationIdentity) }),
             ...(derefTarget && { derefTarget }) };
         const getter = facts.valueReference && propertyReadMember(step.members);
         if (getter) return { receiver: declarationIdentity(resolved.declaration),
@@ -381,7 +568,21 @@ function confirmationFacts(index, file, call, targets, options = {}) {
             if (parents.length === 1) return walk(parents[0], chain);
             if (parents.length > 1) return null;
             const group = overloadMemberGroup(chain);
-            if (!group?.length) return null;
+            if (!group?.length) {
+                const outer = lexicalOuterOf(chain);
+                return outer ? walk(outer.definition, chain, { enclosingOf: outer.inner }) : null;
+            }
+            // One member of the name in the whole chain, a call of exactly its
+            // fixed parameter count with no typed argument and no type
+            // arguments: overload selection reads nothing (fix #428), the
+            // lookup ends at the declaring step.
+            if (group.length === 1 && soleMemberFits(call, group[0])) {
+                const declaring = chain.findIndex(chainStep => chainStep.members.length > 0);
+                if (declaring >= 0 && chain[declaring].members.length === 1) {
+                    return { receiver: declarationIdentity(resolved.declaration), steps: chain.slice(0, declaring + 1),
+                        selected: declarationIdentity(group[0]) };
+                }
+            }
             const overload = captureOverload(index, call, group, language, options.selectOverload);
             if (!overload) return null;
             return { receiver: declarationIdentity(resolved.declaration), steps: chain,
@@ -419,6 +620,8 @@ function confirmationFacts(index, file, call, targets, options = {}) {
                 receiver: declarationIdentity(resolved.declaration),
                 steps: [...steps, { ...step, overload }], selected: overload.selected,
             };
+            const gap = memberChoiceGap(members);
+            if (gap) facts.lookupGap = gap;
             // Every member the lookup found is known but the arguments cannot
             // choose one (fix #396). Name lookup stops at the declaring class,
             // so the callee is one of its members of that name: the witness
@@ -432,6 +635,20 @@ function confirmationFacts(index, file, call, targets, options = {}) {
                     selected: declarationIdentity(members[0]), memberSet: true,
                 };
             }
+            if (gap) return null;
+        }
+        const gap = members.length > 1 ? memberChoiceGap(members) : null;
+        if (gap) {
+            facts.lookupGap = gap;
+            return null;
+        }
+        // A Rust type also takes the methods of traits it implements, a
+        // trait's provided methods included: no member of the name among its
+        // impls is a lookup this witness cannot finish (report-only, fix #428).
+        if (!members.length && !parents.length && langTraits(language)?.itemScopeResolution && !superLookup &&
+            ['struct', 'enum', 'union'].includes(owner.type)) {
+            facts.lookupGap = 'trait-method-probe';
+            return null;
         }
         if (members.length || parents.length !== 1) return null;
         return walk(parents[0], [...steps, step]);
@@ -441,4 +658,4 @@ function confirmationFacts(index, file, call, targets, options = {}) {
     return facts;
 }
 
-module.exports = { confirmationFacts, namedDeclaration, occurrenceIdentity, definitionsInFile, definitionAt };
+module.exports = { confirmationFacts, namedDeclaration, occurrenceIdentity, definitionsInFile, definitionAt, partialTypeParts };

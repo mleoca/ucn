@@ -15189,11 +15189,18 @@ describe('fix #391: an argument of unknown type leaves overload resolution open'
         });
         try {
             const index = idx(dir);
+            // fix #428: Ext2.Add provably takes the argument, so the call is
+            // not Ext1's (excluded); with no such definition it stays visible.
             const ext1 = index.context('Add', { file: 'B.cs', line: 6 });
             assert.deepStrictEqual((ext1.callers || []).map(c => c.line), []);
-            assert.deepStrictEqual((ext1.unverifiedCallers || []).map(c => `${c.line}:${c.reason}`), ['15:overload-ambiguous']);
+            assert.deepStrictEqual((ext1.unverifiedCallers || []).map(c => `${c.line}:${c.reason}`), []);
             const ext2 = index.context('Add', { file: 'B.cs', line: 11 });
             assert.deepStrictEqual((ext2.callers || []).map(c => c.line), [15]);
+            fs.writeFileSync(path.join(dir, 'B.cs'), fs.readFileSync(path.join(dir, 'B.cs'), 'utf8')
+                .replace('    public static Builder Add(this Builder b, Strategy s) => b;', '    public static Builder Other(this Builder b, Strategy s) => b;'));
+            const alone = idx(dir).context('Add', { file: 'B.cs', line: 6 });
+            assert.deepStrictEqual((alone.callers || []).map(c => c.line), []);
+            assert.deepStrictEqual((alone.unverifiedCallers || []).map(c => `${c.line}:${c.reason}`), ['15:overload-ambiguous']);
         } finally { rm(dir); }
     });
 });
@@ -17736,6 +17743,289 @@ describe('fix #426: a local function sharing its method\'s line is scoped by sou
             assert.ok(result.ok, result.error);
             assert.deepStrictEqual(result.result.changes.map(c => c.newExpression),
                 ['public int Run() { int HandlerZ(int t = 0) => t + 1; Func<int, int> f = HandlerZ; return f(1); }']);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #428: a confirmed caller\'s witness establishes its target (validation agrees with the tier)', () => {
+    const contextCallers = (index, handle) => {
+        const result = execute(index, 'context', { name: handle });
+        assert.ok(result.ok, result.error);
+        return result.result.callers || [];
+    };
+    const superCases = [
+        ['a.py', 'class Base:\n    def close(self):\n        pass\n\nclass Child(Base):\n    def close(self):\n        super().close()\n        super(Child, self).close()\n', 'a.py:2:close', [7, 8]],
+        ['a.js', 'class Base { formatItem(x) { return x } }\nclass Child extends Base { formatItem(x) { return super.formatItem(x) } }\nmodule.exports = { Base, Child }\n', 'a.js:1:formatItem', [2]],
+        ['a.ts', 'export class Base { formatItem(x: number) { return x } }\nexport class Child extends Base { formatItem(x: number) { return super.formatItem(x) } }\n', 'a.ts:1:formatItem', [2]],
+        ['A.java', 'class Base { void passivate(Object o) {} }\nclass Child extends Base { void passivate(Object o) { super.passivate(o); } }\n', 'A.java:1:passivate', [2]],
+        ['A.cs', 'class Base { public virtual void Dispose() {} }\nclass Child : Base { public override void Dispose() { base.Dispose(); } }\n', 'A.cs:1:Dispose', [2]],
+    ];
+    for (const [file, source, handle, lines] of superCases) {
+        it(`${file}: a super call's lookup starts at the enclosing class's bases`, () => {
+            const dir = tmp({ [file]: source });
+            try {
+                const callers = contextCallers(idx(dir), handle);
+                assert.deepStrictEqual(callers.map(c => c.line), lines);
+                for (const caller of callers) assert.strictEqual(caller.provenance.validation, 'establishes-target');
+            } finally { rm(dir); }
+        });
+    }
+    it('Java and C# qualified static calls are type-qualified witnesses of the named class', () => {
+        const dir = tmp({
+            'Util.java': 'package p;\npublic class Util { public static int twice(int v) { return v * 2; } }\n',
+            'Use.java': 'package p;\npublic class Use { int run() { return Util.twice(2); } }\n',
+            'Util.cs': 'namespace Q { public static class Util { public static int Twice(int v) => v * 2; } }\n',
+            'Use.cs': 'namespace Q { public class Use { int Run() => Util.Twice(2); } }\n',
+        });
+        try {
+            const index = idx(dir);
+            for (const handle of ['Util.java:2:twice', 'Util.cs:1:Twice']) {
+                const callers = contextCallers(index, handle);
+                assert.strictEqual(callers.length, 1, handle);
+                assert.strictEqual(callers[0].provenance.rule, 'type-qualified');
+                assert.strictEqual(callers[0].provenance.validation, 'establishes-target');
+            }
+        } finally { rm(dir); }
+    });
+    it('Python: a super call under several bases stays visible, never confirmed on an undecided lookup', () => {
+        const dir = tmp({ 'm.py': 'class A:\n    def m(self):\n        return 1\n\nclass B:\n    def m(self):\n        return 2\n\nclass C(A, B):\n    def m(self):\n        return super().m()\n\nclass D(A):\n    def run(self):\n        return self.m()\n' });
+        try {
+            const result = execute(idx(dir), 'context', { name: 'm.py:2:m' });
+            assert.deepStrictEqual(result.result.callers.map(c => [c.line, c.provenance.validation]), [[15, 'establishes-target']]);
+            assert.deepStrictEqual(result.result.unverifiedCallers.map(c => [c.line, c.reason]), [[11, 'provenance-incomplete']]);
+        } finally { rm(dir); }
+    });
+    it('Java: a static call through a class is a type reference witnessed by the class the qualifier names', () => {
+        const dir = tmp({
+            'p/Parser.java': 'package p;\npublic class Parser {\n    public Parser() {}\n    public static int parse(String s) { return 1; }\n}\n',
+            'p/Use.java': 'package p;\npublic class Use { int run() { return Parser.parse("x"); } }\n',
+        });
+        try {
+            const callers = contextCallers(idx(dir), 'p/Parser.java:2:Parser');
+            assert.deepStrictEqual(callers.map(c => `${c.relativePath}:${c.line}`), ['p/Use.java:2']);
+            assert.strictEqual(callers[0].provenance.validation, 'establishes-target');
+        } finally { rm(dir); }
+    });
+    it('C#: the parts of a partial class declare one class (members and bases of every part)', () => {
+        const dir = tmp({
+            'Reader.cs': 'namespace N\n{\n    public abstract partial class Reader\n    {\n        protected void SetToken(int token) { }\n    }\n}\n',
+            'Reader.Async.cs': 'namespace N\n{\n    public abstract partial class Reader\n    {\n        public void Skip() { SetToken(1); }\n    }\n}\n',
+            'Sub.cs': 'namespace N\n{\n    public partial class Sub : Reader\n    {\n        public void Run() { SetToken(2); }\n    }\n}\n',
+            'Sub.More.cs': 'namespace N\n{\n    public partial class Sub\n    {\n        public void Go() { SetToken(3); }\n    }\n}\n',
+        });
+        try {
+            const callers = contextCallers(idx(dir), 'Reader.cs:5:SetToken');
+            assert.deepStrictEqual(callers.map(c => `${c.relativePath}:${c.line}`),
+                ['Reader.Async.cs:5', 'Sub.More.cs:5', 'Sub.cs:5']);
+            for (const caller of callers) assert.strictEqual(caller.provenance.validation, 'establishes-target');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #428: a reflective name passed as a literal one call away keeps its target alive', () => {
+    const deadNames = dir => {
+        const result = execute(idx(dir), 'deadcode', { includeExported: true });
+        assert.ok(result.ok, result.error);
+        return result.result.map(item => item.name);
+    };
+    it('JS: a computed registry keyed by a parameter of the dispatching function (winston useFormat shape)', () => {
+        const dir = tmp({
+            'common.js': 'exports.warn = {\n  deprecated (prop) { return () => prop },\n  useFormat (prop) { return () => prop + \'!\' },\n  unused (prop) { return prop },\n  forFunctions (obj, type, props) {\n    props.forEach(prop => { obj[prop] = exports.warn[type](prop) })\n  }\n}\n',
+            'main.js': 'const { warn } = require(\'./common\')\nwarn.forFunctions(exports, \'useFormat\', [\'cli\'])\nwarn.forFunctions(exports, \'deprecated\', [\'old\'])\n',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'deadcode', { includeExported: true });
+            assert.ok(result.ok, result.error);
+            const dead = result.result.map(item => item.name);
+            assert.ok(!dead.includes('useFormat') && !dead.includes('deprecated'), dead.join(','));
+            assert.ok(dead.includes('unused'), 'a name no caller passes stays a candidate');
+            assert.deepStrictEqual(result.result.reflection.withheldByPattern.map(w => w.pattern), ['deprecated', 'useFormat']);
+            const show = execute(index, 'context', { name: 'common.js:3:useFormat' });
+            assert.deepStrictEqual(show.result.unverifiedCallers.map(c => [c.line, c.reason]), [[6, 'reflection-pattern']]);
+        } finally { rm(dir); }
+    });
+    it('Python, Java and C#: a reflective lookup by a method parameter', () => {
+        const dir = tmp({
+            'a.py': 'class R:\n    def run(self, name):\n        return getattr(self, name)()\n    def go(self):\n        return 1\n    def idle(self):\n        return 2\n\ndef use(r):\n    r.run("go")\n',
+            'A.java': 'class R { void run(String name) throws Exception { getClass().getMethod(name).invoke(this); } void go() {} void idle() {} void use() throws Exception { run("go"); } }\n',
+            'A.cs': 'class R { void Run(string name) { GetType().GetMethod(name).Invoke(this, null); } void Go() {} void Idle() {} void Use() { Run("Go"); } }\n',
+        });
+        try {
+            const dead = deadNames(dir);
+            for (const name of ['go', 'Go']) assert.ok(!dead.includes(name), `${name}: ${dead.join(',')}`);
+            for (const name of ['idle', 'Idle']) assert.ok(dead.includes(name), `${name}: ${dead.join(',')}`);
+        } finally { rm(dir); }
+    });
+    it('C#: only calls that can bind the wrapper feed it (owner qualifier, extension receiver, arity)', () => {
+        const dir = tmp({
+            'R.cs': [
+                'using System;',
+                'static class Ext { public static object Call(this Type type, string name) => type.GetMethod(name).Invoke(null, null); }',
+                'class Other { public static object Call(Type type, string name) => null; }',
+                'class R',
+                '{',
+                '    public static void Go() { }',
+                '    public static void Idle() { }',
+                '    public static void Stop() { }',
+                '    static void Use()',
+                '    {',
+                '        typeof(R).Call("Go");',
+                '        Other.Call(typeof(R), "Idle");',
+                '        typeof(R).Call("Stop", 1);',
+                '    }',
+                '}',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const dead = deadNames(dir);
+            assert.ok(!dead.includes('Go'), dead.join(','));
+            assert.ok(dead.includes('Idle') && dead.includes('Stop'), dead.join(','));
+        } finally { rm(dir); }
+    });
+    it('a rebound or non-literal argument names nothing (the site stays a dynamic disclosure)', () => {
+        const dir = tmp({
+            'common.js': 'exports.reg = {\n  a () { return 1 },\n  dispatch (type) { type = type || "a"; return exports.reg[type]() },\n  pick (key) { return exports.reg[key]() }\n}\n',
+            'main.js': 'const { reg } = require(\'./common\')\nreg.dispatch("a")\nconst k = process.argv[2]\nreg.pick(k)\n',
+        });
+        try {
+            const result = execute(idx(dir), 'deadcode', { includeExported: true });
+            assert.ok(result.result.map(item => item.name).includes('a'));
+            assert.strictEqual(result.result.reflection.withheld, 0);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #428: overloaded APIs decided by what the arguments prove (Java, C#)', () => {
+    const callers = (index, file, line, name) => {
+        const def = index.symbols.get(name).find(d => d.relativePath === file && (d.startLine === line || d.nameLine === line));
+        const found = index.findCallers(name, { targetDefinitions: [def], collectAccount: true, includeMethods: true });
+        return { confirmed: found.map(c => c.line), unverified: (found.unverifiedEntries || []).map(c => [c.line, c.reason]) };
+    };
+    it('C#: a lambda never converts to a class-typed parameter, a delegate overload takes it', () => {
+        const dir = tmp({
+            'A.cs': 'namespace Acme;\npublic class Config { public void Scan(string a) { } }\npublic class Builder\n{\n    public Builder With(Action<Config> configure) => this;\n    public Builder With(Config config) => this;\n    public static void Go(Builder b, Config c)\n    {\n        b.With(x => x.Scan("z"));\n        b.With(c);\n    }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(callers(index, 'A.cs', 5, 'With'), { confirmed: [9], unverified: [] });
+            assert.deepStrictEqual(callers(index, 'A.cs', 6, 'With'), { confirmed: [10], unverified: [] });
+        } finally { rm(dir); }
+    });
+    it('C#: a type parameter only an implicitly typed lambda\'s input mentions is never inferred', () => {
+        const dir = tmp({
+            'Map.cs': [
+                'using System.Linq.Expressions;',
+                'namespace M;',
+                'public class ClassMap<TClass>',
+                '{',
+                '    public virtual int Map<TMember>(Expression<Func<TClass, TMember?>> expression, bool useExistingMap = true) => 1;',
+                '    public virtual int Map<T>(Expression<Func<T, object?>> expression, bool useExistingMap = true) => 2;',
+                '}',
+                'public class Row { public int Id { get; set; } }',
+                '',
+                '',
+                '',
+                '',
+                'public static class Seq',
+                '{',
+                '    public static IEnumerable<TResult> Pick<TSource, TResult>(this IEnumerable<TSource> source, Func<TSource, TResult> selector) => null;',
+                '    public static IEnumerable<TSource> Pick<TSource>(this IEnumerable<TSource> source, int count) => null;',
+                '    public static void Use(List<Row> rows) { rows.Pick(r => r.Id); }',
+                '}',
+                '',
+            ].join('\n'),
+            'RowMap.cs': 'namespace M;\npublic class RowMap : ClassMap<Row>\n{\n    public RowMap()\n    {\n        Map(m => m.Id);\n        Map<Row>(m => m.Id);\n    }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const member = callers(index, 'Map.cs', 5, 'Map');
+            assert.deepStrictEqual(member.confirmed, [6], 'Map(m => m.Id) infers TMember, never T');
+            assert.deepStrictEqual(member.unverified.map(([line]) => line), [7], 'explicit Map<Row>(..) stays undecided');
+            assert.deepStrictEqual(callers(index, 'Map.cs', 6, 'Map').confirmed, []);
+            // TSource is fixed by the receiver, then TResult by the lambda's output.
+            assert.deepStrictEqual(callers(index, 'Map.cs', 15, 'Pick').confirmed, [17]);
+        } finally { rm(dir); }
+    });
+    it('C#: every argument converts to dynamic', () => {
+        const dir = tmp({
+            'D.cs': 'namespace D;\npublic class Args { }\npublic class Db\n{\n    public int Run(string sql, dynamic param = null) => 1;\n    public int Run(int code) => 2;\n    public void Use() { Run("x", new Args()); }\n}\n',
+        });
+        try {
+            assert.deepStrictEqual(callers(idx(dir), 'D.cs', 5, 'Run'), { confirmed: [7], unverified: [] });
+        } finally { rm(dir); }
+    });
+    it('C#: a DbConnection receiver binds a this-IDbConnection extension; a sibling overload\'s argument excludes', () => {
+        const dir = tmp({
+            'Ext.cs': [
+                'using System.Data;',
+                'namespace Dap;',
+                'public struct CommandDefinition { public CommandDefinition(string text) { } }',
+                'public static class SqlMapper',
+                '{',
+                '    public static int Execute(this IDbConnection cnn, string sql, object param = null) => 1;',
+                '    public static int Execute(this IDbConnection cnn, CommandDefinition command) => 2;',
+                '}',
+                '',
+            ].join('\n'),
+            'Use.cs': [
+                'using System.Data.Common;',
+                'using Dap;',
+                'namespace App;',
+                'public class Repo',
+                '{',
+                '    private DbConnection connection;',
+                '    private Npgsql.NpgsqlConnection other;',
+                '    public void A() { connection.Execute("delete from t"); }',
+                '    public void B() { connection.Execute(new CommandDefinition("x")); }',
+                '    public void C() { other.Execute(new CommandDefinition("y")); other.Execute("z"); }',
+                '}',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const text = callers(index, 'Ext.cs', 6, 'Execute');
+            assert.deepStrictEqual(text.confirmed, [8]);
+            assert.deepStrictEqual(text.unverified, [[10, 'extension-receiver-unresolved']], 'an unmodeled provider type stays visible');
+            const command = callers(index, 'Ext.cs', 7, 'Execute');
+            assert.deepStrictEqual(command.confirmed, [9]);
+            assert.deepStrictEqual(command.unverified, [[10, 'extension-receiver-unresolved']]);
+        } finally { rm(dir); }
+    });
+    it('Java: a type annotation before a variable arity parameter\'s ... keeps the parameter', () => {
+        const dir = tmp({
+            'A.java': 'package p;\nimport java.lang.annotation.*;\n@Target(ElementType.TYPE_USE) @interface Nullable {}\nclass A {\n  Object getBean(String name) { return null; }\n  Object getBean(String name, @Nullable Object @Nullable ... args) { return null; }\n  void use() { getBean("x"); getBean("x", 1, 2); }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const varargs = index.symbols.get('getBean').find(d => d.startLine === 6);
+            assert.deepStrictEqual(varargs.paramsStructured.map(p => [p.name, !!p.rest]), [['name', false], ['args', true]]);
+            assert.ok(!index.files.get(path.join(dir, 'A.java')).parseRecovery);
+            assert.deepStrictEqual(callers(index, 'A.java', 5, 'getBean'), { confirmed: [7], unverified: [] });
+        } finally { rm(dir); }
+    });
+    it('Java: a class literal no pinned overload takes binds a subclass overload; a JDK List never fills a project varargs element', () => {
+        const dir = tmp({
+            'p/Base.java': 'package p;\npublic abstract class Base {\n  public Object getBean(String name) { return null; }\n  public Object getBean(String name, Object... args) { return null; }\n}\n',
+            'p/Sub.java': 'package p;\npublic class Sub extends Base {\n  public <T> T getBean(Class<T> type) { return null; }\n  void use(Sub bf) { bf.getBean(Sub.class); bf.getBean("s"); }\n}\n',
+            'p/Module.java': 'package p;\npublic interface Module { void configure(); }\n',
+            'p/Builder.java': 'package p;\nimport java.util.Arrays;\npublic class Builder {\n  public Module with(Module... overrides) { return with(Arrays.asList(overrides)); }\n  public Module with(Iterable<? extends Module> overrides) { return null; }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.deepStrictEqual(callers(index, 'p/Base.java', 3, 'getBean'), { confirmed: [4], unverified: [] });
+            assert.deepStrictEqual(callers(index, 'p/Builder.java', 5, 'with'), { confirmed: [4], unverified: [] });
+            assert.deepStrictEqual(callers(index, 'p/Builder.java', 4, 'with'), { confirmed: [], unverified: [] });
+        } finally { rm(dir); }
+    });
+    it('Java: a lambda never converts to a class-typed parameter', () => {
+        const dir = tmp({
+            'A.java': 'package p;\nimport java.util.function.Consumer;\nclass Cfg {}\nclass B {\n  B with(Consumer<Cfg> c) { return this; }\n  B with(Cfg c) { return this; }\n  void go(B b) { b.with(x -> {}); }\n}\n',
+        });
+        try {
+            assert.deepStrictEqual(callers(idx(dir), 'A.java', 5, 'with'), { confirmed: [7], unverified: [] });
         } finally { rm(dir); }
     });
 });

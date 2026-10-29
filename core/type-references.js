@@ -2597,6 +2597,15 @@ function scanFile(index, resolver, file, entry, language, lineNumbers) {
         // An `__all__` entry is a code reference: once edited it is no
         // longer a text-only review item.
         if (token.role.role === 'dunder-all') slot.stringAnnotation = true;
+        // The impact band (fix #428) reads each token's syntactic role and
+        // why a token names something else; a rename reads only verdicts.
+        if (resolver.collectRoles) {
+            // A Python annotation is an expression in a type position.
+            const role = token.role.role === 'value' && resolver.family === 'python' &&
+                ancestor(token.node, PY_ANNOTATION, PY_ANNOTATION_STOP) ? 'type' : token.role.role;
+            (slot.roles ||= new Map()).set(token.node.startPosition.column, role);
+            if (constructionHead(token.node)) (slot.constructionColumns ||= []).push(token.node.startPosition.column);
+        }
         if (decision.verdict === 'yes') {
             slot.edits.push(token.node.startPosition.column);
             // A binding renamed by aliasing its import (`import x as y`).
@@ -2605,14 +2614,43 @@ function scanFile(index, resolver, file, entry, language, lineNumbers) {
         else if (decision.verdict === 'unknown') {
             slot.reviews.push({ column: token.node.startPosition.column, reason: decision.reason || 'unresolved' });
         } else {
-            slot.skips++;
-            slot.skipColumns.push(token.node.startPosition.column);
+            skipToken(resolver, slot, token.node.startPosition.column, decision.reason);
         }
     }
     for (const comment of docComments) decideDocCrefs(resolver, file, comment, lineOf(comment.startPosition.row));
     if (resolver.family === 'c' && !resolver.valueReferences) decideReplacementListCasts(resolver, file, lines);
     resolver.rememberLocalFile?.(file, lines, fileLocalOnly);
     return lines;
+}
+
+/** A token that names something else: counted, and why when asked. */
+function skipToken(resolver, slot, column, reason) {
+    slot.skips++;
+    slot.skipColumns.push(column);
+    if (resolver.collectRoles) (slot.skipReasons ||= new Map()).set(column, reason || 'other-declaration');
+}
+
+// Expressions whose head names the constructed type (fix #428): `S { .. }`
+// (Rust struct expressions) and `S(..)` (tuple structs, functional casts).
+const CONSTRUCTION_HEADS = new Map([
+    ['struct_expression', 'name'], ['call_expression', 'function'],
+]);
+const HEAD_WRAPPERS = new Set(['scoped_type_identifier', 'scoped_identifier', 'generic_type', 'generic_function']);
+
+/** Is this token the head of a construction expression? */
+function constructionHead(node) {
+    let current = node;
+    for (let depth = 0; depth < 4 && current.parent; depth++) {
+        const parent = current.parent;
+        const field = CONSTRUCTION_HEADS.get(parent.type);
+        if (field) return sameNode(parent.childForFieldName(field), current);
+        if (!HEAD_WRAPPERS.has(parent.type)) return false;
+        // A path's last segment names the type; a qualifier does not.
+        const name = parent.childForFieldName('name') || parent.childForFieldName('type');
+        if (name && !sameNode(name, current)) return false;
+        current = parent;
+    }
+    return false;
 }
 
 /**
@@ -2682,10 +2720,8 @@ function decideDocCrefs(resolver, file, comment, slot) {
             handled = true;
             if (verdict.verdict === 'yes') slot.edits.push(column);
             else if (verdict.verdict === 'unknown') slot.reviews.push({ column, reason: 'doc-cref' });
-            else {
-                slot.skips++;
-                slot.skipColumns.push(column);
-            }
+            else skipToken(resolver, slot, column, verdict.reason);
+            if (resolver.collectRoles) (slot.roles ||= new Map()).set(column, 'doc-cref');
         }
     }
     if (handled) slot.stringAnnotation = true;
@@ -3428,10 +3464,8 @@ function decideStringAnnotation(resolver, file, entry, node, slot) {
         const column = node.startPosition.column + offset;
         if (verdict.verdict === 'yes') slot.edits.push(column);
         else if (verdict.verdict === 'unknown') slot.reviews.push({ column, reason: verdict.reason || 'string-annotation' });
-        else {
-            slot.skips++;
-            slot.skipColumns.push(column);
-        }
+        else skipToken(resolver, slot, column, verdict.reason);
+        if (resolver.collectRoles) (slot.roles ||= new Map()).set(column, 'string-annotation');
     }
     slot.stringAnnotation = true;
 }
