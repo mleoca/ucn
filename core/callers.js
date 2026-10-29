@@ -53,7 +53,13 @@ const { resolveQualifier: resolveCppQualifier, effectiveNamespace: cppEffectiveN
  */
 function _notForeignSameNameOwner(index, member, ref) {
     if (!ref || ownerNameOf(member) !== ref.name) return true;
-    return ownedBy(index, member, ref) !== 'no';
+    if (ownedBy(index, member, ref) !== 'no') return true;
+    // Where inherited overloads join a member group (trait
+    // hasArityOverloads), a same-name ancestor is no foreign class (fix
+    // #430: the generic `ClassMap<TClass> : ClassMap` inherits the
+    // non-generic `References`).
+    return !!langTraits(index.files.get(member.file)?.language)?.hasArityOverloads &&
+        descendsFromTargets(index, ref, [member]) === 'yes';
 }
 
 const CONSTRUCTABLE_BINDING_KINDS = new Set([
@@ -445,6 +451,15 @@ function _javaConstructorDisposition(index, filePath, fileEntry, call, targetDef
     const caller = index.findEnclosingFunction(filePath, call.line, true, call);
     if (targets.some(d => d.file === filePath &&
         (!d.enclosingType || d.enclosingType === caller?.className))) return 'target';
+    // A member type of a class enclosing the call is the name's lexical
+    // binding (fix #430: `new Builder()` inside CodeBlock is CodeBlock.Builder,
+    // whatever other classes declare a nested Builder).
+    const enclosingTypes = (fileEntry.symbols || []).filter(d => typeKinds.has(d.type) &&
+        d.startLine <= call.line && (d.endLine ?? d.startLine) >= call.line);
+    const lexical = all.filter(d => d.file === filePath && d.enclosingType &&
+        enclosingTypes.some(outer => outer.name === String(d.enclosingType).split('.').pop() &&
+            d.startLine >= outer.startLine && (d.endLine ?? d.startLine) <= (outer.endLine ?? outer.startLine)));
+    if (lexical.length === 1) return isTarget(lexical[0]) ? 'target' : 'other';
 
     const callerPackage = _javaPackageKey(fileEntry.relativePath);
     const samePackage = all.filter(d => !d.enclosingType &&
@@ -1950,7 +1965,7 @@ function findCallers(index, name, options = {}) {
                         name,
                         typeQueryTargets,
                         call.line,
-                        call.receiverTypeNamespace);
+                        call.receiverTypeNamespace || call.constructorQualifier);
                     if (constructorIdentity === 'other') {
                         recordExcluded(
                             filePath, call.line, 'other-definition-import');
@@ -2562,7 +2577,13 @@ function findCallers(index, name, options = {}) {
                 // ENCLOSING class by construction. Both stay in the calls
                 // cache for deadcode/--unused reachability; `super(...)`
                 // names a DIFFERENT class and keeps its caller edge.
-                if ((call.enumConstant || call.ctorDelegation === 'this') && !options.constructorProjectionSource) {
+                // Where a constructor's uses are uses of its type (trait
+                // constructorUsesAreTypeReferences: C#, whose constructors
+                // have no name of their own), a `: this(..)` initializer is
+                // a class edge like `: base(..)` (fix #430).
+                if ((call.enumConstant || call.ctorDelegation === 'this' &&
+                    !langTraits(fileEntry.language)?.constructorUsesAreTypeReferences) &&
+                    !options.constructorProjectionSource) {
                     continue;
                 }
 
@@ -5698,7 +5719,18 @@ function findCallers(index, name, options = {}) {
                             // Go embedding has no virtual dispatch. Field-hop types
                             // get the ancestor guard too (Java virtual dispatch).
                             const structural = langTraits(fileEntry.language)?.typeSystem === 'structural';
-                            if (targetTypes.has(knownType)) {
+                            // A receiver type written under its enclosing type
+                            // where other types share its name (fix #430:
+                            // `HttpConnection.Response` beside the interface
+                            // `Connection.Response`): the member its class chain
+                            // declares is the one the call binds.
+                            const nestedBinding = !structural && !viaFieldHop && call.receiverType === knownType
+                                ? _nestedReceiverBinding(index, call, knownType, targetDefs, definitions) : null;
+                            if (nestedBinding === 'other') {
+                                receiverTypeValidated = false;
+                            } else if (nestedBinding === 'target') {
+                                receiverTypeValidated = true;
+                            } else if (targetTypes.has(knownType)) {
                                 receiverTypeValidated = true;
                                 // Identity discipline (fix #206, extended to
                                 // structural flow in #272): a
@@ -15798,6 +15830,32 @@ function _arityCompatibleBindings(index, language, call, bindings) {
 }
 
 /**
+ * The member a Java/C# call binds through a receiver class written under its
+ * enclosing type (`HttpConnection.Response res; res.header(..)`) when other
+ * project types share the class's simple name (fix #430): the member the
+ * class's own chain declares is the static target. 'target' when it is a
+ * target, 'other' when it is another member and no target owner descends
+ * from the receiver class (no dispatch into it), null when undecided (the
+ * name-level physics decide).
+ */
+function _nestedReceiverBinding(index, call, typeName, targetDefs, definitions) {
+    const qualifier = call.receiverTypeQualifier || call.receiverTypeNamespace;
+    if (!qualifier || !langTraits(index.files.get(targetDefs[0]?.file)?.language)?.typeNameScoping) return null;
+    const named = classDefsNamed(index, typeName);
+    if (named.unique) return null;
+    const pathOf = d => [d.namespace, d.enclosingType].filter(Boolean).join('.');
+    const hits = named.entries.filter(entry => entry.def.enclosingType && (entry.def.enclosingType === qualifier ||
+        pathOf(entry.def) === qualifier || pathOf(entry.def).endsWith(`.${qualifier}`)));
+    if (hits.length !== 1) return null;
+    const ref = { name: typeName, key: hits[0].key, def: hits[0].def };
+    const members = (definitions || []).filter(d => !NON_CALLABLE_TYPES.has(d.type) && d.className);
+    const declaring = findDeclaringClass(index, ref, members);
+    if (!declaring || declaring.uncertain || declaring.members.length === 0) return null;
+    if (declaring.members.some(member => targetDefs.includes(member))) return 'target';
+    return relationToTargets(index, ref, targetDefs) === 'unrelated' ? 'other' : null;
+}
+
+/**
  * fix #380 (P0-10): a capitalized bare receiver the parser could not see as a
  * member of the lexically enclosing type (`Component.Run(x)` in one C#
  * `partial` part with `Component` declared in another part, a Java
@@ -16142,6 +16200,26 @@ function _resolveReceiverTypeIdentity(index, filePath, knownType, targetDefs, li
         // considering using directives (`Newtonsoft.Json.Converters` can
         // see `Newtonsoft.Json.JsonReader`).
         const namespaceCandidates = [];
+        // A qualifier naming a type (`Root.Tests.PipelineTests.Logger`, fix
+        // #430): the qualified name is the declaring namespace plus the
+        // enclosing types, written in full or relative to an enclosing
+        // namespace of the site. The type it names decides.
+        if (namespaceHint) {
+            const qualifiedOwner = d => [d.namespace, d.enclosingType].filter(Boolean).join('.');
+            const relative = [namespaceHint];
+            for (const segments = (callerNamespace || '').split('.').filter(Boolean); segments.length > 0; segments.pop()) {
+                relative.push(`${segments.join('.')}.${namespaceHint}`);
+            }
+            for (const written of relative) {
+                const nested = typeDefs.filter(d => d.enclosingType && qualifiedOwner(d) === written);
+                if (nested.length === 0) continue;
+                const sameType = (t, d) => (t.namespace || null) === (d.namespace || null) &&
+                    (t.enclosingType || null) === (d.enclosingType || null);
+                const targetTypes = targetDefs.filter(t => t.className === knownType || t.name === knownType);
+                return nested.some(d => targetTypes.some(t => t.name === knownType && IDENTITY_TYPE_KINDS.has(t.type)
+                    ? sameType(t, d) : ownerDefinitionOf(index, t) === d)) ? 'target' : 'other';
+            }
+        }
         if (namespaceHint) {
             namespaceCandidates.push(namespaceHint);
         } else if (callerNamespace) {
@@ -18688,6 +18766,13 @@ function _calleeReceiverMethodGroup(index, symbols, typeName, language, contextF
                     const key = [...ownerKeys][0];
                     if (key) ownerRef = { key, def: ownerDefinitionOf(index, declared[0]) };
                 }
+            } else if (!ownerRef && named.entries.length > 0) {
+                // A uniquely named type is its own definition (fix #430):
+                // its bases resolve through that definition's base clause
+                // (`ClassMap<T>` of arity 1 beside a non-generic `ClassMap`),
+                // not by bare name.
+                const def = named.entries.find(entry => entry.def.type === 'class')?.def || named.entries[0].def;
+                ownerRef = { name: owner, key: named.entries[0].key, def };
             }
             const visitKey = ownerRef ? ownerRef.key : owner;
             if (seenTypes.has(visitKey)) continue;
@@ -22415,7 +22500,10 @@ function _csharpExtensionInScope(index, filePath, fileEntry, call, def) {
     const namespace = def.namespace || null;
     if (!namespace) return true; // global namespace: visible everywhere
     const enclosing = index.findEnclosingFunction(filePath, call.line, true, call);
-    const callerNamespace = enclosing?.namespace || null;
+    // A local function records no namespace of its own (fix #430): the
+    // types around the call place it.
+    const callerNamespace = enclosing?.namespace ||
+        require('./type-denotation').siteNamespaceOf(fileEntry, call.line) || null;
     if (callerNamespace && (callerNamespace === namespace || callerNamespace.startsWith(`${namespace}.`))) {
         return true;
     }
@@ -23842,8 +23930,13 @@ function _producerReturnMethodGroup(index, owner, method, ownerFile, contextFile
     }
     let ref;
     if (qualifier) {
-        const exact = named.entries.filter(entry =>
-            [entry.def.namespace, entry.def.enclosingType, entry.def.name].filter(Boolean).join('.') === written);
+        // The written qualifier spells the type's path in full or from its
+        // enclosing type (fix #430: `AnnotationSpec.Builder` in package
+        // com.squareup.javapoet).
+        const pathOf = entry => [entry.def.namespace, entry.def.enclosingType, entry.def.name].filter(Boolean).join('.');
+        let exact = named.entries.filter(entry => pathOf(entry) === written);
+        if (!exact.length) exact = named.entries.filter(entry => entry.def.enclosingType &&
+            pathOf(entry).endsWith(`.${written}`));
         if (!exact.length || new Set(exact.map(entry => entry.key)).size !== 1) return null;
         ref = { name: ownerSimple, key: exact[0].key, def: exact[0].def };
     } else ref = resolveClassRef(index, ownerSimple, context);
@@ -23951,9 +24044,12 @@ function _javaOwnerFieldType(index, owner, fieldName) {
     const platformType = CSHARP_PLATFORM_MEMBER_TYPES.get(
         `${ownerSimple}.${fieldName}`);
     if (platformType) return platformType;
+    // A C# property is read like a field: its declared type is the value's
+    // (fix #430: `Create(writer.ContainerPath, ..)` passes a string).
     const fields = (index.symbols.get(fieldName) || []).filter(definition =>
         definition.className === ownerSimple &&
-        (definition.type === 'field' || definition.memberType === 'field') &&
+        (definition.type === 'field' || definition.memberType === 'field' ||
+            (definition.type === 'property' || definition.memberType === 'property') && !definition.explicitInterface) &&
         definition.fieldType);
     if (fields.length === 0) {
         // JDK constant-field contracts (fix #299D): Float.NaN is a float,
@@ -24352,7 +24448,8 @@ function _javaArgumentOrigin(index, kind, origin) {
         const parts = kind.slice('field:'.length).split(':'), name = parts.pop();
         const owner = parts.join(':').replace(/<.*$/s, '').split('.').pop();
         const fields = (index.symbols.get(name) || []).filter(def => def.className === owner &&
-            (def.type === 'field' || def.memberType === 'field') && def.fieldType);
+            (def.type === 'field' || def.memberType === 'field' ||
+                (def.type === 'property' || def.memberType === 'property') && !def.explicitInterface) && def.fieldType);
         const files = new Set(fields.map(def => def.file));
         return files.size === 1 ? { file: [...files][0], ...(origin?.invocation && { invocation: origin.invocation }) } : null;
     }
@@ -25112,6 +25209,32 @@ function _javaVariadicNormalFormPossible(index, call, definition) {
         position, _declaredTypeParameterNames(definition), definition);
 }
 
+/**
+ * Whether the call's method type arguments rule a definition out, whatever
+ * its arguments: explicit type arguments (`M<string>(..)`, `obj.<T>m()`)
+ * name a generic method of that many type parameters (fix #391; where
+ * generic arity is part of identity (C#) a non-generic method takes none,
+ * Java ignores them on a non-generic method, JLS 15.12.2.1); without them a
+ * C# generic method is applicable only when inference from the arguments
+ * fixes every type parameter (fix #393): one no parameter type mentions is
+ * never inferred, nor one only an implicitly typed lambda's parameter types
+ * mention (fix #428).
+ */
+function _typeArgumentsReject(index, call, def) {
+    const language = def.file && index.files.get(def.file)?.language;
+    if (!language) return false;
+    if (call.methodTypeArgs > 0) {
+        const declared = _methodTypeParameterCount(def);
+        return declared > 0 ? declared !== call.methodTypeArgs : !!langTraits(language)?.genericArityIsIdentity;
+    }
+    if (!langTraits(language)?.typeArgumentsFromArgumentsOnly || _methodTypeParameterCount(def) === 0) return false;
+    const rawParams = def.paramsStructured;
+    if (!Array.isArray(rawParams)) return false;
+    const boundExtension = !!(def.isExtensionMethod && call.isMethod && call.receiver !== def.className);
+    const ps = boundExtension ? rawParams.slice(1) : rawParams;
+    return !_csharpTypeParametersInferable(def, rawParams, ps, boundExtension, call.argKinds);
+}
+
 function _overloadApplicable(index, call, def) {
     const rawParams = def.paramsStructured;
     const boundExtension = !!(def.isExtensionMethod && call.isMethod &&
@@ -25125,25 +25248,7 @@ function _overloadApplicable(index, call, def) {
     if (call.argCount < min) return false;
     if (!hasRest && call.argCount > ps.length) return false;
     const language = def.file && index.files.get(def.file)?.language;
-    // Explicit method type arguments (`M<string>(..)`, `obj.<T>m()`) name a
-    // generic method of that many type parameters (fix #391). Where generic
-    // arity is part of identity (C#) a non-generic method takes none; Java
-    // ignores them on a non-generic method (JLS 15.12.2.1).
-    if (call.methodTypeArgs > 0 && language) {
-        const declared = _methodTypeParameterCount(def);
-        if (declared > 0 ? declared !== call.methodTypeArgs
-            : langTraits(language)?.genericArityIsIdentity) return false;
-    }
-    // Without explicit type arguments a C# generic method is applicable only
-    // when inference from the arguments fixes every type parameter (fix
-    // #393): one no parameter type mentions is never inferred, nor one only
-    // an implicitly typed lambda's parameter types mention (fix #428).
-    if (!(call.methodTypeArgs > 0) && language &&
-        langTraits(language)?.typeArgumentsFromArgumentsOnly &&
-        _methodTypeParameterCount(def) > 0 &&
-        !_csharpTypeParametersInferable(def, rawParams, ps, boundExtension, call.argKinds)) {
-        return false;
-    }
+    if (_typeArgumentsReject(index, call, def)) return false;
     const kinds = call.argKinds;
     if (!Array.isArray(kinds)) return true;
     const typeParams = language === 'cpp' ? null : _declaredTypeParameterNames(def);
@@ -26671,8 +26776,19 @@ function _overloadDiscipline(index, call, targetDefs, definitions, callerFile) {
         // even when that family has only one overload.
         return 'other-overload';
     }
-    if (family.length <= 1) return null;
-    if (family.every(d => pinnedKeys.has(pinKey(d)))) return null;
+    if (family.length <= 1 || family.every(d => pinnedKeys.has(pinKey(d)))) {
+        // A lone pin the call's type arguments rule out (fix #430:
+        // `References<BMap>(..)` never binds the non-generic
+        // `References(Type, ..)`): the call binds a member outside the
+        // pin's family, the generic one a subclass declares.
+        const pins = family.length ? family : targetDefs;
+        if ((targetLanguage === 'java' || targetLanguage === 'csharp') && pins.length > 0 &&
+            pins.every(d => _overloadArityFits(call, d) && _typeArgumentsReject(index, call, d))) {
+            return _argumentsProvablyFitElsewhere(index, call, definitions, pins, targetLanguage)
+                ? 'other-overload' : { ambiguous: true, candidates: 0 };
+        }
+        return null;
+    }
     // Producer-return argument typing (fix #299B): a bare-identifier
     // producer (`paint(tint(3))`) types its argument position from the
     // project's declared return type — the #199/#207 return-type-flow rail
@@ -27849,12 +27965,29 @@ function _interfaceFieldExcludesStatic(index, file, call, rootType, contract, ta
 function _declaredFieldInterfaceType(index, rootType, fieldName, language, rootNamespace) {
     const defs = index.symbols.get(fieldName);
     if (!defs) return null;
-    const fields = defs.filter(d =>
-        (d.type === 'field' || d.memberType === 'field' ||
-         d.type === 'property' || d.memberType === 'property') &&
-        d.className === rootType && d.fieldType &&
-        (language !== 'csharp' || !rootNamespace ||
-            (d.namespace || null) === rootNamespace));
+    const declared = d => (d.type === 'field' || d.memberType === 'field' ||
+        d.type === 'property' || d.memberType === 'property') && d.fieldType &&
+        (language !== 'csharp' || !rootNamespace || (d.namespace || null) === rootNamespace);
+    let fields = defs.filter(d => declared(d) && d.className === rootType);
+    // Fields are inherited (fix #430: `TraceWriter.Trace(..)` in a subclass
+    // of the class declaring `ITraceWriter? TraceWriter`): the nearest
+    // declaring ancestor level, as for class-typed fields.
+    if (fields.length === 0 && !defs.some(d => d.className === rootType)) {
+        let level = [rootType];
+        const seen = new Set(level);
+        while (level.length > 0 && seen.size < 64) {
+            const parents = [...new Set(level.flatMap(owner =>
+                index._getInheritanceParents?.(owner) || []))].filter(owner => owner && !seen.has(owner));
+            if (parents.length === 0) break;
+            for (const owner of parents) seen.add(owner);
+            if (defs.some(d => parents.includes(d.className))) {
+                fields = defs.filter(d => declared(d) && parents.includes(d.className));
+                if (fields.length !== defs.filter(d => parents.includes(d.className)).length) return null;
+                break;
+            }
+            level = parents;
+        }
+    }
     if (fields.length === 0) return null;
     const normalized = new Set();
     for (const f of fields) {

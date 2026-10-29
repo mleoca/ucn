@@ -13,7 +13,10 @@ function inheritedAccessor(index, enclosing, name, definition) {
         if (owner === ownerName(definition) && file === definition.file) return true;
         // An override owns this spelling. Multiple inheritance and duplicate
         // declarations need richer lookup evidence, so keep them unverified.
-        if ((index.symbols.get(name) || []).some(d => d.className === owner && d.file === file)) return false;
+        // An instance attribute assigned through an inherited property
+        // runs the property (fix #430): it overrides nothing.
+        if ((index.symbols.get(name) || []).some(d => d.className === owner && d.file === file &&
+            !d.instanceAttribute)) return false;
         const definitions = (index.symbols.get(owner) || []).filter(d => d.file === file && ['class', 'struct'].includes(d.type));
         if (definitions.length !== 1) return false;
         const parents = index._getInheritanceParentsAt(owner, file, definitions[0].startLine) || [];
@@ -177,15 +180,19 @@ function bareTypeName(value) {
         .replace(/[?*&\s]/g, '') || null;
 }
 
-function typeMatchesOwner(index, typeName, contextFile, owner, ownerFile) {
+function typeMatchesOwner(index, typeName, contextFile, owner, definition) {
     const bare = bareTypeName(typeName);
     if (!bare || !owner || bare !== owner) return false;
-    const resolved = index._resolveClassFile?.(bare, contextFile);
-    if (resolved) return path.resolve(resolved) === path.resolve(ownerFile);
-    const ownerDefs = (index.symbols.get(owner) || []).filter(symbol =>
-        ['class', 'struct', 'interface', 'trait', 'record'].includes(symbol.type));
-    return ownerDefs.length === 1 &&
-        path.resolve(ownerDefs[0].file) === path.resolve(ownerFile);
+    // The class the name denotes where it is written, by the language's
+    // lookup (fix #430: a same-namespace `Ping` before a sample project's
+    // `Ping`), is the accessor's owner class (the parts of a partial type
+    // are one class); a name that does not resolve to one class is no
+    // evidence.
+    const { resolveClassRef, ownerRefOf } = require('./class-identity');
+    const ref = resolveClassRef(index, bare, contextFile);
+    const own = ownerRefOf(index, definition);
+    if (ref?.key && own?.key) return ref.key === own.key;
+    return !!ref?.def?.file && path.resolve(ref.def.file) === path.resolve(definition.file);
 }
 
 // Members of the same object literal (fix #397): `this` in one names the
@@ -531,7 +538,7 @@ function findAccessorReferences(index, name, definition, options = {}) {
                 ref.file, enclosing.className)?.get(receiver) || null;
         }
         if (receiverType && typeMatchesOwner(
-            index, receiverType, ref.file, owner, definition.file)) {
+            index, receiverType, ref.file, owner, definition)) {
             confirmed.push({
                 ...shaped,
                 callerName: enclosing?.name || null,
@@ -553,7 +560,7 @@ function findAccessorReferences(index, name, definition, options = {}) {
             });
             continue;
         }
-        if (receiver && typeMatchesOwner(index, receiver, ref.file, owner, definition.file)) {
+        if (receiver && typeMatchesOwner(index, receiver, ref.file, owner, definition)) {
             confirmed.push({
                 ...shaped,
                 callerName: enclosing?.name || null,

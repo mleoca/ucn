@@ -388,7 +388,16 @@ function _resolveAmong(index, entries, contextFile, namespace) {
         const samePkg = entries.filter(e => goBareNameReaches(index, contextFile, e.def));
         if (samePkg.length > 0) return _single(samePkg);
     }
-    // 3. Direct imports.
+    // 3. A C# namespace's own members precede the types its using
+    //    directives import (fix #430): `Post` inside namespace
+    //    `Dapper.Tests.Performance` is that namespace's Post whatever
+    //    `using Dapper.Tests.Performance.Dashing;` brings.
+    if (traits?.typeNameScoping === 'namespace-usings') {
+        const own = _contextNamespace(index, contextFile, namespace);
+        const declared = own ? entries.filter(e => e.def.namespace === own) : [];
+        if (declared.length > 0) return _single(declared);
+    }
+    // 4. Direct imports.
     const imports = index.importGraph.get(contextFile);
     if (imports && imports.size > 0) {
         const imported = entries.filter(e => imports.has(e.def.file));
@@ -409,7 +418,7 @@ function _resolveAmong(index, entries, contextFile, namespace) {
         }
         if (imported.length > 0) return _single(imported);
     }
-    // 4. Same or enclosing namespace/package (Java packages, C#/C++
+    // 5. Same or enclosing namespace/package (Java packages, C#/C++
     //    namespaces), nearest first.
     const ns = _contextNamespace(index, contextFile, namespace);
     if (ns) {
@@ -421,7 +430,7 @@ function _resolveAmong(index, entries, contextFile, namespace) {
             return _single(visible.filter(e => e.def.namespace.length === longest));
         }
     }
-    // 5. Re-exports: the nearest transitive import reach, when unique.
+    // 6. Re-exports: the nearest transitive import reach, when unique.
     return _transitiveImportMatch(index, contextFile, entries);
 }
 

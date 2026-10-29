@@ -18029,3 +18029,405 @@ describe('fix #428: overloaded APIs decided by what the arguments prove (Java, C
         } finally { rm(dir); }
     });
 });
+
+describe('fix #430: C# receivers, constructor delegation, overloads and type identity', () => {
+    const csproj = '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>';
+    it('null-forgiving and inherited interface-typed members are receivers of the interface member', () => {
+        const dir = tmp({
+            'c.csproj': csproj,
+            'ITraceWriter.cs': [
+                'namespace N.Serialization',
+                '{',
+                '    public interface ITraceWriter { void Trace(int level, string message); }',
+                '    public class MemoryTraceWriter : ITraceWriter { public void Trace(int level, string message) { } }',
+                '    public class DiagnosticsTraceWriter : ITraceWriter { public void Trace(int level, string message) { } }',
+                '}',
+            ].join('\n'),
+            'Base.cs': [
+                'namespace N.Serialization',
+                '{',
+                '    internal abstract class InternalBase',
+                '    {',
+                '        internal readonly ITraceWriter? TraceWriter;',
+                '    }',
+                '    internal class InternalWriter : InternalBase',
+                '    {',
+                '        public void Write()',
+                '        {',
+                '            TraceWriter.Trace(1, "x");',
+                '        }',
+                '    }',
+                '}',
+            ].join('\n'),
+            'Serializer.cs': [
+                'using N.Serialization;',
+                'namespace N',
+                '{',
+                '    public class Serializer',
+                '    {',
+                '        public virtual ITraceWriter? TraceWriter { get; set; }',
+                '        public void Deserialize()',
+                '        {',
+                '            TraceWriter!.Trace(2, "y");',
+                '            TraceWriter.Trace(3, "z");',
+                '        }',
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const trace = index.context('Trace', { file: 'ITraceWriter.cs', line: 3 });
+            assert.deepStrictEqual((trace.callers || []).map(c => `${c.relativePath}:${c.line}`).sort(),
+                ['Base.cs:11', 'Serializer.cs:10', 'Serializer.cs:9']);
+            const callees = index.context('Write', { file: 'Base.cs', line: 9 });
+            assert.ok([...(callees.callees || []), ...(callees.unverifiedCallees || [])].some(c => c.name === 'Trace'),
+                JSON.stringify(callees.unverifiedCallees));
+        } finally { rm(dir); }
+    });
+
+    it('`: this(..)` is a class edge of a partial type and a base delegation selects a constructor of any part', () => {
+        const dir = tmp({
+            'c.csproj': csproj,
+            'V.cs': [
+                'namespace L',
+                '{',
+                '    public enum TokType { Raw, Str }',
+                '    public class Tok { public Tok(object v, int t) { } }',
+                '    public partial class J : Tok',
+                '    {',
+                '        internal J(object? value, TokType type) : base(value, 1) { }',
+                '        public J(string? value)',
+                '            : this(value, TokType.Str) { }',
+                '    }',
+                '    public partial class JR : J',
+                '    {',
+                '        public JR(object? rawJson) : base(rawJson, TokType.Raw) { }',
+                '    }',
+                '}',
+            ].join('\n'),
+            'A.Async.cs': [
+                'namespace L',
+                '{',
+                '    public partial class J',
+                '    {',
+                '        public void W() { }',
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            for (const [file, line] of [['V.cs', 5], ['A.Async.cs', 3]]) {
+                const cls = index.context('J', { file, line });
+                assert.deepStrictEqual((cls.callers || []).map(c => `${c.relativePath}:${c.line}`).sort(), ['V.cs:13', 'V.cs:9']);
+            }
+            const ctor = index.context('JR', { file: 'V.cs', line: 13 });
+            assert.deepStrictEqual((ctor.callees || []).filter(c => c.name === 'J').map(c => `${c.relativePath}:${c.startLine}`), ['V.cs:7']);
+        } finally { rm(dir); }
+    });
+
+    it('explicit method type arguments and inherited same-name overloads decide both directions', () => {
+        const dir = tmp({
+            'c.csproj': csproj,
+            'ClassMap.cs': [
+                'using System;',
+                'using System.Reflection;',
+                'namespace C',
+                '{',
+                '    public abstract class ClassMap',
+                '    {',
+                '        public virtual object References(Type classMapType, MemberInfo member, params object[] constructorArgs) => null;',
+                '    }',
+                '}',
+            ].join('\n'),
+            'ClassMapT.cs': [
+                'using System;',
+                'using System.Linq.Expressions;',
+                'using System.Reflection;',
+                'namespace C',
+                '{',
+                '    public abstract class ClassMap<TClass> : ClassMap',
+                '    {',
+                '        public virtual object Map<TMember>(Expression<Func<TClass, TMember>> expression, bool useExistingMap = true) => null;',
+                '        public virtual object References<TClassMap>(Expression<Func<TClass, object>> expression, params object[] constructorArgs) where TClassMap : ClassMap',
+                '        {',
+                '            MemberInfo member = null;',
+                '            return References(typeof(TClassMap), member, constructorArgs);',
+                '        }',
+                '    }',
+                '}',
+            ].join('\n'),
+            'RowMap.cs': [
+                'namespace C',
+                '{',
+                '    public class Row { public int Id { get; set; } public Row B { get; set; } }',
+                '    public sealed class RowMap : ClassMap<Row>',
+                '    {',
+                '        public RowMap()',
+                '        {',
+                '            Map(m => m.Id);',
+                '            References<RowMap>(m => m.B, "B Field");',
+                '        }',
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const plain = index.context('References', { file: 'ClassMap.cs', line: 7 });
+            assert.deepStrictEqual((plain.callers || []).map(c => `${c.relativePath}:${c.line}`), ['ClassMapT.cs:12']);
+            assert.ok(!(plain.callers || []).some(c => c.relativePath === 'RowMap.cs'));
+            const generic = index.context('References', { file: 'ClassMapT.cs', line: 9 });
+            assert.deepStrictEqual((generic.callers || []).map(c => `${c.relativePath}:${c.line}`), ['RowMap.cs:9']);
+            assert.deepStrictEqual((generic.callees || []).filter(c => c.name === 'References')
+                .map(c => `${c.relativePath}:${c.startLine}`), ['ClassMap.cs:7']);
+            const ctor = index.context('RowMap', { file: 'RowMap.cs', line: 6 });
+            assert.deepStrictEqual((ctor.callees || []).filter(c => c.name === 'Map')
+                .map(c => `${c.relativePath}:${c.startLine}`), ['ClassMapT.cs:8']);
+        } finally { rm(dir); }
+    });
+
+    it('a type-qualified construction, a same-namespace receiver type and a local function name their own types', () => {
+        const dir = tmp({
+            'c.csproj': csproj,
+            'A.cs': 'namespace Root.Tests\n{\n    public class PipelineTests\n    {\n        public class Logger { public void Log() { } }\n    }\n}\n',
+            'B.cs': 'namespace Root.Ext.Tests\n{\n    public class Logger { public void Log() { } }\n    public class Ping { public string Message { get; set; } }\n}\n',
+            'S.cs': 'namespace Root.Samples;\n\npublic class Ping { public string Message { get; set; } }\n',
+            'Ext.cs': 'namespace Root\n{\n    public static class Ext { public static int Count(this System.Data.IDbConnection c, string sql) => 0; }\n}\n',
+            'C.cs': [
+                'namespace Root.Ext.Tests;',
+                '',
+                'using Root.Samples;',
+                '',
+                'public class PipelineTests',
+                '{',
+                '    public void Run(System.Data.Common.DbConnection connection)',
+                '    {',
+                '        var a = new Logger();',
+                '        var b = new Root.Tests.PipelineTests.Logger();',
+                '        b.Log();',
+                '        static int Local<T>(System.Data.Common.DbConnection inner) { return inner.Count("x"); }',
+                '    }',
+                '    public string Handle(Ping request) => request.Message;',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const sites = (name, file, line) => (index.context(name, { file, line }).callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.deepStrictEqual(sites('Logger', 'B.cs', 3), ['C.cs:9']);
+            assert.deepStrictEqual(sites('Logger', 'A.cs', 5), ['C.cs:10']);
+            assert.deepStrictEqual(sites('Log', 'A.cs', 5), ['C.cs:11']);
+            assert.deepStrictEqual(sites('Log', 'B.cs', 3), []);
+            assert.deepStrictEqual(sites('Count', 'Ext.cs', 3), ['C.cs:12']);
+            const confirmed = (file, line) => (index.impact('Message', { file, line }).propertyAccesses?.byFile || [])
+                .flatMap(g => g.sites.map(s => `${s.file}:${s.line}`));
+            assert.deepStrictEqual(confirmed('B.cs', 4), ['C.cs:14']);
+            assert.deepStrictEqual(confirmed('S.cs', 3), []);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #430: C# argument evidence and partial-type accessor owners', () => {
+    const csproj = '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>';
+    it('`this`, a property argument and an argument count decide overloads and constructors', () => {
+        const dir = tmp({
+            'c.csproj': csproj,
+            'A.cs': [
+                'using System;',
+                'namespace N',
+                '{',
+                '    public abstract class JsonWriter { public string ContainerPath { get; } }',
+                '    public class BsonWriter : JsonWriter { void W() { WEx.Create(this, "m", null); } }',
+                '    public class WEx : Exception',
+                '    {',
+                '        internal static WEx Create(JsonWriter writer, string message, Exception? ex)',
+                '        {',
+                '            return Create(writer.ContainerPath, message, ex);',
+                '        }',
+                '        internal static WEx Create(string path, string message, Exception? ex) => null;',
+                '    }',
+                '    public enum Kind { A, B }',
+                '    public class V',
+                '    {',
+                '        internal V(object? value, Kind kind) { }',
+                '        public V(string? value) : this(value, Kind.A) { }',
+                '        public V(object? value) : this(value, Kind.B) { }',
+                '        public static V Make(object o) => new V(o);',
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const lines = (name, line) => {
+                const r = index.context(name, { file: 'A.cs', line });
+                return { confirmed: (r.callers || []).map(c => c.line), unverified: (r.unverifiedCallers || []).map(c => c.line) };
+            };
+            assert.deepStrictEqual(lines('Create', 8), { confirmed: [5], unverified: [] });
+            assert.deepStrictEqual(lines('Create', 12), { confirmed: [10], unverified: [] });
+            const two = lines('V', 17);
+            assert.ok(!two.unverified.includes(20), JSON.stringify(two));
+        } finally { rm(dir); }
+    });
+
+    it('a property read through any part of a partial owner is the owner\'s', () => {
+        const dir = tmp({
+            'c.csproj': csproj,
+            'A.Async.cs': 'namespace N\n{\n    public partial class Tok { public void W() { } }\n}\n',
+            'B.cs': 'namespace N\n{\n    public class Walker { public Tok? Up(Tok t) => t.Parent; }\n}\n',
+            'A.cs': [
+                'namespace N',
+                '{',
+                '    public partial class Tok',
+                '    {',
+                '        public Tok? Parent { get; internal set; }',
+                '        public int Depth()',
+                '        {',
+                '            int d = 0;',
+                '            for (Tok? current = this; current != null; current = current.Parent) d++;',
+                '            return d;',
+                '        }',
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const band = index.impact('Parent', { file: 'A.cs', line: 5 }).propertyAccesses;
+            assert.deepStrictEqual(band.byFile.flatMap(g => g.sites.map(s => `${s.file}:${s.line}`)), ['A.cs:9', 'B.cs:3']);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #430: C/C++ members of unnamed structs and unions, variable templates, alternative heads, macro operators', () => {
+    const header = [
+        'typedef struct ev_s {',
+        '    int type;',
+        '    union {',
+        '        struct {',
+        '            int encoding;',
+        '        } stream_start;',
+        '        struct {',
+        '            struct {',
+        '                int *start;',
+        '                int *end;',
+        '            } tag_directives;',
+        '            int implicit;',
+        '        } document_start;',
+        '    } data;',
+        '    struct {',
+        '        int *start;',
+        '        int *top;',
+        '    } simple_keys;',
+        '} ev_t;',
+        '',
+        'struct block {',
+        '    struct block *next;',
+        '    union {',
+        '        char data[16];',
+        '        double alignment;',
+        '    };',
+        '};',
+    ].join('\n');
+    for (const [ext, unit] of [['c', 'c'], ['cpp', 'cpp']]) {
+        it(`indexes nested unnamed members and resolves accesses through their member paths (${ext})`, () => {
+            const dir = tmp({
+                [`y.${ext === 'c' ? 'h' : 'hpp'}`]: header,
+                [`u.${unit}`]: [
+                    `#include "y.${ext === 'c' ? 'h' : 'hpp'}"`,
+                    'int f(ev_t *e, struct block *b) {',
+                    '    e->data.stream_start.encoding = 1;',
+                    '    e->data.document_start.tag_directives.start = 0;',
+                    '    e->simple_keys.start = 0;',
+                    '    b->alignment = 1.0;',
+                    '    return e->type + e->data.document_start.implicit;',
+                    '}',
+                ].join('\n'),
+            });
+            try {
+                const index = idx(dir);
+                const file = `y.${ext === 'c' ? 'h' : 'hpp'}`;
+                const fields = name => (index.symbols.get(name) || []).filter(d => d.type === 'field')
+                    .map(d => `${d.className}:${d.startLine}:${JSON.stringify(d.memberPaths || null)}`).sort();
+                assert.deepStrictEqual(fields('encoding'), ['ev_s:5:[["data","stream_start"]]']);
+                assert.deepStrictEqual(fields('start'), ['ev_s:16:[["simple_keys"]]', 'ev_s:9:[["data","document_start","tag_directives"]]']);
+                assert.deepStrictEqual(fields('alignment'), ['block:25:null']);
+                const confirmed = line => {
+                    const name = { 5: 'encoding', 9: 'start', 16: 'start', 25: 'alignment', 12: 'implicit' }[line];
+                    const band = index.impact(name, { file, line }).valueAccesses;
+                    return { confirmed: band.byFile.flatMap(g => g.sites.map(s => s.line)), unverified: band.unverifiedSites.length };
+                };
+                assert.deepStrictEqual(confirmed(5), { confirmed: [3], unverified: 0 });
+                assert.deepStrictEqual(confirmed(9), { confirmed: [4], unverified: 0 });
+                assert.deepStrictEqual(confirmed(16), { confirmed: [5], unverified: 0 });
+                assert.deepStrictEqual(confirmed(25), { confirmed: [6], unverified: 0 });
+                assert.deepStrictEqual(confirmed(12), { confirmed: [7], unverified: 0 });
+            } finally { rm(dir); }
+        });
+    }
+
+    it('reads implicit-this member paths, variable templates and alternative function heads (C++)', () => {
+        const dir = tmp({
+            'a.cpp': [
+                'struct Holder {',
+                '    union { int raw; float real; };',
+                '    struct { int a; int b; } pair;',
+                '    int sum() { return raw + pair.a + this->pair.b; }',
+                '};',
+                'struct as_value_t { template<typename> static constexpr bool value = true; };',
+                'template<typename... T> inline constexpr bool tc_v = (sizeof...(T) == 1u);',
+                'using id_type = unsigned;',
+                'template<typename Type>',
+                'struct type_hash final {',
+                '#if defined ENTT_PRETTY_FUNCTION',
+                '    [[nodiscard]] static constexpr id_type value() noexcept {',
+                '        return 2;',
+                '#else',
+                '    [[nodiscard]] static constexpr id_type value() noexcept {',
+                '        return 3;',
+                '#endif',
+                '    }',
+                '};',
+                'int use(Holder &h) { return h.raw + h.pair.a + (tc_v<int> ? 1 : 0) + type_hash<int>::value(); }',
+                'template <typename T> struct TypeIdHelper { static bool dummy_; };',
+                'template <typename T> bool TypeIdHelper<T>::dummy_ = false;',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const sites = (name, line) => index.impact(name, { file: 'a.cpp', line }).valueAccesses.byFile
+                .flatMap(g => g.sites.map(s => s.line));
+            assert.deepStrictEqual(sites('raw', 2), [4, 20]);
+            assert.deepStrictEqual(sites('a', 3), [4, 20]);
+            assert.deepStrictEqual(sites('b', 3), [4]);
+            assert.deepStrictEqual((index.symbols.get('value') || []).map(d => `${d.type}:${d.startLine}`).sort(),
+                ['field:6', 'method:12', 'method:15']);
+            assert.deepStrictEqual((index.symbols.get('tc_v') || []).map(d => `${d.type}:${d.startLine}`), ['state:7']);
+            // An out-of-class definition of a class template's static member
+            // defines the member, no variable.
+            assert.deepStrictEqual((index.symbols.get('dummy_') || []).map(d => `${d.type}:${d.startLine}`), ['field:21']);
+            assert.deepStrictEqual(sites('tc_v', 7), [20]);
+        } finally { rm(dir); }
+    });
+
+    it('a macro body call with stringized arguments keeps its argument count', () => {
+        const dir = tmp({
+            'p.hpp': [
+                'namespace testing {',
+                'template <typename Pred, typename T1>',
+                'int AssertPred1Helper(const char* pred_text, const char* e1, Pred pred, const T1& v1) { return pred(v1); }',
+                '#define GTEST_PRED1_(pred, v1) \\',
+                '  ::testing::AssertPred1Helper(#pred, #v1, pred, v1)',
+                '#define JOIN(a, b) a ## b',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const callers = index.context('AssertPred1Helper', { file: 'p.hpp', line: 3 });
+            assert.deepStrictEqual((callers.callers || []).map(c => c.line), [5]);
+        } finally { rm(dir); }
+    });
+});

@@ -103,6 +103,23 @@ function isWrittenBinding(node) {
     return false;
 }
 
+/** Whether a member name token is the name of an assignment target
+ * (`self.x = v`, `self.x += v`, `self.a, self.b = ..`). */
+function isWrittenMember(node) {
+    const member = node.parent;
+    if (!member || !MEMBER_NODES.has(member.type)) return false;
+    for (let current = member; current?.parent; current = current.parent) {
+        const parent = current.parent;
+        if (WRITE_EXPRESSIONS.has(parent.type)) {
+            const left = parent.childForFieldName('left');
+            return !!left && contains(left, member);
+        }
+        if (!['expression_list', 'pattern_list', 'tuple_pattern', 'list_pattern', 'tuple', 'list',
+            'parenthesized_expression'].includes(parent.type)) return false;
+    }
+    return false;
+}
+
 function contains(scope, node) {
     return !scope || scope.startIndex <= node.startIndex && scope.endIndex >= node.endIndex;
 }
@@ -1131,6 +1148,71 @@ class ValueReferenceResolver extends TypeReferenceResolver {
         return this.judge(definitions, 'other-member-owner');
     }
 
+    /** Whether a member of another path through unnamed structs or unions
+     * of the pin's class is declared at this token (fix #430). */
+    otherPathMemberAt(file, node) {
+        const line = node.startPosition.row + 1;
+        const paths = JSON.stringify(this.def.memberPaths || null);
+        return this.members.some(member => member !== this.def && member.file === file &&
+            (member.nameLine || member.startLine) === line && member.className === this.def.className &&
+            JSON.stringify(member.memberPaths || null) !== paths);
+    }
+
+    /**
+     * The member a `receiver.name` access names when a member of an unnamed
+     * struct or union has the name (fix #430): such a member is reached
+     * through the declarators of its type (`e->data.stream_start.encoding`),
+     * so the receiver must end with one of its member paths, and the object
+     * that path starts from must be of the enclosing class. Null when no
+     * member of the name has a path (the ordinary member lookup decides).
+     */
+    pathMemberAt(file, receiver) {
+        const ordinary = langTraits(this.language)?.typeArgumentValues === 'ordinary';
+        const bindings = ordinary ? this.classValueMembers() : null;
+        const candidates = ordinary ? bindings.members : this.memberCandidates;
+        if (!candidates.some(member => member.memberPaths)) return null;
+        const names = [], bases = [receiver];
+        for (let base = receiver; base?.type === 'field_expression' && names.length < 16;) {
+            names.unshift(base.childForFieldName('field')?.text);
+            base = base.childForFieldName('argument');
+            bases.unshift(base);
+        }
+        // A bare name starting the chain inside a member function is an
+        // implicit `this->name` unless a local binds it.
+        const root = bases[0];
+        const implicitOwner = root?.type === 'identifier' && ordinary &&
+            !this.localBinding(file, root, root.text, true) ? this.enclosingOwner(file, root) : null;
+        if (implicitOwner) {
+            names.unshift(root.text);
+            bases.unshift(null);
+        }
+        const endsWith = path => path.length <= names.length &&
+            path.every((part, i) => names[names.length - path.length + i] === part);
+        const byDepth = new Map();
+        for (const member of candidates) {
+            for (const path of member.memberPaths || [[]]) {
+                if (!endsWith(path)) continue;
+                if (!byDepth.has(path.length)) byDepth.set(path.length, new Set());
+                byDepth.get(path.length).add(member);
+            }
+        }
+        const reached = new Set();
+        let unresolved = false;
+        for (const [depth, members] of byDepth) {
+            const base = bases[names.length - depth];
+            const owner = base === null ? implicitOwner : this.receiverOwner(file, base);
+            if (!owner?.key || this.ambiguousClassFamily(owner)) { unresolved = true; continue; }
+            const declaring = findDeclaringClass(this.index, owner, [...members]);
+            if (!declaring || declaring.uncertain) { unresolved = true; continue; }
+            for (const member of declaring.members) reached.add(member);
+        }
+        if (unresolved) return { verdict: 'unknown', reason: 'member-owner-unresolved' };
+        if (reached.size === 0) return { verdict: 'no', reason: 'other-member-owner' };
+        if (ordinary) return this.classBindingsVerdict([...reached], bindings.originals);
+        if (reached.size !== 1) return { verdict: 'unknown', reason: 'ambiguous-value-declaration' };
+        return this.group.has([...reached][0]) ? { verdict: 'yes' } : { verdict: 'no', reason: 'other-member-owner' };
+    }
+
     cppMemberAt(owner) {
         if (!owner?.key || this.ambiguousClassFamily(owner)) return { verdict: 'unknown', reason: 'member-owner-unresolved' };
         const bindings = this.classValueMembers();
@@ -1198,14 +1280,17 @@ class ValueReferenceResolver extends TypeReferenceResolver {
                     queue.push(parent);
                 }
             }
+            // An owner known by key alone (no definition to read its
+            // enclosing scope from) leaves the lookup undecided (fix #430).
+            if (!owner.node && !owner.def) return { verdict: 'unknown', reason: 'member-owner-unresolved' };
             const body = owner.node || this.declarationNode(owner.def);
-            const sourceFile = owner.def.file;
+            const sourceFile = owner.def?.file || file;
             let outer = body && TYPE_BODIES.has(body.type) ? this.enclosingOwner(sourceFile, body, false) : null;
             if (!outer && body) {
                 const qualifier = typeSyntax(body.childForFieldName('name'))?.qualifier;
                 if (qualifier) outer = this.classForType(sourceFile, typeSyntax(qualifier));
             }
-            if (!outer && owner.def.enclosingType) return { verdict: 'unknown', reason: 'member-owner-unresolved' };
+            if (!outer && owner.def?.enclosingType) return { verdict: 'unknown', reason: 'member-owner-unresolved' };
             owner = outer;
         }
         return null;
@@ -1548,12 +1633,26 @@ class ValueReferenceResolver extends TypeReferenceResolver {
         } else if (shape?.kind === 'initializer') {
             verdict = this.memberAt(this.classForType(file, shape.type));
         } else if (receiver) {
-            verdict = langTraits(entry.language)?.typeArgumentValues === 'ordinary'
+            const receiverOwner = this.owner && langTraits(entry.language)?.typeArgumentValues !== 'ordinary'
+                ? this.receiverOwner(file, receiver) : null;
+            verdict = (this.owner && this.pathMemberAt(file, receiver)) ||
+                (langTraits(entry.language)?.typeArgumentValues === 'ordinary'
                 ? this.cppMemberAt(this.receiverOwner(file, receiver))
-                : this.owner ? this.memberAt(this.receiverOwner(file, receiver))
+                : this.owner ? this.memberAt(receiverOwner)
                 : (this.family === 'js' && this.jsModuleMemberAt(file, receiver)) ||
                     this.resolveQualified(file, node.startPosition.row + 1, receiver,
-                        receiver.text, { role: 'member' });
+                        receiver.text, { role: 'member' }));
+            // An attribute a method declares by assigning it on its receiver
+            // (a Python instance attribute, fix #430): the write at the
+            // pin's declaration line is the declaration, the first write of
+            // another class in the slot is that member's declaration.
+            if (verdict?.verdict === 'yes' && receiverOwner && isWrittenMember(node)) {
+                if (file === this.def.file && node.startPosition.row + 1 === (this.def.nameLine || this.def.startLine)) {
+                    declaration = true;
+                } else if (this.groupMemberAt(file, node, receiverOwner) === 'group') {
+                    verdict = { verdict: 'yes', declarationOf: true };
+                }
+            }
         } else if (globalQualified) {
             // `::name` is looked up in the global namespace only (fix #420):
             // never a class member, and never a local or a class-scope
@@ -1608,7 +1707,7 @@ class ValueReferenceResolver extends TypeReferenceResolver {
                 if (sameDeclaration && sameOwner && declaredStorage) this.declarationStorages.add(declaredStorage);
                 if (verdict.verdict === 'no' && declaredStorage && declaredStorage !== this.targetStorage) {
                     verdict = { verdict: 'no', reason: 'other-value-storage' };
-                } else if (verdict.verdict === 'no' && sameOwner) {
+                } else if (verdict.verdict === 'no' && sameOwner && !this.otherPathMemberAt(file, node)) {
                     verdict = { verdict: 'unknown', reason: 'value-declaration-identity' };
                     declaration = false;
                 } else if (verdict.verdict === 'no' && related) {

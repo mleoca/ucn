@@ -1589,6 +1589,9 @@ const HANDLERS = {
         const result = index.tests(p.name, {
             callsOnly: p.callsOnly || false,
             className: p.className,
+            // A line handle names one definition (fix #430): an overload or
+            // a constructor, never its whole same-name family.
+            ...(testsTargetIsHandle && p.line && testsResolution?.def && { definition: testsResolution.def }),
             // Bare ambiguous names use the same deterministic definition as
             // the rest of the semantic surface. The warning below discloses
             // that choice and gives the caller a stable file= escape hatch.

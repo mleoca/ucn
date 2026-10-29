@@ -227,6 +227,8 @@ const STRUCTURAL_TRAITS = {
     // mem-initializers): such a site holds no token a type rename edits
     // (fix #421).
     keywordConstructorDelegation: false,
+    constructorUsesAreTypeReferences: false,
+    packExpansionArguments: false,
     // Whether a call may pass more or fewer arguments than the callee
     // declares without error (JavaScript): argument count then never decides
     // which one callable runs. TypeScript reports the mismatch at compile time
@@ -340,6 +342,8 @@ const NOMINAL_TRAITS = {
     constructorInheritance: null,
     implicitBaseConstruction: null,
     keywordConstructorDelegation: false,
+    constructorUsesAreTypeReferences: false,
+    packExpansionArguments: false,
     // Whether a member may be defined outside its class body (C++
     // `W::W(int) {}` in a source file, its class in a header): such a
     // definition holds the body of one in-class declaration (fix #421).
@@ -945,6 +949,9 @@ const LANGUAGES = {
             isInvokedName: (node, options) => require('./c-family').isInvokedName(node, options),
             nameReferenceFamily: 'c',
             typeArgumentValues: 'ordinary',
+            // A call's arguments may expand a parameter pack (`f(params...)`):
+            // the written count is not the argument count (fix #430).
+            packExpansionArguments: true,
             selfParam: ['this'],
             packageScope: 'file',
             hasDynamicImports: false,
@@ -1005,6 +1012,10 @@ const LANGUAGES = {
                 ownerScope: node => require('./csharp').implicitOwnerScope(node),
                 firstBaseOnly: true, referenceTypesOnly: true, baseKinds: ['class', 'record'], separator: '.' },
             keywordConstructorDelegation: true,
+            // A use of a constructor is a use of its type (fix #430): a
+            // `: this(..)` initializer depends on the type as `: base(..)`
+            // depends on the base.
+            constructorUsesAreTypeReferences: true,
             plainQueryTree: false,
             isInvokedName: (node, options) => require('./csharp').isInvokedName(node, options),
             nameReferenceFamily: 'csharp',

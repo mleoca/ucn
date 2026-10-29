@@ -196,7 +196,7 @@ const OPTIONAL_SYMBOL_FIELDS = Object.freeze([
     'typeArity', 'ownerTypeArity',
     'annotationType', 'valueShape', 'friendOf', 'templateParams', 'delegateParams',
         'typedefName', 'forwardDeclaration', 'anonymousNamespace', 'specialization',
-        'memberConst', 'refQualifier', 'fieldPointers',
+        'memberConst', 'refQualifier', 'fieldPointers', 'memberPaths', 'instanceAttribute',
         'ambientAugmentation',
 ]);
 

@@ -1729,6 +1729,22 @@ function conditionalRecoverySources(code) {
         const source = selected.join('');
         if (!sources.includes(source)) sources.push(source);
     }
+    // Every alternative head of one construct at once (fix #430).
+    const directiveRows = [];
+    const directiveEnd = new Map();
+    for (let row = 0; row < lines.length; row++) {
+        if (!directives[row]) continue;
+        let end = row;
+        while (end + 1 < lines.length && /\\[ \t]*\r?\n?$/.test(lines[end])) end++;
+        directiveEnd.set(row, end);
+        directiveRows.push({ row, kind: directives[row].kind });
+    }
+    const closures = alternativeBranchClosures(lines, directiveRows, directiveEnd);
+    if (closures) {
+        const source = lines.map((line, row) => closures.replace.has(row) ? closures.replace.get(row)
+            : closures.rows.has(row) ? blankLine(line) : line).join('');
+        if (!sources.includes(source)) sources.push(source);
+    }
     return sources;
 }
 
@@ -1736,6 +1752,77 @@ const CALL_SHAPE = /[A-Za-z_]\w*\s*\(/g;
 const DIRECTIVE_TOKEN_TYPES = new Set([
     '#if', '#ifdef', '#ifndef', '#elif', '#elifdef', '#elifndef', '#else', '#endif',
 ]);
+
+/**
+ * The `{` minus `}` count of the program tokens on rows [from, to): directive
+ * lines (a `#define` replacement list, with its continuation lines) are not
+ * program tokens, nor are braces in comments and literals.
+ */
+function programBraceBalance(lines, from, to) {
+    const kept = [];
+    for (let row = from; row < to; row++) {
+        if (/^\s*#/.test(lines[row])) {
+            while (row + 1 < to && /\\[ \t]*\r?\n?$/.test(lines[row])) row++;
+            continue;
+        }
+        kept.push(lines[row]);
+    }
+    const text = kept.join('');
+    let balance = 0;
+    for (let index = 0; index < text.length; index++) {
+        const skipped = skipLexicalRegion(text, index);
+        if (skipped != null) {
+            index = skipped - 1;
+            continue;
+        }
+        if (text[index] === '{') balance++;
+        else if (text[index] === '}') balance--;
+    }
+    return balance;
+}
+
+/**
+ * Alternative heads of one construct (fix #430): a conditional whose every
+ * branch opens the same number k of braces the code after it closes
+ * (`#if X  T f() {  #else  T f() {  #endif ... }`, entt `type_hash::value`).
+ * Each branch is read as its own construct, closed by k braces written into
+ * the directive line that ends it (the `#elif`/`#else` line, blank in every
+ * configuration), so every alternative is a declaration; directive lines are
+ * blanked and every other byte and row kept. Returns { rows, replace } for
+ * the groups of `directives` (`{ row, kind }` in order, `directiveEnd` maps a
+ * row to its last continuation row) that qualify, or null.
+ */
+function alternativeBranchClosures(lines, directives, directiveEnd) {
+    const rows = new Set();
+    const replace = new Map();
+    const stack = [];
+    for (const directive of directives) {
+        if (directive.kind === 'if' || directive.kind === 'ifdef' || directive.kind === 'ifndef') {
+            stack.push({ branches: [directive.row] });
+        } else if (directive.kind === 'elif' || directive.kind === 'else') {
+            stack[stack.length - 1]?.branches.push(directive.row);
+        } else if (directive.kind === 'endif') {
+            const group = stack.pop();
+            if (!group) return null;
+            if (group.branches.length < 2) continue;
+            const edges = [...group.branches, directive.row];
+            const balances = group.branches.map((row, b) => programBraceBalance(lines, row + 1, edges[b + 1]));
+            const k = balances[0];
+            if (!(k > 0) || balances.some(balance => balance !== k)) continue;
+            const closers = group.branches.slice(1);
+            if (closers.some(row => directiveEnd.get(row) !== row ||
+                lines[row].replace(/[\r\n]+$/, '').length < k)) continue;
+            for (const row of edges) {
+                for (let line = row; line <= directiveEnd.get(row); line++) rows.add(line);
+            }
+            for (const row of closers) {
+                const blank = blankLine(lines[row]);
+                replace.set(row, '}'.repeat(k) + blank.slice(k));
+            }
+        }
+    }
+    return rows.size > 0 ? { rows, replace } : null;
+}
 
 /**
  * fix #391: the source with the preprocessor conditionals the grammar could
@@ -1751,7 +1838,7 @@ const DIRECTIVE_TOKEN_TYPES = new Set([
  * number. Only the conditionals the grammar could not place change; every
  * other line reads as before.
  */
-function misplacedDirectiveRepair(tree, source) {
+function misplacedDirectiveRepair(tree, source, info = null) {
     const misplaced = new Set();
     const visit = node => {
         const error = node.type === 'ERROR';
@@ -1766,30 +1853,7 @@ function misplacedDirectiveRepair(tree, source) {
     // conditionals (`#ifdef X else { #endif ... #ifdef X } #endif`, fix
     // #393): the grammar reads it as a block that swallows the declarations
     // after it, with no ERROR near the directives.
-    const braceBalance = (from, to) => {
-        // Program tokens only: directive lines (a `#define` replacement
-        // list, with its continuation lines) are not.
-        const kept = [];
-        for (let row = from; row < to; row++) {
-            if (/^\s*#/.test(lines[row])) {
-                while (row + 1 < to && /\\[ \t]*\r?\n?$/.test(lines[row])) row++;
-                continue;
-            }
-            kept.push(lines[row]);
-        }
-        const text = kept.join('');
-        let balance = 0;
-        for (let index = 0; index < text.length; index++) {
-            const skipped = skipLexicalRegion(text, index);
-            if (skipped != null) {
-                index = skipped - 1;
-                continue;
-            }
-            if (text[index] === '{') balance++;
-            else if (text[index] === '}') balance--;
-        }
-        return balance;
-    };
+    const braceBalance = (from, to) => programBraceBalance(lines, from, to);
     // Directive line spans (a directive continues over backslash-newlines).
     const directiveEnd = new Map();
     const directives = [];
@@ -1802,6 +1866,8 @@ function misplacedDirectiveRepair(tree, source) {
         directives.push({ row, kind: directive.kind });
     }
     const blank = new Set();
+    // Groups of alternative heads keep every branch, each closed in place.
+    const closures = alternativeBranchClosures(lines, directives, directiveEnd);
     const stack = [];
     for (const directive of directives) {
         if (directive.kind === 'if' || directive.kind === 'ifdef' || directive.kind === 'ifndef') {
@@ -1812,6 +1878,7 @@ function misplacedDirectiveRepair(tree, source) {
             const group = stack.pop();
             if (!group) return null;
             const rows = [...group.branches, directive.row];
+            if (closures?.rows.has(directive.row)) continue;
             if (!rows.some(row => misplaced.has(row))) {
                 const edges = [...group.branches, directive.row];
                 let split = false;
@@ -1846,8 +1913,10 @@ function misplacedDirectiveRepair(tree, source) {
             }
         }
     }
-    if (stack.length > 0 || blank.size === 0) return null;
-    return lines.map((line, row) => (blank.has(row) ? blankLine(line) : line)).join('');
+    if (stack.length > 0 || (blank.size === 0 && !closures)) return null;
+    if (info && closures) info.closedAlternatives = true;
+    return lines.map((line, row) => closures?.replace.has(row) ? closures.replace.get(row)
+        : blank.has(row) || closures?.rows.has(row) ? blankLine(line) : line).join('');
 }
 
 const STRUCTURE_SCORE_TYPES = [
@@ -2275,7 +2344,8 @@ function parseTree(parser, code) {
         // round over the repaired tree, which exposes misreads the damage hid.
         if (!conditionalApplied && !(repairFolded && best) &&
             (largeSource || attributeSelected.rootNode.hasError)) {
-            const repairedSource = misplacedDirectiveRepair(attributeSelected, attributeSource);
+            const repairInfo = {};
+            const repairedSource = misplacedDirectiveRepair(attributeSelected, attributeSource, repairInfo);
             if (repairedSource) {
                 let candidate = safeParse(parser, repairedSource, undefined, PARSE_OPTIONS);
                 liveTrees.add(candidate);
@@ -2290,7 +2360,12 @@ function parseTree(parser, code) {
                         candidateErrors = round.errors;
                     }
                 }
-                if (candidateErrors < selectedErrors) {
+                // A repair that reads alternative heads (fix #430) is also
+                // kept at an equal error count when it recovers structure,
+                // as the configuration sweep prefers the richest view.
+                if (candidateErrors < selectedErrors || repairInfo.closedAlternatives &&
+                    candidateErrors === selectedErrors &&
+                    treeStructureScore(candidate) > treeStructureScore(attributeSelected)) {
                     best = candidate;
                     bestCode = candidateSource;
                 } else {
@@ -2554,6 +2629,15 @@ function withoutShadowedFreeFunctions(secondary, primaryClasses) {
                 return memberEnd > member.startLine && member.startLine < fn.startLine && end <= memberEnd;
             }));
     });
+}
+
+/** Whether a declarator names a qualified entity (`H<T>::x`, `*Foo::p`). */
+function qualifiedDeclarator(node) {
+    for (let current = node, depth = 0; current && depth < 16; depth++) {
+        if (current.type === 'qualified_identifier') return true;
+        current = current.childForFieldName('declarator');
+    }
+    return false;
 }
 
 function unwrapDeclarator(node) {
@@ -3600,13 +3684,28 @@ function memberFromNode(node, className, access, lines, mode) {
     };
 }
 
-function fieldMembers(node, access, lines) {
+function fieldMembers(node, access, lines, paths = null) {
     if (node.type !== 'field_declaration') return [];
     if (functionDeclarator(node)) return [];
     const typeNode = node.childForFieldName('type') ||
         node.namedChildren.find(child => TYPE_NODES.has(child.type));
     const fields = [];
-    for (const child of node.childrenForFieldName('declarator')) {
+    const declarators = node.childrenForFieldName('declarator');
+    // Members of an unnamed struct or union (fix #430): without a declarator
+    // (an anonymous member) they are members of the enclosing class; with
+    // declarators they are reached through them (`e.data.start`), recorded
+    // as the member paths from the enclosing class.
+    const nestedBody = (typeNode?.type === 'struct_specifier' || typeNode?.type === 'union_specifier') &&
+        !typeNode.childForFieldName('name') ? typeNode.childForFieldName('body') : null;
+    if (nestedBody) {
+        const declaredNames = declarators.map(child => declaratorIdentity(child).name).filter(Boolean);
+        const nestedPaths = declaredNames.length === 0 ? paths
+            : (paths || [[]]).flatMap(path => declaredNames.map(name => [...path, name]));
+        for (const entry of memberListEntries(nestedBody)) {
+            if (entry.type === 'field_declaration') fields.push(...fieldMembers(entry, access, lines, nestedPaths));
+        }
+    }
+    for (const child of declarators) {
         const identity = declaratorIdentity(child);
         if (!identity.name || identity.name === typeNode?.text) continue;
         const { startLine, endLine, indent, sourceSpan } = nodeToLocation(child, lines);
@@ -3628,11 +3727,38 @@ function fieldMembers(node, access, lines) {
             indent,
             modifiers: access ? [access] : [],
             memberType: 'field',
-            fieldType: typeNode?.text || null,
+            fieldType: nestedBody ? null : typeNode?.text || null,
             ...(!arrays && { fieldPointers: pointers }),
+            ...(paths?.length && { memberPaths: paths.map(path => [...path]) }),
         });
     }
     return fields;
+}
+
+/** The data members a member variable template declares (fix #430:
+ * `template <class> static constexpr bool value = true;`). */
+function variableTemplateMembers(node, access, lines) {
+    const declaration = (node.namedChildren || []).find(child => child.type === 'declaration');
+    if (!declaration || functionDeclarator(declaration)) return [];
+    const typeNode = declaration.childForFieldName('type');
+    const members = [];
+    for (const child of declaration.childrenForFieldName('declarator')) {
+        const identity = declaratorIdentity(child);
+        if (!identity.name) continue;
+        const { startLine, endLine, indent, sourceSpan } = nodeToLocation(child, lines);
+        members.push({
+            name: identity.name,
+            startLine,
+            endLine,
+            sourceSpan,
+            indent,
+            modifiers: modifiersOf(declaration, access ? [access] : []),
+            memberType: 'field',
+            fieldType: typeNode?.text || null,
+            ...(templateParameterNames(declaration) && { templateParams: templateParameterNames(declaration) }),
+        });
+    }
+    return members;
 }
 
 /**
@@ -3804,7 +3930,9 @@ function classMembers(node, lines, mode) {
         const member = macroName ? null : memberFromNode(
             child, identity.ownerName || identity.name, effectiveAccess, lines, mode);
         if (member) members.push(member);
-        else if (!macroName) members.push(...fieldMembers(child, effectiveAccess, lines));
+        else if (!macroName && child.type === 'template_declaration') {
+            members.push(...variableTemplateMembers(child, effectiveAccess, lines));
+        } else if (!macroName) members.push(...fieldMembers(child, effectiveAccess, lines));
         if (unknownAccess) {
             for (let i = before; i < members.length; i++) {
                 members[i].accessAfterMacro = { ...unknownAccess };
@@ -4365,11 +4493,20 @@ function findStateObjectsInTree(tree, lines) {
         // an #if/#else remain part of the source inventory even though only
         // one arm can exist in any particular build configuration.
         let scope = node.parent;
-        while (scope && /^preproc_/.test(scope.type)) scope = scope.parent;
+        // A variable template's `template <..>` head is transparent too
+        // (fix #430: `template <class T> inline constexpr bool v = ..;`);
+        // a qualified declarator under it defines a class template's static
+        // member (`template <class T> bool H<T>::x = false;`), no variable.
+        let templated = false;
+        while (scope && (/^preproc_/.test(scope.type) || scope.type === 'template_declaration')) {
+            if (scope.type === 'template_declaration') templated = true;
+            scope = scope.parent;
+        }
         if (scope?.type !== 'translation_unit' && scope?.type !== 'declaration_list') return false;
         for (const child of node.namedChildren || []) {
             const identity = declaratorIdentity(child);
             if (!identity.name || TYPE_NODES.has(child.type)) continue;
+            if (templated && qualifiedDeclarator(child)) continue;
             const { startLine, endLine, indent, sourceSpan } = nodeToLocation(child, lines);
             states.push({
                 name: identity.name,
@@ -6980,6 +7117,32 @@ function findCallsInCode(code, parser, options = {}, existingTree = null,
  * for conservation but marked as lexical parameter dispatch; they must never
  * resolve to an unrelated project function that happens to share `fn`'s name.
  */
+/**
+ * A replacement list with its stringizing operators read as the string
+ * literals they produce, every byte kept in place (fix #430):
+ * `AssertPred1Helper(#pred, #v1, pred, v1)` is a call of four arguments, not
+ * a parse error of three. Token pasting stays as written: the pasted
+ * parameter is what the macro's parameter effects read.
+ */
+function withoutPreprocessingOperators(body, parameters) {
+    if (!body.includes('#')) return body;
+    const tokens = lexPP(body);
+    const chars = body.split('');
+    for (let i = 0; i < tokens.length; i++) {
+        const token = tokens[i];
+        if (token.k !== 'punct') continue;
+        if (token.v === '#' && tokens[i + 1]?.k === 'id' &&
+            (parameters.has(tokens[i + 1].v) || tokens[i + 1].v === '__VA_ARGS__')) {
+            const end = tokens[i + 1].start + tokens[i + 1].v.length;
+            for (let at = token.start; at < end; at++) chars[at] = 'x';
+            chars[token.start] = '"';
+            chars[end - 1] = '"';
+            i++;
+        }
+    }
+    return chars.join('');
+}
+
 function findMacroBodyCalls(tree, code, parser, onlyName = null) {
     const calls = [];
     for (const node of macroDefinitionNodes(tree)) {
@@ -7000,7 +7163,7 @@ function findMacroBodyCalls(tree, code, parser, onlyName = null) {
         const parameters = new Set(parameterNames);
         // Replace only the continuation backslash. Keeping the newline and
         // every other byte makes source-line/column and span remapping exact.
-        const body = valueNode.text.replace(/\\(?=\r?\n)/g, ' ');
+        const body = withoutPreprocessingOperators(valueNode.text.replace(/\\(?=\r?\n)/g, ' '), parameters);
         const prefix = 'void __ucn_macro_body__(void) {\n';
         const synthetic = `${prefix}${body}\n;}`;
         // Synthetic replacement-list wrappers are one-shot parse inputs. Do

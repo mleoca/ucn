@@ -607,18 +607,21 @@ function extractStructFields(structNode, codeOrLines) {
         const field = fieldListNode.namedChild(i);
         if (field.type === 'field_declaration') {
             const { startLine, endLine, sourceSpan } = nodeToLocation(field, codeOrLines);
-            const nameNode = field.childForFieldName('name');
+            const nameNodes = field.childrenForFieldName('name');
             const typeNode = field.childForFieldName('type');
 
-            if (nameNode) {
-                fields.push({
-                    name: nameNode.text,
-                    startLine,
-                    endLine,
-                    sourceSpan,
-                    memberType: 'field',
-                    ...(typeNode && { fieldType: typeNode.text })
-                });
+            if (nameNodes.length > 0) {
+                // `Keys, Values []string` declares every name (fix #430).
+                for (const nameNode of nameNodes) {
+                    fields.push({
+                        name: nameNode.text,
+                        startLine,
+                        endLine,
+                        sourceSpan,
+                        memberType: 'field',
+                        ...(typeNode && { fieldType: typeNode.text })
+                    });
+                }
             } else if (typeNode) {
                 // Embedded field: has type but no name (e.g., `Base` in `type Child struct { Base; Name string }`)
                 // Use the type name as the field name

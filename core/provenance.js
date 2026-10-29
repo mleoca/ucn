@@ -103,6 +103,18 @@ function validateConfirmation(provenance, target, invalidCall = false) {
         // constructors, which is never its target: Java JLS 8.8.7, C#
         // CS0516, C++ [class.base.init] (fix #419).
         const delegating = constructor.delegating;
+        // The parts of a C# partial type are one type (fix #430): a member
+        // lies in one of them. Every part names the owner's type.
+        const parts = constructor.parts === undefined ? [owner] : constructor.parts;
+        if (constructor.parts !== undefined && (!Array.isArray(parts) || !validIdentity(owner) ||
+            !parts.some(part => sameDeclaration(part, owner)) ||
+            parts.some(part => !validIdentity(part) || part.name !== owner.name || part.kind !== owner.kind ||
+                (part.namespace || null) !== (owner.namespace || null) ||
+                (part.enclosingType || null) !== (owner.enclosingType || null)))) {
+            return inconsistent('constructor-owner-mismatch');
+        }
+        const inPart = def => parts.some(part => def.file === part.file &&
+            def.startLine >= part.startLine && def.endLine <= part.endLine);
         if (delegating !== undefined) {
             const site = facts.site;
             // An out-of-class definition (fix #421) holds the site and
@@ -112,8 +124,7 @@ function validateConfirmation(provenance, target, invalidCall = false) {
             const scopePath = def => [def.namespace, def.enclosingType].filter(Boolean).join('::');
             if (!validIdentity(owner) || !validIdentity(delegating) || call?.delegation !== 'this' ||
                 call.syntax !== 'delegation' || delegating.kind !== 'constructor' ||
-                delegating.className !== owner.name || delegating.file !== owner.file ||
-                delegating.startLine < owner.startLine || delegating.endLine > owner.endLine ||
+                delegating.className !== owner.name || !inPart(delegating) ||
                 (delegating.namespace || null) !== (owner.namespace || null) ||
                 !site || site.file !== body.file || site.line < body.startLine || site.line > body.endLine ||
                 (members || []).some(member => sameDeclaration(member, delegating))) {
@@ -164,7 +175,7 @@ function validateConfirmation(provenance, target, invalidCall = false) {
         }
         const constructorProtocol = require('../languages').langTraits(facts.language)?.constructorProtocol;
         if (members.some(member => (member.kind !== 'constructor' && member.name !== constructorProtocol?.initializer) || member.className !== owner.name ||
-            member.file !== owner.file || member.startLine < owner.startLine || member.endLine > owner.endLine ||
+            !inPart(member) ||
             (member.namespace || null) !== (owner.namespace || null) ||
             (member.enclosingType || null) !== (owner.enclosingType || null)) ||
             !members.some(member => sameDeclaration(member, selected))) return inconsistent('constructor-owner-mismatch');
@@ -368,9 +379,15 @@ function validateConfirmation(provenance, target, invalidCall = false) {
         if (!sameDeclaration(receiver, facts.receiverResolvedIn)) return inconsistent('receiver-identity-mismatch');
         const aliases = facts.receiverAliases || [];
         const typeDeclaration = facts.receiverTypeDeclaration || receiver;
+        // The written qualifier spells the declaration's enclosing type, its
+        // namespace, or (fix #430) its namespace and enclosing types, in full
+        // or from an enclosing namespace of the site.
+        const qualifiedPath = [typeDeclaration.namespace, typeDeclaration.enclosingType].filter(Boolean).join('.');
         if (facts.receiverTypeQualifier && ['java', 'csharp'].includes(facts.language) &&
             facts.receiverTypeQualifier !== typeDeclaration.enclosingType &&
-            facts.receiverTypeQualifier !== typeDeclaration.namespace) {
+            facts.receiverTypeQualifier !== typeDeclaration.namespace &&
+            !(typeDeclaration.enclosingType && (qualifiedPath === facts.receiverTypeQualifier ||
+                qualifiedPath.endsWith(`.${facts.receiverTypeQualifier}`)))) {
             return inconsistent('receiver-qualifier-mismatch');
         }
         if (facts.receiverImportChain && validateConfirmation({ facts: {

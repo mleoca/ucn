@@ -6983,3 +6983,204 @@ describe('fix #426: Java rename closure, qualified inner creations and method re
         } finally { rm(dir); }
     });
 });
+
+describe('fix #430: Java fields after enum constants, declared resource types, nested receiver classes', () => {
+    it('indexes enum fields after the constants', () => {
+        const dir = tmp({
+            'src/St.java': [
+                'enum St {',
+                '    A {',
+                '        boolean go() { return nullString.isEmpty(); }',
+                '    },',
+                '    B {',
+                '        boolean go() { return false; }',
+                '    };',
+                '',
+                '    private static final String nullString = String.valueOf(\'\\u0000\');',
+                '    int count = 0;',
+                '',
+                '    abstract boolean go();',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const field = name => (index.symbols.get(name) || []).filter(d => d.type === 'field')
+                .map(d => `${d.className}:${d.startLine}:${d.fieldType}`);
+            assert.deepStrictEqual(field('nullString'), ['St:9:String']);
+            assert.deepStrictEqual(field('count'), ['St:10:int']);
+            const band = index.impact('nullString', { file: 'src/St.java', line: 9 }).valueAccesses;
+            assert.deepStrictEqual(band.byFile.flatMap(g => g.sites.map(s => s.line)), [3]);
+        } finally { rm(dir); }
+    });
+
+    it('a try-with-resources variable has its declared type; the constructed value stays dispatch evidence', () => {
+        const dir = tmp({
+            'src/p/Pool.java': 'package p;\npublic interface Pool extends AutoCloseable {\n    int getNumActive();\n    void close();\n}\n',
+            'src/p/BasePool.java': 'package p;\npublic abstract class BasePool implements Pool {\n    public int getNumActive() { return -1; }\n    public void close() { }\n}\n',
+            'src/p/PoolTest.java': [
+                'package p;',
+                'class PoolTest {',
+                '    static final class TestPool extends BasePool { }',
+                '    void t() {',
+                '        try (Pool pool = new TestPool()) {',
+                '            pool.getNumActive();',
+                '        }',
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const iface = index.context('getNumActive', { file: 'src/p/Pool.java', line: 3 });
+            assert.deepStrictEqual((iface.callers || []).map(c => `${c.relativePath}:${c.line}`), ['src/p/PoolTest.java:6']);
+            // The final resource holds exactly the constructed value, as a
+            // never-reassigned local does: its inherited member runs.
+            const base = index.context('getNumActive', { file: 'src/p/BasePool.java', line: 3 });
+            assert.deepStrictEqual((base.callers || []).map(c => c.line), [6]);
+        } finally { rm(dir); }
+    });
+
+    it('a receiver class written under its enclosing type binds the member its own chain declares', () => {
+        const dir = tmp({
+            'src/p/Conn.java': [
+                'package p;',
+                '',
+                'public interface Conn {',
+                '    interface Base<T extends Base<T>> {',
+                '        String header(String name);',
+                '    }',
+                '    interface Response extends Base<Response> {',
+                '        int status();',
+                '    }',
+                '}',
+            ].join('\n'),
+            'src/p/HttpConn.java': [
+                'package p;',
+                '',
+                'public class HttpConn implements Conn {',
+                '    private static abstract class Base<T extends Conn.Base<T>> implements Conn.Base<T> {',
+                '        public String header(String name) { return name; }',
+                '    }',
+                '    public static class Response extends HttpConn.Base<Conn.Response> implements Conn.Response {',
+                '        public int status() { return 0; }',
+                '    }',
+                '    void exec(Conn.Response viaInterface) {',
+                '        Response res = null;',
+                '        String a = res.header("x");',
+                '        String b = viaInterface.header("y");',
+                '    }',
+                '}',
+            ].join('\n'),
+            'src/p/HttpConnTest.java': [
+                'package p;',
+                '',
+                'class HttpConnTest {',
+                '    void t() {',
+                '        HttpConn.Response res = new HttpConn.Response();',
+                '        res.header("Cache");',
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const sites = (file, line) => (index.context('header', { file, line }).callers || [])
+                .map(c => `${c.relativePath}:${c.line}`).sort();
+            assert.deepStrictEqual(sites('src/p/Conn.java', 5), ['src/p/HttpConn.java:13']);
+            assert.deepStrictEqual(sites('src/p/HttpConn.java', 5), ['src/p/HttpConn.java:12', 'src/p/HttpConnTest.java:6']);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #430: tests <constructor handle> lists the sites of that constructor', () => {
+    it('keeps the overload-ambiguous sites unverified and leaves other overloads out', () => {
+        const dir = tmp({
+            'src/main/java/p/Prim.java': [
+                'package p;',
+                'public final class Prim {',
+                '    private final Object value;',
+                '    public Prim(Boolean bool) { value = bool; }',
+                '    public Prim(Number number) { value = number; }',
+                '    public Prim(String string) { value = string; }',
+                '}',
+            ].join('\n'),
+            'src/test/java/p/PrimTest.java': [
+                'package p;',
+                'class PrimTest {',
+                '    void t(Object unknown) {',
+                '        new Prim("a");',
+                '        new Prim(1);',
+                '        new Prim(true);',
+                '        new Prim(null);',
+                '    }',
+                '    static String make() { return "x"; }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'tests', { name: 'src/main/java/p/Prim.java:6:Prim' });
+            assert.ok(result.ok, result.error);
+            const lines = result.result.flatMap(file => file.matches.filter(m => m.matchType !== 'test-case')
+                .map(m => `${m.line}:${m.matchType}`));
+            assert.ok(lines.includes('4:call'), JSON.stringify(lines));
+            assert.ok(!lines.some(line => line.startsWith('5:') || line.startsWith('6:')), JSON.stringify(lines));
+            const caller = index.context('Prim', { file: 'src/main/java/p/Prim.java', line: 6 });
+            const unverified = (caller.unverifiedCallers || []).map(c => c.line);
+            assert.deepStrictEqual(unverified, [7]);
+            for (const line of unverified) assert.ok(lines.includes(`${line}:unverified-call`), JSON.stringify({ lines, unverified }));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #430: Java nested member types named like other classes\' member types', () => {
+    it('`new Builder()` binds the enclosing class\'s member type and `Outer.Builder` producers return their own type', () => {
+        const dir = tmp({
+            'src/p/AnnotationSpec.java': [
+                'package p;',
+                'public final class AnnotationSpec {',
+                '    public static Builder builder() { return new Builder(); }',
+                '    public Builder toBuilder() { return new Builder(); }',
+                '    public static final class Builder {',
+                '        private Builder() { }',
+                '        public AnnotationSpec build() { return new AnnotationSpec(); }',
+                '    }',
+                '}',
+            ].join('\n'),
+            'src/p/FieldSpec.java': [
+                'package p;',
+                'public final class FieldSpec {',
+                '    public static Builder builder() { return new Builder(); }',
+                '    public Builder toBuilder() { return new Builder(); }',
+                '    public static final class Builder {',
+                '        private Builder() { }',
+                '        public FieldSpec build() { return new FieldSpec(); }',
+                '    }',
+                '}',
+            ].join('\n'),
+            'src/p/SpecTest.java': [
+                'package p;',
+                'class SpecTest {',
+                '    void t() {',
+                '        AnnotationSpec.Builder builder = AnnotationSpec.builder();',
+                '        builder = builder.build().toBuilder();',
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const confirmed = (name, file, line) => (index.context(name, { file, line }).callers || [])
+                .map(c => `${c.relativePath}:${c.line}`).sort();
+            const unverified = (name, file, line) => (index.context(name, { file, line }).unverifiedCallers || [])
+                .map(c => `${c.relativePath}:${c.line}`);
+            assert.deepStrictEqual(confirmed('Builder', 'src/p/AnnotationSpec.java', 6),
+                ['src/p/AnnotationSpec.java:3', 'src/p/AnnotationSpec.java:4']);
+            assert.deepStrictEqual(unverified('Builder', 'src/p/AnnotationSpec.java', 6), []);
+            assert.deepStrictEqual(confirmed('toBuilder', 'src/p/AnnotationSpec.java', 4), ['src/p/SpecTest.java:5']);
+            assert.deepStrictEqual([...confirmed('toBuilder', 'src/p/FieldSpec.java', 4),
+                ...unverified('toBuilder', 'src/p/FieldSpec.java', 4)], []);
+        } finally { rm(dir); }
+    });
+});

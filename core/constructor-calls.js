@@ -50,8 +50,15 @@ function ownMembers(index, owner) {
     const saved = memo?.get(owner);
     const symbols = index.files.get(owner.file)?.symbols || [];
     if (saved && saved.symbols === symbols) return saved.members;
-    const identity = declarationIdentity(owner);
-    const members = symbols.filter(def => sameDeclaration(declarationIdentity(ownerDefinitionOf(index, def)), identity));
+    // The parts of a C# partial type are one type (fix #430): a part
+    // without constructors (`partial class JValue` in JValue.Async.cs) has
+    // the constructors the other parts declare.
+    const parts = require('./provenance-facts').partialTypeParts(index, owner) || [owner];
+    const members = parts.flatMap(part => {
+        const identity = declarationIdentity(part);
+        return (index.files.get(part.file)?.symbols || []).filter(def =>
+            sameDeclaration(declarationIdentity(ownerDefinitionOf(index, def)), identity));
+    });
     memo?.set(owner, { symbols, members });
     return members;
 }
@@ -401,7 +408,9 @@ function constructionChoice(index, owner, call, classBinding, targets) {
         // The delegating constructor is never its own delegation's target,
         // even when no other member of the family remains (fix #419).
         if (evidence.delegating) {
+            const parts = require('./provenance-facts').partialTypeParts(index, owner);
             facts.constructorCall = { owner: declarationIdentity(owner), members: [],
+                ...(parts && { parts: parts.map(declarationIdentity) }),
                 delegating: declarationIdentity(evidence.delegating),
                 ...(evidence.delegatingDefinition && delegatingDefinitionFacts(evidence)), classBinding,
                 call: { isConstructor: !!call.isConstructor, syntax: call.constructorSyntax || null, delegation: 'this' } };
@@ -416,8 +425,10 @@ function constructionChoice(index, owner, call, classBinding, targets) {
     const { members, declaring, hierarchy, delegating, delegatingDefinition, language, protocol, overload, selected, chosen,
         nameScope, typeLookup } = evidence;
     targets ||= members;
+    const parts = require('./provenance-facts').partialTypeParts(index, declaring);
     const facts = { language, site: classBinding?.facts?.site, targets: targets.map(declarationIdentity),
         constructorCall: { owner: declarationIdentity(declaring), members: members.map(declarationIdentity),
+            ...(parts && { parts: parts.map(declarationIdentity) }),
             ...(hierarchy && { constructedOwner: declarationIdentity(owner), hierarchy }),
             ...(delegating && { delegating: declarationIdentity(delegating) }),
             ...(delegatingDefinition && delegatingDefinitionFacts(evidence)),
@@ -445,6 +456,18 @@ function constructionChoice(index, owner, call, classBinding, targets) {
                 : checked?.verdict !== 'establishes-target' ? 'constructor-proof-incomplete' : null;
     provenance.validation = checked?.verdict || 'incomplete';
     if (checked?.diagnostic) provenance.diagnostic = checked.diagnostic;
+    // An undecided overload choice whose arguments no pinned constructor
+    // can take by count runs another constructor (fix #430: a one-argument
+    // `new JValue(x)` never runs `JValue(object?, JTokenType)`).
+    // A C++ braced list may run an initializer-list constructor whatever its
+    // element count, so only parenthesized and `new T(..)` arguments count.
+    if (reason === 'constructor-overload-ambiguous' && langTraits(language)?.hasArityOverloads &&
+        call.constructorSyntax !== 'list' && !langTraits(language)?.packExpansionArguments &&
+        Number.isInteger(call.argCount) && !call.argSpread && targets.length > 0 &&
+        targets.every(target => isConstructor(target, index) && !target.headerConstructor &&
+            !require('./callers')._callArityCompatible(call, [target], language))) {
+        return { other: true, reason: 'constructor-overload-other', provenance };
+    }
     return { members, definition: selected && members.find(def => sameDeclaration(selected, declarationIdentity(def))),
         provenance, reason };
 }

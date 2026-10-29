@@ -1335,6 +1335,11 @@ function tests(index, nameOrFile, options = {}) {
     } else if (!isFilePath) {
         targetDefs = index.find(nameOrFile, { exact: true, className: options.className });
     }
+    // A pinned definition among same-name ones (an overload, a constructor
+    // beside its class and siblings, fix #430): calls are this definition's
+    // only when the caller engine attributes them to it.
+    const pinnedFamily = !isFilePath && options.definition && targetDefs.length > 1;
+    if (!isFilePath && options.definition) targetDefs = [options.definition];
 
     // Find all test files
     const testFiles = [];
@@ -1534,6 +1539,7 @@ function tests(index, nameOrFile, options = {}) {
                 // own definition (fix #246).
                 if (localShadow && !usage.receiver && usage.usageType !== 'import') continue;
 
+                if (pinnedFamily && usage.usageType === 'call') continue;
                 // A line is claimed only by a usage that is recorded: two
                 // same-kind tokens on one line (`a.m = b.m`) are judged
                 // separately, so a rejected first token never hides a
@@ -1697,7 +1703,9 @@ function tests(index, nameOrFile, options = {}) {
     if (!isFilePath && targetDefs.length > 0) {
         const testInfo = new Map(testFiles.map(t => [t.path, t]));
         const callerSites = [];
-        const globallyUniqueTarget = index.find(searchTerm, { exact: true }).length === 1;
+        // A pinned definition's unverified sites were adjudicated against it
+        // alone, like a globally unique name's (fix #430).
+        const globallyUniqueTarget = !!options.definition || index.find(searchTerm, { exact: true }).length === 1;
         for (const def of targetDefs) {
             const raw = index.findCallers(searchTerm, {
                 targetDefinitions: [def],

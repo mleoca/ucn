@@ -8944,3 +8944,37 @@ describe('fix #425: a bare Go name reaches another package only through a dot im
         } finally { rm(dir); }
     });
 });
+
+describe('fix #430: every name of a multi-name Go struct field is a field', () => {
+    it('indexes `Keys, Values []string` as two fields with their accesses', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/g\n\ngo 1.21\n',
+            'a.go': [
+                'package g',
+                '',
+                'type Ctx struct {',
+                '\tKeys, Values []string',
+                '\tstart, success, failure int',
+                '}',
+                '',
+                'func (c *Ctx) Add(k, v string) {',
+                '\tc.Keys = append(c.Keys, k)',
+                '\tc.Values = append(c.Values, v)',
+                '\tc.failure++',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const fields = name => (index.symbols.get(name) || []).filter(d => d.type === 'field')
+                .map(d => `${d.className}:${d.startLine}:${d.fieldType}`);
+            assert.deepStrictEqual(fields('Keys'), ['Ctx:4:[]string']);
+            assert.deepStrictEqual(fields('Values'), ['Ctx:4:[]string']);
+            assert.deepStrictEqual(fields('failure'), ['Ctx:5:int']);
+            const band = index.impact('Values', { file: 'a.go', line: 4 }).valueAccesses;
+            assert.deepStrictEqual(band.byFile.flatMap(g => g.sites.map(s => s.line)), [10, 10]);
+            const failure = index.impact('failure', { file: 'a.go', line: 5 }).valueAccesses;
+            assert.deepStrictEqual(failure.byFile.flatMap(g => g.sites.map(s => s.line)), [11]);
+        } finally { rm(dir); }
+    });
+});

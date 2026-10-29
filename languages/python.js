@@ -76,6 +76,91 @@ function pythonClassBodyDefs(body) {
     return out;
 }
 
+/** The nodes an assignment target binds, through tuple and list targets:
+ * identifiers (`kind` 'identifier') or attributes ('attribute'). */
+function pythonTargetNames(target, kind) {
+    const out = [];
+    const visit = node => {
+        if (!node) return;
+        if (node.type === kind) { out.push(node); return; }
+        if (['pattern_list', 'tuple_pattern', 'list_pattern', 'expression_list', 'tuple', 'list',
+            'parenthesized_expression'].includes(node.type)) {
+            for (let i = 0; i < node.namedChildCount; i++) visit(node.namedChild(i));
+        }
+    };
+    visit(target);
+    return out;
+}
+
+/** The first positional parameter's name of a function definition. */
+function pythonReceiverName(fn) {
+    const params = fn.childForFieldName('parameters');
+    for (let i = 0; i < (params?.namedChildCount || 0); i++) {
+        const param = params.namedChild(i);
+        if (param.type === 'identifier') return param.text;
+        if (['typed_parameter', 'default_parameter', 'typed_default_parameter'].includes(param.type)) {
+            const name = param.childForFieldName('name') || param.namedChild(0);
+            return name?.type === 'identifier' ? name.text : null;
+        }
+        if (param.type !== 'positional_separator') return null;
+    }
+    return null;
+}
+
+/** Whether a nested function or lambda binds `name` as a parameter. */
+function pythonParamsBind(fn, name) {
+    const params = fn.childForFieldName('parameters');
+    for (let i = 0; i < (params?.namedChildCount || 0); i++) {
+        let param = params.namedChild(i);
+        if (param.type === 'default_parameter' || param.type === 'typed_default_parameter') {
+            param = param.childForFieldName('name');
+        } else if (param.type === 'typed_parameter') {
+            param = param.namedChild(0);
+        }
+        if (param?.type === 'list_splat_pattern' || param?.type === 'dictionary_splat_pattern') {
+            param = param.namedChild(0);
+        }
+        if (param?.type === 'identifier' && param.text === name) return true;
+    }
+    return false;
+}
+
+/** Instance attributes the methods of a class body assign on their receiver,
+ * one per name in source order, names in `declared` excluded (fix #430).
+ * A static method has no receiver; a nested class has its own; a nested
+ * function or lambda that rebinds the receiver's name assigns another value. */
+function pythonInstanceAttributes(bodyNode, declared) {
+    const out = [];
+    const seen = new Set(declared);
+    for (const def of pythonClassBodyDefs(bodyNode)) {
+        const fn = def.type === 'decorated_definition' ? def.childForFieldName('definition') : def;
+        if (def.type === 'decorated_definition' && def.namedChildren.some(child =>
+            child.type === 'decorator' && /^@\s*staticmethod\b/.test(child.text))) continue;
+        const receiver = fn && pythonReceiverName(fn);
+        const body = fn?.childForFieldName('body');
+        if (!receiver || !body) continue;
+        traverseTree(body, node => {
+            if (node.type === 'class_definition') return false;
+            if ((node.type === 'function_definition' || node.type === 'lambda') &&
+                pythonParamsBind(node, receiver)) return false;
+            if (node.type !== 'assignment' && node.type !== 'augmented_assignment') return true;
+            const type = node.type === 'assignment' ? node.childForFieldName('type') : null;
+            for (const target of pythonTargetNames(node.childForFieldName('left'), 'attribute')) {
+                const object = target.childForFieldName('object');
+                const attr = target.childForFieldName('attribute');
+                if (object?.type !== 'identifier' || object.text !== receiver || !attr) continue;
+                if (seen.has(attr.text)) continue;
+                seen.add(attr.text);
+                out.push({ name: attr.text, startLine: attr.startPosition.row + 1,
+                    endLine: node.endPosition.row + 1, memberType: 'field', instanceAttribute: true,
+                    ...(type && { returnType: type.text }) });
+            }
+            return true;
+        });
+    }
+    return out;
+}
+
 function parseTree(parser, code) {
     return safeParse(parser, code, undefined, PARSE_OPTIONS);
 }
@@ -1071,18 +1156,34 @@ function extractClassMembers(classNode, code) {
     if (!bodyNode) return members;
 
     // A class-body assignment declares an attribute, including an annotated
-    // dataclass field. Function and nested-class bodies have their own owners.
+    // dataclass field and each name of a tuple target. Function and
+    // nested-class bodies have their own owners.
+    const declared = new Set();
     traverseTree(bodyNode, node => {
         if (node.type === 'function_definition' || node.type === 'class_definition') return false;
         if (node.type !== 'assignment') return true;
-        const name = node.childForFieldName('left');
-        if (name?.type !== 'identifier') return true;
         const type = node.childForFieldName('type');
-        members.push({ name: name.text, startLine: name.startPosition.row + 1,
-            endLine: node.endPosition.row + 1, memberType: 'field',
-            ...(type && { returnType: type.text }) });
+        for (const name of pythonTargetNames(node.childForFieldName('left'), 'identifier')) {
+            declared.add(name.text);
+            members.push({ name: name.text, startLine: name.startPosition.row + 1,
+                endLine: node.endPosition.row + 1, memberType: 'field',
+                ...(type && { returnType: type.text }) });
+        }
         return true;
     });
+    // An attribute a method assigns on its receiver (`self.x = v`, `self.x:
+    // T = v`, `self.x += v`) is an instance attribute of the class (fix
+    // #430): one declaration per name, the first in source order, unless
+    // the class body declares the name.
+    // A property the class body declares is a data descriptor: assigning
+    // it on the receiver runs its setter, never declares an attribute.
+    for (const def of pythonClassBodyDefs(bodyNode)) {
+        if (def.type !== 'decorated_definition') continue;
+        const name = def.childForFieldName('definition')?.childForFieldName('name')?.text;
+        if (name && def.namedChildren.some(child => child.type === 'decorator' &&
+            /^@\s*(?:property|[A-Za-z_]\w*\.(?:setter|deleter))\s*$/.test(child.text))) declared.add(name);
+    }
+    for (const attribute of pythonInstanceAttributes(bodyNode, declared)) members.push(attribute);
 
     for (const child of pythonClassBodyDefs(bodyNode)) {
         let funcNode = child;

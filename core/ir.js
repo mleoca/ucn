@@ -83,7 +83,7 @@ function normalizeSymbol(symbol, family, language, kind, owner = null) {
         'typeArity', 'ownerTypeArity',
         'annotationType', 'valueShape', 'friendOf', 'templateParams', 'delegateParams',
         'typedefName', 'forwardDeclaration', 'anonymousNamespace', 'specialization',
-        'memberConst', 'refQualifier', 'fieldPointers',
+        'memberConst', 'refQualifier', 'fieldPointers', 'memberPaths', 'instanceAttribute',
         'ambientAugmentation',
     ];
     for (const field of passthrough) {

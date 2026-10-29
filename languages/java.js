@@ -842,6 +842,9 @@ function extractEnumConstants(enumNode, codeOrLines) {
                                 ...(memberGenerics && { generics: memberGenerics })
                             });
                         }
+                    } else if (member.type === 'field_declaration') {
+                        // Fields after the constants (fix #430).
+                        constants.push(...javaFieldMembers(member, code));
                     } else if (member.type === 'constructor_declaration') {
                         const nameNode = member.childForFieldName('name');
                         const paramsNode = member.childForFieldName('parameters');
@@ -871,6 +874,48 @@ function extractEnumConstants(enumNode, codeOrLines) {
     }
 
     return constants;
+}
+
+/**
+ * The field members a field or constant declaration declares. Interface and
+ * annotation type constants (`constant_declaration`, implicitly public static
+ * final; fix #389) are fields like class fields.
+ */
+function javaFieldMembers(child, code) {
+    const members = [];
+    const typeNode = child.childForFieldName('type');
+    const fieldTypeText = typeNode ? typeNode.text : null;
+    // Visibility travels with the member (fix #251 — public
+    // instance fields were invisible to api/fileExports because
+    // the member had no modifiers for the #240 discipline to read;
+    // the #241 Rust-field twin).
+    const fieldModifiers = extractModifiers(child);
+    if (child.type === 'constant_declaration') {
+        for (const implicit of ['public', 'static', 'final']) {
+            if (!fieldModifiers.includes(implicit)) fieldModifiers.push(implicit);
+        }
+    }
+    for (let j = 0; j < child.namedChildCount; j++) {
+        const decl = child.namedChild(j);
+        if (decl.type !== 'variable_declarator') continue;
+        const nameNode = decl.childForFieldName('name');
+        if (!nameNode || !fieldTypeText) continue;
+        const { startLine, endLine, sourceSpan } = nodeToLocation(child, code);
+        // fix #390: an annotation on its own line starts the
+        // declaration; the name's line is where edits go.
+        const nameLine = nameNode.startPosition.row + 1;
+        members.push({
+            name: nameNode.text,
+            startLine,
+            endLine,
+            sourceSpan,
+            ...(nameLine !== startLine && { nameLine }),
+            memberType: 'field',
+            ...(fieldModifiers.length > 0 && { modifiers: [...fieldModifiers] }),
+            fieldType: fieldTypeText
+        });
+    }
+    return members;
 }
 
 /**
@@ -999,44 +1044,8 @@ function extractClassMembers(classNode, codeOrLines) {
 
         // Field declarations: declared types drive receiver disambiguation
         // (fix #202) — Rust/Go already emit field members with fieldType.
-        // Interface and annotation type constants (`constant_declaration`,
-        // implicitly public static final; fix #389) are fields like class
-        // fields.
         if (child.type === 'field_declaration' || child.type === 'constant_declaration') {
-            const typeNode = child.childForFieldName('type');
-            const fieldTypeText = typeNode ? typeNode.text : null;
-            // Visibility travels with the member (fix #251 — public
-            // instance fields were invisible to api/fileExports because
-            // the member had no modifiers for the #240 discipline to read;
-            // the #241 Rust-field twin).
-            const fieldModifiers = extractModifiers(child);
-            if (child.type === 'constant_declaration') {
-                for (const implicit of ['public', 'static', 'final']) {
-                    if (!fieldModifiers.includes(implicit)) fieldModifiers.push(implicit);
-                }
-            }
-            for (let j = 0; j < child.namedChildCount; j++) {
-                const decl = child.namedChild(j);
-                if (decl.type === 'variable_declarator') {
-                    const nameNode = decl.childForFieldName('name');
-                    if (nameNode && fieldTypeText) {
-                        const { startLine, endLine, sourceSpan } = nodeToLocation(child, code);
-                        // fix #390: an annotation on its own line starts the
-                        // declaration; the name's line is where edits go.
-                        const nameLine = nameNode.startPosition.row + 1;
-                        members.push({
-                            name: nameNode.text,
-                            startLine,
-                            endLine,
-                            sourceSpan,
-                            ...(nameLine !== startLine && { nameLine }),
-                            memberType: 'field',
-                            ...(fieldModifiers.length > 0 && { modifiers: fieldModifiers }),
-                            fieldType: fieldTypeText
-                        });
-                    }
-                }
-            }
+            members.push(...javaFieldMembers(child, code));
         }
     }
 
@@ -2442,24 +2451,27 @@ function findCallsInCode(code, parser) {
             const resTypeNode = node.childForFieldName('type');
             const resNameNode = node.childForFieldName('name');
             const resValueNode = node.childForFieldName('value');
-            let typeName = resValueNode?.type === 'object_creation_expression'
-                ? extractTypeName(resValueNode.childForFieldName('type'))
-                : null;
-            let typeQualifier = resValueNode?.type === 'object_creation_expression'
-                ? extractReceiverTypeQualifier(resValueNode.childForFieldName('type'))
-                : null;
-            if (!typeName && resTypeNode && resTypeNode.text !== 'var') {
-                typeName = extractTypeName(resTypeNode);
-                typeQualifier = extractReceiverTypeQualifier(resTypeNode);
-            }
+            // The declared type is the variable's static type; only `var`
+            // takes the constructed one (fix #430: `try (ObjectPool<..> pool =
+            // new TestObjectPool())` calls ObjectPool's members).
+            const declared = resTypeNode && resTypeNode.text !== 'var';
+            const constructed = resValueNode?.type === 'object_creation_expression'
+                ? resValueNode.childForFieldName('type') : null;
+            const typeSource = declared ? resTypeNode : constructed;
+            const typeName = typeSource ? extractTypeName(typeSource) : null;
+            const typeQualifier = typeSource ? extractReceiverTypeQualifier(typeSource) : null;
+            // A resource is final: it holds exactly the constructed value,
+            // as a never-reassigned local does (fix #394).
+            const constructedType = declared && constructed ? extractTypeName(constructed) : null;
+            const exactValue = constructedType && (constructedType !== typeName ||
+                (extractReceiverTypeQualifier(constructed) || null) !== (typeQualifier || null));
             if (resNameNode && typeName) {
                 const scopeKey = functionStack[functionStack.length - 1].startLine;
                 const typeMap = scopeTypes.get(scopeKey);
-                if (typeMap) typeMap.set(resNameNode.text, typeName, 'with-binding', node);
+                if (typeMap) typeMap.set(resNameNode.text, typeName,
+                    exactValue ? { ...typeOrigin('with-binding', node), constructedType } : 'with-binding', node);
                 const rawTypeMap = scopeRawTypes.get(scopeKey);
-                const rawType = resValueNode?.type === 'object_creation_expression'
-                    ? resValueNode.childForFieldName('type')?.text
-                    : resTypeNode?.text;
+                const rawType = typeSource?.text;
                 if (rawType) rawTypeMap?.set(resNameNode.text, rawType);
                 const qualifierMap = scopeTypeQualifiers.get(scopeKey);
                 if (typeQualifier) qualifierMap?.set(resNameNode.text, typeQualifier);

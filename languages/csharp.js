@@ -1946,6 +1946,31 @@ function receiverFieldPath(node, variableTypes, enclosingClass) {
     return null;
 }
 
+/**
+ * A receiver expression's text with the null-forgiving operator removed
+ * (fix #430): `TraceWriter!.Trace(..)` calls `Trace` on `TraceWriter`, the
+ * operator changes no type or lookup.
+ */
+function nullForgivingFreeText(node) {
+    if (!node) return node?.text;
+    const cuts = [];
+    const visit = current => {
+        if (current.type === 'postfix_unary_expression' && current.childCount === 2 &&
+            current.child(1).type === '!') cuts.push(current.child(1));
+        if (current.type === 'argument_list' || current.type === 'lambda_expression') return;
+        for (let i = 0; i < current.namedChildCount; i++) visit(current.namedChild(i));
+    };
+    visit(node);
+    if (cuts.length === 0) return node.text;
+    let text = '', at = node.startIndex;
+    const source = node.text;
+    for (const cut of cuts.sort((a, b) => a.startIndex - b.startIndex)) {
+        text += source.slice(at - node.startIndex, cut.startIndex - node.startIndex);
+        at = cut.endIndex;
+    }
+    return text + source.slice(at - node.startIndex);
+}
+
 function invocationIdentity(node) {
     if (!node) return {};
     if (node.type === 'identifier' || node.type === 'generic_name') {
@@ -1959,7 +1984,7 @@ function invocationIdentity(node) {
         return {
             name: nameNode?.type === 'generic_name' ? nameNode.namedChild(0)?.text : nameNode?.text,
             nameNode,
-            receiver: expression?.text,
+            receiver: nullForgivingFreeText(expression),
             isMethod: true,
         };
     }
@@ -1974,7 +1999,7 @@ function invocationIdentity(node) {
             name: nameNode?.type === 'generic_name'
                 ? nameNode.namedChild(0)?.text : nameNode?.text,
             nameNode,
-            receiver: expression?.text,
+            receiver: nullForgivingFreeText(expression),
             isMethod: true,
         };
     }
@@ -2022,6 +2047,15 @@ function staticMemberPath(node, variableTypes) {
 function staticArgKind(node, variableTypes) {
     if (!node) return 'expr';
     switch (node.type) {
+        case 'this': {
+            // `this` is an instance of the enclosing type (fix #430); a
+            // generic type's own instance stays unknown.
+            let owner = node.parent;
+            while (owner && !TYPE_DECLARATIONS.has(owner.type)) owner = owner.parent;
+            const name = owner?.childForFieldName('name')?.text;
+            return name && !owner.childForFieldName('type_parameters') &&
+                !owner.namedChildren.some(child => child.type === 'type_parameter_list') ? `type:${name}` : 'expr';
+        }
         case 'string_literal':
         case 'verbatim_string_literal':
         case 'interpolated_string_expression':
@@ -2179,7 +2213,8 @@ function callArgs(node, variableTypes) {
         node.namedChildren.find(child => child.type === 'argument_list');
     const args = (argsNode?.namedChildren || []).filter(child => child.type === 'argument');
     const argKinds = args.map(argument =>
-        staticArgKind(argument.namedChild(0), variableTypes));
+        staticArgKind(argument.namedChild(0) ||
+            (argument.childCount === 1 && argument.child(0)?.type === 'this' ? argument.child(0) : null), variableTypes));
     return {
         argCount: args.length,
         ...(argKinds.some(kind => kind !== 'expr') && { argKinds }),

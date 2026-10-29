@@ -9987,3 +9987,56 @@ describe('fix #425: Python class patterns type the capture and narrow the subjec
         } finally { rm(dir); }
     });
 });
+
+describe('fix #430: Python instance attributes are value members of their class', () => {
+    it('indexes the first receiver assignment per class, annotated, and resolves its accesses and rename', () => {
+        const dir = tmp({
+            'a.py': [
+                'class Client:',
+                '    timeout: int = 5',
+                '',
+                '    def __init__(self, url, hooks=None):',
+                '        self.url = url',
+                '        self._hooks: dict = hooks or {}',
+                '        self.count = 0',
+                '        self.timeout = 9',
+                '',
+                '    def run(self):',
+                '        self.count += 1',
+                '        self.extra = self.url',
+                '        def inner(self):',
+                '            self.shadowed = 1',
+                '        return self._hooks',
+                '',
+                '    @staticmethod',
+                '    def make(cfg):',
+                '        cfg.static_only = 1',
+                '',
+                'def use(c: Client):',
+                '    print(c.url, c.count)',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const fields = name => (index.symbols.get(name) || []).filter(d => d.type === 'field')
+                .map(d => `${d.className}:${d.startLine}${d.returnType ? `:${d.returnType}` : ''}`);
+            assert.deepStrictEqual(fields('url'), ['Client:5']);
+            assert.deepStrictEqual(fields('_hooks'), ['Client:6:dict']);
+            assert.deepStrictEqual(fields('count'), ['Client:7']);
+            assert.deepStrictEqual(fields('extra'), ['Client:12']);
+            // The class body declares `timeout`; a nested function rebinding
+            // `self` and a static method's parameter assign other objects.
+            assert.deepStrictEqual(fields('timeout'), ['Client:2:int']);
+            assert.deepStrictEqual(fields('shadowed'), []);
+            assert.deepStrictEqual(fields('static_only'), []);
+            const band = index.impact('url', { file: 'a.py', line: 5 }).valueAccesses;
+            assert.deepStrictEqual(band.byFile.flatMap(g => g.sites.map(s => s.line)), [12, 22]);
+            assert.ok(band.account.conserved);
+            const plan = execute(index, 'plan', { name: 'a.py:5:url', renameTo: 'address' });
+            assert.ok(plan.ok, plan.error);
+            const changes = plan.result.changes || [];
+            assert.deepStrictEqual(changes.map(c => c.line).sort((a, b) => a - b), [5, 12, 22]);
+            assert.ok(!changes.some(c => c.needsReview), JSON.stringify(changes.filter(c => c.needsReview)));
+        } finally { rm(dir); }
+    });
+});
